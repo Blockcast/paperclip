@@ -42,6 +42,19 @@ const code = workflow
 const crons = [...code.matchAll(/^\s*- cron:\s*["']([^"']+)["']/gm)].map((m) => m[1]);
 
 /**
+ * Guard (1) only: everything before it emits `outcome=skipped-pending`.
+ *
+ * Guard (2)'s `gh run list` is deliberately outside this region. A stale read
+ * there causes a redundant dispatch; a stale read in guard (1) causes a MISSED
+ * one, which is the BLO-38907 defect.
+ */
+const pendingReadRegion = (() => {
+  const end = code.indexOf('outcome=skipped-pending');
+  if (end === -1) throw new Error('expected guard (1) to emit outcome=skipped-pending');
+  return code.slice(0, end);
+})();
+
+/**
  * The entries of the workflow's TOP-LEVEL `permissions:` block, in order.
  *
  * Scoped deliberately. Matching `actions:\s*write` against the whole file lets a
@@ -489,14 +502,17 @@ test('every outcome the close step fires on is classified by the resolver', () =
 // ---------------------------------------------------------------------------
 
 test('the pending-runs JSON carries headSha for the stall-clock derivation', () => {
-  const jsonFields = workflow.match(/--json\s+([A-Za-z,]+)\s*\\/g) ?? [];
-  const pendingQuery = jsonFields.find((line) => line.includes('status'));
-  assert.ok(pendingQuery, 'expected a --json query selecting the pending dispatch fields');
+  // BLO-38907 moved this read from `gh run list --json …` to the REST endpoint, so
+  // the fields are now produced by a jq object construction rather than a CLI flag.
+  // The invariant is unchanged: all five keys must reach the consumers, and the
+  // REST endpoint returns snake_case, so the mapping is load-bearing — drop a key
+  // and the consumer sees `undefined`, which for `createdAt` is an unparseable date
+  // and for `databaseId` is a cancel call against `undefined`.
   for (const field of ['databaseId', 'status', 'createdAt', 'url', 'headSha']) {
     assert.match(
-      pendingQuery,
-      new RegExp(`\\b${field}\\b`),
-      `pending-runs JSON must select ${field}`,
+      pendingReadRegion,
+      new RegExp(`\\b${field}\\s*:`),
+      `pending-runs JSON must carry ${field}`,
     );
   }
 });
@@ -525,12 +541,71 @@ test('the dispatcher and DEPLOY_WORKFLOW_FILE name the same workflow', () => {
   // which read as working. `code` is comment-stripped, so the file's own prose
   // about docker.yml cannot satisfy this.
   const invocations = [...code.matchAll(/--workflow=(\S+)/g)].map((m) => m[1]);
-  assert.ok(invocations.length > 0, 'the dispatcher must query the deploy workflow by name');
-  for (const workflowFile of invocations) {
+  // BLO-38907 moved guard (1) off `gh run list` and onto the REST endpoint, where
+  // the workflow is spelled in a URL path rather than a `--workflow=` flag. Both
+  // spellings must be checked or the new one is free to drift.
+  const restPaths = [...code.matchAll(/actions\/workflows\/([^/]+)\/runs\?/g)].map((m) => m[1]);
+  const named = [...invocations, ...restPaths];
+  assert.ok(named.length > 0, 'the dispatcher must query the deploy workflow by name');
+  for (const workflowFile of named) {
     assert.equal(
       workflowFile,
       DEPLOY_WORKFLOW_FILE,
       `dispatcher queries ${workflowFile} but the scripts build urls for ${DEPLOY_WORKFLOW_FILE}`,
     );
   }
+});
+
+// BLO-38907. Guard (1)'s read is the single point of failure for the whole chain:
+// `skipped-pending` is what arms the escalation AND the supersede, and it is also
+// what stops the daily slot stacking a second approval on production. A read that
+// under-reports is therefore not a degraded signal, it is the absence of all three.
+//
+// Measured live 2026-10-01 on Blockcast/paperclip while run 36850416203 was
+// `waiting`: `gh run list --workflow=docker.yml --event=workflow_dispatch` served a
+// slice whose newest entry was 2026-09-10T12:15:25Z — no October run at all, at
+// --limit 20 and --limit 50 — then returned the correct page on the next 11 calls.
+// The production 17:31Z slot hit the stale branch and reported `checked-no-pending`
+// with a deploy on the gate: no escalation, no supersede, and a GREEN run, which is
+// precisely the `conclusion`-carries-the-signal contract PEN-2848 established.
+//
+// The region tested is everything BEFORE `outcome=skipped-pending`, i.e. guard (1)
+// only — see `pendingReadRegion` at the top of this file.
+
+test('guard (1) does not read the pending set through `gh run list --event=`', () => {
+  assert.ok(
+    !/gh run list[^\n]*--event=/.test(pendingReadRegion),
+    'the pending read must not use `gh run list --event=` — measured to serve a ' +
+      'three-week-stale slice intermittently, which reads as "nothing pending"',
+  );
+});
+
+test('guard (1) unions two independent run queries, so a stale slice cannot zero it', () => {
+  // The fail-closed property, and it does not depend on either query being proven
+  // sound: a stale slice can only REMOVE rows from a result, so a union of two
+  // differently-filtered reads cannot produce a false zero. One read alone can.
+  // Dropping either query, or collapsing the union, restores the defect silently.
+  const queries = [...pendingReadRegion.matchAll(/actions\/workflows\/[^/]+\/runs\?([^"'\s]+)/g)].map(
+    (m) => m[1],
+  );
+  assert.equal(
+    queries.length,
+    2,
+    `guard (1) must union two run queries; found ${queries.length}: ${queries.join(' | ')}`,
+  );
+  assert.ok(
+    queries.some((q) => q.includes('event=workflow_dispatch')),
+    'one query must select the dispatch event',
+  );
+  assert.ok(
+    queries.some((q) => q.includes('status=waiting')),
+    'the other must select by status, so the two cannot go stale together on one filter',
+  );
+  // `unique_by` is what makes the union a union rather than a double-count: both
+  // queries return the same waiting run on the common path, and WAITING is printed
+  // to the step summary and read by the alert.
+  assert.ok(
+    /unique_by\(\.databaseId\)/.test(pendingReadRegion),
+    'the union must be de-duplicated by run id',
+  );
 });
