@@ -721,6 +721,62 @@ test("an entry moved in from a non-entry path still counts as added", () => {
   );
 });
 
+test("moving vendored source into the entry directory is rejected", () => {
+  // The destination is a valid entry path, which is what makes this the half
+  // --no-renames does NOT close: with the flag alone `changed` names the source
+  // again, but the destination is then an added entry whose diff is full of the
+  // moved source code, so it satisfies substantiveEntries as its own record and
+  // the guard passes on a file that has left the vendored tree.
+  const { git, commit, check } = scratchRepo();
+  // Moved with its content untouched, so git scores it R100. Modifying it in
+  // the same range drops the pair below the similarity threshold and git
+  // reports D + A instead -- a different, weaker shape that still demands an
+  // entry, so it is not this bypass.
+  git("mv", SOURCE, `${LOG_DIR}/blo-9.md`);
+  commit("launder vendored source into the entry directory");
+
+  const result = check();
+  assert.equal(result.ok, false, "source moved into LOG_DIR has left the tree");
+  assert.match(result.reason, /moves 1 vendored source file\(s\) into/);
+  assert.ok(
+    result.detail.some((line) => line.includes(SOURCE) && line.includes("blo-9.md")),
+    "the failure should name both ends of the move",
+  );
+});
+
+test("moving vendored source into the entry directory under a non-entry name is rejected", () => {
+  // The --no-renames twin of the case above. `moved.txt` is not an entry path,
+  // so addedEntries is empty and the guard would reject on `gained no entry`
+  // once `changed` names the source -- but only once it does. Without the flag
+  // the move is reported at its destination alone, that destination is filtered
+  // out as a LOG_DIR path, and `changed` reaches the early return empty.
+  const { git, commit, check } = scratchRepo();
+  git("mv", SOURCE, `${LOG_DIR}/moved.txt`);
+  commit("launder vendored source under a non-entry name");
+
+  assert.equal(check().ok, false, "a non-entry destination is still a removal");
+});
+
+test("moving vendored source onto a NOT_SOURCE path is rejected", () => {
+  // The --no-renames on `changed` earns its place here and nowhere else.
+  // LOG_DIR is not the only sink `changed` filters out -- NOT_SOURCE is the
+  // other, and relocatedIntoLog deliberately does not cover it. A move onto a
+  // NOT_SOURCE path that already exists is an M plus a D, so it rejects either
+  // way; it pairs as a rename only when the destination is absent at the base,
+  // and then the destination is filtered and `changed` comes back empty.
+  const { git, commit, dir } = scratchRepo();
+  git("rm", "--quiet", `${VENDOR_DIR}/PROVENANCE.md`);
+  commit("drop PROVENANCE.md so the move below pairs as a rename");
+  const base = git("rev-parse", "HEAD").trim();
+
+  git("mv", SOURCE, `${VENDOR_DIR}/PROVENANCE.md`);
+  commit("launder vendored source onto a path `changed` filters out");
+
+  const result = checkVendoredProvenanceLog({ base, head: "HEAD", cwd: dir });
+  assert.equal(result.ok, false, "source that left the tree must still be recorded");
+  assert.match(result.reason, /gained no entry/);
+});
+
 test("an entry with a non-ASCII filename satisfies the guard", () => {
   // core.quotePath defaults on, so git returns `"...caf\303\251.md"` -- quotes
   // and all. That fails isEntryPath and the LOG_DIR filter in `changed`, so the
