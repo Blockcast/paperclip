@@ -47,6 +47,10 @@ import {
 } from "./git-checkout-identity.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+import {
+  recordExecutionWorkspaceTeardown,
+  type ExecutionWorkspaceTeardownTrigger,
+} from "./metrics.js";
 
 export function resolveShell(): string {
   const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
@@ -5164,7 +5168,19 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   cleanupCommand?: string | null;
   teardownCommand?: string | null;
   recorder?: WorkspaceOperationRecorder | null;
+  /**
+   * Which caller asked for this teardown, for the PEN-3692 metrics split.
+   *
+   * Optional with an `unknown` default so adding it could not change any
+   * caller's behaviour, but every production call site sets it explicitly —
+   * the whole point of the label is to separate the periodic collector from
+   * the per-failure run teardown, which PEN-3692 could not do because both
+   * reach this function identically. A rising `unknown` share means a new call
+   * site was added without being classified.
+   */
+  trigger?: ExecutionWorkspaceTeardownTrigger;
 }) {
+  const trigger = input.trigger ?? "unknown";
   const warnings: string[] = [];
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
   const repoRoot = input.workspace.providerType === "git_worktree" && workspacePath
@@ -5239,6 +5255,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         });
         warnings.push(...authorization.warnings);
         if (authorization.authorized) {
+          const startedAt = Date.now();
+          let removalSucceeded = false;
           try {
             const removeForceArgs = authorization.removeForce === "double"
               ? ["--force", "--force"]
@@ -5258,8 +5276,21 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
               successMessage: `Removed git worktree ${workspacePath}\n`,
               failureLabel: `git worktree remove ${workspacePath}`,
             });
+            removalSucceeded = true;
           } catch (err) {
             warnings.push(err instanceof Error ? err.message : String(err));
+          } finally {
+            // PEN-3692: the tree walk this removal just performed is charged to
+            // the worker's own cgroup — `recordGitOperation` shells out, and an
+            // execFile child shares its parent's cgroup. Recorded in `finally`
+            // so a removal that threw still contributes the work it did before
+            // throwing.
+            recordExecutionWorkspaceTeardown({
+              trigger,
+              method: "worktree_remove",
+              succeeded: removalSucceeded,
+              durationMs: Date.now() - startedAt,
+            });
           }
         }
       }
@@ -5301,7 +5332,25 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     if (containsProjectWorkspace) {
       warnings.push(`Refusing to remove path "${workspacePath}" because it contains the project workspace.`);
     } else {
-      await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
+      const startedAt = Date.now();
+      let removalSucceeded = false;
+      try {
+        await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
+        removalSucceeded = true;
+      } finally {
+        // PEN-3692: try/finally, not try/catch — this call deliberately does
+        // not swallow its error (the caller treats a failed local_fs removal as
+        // fatal), so the throw still propagates and only the measurement is
+        // added. A recursive delete must readdir+lstat+unlink every entry, and
+        // unlike the worktree path it does so in-process, holding a libuv
+        // threadpool thread throughout.
+        recordExecutionWorkspaceTeardown({
+          trigger,
+          method: "remove_local_fs",
+          succeeded: removalSucceeded,
+          durationMs: Date.now() - startedAt,
+        });
+      }
       if (input.recorder) {
         await input.recorder.recordOperation({
           phase: "workspace_teardown",

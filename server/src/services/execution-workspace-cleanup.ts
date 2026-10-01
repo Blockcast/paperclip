@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { companies, executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
 import { and, asc, eq, isNull, lte, ne, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
+import { recordExecutionWorkspaceCollectorPass } from "./metrics.js";
 import {
   cleanupExecutionWorkspaceArtifacts,
   inspectWorktreeReclaimSafety,
@@ -349,6 +350,7 @@ export function executionWorkspaceCleanupService(db: Db) {
         }
 
         const cleanup = await cleanupExecutionWorkspaceArtifacts({
+          trigger: "collector",
           workspace: {
             id: candidate.id,
             cwd: candidate.cwd,
@@ -427,7 +429,12 @@ export function executionWorkspaceCleanupService(db: Db) {
       }
     }
 
-    return { stamped, scanned, collected, skipped, failed };
+    const result = { stamped, scanned, collected, skipped, failed };
+    // PEN-3692: recorded here rather than at the `index.ts` call site so the
+    // census cannot be lost by a future caller that forgets, and so it sits
+    // next to the `return` any new field would also have to pass through.
+    recordExecutionWorkspaceCollectorPass(result);
+    return result;
   }
 
   return { reconcileExecutionWorkspaceCleanup, stampIdleLegacyWorkspaces };
