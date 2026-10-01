@@ -1468,7 +1468,7 @@ describe("issue execution policy routes", () => {
       .send({});
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true });
+    expect(res.body).toEqual({ ok: true, outcome: "triggered" });
     expect(mockHeartbeatService.triggerIssueMonitor).toHaveBeenCalledWith(
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       expect.objectContaining({
@@ -1477,6 +1477,46 @@ describe("issue execution policy routes", () => {
         agentId: null,
       }),
     );
+  });
+
+  // PEN-3326: a check-now whose wake the platform declined re-arms the monitor
+  // instead of firing; the route must say so rather than answer a bare ok.
+  it("reports a deferred check-now outcome from the dedicated route (PEN-3326)", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1001",
+      title: "Manual monitor trigger",
+      executionPolicy: normalizeIssueExecutionPolicy({
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          notes: "Check deployment",
+          scheduledBy: "board",
+        },
+      }),
+      executionState: null,
+    });
+    mockHeartbeatService.triggerIssueMonitor.mockResolvedValueOnce({
+      outcome: "dispatch_suppressed_deferred",
+      nextCheckAt: "2026-04-11T12:36:00.000Z",
+      suppressionReason: "heartbeat.wakeOnDemand.disabled",
+    } as never);
+
+    const res = await request(await createApp())
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/monitor/check-now")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true,
+      outcome: "dispatch_suppressed_deferred",
+      nextCheckAt: "2026-04-11T12:36:00.000Z",
+      suppressionReason: "heartbeat.wakeOnDemand.disabled",
+    });
   });
 
   it("lets a board user create a child issue with a scheduled monitor", async () => {

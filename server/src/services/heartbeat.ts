@@ -853,6 +853,39 @@ export const ISSUE_MONITOR_DISPATCH_LAPSE_MS = 15 * 60 * 1000;
  */
 export const ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS = 4 * 60 * 60 * 1000;
 const ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS = 5 * 60 * 1000;
+
+/**
+ * PEN-3326: backoff for a monitor fire that `enqueueWakeup` *suppressed* — it
+ * wrote a durable `skipped` wakeup row and queued nothing, so no run exists and
+ * nothing will retry.
+ *
+ * Why a ladder rather than the flat `ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS`
+ * above: the suppressions that reach a monitor fire are agent/company state
+ * (`budget.blocked`, `agent.not_invokable`, `heartbeat.scheduling_suppressed`,
+ * `heartbeat.worktree_execution_cutoff`, `heartbeat.wakeOnDemand.disabled`,
+ * `issue_tree_hold_active`, …) and clear on a human action, not on a timer. A
+ * flat 5 minutes would spend the whole `DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS`
+ * budget (24) inside two hours and churn the activity log 24 times to do it.
+ * Doubling to a one-hour ceiling spans the same budget over ~21h
+ * (5 + 10 + 20 + 40 + 20 x 60 = 1275 min) at a quarter of the writes.
+ *
+ * The bound is deliberate and is NOT a silent drop: exhausting it routes the
+ * monitor through `clearIssueMonitorAndRecover`, which logs
+ * `issue.monitor_exhausted` and fires the configured `recoveryPolicy`. The
+ * behaviour this replaces deleted the timer on the FIRST suppression with no
+ * recovery at all.
+ */
+const ISSUE_MONITOR_SUPPRESSED_REARM_BASE_DELAY_MS = 5 * 60 * 1000;
+const ISSUE_MONITOR_SUPPRESSED_REARM_MAX_DELAY_MS = 60 * 60 * 1000;
+
+function suppressedDispatchRearmDelayMs(attemptCount: number): number {
+  const exponent = Math.max(0, attemptCount - 1);
+  return Math.min(
+    ISSUE_MONITOR_SUPPRESSED_REARM_BASE_DELAY_MS * Math.pow(2, exponent),
+    ISSUE_MONITOR_SUPPRESSED_REARM_MAX_DELAY_MS,
+  );
+}
+
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE = "paperclip_monitor_dispatch";
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX = "heartbeat_run:";
 
@@ -14373,6 +14406,84 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       source: input.activitySource,
     });
 
+    // Leave the recovery comment on the source issue and log the suppression. The
+    // comment is the artifact an observer of the SOURCE issue can actually see: the
+    // recovery row is a separate issue, and the activity log is not on the thread.
+    //
+    // `recoveryCommentAlreadyPosted` is set by the `wake_owner` caller, which
+    // writes the recovery body unconditionally before the wake (BLO-29856). There
+    // the fallback must add only the note naming why the wake did not land —
+    // re-posting the body would put two copies of it on the thread. The insert is
+    // best-effort for the same reason master's is: a comment that cannot land must
+    // not throw out of the tick, and the activity row is the durable record.
+    async function recordRecoveryWakeSuppression(
+      suppressedCommentLead: string,
+      suppressionMessage: string,
+      options: { recoveryCommentAlreadyPosted?: boolean } = {},
+    ): Promise<void> {
+      const suppressionNote = `${suppressedCommentLead}: ${suppressionMessage}`;
+      try {
+        await db.insert(issueComments).values({
+          companyId: input.claimed.companyId,
+          issueId: input.claimed.id,
+          ...(options.recoveryCommentAlreadyPosted
+            ? {
+              idempotencyKey:
+                `issue-monitor-recovery-wake-suppressed:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+            }
+            : {}),
+          body: options.recoveryCommentAlreadyPosted
+            ? suppressionNote
+            : [
+              monitorRecoveryComment({
+                issue: input.claimed,
+                clearReason: input.clearReason,
+                recoveryPolicy: input.recoveryPolicy,
+                nextAttemptCount: input.nextAttemptCount,
+              }),
+              "",
+              suppressionNote,
+            ].join("\n"),
+        });
+      } catch (commentErr) {
+        logger.warn(
+          { err: commentErr, issueId: input.claimed.id, clearReason: input.clearReason },
+          "issue monitor recovery wake-suppression comment insert failed (non-fatal, suppression still logged)",
+        );
+      }
+      await logActivity(db, {
+        companyId: input.claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_recovery_wake_suppressed",
+        entityType: "issue",
+        entityId: input.claimed.id,
+        details: { ...details, suppressionMessage },
+      });
+    }
+
+    // Queue a recovery wake, or when the gate declines it with a 4xx, fall back to
+    // the suppression record above. The wake target is the same seat whose
+    // suppression this recovery follows, so a declined wake is the expected case,
+    // not an error to escape the tick with.
+    async function enqueueRecoveryWakeOrComment(
+      agentId: string,
+      wakeInput: Parameters<typeof enqueueWakeup>[1],
+      suppressedCommentLead: string,
+      options: { recoveryCommentAlreadyPosted?: boolean } = {},
+    ): Promise<"queued" | "suppressed"> {
+      try {
+        await enqueueWakeup(agentId, wakeInput);
+        return "queued";
+      } catch (err) {
+        if (!(err instanceof HttpError) || err.status < 400 || err.status >= 500) throw err;
+        await recordRecoveryWakeSuppression(suppressedCommentLead, err.message, options);
+        return "suppressed";
+      }
+    }
+
     if (input.recoveryPolicy === "create_recovery_issue") {
       let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(input.claimed);
       if (!recoveryIssue) {
@@ -14398,39 +14509,102 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      if (recoveryIssue.assigneeAgentId) {
-        await enqueueWakeup(recoveryIssue.assigneeAgentId, {
-          source: "automation",
-          triggerDetail: "system",
-          reason: "issue_monitor_recovery_issue",
-          idempotencyKey: `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
-          payload: withRecoveryModelProfileHint({ issueId: recoveryIssue.id, sourceIssueId: input.claimed.id }, "status_only"),
-          requestedByActorType: input.actorType,
-          requestedByActorId: input.actorId,
-          contextSnapshot: withRecoveryModelProfileHint({
-            issueId: recoveryIssue.id,
-            sourceIssueId: input.claimed.id,
-            source: "issue.monitor.recovery_issue",
-            wakeReason: "issue_monitor_recovery_issue",
-          }, "status_only"),
+      // PEN-3326: the recovery issue defaults to the source issue's own assignee,
+      // which on the paused-seat exhaustion that now reaches here is the agent
+      // that could not be woken. The row is the unsuppressible artifact; a
+      // declined wake must not throw past the `issue.monitor_recovery_issue_created`
+      // log below, so route it through the same comment fallback as `wake_owner`.
+      //
+      // The fallback swallows 4xx only and rethrows 5xx, which is right — a server
+      // fault is not this tick's to absorb. But the recovery-issue row has already
+      // committed by then, so letting that rethrow skip the log below would leave
+      // the row discoverable by `originId` and by nothing else. Hence `finally`:
+      // the creation is logged on every exit, and the wake's own outcome is
+      // labelled rather than defaulting to "delivered" — `suppressed` for the 4xx
+      // fallback, `failed` for the 5xx that is about to propagate.
+      //
+      // `unassigned` is the fourth state and the one the union used to omit: the
+      // wake is skipped outright when the recovery row has no assignee, which
+      // `findOpenIssueMonitorRecoveryIssue` can return when a pre-existing
+      // recovery issue has since had its assignee cleared. Without a member for
+      // it the details spread emitted neither `recoveryWakeSuppressed` nor
+      // `recoveryWakeFailed` — byte-identical to a delivered wake, i.e. exactly
+      // the "default to the delivered reading" this labelling exists to prevent,
+      // in the one state where nobody was woken at all.
+      //
+      // The label alone made it auditable but not actionable, so this state
+      // records the SAME suppression artifact the 4xx fallback does: a comment on
+      // the source issue and an `issue.monitor_recovery_wake_suppressed` row. It
+      // is the only exit with nobody to wake, so the source thread is the only
+      // place a reader will look — and it is reached on the exhaustion path, with
+      // the monitor already being cleared, so there is no later tick to report it.
+      // The created-row label stays `recoveryWakeUnassigned` rather than borrowing
+      // `recoveryWakeSuppressed`: the artifact is shared, the cause is not.
+      let recoveryWakeOutcome: "queued" | "suppressed" | "failed" | "unassigned" =
+        recoveryIssue.assigneeAgentId ? "queued" : "unassigned";
+      try {
+        if (recoveryIssue.assigneeAgentId) {
+          recoveryWakeOutcome = await enqueueRecoveryWakeOrComment(recoveryIssue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_monitor_recovery_issue",
+            idempotencyKey: `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+            payload: withRecoveryModelProfileHint({ issueId: recoveryIssue.id, sourceIssueId: input.claimed.id }, "status_only"),
+            requestedByActorType: input.actorType,
+            requestedByActorId: input.actorId,
+            contextSnapshot: withRecoveryModelProfileHint({
+              issueId: recoveryIssue.id,
+              sourceIssueId: input.claimed.id,
+              source: "issue.monitor.recovery_issue",
+              wakeReason: "issue_monitor_recovery_issue",
+            }, "status_only"),
+          }, "The recovery-issue wake could not be delivered");
+        } else {
+          await recordRecoveryWakeSuppression(
+            "The recovery-issue wake was skipped",
+            `recovery issue ${recoveryIssue.identifier ?? recoveryIssue.id} has no assignee, so there was no seat to wake`,
+          );
+        }
+      } catch (err) {
+        recoveryWakeOutcome = "failed";
+        throw err;
+      } finally {
+        // The `.catch()` below is what makes this safe to `await`: it settles the
+        // rejection before the `await` can see it, so a throwing `logActivity`
+        // cannot complete the `finally` abruptly and REPLACE the exception the
+        // `catch` is still rethrowing. Without it the tick would log "issue
+        // monitor tick failed" against the activity-insert error instead of the
+        // 5xx root cause — and the two are correlated, since a 5xx originating in
+        // the DB layer is precisely when this insert also fails, so the
+        // best-effort annotation would outrank the error it exists to annotate
+        // exactly when that error matters most. The `await` must stay: it keeps
+        // the log ordered before the function returns. Swallowing the log error
+        // keeps the row discoverable by `originId`, which is the same fallback the
+        // `finally` was chosen for.
+        await logActivity(db, {
+          companyId: input.claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_recovery_issue_created",
+          entityType: "issue",
+          entityId: input.claimed.id,
+          details: {
+            ...details,
+            recoveryIssueId: recoveryIssue.id,
+            recoveryIdentifier: recoveryIssue.identifier,
+            ...(recoveryWakeOutcome === "suppressed" ? { recoveryWakeSuppressed: true } : {}),
+            ...(recoveryWakeOutcome === "failed" ? { recoveryWakeFailed: true } : {}),
+            ...(recoveryWakeOutcome === "unassigned" ? { recoveryWakeUnassigned: true } : {}),
+          },
+        }).catch((logErr) => {
+          logger.error(
+            { logErr, issueId: input.claimed.id, recoveryIssueId: recoveryIssue.id },
+            "issue monitor recovery-issue activity log failed",
+          );
         });
       }
-
-      await logActivity(db, {
-        companyId: input.claimed.companyId,
-        actorType: input.actorType,
-        actorId: input.actorId,
-        agentId: input.agentId,
-        runId: input.runId,
-        action: "issue.monitor_recovery_issue_created",
-        entityType: "issue",
-        entityId: input.claimed.id,
-        details: {
-          ...details,
-          recoveryIssueId: recoveryIssue.id,
-          recoveryIdentifier: recoveryIssue.identifier,
-        },
-      });
       return;
     }
 
@@ -14491,7 +14665,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     }
 
-    await enqueueWakeup(input.claimed.assigneeAgentId!, {
+    // PEN-3326: the comment above is the visibility half; this is the suppression
+    // half, and the two are independent. `wake_owner` is the DEFAULT recovery
+    // policy and its owner is the issue's own assignee — which on the failure this
+    // recovery most often follows (a suppressed dispatch that exhausted its
+    // deferral budget) is precisely the agent that cannot be woken. A bare
+    // `enqueueWakeup` here lets that 4xx escape the tick, so the escalation meant
+    // to make the loss loud is itself silently suppressed. Swallow it and record
+    // the suppression instead. The recovery body is already on the thread, so the
+    // fallback adds only the note naming why the wake did not land.
+    const wake = await enqueueRecoveryWakeOrComment(input.claimed.assigneeAgentId!, {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_monitor_recovery",
@@ -14518,7 +14701,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutAt: input.monitor?.timeoutAt ?? null,
         maxAttempts: input.monitor?.maxAttempts ?? null,
       }, "status_only"),
-    });
+    }, "The owner-recovery wake could not be delivered", { recoveryCommentAlreadyPosted: true });
+    if (wake === "suppressed") return;
 
     await logActivity(db, {
       companyId: input.claimed.companyId,
@@ -14694,7 +14878,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ...buildIssueMonitorClearedPatch({
               issue: claimed,
               policy,
-              clearReason: "dispatch_skipped",
+              clearReason: "dispatch_watchdog_recovered",
               clearedAt: input.now,
             }),
             updatedAt: input.now,
@@ -14807,17 +14991,141 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
+    // PEN-3326: `enqueueWakeup` can decline a monitor fire outright — it writes a
+    // durable `skipped` wakeup row and queues nothing. Two shapes reach here: the
+    // skip-then-throw gates (`budget.blocked`, `agent.not_invokable`) arrive as a
+    // 409 in the catch below, and the skip-then-return-null gates
+    // (`heartbeat.scheduling_suppressed`, `heartbeat.worktree_execution_cutoff`,
+    // `heartbeat.wakeOnDemand.disabled`, `issue_tree_hold_active`, …) arrive as a
+    // plain `null` on the success path. Both mean the same thing — NO run exists
+    // and nothing will retry — so consuming the timer loses the work outright.
+    // Re-arm instead, bounded, exactly as the sibling `dependency_blocked`
+    // deferral below already does.
+    //
+    // The sink, not the HTTP status, is the discriminator. A null return also
+    // covers `alreadyDelivered` (a wake IS pending) and `providerCapacityDeferred`
+    // (a scheduled_retry run IS committed); neither loses work and neither sets
+    // `durableSkipReason`. Reading the status instead would be wrong in both
+    // directions: it cannot see the return-null gates at all, and it cannot tell
+    // `budget.blocked`'s 409 from a 409 raised by anything else.
+    //
+    // One more return-null writer exists, and it is the only `durableSkipReason`
+    // set outside the funnel at `enqueueWakeup`'s single skip helper:
+    // `pipeline_stage_exit_cancellation_pending`. It fires only on
+    // `issue.status === "cancelled"`, which the tick's own claim filter excludes
+    // (`in_progress`/`in_review`), so reaching it needs a cancellation to commit
+    // in the window between the claim and the gate. It is deliberately NOT
+    // special-cased here: the deferral is still the least-wrong answer, since the
+    // alternative on this path is the triggered patch that asserts a wake nobody
+    // queued. Known consequence, tracked separately — the re-arm leaves a future
+    // `monitorNextCheckAt` on a cancelled row, no later tick can claim it back
+    // (same status filter), and nothing else nulls that column on cancellation,
+    // so `hasActiveMonitorPath` reads a wake path that will never dispatch.
+    //
+    // `company.inactive` is the last gate that reaches here, and it is bounded
+    // the same way — by a filter upstream of this function, not by anything in
+    // it. Both of the tick's own selects innerJoin `companies` on
+    // `status = 'active'`, so a paused, archived or missing company's monitors
+    // are never enumerated in the first place and no attempt budget is ever
+    // spent against them. Two narrow paths remain: a status flip landing between
+    // that select and the gate's own company read (one deferral, then the row is
+    // simply never selected again), and an agent-actor `POST
+    // /issues/:id/monitor/check-now`, which is one manual dispatch — a user
+    // actor gets the `throw conflict` arm instead. Deferring is the right answer
+    // on both: `paused → active` and `archived → active` are BOTH supported
+    // transitions that restore agents, so the monitor a reactivation needs is
+    // the one this keeps. Only a missing company row is genuinely terminal, and
+    // the FK makes that unreachable from an issue that exists.
+    const monitorSuppression: WakeSuppressionOutcome = {
+      durableSkipReason: null,
+      providerCapacityDeferred: false,
+      dependencyBlockedRetryAt: null,
+      alreadyDelivered: false,
+    };
+    const deferSuppressedDispatch = async (
+      skipReason: string,
+      errorMessage: string | null,
+    ): Promise<
+      | {
+        kind: "rearmed";
+        result: { outcome: "dispatch_suppressed_deferred"; nextCheckAt: string; suppressionReason: string };
+      }
+      | { kind: "unpersistable" }
+    > => {
+      // No exhaustion check here. The top-level `clearReason` above already ran
+      // `exhaustedMonitorClearReason` against `priorAttemptCount` and the same
+      // `input.now`, so reaching this point means the budget is not spent. This
+      // re-arm persists `nextAttemptCount`, and the next pass's top-level check
+      // routes a spent budget to `clearIssueMonitorAndRecover` (the loud path:
+      // `issue.monitor_exhausted` plus the configured recoveryPolicy), exactly as
+      // the `dependency_blocked` deferral below terminates. Re-checking the
+      // INCREMENTED count here moved the ceiling by one: at `maxAttempts: 1` a
+      // suppressed dispatch got no deferral at all.
+      const retryAt = new Date(input.now.getTime() + suppressedDispatchRearmDelayMs(nextAttemptCount));
+      const retryPolicy = monitor
+        ? normalizeIssueExecutionPolicy({
+            ...policy,
+            monitor: { ...monitor, nextCheckAt: retryAt.toISOString() },
+          })
+        : null;
+      // Same guard, and for the same reason, as the dependency-blocked branch: if
+      // the monitor policy has drifted away while `monitorNextCheckAt` is still
+      // set there is nothing to rebuild, and reporting "deferred" without a write
+      // would leave the column in the past AND the attempt unincremented — a row
+      // that re-claims every staleClaimThreshold forever against a frozen attempt
+      // count, i.e. the unbounded loop this bound exists to prevent.
+      if (!retryPolicy?.monitor) return { kind: "unpersistable" };
+
+      await db
+        .update(issues)
+        .set({
+          ...buildIssueMonitorDispatchRearmPatch({
+            issue: claimed,
+            policy: retryPolicy,
+            attemptCount: nextAttemptCount,
+          }),
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, claimed.id));
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_dispatch_suppressed_deferred",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: retryAt.toISOString(),
+          previousCheckAt: scheduledAtIso,
+          monitorAttemptCount: nextAttemptCount,
+          // Both were already in hand at the old clear site and neither survived
+          // it: `suppressionReason` is the durable label written onto the skipped
+          // wakeup row, `reason` the gate's own sentence where it threw one.
+          suppressionReason: skipReason,
+          reason: errorMessage,
+          notes: claimed.monitorNotes ?? null,
+          ...monitorMetadata,
+          source: input.activitySource,
+        },
+      });
+      return {
+        kind: "rearmed",
+        result: {
+          outcome: "dispatch_suppressed_deferred" as const,
+          nextCheckAt: retryAt.toISOString(),
+          suppressionReason: skipReason,
+        },
+      };
+    };
+
     try {
       // BLO-22048: an unresolved blocker makes enqueueWakeup park the wake as a
       // `dependency_blocked` scheduled_retry and return null *without throwing*,
       // so the triggered patch below would otherwise fire for a wake that never
       // ran. The sink is how that deferral is distinguished from a real dispatch.
-      const monitorSuppression: WakeSuppressionOutcome = {
-        durableSkipReason: null,
-        providerCapacityDeferred: false,
-        dependencyBlockedRetryAt: null,
-        alreadyDelivered: false,
-      };
       await enqueueWakeup(targetAgentId, {
         source: input.source,
         triggerDetail: input.triggerDetail,
@@ -14942,6 +15250,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { outcome: "dependency_blocked_deferred" as const, nextCheckAt: retryAt.toISOString() };
       }
 
+      // PEN-3326: a declined wake reaching here as a plain `null` was the worse
+      // half of this defect. It fell through to the triggered patch below, which
+      // consumes the timer AND logs `issue.monitor_triggered` — an activity row
+      // asserting a wake that was never queued. The clear path at least said
+      // "skipped".
+      if (monitorSuppression.durableSkipReason) {
+        const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, null);
+        if (deferral.kind === "rearmed") return deferral.result;
+        // `unpersistable` — fall through to the triggered patch, which at least
+        // terminates the row rather than leaving it re-claiming forever. This is
+        // the pre-existing behaviour for policy drift, unchanged.
+      }
+
       await db
         .update(issues)
         .set({
@@ -14977,6 +15298,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { outcome: "triggered" as const };
     } catch (err) {
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
+        // PEN-3326: the skip-then-throw gates (`budget.blocked`,
+        // `agent.not_invokable`) land here. They are suppressions, not verdicts
+        // on this issue: the agent is paused or not invokable *right now*, on a
+        // condition a human clears. Deleting the timer made that recoverable
+        // pause permanently destructive — resuming the seat does not bring the
+        // schedule back, and the row then reads healthy on every field an
+        // observer checks. THIS throw-branch deferral is automation-only: the
+        // manual/on-demand caller passes `clearOnClientError: false`, already
+        // leaves the monitor intact, and must keep seeing the 409. The
+        // return-null deferral above is deliberately NOT gated the same way: a
+        // null return carries no error to surface, so falling through on the
+        // manual path would replay the "triggered for a wake never queued"
+        // defect. It re-arms instead, and the route reports the deferred
+        // outcome rather than a bare ok.
+        if (input.clearOnClientError && monitorSuppression.durableSkipReason) {
+          const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, err.message);
+          if (deferral.kind === "rearmed") return deferral.result;
+          // `unpersistable` — fall through to the clear below, unchanged.
+        }
         if (input.clearOnClientError) {
           await db
             .update(issues)
@@ -15220,6 +15560,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Leaving it uncounted made `checked` exceed `triggered + skipped` with no
     // explanation — the same "the deferral is invisible" shape BLO-22048 is about.
     let dependencyBlockedDeferred = 0;
+    // Counted separately again, and for the same reason: a suppressed dispatch
+    // declined nothing either — it re-armed. Folding it into `skipped` would hide
+    // the very distinction PEN-3326 is about.
+    let dispatchSuppressedDeferred = 0;
 
     for (const due of dueMonitors) {
       const claimed = await db.transaction(async (tx) => {
@@ -15266,6 +15610,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (result.outcome === "triggered") triggered += 1;
         if (result.outcome === "skipped") skipped += 1;
         if (result.outcome === "dependency_blocked_deferred") dependencyBlockedDeferred += 1;
+        if (result.outcome === "dispatch_suppressed_deferred") dispatchSuppressedDeferred += 1;
       } catch (err) {
         logger.error({ err, issueId: claimed.id }, "issue monitor tick failed");
       }
@@ -15276,6 +15621,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       triggered,
       skipped,
       dependencyBlockedDeferred,
+      dispatchSuppressedDeferred,
     };
   }
 
@@ -40296,7 +40642,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Blocker-deferred monitors delivered no wake, so they belong on the
         // not-enqueued side of the ledger rather than silently widening the gap
         // between `checked` and the two counters that explain it (BLO-22048).
+        // A suppressed-dispatch deferral (PEN-3326) is the same shape: no wake
+        // was delivered, and the timer survived.
         skipped: skipped + issueMonitors.skipped + issueMonitors.dependencyBlockedDeferred +
+          issueMonitors.dispatchSuppressedDeferred +
           expiredIssueMonitors.recovered,
         idleSkipped,
       };
