@@ -308,6 +308,16 @@ async function probeOne(
     const atHead = surfaces.reviews
       .filter((r) => (r.state ?? "").trim().toUpperCase() !== "DISMISSED")
       .filter((r) => (r.commitId ?? "").trim().toLowerCase() === normalizedHead)
+      // No tiebreak for a null `submittedAt`, ON PURPOSE (BLO-34808 item 2,
+      // closed as not-a-defect rather than left unexplained). Equal sort keys
+      // would fall back to GitHub's unsorted response order — but the state is
+      // unreachable: `PENDING` is the only unsubmitted review state and
+      // `githubListReviewerSurfacesAtPr` already drops it, so every row here
+      // carries a real timestamp. The ordering rule itself IS covered: the two
+      // multi-review fixtures in `evidence-truth.test.ts` ("only the NEWEST
+      // review at head decides", "a DISMISSED review does not veto a live clean
+      // one") use distinct real `submittedAt` values. Adding a tiebreak would
+      // be dead code with no failing mutation.
       .sort((a, b) => (b.submittedAt ?? "").localeCompare(a.submittedAt ?? ""));
     const newest = atHead[0];
     const formalBlocking = newest !== undefined && hasActionablePrReviewFeedback(newest.body, newest.state);
