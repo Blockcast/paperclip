@@ -1319,13 +1319,16 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
   );
   assert.match(
     warning,
-    /Blockcast\/onprem-k8s#4036[^.]*PaperclipAgentStartLockWedged at `[^`]*> 14400` for 5m/,
-    "values.yaml must give the live Wedged rule landed by #4036: > 14400 for 5m",
+    // Pin the metric name, not just the threshold: an unconstrained `[^`]*`
+    // here passes a WARNING that quotes a completely wrong series, which is the
+    // one element of this block that fails silently in the operator's hands.
+    /Blockcast\/onprem-k8s#4036[^.]*PaperclipAgentStartLockWedged at `max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > 14400` for 5m/,
+    "values.yaml must give the live Wedged rule landed by #4036: max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400 for 5m",
   );
   assert.match(
     warning,
-    /SEPARATE alert, PaperclipAgentStartLockFleetStall, at `count\([^`]*> 900\) >= 3` for 10m/,
-    "values.yaml must name FleetStall (>= 3 agents past 900s for 10m) as a separate live alert",
+    /SEPARATE alert, PaperclipAgentStartLockFleetStall, at `count\(max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > 900\) >= 3` for 10m/,
+    "values.yaml must name FleetStall as a separate live alert: count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3 for 10m",
   );
   assert.doesNotMatch(
     warning,
