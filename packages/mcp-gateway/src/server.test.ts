@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MCP_SESSION_HEADER } from "./session-keepalive.js";
-import { buildInitializeReplayHeaders, createGatewayServer, loadGatewayConfig, type GatewayState } from "./server.js";
+import { buildInitializeReplayHeaders, createGatewayServer, createHealthServer, DEFAULT_PORT, loadGatewayConfig, type GatewayState } from "./server.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import {
   DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
@@ -2049,5 +2049,119 @@ describe("PEN-2370: response bodies have exactly one exit", () => {
 
   it("does not count a bodyless end, which carries nothing to disclose", () => {
     expect(findBodyBearingWrites(parseServerSource("res.end();\nres.end();"))).toHaveLength(0);
+  });
+});
+
+describe("PEN-3052: probe-only health listener on a second port", () => {
+  // Why this exists: the kubelet probes from the node's host network, so the
+  // CiliumNetworkPolicy that denies the proxy port from `fromEntities: [host,
+  // remote-node]` would deny the probes too. Both probes on
+  // `paperclip-mcp-gateway-k8s-ro` target the proxy port and liveness failure
+  // restarts the container, so the deny cannot land until they move.
+
+  async function startHealthServer(isServing: () => boolean = () => true): Promise<string> {
+    const server = createHealthServer(isServing);
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    return `http://127.0.0.1:${port}`;
+  }
+
+  it("answers the probe paths and nothing else", async () => {
+    const base = await startHealthServer();
+
+    for (const probePath of ["/healthz", "/"]) {
+      const res = await fetch(`${base}${probePath}`);
+      expect(res.status, probePath).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+    }
+
+    const withQuery = await fetch(`${base}/healthz?probe=kubelet`);
+    expect(withQuery.status).toBe(200);
+  });
+
+  // THE security property. The deny this listener exists to permit names one
+  // port; anything reachable here is reachable around that deny. A health
+  // listener that proxied would be a wider hole than the one being closed.
+  it("does not proxy — no MCP route is reachable on the health port", async () => {
+    const base = await startHealthServer();
+
+    const paths = ["/mcp", "/mcp/", "/k8s-admin/mcp", "/k8s-admin/mcp/tools", "/.well-known/oauth-protected-resource"];
+    for (const path of paths) {
+      const res = await fetch(`${base}${path}`, { method: "POST", body: "{}" });
+      expect(res.status, path).toBe(404);
+    }
+
+    // ...and a GET of the same routes is not a way around the POST check.
+    for (const path of paths) {
+      const res = await fetch(`${base}${path}`);
+      expect(res.status, `GET ${path}`).toBe(404);
+    }
+  });
+
+  it("refuses a write method even on a probe path", async () => {
+    const base = await startHealthServer();
+    const res = await fetch(`${base}/healthz`, { method: "POST", body: "{}" });
+    expect(res.status).toBe(405);
+  });
+
+  // A static 200 would report healthy with the proxy socket shut, which is
+  // strictly weaker than the probe it replaces — that one at least had to
+  // reach the proxy listener to answer at all.
+  it("reports 503 when the proxy listener is not serving", async () => {
+    let serving = false;
+    const base = await startHealthServer(() => serving);
+
+    const down = await fetch(`${base}/healthz`);
+    expect(down.status).toBe(503);
+    expect(await down.json()).toMatchObject({ ok: false });
+
+    serving = true;
+    expect((await fetch(`${base}/healthz`)).status).toBe(200);
+  });
+
+  it("discloses less than /healthz on the proxy port, which no deny covers here", async () => {
+    const base = await startHealthServer();
+    const body = await (await fetch(`${base}/healthz`)).json();
+
+    // The proxy port's /healthz reports these; this port must not.
+    for (const leaky of ["upstreams", "breakers", "sessions", "upstreamCallCounts"]) {
+      expect(Object.keys(body as object), leaky).not.toContain(leaky);
+    }
+  });
+
+  describe("PAPERCLIP_MCP_HEALTH_PORT parsing", () => {
+    it("binds no second socket unless configured", () => {
+      expect(loadGatewayConfig({}).healthPort).toBeNull();
+      expect(loadGatewayConfig({ PAPERCLIP_MCP_HEALTH_PORT: "" }).healthPort).toBeNull();
+      expect(loadGatewayConfig({ PAPERCLIP_MCP_HEALTH_PORT: "   " }).healthPort).toBeNull();
+    });
+
+    it("accepts a port and leaves PORT alone", () => {
+      const config = loadGatewayConfig({ PORT: "8080", PAPERCLIP_MCP_HEALTH_PORT: " 8081 " });
+      expect(config.healthPort).toBe(8081);
+      expect(config.port).toBe(8080);
+      expect(loadGatewayConfig({}).port).toBe(DEFAULT_PORT);
+    });
+
+    // `Number.parseInt` is lenient in ways that matter for a port: it reads
+    // "8081abc" as 8081 and "0x1f9" as 0, and a bare `Number()` accepts
+    // "Infinity". Falling back on junk would leave the kubelet probing a
+    // socket nobody bound, which liveness turns into a CrashLoop with no
+    // stated cause.
+    it("refuses anything that is not a port, rather than falling back", () => {
+      for (const raw of ["Infinity", "-1", "0", "70000", "65536", "8081abc", "0x1f9", "+8081", "80.5", "eighty"]) {
+        expect(() => loadGatewayConfig({ PAPERCLIP_MCP_HEALTH_PORT: raw }), raw).toThrow(/1-65535/);
+      }
+      expect(loadGatewayConfig({ PAPERCLIP_MCP_HEALTH_PORT: "65535" }).healthPort).toBe(65535);
+      expect(loadGatewayConfig({ PAPERCLIP_MCP_HEALTH_PORT: "1" }).healthPort).toBe(1);
+    });
+
+    it("refuses a health port equal to the proxy port", () => {
+      expect(() => loadGatewayConfig({ PORT: "8080", PAPERCLIP_MCP_HEALTH_PORT: "8080" }))
+        .toThrow(/must differ from PORT/);
+      // Default PORT is implied, not just the explicit one.
+      expect(() => loadGatewayConfig({ PAPERCLIP_MCP_HEALTH_PORT: "8080" })).toThrow(/must differ from PORT/);
+    });
   });
 });
