@@ -230,6 +230,12 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
         }
         return jsonResponse(options.reviews ?? []);
       }
+      // `GET /pulls/{n}` — the PR author. The gate reads it only to refuse
+      // `clean` for a self-attestation (BLO-34316), so this must answer with an
+      // identity distinct from `prReviewerBotLogin`: left unstubbed, the fetch
+      // throws, the bounded retry swallows it, and every clean verdict here
+      // collapses to `fetch_failed` with nothing posted.
+      if (/\/pulls\/\d+(?:\?|$)/.test(u)) return jsonResponse({ user: { login: "distinct-pr-author" } });
       if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse(options.comments ?? []);
       if (u.includes("/check-runs")) return jsonResponse({ id: 2 }, true, 201);
       if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) {
