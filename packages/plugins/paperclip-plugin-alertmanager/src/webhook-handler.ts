@@ -728,11 +728,20 @@ type AggregateFenceWedgedMemo = Set<string>;
  *   - Waiters keep their jitter timer. The signal only ever *shortens* a wait,
  *     so a fence held by another process, another slot, or a dead owner behaves
  *     precisely as before — including the budget arithmetic and the wedged memo.
- *   - A wake is never required for progress. If the woken waiter exhausts its
- *     budget before retrying, the wake is dropped rather than forwarded; the
- *     remaining waiters still retry on their own timers within
- *     `maxDelayMs`. That bounds a lost wake at one extra poll interval, which
- *     is why forwarding it is not worth the state it would cost.
+ *   - A wake is never required for progress. Two things drop one. The woken
+ *     waiter can exhaust its budget before retrying. Or a release can land
+ *     while a waiter is inside `beginAggregateFiring` on the *timer* path:
+ *     that waiter is still queued — only `signalLocalFenceRelease` and the
+ *     `finally` remove it — so it gets shifted and woken while it is awaiting
+ *     the claim rather than `awaken()`, and the wake resolves a promise nobody
+ *     holds. Its own claim then fails against the release that has not
+ *     committed yet, `requeueLocalFenceWaiter` restores its place, and the
+ *     fence sits free until a timer fires. (The wake path cannot do this: a
+ *     woken waiter is out of the queue for the whole claim.) Either way the
+ *     wake is dropped rather than forwarded; the remaining waiters still retry
+ *     on their own timers within `maxDelayMs`. That bounds a lost wake at one
+ *     extra poll interval, which is why forwarding it is not worth the state
+ *     it would cost.
  *
  * Waking exactly one is deliberate. Waking all would rebuild the thundering
  * herd this file's jitter exists to break up, and only one of them can win.
@@ -814,6 +823,13 @@ function signalLocalFenceRelease(companyId: string, aggregateKey: string): void 
  * handoff FIFO by arrival. Re-entry is conditional on the waiter actually being
  * absent, so a waiter whose timer fired (still queued, never woken) is not
  * duplicated.
+ *
+ * FIFO is best-effort rather than guaranteed, and only under concurrent loss:
+ * if two releases wake two waiters at once, both re-enter here, and whichever
+ * claim round trip resolves second ends up in front of the one that arrived
+ * first. Not worth defending with state — the reordering is confined to the
+ * front of the queue (both losers still precede every fresh arrival), so it
+ * cannot starve anyone, which is the property this registry actually owes.
  */
 function requeueLocalFenceWaiter(queueKey: string, waiter: LocalFenceWaiter): void {
   const queue = aggregateFenceLocalWaiters.get(queueKey) ?? [];
