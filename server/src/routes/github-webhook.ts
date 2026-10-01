@@ -1125,15 +1125,17 @@ function bodyReRaisesPriorFinding(body: string | null | undefined): boolean {
 // as "no finding re-raised" — failing in the suppressing direction. The
 // fallback only serves synthetic contexts that never went through a producer.
 //
-// This guard has a failing mutation as of BLO-38809: deleting the resolve-site
-// line makes "classifies the ledger off the RAW review body, past the clamp
-// boundary" fail. It did not before, and the reason it did not is worth keeping:
-// in the reviewer's own template the ledger sits in the OPENING section, above
-// the counted findings buckets, so any body whose ledger is clamped has already
-// had its findings clamped — and that case is caught first by the older raw read
-// for reviewHasActionableFeedback. That ordering is enforced only by the
-// reviewer's template, not by this module, which is why the raw read stays and
-// why the guard is now pinned by a synthetic body rather than by that accident.
+// BOTH producers of this field have a failing mutation as of BLO-38809:
+// deleting the `pull_request_review` resolve-site line fails "classifies the
+// ledger off the RAW review body", and deleting the `issue_comment` one fails
+// the RAW comment body sibling. Neither did before, and the reason they did not
+// is worth keeping: in the reviewer's own template the ledger sits in the
+// OPENING section, above the counted findings buckets, so any body whose ledger
+// is clamped has already had its findings clamped — and that case is caught
+// first by the older raw read for reviewHasActionableFeedback. That ordering is
+// enforced only by the reviewer's template, not by this module, which is why the
+// raw read stays and why both guards are now pinned by a synthetic body rather
+// than by that accident.
 function reRaisesPriorFinding(context: ResolvedEventContext): boolean {
   return context.reviewReRaisesPriorFinding ?? bodyReRaisesPriorFinding(prFeedbackBody(context));
 }
