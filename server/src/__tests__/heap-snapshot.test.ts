@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -18,6 +27,7 @@ import {
   planHeapSnapshotStartup,
   pruneHeapSnapshots,
   reclaimableHeapSnapshotBytes,
+  seedLastAutoSnapshotAtMs,
   takeHeapSnapshot,
 } from "../services/heap-snapshot.js";
 
@@ -435,6 +445,57 @@ describe("newestHeapSnapshotStampMs", () => {
     writeSnapshotFile(OLD, 1000);
 
     expect(newestHeapSnapshotStampMs(dir, nowMs)).toBe(Date.parse("2026-09-29T20:00:00.000Z"));
+  });
+});
+
+describe("seedLastAutoSnapshotAtMs", () => {
+  const nowMs = Date.parse("2026-09-29T23:00:00.000Z");
+
+  it("passes the stamp through when the volume reads, so the seed still spaces the pair", () => {
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
+
+    expect(seedLastAutoSnapshotAtMs(dir, nowMs)).toEqual({
+      stampMs: Date.parse("2026-09-29T22:00:00.000Z"),
+      readError: null,
+    });
+  });
+
+  it("survives a directory that exists but cannot be read, instead of crash-looping the worker", () => {
+    // The seed runs above the feature flag inside startServer(), which is
+    // invoked as `void startServer().catch(() => process.exit(1))` — so a throw
+    // here is not a failed diagnostic, it is a boot loop on every worker,
+    // including ones that never enabled capture. existsSync does not screen it:
+    // chmod 0 leaves the directory present and fails readdirSync with EACCES,
+    // the shape a shared CephFS claim produces transiently.
+    writeSnapshotFile(NEW, 2000);
+    chmodSync(dir, 0o000);
+    try {
+      // Control: the unguarded read this wraps genuinely throws on this fixture,
+      // so the totality below is attributable to the guard rather than to chmod
+      // having been a no-op (it would be, were these tests running as root).
+      expect(() => newestHeapSnapshotStampMs(dir, nowMs)).toThrow();
+
+      const seed = seedLastAutoSnapshotAtMs(dir, nowMs);
+      expect(seed.stampMs).toBeNull();
+      expect(seed.readError).toBeInstanceOf(Error);
+    } finally {
+      // Restored unconditionally: afterEach's rmSync cannot remove a 0o000
+      // directory, so a failed assertion here would otherwise strand the fixture
+      // and fail every later test in the file with its cleanup error.
+      chmodSync(dir, 0o700);
+    }
+  });
+
+  it("distinguishes nothing-to-read from cannot-read, so an absent directory is not reported as a fault", () => {
+    // Both resolve to `stampMs: null`, which is why the caller branches on
+    // readError instead: an empty or absent volume is the ordinary first-boot
+    // state and must not log a failure, while an unreadable one must.
+    expect(seedLastAutoSnapshotAtMs(path.join(dir, "absent"), nowMs)).toEqual({
+      stampMs: null,
+      readError: null,
+    });
+    expect(seedLastAutoSnapshotAtMs(dir, nowMs)).toEqual({ stampMs: null, readError: null });
   });
 });
 

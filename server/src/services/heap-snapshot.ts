@@ -404,7 +404,7 @@ interface PrunableEntry {
 }
 
 /**
- * The entries `pruneHeapSnapshots(dir, keep, maxAgeMs)` would delete.
+ * The entries `pruneHeapSnapshots(dir, keep, maxAgeMs, nowMs)` would delete.
  *
  * Split out from the deletion so the free-space precondition can price a prune
  * without committing to it.
@@ -470,7 +470,7 @@ function collectPrunable(
 }
 
 /**
- * Bytes a `pruneHeapSnapshots(dir, keep, maxAgeMs)` would release right now.
+ * Bytes a `pruneHeapSnapshots(dir, keep, maxAgeMs, nowMs)` would release right now.
  *
  * Exported for the free-space precondition in `takeHeapSnapshot`, which must do
  * this arithmetic *before* deleting anything.
@@ -560,6 +560,47 @@ export function newestHeapSnapshotStampMs(dir: string, nowMs: number = Date.now(
   if (newest === undefined) return null;
   const stamp = retentionKeyMs(newest, nowMs);
   return stamp === 0 ? null : stamp;
+}
+
+/**
+ * The `lastAutoSnapshotAtMs` seed, resolved against a volume that may not be
+ * readable. Never throws.
+ *
+ * `newestHeapSnapshotStampMs` reads the filesystem, so it throws like every
+ * other read here — and startup is the one caller that cannot afford it.
+ * `startServer()` is invoked as `void startServer().catch(() => process.exit(1))`,
+ * so an EACCES/EIO/ESTALE out of this seed is not a failed diagnostic, it is
+ * `process.exit(1)` on every boot until the volume recovers. `existsSync` does
+ * not screen that: a directory that exists but cannot be *read* passes it and
+ * throws from `readdirSync` — and the snapshot directory is a shared CephFS
+ * claim every agent pod also mounts rw, which makes a transient one ordinary.
+ *
+ * Totality lives here rather than at the call site because this seed is the
+ * third read on that path to need the same guard, and the first to be reached
+ * **before** the feature flag is consulted — so it alone crash-loops the whole
+ * worker tier on a deployment that never enabled the feature. A `try` around
+ * the call site would have closed this instance; returning a verdict closes the
+ * class, and makes the posture testable rather than inline. (Ally review,
+ * PEN-3631; the same defect as `prior:9243c0f important 3`.)
+ *
+ * Fails **open**, to `stampMs: null` — the posture an empty directory gets, and
+ * exactly the behaviour that preceded this seed. The alternative, seeding `nowMs`
+ * so an unreadable volume throttles, would silently withhold the first capture
+ * of a diagnostic on evidence that says nothing about when the last one ran; and
+ * a volume this process cannot read is one it is about to fail to write anyway,
+ * audibly. `readError` is returned rather than swallowed so the caller can say
+ * so: a seed that quietly degrades to null would re-open the cross-restart gap
+ * this function exists to close, with nothing in the log to attribute it to.
+ */
+export function seedLastAutoSnapshotAtMs(
+  dir: string,
+  nowMs: number = Date.now(),
+): { stampMs: number | null; readError: unknown } {
+  try {
+    return { stampMs: newestHeapSnapshotStampMs(dir, nowMs), readError: null };
+  } catch (err) {
+    return { stampMs: null, readError: err };
+  }
 }
 
 /**
