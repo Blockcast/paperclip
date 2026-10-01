@@ -200,23 +200,59 @@ const PREFILL_RUN: StalledRun = {
 
 const STARTUP_STALL_SENTINEL = "STARTUP_STALL_SENTINEL";
 /**
+ * Startup budget for the two diagnostic runs below. Both spawn plain `node` rather than
+ * the fixture under `tsx`, because this budget has to clear process startup and `node`
+ * boots in tens of milliseconds where a cold `tsx` compile is measured in seconds.
+ *
+ * 2_000ms is therefore ~50x the time the sentinel needs to reach us, and it bounds
+ * diagnostic assertions rather than the thing under test: a runner slow enough to miss it
+ * reports `its stdout said: <nothing>` and fails loudly with the full context, which is
+ * precisely the property those tests pin. They cannot fail silently or pass wrongly.
+ */
+const STALL_DIAGNOSTIC_TIMEOUT_MS = 2_000;
+/**
  * Drives the startup-watchdog branch: announces itself on stdout, then stays alive
  * without ever writing BACKPRESSURE, so the watchdog is the only thing that can end
- * the run. Plain `node` rather than the fixture under `tsx` because the budget below
- * has to clear process startup, and `node -e` boots in tens of milliseconds where a
- * cold `tsx` compile is measured in seconds.
- *
- * 2_000ms is therefore ~50x the time the sentinel needs to reach us, and it bounds a
- * diagnostic assertion rather than the thing under test: a runner slow enough to miss
- * it would report `its stdout said: <nothing>` and fail loudly with the full context,
- * which is precisely the property this test pins. It cannot fail silently or pass
- * wrongly.
+ * the run.
  */
 const STARTUP_STALL_RUN: StalledRun = {
   command: process.execPath,
   args: ["-e", `process.stdout.write("${STARTUP_STALL_SENTINEL}\\n"); setInterval(() => {}, 1_000);`],
-  startupTimeoutMs: 2_000,
+  startupTimeoutMs: STALL_DIAGNOSTIC_TIMEOUT_MS,
 };
+
+/**
+ * Same, except it *does* write BACKPRESSURE — immediately, so the bytes sit unread in the
+ * stdout pipe while the test below holds the event loop past the startup deadline. That
+ * is the one input that reaches the `startupTimedOut` guard in the stdout handler;
+ * STARTUP_STALL_RUN never writes the token at all, which is why that guard shipped with
+ * no failing mutation (BLO-38558).
+ */
+const LATE_BACKPRESSURE_RUN: StalledRun = {
+  command: process.execPath,
+  args: ["-e", `process.stdout.write("${STARTUP_STALL_SENTINEL}\\nBACKPRESSURE\\n"); setInterval(() => {}, 1_000);`],
+  startupTimeoutMs: STALL_DIAGNOSTIC_TIMEOUT_MS,
+};
+
+/**
+ * Hold the event loop — not sleep on it — for `ms`, from its check phase, so that a
+ * timer already past due and an fd already readable both come due with nothing
+ * servicing either. `Atomics.wait` on a never-notified SharedArrayBuffer is the stdlib
+ * way to block without burning a core.
+ *
+ * Both halves are load-bearing, and `setImmediate` specifically. Blocking leaves the
+ * child's stdout unread in the pipe. Which phase you block in then decides the release
+ * order, because libuv samples `loop->time` once per iteration: block inside a timers-
+ * or poll-phase callback and that sample is stale, so the overdue timer cannot fire
+ * until the *next* iteration — which is after the poll that delivers the buffered read.
+ * From the check phase the block ends the iteration, so the next one re-samples the
+ * clock and runs timers first. Measured on Node 24, 5/5 runs each way; it is also why a
+ * plain `await` here passed in isolation and failed in a full file run.
+ */
+async function holdEventLoopAfterPoll(ms: number): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve));
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 
 function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<StalledCrashResult> {
   return new Promise((resolve, reject) => {
@@ -353,6 +389,35 @@ describe("process crash guard — real process exit", () => {
     await expect(runFixtureWithStalledStderr(STARTUP_STALL_RUN)).rejects.toThrow(
       new RegExp(
         `did not report stderr backpressure within ${STARTUP_STALL_RUN.startupTimeoutMs}ms` +
+          `[\\s\\S]*its stdout said: ${STARTUP_STALL_SENTINEL}`,
+      ),
+    );
+  });
+
+  /**
+   * Pins the `startupTimedOut` guard in the stdout handler, which the test above cannot:
+   * its program never writes BACKPRESSURE, so deleting that clause left the whole suite
+   * green (BLO-38558).
+   *
+   * Without the guard, a chunk delivered after the watchdog fired starts the crash
+   * deadline against a child the watchdog has already SIGKILLed — writing `CRASH\n` into
+   * a pipe with no reader — and the `exit` handler then takes the success branch and
+   * resolves `{ code: null }`, reporting a startup timeout as a crash-guard failure.
+   * That is the unattributable-signature class BLO-25854 and BLO-36057 both paid for.
+   *
+   * The late chunk has to be *buffered* rather than written late. A fixture that waits
+   * for the kill and only then writes delivers it after `exit`, where Node has already
+   * destroyed `child.stdin` and the exit handler has already branched — measured, the
+   * mutation survives that shape entirely. Holding the loop leaves the bytes readable
+   * from the start, so the watchdog fires first and the chunk lands before `exit`.
+   */
+  it("ignores backpressure that arrives after the startup watchdog fired", async () => {
+    const run = runFixtureWithStalledStderr(LATE_BACKPRESSURE_RUN);
+    await holdEventLoopAfterPoll(LATE_BACKPRESSURE_RUN.startupTimeoutMs + 200);
+
+    await expect(run).rejects.toThrow(
+      new RegExp(
+        `did not report stderr backpressure within ${LATE_BACKPRESSURE_RUN.startupTimeoutMs}ms` +
           `[\\s\\S]*its stdout said: ${STARTUP_STALL_SENTINEL}`,
       ),
     );
