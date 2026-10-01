@@ -724,11 +724,22 @@ Agent env vars now support secret references. By default, secret values are stor
 Run *transcript content* — the `GET /api/heartbeat-runs/:runId/log` body, the
 `message` / `payload` of `GET /api/heartbeat-runs/:runId/events`, and the
 captured output of a workspace operation — is scoped to
-the run's owning agent, that agent's manager chain, human board members of the
-company, and any principal holding the `runs:read_transcript` grant (PEN-3142,
-implementing the decision on PEN-3140). Company-wide peer read was withdrawn
-because the run log has carried vendor credential material across several
-incidents and the scrub protecting it runs only at write time.
+the run's owning agent, that agent's manager chain, operator-grade human board
+members of the company, and any principal holding the `runs:read_transcript`
+grant (PEN-3142, implementing the decision on PEN-3140). Company-wide peer read
+was withdrawn because the run log has carried vendor credential material across
+several incidents and the scrub protecting it runs only at write time.
+
+**Operator-grade** means an active `owner`, `admin`, or `operator` membership in
+the company (`TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES`, `routes/authz.ts`), plus
+the trusted local board, which has no membership row. A `viewer` or `member`
+does *not* read transcripts by default — the same line the codebase already
+draws for `workspace_runtime:read`, which guards less sensitive material. That
+is a default rather than a lockout: such an actor falls through to the
+authorization service, so an explicit `runs:read_transcript` grant admits one,
+and the denial carries the named boundary reason either way. The gate is the
+only place the human operator set is written down; migration 0248 seeds the
+grant for `ceo` / `cto` agents and deliberately says nothing about humans.
 
 Run *state* is unchanged and stays company-readable: `GET
 /api/heartbeat-runs/:runId` (status, exit/park reason, retry edge, error text,
@@ -744,7 +755,7 @@ either.
 |---|---|
 | `phase`, `status`, `exitCode`, `command`, `cwd`, `metadata`, the ids, the timestamps, and the log volume/location/digest (`logStore`, `logRef`, `logBytes`, `logSha256`, `logCompressed`) | **state** — company-readable |
 | `stdoutExcerpt`, `stderrExcerpt` | **transcript** — scoped as above |
-| `GET /api/workspace-operations/:operationId/log` body | **transcript** — scoped as above |
+| `GET /api/workspace-operations/:operationId/log` body | **transcript** — but gated by `workspace_runtime:read`, *not* by the transcript decider (see below) |
 
 The excerpts are withheld on **all three** read routes, or the boundary is not
 closed: `GET /api/heartbeat-runs/:runId/workspace-operations`,
@@ -755,6 +766,19 @@ per-operation `/log` above. Withheld rows carry
 entitled" from "this operation captured no output"; every state field survives
 beside them, because hiding the operator's text is the point and hiding that an
 operation ran is not.
+
+**Which gate covers the per-operation `/log` body.** That route is deliberately
+left on BLO-34631's `workspace_runtime:read` entitlement and is *not*
+additionally gated on `decideRunTranscriptRead` (the rationale is on the route
+in `routes/agents.ts`). The entitlement answers the transcript question there
+and answers it more tightly: `workspace_runtime:read` is unmapped in
+`permissionForAction` and absent from the same-company agent allow-list, so no
+agent actor resolves it at all. Stacking the transcript gate on top would turn a
+withheld 200 into a 403 for non-owners and change nothing about which bytes
+leave. The two entitlements agree on viewers — neither admits one without a
+grant. Stated explicitly because this is the paragraph a maintainer reads to
+answer "is the operation log gated?", and the answer is yes, by a different gate
+than the one above it.
 
 `command` / `cwd` / `metadata` are separately masked by an **orthogonal** gate,
 `workspace_runtime:read` (`routes/workspace-response.ts`). The two compose and
@@ -820,10 +844,15 @@ deliberate act. State-only types (`heartbeat.run.status` and its `error`,
 `heartbeat.run.queued`, `agent.status`, `activity.logged`,
 `external_object.updated`) carry none of those keys and pass through untouched.
 
-The decision is memoized per socket, keyed on the run's owning agent. The
-staleness that buys is bounded and one-directional: a grant revoked mid-stream
-is not picked up until the socket reconnects, which is why the memo is scoped to
-a live connection rather than cached globally.
+The decision is memoized per socket, keyed on the run's owning agent, and the
+entry **expires after 30s**. The REST list gate memoizes too, but its cache
+cannot outlive one request; a socket is long-lived by design (`live-events-ws.ts`
+keeps it alive with ping/pong), so an entry with no expiry would keep streaming
+transcript content after a revoked grant, a reporting-line change, or a move out
+of a low-trust boundary — for as long as the client stayed connected. Bounding
+the reuse window in time keeps the per-event saving without that fail-open
+direction. The entry is stamped when the decision starts, so a slow authorizer
+shortens the window rather than extending it.
 
 **Not audited, deliberately.** The two pull routes emit an `activity_log` row per
 read. The push channel does not: it would emit one row per log chunk per

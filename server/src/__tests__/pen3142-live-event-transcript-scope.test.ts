@@ -216,6 +216,7 @@ describe("PEN-3142 live-event transcript gate", () => {
         companyId,
         actorType: "board",
         actorId: boardUserId,
+        membershipRole: "owner",
       });
 
       const projected = await project(logEvent() as never);
@@ -226,20 +227,115 @@ describe("PEN-3142 live-event transcript gate", () => {
       expect(mockDecide).not.toHaveBeenCalled();
     });
 
-    it("decides once per owning agent for the life of the socket", async () => {
+    it("delivers transcript content to the trusted local board, which has no membership row", async () => {
       const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
       const project = createLiveEventTranscriptGate({} as never, {
         companyId,
-        actorType: "agent",
-        actorId: peerAgentId,
+        actorType: "board",
+        actorId: "board",
+        trustedLocal: true,
       });
 
-      for (let i = 0; i < 25; i += 1) await project(logEvent() as never);
+      // `local_trusted` mode authorizes the upgrade with no session and no
+      // membership; REST calls it `local_implicit` and allows it. A socket that
+      // decided it as a role-less member would withhold from the local board.
+      expect(JSON.stringify(await project(logEvent() as never))).toContain(CANARY);
+      expect(mockDecide).not.toHaveBeenCalled();
+    });
+
+    it("withholds from a viewer-role board subscriber who holds no grant", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "board",
+        actorId: boardUserId,
+        membershipRole: "viewer",
+      });
+
+      const projected = await project(logEvent() as never);
+
+      // The push path has to draw the human line in the same place the pull
+      // paths do, or the socket becomes the way around the gate.
+      expect(JSON.stringify(projected)).not.toContain(CANARY);
+      expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "runs:read_transcript",
+      }));
+    });
+
+    it("decides once per owning agent inside the TTL window", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      let clock = 1_000;
+      const project = createLiveEventTranscriptGate(
+        {} as never,
+        { companyId, actorType: "agent", actorId: peerAgentId },
+        { now: () => clock },
+      );
+
+      for (let i = 0; i < 25; i += 1) {
+        clock += 100;
+        await project(logEvent() as never);
+      }
       const otherOwner = logEvent();
       otherOwner.payload.agentId = "55555555-5555-4555-8555-555555555555";
       await project(otherOwner as never);
 
-      // 26 transcript events, 2 distinct owning agents.
+      // 26 transcript events spanning 2.5s, 2 distinct owning agents.
+      expect(mockDecide).toHaveBeenCalledTimes(2);
+    });
+
+    it("re-decides after the TTL, so a revoked grant stops the stream", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      mockDecide.mockResolvedValue({ allowed: true, reason: "allow_grant", explanation: "granted" });
+      let clock = 1_000;
+      const project = createLiveEventTranscriptGate(
+        {} as never,
+        { companyId, actorType: "agent", actorId: peerAgentId },
+        { now: () => clock, ttlMs: 30_000 },
+      );
+
+      expect(JSON.stringify(await project(logEvent() as never))).toContain(CANARY);
+      // Revoked mid-connection. A socket is kept alive indefinitely by the
+      // ping/pong keepalive, so a cache with no expiry would stream transcript
+      // content for the life of the client — the fail-OPEN direction.
+      mockDecide.mockResolvedValue({
+        allowed: false,
+        reason: "deny_missing_grant",
+        explanation: "revoked",
+      });
+
+      clock += 29_999;
+      expect(JSON.stringify(await project(logEvent() as never))).toContain(CANARY);
+      expect(mockDecide).toHaveBeenCalledTimes(1);
+
+      clock += 2;
+      expect(JSON.stringify(await project(logEvent() as never))).not.toContain(CANARY);
+      expect(mockDecide).toHaveBeenCalledTimes(2);
+    });
+
+    it("stamps the cache entry when the decision STARTS, not when it resolves", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      let clock = 1_000;
+      let release: (value: unknown) => void = () => {};
+      mockDecide.mockReturnValueOnce(
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+      );
+      const project = createLiveEventTranscriptGate(
+        {} as never,
+        { companyId, actorType: "agent", actorId: peerAgentId },
+        { now: () => clock, ttlMs: 30_000 },
+      );
+
+      const first = project(logEvent() as never);
+      // A slow authorizer must shorten the reuse window, not extend it: stamping
+      // on resolve would let a 20s decision be reused for 50s.
+      clock += 20_000;
+      release({ allowed: false, reason: "deny_missing_grant", explanation: "slow" });
+      await first;
+
+      clock += 10_001;
+      await project(logEvent() as never);
       expect(mockDecide).toHaveBeenCalledTimes(2);
     });
   });
