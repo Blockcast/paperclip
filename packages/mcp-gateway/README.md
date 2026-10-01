@@ -243,6 +243,15 @@ what the accept probe's own 250ms connect timeout sits inside, and
 `failureThreshold: 3` is why three consecutive failures restart the
 authenticated proxy rather than drop a sample.
 
+`initialDelaySeconds` is deliberately absent: the startup window is covered by
+the threshold rather than by a delay. The health listener binds inside the proxy
+listener's own `listen` callback, so until the proxy is up *both* ports are
+closed and every probe before that is a connection refusal, not a wrong answer.
+At `periodSeconds: 15` / `failureThreshold: 3` that grants liveness ~45s of
+start-up grace, which is ample for this process today. Tighten `periodSeconds`
+and that grace shrinks with it — at which point add an explicit
+`initialDelaySeconds` rather than rediscovering why the margin was enough.
+
 Four properties this port is required to keep, all pinned in `server.test.ts`:
 
 - **It never proxies.** The deny it exists to permit names one port, so anything

@@ -2209,9 +2209,25 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
     // the authenticated proxy needs three.
     //
     // Pinned on emit order rather than on a real stall, which is a genuine race
-    // and would land here as a flaky test. Emitting both events in one turn,
-    // timeout first, is exactly the ordering the loop produces on resume.
-    it("prefers a connect that lands in the same turn as an expired timeout", async () => {
+    // and would land here as a flaky test. Emitting the timeout first, then the
+    // connect, is exactly the ordering the loop produces on resume.
+    //
+    // The `nextTick` drain between the two emits is load-bearing, not padding
+    // (PEN-3052 review). It is what pins *which phase* the decision is deferred
+    // to, rather than merely that it is deferred. Emitting both in one
+    // synchronous turn — as this test first did — lets the `connect` land first
+    // under any deferral at all, so `setImmediate` → `queueMicrotask` or
+    // `process.nextTick` kept it green while fully restoring the defect: both
+    // of those queues drain at the end of the timers phase, still ahead of
+    // poll. Measured against a real `http.Server` under a 400ms stall,
+    // `setImmediate` reports healthy 20/20 while `queueMicrotask` and
+    // `process.nextTick` manage 10/20 each — the identical rate to the pre-fix
+    // direct call. Draining nextTick (which also drains the microtasks queued
+    // behind it) leaves only a check-phase deferral alive to see the `connect`,
+    // so all three shapes now fail here. A bare `await Promise.resolve()` is
+    // NOT sufficient: it catches `queueMicrotask`, but `process.nextTick`
+    // survives it.
+    it("defers the timeout verdict past poll, so an already-completed connect wins", async () => {
       const socket = new net.Socket();
       const connect = vi.spyOn(net, "connect").mockImplementation(() => socket);
       try {
@@ -2219,6 +2235,7 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
         const result = probe();
 
         socket.emit("timeout");
+        await new Promise((resolve) => process.nextTick(resolve));
         socket.emit("connect");
 
         expect(await result).toBe(true);
