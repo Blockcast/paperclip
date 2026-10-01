@@ -34,7 +34,8 @@ function read(rows, dead = "__none__") {
 /**
  * Classify workflow runs at a head into the stale-run alternation.
  * `wits` is the BLO-38577 off-head witness list, newline-separated
- * `workflow-id<SP>iso-timestamp`. Empty is the no-witness case, and every
+ * `workflow-id<SP>run-started-at<SP>status-updated-at`. Empty is the
+ * no-witness case, and every
  * pre-BLO-38577 fixture leaves it empty on purpose: the external arm must be
  * inert unless a witness was positively established.
  */
@@ -641,7 +642,9 @@ describe("merge-gate reader", () => {
         ["286646914", "pull_request", "36752366689", "cancelled", "2026-09-30T17:34:32Z"],
         ["315797104", "pull_request", "36762359479", "success", "2026-09-30T18:58:15Z"],
       ];
-      const WITNESS = "286646914 2026-09-30T18:55:08Z"; // ci-gate -> run 36761895861
+      // `wf run-started-at status-updated-at`. Live: ci-gate's green status was
+      // published 18:55:08Z by run 36761895861, which started 18:54:18Z.
+      const WITNESS = "286646914 2026-09-30T18:54:18Z 2026-09-30T18:55:08Z";
 
       it("retires a sole cancelled run on a later off-head pass by its own workflow", () => {
         assert.equal(dead(PIM, WITNESS), "36752366689");
@@ -670,7 +673,7 @@ describe("merge-gate reader", () => {
               ["286504429", "pull_request_target", "34868322890", "cancelled", "2026-09-15T16:33:00Z"],
               ["286504429", "pull_request", "34868326080", "success", "2026-09-15T16:37:00Z"],
             ],
-            "286504429 2026-09-15T17:00:00Z",
+            "286504429 2026-09-15T16:59:00Z 2026-09-15T17:00:00Z",
           ),
           "",
         );
@@ -682,19 +685,19 @@ describe("merge-gate reader", () => {
       // arm was designed around, and it is what makes the 403 on
       // required_status_checks.contexts survivable.
       it("does not let one workflow's witness retire another's run", () => {
-        assert.equal(dead(PIM, "999999999 2026-09-30T18:55:08Z"), "");
+        assert.equal(dead(PIM, "999999999 2026-09-30T18:54:18Z 2026-09-30T18:55:08Z"), "");
       });
 
       // Ordering, for the same reason as the sibling arm: a verdict published
       // BEFORE the victim ran is not evidence about it. One second early.
       it("keeps a run whose only witness predates it", () => {
-        assert.equal(dead(PIM, "286646914 2026-09-30T17:34:31Z"), "");
+        assert.equal(dead(PIM, "286646914 2026-09-30T17:30:00Z 2026-09-30T17:34:31Z"), "");
       });
 
       // The two arms are independent: a witness must not be required to reach
       // the sibling arm, and must not override a missing timestamp either.
       it("still fails closed on a missing victim timestamp, witness or not", () => {
-        assert.equal(dead([["10", "push", "100", "cancelled", ""]], "10 2026-09-19T01:05:00Z"), "");
+        assert.equal(dead([["10", "push", "100", "cancelled", ""]], "10 2026-09-19T01:04:00Z 2026-09-19T01:05:00Z"), "");
       });
 
       // Ally review 5374012593 (Important). The off-head arm is for a head where
@@ -733,18 +736,34 @@ describe("merge-gate reader", () => {
       // oldest-first would pass under both.
       it("keeps the newest witness per workflow when several are published", () => {
         assert.equal(
-          dead(PIM, "286646914 2026-09-30T18:55:08Z\n286646914 2026-09-30T17:00:00Z"),
+          dead(PIM, "286646914 2026-09-30T18:54:18Z 2026-09-30T18:55:08Z\n286646914 2026-09-30T16:59:00Z 2026-09-30T17:00:00Z"),
           "36752366689",
         );
       });
 
-      // Ally review 5374012593 (Important): `split(W[j], P, " ") == 2` had no
-      // failing mutation either. A 3-field row is the realistic malformation (a
-      // run id appended to the pair); relaxing the arity test to `>= 1` accepts
-      // it and reads P[2] as the timestamp, retiring the victim off a row whose
-      // field meanings were never established. Fail closed instead.
+      // Ally review 5375356236 (Suggestion): the ordering fence read the
+      // STATUS's updated_at, which records when a verdict was PUBLISHED, never
+      // when the run that produced it looked at anything. A run publishes at
+      // the END of its own execution, so the gap between the two is the
+      // witness run's whole duration — and a long aggregator run that STARTED
+      // before the victim can publish after it and clear a tree it never saw.
+      // Here the status (17:40) is comfortably later than the victim (17:34:32)
+      // while the run itself began at 17:30. Kills the min: reverting `e` to
+      // the status field alone retires the victim and this goes red.
+      it("refuses a witness whose run started before the victim, however late it published", () => {
+        assert.equal(dead(PIM, "286646914 2026-09-30T17:30:00Z 2026-09-30T17:40:00Z"), "");
+      });
+
+      // Ally review 5374012593 (Important): `split(W[j], P, " ")` had no
+      // failing mutation. The arity is the contract with the live path's
+      // `printf '%s %s\n' "$pair" "$ts"`, and the realistic malformation is a
+      // row built by a caller still on the pre-5375356236 two-field shape:
+      // relaxing the test to `>= 1` accepts it, reads the publish time as the
+      // run start, and reinstates exactly the hazard above. Fail closed on any
+      // arity but three rather than guessing which field is which.
       it("fails closed on a malformed witness row rather than guessing its fields", () => {
-        assert.equal(dead(PIM, "286646914 2026-09-30T18:55:08Z 36761895861"), "");
+        assert.equal(dead(PIM, "286646914 2026-09-30T18:55:08Z"), "");
+        assert.equal(dead(PIM, "286646914 2026-09-30T18:54:18Z 2026-09-30T18:55:08Z 36761895861"), "");
       });
     });
   });
@@ -1131,16 +1150,22 @@ describe("merge-gate reader", () => {
 
     // BLO-38577. The witness RESOLUTION step lives in the live path, so no
     // fixture can reach it — the same position the pagination assertions are
-    // in, and asserted the same way. Both terms are fences with a GREEN failure
-    // direction: without the conclusion test a run that did NOT pass becomes a
-    // witness, and `.workflow_id` is what carries the attribution into
-    // dead_runs(), so projecting anything else silently un-keys it there.
+    // in, and asserted the same way. All three terms are fences with a GREEN
+    // failure direction: without the conclusion test a run that did NOT pass
+    // becomes a witness; `.workflow_id` is what carries the attribution into
+    // dead_runs(), so projecting anything else silently un-keys it there; and
+    // `.run_started_at` is the term that stops a late-published status naming
+    // an early run (Ally 5375356236). The null test on run_started_at must stay
+    // in the `select`: interpolating a null renders the STRING "null", which
+    // beats every ISO timestamp lexically and fails the ordering fence OPEN.
     it("resolves an off-head witness run through a passed-and-attributed fence", () => {
       const resolve = SOURCE.split("\n").find((l) => l.includes("/actions/runs/$rid"));
       assert.ok(resolve, "witness resolution call gone");
       const jq = SOURCE.split("\n").find((l) => l.includes("--jq 'select(.conclusion"));
-      assert.match(jq ?? "", /select\(\.conclusion=="success"\)/, "witness greenness fence gone");
-      assert.match(jq ?? "", /\|\.workflow_id/, "witness attribution projection gone");
+      assert.match(jq ?? "", /select\(\.conclusion=="success"/, "witness greenness fence gone");
+      assert.match(jq ?? "", /\(\.run_started_at \/\/ ""\) != ""/, "witness null-start fence gone");
+      const proj = SOURCE.split("\n").find((l) => l.includes('"\\(.workflow_id)'));
+      assert.match(proj ?? "", /\\\(\.workflow_id\) \\\(\.run_started_at\)/, "witness projection gone");
     });
 
     it("paginates every list fetch", () => {

@@ -107,7 +107,8 @@ require_sha() { # $1 = candidate -> stdout: a STOP line + rc 1 when not 40-hex
 }
 
 dead_runs() { # stdin: run rows; $1 = off-head witnesses -> alternation of stale ids
-  # $1 is newline-separated `workflow-id<SP>iso-timestamp`, empty when none.
+  # $1 is newline-separated `workflow-id<SP>run-started-at<SP>status-updated-at`,
+  # empty when none. A row of any other arity is dropped rather than guessed at.
   # Passed as a VALUE rather than a second input file on purpose: the two-file
   # `FNR==NR` idiom misreads the first run row as a witness whenever the witness
   # side is empty, which is the common case and would silently drop a run from
@@ -293,6 +294,22 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses -> alternation of stale
   #                   Un-keying it (one global newest witness) lets any green
   #                   status clear any workflow, which is the too-loose variant
   #                   this arm was designed around rather than into.
+  #                   Its VALUE is min(run_started_at, status updated_at), not
+  #                   the status time alone. Ally review 5375356236: the status
+  #                   timestamp records when a verdict was PUBLISHED, not when
+  #                   the run that produced it looked at anything, and a run
+  #                   publishes at the END of its own execution — so a status
+  #                   published after the victim can name a run that started
+  #                   well before it, and the gap is the witness run's whole
+  #                   duration. A long aggregator run that began at 17:30 and
+  #                   published at 17:40 never saw a victim created at 17:34,
+  #                   yet cleared it. The min is both terms at once: the witness
+  #                   has to have STARTED at or after the victim AND published
+  #                   at or after it, so it cannot be evidence about a tree it
+  #                   predates. Taking the min rather than ANDing two separate
+  #                   comparisons keeps the pair bound together — two witnesses
+  #                   maxed on independent fields could contribute one field
+  #                   each and synthesise a witness that never existed.
   #   >= started[i]   ordering, for the same reason as the sibling arm: a
   #                   witness published BEFORE the victim ran is not evidence
   #                   about it. No `!= ""` term on ext — an unset value loses
@@ -330,7 +347,9 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses -> alternation of stale
     BEGIN { n = 0   # n MUST be seeded: implicit is "" , not 0
             k = split(wits, W, "\n")
             for (j = 1; j <= k; j++)
-              if (split(W[j], P, " ") == 2 && P[2] > ext[P[1]]) ext[P[1]] = P[2] }
+              if (split(W[j], P, " ") == 3) {
+                e = (P[2] < P[3] ? P[2] : P[3])   # earlier of run-start, publish
+                if (e > ext[P[1]]) ext[P[1]] = e } }
     { key = $1 FS $2
       if ($4 == "success") { newest_pass[key] = ($5 > newest_pass[key] ? $5 : newest_pass[key])
                              passed_at_head[$1] = 1 }
@@ -414,12 +433,21 @@ STATUSES=$(gh api "repos/$R/commits/$H/status?per_page=100" --paginate)
 # `select(.conclusion=="success")` is a FENCE, not a filter: a run that did not
 # pass retires nothing, and `gh` prints its error body to stdout, so an API
 # failure yields a non-matching object, an empty wf, and a kept STOP.
+# `.run_started_at` rides along in the SAME call — it is already in this
+# response, so the tighter fence in dead_runs() costs no extra request. It is
+# carried as a THIRD field because the status's own `updated_at` is a proxy for
+# "when did this verdict happen" and the run's start is the fact; see the
+# `ext[wf]` note there. `(.run_started_at // "") != ""` is why this is a
+# `select` and not an interpolation: `"\(null)"` renders the STRING "null",
+# which beats any ISO timestamp lexically and would fail the ordering fence
+# OPEN. Excluded here, the row never reaches awk at all.
 WITNESSES=$(printf '%s' "$STATUSES" | witness_extract | sort -u \
   | while IFS=$'\t' read -r rid ts; do
       printf '%s\n' "$RUNS" | cut -f3 | grep -qxF "$rid" && continue
-      wf=$(gh api "repos/$R/actions/runs/$rid" \
-             --jq 'select(.conclusion=="success")|.workflow_id' 2>/dev/null)
-      [ -n "$wf" ] && printf '%s %s\n' "$wf" "$ts"
+      pair=$(gh api "repos/$R/actions/runs/$rid" \
+               --jq 'select(.conclusion=="success" and (.run_started_at // "") != "")
+                     |"\(.workflow_id) \(.run_started_at)"' 2>/dev/null)
+      [ -n "$pair" ] && printf '%s %s\n' "$pair" "$ts"
     done)
 
 DEAD=$(printf '%s\n' "$RUNS" | dead_runs "$WITNESSES")
