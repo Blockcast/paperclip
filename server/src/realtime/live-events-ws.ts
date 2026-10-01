@@ -45,6 +45,16 @@ interface UpgradeContext {
   companyId: string;
   actorType: "board" | "agent";
   actorId: string;
+  /**
+   * PEN-3142: the board subscriber's role in the subscribed company. The
+   * transcript gate's human short-circuit is operator-grade only, so the role
+   * has to travel with the connection — resolving it later would mean a second
+   * membership lookup per socket, and defaulting it would silently decide every
+   * board watcher as a viewer.
+   */
+  membershipRole?: string | null;
+  /** The `local_trusted` board, which has no membership row to carry. */
+  trustedLocal?: boolean;
 }
 
 interface IncomingMessageWithContext extends IncomingMessage {
@@ -136,6 +146,7 @@ async function authorizeUpgrade(
         companyId,
         actorType: "board",
         actorId: "board",
+        trustedLocal: true,
       };
     }
 
@@ -154,7 +165,10 @@ async function authorizeUpgrade(
         .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
         .then((rows) => rows[0] ?? null),
       db
-        .select({ companyId: companyMemberships.companyId })
+        .select({
+          companyId: companyMemberships.companyId,
+          membershipRole: companyMemberships.membershipRole,
+        })
         .from(companyMemberships)
         .where(
           and(
@@ -165,13 +179,17 @@ async function authorizeUpgrade(
         ),
     ]);
 
-    const hasCompanyMembership = memberships.some((row) => row.companyId === companyId);
-    if (!roleRow && !hasCompanyMembership) return null;
+    const membership = memberships.find((row) => row.companyId === companyId) ?? null;
+    if (!roleRow && !membership) return null;
 
     return {
       companyId,
       actorType: "board",
       actorId: userId,
+      // Null for an instance admin with no membership in this company: the
+      // transcript gate then falls through to the authorization service, which
+      // answers that case on `allow_instance_admin` rather than on a role.
+      membershipRole: membership?.membershipRole ?? null,
     };
   }
 

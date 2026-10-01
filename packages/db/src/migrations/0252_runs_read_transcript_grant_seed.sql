@@ -11,39 +11,32 @@
 -- line — so without a seeded grant this change would have broken the one
 -- workflow the audit shows actually exists.
 --
--- Scoped to `ceo` / `cto` role agents and to owner/admin human members, matching
--- how 0171 seeded the `tools:*` keys. It is not a re-opening: a CEO already
--- reaches its whole subtree through the manager chain, and every other agent
--- role gets own-run plus its own reports and nothing more.
+-- Scoped to `ceo` / `cto` role agents, matching how 0171 seeded the `tools:*`
+-- keys. It is not a re-opening: a CEO already reaches its whole subtree through
+-- the manager chain, and every other agent role gets own-run plus its own
+-- reports and nothing more. Deliberately NOT seeded to `pending_approval` /
+-- `terminated` agents or to any non-executive agent role.
 --
--- Deliberately NOT seeded to `viewer` members, to `pending_approval` /
--- `terminated` agents, or to any non-executive agent role. Operators who need
--- to widen this should grant `runs:read_transcript` explicitly.
-INSERT INTO "principal_permission_grants" (
-  "company_id",
-  "principal_type",
-  "principal_id",
-  "permission_key",
-  "scope",
-  "granted_by_user_id",
-  "created_at",
-  "updated_at"
-)
-SELECT
-  memberships."company_id",
-  memberships."principal_type",
-  memberships."principal_id",
-  'runs:read_transcript',
-  NULL,
-  NULL,
-  now(),
-  now()
-FROM "company_memberships" memberships
-WHERE memberships."principal_type" = 'user'
-  AND memberships."status" = 'active'
-  AND memberships."membership_role" IN ('owner', 'admin')
-ON CONFLICT ("company_id", "principal_type", "principal_id", "permission_key") DO NOTHING;--> statement-breakpoint
-
+-- AGENTS ONLY, DELIBERATELY. An earlier revision of this file also seeded human
+-- members with `membership_role IN ('owner','admin')`. Those rows were
+-- unreachable (Ally review 5375217878): `req.actor.type` is only
+-- `none` / `agent` / `board`, so a human never reaches the grant fallback that
+-- would read them, and the human set is decided directly by
+-- `TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES` in `server/src/routes/authz.ts`. Two
+-- places naming the human operator set — and naming it differently — is how the
+-- next reader ends up fixing one and not the other. The gate is now the single
+-- place; this migration stays silent about humans.
+--
+-- A `viewer` or `member` human who genuinely needs transcript read is granted
+-- `runs:read_transcript` explicitly: the gate falls through to the decider for
+-- any board actor outside the operator roles, so a grant admits them.
+--
+-- POINT IN TIME. This is a one-shot seed with no role-based fallback at
+-- decision time, so an agent promoted to `ceo` / `cto` AFTER this migration
+-- runs gets no grant and falls back to own-run plus manager chain. For a CEO
+-- that is nearly equivalent (the subtree is already reachable); for a later CTO
+-- it is materially narrower. Re-seeding is manual — grant
+-- `runs:read_transcript` to the new principal.
 INSERT INTO "principal_permission_grants" (
   "company_id",
   "principal_type",
