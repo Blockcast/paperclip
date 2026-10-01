@@ -14,6 +14,7 @@ import {
   heapSnapshotSweepKeep,
   listHeapSnapshots,
   listResidualHeapSnapshots,
+  newestHeapSnapshotStampMs,
   planHeapSnapshotStartup,
   pruneHeapSnapshots,
   reclaimableHeapSnapshotBytes,
@@ -219,6 +220,37 @@ describe("pruneHeapSnapshots", () => {
     expect(pruneHeapSnapshots(dir, 2, NEVER_EXPIRES)).toEqual([foreign]);
   });
 
+  it("treats a future-dated stamp as oldest, so a rename cannot buy immortality", () => {
+    // retentionKeyMs clamped an *unparseable* name to 0 but trusted any stamp
+    // that parsed, and a stamp ahead of now defeated both bounds on the same
+    // entry: nowMs - stamp is negative so no finite maxAgeMs ever expired it,
+    // and the descending sort pinned it at index 0 so it never fell outside
+    // keep either. Immortal and permanently holding a keep slot, evicting the
+    // real snapshots underneath it.
+    //
+    // The maxAgeMs docblock claims the embedded stamp is not mutable the way
+    // mtime is. It is not mutable by touch — the hole the mtime fallback had —
+    // but it is by mv, from any pod on the shared claim, which no file mode
+    // separates. The no-adversary route is forward clock skew between pods.
+    const nowMs = Date.parse("2026-09-29T23:00:00.000Z");
+    const future = `2027-01-01T00-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}`;
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
+    writeSnapshotFile(future, 3000);
+
+    // Sorts oldest despite carrying the newest stamp in the directory, so it
+    // cannot hold a keep slot ahead of a real snapshot.
+    expect(listHeapSnapshots(dir, nowMs)).toEqual([NEW, OLD, future]);
+    expect(pruneHeapSnapshots(dir, 2, NEVER_EXPIRES, nowMs)).toEqual([future]);
+
+    // Re-created because the prune above consumed it. The age bound is the
+    // second and independent bound the same entry used to defeat: a negative
+    // nowMs - stamp meant no finite maxAgeMs could ever reach it, so it was
+    // immune to the exposure window as well as to the retention cap.
+    writeSnapshotFile(future, 3000);
+    expect(pruneHeapSnapshots(dir, 10, DAY_MS, nowMs)).toEqual([future]);
+  });
+
   it("leaves unrelated files alone", () => {
     writeFileSync(path.join(dir, "README.md"), "not a snapshot");
     writeFileSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME), "");
@@ -366,8 +398,47 @@ describe("listHeapSnapshots", () => {
   });
 });
 
-describe("listResidualHeapSnapshots", () => {
-  // Backs the startup report of leftovers while capture is disabled — the state
+describe("newestHeapSnapshotStampMs", () => {
+  const nowMs = Date.parse("2026-09-29T23:00:00.000Z");
+
+  it("reads the newest stamp on the volume, so the limiter survives a restart", () => {
+    // The in-memory limiter is initialised on every boot, so without this seed
+    // autoMinIntervalMs provides no spacing across a restart at all: a worker
+    // that OOM-restarts and re-grows past the threshold inside the interval
+    // retains a pair spaced by the crash cycle, and at keep: 2 the prune takes
+    // the hours-older half with it. findConcurrentSnapshotWriters cannot catch
+    // that — the predecessor wrote before our start and shares no pid with us.
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
+
+    expect(newestHeapSnapshotStampMs(dir, nowMs)).toBe(Date.parse("2026-09-29T22:00:00.000Z"));
+  });
+
+  it("is null on an empty or absent directory, leaving the first capture unthrottled", () => {
+    expect(newestHeapSnapshotStampMs(dir, nowMs)).toBeNull();
+    expect(newestHeapSnapshotStampMs(path.join(dir, "absent"), nowMs)).toBeNull();
+  });
+
+  it("is null when the only snapshots carry no usable stamp", () => {
+    // retentionKeyMs keys an unparseable or future-dated name at 0, which says
+    // nothing about when the last capture happened. Seeding the limiter with
+    // it would read as "captured at the epoch" and bound nothing, so it is
+    // reported as absent instead — the same posture as an empty directory.
+    writeSnapshotFile(`heap-paperclip-0${HEAP_SNAPSHOT_EXTENSION}`, 1000);
+    writeSnapshotFile(`2027-01-01T00-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}`, 2000);
+
+    expect(newestHeapSnapshotStampMs(dir, nowMs)).toBeNull();
+  });
+
+  it("ignores partials, which are not a completed capture", () => {
+    writeSnapshotFile(`2026-09-29T22-30-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}.partial`, 3000);
+    writeSnapshotFile(OLD, 1000);
+
+    expect(newestHeapSnapshotStampMs(dir, nowMs)).toBe(Date.parse("2026-09-29T20:00:00.000Z"));
+  });
+});
+
+describe("listResidualHeapSnapshots", () => {  // Backs the startup report of leftovers while capture is disabled — the state
   // in which an operator believes the exposure is over. A `.partial` holds the
   // same plaintext secrets as a completed file, and sizing the residual check
   // off completed files alone made the likeliest way to strand one (an OOM
@@ -832,6 +903,87 @@ describe("decideHeapSnapshot", () => {
       // silence the operator-facing half of this.
       expect(describeSentinelOutcome(decision, cfg, state())?.level).toBe("warn");
     }
+  });
+
+  it("keeps taking threshold snapshots while the sentinel is rate-limited", () => {
+    // Same independence as the unclaimable case above, and the same damage if
+    // it returns early instead: a declined request says nothing about the heap
+    // either. Anything re-creating the sentinel once per poll — a retry
+    // wrapper, a cron drop, an operator retouching while waiting the interval
+    // out — makes every poll take the rate-limited branch, so a long
+    // sentinelMinIntervalMs becomes a window with no sentinel capture *and* no
+    // threshold evaluation while the heap climbs. Rationing the request path
+    // must not ration the unattended one.
+    const cfg = config({
+      autoThresholdBytes: GB / 2,
+      autoMinIntervalMs: 0,
+      sentinelMinIntervalMs: 5 * MINUTE_MS,
+    });
+    const nowMs = new Date("2026-09-29T23:00:00.000Z").getTime();
+    const sentinelPath = path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME);
+    const declined = (): ReturnType<typeof state> =>
+      state({ lastSentinelSnapshotAtMs: nowMs - MINUTE_MS });
+
+    // Control: with no sentinel this config fires, so a null below is the
+    // sentinel suppressing it rather than the threshold simply not being met.
+    expect(decideHeapSnapshot(cfg, declined(), runtime()).trigger).toBe("threshold");
+
+    for (const poll of [1, 2, 3]) {
+      writeFileSync(sentinelPath, "");
+
+      const decision = decideHeapSnapshot(cfg, declined(), runtime());
+
+      expect(decision, `poll ${poll}`).toEqual({ trigger: "threshold", sentinel: "rate-limited" });
+      // Consumed and still spoken about: falling through does not quietly turn
+      // a declined request into a silent one.
+      expect(existsSync(sentinelPath), `poll ${poll}`).toBe(false);
+      expect(describeSentinelOutcome(decision, cfg, declined())?.level).toBe("info");
+    }
+  });
+
+  it("spaces automatic snapshots against a sentinel capture, not only its own", () => {
+    // The caller stamps one state field per capture, never both, so an arm
+    // reading lastAutoSnapshotAtMs alone sees null after a sentinel capture —
+    // and with a threshold configured the heap sits above it by definition
+    // (that is the PEN-3314 posture), so the very next poll fired
+    // unconditionally. That is a second unrequested stop-the-world pause on an
+    // already-pressured worker, and at keep: 2 the post-write prune then
+    // evicts the hours-older half of the pair being accumulated. Nothing
+    // reports it: findConcurrentSnapshotWriters filters on a foreign pid and
+    // this is one process, so only prunedCount moves.
+    const cfg = config({ autoThresholdBytes: GB / 2, autoMinIntervalMs: 2 * 60 * 60 * 1000 });
+    const nowMs = new Date("2026-09-29T23:00:00.000Z").getTime();
+
+    expect(
+      decideHeapSnapshot(cfg, state({ lastSentinelSnapshotAtMs: nowMs - MINUTE_MS }), runtime()).trigger,
+    ).toBeNull();
+    // Control: the same field one interval back does fire, so the null above
+    // is the spacing rather than the threshold going unmet.
+    expect(
+      decideHeapSnapshot(
+        cfg,
+        state({ lastSentinelSnapshotAtMs: nowMs - 3 * 60 * 60 * 1000 }),
+        runtime(),
+      ).trigger,
+    ).toBe("threshold");
+  });
+
+  it("still honours a human request promptly after an automatic capture", () => {
+    // The converse of the case above, and the reason the sentinel arm keeps
+    // its own field rather than sharing one: spacing the *automatic* trigger
+    // against both captures must not make an operator wait out
+    // autoMinIntervalMs to be heard.
+    const cfg = config({ autoThresholdBytes: GB / 2, autoMinIntervalMs: 2 * 60 * 60 * 1000 });
+    const nowMs = new Date("2026-09-29T23:00:00.000Z").getTime();
+    writeFileSync(path.join(dir, HEAP_SNAPSHOT_SENTINEL_BASENAME), "");
+
+    const decision = decideHeapSnapshot(
+      cfg,
+      state({ lastAutoSnapshotAtMs: nowMs - MINUTE_MS }),
+      runtime(),
+    );
+
+    expect(decision).toEqual({ trigger: "sentinel", sentinel: "claimed" });
   });
 });
 

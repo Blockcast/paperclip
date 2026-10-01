@@ -87,6 +87,7 @@ import {
   heapSnapshotSweepKeep,
   listHeapSnapshots,
   listResidualHeapSnapshots,
+  newestHeapSnapshotStampMs,
   planHeapSnapshotStartup,
   pruneHeapSnapshots,
   takeHeapSnapshot,
@@ -2514,7 +2515,21 @@ export async function startServer(): Promise<StartedServer> {
     const heapSnapshotState: {
       lastAutoSnapshotAtMs: number | null;
       lastSentinelSnapshotAtMs: number | null;
-    } = { lastAutoSnapshotAtMs: null, lastSentinelSnapshotAtMs: null };
+    } = {
+      // Seeded from the volume, not from null. This limiter is the only thing
+      // holding the retained pair hours apart, and it lives in process memory —
+      // so a worker that OOM-restarts and re-grows past the threshold inside
+      // `autoMinIntervalMs` would otherwise capture again immediately and, at
+      // `keep: 2`, prune the hours-older half it was accumulating. The crash
+      // cycle would set the spacing instead of the interval, silently: only
+      // `prunedCount` moves, and `findConcurrentSnapshotWriters` cannot see it
+      // because a restart's predecessor wrote before our start and the
+      // successor shares no pid with it. (Ally review, PEN-3631.)
+      lastAutoSnapshotAtMs: newestHeapSnapshotStampMs(heapSnapshotConfig.dir),
+      // Left null deliberately: a human request after a restart should be
+      // honoured promptly. See `newestHeapSnapshotStampMs`.
+      lastSentinelSnapshotAtMs: null,
+    };
 
     const sweepHeapSnapshots = (): void => {
       // Capture off ⇒ retain nothing. Ageing out via maxAgeMs bounds the window
@@ -2713,23 +2728,6 @@ export async function startServer(): Promise<StartedServer> {
 
           const result = takeHeapSnapshot(heapSnapshotConfig, decision.trigger);
 
-          if ("skipped" in result) {
-            logger.error({ ...result, trigger: decision.trigger }, "Heap snapshot skipped");
-            return;
-          }
-          logger.warn(
-            {
-              snapshotFile: result.filePath,
-              sizeBytes: result.sizeBytes,
-              heapUsedBytes: result.heapUsedBytes,
-              durationMs: result.durationMs,
-              prunedCount: result.prunedCount,
-              trigger: result.trigger,
-              expiresAtMs: Date.now() + heapSnapshotConfig.maxAgeMs,
-            },
-            "Heap snapshot written — contains this process's secrets in plaintext; retrieve, then treat as a credential exposure",
-          );
-
           // `keep` is a cap over the directory, not over this process, and the
           // directory is on a volume every pod mounts. A second live writer
           // means each round fills every slot and the prune above has just
@@ -2739,12 +2737,21 @@ export async function startServer(): Promise<StartedServer> {
           // than at startup because this is the moment the eviction actually
           // happens. (Ally review, PEN-3631.)
           //
+          // Above the skipped-guard below, not after it, because multiple
+          // writers against the shared claim are exactly what fills the volume:
+          // once that happens every capture returns `insufficient-free-space`,
+          // and a detector on the success path alone would go quiet at the one
+          // moment it has something to say. The operator would see repeated
+          // "Heap snapshot skipped" with no hint a peer is responsible. Its
+          // input is `listHeapSnapshots`, equally readable after a refusal.
+          //
           // `performance.timeOrigin` is this process's start as epoch ms. A
           // dead predecessor cannot have written after it, which is what keeps
           // a restart-spanning diff pair — the deliverable — out of the
           // warning without assuming anything about how far apart its halves
-          // land. The in-memory limiter provides no such spacing: see
-          // `findConcurrentSnapshotWriters`.
+          // land. It sees only *foreign* pids: the single-process routes to the
+          // same collapsed pair are bounded in `decideHeapSnapshot` and by the
+          // startup seed of `lastAutoSnapshotAtMs` instead.
           try {
             const concurrent = findConcurrentSnapshotWriters(listHeapSnapshots(heapSnapshotConfig.dir), {
               pid: process.pid,
@@ -2766,10 +2773,27 @@ export async function startServer(): Promise<StartedServer> {
               );
             }
           } catch (err) {
-            // Advisory only — never let the detector fail the capture that just
-            // succeeded, nor the poll that has retention work still to do.
+            // Advisory only — never let the detector fail the capture it is
+            // reporting on, nor the poll that has retention work still to do.
             logger.debug({ err }, "Concurrent heap snapshot writer check failed");
           }
+
+          if ("skipped" in result) {
+            logger.error({ ...result, trigger: decision.trigger }, "Heap snapshot skipped");
+            return;
+          }
+          logger.warn(
+            {
+              snapshotFile: result.filePath,
+              sizeBytes: result.sizeBytes,
+              heapUsedBytes: result.heapUsedBytes,
+              durationMs: result.durationMs,
+              prunedCount: result.prunedCount,
+              trigger: result.trigger,
+              expiresAtMs: Date.now() + heapSnapshotConfig.maxAgeMs,
+            },
+            "Heap snapshot written — contains this process's secrets in plaintext; retrieve, then treat as a credential exposure",
+          );
         } catch (err) {
           logger.error({ err, snapshotDir: heapSnapshotConfig.dir }, "Heap snapshot failed");
         }
