@@ -1493,9 +1493,33 @@ test("the start-lock runbook routes its two arms on agent count, not on an alert
   // `PaperclipAgentStartLockFleetStall` (unlabelled count, one page per
   // episode) and `PaperclipAgentStartLockWedged` only past 4 h, longer than any
   // measured fleet stall. The runbook still has to say which arm wins.
+  // Scope step 0 to the routing blockquote: `routing` also spans the Trigger,
+  // which quotes FleetStall's count, so asserting on `routing` let the step-0
+  // block be deleted with the test still green.
+  const blockquoteAt = wedged.indexOf("This section is the ONE-AGENT arm only");
   assert.ok(
-    routing.includes("count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900)"),
+    blockquoteAt !== -1 && blockquoteAt < routingEnd,
+    "the one-agent section must keep its routing blockquote before its first subsection",
+  );
+  assert.ok(
+    flat(wedged.slice(blockquoteAt, routingEnd)).includes(
+      "count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900)",
+    ),
     "the one-agent section must open with the agent-count query as step 0",
+  );
+  // The Trigger is the section's entry point, read before the blockquote. It
+  // must give Wedged its own landed rule (the solo 4 h arm), not FleetStall's
+  // count, and no start-lock text may still wait on #3985: it closed unmerged
+  // and #4036 landed the split instead.
+  assert.match(
+    flat(wedged.slice(0, blockquoteAt)),
+    /alert `PaperclipAgentStartLockWedged`[^.]*`max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > 14400`/,
+    "the Trigger must give PaperclipAgentStartLockWedged its landed solo rule (> 14400), not FleetStall's count",
+  );
+  assert.doesNotMatch(
+    flat(wedged + fleet),
+    /#3985(?![^.]*closed unmerged)/,
+    "every #3985 mention in the start-lock runbook must say it closed unmerged; the live split is onprem-k8s #4036",
   );
   // Pin every remedy sentence's direction, not just its words. Inverting or
   // deleting any of the fleet-side ones tells a responder to restart during a
