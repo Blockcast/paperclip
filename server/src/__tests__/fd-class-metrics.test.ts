@@ -120,6 +120,14 @@ describe("classifyFdTarget", () => {
     expect(classifyFdTarget("/var/lib/b1d3f3d3-adc9-48af-beb1-013a18368d84/sock")).toBe(
       "file:/var/lib/*",
     );
+    // Including a UUID whose leading chunks carry no digit: the digit rule
+    // alone published `abcdefab-cdef-*`, one series per such run.
+    expect(classifyFdTarget("/var/lib/abcdefab-cdef-4abc-bead-defacedbeefa/sock")).toBe(
+      "file:/var/lib/*",
+    );
+    expect(
+      classifyFdTarget("/runtime-cache/paperclip-runs/abcdefab-cdef-4abc-bead-defacedbeefa/workspace/f"),
+    ).toBe("file:/runtime-cache/paperclip-runs/*/workspace");
   });
 
   it("keeps stable directory names verbatim, including short digit-bearing ones", () => {
