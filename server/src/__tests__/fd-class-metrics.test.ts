@@ -20,7 +20,7 @@
  *    assertion that nothing is open.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   FD_CLASS_OTHER,
@@ -30,6 +30,12 @@ import {
   classifyFdTarget,
   collectFdClassSnapshot,
 } from "../services/fd-class-metrics.js";
+import {
+  PROCESS_OPEN_FDS_BY_CLASS_METRIC,
+  __resetMetricsForTest,
+  renderMetrics,
+  setFdClassMetrics,
+} from "../services/metrics.js";
 
 function enoent(): NodeJS.ErrnoException {
   const err = new Error("ENOENT") as NodeJS.ErrnoException;
@@ -46,6 +52,18 @@ describe("classifyFdTarget", () => {
     expect(classifyFdTarget("anon_inode:inotify")).toBe("anon_inode:inotify");
   });
 
+  it("classifies the SLASHED memfd spelling the kernel actually emits", () => {
+    // Verified against a live Linux kernel, not inferred: memfd_create(
+    // "paperclip-heap") readlinks to `/memfd:paperclip-heap (deleted)` — with a
+    // leading slash. The unslashed assertion above passes against a string the
+    // kernel does not produce, so on its own it would have let every real memfd
+    // fall through to the path branch and land in `deleted:/`, polluting the
+    // class documented as the classic leak signature. PR #2117 adds heap
+    // snapshots via memfd, which is what makes this load-bearing here.
+    expect(classifyFdTarget("/memfd:paperclip-heap (deleted)")).toBe("memfd");
+    expect(classifyFdTarget("/memfd:foo")).toBe("memfd");
+  });
+
   it("refuses to carry an unconstrained anon_inode subtype into a label", () => {
     // The subtype is text read out of procfs. Bounded alphabet, not trust.
     expect(classifyFdTarget("anon_inode:[weird-1234]")).toBe("anon_inode");
@@ -60,6 +78,49 @@ describe("classifyFdTarget", () => {
       ),
     ).toBe("file:/paperclip/instances/default/projects");
     expect(classifyFdTarget("/dev/null")).toBe("file:/dev");
+  });
+
+  it("redacts a per-run identifier that sits INSIDE the depth bound", () => {
+    // The depth bound alone is not a cardinality bound: it stops the identifier
+    // only when ≥4 stable segments precede it. These two trees are created once
+    // per heartbeat run with the identifier at depth 2 and 3, so under depth
+    // bounding alone each run minted a fresh Prometheus series — the detector
+    // reproducing the disease it was built to find (property #1 above).
+    //
+    // `run-scratch.ts` does mkdtemp(`/tmp/paperclip-run-<issue>-<run>-`):
+    expect(classifyFdTarget("/tmp/paperclip-run-BLO-38624-abc123def456-XyZ9aB/scratch.json")).toBe(
+      "file:/tmp/paperclip-run-*",
+    );
+    // A second run must produce the SAME label. Asserted against a literal and
+    // against each other, since equality alone would hold for any constant.
+    expect(classifyFdTarget("/tmp/paperclip-run-PEN-3314-99ffee001122-Qw3rTy/marker")).toBe(
+      "file:/tmp/paperclip-run-*",
+    );
+    // The run-home tree puts the run id one segment deeper:
+    expect(
+      classifyFdTarget("/runtime-cache/paperclip-runs/7d127898-e955-490d-96b7-fac13ceb8b10/workspace/f"),
+    ).toBe("file:/runtime-cache/paperclip-runs/*/workspace");
+    // Shape is preserved, not truncated away: collapsing at the identifier
+    // would fold every per-run tree into `/runtime-cache/paperclip-runs` and
+    // lose the fact that the descriptor is under `workspace`.
+    expect(
+      classifyFdTarget("/runtime-cache/paperclip-runs/0a9dd3bb-69fa-4761-af14-87063e4da571/cache/f"),
+    ).toBe("file:/runtime-cache/paperclip-runs/*/cache");
+    // A wholly identifier-shaped segment reduces to the marker on its own.
+    expect(classifyFdTarget("/var/lib/b1d3f3d3-adc9-48af-beb1-013a18368d84/sock")).toBe(
+      "file:/var/lib/*",
+    );
+  });
+
+  it("keeps stable directory names verbatim, including short digit-bearing ones", () => {
+    // The redaction rejects identifier *shapes*; it must not swallow ordinary
+    // names, or the instrument stops naming code sites and everything useful
+    // collapses into `*`.
+    expect(classifyFdTarget("/usr/lib/x86_64-linux-gnu/libc.so")).toBe(
+      "file:/usr/lib/x86_64-linux-gnu",
+    );
+    expect(classifyFdTarget("/opt/node/v1/lib/f")).toBe("file:/opt/node/v1/lib");
+    expect(classifyFdTarget("/app/node_modules/.pnpm/f")).toBe("file:/app/node_modules/.pnpm");
   });
 
   it("separates a descriptor held on an unlinked file — the classic leak signature", () => {
@@ -216,6 +277,59 @@ describe("collectFdClassSnapshot", () => {
       "file:/d0/sub": 1,
       [FD_CLASS_OTHER]: 2,
     });
+  });
+});
+
+describe("setFdClassMetrics (the publish path)", () => {
+  // The collector is covered above; this covers the layer that turns a snapshot
+  // into series. Both behaviours asserted here are labelled load-bearing in the
+  // source and neither was exercised: deleting `gauge.reset()` left the whole
+  // suite green.
+  afterEach(() => {
+    __resetMetricsForTest();
+  });
+
+  async function publishedClasses(): Promise<Record<string, number>> {
+    const { body } = await renderMetrics();
+    const out: Record<string, number> = {};
+    for (const line of body.split("\n")) {
+      if (line.startsWith("#") || !line.startsWith(PROCESS_OPEN_FDS_BY_CLASS_METRIC)) continue;
+      const matched = /\{fd_class="([^"]*)"\}\s+(\S+)$/.exec(line);
+      if (matched) out[matched[1]!] = Number(matched[2]);
+    }
+    return out;
+  }
+
+  it("publishes one series per class", async () => {
+    setFdClassMetrics({ classes: new Map([["socket", 3], ["file:/tmp", 2]]), total: 5 });
+    expect(await publishedClasses()).toEqual({ socket: 3, "file:/tmp": 2 });
+  });
+
+  it("stops publishing a class once its descriptors are closed", async () => {
+    // This is what `gauge.reset()` buys. Without it `file:/tmp` keeps reporting
+    // 2 forever and reads as a leak that plateaued — the exact misreading this
+    // gauge exists to prevent, since the question it answers is which class is
+    // *currently* accumulating.
+    setFdClassMetrics({ classes: new Map([["socket", 3], ["file:/tmp", 2]]), total: 5 });
+    setFdClassMetrics({ classes: new Map([["socket", 4]]), total: 4 });
+    expect(await publishedClasses()).toEqual({ socket: 4 });
+  });
+
+  it("publishes NO series at all for a null snapshot", async () => {
+    // Property #3. Tested here at the publishing layer, not just at the
+    // collector returning null: a zeroed-but-present series on a non-Linux
+    // runner would be a confident assertion that nothing is open.
+    setFdClassMetrics(null);
+    expect(await publishedClasses()).toEqual({});
+  });
+
+  it("drops the previous scrape's series when procfs becomes unreadable", async () => {
+    // The two behaviours interact: `null` must clear as well as publish
+    // nothing, or a procfs that stops being readable freezes the last good
+    // histogram in place and it reads as live.
+    setFdClassMetrics({ classes: new Map([["socket", 3]]), total: 3 });
+    setFdClassMetrics(null);
+    expect(await publishedClasses()).toEqual({});
   });
 });
 
