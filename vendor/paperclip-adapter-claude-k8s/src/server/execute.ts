@@ -24,10 +24,11 @@ import {
   isClaudeSkillNotFoundStartupFailure,
   extractClaudeRetryNotBefore,
 } from "./parse.js";
-import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
+import { getSelfPodInfo, getBatchApi, getCoreApi, SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
 import {
   buildJobManifest,
   buildPodLogPath,
+  resolveDataMountPath,
   resolveJobIsolation,
   sanitizeLabelValue,
   type JobIsolation,
@@ -295,6 +296,17 @@ function safePathComponent(value: string): string {
   return sanitizePathComponent(value) || "unknown";
 }
 
+/**
+ * POD address of the prompt-cache root, or null to let the bundle fall back to
+ * its managed server-side default.
+ *
+ * Every branch returns a path the CONTAINER must be able to resolve, which is
+ * why the last one is rooted at `resolveDataMountPath` and not at a literal
+ * `/paperclip` — the same correction BLO-32734 applied to the other five
+ * isolation roots. That branch is the runtime-descriptor case: config-source
+ * isolation always populates `isolation.promptCacheRoot`, but a runtime
+ * descriptor may leave it "".
+ */
 function resolvePromptCacheRoot(
   config: Record<string, unknown>,
   ctx: AdapterExecutionContext,
@@ -304,7 +316,7 @@ function resolvePromptCacheRoot(
   if (configured) return configured;
   if (!isolation.enabled) return null;
   if (isolation.promptCacheRoot) return isolation.promptCacheRoot;
-  const root = `/paperclip/instances/default/data/k8s-isolation/${safePathComponent(ctx.agent.companyId)}/${safePathComponent(ctx.agent.id)}/${isolation.key}`;
+  const root = `${resolveDataMountPath(config)}/instances/default/data/k8s-isolation/${safePathComponent(ctx.agent.companyId)}/${safePathComponent(ctx.agent.id)}/${isolation.key}`;
   return `${root}/prompt-cache`;
 }
 
@@ -1742,8 +1754,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   // Prepare the prompt bundle (skills + instructions) on the server filesystem.
-  // The K8s Job pod mounts the same PVC at /paperclip, so bundle paths written
-  // here are accessible inside the pod at the identical absolute path.
+  // One volume, TWO mount points: this process writes at
+  // `SELF_POD_DATA_MOUNT_PATH` and the K8s Job pod reaches the same bytes at
+  // `resolveDataMountPath(config)`. They coincide on the default mount and
+  // diverge under a custom `workspaceMountPath`, which is why both are passed
+  // to `prepareClaudePromptBundle` below rather than one absolute path being
+  // reused as write target, `--add-dir` and `--append-system-prompt-file`
+  // (BLO-37760).
   const skillEntries = await readPaperclipRuntimeSkillEntries(config, import.meta.dirname ?? __dirname);
   const desiredSkillNames = new Set(resolvePaperclipDesiredSkillNames(config, skillEntries));
   const desiredSkills = skillEntries.filter((e) => desiredSkillNames.has(e.key));
@@ -1784,6 +1801,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       skills: desiredSkills,
       instructionsContents,
       rootDir: resolvePromptCacheRoot(config, effectiveCtx, jobIsolation),
+      // `rootDir` above is a POD address (the isolation roots are derived from
+      // `resolveDataMountPath`), but the bundle is written HERE. Hand over both
+      // mounts so the writer and the reported `--add-dir` name the same bytes
+      // under a custom `workspaceMountPath` (BLO-37760).
+      podDataMountPath: resolveDataMountPath(config),
+      serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
       catalogBackedSkillKeys,
       onLog,
     });
