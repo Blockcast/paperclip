@@ -130,6 +130,16 @@ const STILL_PRESENT_DISPOSITION_RE = new RegExp(
   "im",
 );
 
+/**
+ * A prior-finding disposition that defers an accepted finding to a follow-up
+ * issue (`tracked`, BLO-36903). The `tracked` mirror of
+ * STILL_PRESENT_DISPOSITION_RE, kept to the same parsing conventions.
+ */
+const TRACKED_DISPOSITION_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:\u2014|-)[ \t]*tracked[ \t]*(?:\u2014|-)`,
+  "im",
+);
+
 /** The single standalone attestation line Ally is required to emit. */
 const ATTESTED_HEAD_RE = new RegExp(
   String.raw`^${NOT_INDENTED_CODE}(?:[_*]+)?[ \t]*reviewed head:[ \t]*\`?([0-9a-f]{40})\`?[ \t]*(?:[_*]+)?[ \t]*$`,
@@ -244,6 +254,10 @@ export function hasBlockingFindings(body) {
 
 export function hasStillPresentDisposition(body) {
   return STILL_PRESENT_DISPOSITION_RE.test(String(body ?? ""));
+}
+
+export function hasDeferredDisposition(body) {
+  return TRACKED_DISPOSITION_RE.test(String(body ?? ""));
 }
 
 export function attestedHead(body) {
@@ -445,7 +459,13 @@ export function findPrViolations(pr) {
         }
       }
 
-      if (!isApproved(review) && !blocking && !isCleanAppSelfReview(pr, review)) {
+      // A `tracked` review is neither blocking nor clean: it reports a real
+      // finding the reviewer accepted onto a follow-up (BLO-36903). Whether
+      // such a review is APPROVED or COMMENTED is the companion contract's
+      // call, not this auditor's, so I4 admits it alongside `blocking` rather
+      // than demanding an approval of a head that still carries a defect.
+      const deferred = hasDeferredDisposition(review.body);
+      if (!isApproved(review) && !blocking && !deferred && !isCleanAppSelfReview(pr, review)) {
         violations.push(
           `I4 PR #${pr.number} @${short}: ${label} review ${review.id} is ${reviewState(review)} but clean App evidence must be APPROVED`,
         );

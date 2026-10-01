@@ -19,6 +19,7 @@ import {
   findPrViolations,
   findViolations,
   hasBlockingFindings,
+  hasDeferredDisposition,
   hasStillPresentDisposition,
   isAllyAppLogin,
   isAllyAppReviewer,
@@ -180,6 +181,28 @@ describe("hasStillPresentDisposition", () => {
     assert.equal(
       hasStillPresentDisposition(
         "- **prior:354d5b9 important 1** — tracked — accepted onto the follow-up issue",
+      ),
+      false,
+    );
+  });
+});
+
+describe("hasDeferredDisposition", () => {
+  it("fires on a prior finding marked tracked", () => {
+    assert.equal(
+      hasDeferredDisposition(
+        "- **prior:354d5b9 important 1** \u2014 tracked \u2014 accepted onto the follow-up issue",
+      ),
+      true,
+    );
+  });
+
+  it("does NOT fire on other verbs, prose, or an indented-code paste", () => {
+    assert.equal(
+      hasDeferredDisposition(
+        "- **prior:354d5b9 important 1** \u2014 still-present \u2014 the issue remains\n" +
+          "tracked in quoted prose\n" +
+          "    - **prior:354d5b9 important 1** \u2014 tracked \u2014 quoted, not emitted",
       ),
       false,
     );
@@ -376,6 +399,31 @@ describe("findPrViolations", () => {
     const violations = findPrViolations(pr);
     assert.deepEqual(violations, [
       "I4 PR #1146 @ff1c72db: Ally App review 4888334884 is COMMENTED but clean App evidence must be APPROVED",
+    ]);
+  });
+
+  // BLO-36903: a `tracked` review is the third state I4's binary had no slot
+  // for. Its buckets are 0/0 by contract (a tracked item is not mirrored into
+  // the counted bucket) and it is not `still-present`, so without the slot I4
+  // read it as clean-evidence-not-approved. The PR is independently authored
+  // on purpose: `deferred_finding` is only reachable there, which is exactly
+  // where isCleanAppSelfReview does not apply. The twin without the ledger
+  // entry must still raise I4, so the exemption is the verb, not the shape.
+  it("I4: admits a COMMENTED App review whose only residual is a tracked deferral", () => {
+    const zeroBuckets = "\n### Critical Issues (0)\n### Important Issues (0)";
+    const tracked =
+      "\n### Prior Findings Dispositioned (1)\n" +
+      "- **prior:354d5b9 important 1** \u2014 tracked \u2014 accepted onto the follow-up issue";
+    const pr = (body) => ({
+      number: 2076,
+      author: { login: "some-human", is_bot: false },
+      headSha: HEAD,
+      reviews: [appReview({ id: 20761, state: "COMMENTED", body: canonicalBody(HEAD, body) })],
+    });
+
+    assert.deepEqual(findPrViolations(pr(tracked + zeroBuckets)), []);
+    assert.deepEqual(findPrViolations(pr(zeroBuckets)), [
+      "I4 PR #2076 @ff1c72db: Ally App review 20761 is COMMENTED but clean App evidence must be APPROVED",
     ]);
   });
 
