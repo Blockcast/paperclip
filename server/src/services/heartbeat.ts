@@ -29294,10 +29294,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   /**
    * PEN-3607: a dispatch pass that declines to start a run must say so.
    *
-   * `startNextQueuedRunForAgent` has fifteen `return []` sites. Before this,
-   * exactly one of them recorded anything an operator could read — the
-   * `availableSlots <= 0` refusal, via `recordConcurrentRunBlocked`. The other
-   * fourteen wrote no metric, no log above `debug`, and nothing to the run row,
+   * `startNextQueuedRunForAgent` declines through its `return []` sites. Before
+   * this, exactly one of them recorded anything an operator could read — the
+   * `availableSlots <= 0` refusal, via `recordConcurrentRunBlocked`. The others
+   * wrote no metric, no log above `debug`, and nothing to the run row,
    * so a seat that was being considered and refused on every scheduler tick was
    * indistinguishable from a seat nothing was looking at. Measured cost of that
    * gap: agent `bcba1cc7` held four `queued` runs for 73.6 h with no `startedAt`
@@ -29567,7 +29567,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Recorded here as well as on the adapter-scoped counter above. That
         // one is external-lifecycle-only and carries an isolation dimension;
         // this one covers every adapter and sits in the same series as the
-        // other fourteen decline reasons, so "why is this seat not dispatching"
+        // other decline reasons, so "why is this seat not dispatching"
         // is one query rather than a join across two metrics with different
         // population rules.
         await noteDispatchDeclined(agentId, "no_available_slots", agent.companyId);

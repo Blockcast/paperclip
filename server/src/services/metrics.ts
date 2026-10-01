@@ -42,8 +42,8 @@ export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_
  * queued run, counted per agent.
  *
  * This exists because a dark seat was previously unexplainable from outside the
- * process. That dispatch pass has fifteen `return []` sites; before this metric
- * exactly one of them recorded anything ({@link CONCURRENT_RUN_BLOCKED_METRIC},
+ * process. Before this metric, exactly one of that dispatch pass's `return []`
+ * sites recorded anything ({@link CONCURRENT_RUN_BLOCKED_METRIC},
  * which covers only the slot-ceiling refusal), and the rest were silent — no
  * metric, no log above `debug`, no write to the run row. Measured consequence:
  * agent `bcba1cc7` sat 73.6 h with four `queued` runs and no `startedAt`, and

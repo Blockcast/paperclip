@@ -87,12 +87,20 @@ const RETURN_EMPTY = /\breturn \[\];/;
  * So the rule is widened from "every `return []` is instrumented" to "every
  * return that CAN be empty is instrumented, or is provably not empty". The
  * proof is deliberately syntactic and narrow — the nearest preceding
- * `claimedRuns.length` COMPARISON, read with indentation:
+ * `claimedRuns.length` COMPARISON, read against the guard's BLOCK (its close is
+ * the first non-blank line after it at the guard's indent or shallower):
  *
- *   - `if (claimedRuns.length > 0) {` at a shallower indent: this return sits
- *     inside the non-empty branch.
- *   - `if (claimedRuns.length === 0) {` at the same or shallower indent: the
- *     empty case already returned, so control reaching here is non-empty.
+ *   - `if (claimedRuns.length > 0) {`: this return sits strictly inside that
+ *     block, i.e. inside the non-empty branch.
+ *   - `if (claimedRuns.length === 0) {`: this return sits at or after the
+ *     block's close without control having left the guard's enclosing scope,
+ *     so the empty case already returned and control reaching here is
+ *     non-empty.
+ *
+ * Indentation alone is not a proof (review of `884c2705`): it let a
+ * `> 0` guard whose block had already CLOSED vouch for a deeper return in a
+ * later, unrelated block — a neighbouring guard vouching for a return it does
+ * not dominate, the same masking the one-line window above exists to kill.
  *
  * Anything else is unproven and must be instrumented. Requiring a COMPARISON
  * rather than any mention of `claimedRuns.length` is load-bearing: the real
@@ -151,6 +159,7 @@ function indentOf(line: string): number {
 
 function findUnprovenAccumulatorReturns(functionSource: string): number[] {
   const lines = withoutCommentLines(functionSource);
+  const isCode = (candidate: string) => candidate.trim().length > 0;
   const offenders: number[] = [];
   for (const [index, line] of lines.entries()) {
     if (!RETURN_ACCUMULATOR.test(line)) continue;
@@ -163,10 +172,16 @@ function findUnprovenAccumulatorReturns(functionSource: string): number[] {
       const guard = CLAIMED_LENGTH_GUARD.exec(candidate);
       if (!guard) continue;
       const guardIndent = indentOf(candidate);
-      const returnIndent = indentOf(line);
+      // The guard's block closes at the first code line after it that is not
+      // deeper than the guard; blank and comment lines carry no structure.
+      let close = back + 1;
+      while (close < lines.length && !(isCode(lines[close]!) && indentOf(lines[close]!) <= guardIndent)) {
+        close += 1;
+      }
       proven = guard[1]!.startsWith(">")
-        ? returnIndent > guardIndent
-        : returnIndent <= guardIndent;
+        ? index < close
+        : index >= close
+          && !lines.slice(close, index + 1).some((l) => isCode(l) && indentOf(l) < guardIndent);
       break;
     }
     if (!proven) offenders.push(index + 1);
@@ -286,6 +301,57 @@ describe("startNextQueuedRunForAgent decline instrumentation", () => {
       "  }",
     ].join("\n");
     expect(findUnprovenAccumulatorReturns(body)).toEqual([]);
+  });
+
+  it("does not let a CLOSED `> 0` block vouch for a later, deeper return (negative control)", () => {
+    // Review of 884c2705: an indent-only proof accepted line 6, because it is
+    // deeper than the guard — but the guard's block closed on line 4, so
+    // nothing here establishes the accumulator is non-empty.
+    const body = [
+      "  async function fake() {",
+      "    if (claimedRuns.length > 0) {",
+      "      launchClaimedRuns();",
+      "    }",
+      "    if (somethingElse) {",
+      "      return claimedRuns;",
+      "    }",
+      "  }",
+    ].join("\n");
+    expect(findUnprovenAccumulatorReturns(body)).toEqual([6]);
+  });
+
+  it("accepts a deeper return after an `=== 0` early exit, and flags one past the guard's scope", () => {
+    // The mirror of the control above: the empty case returned on line 3, so a
+    // return nested in a later sibling block is dominated and must not be
+    // flagged. An indent-only proof flagged it.
+    const nested = [
+      "  async function fake() {",
+      "    if (claimedRuns.length === 0) {",
+      "      return [];",
+      "    }",
+      "    if (x) {",
+      "      return claimedRuns;",
+      "    }",
+      "  }",
+    ].join("\n");
+    expect(findUnprovenAccumulatorReturns(nested)).toEqual([]);
+
+    // But a guard inside a conditional proves nothing once control leaves that
+    // conditional: when `flag` is false, line 8 runs with the guard never
+    // evaluated.
+    const escaped = [
+      "  async function fake() {",
+      "    if (flag) {",
+      "      if (claimedRuns.length === 0) {",
+      "        return [];",
+      "      }",
+      "    }",
+      "    if (x) {",
+      "      return claimedRuns;",
+      "    }",
+      "  }",
+    ].join("\n");
+    expect(findUnprovenAccumulatorReturns(escaped)).toEqual([8]);
   });
 
   it("flags an accumulator return INSIDE an `=== 0` branch", () => {
