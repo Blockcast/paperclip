@@ -42,6 +42,7 @@ import {
   __test_isReviewerSelfEchoReview,
   __test_isSelfReviewedPr,
   __test_bodyReRaisesPriorFinding,
+  __test_reRaisedPriorFindingLabels,
   __test_hasPrReviewerRequestMention,
   __test_hasPrReviewerAgentRequestMarker,
   __test_hasAllyConsolidatedReviewHeading,
@@ -11938,8 +11939,6 @@ describe("PR review convergence signal (BLO-35909)", () => {
   ].join("\n");
 
   it("classifies the ledger off the RAW review body, past the clamp boundary (BLO-38809)", () => {
-    const pastTheClamp = ledgerPastTheClamp;
-
     const ctx = __test_resolveEventContext("pull_request_review", {
       action: "submitted",
       pull_request: {
@@ -11947,7 +11946,7 @@ describe("PR review convergence signal (BLO-35909)", () => {
         title: "fix(frr): BLO-35909 convergence signal",
         head: { ref: "fix/BLO-35909", sha: "251d5caa8726897b25d603d9e6b1b4118ea36ac0" },
       },
-      review: { body: pastTheClamp, state: "commented", user: { login: "allyblockcast[bot]" } },
+      review: { body: ledgerPastTheClamp, state: "commented", user: { login: "allyblockcast[bot]" } },
       repository: { full_name: "Blockcast/frr" },
     });
     expect(ctx).not.toBeNull();
@@ -11963,6 +11962,22 @@ describe("PR review convergence signal (BLO-35909)", () => {
     // The guard: the field must be PRESENT on the resolved context. `toBe(true)`
     // rather than a truthiness check so the absent-field case (undefined) fails.
     expect(ctx!.reviewReRaisesPriorFinding).toBe(true);
+
+    // The deliberate half of the split, pinned so it is not "fixed" into a
+    // defect. reRaisedPriorFindingLabels reads prFeedbackBody — the CLAMPED
+    // body — so on exactly this shape the escalation fires with no specifics.
+    // That asymmetry is intended and documented at reRaisedPriorFindingLabels
+    // ("it only costs the message its specifics"): the gating read is the raw
+    // one above, so an empty list here never suppresses an escalation.
+    //
+    // The reachable regression is plumbing, not a one-word swap: every body on
+    // ResolvedEventContext is already clamped, so there is nothing here to
+    // repoint this call AT. It bites when someone reads the empty list as the
+    // bug and carries a raw body through to this call — which would make the
+    // two reads disagree about which body is authoritative. That mutation is
+    // caught only here: the controls above assert on the clamped context
+    // bodies, which such a change leaves untouched.
+    expect(__test_reRaisedPriorFindingLabels(ctx!)).toEqual([]);
   });
 
   // The SECOND producer of the same field, and the one that bites in practice:
