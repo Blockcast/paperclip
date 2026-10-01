@@ -39,7 +39,7 @@
 #
 # Row shape     (TSV): name <TAB> conclusion <TAB> timestamp <TAB> run-id|app:<slug>|status
 # Run shape     (TSV): workflow-id <TAB> event <TAB> run-id <TAB> conclusion <TAB> run-started-at
-# Witness shape (SP) : workflow-id <SP> iso-timestamp, newline-separated
+# Witness shape (SP) : workflow-id <SP> run-started-at <SP> status-updated-at (newline-sep)
 set -uo pipefail
 
 extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
@@ -441,7 +441,15 @@ STATUSES=$(gh api "repos/$R/commits/$H/status?per_page=100" --paginate)
 # `select` and not an interpolation: `"\(null)"` renders the STRING "null",
 # which beats any ISO timestamp lexically and would fail the ordering fence
 # OPEN. Excluded here, the row never reaches awk at all.
-WITNESSES=$(printf '%s' "$STATUSES" | witness_extract | sort -u \
+# Dedupe on the RUN ID, not the rid/updated_at PAIR: N green statuses naming one
+# run cost N resolutions of the same run against the quota this block exists to
+# protect. Correctness-neutral — every row for one rid carries the same
+# `run_started_at`, and dead_runs() takes a max over min(start, publish), so
+# keeping the NEWEST publish per run (`-k2,2r`, first-wins) preserves that max
+# exactly. `-t$'\t'` is load-bearing: witness_extract emits TSV and sort's default
+# blank separator would split an updated_at containing no tab differently.
+WITNESSES=$(printf '%s' "$STATUSES" | witness_extract \
+  | sort -t"$(printf '\t')" -k1,1 -k2,2r | awk -F'\t' '!seen[$1]++' \
   | while IFS=$'\t' read -r rid ts; do
       printf '%s\n' "$RUNS" | cut -f3 | grep -qxF "$rid" && continue
       pair=$(gh api "repos/$R/actions/runs/$rid" \

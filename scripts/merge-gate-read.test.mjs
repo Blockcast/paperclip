@@ -1117,7 +1117,8 @@ describe("merge-gate reader", () => {
       );
     });
 
-    it("extracts candidates from every page", () => {      assert.deepEqual(
+    it("extracts candidates from every page", () => {
+      assert.deepEqual(
         witnessExtract([
           page([
             { context: "a", state: "success", updated_at: "t1", target_url: "https://github.com/o/r/actions/runs/1" },
@@ -1169,6 +1170,17 @@ describe("merge-gate reader", () => {
       assert.match(jq ?? "", /\(\.run_started_at \/\/ ""\) != ""/, "witness null-start fence gone");
       const proj = SOURCE.split("\n").find((l) => l.includes('"\\(.workflow_id)'));
       assert.match(proj ?? "", /\\\(\.workflow_id\) \\\(\.run_started_at\)/, "witness projection gone");
+      // The file's own contract header is the third end of this three-field shape, and
+      // was the one end with no guard: it documented two fields while the `== 3` fence
+      // required three, so a caller building to the spec emits an arity-2 row that is
+      // silently dropped (Ally 5376184866). Direction is GREEN-to-RED-to-unclearable:
+      // the witness vanishes and the STOP this reader exists to clear comes back.
+      const hdr = SOURCE.split("\n").find((l) => l.startsWith("# Witness shape"));
+      assert.match(
+        hdr ?? "",
+        /workflow-id <SP> run-started-at <SP> status-updated-at/,
+        "header witness contract drifted from the 3-field shape the fence requires",
+      );
     });
 
     it("paginates every list fetch", () => {
