@@ -71,8 +71,111 @@ function readDispatchFunctionSource(source: string): string {
  */
 const RETURN_EMPTY = /\breturn \[\];/;
 
+/**
+ * Returns of the result ACCUMULATOR, which `return []`-keyed scanning cannot
+ * see at all.
+ *
+ * This is the second hole, found in review of `b45b277f` after the first was
+ * closed. The emergency-continuation branch exited with `return claimedRuns;`
+ * while `claimedRuns` was empty — a decline in every respect that matters,
+ * invisible to {@link RETURN_EMPTY}. It was invisible to the count equality
+ * below too, and in the worst way: adding neither a `return []` nor a
+ * `noteDispatchDeclined`, it left `returnCount === used.length` green while
+ * the path stayed dark. A scanner that only knows one syntactic form of
+ * "return nothing" is one refactor away from blind.
+ *
+ * So the rule is widened from "every `return []` is instrumented" to "every
+ * return that CAN be empty is instrumented, or is provably not empty". The
+ * proof is deliberately syntactic and narrow — the nearest preceding
+ * `claimedRuns.length` COMPARISON, read with indentation:
+ *
+ *   - `if (claimedRuns.length > 0) {` at a shallower indent: this return sits
+ *     inside the non-empty branch.
+ *   - `if (claimedRuns.length === 0) {` at the same or shallower indent: the
+ *     empty case already returned, so control reaching here is non-empty.
+ *
+ * Anything else is unproven and must be instrumented. Requiring a COMPARISON
+ * rather than any mention of `claimedRuns.length` is load-bearing: the real
+ * function calls `advanceOrClearResumeCursor(claimedRuns.length)` between the
+ * `=== 0` guard and the final return, and a looser pattern would latch onto
+ * that and read a non-comparison as a proof.
+ */
+const RETURN_ACCUMULATOR = /\breturn claimedRuns;/;
+const CLAIMED_LENGTH_GUARD = /claimedRuns\.length\s*(===\s*0|>\s*0)/;
+
+/**
+ * Blank out comment-only lines, preserving line NUMBERING so reported
+ * offenders still point at the real source.
+ *
+ * Not hygiene — this scanner reads prose as code without it, and that was
+ * demonstrated rather than imagined. Writing the comment that explains the
+ * emergency-continuation fix broke both scans at once: it quotes the literals
+ * `return claimedRuns;` and `claimedRuns.length === 0`, so it inflated the
+ * return count past the `used.length` equality AND, far worse, was accepted as
+ * a non-emptiness PROOF for the return below it. A scanner that a comment can
+ * satisfy is a scanner that documentation can silently disarm — and the
+ * failure is invisible, because the prose that disarms it is the prose that
+ * says the path is handled.
+ *
+ * Whole-line only, deliberately: this avoids trying to find `//` inside string
+ * and regex literals, which this file's body is full of. But a line that CLOSES
+ * a block comment can carry code after the closing delimiter, and such a line
+ * still begins with an asterisk — it is not a comment line. Blanking it
+ * wholesale would hand the scanner a false NEGATIVE, which is the failure mode
+ * this whole test exists to prevent, so on an asterisk-leading line that
+ * contains a close delimiter we keep everything after the last one.
+ * (`Blockcast/paperclip`'s no-remote-push policy scanner has the mirror-image
+ * bug — it strips only `//`, so JSDoc prose reds a required gate. Same seam,
+ * opposite sign; PEN-3267.)
+ */
+function withoutCommentLines(source: string): string[] {
+  return source.split("\n").map((line) => {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("//")) return "";
+    if (!trimmed.startsWith("*") && !trimmed.startsWith("/*")) return line;
+    const close = line.lastIndexOf("*/");
+    if (close < 0) return "";
+    const tail = line.slice(close + 2);
+    // Preserve column positions so indentation-based proofs stay honest.
+    return tail.trim().length > 0 ? " ".repeat(close + 2) + tail : "";
+  });
+}
+
+function countInCode(source: string, pattern: RegExp): number {
+  return withoutCommentLines(source).filter((line) => pattern.test(line)).length;
+}
+
+function indentOf(line: string): number {
+  return line.length - line.trimStart().length;
+}
+
+function findUnprovenAccumulatorReturns(functionSource: string): number[] {
+  const lines = withoutCommentLines(functionSource);
+  const offenders: number[] = [];
+  for (const [index, line] of lines.entries()) {
+    if (!RETURN_ACCUMULATOR.test(line)) continue;
+    if (line.includes("noteDispatchDeclined(")) continue;
+    const previous = index > 0 ? lines[index - 1]! : "";
+    if (previous.includes("noteDispatchDeclined(") && !RETURN_ACCUMULATOR.test(previous)) continue;
+    let proven = false;
+    for (let back = index - 1; back >= 0; back -= 1) {
+      const candidate = lines[back]!;
+      const guard = CLAIMED_LENGTH_GUARD.exec(candidate);
+      if (!guard) continue;
+      const guardIndent = indentOf(candidate);
+      const returnIndent = indentOf(line);
+      proven = guard[1]!.startsWith(">")
+        ? returnIndent > guardIndent
+        : returnIndent <= guardIndent;
+      break;
+    }
+    if (!proven) offenders.push(index + 1);
+  }
+  return offenders;
+}
+
 function findUninstrumentedReturns(functionSource: string): number[] {
-  const lines = functionSource.split("\n");
+  const lines = withoutCommentLines(functionSource);
   const offenders: number[] = [];
   for (const [index, line] of lines.entries()) {
     if (!RETURN_EMPTY.test(line)) continue;
@@ -132,13 +235,114 @@ describe("recordAgentDispatchDeclined", () => {
 
 describe("startNextQueuedRunForAgent decline instrumentation", () => {
   const functionSource = readDispatchFunctionSource(HEARTBEAT_SOURCE);
-  const returnCount = (functionSource.match(new RegExp(RETURN_EMPTY, "g")) ?? []).length;
+  const returnCount = countInCode(functionSource, RETURN_EMPTY);
 
   it("records a reason at every path that returns without claiming a run", () => {
     // Guards the slice itself: if this drops to 0 the scan below passes
     // vacuously, which is the failure mode a source-level test must not have.
-    expect(returnCount).toBeGreaterThanOrEqual(15);
+    expect(returnCount).toBeGreaterThanOrEqual(16);
     expect(findUninstrumentedReturns(functionSource)).toEqual([]);
+  });
+
+  it("proves every accumulator return is non-empty, which a `return []` scan cannot", () => {
+    // The second hole, from review of b45b277f: `return claimedRuns;` with an
+    // empty accumulator is a decline that the literal-keyed scan above is
+    // structurally unable to see.
+    const accumulatorReturns = countInCode(functionSource, RETURN_ACCUMULATOR);
+    // Same anti-vacuity guard as above: were the accumulator renamed, this scan
+    // would match nothing and report clean.
+    expect(accumulatorReturns).toBeGreaterThanOrEqual(2);
+    expect(findUnprovenAccumulatorReturns(functionSource)).toEqual([]);
+  });
+
+  it("would catch an accumulator return that is not provably non-empty (negative control)", () => {
+    // Three shapes. Only the first is proven; the other two are the live defect
+    // and its near-miss, and both must be flagged.
+    const body = [
+      "  async function fake() {",
+      "    if (flag) {",
+      "      if (claimedRuns.length > 0) {",
+      "        return claimedRuns;", // 4: inside the > 0 branch — proven
+      "      }",
+      "      return claimedRuns;", // 6: the b45b277f defect — empty here
+      "    }",
+      "    return claimedRuns;", // 8: no guard at all — unproven
+      "  }",
+    ].join("\n");
+    expect(findUnprovenAccumulatorReturns(body)).toEqual([6, 8]);
+  });
+
+  it("accepts an accumulator return dominated by an `=== 0` early exit", () => {
+    // The shape the real function ends in, including the intervening
+    // non-comparison use of `claimedRuns.length` that a looser pattern would
+    // mistake for the proof.
+    const body = [
+      "  async function fake() {",
+      "    if (claimedRuns.length === 0) {",
+      "      return [];",
+      "    }",
+      "    advanceOrClearResumeCursor(claimedRuns.length);",
+      "    return claimedRuns;",
+      "  }",
+    ].join("\n");
+    expect(findUnprovenAccumulatorReturns(body)).toEqual([]);
+  });
+
+  it("flags an accumulator return INSIDE an `=== 0` branch", () => {
+    // Same guard, opposite side: returning the accumulator from the branch that
+    // proved it empty is the defect, not the proof.
+    const body = [
+      "  async function fake() {",
+      "    if (claimedRuns.length === 0) {",
+      "      return claimedRuns;",
+      "    }",
+      "  }",
+    ].join("\n");
+    expect(findUnprovenAccumulatorReturns(body)).toEqual([3]);
+  });
+
+  it("is not satisfied by a COMMENT quoting the guard or the return", () => {
+    // Regression control for a defect this scanner caught in the very commit
+    // that added it: the explanatory comment quotes both literals, and before
+    // comment-stripping it both inflated the counts and vouched for the return
+    // underneath it. Documentation must not be able to disarm the check that
+    // the documentation describes.
+    const body = [
+      "  async function fake() {",
+      "    // guarded above by `claimedRuns.length > 0`, so this is safe",
+      "    return claimedRuns;",
+      "  }",
+    ].join("\n");
+    expect(findUnprovenAccumulatorReturns(body)).toEqual([3]);
+
+    const silent = [
+      "  async function fake() {",
+      "    // instrumented via noteDispatchDeclined(agentId, \"dispatch_stopped\", null)",
+      "    return [];",
+      "  }",
+    ].join("\n");
+    expect(findUninstrumentedReturns(silent)).toEqual([3]);
+
+    // And a commented-out return is not a return site.
+    expect(countInCode('    // return [];\n    const x = 1;', RETURN_EMPTY)).toBe(0);
+  });
+
+  it("still sees code sharing a line with a block-comment close", () => {
+    // The false-NEGATIVE risk that comment-stripping introduces, and the exact
+    // hazard the no-remote-push policy scanner hit from the other side (PEN-3267): a line
+    // that closes a block comment begins with an asterisk but is not a comment
+    // line. Built by concatenation so this file does not contain the delimiter
+    // in prose.
+    const close = "*" + "/";
+    const body = [
+      "  async function fake() {",
+      "    /* why",
+      `     ${close} return [];`,
+      "  }",
+    ].join("\n");
+    // The return survives stripping and is correctly flagged as uninstrumented.
+    expect(countInCode(body, RETURN_EMPTY)).toBe(1);
+    expect(findUninstrumentedReturns(body)).toEqual([3]);
   });
 
   it("would catch a newly added silent decline path (negative control)", () => {
@@ -182,7 +386,9 @@ describe("startNextQueuedRunForAgent decline instrumentation", () => {
   });
 
   it("uses only allow-listed reasons at the call sites", () => {
-    const used = [...functionSource.matchAll(/noteDispatchDeclined\(\s*agentId,\s*"([a-z_]+)"/g)]
+    const used = [...withoutCommentLines(functionSource)
+      .join("\n")
+      .matchAll(/noteDispatchDeclined\(\s*agentId,\s*"([a-z_]+)"/g)]
       .map((match) => match[1]!);
     // Tied to `returnCount` rather than asserted independently: a bare
     // `>= 15` on each is satisfiable by an instrumented site whose early exit
