@@ -132,11 +132,14 @@ const STILL_PRESENT_DISPOSITION_RE = new RegExp(
 
 /**
  * A prior-finding disposition that defers an accepted finding to a follow-up
- * issue (`tracked`, BLO-36903). The `tracked` mirror of
- * STILL_PRESENT_DISPOSITION_RE, kept to the same parsing conventions.
+ * issue (`tracked`, BLO-36903). Unlike STILL_PRESENT_DISPOSITION_RE this one
+ * EXEMPTS (I4), so the loose `prior:[^\n]*` convention, fail-safe in a
+ * trigger, would be fail-open here: it must not match a ledger entry the gate
+ * would not count as a deferral. So the ref, severity and index use the gate's
+ * own grammar (PRIOR_FINDING_DISPOSITION_PATTERN, ally-review-detection.ts).
  */
 const TRACKED_DISPOSITION_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:\u2014|-)[ \t]*tracked[ \t]*(?:\u2014|-)`,
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+\d+[ \t]*\*\*[ \t]*(?:\u2014|\u2013|-)[ \t]*tracked[ \t]*(?:\u2014|\u2013|-)`,
   "im",
 );
 
@@ -464,6 +467,8 @@ export function findPrViolations(pr) {
       // such a review is APPROVED or COMMENTED is the companion contract's
       // call, not this auditor's, so I4 admits it alongside `blocking` rather
       // than demanding an approval of a head that still carries a defect.
+      // This is an exemption, so its predicate takes the gate's strict
+      // `prior:` grammar, not the loose one the trigger predicates use.
       const deferred = hasDeferredDisposition(review.body);
       if (!isApproved(review) && !blocking && !deferred && !isCleanAppSelfReview(pr, review)) {
         violations.push(

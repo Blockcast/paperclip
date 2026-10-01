@@ -207,6 +207,18 @@ describe("hasDeferredDisposition", () => {
       false,
     );
   });
+
+  // It exempts, so a ledger entry the gate would not count as a deferral
+  // (PRIOR_FINDING_DISPOSITION_PATTERN) must not count here either.
+  it("does NOT fire on a tracked entry the gate's grammar rejects", () => {
+    for (const ref of ["354d5b9 important", "zzzzzzz important 1", ""]) {
+      assert.equal(
+        hasDeferredDisposition(`- **prior:${ref}** \u2014 tracked \u2014 accepted onto the follow-up issue`),
+        false,
+        ref || "<no ref>",
+      );
+    }
+  });
 });
 
 describe("attestedHead", () => {
@@ -425,6 +437,16 @@ describe("findPrViolations", () => {
     assert.deepEqual(findPrViolations(pr(zeroBuckets)), [
       "I4 PR #2076 @ff1c72db: Ally App review 20761 is COMMENTED but clean App evidence must be APPROVED",
     ]);
+    // A malformed entry the gate counts as zero deferrals is clean to the
+    // gate, so I4 must still fire on it.
+    for (const ref of ["354d5b9 important", "zzzzzzz important 1", ""]) {
+      const malformed =
+        "\n### Prior Findings Dispositioned (1)\n" +
+        `- **prior:${ref}** \u2014 tracked \u2014 accepted onto the follow-up issue`;
+      assert.deepEqual(findPrViolations(pr(malformed + zeroBuckets)), [
+        "I4 PR #2076 @ff1c72db: Ally App review 20761 is COMMENTED but clean App evidence must be APPROVED",
+      ], ref || "<no ref>");
+    }
   });
 
   it("allows a clean canonical App COMMENTED self-review for an App-authored PR", () => {
