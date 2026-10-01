@@ -173,7 +173,44 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
     };
   }
 
-  const changed = git("diff", "--name-only", range, "--", VENDOR_DIR)
+  // Moving vendored source into LOG_DIR/ deletes it from the tree. The
+  // --no-renames below makes `changed` name the source again, which is what
+  // rejects a destination like `moved.txt` -- but a destination that is a valid
+  // entry path then satisfies `substantiveEntries` using the moved source code
+  // as its own body, and the guard passes on a file that has left the tree. So
+  // --no-renames is necessary and not sufficient; this is the other half.
+  //
+  // Rename detection is deliberately ON here, uniquely in this file: everywhere
+  // else the pairing hides the mutation, and here the pairing IS the signal.
+  const relocatedIntoLog = git("diff", "--name-status", "-M", range, "--", VENDOR_DIR)
+    .split("\n")
+    .map((line) => line.split("\t"))
+    // A draft promoted inside the directory (`notes.txt` -> `blo-2.md`) is the
+    // blessed move-in, not laundering. Only a source that was never under
+    // LOG_DIR/ is leaving the vendored tree, so the `from` test is load-bearing
+    // rather than defensive -- without it this rejects that blessed case.
+    .filter(([status, from, to]) =>
+      status?.startsWith("R") && to?.startsWith(`${LOG_DIR}/`) && !from.startsWith(`${LOG_DIR}/`));
+
+  if (relocatedIntoLog.length > 0) {
+    return {
+      ok: false,
+      reason: `This change moves ${relocatedIntoLog.length} vendored source file(s) into ${LOG_DIR}/.`,
+      detail: [
+        "An entry records why the vendored tree changed; it is not somewhere to",
+        "put the tree. Moving source in deletes it from the vendored tree while",
+        "looking like a new entry, so the change goes unrecorded. Move it back",
+        "and add a separate entry describing the removal. Relocated:",
+        ...relocatedIntoLog.map(([, from, to]) => `  ${from} -> ${to}`),
+      ],
+    };
+  }
+
+  // --no-renames for the same reason as the checks above: without it, a moved
+  // file is reported only at its destination, and a destination under LOG_DIR/
+  // is filtered out one line below -- so `changed` comes back empty and the
+  // guard returns ok on a change that removed vendored source.
+  const changed = git("diff", "--name-only", "--no-renames", range, "--", VENDOR_DIR)
     .split("\n")
     .filter(Boolean)
     .filter((p) => !NOT_SOURCE.includes(p) && !p.startsWith(`${LOG_DIR}/`));
@@ -237,7 +274,10 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
       detail: emptyOnly
         ? [
             "An entry file is the record; its path alone is not. Describe what",
-            "changed in the vendored tree and why. Empty entries added:",
+            // Not "empty": a symlinked entry reaches this branch too, and
+            // telling its author the file is empty sends them to look at a file
+            // that has a target in it. `reason` above is already generic.
+            "changed in the vendored tree and why. Entries that record nothing:",
             ...addedEntries.map((p) => `  ${p}`),
           ]
         : [
