@@ -72,11 +72,17 @@ async function waitForPidExit(pid: number, timeoutMs = 2_000) {
  * The timeout is a diagnostic backstop, not a correctness input — it is far
  * beyond any plausible callback delay, so a genuine regression still fails,
  * just with the assertion's own message rather than an opaque timeout.
+ *
+ * It must also stay well inside the enclosing PROCESS_TREE_TEST_BUDGET_MS (15s),
+ * or the backstop is pre-empted by vitest and the message is never printed. The
+ * caller below already spends `timeoutSec` 5 + `graceSec` 1 in runChildProcess
+ * and up to 3s in waitForPidExit, so 2s here leaves ~4s spare on a loaded runner
+ * — where the old unconditional 250ms sleep left ~5.75s but proved nothing.
  */
 async function waitForLifecycleStage(
   lifecycle: ProcessLifecycleEvent[],
-  stage: string,
-  timeoutMs = 5_000,
+  stage: ProcessLifecycleEvent["stage"],
+  timeoutMs = 2_000,
 ) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -732,14 +738,16 @@ describe("runChildProcess", () => {
       // Await the EVENT, not a fixed span. The descendant being gone proves the
       // SIGKILL was delivered; it does not prove the async `onLifecycle`
       // callback carrying `kill_signal` has run yet.
+      //
+      // This is the whole assertion: waitForLifecycleStage returns the same
+      // `lifecycle.some(e => e.stage === stage)` predicate a trailing
+      // `toContain("kill_signal")` would check, so that line would be dead.
       expect(
         await waitForLifecycleStage(lifecycle, "kill_signal"),
         `expected a kill_signal event, observed: ${JSON.stringify(
           lifecycle.map((event) => event.stage),
         )}`,
       ).toBe(true);
-
-      expect(lifecycle.map((event) => event.stage)).toContain("kill_signal");
     },
     PROCESS_TREE_TEST_BUDGET_MS,
   );
