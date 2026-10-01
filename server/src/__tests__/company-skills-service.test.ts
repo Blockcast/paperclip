@@ -2188,6 +2188,13 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(sanctioned).toHaveLength(3); // reconcile, re-import, delete
     // Negative control: the guard can only mean anything if the pattern it
     // scans for is the one these call sites actually use.
+    //
+    // The missing `\s*` is DELIBERATE — do not "fix" it. This asserts the
+    // inline-argument form holds for at least one site, which is exactly the
+    // assumption the `teardowns` scan above rests on; relaxing it to `\s*` here
+    // makes the control vacuous while leaving the scan still able to miss a
+    // wrapped site. `sanctioned` already covers the count, so one strict match
+    // is all this needs.
     expect(source).toMatch(/removeDirectoryByRename\(resolveRuntimeSkillMaterializedPath\(/);
   });
 

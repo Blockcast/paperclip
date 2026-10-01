@@ -4879,18 +4879,25 @@ export function companySkillService(db: Db) {
     if (!packageDir) return null;
     const catalogRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__catalog__");
     const skillDir = path.resolve(catalogRoot, buildSkillRuntimeName(skill.key, skill.slug));
-    await fs.rm(skillDir, { recursive: true, force: true });
-    await fs.mkdir(skillDir, { recursive: true });
-
-    for (const entry of skill.fileInventory) {
-      const sourcePath = entry.path === "SKILL.md"
-        ? `${packageDir}/SKILL.md`
-        : `${packageDir}/${entry.path}`;
-      const content = normalizedFiles[sourcePath];
-      if (typeof content !== "string") continue;
-      const targetPath = path.resolve(skillDir, entry.path);
-      await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, content, "utf8");
+    const replacement = await createDirectoryReplacement(skillDir);
+    try {
+      for (const entry of skill.fileInventory) {
+        const sourcePath = entry.path === "SKILL.md"
+          ? `${packageDir}/SKILL.md`
+          : `${packageDir}/${entry.path}`;
+        const content = normalizedFiles[sourcePath];
+        if (typeof content !== "string") continue;
+        const targetPath = path.resolve(replacement.stagingDir, entry.path);
+        if (targetPath !== replacement.stagingDir && !targetPath.startsWith(`${replacement.stagingDir}${path.sep}`)) {
+          throw unprocessable(`Skill file path is invalid: ${entry.path}`);
+        }
+        await fs.mkdir(path.dirname(targetPath), { recursive: true });
+        await fs.writeFile(targetPath, content, "utf8");
+      }
+      await replacement.commit();
+    } catch (error) {
+      await replacement.cleanup();
+      throw error;
     }
 
     return skillDir;
@@ -4955,6 +4962,15 @@ export function companySkillService(db: Db) {
    * residual exposure is the one syscall between the two renames, in which
    * `targetDir` does not exist: an unbounded window that failed silently, traded
    * for a one-syscall window that fails loudly and self-heals.
+   *
+   * One publisher is deliberately excluded: `materializeVersionSnapshot` keeps
+   * the non-atomic shape on `__versions__`. Version snapshots are
+   * content-addressed, so `materializedVersionSnapshotMatches` makes
+   * re-materialization rare, and `assertSkillEntrypointPresent` backstops the
+   * key-mint for catalog-backed keys. Recorded here as well as in
+   * `prompt-cache.ts` and the `PROVENANCE-CHANGES.md` row, so the next reader
+   * does not take the sentence above as covering the whole file — which is how
+   * the `__runtime__` siblings were missed in the first place.
    */
   async function createDirectoryReplacement(targetDir: string) {
     const parentDir = path.dirname(targetDir);
