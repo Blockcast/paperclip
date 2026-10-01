@@ -202,6 +202,15 @@ test('buildAlert: names the pending run so the reader can act without opening th
   assert.match(alert.annotations.description, /Approve or reject/);
   assert.match(alert.annotations.description, /33456522759/);
   assert.match(alert.annotations.summary, /10\.0h/);
+
+  // BLO-32545. The body used to assert that a skipped slot 'still reports
+  // conclusion=success' and that 'nothing else escalates this'. Both stopped being
+  // true when the four-exits work made skipped-pending exit 1 and added the durable
+  // record, and the stale sentence was cited as current fact in a live triage
+  // ruling. The description is operator-facing, so a false mechanism in it is a
+  // defect even though no behaviour depends on the string.
+  assert.doesNotMatch(alert.annotations.description, /conclusion=success/);
+  assert.doesNotMatch(alert.annotations.description, /Nothing else escalates/);
 });
 
 test('buildAlert: the call to action is the waiting-runs queue, never the perishable run url', () => {
