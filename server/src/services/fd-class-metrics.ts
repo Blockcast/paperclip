@@ -101,6 +101,17 @@ export const FD_CLASS_PATH_SEGMENTS = 4;
  */
 export const FD_CLASS_VOLATILE_SEGMENT = "*";
 
+/**
+ * Hard ceiling on the verbatim prefix {@link boundedSegment} will rebuild.
+ *
+ * Shape-rejection alone leaves one residual: a name whose every token is
+ * individually stable rebuilds at whatever length it happens to be. 32 is
+ * comfortably above every real directory name in this repo's trees
+ * (`x86_64-linux-gnu` is 16, `instances` 9) while keeping each published label
+ * segment bounded by a constant.
+ */
+export const FD_CLASS_MAX_SEGMENT_CHARS = 32;
+
 /** Class assigned when `readlink` races the descriptor being closed (`ENOENT`). */
 export const FD_CLASS_VANISHED = "vanished";
 /** Class carrying the count of descriptors skipped by {@link FD_CLASS_MAX_ENTRIES}. */
@@ -171,6 +182,15 @@ function isStableSegmentToken(token: string): boolean {
  * scratch-directory code site. A segment that is wholly identifier-shaped
  * (a bare UUID) reduces to `*` on its own, and a segment with no volatile
  * token at all is returned untouched.
+ *
+ * {@link FD_CLASS_MAX_SEGMENT_CHARS} makes the bound *total* rather than
+ * merely shape-based. Without it a long all-lowercase hyphenated name — every
+ * token individually stable — rebuilds verbatim at unbounded length, which is
+ * the one residual way a churning directory could still mint a series per run.
+ * Nothing this repo generates has that shape (run ids are hex, issue keys are
+ * uppercase, mkdtemp suffixes are mixed alnum), so this is a backstop against
+ * a shape not yet seen rather than a fix for an observed case — but "the
+ * alphabet is bounded" should be true unconditionally, not just in practice.
  */
 function boundedSegment(segment: string): string {
   // A leading dot is part of the name (`.pnpm`, `.cache`, `.git`), not a
@@ -185,11 +205,12 @@ function boundedSegment(segment: string): string {
   // Even indices are tokens, odd indices the separator that followed them; the
   // separator is kept so the stable prefix rebuilds verbatim.
   for (let i = 0; i < parts.length; i += 2) {
-    if (!isStableSegmentToken(parts[i] ?? "")) {
+    const token = parts[i] ?? "";
+    if (!isStableSegmentToken(token) || prefix.length + token.length > FD_CLASS_MAX_SEGMENT_CHARS) {
       redacted = true;
       break;
     }
-    prefix += (parts[i] ?? "") + (parts[i + 1] ?? "");
+    prefix += token + (parts[i + 1] ?? "");
   }
   // Every token stable — a compound name like `x86_64-linux-gnu` that only
   // failed the whole-segment test because of its separators. Keep it verbatim

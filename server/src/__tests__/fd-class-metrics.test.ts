@@ -133,6 +133,25 @@ describe("classifyFdTarget", () => {
     expect(classifyFdTarget("/app/node_modules/.pnpm/f")).toBe("file:/app/node_modules/.pnpm");
   });
 
+  it("caps the verbatim prefix even when every token is individually stable", () => {
+    // The residual in shape-rejection: a long all-lowercase hyphenated name
+    // passes every token test and would rebuild at unbounded length. Nothing
+    // this repo generates has that shape, so this is a backstop — but it is
+    // what makes "the label alphabet is bounded" true unconditionally.
+    const long = "alpha-bravo-charlie-delta-echo-foxtrot-golf-hotel";
+    expect(classifyFdTarget(`/srv/${long}/f`)).toBe("file:/srv/alpha-bravo-charlie-delta-echo-*");
+    // A different long name sharing the first 32 chars collapses to the SAME
+    // label, which is the property that bounds the series count.
+    expect(classifyFdTarget(`/srv/${long}-india-juliet/f`)).toBe(
+      "file:/srv/alpha-bravo-charlie-delta-echo-*",
+    );
+    // Real names stay untouched — the cap must not start mangling ordinary
+    // directories, or the instrument stops naming code sites.
+    expect(classifyFdTarget("/usr/lib/x86_64-linux-gnu/libc.so")).toBe(
+      "file:/usr/lib/x86_64-linux-gnu",
+    );
+  });
+
   it("separates a descriptor held on an unlinked file — the classic leak signature", () => {
     expect(classifyFdTarget("/paperclip/data/diagnostics/heap/x.heapsnapshot (deleted)")).toBe(
       "deleted:/paperclip/data/diagnostics/heap",
