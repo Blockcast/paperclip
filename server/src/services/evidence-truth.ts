@@ -390,13 +390,41 @@ async function probeOne(
     // artifact of record is a formal review, reads `review:ally-clean` for a
     // head with a live accepted residual (BLO-36903).
     //
-    // Enforced ONLY as the cross-surface veto on `out.clean` below, not as an
-    // extra condition on `formalClean`. Adding it in both places is redundant:
-    // `formalClean` feeds nothing but that veto, so the second copy changes no
-    // detection and no test can distinguish it (verified by mutation). It also
-    // saves no work — the comment surface reads the PR author on this same path
-    // regardless — so the obvious "short-circuit before the author read"
-    // justification for keeping it is false. Left in one place on purpose.
+    // Keyed on `newest`, deliberately NOT on the head attestation the way
+    // `formalClean` is one line below: as a veto its fail direction is
+    // inverted, so a body that accepts a residual without attesting a head
+    // should still suppress the other surface's clean rather than be ignored.
+    // BLO-38032 tracks that asymmetry.
+    //
+    // Enforced ONLY as the cross-surface veto on `out.clean` below, and NOT as
+    // an extra condition on the `formalAttestingReview` guard. Two reasons, in
+    // order of weight:
+    //
+    //   1. The guard cannot replace the veto, because of the keying above — so
+    //      a copy there would be an ADDITIONAL arm, not a relocation.
+    //   2. Two arms would mask each other under mutation. `formalClean` feeds
+    //      nothing but this veto, so with a copy on the guard, deleting the
+    //      veto's `!formalDeferred` leaves every assertion green and vice
+    //      versa. BLO-34263: a guard with no failing mutation is a comment, and
+    //      an arm whose only sibling already covers every case is how a
+    //      detector ends up with N-1 decorations.
+    //
+    // CORRECTION, and the cost is real rather than zero (Ally review of #2076,
+    // head 0394d75b0): an earlier revision of this comment justified the single
+    // copy with "the comment surface reads the PR author on this same path
+    // regardless". That is FALSE on exactly the population `formalClean` exists
+    // for. Surface 1 reaches `readPrAuthor` only via `authorUnknown`, which is
+    // set only by `withheldPositive`, which needs `isAllyConsolidatedReviewComment`
+    // -> `hasAllyConsolidatedReviewHeading`; `countAllyDeferredPriorFindings`
+    // and `extractAllyReviewedHeadSha` need no heading. So on a body that
+    // attests this head and carries a `tracked` entry but has NO `## Ally`
+    // heading, Surface 1 returns `not_evaluated` with no `authorUnknown` and
+    // never fetches, while this branch does. ACCEPTED COST, stated so it is not
+    // rediscovered as a bug: one call from the scarce budget above, and on a
+    // failed read a `github-truth-probe-failed:pr_author` diagnostic for a
+    // cause that did not decide anything. `out.clean` is false either way, so
+    // the direction is safe, and the population is confined to bodies that fail
+    // Surface 1's grammar. Paying it buys the mutation coverage in (2).
     const formalDeferred = newest !== undefined && countAllyDeferredPriorFindings(newest.body) > 0;
     if (formalAttestingReview !== undefined) {
       const prAuthorLogin = await readPrAuthor();

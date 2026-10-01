@@ -763,9 +763,15 @@ describe("buildGithubTruthProbe", () => {
     expect(r.detections["review:ally-clean"]).toBeUndefined();
   });
 
-  // The comment surface refuses a `tracked` deferral as `deferred_finding`; the
-  // formal surface must too, because on an App-authored PR the formal review is
-  // the only artifact and the comment surface reads not_evaluated.
+  // A `tracked` deferral on a formal review must not read as clean.
+  //
+  // This row does NOT isolate the formal surface, and saying so is the point:
+  // `submittedAt` is a string, so the review is also spread into
+  // `commentInput.comments`, and `clean` carries the `## Ally` heading — so
+  // Surface 1 parses it, returns `deferred_finding`, and `commentDeferred`
+  // alone satisfies the assertion. Deleting `formalDeferred` from the veto
+  // leaves this green. It is kept as the realistic end-to-end shape; the row
+  // below is the one that pins the formal half.
   //
   // The default fixture author is `some-human`, i.e. INDEPENDENT, and that is
   // load-bearing here: the BLO-34969 independence gate would withhold this
@@ -786,6 +792,59 @@ describe("buildGithubTruthProbe", () => {
       }),
     )({ workProducts: [wp()] });
     expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.probeFailed).toBe(false);
+  });
+
+  // The failing mutation for the cross-surface deferral veto, on a
+  // PRODUCTION-REACHABLE shape (Ally review of #2076, head 0394d75b0).
+  //
+  // The veto's only other failing mutation lives on a `submittedAt: null`
+  // review — a divergence `evidence-truth.ts` itself calls something "GitHub
+  // does not produce for a submitted review". Per BLO-34263 a guard needs a
+  // mutation that fails for the reason the guard EXISTS, so a guard whose sole
+  // witness is an acknowledged-unreachable shape is not covered.
+  //
+  // This is the negative twin of the `attestedNoHeading` positive control
+  // above, and it reuses it on purpose: a body with a `Reviewed head:` marker
+  // and NO `## Ally` heading is the exact population that comment names as
+  // what `formalClean` still buys. Surface 1 skips it on grammar
+  // (`isAllyConsolidatedReviewComment` requires the heading) and returns
+  // `not_evaluated` with no `authorUnknown`, so `commentDeferred` is false and
+  // cannot carry this assertion. Surface 2 is the only surface that reaches
+  // it, the author is distinct so `formalClean` is genuinely true, and
+  // `formalDeferred` is the one thing standing between that and a published
+  // `review:ally-clean` on a head with a live accepted residual.
+  //
+  // MUTATION: drop `!formalDeferred` from the `out.clean` veto and this flips
+  // to `true`.
+  it("a tracked deferral vetoes a clean the formal surface alone can see", async () => {
+    const trackedNoHeading = `${attestedNoHeading}
+
+### Prior Findings Dispositioned (1)
+- **prior:abcdef0 important 1** - tracked - accepted onto BLO-36822.`;
+    const r = await buildGithubTruthProbe(
+      deps({
+        // A PR opened by someone other than the reviewer identity, so the
+        // BLO-34969 independence gate is satisfied and the deferral is the
+        // only reason the detection can be absent.
+        fetchPrAuthorLogin: async () => "some-human",
+        listReviewerSurfaces: async () => ({
+          reviews: [
+            {
+              login: ALLY,
+              body: trackedNoHeading,
+              state: "COMMENTED",
+              commitId: HEAD,
+              submittedAt: "2026-09-06T00:00:00Z",
+            },
+          ],
+          comments: [],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    // The author read succeeded, so the absence is the veto and not a failed
+    // probe — without this the row would also pass on an unreadable author.
     expect(r.probeFailed).toBe(false);
   });
 });
