@@ -73,8 +73,15 @@ witness_extract() { # stdin: commit-status API body -> run-id <TAB> updated_at
   # Ally's statuses point at the PR, not a run, and must never become witnesses.
   # This only proposes; the caller still has to resolve the run and confirm it
   # both passed and belongs to the victim's workflow.
+  # ANCHORED to a GitHub Actions run URL. Unanchored `runs/[0-9]+` matches any
+  # third-party status target — `https://ci.example.com/jobs/runs/999` extracts
+  # as candidate run 999 — letting a foreign CI system propose a witness id.
+  # Residual, deliberately not chased: another GitHub repo's run URL still fits
+  # the shape, but the caller resolves the id against THIS repo, so it would
+  # also have to name a success run of the victim's own workflow here to matter.
   jq -r '.statuses[]|select(.state=="success")
-         |[((.target_url // "" | capture("runs/(?<r>[0-9]+)").r) // ""),
+         |[((.target_url // ""
+             | capture("github\\.com/[^/]+/[^/]+/actions/runs/(?<r>[0-9]+)").r) // ""),
            .updated_at]|@tsv' \
     | awk -F'\t' '$1 != ""'
 }
@@ -295,6 +302,25 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses -> alternation of stale
   # `started[i] != ""` still fences BOTH arms; it is the one term that cannot be
   # inferred from a comparison.
   #
+  #   cx[i]           the victim was CANCELLED, not FAILED. This arm is for a
+  #                   head where NO verdict was ever produced, and the two cases
+  #                   are not symmetric: a cancelled victim says nothing, so the
+  #                   off-head green is the only verdict and adds information; a
+  #                   FAILED victim already produced a verdict at this head and
+  #                   it said no. The witness is by construction a run against a
+  #                   DIFFERENT TREE (the scheduled run's head_sha is main's), so
+  #                   retiring an at-head failure with it overrules this tree's
+  #                   own answer using a pass on another one. `passed_at_head`
+  #                   already refuses a pass from a different LANE; a pass from a
+  #                   different TREE is the stronger case of the same hazard, and
+  #                   letting it through is a merge-authorizing false GREEN —
+  #                   the exact direction of all three prior regressions here.
+  #                   BLO-38577's measured shape is cancellation only; this term
+  #                   keeps the arm inside what was actually measured. Note the
+  #                   SIBLING arm above is unaffected and still retires a failed
+  #                   victim, because `newest_pass` is a pass at THIS head: same
+  #                   tree, same lane, so it is evidence about this code.
+  #
   # Accepted residual, stated because it is the green-direction cost: a producer
   # whose off-head status is ADVISORY rather than required will retire its own
   # victim here. Bounded to that producer's own runs, to a head where it passed
@@ -309,11 +335,12 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses -> alternation of stale
       if ($4 == "success") { newest_pass[key] = ($5 > newest_pass[key] ? $5 : newest_pass[key])
                              passed_at_head[$1] = 1 }
       if ($4 == "cancelled" || $4 == "failure") {
-        id[n] = $3; grp[n] = key; wf[n] = $1; started[n] = $5; n++ } }
+        id[n] = $3; grp[n] = key; wf[n] = $1; started[n] = $5
+        cx[n] = ($4 == "cancelled"); n++ } }
     END { for (i = 0; i < n; i++) {
             if (started[i] == "") continue
             if (newest_pass[grp[i]] >= started[i]) { print id[i]; continue }
-            if (!passed_at_head[wf[i]] && ext[wf[i]] >= started[i]) print id[i] } }' \
+            if (cx[i] && !passed_at_head[wf[i]] && ext[wf[i]] >= started[i]) print id[i] } }' \
     | sort -n | paste -sd'|' -
 }
 

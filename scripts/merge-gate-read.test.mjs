@@ -696,6 +696,56 @@ describe("merge-gate reader", () => {
       it("still fails closed on a missing victim timestamp, witness or not", () => {
         assert.equal(dead([["10", "push", "100", "cancelled", ""]], "10 2026-09-19T01:05:00Z"), "");
       });
+
+      // Ally review 5374012593 (Important). The off-head arm is for a head where
+      // NO verdict was produced. A FAILED victim produced one and it said no,
+      // and the witness is by construction a run against a DIFFERENT TREE (the
+      // scheduled run sits at main's head_sha) — so retiring it would overrule
+      // this tree's own answer with a pass on another one. Same victim, same
+      // witness, same timing as the motivating case above; only `conclusion`
+      // differs, which isolates the term. Kills the `cx[i]` guard.
+      it("refuses an off-head witness for a FAILED victim, not merely a cancelled one", () => {
+        assert.equal(
+          dead([["286646914", "pull_request", "36752366689", "failure", "2026-09-30T17:34:32Z"]], WITNESS),
+          "",
+        );
+      });
+
+      // ...while the SIBLING arm must still retire that same failed victim: a
+      // pass at THIS head is the same tree and the same lane, so it IS evidence
+      // about this code. Without this, narrowing to `cx` could be over-applied
+      // to both arms and silently re-open BLO-34619.
+      it("still retires a FAILED victim on an at-head pass by its own lane", () => {
+        assert.equal(
+          dead([
+            ["286646914", "pull_request", "36752366689", "failure", "2026-09-30T17:34:32Z"],
+            ["286646914", "pull_request", "36752400000", "success", "2026-09-30T17:40:00Z"],
+          ]),
+          "36752366689",
+        );
+      });
+
+      // Ally review 5374012593 (Important): `P[2] > ext[P[1]]` had no failing
+      // mutation — un-keying the max to `ext["g"]` survived the suite. Two
+      // witnesses for ONE workflow, NEWEST FIRST: the un-keyed max is never
+      // assigned, so every row beats it and the OLDER row lands last, pulling
+      // ext back before the victim and wrongly sparing it. Order matters here;
+      // oldest-first would pass under both.
+      it("keeps the newest witness per workflow when several are published", () => {
+        assert.equal(
+          dead(PIM, "286646914 2026-09-30T18:55:08Z\n286646914 2026-09-30T17:00:00Z"),
+          "36752366689",
+        );
+      });
+
+      // Ally review 5374012593 (Important): `split(W[j], P, " ") == 2` had no
+      // failing mutation either. A 3-field row is the realistic malformation (a
+      // run id appended to the pair); relaxing the arity test to `>= 1` accepts
+      // it and reads P[2] as the timestamp, retiring the victim off a row whose
+      // field meanings were never established. Fail closed instead.
+      it("fails closed on a malformed witness row rather than guessing its fields", () => {
+        assert.equal(dead(PIM, "286646914 2026-09-30T18:55:08Z 36761895861"), "");
+      });
     });
   });
 
@@ -1022,15 +1072,37 @@ describe("merge-gate reader", () => {
       );
     });
 
-    it("extracts candidates from every page", () => {
+    // Ally review 5374012593 (Suggestion). The run-id pattern is anchored to a
+    // GitHub Actions run URL: unanchored `runs/[0-9]+` matches ANY status
+    // target, so a third-party CI system's green status proposes a witness id
+    // it has no business proposing. Both rows are `success` with a `runs/<n>`
+    // substring and neither is a GitHub Actions URL; only the real one survives.
+    it("ignores a runs/<id> substring that is not a GitHub Actions run URL", () => {
       assert.deepEqual(
         witnessExtract([
           page([
-            { context: "a", state: "success", updated_at: "t1", target_url: "x/actions/runs/1" },
-            { context: "b", state: "success", updated_at: "t2", target_url: "x/actions/runs/2" },
+            { context: "third-party", state: "success", updated_at: "t0", target_url: "https://ci.example.com/jobs/runs/999" },
+            { context: "docs", state: "success", updated_at: "t1", target_url: "https://example.com/runs/888" },
+            {
+              context: "ci-gate",
+              state: "success",
+              updated_at: "t2",
+              target_url: "https://github.com/o/r/actions/runs/42",
+            },
+          ]),
+        ]),
+        ["42\tt2"],
+      );
+    });
+
+    it("extracts candidates from every page", () => {      assert.deepEqual(
+        witnessExtract([
+          page([
+            { context: "a", state: "success", updated_at: "t1", target_url: "https://github.com/o/r/actions/runs/1" },
+            { context: "b", state: "success", updated_at: "t2", target_url: "https://github.com/o/r/actions/runs/2" },
           ]),
           page([
-            { context: "c", state: "success", updated_at: "t3", target_url: "x/actions/runs/3" },
+            { context: "c", state: "success", updated_at: "t3", target_url: "https://github.com/o/r/actions/runs/3" },
           ]),
         ]),
         ["1\tt1", "2\tt2", "3\tt3"],
