@@ -130,7 +130,13 @@ export interface HeapSnapshotConfig {
    * round of snapshots fills every slot and the post-write prune takes the
    * previous round out, so the pair stops spanning hours and becomes one
    * instant across processes. Budget `keep >= replicas × pairs`.
-   * `findConcurrentSnapshotWriters` detects the condition if it ever arises.
+   * `findConcurrentSnapshotWriters` detects *that* condition — and only that
+   * one. It filters on `entry.pid !== self.pid`, so it is blind to the two
+   * single-process routes to the same collapsed pair: a sentinel capture
+   * followed by a threshold capture one poll later, and a restart that re-grows
+   * past the threshold inside `autoMinIntervalMs`. Both are bounded in
+   * `decideHeapSnapshot` and at startup instead, because neither has a foreign
+   * pid for the detector to see.
    */
   keep: number;
   /** Refuse to snapshot unless this many bytes remain free after the estimated write. */
@@ -170,10 +176,13 @@ export interface HeapSnapshotConfig {
    * Measured from the filename stamp rather than mtime on purpose. Retrieval is
    * documented as copying these off the shared volume, and copy tooling rewrites
    * mtimes — so an mtime-based bound would let a reader *extend* the window by
-   * touching the file. The embedded stamp is not mutable that way. A file whose
-   * name this module did not write has no stamp to read and is treated as
+   * touching the file. The embedded stamp is not mutable by `touch`. It *is*
+   * mutable by `mv`, from any pod on the claim, so the key clamps a future stamp
+   * to `0` rather than trusting it — see `retentionKeyMs`, which carries why an
+   * unclamped future stamp defeats this bound and `keep` simultaneously. A file
+   * whose name this module did not write has no stamp to read and is treated as
    * already expired rather than falling back to mtime, which would reopen
-   * exactly that hole for any name that did not parse (see `retentionKeyMs`).
+   * exactly that hole for any name that did not parse.
    *
    * Must exceed `autoMinIntervalMs`, or the older half of a diff pair can expire
    * before the newer half is taken; the caller warns when it does not.
@@ -256,11 +265,28 @@ function snapshotStampMs(name: string): number | null {
  * could take a keep slot and evict the older half of a diff pair — the one
  * artifact PEN-3314 needs and the one that cannot be retaken.
  *
+ * A stamp *ahead* of `nowMs` is keyed `0` for the same reason, and that case is
+ * not hypothetical padding. Left unclamped it defeats both retention bounds at
+ * once on the same entry: `nowMs - stamp` is negative, so no finite `maxAgeMs`
+ * ever expires it, and the descending sort pins it at index 0, so it never falls
+ * outside `keep` either. The file becomes immortal *and* permanently holds a
+ * keep slot, evicting the real snapshots underneath it.
+ *
+ * That contradicts the immutability the `maxAgeMs` docblock claims for this key.
+ * The stamp is not mutable by `touch`, which is the hole the mtime fallback had
+ * — but it is mutable by `mv`, from any pod on the shared claim, which no file
+ * mode separates. Renaming is not an escalation of confidentiality (an actor who
+ * can rename already reads the file); the durable harm is the false invariant and
+ * the pinned keep slot. The no-adversary route is forward clock skew between
+ * pods, which this module already concedes is live — small skew only perturbs
+ * the ordering, but a materially future stamp buys immortality.
+ *
  * Sole source of this key: every ordering and every age test routes through it,
  * so the two cannot drift apart again. (Ally review, PEN-3631.)
  */
-function retentionKeyMs(name: string): number {
-  return snapshotStampMs(name) ?? 0;
+function retentionKeyMs(name: string, nowMs: number): number {
+  const stamped = snapshotStampMs(name);
+  return stamped === null || stamped > nowMs ? 0 : stamped;
 }
 
 /** The pid segment `snapshotBasename` embedded, or null for a foreign name. */
@@ -426,7 +452,7 @@ function collectPrunable(
     .map((name) => {
       try {
         const stats = statSync(path.join(dir, name));
-        return { name, sizeBytes: stats.size, sortKey: retentionKeyMs(name) };
+        return { name, sizeBytes: stats.size, sortKey: retentionKeyMs(name, nowMs) };
       } catch {
         return null;
       }
@@ -501,11 +527,39 @@ export function pruneHeapSnapshots(
  * `listResidualHeapSnapshots`, which also sees `.partial` leftovers — they carry
  * the same secrets and this function is blind to them by construction.
  */
-export function listHeapSnapshots(dir: string): string[] {
+export function listHeapSnapshots(dir: string, nowMs: number = Date.now()): string[] {
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .filter(isCompletedSnapshot)
-    .sort((a, b) => retentionKeyMs(b) - retentionKeyMs(a));
+    .sort((a, b) => retentionKeyMs(b, nowMs) - retentionKeyMs(a, nowMs));
+}
+
+/**
+ * The newest capture stamp already on the volume, or `null` if there is none.
+ *
+ * Exported so startup can seed `lastAutoSnapshotAtMs` from disk. The in-memory
+ * limiter is initialised to null on every boot, so without this seed
+ * `autoMinIntervalMs` provides no spacing across a restart at all: a worker that
+ * OOM-restarts and re-grows past the threshold inside the interval retains a
+ * pair spaced by the crash cycle rather than by the interval, and at `keep: 2`
+ * the prune takes the hours-older half with it. The deliverable is a pair hours
+ * apart; a pair minutes apart is not a diff.
+ *
+ * Returns `null` rather than `0` for an unstamped or future-stamped newest file:
+ * `retentionKeyMs` keys both at `0`, which carries no information about when the
+ * last capture happened, and seeding the limiter with it would read as "captured
+ * at the epoch" and bound nothing. Null leaves the first capture unthrottled,
+ * which is the same posture as an empty directory.
+ *
+ * Deliberately not used to seed `lastSentinelSnapshotAtMs`: a human request
+ * after a restart should fire promptly, and the sentinel's own rationing exists
+ * to bound an operator loop, not to space a diff pair. (Ally review, PEN-3631.)
+ */
+export function newestHeapSnapshotStampMs(dir: string, nowMs: number = Date.now()): number | null {
+  const newest = listHeapSnapshots(dir, nowMs)[0];
+  if (newest === undefined) return null;
+  const stamp = retentionKeyMs(newest, nowMs);
+  return stamp === 0 ? null : stamp;
 }
 
 /**
@@ -525,12 +579,15 @@ export function listHeapSnapshots(dir: string): string[] {
  * life of the process, and the operator was told nothing. (Ally review Important
  * 1; upheld as a condition of acceptance by the CEO on PEN-3631.)
  */
-export function listResidualHeapSnapshots(dir: string): {
+export function listResidualHeapSnapshots(
+  dir: string,
+  nowMs: number = Date.now(),
+): {
   completed: string[];
   partial: string[];
 } {
   if (!existsSync(dir)) return { completed: [], partial: [] };
-  const byNewest = (a: string, b: string): number => retentionKeyMs(b) - retentionKeyMs(a);
+  const byNewest = (a: string, b: string): number => retentionKeyMs(b, nowMs) - retentionKeyMs(a, nowMs);
   const entries = readdirSync(dir);
   return {
     completed: entries.filter(isCompletedSnapshot).sort(byNewest),
@@ -759,15 +816,20 @@ export interface HeapSnapshotDecision {
  * the same reason: honoured-exactly-once has to hold whether or not the request
  * produced a snapshot, or a backlog of touches would drain one per poll.
  *
- * A sentinel that could not be *claimed* is the one case that falls through to
- * the threshold arm rather than returning. The two triggers are independent —
- * separate config, separate interval, separate state field — and a request file
- * the worker cannot delete says nothing about the heap. Returning early there
- * would suppress automatic capture for as long as the file stayed put, which is
- * the whole life of the process on a real filesystem fault: the file is still
- * there by definition, so every later poll would take the same branch. That
- * would silently disable the unattended threshold pair while reporting only a
- * wedged *request* path.
+ * Neither a *declined* nor an *unclaimable* sentinel returns early: both fall
+ * through to the threshold arm. The two triggers are independent — separate
+ * config, separate interval, separate state field — and neither a request file
+ * the worker cannot delete nor one the rate limit turned away says anything
+ * about the heap. Returning early on either would suppress automatic capture
+ * for as long as the condition held, which is the whole life of the process for
+ * claim-failed (the file is still there by definition, so every later poll takes
+ * the same branch) and the whole of a long `sentinelMinIntervalMs` for a
+ * rate-limited one that anything re-creates per poll — a retry wrapper, a cron
+ * drop, an operator retouching while waiting the interval out. That is a real
+ * suppression window, not a reordering: no sentinel capture *and* no threshold
+ * evaluation while the heap climbs. Note the separate decision above — a
+ * declined sentinel is still *consumed* — is about honoured-exactly-once and
+ * is not a reason to skip the threshold arm. (Ally review, PEN-3631.)
  */
 export function decideHeapSnapshot(
   config: HeapSnapshotConfig,
@@ -795,9 +857,13 @@ export function decideHeapSnapshot(
       ) {
         // Claimed but declined: the pause this would cost is the thing being
         // rationed, and the sentinel is writable from every pod on the claim.
-        return { trigger: null, sentinel: "rate-limited" };
+        // Fall through rather than return — see the docblock: a declined
+        // request says nothing about the heap, and something re-creating the
+        // file each poll would otherwise suppress the threshold arm outright.
+        sentinel = "rate-limited";
+      } else {
+        return { trigger: "sentinel", sentinel: "claimed" };
       }
-      return { trigger: "sentinel", sentinel: "claimed" };
     }
   }
 
@@ -805,8 +871,22 @@ export function decideHeapSnapshot(
   if (runtime.heapUsedBytes() < config.autoThresholdBytes) {
     return { trigger: null, sentinel };
   }
-  const lastAt = state.lastAutoSnapshotAtMs;
-  if (lastAt !== null && runtime.now().getTime() - lastAt < config.autoMinIntervalMs) {
+  // Spaced against the newest capture by *either* trigger, not just this one.
+  // `autoMinIntervalMs` exists to keep the retained pair hours apart, and the
+  // caller stamps one field or the other per capture — so reading only
+  // `lastAutoSnapshotAtMs` means a sentinel capture leaves it null and the very
+  // next poll fires the threshold arm unconditionally (with a threshold set the
+  // heap sits above it by definition — that is the PEN-3314 posture). That is a
+  // second unrequested stop-the-world pause on an already-pressured worker, and
+  // at `keep: 2` the post-write prune then evicts the hours-older half the
+  // operator was accumulating. The sentinel arm deliberately keeps its own
+  // field, so a human request still fires promptly after an automatic capture.
+  // (Ally review, PEN-3631.)
+  const lastAt = Math.max(
+    state.lastAutoSnapshotAtMs ?? Number.NEGATIVE_INFINITY,
+    state.lastSentinelSnapshotAtMs ?? Number.NEGATIVE_INFINITY,
+  );
+  if (Number.isFinite(lastAt) && runtime.now().getTime() - lastAt < config.autoMinIntervalMs) {
     return { trigger: null, sentinel };
   }
   return { trigger: "threshold", sentinel };
