@@ -11,9 +11,9 @@
  * dispatch while one is already pending. The guard is correct. But the job it
  * protects is gated on three named human reviewers, so while any deploy sits
  * `waiting`, the daily dispatcher is a permanent no-op — and every skipped run
- * still reports `conclusion: success`. On 2026-09-01 that took production to 45
+ * reported `conclusion: success`. On 2026-09-01 that took production to 45
  * commits behind with an oldest-missing-commit age of 28.8h, and nothing
- * escalated: the mechanism built to remove a human from the loop disarms itself
+ * escalated: the mechanism built to remove a human from the loop disarmed itself
  * precisely when the human is what is stuck.
  *
  * WHY severity=critical, WHEN THE SIBLING DRIFT ALERT IS ONLY `warning`
