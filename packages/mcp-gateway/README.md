@@ -247,10 +247,22 @@ authenticated proxy rather than drop a sample.
 the threshold rather than by a delay. The health listener binds inside the proxy
 listener's own `listen` callback, so until the proxy is up *both* ports are
 closed and every probe before that is a connection refusal, not a wrong answer.
-At `periodSeconds: 15` / `failureThreshold: 3` that grants liveness ~45s of
-start-up grace, which is ample for this process today. Tighten `periodSeconds`
-and that grace shrinks with it — at which point add an explicit
-`initialDelaySeconds` rather than rediscovering why the margin was enough.
+At `periodSeconds: 15` / `failureThreshold: 3` that grants liveness ~30s of
+start-up grace — not 45s. The kubelet probes immediately rather than one period
+in: `doProbe` is the loop *condition* in its probe worker, and with
+`initialDelaySeconds` unset its delay gate is `0 < 0`. So the three failures land
+at t≈0s / 15s / 30s, and the margin is `periodSeconds × (failureThreshold − 1)`,
+not `× failureThreshold`. Tighten `periodSeconds` and that grace shrinks with it
+— at which point add an explicit `initialDelaySeconds` rather than rediscovering
+why the margin was enough.
+
+30s is still ample for this process today: the figure was wrong here, not the
+config. Do not budget the slack above it either. The worker's ticker is phased to
+*its own* start, which precedes the container's, so the first probe really lands
+somewhere in `(0, periodSeconds]` and the observed restart ranges up to ~45s;
+after a kubelet restart `run()` additionally sleeps a random fraction of a period
+first. Both offsets are phase-dependent and neither is guaranteed, so 30s is the
+number a start-up has to fit inside.
 
 Four properties this port is required to keep, all pinned in `server.test.ts`:
 
