@@ -710,8 +710,8 @@ export function isClaudeTransientUpstreamError(input: {
   //
   // Narrowing THIS function alone would be inert in production, and that is why
   // the change does not stop here. Every classifier in `execute.ts` is gated on
-  // `detectClaudeLoginRequired` before this rule is consulted (`execute.ts:1218`,
-  // consumed at :1257/:1266/:1283 on the `!parsed` path and :1406-1450 on the
+  // `detectClaudeLoginRequired` before this rule is consulted (`execute.ts:1235`,
+  // consumed at :1274/:1283/:1300 on the `!parsed` path and :1423-1467 on the
   // parsed one), so a transcript-only auth token suppressed the verdict upstream
   // of here. That call site is narrowed the same way, on the same shape gate.
   // The `loginUrl` it reports is deliberately left on the whole transcript: it is
@@ -734,7 +734,7 @@ export function isClaudeTransientUpstreamError(input: {
   // Two distinct populations reach this with no result event, and both need the
   // wide transcript haystack:
   //
-  //   1. `parsed: null` — `execute.ts`'s `!parsed` fallback (:1254), when the CLI
+  //   1. `parsed: null` — `execute.ts`'s `!parsed` fallback (:1271), when the CLI
   //      died without emitting one.
   //   2. `parsed` truthy but not a result event — `execute.ts`'s `parsed` is
   //      `parsedStream.resultJson ?? parseJson(proc.stdout)` (:1181), and that
