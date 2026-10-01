@@ -333,8 +333,9 @@ function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<Sta
       if (startedAt === undefined) {
         // Snapshot before the await: `readRemainingStderr` yields, and a BACKPRESSURE
         // chunk delivered in that window would set the flag after `exit` had already
-        // branched. Reading it later would call that shape a guard entry when the
-        // guard did nothing, which is the one way this diagnostic could lie.
+        // branched. The guard does run in that shape — but it is also the shape where
+        // the mutation survives (see the test below), so crediting it would have this
+        // test report a kill it no longer makes.
         const lateAtExit = lateBackpressureIgnored;
         void readRemainingStderr(child.stderr)
           .then((stderr) => {
