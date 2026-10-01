@@ -766,6 +766,11 @@ describe("prompt-bundle skill symlinks carry POD addresses (BLO-37961)", () => {
       expect(target.startsWith(`${podMount}/`)).toBe(true);
       // (2) ...and the bytes are really at that address, so this is resolution
       //     and not string manipulation that happens to look right.
+      //     NOTE: this passes because `withVolume` materializes the tree under
+      //     BOTH mounts. In production `podMount` does not exist in server
+      //     space at all, so this cannot be read as evidence that the target
+      //     resolves server-side — nothing requires that, since `fs.symlink`
+      //     never stats its source. Clause (1) is the load-bearing one.
       expect(await fs.stat(path.join(target, "SKILL.md")).then(() => true, () => false)).toBe(true);
       // Derived from the input rather than restated, so the two cannot drift.
       expect(target).toBe(podSkillSource);
@@ -873,8 +878,113 @@ describe("prompt-bundle skill symlinks carry POD addresses (BLO-37961)", () => {
     });
   });
 
-  it("rewrites the catalog entry and spares the image entry in the SAME bundle", async () => {
-    // The live set is MIXED, which is why the defect was not obvious: a bundle
+  // Ally review of this head (Suggestion): the unlink above used to be a
+  // blanket `.catch(() => {})`, which swallowed the one failure that silently
+  // restores the defect the block exists to fix — the stale link survives,
+  // `ensurePaperclipSkillSymlink` stats its old SERVER address, finds it, and
+  // returns `skipped`. Nothing else reports it: `desired` IS under the pod
+  // mount in the migration shape, so the off-volume warn cannot fire.
+  //
+  // Two legs, because the narrowing has two halves and each needs its own
+  // failing mutation. EPERM must report (reverting to the blanket catch turns
+  // this red); ENOENT must stay silent — the link is already gone, so the
+  // helper writes the right one and there is nothing to report. Without the
+  // ENOENT leg the `code === "ENOENT"` early return has no failing mutation,
+  // i.e. it is a comment (BLO-34263).
+  it.each([
+    { code: "EPERM", message: "EPERM: operation not permitted, unlink", warns: true, repaired: false },
+    { code: "ENOENT", message: "ENOENT: no such file or directory, unlink", warns: false, repaired: true },
+  ])("stale link, unlink fails $code → warns=$warns", async ({ code, message, warns, repaired }) => {
+    await withVolume(async ({ podMount, serverMount, serverSkillSource, podSkillSource }) => {
+      const volumeRelativeRoot = "instances/default/data/k8s-isolation/acme-co/agent-1/prompt-cache";
+      const run1 = {
+        companyId,
+        skills: [skillEntry(serverSkillSource)],
+        instructionsContents: null,
+        rootDir: path.posix.join(serverMount, volumeRelativeRoot),
+        podDataMountPath: serverMount,
+        serverDataMountPath: serverMount,
+        onLog,
+      };
+      // Run 1 — produce the real pre-fix artifact, as the repair test above does.
+      const before = await prepareClaudePromptBundle(run1);
+      expect(await linkTarget(before)).toBe(serverSkillSource);
+
+      const linkPath = path.join(before.serverRootDir, ".claude", "skills", runtimeName);
+      const realUnlink = fs.unlink.bind(fs);
+      const unlink = vi.spyOn(fs, "unlink").mockImplementation(async (p) => {
+        if (String(p) !== linkPath) return realUnlink(p);
+        // ENOENT leg: really remove it, so the rest of the run meets the state
+        // the error claims (link already gone) rather than a contradiction.
+        if (code === "ENOENT") await realUnlink(p);
+        throw Object.assign(new Error(message), { code });
+      });
+      // Collect eagerly: `mockRestore()` clears `mock.calls`, so the natural
+      // read-after-restore sees [] and the assertion passes vacuously.
+      const warned: string[] = [];
+      const warn = vi.spyOn(console, "warn").mockImplementation((line) => { warned.push(String(line)); });
+      let after: Awaited<ReturnType<typeof prepareClaudePromptBundle>>;
+      try {
+        // Run 2 — the pod mount moves, so the link must be rewritten; the
+        // unlink fails.
+        after = await prepareClaudePromptBundle({
+          ...run1,
+          rootDir: path.posix.join(podMount, volumeRelativeRoot),
+          podDataMountPath: podMount,
+        });
+      } finally {
+        unlink.mockRestore();
+        warn.mockRestore();
+      }
+
+      const retained = warned
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((e) => e.event === "claude_k8s.prompt_bundle_stale_skill_link_retained");
+      expect(retained).toEqual(
+        warns
+          ? [expect.objectContaining({
+              skillKey: catalogKey,
+              staleLinkTarget: serverSkillSource,
+              desiredLinkTarget: podSkillSource,
+            })]
+          : [],
+      );
+      // Pin the warn to an OUTCOME, not to a code path: when it fires the pod
+      // really is still handed the address it cannot follow, and when it stays
+      // silent the link really did get repaired.
+      expect(after.serverRootDir).toBe(before.serverRootDir);
+      expect(await linkTarget(after)).toBe(repaired ? podSkillSource : serverSkillSource);
+    });
+  });
+
+  it("does not warn when there is no stale link to drop", async () => {
+    // Guards against a `console.warn` emitted outside the catch entirely, which
+    // would fire on every run of the default fleet.
+    await withVolume(async ({ podMount, serverMount, podRootDir, serverSkillSource }) => {
+      const warned: string[] = [];
+      const warn = vi.spyOn(console, "warn").mockImplementation((line) => { warned.push(String(line)); });
+      try {
+        await prepareClaudePromptBundle({
+          companyId,
+          skills: [skillEntry(serverSkillSource)],
+          instructionsContents: null,
+          rootDir: podRootDir,
+          podDataMountPath: podMount,
+          serverDataMountPath: serverMount,
+          onLog,
+        });
+      } finally {
+        warn.mockRestore();
+      }
+      expect(
+        warned
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+          .filter((e) => e.event === "claude_k8s.prompt_bundle_stale_skill_link_retained"),
+      ).toEqual([]);
+    });
+  });
+
+  it("rewrites the catalog entry and spares the image entry in the SAME bundle", async () => {    // The live set is MIXED, which is why the defect was not obvious: a bundle
     // whose image-path links all resolve looks healthy. One leg per shape in one
     // call, so a rewrite that is unconditional in either direction fails here.
     await withVolume(async ({ podMount, serverMount, podRootDir, serverSkillSource, podSkillSource, offMountSkillSource }) => {
