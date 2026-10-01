@@ -1709,6 +1709,15 @@ export function shouldScheduleAutomaticRunRetry(
   // in the same window retried normally (24 `transient_failure_retry` runs).
   // Classification is not enrolment, and nothing failed loudly when the two
   // diverged — see the parity test in heartbeat-recoverable-error-family.test.ts.
+  //
+  // The rename had THREE enrolment sites, not two (Ally, #2159). All are now
+  // aligned: TRANSIENT_INFRA_CONTINUATION_ERROR_CODES (#1669 got this one), the
+  // literal below, and ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES in
+  // recovery/zero-token-startup-failure.ts — the last decides owner-vs-manager
+  // routing, so missing it sent an assignee's stranded issue up the manager
+  // ladder. Both of the sites this file can reach are asserted by comparison
+  // against `adapter_failed` in that test, so a fourth site, or a fourth rename,
+  // fails CI rather than being measured 18 hours later.
   if (
     run.errorCode !== "adapter_failed" &&
     run.errorCode !== "process_lost" &&
