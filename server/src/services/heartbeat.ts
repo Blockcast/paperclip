@@ -28479,7 +28479,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_critical_lane",
         });
-        await noteDispatchDeclined(agentId, "emergency_lane_continuation", agent.companyId);
+        await noteDispatchDeclined(agentId, "critical_lane_continuation", agent.companyId);
         return [];
       }
       dispatchCriticalLaneCursorByAgent.delete(agentId);
@@ -28490,7 +28490,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reason: "resume_critical_lane",
         });
         if (!foundReadyCritical) {
-          await noteDispatchDeclined(agentId, "emergency_lane_continuation", agent.companyId);
+          await noteDispatchDeclined(agentId, "critical_lane_continuation", agent.companyId);
           return [];
         }
       }
@@ -28598,7 +28598,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_recovery_lane",
         });
-        await noteDispatchDeclined(agentId, "emergency_lane_continuation", agent.companyId);
+        await noteDispatchDeclined(agentId, "recovery_lane_continuation", agent.companyId);
         return [];
       }
       dispatchRecoveryLaneCursorByAgent.delete(agentId);
@@ -28609,7 +28609,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reason: "resume_recovery_lane",
         });
         if (!foundReadyRecovery) {
-          await noteDispatchDeclined(agentId, "emergency_lane_continuation", agent.companyId);
+          await noteDispatchDeclined(agentId, "recovery_lane_continuation", agent.companyId);
           return [];
         }
       }

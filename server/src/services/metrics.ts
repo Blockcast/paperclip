@@ -2119,8 +2119,24 @@ const knownReasonSet: ReadonlySet<string> = new Set(KNOWN_BLOCKED_REASONS);
  * {@link UNKNOWN_DISPATCH_DECLINE_REASON}, which reintroduces exactly the blind
  * spot this metric was added to close.
  *
- * The first three are process-wide, not per-agent: they fire identically for
- * every agent in the instance and carry {@link UNKNOWN_AGENT_ID}.
+ * The first FOUR collapse to {@link UNKNOWN_AGENT_ID}, not the first three.
+ * `dispatch_stopped`, `api_tier_fence` and `scheduling_suppressed` do so
+ * because they are process-wide: they fire identically for every agent in the
+ * instance, so they pass `companyId: null` and the roster read is skipped.
+ *
+ * `agent_missing` collapses for a different and more permanent reason, and it
+ * is NOT fixable by passing a company id. The bound is membership of the
+ * `agents` table: `getActiveAgentIds` selects the ids present for a company,
+ * and `agent_missing` is emitted precisely when `SELECT * FROM agents WHERE
+ * id = ?` returned no row. A row that does not exist cannot be in any
+ * company's set, so {@link normalizeAgentId} would return
+ * {@link UNKNOWN_AGENT_ID} for it whatever company were supplied. It is
+ * structurally unscopeable; do not "fix" it by threading a company id through.
+ *
+ * Operator consequence: filtering `agent_id!="unknown"` to get per-agent facts
+ * drops `agent_missing` entirely — and that is the one reason where *which*
+ * agent vanished is the whole datum. Read that reason from the logs, which
+ * carry the id.
  */
 export const KNOWN_DISPATCH_DECLINE_REASONS = [
   /** Dispatch disabled for this process (`skipQueuedRunDispatch` / `dispatchStopped`). */
@@ -2139,8 +2155,16 @@ export const KNOWN_DISPATCH_DECLINE_REASONS = [
   "no_available_slots",
   /** A pending image bump is draining the agent's slots before it applies. */
   "pending_image_bump",
-  /** A bounded critical/recovery lane pass is still walking; lower lanes wait. */
-  "emergency_lane_continuation",
+  /**
+   * A bounded critical-lane pass is still walking; lower lanes wait.
+   * Split from the recovery lane deliberately: a seat starved by a walking
+   * critical pass and one starved by the recovery lane are different faults,
+   * and collapsing them would put the "which lane holds this seat" question
+   * back behind a log join — the exact cost this metric exists to remove.
+   */
+  "critical_lane_continuation",
+  /** As above, for the recovery-action lane. */
+  "recovery_lane_continuation",
   /** The queue was scanned and held no candidate row at all. */
   "no_queued_candidates",
   /** Candidates existed and every one of them refused to claim. */
