@@ -229,7 +229,7 @@ readinessProbe: { httpGet: { path: /healthz, port: health } }
 livenessProbe:  { httpGet: { path: /healthz, port: health } }
 ```
 
-Two properties this port is required to keep, both pinned in `server.test.ts`:
+Three properties this port is required to keep, all pinned in `server.test.ts`:
 
 - **It never proxies.** The deny it exists to permit names one port, so anything
   reachable here is reachable around that deny. A health listener that routed to
@@ -237,6 +237,16 @@ Two properties this port is required to keep, both pinned in `server.test.ts`:
 - **It discloses less than the proxy port's `/healthz`,** which reports upstream
   names, breaker state and per-prefix session counts. No deny covers this port;
   treat its body as readable by anything that can route to the pod.
+- **Its connections are bounded** — 64 concurrent, 2s headers, 5s request —
+  rather than left on Node's unlimited / 60s / 300s defaults. Those defaults
+  suit an authenticated proxy port; this one is reachable by exactly the `host`
+  and `remote-node` entities the deny excludes, with nothing authenticating in
+  front of it. Since `createProxyAcceptProbe` needs a descriptor of its own,
+  unbounded socket-holding here would push the process toward fd pressure, fail
+  the probe, and turn a 503 into a liveness restart of the authenticated proxy.
+  An EMFILE that happens anyway still reads as 503, deliberately: a process out
+  of descriptors genuinely is not accepting, so the honest answer is "not
+  serving" and a restart is the correct recovery.
 
 ### What the 200 actually asserts
 

@@ -2177,21 +2177,32 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
     });
 
     it("reports false rather than hanging when the connect does not complete", async () => {
-      // 203.0.113.0/24 is TEST-NET-3: routable-looking, never answers — the
-      // saturated-accept-queue shape, where the SYN is dropped rather than
-      // refused. Overriding `host` only to reach that state; production is
-      // always loopback.
-      const probe = createProxyAcceptProbe(9, { timeoutMs: 50, ttlMs: 0, host: "203.0.113.1" });
-      const started = Date.now();
-      expect(await probe()).toBe(false);
-      // Bounded by the timeout, not by the OS connect retry schedule.
-      expect(Date.now() - started).toBeLessThan(2000);
+      // The saturated-accept-queue shape: the SYN is dropped rather than
+      // refused, so the connect neither completes nor errors.
+      //
+      // Pinned with a socket that emits neither event rather than with a real
+      // unroutable address (TEST-NET-3, which this test used to dial). In a
+      // no-egress sandbox that address fails immediately with ENETUNREACH
+      // through the `once("error")` branch, well inside the bound — so that
+      // shape passed even with `socket.setTimeout` deleted, and what it proved
+      // depended on the host's egress rather than on the code.
+      const connect = vi.spyOn(net, "connect").mockImplementation(() => new net.Socket());
+      try {
+        const probe = createProxyAcceptProbe(9, { timeoutMs: 50, ttlMs: 0 });
+        const started = Date.now();
+        expect(await probe()).toBe(false);
+        // Bounded by the timeout, not by the OS connect retry schedule.
+        expect(Date.now() - started).toBeLessThan(2000);
+        expect(connect).toHaveBeenCalledTimes(1);
+      } finally {
+        connect.mockRestore();
+      }
     });
 
     // Nothing in front of the health port authenticates, so without the cache
     // each unauthenticated request would open a fresh connection into the very
     // accept queue being measured.
-    it("collapses repeated calls within the TTL into one connection", async () => {
+    it("collapses repeated calls within the TTL, and re-probes once it lapses", async () => {
       let accepted = 0;
       const listener = net.createServer((socket) => {
         accepted += 1;
@@ -2201,13 +2212,77 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
       await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
       const { port } = listener.address() as AddressInfo;
 
-      const probe = createProxyAcceptProbe(port, { ttlMs: 10_000 });
+      const probe = createProxyAcceptProbe(port, { ttlMs: 20 });
       expect(await Promise.all([probe(), probe(), probe()])).toEqual([true, true, true]);
       // The client resolves on its own `connect`; the server's `connection`
       // event is a separate turn, so settle before counting.
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(accepted).toBe(1);
+
+      // ...and the other half of the window, which is the half that matters
+      // (PEN-3052 review). Asserting only collapse *within* the TTL leaves
+      // `now - cached.at < ttlMs` free to be deleted: the probe then memoises
+      // its first successful connect forever, so a later wedged accept queue
+      // answers 200 indefinitely and liveness never restarts the pod —
+      // precisely the failure this listener exists to prevent. The 50ms settle
+      // above is already past the 20ms TTL, so this call must re-probe.
+      expect(await probe()).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(accepted).toBe(2);
     });
+
+    // The window is measured on `performance.now()`, not `Date.now()`. Under a
+    // backwards wall-clock step `now - cached.at` goes negative, which compares
+    // as inside the TTL — pinning the cached answer for the duration of the
+    // jump. A pinned `true` is the stale positive this probe exists to avoid.
+    it("measures its TTL on a monotonic clock", async () => {
+      let accepted = 0;
+      const listener = net.createServer((socket) => {
+        accepted += 1;
+        socket.destroy();
+      });
+      servers.push(listener as unknown as http.Server);
+      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+      const { port } = listener.address() as AddressInfo;
+
+      const probe = createProxyAcceptProbe(port, { ttlMs: 20 });
+      expect(await probe()).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(accepted).toBe(1);
+
+      // An hour-long backwards step, i.e. far larger than the TTL.
+      const realNow = Date.now;
+      const skewed = vi.spyOn(Date, "now").mockImplementation(() => realNow() - 3_600_000);
+      try {
+        expect(await probe()).toBe(true);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(accepted).toBe(2);
+      } finally {
+        skewed.mockRestore();
+      }
+    });
+  });
+
+  // This listener sits OUTSIDE the deny by construction — that is why it
+  // exists — so it is reachable by exactly the `host` / `remote-node` entities
+  // the deny excludes from the proxy port, with nothing authenticating in
+  // front of it. Node's defaults (unlimited connections, 60s headers, 300s
+  // request) hold a byte-silent socket for a minute each, and the accept probe
+  // needs an fd of its own: left unbounded, socket-holding here becomes a
+  // restart lever on the authenticated proxy via a 503 from the fd-starved
+  // probe. Asserted on the constructed server, not at the `listen` call site,
+  // so a second caller cannot bind it unbounded.
+  it("bounds connections and timeouts, since nothing in front of this port authenticates", () => {
+    // Never bound: these are properties of the constructed server, so the test
+    // needs no listener and nothing to tear down.
+    const health = createHealthServer(() => true);
+
+    expect(health.maxConnections).toBe(64);
+    // Both well under Node's defaults, which are what this pins against.
+    expect(health.headersTimeout).toBeGreaterThan(0);
+    expect(health.headersTimeout).toBeLessThanOrEqual(2_000);
+    expect(health.requestTimeout).toBeGreaterThan(0);
+    expect(health.requestTimeout).toBeLessThanOrEqual(5_000);
   });
 
   it("discloses less than /healthz on the proxy port, which no deny covers here", async () => {
