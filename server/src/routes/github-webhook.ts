@@ -7083,6 +7083,7 @@ export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarke
 export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;
 export const __test_isSelfReviewedPr = isSelfReviewedPr;
 export const __test_bodyReRaisesPriorFinding = bodyReRaisesPriorFinding;
+export const __test_reRaisedPriorFindingLabels = reRaisedPriorFindingLabels;
 export const __test_resolvePrCommentReviewGateWebhookTrigger = resolvePrCommentReviewGateWebhookTrigger;
 export const __test_readReviewGateEscalationHeadSha = readReviewGateEscalationHeadSha;
 export const __test_isActionablePrReviewComment = isActionablePrReviewComment;
