@@ -1232,10 +1232,10 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   // (~390/day). That agent count slides with the 7d window -- re-measured
   // 22 of 23 on 2026-09-26 -- so cite it with its date and never as "all
   // agents". Holds past 300s are routine, not exceptional. Blockcast's live
-  // rule is therefore being retuned to a fleet-count expression, with the
-  // log/alert numbers deliberately UNPINNED (Blockcast/onprem-k8s#3985,
-  // unmerged; until it lands the live rule is still > 300 and the two still
-  // share 300); see deploy/helm/paperclip/values.yaml
+  // rules therefore no longer use 300: Blockcast/onprem-k8s#4036 split the
+  // page into Wedged (> 14400 for 5m) and FleetStall (>= 3 agents past 900s
+  // for 10m), with the log/alert numbers deliberately UNPINNED (the earlier
+  // single-rule retune, #3985, closed unmerged); see deploy/helm/paperclip/values.yaml
   // (agentStartLockHeldSeconds) and runbooks/queued-run-stranded.md. This
   // assertion still stands because THIS chart copy was not retuned -- it
   // guards the 300 that is still rendered here, not the deployed policy.
@@ -1288,19 +1288,18 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
 test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)", () => {
   // Nothing renders from these two passages, so only an assertion catches them
   // drifting. values.yaml is read by third parties enabling this chart
-  // elsewhere: calling the fleet-count retune Blockcast's live rule while
-  // Blockcast/onprem-k8s#3985 is unmerged hands them an unproven expression as
-  // proven -- and the mirror error, still calling it pending after #3985 lands,
-  // hands them `> 300` when the live rule is `> 900`.
+  // elsewhere, immediately before they set prometheusRule.enabled: true, so a
+  // stale live threshold here is the number they port.
   //
-  // This test CANNOT observe #3985's state (CI has no read of onprem-k8s), so
-  // it deliberately enforces only that the prose stays DEFINITE about that
-  // state, in EITHER direction. Pinning it to "pending" would make the correct
-  // post-merge edit a red build whose failure message argues the now-false
-  // claim back in. The gate on which direction is true is the must-update
-  // checklist on Blockcast/onprem-k8s#3985, which names this file by path --
-  // that is where the merge event actually happens, and this repo has no
-  // signal for it.
+  // This pin previously accepted either outcome of Blockcast/onprem-k8s#3985
+  // (pending with `> 300`, or merged with `> 900`). #3985 resolved to a third
+  // outcome that pin could not express: it closed unmerged on 2026-09-28, and
+  // Blockcast/onprem-k8s#4036 landed the same day with a SPLIT instead --
+  // Wedged at `> 14400` for 5m and a separate FleetStall at `>= 3` for 10m.
+  // Both PRs are terminal, so the WARNING is now pinned to that landed state.
+  // CI has no read of onprem-k8s and cannot see a later move; if those rules
+  // change again, read the two lockstep alert files there and update the
+  // WARNING, the runbook's KNOWN DIVERGENCE, and these patterns together.
   const values = readFileSync(
     path.join(repoRoot, "deploy/helm/paperclip/values.yaml"),
     "utf8",
@@ -1315,18 +1314,24 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
   const warning = values.slice(warningIndex, warningEnd === -1 ? undefined : warningEnd);
   assert.match(
     warning,
-    /in Blockcast\/onprem-k8s#3985, (?:not yet merged; until it lands the live rule is still `> 300`|merged; the live rule is now `> 900`)/,
-    "values.yaml must state #3985's status definitely: pending with the live rule still > 300, or merged with it now > 900",
+    /Blockcast\/onprem-k8s#3985[^.]*closed unmerged/,
+    "values.yaml must say Blockcast/onprem-k8s#3985 closed unmerged",
   );
-  // Only meaningful while the prose claims pending -- after #3985 lands, saying
-  // the retune is deployed is the correct statement, not the forbidden one.
-  if (/not yet merged/.test(warning)) {
-    assert.doesNotMatch(
-      warning,
-      /live rule in Blockcast\/onprem-k8s is now|NO LONGER the deployed policy/,
-      "values.yaml must not describe the unmerged retune as deployed",
-    );
-  }
+  assert.match(
+    warning,
+    /Blockcast\/onprem-k8s#4036[^.]*PaperclipAgentStartLockWedged at `[^`]*> 14400` for 5m/,
+    "values.yaml must give the live Wedged rule landed by #4036: > 14400 for 5m",
+  );
+  assert.match(
+    warning,
+    /SEPARATE alert, PaperclipAgentStartLockFleetStall, at `count\([^`]*> 900\) >= 3` for 10m/,
+    "values.yaml must name FleetStall (>= 3 agents past 900s for 10m) as a separate live alert",
+  );
+  assert.doesNotMatch(
+    warning,
+    /not yet merged|until it lands|being retuned/i,
+    "values.yaml must not describe the start-lock retune as pending; #3985 closed and #4036 landed the split",
+  );
 
   const runbook = readFileSync(
     path.join(repoRoot, "runbooks/queued-run-stranded.md"),
