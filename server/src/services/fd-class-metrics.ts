@@ -188,14 +188,18 @@ function isStableSegmentToken(token: string): boolean {
  * (a bare UUID) reduces to `*` on its own, and a segment with no volatile
  * token at all is returned untouched.
  *
- * {@link FD_CLASS_MAX_SEGMENT_CHARS} makes the bound *total* rather than
- * merely shape-based. Without it a long all-lowercase hyphenated name — every
- * token individually stable — rebuilds verbatim at unbounded length, which is
- * the one residual way a churning directory could still mint a series per run.
+ * {@link FD_CLASS_MAX_SEGMENT_CHARS} bounds label *length*, not label
+ * *cardinality*, and the gap between those is the residual. A segment whose
+ * tokens are each individually stable still rebuilds verbatim, so a churning
+ * directory named from lowercase non-hex tokens mints one series per run while
+ * sitting well inside the cap: measured, 60,000 `/srv/sess-<12 lowercase
+ * non-hex>/f` paths give 60,000 distinct labels, every segment 17 characters.
  * Nothing this repo generates has that shape (run ids are hex, issue keys are
- * uppercase, mkdtemp suffixes are mixed alnum), so this is a backstop against
- * a shape not yet seen rather than a fix for an observed case — but "the
- * alphabet is bounded" should be true unconditionally, not just in practice.
+ * uppercase, mkdtemp suffixes are mixed alnum), and each of those collapses to
+ * exactly 1 label over 60,000 samples. So the alphabet is bounded for every
+ * shape this repo generates, not unconditionally — the cap is a backstop that
+ * keeps an unanticipated shape's label *short*, not a guarantee it stays
+ * single.
  */
 function boundedSegment(segment: string): string {
   // A leading dot is part of the name (`.pnpm`, `.cache`, `.git`), not a
