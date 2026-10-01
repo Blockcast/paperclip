@@ -616,6 +616,25 @@ describe("isClaudeTransientUpstreamError — login veto transcript independence 
       }),
     ).toBe(false);
   });
+
+  // `parsed: null` is the one input where truthiness and the result-event shape
+  // check agree, so it cannot witness the difference between the two gates. This
+  // case can. It is UNREACHABLE in this copy — `parsed` here is `resultJson` with
+  // `scanForResultEvent` recovery, both of which hard-check `type === "result"` —
+  // and is asserted anyway, because the gate is written on the shape in both
+  // copies precisely so they cannot drift, and the twin where this input IS
+  // reachable is the one that regressed. If this copy ever gains a `parseJson`
+  // fallback like the twin's, this test is what notices.
+  it("still vetoes a transcript login prompt when `parsed` is truthy but not a result event", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { type: "system", subtype: "init", session_id: "s1" },
+        stdout: "API Error: 429 rate_limit_error\nNot logged in. Please run `claude login`.",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("matchClaudeUpstreamCapacityCode", () => {

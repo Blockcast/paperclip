@@ -450,10 +450,22 @@ export function isClaudeTransientUpstreamError(input: {
   // before any result event exists, where the transcript is the only surface that
   // carries the prompt. What changes is what THIS rule passes it.
   //
-  // Narrowing a veto grants retry families, so it is gated on the same `parsed`
-  // condition rather than applied unconditionally: with no result event there are
+  // Narrowing a veto grants retry families, so it is gated on the terminal result
+  // event rather than applied unconditionally: with no result event there are
   // no bounded surfaces, the CLI's login prompt is emitted before any result
   // event, and that is exactly the shape the transcript read exists to catch.
+  //
+  // That gate is the SHAPE check and not `parsed` truthiness, for the same reason
+  // the haystack below uses it. In THIS copy the two coincide — `parsed` is
+  // `resultJson` with `scanForResultEvent` recovery, both of which hard-check
+  // `type === "result"`, so a truthy non-result object cannot arrive — but the
+  // `claude-local` twin derives `parsed` as `parsedStream.resultJson ??
+  // parseJson(stdout)`, where the second arm admits any parseable object. There
+  // the difference is live: truthiness would hand `stdout: ""` to a run with no
+  // result event, hiding a CLI login prompt that only reached stdout while the
+  // wide haystack still matched a transcript token, retrying an auth failure as
+  // `claude_transient_upstream`. Written on the shape in both copies so the two
+  // cannot drift — drift between them is how this rule's own defect arose.
   //
   // `stderr` is deliberately retained, matching `buildClaudeTerminalResultHaystack`.
   // It is measured inert rather than assumed so: on all 446 runs, including or
@@ -462,7 +474,7 @@ export function isClaudeTransientUpstreamError(input: {
   // that did produce a result event.
   const loginMeta = detectClaudeLoginRequired({
     parsed,
-    stdout: parsed ? "" : (input.stdout ?? ""),
+    stdout: isClaudeTerminalResultEvent(parsed) ? "" : (input.stdout ?? ""),
     stderr: input.stderr ?? "",
   });
   if (loginMeta.requiresLogin) return false;
