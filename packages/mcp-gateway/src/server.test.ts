@@ -2324,14 +2324,20 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
     // `createServer` option, which is why this is pinned rather than assumed.
     expect(health.connectionsCheckingInterval).toBe(1_000);
 
-    // Idle keep-alive sockets reclaimed faster than Node's 5s default.
+    // Idle keep-alive sockets reclaimed faster than Node's 5s default. Set in
+    // the options object with the three above, so this also fails against a
+    // refactor that rebuilds the server without it.
     expect(health.keepAliveTimeout).toBe(2_000);
 
     // Deliberately never assigned. A cap refuses the *incoming* socket once it
     // is reached, so the sockets already held win and the kubelet's next probe
     // connection is the one reset — making a liveness restart of the
     // authenticated proxy reachable at the cap instead of at the process fd
-    // limit. The bound here is how long a socket is held, not how many are.
+    // limit. A cap set well clear of probe contention would avoid that and
+    // would bound descriptor consumption, which nothing here bounds; it is
+    // accepted against rather than refuted, and `createHealthServer` records
+    // the three reasons. Read them before changing this line: unbounded
+    // descriptor use on this port is a recorded acceptance, not an oversight.
     expect(health.maxConnections).toBeUndefined();
   });
 
@@ -2365,7 +2371,13 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
 
     const { ms, banner } = await reaped;
     // The specific status matters: it is what distinguishes the headers-timeout
-    // sweep from any other reason the socket might have closed.
+    // sweep from any other reason the socket might have closed. It is Node's
+    // *default* `clientError` handling that writes it, which holds only while
+    // this server has no `clientError` listener of its own — true today. Worth
+    // knowing because the realistic way this breaks is a refactor that shares
+    // construction with the proxy listener and brings a handler along: the
+    // failure would then point at the sweep interval this test exists to pin,
+    // rather than at the cause.
     expect(banner.startsWith("HTTP/1.1 408")).toBe(true);
     expect(ms).toBeLessThan(10_000);
   }, 15_000);

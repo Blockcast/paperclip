@@ -1348,14 +1348,27 @@ export function createHealthServer(isServing: () => boolean | Promise<boolean>):
   // on an interval that defaults to 30_000ms, so a byte-silent socket survives
   // until the first sweep *after* the timeout elapses. Measured on this shape:
   // 30040ms to enforce a 2s `headersTimeout` at the default interval, against
-  // 2007ms at 1_000ms. Without this line the bound stated below and in
-  // README.md is ~15x looser than written — which is exactly the arithmetic the
-  // cost of holding a socket here is computed from.
+  // ~2–3s at 1_000ms (measured 2007ms). Because the reap lands on a sweep and
+  // not on a per-socket timer, that is a range whose floor is the timeout and
+  // whose ceiling is one interval past it; 2007ms is a sample at the floor, not
+  // the enforcement figure to compute from. Without this line the bound stated
+  // below and in README.md is ~15x looser than written — which is exactly the
+  // arithmetic the cost of holding a socket here is computed from.
+  //
+  // `keepAliveTimeout` reclaims an idle keep-alive socket in 2s rather than
+  // Node's 5s. Read that narrowly: it bounds the idle and the malformed socket,
+  // not a determined client. `requestTimeout` restarts per request, so anything
+  // willing to send one cheap request per keep-alive window — roughly 40 bytes
+  // every 2s — holds its socket indefinitely. What these timeouts bound is the
+  // cost *per socket*, as a floor under the holder's effort. They do not bound
+  // how many sockets are held, and neither does anything else here; see the
+  // `maxConnections` block below for why that is accepted rather than capped.
   const health = http.createServer(
     {
       connectionsCheckingInterval: 1_000,
       headersTimeout: 2_000,
       requestTimeout: 5_000,
+      keepAliveTimeout: 2_000,
     },
     (req, res) => {
       const pathName = (req.url ?? "/").split("?", 1)[0] ?? "/";
@@ -1394,20 +1407,12 @@ export function createHealthServer(isServing: () => boolean | Promise<boolean>):
     },
   );
 
-  // An idle keep-alive socket is reclaimed in 2s rather than Node's 5s. This
-  // bounds drift, not a determined client: `requestTimeout` restarts per
-  // request, so anything willing to send one cheap request per period keeps its
-  // socket indefinitely. Shrinking how long a socket is held is the mitigation
-  // that scales with the holder's cost; see below for why the cliff-shaped one
-  // was removed.
-  health.keepAliveTimeout = 2_000;
-
   // Deliberately NO `maxConnections` (PEN-3052 review). An earlier revision set
   // it to 64, reasoning that `createProxyAcceptProbe` needs an fd, so unbounded
   // socket-holding here could push the process toward fd pressure, fail the
   // probe, and turn a 503 into a liveness restart of the authenticated proxy.
-  // The cap does not prevent that outcome. It makes it enormously cheaper to
-  // cause — 64 sockets instead of the process fd limit.
+  // At 64 the cap does not prevent that outcome. It makes it enormously cheaper
+  // to cause — 64 sockets instead of the process fd limit.
   //
   // Node drops the *incoming* socket once `_connections >= maxConnections`
   // (`net.js` `onconnection` closes the new handle with no response), so the
@@ -1416,18 +1421,42 @@ export function createHealthServer(isServing: () => boolean | Promise<boolean>):
   // Three of those is a liveness failure and a restart of the authenticated
   // proxy — the exact outcome these bounds exist to put further out of reach.
   //
-  // A cap has no notion of which connection matters, so it cannot protect the
-  // probe; it only moves the restart threshold down to itself. EMFILE at least
-  // reports something true — a process out of descriptors genuinely is not
-  // accepting — whereas a process holding 64 idle sockets on the *health* port
-  // is serving the proxy perfectly and gets restarted anyway. So the bound here
-  // is the timeouts above, which shrink how long any one socket is held, rather
-  // than a cap on how many may be held at once.
+  // The review that produced this block offered a second branch — keep a cap
+  // but set it well clear of anything a probe contends with — and that branch
+  // is ACCEPTED AGAINST rather than refuted. It is a real proposal: a cap
+  // bounds something the timeouts above do not, namely how many descriptors
+  // this unauthenticated listener can take from the process. The cost of
+  // exhausting them is not confined to this port, which is the part worth
+  // stating plainly — an fd-exhausted process cannot accept on the proxy port
+  // and cannot open outbound sockets to upstreams, so the authenticated proxy
+  // is already degraded for the window before liveness notices and restarts.
+  //
+  // It is still not taken, for three reasons, recorded so the next reader does
+  // not have to re-derive them:
+  //   1. Both designs end in a restart. Anything able to hold sockets here
+  //      causes one either way; a high cap changes only whether the proxy keeps
+  //      serving during the window before it.
+  //   2. It buys that window by LOWERING the effort needed to trigger the
+  //      restart — from the process fd limit down to the cap. That is the same
+  //      trade the 64 cap was rejected for, moved along the axis, not off it.
+  //   3. A constant cannot be shown to bind. The fd limit is set by the
+  //      container runtime, not here, so any fixed cap is either inert (limit
+  //      far above it) or load-bearing (limit near it) depending on where this
+  //      is deployed. A stated bound that silently does not bind is worse than
+  //      a recorded acceptance, which is what this block is.
+  //
+  // So: unbounded descriptor consumption on this port is ACCEPTED. What stands
+  // against it is the timeouts above, which put a floor under the per-socket
+  // cost of holding this port, and the deny-scoping of who can route to it at
+  // all — not a cap. If that scoping is ever widened, this is the paragraph to
+  // revisit, and a cap derived from the live fd limit rather than a constant is
+  // the form to revisit it in.
   //
   // Unchanged deliberate non-change: an EMFILE that happens anyway still reads
   // as 503, not 200. A process out of descriptors is accurately described as
   // "not serving", and a restart is the correct recovery; masking it would be
-  // the bug.
+  // the bug. That is a separate question from the one above — it is about the
+  // honesty of the signal once descriptors are gone, not about bounding them.
   return health;
 }
 

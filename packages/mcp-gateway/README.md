@@ -242,22 +242,50 @@ Four properties this port is required to keep, all pinned in `server.test.ts`:
   Node's 60s / 300s / 30s-sweep defaults. Those defaults suit an authenticated
   proxy port; this one is reachable by exactly the `host` and `remote-node`
   entities the deny excludes, with nothing authenticating in front of it.
+  Read "in time" narrowly: what these reclaim is the **idle and the malformed**
+  socket. `requestTimeout` restarts per request, so a client willing to send one
+  cheap request inside each keep-alive window holds its socket indefinitely —
+  roughly one 40-byte request every 2s. What the timeouts bound is therefore the
+  *per-socket* cost, as a floor under the holder's effort; they do not bound the
+  number of sockets, and no number here does.
   The sweep interval is the part worth stating explicitly: Node arms no
   per-socket timer for these timeouts, it reaps expired connections on
   `connectionsCheckingInterval`, which defaults to 30s and is settable only as a
   `http.createServer` option. Left at the default, the 2s headers timeout above
-  is enforced in ~30s — measured at 30040ms, against 2007ms at a 1s interval.
+  is enforced in ~30s — measured at 30040ms, against ~2–3s at a 1s interval
+  (measured 2007ms). Reaping happens on the sweep rather than on a per-socket
+  timer, so that is a range and 2007ms is its floor, not the figure to compute
+  from.
 - **There is deliberately no connection cap.** An earlier revision set
   `maxConnections = 64` to keep socket-holding here from pushing the process
   toward fd pressure, since `createProxyAcceptProbe` needs a descriptor of its
   own and a failed probe turns a 503 into a liveness restart of the
-  authenticated proxy. A cap does not prevent that; it makes it far cheaper.
-  Node closes the *incoming* handle once the cap is reached, with no response,
-  so the sockets already held win and the kubelet's next probe connection is the
-  one reset — moving the restart threshold down from the process fd limit to the
-  cap. A cap has no notion of which connection matters, so it cannot protect the
-  probe. Shrinking how long a socket is held is the bound that scales with the
-  holder's cost.
+  authenticated proxy. At 64 a cap makes that outcome cheaper, not rarer: Node
+  closes the *incoming* handle once the cap is reached, with no response, so the
+  sockets already held win and the kubelet's next probe connection is the one
+  reset — moving the restart threshold down from the process fd limit to the
+  cap.
+  A cap set well clear of probe contention is a different proposal, and it is
+  **accepted against, not refuted.** It would bound something the timeouts do
+  not: how many descriptors this unauthenticated listener can take from the
+  process. That is worth naming, because the cost of exhausting them is not
+  confined to this port — an fd-exhausted process also cannot accept on the
+  proxy port or open outbound sockets to upstreams, so the authenticated proxy
+  is degraded for the window before liveness restarts the pod. Three reasons it
+  is still not taken, recorded here so the next reader does not re-derive them:
+  - Both designs end in a restart. A holder that can hold sockets here causes
+    one either way; a high cap only changes whether the proxy keeps serving
+    during the window before it.
+  - It buys that window by *lowering* the effort needed to trigger the restart,
+    from the process fd limit to the cap. That is the same trade the 64 cap was
+    rejected for, moved along the axis rather than off it.
+  - A constant cannot be shown to bind. The fd limit is set by the container
+    runtime, not here, so any fixed cap is either inert (limit far above it) or
+    load-bearing (limit near it) depending on deployment — and a stated bound
+    that silently does not bind is worse than a recorded acceptance.
+  So unbounded descriptor consumption on this port is accepted. What stands
+  against it is the timeouts, which put a floor under the per-socket cost, and
+  the deny-scoping of who can route here at all — not a cap.
   An EMFILE that happens anyway still reads as 503, deliberately: a process out
   of descriptors genuinely is not accepting, so the honest answer is "not
   serving" and a restart is the correct recovery.
