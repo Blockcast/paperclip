@@ -404,7 +404,7 @@ function buildClaudeTransientHaystack(input: {
  * to distinguish the two: forgetting to is precisely how the narrowing below
  * first went wrong, and there are three call sites plus the vendored twin.
  */
-function isClaudeTerminalResultEvent(parsed: Record<string, unknown> | null): boolean {
+export function isClaudeTerminalResultEvent(parsed: Record<string, unknown> | null): boolean {
   return parsed !== null && asString(parsed.type, "") === "result";
 }
 
@@ -680,13 +680,22 @@ export function isClaudeTransientUpstreamError(input: {
   if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
     return false;
   }
-  // The login veto reads the same bounded surfaces as the haystack below, under
-  // the same `parsed` condition and for the same reason (PEN-3259). Twin of the
-  // change in `vendor/paperclip-adapter-claude-k8s/src/server/parse.ts`, which
-  // carries the full measurement. `detectClaudeLoginRequired` itself is unchanged
-  // and still reads `stdout` for its other callers, which ask whether the run
-  // needs re-authentication before any result event exists; what changes is what
+  // The login veto reads the same bounded surfaces as the haystack below, on the
+  // same `isClaudeTerminalResultEvent` gate and for the same reason (PEN-3259).
+  // Twin of the change in `vendor/paperclip-adapter-claude-k8s/src/server/parse.ts`,
+  // which carries the full measurement. `detectClaudeLoginRequired` itself is
+  // unchanged and still reads `stdout` for its other callers, which ask whether the
+  // run needs re-authentication before any result event exists; what changes is what
   // THIS rule passes it.
+  //
+  // The gate is the SHAPE check, not `parsed` truthiness, and in this copy that
+  // distinction is live rather than cosmetic — see the two populations enumerated
+  // below. Gating on truthiness here would hand `stdout: ""` to a run whose
+  // `parsed` is a truthy non-result object, so a CLI login prompt that only ever
+  // reached stdout would go unseen, the wide haystack would still match any
+  // transient token in the transcript, and the run would be retried as
+  // `claude_transient_upstream` instead of surfacing `claude_auth_required`. The
+  // two gates must stay the same gate.
   //
   // This copy is the MORE exposed of the two, not the less. Its
   // CLAUDE_AUTH_REQUIRED_RE does not match the bare word `unauthorized` (the k8s
@@ -699,13 +708,23 @@ export function isClaudeTransientUpstreamError(input: {
   // two patterns against representative agent output, not a claim about runs this
   // adapter served.)
   //
+  // Narrowing THIS function alone would be inert in production, and that is why
+  // the change does not stop here. Every classifier in `execute.ts` is gated on
+  // `detectClaudeLoginRequired` before this rule is consulted (`execute.ts:1218`,
+  // consumed at :1257/:1266/:1283 on the `!parsed` path and :1406-1450 on the
+  // parsed one), so a transcript-only auth token suppressed the verdict upstream
+  // of here. That call site is narrowed the same way, on the same shape gate.
+  // The `loginUrl` it reports is deliberately left on the whole transcript: it is
+  // derived independently of `requiresLogin` (:193) and is operator-facing, not a
+  // classification input.
+  //
   // The quota veto below deliberately keeps the wide haystack: narrowing a second
   // veto in the same change would grant a second retry family off one measurement,
   // and `isClaudeProviderQuotaError` routes to a different outcome than this rule.
   // Same latent shape, tracked separately rather than swept in.
   const loginMeta = detectClaudeLoginRequired({
     parsed,
-    stdout: parsed ? "" : (input.stdout ?? ""),
+    stdout: isClaudeTerminalResultEvent(parsed) ? "" : (input.stdout ?? ""),
     stderr: input.stderr ?? "",
   });
   if (loginMeta.requiresLogin) return false;
@@ -715,10 +734,10 @@ export function isClaudeTransientUpstreamError(input: {
   // Two distinct populations reach this with no result event, and both need the
   // wide transcript haystack:
   //
-  //   1. `parsed: null` — `execute.ts`'s `!parsed` fallback (:1227), when the CLI
+  //   1. `parsed: null` — `execute.ts`'s `!parsed` fallback (:1254), when the CLI
   //      died without emitting one.
   //   2. `parsed` truthy but not a result event — `execute.ts`'s `parsed` is
-  //      `parsedStream.resultJson ?? parseJson(proc.stdout)` (:1163), and that
+  //      `parsedStream.resultJson ?? parseJson(proc.stdout)` (:1181), and that
   //      second arm is a bare `JSON.parse`, so any single parseable object on
   //      stdout arrives here truthy.
   //

@@ -12,6 +12,7 @@ import {
   isClaudeImageProcessingError,
   isClaudeModelNotFoundError,
   isClaudeQuotaExhausted,
+  isClaudeTerminalResultEvent,
 } from "./parse.js";
 
 describe("detectClaudeLoginRequired", () => {
@@ -278,6 +279,134 @@ describe("isClaudeTransientUpstreamError — login veto transcript independence 
         errorMessage: "Claude exited with code 1",
       }),
     ).toBe(false);
+  });
+
+  // "No result event arrived" has TWO arrivals in this copy, not one, because
+  // execute.ts derives `parsed` as `parsedStream.resultJson ?? parseJson(stdout)`
+  // and that second arm is a bare `JSON.parse` — any single parseable object on
+  // stdout lands here truthy. `parsed: null` above is the one input where
+  // truthiness and the result-event shape check agree, so it cannot witness the
+  // difference between them; this case can. Gating the login veto on `parsed`
+  // truthiness hands it `stdout: ""`, the prompt goes unseen, and the wide
+  // haystack (correctly selected, since this is not a result event) then matches
+  // `429` and labels the run transient — retrying an auth failure instead of
+  // surfacing `claude_auth_required`.
+  it("still vetoes a transcript login prompt when `parsed` is truthy but not a result event", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { type: "system", subtype: "init", session_id: "s1" },
+        stdout: "API Error: 429 rate_limit_error\nNot logged in. Please run `claude login`.",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
+
+  // The same input WITHOUT the login prompt must still be transient, so the test
+  // above is pinning the veto rather than a blanket refusal of this shape.
+  it("still classifies a truthy non-result event transient off the transcript alone", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { type: "system", subtype: "init", session_id: "s1" },
+        stdout: "API Error: 429 rate_limit_error",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(true);
+  });
+});
+
+// Important issue 1 from the fb2f835 review: every test above asserts on the
+// classifier in isolation, but `execute.ts` consults `detectClaudeLoginRequired`
+// FIRST and forces `transientUpstream` false when it fires — so the classifier
+// change was a no-op at every production call site and CI stayed green anyway.
+// This block composes the decision the way `execute.ts:1218-1450` does. It is a
+// mirror, not the real thing: this adapter exports no `classifyClaudeUpstreamFailure`
+// for a test to drive, so the composition is restated here and must be kept in
+// step with that call site.
+describe("execute.ts login-veto composition over the classifier (PEN-3259)", () => {
+  // Mirrors execute.ts:1218 (the narrowed classification input) and :1431
+  // (`transientUpstream`) / :1450 (`resolvedErrorCode`).
+  const classifyAsExecuteDoes = (input: {
+    parsed: Record<string, unknown> | null;
+    stdout: string;
+    stderr?: string;
+    errorMessage?: string;
+  }) => {
+    const requiresLogin = detectClaudeLoginRequired({
+      parsed: input.parsed,
+      stdout: isClaudeTerminalResultEvent(input.parsed) ? "" : input.stdout,
+      stderr: input.stderr ?? "",
+    }).requiresLogin;
+    const transientUpstream =
+      !requiresLogin &&
+      isClaudeTransientUpstreamError({
+        parsed: input.parsed,
+        stdout: input.stdout,
+        stderr: input.stderr ?? "",
+        errorMessage: input.errorMessage,
+      });
+    return {
+      transientUpstream,
+      errorCode: requiresLogin ? "claude_auth_required" : transientUpstream ? "claude_transient_upstream" : null,
+    };
+  };
+
+  const capacity429Result = {
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: 429,
+    result:
+      "API Error: Request rejected (429) · All Claude subscription capacity for this tenant is " +
+      "rate-limited; capacity may reset at 2026-09-13T10:19:59.613Z; retry in 1106s",
+  };
+
+  it("retries a genuine 429 whose transcript merely mentions auth, end to end", () => {
+    expect(
+      classifyAsExecuteDoes({
+        parsed: capacity429Result,
+        stdout:
+          '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result",' +
+          '"content":"deploy.log: worker failed to authenticate against the registry"}]}}',
+        errorMessage: "Claude run failed: API Error: Request rejected (429)",
+      }),
+    ).toEqual({ transientUpstream: true, errorCode: "claude_transient_upstream" });
+  });
+
+  it("still routes a run with no result event and a transcript login prompt to auth", () => {
+    expect(
+      classifyAsExecuteDoes({
+        parsed: null,
+        stdout: "API Error: 429 rate_limit_error\nNot logged in. Please run `claude login`.",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toEqual({ transientUpstream: false, errorCode: "claude_auth_required" });
+  });
+
+  it("still routes a truthy non-result event with a transcript login prompt to auth", () => {
+    expect(
+      classifyAsExecuteDoes({
+        parsed: { type: "system", subtype: "init", session_id: "s1" },
+        stdout: "API Error: 429 rate_limit_error\nNot logged in. Please run `claude login`.",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toEqual({ transientUpstream: false, errorCode: "claude_auth_required" });
+  });
+
+  it("still routes a result event that itself reports a login requirement to auth", () => {
+    expect(
+      classifyAsExecuteDoes({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 429,
+          result: "API Error: rate limited — not logged in; please run `claude login`",
+        },
+        stdout: "",
+      }),
+    ).toEqual({ transientUpstream: false, errorCode: "claude_auth_required" });
   });
 });
 
