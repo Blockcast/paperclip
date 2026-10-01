@@ -1681,8 +1681,18 @@ async function main(): Promise<void> {
     process.on(sig, () => {
       // eslint-disable-next-line no-console
       console.log(`[mcp-gateway] ${sig} received, shutting down`);
-      // Health first: readiness then fails on the next probe and the pod leaves
-      // its Service endpoints while the proxy drains in-flight requests.
+      // Health first so the probe port stops answering immediately. That is all
+      // the ordering buys, and it is worth being precise about what it does not:
+      // the pod leaves its Service endpoints because the EndpointSlice
+      // controller acts on its `deletionTimestamp`, which it gets concurrently
+      // with this signal — not because readiness flipped. Readiness could not
+      // flip in time anyway. It needs `failureThreshold` consecutive failures,
+      // i.e. `periodSeconds × (failureThreshold − 1)` ≈ 10s at the documented
+      // `periodSeconds: 5` / `failureThreshold: 3` (see README), which outlasts
+      // the 5s cap below; the process is gone before the kubelet records a
+      // single failure. Making readiness the mechanism is a Deployment-side
+      // change — a longer `terminationGracePeriodSeconds` and a drain to match
+      // — not something this ordering can deliver.
       healthServer?.close();
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 5000).unref();
