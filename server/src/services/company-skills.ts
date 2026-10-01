@@ -2955,7 +2955,7 @@ export function companySkillService(db: Db) {
       await db
         .delete(companySkills)
         .where(eq(companySkills.id, skill.id));
-      await fs.rm(resolveRuntimeSkillMaterializedPath(companyId, skill), { recursive: true, force: true });
+      await removeDirectoryByRename(resolveRuntimeSkillMaterializedPath(companyId, skill));
     }
   }
 
@@ -4897,6 +4897,41 @@ export function companySkillService(db: Db) {
   }
 
   /**
+   * Moves whatever is published at `targetDir` aside in one `rename(2)`, so it
+   * stops being served without ever being observable as a partial tree. Returns
+   * the retired path, or null when there was nothing to retire.
+   */
+  async function retireDirectoryAside(targetDir: string): Promise<string | null> {
+    const retiredDir = path.join(
+      path.dirname(targetDir),
+      `.${path.basename(targetDir)}.old-${randomUUID()}`,
+    );
+    try {
+      await fs.rename(targetDir, retiredDir);
+      return retiredDir;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return null;
+    }
+  }
+
+  /**
+   * The only sanctioned way to stop serving a published tree. Retire it by
+   * rename, then delete it under its dot-prefixed name — never `fs.rm` in
+   * place, which is a walk a concurrent reader can sample mid-shrink (see
+   * `createDirectoryReplacement`).
+   *
+   * The delete is best-effort: by the time it runs the tree has already stopped
+   * being served, so a leftover dot-prefixed sibling is garbage rather than a
+   * fault, and must not displace the caller's own error. Matches the retired-tree
+   * cleanup in `commit()`.
+   */
+  async function removeDirectoryByRename(targetDir: string) {
+    const retiredDir = await retireDirectoryAside(targetDir);
+    if (retiredDir) await fs.rm(retiredDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  /**
    * Stage a directory's replacement beside `targetDir` and publish it by rename.
    *
    * BLO-32167. Every publisher in this file must leave `targetDir` observable in
@@ -4914,10 +4949,12 @@ export function companySkillService(db: Db) {
    * in place — reintroduces the defect from the other end: `rm` is itself a
    * walk, so a reader landing mid-`rm` sees a shrinking directory and hashes it
    * happily. The rule holds for the outgoing tree, for a concurrent publisher's
-   * tree found in the slot on collision, and for `removeTarget()`. The residual
-   * exposure is the one syscall between the two renames, in which `targetDir`
-   * does not exist: an unbounded window that failed silently, traded for a
-   * one-syscall window that fails loudly and self-heals.
+   * tree found in the slot on collision, and for every other teardown of a
+   * published tree in this file — inventory reconcile, re-import and skill
+   * delete all route through `removeDirectoryByRename` for the same reason. The
+   * residual exposure is the one syscall between the two renames, in which
+   * `targetDir` does not exist: an unbounded window that failed silently, traded
+   * for a one-syscall window that fails loudly and self-heals.
    */
   async function createDirectoryReplacement(targetDir: string) {
     const parentDir = path.dirname(targetDir);
@@ -4929,16 +4966,7 @@ export function companySkillService(db: Db) {
 
     // Moves whatever is published at `targetDir` aside in one syscall. Returns
     // the retired path, or null when there was nothing to retire.
-    async function retireTarget(): Promise<string | null> {
-      const retiredDir = path.join(parentDir, `.${baseName}.old-${randomUUID()}`);
-      try {
-        await fs.rename(targetDir, retiredDir);
-        return retiredDir;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        return null;
-      }
-    }
+    const retireTarget = () => retireDirectoryAside(targetDir);
 
     return {
       stagingDir,
@@ -4970,8 +4998,7 @@ export function companySkillService(db: Db) {
       },
       // Stops serving `targetDir` without ever exposing a partial tree.
       async removeTarget() {
-        const retiredDir = await retireTarget();
-        if (retiredDir) await fs.rm(retiredDir, { recursive: true, force: true });
+        await removeDirectoryByRename(targetDir);
       },
       async cleanup() {
         await fs.rm(stagingDir, { recursive: true, force: true });
@@ -5740,7 +5767,7 @@ export function companySkillService(db: Db) {
       const persisted = toCompanySkill(row);
       // Clear cached __runtime__ directory so next heartbeat re-materializes from updated source
       if (existing) {
-        await fs.rm(resolveRuntimeSkillMaterializedPath(companyId, persisted), { recursive: true, force: true }).catch(() => {});
+        await removeDirectoryByRename(resolveRuntimeSkillMaterializedPath(companyId, persisted)).catch(() => {});
       }
       out.push(persisted);
     }
@@ -6603,7 +6630,7 @@ export function companySkillService(db: Db) {
       .where(eq(companySkills.id, skillId));
 
     // Clean up materialized runtime files
-    await fs.rm(resolveRuntimeSkillMaterializedPath(companyId, skill), { recursive: true, force: true });
+    await removeDirectoryByRename(resolveRuntimeSkillMaterializedPath(companyId, skill));
 
     return skill;
   }
