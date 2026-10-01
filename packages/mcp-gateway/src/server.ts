@@ -12,6 +12,12 @@
  * with a last-known-good cache fallback, or legacy local JSON env/file.
  *
  * Health check: GET / → 200 with the current upstream table.
+ *
+ * Optionally also binds a second, probe-only listener on
+ * `$PAPERCLIP_MCP_HEALTH_PORT` serving nothing but `GET /healthz`
+ * (`createHealthServer`). Unset by default. It exists so a network policy can
+ * deny the proxy port from the host network without denying the kubelet's
+ * probes along with it — see PEN-3052.
  */
 
 import http from "node:http";
@@ -63,8 +69,12 @@ export const DEFAULT_UPSTREAM_TIMEOUT_MS = 60_000;
 export const DEFAULT_BREAKER_FAILURE_THRESHOLD = 5;
 export const DEFAULT_BREAKER_OPEN_COOLDOWN_MS = 30_000;
 export const DEFAULT_BREAKER_HALF_OPEN_MAX_PROBES = 1;
+export const DEFAULT_PORT = 8080;
 
 export interface GatewayConfig {
+  port: number;
+  /** Probe-only listener; null (the default) binds no second socket. */
+  healthPort: number | null;
   upstreamTimeoutMs: number;
   breaker: CircuitBreakerConfig;
   sessionPersistenceFile: string | null;
@@ -82,13 +92,54 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+/**
+ * Strict parse for the health listener's port. Deliberately not
+ * `parsePositiveInt`: falling back on junk is right for a tuning knob and wrong
+ * for a port. The Deployment points both kubelet probes at whatever this value
+ * says, so a typo that silently resolved to some other port would leave the
+ * probes hitting a closed socket — and liveness failure restarts the container.
+ * Refusing at startup names the cause; falling back hides it behind a
+ * CrashLoop.
+ *
+ * The regex is load-bearing. `Number.parseInt` accepts "8081abc" (→ 8081),
+ * "0x1f9" (→ 0) and " +8081"; a bare `Number()` accepts "Infinity". Rejecting
+ * anything that is not pure digits is what makes the 1-65535 bound below mean
+ * what it says.
+ */
+function parseHealthPort(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const port = /^[0-9]+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(
+      `PAPERCLIP_MCP_HEALTH_PORT must be an integer in 1-65535, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return port;
+}
+
 export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
   const publicUrl = env.PAPERCLIP_MCP_PUBLIC_URL?.trim().replace(/\/+$/, "");
   const authorizationServer = env.PAPERCLIP_MCP_AUTHORIZATION_SERVER?.trim().replace(/\/+$/, "");
   if ((publicUrl && !authorizationServer) || (!publicUrl && authorizationServer)) {
     throw new Error("PAPERCLIP_MCP_PUBLIC_URL and PAPERCLIP_MCP_AUTHORIZATION_SERVER must be configured together");
   }
+  const port = Number.parseInt(env.PORT ?? String(DEFAULT_PORT), 10);
+  const healthPort = parseHealthPort(env.PAPERCLIP_MCP_HEALTH_PORT);
+  // Same port would mean one socket again, which defeats the whole point: the
+  // network policy denies the proxy port by number, so the probe has to live
+  // somewhere that deny does not reach. EADDRINUSE would catch it eventually,
+  // but only after the proxy listener is already up and serving.
+  if (healthPort !== null && healthPort === port) {
+    throw new Error(
+      `PAPERCLIP_MCP_HEALTH_PORT (${healthPort}) must differ from PORT (${port}); ` +
+        "the health listener exists to be reachable when the proxy port is denied",
+    );
+  }
   return {
+    port,
+    healthPort,
     upstreamTimeoutMs: parsePositiveInt(env.PAPERCLIP_MCP_UPSTREAM_TIMEOUT_MS, DEFAULT_UPSTREAM_TIMEOUT_MS),
     breaker: {
       failureThreshold: parsePositiveInt(
@@ -1243,6 +1294,57 @@ export function createGatewayServer(state: GatewayState): http.Server {
   });
 }
 
+function writeHealthResponse(res: http.ServerResponse, status: number, payload: unknown): void {
+  // Through the same chokepoint as every other body in this process. Nothing
+  // here is upstream-derived, so the scrubber is a no-op on it — but PEN-2370's
+  // guard is "exactly one exit", not "one exit plus the ones we vouched for",
+  // and a second `res.end(body)` is how that invariant stops being checkable.
+  writeResponse(res, gatewayResult(status, JSON.stringify(payload)), null, null);
+}
+
+/**
+ * Probe-only listener, bound on `PAPERCLIP_MCP_HEALTH_PORT` (PEN-3052).
+ *
+ * Why a second socket exists at all: the kubelet probes a pod from the *node's*
+ * host network, so a CiliumNetworkPolicy that denies the proxy port from
+ * `fromEntities: [host, remote-node]` denies the probe along with the bypass it
+ * is closing. On this Deployment both probes target the proxy port and liveness
+ * failure restarts the container, so adding that deny without first moving the
+ * probes off that port CrashLoops the gateway.
+ *
+ * ⛔ This server must never route to an upstream. The deny it exists to permit
+ * names ONE port; anything reachable here is reachable around that deny, so a
+ * proxying health listener would be a wider hole than the one being closed. The
+ * `does not proxy` cases in server.test.ts pin that.
+ *
+ * The body is deliberately barer than `/healthz` on the proxy port, which
+ * reports upstream names, breaker state and per-prefix session counts. No deny
+ * covers this port, so treat everything it emits as readable by anything that
+ * can route to the pod.
+ *
+ * `isServing` keeps the signal honest. A static 200 would report healthy with
+ * the proxy listener closed — strictly weaker than the probe it replaces, which
+ * at least had to reach the proxy socket to answer.
+ */
+export function createHealthServer(isServing: () => boolean): http.Server {
+  return http.createServer((req, res) => {
+    const pathName = (req.url ?? "/").split("?", 1)[0] ?? "/";
+    if (pathName !== "/" && pathName !== "/healthz") {
+      writeHealthResponse(res, 404, { error: "not found" });
+      return;
+    }
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      writeHealthResponse(res, 405, { error: "method not allowed" });
+      return;
+    }
+    if (!isServing()) {
+      writeHealthResponse(res, 503, { ok: false, error: "proxy listener is not accepting connections" });
+      return;
+    }
+    writeHealthResponse(res, 200, { ok: true });
+  });
+}
+
 function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResponse): void {
   const cause = (e as { cause?: unknown }).cause;
   const causeCode = (cause as { code?: string } | undefined)?.code;
@@ -1275,7 +1377,7 @@ function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResp
 async function main(): Promise<void> {
   const upstreams = await loadUpstreams();
   const config = loadGatewayConfig();
-  const port = Number.parseInt(process.env.PORT ?? "8080", 10);
+  const port = config.port;
   const state: GatewayState = {
     upstreams,
     sessions: new Map(),
@@ -1291,6 +1393,7 @@ async function main(): Promise<void> {
   state.sessionPersistenceLoaded = true;
 
   const server = createGatewayServer(state);
+  let healthServer: http.Server | null = null;
 
   server.listen(port, () => {
     // eslint-disable-next-line no-console
@@ -1299,12 +1402,35 @@ async function main(): Promise<void> {
         `timeout=${config.upstreamTimeoutMs}ms breaker(threshold=${config.breaker.failureThreshold},cooldown=${config.breaker.openCooldownMs}ms) ` +
         `sessionStore=${config.sessionPersistenceFile ?? "memory"}`,
     );
+
+    // Started from inside the proxy listener's callback so the health port can
+    // never be up while the proxy socket is unbound — the one window in which
+    // a 200 here would be a lie that `isServing` cannot catch.
+    if (config.healthPort === null) return;
+    const health = createHealthServer(() => server.listening);
+    health.on("error", (e: Error) => {
+      // Fail closed and say why. The Deployment points both probes at this
+      // port, so a failed bind kills the container regardless; exiting here
+      // makes the cause legible instead of surfacing as an unexplained
+      // CrashLoopBackOff with a healthy-looking proxy log above it.
+      // eslint-disable-next-line no-console
+      console.error(`[mcp-gateway] health listener on :${config.healthPort} failed: ${e.message}`);
+      process.exit(1);
+    });
+    healthServer = health;
+    health.listen(config.healthPort, () => {
+      // eslint-disable-next-line no-console
+      console.log(`[mcp-gateway] health listening on :${config.healthPort} (GET /healthz)`);
+    });
   });
 
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
     process.on(sig, () => {
       // eslint-disable-next-line no-console
       console.log(`[mcp-gateway] ${sig} received, shutting down`);
+      // Health first: readiness then fails on the next probe and the pod leaves
+      // its Service endpoints while the proxy drains in-flight requests.
+      healthServer?.close();
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 5000).unref();
     });

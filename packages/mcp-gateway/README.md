@@ -186,6 +186,8 @@ disabled unless both variables are present; partial configuration fails startup.
 
 ## Endpoints
 
+On `$PORT` (default 8080):
+
 - `GET /healthz` — health check; returns `{ ok: true, upstreams, upstreamCallCounts, breakers, sessions }`.
 - `GET /` — same as `/healthz`.
 - `GET /.well-known/oauth-protected-resource[/mcp]` — tenant MCP OAuth protected-resource metadata when configured.
@@ -194,6 +196,55 @@ disabled unless both variables are present; partial configuration fails startup.
 - `<METHOD> /mcp` — aggregate MCP endpoint; exposes one stable tool list with `<prefix>__<toolName>` names.
 - `<METHOD> /<prefix>/mcp` — proxied to the upstream URL for `<prefix>`.
 - `<METHOD> /<prefix>/mcp/<rest...>` — preserves the trailing path.
+
+On `$PAPERCLIP_MCP_HEALTH_PORT`, when set — see [Probe-only health port](#probe-only-health-port):
+
+- `GET /healthz`, `GET /` — `{ ok: true }`, or 503 `{ ok: false }` when the proxy listener is not accepting connections.
+- everything else — 404. No MCP route, no upstream, no discovery document is served here.
+
+## Probe-only health port
+
+`PAPERCLIP_MCP_HEALTH_PORT` binds a second listener that serves `GET /healthz`
+and nothing else. Unset by default; nothing changes unless you set it.
+
+It exists so a `NetworkPolicy` can deny the proxy port without taking the
+kubelet's probes down with it. The kubelet reaches a pod from the **node's host
+network**, so a Cilium `ingressDeny` with `fromEntities: [host, remote-node]` on
+the proxy port denies the probes as well as the bypass it is closing. On a
+Deployment whose liveness probe targets that port, adding the deny is a
+CrashLoop rather than a policy change (PEN-3052).
+
+```yaml
+env:
+  - name: PORT
+    value: "8080"
+  - name: PAPERCLIP_MCP_HEALTH_PORT
+    value: "8081"
+ports:
+  - { name: http,   containerPort: 8080 }
+  - { name: health, containerPort: 8081 }
+readinessProbe: { httpGet: { path: /healthz, port: health } }
+livenessProbe:  { httpGet: { path: /healthz, port: health } }
+```
+
+Two properties this port is required to keep, both pinned in `server.test.ts`:
+
+- **It never proxies.** The deny it exists to permit names one port, so anything
+  reachable here is reachable around that deny. A health listener that routed to
+  an upstream would be a wider hole than the one being closed.
+- **It discloses less than the proxy port's `/healthz`,** which reports upstream
+  names, breaker state and per-prefix session counts. No deny covers this port;
+  treat its body as readable by anything that can route to the pod.
+
+The value must be a plain integer in 1–65535 and must differ from `PORT`.
+Anything else fails startup rather than falling back — a port that silently
+resolved elsewhere would leave the probes hitting a closed socket, which
+liveness turns into a restart loop with no stated cause.
+
+An exec probe was considered and rejected for this workload: `node -e` costs
+~90 ms CPU per spawn against a 200m limit (20 ms per CFS period), i.e. ~4.5
+periods of the entire quota per probe, on a container already throttled 8–10% of
+periods. On a liveness path that is a throttle-driven CrashLoop.
 
 ## Migrating an agent
 
