@@ -1199,7 +1199,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // PEN-3259: this file's own veto, and the one that actually decides the label.
     // `isClaudeTransientUpstreamError` narrows its internal login veto to the
     // terminal-result surfaces, but every classifier below is gated on
-    // `requiresLogin` FIRST (:1406-1431, :1450), so a transcript-only auth token
+    // `requiresLogin` FIRST (:1423-1446, :1467), so a transcript-only auth token
     // suppressed the real verdict before the narrowed rule was ever consulted —
     // which left the parse.ts change a no-op at every production call site. The
     // same narrowing has to be applied here or it does not take effect.
@@ -1215,6 +1215,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // (parse.ts:193), so narrowing it wholesale would also drop the login URL
     // surfaced to the operator in `errorMeta` — a separate regression from the one
     // being fixed. What is narrowed is the CLASSIFICATION input only.
+    //
+    // What this admits, enumerated — `requiresLogin` gates five things below:
+    //   1. `transientUpstream` (:1446) — the intended family.
+    //   2. `quotaExhausted` (:1431) — newly reachable. `isClaudeQuotaExhausted`
+    //      reads `parsed` ONLY (no `stdout` parameter), so it cannot be
+    //      transcript-poisoned either way.
+    //   3. `providerQuota` (:1435) — NOT widened. `isClaudeProviderQuotaError`
+    //      keeps its own wide-transcript login veto internally, deliberately, so
+    //      the outer narrowing cannot reach it.
+    //   4/5. `claudeReportedSuccess` / `failed` (:1423-1426) and
+    //      `resolvedErrorCode` (:1467). `failed` ORs in `requiresLogin`, so under
+    //      the wide read a run whose terminal event reported clean SUCCESS was
+    //      marked failed and coded `claude_auth_required` because its transcript
+    //      contained `failed to authenticate` somewhere — ordinary git/gh/ssh and
+    //      registry output. Those false positives are what this drops. The
+    //      override itself is preserved: the case the comment at :1412 describes
+    //      lives on `parsed.result`, which the narrowed read still consults.
     const requiresLogin = detectClaudeLoginRequired({
       parsed,
       stdout: isClaudeTerminalResultEvent(parsed) ? "" : proc.stdout,
