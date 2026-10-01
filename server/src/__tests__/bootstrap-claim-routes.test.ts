@@ -6,6 +6,15 @@ import { accessRoutes } from "../routes/access.js";
 import { boardMutationGuard } from "../middleware/board-mutation-guard.js";
 import { errorHandler } from "../middleware/index.js";
 
+/**
+ * PEN-3658: `isInviteExpired` (routes/access.ts) is `expiresAt <= Date.now()`, so a
+ * fixed future date here is an *expiring* fixture — the bootstrap acceptance cases
+ * stop resolving on the calendar day it passes, with nothing in the diff that
+ * changed. Derive it from the clock. Same defect class as the BLO-27912 park
+ * deadline, which lapsed at 2026-09-30T00:00:00Z and ejected six merge groups.
+ */
+const ACTIVE_INVITE_EXPIRES_AT = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
 const claimFirstInstanceAdminMock = vi.hoisted(() => vi.fn());
 const accessServiceMock = vi.hoisted(() => ({
   isInstanceAdmin: vi.fn(),
@@ -178,7 +187,7 @@ describe("bootstrap invite first-admin acceptance", () => {
       allowedJoinTypes: "human",
       tokenHash: hashToken("pcp_invite_test"),
       defaultsPayload: {},
-      expiresAt: new Date("2027-03-10T00:00:00.000Z"),
+      expiresAt: ACTIVE_INVITE_EXPIRES_AT,
       invitedByUserId: null,
       revokedAt: null,
       acceptedAt: null,
