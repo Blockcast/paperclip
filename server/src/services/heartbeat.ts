@@ -24992,13 +24992,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         //
         // One caveat on that probe in *this* caller: it sources its Job name
         // from `getActiveExternalRuntimeReservation`, which filters
-        // `released_at IS NULL`. In `reapOrphanedRuns` the reservation sweep
-        // above runs first in the same pass and has usually just released that
-        // row, so `jobName` is null here and only the pod arm
-        // (`listManagedAgentPods`, fail-closed on a null read) actually
-        // evaluates. That is pre-existing and still safe — the sibling sweep
-        // verified the Job moments earlier, so coverage holds across the pair —
-        // but do not rely on the Job arm being live on this path.
+        // `released_at IS NULL`, and in `reapOrphanedRuns` the reservation
+        // sweep above runs first in the same pass. For a run NOT in
+        // `activeRunExecutions` that sweep has usually just released the row,
+        // so `jobName` is null and only the pod arm (`listManagedAgentPods`,
+        // fail-closed on a null read) evaluates; that is pre-existing.
+        //
+        // Ordering dependency on PEN-3640 (#2137) for the wedged runs this
+        // change unblocks: until #2137 lands, the reservation sweep's first
+        // statement still skips any run in `activeRunExecutions`, so a wedged
+        // run's reservation is NOT released first, `jobName` is non-null, and
+        // the Job arm is live here alongside the pod arm. Once #2137 removes
+        // that sibling guard, wedged runs join the case above and the pod arm
+        // is what this path must rest on. That is still safe, because the
+        // sibling sweep verified the Job moments earlier and coverage holds
+        // across the pair, but do not rely on the Job arm being live here.
         if (!hasExternalLifecycle(run.adapterType) && activeRunExecutions.has(run.runId)) continue;
         if (hasExternalLifecycle(run.adapterType)) {
           // Background Job deletion does not prove that the Job or its

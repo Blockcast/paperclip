@@ -8656,7 +8656,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // out of external-runtime work for 77h and 49h against a worker up 6.6
     // days. The reaper's main loop already carried the external-lifecycle
     // bypass; this loop did not. (The sibling reservation sweep has the same
-    // defect and is fixed separately by PEN-3640 / #2137.)
+    // defect and is fixed separately by PEN-3640 / #2137.) Attribution: the
+    // 77h/49h figures evidence the shared `activeRunExecutions` defect class,
+    // not this sweep alone. External-runtime slot capacity is gated by the
+    // reservation row (`ACTIVE_RUNTIME_SLOT_CONSTRAINT`), so the slot lockout
+    // they measure clears with #2137; this PR clears the environment-lease
+    // half. The measured symptom needs both.
     // ---------------------------------------------------------------------
     it("releases an orphaned external-lifecycle lease whose executor is wedged in activeRunExecutions (BLO-32052)", async () => {
       const { runId, leaseId, reservation } = await seedTerminalExternalRunWithLease();
@@ -8699,13 +8704,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // The production-reachable shape on the `reapOrphanedRuns` path, and the
       // one the two tests above do NOT cover: they seed a launched reservation,
       // so `confirmStaleKilledJobQuiesced` finds a live `jobName` and the Job
-      // arm does the work. In the real pass the sibling reservation sweep runs
-      // first and has usually just released that row, and the probe sources its
-      // name from `getActiveExternalRuntimeReservation` (filtered
-      // `released_at IS NULL`) — so `jobName` is null and `listManagedAgentPods`
-      // is the ONLY thing deciding. Since this PR is what makes that path
-      // reachable for a wedged executor, the fail-closed `pods !== null` arm is
-      // the entire safety argument and is pinned here rather than assumed.
+      // arm does the work. The probe sources its name from
+      // `getActiveExternalRuntimeReservation` (filtered `released_at IS NULL`),
+      // and the sibling reservation sweep runs first in the real pass. Until
+      // PEN-3640 / #2137 lands, that sweep still skips a wedged run, so its
+      // reservation is not released first and the Job arm is still live for
+      // it. Once #2137 removes that guard, the sweep has usually just released
+      // the row, `jobName` is null, and `listManagedAgentPods` is the ONLY
+      // thing deciding. That is the state this path must rest on, so the
+      // fail-closed `pods !== null` arm is pinned here rather than assumed.
       //
       // No reservation is seeded at all, which is the same observable state as
       // one already released.
