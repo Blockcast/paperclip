@@ -18,11 +18,29 @@ identity NOP presents (via mTLS) to the orc8r `tenants_beacon` service
 when minting `individual_beacon` members under the public umbrella
 (`st_public`).
 
-The `tenants_beacon` servicer is tracked as delivered by BLO-5410. Its
-caller verification and RPC idempotency are prerequisites for the flow below:
-the first `MintMember` call from NOP fails with a caller-not-found error if
-this row is missing. This runbook specifies the NOP-side E2 completeness
-delta rather than restating the servicer implementation.
+### BLO-5410 shipped status
+
+This is the one statement of BLO-5410's status; every other section defers
+to it. BLO-5410 is closed, and what shipped is the idempotent `MintMember`
+RPC in magma `orc8r/cloud/go/services/tenants_beacon/servicers/protected/servicer.go`.
+`MintGateway` is unimplemented. The shipped servicer does not read
+`system_principals` or `revocation_blocklist`, so nothing on the
+`MintMember` path checks this row, its `disabled_at`, or a blocklist entry.
+(accessd's ACL projection reads `disabled_at` and `revocation_blocklist`, but
+only for `per_tenant` principals; `sp_nop_bridge` is `global`.) Checked
+against magma `main` at `a68ad7e`, 2026-10-01.
+
+Consequences:
+
+- The row is still required: the certifier rejects a SystemPrincipal CSR
+  whose `sp_uuid` has no row, so NOP cannot obtain its bridge cert without it.
+- Neither the soft-disable nor the blocklist INSERT below stops `MintMember`
+  today. The only takedown in this runbook that does not depend on the
+  missing enforcement is reissuing the bridge cert and expiring/removing the
+  old one.
+
+This runbook specifies the NOP-side E2 completeness delta rather than
+restating the servicer implementation.
 
 ## E2 completeness delta
 
@@ -111,11 +129,12 @@ registration state and orchestrator logs for the idempotency key.
 
 ### Dependency boundary
 
-BLO-5410 is the delivered caller-verification plus MintMember/MintGateway
-servicer contract. BLO-5389 remains the cert/discovery/rotation track; this
-document does not move those controls into registration. A gap in the shipped
-BLO-5410 artifact is a blocker to claiming E2 complete, not a reason for NOP
-to add a second caller-verification implementation.
+BLO-5410 owns the caller-verification plus MintMember/MintGateway servicer
+contract; its shipped status is stated once, under "BLO-5410 shipped status"
+above. BLO-5389 remains the cert/discovery/rotation track; this document does
+not move those controls into registration. The gaps in the shipped BLO-5410
+artifact listed there are a blocker to claiming E2 complete, not a reason for
+NOP to add a second caller-verification implementation.
 
 ## Prerequisites
 
@@ -248,6 +267,15 @@ After BLO-5389 lands:
 
 ## Disabling (planned maintenance)
 
+> **Wave 1 caveat:** Nothing on the `MintMember` path reads `disabled_at`
+> today (see "BLO-5410 shipped status"). Setting it does NOT pause
+> onboarding: NOP keeps minting `individual_beacon` members. Until a
+> `tenants_beacon` caller check reads this column, take NOP down for a
+> maintenance window the same way as a revocation: reissue the bridge cert
+> and expire/remove the old one, then issue a fresh cert per the Cert
+> issuance section to bring NOP back. Treat the rest of this section as
+> "after-enforcement" guidance.
+
 For graceful, reversible takedowns (planned maintenance, paused
 onboarding window), prefer a soft-disable over revocation:
 
@@ -257,21 +285,24 @@ UPDATE system_principals
  WHERE sp_uuid = 'sp_00000000-0000-4000-8000-000000000002';
 ```
 
-Once BLO-5410's `MintMember` servicer ships, `tenants_beacon` will
-refuse calls from any principal whose `disabled_at IS NOT NULL`. To
-re-enable, set `disabled_at = NULL`. No cert reissue needed.
+Once a `tenants_beacon` caller check reads `disabled_at` (the shipped
+BLO-5410 servicer does not), it will refuse calls from any principal whose
+`disabled_at IS NOT NULL`. To re-enable, set `disabled_at = NULL`. No cert
+reissue needed.
 
 ## Revocation
 
 > **Wave 1 caveat:** The fast-revocation propagation path described
-> below depends on (a) the `tenants_beacon` mTLS-caller-verify code in
-> the `MintMember` servicer ([BLO-5410](https://paperclip/BLO/issues/BLO-5410))
-> and (b) the Redis-backed reseed reader
-> ([BLO-5412](https://paperclip/BLO/issues/BLO-5412)). Neither has shipped.
-> Until both land, **revocation requires reissuing the bridge cert and
-> expiring/removing the old one** — a `revocation_blocklist` INSERT alone
-> will NOT stop in-flight calls. Treat this section as
-> "after-BLO-5410/5412" guidance.
+> below depends on (a) a `tenants_beacon` caller check that reads
+> `revocation_blocklist`, which the shipped
+> [BLO-5410](https://paperclip/BLO/issues/BLO-5410) `MintMember` servicer
+> does not have (see "BLO-5410 shipped status"), and (b) a Redis-backed
+> reseed reader. [BLO-5412](https://paperclip/BLO/issues/BLO-5412) closed as
+> a JWKS JWT verifier with TTL-only replay protection and no Redis store, so
+> no reseed reader exists either. Until both land, **revocation requires
+> reissuing the bridge cert and expiring/removing the old one**: a
+> `revocation_blocklist` INSERT alone will NOT stop in-flight calls. Treat
+> this section as "after-enforcement" guidance.
 
 To revoke NOP's bridge identity (e.g. during an incident):
 
@@ -289,7 +320,7 @@ INSERT INTO revocation_blocklist (
 );
 ```
 
-2. (After BLO-5410/5412.) The fast-revocation channel (Redis-backed,
+2. (After enforcement lands.) The fast-revocation channel (Redis-backed,
    reseeded from this table) will propagate within seconds;
    `tenants_beacon` mTLS caller verify will reject the cert on the
    next call.
@@ -332,10 +363,12 @@ The 2-3 failure modes you're most likely to hit:
   2. NOP's outbound mTLS client is pointing at the wrong CA bundle
      (verify the path/env var pinned by BLO-5413).
 
-- **`MintMember` succeeds in dev but refuses in staging/prod.** Check
-  whether `disabled_at IS NOT NULL` on the singleton row (perhaps left
-  over from a planned-maintenance window — see the Disabling section
-  above). Set `disabled_at = NULL` to re-enable.
+- **`MintMember` succeeds in dev but refuses in staging/prod.** Once
+  `disabled_at` is enforced (it is not in the shipped BLO-5410 servicer;
+  see "BLO-5410 shipped status"), check whether `disabled_at IS NOT NULL`
+  on the singleton row, perhaps left over from a planned-maintenance
+  window. Set `disabled_at = NULL` to re-enable. Today a refusal cannot come
+  from `disabled_at`; check the cert SAN and CA bundle above instead.
 
 ## Related
 
@@ -343,8 +376,9 @@ The 2-3 failure modes you're most likely to hit:
   Phase 4 ordering doc.
 - This ticket: [BLO-5400](https://paperclip/BLO/issues/BLO-5400) —
   seed migration + this runbook.
-- Downstream: [BLO-5410](https://paperclip/BLO/issues/BLO-5410) —
-  `MintMember` servicer that consumes this row;
+- Downstream: [BLO-5410](https://paperclip/BLO/issues/BLO-5410):
+  `MintMember` servicer (does not yet read this row; see "BLO-5410 shipped
+  status");
   [BLO-5413](https://paperclip/BLO/issues/BLO-5413) — NOP outbound
   mTLS client that presents the cert.
 - Long-term automation:
