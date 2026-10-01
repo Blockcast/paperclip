@@ -545,3 +545,46 @@ test("the platform dashboard datasource uid is overridable alongside the funnel'
   );
   assert.deepEqual([...uids], ["some-other-prom"]);
 });
+
+test("the uid and panel titles that onprem-k8s alerts hard-code are pinned (BLO-38862)", () => {
+  // Blockcast/onprem-k8s monitoring/prometheus-rules-2-configmap.yaml and its
+  // CRD mirror hard-code all three of these strings into the two alerts that
+  // actually fire. (This chart's own PrometheusRule is disabled on Blockcast,
+  // so the assertion above about the dead-letter annotation does NOT reach
+  // them -- it checks this repo's copy against this repo's dashboard.)
+  //
+  //   PaperclipGithubReviewRequestDeadLettered       uid, 'Unresolved dead-letters'
+  //   PaperclipGithubReviewRequestSuppressionOutage  uid, 'Terminal suppression by cause'
+  //
+  // The uid appears twice per alert -- once in the `dashboard:` annotation and
+  // again in an inline https://stats.orc8r.blockcast.net/d/<uid> URL inside the
+  // description -- so renaming it 404s all four links. The panel titles are
+  // named in that description prose as navigation ("the `Unresolved
+  // dead-letters` stat tells you which arm of this two-armed rule fired";
+  // "read the firing cause from the summary above, not from the `Terminal
+  // suppression by cause` panel"), so renaming one silently sends a paged
+  // operator to a panel that no longer exists.
+  //
+  // The guard belongs here rather than in onprem-k8s: the dashboard JSON is not
+  // in that repo, so an assertion there compares its own constant to itself and
+  // passes forever while reading as coverage. Renaming any of these is fine --
+  // renaming without updating onprem-k8s in the same change is not.
+  const { dashboard } = renderDashboard();
+
+  assert.equal(
+    dashboard.uid,
+    "paperclip-review-request-funnel",
+    "renaming this uid 404s the dashboard links in both onprem-k8s review-request alerts",
+  );
+
+  const titles = dashboard.panels.map((panel) => panel.title);
+  for (const title of [
+    "Unresolved dead-letters",
+    "Terminal suppression by cause",
+  ]) {
+    assert.ok(
+      titles.includes(title),
+      `onprem-k8s alert runbook prose sends the operator to the '${title}' panel by name; renaming or removing it breaks that instruction`,
+    );
+  }
+});
