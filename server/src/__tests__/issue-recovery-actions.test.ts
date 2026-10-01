@@ -6540,6 +6540,125 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  // BLO-27586: the revalidation classifier was recovery-KIND-blind. Its "attendance" family of
+  // discharges — agent owner on todo/in_progress, typed review participant, pending
+  // interaction/approval, scheduled monitor — asserts "someone is now attending this row", which
+  // retires an action only when being UNATTENDED is what raised it. Every kind was judged by that
+  // one predicate, so a routine successful monitor re-arm cancelled escalations raised against
+  // conditions the re-arm said nothing about. The three tests below pin the gate from both sides.
+  async function seedInProgressWithAction(kind: string, cause: string) {
+    const seeded = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "in_progress", assigneeAgentId: seeded.coderId, assigneeUserId: null })
+      .where(eq(issues.id, seeded.sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId: seeded.companyId,
+      sourceIssueId: seeded.sourceIssueId,
+      kind,
+      ownerType: "agent",
+      ownerAgentId: seeded.managerId,
+      previousOwnerAgentId: seeded.coderId,
+      returnOwnerAgentId: seeded.coderId,
+      cause,
+      fingerprint: `${kind}:blo-27586`,
+      evidence: { prNumber: 1196 },
+      nextAction: "Take over the PR or record a disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    return { ...seeded, action, recoveryActionSvc };
+  }
+
+  it("preserves a pr_review_non_convergence action across a successful monitor re-arm (BLO-27586)", async () => {
+    // The measured 2026-10-01 case on BLO-38762. The body carries NO status field and the monitor
+    // write SUCCEEDS, so nothing anywhere fails — yet the escalation was cancelled. This is the
+    // broader half of the defect: the fleet's monitor discipline performs this exact write on
+    // every poll, so every poll silently cancelled any recovery action on the row.
+    const { companyId, coderId, sourceIssueId, action, recoveryActionSvc } =
+      await seedInProgressWithAction("pr_review_non_convergence", "self_review_pr_non_convergence");
+    const nextCheckAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const app = createApp();
+
+    const patched = await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({
+        executionPolicy: {
+          monitor: { nextCheckAt, notes: "pr:1196:review", scheduledBy: "assignee" },
+        },
+      })
+      .expect(200);
+
+    // Both halves. The monitor must still arm — this gate must not cost the write the caller asked
+    // for — and the action the caller said nothing about must survive it.
+    expect(patched.body.monitorNextCheckAt).toBeTruthy();
+    expect(patched.body.activeRecoveryAction).toMatchObject({ id: action.id, status: "active" });
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({ status: "active", outcome: null, resolutionNote: null });
+    expect(actionRow?.resolvedAt).toBeNull();
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+    });
+    // Read back on a fresh GET, not just the PATCH echo: the read path revalidates too.
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(detail.body.activeRecoveryAction).toMatchObject({ id: action.id });
+    expect(detail.body.assigneeAgentId).toBe(coderId);
+  });
+
+  it("preserves a workspace_validation action across an executionPolicy clear (BLO-27586)", async () => {
+    // The original 2026-08-14 measurement on BLO-21602: `{"executionPolicy": {}}`. Asserts only the
+    // AC2 half — the action survives. Whether the monitor itself clears is AC1, a separate defect
+    // that this change does not touch, so this test deliberately makes no claim about it.
+    const { companyId, sourceIssueId, action, recoveryActionSvc } =
+      await seedInProgressWithAction("workspace_validation", "workspace_validation_failed");
+    const app = createApp();
+
+    const patched = await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ executionPolicy: {} })
+      .expect(200);
+
+    expect(patched.body.activeRecoveryAction).toMatchObject({ id: action.id, status: "active" });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+    });
+  });
+
+  it("still discharges a stranded_assigned_issue action on the same re-arm (BLO-27586)", async () => {
+    // The other side of the gate, and the reason it is a allowlist rather than a removal: for
+    // `stranded_assigned_issue` the raising condition literally IS "unattended", so an agent owner
+    // retiring it is correct behaviour. Without this test, gating every kind — or hard-coding the
+    // guard to false — would leave the two tests above passing.
+    const { companyId, sourceIssueId, action, recoveryActionSvc } =
+      await seedInProgressWithAction("stranded_assigned_issue", "stranded_assigned_issue");
+    const nextCheckAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const app = createApp();
+
+    await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({
+        executionPolicy: {
+          monitor: { nextCheckAt, notes: "pr:1196:review", scheduledBy: "assignee" },
+        },
+      })
+      .expect(200);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Recovery action became stale because the source issue is in_progress with an agent owner.",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
   it("does not hand a user-assigned blocked issue to a recovery return owner", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db

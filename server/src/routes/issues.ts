@@ -3605,9 +3605,41 @@ export function issueRoutes(
     }
   }
 
+  /**
+   * Recovery kinds whose RAISING predicate is "nobody is attending this row" (BLO-27586).
+   *
+   * Only these are retired by the *attendance* family of revalidation discharges below — an
+   * agent owner on todo/in_progress, a typed review participant, a pending interaction or
+   * approval, a scheduled monitor. Those branches fire on ANY durable write to the row, carry
+   * no judgement about why the action was raised, and leave no trace, so for any other kind
+   * they cancel an escalation for satisfying a condition it was never raised against.
+   *
+   * The remaining production kinds each name a defect that regaining an owner does not repair:
+   * `missing_disposition` still has no disposition, `workspace_validation` still has a corrupt
+   * execution-workspace record (and a bare status flip there is a documented loop feeder —
+   * BLO-31878), `configuration_validation` is still misconfigured, and
+   * `pr_review_non_convergence` still has a PR review that has not converged.
+   *
+   * Measured twice in one afternoon on BLO-38762: a routine, successful `executionPolicy.monitor`
+   * re-arm — the write the fleet's monitor discipline performs on every poll, with no `status`
+   * field in the body at all — silently cancelled a `pr_review_non_convergence` escalation.
+   *
+   * NOT gated here, deliberately, and each for its own reason rather than by oversight:
+   *  - terminal (`done`/`cancelled`), `backlog`, and blocked-with-unresolved-blockers are
+   *    DELIVERABILITY discharges. No owner wake can reach those rows whatever raised the action,
+   *    so leaving one active would name a wake nothing delivers.
+   *  - a human owner (`assigneeUserId`) and a manual blocked->todo are explicit, board-visible
+   *    dispositions by an actor holding the assignee grant — not the traceless automated writes
+   *    this gate exists to stop.
+   */
+  const ATTENDANCE_RAISED_RECOVERY_KINDS = new Set(["stranded_assigned_issue"]);
+
   async function classifySourceRecoveryRevalidation(input: {
     issue: IssueRouteSnapshot;
     trigger: RecoveryRevalidationTrigger;
+    /** `issue_recovery_actions.kind` of the action being revalidated. Required: there is one
+     *  call site and defaulting it either way silently picks a behaviour for future callers. */
+    recoveryKind: string;
     statusChanged?: boolean;
     assigneeChanged?: boolean;
     blockersChanged?: boolean;
@@ -3620,6 +3652,7 @@ export function issueRoutes(
     blockedToTodoRecovery?: boolean;
   }): Promise<string | null> {
     const { issue } = input;
+    const attendanceDischarges = ATTENDANCE_RAISED_RECOVERY_KINDS.has(input.recoveryKind);
     if (issue.status === "done" || issue.status === "cancelled") {
       return `Recovery action became stale because the source issue reached ${issue.status}.`;
     }
@@ -3671,11 +3704,11 @@ export function issueRoutes(
       return "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.";
     }
 
-    if ((issue.status === "todo" || issue.status === "in_progress") && issue.assigneeAgentId) {
+    if (attendanceDischarges && (issue.status === "todo" || issue.status === "in_progress") && issue.assigneeAgentId) {
       return `Recovery action became stale because the source issue is ${issue.status} with an agent owner.`;
     }
 
-    if (issue.status === "in_review") {
+    if (attendanceDischarges && issue.status === "in_review") {
       const executionState = parseIssueExecutionState(issue.executionState);
       const participant = executionState?.status === "pending" ? executionState.currentParticipant : null;
       if (
@@ -3697,7 +3730,7 @@ export function issueRoutes(
     }
 
     const monitor = summarizeIssueMonitor(issue, normalizeIssueExecutionPolicy(issue.executionPolicy ?? null));
-    if (monitor.nextCheckAt && Date.parse(monitor.nextCheckAt) > Date.now()) {
+    if (attendanceDischarges && monitor.nextCheckAt && Date.parse(monitor.nextCheckAt) > Date.now()) {
       return "Recovery action became stale because the source issue now has a scheduled monitor.";
     }
 
@@ -3726,7 +3759,10 @@ export function issueRoutes(
         : input.activeRecoveryAction;
     if (!activeRecoveryAction) return null;
 
-    const resolutionNote = await classifySourceRecoveryRevalidation(input);
+    const resolutionNote = await classifySourceRecoveryRevalidation({
+      ...input,
+      recoveryKind: activeRecoveryAction.kind,
+    });
     if (!resolutionNote) return activeRecoveryAction;
 
     const resolved = await recoveryActionsSvc.resolveActiveForIssue({
