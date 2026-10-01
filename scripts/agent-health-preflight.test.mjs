@@ -77,8 +77,52 @@ describe("agent-health v4 preflight", () => {
     assert.equal(census.counts.runless, 1);
     assert.equal(census.counts.coalesced, 1);
     assert.equal(census.counts.duplicate, 1);
-    assert.equal(census.counts["receipt-only"], 1);
-    assert.equal(census.counts["classification-producing"], 22);
+    // Windows 2 and 5 emitted a receipt that did not classify. Window 2 is ALSO
+    // `runless`, and used to report only that — a shape finding silently
+    // swallowing the emission finding beside it.
+    assert.equal(census.counts["receipt-only"], 2);
+    assert.deepEqual(census.slots[2].states, ["runless", "receipt-only"]);
+    // 28 windows less the four that did not classify: 1 (no receipt), 2 and 5
+    // (receipt, no classification) and 6 (no rows). Windows 3 and 4 classified
+    // while also being `coalesced` / `duplicate`, and were the two dropped.
+    assert.equal(census.counts["classification-producing"], 24);
+    assert.deepEqual(census.slots[3].states, ["coalesced", "classification-producing"]);
+    assert.deepEqual(census.slots[4].states, ["duplicate", "classification-producing"]);
+    // The display value is unmoved by any of that: the terminal push is last,
+    // so the most specific problem still leads.
+    assert.equal(census.slots[2].state, "runless");
+    assert.equal(census.slots[3].state, "coalesced");
+    assert.equal(census.slots[4].state, "duplicate");
+  });
+
+  // The structural invariant the three masking bugs all violated: the receipt
+  // axis PARTITIONS the windows, so its three terms sum to exactly 28 however
+  // many shape findings co-occur. Asserted over the same compound fixture
+  // because a partition is only interesting where slots are compound.
+  it("partitions every window across the three receipt states", () => {
+    const windows = sevenDayWindowKeys();
+    const rows = windows.map((windowKey, index) => ({
+      windowKey,
+      runId: `run-${index}`,
+      status: "completed",
+      commentId: `comment-${index}`,
+      classification: "agent_in_error",
+      fingerprint: `fingerprint-${index}`,
+    }));
+    rows[1].commentId = null;
+    rows[1].classification = null;
+    rows[2].runId = null;
+    rows[3].coalescedIntoRunId = "run-0";
+    rows[4].fingerprint = "duplicate-fingerprint";
+    rows.push({ ...rows[4], runId: "duplicate-run", fingerprint: "duplicate-fingerprint" });
+    const census = classifyRoutineRuns(rows);
+    const axis = census.counts["classification-producing"] + census.counts["receipt-only"] + census.counts.silent;
+    assert.equal(axis, 28, "every window is silent, receipt-only, or classification-producing — exactly one");
+    for (const slot of census.slots) {
+      const onAxis = slot.states.filter((state) =>
+        ["silent", "receipt-only", "classification-producing"].includes(state));
+      assert.equal(onAxis.length, 1, `${slot.windowKey} carried ${onAxis.length} receipt states: ${slot.states}`);
+    }
   });
 
   it("does not let the first row hide a later classification or run id", () => {
@@ -286,12 +330,15 @@ describe("agent-health v4 preflight", () => {
       { windowKey, runId: "r2", status: "completed", commentId: "c2", fingerprint: "same" },
       { windowKey, runId: "r3", status: "completed", commentId: "c3", coalescedIntoRunId: "r2" },
     ]);
-    assert.deepEqual(census.slots[0].states, ["completed-without-comment", "duplicate", "coalesced"]);
+    assert.deepEqual(census.slots[0].states, ["completed-without-comment", "duplicate", "coalesced", "receipt-only"]);
     assert.equal(census.slots[0].state, "completed-without-comment", "primary stays the highest-precedence finding");
     // Every secondary finding is visible in the aggregate, not just per-slot.
     assert.equal(census.counts["completed-without-comment"], 1);
     assert.equal(census.counts.duplicate, 1, "a duplicate storm must not vanish behind a receiptless run");
     assert.equal(census.counts.coalesced, 1);
+    // r2 and r3 both posted a receipt, neither classified. Three shape findings
+    // firing at once must not erase the fact that this window emitted.
+    assert.equal(census.counts["receipt-only"], 1);
   });
 
   it("counts a compound slot once per state, so the histogram over-counts windows by design", () => {
@@ -301,7 +348,10 @@ describe("agent-health v4 preflight", () => {
       { windowKey, runId: "r2", status: "completed", commentId: "c2", fingerprint: "same" },
     ]);
     const total = Object.values(census.counts).reduce((sum, n) => sum + n, 0);
-    assert.equal(total, 29, "28 windows, one of which is two things at once");
+    // 27 silent windows, plus one slot that is three things at once:
+    // `completed-without-comment` (r1), `duplicate` (shared fingerprint) and
+    // `receipt-only` (r2 emitted, nothing classified).
+    assert.equal(total, 30, "28 windows, one of which is three things at once");
     // `silent` is the term the completeness gate reads, and a slot with no rows
     // carries exactly one state — so aggregating over `states` cannot move it.
     assert.equal(census.counts.silent, 27);
@@ -468,6 +518,58 @@ describe("census completeness is derived from observed coverage, not from the ke
     assert.ok(census.slots[0].states.includes("silent"));
     assert.equal(census.counts.runless, 1);
     assert.equal(census.counts.silent, 28);
+  });
+
+  // The converse, and the live case the CTO measured against real BLO-3202 data
+  // on 2026-10-01: the receipt landed, the `/routines/{id}/runs` row did not.
+  // `runless` reported alone and the emission vanished from coverage — 7/28
+  // where the fleet had emitted 9.
+  it("still counts a classification when the window has a receipt but no run row", () => {
+    const [windowKey] = sevenDayWindowKeys();
+    const census = classifyRoutineRuns([
+      { windowKey, runId: null, status: "queued", commentId: "c-posted", classification: "agent_in_error" },
+    ]);
+    assert.deepEqual(census.slots[0].states, ["runless", "classification-producing"]);
+    assert.equal(census.slots[0].state, "runless", "the scheduling failure still leads the display");
+    assert.equal(census.counts["classification-producing"], 1, "a receipt the fleet posted must reach coverage");
+    assert.equal(census.counts.runless, 1);
+    // The emission axis and the gate term stay independent: this window is not
+    // silent, and completeness is untouched by the shape finding beside it.
+    assert.equal(census.counts.silent, 27);
+    assert.equal(census.observedWindows, 1);
+  });
+
+  // The integration seam. The routine fires six-hourly at minute 7, the census
+  // grid is :00, and `placeWindowKey` is deliberately strict — so wiring
+  // `windowKey` straight from `triggeredAt` fails closed on every row at once.
+  // Pinned as a test because the trap is that the flooring helper already
+  // exists and is already exported: the defect is that its name does not say
+  // so, and prose alone would not keep it findable.
+  it("floors an off-grid trigger instant onto the census grid", () => {
+    assert.equal(currentWindowEnd("2026-10-01T06:07:00.000Z"), "2026-10-01T06:00:00Z");
+    assert.equal(currentWindowEnd("2026-10-01T05:59:59.999Z"), "2026-10-01T00:00:00Z");
+  });
+
+  it("fails closed on raw :07 trigger instants, and cleanly once floored", () => {
+    const fired = sevenDayWindowKeys().map((key, index) => ({
+      // What a routine-run record actually carries: the trigger instant, :07.
+      windowKey: key.replace(":00:00Z", ":07:00Z"),
+      runId: `run-${index}`,
+      status: "completed",
+      commentId: `c-${index}`,
+      classification: "agent_in_error",
+      fingerprint: `fp-${index}`,
+    }));
+
+    const naive = classifyRoutineRuns(fired);
+    assert.equal(naive.malformedRows.length, 28, "every row off-grid, not just the edges");
+    assert.equal(naive.counts.silent, 28);
+    assert.equal(naive.complete, false, "a healthy fleet would report a permanent red");
+
+    const floored = classifyRoutineRuns(fired.map((row) => ({ ...row, windowKey: currentWindowEnd(row.windowKey) })));
+    assert.equal(floored.malformedRows.length, 0);
+    assert.equal(floored.counts["classification-producing"], 28);
+    assert.equal(floored.complete, true);
   });
 
   // AC2: the recorded 2026-09-04T18 census input, which reported silent === 0.
