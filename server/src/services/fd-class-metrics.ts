@@ -112,13 +112,18 @@ export const FD_CLASS_OTHER = "other";
 
 /**
  * Kernel anonymous-inode subtypes are a small fixed set (`[eventpoll]`,
- * `[eventfd]`, `[timerfd]`, `[inotify]`, `[signalfd]`, ...), but they arrive as
- * text read out of procfs, so they are constrained rather than trusted: the
- * subtype is kept only if it is short and lowercase-alphabetic. Anything else
- * collapses to the bare `anon_inode` class. This keeps the label alphabet
- * closed without having to enumerate kernel versions.
+ * `[eventfd]`, `[timerfd]`, `[inotify]`, `[signalfd]`, `bpf-map`, ...), but they
+ * arrive as text read out of procfs, so they are constrained rather than
+ * trusted: the subtype is kept only if it is short and drawn from a closed
+ * alphabet. Anything else collapses to the bare `anon_inode` class. This keeps
+ * the label alphabet closed without having to enumerate kernel versions.
+ *
+ * `-` is admitted because real kernel subtypes use it (`bpf-map`, `bpf-prog`,
+ * `bpf-link`); excluding it collapsed those to bare `anon_inode` and also made
+ * the `bpf-map:` example in {@link classifyFdTarget} describe behaviour the
+ * code did not have.
  */
-const ANON_INODE_SUBTYPE = /^[a-z_]{1,24}$/;
+const ANON_INODE_SUBTYPE = /^[a-z_-]{1,24}$/;
 
 /** Suffix procfs appends when the target has been unlinked. */
 const DELETED_SUFFIX = " (deleted)";
@@ -233,6 +238,14 @@ export function classifyFdTarget(target: string): string {
   // An fd still held on an unlinked file is the classic leak signature, so it
   // gets its own prefix rather than being folded in with live files — a leak
   // that only shows up here is a much narrower search than one that does not.
+  //
+  // ⚠ Not authenticated, and this class is the one an investigator leans on
+  // hardest. procfs appends " (deleted)" to an unlinked target, but a LIVE file
+  // whose name simply ends in that text readlinks identically — verified: a
+  // real, non-deleted `/tmp/s2/evil (deleted)` is indistinguishable here from a
+  // deleted `/tmp/s2/evil`. Agents write arbitrary filenames into workspaces,
+  // so `deleted:<dir>` can be inflated by a filename alone. Inherent to procfs
+  // rather than fixable here; it is called out in the gauge `help` too.
   const deleted = raw.endsWith(DELETED_SUFFIX);
   const path = deleted ? raw.slice(0, -DELETED_SUFFIX.length) : raw;
 
@@ -323,7 +336,19 @@ export function collectFdClassSnapshot(options: CollectFdClassOptions = {}): FdC
     raw.set(fdClass, (raw.get(fdClass) ?? 0) + 1);
   };
 
-  const inspected = entries.length > maxEntries ? entries.slice(0, maxEntries) : entries;
+  const inspected = entries.length > maxEntries
+    // Numeric sort before slicing, because `readdirSync` on procfs returns
+    // LEXICOGRAPHIC order (measured under Node: `0,1,10,11,…,2,20,21,3`) — note
+    // the kernel itself iterates numerically, so this is Node's ordering, not
+    // procfs's, and sampling it in Python shows numeric order and hides the
+    // problem. Without the sort the cap takes a prefix biased toward low
+    // leading digits rather than the lowest-numbered descriptors, and it does
+    // so exactly when truncation engages — i.e. in the leak scenario this
+    // exists to describe, where a biased sample of the table is the one thing
+    // it must not report. The partition stays correct either way; what the sort
+    // buys is that the truncation boundary means what the comment says.
+    ? [...entries].sort((a, b) => Number(a) - Number(b)).slice(0, maxEntries)
+    : entries;
   for (const entry of inspected) {
     let target: string;
     try {
