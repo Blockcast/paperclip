@@ -276,6 +276,14 @@ function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<Sta
      * two entry points unable to drift apart again: there is only one formatter.
      */
     let startupTimedOut = false;
+    /**
+     * Set when a BACKPRESSURE chunk arrives *after* the startup watchdog already
+     * SIGKILLed the child — i.e. when the guard below is entered rather than merely
+     * present. Reported in the `exit` message so a test can assert the branch was
+     * taken instead of inferring it from timing: the two runs differ only in whether
+     * the fixture writes the token, and both otherwise fail with the same text.
+     */
+    let lateBackpressureIgnored = false;
     const startupWatchdog = setTimeout(() => {
       startupTimedOut = true;
       child.kill("SIGKILL");
@@ -292,7 +300,11 @@ function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<Sta
       // below — but do not start the deadline off them: the child is already dead,
       // so `stdin.end` would write to a closed pipe and the elapsed time would be
       // measured against a corpse.
-      if (startupTimedOut || startedAt !== undefined || !chunk.includes("BACKPRESSURE")) return;
+      if (startedAt !== undefined || !chunk.includes("BACKPRESSURE")) return;
+      if (startupTimedOut) {
+        lateBackpressureIgnored = true;
+        return;
+      }
       clearTimeout(startupWatchdog);
       startedAt = Date.now();
       watchdog = setTimeout(() => {
@@ -315,6 +327,11 @@ function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<Sta
       clearTimeout(startupWatchdog);
       if (watchdog) clearTimeout(watchdog);
       if (startedAt === undefined) {
+        // Snapshot before the await: `readRemainingStderr` yields, and a BACKPRESSURE
+        // chunk delivered in that window would set the flag after `exit` had already
+        // branched. Reading it later would call that shape a guard entry when the
+        // guard did nothing, which is the one way this diagnostic could lie.
+        const lateAtExit = lateBackpressureIgnored;
         void readRemainingStderr(child.stderr)
           .then((stderr) => {
             reject(
@@ -326,7 +343,8 @@ function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<Sta
                     : "fixture exited before reporting stderr backpressure"
                 } ` +
                   `(code=${code}, signal=${signal}); its stdout said: ${stdout.trim() || "<nothing>"}; ` +
-                  `its stderr said: ${stderr.trim() || "<nothing>"}`,
+                  `its stderr said: ${stderr.trim() || "<nothing>"}; ` +
+                  `late backpressure after timeout: ${lateAtExit}`,
               ),
             );
           })
@@ -413,6 +431,12 @@ describe("process crash guard — real process exit", () => {
    * destroyed `child.stdin` and the exit handler has already branched — measured, the
    * mutation survives that shape entirely. Holding the loop leaves the bytes readable
    * from the start, so the watchdog fires first and the chunk lands before `exit`.
+   *
+   * `late backpressure after timeout: true` is the half of this assertion that is not
+   * shared with the neighbour above. Without it the two tests reject with byte-identical
+   * text, so if the ordering ever drifted into the post-`exit` shape this one would keep
+   * passing while silently stopping to kill the mutation — a test whose presence hides
+   * the gap it was added to close.
    */
   it("ignores backpressure that arrives after the startup watchdog fired", async () => {
     const run = runFixtureWithStalledStderr(LATE_BACKPRESSURE_RUN);
@@ -421,7 +445,8 @@ describe("process crash guard — real process exit", () => {
     await expect(run).rejects.toThrow(
       new RegExp(
         `did not report stderr backpressure within ${LATE_BACKPRESSURE_RUN.startupTimeoutMs}ms` +
-          `[\\s\\S]*its stdout said: ${STARTUP_STALL_SENTINEL}`,
+          `[\\s\\S]*its stdout said: ${STARTUP_STALL_SENTINEL}` +
+          `[\\s\\S]*late backpressure after timeout: true`,
       ),
     );
   });
