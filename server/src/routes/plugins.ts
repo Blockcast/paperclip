@@ -259,7 +259,10 @@ const WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS = 30;
 export function webhookDisposition(result: unknown): { accepted?: number; rejected?: string } {  if (!result || typeof result !== "object") return {};
   const { accepted, rejected } = result as Record<string, unknown>;
   if (typeof accepted !== "number" || !Number.isFinite(accepted) || accepted < 0) return {};
-  return typeof rejected === "string" ? { accepted, rejected } : { accepted };
+  // `rejected` is only valid alongside `accepted: 0` (PluginWebhookResult). A
+  // reason contradicted by a non-zero count is dropped, never the count.
+  if (typeof rejected === "string") return accepted === 0 ? { accepted, rejected } : { accepted };
+  return { accepted };
 }
 /**
  * Non-`ready` plugin statuses webhook ingestion answers as *terminal* (410).
