@@ -6591,8 +6591,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     // Both halves. The monitor must still arm — this gate must not cost the write the caller asked
     // for — and the action the caller said nothing about must survive it.
+    //
+    // Asserted on the DB row and a fresh GET, never on the PATCH echo: the echo only *overrides*
+    // `activeRecoveryAction` when the write DISCHARGED one (routes/issues.ts, the
+    // `activeRecoveryActionBeforeUpdate && !revalidatedRecoveryAction` block), so a preserved
+    // action reads back `undefined` there. Absent from the echo is not absent from the row.
     expect(patched.body.monitorNextCheckAt).toBeTruthy();
-    expect(patched.body.activeRecoveryAction).toMatchObject({ id: action.id, status: "active" });
 
     const [actionRow] = await db
       .select()
@@ -6603,9 +6607,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
       id: action.id,
     });
-    // Read back on a fresh GET, not just the PATCH echo: the read path revalidates too.
+    // The read path revalidates too, so a GET is the surface that would expose a leak here.
     const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
-    expect(detail.body.activeRecoveryAction).toMatchObject({ id: action.id });
+    expect(detail.body.activeRecoveryAction).toMatchObject({ id: action.id, status: "active" });
     expect(detail.body.assigneeAgentId).toBe(coderId);
   });
 
@@ -6617,12 +6621,63 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       await seedInProgressWithAction("workspace_validation", "workspace_validation_failed");
     const app = createApp();
 
-    const patched = await request(app)
+    await request(app)
       .patch(`/api/issues/${sourceIssueId}`)
       .send({ executionPolicy: {} })
       .expect(200);
 
-    expect(patched.body.activeRecoveryAction).toMatchObject({ id: action.id, status: "active" });
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({ status: "active", outcome: null, resolutionNote: null });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+    });
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(detail.body.activeRecoveryAction).toMatchObject({ id: action.id, status: "active" });
+  });
+
+  it("preserves a missing_disposition action across a document write on an in_review row (BLO-27586)", async () => {
+    // Covers the third gated branch, and deliberately via `trigger: "document"` rather than a PATCH.
+    // Two reasons. (1) A PATCH carrying `executionPolicy` recomputes `executionState` from the
+    // policy, which blanks the seeded participant — so a PATCH-driven version of this test passes
+    // whether or not the guard exists, the "green for the wrong reason" trap. (2) 4 of the 50 most
+    // recent resolutions arrived through this trigger, which is exactly why AC2's literal wording
+    // ("a PATCH whose body names only `executionPolicy`") leaks and the kind gate does not.
+    const { companyId, managerId, sourceIssueId, action, recoveryActionSvc } =
+      await seedInProgressWithAction("missing_disposition", "successful_run_missing_issue_disposition");
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        assigneeAgentId: null,
+        executionState: {
+          status: "pending",
+          currentStageId: "11111111-1111-4111-8111-111111111111",
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: managerId, userId: null },
+          returnAssignee: { type: "agent", agentId: managerId, userId: null },
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      })
+      .where(eq(issues.id, sourceIssueId));
+    const app = createApp();
+
+    await request(app)
+      .put(`/api/issues/${sourceIssueId}/documents/findings`)
+      .send({ title: "Findings", format: "markdown", body: "Recorded while the review stage is pending." })
+      .expect(201);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({ status: "active", outcome: null, resolutionNote: null });
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
       id: action.id,
     });
