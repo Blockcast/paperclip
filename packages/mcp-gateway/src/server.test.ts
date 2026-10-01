@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MCP_SESSION_HEADER } from "./session-keepalive.js";
-import { buildInitializeReplayHeaders, createGatewayServer, createHealthServer, DEFAULT_PORT, loadGatewayConfig, type GatewayState } from "./server.js";
+import { buildInitializeReplayHeaders, createGatewayServer, createHealthServer, createProxyAcceptProbe, DEFAULT_PORT, loadGatewayConfig, type GatewayState } from "./server.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import {
   DEFAULT_CREDENTIAL_CUSTODY_TOKEN_CACHE_MAX_ENTRIES,
@@ -2059,7 +2059,9 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
   // `paperclip-mcp-gateway-k8s-ro` target the proxy port and liveness failure
   // restarts the container, so the deny cannot land until they move.
 
-  async function startHealthServer(isServing: () => boolean = () => true): Promise<string> {
+  async function startHealthServer(
+    isServing: () => boolean | Promise<boolean> = () => true,
+  ): Promise<string> {
     const server = createHealthServer(isServing);
     servers.push(server);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -2105,6 +2107,19 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
     expect(res.status).toBe(405);
   });
 
+  // HEAD is explicitly allowed alongside GET. Without this, dropping the
+  // `&& req.method !== "HEAD"` clause passes the suite and every HEAD probe
+  // starts answering 405.
+  it("allows HEAD on the probe paths", async () => {
+    const base = await startHealthServer();
+    for (const probePath of ["/healthz", "/"]) {
+      const res = await fetch(`${base}${probePath}`, { method: "HEAD" });
+      expect(res.status, probePath).toBe(200);
+    }
+    // ...and a HEAD of a non-probe path is still not a way in.
+    expect((await fetch(`${base}/mcp`, { method: "HEAD" })).status).toBe(404);
+  });
+
   // A static 200 would report healthy with the proxy socket shut, which is
   // strictly weaker than the probe it replaces — that one at least had to
   // reach the proxy listener to answer at all.
@@ -2118,6 +2133,81 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
 
     serving = true;
     expect((await fetch(`${base}/healthz`)).status).toBe(200);
+  });
+
+  // `isServing` may be async, because the production one opens a socket.
+  it("awaits an async isServing, and fails closed when it rejects", async () => {
+    let answer: () => Promise<boolean> = async () => false;
+    const base = await startHealthServer(() => answer());
+
+    expect((await fetch(`${base}/healthz`)).status).toBe(503);
+
+    answer = async () => true;
+    expect((await fetch(`${base}/healthz`)).status).toBe(200);
+
+    // A check that throws must read as unhealthy, not as a thrown request.
+    answer = async () => {
+      throw new Error("probe exploded");
+    };
+    const errored = await fetch(`${base}/healthz`);
+    expect(errored.status).toBe(503);
+    expect(await errored.json()).toMatchObject({ ok: false });
+  });
+
+  // `server.listening` is `!!this._handle`, so it stays true for a socket that
+  // is bound but no longer accepting. While liveness targets the proxy port
+  // directly a wedged accept queue times the probe out and the pod restarts on
+  // its own; served from the health port on `listening` alone, that same state
+  // would answer 200 forever and the pod would never self-heal.
+  describe("createProxyAcceptProbe", () => {
+    it("is true for a listener that accepts, false for a port nobody holds", async () => {
+      const listener = net.createServer();
+      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+      const { port } = listener.address() as AddressInfo;
+
+      // Closed here rather than in afterEach: the second half of this test
+      // needs the port genuinely unbound, and closing twice rejects.
+      try {
+        expect(await createProxyAcceptProbe(port, { ttlMs: 0 })()).toBe(true);
+      } finally {
+        await new Promise<void>((resolve) => listener.close(() => resolve()));
+      }
+
+      expect(await createProxyAcceptProbe(port, { ttlMs: 0 })()).toBe(false);
+    });
+
+    it("reports false rather than hanging when the connect does not complete", async () => {
+      // 203.0.113.0/24 is TEST-NET-3: routable-looking, never answers — the
+      // saturated-accept-queue shape, where the SYN is dropped rather than
+      // refused. Overriding `host` only to reach that state; production is
+      // always loopback.
+      const probe = createProxyAcceptProbe(9, { timeoutMs: 50, ttlMs: 0, host: "203.0.113.1" });
+      const started = Date.now();
+      expect(await probe()).toBe(false);
+      // Bounded by the timeout, not by the OS connect retry schedule.
+      expect(Date.now() - started).toBeLessThan(2000);
+    });
+
+    // Nothing in front of the health port authenticates, so without the cache
+    // each unauthenticated request would open a fresh connection into the very
+    // accept queue being measured.
+    it("collapses repeated calls within the TTL into one connection", async () => {
+      let accepted = 0;
+      const listener = net.createServer((socket) => {
+        accepted += 1;
+        socket.destroy();
+      });
+      servers.push(listener as unknown as http.Server);
+      await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+      const { port } = listener.address() as AddressInfo;
+
+      const probe = createProxyAcceptProbe(port, { ttlMs: 10_000 });
+      expect(await Promise.all([probe(), probe(), probe()])).toEqual([true, true, true]);
+      // The client resolves on its own `connect`; the server's `connection`
+      // event is a separate turn, so settle before counting.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(accepted).toBe(1);
+    });
   });
 
   it("discloses less than /healthz on the proxy port, which no deny covers here", async () => {
@@ -2162,6 +2252,18 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
         .toThrow(/must differ from PORT/);
       // Default PORT is implied, not just the explicit one.
       expect(() => loadGatewayConfig({ PAPERCLIP_MCP_HEALTH_PORT: "8080" })).toThrow(/must differ from PORT/);
+    });
+
+    // The `must differ` guard above is only as good as the number it compares
+    // against, and `Number.parseInt` read PORT="8O81" (letter O) as 8. PORT now
+    // gets the same strict parse as the health port.
+    it("parses PORT as strictly as the health port", () => {
+      for (const raw of ["8O81", "8081abc", "0x1f9", "+8081", "0", "70000", "Infinity", "eighty"]) {
+        expect(() => loadGatewayConfig({ PORT: raw }), raw).toThrow(/PORT must be an integer in 1-65535/);
+      }
+      expect(loadGatewayConfig({ PORT: " 8080 " }).port).toBe(8080);
+      // Unset or blank still falls back to the default; only junk is refused.
+      expect(loadGatewayConfig({ PORT: "" }).port).toBe(DEFAULT_PORT);
     });
   });
 });
