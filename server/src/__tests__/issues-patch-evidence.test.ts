@@ -25,7 +25,13 @@ import { issueRoutes } from "../routes/issues.js";
  * NETWORK TRIPWIRE (BLO-34808 item 3).
  *
  * This suite drives the real PATCH handler, which carries the module-level
- * `githubTruthProbe` built in `services/issues.ts` out of these five functions.
+ * `githubTruthProbe` built in `services/issues.ts`. Only FOUR of the five
+ * functions mocked below are that probe's deps (`GithubTruthDeps`); the fifth,
+ * `githubHasCommitEvidence`, is a separate dial-out on the done-gate path that
+ * the probe never touches. It is mocked on purpose and must not be pruned as
+ * unused: a later `status: "done"` fixture would otherwise open a socket this
+ * tripwire cannot see.
+ *
  * Before this mock the suite was deterministic only by accident: no fixture
  * attached a `pull_request` work product, so the probe returned at
  * `all.length === 0` before a socket opened. The first fixture to attach one —

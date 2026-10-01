@@ -318,6 +318,13 @@ async function probeOne(
       // review at head decides", "a DISMISSED review does not veto a live clean
       // one") use distinct real `submittedAt` values. Adding a tiebreak would
       // be dead code with no failing mutation.
+      //
+      // The `typeof r.submittedAt === "string"` filter in the comment-surface
+      // merge above is NOT a second opinion on that reachability, and the two
+      // sites do not disagree: `ReviewerReview.submittedAt` is `string | null`
+      // while the gate row's `createdAt` is `string | Date`, so that filter is
+      // what makes the `as string` beside it honest — on top of mirroring the
+      // production gate's own row filter. Reachability is argued here only.
       .sort((a, b) => (b.submittedAt ?? "").localeCompare(a.submittedAt ?? ""));
     const newest = atHead[0];
     const formalBlocking = newest !== undefined && hasActionablePrReviewFeedback(newest.body, newest.state);
