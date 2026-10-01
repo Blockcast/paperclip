@@ -307,7 +307,10 @@ function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<Sta
       child.stdin.end("CRASH\n");
     });
 
-    child.on("error", reject);
+    child.on("error", (error) => {
+      clearTimeout(startupWatchdog);
+      reject(error);
+    });
     child.on("exit", (code, signal) => {
       clearTimeout(startupWatchdog);
       if (watchdog) clearTimeout(watchdog);
