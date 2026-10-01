@@ -2409,8 +2409,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   // Prepare the prompt bundle (skills + instructions) on the server filesystem.
-  // The K8s Job pod mounts the same PVC at /paperclip, so bundle paths written
-  // here are accessible inside the pod at the identical absolute path.
+  // One volume, TWO mount points: this process writes at
+  // `SELF_POD_DATA_MOUNT_PATH` and the K8s Job pod reaches the same bytes at
+  // `resolveDataMountPath(config)`. They coincide on the default mount and
+  // diverge under a custom `workspaceMountPath`, which is why both are passed
+  // to `prepareClaudePromptBundle` below rather than one absolute path being
+  // reused as write target, `--add-dir` and `--append-system-prompt-file`
+  // (BLO-37760).
   const skillEntries = await readPaperclipRuntimeSkillEntries(config, import.meta.dirname ?? __dirname);
   const desiredSkillNames = new Set(resolvePaperclipDesiredSkillNames(config, skillEntries));
   const desiredSkills = skillEntries.filter((e) => desiredSkillNames.has(e.key));
