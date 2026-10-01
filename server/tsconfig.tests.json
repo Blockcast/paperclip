@@ -6,5 +6,5 @@
     "rootDir": ".."
   },
   "include": ["src/__tests__/pr-comment-review-gate.test.ts"],
-  "exclude": []
+  "exclude": ["node_modules", "dist"]
 }
