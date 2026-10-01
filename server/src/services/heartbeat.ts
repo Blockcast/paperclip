@@ -2223,6 +2223,17 @@ const EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS = 5 * 60 * 1000;
 // attributable cause. Well above the legitimate transients (the 5 min grace
 // above, a Job mid-termination) so steady-state churn stays quiet.
 const EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_AFTER_MS = 30 * 60 * 1000;
+// PEN-3640 (Ally important 1): once past the age gate above, a reservation
+// warns at most this often. The gate is one-way, and the sweep runs on the
+// `heartbeatSchedulerIntervalMs` tick (default 30 s), so without this a single
+// strand emits thousands of identical lines and a kube-read outage turns the
+// whole pending backlog into a 30 s log storm. One attributable line per row
+// per hour keeps the diagnostic and loses the flood.
+const EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_INTERVAL_MS = 60 * 60 * 1000;
+// Size at which the per-row log-state map is swept for stale entries. Well
+// above any plausible simultaneous strand count, so steady state never pays
+// for the scan.
+const STUCK_RESERVATION_LOG_STATE_PRUNE_AT = 256;
 // BLO-12996: hard ceiling after which a live-but-silent external-lifecycle Job
 // is force-killed to unblock agent dispatch. This is deliberately MUCH longer
 // than EXTERNAL_LIFECYCLE_STALE_MS (15 min). The 15-min soft floor is safe for
@@ -25464,6 +25475,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // kube-independent stages of the same tick.
   type RuntimeResourceReconciliationFailures = { failedRowCount: number };
 
+  // PEN-3640 (Ally important 1): per-row rate-limit state for the stuck-skip
+  // diagnostic below. Keyed by reservation id, value is when that row last
+  // warned.
+  //
+  // This lives in the service closure rather than at module scope on purpose.
+  // `heartbeatService` is constructed once in production but many times across
+  // a test file, and module-scoped state would let one test's warn suppress
+  // the next test's, making assertions on this log order-dependent.
+  //
+  // Pruning is by AGE, never by "not in this pass's pending set". The
+  // `onlyRunId` call site in `releaseCancelledRunRuntimeResources` runs this
+  // sweep scoped to a single run, so a pass routinely sees exactly one row;
+  // set-difference pruning would evict every other row's entry on each cancel
+  // and defeat the rate limit entirely.
+  const stuckReservationLastLoggedAtMs = new Map<string, number>();
+
   async function reconcileReleasePendingExternalRuntimeReservations(
     jobRunStatuses: Map<string, AgentJobRunStatus> | null,
     ambiguousRunIds: ReadonlySet<string> = new Set(),
@@ -25532,14 +25559,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       );
     // PEN-3640: name the branch that is refusing to release a long-held
-    // reservation. Rate-limited by age, not by pass, so a healthy fleet stays
-    // silent and a genuine strand is attributable from the logs alone.
+    // reservation, so a strand is attributable from the logs alone instead of
+    // only showing up as a rising gauge.
+    //
+    // Two separate clocks, and the distinction is load-bearing (Ally
+    // suggestion 1). The GATE is time spent refused — `updatedAt`, the same
+    // clock `isolationSetupGraceActive` already uses below. `reservedAt` would
+    // gate on how long the run has existed, so a run cancelled after 30+ min
+    // would warn on the very first pass while its Job is still legitimately
+    // terminating. Both are logged: `refusedSeconds` is the strand signal,
+    // `heldSeconds` is what the leaked slot has cost.
+    //
+    // Rate-limited per row (Ally important 1). The age gate alone is one-way:
+    // once a reservation crosses it, it warns on EVERY sweep pass. At the
+    // default 30 s scheduler tick the 64.6 h production strand would have
+    // emitted ~7,700 lines for a single row. The sharper case is correlated
+    // failure — when the kube read is unavailable `terminalOrMissing` stays
+    // false for the whole backlog at once, so `job_not_terminal_or_unreadable`
+    // would fire for every pending row every 30 s, a log storm at exactly the
+    // moment the other signals most need to stay legible.
     const noteStuckSkip = (
       reservation: typeof externalRuntimeReservations.$inferSelect,
       refusedBy: string,
     ) => {
-      const heldMs = Date.now() - new Date(reservation.reservedAt).getTime();
-      if (heldMs < EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_AFTER_MS) return;
+      const now = Date.now();
+      const refusedMs = now - new Date(reservation.updatedAt).getTime();
+      if (refusedMs < EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_AFTER_MS) return;
+      const lastLoggedAtMs = stuckReservationLastLoggedAtMs.get(reservation.id);
+      if (
+        lastLoggedAtMs !== undefined
+        && now - lastLoggedAtMs < EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_INTERVAL_MS
+      ) {
+        return;
+      }
+      stuckReservationLastLoggedAtMs.set(reservation.id, now);
+      // Bound the map against rows that are released (or vanish) between
+      // passes. Anything that has not warned in two intervals cannot be
+      // suppressing a line, so dropping it is free.
+      if (stuckReservationLastLoggedAtMs.size > STUCK_RESERVATION_LOG_STATE_PRUNE_AT) {
+        for (const [id, at] of stuckReservationLastLoggedAtMs) {
+          if (now - at >= 2 * EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_INTERVAL_MS) {
+            stuckReservationLastLoggedAtMs.delete(id);
+          }
+        }
+      }
       logger.warn(
         {
           reservationId: reservation.id,
@@ -25547,7 +25610,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId: reservation.agentId,
           reservationState: reservation.state,
           jobName: reservation.jobName ?? reservation.expectedJobName,
-          heldSeconds: Math.round(heldMs / 1000),
+          refusedSeconds: Math.round(refusedMs / 1000),
+          heldSeconds: Math.round((now - new Date(reservation.reservedAt).getTime()) / 1000),
           refusedBy,
         },
         "external-runtime reservation still unreleased after reclaim sweep refused it",
@@ -25660,6 +25724,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             reservation.releaseReason ??
             (terminalPrelaunchOrphan ? "terminal_prelaunch_orphan" : "job_terminal_or_missing"),
         });
+        // PEN-3640: the row is drained, so its rate-limit entry can never
+        // suppress anything again. Dropping it here keeps the common case off
+        // the age-based prune path entirely.
+        if (released) stuckReservationLastLoggedAtMs.delete(reservation.id);
         if (released && isHeartbeatRunTerminalStatus(run.status)) {
           await releaseIssueExecutionAndPromote(run, {
             externalWaitYield: run.errorCode === "external_wait_yield",

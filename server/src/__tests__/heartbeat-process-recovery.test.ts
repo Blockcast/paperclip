@@ -689,10 +689,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     slotId?: number;
     jobName?: string;
     jobUid?: string;
+    // PEN-3640: the stuck-skip diagnostic gates on `updatedAt` (time spent
+    // refused), not `reservedAt` (time the run has existed). Overridable so a
+    // test can drive the two clocks apart.
+    reservedAt?: Date;
+    updatedAt?: Date;
   }) {
     const jobName = input.jobName ?? `agent-job-${input.runId.slice(0, 8)}`;
     const jobUid = input.jobUid ?? `uid-${input.runId}`;
     const now = new Date("2026-03-19T00:01:00.000Z");
+    const reservedAt = input.reservedAt ?? now;
     return db
       .insert(externalRuntimeReservations)
       .values({
@@ -707,11 +713,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         isolationMode: "shared",
         isolationKey: `agent-shared:${input.agentId}`,
         isolationBoundAt: now,
-        reservedAt: now,
-        launchingAt: now,
-        launchedAt: now,
-        createdAt: now,
-        updatedAt: now,
+        reservedAt,
+        launchingAt: reservedAt,
+        launchedAt: reservedAt,
+        createdAt: reservedAt,
+        updatedAt: input.updatedAt ?? reservedAt,
       })
       .returning()
       .then((rows) => rows[0]);
@@ -8946,6 +8952,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       );
       heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
+      // PEN-3640 (Ally suggestion 2): the `refusedBy` labelling is half this
+      // change's value and nothing else asserts on it, so a refactor could drop
+      // it silently. This fixture is already the right one -- its `updatedAt`
+      // sits far past the 30-min gate -- so the assertion costs one spy.
+      const warnSpy = vi.spyOn(logger, "warn");
+
       await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
 
       const persisted = await db
@@ -8954,6 +8966,82 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(externalRuntimeReservations.id, reservation.id))
         .then((rows) => rows[0]);
       expect(persisted?.releasedAt).toBeNull();
+
+      // Scoped to THIS reservation on purpose: `reapOrphanedRuns` sweeps the
+      // whole namespace, so an unreleased row left behind by an earlier test in
+      // this file could otherwise inflate the count.
+      const stuckSkipCalls = () =>
+        warnSpy.mock.calls.filter(
+          (call) =>
+            call[1] === "external-runtime reservation still unreleased after reclaim sweep refused it"
+            && (call[0] as Record<string, unknown>)?.reservationId === reservation.id,
+        );
+      expect(stuckSkipCalls()).toHaveLength(1);
+      expect(stuckSkipCalls()[0]![0] as Record<string, unknown>).toMatchObject({
+        reservationId: reservation.id,
+        runId,
+        refusedBy: "active_run_execution",
+      });
+
+      // PEN-3640 (Ally important 1): the age gate is one-way -- past 30 min it
+      // admits every pass. At the default 30 s scheduler tick that is ~7,700
+      // lines for the single 64.6 h production strand, and under a kube-read
+      // outage every pending row at once. The per-row rate limit must keep the
+      // second sweep silent.
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      expect(stuckSkipCalls()).toHaveLength(1);
+
+      warnSpy.mockRestore();
+    });
+
+    it("does not warn about a reservation refused only moments ago, however old the run (PEN-3640)", async () => {
+      // PEN-3640 (Ally suggestion 1): the gate measures time spent REFUSED, not
+      // the age of the run. A run cancelled after hours sits `release_pending`
+      // while its Job terminates; measured from `reservedAt` it would trip the
+      // warn on its very first pass, which is healthy churn and not a strand.
+      // `isolationSetupGraceActive` already uses `updatedAt` for exactly this.
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "codex_local",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: false,
+      });
+      const reservation = await seedLaunchedReservation({
+        companyId,
+        agentId,
+        runId,
+        // Dispatched long ago...
+        reservedAt: new Date("2026-03-19T00:01:00.000Z"),
+        // ...but it entered this refusing state just now.
+        updatedAt: new Date(),
+      });
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      const warnSpy = vi.spyOn(logger, "warn");
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+      // Still refused -- this test is about the diagnostic, not the guard.
+      const persisted = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation.id))
+        .then((rows) => rows[0]);
+      expect(persisted?.releasedAt).toBeNull();
+
+      expect(
+        warnSpy.mock.calls.filter(
+          (call) =>
+            call[1] === "external-runtime reservation still unreleased after reclaim sweep refused it"
+            && (call[0] as Record<string, unknown>)?.reservationId === reservation.id,
+        ),
+      ).toHaveLength(0);
+      warnSpy.mockRestore();
     });
 
     // BLO-21460 (Ally important 2): the three contracts this PR introduces that
