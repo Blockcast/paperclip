@@ -41,6 +41,7 @@ import {
   __test_isReviewerSelfEchoReview,
   __test_isSelfReviewedPr,
   __test_bodyReRaisesPriorFinding,
+  __test_reRaisedPriorFindingLabels,
   __test_hasPrReviewerRequestMention,
   __test_hasPrReviewerAgentRequestMarker,
   __test_hasAllyConsolidatedReviewHeading,
@@ -11466,6 +11467,147 @@ describe("PR review convergence signal (BLO-35909)", () => {
     ).toBe(false);
     expect(__test_bodyReRaisesPriorFinding(null)).toBe(false);
     expect(__test_bodyReRaisesPriorFinding(undefined)).toBe(false);
+  });
+
+  // BLO-38809: a resolve site must CLASSIFY, not just forward the body.
+  // reRaisesPriorFinding falls back to `bodyReRaisesPriorFinding(prFeedbackBody(context))`
+  // when the field is absent, so dropping a resolve-time line still yields a
+  // boolean and nothing goes red — it just re-derives the verdict off the
+  // CLAMPED body, which is the pre-BLO-35909 behaviour. Only a ledger past the
+  // clamp boundary can tell the two paths apart, so this fixture puts one there
+  // (frr#61's buckets sat at bytes 4248/4273 against the 4096-byte clamp).
+  //
+  // Shared by both producers' guards below. The Important bucket is what makes
+  // the body actionable feedback, which the `issue_comment` resolve branch
+  // requires before it will return a context at all.
+  const stillPresent = "- **prior:de0d81ab important 1** — still-present — head has moved on";
+  const ledgerPastTheClamp = [
+    "## Ally — Consolidated PR Review",
+    "",
+    "### Important Issues (1)",
+    "",
+    "- **[tests]** a finding, so this body reads as actionable feedback.",
+    "",
+    "### Suggestions (60)",
+    "",
+    ...Array.from(
+      { length: 60 },
+      (_, i) => `- nit ${i}: prose padding so the ledger below lands past the 4096-byte clamp boundary.`,
+    ),
+    "",
+    "### Prior Findings Dispositioned",
+    "",
+    stillPresent,
+  ].join("\n");
+
+  it("classifies the ledger off the RAW review body, past the clamp boundary (BLO-38809)", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 61,
+        title: "fix(frr): BLO-35909 convergence signal",
+        head: { ref: "fix/BLO-35909", sha: "251d5caa8726897b25d603d9e6b1b4118ea36ac0" },
+      },
+      review: { body: ledgerPastTheClamp, state: "commented", user: { login: "allyblockcast[bot]" } },
+      repository: { full_name: "Blockcast/frr" },
+    });
+    expect(ctx).not.toBeNull();
+
+    // Control: without this the fixture proves nothing. A body shorter than the
+    // clamp reads the same on both paths, so the assertion below would pass on
+    // the fallback too. This pins that the ledger really is unreachable from the
+    // clamped body the fallback would read (prFeedbackBody === reviewBody here,
+    // commentBody being undefined on a review context).
+    expect(ctx!.reviewBody).not.toContain("still-present");
+    expect(__test_bodyReRaisesPriorFinding(ctx!.reviewBody)).toBe(false);
+
+    // The guard: the field must be PRESENT on the resolved context. `toBe(true)`
+    // rather than a truthiness check so the absent-field case (undefined) fails.
+    expect(ctx!.reviewReRaisesPriorFinding).toBe(true);
+
+    // The deliberate half of the split, pinned so it is not "fixed" into a
+    // defect. reRaisedPriorFindingLabels reads prFeedbackBody — the CLAMPED
+    // body — so on exactly this shape the escalation fires with no specifics.
+    // That asymmetry is intended and documented at reRaisedPriorFindingLabels
+    // ("it only costs the message its specifics"): the gating read is the raw
+    // one above, so an empty list here never suppresses an escalation.
+    //
+    // The reachable regression is plumbing, not a one-word swap: every body on
+    // ResolvedEventContext is already clamped, so there is nothing here to
+    // repoint this call AT. It bites when someone reads the empty list as the
+    // bug and carries a raw body through to this call — which would make the
+    // two reads disagree about which body is authoritative. That mutation is
+    // caught only here: the controls above assert on the clamped context
+    // bodies, which such a change leaves untouched.
+    expect(__test_reRaisedPriorFindingLabels(ctx!)).toEqual([]);
+  });
+
+  // The positive half of the pair above. That assertion pins a DIRECTION (empty
+  // on a past-the-clamp body) and is satisfied by a function that returns []
+  // unconditionally — dropping the .map, or returning [] outright, leaves it
+  // green. Without this test that mutation is invisible, and the escalation at
+  // reRaisedFindings would silently lose its specifics forever: the same
+  // "guard that passes on broken code" shape this describe block exists to
+  // close. Short body on purpose — the ledger sits INSIDE the clamp, so
+  // prFeedbackBody still carries it and the function has something to find.
+  it("names the re-raised findings when the ledger is inside the clamp (BLO-38809)", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 61,
+        title: "fix(frr): BLO-35909 convergence signal",
+        head: { ref: "fix/BLO-35909", sha: "251d5caa8726897b25d603d9e6b1b4118ea36ac0" },
+      },
+      review: {
+        body: ledger("still-present"),
+        state: "commented",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/frr" },
+    });
+    expect(ctx).not.toBeNull();
+
+    // Control: this body is reachable from the clamped read, which is what
+    // makes a non-empty result possible at all here and distinguishes this
+    // fixture from the past-the-clamp one above.
+    expect(ctx!.reviewBody).toContain("still-present");
+
+    expect(__test_reRaisedPriorFindingLabels(ctx!)).toEqual(["important #1 from de0d81ab"]);
+  });
+
+  // The SECOND producer of the same field, and the one that bites in practice:
+  // Ally frequently answers as a plain PR comment and files no review object at
+  // all, so this is a live surface rather than a symmetry exercise. Identical
+  // hazard and identical direction — `commentBody` is clamped on the context, so
+  // without the resolve-time classification the `??` fallback re-derives `false`
+  // ("no finding re-raised") and the escalation is suppressed.
+  it("classifies the ledger off the RAW comment body, past the clamp boundary (BLO-38809)", () => {
+    const ctx = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 61,
+        title: "fix(frr): BLO-35909 convergence signal",
+        body: null,
+        html_url: "https://github.com/Blockcast/frr/pull/61",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/frr/pulls/61" },
+      },
+      comment: {
+        id: 987654,
+        body: ledgerPastTheClamp,
+        html_url: "https://github.com/Blockcast/frr/pull/61#issuecomment-987654",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/frr" },
+    });
+    expect(ctx).not.toBeNull();
+
+    // Same control, same reason: prFeedbackBody is `reviewBody ?? commentBody`
+    // and `reviewBody` is undefined on an issue_comment context, so this is
+    // exactly what the fallback would read.
+    expect(ctx!.commentBody).not.toContain("still-present");
+    expect(__test_bodyReRaisesPriorFinding(ctx!.commentBody)).toBe(false);
+
+    expect(ctx!.reviewReRaisesPriorFinding).toBe(true);
   });
 });
 
