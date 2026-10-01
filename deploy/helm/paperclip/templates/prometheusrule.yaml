@@ -120,6 +120,29 @@
 
     - Same manual `monitoring-rules` Argo sync gate as above (BLO-19095)
       applies after merge -- a merged rule is not a deployed one.
+
+  STATUS of the BLO-21078 mass-cancellation alert
+  (PaperclipGithubWorkflowRunMassCancellation), same auditability rule:
+
+    - NOT in onprem-k8s and NOT live. Blockcast/onprem-k8s#1968 (branch
+      platformsre/blo-21078-mass-cancellation-alert) proposed it and was
+      CLOSED UNMERGED on 2026-09-13T07:25:56Z; no other onprem-k8s PR carries
+      it. Re-checked 2026-09-29 at onprem-k8s master b53d049d0af1: absent
+      (both the alert name and paperclip_github_workflow_run_conclusion_total)
+      from all of monitoring/prometheus-rules-{1..5}-configmap.yaml and from
+      paperclip/paperclip-runtime-alerts-prometheusrule.yaml. Verify:
+        for f in monitoring/prometheus-rules-{1..5}-configmap.yaml \
+                 paperclip/paperclip-runtime-alerts-prometheusrule.yaml; do
+          gh api "repos/Blockcast/onprem-k8s/contents/$f" \
+            -H 'Accept: application/vnd.github.raw' \
+            | grep -c PaperclipGithubWorkflowRunMassCancellation
+        done
+
+    - So BLO-21078 has no detector in production. The chart rule below is
+      the only copy anywhere, and it renders nowhere live. Landing it in both
+      onprem-k8s files (then the manual `monitoring-rules` Argo sync,
+      BLO-19095) is the change that closes BLO-21078; until then the chart
+      rule is the reviewed source for that change, not a mirror of one.
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
@@ -403,13 +426,11 @@ spec:
           annotations:
             summary: "Paperclip GitHub review-request wakes suppressed by an outage-like cause (reviews are being dropped)"
             description: "At least one GitHub review-request reviewer wake was terminally suppressed in the last {{ .Values.prometheusRule.githubDeliverySuppressionWindow }} with an outage-like cause ({{ .Values.prometheusRule.githubDeliverySuppressionOutageCauses }}) (BLO-18859). Suppressed means the wake was declined rather than dispatched: no run exists and nothing will re-arm it, so the PR has a posted trigger and no review — the same user-visible outcome as a dead-letter. Check the `cause` label first. `heartbeat.scheduling_suppressed` means the fleet-wide scheduling-suppression flag is on: if that is not a deliberate maintenance window, clear it (this is the mode that silently strands every review). `dispatch_rejected` means the dispatch path threw a business-rule HttpError with no durable skipped row — an unresolvable agent or responsible user; waiting will not fix it. `other` means the server emitted a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES in services/metrics.ts: find it with `select reason, count(*) from agent_wakeup_requests where status = 'skipped' and created_at > now() - interval '1 hour' group by 1 order by 2 desc`, then either add it to the allow-list as an expected decline or fix the cause. Expected declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded from this selector by default and are visible on the same counter for context."
-        # BLO-21078: mirrors the authoritative copy in
-        # Blockcast/onprem-k8s monitoring/prometheus-rules-2-configmap.yaml (key
-        # paperclip-runtime-alerts.rules.yml) and its CRD copy
-        # paperclip/paperclip-runtime-alerts-prometheusrule.yaml — see those
-        # files for the full incident writeup and threshold-tuning caveat.
-        # This chart copy renders nowhere live (prometheusRule.enabled is
-        # false on Blockcast, see the file header); kept only for coherence.
+        # BLO-21078. This is NOT a mirror: no onprem-k8s copy of this rule
+        # exists (onprem-k8s#1968 closed unmerged, see the BLO-21078 STATUS
+        # stanza in the file header), and this chart copy renders nowhere
+        # live (prometheusRule.enabled is false on Blockcast). Until it lands
+        # in onprem-k8s, BLO-21078 has no detector in production.
         # The `supersession="none"` selector is load-bearing, not a
         # refinement: pr.yml sets concurrency.cancel-in-progress, so an
         # ordinary force-push yields conclusion="cancelled" too. Measured
@@ -419,15 +440,110 @@ spec:
         # and raising the threshold does not help because benign
         # cancellations scale with agent push rate — the noise floor rises
         # with the signal.
+        #
+        # THIS IS A RATIO, NOT A COUNT, and that is the whole point. The
+        # comment above called it: the noise floor rises with the signal.
+        # That is true of the non-superseded stream too, so the supersession
+        # selector bought a 92.8% reduction and still left a count threshold
+        # unusable. Measured against the live counters 2026-09-29 over 7d,
+        # the ORIGINAL `>= 3` count expression is true for 67.9% of
+        # wall-clock (p50 5.17, p99 71.1, max 132.4 per 15m) — it would have
+        # paged continuously from the moment it deployed. Decisively: the
+        # BLO-21078 incident this rule exists to catch was 4 cancellations
+        # in 18 minutes, which is BELOW today's median. No count threshold
+        # can both catch that incident and stay quiet; the instrument was
+        # wrong, not the number.
+        #
+        # The incident's real signature was BREADTH — 4 consecutive runs on
+        # unrelated branches, i.e. essentially every run in the window dying
+        # — so the discriminating quantity is the cancelled SHARE of
+        # completions, which is scale-free and does not drift with push
+        # rate.
+        #
+        # The supersession selector applies to the DENOMINATOR and the floor
+        # too, for the same reason it applies to the numerator. Superseded
+        # cancellations outnumber the rest ~13:1 (73,322 vs 5,657 over 7d)
+        # and swing with force-push rate independently of the signal, so
+        # left in the denominator they mask a real kill: 8 non-superseded
+        # cancellations beside a routine 20-run force-push burst and 2
+        # successes reads 8/30 = 0.27 and stays quiet, but 8/10 = 0.8 once
+        # they are excluded. Not hypothetical: on 2026-09-24T17:46-17:59Z,
+        # inside the 2h41m BLO-36178 ARC listener outage that paged nobody,
+        # 64-130 non-superseded cancellations per 15m sat beside 564-2,616
+        # superseded ones. The all-completions form read 0.04-0.09 there;
+        # this form reads 0.36-0.42. Every non-cancelled conclusion records
+        # supersession="none" (recordGithubWorkflowRunConclusion in
+        # services/metrics.ts), so {supersession="none"} is exactly "every
+        # completion except a superseded cancellation".
+        #
+        # Measured on THIS basis, live counters, 7d to 2026-09-29T07:40Z at
+        # 1m resolution: p50 1.46%, p99 17.7%, max 42.1%, and the max IS the
+        # BLO-36178 window above. Outside it the 7d max is 31.7%
+        # (2026-09-28T05:11Z, ~20 of 62, not attributed to any incident).
+        # So 0.35 sits 2x above p99 and 1.1x above the highest non-incident
+        # window, and the one incident inside retention read 0.36-0.42: the
+        # margin is thin on both sides, not an order of magnitude. (The
+        # original BLO-21078 incident, outside retention, measured 0.8-1.0 on
+        # the all-completions basis; dropping terms from the denominator can
+        # only raise that.) Retention is 7d, so re-derive this once more
+        # incident windows exist.
+        #
+        # The trade, stated: a supersession-classifier miss (a superseded
+        # run recorded as "none") now scales with force-push volume instead
+        # of being normalised by it. No non-incident window in the 7d
+        # measurement crossed 0.35 (max 0.317, above).
+        #
+        # The `>= 8` volume floor is required, not belt-and-braces: without
+        # it a single cancelled run out of two completions reads as 50% and
+        # pages on an idle repo, which is precisely when the ratio is least
+        # meaningful. It counts the same non-superseded completions as the
+        # denominator: counting all completions would let 1 cancelled + 1
+        # success beside a 20-run force-push burst clear the floor and read
+        # as 50%.
+        #
+        # clamp_min is defence in depth and is NOT load-bearing, so do not
+        # read it as the idle guard: the numerator is a label subset of the
+        # denominator, so x/0 with x>0 is unreachable, and at 0/0 the
+        # comparison yields NaN and filters out. The expression returns
+        # empty with and without it (both forms checked under promtool).
+        # `>= 8` is the operative guard.
+        #
+        # `for: 2m` is close to no debouncing for a single burst against
+        # otherwise steady traffic, noted because it is the obvious knob to
+        # reach for if the margin above proves too thin. An increase() over
+        # [15m] holds the burst for the full width of the window: a single
+        # 1m burst of 25 cancellations on steady 4/min traffic pins the
+        # ratio flat at 0.294 for ~14m, then drops to 0 only when the burst
+        # leaves the window. With a steady denominator, any `for:` shorter
+        # than the window behaves the same.
+        #
+        # That does NOT hold when the denominator moves. The ratio also
+        # un-crosses when completions grow while the burst is still inside
+        # the window, so `for:` does change outcomes there (promtool, this
+        # expr, 25 cancellations at t=21m on 1 success/min): a 60-run
+        # backlog draining at t=26m (0.625 -> 0.240) fires under `for: 2m`
+        # and stays silent under `for: 6m`; a 300-run drain at t=22m clears
+        # the crossing after one evaluation, so even `for: 2m` stays silent.
+        # "Mass cancel, then the pool recovers and the backlog completes" is
+        # plausibly benign, and raising `for:` does suppress that shape, at
+        # the cost of equally suppressing a real kill whose backlog drains
+        # fast. Against a transient spike on steady traffic the defence is
+        # the threshold margin -- the 0.35-vs-0.317 gap disclosed above.
         - alert: PaperclipGithubWorkflowRunMassCancellation
           expr: |
-            sum(increase(paperclip_github_workflow_run_conclusion_total{conclusion="cancelled",supersession="none"}[15m])) >= 3
+            (
+              sum(increase(paperclip_github_workflow_run_conclusion_total{conclusion="cancelled",supersession="none"}[15m]))
+              /
+              clamp_min(sum(increase(paperclip_github_workflow_run_conclusion_total{supersession="none"}[15m])), 1)
+            ) >= 0.35
+            and
+            sum(increase(paperclip_github_workflow_run_conclusion_total{supersession="none"}[15m])) >= 8
           for: 2m
           labels:
             severity: warning
           annotations:
-            summary: "GitHub Actions is mass-cancelling workflow runs (3+ non-superseded cancellations in 15m)"
-            description: "At least 3 workflow_run webhook deliveries concluded `cancelled` without being superseded by a newer run on the same branch in the last 15m (BLO-21078) — i.e. not explained by concurrency cancel-in-progress. See the onprem-k8s authoritative copy of this rule for the full runbook."
+            summary: "GitHub Actions is mass-cancelling workflow runs (35%+ of non-superseded completions cancelled in 15m)"
+            description: "Over the last 15m, at least 35% of completed workflow_run deliveries, excluding cancellations superseded by a newer run on the same branch, concluded `cancelled` (BLO-21078), i.e. not explained by concurrency cancel-in-progress, across at least 8 such completions. Normal operation runs at ~1.5% (p99 17.7%, highest non-incident 15m window 31.7%), so this is a runner-side or GitHub-side kill affecting runs indiscriminately, not one branch's CI failing. Check ARC runner pool health in `arc-runners` first: a scale-set spec change under `--update-strategy=immediate` deletes in-flight ephemeral runners, which GitHub records as `cancelled`. See the runbook_url issue (BLO-21078) for the full incident writeup."
             runbook_url: "/BLO/issues/BLO-21078"
     - name: paperclip-wake-terminal-failed
       rules:
