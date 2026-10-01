@@ -48,7 +48,15 @@ import * as nodeFs from "node:fs";
 /** POSIX `STDERR_FILENO`; used when `process.stderr.fd` is unavailable. */
 const STDERR_FD = 2;
 
-const MAX_WRITE_WAIT_MS = 100;
+/**
+ * How long one fatal-path breadcrumb write waits for its stream callback before
+ * the exit proceeds anyway.
+ *
+ * Exported because it is the *only* constant that governs how fast the crash
+ * guard exits behind a stalled stderr, and `process-crash-guard-exit.test.ts`
+ * derives its deadline from it rather than restating a literal (BLO-37311).
+ */
+export const MAX_WRITE_WAIT_MS = 100;
 
 /**
  * Writes the whole buffer to `fd` with a real `write(2)`.

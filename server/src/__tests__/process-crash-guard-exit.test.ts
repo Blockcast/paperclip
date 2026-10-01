@@ -25,6 +25,8 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { MAX_WRITE_WAIT_MS } from "../shutdown-log.js";
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = path.join(here, "fixtures", "crash-guard-exit-fixture.ts");
 const tsx = path.resolve(here, "..", "..", "node_modules", ".bin", "tsx");
@@ -56,19 +58,42 @@ const FIXTURE_STARTUP_TIMEOUT_MS = 10_000;
 const FIXTURE_RUN_WATCHDOG_MS = FIXTURE_STARTUP_TIMEOUT_MS + 5_000;
 /**
  * The behaviour under test: with stderr stalled, the guard must still exit this fast.
- * This is the contract — tighten or loosen it only when the guard's own deadline moves.
  *
- * Deliberately left at 1_500 by BLO-25854, which fixed the *other* failure signature on
- * this test and stopped short of this one. This bound spends only 30% of the guard's
- * DEFAULT_CRASH_GUARD_TIMEOUT_MS, and has been seen failing at 1547ms on a loaded
- * runner — a 3% overshoot against 70% unused budget. Deriving it from that constant is
- * the obvious repair, but a mutation test (deleting the `timer.unref()` early exit the
- * assertion exists to protect) failed through the startup watchdog rather than through
- * this assertion, so the re-derivation could not be shown to preserve what it catches.
- * Tracked as BLO-22985 (hardcoded wall-clock budgets under CI load) rather than changed
- * here on an unvalidated rationale.
+ * Derived, not literal, and derived from `MAX_WRITE_WAIT_MS` rather than from the
+ * guard's `DEFAULT_CRASH_GUARD_TIMEOUT_MS` — that one budgets `onCrash` bookkeeping,
+ * and this fixture installs the guard with no `onCrash` at all, so the 5_000ms timeout
+ * is never armed here. Describing this bound as "30% of DEFAULT_CRASH_GUARD_TIMEOUT_MS"
+ * (as it was until BLO-37311) measured it against a constant that does not govern it.
+ *
+ * What does govern it: the fatal path awaits two sequential bounded breadcrumb writes,
+ * each capped at MAX_WRITE_WAIT_MS, then exits. Measured on a warm runner, clean tree:
+ * 235ms, i.e. the 200ms budget plus ~35ms of process teardown. Raising MAX_WRITE_WAIT_MS
+ * to 1_000 moves it to 2036ms — linear in the budget, as the model predicts.
+ *
+ * The multiplier is pinned at both ends and the window is narrow, so do not widen this
+ * without re-measuring both:
+ *   - floor — a loaded runner has been seen at 1547ms (BLO-22985), so anything at or
+ *     below the old 1_500 literal flakes; that overshoot is teardown stretching, not
+ *     the timer budget, which fires on schedule.
+ *   - ceiling — a 10x regression of the write budget lands at 2036ms, and this
+ *     assertion is what catches it (verified by mutation, see below). Past ~2_000 the
+ *     regression stops being caught here and degrades into a watchdog SIGKILL, which
+ *     reports "did not exit" rather than a measured elapsed.
+ * 9x sits between them with ~13% margin on each side.
+ *
+ * Mutation-tested for independent value (BLO-37311), because the previous comment
+ * claimed this assertion protects the `timer.unref()` early exit in the guard and that
+ * is false: deleting `timer.unref?.()` leaves all 7 tests green, since the `if (!onCrash)
+ * { finish(); return; }` branch returns before that timer is ever created. The mutation
+ * that does target this bound is raising the two `writeShutdownBreadcrumbsBounded` call
+ * sites to 1_000ms, which fails *here* — "expected 2036 to be less than 1800" — and not
+ * through either watchdog. So the bound is not redundant with the startup watchdog.
+ *
+ * Run mutations against the whole file, never `-t` filtered: alone, the stalled case
+ * pays a cold `tsx` compile and dies at the startup watchdog having never reached
+ * backpressure, which looks like a mutation kill and is not one.
  */
-const STALLED_EXIT_DEADLINE_MS = 1_500;
+const STALLED_EXIT_DEADLINE_MS = MAX_WRITE_WAIT_MS * 2 * 9;
 /**
  * Harness backstop, never the thing under test. It must stay well clear of
  * STALLED_EXIT_DEADLINE_MS: a slow-but-working exit has to fail the assertion with a
