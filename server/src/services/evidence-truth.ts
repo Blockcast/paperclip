@@ -488,8 +488,12 @@ async function probeOne(
     // returns author-blind exactly like `blocking_finding` while still being
     // `commentBlocking`. So do not delete this clause as redundant with
     // Surface 1, and do not re-justify it from the authorUnknown-carrying
-    // route. `evidence-truth.test.ts` pins both reachable routes and keeps the
-    // memoized one as the negative control.
+    // route. `evidence-truth.test.ts` pins both reachable routes, and its "the
+    // PR author is read at most once even when both surfaces ask" case is the
+    // negative control — `commentBlocking` is false there, so this clause must
+    // NOT suppress and the read still happens. The memoized carried sub-shape
+    // two paragraphs up has no test and should not get one: by the argument
+    // above it would measure nothing.
     if (formalAttestingReview !== undefined && !commentBlocking) {
       const prAuthorLogin = await readPrAuthor();
       // An unread author leaves this false: it cannot establish independence,
