@@ -2134,6 +2134,56 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(merged.githubPrReviewAuthorLogin).toBe("ally");
   });
 
+  // BLO-30420. The declined-classification reason is written only when a
+  // review is NOT actionable, under a conditional spread, so an actionable
+  // review re-supplies neither key. If the two keys are not on the scrub
+  // lists, a second review-instance wake coalescing onto the same run keeps
+  // the earlier decline's reason next to `githubReviewFeedbackActionable:
+  // true` -- the pair github-webhook.test.ts forbids for a single delivery --
+  // and via the different-PR scrub the same reason crosses onto another PR.
+  it("does not carry a stale suppression reason onto a later actionable review (BLO-30420)", () => {
+    const declined = {
+      issueId: "issue-1681",
+      wakeReason: "github_pr_review_submitted",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 1681,
+      githubHeadSha: "6f89faa8",
+      githubPrReviewBody: "Findings header with no enumerable items.",
+      githubPrReviewAuthorLogin: "allyblockcast[bot]",
+      githubReviewFeedbackSuppressionReason: "ally_review_findings_unenumerable",
+      githubReviewFeedbackSuppressionPredicate: "findings_header_without_items",
+      prRole: "author",
+    };
+
+    // Same PR, next review instance, actionable this time.
+    const samePr = mergeCoalescedContextSnapshot(declined, {
+      issueId: "issue-1681",
+      wakeReason: "github_pr_review_feedback",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 1681,
+      githubHeadSha: "6f89faa8",
+      githubPrReviewBody: "1 Important finding.",
+      githubPrReviewAuthorLogin: "allyblockcast[bot]",
+      githubReviewFeedbackActionable: true,
+      prRole: "author",
+    });
+    expect(samePr.githubReviewFeedbackActionable).toBe(true);
+    expect(samePr).not.toHaveProperty("githubReviewFeedbackSuppressionReason");
+    expect(samePr).not.toHaveProperty("githubReviewFeedbackSuppressionPredicate");
+
+    // Different PR routed to the same issue: the reason must not cross PRs.
+    const otherPr = mergeCoalescedContextSnapshot(declined, {
+      issueId: "issue-1681",
+      wakeReason: "github_pr_ready_for_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 1699,
+      githubHeadSha: "c9890150",
+      prRole: "author",
+    });
+    expect(otherPr).not.toHaveProperty("githubReviewFeedbackSuppressionReason");
+    expect(otherPr).not.toHaveProperty("githubReviewFeedbackSuppressionPredicate");
+  });
+
   // BLO-22229. Reproduces the incident verbatim: a formal `kkroo` APPROVED
   // review is still the active run's context when Ally posts a *comment*-
   // shaped consolidated review carrying Critical findings on the SAME PR.
