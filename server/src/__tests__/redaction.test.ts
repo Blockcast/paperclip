@@ -10,6 +10,7 @@ import {
   sanitizeRecord,
   withholdAgentConfigFromApprovalPayload,
   withholdAgentConfigKeys,
+  withholdRunTranscriptStateContent,
 } from "../redaction.js";
 
 describe("redaction", () => {
@@ -1038,5 +1039,49 @@ describe("maskWorkspaceRuntimeForRead (PEN-2846)", () => {
     // caller already branches on, including the UI's `Boolean(...)` presence check.
     expect(maskWorkspaceRuntimeForRead(null)).toBeNull();
     expect(maskWorkspaceRuntimeForRead(undefined)).toBeUndefined();
+  });
+});
+
+/**
+ * PEN-3142 — the `resultJson` projection on the run-state route. The gate
+ * decides WHETHER a reader sees transcript content; this decides what is left
+ * of the blob when they do not.
+ */
+describe("withholdRunTranscriptStateContent resultJson arrays (PEN-3142)", () => {
+  const SECRET = "SUPER-SECRET-TRANSCRIPT-CANARY-a1b2c3";
+
+  it("nulls a withheld array element IN PLACE rather than compacting the array", () => {
+    const projected = withholdRunTranscriptStateContent({
+      resultJson: { errors: [SECRET, 42, true] },
+    }) as any;
+
+    // Splicing the prose out would shift every later element down, so a
+    // consumer reading `errors[1]` positionally would silently get `errors[2]`
+    // — a wrong answer where a null is a visibly missing one.
+    expect(projected.resultJson.errors).toEqual([null, 42, true]);
+    expect(JSON.stringify(projected)).not.toContain(SECRET);
+    // Distinguishable from an element that was genuinely null.
+    expect(projected.withheldFields).toContain("resultJson.errors[0]");
+  });
+
+  it("withholds the field entirely when every element was transcript", () => {
+    const projected = withholdRunTranscriptStateContent({
+      resultJson: { errors: [SECRET, `${SECRET}-2`] },
+    }) as any;
+
+    // An array of nulls would disclose how many prose elements there were.
+    expect(projected.resultJson).not.toHaveProperty("errors");
+    expect(JSON.stringify(projected)).not.toContain(SECRET);
+  });
+
+  it("keeps an array whose elements are all machine values untouched", () => {
+    const projected = withholdRunTranscriptStateContent({
+      resultJson: { permission_denials: [{ num_turns: 2, summary: SECRET }], counts: [1, 2, 3] },
+    }) as any;
+
+    expect(projected.resultJson.counts).toEqual([1, 2, 3]);
+    // Elements inherit the array's key, so an object element still recurses.
+    expect(projected.resultJson.permission_denials).toEqual([{ num_turns: 2 }]);
+    expect(JSON.stringify(projected)).not.toContain(SECRET);
   });
 });

@@ -208,6 +208,51 @@ type RunTranscriptReadDecider = {
 };
 
 /**
+ * The human membership roles that read a transcript without holding a grant —
+ * the "human operators" of the PEN-3140 decision.
+ *
+ * `viewer` and `member` are deliberately absent. The codebase already draws
+ * this line one notch LOWER, for material that is less sensitive than a
+ * transcript: `workspace_runtime:read` is behind `requiresNonViewer` in
+ * `services/authorization.ts` and answers a viewer with `deny_missing_grant`.
+ * A run log that has carried vendor credential material across three incidents
+ * (PEN-2328 → PEN-2370 → PEN-3139) cannot be looser than operator-authored
+ * runtime config, so the gate matches that precedent rather than admitting
+ * every board membership role.
+ *
+ * Exclusion is not a lockout: a viewer falls through to the decider below, so
+ * an explicit `runs:read_transcript` grant still admits one. That is the same
+ * escape hatch the agent side gets, which is why the seed migration can name
+ * the agent roles and stay silent about humans — this set is the only place
+ * the human operator set is written down (Ally review 5375217878).
+ */
+const TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES: ReadonlySet<string> = new Set([
+  "owner",
+  "admin",
+  "operator",
+]);
+
+/**
+ * Whether a board actor holds an operator-grade membership in this company.
+ *
+ * `local_implicit` is allowed for the same reason `hasCompanyAccess` allows it:
+ * it is the trusted local board / internal bootstrap, which carries no
+ * membership row to inspect. Keeping the two in step matters — a divergence
+ * here would make the local board's transcript reads depend on which of the two
+ * functions a route happened to call.
+ */
+function boardActorIsTranscriptOperator(req: Request, companyId: string): boolean {
+  if (req.actor.source === "local_implicit") return true;
+  return (req.actor.memberships ?? []).some(
+    (membership) =>
+      membership.companyId === companyId &&
+      (membership.status === undefined || membership.status === "active") &&
+      typeof membership.membershipRole === "string" &&
+      TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES.has(membership.membershipRole),
+  );
+}
+
+/**
  * `decision` is present whenever the authorization service actually ran, so a
  * route can render the named boundary vocabulary. It is absent for the two
  * cases decided without it: a human operator (allowed), and the fail-closed
@@ -228,9 +273,18 @@ export type RunTranscriptReadOutcome = {
  * through here. This gate covers transcript *content* only: the
  * `GET /heartbeat-runs/:runId/log` body, the `message` / `payload` of
  * `GET /heartbeat-runs/:runId/events`, and — per the PEN-3202 ruling
- * implemented by PEN-3204 — the captured OUTPUT of a workspace operation
- * (`stdoutExcerpt` / `stderrExcerpt` and the
- * `GET /workspace-operations/:operationId/log` body).
+ * implemented by PEN-3204 — the `stdoutExcerpt` / `stderrExcerpt` captured
+ * output projected onto workspace-operation rows.
+ *
+ * NOT `GET /workspace-operations/:operationId/log`. That route is deliberately
+ * left on BLO-34631's `workspace_runtime:read` entitlement and is not
+ * additionally gated here; the reasoning, and why stacking the two would change
+ * no bytes, is on the route itself (`routes/agents.ts`, the
+ * `workspace-operations/:operationId/log` handler). Said explicitly because
+ * this docblock is where a maintainer asks "is the operation log gated?", and
+ * it previously answered yes about a gate that is not this one (Ally review
+ * 5375217878). Note the two entitlements do agree on viewers: neither admits
+ * one without a grant.
  *
  * A workspace operation is a MIX rather than a counterexample: the operation
  * ROW stays company-readable — `phase`, `status`, `exitCode`, `command`, `cwd`,
@@ -242,13 +296,15 @@ export type RunTranscriptReadOutcome = {
  * function on a null agent id, because the grant fallback below would otherwise
  * admit a grant holder for an operation with no owner to decide about.
  *
- * Same shape as `actorCanReadAgentConfig` above, and for the same reason:
- * human board members of the company keep the read, agent actors get own-run
- * plus manager chain from the decider and otherwise need an explicit
- * `runs:read_transcript` grant, so peers cannot read each other's transcripts.
- * The run log has carried vendor credential material across several incidents
- * (PEN-2328 → PEN-2370 → PEN-3139) and the scrub protecting it is write-time
- * only, which is why standing company-wide peer read was withdrawn.
+ * Same shape as `actorCanReadAgentConfig` above, with one deliberate
+ * difference: the human short-circuit is scoped to operator-grade memberships
+ * (see `TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES`) rather than to every board
+ * actor. Agent actors get own-run plus manager chain from the decider; everyone
+ * else — peer agents and viewer/member humans alike — needs an explicit
+ * `runs:read_transcript` grant. The run log has carried vendor credential
+ * material across several incidents (PEN-2328 → PEN-2370 → PEN-3139) and the
+ * scrub protecting it is write-time only, which is why standing company-wide
+ * peer read was withdrawn.
  *
  * It lives here, taking the run's owning agent rather than a whole run row, so
  * BOTH transcript routes call one definition. `/log` and `/events` carry the
@@ -263,7 +319,12 @@ export async function decideRunTranscriptRead(
   run: { companyId: string; agentId: string | null },
 ): Promise<RunTranscriptReadOutcome> {
   if (!hasCompanyAccess(req, run.companyId)) return { allowed: false, decision: null };
-  if (req.actor.type === "board") return { allowed: true, decision: null };
+  // Operator-grade humans only. A viewer or member falls THROUGH to the decider
+  // rather than being denied here, so an explicitly granted one is still
+  // admitted and the denial still carries the named boundary vocabulary.
+  if (req.actor.type === "board" && boardActorIsTranscriptOperator(req, run.companyId)) {
+    return { allowed: true, decision: null };
+  }
   const decision = await access.decide({
     actor: req.actor,
     action: "runs:read_transcript",

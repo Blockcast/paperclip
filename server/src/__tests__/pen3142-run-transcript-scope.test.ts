@@ -568,6 +568,114 @@ describe("run transcript scoping (PEN-3142)", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(mockDecide).not.toHaveBeenCalled();
     });
+
+    /**
+     * Ally review 5375217878 (Important #1): the short-circuit used to admit
+     * EVERY board membership role, while the seed migration named only a subset
+     * — two sides of one gate disagreeing about who an operator is. The intent
+     * these tests pin is the `requiresNonViewer` precedent the codebase already
+     * applies to `workspace_runtime:read`, which guards *less* sensitive
+     * material than a transcript: owner / admin / operator read, viewer and
+     * member do not, and a grant is how you widen it.
+     */
+    describe("human membership roles", () => {
+      const humanActor = (membershipRole: string) => ({
+        type: "board",
+        userId: "user-1",
+        companyIds: ["company-1"],
+        source: "session",
+        isInstanceAdmin: false,
+        memberships: [{ companyId: "company-1", membershipRole, status: "active" }],
+      });
+
+      for (const membershipRole of ["owner", "admin", "operator"]) {
+        it(`keeps the read for a ${membershipRole} without consulting the grant`, async () => {
+          const res = await requestApp(
+            await createApp(humanActor(membershipRole)),
+            (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log"),
+          );
+
+          expect(res.status, JSON.stringify(res.body)).toBe(200);
+          expect(mockDecide).not.toHaveBeenCalled();
+        });
+      }
+
+      for (const membershipRole of ["viewer", "member"]) {
+        it(`denies a ${membershipRole} who holds no grant, and says why`, async () => {
+          const res = await requestApp(
+            await createApp(humanActor(membershipRole)),
+            (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log"),
+          );
+
+          expect(res.status, JSON.stringify(res.body)).toBe(403);
+          // Falls THROUGH to the decider rather than being refused inline, so
+          // the denial carries the named boundary vocabulary and a grant can
+          // still admit — see the next case.
+          expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+            action: "runs:read_transcript",
+            resource: expect.objectContaining({ type: "agent", agentId: runOwnerAgentId }),
+          }));
+          expect(auditCallsFor("heartbeat.run_log_accessed")[0]?.[1]?.details).toMatchObject({
+            result: "denied",
+          });
+        });
+      }
+
+      it("admits a viewer who was granted runs:read_transcript explicitly", async () => {
+        mockDecide.mockImplementation(async (input: { action?: string }) => ({
+          allowed: true,
+          action: input.action,
+          reason: "allow_grant",
+          explanation: "Allowed by principal grant runs:read_transcript.",
+        }));
+
+        const res = await requestApp(
+          await createApp(humanActor("viewer")),
+          (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log"),
+        );
+
+        // The exclusion is a default, not a lockout: this is the escape hatch
+        // constraint 5 of the PEN-3140 decision asks for, on the human side.
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+      });
+
+      it("ignores an operator membership in a DIFFERENT company", async () => {
+        const res = await requestApp(
+          await createApp({
+            type: "board",
+            userId: "user-1",
+            companyIds: ["company-1", "company-2"],
+            source: "session",
+            isInstanceAdmin: false,
+            memberships: [
+              { companyId: "company-2", membershipRole: "owner", status: "active" },
+              { companyId: "company-1", membershipRole: "viewer", status: "active" },
+            ],
+          }),
+          (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log"),
+        );
+
+        // Matching on role without matching on company would let an owner
+        // anywhere read transcripts everywhere they hold any membership.
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+      });
+
+      it("ignores a non-active operator membership", async () => {
+        const res = await requestApp(
+          await createApp({
+            type: "board",
+            userId: "user-1",
+            companyIds: ["company-1"],
+            source: "session",
+            isInstanceAdmin: false,
+            memberships: [{ companyId: "company-1", membershipRole: "owner", status: "suspended" }],
+          }),
+          (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log"),
+        );
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+      });
+    });
   });
 
   describe("GET /heartbeat-runs/:runId/events", () => {

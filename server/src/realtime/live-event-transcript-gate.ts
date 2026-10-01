@@ -7,6 +7,7 @@ import {
 } from "../redaction.js";
 import { decideRunTranscriptRead } from "../routes/authz.js";
 import { accessService } from "../services/access.js";
+import { logger } from "../middleware/logger.js";
 
 /**
  * The identity a live-events subscriber connected with, as resolved by
@@ -17,9 +18,35 @@ export interface LiveEventSubscriberContext {
   companyId: string;
   actorType: "board" | "agent";
   actorId: string;
+  /**
+   * The subscriber's membership role in the subscribed company, for a board
+   * actor resolved at upgrade. Carried because `decideRunTranscriptRead` scopes
+   * its human short-circuit to operator-grade roles — without it every board
+   * socket would be decided as a role-less member and lose transcript content
+   * that the REST twin still returns.
+   */
+  membershipRole?: string | null;
+  /**
+   * True for the `local_trusted` board, which has no membership row to carry.
+   * Maps onto the `local_implicit` actor source the REST paths use for exactly
+   * the same caller.
+   */
+  trustedLocal?: boolean;
 }
 
 type RunTranscriptDecider = Parameters<typeof decideRunTranscriptRead>[1];
+
+/**
+ * How long one allow/deny decision may be reused on a socket.
+ *
+ * The REST twin's cache is per request, so it cannot go stale. A socket's
+ * cannot have that property — it is long-lived by design — so the staleness is
+ * bounded in time instead. 30s is short enough that a revoked grant, a removed
+ * manager edge, or an agent moved out of a low-trust boundary stops the stream
+ * promptly, and long enough that a busy company costs ~2 decisions per minute
+ * per owning agent rather than one per event (Ally review 5375217878).
+ */
+const DECISION_TTL_MS = 30_000;
 
 /**
  * `decideRunTranscriptRead` reads exactly two things off the request — the
@@ -51,7 +78,21 @@ function syntheticRequest(context: LiveEventSubscriberContext): Request {
           type: "board" as const,
           userId: context.actorId,
           companyIds: [context.companyId],
-          source: "session" as const,
+          // The role the upgrade read off `company_memberships`, in the shape
+          // the REST actor carries it, so the operator short-circuit asks one
+          // question on both paths. Omitted entirely for the trusted local
+          // board, which has no membership row — `local_implicit` is what the
+          // REST middleware calls that same caller.
+          memberships: context.trustedLocal
+            ? undefined
+            : [
+                {
+                  companyId: context.companyId,
+                  membershipRole: context.membershipRole ?? null,
+                  status: "active",
+                },
+              ],
+          source: context.trustedLocal ? ("local_implicit" as const) : ("session" as const),
         };
   return { actor } as unknown as Request;
 }
@@ -64,31 +105,39 @@ function syntheticRequest(context: LiveEventSubscriberContext): Request {
  * event is always delivered, and only transcript-bearing keys are withheld, so
  * a peer can still watch that a run is producing output without reading it.
  *
- * MEMOIZED OVER THE SOCKET'S LIFETIME, keyed on the run's OWNING AGENT, which
- * is the resource the decision is actually scoped to. A socket streaming a busy
+ * MEMOIZED PER OWNING AGENT, which is the resource the decision is actually
+ * scoped to, and expired after `DECISION_TTL_MS`. A socket streaming a busy
  * company sees thousands of events from a handful of agents; without the memo
  * this would be one authorization round-trip per event.
  *
- * The staleness that buys is bounded and deliberate: a grant or reporting-line
- * change mid-connection is not picked up until the socket reconnects. That is
- * the same trade the REST list route makes per request, one connection long
- * instead of one request long, and it only ever fails CLOSED for a peer who was
- * denied at connect time — a revoked grant keeps streaming until reconnect,
- * which is why this is scoped to a live socket rather than cached globally.
+ * The TTL is the difference between this and the REST list gate, which is safe
+ * because its cache cannot outlive one request (`routes/authz.ts`). A socket's
+ * lifetime is unbounded — `live-events-ws.ts` keeps it alive with ping/pong —
+ * so an un-expiring allow would keep streaming `chunk` / `message` / `payload`
+ * / `lastAssistantSnippet` after a revoked grant, a reporting-line change, or a
+ * move out of a low-trust boundary, for as long as the client stayed connected.
+ * That is the fail-OPEN direction, so the reuse window is bounded in time
+ * rather than by the connection (Ally review 5375217878).
+ *
+ * The entry is stamped when the decision STARTS, not when it resolves, so a
+ * slow authorizer shortens the window rather than extending it.
  */
 export function createLiveEventTranscriptGate(
   db: Db,
   context: LiveEventSubscriberContext,
-  deps?: { access?: RunTranscriptDecider },
+  deps?: { access?: RunTranscriptDecider; now?: () => number; ttlMs?: number },
 ): (event: LiveEvent) => Promise<LiveEvent> {
   const access = deps?.access ?? (accessService(db) as RunTranscriptDecider);
+  const now = deps?.now ?? (() => Date.now());
+  const ttlMs = deps?.ttlMs ?? DECISION_TTL_MS;
   const req = syntheticRequest(context);
-  const cache = new Map<string, Promise<boolean>>();
+  const cache = new Map<string, { decidedAt: number; allowed: Promise<boolean> }>();
 
   const canRead = (agentId: string | null): Promise<boolean> => {
     const key = agentId ?? "";
+    const startedAt = now();
     const cached = cache.get(key);
-    if (cached) return cached;
+    if (cached && startedAt - cached.decidedAt < ttlMs) return cached.allowed;
     const pending = decideRunTranscriptRead(req, access, {
       companyId: context.companyId,
       agentId,
@@ -96,8 +145,21 @@ export function createLiveEventTranscriptGate(
       .then((outcome) => outcome.allowed)
       // Fail closed. An authorization error must not become a transcript read;
       // the subscriber still receives the event, just without the content.
-      .catch(() => false);
-    cache.set(key, pending);
+      //
+      // Logged for the reason the REST twin gives at `routes/authz.ts`: a
+      // broken authorizer that failed silently would be indistinguishable from
+      // an ordinary unentitled read, on the one path that exists to make
+      // transcript access decidable. Fail closed AND say so — and say so here
+      // too, so the posture really is local to both gates rather than inferable
+      // only from the REST one.
+      .catch((error) => {
+        logger.error(
+          { err: error, companyId: context.companyId, agentId },
+          "live-event transcript read decision failed; withholding",
+        );
+        return false;
+      });
+    cache.set(key, { decidedAt: startedAt, allowed: pending });
     return pending;
   };
 
