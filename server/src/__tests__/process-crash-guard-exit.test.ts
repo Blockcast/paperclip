@@ -78,7 +78,7 @@ const FIXTURE_RUN_WATCHDOG_MS = FIXTURE_STARTUP_TIMEOUT_MS + 5_000;
  * Because this bound and STALLED_EXIT_WATCHDOG_MS both scale with MAX_WRITE_WAIT_MS,
  * raising that constant moves the bound clear of the very regression it exists to
  * catch: measured at a 10x budget the guard takes 2054ms while this bound becomes
- * 18_000ms, so before the pin below existed that edit left every test in this file
+ * 18_000ms, so without the pin below that edit leaves every test in this file
  * green — a coverage loss against the `1_500` literal this replaced, which failed it
  * outright ("expected 2054 to be less than 1500"). The pin asserted in "the stalled-exit
  * deadline is calibrated for the current write budget" below is what restores it, so the
@@ -376,14 +376,17 @@ describe("process crash guard — real process exit", () => {
    * Both that deadline and STALLED_EXIT_WATCHDOG_MS are multiples of MAX_WRITE_WAIT_MS,
    * so without this assertion a change to the write budget widens every bound in the
    * file and the slowdown it causes goes unnoticed — measured at 1_000 the stalled exit
-   * takes 2054ms and, before this assertion existed, every test in the file still passed.
-   * Failing here instead names the constant that moved.
+   * takes 2054ms while every other test in the file still passes. Failing here instead
+   * names the constant that moved.
    *
    * If you are changing the budget deliberately this is the expected failure: re-measure
    * the stalled exit, then move this pin and the 9x multiplier together.
    */
   it("the stalled-exit deadline is calibrated for the current write budget", () => {
-    expect(MAX_WRITE_WAIT_MS).toBe(100);
+    expect(
+      MAX_WRITE_WAIT_MS,
+      "write budget changed: re-measure the stalled exit, then move this pin and the 9x multiplier in STALLED_EXIT_DEADLINE_MS together",
+    ).toBe(100);
   });
 
   it("still exits when stderr is not drained", async () => {
