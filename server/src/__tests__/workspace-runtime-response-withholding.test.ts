@@ -208,6 +208,11 @@ const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockWorkspaceOperationService = vi.hoisted(() => ({
   listForExecutionWorkspace: vi.fn(),
   createRecorder: vi.fn(),
+  // PEN-3204 added the run-transcript gate to this route, and the gate resolves each
+  // operation's owning agent through this method. It is stubbed here rather than left
+  // off because a barrel mock that omits a method the handler calls fails as a 500,
+  // which reads as a route defect instead of an incomplete double.
+  owningAgentIdsByRunId: vi.fn(),
 }));
 const mockHeartbeatService = vi.hoisted(() => ({ wakeup: vi.fn() }));
 
@@ -412,6 +417,10 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       project: { id: "project-1", companyId: "company-1" },
     });
     mockProjectService.listWorkspaces.mockResolvedValue([projectWorkspaceFixture()]);
+    // Matches what the real service returns for this file's fixture: its `heartbeatRunId`
+    // is null, and `owningAgentIdsByRunId` resolves only ids it finds, so an unowned
+    // operation is absent from the map rather than mapped to null.
+    mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(new Map<string, string>());
   });
 
   describe("projection helpers", () => {
@@ -865,14 +874,24 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
      * The contrast in the last two assertions is the whole point: this reader is unentitled, and
      * the SAME row still withholds `command`/`cwd`. So this case cannot pass by the projection
      * being skipped, only by the excerpts being deliberately exempt from it.
+     *
+     * PEN-3142/PEN-3204 (merge of 2026-09-20): the fixture is given an OWNER so that this case
+     * keeps testing the axis it was written for. A second and orthogonal gate now also reads this
+     * route — the run-transcript gate — and it fails closed on an operation with no resolvable
+     * owning agent. Left bare, this row would arrive withheld by that gate and the assertions
+     * below would pass or fail for a reason that has nothing to do with `workspace_runtime:read`.
+     * The reader stays unentitled on THIS axis (`decideAsUnprivilegedReader` denies only
+     * `workspace_runtime:read`, and allows the transcript read), so the contrast above is intact.
      */
     it("discloses the operation excerpts to a reader without workspace_runtime:read", async () => {
       mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
         workspaceOperationFixture({
+          heartbeatRunId: "run-2",
           stdoutExcerpt: OPERATION_STDOUT_SENTINEL,
           stderrExcerpt: OPERATION_STDERR_SENTINEL,
         }),
       ]);
+      mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(new Map([["run-2", "agent-2"]]));
 
       const res = await request(createApp("execution-workspaces")).get(
         "/api/execution-workspaces/workspace-1/workspace-operations",
@@ -887,10 +906,19 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
 
     /**
      * PEN-3205, read side. `publicWorkspaceOperation` masks `command`/`cwd`/`metadata` and spreads
-     * the rest, so `stdoutExcerpt` crosses this route UNMASKED by design (BLO-34631 surveyed that
-     * and kept it) — the username censor is the only control standing over it here, and
-     * `routes/agents.ts` was already applying it on the sibling list route while this one answered
-     * with a bare `res.json`.
+     * the rest, so `stdoutExcerpt` crosses that projection UNMASKED by design (BLO-34631 surveyed
+     * that and kept it), and `routes/agents.ts` was already applying the username censor on the
+     * sibling list route while this one answered with a bare `res.json`.
+     *
+     * PEN-3142/PEN-3204 added a SECOND control over the same field on this route — the
+     * run-transcript gate — so the censor is no longer the only thing standing over the excerpt
+     * here. That matters for the shape of this pair: the gate fails closed on an operation with no
+     * resolvable owning agent, which is what the bare fixture is, so an unowned operation now
+     * arrives with `stdoutExcerpt: null` and could not discriminate the censor setting at all.
+     * These two cases therefore pin an OWNED operation whose owner is the calling agent itself
+     * (own-run, allowed under the transcript decision) — that is the only configuration in which
+     * the censor is the live discriminator, which is what this pair is for. The withholding side
+     * is covered separately, above and in `pen3142-run-transcript-scope`.
      *
      * The home directory comes from `os.homedir()` rather than a literal because that is the same
      * value `defaultHomeDirs` derives its (module-cached) candidate list from, so this is
@@ -902,8 +930,9 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       mockInstanceGeneralSettings.censorUsernameInLogs = true;
       const homeDir = os.homedir();
       mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
-        workspaceOperationFixture({ stdoutExcerpt: `cloned into ${homeDir}/checkout` }),
+        workspaceOperationFixture({ heartbeatRunId: "run-1", stdoutExcerpt: `cloned into ${homeDir}/checkout` }),
       ]);
+      mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(new Map([["run-1", "agent-1"]]));
 
       const res = await request(createApp("execution-workspaces")).get(
         "/api/execution-workspaces/workspace-1/workspace-operations",
@@ -920,8 +949,9 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
       mockInstanceGeneralSettings.censorUsernameInLogs = false;
       const homeDir = os.homedir();
       mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
-        workspaceOperationFixture({ stdoutExcerpt: `cloned into ${homeDir}/checkout` }),
+        workspaceOperationFixture({ heartbeatRunId: "run-1", stdoutExcerpt: `cloned into ${homeDir}/checkout` }),
       ]);
+      mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(new Map([["run-1", "agent-1"]]));
 
       const res = await request(createApp("execution-workspaces")).get(
         "/api/execution-workspaces/workspace-1/workspace-operations",
@@ -929,6 +959,38 @@ describe("workspace runtime withholding boundary (PEN-2852)", () => {
 
       expect(res.status).toBe(200);
       expect(res.body[0].stdoutExcerpt).toBe(`cloned into ${homeDir}/checkout`);
+    });
+
+    /**
+     * The composition guard for the two controls above. An operation owned by a DIFFERENT agent
+     * has its captured output withheld on this route even with the censor off — so the pair above
+     * cannot be read as "the excerpt always crosses", and dropping the transcript gate from this
+     * route while keeping the censor fails here rather than passing quietly.
+     */
+    it("withholds the excerpt of another agent's operation regardless of the censor setting", async () => {
+      mockInstanceGeneralSettings.censorUsernameInLogs = false;
+      mockWorkspaceOperationService.listForExecutionWorkspace.mockResolvedValue([
+        workspaceOperationFixture({ heartbeatRunId: "run-2", stdoutExcerpt: "peer transcript bytes" }),
+      ]);
+      mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(new Map([["run-2", "agent-2"]]));
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "workspace_runtime:read" && input.action !== "runs:read_transcript",
+        action: input.action,
+        reason: "test",
+        explanation: "Allowed by test mock.",
+      }));
+
+      const res = await request(createApp("execution-workspaces")).get(
+        "/api/execution-workspaces/workspace-1/workspace-operations",
+      );
+
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain("peer transcript bytes");
+      expect(res.body[0].stdoutExcerpt).toBeNull();
+      // Withheld, not absent — run STATE stays readable, which is the PEN-3142 boundary.
+      expect(res.body[0].withheldFields).toContain("stdoutExcerpt");
+      expect(res.body[0].phase).toBe("workspace_provision");
+      expect(res.body[0].status).toBe("succeeded");
     });
 
     /**
