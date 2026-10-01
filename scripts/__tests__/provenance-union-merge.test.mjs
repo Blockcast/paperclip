@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -592,6 +592,35 @@ test("deleting an entry file is rejected", () => {
     result.detail.some((line) => line.includes("blo-1.md")),
     "the failure should name the entry it removed",
   );
+});
+
+test("emptying a prior entry in place is rejected, as deleting it is", () => {
+  // An emptied entry is an `M`, not a `D`, so the deletion guard passes it. The
+  // typo-fix case above must keep passing, so this is erasure, not editing.
+  for (const body of ["", "  \n\n"]) {
+    const { write, commit, checkFromPrior } = repoWithPriorEntry();
+    write(`${LOG_DIR}/blo-1.md`, body);
+    commit("empty an earlier entry");
+
+    const result = checkFromPrior();
+    assert.equal(result.ok, false, `emptying a prior entry to ${JSON.stringify(body)} must not pass`);
+    assert.match(result.reason, /empties 1 existing entry/);
+    assert.ok(result.detail.some((line) => line.includes("blo-1.md")), "the failure should name the entry");
+  }
+});
+
+test("replacing a prior entry with a symlink is rejected", () => {
+  // A symlink swap is a `T`, which --diff-filter=M alone misses, and its blob
+  // is the link target, which is not blank: so the mode is checked, not the text.
+  const { dir, write, commit, checkFromPrior } = repoWithPriorEntry();
+  write(`${LOG_DIR}/notes.txt`, "elsewhere\n");
+  unlinkSync(join(dir, LOG_DIR, "blo-1.md"));
+  symlinkSync("notes.txt", join(dir, LOG_DIR, "blo-1.md"));
+  commit("point an earlier entry somewhere else");
+
+  const result = checkFromPrior();
+  assert.equal(result.ok, false, "a symlinked entry no longer records anything itself");
+  assert.match(result.reason, /empties 1 existing entry/);
 });
 
 test("deleting every prior entry while adding your own is rejected", () => {
