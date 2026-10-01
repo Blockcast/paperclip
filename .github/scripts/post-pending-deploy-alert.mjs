@@ -242,8 +242,9 @@ export function buildAlert({
         `A ${DEPLOY_WORKFLOW_FILE} deploy has been parked on the ${environment} reviewer gate since ` +
         `${stallSince} (${hours}h; threshold ${alertAfterHours}h).\n\n` +
         "While it waits, scheduled-production-deploy.yml's anti-stacking guard skips every " +
-        'daily slot, so production drift grows and each skipped run still reports ' +
-        'conclusion=success. Nothing else escalates this.\n\n' +
+        'daily slot, so production drift grows. Past this threshold the dispatcher run also ' +
+        'fails (conclusion=failure) and this alert refreshes each slot, so the stall is ' +
+        'visible — but only a reviewer approving or rejecting can clear it.\n\n' +
         (superseded
           ? 'The pending run has been superseded at least once so the approvable head stays ' +
             `current, so it is younger than the stall: it has been waiting since ${oldest.createdAt}. ` +
