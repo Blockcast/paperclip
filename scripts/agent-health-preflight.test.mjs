@@ -550,6 +550,18 @@ describe("census completeness is derived from observed coverage, not from the ke
     assert.equal(currentWindowEnd("2026-10-01T05:59:59.999Z"), "2026-10-01T00:00:00Z");
   });
 
+  // An absent `triggeredAt` key reads as `undefined`. A `Date.now()` default
+  // swallowed it and filed the row under the CURRENT window: its true window
+  // read `silent`, the newest absorbed its runs, and the census reported no
+  // defect at all (Ally review, PR #2155). Every absent form must be loud.
+  it("throws on an absent trigger instant instead of bucketing the row into now", () => {
+    const { triggeredAt } = { runId: "run-9", status: "completed" };
+    assert.throws(() => currentWindowEnd(triggeredAt), /invalid census now: undefined/);
+    assert.throws(() => currentWindowEnd(), /invalid census now: undefined/);
+    assert.throws(() => currentWindowEnd(null), /invalid census now: null/);
+    assert.throws(() => currentWindowEnd(""), /invalid census now/);
+  });
+
   it("fails closed on raw :07 trigger instants, and cleanly once floored", () => {
     const fired = sevenDayWindowKeys().map((key, index) => ({
       // What a routine-run record actually carries: the trigger instant, :07.

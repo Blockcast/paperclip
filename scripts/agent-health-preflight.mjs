@@ -837,7 +837,7 @@ const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
  * NOT inherit it: run on any later day it censuses a window already in the
  * past, so real runs land in no expected bucket and are dropped while the
  * missing older windows count as `silent` (Ally review, PR #1571). Callers on
- * the executable path pass `currentWindowEnd()`.
+ * the executable path pass `currentWindowEnd(Date.now())`.
  *
  * `end` must be ON the six-hour grid, the same contract `placeWindowKey` already
  * enforces on every row key. Parseable-but-off-grid was accepted here, which made
@@ -847,7 +847,7 @@ const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
  * as non-failing caller sloppiness, as the only distinguishing signal (Ally
  * review, PR #1571). It failed closed, so it could not ship a false pass; it
  * named the wrong defect, which is the standard `placeWindowKey`'s own docblock
- * applies. Unreachable from `currentWindowEnd()` (it snaps) and from the pinned
+ * applies. Unreachable from `currentWindowEnd` (it snaps) and from the pinned
  * default; reachable from the CLI's `process.argv[3]` backfill path.
  */
 export function sevenDayWindowKeys(end = "2026-08-31T06:00:00.000Z") {
@@ -883,8 +883,17 @@ export function sevenDayWindowKeys(end = "2026-08-31T06:00:00.000Z") {
  * catches the hour-24 key that `Date.parse` rolls silently into the next day —
  * so teaching it to accept and floor off-grid keys would delete a real guard to
  * paper over a wiring mistake.
+ *
+ * `now` has NO default, deliberately. A `Date.now()` default swallowed
+ * `undefined`, which is what an absent `triggeredAt` key reads as, so
+ * `currentWindowEnd(row.triggeredAt)` silently bucketed that row into the
+ * CURRENT window: its true window read `silent`, the newest absorbed its runs,
+ * and the census reported no defect (`malformedRows` empty, one silent window
+ * inside tolerance, `complete: true`) (Ally review, PR #2155). `null` and `""`
+ * already threw; `undefined` now throws too, so all three absent forms are loud,
+ * matching `hasAnyReceipt`. The CLI passes `Date.now()` explicitly.
  */
-export function currentWindowEnd(now = Date.now()) {
+export function currentWindowEnd(now) {
   const ms = typeof now === "number" ? now : Date.parse(now);
   if (!Number.isFinite(ms)) throw new Error(`invalid census now: ${now}`);
   return windowKey(Math.floor(ms / SIX_HOURS_MS) * SIX_HOURS_MS);
@@ -901,7 +910,7 @@ export function currentWindowEnd(now = Date.now()) {
  * Two silent windows (half a day) absorb one late or missed routine slot; a
  * sustained outage fails the gate.
  *
- * ONE OF THE TWO IS SPENT BY DEFAULT on the executable path. `currentWindowEnd()`
+ * ONE OF THE TWO IS SPENT BY DEFAULT on the executable path. `currentWindowEnd`
  * snaps to the boundary at-or-before now, so the newest expected window is still
  * in progress and is legitimately `silent` for up to six hours: the effective
  * tolerance for a genuinely late slot is therefore ONE, not two. It is not
@@ -1206,7 +1215,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     ? JSON.parse(await import("node:fs/promises").then((fs) => fs.readFile(process.argv[2], "utf8")))
     : [];
   // Explicit `end` — never the pinned fixture default, which drifts into the past.
-  const end = process.argv[3] ?? currentWindowEnd();
+  const end = process.argv[3] ?? currentWindowEnd(Date.now());
   const result = runPreflight(input, end);
   console.log(JSON.stringify({ censusEnd: end, ...result }, null, 2));
   if (!result.pass) process.exitCode = 1;
