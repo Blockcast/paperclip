@@ -68,8 +68,11 @@ export type PenstockProbePath = PenstockProbePathLabel;
  *
  * `inconclusive` is the load-bearing one: it is the capacity branch that
  * returns no verdict and therefore *causes* the fallback, so its rate is the
- * fallback's cause rather than merely its correlate. Aliased from the metrics
- * label union for the same anti-drift reason as {@link PenstockProbePath}.
+ * fallback's cause rather than merely its correlate — on anthropic, the only
+ * provider with a fallback to cause. Read it per-provider: summed across
+ * providers it over-counts, because codex mints it with nothing downstream.
+ * Aliased from the metrics label union for the same anti-drift reason as
+ * {@link PenstockProbePath}.
  */
 type PenstockProbeOutcome = PenstockProbeOutcomeLabel;
 
@@ -700,7 +703,8 @@ function logProbeAuthFault(
 
 /**
  * The capacity endpoint declined to answer, so the caller falls through to the
- * messages fallback.
+ * messages fallback — on a provider that has one. `resolvePenstockCheck` sets
+ * `messagesUrl` for anthropic alone, so on codex this is a terminal fail-open.
  *
  * Distinct from the `error` outcome even though both yield `null`: this branch
  * is a *successful* HTTP exchange that carried no verdict (404, non-ok status,
