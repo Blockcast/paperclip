@@ -159,18 +159,28 @@ jobs:
           #   1. Read the REST endpoint `gh run list` wraps, rather than the CLI
           #      path where the divergence was measured. The raw endpoint returned
           #      the waiting run, first, on every attempt.
-          #   2. UNION it with a `status=waiting` query and take unique ids. This
-          #      is the fail-closed half and does not depend on either read being
-          #      proven sound: a stale slice can only ever REMOVE rows, so a union
-          #      cannot produce a false "nothing pending". The worst case is a
-          #      skipped dispatch, which the next daily slot retries; the worst
-          #      case of a false zero is a stacked approval on production.
-          # A read that fails outright still aborts the step under `set -e`, which
-          # is red and visible — never a silent zero.
+          #   2. UNION it with one `status=` query per non-terminal status the
+          #      filter below selects (`waiting`, `queued`, `in_progress` — the API's
+          #      `status` takes one value) and take unique ids. This is the
+          #      fail-closed half and does not depend on any read being proven
+          #      sound: a stale slice can only ever REMOVE rows, so every pending
+          #      status has two independent sources and a union cannot produce a
+          #      false "nothing pending". The worst case is a skipped dispatch,
+          #      which the next daily slot retries; the worst case of a false zero
+          #      is a stacked approval on production.
+          # A read that fails outright still aborts the step, which is red and
+          # visible — never a silent zero. That is `set -o pipefail` (top of this
+          # step), NOT `set -e`: the `gh api` calls are on the left of a pipe, so
+          # without pipefail the pipeline's status is `jq`'s, which succeeds on
+          # empty input and yields exactly the false zero this guard exists to stop.
           {
             gh api "repos/$REPO/actions/workflows/docker.yml/runs?event=workflow_dispatch&per_page=50" \
                 --jq '.workflow_runs[]'
             gh api "repos/$REPO/actions/workflows/docker.yml/runs?status=waiting&per_page=50" \
+                --jq '.workflow_runs[]'
+            gh api "repos/$REPO/actions/workflows/docker.yml/runs?status=queued&per_page=50" \
+                --jq '.workflow_runs[]'
+            gh api "repos/$REPO/actions/workflows/docker.yml/runs?status=in_progress&per_page=50" \
                 --jq '.workflow_runs[]'
           } | jq -s '[ .[]
                 | select(.event == "workflow_dispatch")

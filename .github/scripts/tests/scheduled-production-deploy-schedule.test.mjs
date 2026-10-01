@@ -574,38 +574,53 @@ test('the dispatcher and DEPLOY_WORKFLOW_FILE name the same workflow', () => {
 
 test('guard (1) does not read the pending set through `gh run list --event=`', () => {
   assert.ok(
-    !/gh run list[^\n]*--event=/.test(pendingReadRegion),
+    // `(?:[^\n]|\\\n)*` crosses backslash-newline continuations: the pre-fix
+    // form put `--event=` on the line AFTER `gh run list`, which `[^\n]*` missed.
+    !/gh run list(?:[^\n]|\\\n)*--event=/.test(pendingReadRegion),
     'the pending read must not use `gh run list --event=` — measured to serve a ' +
       'three-week-stale slice intermittently, which reads as "nothing pending"',
   );
 });
 
-test('guard (1) unions two independent run queries, so a stale slice cannot zero it', () => {
-  // The fail-closed property, and it does not depend on either query being proven
-  // sound: a stale slice can only REMOVE rows from a result, so a union of two
+test('guard (1) unions independent run queries, so a stale slice cannot zero it', () => {
+  // The fail-closed property, and it does not depend on any query being proven
+  // sound: a stale slice can only REMOVE rows from a result, so a union of
   // differently-filtered reads cannot produce a false zero. One read alone can.
-  // Dropping either query, or collapsing the union, restores the defect silently.
+  // Dropping a query, or collapsing the union, restores the defect silently.
   const queries = [...pendingReadRegion.matchAll(/actions\/workflows\/[^/]+\/runs\?([^"'\s]+)/g)].map(
     (m) => m[1],
   );
-  assert.equal(
-    queries.length,
-    2,
-    `guard (1) must union two run queries; found ${queries.length}: ${queries.join(' | ')}`,
+  assert.ok(
+    queries.length >= 2,
+    `guard (1) must union at least two run queries; found ${queries.length}: ${queries.join(' | ')}`,
   );
   assert.ok(
     queries.some((q) => q.includes('event=workflow_dispatch')),
     'one query must select the dispatch event',
   );
-  assert.ok(
-    queries.some((q) => q.includes('status=waiting')),
-    'the other must select by status, so the two cannot go stale together on one filter',
-  );
-  // `unique_by` is what makes the union a union rather than a double-count: both
-  // queries return the same waiting run on the common path, and WAITING is printed
+  // GitHub's `status` filter takes ONE value, so each non-terminal status guard (1)
+  // counts needs its own query. A status read only through the event query is
+  // single-sourced on the read measured to go stale — for `queued`/`in_progress`
+  // that is a missed skip, i.e. the 2026-08-30 double roll.
+  for (const status of ['waiting', 'queued', 'in_progress']) {
+    assert.ok(
+      queries.some((q) => q.includes(`status=${status}`)),
+      `guard (1) must also query status=${status}, so it cannot go stale with the event query`,
+    );
+  }
+  // `unique_by` is what makes the union a union rather than a double-count: the
+  // event and status queries return the same waiting run on the common path, and WAITING is printed
   // to the step summary and read by the alert.
   assert.ok(
     /unique_by\(\.databaseId\)/.test(pendingReadRegion),
     'the union must be de-duplicated by run id',
   );
+});
+
+test('guard (1) step sets pipefail, so a failed read aborts instead of reading as zero', () => {
+  // The `gh api` reads sit on the LEFT of a pipe into `jq`. Without pipefail the
+  // pipeline's status is jq's, which succeeds on empty input: a failed read becomes
+  // PENDING=0, the BLO-38907 false zero. `set -e` alone does not catch it.
+  const step = pendingReadRegion.slice(pendingReadRegion.lastIndexOf('run: |'));
+  assert.match(step, /^\s*set\s+-\w*o\s+pipefail\b/m, 'guard (1) step must `set -o pipefail`');
 });
