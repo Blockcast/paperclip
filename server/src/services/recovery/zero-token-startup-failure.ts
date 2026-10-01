@@ -233,10 +233,19 @@ export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   // provider outage.
   //
   // The family's third member, `provider_transient_upstream`, is deliberately
-  // NOT added: BLO-18285 documents it as the server-side classification of a
-  // hint-less 503 that the bounded retry should normally park in
-  // `scheduled_retry` before any sweep sees it. Membership here is per code,
-  // not per family.
+  // NOT added, and the exclusion rests on measurement, not on BLO-18285's
+  // "normally parked in `scheduled_retry`": it IS reachable on a billed run
+  // (heartbeat's finalization assigns it to an `outcome === "failed"` run with
+  // no zero-token gate). Over the same 400-run window above it had ZERO
+  // occurrences, billed or not — and agent `29033747` runs `claude_k8s`, the
+  // k8s adapter this server-side classification exists for, so that zero is
+  // not the codex-style "never runs the emitting adapter" artifact. Also zero
+  // across that agent's 1000 most recent runs (2026-09-25T02:19Z →
+  // 2026-10-01T20:09Z) and the Penstock company's 1000 most recent
+  // (2026-09-28T20:32Z → 2026-10-01T20:24Z). Membership here is per code, not
+  // per family: the first billed `provider_transient_upstream` run observed
+  // puts it in this set, and the PEN-3442 negative control then needs a
+  // different subject.
   "claude_transient_upstream",
   "codex_transient_upstream",
 ]);

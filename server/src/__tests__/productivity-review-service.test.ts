@@ -2156,10 +2156,12 @@ describeEmbeddedPostgres("productivity review service", () => {
   // place it would most plausibly leak: `provider_transient_upstream` is the
   // THIRD member of the transient-upstream family in
   // `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` and is deliberately NOT added to
-  // the infra-class set, because BLO-18285 documents it as the server-side
-  // classification of a hint-less 503 that should normally have been parked in
-  // `scheduled_retry` before a sweep sees it. Membership here is per code, not
-  // per family — a reader who adds one sibling "for consistency" reds this.
+  // the infra-class set. The exclusion is measured, not inferred from
+  // BLO-18285's "normally parked in `scheduled_retry`" — see the zero-occurrence
+  // count recorded at the set in `zero-token-startup-failure.ts`. Membership
+  // here is per code, not per family — a reader who adds one sibling "for
+  // consistency" reds this; a billed one observed in production is the reason
+  // to add it and re-subject this control.
   it("keeps a billed provider_transient_upstream run in the no-comment streak (PEN-3442 negative control)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
