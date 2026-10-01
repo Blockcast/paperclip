@@ -13,7 +13,10 @@
     "Empty as of 2026-09-20 (PEN-2847). The six founding entries (#1525 x2, #1360, #1316 x2,",
     "#1304) had all self-expired by head movement, exactly as the fingerprint design intends,",
     "and the guard warned on every hourly run asking for their removal. An empty list is not a",
-    "disabled ratchet: with no entries, every finding on a mergeable PR fails the run."
+    "disabled ratchet: with no entries, every finding on a mergeable PR fails the run.",
+    "Separately (BLO-25764): the I1 shape four of them suppressed is no longer a violation when",
+    "the bodies differ - a re-review supersedes. That exemption is I1-only and does not reach",
+    "I3, which asserts one canonical body and a matching attestation."
   ],
   "entries": []
 }
