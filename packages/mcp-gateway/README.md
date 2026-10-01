@@ -229,7 +229,7 @@ readinessProbe: { httpGet: { path: /healthz, port: health } }
 livenessProbe:  { httpGet: { path: /healthz, port: health } }
 ```
 
-Three properties this port is required to keep, all pinned in `server.test.ts`:
+Four properties this port is required to keep, all pinned in `server.test.ts`:
 
 - **It never proxies.** The deny it exists to permit names one port, so anything
   reachable here is reachable around that deny. A health listener that routed to
@@ -237,13 +237,27 @@ Three properties this port is required to keep, all pinned in `server.test.ts`:
 - **It discloses less than the proxy port's `/healthz`,** which reports upstream
   names, breaker state and per-prefix session counts. No deny covers this port;
   treat its body as readable by anything that can route to the pod.
-- **Its connections are bounded** — 64 concurrent, 2s headers, 5s request —
-  rather than left on Node's unlimited / 60s / 300s defaults. Those defaults
-  suit an authenticated proxy port; this one is reachable by exactly the `host`
-  and `remote-node` entities the deny excludes, with nothing authenticating in
-  front of it. Since `createProxyAcceptProbe` needs a descriptor of its own,
-  unbounded socket-holding here would push the process toward fd pressure, fail
-  the probe, and turn a 503 into a liveness restart of the authenticated proxy.
+- **Its connections are bounded in time, not in number** — 2s headers, 5s
+  request, swept every 1s, idle keep-alive reclaimed at 2s — rather than left on
+  Node's 60s / 300s / 30s-sweep defaults. Those defaults suit an authenticated
+  proxy port; this one is reachable by exactly the `host` and `remote-node`
+  entities the deny excludes, with nothing authenticating in front of it.
+  The sweep interval is the part worth stating explicitly: Node arms no
+  per-socket timer for these timeouts, it reaps expired connections on
+  `connectionsCheckingInterval`, which defaults to 30s and is settable only as a
+  `http.createServer` option. Left at the default, the 2s headers timeout above
+  is enforced in ~30s — measured at 30040ms, against 2007ms at a 1s interval.
+- **There is deliberately no connection cap.** An earlier revision set
+  `maxConnections = 64` to keep socket-holding here from pushing the process
+  toward fd pressure, since `createProxyAcceptProbe` needs a descriptor of its
+  own and a failed probe turns a 503 into a liveness restart of the
+  authenticated proxy. A cap does not prevent that; it makes it far cheaper.
+  Node closes the *incoming* handle once the cap is reached, with no response,
+  so the sockets already held win and the kubelet's next probe connection is the
+  one reset — moving the restart threshold down from the process fd limit to the
+  cap. A cap has no notion of which connection matters, so it cannot protect the
+  probe. Shrinking how long a socket is held is the bound that scales with the
+  holder's cost.
   An EMFILE that happens anyway still reads as 503, deliberately: a process out
   of descriptors genuinely is not accepting, so the honest answer is "not
   serving" and a restart is the correct recovery.
