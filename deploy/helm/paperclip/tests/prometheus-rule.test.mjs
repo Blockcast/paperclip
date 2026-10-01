@@ -1487,26 +1487,32 @@ test("the start-lock runbook routes its two arms on agent count, not on an alert
   const routing = flat(wedged.slice(0, routingEnd));
   const fleetIntro = flat(fleet.slice(0, fleetIntroEnd));
 
-  // Step 0 is the agent count. `PaperclipAgentStartLockWedged` is keyed
-  // `by (agent_id)`, so a fleet stall fires it once per agent: the name of the
-  // alert that paged cannot route, and the two alerts co-fire rather than
-  // exclude each other, so the runbook has to say which one wins.
+  // Step 0 is the agent count, which keys on shape and so survives the alert
+  // names' semantics moving (they moved twice in four days). Since
+  // onprem-k8s #4036 (BLO-35571) the split is live: a fleet stall pages
+  // `PaperclipAgentStartLockFleetStall` (unlabelled count, one page per
+  // episode) and `PaperclipAgentStartLockWedged` only past 4 h, longer than any
+  // measured fleet stall. The runbook still has to say which arm wins.
   assert.ok(
     routing.includes("count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900)"),
     "the one-agent section must open with the agent-count query as step 0",
   );
-  assert.match(routing, /once per agent/, "routing must say Wedged fires once per agent in a fleet stall");
   assert.match(routing, /takes precedence/, "routing must say which arm wins when both alerts fire");
 
-  // PaperclipAgentStartLockFleetStall is in neither this chart nor the
-  // deployed onprem-k8s rules (proposed in onprem-k8s #4036, BLO-35571). A
-  // routing key that nothing can page with resolves the wrong way every time.
-  // Drop the "not deployed" half together with that wording once it deploys.
+  // FleetStall landed in onprem-k8s #4036 and is in the deployed rules, but
+  // not in this chart. Both texts must name it, say where to verify what is
+  // live, and not resurrect the "not deployed" wording whose premise expired
+  // when #4036 merged (2026-09-28).
   for (const [where, text] of [["the routing block", routing], ["the fleet-stall trigger", fleetIntro]]) {
     assert.match(
       text,
-      /`PaperclipAgentStartLockFleetStall`[^.]*\*\*not deployed\*\*/,
-      `${where} must mark PaperclipAgentStartLockFleetStall as not deployed`,
+      /`PaperclipAgentStartLockFleetStall`[^.]*(?:once|one page) per episode/,
+      `${where} must say a fleet stall pages PaperclipAgentStartLockFleetStall, once per episode`,
+    );
+    assert.doesNotMatch(
+      text,
+      /not deployed/,
+      `${where} must not call PaperclipAgentStartLockFleetStall not deployed; it landed in onprem-k8s #4036`,
     );
     assert.match(text, /\/api\/v1\/rules/, `${where} must say where to verify which rules are live`);
   }

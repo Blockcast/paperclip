@@ -441,30 +441,22 @@ Owner: Platform / SRE (PEN-3305)
 > | `>= 3` | [fleet stall](#fleet-stall-many-agents-in-lockstep-blo-36922): many agents together, ~25–120 min observed, **self-clears** | do **not** replace the process |
 > | below 3, or no data | fewer than three agents; unbounded (6–19 h observed) | this section, which ends with replacing the process |
 >
-> **The fleet arm takes precedence.** `PaperclipAgentStartLockWedged` is keyed
-> `by (agent_id)`, so it fires **once per agent**: a 13-agent fleet stall pages
-> it 13 times, alongside any fleet-stall page rather than instead of it. While
-> the count reads `>= 3`, do not apply this section's remedy to any agent. The
-> Wedged page also comes before any agent can have crossed 900 s, so if it is
-> firing for several agents at once, re-run the count once they are past 900 s
-> before acting; the wedge this section exists for runs for hours, not minutes. Once
-> the count drops below 3, an agent that is still held is back in this arm.
->
-> `PaperclipAgentStartLockFleetStall` (that count, `>= 3` for 10m) is **not
-> deployed**. It is proposed in `Blockcast/onprem-k8s` #4036 (BLO-35571) and
-> is not in this chart, so until it lands and the `monitoring-rules` Argo
-> application is synced (BLO-19095), `PaperclipAgentStartLockWedged` is the
-> only start-lock alert that can page. Verify at `/api/v1/rules` before
-> relying on either name.
+> **The fleet arm takes precedence.** A fleet stall pages
+> `PaperclipAgentStartLockFleetStall` (that count, `>= 3` for 10m), once per
+> episode. In `Blockcast/onprem-k8s`, `PaperclipAgentStartLockWedged` pages
+> only past a 4 h hold (`> 14400`), longer than any measured fleet stall, so it
+> is not the page for that shape. While the count reads `>= 3`, do not apply this
+> section's remedy to any agent, whichever name paged. Once the count drops below
+> 3, an agent that is still held is back in this arm. FleetStall is not in this
+> chart; verify at `/api/v1/rules` before relying on either name.
 >
 > Deleting the worker pod on a fleet stall destroys the only evidence of the
 > cause and buys nothing: the episode was going to end on its own.
 >
-> ⚠️ `Blockcast/onprem-k8s` #3985 (BLO-36522) separately retunes **Wedged
-> itself** to that same `>= 3` count (see Trigger above), so once it lands the
-> two names describe the same shape and neither name can route. The step-0
-> count is what routes, before and after. The coverage that retune gives up —
-> a solo indefinite hold pages on nothing — is recorded below.
+> `Blockcast/onprem-k8s` #4036 (BLO-35571) landed the split: Wedged is the solo
+> arm at 4 h, FleetStall the fleet arm (`>= 3` agents at 900 s); #3985, which the
+> Trigger above still cites, closed unmerged. The step-0 count stays the robust
+> check because it does not depend on either name.
 
 ### ⚠️ What this alert claims, and what it no longer claims (BLO-36522)
 
@@ -798,10 +790,11 @@ still stands, because it guards the number this chart actually renders.
 Trigger: **the shape, not an alert name.** The step-0 count at the top of the
 [one-agent section](#agent-start-lock-wedged-pen-3305) reads `>= 3`:
 `count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3`.
-Today that shape pages only as `PaperclipAgentStartLockWedged`, once per agent.
-The dedicated `PaperclipAgentStartLockFleetStall` (same expr, `for: 10m`) is
-**not deployed**: it is proposed in `Blockcast/onprem-k8s` #4036 (BLO-35571)
-and absent from this chart. Verify at `/api/v1/rules` before expecting it to
+That shape pages as `PaperclipAgentStartLockFleetStall` (same expr, `for: 10m`),
+one page per episode. It landed in `Blockcast/onprem-k8s` #4036 (BLO-35571) and
+is absent from this chart. The onprem-k8s `PaperclipAgentStartLockWedged`
+(`> 14400`, 4 h) cannot fire on this shape as measured: the 7-day maximum
+hold was 8043s (2h14m). Verify at `/api/v1/rules` before expecting either to
 page.
 
 **Do NOT replace the process.** Every measured episode self-cleared with
