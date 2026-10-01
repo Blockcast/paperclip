@@ -164,9 +164,39 @@ permissions:
 # every queued sweep runs. At 90 open PRs that is ~270 reads each against the
 # 1,000/hour/repository `github.token` budget, so a long starvation window can
 # exhaust it. That degrades LOUDLY -- the script detects rate-limit exhaustion
-# explicitly and reports it, and writes stay capped by MAX_REFIRES_PER_RUN -- so
-# it turns the tab red rather than going quiet, which is the failure direction
-# this reconciler must never have.
+# explicitly and reports it, and writes stay capped by
+# MAX_REFIRE_ATTEMPTS_PER_RUN (2x MAX_REFIRES_PER_RUN by default; each re-fire
+# costs up to 4 requests -- request_review does GET + conditional DELETE +
+# POST, then the marker comment POST -- so at most 40 requests, 30 of them
+# writes, negligible beside the reads above) -- so it turns the tab red rather
+# than going quiet, which is the failure direction this reconciler must never
+# have.
+#
+# The pre-write re-check is bounded by the SAME ceiling and is counted here
+# because it is a read the paragraph above does not cover: it issues up to 2
+# paginated reads per candidate (comments, then reviews, with an early return
+# between), so at most 20 on top of the ~270. A FAILING re-check used to reach
+# neither counter, which made that cost unbounded -- after a read-pass
+# rate-limit break every later re-check raises, and pass 2 then walked the
+# entire eligible set making doomed reads (measured: 90 of 90). Counting it
+# against the ceiling is what makes the figure above a bound rather than an
+# estimate (PEN-3394).
+#
+# That bound covers re-checks that are ATTEMPTED or that FAIL. A re-check that
+# WITHHOLDS spends neither counter -- deliberately, so the slot stays free for
+# the next ranked PR -- so the withheld case is bounded by the eligible set
+# rather than by the ceiling: 90 eligible PRs all withholding is 90 re-check
+# calls, not 20. The ~20 is therefore a steady-state figure, and it holds
+# because refire_still_permitted re-applies the same cooldown and
+# reviewed-head predicates the scan already applied -- so withholding needs a
+# marker or a review to land in the scan-to-write gap, which is a per-PR race
+# and not a steady state (PEN-3394 review).
+#
+# Both paragraphs sit BELOW the closing clause on purpose: inserting them
+# between "writes stay capped by ..." and "so it turns the tab red ..." left
+# that clause 25 lines from its subject, where it read as a claim that a
+# withheld re-check turns the tab red. It does not -- a withheld re-fire is a
+# clean guard outcome and never sets `degraded`.
 #
 # SECOND RESIDUAL, likewise stated rather than implied: two sweeps that execute
 # CONCURRENTLY can both re-fire the same PR. The per-PR cooldown is derived from
