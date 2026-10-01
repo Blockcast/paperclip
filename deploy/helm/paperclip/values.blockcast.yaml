@@ -560,8 +560,23 @@ worker:
     # `keep` is raised to match.
     #
     # Remaining defaults are already right for this: keep=2 holds exactly the
-    # pair, maxAge=24h outlives a 12h spacing, minFree=10GB against 309GB free
-    # on the claim (measured 2026-10-01).
+    # pair, minFree=10GB against 309GB free on the claim (measured 2026-10-01),
+    # and maxAge=24h gives `24h − spacing` to retrieve the OLDER half once the
+    # pair is complete — not 24h. Capture A at T and B at T+12h and A still
+    # expires at T+24h, i.e. 12h after there is anything to diff. That window
+    # shrinks as you widen the spacing, and nothing warns when it does: the
+    # startup check only fires on `maxAge <= autoMinInterval`, which is the
+    # automatic trigger's spacing and is inert with the threshold unset.
+    #
+    # ⚠️ Reverting this DELETES every snapshot on the claim — with capture off
+    # the sweep retains nothing (effective `keep` 0), and it runs at worker
+    # startup, so the pair is gone on the rollout that applies the revert, not
+    # over the next maxAge. That is deliberate: disabling capture is how an
+    # operator declares the exposure window closed, and the prune used to live
+    # *inside* the flag, so switching capture off froze the files on the volume
+    # forever at the exact moment the operator believed they were safe. Retrieve
+    # the pair off the volume FIRST — see doc/DEVELOPING.md "A snapshot is a
+    # credential, not a diagnostic" for the ordering.
     #
     # Revert this one entry to disable; nothing else in the feature is reachable
     # with it unset. The decision to enable is the CEO's — see PEN-3631.

@@ -2520,6 +2520,17 @@ export async function startServer(): Promise<StartedServer> {
     // Read bare, an unreadable snapshot directory rejected startServer() — which
     // is invoked as `void startServer().catch(() => process.exit(1))` — and so
     // crash-looped the worker tier over a switched-off diagnostic.
+    //
+    // The seed is directory-wide, not this-replica's-history: it reads the
+    // newest stamp any writer left, so a peer replica's capture — or this
+    // replica's own sentinel-driven one — also spaces THIS replica's automatic
+    // trigger. The claim is ReadWriteMany, so that is reachable, and it is the
+    // behaviour we want: `keep` is a directory-wide cap for the same reason, and
+    // the thing being rate-limited is captures landing on one volume, not
+    // captures originating in one process. "Cross-restart spacing" below names
+    // the route this was written for, not the only one it covers. Inert in the
+    // shipped config, where the threshold is unset and the automatic arm never
+    // reaches the spacing check at all. (Ally review suggestion, PEN-3631.)
     const autoSnapshotSeed = seedLastAutoSnapshotAtMs(heapSnapshotConfig.dir);
     if (autoSnapshotSeed.readError !== null) {
       logger.error(
