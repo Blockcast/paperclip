@@ -99,6 +99,7 @@ export type {
   PluginHealthDiagnostics,
   PluginConfigValidationResult,
   PluginWebhookInput,
+  PluginWebhookResult,
   PluginApiRequestInput,
   PluginApiResponse,
 } from "./define-plugin.js";

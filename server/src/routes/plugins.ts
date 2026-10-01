@@ -243,6 +243,28 @@ const DEFAULT_RAG_HEALTH_WINDOW_DAYS = 7;
  */
 const WEBHOOK_NOT_READY_RETRY_AFTER_SECONDS = 30;
 /**
+ * Narrow an untrusted `handleWebhook` RPC result into the disposition fields the
+ * 200 response body carries (BLO-38643).
+ *
+ * The value crosses a JSON-RPC boundary from a separate worker process, so it is
+ * validated rather than trusted: anything that is not a well-formed
+ * `PluginWebhookResult` yields `{}` and the response omits the fields entirely.
+ *
+ * That omission is deliberate and is the safe direction. A plugin that does not
+ * report leaves its sender exactly as informed as before this change — whereas
+ * defaulting to `{accepted: 0}` would report every such delivery as dropped, and
+ * defaulting to `{accepted: 1}` would invent the acceptance this exists to make
+ * trustworthy. Absent means unknown; it never means delivered.
+ */
+export function webhookDisposition(result: unknown): { accepted?: number; rejected?: string } {  if (!result || typeof result !== "object") return {};
+  const { accepted, rejected } = result as Record<string, unknown>;
+  if (typeof accepted !== "number" || !Number.isFinite(accepted) || accepted < 0) return {};
+  // `rejected` is only valid alongside `accepted: 0` (PluginWebhookResult). A
+  // reason contradicted by a non-zero count is dropped, never the count.
+  if (typeof rejected === "string") return accepted === 0 ? { accepted, rejected } : { accepted };
+  return { accepted };
+}
+/**
  * Non-`ready` plugin statuses webhook ingestion answers as *terminal* (410).
  * Everything else that is not `ready` is treated as recoverable and answers
  * 503 + `Retry-After`.
@@ -3312,9 +3334,10 @@ export function pluginRoutes(
     //
     // Slack tests Events API URLs with a one-time POST that carries
     // { type: "url_verification", challenge: "<token>" } and expects the
-    // response body to echo the challenge. The plugin SDK's handleWebhook
-    // RPC is fire-and-forget (returns void), so workers cannot set the
-    // HTTP response body — handle this Slack interop convention host-side.
+    // response body to echo the challenge. Answered host-side because the
+    // challenge is a transport convention, not plugin logic — a worker that
+    // reports a disposition (BLO-38643) still has no way to choose the whole
+    // response shape.
     const verifBody = req.body as { type?: unknown; challenge?: unknown } | undefined;
     if (
       verifBody?.type === "url_verification" &&
@@ -3396,7 +3419,7 @@ export function pluginRoutes(
 
     // Step 7: Dispatch to the worker via handleWebhook RPC
     try {
-      await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
+      const handlerResult = await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
         companyId,
         endpointKey,
         headers: req.headers as Record<string, string | string[]>,
@@ -3417,9 +3440,15 @@ export function pluginRoutes(
         })
         .where(eq(pluginWebhookDeliveries.id, delivery.id));
 
+      // `status: "success"` describes the TRANSPORT — the worker was reached and
+      // did not throw. It is true of a deliberate drop too, so on its own it is
+      // an affirmative claim of success over a destroyed payload. The plugin's
+      // disposition is spread in beside it so a sender can tell the two apart
+      // from the response alone (BLO-38643).
       res.status(200).json({
         deliveryId: delivery.id,
         status: "success",
+        ...webhookDisposition(handlerResult),
       });
     } catch (err) {
       // Step 8 (error): Update delivery record to failed

@@ -9,7 +9,7 @@
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { hostname as osHostname } from "node:os";
-import type { PluginContext, PluginFencingPrecondition, PluginWebhookInput } from "@paperclipai/plugin-sdk";
+import type { PluginContext, PluginFencingPrecondition, PluginWebhookInput, PluginWebhookResult } from "@paperclipai/plugin-sdk";
 import {
   ACCEPTED_SCHEMA_VERSIONS,
   DEFAULT_OPERATOR_SUPPRESSION_HOURS,
@@ -2803,8 +2803,9 @@ function buildRecoveredStateRecord(
 
 /**
  * Top-level webhook handler. Pure-ish: takes ctx + config + an authentication
- * verdict + input, returns void. Throws `WebhookUnauthorizedError` when that
- * verdict is `false` — the worker's onWebhook re-throws this so the host
+ * verdict + input, returns the delivery's disposition. Throws
+ * `WebhookUnauthorizedError` when that verdict is `false` — the worker's
+ * onWebhook re-throws this so the host
  * can surface a 401 / drop the delivery. Throws `AlertDeliveryIncompleteError`
  * when any alert in the batch failed to process, so the host records the
  * delivery `failed` and Alertmanager retries it.
@@ -2821,6 +2822,13 @@ function buildRecoveredStateRecord(
  * and ends Alertmanager's retries. Only do that when the delivery needs no
  * retry — a malformed or unsupported-version payload, or a filtered alert —
  * never when something that could succeed later has failed.
+ *
+ * The returned `PluginWebhookResult` is what makes that acknowledgement
+ * *legible* to the sender. Real Alertmanager ignores it, but a hand-rolled
+ * producer reading only the status code cannot otherwise tell an ingested page
+ * from a destroyed one — which is how a malformed payload from the Prometheus
+ * liveness checker went undetected for 36 days while every page it sent was
+ * dropped here and reported delivered (BLO-38643).
  */
 export async function handleWebhook(
   ctx: PluginContext,
@@ -2828,12 +2836,12 @@ export async function handleWebhook(
   authenticated: boolean,
   input: PluginWebhookInput,
   fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
-): Promise<void> {
+): Promise<PluginWebhookResult> {
   if (input.endpointKey !== WEBHOOK_KEYS.alertmanager) {
     ctx.logger.warn(
       `paperclip-plugin-alertmanager: ignoring webhook for unknown endpoint key "${input.endpointKey}"`,
     );
-    return;
+    return { accepted: 0, rejected: "unknown_endpoint" };
   }
 
   if (!authenticated) {
@@ -2850,7 +2858,7 @@ export async function handleWebhook(
       "paperclip-plugin-alertmanager: dropping webhook with malformed body",
     );
     await ctx.metrics.write("alertmanager.webhook.malformed", 1);
-    return;
+    return { accepted: 0, rejected: "malformed" };
   }
 
   if (!ACCEPTED_SCHEMA_VERSIONS.has(body.version)) {
@@ -2860,10 +2868,25 @@ export async function handleWebhook(
     await ctx.metrics.write("alertmanager.webhook.unsupported_version", 1, {
       version: body.version,
     });
-    return;
+    return { accepted: 0, rejected: "unsupported_version" };
   }
 
   const failedFingerprints: string[] = [];
+  // Alerts the receiver RECOGNISED AND PROCESSED, reported to the sender in the
+  // 200 body: the count that answers "did my page reach your logic intact",
+  // which a status code cannot (BLO-38643).
+  //
+  // One rule, because a signal with exceptions is not a signal. NOT counted =
+  // the receiver refused the alert: excluded by the label filter, a malformed
+  // `paperclip_issue`, an unknown status, or a permanent per-alert error.
+  // Counted = a handler ran, whatever the policy outcome — so the severity
+  // floor, a dedupe re-fire, an opt-out, and a resolve for an unknown
+  // fingerprint all count.
+  //
+  // So `accepted` does NOT promise an issue was created. It promises the
+  // payload was understood and routed. Claiming more than that is the exact
+  // defect being fixed here, so it is stated rather than implied.
+  let accepted = 0;
   // Scoped to this delivery — see FallbackOwnerMemo. A storm is the case that
   // matters: without it, every ownerless alert in the batch repeats the same
   // company-wide agent lookup.
@@ -2932,6 +2955,11 @@ export async function handleWebhook(
               `paperclip-plugin-alertmanager: failed to record issue opt-out metric for ${alert.fingerprint}: ${String(metricErr)}`,
             );
           }
+          // Counted: the receiver understood the alert and the operator's own
+          // policy said do not file. Same class as the severity floor, which
+          // counts by sitting inside handleFiring — this keeps the two
+          // consistent rather than letting placement decide the answer.
+          accepted += 1;
           continue;
         }
         await handleFiring(
@@ -2942,6 +2970,7 @@ export async function handleWebhook(
           fenceWaitPolicy,
           fenceWedgedMemo,
         );
+        accepted += 1;
       } else if (status === "resolved") {
         // Reached with BOTH policy gates above deliberately bypassed — this
         // path is creation-only, exactly like the severity floor in
@@ -2972,6 +3001,7 @@ export async function handleWebhook(
         // row, and handleResolved drops an unknown fingerprint without touching
         // anything.
         await handleResolved(ctx, config, alert);
+        accepted += 1;
       } else {
         ctx.logger.warn(
           `paperclip-plugin-alertmanager: unknown alert status "${status}" for fingerprint ${alert.fingerprint}`,
@@ -3037,4 +3067,11 @@ export async function handleWebhook(
     // succeeded update their existing issue rather than filing a duplicate.
     throw new AlertDeliveryIncompleteError(failedFingerprints);
   }
+
+  // Reached only when nothing in the batch failed transiently, so this count is
+  // final. `accepted: 0` here means every alert was deliberately dropped — by
+  // the label filter, by `paperclip_issue`, by an unknown status, or by a
+  // permanent per-alert error — all of which answer 200 and would otherwise be
+  // indistinguishable from ingestion at the sender.
+  return { accepted };
 }

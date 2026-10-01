@@ -594,6 +594,84 @@ describe("handleWebhook — schema validation", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// BLO-38643 — delivery disposition reported in the 200 response body
+//
+// Every case below answers HTTP 200. That is correct and must stay: it is what
+// stops Alertmanager retrying a body that can never parse. The defect was that
+// 200 was the *only* signal, so a sender could not tell an ingested page from a
+// destroyed one — and the Prometheus liveness checker shipped a malformed
+// payload that was silently dropped here for 36 days while reporting every page
+// as delivered.
+//
+// These assertions are on the returned value rather than on a metric because
+// the sender cannot read a metric: the signal has to be synchronous and in-band
+// on the response it already receives.
+// ---------------------------------------------------------------------------
+
+describe("handleWebhook — delivery disposition (BLO-38643)", () => {
+  it("reports the ingested count for a valid payload", async () => {
+    const { ctx, mocks } = mkCtx();
+    await expect(handleWebhook(ctx, baseConfig(), true, baseInput())).resolves.toEqual({
+      accepted: 1,
+    });
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts every ingested alert in a batch, not just the first", async () => {
+    const { ctx } = mkCtx();
+    const envelope = baseEnvelope({
+      alerts: [
+        baseAlert(),
+        baseAlert({ fingerprint: "ffffffffffffffff", labels: { ...baseAlert().labels, node: "pve-4" } }),
+      ],
+    });
+    await expect(
+      handleWebhook(ctx, baseConfig(), true, baseInput({ parsedBody: envelope })),
+    ).resolves.toEqual({ accepted: 2 });
+  });
+
+  it("reports rejected=malformed instead of a bare acknowledgement", async () => {
+    const { ctx } = mkCtx();
+    const input = baseInput({ parsedBody: { not: "an alertmanager payload" } });
+    await expect(handleWebhook(ctx, baseConfig(), true, input)).resolves.toEqual({
+      accepted: 0,
+      rejected: "malformed",
+    });
+  });
+
+  it("reports rejected=unsupported_version", async () => {
+    const { ctx } = mkCtx();
+    const envelope = baseEnvelope({ version: "5" });
+    const input = baseInput({ parsedBody: envelope, rawBody: JSON.stringify(envelope) });
+    await expect(handleWebhook(ctx, baseConfig(), true, input)).resolves.toEqual({
+      accepted: 0,
+      rejected: "unsupported_version",
+    });
+  });
+
+  it("reports rejected=unknown_endpoint", async () => {
+    const { ctx } = mkCtx();
+    const input = baseInput({ endpointKey: "something-else" });
+    await expect(handleWebhook(ctx, baseConfig(), true, input)).resolves.toEqual({
+      accepted: 0,
+      rejected: "unknown_endpoint",
+    });
+  });
+
+  // A label-filtered alert is dropped deliberately and answers 200, so without
+  // this it is indistinguishable from ingestion at the sender — the same shape
+  // as the malformed drop, reached one layer deeper.
+  it("does not count a label-filtered alert as accepted", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ acceptOnlyLabels: { team: "networking" } });
+    await expect(handleWebhook(ctx, config, true, baseInput())).resolves.toEqual({
+      accepted: 0,
+    });
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+  });
+});
+
 describe("handleWebhook — firing first time", () => {
   it("creates an issue with the right title, priority, originKind, and assignee", async () => {
     const { ctx, mocks } = mkCtx();
@@ -676,7 +754,7 @@ describe("handleWebhook — firing first time", () => {
     // retry can fix, so the delivery acknowledges it instead of failing.
     await expect(
       handleWebhook(ctx, config, true, baseInput()),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ accepted: 0 });
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.state.set).not.toHaveBeenCalled();
     expect(mocks.metrics.write).toHaveBeenCalledWith(
@@ -760,7 +838,7 @@ describe("handleWebhook — firing first time", () => {
           parsedBody: baseEnvelope({ alerts: [ownerless, owned] }),
         }),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ accepted: 1 });
 
     // The healthy alert still became tracked work — and it is ordered SECOND in
     // the payload, behind the ownerless one, so this pins that the permanent
@@ -810,7 +888,7 @@ describe("handleWebhook — firing first time", () => {
 
     await expect(
       handleWebhook(ctx, config, true, baseInput()),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ accepted: 0 });
 
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.state.set).not.toHaveBeenCalled();
@@ -930,7 +1008,7 @@ describe("handleWebhook — firing first time", () => {
 
     await expect(
       handleWebhook(ctx, config, true, baseInput()),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ accepted: 0 });
 
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.state.set).not.toHaveBeenCalled();
@@ -4264,7 +4342,7 @@ describe("handleWebhook — creation policy", () => {
         true,
         baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ accepted: 1 });
 
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.state.set).not.toHaveBeenCalled();
@@ -4323,7 +4401,7 @@ describe("handleWebhook — creation policy", () => {
         true,
         baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ accepted: 1 });
 
     expect(mocks.issues.create).not.toHaveBeenCalled();
     expect(mocks.state.set).not.toHaveBeenCalled();
@@ -4716,14 +4794,14 @@ describe("handleWebhook — delivery acknowledgement", () => {
     const { ctx } = mkCtx();
     await expect(
       handleWebhook(ctx, baseConfig(), true, baseInput({ parsedBody: twoAlertEnvelope() })),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ accepted: 2 });
   });
 
   it("still acknowledges a malformed payload — permanent, so retrying is pointless", async () => {
     const { ctx } = mkCtx();
     await expect(
       handleWebhook(ctx, baseConfig(), true, baseInput({ parsedBody: { nope: true } })),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ accepted: 0, rejected: "malformed" });
   });
 
   it("does not let a metrics outage abort the remaining alerts", async () => {
