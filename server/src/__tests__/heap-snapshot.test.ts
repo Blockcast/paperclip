@@ -10,6 +10,7 @@ import {
   decideHeapSnapshot,
   describeSentinelOutcome,
   ensureHeapSnapshotDir,
+  findConcurrentSnapshotWriters,
   heapSnapshotSweepKeep,
   listHeapSnapshots,
   listResidualHeapSnapshots,
@@ -87,16 +88,30 @@ function writeSnapshotFile(name: string, mtimeSeconds: number): void {
   utimesSync(filePath, mtimeSeconds, mtimeSeconds);
 }
 
+/**
+ * Realistic fixture names, stamped the way `snapshotBasename` stamps them.
+ *
+ * Load-bearing, not cosmetic. Retention keys off the embedded stamp and a name
+ * that does not parse is deliberately keyed `0` (see `retentionKeyMs`), so the
+ * bare `old`/`mid`/`new` labels these replaced all collapsed to one key — and
+ * every ordering assertion over them passed on `readdirSync` enumeration order
+ * rather than on the property under test. Each is before `runtime().now()`
+ * (23:00Z), so a finite `maxAgeMs` sees them as past, not future.
+ */
+const OLD = `2026-09-29T20-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}`;
+const MID = `2026-09-29T21-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}`;
+const NEW = `2026-09-29T22-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}`;
+
 describe("pruneHeapSnapshots", () => {
   it("retains the newest N completed snapshots and deletes the rest", () => {
-    writeSnapshotFile(`old${HEAP_SNAPSHOT_EXTENSION}`, 1000);
-    writeSnapshotFile(`mid${HEAP_SNAPSHOT_EXTENSION}`, 2000);
-    writeSnapshotFile(`new${HEAP_SNAPSHOT_EXTENSION}`, 3000);
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(MID, 2000);
+    writeSnapshotFile(NEW, 3000);
 
     const removed = pruneHeapSnapshots(dir, 2, NEVER_EXPIRES);
 
-    expect(removed).toEqual([`old${HEAP_SNAPSHOT_EXTENSION}`]);
-    expect(readdirSync(dir).sort()).toEqual([`mid${HEAP_SNAPSHOT_EXTENSION}`, `new${HEAP_SNAPSHOT_EXTENSION}`]);
+    expect(removed).toEqual([OLD]);
+    expect(readdirSync(dir).sort()).toEqual([MID, NEW]);
   });
 
   it("deletes abandoned .partial files regardless of the retention cap", () => {
@@ -170,6 +185,38 @@ describe("pruneHeapSnapshots", () => {
     expect(pruneHeapSnapshots(dir, 10, NEVER_EXPIRES, nowMs)).toEqual([
       `foreign${HEAP_SNAPSHOT_EXTENSION}.partial`,
     ]);
+  });
+
+  it("expires a completed snapshot whose name it did not write, however fresh its mtime", () => {
+    // The hole this closes. `maxAgeMs` is the exposure window and is documented
+    // as stamp-based precisely so a reader cannot extend it by touching the
+    // file — but the fallback for an unparsed name was that file's mtime, so a
+    // secret-bearing snapshot whose name happened not to parse, with a
+    // refreshed mtime, never expired at all. keep=10 leaves the age bound as
+    // the only thing that can remove anything here. (Ally review, PEN-3631.)
+    const nowMs = Date.parse("2026-09-29T23:00:00.000Z");
+    const foreign = `heap-paperclip-0${HEAP_SNAPSHOT_EXTENSION}`;
+    writeSnapshotFile(foreign, (nowMs - MINUTE_MS) / 1000); // touched one minute ago
+    writeSnapshotFile(NEW, 1000);
+
+    expect(pruneHeapSnapshots(dir, 10, DAY_MS, nowMs)).toEqual([foreign]);
+    expect(readdirSync(dir)).toEqual([NEW]);
+  });
+
+  it("ranks a name it did not write as oldest, in the prune and the listing alike", () => {
+    // The ordering half, which needs no adversary. `collectPrunable` keyed an
+    // unparsed name at its mtime while `listHeapSnapshots` keyed it at 0, so
+    // the two disagreed about which end of the ordering the same file sat on:
+    // one called it newest, the other oldest. At keep=2 that spent a retention
+    // slot on it and evicted OLD — the older half of the diff pair PEN-3314
+    // needs, and the half that cannot be retaken.
+    const foreign = `heap-paperclip-0${HEAP_SNAPSHOT_EXTENSION}`;
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
+    writeSnapshotFile(foreign, Date.now() / 1000); // the freshest mtime in the directory
+
+    expect(listHeapSnapshots(dir)).toEqual([NEW, OLD, foreign]);
+    expect(pruneHeapSnapshots(dir, 2, NEVER_EXPIRES)).toEqual([foreign]);
   });
 
   it("leaves unrelated files alone", () => {
@@ -423,8 +470,8 @@ describe("takeHeapSnapshot", () => {
     // Seeded deliberately: the refusal path used to prune *first*, so from an
     // empty directory this assertion could not fail. A snapshot names a past
     // heap state and cannot be retaken, and the PEN-3314 deliverable is a pair.
-    writeSnapshotFile(`old${HEAP_SNAPSHOT_EXTENSION}`, 1000);
-    writeSnapshotFile(`new${HEAP_SNAPSHOT_EXTENSION}`, 2000);
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
 
     // 1 GB heap => 2 GB estimate, atop a 10 GB floor: 11 GB free is not enough,
     // and the two seeded files are nowhere near closing a 1 GB shortfall.
@@ -436,14 +483,14 @@ describe("takeHeapSnapshot", () => {
       requiredBytes: 12 * GB,
       reclaimableBytes: 2,
     });
-    expect(readdirSync(dir).sort()).toEqual([`new${HEAP_SNAPSHOT_EXTENSION}`, `old${HEAP_SNAPSHOT_EXTENSION}`]);
+    expect(readdirSync(dir).sort()).toEqual([OLD, NEW]);
   });
 
   it("credits what the pre-prune would reclaim, so the cap still buys headroom", () => {
     // Byte-exact on purpose: required = 100 floor + 10 heap * 2 = 120. Free is
     // 118, and pruning `old` (2 bytes) is exactly what closes the gap.
-    writeSnapshotFile(`old${HEAP_SNAPSHOT_EXTENSION}`, 1000);
-    writeSnapshotFile(`new${HEAP_SNAPSHOT_EXTENSION}`, 2000);
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
 
     const result = takeHeapSnapshot(
       config({ minFreeBytes: 100, keep: 2 }),
@@ -452,7 +499,7 @@ describe("takeHeapSnapshot", () => {
     );
 
     expect("filePath" in result).toBe(true);
-    expect(readdirSync(dir)).not.toContain(`old${HEAP_SNAPSHOT_EXTENSION}`);
+    expect(readdirSync(dir)).not.toContain(OLD);
   });
 
   it("prunes BEFORE the write when the write actually needs the room", () => {
@@ -461,8 +508,8 @@ describe("takeHeapSnapshot", () => {
     // final directory would be vacuous here — the post-write prune removes `old`
     // either way — so this observes the directory mid-write, which is the only
     // point at which "before" and "after" are distinguishable.
-    writeSnapshotFile(`old${HEAP_SNAPSHOT_EXTENSION}`, 1000);
-    writeSnapshotFile(`new${HEAP_SNAPSHOT_EXTENSION}`, 2000);
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
 
     let duringWrite: string[] = [];
     // required = 100 + 10*2 = 120; free 118 is short by 2, which the prune covers.
@@ -481,7 +528,7 @@ describe("takeHeapSnapshot", () => {
     );
 
     expect("filePath" in result).toBe(true);
-    expect(duringWrite).not.toContain(`old${HEAP_SNAPSHOT_EXTENSION}`);
+    expect(duringWrite).not.toContain(OLD);
   });
 
   it("does NOT pre-prune when there is already room, so a write that dies cannot cost the baseline", () => {
@@ -493,8 +540,8 @@ describe("takeHeapSnapshot", () => {
     // Observed mid-write rather than at the end, because the post-write prune
     // (keep=2) removes `old` regardless — at the end the two orderings are
     // indistinguishable, which is exactly how this shipped unnoticed.
-    writeSnapshotFile(`old${HEAP_SNAPSHOT_EXTENSION}`, 1000);
-    writeSnapshotFile(`new${HEAP_SNAPSHOT_EXTENSION}`, 2000);
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
 
     let duringWrite: string[] = [];
     const result = takeHeapSnapshot(
@@ -513,16 +560,16 @@ describe("takeHeapSnapshot", () => {
     );
 
     expect("filePath" in result).toBe(true);
-    expect(duringWrite).toContain(`old${HEAP_SNAPSHOT_EXTENSION}`);
-    expect(duringWrite).toContain(`new${HEAP_SNAPSHOT_EXTENSION}`);
+    expect(duringWrite).toContain(OLD);
+    expect(duringWrite).toContain(NEW);
   });
 
   it("keeps both snapshots when an ample-space write throws, so the pair survives an OOM", () => {
     // The consequence the case above exists to prevent, stated as an outcome:
     // the write dies and the diff pair is still on disk. Under the old
     // unconditional pre-prune `old` was already gone by this point.
-    writeSnapshotFile(`old${HEAP_SNAPSHOT_EXTENSION}`, 1000);
-    writeSnapshotFile(`new${HEAP_SNAPSHOT_EXTENSION}`, 2000);
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
 
     expect(() =>
       takeHeapSnapshot(
@@ -539,7 +586,7 @@ describe("takeHeapSnapshot", () => {
     ).toThrow("heap exhausted mid-write");
 
     expect(readdirSync(dir).sort()).toEqual(
-      [`new${HEAP_SNAPSHOT_EXTENSION}`, `old${HEAP_SNAPSHOT_EXTENSION}`].sort(),
+      [NEW, OLD].sort(),
     );
   });
 
@@ -558,8 +605,8 @@ describe("takeHeapSnapshot", () => {
 
   it("refuses when even the reclaimable bytes would not close the gap", () => {
     // One byte tighter than the case above: 117 + 2 < 120, so nothing is spent.
-    writeSnapshotFile(`old${HEAP_SNAPSHOT_EXTENSION}`, 1000);
-    writeSnapshotFile(`new${HEAP_SNAPSHOT_EXTENSION}`, 2000);
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
 
     const result = takeHeapSnapshot(
       config({ minFreeBytes: 100, keep: 2 }),
@@ -568,7 +615,34 @@ describe("takeHeapSnapshot", () => {
     );
 
     expect("skipped" in result).toBe(true);
-    expect(readdirSync(dir).sort()).toEqual([`new${HEAP_SNAPSHOT_EXTENSION}`, `old${HEAP_SNAPSHOT_EXTENSION}`]);
+    expect(readdirSync(dir).sort()).toEqual([OLD, NEW]);
+  });
+
+  it("prices the age prune, so an expired snapshot's bytes prevent a false refusal", () => {
+    // Ally suggestion. The early `maxAgeMs` arguments were unfalsifiable: every
+    // case reaching the pricing call passed NEVER_EXPIRES, where Infinity and 0
+    // are indistinguishable, and the one case with a finite bound had ample
+    // free space, so the pre-prune was skipped before the bound mattered.
+    //
+    // Here the age prune is the *only* thing that can free a byte — keep=10
+    // means the count cap frees nothing — and the refusal threshold is exactly
+    // one byte away. A pricing call that ignored maxAgeMs would price the prune
+    // at 0 and refuse `insufficient-free-space` on a volume the prune would
+    // have made room on, which is unrecoverable: a snapshot names a past heap
+    // state and cannot be retaken.
+    const expired = `2026-09-28T20-00-00-000Z-pid1${HEAP_SNAPSHOT_EXTENSION}`; // 27h before now()
+    writeSnapshotFile(expired, 1000);
+
+    // required = 100 floor + 10 heap * 2 = 120; free is 118, and the expired
+    // snapshot's 2 bytes are exactly what closes the gap.
+    const result = takeHeapSnapshot(
+      config({ minFreeBytes: 100, keep: 10, maxAgeMs: DAY_MS }),
+      "threshold",
+      runtime({ heapUsedBytes: () => 10, freeBytes: () => 118 }),
+    );
+
+    expect("filePath" in result).toBe(true);
+    expect(readdirSync(dir)).not.toContain(expired);
   });
 
   it("leaves the cap honoured at rest once the write completes", () => {
@@ -576,16 +650,16 @@ describe("takeHeapSnapshot", () => {
     // pre-prune is skipped (see the Important-1 cases above) and it is the
     // post-write pass that enforces the cap here. The two mid-write cases are
     // what pin *when* the prune runs; this pins the end state.
-    writeSnapshotFile(`old${HEAP_SNAPSHOT_EXTENSION}`, 1000);
-    writeSnapshotFile(`new${HEAP_SNAPSHOT_EXTENSION}`, 2000);
+    writeSnapshotFile(OLD, 1000);
+    writeSnapshotFile(NEW, 2000);
 
     const result = takeHeapSnapshot(config({ keep: 2 }), "threshold", runtime());
 
     expect("filePath" in result).toBe(true);
     const names = readdirSync(dir).sort();
     expect(names).toHaveLength(2);
-    expect(names).toContain(`new${HEAP_SNAPSHOT_EXTENSION}`);
-    expect(names).not.toContain(`old${HEAP_SNAPSHOT_EXTENSION}`);
+    expect(names).toContain(NEW);
+    expect(names).not.toContain(OLD);
   });
 
   it("removes the partial when the snapshot write throws", () => {
@@ -817,5 +891,98 @@ describe("describeSentinelOutcome", () => {
     const absent = decideHeapSnapshot(cfg, state(), runtime());
     expect(absent.sentinel).toBe("absent");
     expect(describeSentinelOutcome(absent, cfg, state())).toBeNull();
+  });
+});
+
+describe("findConcurrentSnapshotWriters", () => {
+  // The window callers pass is `autoMinIntervalMs`: the shortest legitimate gap
+  // between two snapshots from one process, so anything tighter came from two.
+  const WINDOW_MS = 2 * 60 * 60 * 1000;
+
+  it("reports two processes writing inside one capture interval", () => {
+    // `keep` is a cap over the directory, not over a process. Two writers mean
+    // each round fills every slot and the post-write prune takes the previous
+    // round out, so what survives is two processes at one instant rather than
+    // one process hours apart — which cannot be diffed. It fails silently
+    // otherwise: only `prunedCount` moves.
+    expect(
+      findConcurrentSnapshotWriters(
+        [
+          `2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T22-00-30-000Z-pid20${HEAP_SNAPSHOT_EXTENSION}`,
+        ],
+        WINDOW_MS,
+      ),
+    ).toEqual({ pids: [10, 20], closestGapMs: 30_000 });
+  });
+
+  it("stays silent on a diff pair that spans a restart, which is the deliverable", () => {
+    // Why the discriminator is "different pids CLOSE TOGETHER" and not "more
+    // than one pid". A pair spanning a worker restart has two pids and is
+    // exactly what PEN-3314 asks for; `autoMinIntervalMs` guarantees its halves
+    // are hours apart. Warning here would fire on the happy path, and a warning
+    // that cries wolf on the happy path is one operators learn to scroll past.
+    expect(
+      findConcurrentSnapshotWriters(
+        [
+          `2026-09-29T20-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T22-00-00-000Z-pid20${HEAP_SNAPSHOT_EXTENSION}`,
+        ],
+        WINDOW_MS,
+      ),
+    ).toBeNull();
+  });
+
+  it("stays silent on one process snapshotting twice in quick succession", () => {
+    // A sentinel request is rate-limited by its own, much shorter interval and
+    // may legitimately land close to an automatic capture. One pid is never the
+    // failure mode this detects.
+    expect(
+      findConcurrentSnapshotWriters(
+        [
+          `2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T22-00-30-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
+        ],
+        WINDOW_MS,
+      ),
+    ).toBeNull();
+  });
+
+  it("ignores partials and names it did not write", () => {
+    // Neither can be attributed to a process: a partial is not a retained
+    // snapshot and so holds no `keep` slot, and an unparsed name yields no pid.
+    // Only the one completed, stamped file remains, so there is no pair.
+    expect(
+      findConcurrentSnapshotWriters(
+        [
+          `2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T22-00-10-000Z-pid20${HEAP_SNAPSHOT_EXTENSION}.partial`,
+          `heap-paperclip-0${HEAP_SNAPSHOT_EXTENSION}`,
+        ],
+        WINDOW_MS,
+      ),
+    ).toBeNull();
+  });
+
+  it("finds a non-adjacent pair, and reports the tightest gap", () => {
+    // Three snapshots where the two offending ones are not neighbours in time:
+    // scanning adjacent pairs only would miss pid20 against the later pid10.
+    expect(
+      findConcurrentSnapshotWriters(
+        [
+          `2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T22-00-45-000Z-pid20${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T22-00-50-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
+        ],
+        WINDOW_MS,
+      ),
+    ).toEqual({ pids: [10, 20], closestGapMs: 5_000 });
+  });
+
+  it("is silent on an empty or single-entry directory", () => {
+    expect(findConcurrentSnapshotWriters([], WINDOW_MS)).toBeNull();
+    expect(
+      findConcurrentSnapshotWriters([`2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`], WINDOW_MS),
+    ).toBeNull();
   });
 });

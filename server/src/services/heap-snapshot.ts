@@ -118,7 +118,20 @@ export const defaultHeapSnapshotRuntime: HeapSnapshotRuntime = {
 
 export interface HeapSnapshotConfig {
   dir: string;
-  /** Number of completed snapshots to retain. Older ones are pruned newest-first. */
+  /**
+   * Number of completed snapshots to retain. Older ones are pruned newest-first.
+   *
+   * A cap over the whole **directory**, not per writing process — and `dir` is on
+   * a volume every pod mounts. That is sound today only because the tier that
+   * runs this is a singleton: the worker StatefulSet is `replicas: 1` and the API
+   * Deployment sets `PAPERCLIP_NODE_ROLE=api`, which excludes it from the feature
+   * entirely. Raising the worker replica count without raising `keep` with it
+   * breaks the PEN-3314 deliverable rather than merely crowding the disk: each
+   * round of snapshots fills every slot within one window and the post-write
+   * prune takes the previous round out, so the pair stops spanning hours and
+   * becomes one instant across processes. Budget `keep >= replicas × pairs`.
+   * `findConcurrentSnapshotWriters` detects the condition if it ever arises.
+   */
   keep: number;
   /** Refuse to snapshot unless this many bytes remain free after the estimated write. */
   minFreeBytes: number;
@@ -157,7 +170,10 @@ export interface HeapSnapshotConfig {
    * Measured from the filename stamp rather than mtime on purpose. Retrieval is
    * documented as copying these off the shared volume, and copy tooling rewrites
    * mtimes — so an mtime-based bound would let a reader *extend* the window by
-   * touching the file. The embedded stamp is not mutable that way.
+   * touching the file. The embedded stamp is not mutable that way. A file whose
+   * name this module did not write has no stamp to read and is treated as
+   * already expired rather than falling back to mtime, which would reopen
+   * exactly that hole for any name that did not parse (see `retentionKeyMs`).
    *
    * Must exceed `autoMinIntervalMs`, or the older half of a diff pair can expire
    * before the newer half is taken; the caller warns when it does not.
@@ -199,7 +215,8 @@ function isPartialSnapshot(name: string): boolean {
 }
 
 /** Matches `snapshotBasename`: an ISO stamp with `:` and `.` flattened to `-`. */
-const SNAPSHOT_NAME_PATTERN = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z-pid\d+/;
+const SNAPSHOT_NAME_PATTERN =
+  /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z-pid(\d+)/;
 
 /**
  * Recover the capture time from the filename, or null if it was not written by
@@ -216,6 +233,110 @@ function snapshotStampMs(name: string): number | null {
   const [, date, hh, mm, ss, ms] = match;
   const parsed = Date.parse(`${date}T${hh}:${mm}:${ss}.${ms}Z`);
   return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * The one retention key for a snapshot file: its embedded capture stamp, or `0`
+ * for any name this module did not write.
+ *
+ * Zero is load-bearing in both directions at once. A file keyed `0` sorts
+ * *oldest* under every ordering here, so it can never hold a `keep` slot ahead
+ * of a real snapshot; and `nowMs - 0` exceeds every finite `maxAgeMs`, so it is
+ * expirable on the first sweep that sees it. Maximally old and maximally
+ * expirable is the correct posture for a secret-bearing file on this volume
+ * that this process cannot date.
+ *
+ * The fallback this replaces was `?? stats.mtimeMs`, and it broke both halves.
+ * `maxAgeMs` is documented as stamp-based precisely so a reader cannot extend
+ * the exposure window by touching the file — and mtime handed that mutability
+ * straight back for any name that happened not to parse, so a file with a
+ * refreshed mtime never expired at all. It also broke *inconsistently*:
+ * `listHeapSnapshots` already keyed the same file at `0`, so the two functions
+ * disagreed about which end of the ordering it sat on, and an unstamped file
+ * could take a keep slot and evict the older half of a diff pair — the one
+ * artifact PEN-3314 needs and the one that cannot be retaken.
+ *
+ * Sole source of this key: every ordering and every age test routes through it,
+ * so the two cannot drift apart again. (Ally review, PEN-3631.)
+ */
+function retentionKeyMs(name: string): number {
+  return snapshotStampMs(name) ?? 0;
+}
+
+/** The pid segment `snapshotBasename` embedded, or null for a foreign name. */
+function snapshotPid(name: string): number | null {
+  const match = SNAPSHOT_NAME_PATTERN.exec(name);
+  return match === null ? null : Number(match[6]);
+}
+
+export interface ConcurrentSnapshotWriters {
+  /** Every pid involved in a too-close pair, ascending. */
+  pids: number[];
+  /** The tightest gap found between two different pids. */
+  closestGapMs: number;
+}
+
+/**
+ * Detect two *different* processes writing snapshots into one directory inside
+ * a single `windowMs`, or null if nothing here looks concurrent.
+ *
+ * `keep` is a global cap over this directory, and the directory is shared by
+ * every process that mounts the volume. With more than one writer, each round
+ * of snapshots fills all `keep` slots within the same window and the post-write
+ * prune removes the previous round wholesale — leaving two snapshots of
+ * *different processes at one instant* rather than one process hours apart. The
+ * diff PEN-3314 needs becomes unobtainable, and it fails silently, with only
+ * `prunedCount` moving.
+ *
+ * The discriminator is deliberately "different pids **close together**", not
+ * "more than one pid". A diff pair that spans a worker restart has two pids and
+ * is the *intended* deliverable — `autoMinIntervalMs` guarantees its halves are
+ * hours apart. Warning on multi-pid alone would fire on exactly the workflow
+ * this feature exists to support, and a warning that cries wolf on the happy
+ * path is one operators learn to scroll past. Two different pids inside one
+ * capture interval cannot be a sequential pair; it is concurrency or it is a
+ * clock that cannot be trusted, and both want the same operator response.
+ *
+ * Pass `autoMinIntervalMs` as the window: it is the shortest legitimate spacing
+ * between two snapshots from one process, so anything tighter came from two.
+ *
+ * Detection rather than partitioning, and that is a choice. Partitioning the
+ * keep window by pid was the other option and is worse here: pid changes on
+ * every restart, not every replica, so partitions would accumulate per-restart
+ * and turn a global disk cap into one unbounded in the number of partitions —
+ * on a shared volume that PEN-3631 requires snapshots not be allowed to fill.
+ * (Ally review, PEN-3631.)
+ */
+export function findConcurrentSnapshotWriters(
+  names: string[],
+  windowMs: number,
+): ConcurrentSnapshotWriters | null {
+  if (windowMs <= 0) return null;
+  const parsed = names
+    .filter(isCompletedSnapshot)
+    .map((name) => {
+      const stampMs = snapshotStampMs(name);
+      const pid = snapshotPid(name);
+      return stampMs === null || pid === null ? null : { stampMs, pid };
+    })
+    .filter((entry): entry is { stampMs: number; pid: number } => entry !== null)
+    .sort((a, b) => a.stampMs - b.stampMs);
+
+  const pids = new Set<number>();
+  let closestGapMs = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < parsed.length; i += 1) {
+    for (let j = i + 1; j < parsed.length; j += 1) {
+      const gapMs = parsed[j].stampMs - parsed[i].stampMs;
+      // Ascending by stamp, so every later j is at least this far out too.
+      if (gapMs >= windowMs) break;
+      if (parsed[i].pid === parsed[j].pid) continue;
+      pids.add(parsed[i].pid);
+      pids.add(parsed[j].pid);
+      if (gapMs < closestGapMs) closestGapMs = gapMs;
+    }
+  }
+  if (pids.size === 0) return null;
+  return { pids: [...pids].sort((a, b) => a - b), closestGapMs };
 }
 
 interface PrunableEntry {
@@ -250,6 +371,15 @@ function collectPrunable(
       const stats = statSync(path.join(dir, name));
       // Filename stamp first; mtime only for a file this module did not name,
       // where there is nothing else to go on. See PARTIAL_ABANDONED_AFTER_MS.
+      //
+      // Deliberately NOT routed through `retentionKeyMs`. The completed path
+      // keys an unparsed name at 0 because its only bound is `maxAgeMs`, which
+      // mtime made evadable without limit. Here the bound is a fixed 10-minute
+      // abandonment window, so the exposure is capped either way — and keying
+      // at 0 would delete every stampless partial on sight, including a peer's
+      // genuinely in-flight write. The two paths differ because what they are
+      // protecting against differs. (Ally review noted the shared shape and
+      // that this bound caps it; PEN-3631.)
       const startedAtMs = snapshotStampMs(name) ?? stats.mtimeMs;
       if (nowMs - startedAtMs < PARTIAL_ABANDONED_AFTER_MS) continue;
       prunable.push({ name, sizeBytes: stats.size });
@@ -263,7 +393,7 @@ function collectPrunable(
     .map((name) => {
       try {
         const stats = statSync(path.join(dir, name));
-        return { name, sizeBytes: stats.size, sortKey: snapshotStampMs(name) ?? stats.mtimeMs };
+        return { name, sizeBytes: stats.size, sortKey: retentionKeyMs(name) };
       } catch {
         return null;
       }
@@ -342,7 +472,7 @@ export function listHeapSnapshots(dir: string): string[] {
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .filter(isCompletedSnapshot)
-    .sort((a, b) => (snapshotStampMs(b) ?? 0) - (snapshotStampMs(a) ?? 0));
+    .sort((a, b) => retentionKeyMs(b) - retentionKeyMs(a));
 }
 
 /**
@@ -367,8 +497,7 @@ export function listResidualHeapSnapshots(dir: string): {
   partial: string[];
 } {
   if (!existsSync(dir)) return { completed: [], partial: [] };
-  const byNewest = (a: string, b: string): number =>
-    (snapshotStampMs(b) ?? 0) - (snapshotStampMs(a) ?? 0);
+  const byNewest = (a: string, b: string): number => retentionKeyMs(b) - retentionKeyMs(a);
   const entries = readdirSync(dir);
   return {
     completed: entries.filter(isCompletedSnapshot).sort(byNewest),

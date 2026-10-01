@@ -83,7 +83,9 @@ import {
   decideHeapSnapshot,
   describeSentinelOutcome,
   ensureHeapSnapshotDir,
+  findConcurrentSnapshotWriters,
   heapSnapshotSweepKeep,
+  listHeapSnapshots,
   listResidualHeapSnapshots,
   planHeapSnapshotStartup,
   pruneHeapSnapshots,
@@ -1134,6 +1136,29 @@ export async function startServer(): Promise<StartedServer> {
   // the watchdog registration below for why the recovery-chain detector must
   // not ride the heartbeat tick.
   let heartbeatRecoveryChainWatchdogInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * PEN-3631. The heap-snapshot poll, declared out here so `shutdown()` can
+   * clear it the way it clears `heartbeatSchedulerInterval`.
+   *
+   * Leaking the timer would be harmless on its own — shutdown ends in
+   * `process.exit`. What is not harmless is what the callback *does* during the
+   * drain that precedes it. It is deliberately synchronous and
+   * `writeHeapSnapshot` is stop-the-world, so a trigger observed after SIGTERM
+   * blocks the event loop for the length of a multi-gigabyte write while
+   * `shutdown()` is still awaiting `drainInFlightRunSetup`, per-company secret
+   * queries and `embeddedPostgres.stop()`. Outlast the remaining
+   * `terminationGracePeriodSeconds` and the pod is SIGKILLed mid-drain with
+   * in-flight runs never terminalized — precisely the outcome the drain exists
+   * to prevent. With a threshold set the heap sits above it by definition (that
+   * is the PEN-3314 posture) and `lastAutoSnapshotAtMs` is null after a restart,
+   * so the first post-SIGTERM poll fires unconditionally; any pod on the shared
+   * claim touching the sentinel reaches the same place on demand.
+   *
+   * `unref()` would not do: it stops the timer holding the loop open, not an
+   * already-fired callback from blocking the drain.
+   */
+  let heapSnapshotPollInterval: ReturnType<typeof setInterval> | null = null;
+  let heapSnapshotPollStopped = false;
   /**
    * BLO-19123. Last time the hand-back drain actually ran, so its cadence is decoupled from
    * the scheduler's.
@@ -2525,7 +2550,22 @@ export async function startServer(): Promise<StartedServer> {
       // there would be no way to request the first snapshot. Only when capture is
       // on — a disabled feature should not materialise a directory, and the sweep
       // below treats a missing one as nothing to do.
-      ensureHeapSnapshotDir(heapSnapshotConfig.dir);
+      //
+      // Guarded for the same reason the sweep is: this runs inside startServer(),
+      // which is invoked as `void startServer().catch(() => process.exit(1))`, so
+      // an unhandled EACCES/EIO/ESTALE here is not a failed diagnostic — it is a
+      // boot crash-loop. The shared CephFS claim every agent pod also mounts rw
+      // makes a transient one entirely ordinary. Capture will fail later and say
+      // so; nothing in this block may reject startup.
+      try {
+        ensureHeapSnapshotDir(heapSnapshotConfig.dir);
+      } catch (err) {
+        logger.error(
+          { err, snapshotDir: heapSnapshotConfig.dir },
+          "Heap snapshot directory could not be created — capture is enabled but the sentinel has nowhere to land, " +
+            "so requests will not be honoured until this is resolved",
+        );
+      }
 
       logger.warn(
         {
@@ -2568,17 +2608,44 @@ export async function startServer(): Promise<StartedServer> {
     // and an OOM *during* the write is this feature's own documented failure
     // mode — so the case most likely to strand one was the case this check used
     // to be blind to. (Ally review Important 1, PEN-3631.)
-    const residualSnapshots = config.heapSnapshotEnabled
-      ? { completed: [], partial: [] }
-      : listResidualHeapSnapshots(heapSnapshotConfig.dir);
+    //
+    // Guarded like the sweep above it. This is on the *default* path — the
+    // branch runs only when capture is disabled — and is reached on every boot
+    // once the directory exists, i.e. after the documented enable → capture →
+    // retrieve → disable cycle. Read bare, a directory this process cannot read
+    // turned a switched-off diagnostic into a rejected startServer() and so into
+    // a crash-loop. On failure the residual state is *unknown*, which is
+    // deliberately resolved towards keeping the poll armed: the poll's own sweep
+    // is itself guarded, so retrying costs nothing, while assuming the volume is
+    // clear would silently abandon credential-bearing files. (Ally review,
+    // PEN-3631.)
+    let residualSnapshots: { completed: string[]; partial: string[] } = {
+      completed: [],
+      partial: [],
+    };
+    let residualSnapshotsUnreadable = false;
+    if (!config.heapSnapshotEnabled) {
+      try {
+        residualSnapshots = listResidualHeapSnapshots(heapSnapshotConfig.dir);
+      } catch (err) {
+        residualSnapshotsUnreadable = true;
+        logger.error(
+          { err, snapshotDir: heapSnapshotConfig.dir },
+          "Heap snapshot directory could not be read at startup — residual snapshot state is unknown. Assuming files " +
+            "may remain and keeping the sweep poll armed; these would contain this process's secrets in plaintext",
+        );
+      }
+    }
     const residualSnapshotCount =
       residualSnapshots.completed.length + residualSnapshots.partial.length;
     const heapSnapshotPlan = planHeapSnapshotStartup({
       captureEnabled: config.heapSnapshotEnabled,
-      residualSnapshotCount,
+      // Unknown is treated as "something may be there", so the poll stays armed
+      // and keeps retrying the sweep rather than concluding the volume is clear.
+      residualSnapshotCount: residualSnapshotsUnreadable ? 1 : residualSnapshotCount,
     });
 
-    if (heapSnapshotPlan.warnResidualSnapshots) {
+    if (heapSnapshotPlan.warnResidualSnapshots && !residualSnapshotsUnreadable) {
       logger.warn(
         {
           snapshotDir: heapSnapshotConfig.dir,
@@ -2600,7 +2667,13 @@ export async function startServer(): Promise<StartedServer> {
     }
 
     if (heapSnapshotPlan.poll) {
-      setInterval(() => {
+      heapSnapshotPollInterval = setInterval(() => {
+        // Checked before anything else, including the sweep. Clearing the handle
+        // in shutdown() covers the common case; this covers a callback that had
+        // already entered the queue when the signal arrived, and keeps the
+        // guarantee local rather than resting on there being no `await` between
+        // the signal handler and the clear. See heapSnapshotPollInterval.
+        if (heapSnapshotPollStopped) return;
         // Deliberately synchronous. writeHeapSnapshot is stop-the-world anyway, so
         // there is nothing to yield to, and keeping it on one tick means a poll can
         // never overlap its own predecessor.
@@ -2656,6 +2729,41 @@ export async function startServer(): Promise<StartedServer> {
             },
             "Heap snapshot written — contains this process's secrets in plaintext; retrieve, then treat as a credential exposure",
           );
+
+          // `keep` is a cap over the directory, not over this process, and the
+          // directory is on a volume every pod mounts. Two writers inside one
+          // capture interval means each round fills every slot and the prune
+          // above has just taken the previous round out — so the pair stops
+          // spanning hours and becomes one instant across processes, which is
+          // not a diff. It fails silently otherwise: only `prunedCount` moves.
+          // Checked here rather than at startup because this is the moment the
+          // eviction actually happens, and `autoMinIntervalMs` rate-limits the
+          // warning for free. (Ally review, PEN-3631.)
+          try {
+            const concurrent = findConcurrentSnapshotWriters(
+              listHeapSnapshots(heapSnapshotConfig.dir),
+              heapSnapshotConfig.autoMinIntervalMs,
+            );
+            if (concurrent !== null) {
+              logger.warn(
+                {
+                  snapshotDir: heapSnapshotConfig.dir,
+                  pids: concurrent.pids,
+                  closestGapMs: concurrent.closestGapMs,
+                  keep: heapSnapshotConfig.keep,
+                  autoMinIntervalMs: heapSnapshotConfig.autoMinIntervalMs,
+                },
+                "Heap snapshots from more than one process landed in this directory inside one capture interval — 'keep' is a " +
+                  "directory-wide cap, so each round evicts the previous one and the retained snapshots are different processes " +
+                  "at one instant rather than one process hours apart, which cannot be diffed. Raise " +
+                  "PAPERCLIP_HEAP_SNAPSHOT_KEEP to at least writers x desired-pairs, or give each writer its own directory",
+              );
+            }
+          } catch (err) {
+            // Advisory only — never let the detector fail the capture that just
+            // succeeded, nor the poll that has retention work still to do.
+            logger.debug({ err }, "Concurrent heap snapshot writer check failed");
+          }
         } catch (err) {
           logger.error({ err, snapshotDir: heapSnapshotConfig.dir }, "Heap snapshot failed");
         }
@@ -2835,6 +2943,17 @@ export async function startServer(): Promise<StartedServer> {
       if (heartbeatRecoveryChainWatchdogInterval) {
         clearInterval(heartbeatRecoveryChainWatchdogInterval);
         heartbeatRecoveryChainWatchdogInterval = null;
+      }
+
+      // Disarmed alongside the scheduler, and before the drain below, because a
+      // heap snapshot is a synchronous multi-gigabyte stop-the-world write: one
+      // fired during the drain can push the pod past its termination grace and
+      // get it SIGKILLed with runs still in flight. The flag is set as well as
+      // the handle cleared — see heapSnapshotPollInterval. (PEN-3631.)
+      heapSnapshotPollStopped = true;
+      if (heapSnapshotPollInterval) {
+        clearInterval(heapSnapshotPollInterval);
+        heapSnapshotPollInterval = null;
       }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
