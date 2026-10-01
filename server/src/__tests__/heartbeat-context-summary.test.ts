@@ -284,9 +284,9 @@ describe("buildPaperclipTaskMarkdown", () => {
       "counted_findings_buckets_all_zero",
     );
     // The declined classification is written as `true`-only, so a declined wake
-    // leaves it false -- the actionable and declined cases stay distinguishable
+    // leaves it null -- the actionable and declined cases stay distinguishable
     // from inside the run.
-    expect(prReview?.reviewFeedbackActionable).toBe(false);
+    expect(prReview?.reviewFeedbackActionable).toBeNull();
 
     const authorMarkdown = buildPaperclipTaskMarkdown({ issue: null, prReview });
 
@@ -317,7 +317,7 @@ describe("buildPaperclipTaskMarkdown", () => {
       githubPrReviewAuthorLogin: "allyblockcast[bot]",
     });
     expect(prReview?.reviewFeedbackSuppressionReason).toBeNull();
-    expect(prReview?.reviewFeedbackActionable).toBe(false);
+    expect(prReview?.reviewFeedbackActionable).toBeNull();
 
     const authorMarkdown = buildPaperclipTaskMarkdown({ issue: null, prReview });
     expect(authorMarkdown).toContain("If the findings are correct");
@@ -346,6 +346,42 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(authorMarkdown).not.toContain("classified as carrying NO actionable findings");
     // An actionable review still gets the unchanged push directive.
     expect(authorMarkdown).toContain("If the findings are correct");
+  });
+
+  // The two classifications are mutually exclusive for a single delivery, so
+  // this state is unreachable from today's webhook. It is pinned anyway because
+  // the decline-first ordering is a safety property the code comments claim,
+  // and until this test existed nothing held it: swapping the informational
+  // block's arms passed all 541 tests in this file (measured 2026-10-01).
+  //
+  // Note what the ordering does and does not protect. The closing directive is
+  // safe structurally -- its ternary keys on the decline reason and never reads
+  // `reviewFeedbackActionable` -- so a swap cannot resurrect the push
+  // instruction. What it breaks is coherence: the run would be told there is
+  // "something concrete to address" directly above a directive saying no
+  // implementation pass is required, which is the self-contradicting wake this
+  // PR exists to remove.
+  it("prefers the decline line when both classifications are present", () => {
+    const prReview = derivePaperclipPrReview({
+      wakeReason: "github_pr_review_submitted",
+      githubPrNumber: 1681,
+      githubRepoFullName: "Blockcast/paperclip",
+      githubEvent: "pull_request_review",
+      prRole: "author",
+      githubPrReviewState: "commented",
+      githubReviewFeedbackActionable: true,
+      githubReviewFeedbackSuppressionReason: "ally_review_findings_all_zero",
+    });
+    expect(prReview?.reviewFeedbackActionable).toBe(true);
+    expect(prReview?.reviewFeedbackSuppressionReason).toBe("ally_review_findings_all_zero");
+
+    const authorMarkdown = buildPaperclipTaskMarkdown({ issue: null, prReview });
+    // Decline wins the informational block ...
+    expect(authorMarkdown).toContain("classified as carrying NO actionable findings");
+    expect(authorMarkdown).not.toContain("classified as carrying actionable findings");
+    // ... and the directive agrees with it rather than asking for a no-op push.
+    expect(authorMarkdown).toContain("no implementation pass is required");
+    expect(authorMarkdown).not.toContain("If the findings are correct");
   });
 
   it("falls back to a generic author-facing directive when reviewer login / state / body are missing", () => {
@@ -674,7 +710,7 @@ describe("derivePaperclipPrReview", () => {
       prAuthorLogin: null,
       // BLO-38816: review-feedback classification. Absent from this snapshot,
       // so the run reads "unclassified" -- not "declined".
-      reviewFeedbackActionable: false,
+      reviewFeedbackActionable: null,
       reviewFeedbackSuppressionReason: null,
       reviewFeedbackSuppressionPredicate: null,
     });
