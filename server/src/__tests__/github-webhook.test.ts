@@ -11905,6 +11905,55 @@ describe("PR review convergence signal (BLO-35909)", () => {
     expect(__test_bodyReRaisesPriorFinding(null)).toBe(false);
     expect(__test_bodyReRaisesPriorFinding(undefined)).toBe(false);
   });
+
+  // BLO-38809: the resolve site must CLASSIFY, not just forward the body.
+  // reRaisesPriorFinding falls back to `bodyReRaisesPriorFinding(prFeedbackBody(context))`
+  // when the field is absent, so dropping the resolve-time line still yields a
+  // boolean and nothing goes red — it just re-derives the verdict off the
+  // CLAMPED body, which is the pre-BLO-35909 behaviour. Only a ledger past the
+  // clamp boundary can tell the two paths apart, so this fixture puts one there
+  // (frr#61's buckets sat at bytes 4248/4273 against the 4096-byte clamp).
+  it("classifies the ledger off the RAW review body, past the clamp boundary (BLO-38809)", () => {
+    const stillPresent = "- **prior:de0d81ab important 1** — still-present — head has moved on";
+    const pastTheClamp = [
+      "## Ally — Consolidated PR Review",
+      "",
+      "### Suggestions (60)",
+      "",
+      ...Array.from(
+        { length: 60 },
+        (_, i) => `- nit ${i}: prose padding so the ledger below lands past the 4096-byte clamp boundary.`,
+      ),
+      "",
+      "### Prior Findings Dispositioned",
+      "",
+      stillPresent,
+    ].join("\n");
+
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 61,
+        title: "fix(frr): BLO-35909 convergence signal",
+        head: { ref: "fix/BLO-35909", sha: "251d5caa8726897b25d603d9e6b1b4118ea36ac0" },
+      },
+      review: { body: pastTheClamp, state: "commented", user: { login: "allyblockcast[bot]" } },
+      repository: { full_name: "Blockcast/frr" },
+    });
+    expect(ctx).not.toBeNull();
+
+    // Control: without this the fixture proves nothing. A body shorter than the
+    // clamp reads the same on both paths, so the assertion below would pass on
+    // the fallback too. This pins that the ledger really is unreachable from the
+    // clamped body the fallback would read (prFeedbackBody === reviewBody here,
+    // commentBody being undefined on a review context).
+    expect(ctx!.reviewBody).not.toContain("still-present");
+    expect(__test_bodyReRaisesPriorFinding(ctx!.reviewBody)).toBe(false);
+
+    // The guard: the field must be PRESENT on the resolved context. `toBe(true)`
+    // rather than a truthiness check so the absent-field case (undefined) fails.
+    expect(ctx!.reviewReRaisesPriorFinding).toBe(true);
+  });
 });
 
 // BLO-23059: Claude Code Review's "paused" org-settings notice arrives as a
