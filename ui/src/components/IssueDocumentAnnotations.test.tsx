@@ -325,12 +325,12 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
-    await vi.waitFor(() => {
+    const chip = await vi.waitFor(() => {
       const el = container.querySelector('[data-testid="document-annotation-count-plan"]');
       expect(el).not.toBeNull();
       expect(el!.textContent).toContain("1");
+      return el!;
     });
-    const chip = container.querySelector('[data-testid="document-annotation-count-plan"]');
     expect(mockAnnotationsApi.list).toHaveBeenCalledTimes(1);
 
     await act(async () => {
@@ -645,13 +645,13 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
-    // Click the open thread to expand it.
-    await vi.waitFor(() => {
-      expect(container.querySelector('[data-thread-id="open-1"]')).not.toBeNull();
+    const threadCard = await vi.waitFor(() => {
+      const el = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
+      expect(el).not.toBeNull();
+      return el!;
     });
-    const threadCard = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
-    expect(threadCard).not.toBeNull();
-    await act(async () => threadCard!.click());
+    // Click the open thread to expand it.
+    await act(async () => threadCard.click());
     await flush();
 
     const expandedThread = container.querySelector('[data-thread-id="open-1"]');
@@ -886,11 +886,12 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
-    await vi.waitFor(() => {
-      expect(container.querySelector('[data-thread-id="open-1"]')).not.toBeNull();
+    const openThread = await vi.waitFor(() => {
+      const el = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
+      expect(el).not.toBeNull();
+      return el!;
     });
-    const openThread = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
-    await act(async () => openThread!.click());
+    await act(async () => openThread.click());
     await flush();
 
     const reply = container.querySelector(
@@ -925,11 +926,12 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
-    await vi.waitFor(() => {
-      expect(container.querySelector('[data-thread-id="open-1"]')).not.toBeNull();
+    const openThread = await vi.waitFor(() => {
+      const el = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
+      expect(el).not.toBeNull();
+      return el!;
     });
-    const openThread = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
-    await act(async () => openThread!.click());
+    await act(async () => openThread.click());
     await flush();
 
     const reply = container.querySelector(
@@ -976,11 +978,12 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
-    await vi.waitFor(() => {
-      expect(container.querySelector('[data-thread-id="open-1"]')).not.toBeNull();
+    const openThread = await vi.waitFor(() => {
+      const el = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
+      expect(el).not.toBeNull();
+      return el!;
     });
-    const openThread = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
-    await act(async () => openThread!.click());
+    await act(async () => openThread.click());
     await flush();
 
     const resolveButton = Array.from(container.querySelectorAll("button")).find(
