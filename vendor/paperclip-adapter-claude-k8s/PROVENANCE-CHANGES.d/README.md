@@ -14,6 +14,16 @@ Content is free-form prose: what changed, which files, and why.
 `scripts/check-vendored-provenance-log.mjs` (the `policy` job) fails any PR that
 touches vendored source without one.
 
+Two things the guard enforces beyond "a file exists":
+
+- **The directory is append-only.** Never delete or rename an entry — each one
+  records why the vendored tree changed in some earlier PR, and removing it
+  erases that record. To correct an entry, add a new one that supersedes it.
+  (A rename is a delete: git pairs a removed entry with a similar new one and
+  reports neither, so the guard suppresses rename detection to see through it.)
+- **An entry has to say something.** An empty or whitespace-only file is a path,
+  not a record, and is rejected — the same rule the old row table had.
+
 ## Why a directory and not a table
 
 Two PRs adding two distinct files never conflict, under any merge
