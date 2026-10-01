@@ -137,10 +137,47 @@ jobs:
           # which needs the waiting run's head to test whether a cancelled
           # predecessor is a strict ancestor of it — i.e. whether it was
           # superseded rather than cancelled for some other reason.
-          gh run list --repo "$REPO" --workflow=docker.yml \
-              --event=workflow_dispatch --limit 20 \
-              --json databaseId,status,createdAt,url,headSha \
-              --jq '[.[] | select(.status == "waiting" or .status == "in_progress" or .status == "queued")]' \
+          #
+          # BLO-38907: this read used to be
+          #   gh run list --workflow=docker.yml --event=workflow_dispatch --limit 20
+          # and that form INTERMITTENTLY RETURNS A STALE SLICE. Measured live on
+          # 2026-10-01 while run 36850416203 was `waiting`: the identical query
+          # returned a page whose newest entry was 2026-09-10T12:15:25Z — no
+          # October run at all, at --limit 20 AND --limit 50 — so the guard counted
+          # zero pending. This run's own 17:31Z slot hit it in production and
+          # reported `checked-no-pending` with a deploy sitting on the gate.
+          #
+          # That failure is silent in the worst direction. Guard (1) reading zero
+          # means: no `skipped-pending`, so no ProductionDeployApprovalStuck
+          # escalation and no supersede (the approvable head froze 14 commits
+          # behind master); a GREEN run, when PEN-2848 made `conclusion` itself
+          # the stall signal; and on the daily slot it falls through to guard (2)
+          # and dispatches a SECOND deploy — the double-roll guard (1) exists to
+          # prevent (observed 2026-08-30).
+          #
+          # Two changes, both aimed at that:
+          #   1. Read the REST endpoint `gh run list` wraps, rather than the CLI
+          #      path where the divergence was measured. The raw endpoint returned
+          #      the waiting run, first, on every attempt.
+          #   2. UNION it with a `status=waiting` query and take unique ids. This
+          #      is the fail-closed half and does not depend on either read being
+          #      proven sound: a stale slice can only ever REMOVE rows, so a union
+          #      cannot produce a false "nothing pending". The worst case is a
+          #      skipped dispatch, which the next daily slot retries; the worst
+          #      case of a false zero is a stacked approval on production.
+          # A read that fails outright still aborts the step under `set -e`, which
+          # is red and visible — never a silent zero.
+          {
+            gh api "repos/$REPO/actions/workflows/docker.yml/runs?event=workflow_dispatch&per_page=50" \
+                --jq '.workflow_runs[]'
+            gh api "repos/$REPO/actions/workflows/docker.yml/runs?status=waiting&per_page=50" \
+                --jq '.workflow_runs[]'
+          } | jq -s '[ .[]
+                | select(.event == "workflow_dispatch")
+                | select(.status == "waiting" or .status == "in_progress" or .status == "queued")
+                | { databaseId: .id, status: .status, createdAt: .created_at,
+                    url: .html_url, headSha: .head_sha } ]
+              | unique_by(.databaseId) | sort_by(.createdAt) | reverse' \
               > "$PENDING_JSON_PATH"
           PENDING="$(jq 'length' "$PENDING_JSON_PATH")"
           if [ "${PENDING:-0}" -gt 0 ]; then
