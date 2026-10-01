@@ -747,7 +747,13 @@ const aggregateFenceLocalWaiters = new Map<string, LocalFenceWaiter[]>();
 
 /** Fences are company-scoped, so the local queue must be too. */
 function localFenceQueueKey(companyId: string, aggregateKey: string): string {
-  return `${companyId} ${aggregateKey}`;
+  // `\0` rather than a literal NUL byte: byte-identical at runtime, but a raw
+  // NUL makes this whole file binary to content search. Measured here, `grep`
+  // did not even print "binary file matches" — it exited 1 with no output,
+  // i.e. a silent false negative, while `rg` suppressed the matches (PEN-3013
+  // review). NUL stays the separator: it is the one byte that cannot appear in
+  // either component, so the key cannot be forged by a crafted aggregate key.
+  return `${companyId}\0${aggregateKey}`;
 }
 
 function createLocalFenceWaiter(): LocalFenceWaiter {
@@ -787,6 +793,33 @@ function signalLocalFenceRelease(companyId: string, aggregateKey: string): void 
   const next = queue.shift();
   if (queue.length === 0) aggregateFenceLocalWaiters.delete(queueKey);
   next?.wake();
+}
+
+/**
+ * Put a woken waiter back at the head of the queue after a claim it could not
+ * convert.
+ *
+ * A wake is not a grant. `signalLocalFenceRelease` removes the waiter from the
+ * queue, but ownership is still decided by `beginAggregateFiring`, and the
+ * window between the two is a full database round trip — wide enough for a
+ * freshly arrived delivery, which attempts a claim once before it registers, to
+ * take the fence first. Without this the loser would have both consumed the
+ * wake (no other queued delivery received it) and dropped out of the queue, so
+ * it could never be woken again and would fall back to pure jittered polling
+ * for the rest of its budget — strictly worse treatment than a waiter that was
+ * never woken, and inflicted specifically on the longest-waiting delivery.
+ *
+ * Front rather than back, because the waiter's arrival time has not changed:
+ * it still predates everything now queued, so `unshift` is what keeps the
+ * handoff FIFO by arrival. Re-entry is conditional on the waiter actually being
+ * absent, so a waiter whose timer fired (still queued, never woken) is not
+ * duplicated.
+ */
+function requeueLocalFenceWaiter(queueKey: string, waiter: LocalFenceWaiter): void {
+  const queue = aggregateFenceLocalWaiters.get(queueKey) ?? [];
+  if (queue.includes(waiter)) return;
+  queue.unshift(waiter);
+  aggregateFenceLocalWaiters.set(queueKey, queue);
 }
 
 /** Test seam: how many deliveries are queued on a local fence right now. */
@@ -876,6 +909,10 @@ async function claimAggregateFiringWaiting(
       await Promise.race([waiter.awaken(), policy.sleep(delayMs)]);
       attempt += 1;
       claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+      // A wake that lost the reclaim race must not cost the waiter its place in
+      // the queue; see {@link requeueLocalFenceWaiter}. No-op when the timer,
+      // not a wake, is what ended the sleep.
+      if (!claim.ok) requeueLocalFenceWaiter(queueKey, waiter);
     }
   } finally {
     const live = aggregateFenceLocalWaiters.get(queueKey);

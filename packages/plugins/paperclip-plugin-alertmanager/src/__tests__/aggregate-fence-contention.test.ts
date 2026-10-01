@@ -66,7 +66,16 @@ async function applyMigrations(pg: PGlite): Promise<void> {
   }
 }
 
-function realDb(pg: PGlite) {
+/**
+ * `beforeExecute` is the seam the lost-reclaim case needs: it can suspend one
+ * delivery's next write mid-flight so another delivery provably gets there
+ * first. It is per-context, so arming it on one delivery leaves the others
+ * running at full speed.
+ */
+function realDb(
+  pg: PGlite,
+  hooks: { beforeExecute?: (sql: string) => Promise<void> } = {},
+) {
   return {
     namespace: NAMESPACE,
     query: vi.fn(async (sql: string, params: unknown[] = []) => {
@@ -74,6 +83,7 @@ function realDb(pg: PGlite) {
       return result.rows;
     }),
     execute: vi.fn(async (sql: string, params: unknown[] = []) => {
+      await hooks.beforeExecute?.(sql);
       const result = await pg.query(sql, params as unknown[]);
       return { rowCount: result.affectedRows ?? 0 };
     }),
@@ -147,7 +157,12 @@ const firingBatchOf = (size: number): AlertmanagerWebhookPayload => ({
   })),
 });
 
-function mkCtx(overrides: { onIssueCreate?: () => Promise<void> } = {}) {
+function mkCtx(
+  overrides: {
+    onIssueCreate?: () => Promise<void>;
+    beforeExecute?: (sql: string) => Promise<void>;
+  } = {},
+) {
   const logger = {
     info: vi.fn(),
     warn: vi.fn(),
@@ -177,7 +192,7 @@ function mkCtx(overrides: { onIssueCreate?: () => Promise<void> } = {}) {
       listComments: vi.fn(async () => []),
       createComment: vi.fn(async () => ({ id: "comment-1" })),
     },
-    db: realDb(db),
+    db: realDb(db, { beforeExecute: overrides.beforeExecute }),
     events: { emit: vi.fn(async (..._args: unknown[]) => {}) },
     metrics: { write: vi.fn(async () => {}) },
     activity: { log: vi.fn(async () => {}) },
@@ -677,8 +692,12 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
     });
 
   /** Bounded barrier: fail naming the real condition rather than timing out. */
-  async function awaitQueuedWaiters(count: number, what: string): Promise<void> {
-    const deadline = Date.now() + 5_000;
+  async function awaitQueuedWaiters(
+    count: number,
+    what: string,
+    budgetMs = 5_000,
+  ): Promise<void> {
+    const deadline = Date.now() + budgetMs;
     while (localFenceWaiterCount(COMPANY_ID, AGG_KEY) < count) {
       if (Date.now() > deadline) {
         throw new Error(
@@ -838,4 +857,98 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
     // hand the fence to a delivery that has already returned.
     expect(localFenceWaiterCount(COMPANY_ID, AGG_KEY)).toBe(0);
   });
+
+  it("keeps its place in the queue when a fresh delivery wins the post-wake race", async () => {
+    // A wake is not a grant: `signalLocalFenceRelease` dequeues the waiter, but
+    // ownership is still decided by the claim UPDATE, and a delivery that
+    // arrives in between attempts a claim once BEFORE it registers. If the
+    // woken waiter is not put back, it has consumed the wake and left the
+    // queue, so no later release can reach it — the starvation this suite
+    // exists to remove, landing on the longest-waiting delivery.
+    //
+    // The race is made deterministic rather than hoped for: B's next write is
+    // suspended mid-flight, C claims the now-free fence while B is held there,
+    // and only then is B allowed to proceed into a claim that must fail.
+    const holdA = deferred();
+    const holdC = deferred();
+    const { ctx: ctxA } = mkCtx({ onIssueCreate: async () => holdA.promise });
+
+    let armed = false;
+    const bReachedClaim = deferred();
+    const releaseBClaim = deferred();
+    let interceptedSql = "";
+    const { ctx: ctxB } = mkCtx({
+      beforeExecute: async (sql) => {
+        if (!armed) return;
+        armed = false; // once: only the post-wake reclaim is suspended
+        interceptedSql = sql;
+        bReachedClaim.resolve();
+        await releaseBClaim.promise;
+      },
+    });
+    const { ctx: ctxC } = mkCtx({ onIssueCreate: async () => holdC.promise });
+
+    const a = deliver(
+      ctxA,
+      firingPayloadFor("staging-traffic-control", "traffic-ops-autorenew", "fp-lostA"),
+      "req-lost-a",
+      slowPollPolicy(),
+    );
+    await awaitFenceHeld("delivery A");
+
+    const b = deliver(
+      ctxB,
+      firingPayloadFor("ssh-bastion", "teleport-session-sync", "fp-lostB"),
+      "req-lost-b",
+      slowPollPolicy(),
+    );
+    await awaitQueuedWaiters(1, "delivery B");
+
+    // Arm only now, so the hook cannot catch B's pre-registration attempt.
+    armed = true;
+    holdA.resolve();
+    await a;
+    // B has been woken and is suspended inside its reclaim.
+    await bReachedClaim.promise;
+    // The seam is self-verifying: assert we really suspended the fence claim
+    // and not some unrelated write that happened to be next.
+    expect(interceptedSql).toContain("alertmanager_aggregate_lifecycle_fences");
+    expect(interceptedSql).toContain("'firing'");
+    expect(localFenceWaiterCount(COMPANY_ID, AGG_KEY)).toBe(0);
+
+    // C arrives fresh and unqueued, and takes the fence B was just handed.
+    const c = deliver(
+      ctxC,
+      firingPayloadFor("staging-blockcastd", "cast-contract-guard", "fp-lostC"),
+      "req-lost-c",
+      slowPollPolicy(),
+    );
+    await awaitFenceHeld("delivery C");
+
+    // Now let B's doomed claim land.
+    releaseBClaim.resolve();
+
+    // THE ASSERTION. B lost the race it was woken for. It must be back on the
+    // queue — at the front, since nothing else is waiting — or C's release
+    // below reaches nobody. Without the re-queue this stays 0 forever.
+    //
+    // Deliberately bounded well under the 5s poll interval: a re-queue happens
+    // immediately after the failed claim, so 2s is generous for the real
+    // behaviour while still beating the fallback poll, which keeps the failure
+    // this barrier's named error rather than an undiagnostic test timeout.
+    await awaitQueuedWaiters(1, "delivery B after losing the reclaim race", 2_000);
+
+    const releasedAt = Date.now();
+    holdC.resolve();
+    await expect(c).resolves.toBeUndefined();
+    await expect(b).resolves.toBeUndefined();
+
+    // B's own timer could not fire for another ~5s, so finishing this quickly
+    // proves C's release reached B through the queue it was put back on.
+    expect(Date.now() - releasedAt).toBeLessThan(2_000);
+    expect(localFenceWaiterCount(COMPANY_ID, AGG_KEY)).toBe(0);
+    // Generous relative to the ~2s happy path, so that when this regresses the
+    // bounded barriers above report WHICH condition failed instead of vitest
+    // reporting only that the case ran long.
+  }, 20_000);
 });
