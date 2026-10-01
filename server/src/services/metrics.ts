@@ -365,14 +365,17 @@ export type PenstockProbePathLabel = (typeof KNOWN_PENSTOCK_PROBE_PATHS)[number]
  * - `ok` — probe answered and capacity is available (the gate allows).
  * - `deny_capacity` — answered `penstock.model_capacity_unavailable`.
  * - `deny_temporary` — answered `penstock.model_temporarily_unavailable`.
- * - `inconclusive` — the capacity probe returned no verdict. This is the branch
- *   that triggers the messages fallback, so its rate is the fallback's cause.
+ * - `inconclusive` — the capacity probe returned no verdict. On a provider with
+ *   a fallback (`anthropic`) this is the branch that triggers it, so its rate
+ *   is the fallback's cause; on `codex` there is nothing to trigger and it is a
+ *   terminal fail-open — see "Reading it" above for why.
  *   Minted on `path="capacity"` only; the messages probe never returns it.
  * - `auth_fault` — 401/403. Kept separate from `error` because PEN-2513's whole
  *   finding is that an entitlement fault read as a capacity signal parks
  *   forever on a horizon that cannot expire it. Fails **open** on
  *   `path="messages_fallback"`; on `path="capacity"` it yields no verdict and
- *   falls through to the fallback.
+ *   falls through to the fallback **where one exists (`anthropic`); on `codex`
+ *   there is none, so it too is a terminal fail-open**.
  * - `error` — transport failure or timeout. Fails **open** on **both** paths.
  *   On `path="capacity"` it used to fall through to the fallback; BLO-29900
  *   item 3 stopped that, because a transport failure says nothing about the
