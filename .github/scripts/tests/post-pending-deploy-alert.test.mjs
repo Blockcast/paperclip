@@ -205,12 +205,17 @@ test('buildAlert: names the pending run so the reader can act without opening th
 
   // BLO-32545. The body used to assert that a skipped slot 'still reports
   // conclusion=success' and that 'nothing else escalates this'. Both stopped being
-  // true when the four-exits work made skipped-pending exit 1 and added the durable
-  // record, and the stale sentence was cited as current fact in a live triage
-  // ruling. The description is operator-facing, so a false mechanism in it is a
-  // defect even though no behaviour depends on the string.
-  assert.doesNotMatch(alert.annotations.description, /conclusion=success/);
-  assert.doesNotMatch(alert.annotations.description, /Nothing else escalates/);
+  // UNIVERSALLY true when the four-exits work added the durable record and made a
+  // stall PAST PENDING_DEPLOY_ALERT_HOURS fail the run. Guard (1) itself still
+  // exits 0 (scheduled-production-deploy.yml:161-162); the red comes from the later
+  // `Fail the run when a production approval is stuck` step, gated on
+  // `escalate.outputs.escalated == 'true'`, which post-pending-deploy-alert.mjs sets
+  // only past the threshold (:497 vs :420). So an under-threshold skipped slot is
+  // still green — which is exactly why the retired sentence read as current fact in
+  // a live triage ruling. The description is operator-facing, so an unconditional
+  // mechanism claim in it is a defect even though no behaviour depends on the string.
+  assert.doesNotMatch(alert.annotations.description, /conclusion[=:]\s*success/i);
+  assert.doesNotMatch(alert.annotations.description, /Nothing else escalates/i);
 });
 
 test('buildAlert: the call to action is the waiting-runs queue, never the perishable run url', () => {
