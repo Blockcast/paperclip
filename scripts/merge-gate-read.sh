@@ -30,14 +30,16 @@
 #
 #   merge-gate-read.sh <owner/repo> <sha|pr-head>     # live
 #   merge-gate-read.sh --rows <DEAD-alternation>      # fixture mode, rows on stdin
-#   merge-gate-read.sh --dead                         # fixture mode, runs on stdin
+#   merge-gate-read.sh --dead [witnesses]             # fixture mode, runs on stdin
 #   merge-gate-read.sh --extract                      # fixture mode, check-run JSON on stdin
 #   merge-gate-read.sh --status-extract               # fixture mode, status JSON on stdin
+#   merge-gate-read.sh --witness-extract              # fixture mode, status JSON on stdin
 #   merge-gate-read.sh --runs-extract                 # fixture mode, runs JSON on stdin
 #   merge-gate-read.sh --sha-guard <sha>              # fixture mode, validates one sha
 #
-# Row shape  (TSV): name <TAB> conclusion <TAB> timestamp <TAB> run-id|app:<slug>|status
-# Run shape  (TSV): workflow-id <TAB> event <TAB> run-id <TAB> conclusion <TAB> run-started-at
+# Row shape     (TSV): name <TAB> conclusion <TAB> timestamp <TAB> run-id|app:<slug>|status
+# Run shape     (TSV): workflow-id <TAB> event <TAB> run-id <TAB> conclusion <TAB> run-started-at
+# Witness shape (SP) : workflow-id <SP> iso-timestamp, newline-separated
 set -uo pipefail
 
 extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
@@ -57,6 +59,24 @@ extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
 
 status_extract() { # stdin: commit-status API body (one object per page) -> rows
   jq -r '.statuses[]|[.context,.state,.updated_at,"status"]|@tsv'
+}
+
+witness_extract() { # stdin: commit-status API body -> run-id <TAB> updated_at
+  # BLO-38577. Candidate off-head supersession witnesses: GREEN statuses that
+  # name a workflow run. `select(.state=="success")` is the first fence and must
+  # stay exact — a `pending` or `failure` status is not a verdict, and relaxing
+  # this to `!= "failure"` would let an unfinished gate retire a real STOP.
+  # `.target_url // ""` guards capture(), which RAISES on null rather than
+  # returning no match, aborting jq mid-stream and silently truncating every
+  # status after it — the same nullable-field trap as extract(), same GREEN
+  # direction. A target_url that names no run yields "" and is dropped here:
+  # Ally's statuses point at the PR, not a run, and must never become witnesses.
+  # This only proposes; the caller still has to resolve the run and confirm it
+  # both passed and belongs to the victim's workflow.
+  jq -r '.statuses[]|select(.state=="success")
+         |[((.target_url // "" | capture("runs/(?<r>[0-9]+)").r) // ""),
+           .updated_at]|@tsv' \
+    | awk -F'\t' '$1 != ""'
 }
 
 run_extract() { # stdin: actions/runs API body (one object per page) -> run rows
@@ -79,7 +99,12 @@ require_sha() { # $1 = candidate -> stdout: a STOP line + rc 1 when not 40-hex
   return 1
 }
 
-dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
+dead_runs() { # stdin: run rows; $1 = off-head witnesses -> alternation of stale ids
+  # $1 is newline-separated `workflow-id<SP>iso-timestamp`, empty when none.
+  # Passed as a VALUE rather than a second input file on purpose: the two-file
+  # `FNR==NR` idiom misreads the first run row as a witness whenever the witness
+  # side is empty, which is the common case and would silently drop a run from
+  # DEAD. A single-field value has no such edge.
   # BLO-34367: `cancelled` conflates two run shapes GitHub reports identically.
   #   SUPERSEDED  — cancel-in-progress killed it, a newer run took over. Stale,
   #                 drop it, else its dead rows are a false RED (BLO-34114).
@@ -220,14 +245,75 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
   # victim decision into verdicts(). How often a later same-lane run drops a
   # name at one head is unmeasured; the mechanism is proven, the frequency is
   # not.
-  awk -F'\t' 'BEGIN { n = 0 }   # n MUST be seeded: implicit is "" , not 0
-              { key = $1 FS $2
-                if ($4 == "success" && $5 > newest_pass[key]) newest_pass[key] = $5
-                if ($4 == "cancelled" || $4 == "failure") {
-                  id[n] = $3; grp[n] = key; started[n] = $5; n++ } }
-              END { for (i = 0; i < n; i++)
-                      if (started[i] != "" \
-                          && newest_pass[grp[i]] >= started[i]) print id[i] }' \
+  # BLO-38577: the sibling arm above asks `actions/runs?head_sha=`, so its
+  # witness can only ever be a run AT THIS HEAD. A producer whose verdict run
+  # lives at another head is therefore structurally unreachable by it, and its
+  # victim prints a STOP that NOTHING can clear — a permanent false RED on every
+  # PR of such a repo. Measured on pim-multicast-gateway: `ci-gate-status` runs
+  # once per PR head as `pull_request`, is cancelled by its own by-design
+  # re-entrancy, and has ZERO siblings of ANY event at that head (3/3 sampled);
+  # the green verdict is published by a `schedule` run whose head_sha is MAIN's,
+  # reachable at the PR head only as the legacy `ci-gate` commit status. The
+  # reader's STOP was a true statement ("no run-level verdict at this head")
+  # delivered in a register that reads as a merge veto, and an unclearable veto
+  # on 100% of a repo's PRs trains the hand-override — the one failure mode that
+  # defeats the whole reader. One such override is the reason this arm exists.
+  #
+  # So widen the WITNESS SURFACE, not the lane. A victim is also stale when its
+  # OWN producer published a later passing verdict off-head, established by
+  # joining a green legacy status at this head through `target_url` back to a
+  # `success` run carrying the SAME workflow_id. That join is the attribution,
+  # and it is what keeps this from being "any green status clears anything":
+  # a status whose target_url names no run (an Ally status points at the PR),
+  # names a run that did not pass, or names a run of a DIFFERENT workflow is not
+  # a witness and the STOP survives. Every missing or unparseable field fails
+  # CLOSED. `required_status_checks.contexts` is 403 to the App installation
+  # token, so required-vs-advisory cannot be read; same-workflow attribution is
+  # what stands in for it, and it is strictly tighter than "the status is green".
+  #
+  # This is the SAME rule the file already honours for check-runs — "latest
+  # state wins", which is also what GitHub's own required-check evaluation does
+  # — applied to the other surface. Direction is GREEN, which is why all three
+  # terms below are fences and not taste:
+  #   passed_at_head  BLO-34114, in the surface dimension. If ANY run of this
+  #                   workflow concluded `success` at this head, we are in the
+  #                   multi-lane world the `event` key exists to police — a
+  #                   `pull_request` lane passes vacuously without secrets — so
+  #                   refuse the off-head witness entirely and keep the STOP.
+  #                   Deliberately "any event": the whole hazard is cross-event.
+  #   ext[wf]         attribution. Keyed on the VICTIM'S workflow_id, so a
+  #                   witness can only ever retire its own producer's runs.
+  #                   Un-keying it (one global newest witness) lets any green
+  #                   status clear any workflow, which is the too-loose variant
+  #                   this arm was designed around rather than into.
+  #   >= started[i]   ordering, for the same reason as the sibling arm: a
+  #                   witness published BEFORE the victim ran is not evidence
+  #                   about it. No `!= ""` term on ext — an unset value loses
+  #                   `>=` against an ISO timestamp as a string AND numerically,
+  #                   so it already fails closed, and a redundant term here
+  #                   would be a comment wearing the costume of code.
+  # `started[i] != ""` still fences BOTH arms; it is the one term that cannot be
+  # inferred from a comparison.
+  #
+  # Accepted residual, stated because it is the green-direction cost: a producer
+  # whose off-head status is ADVISORY rather than required will retire its own
+  # victim here. Bounded to that producer's own runs, to a head where it passed
+  # nothing, and to a verdict later than the victim — and it is the producer's
+  # own latest published state for the head either way.
+  awk -F'\t' -v wits="${1:-}" '
+    BEGIN { n = 0   # n MUST be seeded: implicit is "" , not 0
+            k = split(wits, W, "\n")
+            for (j = 1; j <= k; j++)
+              if (split(W[j], P, " ") == 2 && P[2] > ext[P[1]]) ext[P[1]] = P[2] }
+    { key = $1 FS $2
+      if ($4 == "success") { newest_pass[key] = ($5 > newest_pass[key] ? $5 : newest_pass[key])
+                             passed_at_head[$1] = 1 }
+      if ($4 == "cancelled" || $4 == "failure") {
+        id[n] = $3; grp[n] = key; wf[n] = $1; started[n] = $5; n++ } }
+    END { for (i = 0; i < n; i++) {
+            if (started[i] == "") continue
+            if (newest_pass[grp[i]] >= started[i]) { print id[i]; continue }
+            if (!passed_at_head[wf[i]] && ext[wf[i]] >= started[i]) print id[i] } }' \
     | sort -n | paste -sd'|' -
 }
 
@@ -275,9 +361,10 @@ verdicts() { # $1 = DEAD alternation (empty or '__none__' when nothing is stale)
 # `exit 0` here made the exit contract unobservable by construction, so no
 # fixture could catch the header claiming an exactness it did not have.
 if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}"; exit $?; fi
-if [ "${1:-}" = "--dead" ]; then dead_runs; exit 0; fi
+if [ "${1:-}" = "--dead" ]; then dead_runs "${2:-}"; exit 0; fi
 if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
 if [ "${1:-}" = "--status-extract" ]; then status_extract; exit 0; fi
+if [ "${1:-}" = "--witness-extract" ]; then witness_extract; exit 0; fi
 if [ "${1:-}" = "--runs-extract" ]; then run_extract; exit 0; fi
 if [ "${1:-}" = "--sha-guard" ]; then require_sha "${2:-}"; exit $?; fi
 
@@ -287,13 +374,33 @@ R="$1"
 H=$(gh api "repos/$R/commits/$2" --jq .sha 2>/dev/null)
 require_sha "$H" || exit 1
 
-DEAD=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate \
-        | run_extract | dead_runs)
+RUNS=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate | run_extract)
+# Fetched ONCE and reused: the witness pass and the verdict pass read the same
+# surface, and re-fetching would double this read against a shared, routinely
+# exhausted installation quota.
+STATUSES=$(gh api "repos/$R/commits/$H/status?per_page=100" --paginate)
+
+# BLO-38577 off-head witnesses. A candidate naming a run that IS at this head is
+# skipped: the sibling arm already rules on those, so resolving them would be a
+# second opinion on a question already answered — and it is what keeps this to
+# ~1 extra call on the repos that need it and 0 on the ones that do not.
+# `select(.conclusion=="success")` is a FENCE, not a filter: a run that did not
+# pass retires nothing, and `gh` prints its error body to stdout, so an API
+# failure yields a non-matching object, an empty wf, and a kept STOP.
+WITNESSES=$(printf '%s' "$STATUSES" | witness_extract | sort -u \
+  | while IFS=$'\t' read -r rid ts; do
+      printf '%s\n' "$RUNS" | cut -f3 | grep -qxF "$rid" && continue
+      wf=$(gh api "repos/$R/actions/runs/$rid" \
+             --jq 'select(.conclusion=="success")|.workflow_id' 2>/dev/null)
+      [ -n "$wf" ] && printf '%s %s\n' "$wf" "$ts"
+    done)
+
+DEAD=$(printf '%s\n' "$RUNS" | dead_runs "$WITNESSES")
 
 # BOTH surfaces paginate. GitHub's default page size is 30, so an unpaginated
 # status fetch silently drops the 31st context onward — and a dropped `failure`
 # prints no STOP. The ABSENT guard cannot catch it: `$4!="status"` excludes
 # status rows from the survivor count, so one surviving check-run keeps the guard quiet.
-{ gh api "repos/$R/commits/$H/status?per_page=100" --paginate | status_extract
+{ printf '%s' "$STATUSES" | status_extract
   gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract
 } | verdicts "$DEAD"
