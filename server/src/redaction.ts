@@ -1089,14 +1089,26 @@ function projectRunResultJsonValue(
     // objects recurses, while an array of raw strings under a non-machine key
     // (a provider's `errors: [...]`) drops its prose and keeps its shape --
     // presence still reads as presence, content does not leak.
+    //
+    // A withheld element becomes `null` IN PLACE rather than being spliced out
+    // (Ally review 5375217878). Compacting would silently re-index everything
+    // after it, so a consumer reading `errors[1]` positionally would get the
+    // wrong element rather than a missing one -- and `withheldFields` already
+    // names the exact `path[index]`, so a null here is distinguishable from an
+    // element that was genuinely null.
     const projected: unknown[] = [];
     let droppedAny = false;
+    let keptAny = false;
     for (const [index, element] of value.entries()) {
       const result = projectRunResultJsonValue(key, element, `${path}[${index}]`, withheldFields);
-      if (result.kept) projected.push(result.value);
+      projected.push(result.kept ? result.value : null);
+      if (result.kept) keptAny = true;
       else droppedAny = true;
     }
-    if (droppedAny && projected.length === 0 && value.length > 0) return { kept: false };
+    // Every element withheld: drop the field itself rather than returning an
+    // array of nulls, which would disclose the arity of a value whose every
+    // element was transcript.
+    if (droppedAny && !keptAny && value.length > 0) return { kept: false };
     return { kept: true, value: projected };
   }
 
