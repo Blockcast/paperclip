@@ -7473,6 +7473,151 @@ export function recoveryService(
       });
     }
 
+    // BLO-27463: a terminal `issue_dependencies_blocked` run on the *assignee's own
+    // execution* is a wait state, never a stranded execution path (see
+    // DEPENDENCY_BLOCKED_ERROR_CODE), so it must not open a stranded_assigned_issue
+    // action or move ownership up the org chain — regardless of whether the blockers
+    // have since cleared.
+    //
+    // This previously only refused escalation while the issue was *still* not
+    // dependency-ready. That predicate cannot fire on the population that actually
+    // escalates: heartbeat.ts restores the issue to its pre-checkout status when the
+    // dep-blocked retry budget exhausts, so by the time the sweep sees it the
+    // blockers have resolved or never existed, and the readiness re-check passes.
+    // Measured against the CEO inbox 2026-08-18, of the 24 escalations opened since
+    // the readiness guards landed on 2026-08-09: 24/24 had zero unresolved blockers,
+    // 23/24 were reassigned up the org chain, and 24/24 came to rest in `blocked`
+    // with an empty blocker set — permanently undispatchable per BLO-21523.
+    //
+    // 14 of those 24 were provider rate-limit/quota parks carrying this error code
+    // ("surfaced as `issue_dependencies_blocked`"), which BLO-19889 AC#2 classes as
+    // infra-class and equally non-escalating. Refusing on the error code covers both
+    // populations at the single gate every escalation caller passes through.
+    //
+    // Skipping is safe for that population two ways: a dependency-ready issue is left
+    // in a dispatchable status for the normal scheduler, and a still-blocked one
+    // retains its edge-triggered dependency-resolved wake.
+    //
+    // Review-participant strands are deliberately excluded, because neither of
+    // those safety arguments holds for them. Four of the five review-participant
+    // call sites below reach here with a *terminal participant run*, and because
+    // DEPENDENCY_BLOCKED_ERROR_CODE is a member of
+    // NON_RETRYABLE_CONTINUATION_ERROR_CODES the non-retryable branch catches it
+    // first. An `in_review` issue with a pending stage is not re-dispatched by the
+    // normal scheduler; and when its blockers have already cleared there is no
+    // dependency wake left to retain, because the wait is on the *participant*, not
+    // on a dependency. On the `!agentInvokable` branch the participant provably
+    // cannot be invoked, so suppressing here would leave the stage with no recovery
+    // path at all, silently re-skipped every sweep — strictly worse than the
+    // escalation this gate removes, and reachable in production because
+    // `claimQueuedRun`'s dependency gate cancels *any* queued run for the issue,
+    // participant wakes included. The measurement above covers the
+    // assignee-execution population only; whether an `in_review` dependency wait
+    // should also stop escalating is a separate question that needs its own evidence.
+    //
+    // `recoveryOwnerAgentId == null` is that exclusion stated exactly, rather than
+    // proxied through `previousStatus !== "in_review"`. All five review-participant sites
+    // pass `recoveryOwnerAgentId: participantAgentId`, which the guard at the top of the
+    // `issue.status === "in_review"` block has already narrowed to a non-null string; no
+    // assignee-lane site passes the field at all. The status proxy was broader than its
+    // own justification: three assignee-lane sites forward `previousStatus: issue.status`
+    // and `in_review` is a member of STRANDED_ASSIGNED_ISSUE_STATUSES, so it exempted
+    // them too.
+    //
+    // The two predicates are not currently distinguishable in practice. BLO-19123's F2
+    // (`3830d7bc`) added an earlier arm keyed on `errorCode === DEPENDENCY_BLOCKED &&
+    // (status === "in_review" || !agentInvokable)` that `continue`s before this gate is
+    // reached, so no `in_review` strand of either lane arrives here. This gate therefore
+    // covers the remaining and much larger population: `todo`/`in_progress` issues with
+    // an invokable assignee, which that arm does not match. The exact form is kept
+    // regardless — it states the intent instead of encoding an assumption about an
+    // upstream arm that may later narrow.
+    //
+    // PEN-3636: this gate is decided entirely from `input`, so it is evaluated
+    // *before* the transaction opens rather than inside it.
+    //
+    // It used to sit ~150 lines below, after the transaction had taken two
+    // advisory locks and two round-trips. That made it the single most expensive
+    // no-op in the recovery chain. Measured on one production pass 2026-09-29:
+    // this arm suppressed 994 of 2,234 candidates while the whole pass acted on
+    // 4 rows and ran 29m21s — 85% of a 34m31s chain. For each of those 994 the
+    // sweep opened a transaction, took `lockIssueOwnership`, took
+    // `lockIssueParentMutationCompany`, ran `SELECT … FOR UPDATE` and
+    // `getLatestIssueRun`, then evaluated a condition on values it already held
+    // before any of it, bumped three counters and returned null. Zero writes.
+    //
+    // The second lock is the one that matters. `lockIssueOwnership` is per-issue,
+    // so it contends only with concurrent work on that same issue and does not
+    // scale with the candidate population. `lockIssueParentMutationCompany` is a
+    // single *company-global* mutex (`issues.ts`), taken by every create/update/
+    // parent mutation in the company. Queueing behind it once per candidate, with
+    // a median ~45 concurrent runs, is a mechanism that scales superlinearly with
+    // population — which is the shape this pass regressed into.
+    //
+    // Hoisting is return-value-identical for every candidate. The three early
+    // returns the transaction can take before reaching this point (`!fresh`, the
+    // stale review-stage arm, and the moved-status arm) all `return null`, and so
+    // does this gate, so no candidate changes outcome. Nothing is skipped either:
+    // the work removed is two lock acquisitions and two reads, none of which
+    // write, and advisory locks are xact-scoped so dropping the transaction
+    // releases nothing another caller was relying on.
+    //
+    // ⚠ One observable DOES change, deliberately: the counters below now also
+    // count candidates that match this gate *and* would have lost one of those
+    // three races. Those are silent `return null`s today, counted in no bucket,
+    // so the tally was undercounting the suppressed population by exactly the
+    // racing remainder. The value is diagnostic-only (see the increment site's
+    // own note) and the new reading is the more faithful one — this gate asks a
+    // question about `input`, not about who won a race on the row.
+    //
+    // The INVARIANT on the three increments is preserved and in fact
+    // strengthened: they remain one synchronous block, now with no `await`
+    // anywhere near them, so the `...StillBlocked` subtraction still cannot go
+    // negative.
+    // On `latestRunForReceipt` rather than `input.latestRun`: this is the one
+    // thing about the hoist that is not a pure move. `isRoutineExecutionDuplicate\
+    // SuppressedRun` is a type predicate, so in its negative branch TypeScript
+    // narrows `input.latestRun` to `never` — reading `.errorCode` off it here is a
+    // compile error (TS2339). The old site escaped that only because it sat inside
+    // the `db.transaction` callback, where narrowing of a mutable property access
+    // is discarded and the declared type comes back. `latestRunForReceipt` is the
+    // unnarrowed capture taken at the top of this function for precisely this
+    // reason, and it holds the identical runtime value, so this is a type-level
+    // fix and not a behavioural one.
+    if (input.recoveryOwnerAgentId == null && latestRunForReceipt?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+      // `isDependencyReady` is what separates a still-blocked wait from the
+      // defect-shaped "dependency-blocked with nothing blocking it" arm, and that
+      // distinction is the visibility this gate trades the escalation for. It is
+      // kept, but as a pass-scoped tally rather than a per-issue emission.
+      //
+      // BLO-32668 moved the readiness read out of the transaction for the same
+      // reason this block has now followed it: it serialized a round-trip per
+      // candidate while holding a lock that checkout and adoption both contend
+      // on. The value is diagnostic-only, so a caller-supplied read is as good.
+      //
+      // On the `?? null` below: from the two wired lanes it is unreachable, not a
+      // real fallback. `listIssueDependencyReadinessMap` pre-seeds a default
+      // `IssueDependencyReadiness` for every id it is asked about before it queries
+      // `issueRelations` (`services/issues.ts`), so `.get(issue.id)` never returns
+      // `undefined` for an id in the request. `...Unclassified` is therefore fed
+      // only by call sites that omit `dependencyWaitReadiness` entirely — it is
+      // structurally dead from `todo` and `in_progress`. Kept as defence-in-depth so
+      // that a future lane which forgets to thread readiness degrades into its own
+      // bucket instead of being miscounted as a resolved-blocker defect.
+      //
+      // INVARIANT: these three increments must stay one synchronous block. The
+      // still-blocked arm is not counted here; it is *derived* by subtraction at the
+      // end of the pass, which is only non-negative because no sweep can observe a
+      // suppression that has been totalled but not yet classified. Inserting an
+      // `await` between the total and the classification would make
+      // `...StillBlocked` go negative silently.
+      dependencyWaitEscalationSuppressedTotal += 1;
+      const readiness = input.dependencyWaitReadiness ?? null;
+      if (readiness == null) dependencyWaitEscalationSuppressedUnclassifiedTotal += 1;
+      else if (readiness.isDependencyReady) dependencyWaitEscalationSuppressedDependencyReadyTotal += 1;
+      return null;
+    }
+
     // Serialize escalation per (company, source-issue) so concurrent
     // reconcile sweeps don't fight over the same recovery-action upsert,
     // wakeup, and source-issue UPDATE.
@@ -7573,104 +7718,6 @@ export function recoveryService(
       const documentWriteRefusedRunId = newestIssueRun?.statusOnlyDocumentWriteRefusedAt
         ? newestIssueRun.id
         : null;
-
-      // BLO-27463: a terminal `issue_dependencies_blocked` run on the *assignee's own
-      // execution* is a wait state, never a stranded execution path (see
-      // DEPENDENCY_BLOCKED_ERROR_CODE), so it must not open a stranded_assigned_issue
-      // action or move ownership up the org chain — regardless of whether the blockers
-      // have since cleared.
-      //
-      // This previously only refused escalation while the issue was *still* not
-      // dependency-ready. That predicate cannot fire on the population that actually
-      // escalates: heartbeat.ts restores the issue to its pre-checkout status when the
-      // dep-blocked retry budget exhausts, so by the time the sweep sees it the
-      // blockers have resolved or never existed, and the readiness re-check passes.
-      // Measured against the CEO inbox 2026-08-18, of the 24 escalations opened since
-      // the readiness guards landed on 2026-08-09: 24/24 had zero unresolved blockers,
-      // 23/24 were reassigned up the org chain, and 24/24 came to rest in `blocked`
-      // with an empty blocker set — permanently undispatchable per BLO-21523.
-      //
-      // 14 of those 24 were provider rate-limit/quota parks carrying this error code
-      // ("surfaced as `issue_dependencies_blocked`"), which BLO-19889 AC#2 classes as
-      // infra-class and equally non-escalating. Refusing on the error code covers both
-      // populations at the single gate every escalation caller passes through.
-      //
-      // Skipping is safe for that population two ways: a dependency-ready issue is left
-      // in a dispatchable status for the normal scheduler, and a still-blocked one
-      // retains its edge-triggered dependency-resolved wake.
-      //
-      // Review-participant strands are deliberately excluded, because neither of
-      // those safety arguments holds for them. Four of the five review-participant
-      // call sites below reach here with a *terminal participant run*, and because
-      // DEPENDENCY_BLOCKED_ERROR_CODE is a member of
-      // NON_RETRYABLE_CONTINUATION_ERROR_CODES the non-retryable branch catches it
-      // first. An `in_review` issue with a pending stage is not re-dispatched by the
-      // normal scheduler; and when its blockers have already cleared there is no
-      // dependency wake left to retain, because the wait is on the *participant*, not
-      // on a dependency. On the `!agentInvokable` branch the participant provably
-      // cannot be invoked, so suppressing here would leave the stage with no recovery
-      // path at all, silently re-skipped every sweep — strictly worse than the
-      // escalation this gate removes, and reachable in production because
-      // `claimQueuedRun`'s dependency gate cancels *any* queued run for the issue,
-      // participant wakes included. The measurement above covers the
-      // assignee-execution population only; whether an `in_review` dependency wait
-      // should also stop escalating is a separate question that needs its own evidence.
-      //
-      // `recoveryOwnerAgentId == null` is that exclusion stated exactly, rather than
-      // proxied through `previousStatus !== "in_review"`. All five review-participant sites
-      // pass `recoveryOwnerAgentId: participantAgentId`, which the guard at the top of the
-      // `issue.status === "in_review"` block has already narrowed to a non-null string; no
-      // assignee-lane site passes the field at all. The status proxy was broader than its
-      // own justification: three assignee-lane sites forward `previousStatus: issue.status`
-      // and `in_review` is a member of STRANDED_ASSIGNED_ISSUE_STATUSES, so it exempted
-      // them too.
-      //
-      // The two predicates are not currently distinguishable in practice. BLO-19123's F2
-      // (`3830d7bc`) added an earlier arm keyed on `errorCode === DEPENDENCY_BLOCKED &&
-      // (status === "in_review" || !agentInvokable)` that `continue`s before this gate is
-      // reached, so no `in_review` strand of either lane arrives here. This gate therefore
-      // covers the remaining and much larger population: `todo`/`in_progress` issues with
-      // an invokable assignee, which that arm does not match. The exact form is kept
-      // regardless — it states the intent instead of encoding an assumption about an
-      // upstream arm that may later narrow.
-      if (input.recoveryOwnerAgentId == null && input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
-        // `isDependencyReady` is what separates a still-blocked wait from the
-        // defect-shaped "dependency-blocked with nothing blocking it" arm, and that
-        // distinction is the visibility this gate trades the escalation for. It is
-        // kept, but as a pass-scoped tally rather than a per-issue emission.
-        //
-        // BLO-32668: this used to read readiness here — inside the transaction, under
-        // the per-issue advisory lock — and log one INFO line per suppressed issue.
-        // Both costs scale with a population that is large and growing (515 distinct
-        // issues per ~43 s pass; 2,758 log lines in 10 min, 300-600/min sustained,
-        // measured 2026-09-07), and neither bought anything the caller could not
-        // supply: the value is diagnostic-only, so a pre-lock read is as good, and the
-        // per-issue line said nothing the aggregate does not. The lock-held read was
-        // the worse of the two — it serialized a round-trip per candidate while
-        // holding a lock that checkout and adoption both contend on.
-        //
-        // On the `?? null` below: from the two wired lanes it is unreachable, not a
-        // real fallback. `listIssueDependencyReadinessMap` pre-seeds a default
-        // `IssueDependencyReadiness` for every id it is asked about before it queries
-        // `issueRelations` (`services/issues.ts`), so `.get(issue.id)` never returns
-        // `undefined` for an id in the request. `...Unclassified` is therefore fed
-        // only by call sites that omit `dependencyWaitReadiness` entirely — it is
-        // structurally dead from `todo` and `in_progress`. Kept as defence-in-depth so
-        // that a future lane which forgets to thread readiness degrades into its own
-        // bucket instead of being miscounted as a resolved-blocker defect.
-        //
-        // INVARIANT: these three increments must stay one synchronous block. The
-        // still-blocked arm is not counted here; it is *derived* by subtraction at the
-        // end of the pass, which is only non-negative because no sweep can observe a
-        // suppression that has been totalled but not yet classified. Inserting an
-        // `await` between the total and the classification would make
-        // `...StillBlocked` go negative silently.
-        dependencyWaitEscalationSuppressedTotal += 1;
-        const readiness = input.dependencyWaitReadiness ?? null;
-        if (readiness == null) dependencyWaitEscalationSuppressedUnclassifiedTotal += 1;
-        else if (readiness.isDependencyReady) dependencyWaitEscalationSuppressedDependencyReadyTotal += 1;
-        return null;
-      }
 
       // BLO-19160: re-check the handover evidence under the same lock before
       // creating recovery state. This remains useful for callers whose candidate

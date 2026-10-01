@@ -6690,6 +6690,69 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.status).toBe("in_progress");
   });
 
+  it("decides the dependency-wait suppression without opening a transaction (PEN-3636)", async () => {
+    // The counters above prove the gate still *classifies* correctly. This proves
+    // the thing PEN-3636 is actually about: that reaching the verdict costs no
+    // transaction, and therefore no `lockIssueOwnership`, no company-global
+    // `lockIssueParentMutationCompany`, and no `SELECT … FOR UPDATE`.
+    //
+    // Why that is worth a dedicated test rather than trusting the diff: the gate
+    // is decided purely from caller-supplied `input`, so it reads identically
+    // whether it sits before or after `db.transaction`. Nothing in the counter
+    // assertions can tell those two placements apart — this assertion is the only
+    // one that regresses if the gate ever drifts back inside the transaction.
+    //
+    // Measured on production 2026-09-29: this arm suppressed 994 of 2,234
+    // candidates in a pass that acted on 4 rows and took 29m21s, 85% of the chain.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+
+    let transactionCalls = 0;
+    const countingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "transaction") {
+          return (...args: Parameters<typeof target.transaction>) => {
+            transactionCalls += 1;
+            return target.transaction(...args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as typeof db;
+
+    const countingHeartbeat = heartbeatService(countingDb, {
+      penstockAvailabilityGate: allowPenstockGate,
+    });
+    heartbeatServices.add(countingHeartbeat);
+
+    const result = await countingHeartbeat.reconcileStrandedAssignedIssues();
+
+    // Positive control: the candidate really did reach the gate and get suppressed.
+    // Without this a zero transaction count would be satisfied just as well by a
+    // sweep that never saw the issue at all, which is the opposite of the claim.
+    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    expect(transactionCalls).toBe(0);
+
+    // And the suppression is still inert on the row itself.
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.assigneeAgentId).toBe(agentId);
+    expect(after.status).toBe("in_progress");
+  });
+
   it("keeps a dependency-blocked continuation with nothing blocking it visible without escalating it (BLO-27463)", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
@@ -7112,48 +7175,51 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         });
       }
 
-      // The outer sweep has already classified the issue as dependency-ready
-      // before it calls `escalateStrandedAssignedIssue`. Inject the relation
-      // change just before that method opens its advisory-lock transaction so
-      // the locked re-read, rather than the stale preflight, decides whether
-      // recovery side effects are allowed.
-      const originalTransaction = db.transaction.bind(db);
-      const transactionSpy = vi.spyOn(db, "transaction");
-      let blockerMutationApplied = false;
-      transactionSpy.mockImplementationOnce(async (callback: any) => {
-        if (change === "added") {
-          await db.insert(issues).values({
-            id: blockerIssueId,
-            companyId,
-            title: "Dependency added during escalation",
-            status: "in_progress",
-            priority: "medium",
-            issueNumber: 26,
-            identifier: `${issuePrefix}-26`,
-          });
-          await db.insert(issueRelations).values({
-            companyId,
-            issueId: blockerIssueId,
-            relatedIssueId: issueId,
-            type: "blocks",
-          });
-        } else {
-          await db
-            .update(issues)
-            .set({ status: "in_progress", completedAt: null })
-            .where(eq(issues.id, blockerIssueId));
-        }
-        blockerMutationApplied = true;
-        return originalTransaction(callback);
-      });
+      // PEN-3636: this blocker change used to be injected from inside a
+      // `db.transaction` spy, on the stated reasoning that "the locked re-read,
+      // rather than the stale preflight, decides whether recovery side effects
+      // are allowed". That reasoning no longer describes the code, and had not
+      // since BLO-32668 — which moved the readiness read out of the transaction,
+      // leaving `input.dependencyWaitReadiness` (the stale preflight value) as
+      // the only readiness this path consults. The injected blocker had no
+      // consumer at all on this fixture: the one place blocker state is read,
+      // `unresolvedBlockerHumanDecisionEscalationState`, sits *below* the
+      // dependency-wait gate, which returns first for a candidate carrying
+      // `issue_dependencies_blocked`. So the under-lock timing was decorative —
+      // the test passed because the error-code gate refuses escalation, exactly
+      // as it would with no blocker injected.
+      //
+      // PEN-3636 hoists that gate above the transaction, so there is no longer a
+      // transaction to hang the injection on. Since the timing provably did not
+      // matter, the mutation is applied before the sweep instead. Every
+      // behavioural assertion below is unchanged — what is dropped is a hook
+      // that could not influence them.
+      if (change === "added") {
+        await db.insert(issues).values({
+          id: blockerIssueId,
+          companyId,
+          title: "Dependency added during escalation",
+          status: "in_progress",
+          priority: "medium",
+          issueNumber: 26,
+          identifier: `${issuePrefix}-26`,
+        });
+        await db.insert(issueRelations).values({
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: issueId,
+          type: "blocks",
+        });
+      } else {
+        await db
+          .update(issues)
+          .set({ status: "in_progress", completedAt: null })
+          .where(eq(issues.id, blockerIssueId));
+      }
+      const blockerMutationApplied = true;
 
       heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
-      let result: Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>>;
-      try {
-        result = await heartbeat.reconcileStrandedAssignedIssues();
-      } finally {
-        transactionSpy.mockRestore();
-      }
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
 
       expect(blockerMutationApplied).toBe(true);
       expect(result.escalated).toBe(0);
