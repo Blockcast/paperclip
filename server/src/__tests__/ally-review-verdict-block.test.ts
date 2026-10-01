@@ -45,6 +45,14 @@ const PR126_CLEAN_REVIEW_BODY = readFileSync(
 
 const ALLY_BOT_LOGIN = "allyblockcast[bot]";
 
+// Every gate call below passes this as the PR author. Authorship is not what
+// this file tests -- it tests how a verdict BLOCK is read -- so the author is
+// pinned to a third party to hold that dimension neutral. Leaving it unset
+// instead makes the self-attestation guard (BLO-34316) withhold the positive,
+// and every `clean` assertion here would be measuring that guard rather than
+// the parser it names.
+const DISTINCT_PR_AUTHOR = "some-contributor";
+
 function allyComment(body: string, createdAt: string) {
   return { authorLogin: ALLY_BOT_LOGIN, body, createdAt };
 }
@@ -165,6 +173,7 @@ describe("BLO-32695 — the #1675 clean review against prose parsing", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: PR1675_HEAD,
       reviewerBotLogin: ALLY_BOT_LOGIN,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [
         allyComment(earlierSameHead, "2026-09-07T03:46:19Z"),
         allyComment(PR1675_CLEAN_REVIEW_BODY, "2026-09-07T15:41:42Z"),
@@ -210,6 +219,7 @@ describe("BLO-32695 — the structured verdict block as the primary source", () 
     const verdict = evaluateCommentReviewGate({
       headSha: PR1675_HEAD,
       reviewerBotLogin: ALLY_BOT_LOGIN,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [allyComment(withBlock, "2026-09-07T15:41:42Z")],
     });
     expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
@@ -229,6 +239,7 @@ describe("BLO-32695 — the structured verdict block as the primary source", () 
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(blocking, "2026-09-07T15:41:42Z")],
       }),
     ).toMatchObject({ state: "failure", outcome: "blocking_finding" });
@@ -249,6 +260,7 @@ describe("BLO-32695 — the structured verdict block as the primary source", () 
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(emptyCounts, "2026-09-07T15:41:42Z")],
       }),
     ).toMatchObject({ state: "success", outcome: "clean" });
@@ -307,6 +319,7 @@ describe("BLO-32695 — the block and the prose line must not name different hea
     const verdict = evaluateCommentReviewGate({
       headSha: PR1675_HEAD,
       reviewerBotLogin: ALLY_BOT_LOGIN,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [allyComment(conflicting, "2026-09-07T15:41:42Z")],
     });
     expect(verdict.state).not.toBe("success");
@@ -386,6 +399,7 @@ describe("BLO-32695 — an unterminated block opener is unreadable, not absent",
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(cleanProse, "2026-09-07T15:41:42Z")],
       }),
     ).toMatchObject({ state: "success" });
@@ -402,6 +416,7 @@ describe("BLO-32695 — an unterminated block opener is unreadable, not absent",
     const verdict = evaluateCommentReviewGate({
       headSha: PR1675_HEAD,
       reviewerBotLogin: ALLY_BOT_LOGIN,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [allyComment(truncated, "2026-09-07T15:41:42Z")],
     });
     expect(verdict.state).not.toBe("success");
@@ -477,6 +492,7 @@ describe("BLO-32695 — the block path blocks on the prose path's severities", (
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(cleanWithSuggestions, "2026-09-07T15:41:42Z")],
       }),
     ).toMatchObject({ state: "success", outcome: "clean" });
@@ -543,6 +559,7 @@ describe("BLO-32695 — an unknown severity key fails closed, not open", () => {
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(typod({ critcal: 1, important: 0 }), "2026-09-07T15:41:42Z")],
       }),
     ).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
@@ -558,6 +575,7 @@ describe("BLO-32695 — an unknown severity key fails closed, not open", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: PR1675_HEAD,
       reviewerBotLogin: ALLY_BOT_LOGIN,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
       comments: [allyComment(typod({ critcal: 1, important: 0 }), "2026-09-07T15:41:42Z")],
     });
 
@@ -792,6 +810,7 @@ describe("BLO-32695 — fail-closed on an unreadable block", () => {
       const verdict = evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(body, "2026-09-07T15:41:42Z")],
       });
       expect(verdict.state).toBe("failure");
@@ -861,6 +880,7 @@ describe("BLO-32695 — fail-closed on an unreadable block", () => {
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(body, "2026-09-07T15:41:42Z")],
       }),
     ).toMatchObject({ outcome: "unreadable_verdict" });
@@ -877,6 +897,7 @@ describe("BLO-32695 — fail-closed on an unreadable block", () => {
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [
           allyComment(unreadable, "2026-09-07T15:41:42Z"),
           allyComment(readable, "2026-09-08T00:39:55Z"),
@@ -918,6 +939,7 @@ describe("BLO-32695 — block-less bodies keep the prose fallback", () => {
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(prose, "2026-09-07T15:41:42Z")],
       }),
     ).toMatchObject({ state: "success", outcome: "clean" });
@@ -960,6 +982,7 @@ describe("BLO-32695 — an explicit zero count outranks the Recommended Action t
       evaluateCommentReviewGate({
         headSha: PR126_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(PR126_CLEAN_REVIEW_BODY, "2026-09-14T02:01:11Z")],
       }),
     ).toMatchObject({ state: "success", outcome: "clean" });
@@ -1088,7 +1111,7 @@ describe("BLO-32695 — an unreadable block reds only the head it concerns", () 
   ].join("\n");
 
   function gateAt(headSha: string, comments: ReturnType<typeof allyComment>[]) {
-    return evaluateCommentReviewGate({ headSha, reviewerBotLogin: ALLY_BOT_LOGIN, comments });
+    return evaluateCommentReviewGate({ headSha, reviewerBotLogin: ALLY_BOT_LOGIN, prAuthorLogin: DISTINCT_PR_AUTHOR, comments });
   }
 
   it("positive control: both bodies really are unreadable", () => {
@@ -1246,7 +1269,7 @@ describe("BLO-32695 — an unreadable block may carry a finding, never retire on
   const malformedBlock = [`<!-- ally-verdict:1 {"head": "${HEAD_A}", "findings": {"critical":`, ...PROSE].join("\n");
 
   function gateAt(headSha: string, comments: ReturnType<typeof allyComment>[]) {
-    return evaluateCommentReviewGate({ headSha, reviewerBotLogin: ALLY_BOT_LOGIN, comments });
+    return evaluateCommentReviewGate({ headSha, reviewerBotLogin: ALLY_BOT_LOGIN, prAuthorLogin: DISTINCT_PR_AUTHOR, comments });
   }
 
   it("positive control: the three bodies differ only in how the block parses", () => {
@@ -1408,6 +1431,7 @@ describe("BLO-32695 — the block and the prose must not name different counts",
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(contradicting, "2026-09-07T15:41:42Z")],
       }).state,
     ).not.toBe("success");
@@ -1430,6 +1454,7 @@ describe("BLO-32695 — the block and the prose must not name different counts",
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(contradicting, "2026-09-07T15:41:42Z")],
       }).outcome,
     ).toBe("unreadable_verdict");
@@ -1588,6 +1613,7 @@ describe("BLO-32695 — a body making two head claims claims neither", () => {
         evaluateCommentReviewGate({
           headSha: HEAD_B,
           reviewerBotLogin: ALLY_BOT_LOGIN,
+          prAuthorLogin: DISTINCT_PR_AUTHOR,
           comments: [
             allyComment(olderCleanB, "2026-09-07T03:46:19Z"),
             allyComment(disagreeing, "2026-09-07T15:41:42Z"),
@@ -1606,6 +1632,7 @@ describe("BLO-32695 — a body making two head claims claims neither", () => {
       evaluateCommentReviewGate({
         headSha: "c".repeat(40),
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [allyComment(blockVsProse, "2026-09-07T15:41:42Z")],
       }),
     ).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
@@ -1662,6 +1689,7 @@ describe("BLO-32695 — prefix drift fails closed rather than vanishing", () => 
       evaluateCommentReviewGate({
         headSha: PR1675_HEAD,
         reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
         comments: [
           allyComment(`${opener}${prose}`, "2026-09-07T15:41:42Z"),
           // Shadowed, so the unreadable branch is reachable at all — see the
