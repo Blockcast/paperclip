@@ -1331,7 +1331,7 @@ function writeHealthResponse(res: http.ServerResponse, status: number, payload: 
  * see `createProxyAcceptProbe` for why the production one does.
  */
 export function createHealthServer(isServing: () => boolean | Promise<boolean>): http.Server {
-  return http.createServer((req, res) => {
+  const health = http.createServer((req, res) => {
     const pathName = (req.url ?? "/").split("?", 1)[0] ?? "/";
     if (pathName !== "/" && pathName !== "/healthz") {
       writeHealthResponse(res, 404, { error: "not found" });
@@ -1366,6 +1366,34 @@ export function createHealthServer(isServing: () => boolean | Promise<boolean>):
       }
     })();
   });
+
+  // Bounded here rather than at the `listen` call site so a second caller
+  // cannot bind this server unbounded (PEN-3052 review). Node's defaults are
+  // unlimited connections, a 60s headers timeout and a 300s request timeout,
+  // which is a reasonable posture for an authenticated proxy port and a poor
+  // one here: this listener sits OUTSIDE the deny by construction — that is
+  // the entire reason it exists — so it is reachable by exactly the `host` /
+  // `remote-node` entities the deny excludes from the proxy port, with nothing
+  // in front of it authenticating.
+  //
+  // What that bounds concretely: `createProxyAcceptProbe` needs an fd, so a
+  // caller holding sockets open here can push the process toward fd pressure,
+  // at which point the probe's `net.connect` fails, /healthz answers 503, and
+  // liveness restarts the container. Socket-holding against a listener added
+  // to *protect* availability should not be a restart lever on the
+  // authenticated proxy. A kubelet probe needs one short-lived connection per
+  // period; nothing legitimate on this port needs 64 concurrent ones.
+  //
+  // Deliberate non-change: an EMFILE that happens anyway still reads as 503,
+  // not as 200. A process out of descriptors genuinely cannot accept proxy
+  // connections, so "not serving" is the accurate answer and a restart is the
+  // correct recovery — the bug would be masking it. The fix belongs on the
+  // reachability of that state, which is what these three lines do, not on the
+  // honesty of the signal.
+  health.maxConnections = 64;
+  health.headersTimeout = 2_000;
+  health.requestTimeout = 5_000;
+  return health;
 }
 
 /**
@@ -1399,6 +1427,21 @@ export function createHealthServer(isServing: () => boolean | Promise<boolean>):
  * fresh connection to the proxy listener — a small amplification into the very
  * accept queue being measured. One connect per TTL bounds that regardless of
  * request rate, and is still far finer-grained than the 5s/15s probe periods.
+ *
+ * Two properties of that cache are load-bearing rather than incidental
+ * (PEN-3052 review):
+ *   - The window is measured on `performance.now()`, not `Date.now()`. A
+ *     backwards wall-clock step (NTP correction, VM snapshot restore, resume
+ *     from suspend) makes `now - at` negative, which compares as *inside* the
+ *     TTL — pinning the cached answer for the whole duration of the jump. A
+ *     pinned `true` is exactly the stale positive this probe exists to avoid.
+ *   - An in-flight connect is shared regardless of age. `ttlMs` and
+ *     `timeoutMs` are independent options, so a caller passing
+ *     `timeoutMs > ttlMs` would otherwise get the inverse of the documented
+ *     behaviour: unbounded concurrent connects, worst exactly when the accept
+ *     queue is wedged and every connect is running to its full timeout. This
+ *     cannot pin a stale result, because `connectOnce` always settles within
+ *     `timeoutMs` — the socket timeout is armed before any await point.
  */
 export function createProxyAcceptProbe(
   port: number,
@@ -1408,7 +1451,7 @@ export function createProxyAcceptProbe(
     host = "127.0.0.1",
   }: { timeoutMs?: number; ttlMs?: number; host?: string } = {},
 ): () => Promise<boolean> {
-  let cached: { at: number; result: Promise<boolean> } | null = null;
+  let cached: { at: number; result: Promise<boolean>; pending: boolean } | null = null;
 
   const connectOnce = (): Promise<boolean> =>
     new Promise<boolean>((resolve) => {
@@ -1430,10 +1473,14 @@ export function createProxyAcceptProbe(
     });
 
   return () => {
-    const now = Date.now();
-    if (cached && now - cached.at < ttlMs) return cached.result;
+    const now = performance.now();
+    if (cached && (cached.pending || now - cached.at < ttlMs)) return cached.result;
     const result = connectOnce();
-    cached = { at: now, result };
+    const entry = { at: now, result, pending: true };
+    cached = entry;
+    void result.then(() => {
+      entry.pending = false;
+    });
     return result;
   };
 }
