@@ -2008,6 +2008,7 @@ describe("commit-status description budget", () => {
   // after the real one grew.
   const structured = evaluateCommentReviewGate({
     headSha: CURRENT_HEAD,
+    prAuthorLogin: DISTINCT_PR_AUTHOR,
     comments: [
       allyComment(
         [
@@ -2029,6 +2030,7 @@ describe("commit-status description budget", () => {
   });
   const prose = evaluateCommentReviewGate({
     headSha: CURRENT_HEAD,
+    prAuthorLogin: DISTINCT_PR_AUTHOR,
     comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
   });
 
@@ -2066,7 +2068,9 @@ describe("equal-timestamp ties resolve to the conservative verdict", () => {
     [
       [a, b],
       [b, a],
-    ].map((comments) => evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments }));
+    ].map((comments) =>
+      evaluateCommentReviewGate({ headSha: CURRENT_HEAD, prAuthorLogin: DISTINCT_PR_AUTHOR, comments }),
+    );
 
   it("latestAttestingAllyComment: a finding at this head beats a clean review of the same second", () => {
     for (const verdict of bothOrders(
