@@ -2731,29 +2731,35 @@ export async function startServer(): Promise<StartedServer> {
           );
 
           // `keep` is a cap over the directory, not over this process, and the
-          // directory is on a volume every pod mounts. Two writers inside one
-          // capture interval means each round fills every slot and the prune
-          // above has just taken the previous round out — so the pair stops
-          // spanning hours and becomes one instant across processes, which is
-          // not a diff. It fails silently otherwise: only `prunedCount` moves.
-          // Checked here rather than at startup because this is the moment the
-          // eviction actually happens, and `autoMinIntervalMs` rate-limits the
-          // warning for free. (Ally review, PEN-3631.)
+          // directory is on a volume every pod mounts. A second live writer
+          // means each round fills every slot and the prune above has just
+          // taken the previous round out — so the pair stops spanning hours and
+          // becomes one instant across processes, which is not a diff. It fails
+          // silently otherwise: only `prunedCount` moves. Checked here rather
+          // than at startup because this is the moment the eviction actually
+          // happens. (Ally review, PEN-3631.)
+          //
+          // `performance.timeOrigin` is this process's start as epoch ms. A
+          // dead predecessor cannot have written after it, which is what keeps
+          // a restart-spanning diff pair — the deliverable — out of the
+          // warning without assuming anything about how far apart its halves
+          // land. The in-memory limiter provides no such spacing: see
+          // `findConcurrentSnapshotWriters`.
           try {
-            const concurrent = findConcurrentSnapshotWriters(
-              listHeapSnapshots(heapSnapshotConfig.dir),
-              heapSnapshotConfig.autoMinIntervalMs,
-            );
+            const concurrent = findConcurrentSnapshotWriters(listHeapSnapshots(heapSnapshotConfig.dir), {
+              pid: process.pid,
+              startedAtMs: performance.timeOrigin,
+            });
             if (concurrent !== null) {
               logger.warn(
                 {
                   snapshotDir: heapSnapshotConfig.dir,
                   pids: concurrent.pids,
-                  closestGapMs: concurrent.closestGapMs,
+                  newestStampAt: new Date(concurrent.newestStampMs).toISOString(),
+                  selfPid: process.pid,
                   keep: heapSnapshotConfig.keep,
-                  autoMinIntervalMs: heapSnapshotConfig.autoMinIntervalMs,
                 },
-                "Heap snapshots from more than one process landed in this directory inside one capture interval — 'keep' is a " +
+                "Another process wrote heap snapshots into this directory while this one was running — 'keep' is a " +
                   "directory-wide cap, so each round evicts the previous one and the retained snapshots are different processes " +
                   "at one instant rather than one process hours apart, which cannot be diffed. Raise " +
                   "PAPERCLIP_HEAP_SNAPSHOT_KEEP to at least writers x desired-pairs, or give each writer its own directory",

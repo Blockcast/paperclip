@@ -127,9 +127,9 @@ export interface HeapSnapshotConfig {
    * Deployment sets `PAPERCLIP_NODE_ROLE=api`, which excludes it from the feature
    * entirely. Raising the worker replica count without raising `keep` with it
    * breaks the PEN-3314 deliverable rather than merely crowding the disk: each
-   * round of snapshots fills every slot within one window and the post-write
-   * prune takes the previous round out, so the pair stops spanning hours and
-   * becomes one instant across processes. Budget `keep >= replicas × pairs`.
+   * round of snapshots fills every slot and the post-write prune takes the
+   * previous round out, so the pair stops spanning hours and becomes one
+   * instant across processes. Budget `keep >= replicas × pairs`.
    * `findConcurrentSnapshotWriters` detects the condition if it ever arises.
    */
   keep: number;
@@ -269,36 +269,74 @@ function snapshotPid(name: string): number | null {
   return match === null ? null : Number(match[6]);
 }
 
+/** This process's identity, as the detector below reasons about it. */
+export interface SnapshotWriterSelf {
+  /** `process.pid`. Snapshots carrying it are ours and are never foreign. */
+  pid: number;
+  /**
+   * Epoch ms at which this process started — `performance.timeOrigin`.
+   *
+   * Must be wall-clock epoch ms, comparable against a snapshot's filename
+   * stamp. A monotonic reading (`performance.now()`, `process.uptime()`) is
+   * near-zero at boot, which would place every snapshot on disk at or after it
+   * and make the detector warn on every predecessor instead of none.
+   */
+  startedAtMs: number;
+}
+
 export interface ConcurrentSnapshotWriters {
-  /** Every pid involved in a too-close pair, ascending. */
+  /** The foreign pids that wrote during our lifetime, ascending. */
   pids: number[];
-  /** The tightest gap found between two different pids. */
-  closestGapMs: number;
+  /** Epoch ms of the newest such write — how live the competition is. */
+  newestStampMs: number;
 }
 
 /**
- * Detect two *different* processes writing snapshots into one directory inside
- * a single `windowMs`, or null if nothing here looks concurrent.
+ * Detect *another live process* writing snapshots into this directory, or null
+ * if every snapshot here is explainable as ours or as a dead predecessor's.
  *
  * `keep` is a global cap over this directory, and the directory is shared by
  * every process that mounts the volume. With more than one writer, each round
- * of snapshots fills all `keep` slots within the same window and the post-write
- * prune removes the previous round wholesale — leaving two snapshots of
- * *different processes at one instant* rather than one process hours apart. The
- * diff PEN-3314 needs becomes unobtainable, and it fails silently, with only
- * `prunedCount` moving.
+ * of snapshots fills all `keep` slots and the post-write prune removes the
+ * previous round wholesale — leaving two snapshots of *different processes at
+ * one instant* rather than one process hours apart. The diff PEN-3314 needs
+ * becomes unobtainable, and it fails silently, with only `prunedCount` moving.
  *
- * The discriminator is deliberately "different pids **close together**", not
- * "more than one pid". A diff pair that spans a worker restart has two pids and
- * is the *intended* deliverable — `autoMinIntervalMs` guarantees its halves are
- * hours apart. Warning on multi-pid alone would fire on exactly the workflow
- * this feature exists to support, and a warning that cries wolf on the happy
- * path is one operators learn to scroll past. Two different pids inside one
- * capture interval cannot be a sequential pair; it is concurrency or it is a
- * clock that cannot be trusted, and both want the same operator response.
+ * The discriminator is "a pid that is not ours, stamped at or after we
+ * started". It rests on one fact that nothing in this system can bend: a
+ * predecessor is dead before its successor boots, so it cannot write a snapshot
+ * after our start. Everything older than our start is a predecessor's and is
+ * left alone; anything newer is a process running alongside us, which is the
+ * failure mode, at any spacing.
  *
- * Pass `autoMinIntervalMs` as the window: it is the shortest legitimate spacing
- * between two snapshots from one process, so anything tighter came from two.
+ * It deliberately does NOT key off a time window, and that is a correction
+ * (Ally review, PEN-3631). The previous shape warned on "different pids closer
+ * together than `autoMinIntervalMs`", justified by the claim that a
+ * restart-spanning pair is guaranteed hours apart. There is no such guarantee:
+ * the limiter is `heapSnapshotState`, held in process memory and never seeded
+ * from disk, and `decideHeapSnapshot` applies an interval only when the field is
+ * non-null — so the first trigger after *any* restart fires unconditionally.
+ * An operator who touches the sentinel, suffers the OOM-restart this feature
+ * exists to diagnose, and touches it again ten minutes later produced two pids
+ * ten minutes apart: the documented deliverable, warned about as concurrency,
+ * with `keep`-raising advice that is wrong on a `replicas: 1` worker. That is
+ * the cry-wolf outcome the window was chosen to avoid, reached by the path it
+ * named as safe. Anchoring on our own start time removes the timing assumption
+ * instead of re-tuning it.
+ *
+ * Two alternatives were considered and are worse here. Requiring the pids to
+ * *interleave* needs three retained snapshots to see anything, and `keep`
+ * defaults to 2 — it would be structurally unable to fire on the shipped
+ * configuration. Narrowing the window to `heapSnapshotPollIntervalMs` keeps the
+ * timing assumption (a crash-restart can be quick) and silently drops genuine
+ * concurrency spaced wider than one poll, which this shape catches.
+ *
+ * Two exposures, both pre-existing and both narrowed rather than widened by the
+ * change. Clock skew: a peer whose clock lags ours can stamp a live write
+ * before our start and be missed. Pid collision: pods have separate pid
+ * namespaces, so a peer that happens to share our pid is invisible. Neither is
+ * newly introduced — the filename is the only evidence available here — and the
+ * detector is advisory, so a miss costs a warning, not a capture.
  *
  * Detection rather than partitioning, and that is a choice. Partitioning the
  * keep window by pid was the other option and is worse here: pid changes on
@@ -309,10 +347,9 @@ export interface ConcurrentSnapshotWriters {
  */
 export function findConcurrentSnapshotWriters(
   names: string[],
-  windowMs: number,
+  self: SnapshotWriterSelf,
 ): ConcurrentSnapshotWriters | null {
-  if (windowMs <= 0) return null;
-  const parsed = names
+  const foreign = names
     .filter(isCompletedSnapshot)
     .map((name) => {
       const stampMs = snapshotStampMs(name);
@@ -320,23 +357,19 @@ export function findConcurrentSnapshotWriters(
       return stampMs === null || pid === null ? null : { stampMs, pid };
     })
     .filter((entry): entry is { stampMs: number; pid: number } => entry !== null)
-    .sort((a, b) => a.stampMs - b.stampMs);
+    // Ours is not competition, and a stamp older than our start belongs to a
+    // process that was already gone when we booted.
+    .filter((entry) => entry.pid !== self.pid && entry.stampMs >= self.startedAtMs);
 
-  const pids = new Set<number>();
-  let closestGapMs = Number.POSITIVE_INFINITY;
-  for (let i = 0; i < parsed.length; i += 1) {
-    for (let j = i + 1; j < parsed.length; j += 1) {
-      const gapMs = parsed[j].stampMs - parsed[i].stampMs;
-      // Ascending by stamp, so every later j is at least this far out too.
-      if (gapMs >= windowMs) break;
-      if (parsed[i].pid === parsed[j].pid) continue;
-      pids.add(parsed[i].pid);
-      pids.add(parsed[j].pid);
-      if (gapMs < closestGapMs) closestGapMs = gapMs;
-    }
-  }
-  if (pids.size === 0) return null;
-  return { pids: [...pids].sort((a, b) => a - b), closestGapMs };
+  if (foreign.length === 0) return null;
+  return {
+    pids: [...new Set(foreign.map((entry) => entry.pid))].sort((a, b) => a - b),
+    // Folded rather than spread into `Math.max`: this list is whatever the
+    // directory holds, and a retention failure is exactly when the detector
+    // should still work. A spread over ~100k entries is a RangeError, which the
+    // caller would swallow as a debug line.
+    newestStampMs: foreign.reduce((newest, entry) => (entry.stampMs > newest ? entry.stampMs : newest), -Infinity),
+  };
 }
 
 interface PrunableEntry {

@@ -895,63 +895,102 @@ describe("describeSentinelOutcome", () => {
 });
 
 describe("findConcurrentSnapshotWriters", () => {
-  // The window callers pass is `autoMinIntervalMs`: the shortest legitimate gap
-  // between two snapshots from one process, so anything tighter came from two.
-  const WINDOW_MS = 2 * 60 * 60 * 1000;
+  // Our own identity. The discriminator is "a pid that is not ours, stamped at
+  // or after we started" — a dead predecessor cannot write after its successor
+  // boots, so that holds at any spacing.
+  const SELF_PID = 10;
+  const BOOTED_AT_MS = Date.parse("2026-09-29T21:00:00.000Z");
+  const self = { pid: SELF_PID, startedAtMs: BOOTED_AT_MS };
 
-  it("reports two processes writing inside one capture interval", () => {
-    // `keep` is a cap over the directory, not over a process. Two writers mean
-    // each round fills every slot and the post-write prune takes the previous
-    // round out, so what survives is two processes at one instant rather than
-    // one process hours apart — which cannot be diffed. It fails silently
-    // otherwise: only `prunedCount` moves.
+  it("reports another process writing while we are running", () => {
+    // `keep` is a cap over the directory, not over a process. Two live writers
+    // mean each round fills every slot and the post-write prune takes the
+    // previous round out, so what survives is two processes at one instant
+    // rather than one process hours apart — which cannot be diffed. It fails
+    // silently otherwise: only `prunedCount` moves.
     expect(
       findConcurrentSnapshotWriters(
         [
           `2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
           `2026-09-29T22-00-30-000Z-pid20${HEAP_SNAPSHOT_EXTENSION}`,
         ],
-        WINDOW_MS,
+        self,
       ),
-    ).toEqual({ pids: [10, 20], closestGapMs: 30_000 });
+    ).toEqual({ pids: [20], newestStampMs: Date.parse("2026-09-29T22:00:30.000Z") });
   });
 
-  it("stays silent on a diff pair that spans a restart, which is the deliverable", () => {
-    // Why the discriminator is "different pids CLOSE TOGETHER" and not "more
-    // than one pid". A pair spanning a worker restart has two pids and is
-    // exactly what PEN-3314 asks for; `autoMinIntervalMs` guarantees its halves
-    // are hours apart. Warning here would fire on the happy path, and a warning
-    // that cries wolf on the happy path is one operators learn to scroll past.
+  it("stays silent on a restart-spanning pair even minutes apart, which is the deliverable", () => {
+    // The regression this shape exists to prevent (Ally review, PEN-3631). The
+    // previous discriminator was "different pids closer together than
+    // `autoMinIntervalMs`", justified by a guarantee that a restart-spanning
+    // pair lands hours apart. There is none: the limiter lives in process
+    // memory and is never seeded from disk, so the first trigger after any
+    // restart fires unconditionally. An operator who touches the sentinel,
+    // suffers the OOM-restart this feature diagnoses, and touches it again ten
+    // minutes later gets exactly this pair — the documented deliverable. The
+    // old fixture used a 2h gap and so encoded the premise instead of testing
+    // it; this one is spaced the way a real restart actually lands.
     expect(
       findConcurrentSnapshotWriters(
         [
-          `2026-09-29T20-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
-          `2026-09-29T22-00-00-000Z-pid20${HEAP_SNAPSHOT_EXTENSION}`,
+          // Predecessor: stamped before we booted at 21:00.
+          `2026-09-29T20-50-00-000Z-pid9${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T21-00-30-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
         ],
-        WINDOW_MS,
+        self,
+      ),
+    ).toBeNull();
+  });
+
+  it("stays silent across several restarts, however tightly they crash-loop", () => {
+    // Generalises the case above: every pid older than our start is a
+    // predecessor, so a crash-loop leaves no residue that reads as concurrency.
+    expect(
+      findConcurrentSnapshotWriters(
+        [
+          `2026-09-29T20-58-00-000Z-pid7${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T20-59-00-000Z-pid8${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T20-59-30-000Z-pid9${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T21-05-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
+        ],
+        self,
       ),
     ).toBeNull();
   });
 
   it("stays silent on one process snapshotting twice in quick succession", () => {
     // A sentinel request is rate-limited by its own, much shorter interval and
-    // may legitimately land close to an automatic capture. One pid is never the
-    // failure mode this detects.
+    // may legitimately land close to an automatic capture. Our own pid is never
+    // the failure mode this detects.
     expect(
       findConcurrentSnapshotWriters(
         [
           `2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
           `2026-09-29T22-00-30-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
         ],
-        WINDOW_MS,
+        self,
       ),
     ).toBeNull();
+  });
+
+  it("catches a peer spaced wider than any capture interval", () => {
+    // The window shape could not see this: 3h exceeds the 2h `autoMinIntervalMs`
+    // it was passed, so a slow second writer evicting our pair went unreported.
+    expect(
+      findConcurrentSnapshotWriters(
+        [
+          `2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-30T01-00-00-000Z-pid20${HEAP_SNAPSHOT_EXTENSION}`,
+        ],
+        self,
+      ),
+    ).toEqual({ pids: [20], newestStampMs: Date.parse("2026-09-30T01:00:00.000Z") });
   });
 
   it("ignores partials and names it did not write", () => {
     // Neither can be attributed to a process: a partial is not a retained
     // snapshot and so holds no `keep` slot, and an unparsed name yields no pid.
-    // Only the one completed, stamped file remains, so there is no pair.
+    // Only our own completed, stamped file remains.
     expect(
       findConcurrentSnapshotWriters(
         [
@@ -959,30 +998,28 @@ describe("findConcurrentSnapshotWriters", () => {
           `2026-09-29T22-00-10-000Z-pid20${HEAP_SNAPSHOT_EXTENSION}.partial`,
           `heap-paperclip-0${HEAP_SNAPSHOT_EXTENSION}`,
         ],
-        WINDOW_MS,
+        self,
       ),
     ).toBeNull();
   });
 
-  it("finds a non-adjacent pair, and reports the tightest gap", () => {
-    // Three snapshots where the two offending ones are not neighbours in time:
-    // scanning adjacent pairs only would miss pid20 against the later pid10.
+  it("reports every distinct peer and the newest write among them", () => {
     expect(
       findConcurrentSnapshotWriters(
         [
-          `2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
+          `2026-09-29T22-00-00-000Z-pid30${HEAP_SNAPSHOT_EXTENSION}`,
           `2026-09-29T22-00-45-000Z-pid20${HEAP_SNAPSHOT_EXTENSION}`,
           `2026-09-29T22-00-50-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`,
         ],
-        WINDOW_MS,
+        self,
       ),
-    ).toEqual({ pids: [10, 20], closestGapMs: 5_000 });
+    ).toEqual({ pids: [20, 30], newestStampMs: Date.parse("2026-09-29T22:00:45.000Z") });
   });
 
   it("is silent on an empty or single-entry directory", () => {
-    expect(findConcurrentSnapshotWriters([], WINDOW_MS)).toBeNull();
+    expect(findConcurrentSnapshotWriters([], self)).toBeNull();
     expect(
-      findConcurrentSnapshotWriters([`2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`], WINDOW_MS),
+      findConcurrentSnapshotWriters([`2026-09-29T22-00-00-000Z-pid10${HEAP_SNAPSHOT_EXTENSION}`], self),
     ).toBeNull();
   });
 });
