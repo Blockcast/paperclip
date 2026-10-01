@@ -25022,6 +25022,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // runs are not left unguarded: `confirmStaleKilledJobQuiesced` below is
         // a fail-closed quiescence probe that keeps the lease whenever the
         // runtime is still active or merely unobservable.
+        //
+        // One caveat on that probe in *this* caller: it sources its Job name
+        // from `getActiveExternalRuntimeReservation`, which filters
+        // `released_at IS NULL`. In `reapOrphanedRuns` the reservation sweep
+        // above runs first in the same pass and has usually just released that
+        // row, so `jobName` is null here and only the pod arm
+        // (`listManagedAgentPods`, fail-closed on a null read) actually
+        // evaluates. That is pre-existing and still safe — the sibling sweep
+        // verified the Job moments earlier, so coverage holds across the pair —
+        // but do not rely on the Job arm being live on this path.
         if (!hasExternalLifecycle(run.adapterType) && activeRunExecutions.has(run.runId)) continue;
         if (hasExternalLifecycle(run.adapterType)) {
           // Background Job deletion does not prove that the Job or its
