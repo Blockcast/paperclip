@@ -233,6 +233,13 @@ describe("webhookDisposition — narrowing an untrusted worker result", () => {
     expect(webhookDisposition({ accepted: 0, rejected: { code: 7 } })).toEqual({ accepted: 0 });
   });
 
+  // `rejected` is only valid with `accepted: 0`; a sender branching on
+  // `body.rejected` must never see it paired with a delivery that landed.
+  it("drops a rejected reason contradicted by a non-zero count but keeps the count", async () => {
+    const { webhookDisposition } = await import("../routes/plugins.js");
+    expect(webhookDisposition({ accepted: 5, rejected: "malformed" })).toEqual({ accepted: 5 });
+  });
+
   it.each([
     ["undefined", undefined],
     ["null", null],
