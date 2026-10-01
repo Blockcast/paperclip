@@ -13,6 +13,7 @@ import {
   applyBaseline,
   assertHeadSha,
   assertLiveScopeNonVacuous,
+  assertMergeStateFetched,
   assertPrListComplete,
   attestedHead,
   duplicateBodyAcrossIdentities,
@@ -900,6 +901,22 @@ describe("assertHeadSha", () => {
   });
 });
 
+describe("assertMergeStateFetched", () => {
+  // An absent key reaches prDormancy as unresolved and, on an idle PR, defers
+  // its findings: the fail-OPEN direction. The values GitHub actually returns
+  // for "not computed yet" must still pass through to tier 3.
+  for (const state of ["", null, "UNKNOWN", "CLEAN"]) {
+    it(`passes a fetched ${JSON.stringify(state)}`, () => {
+      const row = { number: 1, mergeStateStatus: state };
+      assert.equal(assertMergeStateFetched(row, "o/r"), row);
+    });
+  }
+
+  it("throws on a row that lost the key, naming the PR", () => {
+    assert.throws(() => assertMergeStateFetched({ number: 42, headRefOid: HEAD }, "o/r"), /no mergeStateStatus key for o\/r#42/);
+  });
+});
+
 describe("a falsy head would otherwise silently pass a maximal violation", () => {
   it("finds every invariant broken at the real head", () => {
     const reviews = [
@@ -1166,6 +1183,14 @@ describe("prDormancy", () => {
       assert.equal(prDormancy(pr), null);
     });
   }
+
+  // "" is a member of UNRESOLVED_MERGE_STATES on purpose, and membership is what
+  // routes an unresolved state into tier 3. Without this case dropping "" from
+  // the set passed every test.
+  it("reads an idle PR whose state is \"\" as untouched, like UNKNOWN", () => {
+    const updatedAt = new Date(Date.now() - (MAX_IDLE_DAYS + 6) * 86_400_000).toISOString();
+    assert.match(prDormancy({ number: 1, mergeStateStatus: "", updatedAt }), /^untouched for \d+d, merge state unresolved$/);
+  });
 });
 
 describe("assertLiveScopeNonVacuous", () => {

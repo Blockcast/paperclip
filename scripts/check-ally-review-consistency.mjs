@@ -913,13 +913,34 @@ export function assertHeadSha(row, repo) {
 }
 
 /**
+ * `prDormancy` reads an unresolved `mergeStateStatus` on an idle PR as dormant,
+ * and an absent key is indistinguishable from GitHub *reporting* `UNKNOWN` once
+ * it reaches the classifier. That direction defers real findings, so a row that
+ * lost the field entirely -- a `gh` or API shape change -- must stop the run here
+ * rather than be read as "not computed yet". `""`, `null` and `UNKNOWN` are values
+ * GitHub returns and stay in `UNRESOLVED_MERGE_STATES`; only a missing key throws.
+ */
+export function assertMergeStateFetched(row, repo) {
+  if (!Object.hasOwn(row ?? {}, "mergeStateStatus")) {
+    throw new Error(
+      `gh pr list returned no mergeStateStatus key for ${repo}#${row?.number}. ` +
+        `An absent state would classify an idle PR as dormant and demote its ` +
+        `findings to warnings; check that PR_LIST_FIELDS is still honoured.`,
+    );
+  }
+  return row;
+}
+
+/**
  * The `gh pr list` fields the audit depends on.
  *
  * Exported so a test can assert every field `prDormancy` reads is actually
  * fetched. Dropping one here does not fail anything loudly — it just feeds the
- * classifier `undefined`, and `prDormancy` is fail-closed, so the whole
- * staleness clause would go quietly inert while every unit test kept passing
- * against hand-built PR objects.
+ * classifier `undefined`. For `updatedAt` that is fail-closed (the PR stays
+ * live), so the staleness clause would go quietly inert; for `mergeStateStatus`
+ * it is fail-OPEN (an idle PR reads as dormant), which is why a missing key is
+ * refused at fetch by `assertMergeStateFetched`. Either way every unit test
+ * would keep passing against hand-built PR objects.
  */
 export const PR_LIST_FIELDS = "number,headRefOid,author,isDraft,mergeStateStatus,updatedAt";
 
@@ -945,7 +966,7 @@ function fetchOpenPrs(repo) {
   assertPrListComplete(rows, repo);
 
   return rows.map((row) => ({
-    number: assertHeadSha(row, repo).number,
+    number: assertMergeStateFetched(assertHeadSha(row, repo), repo).number,
     headSha: row.headRefOid,
     author: row.author,
     isDraft: row.isDraft,
