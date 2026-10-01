@@ -2137,6 +2137,43 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(await fs.readdir(path.dirname(publishedDir))).toEqual([]);
   });
 
+  // BLO-32167. Deleting a skill tears down a tree that is live and complete up
+  // to the moment it goes, so it is the same hazard as a republish: the adapter
+  // walks `__runtime__` from a different process, which no in-process lock can
+  // serialize. `rm` in place would let it hash a half-unlinked tree.
+  it("retires the published tree by rename when a skill is deleted (BLO-32167)", async () => {
+    const companyId = randomUUID();
+    const { skillId, publishedDir } = await seedRematerializingSkill(companyId, "delete");
+    const rm = recordRmTargets();
+
+    try {
+      await svc.deleteSkill(companyId, skillId);
+    } finally {
+      rm.restore();
+    }
+
+    expect(rm.targets).not.toContain(publishedDir);
+    await expect(fs.access(publishedDir)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readdir(path.dirname(publishedDir))).toEqual([]);
+  });
+
+  // BLO-32167. The two remaining teardown sites — inventory reconcile and
+  // re-import — need a local-path source rig to drive, so guard them where the
+  // regression would actually be written instead. `fs.rm` on a published
+  // runtime path is the defect; the only sanctioned teardown is
+  // `removeDirectoryByRename`. Fails for a fourth site added later, too.
+  it("never tears down a published runtime skill path with fs.rm (BLO-32167)", async () => {
+    const source = await fs.readFile(
+      new URL("../services/company-skills.ts", import.meta.url),
+      "utf8",
+    );
+    const teardowns = source.match(/\w+\.rm\(\s*resolveRuntimeSkillMaterializedPath\(/g) ?? [];
+    expect(teardowns).toEqual([]);
+    // Negative control: the guard can only mean anything if the pattern it
+    // scans for is the one these call sites actually use.
+    expect(source).toMatch(/removeDirectoryByRename\(resolveRuntimeSkillMaterializedPath\(/);
+  });
+
   it("falls back to stored markdown when reading SKILL.md from a missing local source", async () => {
     const companyId = randomUUID();
     const skillId = randomUUID();
