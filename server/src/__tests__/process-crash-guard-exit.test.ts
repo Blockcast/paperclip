@@ -439,10 +439,7 @@ describe("process crash guard — real process exit", () => {
    * so without this assertion a change to the write budget widens every bound in the
    * file and the slowdown it causes goes unnoticed — measured at 1_000 the stalled exit
    * takes 2054ms while every other test in the file still passes. Failing here instead
-   * names the constant that moved.
-   *
-   * If you are changing the budget deliberately this is the expected failure: re-measure
-   * the stalled exit, then move this pin and the 9x multiplier together.
+   * names the constant that moved; the assertion message carries the remedy.
    */
   it("the stalled-exit deadline is calibrated for the current write budget", () => {
     expect(
