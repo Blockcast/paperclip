@@ -623,6 +623,22 @@ test("replacing a prior entry with a symlink is rejected", () => {
   assert.match(result.reason, /empties 1 existing entry/);
 });
 
+test("adding a symlink as the new entry does not satisfy the guard", () => {
+  // The `A` twin of the case above: the added entry's diff is its link target,
+  // `+blo-1.md`, which is not blank, so a diff-only test scores it 1 and passes.
+  for (const target of ["blo-1.md", "README.md", "/etc/hostname"]) {
+    const { dir, write, commit, checkFromPrior } = repoWithPriorEntry();
+    write(SOURCE, BUMP);
+    symlinkSync(target, join(dir, LOG_DIR, "blo-9.md"));
+    commit("touch vendored source, add a symlink as the entry");
+
+    const result = checkFromPrior();
+    assert.equal(result.ok, false, `an entry linking to ${target} records nothing itself`);
+    assert.match(result.reason, /records nothing/);
+    assert.ok(result.detail.some((line) => line.includes("blo-9.md")), "the failure should name the entry");
+  }
+});
+
 test("deleting every prior entry while adding your own is rejected", () => {
   const { git, write, commit, checkFromPrior } = repoWithPriorEntry();
   git("rm", "--quiet", `${LOG_DIR}/blo-1.md`);

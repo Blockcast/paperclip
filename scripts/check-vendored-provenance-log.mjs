@@ -76,6 +76,11 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   // Three-dot: diff against the merge base, so base-branch commits landed since
   // the branch point do not masquerade as changes made by this PR.
   const range = `${base}...${head}`;
+  // A symlink's blob is its target path, which is never blank, so neither the
+  // blank-content test nor the added-line scan below can tell a link from a
+  // record: only the mode can. Both entry checks call this one predicate so
+  // the changed-entry and added-entry paths cannot drift apart again.
+  const isRegularFileAtHead = (p) => git("ls-tree", head, "--", p).split(/\s/)[0].startsWith("100");
 
   const numstat = git("diff", "--numstat", range, "--", LOG).trim();
   const [added, deleted] = numstat
@@ -153,10 +158,7 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   )
     .split("\n")
     .filter(isEntryPath)
-    .filter((p) => {
-      const [mode] = git("ls-tree", head, "--", p).split(/\s/);
-      return !mode.startsWith("100") || git("cat-file", "blob", `${head}:${p}`).trim() === "";
-    });
+    .filter((p) => !isRegularFileAtHead(p) || git("cat-file", "blob", `${head}:${p}`).trim() === "");
 
   if (erasedEntries.length > 0) {
     return {
@@ -203,7 +205,11 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   // the character after a header's leading `+` is neither space nor `|`, but a
   // bare `\S` test matches `+++ b/path` itself: measured, a whitespace-only
   // entry scores 1 without this and passes.
+  //
+  // And the mode, as for a changed entry: an added symlink's one added line is
+  // its target, `+blo-1.md`, so the scan alone scores it 1 and passes.
   const substantiveEntries = addedEntries.filter((p) =>
+    isRegularFileAtHead(p) &&
     git("diff", "--unified=0", range, "--", p)
       .split("\n")
       .some((line) => line.startsWith("+") && !line.startsWith("+++") && line.slice(1).trim() !== ""),
