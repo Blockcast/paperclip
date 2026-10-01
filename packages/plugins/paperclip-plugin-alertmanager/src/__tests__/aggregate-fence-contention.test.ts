@@ -262,10 +262,23 @@ function deferred<T = void>() {
  * It must nonetheless stay strictly BELOW the enclosing test budget, or vitest
  * kills the case first and the named message below is unreachable — which would
  * reintroduce the opaque timeout this helper exists to remove. This package sets
- * `testTimeout: 60_000` (vitest.config.ts, BLO-37114); the single case using
- * this helper arms two backstops in sequence, so 15s each bounds the diagnostic
- * path at 30s and leaves the same again for the PGlite work itself. Raising this
- * past ~25s silently disarms the second one.
+ * `testTimeout: 60_000` (vitest.config.ts, BLO-37114).
+ *
+ * The two backstops in the contention case are NOT three sequential spans, and
+ * reading them as one is how the margin gets mis-stated. The second backstop
+ * (the `bRefusals >= 2 || bSettled` wait) runs entirely INSIDE delivery B's own
+ * `budgetMs: 30_000`, because B is constructed before that wait begins. So the
+ * worst case for a PASSING run is backstop #1 (15s) followed by B's budget
+ * (30s, which subsumes backstop #2) = 45s, leaving ~15s inside the 60s case
+ * budget. The naive 15 + 15 + 30 = 60 reads the nested span twice and so
+ * reports zero headroom where there is 15s.
+ *
+ * Two invariants bound this default, and both are violated at 30s, not 25s:
+ *   - 2 x timeoutMs < testTimeout, or backstop #2 is pre-empted and silent.
+ *   - timeoutMs < B's budgetMs, or B can exhaust its budget and reject while A
+ *     is still deliberately held, which is the very failure this case asserts
+ *     against.
+ * 15s satisfies both with 2x margin. Do not raise it without re-deriving these.
  */
 async function waitUntil(
   condition: () => boolean,
@@ -275,7 +288,13 @@ async function waitUntil(
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
     if (Date.now() > deadline) throw new Error(describeFailure());
-    await new Promise((r) => setTimeout(r, 1));
+    // 10ms, matching the sibling helper in adapter-utils/src/server-utils.test.ts.
+    // What this polls for is delivery B's real PGlite work on this same event
+    // loop, so a 1ms self-reschedule (~1000x/s) competes with the thing it is
+    // measuring — worst on the scheduling-starved ARC pod this change targets
+    // (PEN-3528). B's backoff delays are 5-20ms, so 10ms is indistinguishable
+    // for every condition asserted here and strictly cheaper.
+    await new Promise((r) => setTimeout(r, 10));
   }
 }
 
