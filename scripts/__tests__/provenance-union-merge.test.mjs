@@ -372,7 +372,7 @@ test("two concurrent realistic vendored changes rebase with no conflict (BLO-351
  * @param {(ctx: ReturnType<typeof scratchRepo>, branch: {id: string, source: string}) => void} record
  * @returns {{clean: boolean, output: string}}
  */
-function mergeWithoutDrivers(record) {
+function mergeBranches(record, { drivers = false } = {}) {
   const ctx = scratchRepo();
   const { dir, git, base } = ctx;
   const branches = [
@@ -382,8 +382,10 @@ function mergeWithoutDrivers(record) {
 
   // $GIT_DIR/info/attributes has the highest precedence, so this overrides the
   // union line in the tree's own .gitattributes. That is the GitHub equivalence.
-  mkdirSync(join(dir, ".git", "info"), { recursive: true });
-  writeFileSync(join(dir, ".git", "info", "attributes"), `${LOG} merge=text\n`);
+  if (!drivers) {
+    mkdirSync(join(dir, ".git", "info"), { recursive: true });
+    writeFileSync(join(dir, ".git", "info", "attributes"), `${LOG} merge=text\n`);
+  }
 
   for (const branch of branches) {
     git("checkout", "--quiet", "-b", `branch-${branch.id}`, base);
@@ -401,13 +403,15 @@ function mergeWithoutDrivers(record) {
   }
 }
 
+const singleFileAppend = (ctx, branch) => {
+  ctx.write(LOG, `${LOG_HEADER}| \`${branch.id}\` | ${branch.source} | change ${branch.id} |\n`);
+};
+
 test("CONTROL: concurrent appends to the single log file conflict without drivers", () => {
   // The failure as measured on 2026-09-30: master 0bb33a1a7, #2070 ejected at
   // 17:04:28Z and #1459 at 17:07:02Z, both `merge_conflict`, both in this file
   // and nothing else, both clean under a local merge with the union attribute.
-  const { clean, output } = mergeWithoutDrivers((ctx, branch) => {
-    ctx.write(LOG, `${LOG_HEADER}| \`${branch.id}\` | ${branch.source} | change ${branch.id} |\n`);
-  });
+  const { clean, output } = mergeBranches(singleFileAppend);
   assert.equal(
     clean,
     false,
@@ -419,8 +423,25 @@ test("CONTROL: concurrent appends to the single log file conflict without driver
   );
 });
 
+test("CONTROL: the disabled driver is WHY the single-file case conflicts", () => {
+  // The control above pins that it conflicts and which file; this pins the
+  // cause. Without it a future harness change that conflicts in LOG for some
+  // unrelated reason would still satisfy it, and the subject test below would
+  // go on "proving" a merge property the harness was no longer measuring.
+  //
+  // This is round 1's mistake in miniature: that demonstration used `git
+  // rebase`, which honours the driver, so it was green for a reason that had
+  // nothing to do with GitHub.
+  const { clean, output } = mergeBranches(singleFileAppend, { drivers: true });
+  assert.equal(
+    clean,
+    true,
+    `with merge=union in effect the same appends must merge: ${output}`,
+  );
+});
+
 test("one file per change merges cleanly without drivers (BLO-34872 round 2)", () => {
-  const { clean, output } = mergeWithoutDrivers((ctx, branch) => {
+  const { clean, output } = mergeBranches((ctx, branch) => {
     ctx.write(`${LOG_DIR}/change-${branch.id}.md`, `Change ${branch.id}: touched ${branch.source}.\n`);
   });
   assert.equal(clean, true, `two distinct new entry files must never conflict: ${output}`);
@@ -532,4 +553,138 @@ test("the real tree has the entry directory, and PROVENANCE.md points at it", ()
     read(`${VENDOR_DIR}/PROVENANCE.md`).includes("PROVENANCE-CHANGES.d/"),
     "PROVENANCE.md does not mention the entry directory, so contributors keep appending to the frozen table",
   );
+});
+
+// --------------------------------------------------------------------------
+// The entry directory is append-only, and an entry has to record something.
+// All seven below reproduce findings from Ally's review of PR #2148 at
+// 9eaab0364, and each fails with its one guard reverted.
+// --------------------------------------------------------------------------
+
+const BUMP = "export const manifest = 2;\n";
+
+/** Seeds an entry that predates the range under test, as a prior PR would have. */
+function repoWithPriorEntry(name = "blo-1.md", body = "An earlier change.\n") {
+  const scratch = scratchRepo();
+  scratch.write(`${LOG_DIR}/${name}`, body);
+  scratch.commit("an earlier entry, already on the base branch");
+  const priorBase = scratch.git("rev-parse", "HEAD").trim();
+  return {
+    ...scratch,
+    priorBase,
+    checkFromPrior: () =>
+      checkVendoredProvenanceLog({ base: priorBase, head: "HEAD", cwd: scratch.dir }),
+  };
+}
+
+test("deleting an entry file is rejected", () => {
+  // Entry paths are filtered out of `changed`, so before the LOG_DIR deletion
+  // guard a delete-only change reached `changed.length === 0` and returned ok:
+  // erasing the record was the one mutation nothing caught.
+  const { git, commit, checkFromPrior } = repoWithPriorEntry();
+  git("rm", "--quiet", `${LOG_DIR}/blo-1.md`);
+  commit("delete an earlier entry");
+
+  const result = checkFromPrior();
+  assert.equal(result.ok, false, "erasing a prior entry must not pass");
+  assert.match(result.reason, /append-only/);
+  assert.ok(
+    result.detail.some((line) => line.includes("blo-1.md")),
+    "the failure should name the entry it removed",
+  );
+});
+
+test("deleting every prior entry while adding your own is rejected", () => {
+  const { git, write, commit, checkFromPrior } = repoWithPriorEntry();
+  git("rm", "--quiet", `${LOG_DIR}/blo-1.md`);
+  write(SOURCE, BUMP);
+  write(`${LOG_DIR}/blo-2.md`, "My change, and I took the others with me.\n");
+  commit("clear the log, record only mine");
+
+  const result = checkFromPrior();
+  assert.equal(result.ok, false, "a valid entry of your own does not license erasing others'");
+  assert.match(result.reason, /append-only/);
+});
+
+test("a deletion paired with a similar new entry is still seen as a deletion", () => {
+  // --no-renames on the deletion check. git pairs delete+add of similar bodies
+  // as a rename (measured R087 on git 2.47), and plain --diff-filter=D then
+  // reports nothing -- so without the flag the append-only rule above has a
+  // trivial bypass: delete an entry while adding one that looks like it.
+  const body = "An earlier change, with a body long enough to score as similar.\n";
+  const { git, write, commit, checkFromPrior } = repoWithPriorEntry("blo-1.md", body);
+  git("rm", "--quiet", `${LOG_DIR}/blo-1.md`);
+  write(SOURCE, BUMP);
+  write(`${LOG_DIR}/blo-2.md`, `${body}Plus one more line.\n`);
+  commit("supersede an entry by renaming it");
+
+  const result = checkFromPrior();
+  assert.equal(result.ok, false, "the rename pairing must not hide the deletion");
+  assert.match(result.reason, /append-only/);
+});
+
+test("an empty entry file does not satisfy the guard", () => {
+  // isEntryPath tests the path and nothing else, so a zero-byte file used to
+  // pass -- the same "add nothing" satisfier the row filter already rejects.
+  const { write, commit, check } = scratchRepo();
+  write(SOURCE, BUMP);
+  write(`${LOG_DIR}/blo-1.md`, "");
+  commit("touch vendored source, add an empty entry");
+
+  const result = check();
+  assert.equal(result.ok, false, "an empty entry records nothing");
+  assert.match(result.reason, /records nothing/);
+  assert.ok(
+    result.detail.some((line) => line.includes("blo-1.md")),
+    "the failure should name the empty entry, not ask for one that is already there",
+  );
+});
+
+test("a whitespace-only entry does not satisfy the guard", () => {
+  // Specifically the `+++` exclusion. A bare /^\+\s*\S/ matches the diff
+  // header's own plus signs, so without it this file scores 1 and passes.
+  const { write, commit, check } = scratchRepo();
+  write(SOURCE, BUMP);
+  write(`${LOG_DIR}/blo-1.md`, "   \n\t\n");
+  commit("touch vendored source, add a whitespace-only entry");
+
+  const result = check();
+  assert.equal(result.ok, false, "whitespace is not a record");
+  assert.match(result.reason, /records nothing/);
+});
+
+test("an entry moved in from a non-entry path still counts as added", () => {
+  // --no-renames on the added-entry check. The source here is not an entry, so
+  // the append-only rule does not fire; without the flag git pairs the move as
+  // a rename, --diff-filter=A comes back empty, and the guard rejects a change
+  // that did record itself -- naming only the source file, never the entry.
+  const draft = `${LOG_DIR}/notes.txt`;
+  const body = "Drafted here first, with a body long enough to pair as a rename.\n";
+  const { git, write, commit, base, dir } = scratchRepo();
+  write(draft, body);
+  commit("leave a draft in the entry directory");
+  const draftBase = git("rev-parse", "HEAD").trim();
+  assert.notEqual(draftBase, base, "the draft must predate the range under test");
+
+  git("mv", draft, `${LOG_DIR}/blo-2.md`);
+  write(SOURCE, BUMP);
+  commit("promote the draft to this change's entry");
+
+  assert.deepEqual(
+    checkVendoredProvenanceLog({ base: draftBase, head: "HEAD", cwd: dir }),
+    { ok: true },
+  );
+});
+
+test("an entry with a non-ASCII filename satisfies the guard", () => {
+  // core.quotePath defaults on, so git returns `"...caf\303\251.md"` -- quotes
+  // and all. That fails isEntryPath and the LOG_DIR filter in `changed`, so the
+  // entry was counted as unrecorded vendored source and named as the offender.
+  // README.md promises "Any `.md` filename works".
+  const { write, commit, check } = scratchRepo();
+  write(SOURCE, BUMP);
+  write(`${LOG_DIR}/café.md`, "Accented filename.\n");
+  commit("record the change under a non-ASCII entry name");
+
+  assert.deepEqual(check(), { ok: true });
 });

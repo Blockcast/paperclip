@@ -61,7 +61,18 @@ export function isEntryPath(path) {
  * @returns {{ok: true, warning?: string} | {ok: false, reason: string, detail: string[]}}
  */
 export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
-  const git = (...args) => execFileSync("git", args, { encoding: "utf8", cwd });
+  // core.quotePath defaults on, so an entry with any non-ASCII character comes
+  // back as `"vendor/.../caf\303\251.md"` -- surrounding quotes and all. That
+  // fails isEntryPath AND the startsWith filter below, so the entry is counted
+  // as unrecorded vendored source and named in `detail` as the offending file.
+  // README.md promises "Any `.md` filename works"; this makes that true.
+  // ponytail: two residual filename edges, both untested and so left documented
+  // rather than half-fixed -- a path containing a literal newline or quote is
+  // still quoted (`-z` would cover it, at the cost of changing every split
+  // below), and a name containing pathspec glob characters would be matched as
+  // a pattern by the per-entry diff further down (`--literal-pathspecs`).
+  const git = (...args) =>
+    execFileSync("git", ["-c", "core.quotePath=false", ...args], { encoding: "utf8", cwd });
   // Three-dot: diff against the merge base, so base-branch commits landed since
   // the branch point do not masquerade as changes made by this PR.
   const range = `${base}...${head}`;
@@ -103,6 +114,34 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
     };
   }
 
+  // The same rule for the directory, and it has to be here -- above the
+  // `changed.length === 0` return below -- because entry paths are filtered out
+  // of `changed`. Without this, a change that only deletes entries reaches that
+  // return as ok: erasing the record was the one mutation nothing caught, which
+  // is precisely the drift the reason string below exists to prevent.
+  //
+  // --no-renames, or the guard has a trivial bypass. Measured on git 2.47:
+  // deleting an entry while adding a similar one pairs them as R087, and plain
+  // --diff-filter=D then reports *nothing* -- the deletion hides behind the add.
+  const deletedEntries = git(
+    "diff", "--name-only", "--diff-filter=D", "--no-renames", range, "--", LOG_DIR,
+  )
+    .split("\n")
+    .filter(isEntryPath);
+
+  if (deletedEntries.length > 0) {
+    return {
+      ok: false,
+      reason: `${LOG_DIR}/ is append-only, but this change removes ${deletedEntries.length} entry file(s).`,
+      detail: [
+        "Each entry records why the vendored tree changed in some earlier PR;",
+        "removing one erases that record. To correct an entry, add a new one",
+        "that supersedes it -- never delete or rename the old one. Removed:",
+        ...deletedEntries.map((p) => `  ${p}`),
+      ],
+    };
+  }
+
   const changed = git("diff", "--name-only", range, "--", VENDOR_DIR)
     .split("\n")
     .filter(Boolean)
@@ -115,9 +154,31 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   // two PRs adding distinct paths merge cleanly everywhere, two PRs editing one
   // path do not. It also keeps README.md and any earlier entry from satisfying
   // the guard for a later change.
-  const addedEntries = git("diff", "--name-only", "--diff-filter=A", range, "--", LOG_DIR)
+  // --no-renames for the same reason as the deletion check: without it a new
+  // entry that git pairs with some other removed file is reported as a rename,
+  // --diff-filter=A returns empty, and the guard rejects a change that *did*
+  // record itself -- naming only the source file, never the entry sitting in
+  // the diff. A rename is not an edit of the new path, so suppressing pairing
+  // is what makes the filter mean what this comment says it means.
+  const addedEntries = git(
+    "diff", "--name-only", "--diff-filter=A", "--no-renames", range, "--", LOG_DIR,
+  )
     .split("\n")
     .filter(isEntryPath);
+
+  // Mirror the row rule below onto entries: a path is not a record. An empty or
+  // whitespace-only entry satisfies `addedEntries` while recording nothing --
+  // the same "add nothing" satisfier the row filter already rejects.
+  //
+  // `+++` must be excluded explicitly. The row filter gets this free because
+  // the character after a header's leading `+` is neither space nor `|`, but a
+  // bare `\S` test matches `+++ b/path` itself: measured, a whitespace-only
+  // entry scores 1 without this and passes.
+  const substantiveEntries = addedEntries.filter((p) =>
+    git("diff", "--unified=0", range, "--", p)
+      .split("\n")
+      .some((line) => line.startsWith("+") && !line.startsWith("+++") && line.slice(1).trim() !== ""),
+  );
 
   // Count added *rows*, not added lines: a bare `added > 0` is satisfied by a
   // blank line, so the cheapest way to silence the guard would be to add
@@ -128,16 +189,28 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
     .split("\n")
     .filter((line) => /^\+\s*\|/.test(line));
 
-  if (addedEntries.length < 1 && addedRows.length < 1) {
+  if (substantiveEntries.length < 1 && addedRows.length < 1) {
+    // Distinguish "you added nothing" from "you added an empty file": the
+    // second is the misleading case, where the entry the guard is asking for
+    // is sitting right there in the diff.
+    const emptyOnly = addedEntries.length > 0;
     return {
       ok: false,
-      reason: `Vendored source changed but ${LOG_DIR}/ gained no entry.`,
-      detail: [
-        `Add one file, '${LOG_DIR}/<issue-or-pr>.md', describing the change, so`,
-        "the recorded provenance does not silently drift from what is actually",
-        `in the tree. See ${LOG_DIR}/README.md. Changed files:`,
-        ...changed.map((p) => `  ${p}`),
-      ],
+      reason: emptyOnly
+        ? `${LOG_DIR}/ gained an entry, but it records nothing.`
+        : `Vendored source changed but ${LOG_DIR}/ gained no entry.`,
+      detail: emptyOnly
+        ? [
+            "An entry file is the record; its path alone is not. Describe what",
+            "changed in the vendored tree and why. Empty entries added:",
+            ...addedEntries.map((p) => `  ${p}`),
+          ]
+        : [
+            `Add one file, '${LOG_DIR}/<issue-or-pr>.md', describing the change, so`,
+            "the recorded provenance does not silently drift from what is actually",
+            `in the tree. See ${LOG_DIR}/README.md. Changed files:`,
+            ...changed.map((p) => `  ${p}`),
+          ],
     };
   }
 
@@ -148,7 +221,7 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   // Not when the log is the only thing that changed: there is no vendored
   // source being recorded, so there is nothing to redirect.
   const logOnly = changed.length === 1 && changed[0] === LOG;
-  if (addedEntries.length < 1 && !logOnly) {
+  if (substantiveEntries.length < 1 && !logOnly) {
     return {
       ok: true,
       warning: `${LOG} is frozen: this change appends a row to it instead of adding ${LOG_DIR}/<issue-or-pr>.md. Accepted, but concurrent appends to that one file conflict on GitHub and get ejected from the merge queue.`,
@@ -180,5 +253,7 @@ if (isMainModule()) {
     process.exit(1);
   }
   if (result.warning) console.log(`::warning::${result.warning}`);
-  console.log(`${LOG_DIR}: ok`);
+  // Name the surface that actually satisfied the guard. On the legacy path
+  // `${LOG_DIR}: ok` names the one surface that did *not* gain an entry.
+  console.log(result.warning ? `${LOG}: ok (legacy row)` : `${LOG_DIR}: ok`);
 }
