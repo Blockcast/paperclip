@@ -67,16 +67,30 @@ platform cannot resolve automatically. Each runbook should be:
 - [`queued-run-stranded.md#agent-start-lock-wedged-pen-3305`](queued-run-stranded.md#agent-start-lock-wedged-pen-3305) —
   an agent has held its per-agent dispatch start lock past the point the code
   itself calls dispatch stopped. This is the *cause* side of the alert above:
-  the lock has no timeout by design, so nothing external breaks the hold and
-  the agent dispatches nothing until the section settles — which measured
-  holds since 2026-09-16 have done on their own (BLO-36522; replacing the
-  process is *not* the default remedy — see the runbook's Step 4 gate),
-  while `status: idle` /
-  `errorReason: null` / `orgChainHealth: healthy` all read normal. Trigger:
-  alert `PaperclipAgentStartLockWedged`, or
-  `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 300`
+  since PEN-3328 the section is cancellable and aborts at 4h, but cancellation
+  only reaches awaits that observe the signal, so a section wedged on anything
+  else still dispatches nothing until it settles or the process is replaced,
+  while `status: idle` / `errorReason: null` / `orgChainHealth: healthy` all
+  read normal. Firing therefore means the abort was requested and did **not**
+  land. A hold *below* that boundary is a different condition and usually
+  settles on its own (BLO-36522 — 21 agents held past 300s in the 14 days to
+  2026-09-25, peak 8073s, every one self-resolved), so read the runbook's
+  Step 4 gate before replacing anything. Trigger: alert
+  `PaperclipAgentStartLockWedged`, or
+  `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400`
   (threshold quoted for readability; `values.yaml`
-  `prometheusRule.agentStartLockHeldSeconds` is authoritative).
+  `prometheusRule.agentStartLockHeldSeconds` is authoritative). The self-healed
+  case — abort requested and landed — is the entry below instead.
+- [`queued-run-stranded.md#agent-start-lock-aborted-pen-3328`](queued-run-stranded.md#agent-start-lock-aborted-pen-3328) —
+  the same fault as above with the opposite outcome: the section overran the 4h
+  abort budget, cancellation **landed**, the lock released and dispatch has
+  already resumed. Deliberately `warning` and a post-mortem — nobody needs
+  waking, and the wedged runbook's pod replacement is exactly the wrong action
+  here. It needs its own rule because the held gauge is emitted only while a
+  lock is held, so a successful cancellation deletes the series and the handled
+  incident would otherwise be invisible precisely because it was handled.
+  Trigger: alert `PaperclipAgentStartLockAborted`, or
+  `increase(paperclip_agent_start_lock_aborted_total[1h]) > 0`.
 - [`queued-run-stranded.md#overdue-scheduled-retry-blo-22094`](queued-run-stranded.md#overdue-scheduled-retry-blo-22094) —
   a `heartbeat_runs` row parked at `status='scheduled_retry'` past its own due
   time, never promoted: the retry-promotion sweep either wedged or is
