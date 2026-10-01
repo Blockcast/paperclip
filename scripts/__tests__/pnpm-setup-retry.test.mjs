@@ -56,7 +56,8 @@ const wrapperRef = "./.github/actions/setup-pnpm";
 // 24th is listed in WRAPPER_JOBS_WITHOUT_A_BUDGET below), the next-lowest two
 // declare exactly 15, and `policy` was the lone outlier at 10 -- as well as the
 // only one observed dying at its cap. That outlier is closed: #2010 raised
-// `policy` to 22 under the BLO-35615 work-based rule, so every wrapper job now
+// `policy` to 22 under the BLO-35615 work-based rule, and BLO-35886 re-derived
+// it to 29 once F = 0.32 was retracted for F = 0.21, so every wrapper job now
 // clears this floor. The past tense is load-bearing -- do not "correct" it back
 // to present without re-reading pr.yml.
 //
