@@ -27,6 +27,7 @@
 // a fourth recoverable code without a matching family arm fails CI instead of
 // silently re-opening this gap.
 import { describe, expect, it } from "vitest";
+import { ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES } from "../services/recovery/zero-token-startup-failure.js";
 import {
   RECOVERABLE_AGENT_STATUS_ERROR_CODES,
   readHeartbeatRunErrorFamily,
@@ -215,7 +216,7 @@ describe("BLO-35668: skill_materialization_pending retries wherever adapter_fail
     ["pr_review context", prReview],
     ["issue context", { issueId: "issue-a" }],
     ["neither", {}],
-  ])("matches adapter_failed exactly (%s)", (_label, contextSnapshot) => {
+  ] as const)("matches adapter_failed exactly (%s)", (_label, contextSnapshot) => {
     expect(
       shouldScheduleAutomaticRunRetry({
         errorCode: "skill_materialization_pending",
@@ -242,5 +243,33 @@ describe("BLO-35668: skill_materialization_pending retries wherever adapter_fail
         contextSnapshot: prReview,
       }),
     ).toBe(false);
+  });
+
+  // The THIRD enrolment site of the same rename, raised by Ally as an Important
+  // finding on #2159. This one is routing, not retry: ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES
+  // decides owner-vs-manager for a `stranded_assigned_issue`, and the routing
+  // union's other arm (`isInfraClassStrandedFailure`) is scoped to
+  // `k8s_job_deleted_externally`, git transport, and `claude_truncated` +
+  // pod-removal wording — a ClaudeSkillSourceUnavailableError matches none. So
+  // the miss handed an assignee's issue UP the manager ladder for a
+  // materialization race they had no part in: the BLO-20933 hazard that set
+  // exists to prevent.
+  //
+  // By comparison rather than a literal `true`, for the same reason as above: if
+  // `adapter_failed` is ever removed from that set, this code should follow it
+  // out rather than fail.
+  //
+  // NOT folded into one set shared with the retry gate (Ally's suggestion 2).
+  // The two are different populations, not one drifted list:
+  // `shouldScheduleAutomaticRunRetry` also admits `session_unavailable` and
+  // `process_lost`, and neither belongs in the routing set — BLO-27463's scope
+  // note above it deliberately keeps routing and the attempt budget separate,
+  // and merging them would widen routing onto codes it argued out. The invariant
+  // that actually holds is the narrower one asserted here and above: these two
+  // codes name ONE fault at ONE emit site, so they move together.
+  it("is routed infra-class wherever adapter_failed is", () => {
+    expect(ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has("skill_materialization_pending")).toBe(
+      ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has("adapter_failed"),
+    );
   });
 });
