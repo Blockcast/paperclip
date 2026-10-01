@@ -6997,6 +6997,50 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // BLO-30420: record the classifier's decision to decline BEFORE the wake
+    // loop, and independently of it -- and above the `no_matching_issue` exit
+    // below, not merely above the loop. Emitting inside the loop would lose the
+    // diagnostic in precisely the cases that need it most -- no owning issue,
+    // terminal status, unassigned -- where the loop body never runs and the
+    // delivery leaves no trace at all. `terminal status` and `unassigned` are
+    // `skipped` entries inside the loop, so a position above the loop covers
+    // them; `no owning issue` returns at `matched.length === 0` and is only
+    // covered from here. `resolveReviewFeedbackSuppression` reads nothing but
+    // `context`, so it is computable this early.
+    //
+    // This is a diagnostic only: it reads the already-computed verdict and
+    // changes no wake, comment, dedupe or escalation behavior.
+    const reviewFeedbackSuppression = resolveReviewFeedbackSuppression(context);
+    if (reviewFeedbackSuppression) {
+      // `ally_review_findings_all_zero` is the healthy no-op and the
+      // overwhelmingly common one; logging it at `info` buries
+      // `ally_review_findings_unenumerable`, the suspect reason this
+      // diagnostic exists to surface.
+      const level =
+        reviewFeedbackSuppression.reason === "ally_review_findings_all_zero" ? "debug" : "info";
+      logger[level](
+        {
+          deliveryId,
+          event: eventName,
+          wakeReason: context.wakeReason,
+          prNumber: context.prNumber,
+          repoFullName: context.repoFullName,
+          reviewId: context.reviewId,
+          reviewUrl: context.reviewUrl,
+          reviewState: context.reviewState,
+          reviewAuthorLogin: context.reviewAuthorLogin,
+          headSha: context.headSha,
+          // Bounded: a PR body may reference arbitrarily many issues, and this
+          // line fires per declined review. The count stays exact.
+          matchedIdentifiers: matched.slice(0, 10).map((m) => m.identifier),
+          matchedCount: matched.length,
+          suppressionReason: reviewFeedbackSuppression.reason,
+          suppressionPredicate: reviewFeedbackSuppression.predicate,
+        },
+        "github webhook declined PR review feedback delivery: classifier found no actionable findings",
+      );
+    }
+
     if (matched.length === 0) {
       respond(200, {
         ok: true,
@@ -7018,6 +7062,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         // happens to take -- report it on every path that has computed it.
         reviewerWakeFired,
         reviewerRunsCancelled,
+        // BLO-30420: same argument, same shape. A declined review on a PR with
+        // no owning issue is exactly the delivery that otherwise leaves no
+        // trace, so report the classifier's reason on this exit too.
+        ...(reviewFeedbackSuppression ? { reviewFeedbackSuppressed: reviewFeedbackSuppression } : {}),
       });
       return;
     }
@@ -7134,36 +7182,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // downstream consumer -- isPrWake, wakeIdempotencySuffix, the heartbeat
     // directive -- already keys on.
     const reviewGateEscalation = context.wakeReason === "github_pr_review_gate_escalation";
-
-    // BLO-30420: record the classifier's decision to decline BEFORE the wake
-    // loop, and independently of it. Emitting inside the loop would lose the
-    // diagnostic in precisely the cases that need it most -- no owning issue,
-    // terminal status, unassigned -- where the loop body never runs and the
-    // delivery leaves no trace at all.
-    //
-    // This is a diagnostic only: it reads the already-computed verdict and
-    // changes no wake, comment, dedupe or escalation behavior.
-    const reviewFeedbackSuppression = resolveReviewFeedbackSuppression(context);
-    if (reviewFeedbackSuppression) {
-      logger.info(
-        {
-          deliveryId,
-          event: eventName,
-          wakeReason: context.wakeReason,
-          prNumber: context.prNumber,
-          repoFullName: context.repoFullName,
-          reviewId: context.reviewId,
-          reviewUrl: context.reviewUrl,
-          reviewState: context.reviewState,
-          reviewAuthorLogin: context.reviewAuthorLogin,
-          headSha: context.headSha,
-          matchedIdentifiers: matched.map((m) => m.identifier),
-          suppressionReason: reviewFeedbackSuppression.reason,
-          suppressionPredicate: reviewFeedbackSuppression.predicate,
-        },
-        "github webhook declined PR review feedback delivery: classifier found no actionable findings",
-      );
-    }
 
     // synchronize and converted_to_draft are reviewer-lifecycle signals. The
     // reviewer wake above is PR-scoped for task affinity/coalescing, while
@@ -7536,8 +7554,18 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             // BLO-30420: persist the declined-classification reason alongside
             // the wake it accompanies. The author is still woken for a
             // non-actionable review (it is a real review event), but with no
-            // feedback comment -- so without this the run has no way to tell
-            // "the reviewer found nothing" from "the findings were lost".
+            // feedback comment -- so without this a later reader of
+            // `heartbeat_runs` has no way to tell "the reviewer found nothing"
+            // from "the findings were lost".
+            //
+            // Persisted only: nothing projects this key INTO the run. The
+            // directive `buildPaperclipTaskMarkdown` renders is unchanged, so
+            // the run itself still infers the no-op from absence. Making it
+            // run-visible means a `derivePaperclipPrReview` passthrough plus a
+            // rendered line -- a behavior change this issue's AC does not ask
+            // for ("persisted OR returned"), and one the sibling
+            // `githubReviewFeedbackActionable` needs equally. Tracked in
+            // BLO-38816, deliberately not widened into this diff.
             ...(reviewFeedbackSuppression
               ? {
                   githubReviewFeedbackSuppressionReason: reviewFeedbackSuppression.reason,

@@ -9806,8 +9806,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
       ).toHaveLength(0);
 
       // Wake behavior is unchanged: a review event still reaches the author,
-      // now carrying the reason so the run can tell "reviewer found nothing"
-      // from "the findings were lost".
+      // now carrying the reason on the run's context so a later reader of
+      // `heartbeat_runs` can tell "reviewer found nothing" from "the findings
+      // were lost". The directive the run itself renders is unchanged --
+      // projecting the reason into it is BLO-38816.
       expect(response.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
       const wakes = await db
         .select({ id: agentWakeupRequests.id })
@@ -9833,6 +9835,43 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(
         (runs[0]!.contextSnapshot as Record<string, unknown>).githubReviewFeedbackActionable,
       ).toBeUndefined();
+    });
+
+    it("reports the declined reason on the no_matching_issue exit, which returns above the wake loop", async () => {
+      // The placement regression. The diagnostic used to be emitted just above
+      // the wake loop, which covers `terminal status` and `unassigned` (both
+      // are `skipped` entries inside the loop) but NOT a review on a PR whose
+      // identifier owns no issue -- that returns at `matched.length === 0`,
+      // above the loop, and so left no log line and no response field at all.
+      // That is precisely the "delivery leaves no trace" case the diagnostic
+      // exists for, so it must be computed above that exit too.
+      const fullBody = frr61ShapedBody({ priorStillPresent: false });
+      const truncatedBody = Buffer.from(fullBody, "utf8")
+        .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
+        .toString("utf8");
+
+      // A well-formed identifier with no issue row behind it: past the
+      // `no_paperclip_identifier` gate, into the `no_matching_issue` exit.
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+      const response = await sendReviewSubmitted(
+        app,
+        reviewSubmittedFeedbackPayload({
+          prNumber: 61,
+          reviewId: 4968003840,
+          state: "commented",
+          headSha: "f78f3dcd8818ed2bf9b7550965c96c614f433987",
+          identifier: "PEN-9999",
+          body: truncatedBody,
+        }),
+        "delivery-blo-30420-frr61-unowned",
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.body.ignored).toBe("no_matching_issue");
+      expect(response.body.reviewFeedbackSuppressed).toEqual({
+        reason: "ally_review_findings_unenumerable",
+        predicate: "hasAllyConsolidatedReviewHeading && extractAllyReportedFindingRefs === null",
+      });
     });
 
     it("distinguishes a classifier disposition from blocked-status suppression on the same body", async () => {
