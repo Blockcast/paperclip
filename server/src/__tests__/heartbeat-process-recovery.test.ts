@@ -8649,51 +8649,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
 
     // ---------------------------------------------------------------------
-    // BLO-32052: both sweeps gated on `activeRunExecutions`, which is an
-    // in-memory Set that `executeRun` never clears when its await does not
-    // resolve. That turned a one-pass deferral into a permanent quarantine:
-    // measured in production, two single-slot agents were locked out of
-    // external-runtime work for 77h and 49h against a worker up 6.6 days,
-    // while the sweep reported `failedRowCount: 0` on every pass. The reaper
-    // already carried the external-lifecycle bypass; these two loops did not.
+    // BLO-32052: the orphaned-lease sweep gated on `activeRunExecutions`,
+    // which is an in-memory Set that `executeRun` never clears when its await
+    // does not resolve. That turned a one-pass deferral into a permanent
+    // quarantine: measured in production, two single-slot agents were locked
+    // out of external-runtime work for 77h and 49h against a worker up 6.6
+    // days. The reaper's main loop already carried the external-lifecycle
+    // bypass; this loop did not. (The sibling reservation sweep has the same
+    // defect and is fixed separately by PEN-3640 / #2137.)
     // ---------------------------------------------------------------------
-    it("releases a release_pending reservation whose executor is wedged in activeRunExecutions (BLO-32052)", async () => {
-      const { companyId, agentId, runId } = await seedRunFixture({
-        adapterType: "claude_k8s",
-        processPid: null,
-        processGroupId: null,
-        agentStatus: "running",
-        includeIssue: true,
-      });
-      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
-      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
-        name === reservation.jobName
-          ? { phase: "missing" as const, reason: "NotFound" as const, name }
-          : null,
-      );
-      // Drive the real production shape rather than seeding the end state: the
-      // migration-0128 trigger is what writes `release_pending`, and it only
-      // fires on a terminal status transition. Pods unobservable here, so
-      // cancel leaves the row pending instead of releasing it inline.
-      mockListManagedAgentPods.mockResolvedValue(null);
-      await heartbeat.cancelRun(runId);
-      expect((await getReservation(runId))?.state).toBe("release_pending");
-
-      // The wedge: the Job is gone, but nothing ever notified the awaiting
-      // executor, so the runId is still registered. This is the
-      // `external_wait_yield` self-cancel shape — the run terminalizes itself
-      // over the API while the worker holding it stays blocked.
-      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
-      mockListManagedAgentPods.mockResolvedValue([]);
-
-      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
-
-      // The slot must come back. Before the fix this stayed `release_pending`
-      // for as long as the worker process lived.
-      expect((await getReservation(runId))?.state).toBe("released");
-      expect((await getReservation(runId))?.releasedAt).not.toBeNull();
-    });
-
     it("releases an orphaned external-lifecycle lease whose executor is wedged in activeRunExecutions (BLO-32052)", async () => {
       const { runId, leaseId, reservation } = await seedTerminalExternalRunWithLease();
       mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
@@ -8729,6 +8693,46 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(0);
 
       expect((await getLease(leaseId))?.status).toBe("active");
+    });
+
+    it("falls back to the pod arm alone once the reservation is released, and is fail-closed there (BLO-32052)", async () => {
+      // The production-reachable shape on the `reapOrphanedRuns` path, and the
+      // one the two tests above do NOT cover: they seed a launched reservation,
+      // so `confirmStaleKilledJobQuiesced` finds a live `jobName` and the Job
+      // arm does the work. In the real pass the sibling reservation sweep runs
+      // first and has usually just released that row, and the probe sources its
+      // name from `getActiveExternalRuntimeReservation` (filtered
+      // `released_at IS NULL`) — so `jobName` is null and `listManagedAgentPods`
+      // is the ONLY thing deciding. Since this PR is what makes that path
+      // reachable for a wedged executor, the fail-closed `pods !== null` arm is
+      // the entire safety argument and is pinned here rather than assumed.
+      //
+      // No reservation is seeded at all, which is the same observable state as
+      // one already released.
+      const { companyId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      // Arm 1 — kube unreadable. Quiescence is unproven, so the lease is KEPT.
+      mockListManagedAgentPods.mockResolvedValue(null);
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(0);
+      expect((await getLease(leaseId))?.status).toBe("active");
+      // Pins "only the pod arm evaluates": with no active reservation there is
+      // no job name to probe, so the Job arm must not have run.
+      expect(mockReadAgentJobRunStatusByName).not.toHaveBeenCalled();
+
+      // Arm 2 — same fixture, pods now observable and empty. Proven quiesced,
+      // so the lease is released. Without this half, arm 1 would also pass on a
+      // sweep that never releases anything.
+      mockListManagedAgentPods.mockResolvedValue([]);
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(1);
+      expect((await getLease(leaseId))?.status).toBe("failed");
     });
 
     it("lease sweep isolates a per-row probe failure and still releases the other row", async () => {

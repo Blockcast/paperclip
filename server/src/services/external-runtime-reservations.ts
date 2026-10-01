@@ -249,17 +249,6 @@ function recordExternalRuntimeClaimAttempt(db: Db, claimedAt: Date, claimed: boo
   refreshExternalRuntimeReservationMetricsBestEffort(db, claimedAt, "claim");
 }
 
-/**
- * BLO-32052: reservation rows are assumed 100% external-lifecycle. Today the
- * only production creation path is `claimRunWithExternalRuntimeSlotPool`,
- * gated on `hasExternalLifecycle(agent.adapterType)` (heartbeat.ts), and this
- * non-pool export has no production caller. That invariant is load-bearing:
- * `reconcileReleasePendingExternalRuntimeReservations` releases with no
- * in-process ownership check *because* every row is external-lifecycle. If you
- * add a caller here, keep the same adapter gate — a reservation for a run whose
- * lifecycle this process owns would be released by that sweep with no runtime
- * verification beyond the kube Job probe, which a local adapter never has.
- */
 export async function claimRunWithExternalRuntimeSlot(
   db: Db,
   runId: string,

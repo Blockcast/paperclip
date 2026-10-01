@@ -24824,41 +24824,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // later kube-independent stages of the tick chain. Report partial
       // failure through the freshness gauge instead of unwinding.
       try {
-        // BLO-32052: do NOT gate this loop on `activeRunExecutions`. It used
-        // to, and that guard quarantined rows permanently rather than merely
-        // deferring them: `executeRun` leaves a runId in the Set forever when
-        // its in-process await never resolves — the canonical case here is the
-        // `external_wait_yield` self-cancel (routes/issues.ts), where the run
-        // is terminalized and its Job deleted out from under the awaiting
-        // worker, so nothing ever notifies the await. The Set is in-memory and
-        // only cleared by a process restart, so the reservation's slot stayed
-        // pinned for days. Measured 2026-10-01: two single-slot agents locked
-        // out of external-runtime work for 77h and 49h against a worker up
-        // 6.6d, while the sweep reported `failedRowCount: 0` every pass.
-        //
-        // The reaper's main loop already learned this and carries an explicit
-        // external-lifecycle bypass (see `externalLifecycleRun` below in
-        // reapOrphanedRuns, and the same three hung-await cases named there);
-        // this loop was simply not updated with it. Here the bypass is total
-        // rather than conditional, because the population is 100%
-        // external-lifecycle by construction: the only path that creates a
-        // reservation is `claimRunWithExternalRuntimeSlotPool`, which is gated
-        // on `hasExternalLifecycle(agent.adapterType)`. So a `&&
-        // !externalLifecycleRun` form would be identically false — dead code
-        // that reads like a live safety check.
-        //
-        // Dropping it is safe because in-process ownership was never the
-        // authority for these rows and three independent gates remain:
-        //  1. every selected row has a TERMINAL run — branches 2/3 of the
-        //     WHERE test `heartbeat_runs.status` directly, and `release_pending`
-        //     is only ever written by the migration-0128 trigger, which fires
-        //     exclusively on a terminal status transition;
-        //  2. the kube Job is re-verified below (`observed.phase === "active"`
-        //     skips, exact `readAgentJobRunStatusByName` + jobUid identity
-        //     match required) — a live Job keeps its slot regardless;
-        //  3. `releaseExternalRuntimeReservation` matches on
-        //     `released_at IS NULL`, so racing a run's own finalize is an
-        //     idempotent no-op rather than a double release.
+        if (activeRunExecutions.has(reservation.runId)) continue;
         if (ambiguousRunIds.has(reservation.runId)) continue;
         const observed = jobRunStatuses?.get(reservation.runId) ?? null;
         const launchedIdentityMatches = Boolean(
@@ -25016,12 +24982,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // source of truth, and a hung `executeRun` await leaves the runId in
         // `activeRunExecutions` forever (the Set is in-memory and only a
         // process restart clears it), which quarantined orphaned leases
-        // permanently instead of deferring them by a pass. Same defect, same
-        // Set, same fix as the reservation sweep above and the
-        // `externalLifecycleRun` bypass in reapOrphanedRuns. External-lifecycle
-        // runs are not left unguarded: `confirmStaleKilledJobQuiesced` below is
-        // a fail-closed quiescence probe that keeps the lease whenever the
-        // runtime is still active or merely unobservable.
+        // permanently instead of deferring them by a pass. Same defect and
+        // same Set as the `externalLifecycleRun` bypass in reapOrphanedRuns,
+        // and as PEN-3640 (#2137) fixes in the reservation sweep above.
+        // External-lifecycle runs are not left unguarded:
+        // `confirmStaleKilledJobQuiesced` below is a fail-closed quiescence
+        // probe that keeps the lease whenever the runtime is still active or
+        // merely unobservable.
         //
         // One caveat on that probe in *this* caller: it sources its Job name
         // from `getActiveExternalRuntimeReservation`, which filters
