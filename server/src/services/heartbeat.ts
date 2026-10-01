@@ -1776,8 +1776,8 @@ export function shouldScheduleAutomaticRunRetry(
   // literal below, and ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES in
   // recovery/zero-token-startup-failure.ts — the last decides owner-vs-manager
   // routing, so missing it sent an assignee's stranded issue up the manager
-  // ladder. Both of the sites this file can reach are asserted by comparison
-  // against `adapter_failed` in that test, so a rename applied UNEVENLY ACROSS
+  // ladder. Both of the sites that test can reach are asserted there by
+  // comparison against `adapter_failed`, so a rename applied UNEVENLY ACROSS
   // THOSE TWO fails CI rather than being measured 18 hours later. A rename at
   // the adapter emit site alone does not: it leaves both gates holding the old
   // literal, mutually consistent and green, while production emits a code no
