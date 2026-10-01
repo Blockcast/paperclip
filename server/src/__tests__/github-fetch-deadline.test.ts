@@ -181,12 +181,14 @@ describe("ghReadBody: the deadline stays armed through the body read (BLO-38257)
    * Membership is `ghFetch(` AND `unprocessable(`: `ghFetch` is what arms the
    * deadline through the body read, and `unprocessable(` is what makes the file
    * one of the helpers whose callers are promised a structured rejection.
-   * Known ceiling: a file that calls `ghFetch` and does NOT use `unprocessable`
-   * is out of scope here — `github-app-auth.ts` and `pr-review-state-reconciler.ts`
-   * are the current such files, and every body read in them is already inside a
-   * try/catch or carries `.catch(() => …)`. Widening to `ghFetch(` alone needs a
-   * try/catch-aware scanner, which is a parser; do that only if one of them ever
-   * grows an unhandled read.
+   * Known ceiling: a file that mentions `ghFetch` and does NOT use
+   * `unprocessable` is out of scope here. Recompute that set instead of keeping a
+   * list of it, which is how the previous form rotted: from `server/src/services`,
+   * `grep -L unprocessable $(grep -l ghFetch *.ts)`. At BLO-38471 it held four
+   * files, and every body read in them was inside a try/catch or carried
+   * `.catch(() => …)`. Widening to `ghFetch(` alone needs a try/catch-aware
+   * scanner, which is a parser; do that only if a file in that set grows an
+   * unhandled read.
    */
   function scanGhFetchBodyReads(dir: string) {
     const scanned: string[] = [];
