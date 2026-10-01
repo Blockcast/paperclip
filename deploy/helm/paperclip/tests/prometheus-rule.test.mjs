@@ -1497,7 +1497,19 @@ test("the start-lock runbook routes its two arms on agent count, not on an alert
     routing.includes("count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900)"),
     "the one-agent section must open with the agent-count query as step 0",
   );
-  assert.match(routing, /takes precedence/, "routing must say which arm wins when both alerts fire");
+  // Pin the direction, not just the word: naming the wrong arm, or dropping
+  // the `not` from the `>= 3` remedy, each tells a responder to restart
+  // during a fleet stall.
+  assert.match(
+    routing,
+    /\*\*The fleet arm takes precedence\.\*\*/,
+    "routing must say the fleet arm wins when both alerts fire",
+  );
+  assert.match(
+    routing,
+    /\| `>= 3` \|[^|]*\| do \*\*not\*\* replace the process \|/,
+    "the `>= 3` row's remedy must say do not replace the process",
+  );
 
   // FleetStall landed in onprem-k8s #4036 and is in the deployed rules, but
   // not in this chart. Both texts must name it, say where to verify what is
