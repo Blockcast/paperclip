@@ -409,8 +409,8 @@ describe("PEN-3013 — two distinct objects under one alertname both deliver", (
     holdFirst.resolve();
 
     // The headline criterion: neither delivery fails.
-    await expect(a).resolves.toBeUndefined();
-    await expect(b).resolves.toBeUndefined();
+    await expect(a).resolves.toEqual({ accepted: 1 });
+    await expect(b).resolves.toEqual({ accepted: 1 });
 
     // ...and B got there by WAITING, not by sailing through uncontended. This is
     // what fails if the bounded wait is removed: B would reject instead.

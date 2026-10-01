@@ -94,9 +94,9 @@ export const plugin = definePlugin({
     // CompanyScopeUnavailableError and propagates. `null` means the delivery
     // carried no companyId, which no retry can fix, so it is dropped.
     const scope = await resolveCompanyScope(ctx, input.companyId);
-    if (!scope) return;
+    if (!scope) return { accepted: 0, rejected: "unknown_company" };
     const authenticated = await authenticateWebhook(ctx, scope.config, input);
-    await handleWebhook(ctx, scope.config, authenticated, input);
+    return handleWebhook(ctx, scope.config, authenticated, input);
   },
 
   async onApiRequest(input) {
