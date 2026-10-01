@@ -716,8 +716,11 @@ describe("merge-gate reader", () => {
 
       // ...while the SIBLING arm must still retire that same failed victim: a
       // pass at THIS head is the same tree and the same lane, so it IS evidence
-      // about this code. Without this, narrowing to `cx` could be over-applied
-      // to both arms and silently re-open BLO-34619.
+      // about this code. Ally review 5375356236 measured that over-applying
+      // `cx` to the sibling arm is ALSO killed by the BLO-34619 fixture above,
+      // so this is not the only thing standing between `cx` and that
+      // regression — it is redundant cover, kept because it names the intent at
+      // the point of the narrowing, where the BLO-34619 fixture does not.
       it("still retires a FAILED victim on an at-head pass by its own lane", () => {
         assert.equal(
           dead([
