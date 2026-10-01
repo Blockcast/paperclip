@@ -8482,6 +8482,69 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect((await getLease(leaseId))?.status).toBe("failed");
     });
 
+    // PEN-3674: `activeRunExecutions` is a module-scoped Set with no timestamps
+    // and so no TTL, and `executeRun` removes its entry only in its own
+    // `finally`. An external-lifecycle adapter whose await never settles pins
+    // that entry for the remaining life of the worker PROCESS, and this sweep
+    // used to skip such a run unconditionally -- so the lease stayed `active`
+    // on every pass forever.
+    //
+    // Note the shape the fixture has to reproduce. A worker that DIES is the
+    // benign case: the Set is process-scoped, so it dies too and the next sweep
+    // reclaims the row. A test that killed a process and asserted reclamation
+    // would therefore pass against the UNFIXED code -- green for the wrong
+    // reason. The failing condition needs the Set entry live, which is what the
+    // `__test_unsafelyTrackActiveRunExecution` hook supplies.
+    //
+    // Measured in production 2026-10-01: `..._orphaned_active` held at 2-3 with
+    // the oldest lease at 79.2 h, ramping at exactly 1 s/s across an unbroken
+    // worker uptime (`paperclip-0`, 0 restarts).
+    //
+    // The pair below pins the CONDITION, not merely that the guard fires: the
+    // control is the reason the skip still exists at all, and a "fix" that
+    // deleted the skip outright would pass the first and fail the second.
+    it("releases an orphaned external lease for a run still stuck in activeRunExecutions (PEN-3674)", async () => {
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      // Job gone and no run-labelled pods, i.e. quiescence is provable. The
+      // only thing still claiming this run is alive is the stale Set entry.
+      mockReadAgentJobRunStatusByName.mockResolvedValue({
+        phase: "missing",
+        reason: "NotFound",
+        name: reservation.jobName,
+      });
+      mockListManagedAgentPods.mockResolvedValue([]);
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      expect(await heartbeat.reconcileOrphanedEnvironmentLeases()).toBe(1);
+      expect((await getLease(leaseId))?.status).toBe("failed");
+    });
+
+    it("still retains an orphaned lease for a NON-external run in activeRunExecutions (PEN-3674 control)", async () => {
+      // For an in-process adapter the await IS authoritative: `executeRun` is
+      // driving this run in this very pod and will release the lease in its own
+      // `finally`, so the sweep must not race it. This is the half of the guard
+      // that must survive the fix above.
+      const { companyId, runId, issueId } = await seedRunFixture({
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      expect(await heartbeat.reconcileOrphanedEnvironmentLeases()).toBe(0);
+      expect((await getLease(leaseId))?.status).toBe("active");
+    });
+
     it("does not count a lease as released when the environment provider fails", async () => {
       const { companyId, runId, issueId } = await seedRunFixture({
         runStatus: "failed",

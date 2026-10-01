@@ -25151,7 +25151,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // A run finalizing right now in this process releases its own leases
         // in its `finally` block; racing it here risks acting on a status
         // snapshot from just before that block runs. Let it win.
-        if (activeRunExecutions.has(run.runId)) continue;
+        //
+        // PEN-3674: that reasoning holds only while the in-process await is
+        // authoritative, which is true for an in-process adapter and false for
+        // an external-lifecycle one -- there the kube Job is the source of
+        // truth and the await can hang forever (a preRun hook timeout, an MCP
+        // RPC with no client timeout, a Job that vanished without notifying the
+        // awaiting code). `activeRunExecutions` is a module-scoped Set with no
+        // timestamps and so no TTL, and `executeRun` only removes an entry in
+        // its own `finally`; an await that never settles pins the entry for the
+        // remaining life of the worker PROCESS. A process that dies is the
+        // benign case -- the Set dies with it and the next sweep reclaims the
+        // row -- so the shape that strands is a healthy, long-lived worker.
+        //
+        // Falling through here does not weaken anything, because the branch
+        // immediately below already gates every external-lifecycle release on
+        // `confirmStaleKilledJobQuiesced` and fails closed on an active or
+        // unobservable runtime. The unconditional skip made that strictly
+        // stronger probe unreachable for exactly the runs that needed it.
+        //
+        // `reapOrphanedRuns` already carries this exemption on the same Set
+        // (the `!externalLifecycleRun` guard below); this sweep and the
+        // reservation sweep above were both left behind. Measured in
+        // production 2026-10-01 on `paperclip-0` (0 restarts, one unbroken
+        // process): `paperclip_environment_leases_orphaned_active` oscillated
+        // 3 -> 2 -> 4 over eight hours while
+        // `..._orphaned_oldest_age_seconds` ramped at exactly 1 s/s through
+        // every one of those passes, reaching 87.3 h. Other rows were being
+        // reclaimed normally in the same sweep, so the sweep was not stuck --
+        // one row was individually quarantined, which is the signature this
+        // skip produces and no other branch here does.
+        if (activeRunExecutions.has(run.runId) && !hasExternalLifecycle(run.adapterType)) continue;
         if (hasExternalLifecycle(run.adapterType)) {
           // Background Job deletion does not prove that the Job or its
           // run-labelled pods have stopped. Reuse the same fail-closed probe as
