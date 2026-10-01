@@ -11980,6 +11980,39 @@ describe("PR review convergence signal (BLO-35909)", () => {
     expect(__test_reRaisedPriorFindingLabels(ctx!)).toEqual([]);
   });
 
+  // The positive half of the pair above. That assertion pins a DIRECTION (empty
+  // on a past-the-clamp body) and is satisfied by a function that returns []
+  // unconditionally — dropping the .map, or returning [] outright, leaves it
+  // green. Without this test that mutation is invisible, and the escalation at
+  // reRaisedFindings would silently lose its specifics forever: the same
+  // "guard that passes on broken code" shape this describe block exists to
+  // close. Short body on purpose — the ledger sits INSIDE the clamp, so
+  // prFeedbackBody still carries it and the function has something to find.
+  it("names the re-raised findings when the ledger is inside the clamp (BLO-38809)", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 61,
+        title: "fix(frr): BLO-35909 convergence signal",
+        head: { ref: "fix/BLO-35909", sha: "251d5caa8726897b25d603d9e6b1b4118ea36ac0" },
+      },
+      review: {
+        body: ledger("still-present"),
+        state: "commented",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/frr" },
+    });
+    expect(ctx).not.toBeNull();
+
+    // Control: this body is reachable from the clamped read, which is what
+    // makes a non-empty result possible at all here and distinguishes this
+    // fixture from the past-the-clamp one above.
+    expect(ctx!.reviewBody).toContain("still-present");
+
+    expect(__test_reRaisedPriorFindingLabels(ctx!)).toEqual(["important #1 from de0d81ab"]);
+  });
+
   // The SECOND producer of the same field, and the one that bites in practice:
   // Ally frequently answers as a plain PR comment and files no review object at
   // all, so this is a live surface rather than a symmetry exercise. Identical
