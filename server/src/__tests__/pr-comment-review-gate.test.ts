@@ -910,13 +910,26 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * `prAuthorLogin` at all, so an author-reading exclusion never fires on them.
  * Measured at this head (113 tests), one mutation per run:
  *
- *   placement (1), always-exclude   37 fail — incl. this block's first; the
+ *   placement (1), always-exclude   24 fail — incl. this block's first; the
  *                                   pre-existing twin catches it too
  *   placement (2), always-exclude    5 fail — incl. the witness; 4 pre-existing
  *                                   ledger tests catch it too
  *   placement (1), author-threaded   3 fail — incl. this block's first; 2
- *                                   pre-existing self-attestation tests catch it
+ *                                   pre-existing author-identity tests catch it
  *   placement (2), author-threaded   1 fail — THE WITNESS ALONE
+ *
+ * ⚠ Re-taking placement (1) requires care, and getting it wrong reads as a
+ * REASSURING result rather than an error. The mutated line —
+ * `if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;`
+ * — appears TWICE in pr-comment-review-gate.ts, byte-identical: once in
+ * `latestAttestingAllyComment` and once in `headsWithUndispositionedFinding`.
+ * Only the second is placement (1). A naive first-occurrence substitution
+ * mutates the attestation path instead, which leaves the carry path intact, so
+ * this block's first fixture PASSES and the run looks like evidence that the
+ * fixture is worthless — the opposite of what placement (1) actually does to
+ * it. Anchor on the occurrence inside `headsWithUndispositionedFinding`, and
+ * treat "the anti-fail-open fixture stayed green under placement (1)" as proof
+ * the mutant missed, never as a measurement.
  *
  * So the first fixture is redundant for detection and earns its place as a
  * NAMED ANCHOR: it records at the site which hazard those general-looking
