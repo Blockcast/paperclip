@@ -1820,6 +1820,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // non-membership does not imply zero-token eligibility, which is an
       // independent test.
       //
+      // No catalog row => a genuine, permanent configuration fault, which keeps
+      // the existing non-retryable `skill_not_found`.
+      //
       // BLO-35668: that first sentence is true and INSUFFICIENT, and this is the
       // comment the next rename starts from. Inheriting `adapter_failed`'s
       // membership in ONE set does not inherit its behaviour — this code has to be
@@ -1841,9 +1844,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Sites 2 and 3 are pinned against `adapter_failed` in
       // server/src/__tests__/heartbeat-recoverable-error-family.test.ts; site 1 is
       // not exported and is still unasserted.
-      //
-      // No catalog row => a genuine, permanent configuration fault, which keeps
-      // the existing non-retryable `skill_not_found`.
       errorCode: err.catalogBacked ? "skill_materialization_pending" : "skill_not_found",
     };
   }
