@@ -15538,6 +15538,17 @@ export function recoveryService(
    * it merged 3h22m after the action was created, and 3h22m after its own
    * `timeoutAt`.
    *
+   * Discharging DOES free that uniqueness slot — the very thing the note above
+   * declines to do — and that is deliberate here, because the difference is the
+   * TRIGGER, not the status. That note's concern is a *sweep* freeing the slot
+   * and then minting a brand-new action with a fresh budget and horizon on its
+   * next pass, which is self-perpetuating precisely because the sweep runs
+   * unconditionally on a timer. This path frees the slot only on an observed
+   * PR-close, and re-minting requires a fresh actionable review cycle on that PR
+   * (`github-webhook.ts` -> `escalateStalledSelfReviewPr`), which a closed PR
+   * does not generate unaided. If the PR is reopened and review cycles genuinely
+   * resume, a new action is the CORRECT outcome rather than a re-fire loop.
+   *
    * Matched on the FINGERPRINT, which the creation site above builds from
    * `(issue.id, repoFullName, prNumber)` and is therefore exactly reconstructible
    * here. That is what makes passing a broad candidate issue list safe: an issue
@@ -15588,27 +15599,46 @@ export function recoveryService(
         if (!resolved) continue;
         closedIssueIds.push(issue.id);
 
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: "system",
-          actorId: "pr_review_non_convergence_pr_closed",
-          agentId: resolved.ownerAgentId,
-          runId: input.runId ?? null,
-          action: "issue.recovery_action_resolved",
-          entityType: "issue",
-          entityId: issue.id,
-          details: {
-            source: "recovery.close_pr_review_non_convergence_for_closed_pr",
-            identifier: issue.identifier ?? null,
-            repoFullName: input.repoFullName,
-            prNumber: input.prNumber,
-            prMerged: input.merged,
-            recoveryActionId: resolved.id,
-            recoveryActionStatus: resolved.status,
-            outcome: resolved.outcome,
-            recoveryOwnerAgentId: resolved.ownerAgentId,
-          },
-        });
+        // Contained SEPARATELY from the discharge above, and not merely for
+        // tidiness: by this line the action is already resolved and already
+        // counted in the returned `closed`. Sharing the outer catch would report
+        // "auto-discharge failed" for a discharge that in fact SUCCEEDED, and
+        // send the next reader debugging a write that worked. A failure here
+        // costs an audit row, not the discharge.
+        try {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "pr_review_non_convergence_pr_closed",
+            agentId: resolved.ownerAgentId,
+            runId: input.runId ?? null,
+            action: "issue.recovery_action_resolved",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              source: "recovery.close_pr_review_non_convergence_for_closed_pr",
+              identifier: issue.identifier ?? null,
+              repoFullName: input.repoFullName,
+              prNumber: input.prNumber,
+              prMerged: input.merged,
+              recoveryActionId: resolved.id,
+              recoveryActionStatus: resolved.status,
+              outcome: resolved.outcome,
+              recoveryOwnerAgentId: resolved.ownerAgentId,
+            },
+          });
+        } catch (err) {
+          logger.warn(
+            {
+              err,
+              issueId: issue.id,
+              prNumber: input.prNumber,
+              repoFullName: input.repoFullName,
+              recoveryActionId: resolved.id,
+            },
+            "pr_review_non_convergence auto-discharge succeeded but its audit-log write failed (non-fatal)",
+          );
+        }
       } catch (err) {
         logger.warn(
           { err, issueId: issue.id, prNumber: input.prNumber, repoFullName: input.repoFullName },
