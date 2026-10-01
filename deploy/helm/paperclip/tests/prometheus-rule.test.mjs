@@ -1328,14 +1328,14 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
     );
   }
 
-  // The 2h14m 2026-09-24 episode was three agents in lockstep, i.e. the
-  // fleet-scope regime, and it self-healed. Calling 09-15/16 the only
-  // fleet-scope instance erases the page's strongest datum and leaves a
-  // restart as the sole precedent for the condition now paging.
   const runbook = readFileSync(
     path.join(repoRoot, "runbooks/queued-run-stranded.md"),
     "utf8",
   );
+  // The 2h14m 2026-09-24 episode was three agents in lockstep, i.e. the
+  // fleet-scope regime, and it self-healed. Calling 09-15/16 the only
+  // fleet-scope instance erases the page's strongest datum and leaves a
+  // restart as the sole precedent for the condition now paging.
   const sectionIndex = runbook.indexOf("## Agent start lock wedged (PEN-3305)");
   assert.notStrictEqual(sectionIndex, -1, "runbook must keep the start-lock section heading");
   const nextSection = runbook.indexOf("\n## ", sectionIndex + 1);
@@ -1439,6 +1439,87 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
         + "and 22 of 23 on 2026-09-26 -- a sliding window, cite it with its date)",
     );
   }
+});
+
+test("the start-lock runbook routes its two arms on agent count, not on an alert name (BLO-36922)", () => {
+  // The two arms have opposite remedies: the one-agent wedge ends in replacing
+  // the process, while a fleet stall self-clears and the restart destroys its
+  // only evidence. Each way this routing has been written wrong fails toward
+  // the restart, and nothing rendered breaks when it rots (the chart does not
+  // read the runbook), so only an assertion catches it.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/queued-run-stranded.md"),
+    "utf8",
+  );
+  // Blockquote markers and line wraps are layout, not content; match on the
+  // prose so a re-wrap cannot make an assertion pass or fail.
+  const flat = (text) => text.replace(/^> ?/gm, "").replace(/\s+/g, " ");
+  const wedgedAt = runbook.indexOf("\n## Agent start lock wedged (PEN-3305)\n");
+  const referencesAt = runbook.indexOf("\n## References\n");
+  const [fleetHeading] = runbook.match(/^#+ Fleet stall: .*$/m) ?? [];
+  assert.ok(
+    wedgedAt !== -1 && referencesAt !== -1 && fleetHeading,
+    "runbook must keep the one-agent, fleet-stall and References headings -- "
+      + "the assertions below scope themselves to them by name",
+  );
+
+  // A sibling `##`, not nested inside the section that opens by saying it is
+  // the one-agent arm only, and after that section's own liveness check,
+  // whose closing paragraph describes the Wedged rule alone.
+  assert.match(
+    fleetHeading,
+    /^## /,
+    "fleet stall must be a sibling ## of the one-agent section, not nested inside it",
+  );
+  const fleetAt = runbook.indexOf(`\n${fleetHeading}\n`);
+  assert.ok(wedgedAt < fleetAt && fleetAt < referencesAt, "fleet stall must follow the one-agent section");
+  const wedged = runbook.slice(wedgedAt, fleetAt);
+  const fleet = runbook.slice(fleetAt, referencesAt);
+  assert.match(
+    wedged,
+    /\n### Verifying the signal is live\n/,
+    "the one-agent section must close with its own liveness check before the fleet arm opens",
+  );
+
+  const routingEnd = wedged.indexOf("\n### ");
+  const fleetIntroEnd = fleet.indexOf("\n### ");
+  assert.ok(routingEnd !== -1 && fleetIntroEnd !== -1, "both arms must keep their subsections");
+  const routing = flat(wedged.slice(0, routingEnd));
+  const fleetIntro = flat(fleet.slice(0, fleetIntroEnd));
+
+  // Step 0 is the agent count. `PaperclipAgentStartLockWedged` is keyed
+  // `by (agent_id)`, so a fleet stall fires it once per agent: the name of the
+  // alert that paged cannot route, and the two alerts co-fire rather than
+  // exclude each other, so the runbook has to say which one wins.
+  assert.ok(
+    routing.includes("count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900)"),
+    "the one-agent section must open with the agent-count query as step 0",
+  );
+  assert.match(routing, /once per agent/, "routing must say Wedged fires once per agent in a fleet stall");
+  assert.match(routing, /takes precedence/, "routing must say which arm wins when both alerts fire");
+
+  // PaperclipAgentStartLockFleetStall is in neither this chart nor the
+  // deployed onprem-k8s rules (proposed in onprem-k8s #4036, BLO-35571). A
+  // routing key that nothing can page with resolves the wrong way every time.
+  // Drop the "not deployed" half together with that wording once it deploys.
+  for (const [where, text] of [["the routing block", routing], ["the fleet-stall trigger", fleetIntro]]) {
+    assert.match(
+      text,
+      /`PaperclipAgentStartLockFleetStall`[^.]*\*\*not deployed\*\*/,
+      `${where} must mark PaperclipAgentStartLockFleetStall as not deployed`,
+    );
+    assert.match(text, /\/api\/v1\/rules/, `${where} must say where to verify which rules are live`);
+  }
+
+  // Both arms are one continuous hold per agent, so `heldMs` grows line over
+  // line in either (agent-start-lock.ts: one interval per acquisition,
+  // `heldMs = nowMs - startedAtMs`). It separates a continuous hold from
+  // sequential short ones, not a fleet stall from a wedge.
+  assert.doesNotMatch(
+    flat(wedged + fleet),
+    /`heldMs`[^.]*discriminat/,
+    "runbook must not offer heldMs as the discriminator between the two arms -- it grows in both",
+  );
 });
 
 test("PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained} key on the never_delivered series only and take their thresholds from values (PEN-3000)", () => {
