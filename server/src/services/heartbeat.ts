@@ -1696,7 +1696,26 @@ export function shouldScheduleAutomaticRunRetry(
   }
 
   if (run.errorCode === "session_unavailable") return true;
-  if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") return false;
+  // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) rides this arm
+  // because it REPLACED `adapter_failed` at the claude-k8s emit site. Its author
+  // reasoned that retryability was "preserved exactly" on the strength of the new
+  // code being a member of recovery/service.ts's
+  // TRANSIENT_INFRA_CONTINUATION_ERROR_CODES — true, but that is the issue
+  // CONTINUATION sweep, a different engine from this one, and it is issue-scoped.
+  // A pr_review run is not an issue run, so this gate is its only retry path, and
+  // here `adapter_failed` is admitted by nothing but the literal below. Renaming
+  // the code therefore silently dropped it: measured 2026-10-01 over an 18h
+  // window on Ally, 13 failures / 0 retries, while every sibling transient code
+  // in the same window retried normally (24 `transient_failure_retry` runs).
+  // Classification is not enrolment, and nothing failed loudly when the two
+  // diverged — see the parity test in heartbeat-recoverable-error-family.test.ts.
+  if (
+    run.errorCode !== "adapter_failed" &&
+    run.errorCode !== "process_lost" &&
+    run.errorCode !== "skill_materialization_pending"
+  ) {
+    return false;
+  }
 
   // BLO-9147 AC1: gate on wakeReason/reviewKind/taskKey from the persisted
   // contextSnapshot, NOT on githubPrNumber presence. derivePaperclipPrReview
