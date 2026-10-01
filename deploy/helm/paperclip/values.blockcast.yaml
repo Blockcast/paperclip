@@ -536,6 +536,37 @@ worker:
     # every skipped row keeps its hand_back_residual_reason.
     - name: PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED
       value: "true"
+    # PEN-3631: turns on the on-demand heap-snapshot path this PR adds. The code
+    # is default-off in config.ts (`=== "true"`), so this line is the whole
+    # opt-in — same shape as the drain flag above, which also shipped dark so
+    # that enabling it stayed a separate decision.
+    #
+    # It is here rather than in a follow-up PR because the deploy job runs
+    # `helm upgrade … -f deploy/helm/paperclip/values.blockcast.yaml` with the
+    # recorded image digest in ONE job, gated on the paperclip-production
+    # environment. A separate values PR would therefore cost a SECOND human
+    # approval and a SECOND worker restart — and that restart destroys the
+    # generation PEN-3314 is measuring, which is the whole point of capturing.
+    # Measured 2026-10-01: production was 408 commits behind master with the pod
+    # template unchanged for 7.1 days, so that second cycle is days, not hours.
+    #
+    # ⛔ THE THRESHOLD IS DELIBERATELY LEFT UNSET (default 0 = automatic capture
+    # OFF). The deliverable is a *deliberate* pair of snapshots hours apart, and
+    # `keep` defaults to 2 — so an unattended threshold capture firing between
+    # them would evict half the pair, which cannot be retaken. Capture is driven
+    # by the sentinel file instead, which any agent seat can drop on the shared
+    # RWX claim with no privilege change (that is the premise of PEN-3631).
+    # Setting PAPERCLIP_HEAP_SNAPSHOT_THRESHOLD_MB here is a regression unless
+    # `keep` is raised to match.
+    #
+    # Remaining defaults are already right for this: keep=2 holds exactly the
+    # pair, maxAge=24h outlives a 12h spacing, minFree=10GB against 309GB free
+    # on the claim (measured 2026-10-01).
+    #
+    # Revert this one entry to disable; nothing else in the feature is reachable
+    # with it unset. The decision to enable is the CEO's — see PEN-3631.
+    - name: PAPERCLIP_HEAP_SNAPSHOT_ENABLED
+      value: "true"
 
 # Service account must mount its bearer token so the k8s-Job adapters can
 # create Jobs / read Pod logs / patch Secrets via the in-cluster kubeconfig.
