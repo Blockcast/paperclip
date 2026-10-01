@@ -10174,10 +10174,13 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     // are needed and neither is redundant:
     //
     //  - `reviewFeedbackActionable` is written (BLO-30420) only as literal
-    //    `true`, so `=== true` is the whole reader. Its absence is ambiguous by
-    //    construction — it means "not actionable" OR "this wake predates the
-    //    writer" — which is exactly why it must NOT be the thing the directive
-    //    keys off.
+    //    `true` at a single site, under a conditional spread, so `=== true` is
+    //    the whole reader and the projection is `true | null` rather than
+    //    `boolean`: a `false` arm is unreachable by construction, and typing
+    //    one would invite a consumer to branch on "classified non-actionable"
+    //    in code that can never run. Its absence is ambiguous — it means "not
+    //    actionable" OR "this wake predates the writer" — which is exactly why
+    //    it must NOT be the thing the directive keys off.
     //  - `reviewFeedbackSuppressionReason` is the positive signal: it is only
     //    ever written when the classifier actually declined the review, so
     //    keying the directive on its presence cannot mis-fire on a wake that
@@ -10185,15 +10188,20 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     //
     // The two signals are mutually exclusive for a single delivery: the webhook
     // writes the suppression pair only when the classifier declined, and
-    // `githubReviewFeedbackActionable` only when it did not. The renderer below
-    // still checks the decline first, so if they ever did disagree the no-push
-    // arm wins — the fail-safe direction.
+    // `githubReviewFeedbackActionable` only when it did not. Should they ever
+    // disagree, the closing directive is safe structurally — its ternary keys
+    // on the decline reason and never consults `reviewFeedbackActionable` — but
+    // the informational block above it is ordered decline-first so the two
+    // cannot contradict each other in the rendered text. That ordering is
+    // pinned by "prefers the decline line when both classifications are
+    // present"; swapping the arms previously passed every test.
     //
     // Reader-before-writer is intentional and inert: the suppression keys are
     // written by BLO-30420 / #1681, which has not merged. Until it does these
     // two read null on every wake and nothing downstream changes;
     // `reviewFeedbackActionable` is live today.
-    reviewFeedbackActionable: contextSnapshot.githubReviewFeedbackActionable === true,
+    reviewFeedbackActionable:
+      contextSnapshot.githubReviewFeedbackActionable === true ? (true as const) : null,
     reviewFeedbackSuppressionReason: readNonEmptyString(
       contextSnapshot.githubReviewFeedbackSuppressionReason,
     ),
@@ -11781,7 +11789,13 @@ export function buildPaperclipTaskMarkdown(input: {
     // is the positive "classifier declined this review" signal and is what the
     // closing directive keys off; `reviewFeedbackActionable` is informational
     // because its absence cannot distinguish non-actionable from unclassified.
-    reviewFeedbackActionable?: boolean;
+    // Typed `true | null`, never `boolean`: the producer writes the key only as
+    // literal `true`, so a `false` arm would be unreachable and a consumer
+    // branching on it would be writing dead code that reads like a real
+    // "classified non-actionable" check. `null` is the honest "not classified
+    // actionable", and `=== false` is a compile error rather than a silent
+    // mis-read.
+    reviewFeedbackActionable?: true | null;
     reviewFeedbackSuppressionReason?: string | null;
     reviewFeedbackSuppressionPredicate?: string | null;
   } | null;
@@ -11931,7 +11945,7 @@ export function buildPaperclipTaskMarkdown(input: {
         // absence this issue exists to remove.
         lines.push(
           "",
-          "This review was classified as carrying actionable findings, so there is something concrete to address below.",
+          "This review was classified as carrying actionable findings, so there is something concrete to address.",
         );
       }
       // BLO-19067: the closing instruction must agree with the review state.
