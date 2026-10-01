@@ -3746,7 +3746,9 @@ function ensureRegistry(): {
         + "vanished (readlink lost a race with close; ~1 per scrape is the readdir handle itself), "
         + "other (fold of everything past the series cap), unclassified-truncated (descriptors "
         + "beyond the per-scrape inspection cap). Counts sum to the true descriptor total. "
-        + "Directory labels are depth-bounded, so this names a code site class, not a file. "
+        + "Directory labels are depth-bounded AND per-segment alphabet-bounded (an "
+        + "identifier-shaped segment becomes '*', e.g. /tmp/paperclip-run-*), so this names a "
+        + "code site class, not a file, and does not mint a series per run. "
         + "NOT an alert source: max_fds is 524288 against ~240 open, and the heap aborts long "
         + "before descriptors matter. Absent series means procfs was unreadable (non-Linux), "
         + "which is deliberately distinct from a zero.",

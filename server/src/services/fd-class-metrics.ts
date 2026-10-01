@@ -25,11 +25,15 @@
  * co-moves with the heap (detrended r = +0.682, first-difference r = +0.445,
  * n=229) while concurrent run count does not (first-difference r = +0.014).
  *
- * Cardinality is bounded three ways, because the hypothesis this instrument
- * tests is "something accumulates per poll pass" and the obvious naive
- * implementation — label by full dirname — would itself accumulate one series
- * per run directory. See {@link FD_CLASS_PATH_SEGMENTS} and
- * {@link FD_CLASS_MAX_SERIES}.
+ * Cardinality is bounded on three independent axes, because the hypothesis
+ * this instrument tests is "something accumulates per poll pass" and the
+ * obvious naive implementation — label by full dirname — would itself
+ * accumulate one series per run directory. Path *depth*
+ * ({@link FD_CLASS_PATH_SEGMENTS}), each segment's *alphabet*
+ * ({@link FD_CLASS_VOLATILE_SEGMENT}), and the published *series count*
+ * ({@link FD_CLASS_MAX_SERIES}). Depth and alphabet are not redundant: depth
+ * stops an identifier only when enough stable segments precede it, and this
+ * repo creates two per-run trees where it does not.
  *
  * @module server/services/fd-class-metrics
  */
@@ -72,8 +76,30 @@ export const FD_CLASS_MAX_SERIES = 24;
  * company UUID. Going deeper would label by identifiers that churn per run —
  * re-creating, in the leak detector, the unbounded-cardinality failure this
  * row already falsified once as a *cause* of the leak.
+ *
+ * ⚠ Depth alone does NOT bound the label alphabet, and that gap was real: the
+ * identifier's *position* varies per tree, so a tree with fewer than 4 stable
+ * leading segments carries its identifier inside the depth bound. Two paths
+ * this repo creates per-run do exactly that —
+ * `fs.mkdtemp(/tmp/paperclip-run-<issue>-<run>-)` (`run-scratch.ts`, once per
+ * heartbeat run on the worker tier) sits at depth 2, and
+ * `/runtime-cache/paperclip-runs/<runId>/workspace` puts the run id at depth 3.
+ * {@link FD_CLASS_MAX_SERIES} does not save this: it bounds series *per
+ * scrape*, not distinct label values *over time*, which is what mints
+ * Prometheus series — and the leaking class is by construction the top class,
+ * so it is guaranteed past the cap and guaranteed to mint one series per run.
+ * {@link boundedSegment} closes it by bounding the alphabet as well.
  */
 export const FD_CLASS_PATH_SEGMENTS = 4;
+
+/**
+ * Stand-in for a path segment that failed {@link boundedSegment}'s stability
+ * test. Retained in place rather than truncated away so the label still names
+ * the *shape* of the tree — `/runtime-cache/paperclip-runs/*​/workspace` names
+ * a code site, where truncating at the identifier would collapse every
+ * per-run tree into the same two segments.
+ */
+export const FD_CLASS_VOLATILE_SEGMENT = "*";
 
 /** Class assigned when `readlink` races the descriptor being closed (`ENOENT`). */
 export const FD_CLASS_VANISHED = "vanished";
@@ -97,6 +123,76 @@ const ANON_INODE_SUBTYPE = /^[a-z_]{1,24}$/;
 /** Suffix procfs appends when the target has been unlinked. */
 const DELETED_SUFFIX = " (deleted)";
 
+/** Separators that compound directory names use (`runtime-cache`, `node_modules`, `kubernetes.io`). */
+const SEGMENT_TOKEN_SEPARATORS = /([-_.])/;
+
+/**
+ * Decide whether one `-`/`_`/`.`-delimited token of a path segment is stable
+ * enough to publish verbatim.
+ *
+ * Inverted deliberately: this rejects *identifier shapes* rather than
+ * allowlisting known-good directory names. An allowlist fails silently in the
+ * expensive direction — a new stable path appears, matches nothing, and the
+ * whole class folds to `other`, which is precisely the naming power this
+ * instrument exists for. Rejecting shapes degrades the other way: an
+ * unrecognised-but-stable name keeps working, and only identifier-looking
+ * tokens are redacted.
+ *
+ * A token is volatile when it:
+ *   - contains an uppercase letter — mkdtemp's random suffix (`XyZ9aB`) and
+ *     issue keys (`BLO-38624`) both carry one, and no directory this repo
+ *     creates deliberately does;
+ *   - contains a digit *and* is ≥4 characters — hex chunks (`b1d3f3d3`,
+ *     `013a18368d84`, `adc9`) and numeric ids (`38624`). The length floor is
+ *     what keeps genuinely stable short names like `v1`, `s3`, `d0` and the
+ *     `x86`/`64` of `x86_64` intact;
+ *   - exceeds 24 characters, as a backstop for an encoding this does not
+ *     anticipate.
+ */
+function isStableSegmentToken(token: string): boolean {
+  if (token.length === 0 || token.length > 24) return false;
+  if (/[A-Z]/.test(token)) return false;
+  if (token.length >= 4 && /[0-9]/.test(token)) return false;
+  return true;
+}
+
+/**
+ * Reduce one path segment to its stable prefix, replacing the first
+ * identifier-shaped token and everything after it with
+ * {@link FD_CLASS_VOLATILE_SEGMENT}.
+ *
+ * `paperclip-run-BLO-38624-abc123def456-XyZ9aB` → `paperclip-run-*`, which is
+ * one label for every run rather than one per run, while still naming the
+ * scratch-directory code site. A segment that is wholly identifier-shaped
+ * (a bare UUID) reduces to `*` on its own, and a segment with no volatile
+ * token at all is returned untouched.
+ */
+function boundedSegment(segment: string): string {
+  // A leading dot is part of the name (`.pnpm`, `.cache`, `.git`), not a
+  // separator introducing an empty first token.
+  const dotted = segment.startsWith(".");
+  const body = dotted ? segment.slice(1) : segment;
+  if (isStableSegmentToken(body)) return segment;
+
+  const parts = body.split(SEGMENT_TOKEN_SEPARATORS);
+  let prefix = "";
+  let redacted = false;
+  // Even indices are tokens, odd indices the separator that followed them; the
+  // separator is kept so the stable prefix rebuilds verbatim.
+  for (let i = 0; i < parts.length; i += 2) {
+    if (!isStableSegmentToken(parts[i] ?? "")) {
+      redacted = true;
+      break;
+    }
+    prefix += (parts[i] ?? "") + (parts[i + 1] ?? "");
+  }
+  // Every token stable — a compound name like `x86_64-linux-gnu` that only
+  // failed the whole-segment test because of its separators. Keep it verbatim
+  // rather than appending a marker for a redaction that did not happen.
+  if (!redacted) return segment;
+  return `${dotted ? "." : ""}${prefix}${FD_CLASS_VOLATILE_SEGMENT}`;
+}
+
 /**
  * Reduce an absolute path to a bounded directory label.
  *
@@ -110,12 +206,17 @@ const DELETED_SUFFIX = " (deleted)";
  * `/var/run/secrets/kubernetes.io`, which names a mount, not a credential. The
  * basename is discarded unconditionally, before any depth logic, so no path
  * shape can route one into a label.
+ *
+ * Depth is bounded first, then each surviving segment's *alphabet* — see
+ * {@link boundedSegment}. Both are required: depth alone leaves an identifier
+ * in the label whenever it sits shallower than {@link FD_CLASS_PATH_SEGMENTS},
+ * and alphabet alone would let an arbitrarily deep tree mint a long label.
  */
 function boundedDirLabel(absolutePath: string): string {
   const segments = absolutePath.split("/").filter((segment) => segment.length > 0);
   // Drop the basename to get the directory, then bound the depth.
   const dirSegments = segments.slice(0, Math.max(0, segments.length - 1));
-  const kept = dirSegments.slice(0, FD_CLASS_PATH_SEGMENTS);
+  const kept = dirSegments.slice(0, FD_CLASS_PATH_SEGMENTS).map(boundedSegment);
   return `/${kept.join("/")}`;
 }
 
@@ -137,7 +238,15 @@ export function classifyFdTarget(target: string): string {
 
   if (path.startsWith("socket:")) return "socket";
   if (path.startsWith("pipe:")) return "pipe";
-  if (path.startsWith("memfd:")) return "memfd";
+  // Both spellings, and before the `/`-prefixed path branch below, because the
+  // kernel emits the *slashed* one: verified on a live Linux kernel,
+  // `memfd_create("paperclip-heap")` readlinks to `/memfd:paperclip-heap
+  // (deleted)`. Matching only the bare form let every memfd fall through to the
+  // path branch, lose its basename and land in `deleted:/` — contaminating the
+  // one class documented as the classic leak signature, which is the sharpest
+  // discriminator this instrument has. The bare form is kept because procfs
+  // has emitted it and it costs nothing to accept.
+  if (path.startsWith("memfd:") || path.startsWith("/memfd:")) return "memfd";
   if (path.startsWith("anon_inode:")) {
     const subtype = path.slice("anon_inode:".length).replace(/^\[|\]$/g, "");
     return ANON_INODE_SUBTYPE.test(subtype) ? `anon_inode:${subtype}` : "anon_inode";
