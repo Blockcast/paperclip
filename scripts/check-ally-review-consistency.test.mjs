@@ -225,6 +225,15 @@ describe("hasDeferredDisposition", () => {
         ref || "<no ref>",
       );
     }
+    // The gate exact-matches the whole hyphenated verb, so a longer one is not
+    // `tracked` there and must not be here.
+    for (const verb of ["tracked-elsewhere", "tracked-on-follow-up", "trackedx"]) {
+      assert.equal(
+        hasDeferredDisposition(`- **prior:354d5b9 important 1** \u2014 ${verb} \u2014 accepted onto the follow-up issue`),
+        false,
+        verb,
+      );
+    }
   });
 });
 
@@ -446,13 +455,13 @@ describe("findPrViolations", () => {
     ]);
     // A malformed entry the gate counts as zero deferrals is clean to the
     // gate, so I4 must still fire on it.
-    for (const ref of ["354d5b9 important", "zzzzzzz important 1", ""]) {
+    for (const ledger of ["354d5b9 important** \u2014 tracked", "zzzzzzz important 1** \u2014 tracked", "** \u2014 tracked", "354d5b9 important 1** \u2014 tracked-elsewhere"]) {
       const malformed =
         "\n### Prior Findings Dispositioned (1)\n" +
-        `- **prior:${ref}** \u2014 tracked \u2014 accepted onto the follow-up issue`;
+        `- **prior:${ledger} \u2014 accepted onto the follow-up issue`;
       assert.deepEqual(findPrViolations(pr(malformed + zeroBuckets)), [
         "I4 PR #2076 @ff1c72db: Ally App review 20761 is COMMENTED but clean App evidence must be APPROVED",
-      ], ref || "<no ref>");
+      ], ledger);
     }
   });
 

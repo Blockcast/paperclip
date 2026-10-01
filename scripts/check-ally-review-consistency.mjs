@@ -136,10 +136,12 @@ const STILL_PRESENT_DISPOSITION_RE = new RegExp(
  * EXEMPTS (I4), so the loose `prior:[^\n]*` convention, fail-safe in a
  * trigger, would be fail-open here: it must not match a ledger entry the gate
  * would not count as a deferral. So the ref, severity and index use the gate's
- * own grammar (PRIOR_FINDING_DISPOSITION_PATTERN, ally-review-detection.ts).
+ * own grammar (PRIOR_FINDING_DISPOSITION_PATTERN, ally-review-detection.ts), and
+ * the verb must end at `tracked`: the gate captures `[a-z][a-z-]*` whole and
+ * exact-matches it, so `tracked-elsewhere` is not a deferral there.
  */
 const TRACKED_DISPOSITION_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+\d+[ \t]*\*\*[ \t]*(?:\u2014|\u2013|-)[ \t]*tracked[ \t]*(?:\u2014|\u2013|-)`,
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+\d+[ \t]*\*\*[ \t]*(?:\u2014|\u2013|-)[ \t]*tracked(?![a-z-])[ \t]*(?:\u2014|\u2013|-)`,
   "im",
 );
 
