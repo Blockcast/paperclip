@@ -130,6 +130,21 @@ const STILL_PRESENT_DISPOSITION_RE = new RegExp(
   "im",
 );
 
+/**
+ * A prior-finding disposition that defers an accepted finding to a follow-up
+ * issue (`tracked`, BLO-36903). Unlike STILL_PRESENT_DISPOSITION_RE this one
+ * EXEMPTS (I4), so the loose `prior:[^\n]*` convention, fail-safe in a
+ * trigger, would be fail-open here: it must not match a ledger entry the gate
+ * would not count as a deferral. So the ref, severity and index use the gate's
+ * own grammar (PRIOR_FINDING_DISPOSITION_PATTERN, ally-review-detection.ts), and
+ * the verb must end at `tracked`: the gate captures `[a-z][a-z-]*` whole and
+ * exact-matches it, so `tracked-elsewhere` is not a deferral there.
+ */
+const TRACKED_DISPOSITION_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+\d+[ \t]*\*\*[ \t]*(?:\u2014|\u2013|-)[ \t]*tracked(?![a-z-])[ \t]*(?:\u2014|\u2013|-)`,
+  "im",
+);
+
 /** The single standalone attestation line Ally is required to emit. */
 const ATTESTED_HEAD_RE = new RegExp(
   String.raw`^${NOT_INDENTED_CODE}(?:[_*]+)?[ \t]*reviewed head:[ \t]*\`?([0-9a-f]{40})\`?[ \t]*(?:[_*]+)?[ \t]*$`,
@@ -244,6 +259,10 @@ export function hasBlockingFindings(body) {
 
 export function hasStillPresentDisposition(body) {
   return STILL_PRESENT_DISPOSITION_RE.test(String(body ?? ""));
+}
+
+export function hasDeferredDisposition(body) {
+  return TRACKED_DISPOSITION_RE.test(String(body ?? ""));
 }
 
 export function attestedHead(body) {
@@ -445,7 +464,15 @@ export function findPrViolations(pr) {
         }
       }
 
-      if (!isApproved(review) && !blocking && !isCleanAppSelfReview(pr, review)) {
+      // A `tracked` review is neither blocking nor clean: it reports a real
+      // finding the reviewer accepted onto a follow-up (BLO-36903). Whether
+      // such a review is APPROVED or COMMENTED is the companion contract's
+      // call, not this auditor's, so I4 admits it alongside `blocking` rather
+      // than demanding an approval of a head that still carries a defect.
+      // This is an exemption, so its predicate takes the gate's strict
+      // `prior:` grammar, not the loose one the trigger predicates use.
+      const deferred = hasDeferredDisposition(review.body);
+      if (!isApproved(review) && !blocking && !deferred && !isCleanAppSelfReview(pr, review)) {
         violations.push(
           `I4 PR #${pr.number} @${short}: ${label} review ${review.id} is ${reviewState(review)} but clean App evidence must be APPROVED`,
         );

@@ -19,6 +19,7 @@ import {
   findPrViolations,
   findViolations,
   hasBlockingFindings,
+  hasDeferredDisposition,
   hasStillPresentDisposition,
   isAllyAppLogin,
   isAllyAppReviewer,
@@ -164,6 +165,68 @@ describe("hasStillPresentDisposition", () => {
       ),
       false,
     );
+  });
+
+  // BLO-36903 AC5. This auditor and the merge gate
+  // (server/src/services/ally-review-detection.ts) must agree on every verb, and
+  // they model the vocabulary differently: the gate enumerates all four kinds,
+  // while this script tests only for the blocking one and treats everything
+  // else as non-blocking. Agreement on `tracked` therefore comes for free — but
+  // "for free" is exactly the kind of claim that stops being true silently, so
+  // it is pinned rather than argued. `classifyPriorDisposition("tracked")` is
+  // `defers`, not `blocks`; if someone ever adds a second blocking verb there,
+  // this assertion is what fails here instead of the two parsers diverging in
+  // production, which is the BLO-31730 failure class.
+  it("does NOT treat a tracked disposition as blocking", () => {
+    assert.equal(
+      hasStillPresentDisposition(
+        "- **prior:354d5b9 important 1** — tracked — accepted onto the follow-up issue",
+      ),
+      false,
+    );
+  });
+});
+
+describe("hasDeferredDisposition", () => {
+  it("fires on a prior finding marked tracked", () => {
+    assert.equal(
+      hasDeferredDisposition(
+        "- **prior:354d5b9 important 1** \u2014 tracked \u2014 accepted onto the follow-up issue",
+      ),
+      true,
+    );
+  });
+
+  it("does NOT fire on other verbs, prose, or an indented-code paste", () => {
+    assert.equal(
+      hasDeferredDisposition(
+        "- **prior:354d5b9 important 1** \u2014 still-present \u2014 the issue remains\n" +
+          "tracked in quoted prose\n" +
+          "    - **prior:354d5b9 important 1** \u2014 tracked \u2014 quoted, not emitted",
+      ),
+      false,
+    );
+  });
+
+  // It exempts, so a ledger entry the gate would not count as a deferral
+  // (PRIOR_FINDING_DISPOSITION_PATTERN) must not count here either.
+  it("does NOT fire on a tracked entry the gate's grammar rejects", () => {
+    for (const ref of ["354d5b9 important", "zzzzzzz important 1", ""]) {
+      assert.equal(
+        hasDeferredDisposition(`- **prior:${ref}** \u2014 tracked \u2014 accepted onto the follow-up issue`),
+        false,
+        ref || "<no ref>",
+      );
+    }
+    // The gate exact-matches the whole hyphenated verb, so a longer one is not
+    // `tracked` there and must not be here.
+    for (const verb of ["tracked-elsewhere", "tracked-on-follow-up", "trackedx"]) {
+      assert.equal(
+        hasDeferredDisposition(`- **prior:354d5b9 important 1** \u2014 ${verb} \u2014 accepted onto the follow-up issue`),
+        false,
+        verb,
+      );
+    }
   });
 });
 
@@ -358,6 +421,41 @@ describe("findPrViolations", () => {
     assert.deepEqual(violations, [
       "I4 PR #1146 @ff1c72db: Ally App review 4888334884 is COMMENTED but clean App evidence must be APPROVED",
     ]);
+  });
+
+  // BLO-36903: a `tracked` review is the third state I4's binary had no slot
+  // for. Its buckets are 0/0 by contract (a tracked item is not mirrored into
+  // the counted bucket) and it is not `still-present`, so without the slot I4
+  // read it as clean-evidence-not-approved. The PR is independently authored
+  // on purpose: `deferred_finding` is only reachable there, which is exactly
+  // where isCleanAppSelfReview does not apply. The twin without the ledger
+  // entry must still raise I4, so the exemption is the verb, not the shape.
+  it("I4: admits a COMMENTED App review whose only residual is a tracked deferral", () => {
+    const zeroBuckets = "\n### Critical Issues (0)\n### Important Issues (0)";
+    const tracked =
+      "\n### Prior Findings Dispositioned (1)\n" +
+      "- **prior:354d5b9 important 1** \u2014 tracked \u2014 accepted onto the follow-up issue";
+    const pr = (body) => ({
+      number: 2076,
+      author: { login: "some-human", is_bot: false },
+      headSha: HEAD,
+      reviews: [appReview({ id: 20761, state: "COMMENTED", body: canonicalBody(HEAD, body) })],
+    });
+
+    assert.deepEqual(findPrViolations(pr(tracked + zeroBuckets)), []);
+    assert.deepEqual(findPrViolations(pr(zeroBuckets)), [
+      "I4 PR #2076 @ff1c72db: Ally App review 20761 is COMMENTED but clean App evidence must be APPROVED",
+    ]);
+    // A malformed entry the gate counts as zero deferrals is clean to the
+    // gate, so I4 must still fire on it.
+    for (const ledger of ["354d5b9 important** \u2014 tracked", "zzzzzzz important 1** \u2014 tracked", "** \u2014 tracked", "354d5b9 important 1** \u2014 tracked-elsewhere"]) {
+      const malformed =
+        "\n### Prior Findings Dispositioned (1)\n" +
+        `- **prior:${ledger} \u2014 accepted onto the follow-up issue`;
+      assert.deepEqual(findPrViolations(pr(malformed + zeroBuckets)), [
+        "I4 PR #2076 @ff1c72db: Ally App review 20761 is COMMENTED but clean App evidence must be APPROVED",
+      ], ledger);
+    }
   });
 
   it("allows a clean canonical App COMMENTED self-review for an App-authored PR", () => {

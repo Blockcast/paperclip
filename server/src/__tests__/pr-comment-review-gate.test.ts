@@ -278,6 +278,146 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
   });
 
+  // BLO-36903. Before `tracked`, a finding the reviewer accepted onto a
+  // follow-up had no truthful ledger verb: `fixed` and `no-longer-applicable`
+  // are both false of a live defect, and `still-present` — the only honest
+  // option left — blocks. So Ally's own recommended landing path was
+  // unreachable through the ledger and the residual had to be demoted to prose.
+  it("reports a tracked residual at this head as deferred, not clean", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(CURRENT_HEAD, OLD_HEAD, "tracked"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    // Non-blocking is the point of the verb...
+    expect(verdict.state).toBe("success");
+    // ...and saying so out loud is the other half: a human approver must be
+    // able to see that a residual was accepted rather than fixed.
+    expect(verdict.outcome).toBe("deferred_finding");
+    expect(verdict.reason).toMatch(/tracked on a follow-up/i);
+    expect(verdict.reason).not.toMatch(/no unresolved findings/i);
+  });
+
+  it("still reports a review with no deferral as clean", () => {
+    // Control for the case above: the deferred branch must be reached by the
+    // ledger verb, not by merely having any ledger or any prior head.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "fixed"), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  it("does not let an unbalanced fence above the ledger downgrade a deferral to clean", () => {
+    // Ally's template attests the head in its opening lines and puts the ledger
+    // after the buckets, so a fence left open between them blanks the ledger on
+    // the emitted-only reading while the attestation and the 0/0 survive. Read
+    // that way the head went `clean` / `success`: a false claim that an accepted
+    // residual was fixed. Moving the fence below the ledger holds the body
+    // otherwise fixed, so fence position alone cannot be what decides it.
+    const buckets = ["### Critical Issues (0)", "### Important Issues (0)"];
+    const ledger = [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** - tracked - accepted onto the follow-up.`,
+    ];
+    const unterminatedFence = ["```ts", "const unterminated = true;"];
+
+    for (const lines of [
+      [...buckets, ...unterminatedFence, ...ledger],
+      [...buckets, ...ledger, ...unterminatedFence],
+    ]) {
+      const verdict = evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
+        comments: [
+          allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+          allyComment(reviewBody(CURRENT_HEAD, lines), "2026-08-04T21:09:19Z"),
+        ],
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "deferred_finding" });
+      expect(verdict.reason).toMatch(/accepts 1 prior finding as tracked/);
+    }
+  });
+
+  it("does not let a tracked entry clear a head that still carries a finding", () => {
+    // Precedence: a `tracked` ledger entry is a statement about one prior
+    // finding, not about the review carrying it. A current head that raises its
+    // own finding still blocks.
+    const body = reviewBody(CURRENT_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — tracked — accepted onto the follow-up.`,
+      "### Critical Issues (0)",
+      "### Important Issues (1)",
+      "- A separate defect this head introduced.",
+      "### Recommended Action",
+      "Fix Critical issues before merge.",
+    ]);
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(body, "2026-08-04T21:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+  });
+
+  it("stops carrying an earlier head's finding once it is tracked", () => {
+    // The carry-forward half. `tracked` disposes the finding for the purpose of
+    // holding the PR red, exactly as `fixed` does — the difference between them
+    // is reported, not enforced.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "tracked"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    expect(verdict.state).toBe("success");
+    expect(verdict.outcome).not.toBe("carried_finding");
+  });
+
+  it("keeps carrying a head whose findings are only partly tracked", () => {
+    // One entry must not clear a review that reported several findings — the
+    // `isFullyDispositioned` invariant, re-pinned for the new verb because
+    // widening the disposing set is exactly the change that could break it.
+    const twoFindings = reviewBody(OLD_HEAD, [
+      "### Critical Issues (0)",
+      "### Important Issues (2)",
+      "- The first defect.",
+      "- The second defect.",
+      "### Recommended Action",
+      "Fix Critical issues before merge.",
+    ]);
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(twoFindings, "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "tracked"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
   it("does not let a ledger entry disposition a finding raised after it", () => {
     // Ally re-raising a finding on a head it previously cleared is the newer
     // fact. A ledger entry can only speak to findings that existed when it was
@@ -1321,6 +1461,18 @@ describe("commentReviewGateCheckConclusion", () => {
     headSha: CURRENT_HEAD,
     comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
   });
+  const deferred = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    // Independent author, for the same reason `clean` above needs one: a
+    // deferral is a POSITIVE claim about what a review decided, so it sits
+    // behind the BLO-34316 independence gate. Without this the fixture reads
+    // `not_evaluated` and every assertion below passes for the wrong reason.
+    prAuthorLogin: DISTINCT_PR_AUTHOR,
+    comments: [
+      allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+      allyComment(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "tracked"), "2026-08-04T21:09:19Z"),
+    ],
+  });
 
   it("renders not-evaluated differently from reviewed-and-clean without reading the description", () => {
     // The defect this exists to close: on the commit-status surface both of
@@ -1375,8 +1527,25 @@ describe("commentReviewGateCheckConclusion", () => {
     }
   });
 
+  it("renders a deferred residual as neither a pass nor a block", () => {
+    // BLO-36903. `success` would assert the head is clean, which is the one
+    // thing a tracked residual is not; `failure` would block the landing path
+    // the reviewer explicitly recommended. `neutral` is exactly "did not pass,
+    // does not block", and the title is what separates it from not-evaluated.
+    expect(deferred.state).toBe("success");
+    expect(commentReviewGateCheckConclusion(deferred)).toBe("neutral");
+    expect(commentReviewGateCheckConclusion(deferred)).not.toBe(
+      commentReviewGateCheckConclusion(clean),
+    );
+    expect(commentReviewGateCheckTitle(deferred)).not.toBe(
+      commentReviewGateCheckTitle(notEvaluated),
+    );
+  });
+
   it("gives each outcome its own title so the conclusion is legible unopened", () => {
-    const titles = [notEvaluated, clean, blocking, carried].map(commentReviewGateCheckTitle);
+    const titles = [notEvaluated, clean, blocking, carried, deferred].map(
+      commentReviewGateCheckTitle,
+    );
 
     expect(new Set(titles).size).toBe(titles.length);
     expect(commentReviewGateCheckTitle(notEvaluated)).toMatch(/not evaluated/i);

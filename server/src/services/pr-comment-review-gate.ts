@@ -15,6 +15,7 @@ import { loadConfig } from "../config.js";
 import type { Db } from "@paperclipai/db";
 import { withGithubStatusDeliveryLock } from "./github-status-delivery-outbox.js";
 import {
+  countAllyDeferredPriorFindings,
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
@@ -70,6 +71,13 @@ export interface CommentReviewGateComment {
 export type CommentReviewGateOutcome =
   /** An Ally comment attests this exact head and reports no unresolved finding. */
   | "clean"
+  /**
+   * An Ally comment attests this exact head, reports no finding owed a fix, and
+   * its ledger accepts at least one prior finding as tracked on a follow-up.
+   * Non-blocking, but deliberately not `clean`: a reader must be able to see
+   * that a residual was accepted rather than fixed (BLO-36903).
+   */
+  | "deferred_finding"
   /** An Ally comment attests this exact head and carries an unresolved finding. */
   | "blocking_finding"
   /** No comment attests this head, but a finding from an earlier head stands undispositioned. */
@@ -83,6 +91,7 @@ export type CommentReviewGateOutcome =
 
 export type CommentReviewGateVerdict =
   | { state: "success"; outcome: "clean"; reason: string }
+  | { state: "success"; outcome: "deferred_finding"; reason: string }
   | {
       state: "success";
       outcome: "not_evaluated";
@@ -250,9 +259,17 @@ function headsWithUndispositionedFinding(
     prior.entry.severity === finding.severity &&
     prior.entry.index === finding.index;
 
-  const isRetired = (headSha: string, attestedAtMs: number, finding: AllyFindingRef): boolean =>
+  // A finding stops holding its head red when the ledger either retires it
+  // (`fixed`/`no-longer-applicable` — the defect is gone) or defers it
+  // (`tracked` — the defect stands and was accepted onto a follow-up). Both are
+  // positive assertions by the reviewer about that exact finding, which is what
+  // separates them from silence; the difference between them is reported to the
+  // reader rather than acted on here (BLO-36903).
+  const isDisposed = (headSha: string, attestedAtMs: number, finding: AllyFindingRef): boolean =>
     ledger.some(
-      (prior) => prior.entry.kind === "retires" && namesFinding(prior, headSha, attestedAtMs, finding),
+      (prior) =>
+        (prior.entry.kind === "retires" || prior.entry.kind === "defers") &&
+        namesFinding(prior, headSha, attestedAtMs, finding),
     );
 
   // Ally saying a finding still stands is an explicit answer, not a gap in this
@@ -268,16 +285,16 @@ function headsWithUndispositionedFinding(
     );
 
   // A head is dispositioned only once *every* finding it raised has been
-  // retired by name. Matching on the head alone would let one `fixed` entry
-  // clear a review that reported several findings, dropping the ones the ledger
-  // never mentioned. `null` means the blocking feedback came from prose or an
-  // uncounted heading, so no finding identities exist to match against and the
-  // head stays carried.
+  // retired or deferred by name. Matching on the head alone would let one
+  // `fixed` entry clear a review that reported several findings, dropping the
+  // ones the ledger never mentioned. `null` means the blocking feedback came
+  // from prose or an uncounted heading, so no finding identities exist to match
+  // against and the head stays carried.
   const isFullyDispositioned = (entry: { attesting: AttestingComment; timeMs: number }): boolean => {
     const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
     if (!reported || reported.length === 0) return false;
     return reported.every((finding) =>
-      isRetired(entry.attesting.attestedHeadSha, entry.timeMs, finding),
+      isDisposed(entry.attesting.attestedHeadSha, entry.timeMs, finding),
     );
   };
 
@@ -297,7 +314,7 @@ function headsWithUndispositionedFinding(
     if (!reported) return [];
     const verbs = new Set<string>();
     for (const finding of reported) {
-      if (isRetired(headSha, entry.timeMs, finding)) continue;
+      if (isDisposed(headSha, entry.timeMs, finding)) continue;
       if (isExplicitlyBlocked(headSha, entry.timeMs, finding)) continue;
       for (const prior of ledger) {
         if (prior.entry.kind !== "unrecognized") continue;
@@ -416,6 +433,45 @@ export function evaluateCommentReviewGate(input: {
         reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
       };
     } else {
+      // Non-blocking, but not clean. A `tracked` ledger entry says the reviewer
+      // looked at a real defect and accepted it onto a follow-up, so reporting
+      // "no unresolved findings" here would state the opposite of what happened
+      // to a human deciding whether to approve (BLO-36903 AC2).
+      //
+      // This is the branch that matters. `evaluateCommentReviewGate`
+      // short-circuits on a current-head attestation before it ever consults the
+      // carry-forward ledger below, so a head whose own review is non-blocking
+      // reaches its verdict here — and the ledger is the only place the deferral
+      // is written down.
+      //
+      // Read off the attesting body alone, not the whole comment history: the
+      // claim being made is "the review of THIS head accepted a residual", which
+      // only that body can support. Entries naming other heads' findings are
+      // still counted, because a ledger entry is by construction about an earlier
+      // head; what is scoped is which review is speaking.
+      //
+      // Counted from the raw body, not through the emitted-only
+      // extractAllyPriorFindingDispositions: here `defers` retires nothing, it
+      // downgrades `clean`, so an unbalanced fence above the ledger must not be
+      // able to erase it and publish a false `success`. The carry-forward's
+      // `isDisposed` is a retiring use and correctly stays emitted-only.
+      //
+      // Gated behind the independence check above, not in front of it: a
+      // deferral is a POSITIVE claim about what a review decided, so crediting a
+      // self-attested one would let an author launder their own residual into a
+      // non-blocking gate — the same fail-open the `clean` branch is guarded
+      // against (BLO-34316). A self-attested deferral falls through to the
+      // carry-forward ledger instead.
+      const deferred = countAllyDeferredPriorFindings(forHead.comment.body);
+      if (deferred > 0) {
+        return {
+          state: "success",
+          outcome: "deferred_finding",
+          reason:
+            `Ally's review of this head accepts ${deferred} prior ` +
+            `${deferred === 1 ? "finding" : "findings"} as tracked on a follow-up, not fixed.`,
+        };
+      }
       return {
         state: "success",
         outcome: "clean",
@@ -522,6 +578,12 @@ export function evaluateCommentReviewGate(input: {
  * the UI and in `check-runs` API reads, and it does not block merge — so a
  * reader can tell "reviewed and clean" from "nothing reviewed this head" by the
  * conclusion alone, without parsing the human-readable description.
+ *
+ * `deferred_finding` takes `neutral` for the same reason it exists: it is
+ * non-blocking but is not a clean pass, and `success` is the one conclusion
+ * that would assert otherwise. It shares the conclusion with `not_evaluated`
+ * and is separated from it by the title — both are "did not pass, does not
+ * block", which is precisely what `neutral` means.
  */
 export function commentReviewGateCheckConclusion(
   verdict: Pick<CommentReviewGateVerdict, "state" | "outcome">,
@@ -537,6 +599,8 @@ export function commentReviewGateCheckTitle(
   switch (verdict.outcome) {
     case "clean":
       return "Reviewed at this head — no unresolved findings";
+    case "deferred_finding":
+      return "Accepted finding tracked on a follow-up — not fixed";
     case "blocking_finding":
       return "Unresolved finding at this head";
     case "carried_finding":
