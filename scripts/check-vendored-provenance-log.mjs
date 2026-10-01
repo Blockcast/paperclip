@@ -142,6 +142,35 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
     };
   }
 
+  // Deletion is not the only way to erase an entry: emptying one in place is an
+  // `M`, and swapping it for a symlink is a `T`, so the D filter above passes
+  // both. Reject erasure, not editing. LOG's `deleted > 0` does not transfer: it
+  // exists for the union driver, distinct files never conflict, and a typo fix
+  // in an earlier entry removes a line and must keep passing. So the rule is
+  // that a changed entry is still a regular file that records something.
+  const erasedEntries = git(
+    "diff", "--name-only", "--diff-filter=MT", "--no-renames", range, "--", LOG_DIR,
+  )
+    .split("\n")
+    .filter(isEntryPath)
+    .filter((p) => {
+      const [mode] = git("ls-tree", head, "--", p).split(/\s/);
+      return !mode.startsWith("100") || git("cat-file", "blob", `${head}:${p}`).trim() === "";
+    });
+
+  if (erasedEntries.length > 0) {
+    return {
+      ok: false,
+      reason: `${LOG_DIR}/ is append-only, but this change empties ${erasedEntries.length} existing entry file(s).`,
+      detail: [
+        "An existing entry may be edited (a typo fix), not erased: it must stay a",
+        "regular file with content. To retract one, add a new entry that",
+        "supersedes it. Emptied or replaced:",
+        ...erasedEntries.map((p) => `  ${p}`),
+      ],
+    };
+  }
+
   const changed = git("diff", "--name-only", range, "--", VENDOR_DIR)
     .split("\n")
     .filter(Boolean)
