@@ -391,11 +391,20 @@ async function observePenstockProbe<T>(input: {
  * exhaustion cycle (see `ac2-fallback-measured-production` on BLO-29900):
  * **39/39** capacity nulls were this branch — the 3s `AbortController`, none of
  * them a 404/unparseable — and **36/36** of the resulting POSTs timed out too
- * and returned `{allow: true}`. So on the measured path the fallback bought
- * *zero* decisions while costing up to 6s of added dispatch latency and one
- * inference call per event, against the provider least able to absorb it. This
- * is the "every retry is a load multiplier" shape, inside the mechanism the
- * 15m capacity-park clamp assumes is free.
+ * and returned `{allow: true}`. The 3-event gap between 39 and 36 is a limit of
+ * the log instrument, not a third behaviour: that measurement counted fallback
+ * POSTs by the `penstock availability probe failed open` string, which only the
+ * *fail-open* branch emits, so a POST that produced a verdict — or whose +3s
+ * line fell outside the window — is invisible to it. Those 3 are the worst case
+ * for this change (≤8% of events, where a verdict may now be discarded); there
+ * the gate fails open instead of denying, and the dispatch's own capacity
+ * refusal parks the run as `rate_limit_exhausted` on the terminal-result path
+ * instead — later, but not lost.
+ * So on the measured path the fallback bought *zero* decisions while costing up
+ * to 6s of added dispatch latency and one inference call per event, against the
+ * provider least able to absorb it. This is the "every retry is a load
+ * multiplier" shape, inside the mechanism the 15m capacity-park clamp assumes
+ * is free.
  *
  * `inconclusive` and `auth_fault` deliberately still fall through: there the
  * endpoint *did* respond, so the fallback is the only thing that can produce a

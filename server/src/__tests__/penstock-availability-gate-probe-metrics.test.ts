@@ -186,6 +186,7 @@ describe("penstock availability gate probe instrumentation (BLO-29900)", () => {
     expect(await probeCount({ path: "messages_fallback" })).toBe(0);
   });
 
+  // PEN-2513 landed after this PR was opened and made 401/403 fail open instead
   // of denying. That branch reaches the fallback by the same route a 404 does,
   // so folding it into `inconclusive` would hide an entitlement fault inside the
   // counter built to stop entitlement faults being read as capacity ones.
