@@ -181,7 +181,10 @@ function findUnprovenAccumulatorReturns(functionSource: string): number[] {
       proven = guard[1]!.startsWith(">")
         ? index < close
         : index >= close
-          && !lines.slice(close, index + 1).some((l) => isCode(l) && indentOf(l) < guardIndent);
+          && !lines.slice(close, index + 1).some((l) => isCode(l) && indentOf(l) < guardIndent)
+          // An `=== 0` guard proves nothing unless its block actually exits;
+          // one that falls through vouches for the return beneath it.
+          && lines.slice(back, close).some((l) => /\b(?:return|throw)\b/.test(l));
       break;
     }
     if (!proven) offenders.push(index + 1);
@@ -352,6 +355,21 @@ describe("startNextQueuedRunForAgent decline instrumentation", () => {
       "  }",
     ].join("\n");
     expect(findUnprovenAccumulatorReturns(escaped)).toEqual([8]);
+  });
+
+  it("does not let an `=== 0` guard that falls through vouch for the return below it (negative control)", () => {
+    // Review of ce5f7334: the `=== 0` arm checked scope but not exit, so a guard
+    // whose block records and falls through let an empty accumulator reach line 6.
+    const body = [
+      "  async function fake() {",
+      "    if (claimedRuns.length === 0) {",
+      "      await noteDispatchDeclined(agentId, \"no_claimable_run\", companyId);",
+      "    }",
+      "    advanceOrClearResumeCursor(claimedRuns.length);",
+      "    return claimedRuns;",
+      "  }",
+    ].join("\n");
+    expect(findUnprovenAccumulatorReturns(body)).toEqual([6]);
   });
 
   it("flags an accumulator return INSIDE an `=== 0` branch", () => {
