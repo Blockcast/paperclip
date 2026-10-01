@@ -29245,6 +29245,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
+   * Rate-limit the per-decline log lines to at most one per (agent, reason)
+   * per {@link DISPATCH_DECLINE_LOG_INTERVAL_MS}.
+   *
+   * `resumeQueuedRuns` drives a dispatch pass for every agent holding a queued
+   * run, on every scheduler tick — 30 s in `index.ts`. So a decline that
+   * PERSISTS logs on every tick for as long as the condition holds: ~2 880
+   * lines per agent per day, and the motivating incident held one shape for
+   * 73.6 h (~8 800 lines). The scenario this instrumentation exists to
+   * illuminate is precisely the scenario that would drown the log it writes to.
+   *
+   * The counter carries the sustained rate, which is what it is for. The log's
+   * job is the unbounded detail that cannot be a metric label
+   * (`invokabilityReason`, `queuedRunCount`) — and that detail does not need
+   * re-emitting every 30 s to be useful. `suppressedSincePreviousLog` keeps the
+   * emitted line honest about how much it stands for, so a throttled line is
+   * never mistaken for an isolated event.
+   *
+   * Bounded by construction: one entry per (agent, reason), agents come from
+   * our own `agents` table and reasons from the closed
+   * `KNOWN_DISPATCH_DECLINE_REASONS`. No caller-influenced key can enter it, so
+   * unlike `webhookRejectionLogState` in `metrics.ts` — whose plugin keys are
+   * externally supplied and therefore capped — this needs no overflow bucket.
+   * Entries for deleted agents linger for the process lifetime; that is a few
+   * bytes each against a set that is already bounded by the roster.
+   */
+  const DISPATCH_DECLINE_LOG_INTERVAL_MS = 10 * 60_000;
+  const dispatchDeclineLogState = new Map<
+    string,
+    { lastLoggedAt: number; suppressed: number }
+  >();
+
+  function takeDispatchDeclineLogSlot(
+    agentId: string,
+    reason: DispatchDeclineReason,
+  ): { log: false } | { log: true; suppressedSincePreviousLog: number } {
+    const key = `${agentId}:${reason}`;
+    const now = Date.now();
+    const previous = dispatchDeclineLogState.get(key);
+    if (previous && now - previous.lastLoggedAt < DISPATCH_DECLINE_LOG_INTERVAL_MS) {
+      previous.suppressed += 1;
+      return { log: false };
+    }
+    dispatchDeclineLogState.set(key, { lastLoggedAt: now, suppressed: 0 });
+    return { log: true, suppressedSincePreviousLog: previous?.suppressed ?? 0 };
+  }
+
+  /**
    * PEN-3607: a dispatch pass that declines to start a run must say so.
    *
    * `startNextQueuedRunForAgent` has fifteen `return []` sites. Before this,
@@ -29375,14 +29422,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // label: the verdict set is open-ended enough that folding it in would
         // widen the series, and the bounded decline reason plus this line
         // together answer the question.
-        logger.warn(
-          {
+        //
+        // Level is split by verdict rather than fixed at `warn`. Paused and
+        // terminated are INTENDED operator actions, not anomalies, and `warn`
+        // is the level that feeds dashboards and alert routes — a deliberately
+        // paused agent should not page anyone every 30 s. An invalid reporting
+        // chain is a genuine fault nobody asked for, so it keeps `warn`.
+        // Either way the line is throttled and the counter carries the rate.
+        const invokableLogSlot = takeDispatchDeclineLogSlot(agentId, "agent_not_invokable");
+        if (invokableLogSlot.log) {
+          const invokableLogDetails = {
             agentId,
             invokabilityReason: invokability.reason,
             invalidOrgChain: invokability.invalidOrgChain,
-          },
-          "startNextQueuedRunForAgent: declined because the agent is not invokable",
-        );
+            suppressedSincePreviousLog: invokableLogSlot.suppressedSincePreviousLog,
+          };
+          const invokableLogMessage =
+            "startNextQueuedRunForAgent: declined because the agent is not invokable";
+          if (invokability.invalidOrgChain) {
+            logger.warn(invokableLogDetails, invokableLogMessage);
+          } else {
+            logger.debug(invokableLogDetails, invokableLogMessage);
+          }
+        }
         await noteDispatchDeclined(agentId, "agent_not_invokable", agent.companyId);
         return [];
       }
@@ -30570,8 +30632,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (scheduledEmergencyContinuationAfterRefusal) {
         if (claimedRuns.length > 0) {
           launchClaimedRuns();
+          return claimedRuns;
         }
-        return claimedRuns;
+        // PEN-3607 (review follow-up): this branch used to `return claimedRuns`
+        // for BOTH cases, above the `claimedRuns.length === 0` block below that
+        // carries `no_claimable_run`. So the empty case returned an empty array
+        // having recorded nothing — and the source scanner could not see it,
+        // because the line read `return claimedRuns;` rather than `return [];`.
+        // It was the worst path to have dark: a candidate refused AND the pass
+        // escalated, which is the strongest signal the pass itself can give
+        // that this seat is in trouble, and it is the exact refusal shape
+        // PEN-3607 was filed about.
+        //
+        // Returning `[]` here rather than the (empty) accumulator is load
+        // bearing, not cosmetic: it puts the exit back in the idiom the scanner
+        // enforces, so the next decline added beside it cannot go silent the
+        // same way.
+        const emergencyLogSlot = takeDispatchDeclineLogSlot(
+          agentId,
+          "emergency_continuation_scheduled",
+        );
+        if (emergencyLogSlot.log) {
+          logger.warn(
+            {
+              agentId,
+              queuedRunCount: queuedRuns.length,
+              availableSlots,
+              suppressedSincePreviousLog: emergencyLogSlot.suppressedSincePreviousLog,
+            },
+            "startNextQueuedRunForAgent: declined — a candidate refused and an emergency continuation was scheduled",
+          );
+        }
+        await noteDispatchDeclined(agentId, "emergency_continuation_scheduled", agent.companyId);
+        return [];
       }
       if (claimedRuns.length === 0) {
         if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
@@ -30582,10 +30675,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // reached every tick, refused every tick, previously recording nothing
         // anywhere. `queuedRunCount` is on the log line rather than the metric
         // because it is unbounded; the series carries only the bounded reason.
-        logger.warn(
-          { agentId, queuedRunCount: queuedRuns.length, availableSlots },
-          "startNextQueuedRunForAgent: declined — candidates were ranked but none could be claimed",
-        );
+        // Throttled for the reason given on takeDispatchDeclineLogSlot: a
+        // wedged seat holds this shape for as long as it stays wedged, so an
+        // unthrottled line here scales with the incident it is reporting.
+        const noClaimLogSlot = takeDispatchDeclineLogSlot(agentId, "no_claimable_run");
+        if (noClaimLogSlot.log) {
+          logger.warn(
+            {
+              agentId,
+              queuedRunCount: queuedRuns.length,
+              availableSlots,
+              suppressedSincePreviousLog: noClaimLogSlot.suppressedSincePreviousLog,
+            },
+            "startNextQueuedRunForAgent: declined — candidates were ranked but none could be claimed",
+          );
+        }
         await noteDispatchDeclined(agentId, "no_claimable_run", agent.companyId);
         return [];
       }

@@ -2365,11 +2365,27 @@ const knownReasonSet: ReadonlySet<string> = new Set(KNOWN_BLOCKED_REASONS);
 /**
  * Bounded `reason` allow-list for {@link AGENT_DISPATCH_DECLINED_METRIC}.
  *
- * One entry per `return []` site in `startNextQueuedRunForAgent`, in the order
+ * One entry per decline site in `startNextQueuedRunForAgent`, in the order
  * dispatch reaches them. Keep them in that order and keep the set closed —
  * adding a decline path without adding its reason here silently collapses it to
  * {@link UNKNOWN_DISPATCH_DECLINE_REASON}, which reintroduces exactly the blind
  * spot this metric was added to close.
+ *
+ * "Decline site" is not quite "`return []` site", in both directions, and the
+ * gaps are deliberate:
+ *
+ *   - `emergency_continuation_scheduled` returns the (empty) `claimedRuns`
+ *     accumulator rather than a `[]` literal. That shape is why the source
+ *     scanner in `dispatch-decline-instrumentation.test.ts` checks returns of
+ *     the accumulator as well as of the literal: keying only on `return [];`
+ *     left this exact path dark.
+ *   - The `onCoalesced` hook passed to `withAgentStartLock` returns `[]` from
+ *     three sites in `agent-start-lock.ts` (re-entrant coalesce, depth guard,
+ *     deadlock guard) and is INTENTIONALLY not a decline. A coalesced call runs
+ *     no queue-selection pass of its own; the pass it folded into claims the
+ *     work, so "no runs claimed by this call" is the honest answer rather than
+ *     a refusal. Do not add a reason for it — recording one would double-count
+ *     a single pass and label a successful dispatch as declined.
  *
  * The first FOUR collapse to {@link UNKNOWN_AGENT_ID}, not the first three.
  * `dispatch_stopped`, `api_tier_fence` and `scheduling_suppressed` do so
@@ -2419,6 +2435,19 @@ export const KNOWN_DISPATCH_DECLINE_REASONS = [
   "recovery_lane_continuation",
   /** The queue was scanned and held no candidate row at all. */
   "no_queued_candidates",
+  /**
+   * A candidate refused to claim and the pass escalated: it scheduled an
+   * emergency continuation for a run that is still `queued`, then broke out of
+   * the candidate loop.
+   *
+   * Split from `no_claimable_run` rather than folded into it because the two
+   * are different faults. "Refused, and something is still trying" and
+   * "refused, with nothing left to try" want different operator responses, and
+   * this one is the stronger distress signal of the pair — it is the case the
+   * pass itself judged bad enough to escalate. Collapsing them would hide that
+   * behind the louder, more common reason.
+   */
+  "emergency_continuation_scheduled",
   /** Candidates existed and every one of them refused to claim. */
   "no_claimable_run",
 ] as const;
