@@ -13,6 +13,7 @@ import {
   applyBaseline,
   assertHeadSha,
   assertLiveScopeNonVacuous,
+  assertMergeStateFetched,
   assertPrListComplete,
   attestedHead,
   duplicateBodyAcrossIdentities,
@@ -20,17 +21,23 @@ import {
   findViolations,
   hasBlockingFindings,
   hasStillPresentDisposition,
+  idleDays,
   isAllyAppLogin,
   isAllyAppReviewer,
   isAllyLogin,
   isAllySeatLogin,
   isAllySeatReviewer,
   isMainModule,
+  MAX_IDLE_DAYS,
+  parseMaxIdleDays,
   operativeAllyReviews,
+  main,
   parseBaseline,
   partitionByMergeEligibility,
+  PR_LIST_FIELDS,
   prDormancy,
   sameLaneBodyRelation,
+  scopeSummary,
   violationFingerprint,
 } from "./check-ally-review-consistency.mjs";
 
@@ -894,6 +901,22 @@ describe("assertHeadSha", () => {
   });
 });
 
+describe("assertMergeStateFetched", () => {
+  // An absent key reaches prDormancy as unresolved and, on an idle PR, defers
+  // its findings: the fail-OPEN direction. The values GitHub actually returns
+  // for "not computed yet" must still pass through to tier 3.
+  for (const state of ["", null, "UNKNOWN", "CLEAN"]) {
+    it(`passes a fetched ${JSON.stringify(state)}`, () => {
+      const row = { number: 1, mergeStateStatus: state };
+      assert.equal(assertMergeStateFetched(row, "o/r"), row);
+    });
+  }
+
+  it("throws on a row that lost the key, naming the PR", () => {
+    assert.throws(() => assertMergeStateFetched({ number: 42, headRefOid: HEAD }, "o/r"), /no mergeStateStatus key for o\/r#42/);
+  });
+});
+
 describe("a falsy head would otherwise silently pass a maximal violation", () => {
   it("finds every invariant broken at the real head", () => {
     const reviews = [
@@ -1160,6 +1183,14 @@ describe("prDormancy", () => {
       assert.equal(prDormancy(pr), null);
     });
   }
+
+  // "" is a member of UNRESOLVED_MERGE_STATES on purpose, and membership is what
+  // routes an unresolved state into tier 3. Without this case dropping "" from
+  // the set passed every test.
+  it("reads an idle PR whose state is \"\" as untouched, like UNKNOWN", () => {
+    const updatedAt = new Date(Date.now() - (MAX_IDLE_DAYS + 6) * 86_400_000).toISOString();
+    assert.match(prDormancy({ number: 1, mergeStateStatus: "", updatedAt }), /^untouched for \d+d, merge state unresolved$/);
+  });
 });
 
 describe("assertLiveScopeNonVacuous", () => {
@@ -1171,6 +1202,37 @@ describe("assertLiveScopeNonVacuous", () => {
       { number: 2, isDraft: true },
     ];
     assert.throws(() => assertLiveScopeNonVacuous(allDormant, "o/r"), /scoping bug, not a clean repo/);
+  });
+
+  it("carries the classification histogram in the throw", () => {
+    // `main` asserts before it logs the scope summary, so the vacuous case —
+    // the single scenario that summary was added to illuminate — is the one
+    // scenario it never reaches. Without the counts in the message the operator
+    // is told the scope collapsed but not which clause swallowed the
+    // population.
+    const allDormant = [
+      { number: 1, mergeStateStatus: "DIRTY" },
+      { number: 2, isDraft: true },
+    ];
+    assert.throws(() => assertLiveScopeNonVacuous(allDormant, "o/r"), (e) => {
+      assert.match(e.message, /dormant by \[.*merge state DIRTY 1.*\]/);
+      assert.match(e.message, /dormant by \[.*draft 1.*\]/);
+      assert.match(e.message, /merge states \[.*DIRTY 1.*\]/);
+      return true;
+    });
+  });
+
+  it("names every field the classifier reads in its remediation hint", () => {
+    // The hint tells the operator which fetched fields to check. `updatedAt`
+    // became a third dormancy input and was missing from it, so the one field
+    // most likely to be dropped was the one the message did not mention.
+    const allDormant = [{ number: 1, mergeStateStatus: "DIRTY" }];
+    assert.throws(() => assertLiveScopeNonVacuous(allDormant, "o/r"), (e) => {
+      for (const field of ["isDraft", "mergeStateStatus", "updatedAt"]) {
+        assert.ok(e.message.includes(field), `hint must name ${field}`);
+      }
+      return true;
+    });
   });
 
   it("passes when at least one PR could merge", () => {
@@ -1230,5 +1292,326 @@ describe("partitionByMergeEligibility", () => {
 
   it("passes an empty finding set through untouched", () => {
     assert.deepEqual(partitionByMergeEligibility([], []), { failing: [], deferred: [] });
+  });
+});
+
+describe("prDormancy — unresolved merge state falls back to the activity clock", () => {
+  // 2026-09-26T23:28:32Z, the last run measured on PEN-2847.
+  const NOW = Date.parse("2026-09-26T23:28:32Z");
+  const daysAgo = (d) => new Date(NOW - d * 86_400_000).toISOString();
+
+  // The regression this clause exists for. PR #1220 was last touched
+  // 2026-09-06 and nothing about it changed for the rest of the month, yet its
+  // verdict alternated across ten consecutive hourly runs on 2026-09-26 as
+  // mergeStateStatus flipped DIRTY <-> UNKNOWN underneath the guard:
+  //   16:31Z defer, 17:29Z fail, 18:34Z defer, 19:27Z fail, 20:29Z defer,
+  //   21:28Z defer, 22:29Z fail, 23:28Z defer.
+  // The verdict has to follow the PR, not the phase of GitHub's cache.
+  it("gives an untouched PR the same verdict in both cache phases", () => {
+    const untouched = { number: 1220, updatedAt: "2026-09-06T10:04:38Z" };
+    const reported = prDormancy({ ...untouched, mergeStateStatus: "DIRTY" }, NOW);
+    const unresolved = prDormancy({ ...untouched, mergeStateStatus: "UNKNOWN" }, NOW);
+
+    assert.ok(reported !== null, "DIRTY phase must defer");
+    assert.ok(
+      unresolved !== null,
+      "UNKNOWN phase must defer too — otherwise the guard oscillates on an unchanged PR",
+    );
+    assert.equal(reported === null, unresolved === null);
+    assert.match(unresolved, /untouched for 20d/);
+  });
+
+  // The other half of the same invariant: an unresolved state on a PR someone is
+  // still working on stays fatal. All 49 UNKNOWN PRs measured on 2026-09-26 had
+  // been touched within 7 days, so this is the common case, and PR #1962 —
+  // 4 competing approvals, UNKNOWN, touched the previous day — must keep failing.
+  it("keeps a recently-touched PR live even when GitHub reports nothing", () => {
+    for (const d of [0, 1, 7, MAX_IDLE_DAYS - 1, MAX_IDLE_DAYS]) {
+      assert.equal(
+        prDormancy({ number: 1962, mergeStateStatus: "UNKNOWN", updatedAt: daysAgo(d) }, NOW),
+        null,
+        `a PR touched ${d}d ago must stay in the audit`,
+      );
+    }
+    assert.ok(
+      prDormancy({ number: 1962, mergeStateStatus: "UNKNOWN", updatedAt: daysAgo(MAX_IDLE_DAYS + 0.01) }, NOW),
+      "strictly beyond the window defers",
+    );
+  });
+
+  // The no-weakening guarantee. A state GitHub reported is a state we trust, so
+  // age can never demote a PR GitHub would merge from. Measured 2026-09-26: of
+  // the 15 open PRs idle >14d, 13 were DIRTY but one was BEHIND and one
+  // UNSTABLE — both merge-capable, and both must stay fatal however old.
+  for (const state of ["CLEAN", "BEHIND", "UNSTABLE", "BLOCKED"]) {
+    it(`never demotes a ${state} PR on age alone`, () => {
+      assert.equal(
+        prDormancy({ number: 1, mergeStateStatus: state, updatedAt: daysAgo(365) }, NOW),
+        null,
+      );
+    });
+  }
+
+  // A state added to the enum after this was written is still a state we were
+  // told, so it is trusted as live regardless of age — same fail-closed reflex
+  // as the deny-list above.
+  it("trusts an unrecognised state as live even when the PR is ancient", () => {
+    assert.equal(
+      prDormancy({ number: 1, mergeStateStatus: "SOME_NEW_STATE", updatedAt: daysAgo(365) }, NOW),
+      null,
+    );
+  });
+
+  // Absence of evidence keeps the finding fatal: the fallback needs a real
+  // timestamp before it will defer anything.
+  for (const [label, updatedAt] of [
+    ["a missing updatedAt", undefined],
+    ["an explicit null", null],
+    ["an unparseable timestamp", "not-a-date"],
+    ["an empty string", ""],
+  ]) {
+    it(`keeps a PR with ${label} live rather than deferring it`, () => {
+      assert.equal(prDormancy({ number: 1, mergeStateStatus: "UNKNOWN", updatedAt }, NOW), null);
+      assert.equal(idleDays({ number: 1, updatedAt }, NOW), null);
+    });
+  }
+
+  it("still defers a draft ahead of every other test", () => {
+    assert.equal(
+      prDormancy({ number: 1, isDraft: true, mergeStateStatus: "UNKNOWN", updatedAt: daysAgo(99) }, NOW),
+      "draft",
+    );
+  });
+
+  it("partitions a stale unresolved PR into deferred, not failing", () => {
+    const finding = {
+      violation: "I1 PR #1220 @a9ee094a: 2 operative Ally App reviews",
+      fingerprint: "I1:1220:a9ee094a:5124949902,5124950225",
+    };
+    const prs = [{ number: 1220, mergeStateStatus: "UNKNOWN", updatedAt: daysAgo(20) }];
+    const { failing, deferred } = partitionByMergeEligibility([finding], prs, NOW);
+    assert.deepEqual(failing, []);
+    assert.equal(deferred.length, 1);
+    assert.match(deferred[0].reason, /untouched for 20d, merge state unresolved/);
+
+    // And it returns to failing the moment the PR is touched — deferral is a
+    // demotion with an expiry, not a suppression.
+    prs[0].updatedAt = daysAgo(0);
+    assert.equal(partitionByMergeEligibility([finding], prs, NOW).failing.length, 1);
+  });
+});
+
+describe("scopeSummary", () => {
+  const NOW = Date.parse("2026-09-26T23:28:32Z");
+  const daysAgo = (d) => new Date(NOW - d * 86_400_000).toISOString();
+
+  // The instrument. On a red run the classification counts previously reached
+  // stdout nowhere at all, so "deferred nothing because nothing qualified" and
+  // "never classified anything" were indistinguishable — which is how a working
+  // scope was read as a broken one for a full review cycle on PEN-2847.
+  it("reports live/dormant counts even when nothing was deferred", () => {
+    const { line, live } = scopeSummary(
+      [
+        { number: 1, mergeStateStatus: "CLEAN", updatedAt: daysAgo(1) },
+        { number: 2, mergeStateStatus: "UNKNOWN", updatedAt: daysAgo(1) },
+      ],
+      [],
+      NOW,
+    );
+    assert.match(line, /2 live \/ 2 open PR\(s\)/);
+    assert.match(line, /dormant by \[none\]/);
+    assert.match(line, /0 finding\(s\) deferred/);
+    assert.match(line, /CLEAN 1/);
+    assert.match(line, /UNKNOWN 1/);
+    // Returned so `main` reports the same number it printed rather than taking
+    // its own pass over the population.
+    assert.equal(live, 2);
+  });
+
+  it("breaks the dormant population down by reason", () => {
+    const { line, live } = scopeSummary(
+      [
+        { number: 1, mergeStateStatus: "CLEAN", updatedAt: daysAgo(1) },
+        { number: 2, mergeStateStatus: "DIRTY", updatedAt: daysAgo(1) },
+        { number: 3, isDraft: true, updatedAt: daysAgo(1) },
+        { number: 4, mergeStateStatus: "UNKNOWN", updatedAt: daysAgo(40) },
+      ],
+      [{ fingerprint: "I1:4:aaaaaaaa:1" }],
+      NOW,
+    );
+    assert.match(line, /1 live \/ 4 open PR\(s\)/);
+    assert.match(line, /merge state DIRTY 1/);
+    assert.match(line, /draft 1/);
+    assert.match(line, /untouched, merge state unresolved 1/);
+    assert.match(line, /1 finding\(s\) deferred/);
+    assert.equal(live, 1);
+  });
+
+  it("names an absent merge state rather than dropping it from the histogram", () => {
+    assert.match(scopeSummary([{ number: 1, updatedAt: daysAgo(1) }], [], NOW).line, /\(ABSENT\) 1/);
+    assert.match(
+      scopeSummary([{ number: 1, mergeStateStatus: null, updatedAt: daysAgo(1) }], [], NOW).line,
+      /\(ABSENT\) 1/,
+    );
+  });
+
+  it("labels an empty-string merge state instead of printing a bare count", () => {
+    // `""` is a value UNRESOLVED_MERGE_STATES deliberately recognises, so it
+    // reaches the histogram. Under `??` it rendered as `merge states [ 1]` — a
+    // count with no label, in the one line whose job is telling "classified
+    // nothing" from "nothing to classify".
+    const { line } = scopeSummary(
+      [
+        { number: 1, mergeStateStatus: "", updatedAt: daysAgo(1) },
+        { number: 2, mergeStateStatus: "CLEAN", updatedAt: daysAgo(1) },
+      ],
+      [],
+      NOW,
+    );
+    assert.match(line, /merge states \[(?:\(ABSENT\) 1, CLEAN 1|CLEAN 1, \(ABSENT\) 1)\]/);
+    assert.doesNotMatch(line, /merge states \[ /);
+  });
+
+  it("survives an empty repo", () => {
+    assert.match(scopeSummary([], [], NOW).line, /0 live \/ 0 open PR\(s\)/);
+    assert.match(scopeSummary(undefined, undefined, NOW).line, /0 finding\(s\) deferred/);
+  });
+});
+
+describe("main — reporting on the branch that actually runs", () => {
+  const NOW = Date.parse("2026-09-26T23:28:32Z");
+  const daysAgo = (d) => new Date(NOW - d * 86_400_000).toISOString();
+
+  // Two operative App reviews at one head => a real I1 violation.
+  const conflicted = (number, updatedAt, mergeStateStatus) => ({
+    number,
+    headSha: HEAD,
+    updatedAt,
+    mergeStateStatus,
+    isDraft: false,
+    author: { login: "someone" },
+    reviews: [
+      appReview({ id: 5124949902, state: "COMMENTED", body: canonicalBody(HEAD, "a") }),
+      appReview({ id: 5124950225, state: "COMMENTED", body: canonicalBody(HEAD, "b") }),
+    ],
+  });
+
+  // assertLiveScopeNonVacuous refuses an audit in which *every* PR is dormant,
+  // so every fixture carries a clean live PR alongside the subject — which is
+  // also what the real population looks like (1 dormant in 139 on 2026-09-26).
+  const cleanLive = {
+    number: 9001, headSha: HEAD, updatedAt: daysAgo(1), mergeStateStatus: "CLEAN",
+    isDraft: false, author: { login: "someone" },
+    reviews: [appReview({ id: 9001, state: "APPROVED" })],
+  };
+
+  function run(prs) {
+    const out = [];
+    const errs = [];
+    const exits = [];
+    main({
+      fetchPrs: () => [cleanLive, ...prs],
+      baseline: () => [],
+      log: (m) => out.push(String(m)),
+      err: (m) => errs.push(String(m)),
+      exit: (c) => exits.push(c),
+      now: NOW,
+      repo: "o/r",
+    });
+    return { out: out.join("\n"), errs: errs.join("\n"), exits };
+  }
+
+  it("prints the liveness-scope summary on a FAILING run", () => {
+    // The whole point. This guard has been red on effectively every scheduled
+    // run, and the classification counts used to be emitted only in the pass
+    // message — so the one branch anybody ever read carried no evidence of what
+    // the scope had done. A reader seeing `deferred = 0` could not tell a
+    // working scope from one that had stopped classifying.
+    const { out, errs, exits } = run([conflicted(1962, daysAgo(1), "UNKNOWN")]);
+    assert.deepEqual(exits, [1], "a live violation must still exit non-zero");
+    assert.match(errs, /guard FAILED/);
+    assert.match(out, /Liveness scope: 2 live \/ 2 open PR\(s\)/);
+    assert.match(out, /0 finding\(s\) deferred/);
+    // `exit` is injected and an injected exit returns, so the failing branch
+    // must `return` after it or execution falls through to the pass message.
+    // `main` is exported now, which makes a non-terminating exit a supported
+    // call shape rather than a test-only artifact — and a failing run that also
+    // prints "guard passed" is exactly the untrustworthy output PEN-2847 set
+    // out to remove.
+    assert.doesNotMatch(out, /guard passed/);
+  });
+
+  it("prints it on a PASSING run too", () => {
+    const clean = {
+      number: 1, headSha: HEAD, updatedAt: daysAgo(1), mergeStateStatus: "CLEAN",
+      isDraft: false, author: { login: "someone" },
+      reviews: [appReview({ id: 1, state: "APPROVED" })],
+    };
+    const { out, exits } = run([clean]);
+    assert.deepEqual(exits, []);
+    assert.match(out, /Liveness scope: 2 live \/ 2 open PR\(s\)/);
+    assert.match(out, /guard passed/);
+  });
+
+  // End-to-end form of the oscillation regression: the same untouched PR, the
+  // same finding, in both cache phases — the run's exit status must not depend
+  // on which phase it sampled.
+  it("returns the same verdict for an untouched PR in either cache phase", () => {
+    const stale = "2026-09-06T10:04:38Z";
+    const dirty = run([conflicted(1220, stale, "DIRTY")]);
+    const unknown = run([conflicted(1220, stale, "UNKNOWN")]);
+
+    assert.deepEqual(dirty.exits, [], "DIRTY phase defers");
+    assert.deepEqual(
+      unknown.exits,
+      [],
+      "UNKNOWN phase must defer too — a verdict that flips with GitHub's cache is unactionable",
+    );
+    const deferredCount = (o) => Number(o.match(/(\d+) finding\(s\) deferred/)?.[1]);
+    assert.ok(deferredCount(dirty.out) > 0, "the DIRTY phase must actually defer something");
+    assert.equal(
+      deferredCount(unknown.out),
+      deferredCount(dirty.out),
+      "both phases must defer the same findings, not merely both exit zero",
+    );
+  });
+
+  it("still fails a live PR carrying the same conflict", () => {
+    // The negative control for the test above: the deferral is about the PR
+    // being abandoned, not about the violation being tolerated.
+    const { exits, errs } = run([conflicted(1220, daysAgo(1), "UNKNOWN")]);
+    assert.deepEqual(exits, [1]);
+    assert.match(errs, /PR #1220/);
+  });
+});
+
+describe("PR_LIST_FIELDS", () => {
+  it("fetches every field the classifier reads", () => {
+    // prDormancy is fail-closed, so an unfetched field reads as undefined and
+    // silently disables a clause instead of erroring. Keep these tied together.
+    for (const field of ["isDraft", "mergeStateStatus", "updatedAt", "number", "headRefOid"]) {
+      assert.ok(
+        PR_LIST_FIELDS.split(",").includes(field),
+        `${field} must be fetched or the clause that reads it goes inert`,
+      );
+    }
+  });
+});
+
+describe("parseMaxIdleDays", () => {
+  it("defaults to 14 only when the variable is unset", () => {
+    assert.equal(parseMaxIdleDays(undefined), 14);
+    assert.equal(parseMaxIdleDays("7"), 7);
+  });
+
+  it("refuses the values that would read every unresolved PR as dormant", () => {
+    // "" is what an Actions `env:` bound to an unset variable or input yields.
+    for (const raw of ["", "  ", "0", "-1"]) {
+      assert.throws(() => parseMaxIdleDays(raw), /ALLY_REVIEW_MAX_IDLE_DAYS/, JSON.stringify(raw));
+    }
+  });
+
+  it("refuses a non-numeric value rather than silently never deferring", () => {
+    assert.throws(() => parseMaxIdleDays("abc"), /ALLY_REVIEW_MAX_IDLE_DAYS/);
   });
 });

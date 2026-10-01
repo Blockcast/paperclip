@@ -541,12 +541,15 @@ export function findViolations(prs) {
  *     without first re-entering scope. For `DIRTY` the exposure is usually nil —
  *     resolving conflicts means pushing, which moves the head, which sheds the
  *     violation outright.
- *   - **Not-updated-in-N-days (still rejected).** Staleness is not a state GitHub
- *     enforces anything against. A `CLEAN` PR untouched for 30 days merges on a
- *     click, with no push, no transition, and no run in between — the guard never
- *     gets its chance to red. That is unbounded fail-open on exactly the BLO-19778
- *     incident, and it is why #1525's two-day-old `BEHIND` measurement killed the
- *     window approach and still does.
+ *   - **Not-updated-in-N-days (only where GitHub reported no usable state).**
+ *     Staleness is not a state GitHub enforces anything against. A `CLEAN` PR
+ *     untouched for 30 days merges on a click, with no push, no transition, and
+ *     no run in between, so a window applied to a REPORTED state would be
+ *     unbounded fail-open on exactly the BLO-19778 incident (and #1525's
+ *     two-day-old `BEHIND` measurement is why). The window therefore applies
+ *     only when `mergeStateStatus` is unresolved; `CLEAN`, `BEHIND` and
+ *     `UNSTABLE` stay live at any age. See `prDormancy()` for the three tiers
+ *     and for the cross-run residual they do not close.
  *
  * Measured on the 121 open PRs of 2026-09-20: 71 live, 50 dormant. #1316
  * (`UNSTABLE`) and #1360 (`BEHIND`) — two of the four PRs that originally pinned
@@ -687,19 +690,116 @@ export function applyBaseline(violations, entries) {
 export const DORMANT_MERGE_STATES = new Set(["DIRTY"]);
 
 /**
+ * The values that mean "GitHub has not told us", as opposed to a real state.
+ *
+ * `mergeStateStatus` is computed lazily server-side and is absent far more often
+ * than the 5-of-121 measured when the deny-list above was written: 49 of 139 open
+ * PRs (35%) read `UNKNOWN` on 2026-09-26. Every one of those 49 had been touched
+ * within 7 days, so for a live PR "unresolved" is the normal reading and keeping
+ * it in the audit is correct.
+ */
+export const UNRESOLVED_MERGE_STATES = new Set(["", "UNKNOWN"]);
+
+/**
+ * Days a PR may sit untouched before an *unresolved* merge state is read as
+ * abandonment rather than as pending computation.
+ *
+ * 14d is outside the observed merge-latency distribution: over the 300 PRs merged
+ * into this repo between 2026-09-04 and 2026-09-26, p99 create->merge was 14.9d
+ * and only 4 (1.3%) lived longer than 14d at all. A PR's last touch is never
+ * earlier than its creation, so this is the conservative side of that figure.
+ */
+export const MAX_IDLE_DAYS = parseMaxIdleDays(process.env.ALLY_REVIEW_MAX_IDLE_DAYS);
+
+/**
+ * Reads `ALLY_REVIEW_MAX_IDLE_DAYS`: unset means 14, anything else must be a
+ * positive finite number or this throws. `""` is what an Actions `env:` bound to
+ * an unset variable or input yields, and `Number("")` is 0, which would read
+ * every unresolved PR touched more than 0 days ago as dormant -- green because
+ * it stopped checking. A negative value fails open the same way.
+ */
+export function parseMaxIdleDays(raw) {
+  if (raw === undefined) {
+    return 14;
+  }
+  const days = Number(raw);
+  if (String(raw).trim() === "" || !Number.isFinite(days) || days <= 0) {
+    throw new Error(
+      `ALLY_REVIEW_MAX_IDLE_DAYS must be a positive number of days, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return days;
+}
+
+/** Days since the PR was last touched, or `null` if that cannot be determined. */
+export function idleDays(pr, now) {
+  const at = Date.parse(String(pr?.updatedAt ?? ""));
+  if (!Number.isFinite(at)) {
+    return null;
+  }
+  return (now - at) / 86_400_000;
+}
+
+/**
  * Why a PR cannot merge right now, or `null` if it can.
  *
- * Unknown, missing and malformed inputs all resolve to `null` (live) on purpose:
- * the only thing that defers a finding is positive evidence that GitHub is
- * blocking the merge. Absence of evidence keeps the finding fatal.
+ * Three tiers, in order, and the order is the whole point:
+ *
+ * 1. GitHub reports a state it will not merge from (`DIRTY`, or a draft) -> defer.
+ * 2. GitHub reports any *other* state -> live, whatever the PR's age. A state we
+ *    were told is a state we trust, so nothing here can demote a PR GitHub would
+ *    merge from *in the run that observed the state*. `BEHIND` and `UNSTABLE` PRs
+ *    months old stay fatal. That guarantee is per-observation only — across runs
+ *    the same PR can be read `UNKNOWN` instead, and then tier 3 applies. See the
+ *    residual below.
+ * 3. GitHub reports nothing usable -> fall back to the PR's own activity clock,
+ *    which is always present and never oscillates.
+ *
+ * Tier 3 exists because tier 1 is not stable. `mergeStateStatus` flips between a
+ * real value and `UNKNOWN` as GitHub's cache turns over, so the same untouched PR
+ * changed verdict hour to hour: PR #1220, last touched 2026-09-06, alternated
+ * between fatal and deferred across ten consecutive hourly runs on 2026-09-26
+ * (16:31Z defer, 17:29Z fail, 18:34Z defer, 19:27Z fail, ...) with nothing about
+ * the PR changing. A guard whose verdict is decided by which phase of a cache it
+ * sampled cannot be acted on. Reading an unresolved state on a PR nobody has
+ * touched in a fortnight as dormant makes both phases agree.
+ *
+ * Absence of evidence still keeps a finding fatal everywhere else: an unparseable
+ * or missing `updatedAt`, and any idle PR inside the window, stay live.
+ *
+ * Residual, not closed here: tier 2's guarantee holds per observation, not across
+ * observations, so a PR whose state flips against `UNKNOWN` still changes the
+ * run's verdict between runs. Two cohorts, opposite directions:
+ *
+ *   - `DIRTY` <-> `UNKNOWN` INSIDE the window (tier 1 defers, tier 3 keeps it
+ *     live). Costs signal, not safety: both readings describe a PR GitHub
+ *     refuses to merge anyway. The measured `UNKNOWN` population was all touched
+ *     within 7 days, so this is the common cohort, not a corner.
+ *   - `CLEAN` <-> `UNKNOWN` PAST the window (tier 2 keeps it live, tier 3 defers
+ *     it). This one fails OPEN: GitHub would merge from the `CLEAN` reading, and
+ *     in the `UNKNOWN` phase the finding drops to a `::warning`, so a run with no
+ *     other finding goes green — the BLO-19778 shape this guard exists to catch.
+ *     Kept rather than removed because the cohort is small (only 1.3% of merges
+ *     lived past 14d) and the warning still prints, but it is a real gap.
+ *
+ * One lever closes both: carry a PR's last reported state across runs and prefer
+ * it over `UNKNOWN`, so `UNKNOWN` means "never observed" rather than "not
+ * observed this hour". Tracked in PEN-3604.
  */
-export function prDormancy(pr) {
+export function prDormancy(pr, now = Date.now()) {
   if (pr?.isDraft === true) {
     return "draft";
   }
   const state = String(pr?.mergeStateStatus ?? "").toUpperCase();
   if (DORMANT_MERGE_STATES.has(state)) {
     return `merge state ${state}`;
+  }
+  if (!UNRESOLVED_MERGE_STATES.has(state)) {
+    return null;
+  }
+  const idle = idleDays(pr, now);
+  if (idle !== null && idle > MAX_IDLE_DAYS) {
+    return `untouched for ${Math.floor(idle)}d, merge state unresolved`;
   }
   return null;
 }
@@ -714,14 +814,22 @@ export function prDormancy(pr) {
  * nothing — "green because it stopped checking", which PEN-2847 names as worse
  * than the permanent red it replaced. Same reflex as `assertPrListComplete` and
  * `assertHeadSha`: throw rather than assert nothing.
+ *
+ * The throw carries the classification histogram. This is the one scenario the
+ * scope summary was added to illuminate, and it is the one scenario the summary
+ * never reaches — `main` asserts before it logs, because there is no point
+ * reporting a run that is about to abort. Folding the counts into the message
+ * means the operator still sees which clause swallowed the population.
  */
-export function assertLiveScopeNonVacuous(prs, repo) {
+export function assertLiveScopeNonVacuous(prs, repo, now = Date.now()) {
   const rows = prs ?? [];
-  if (rows.length > 0 && rows.every((pr) => prDormancy(pr) !== null)) {
+  const { live, reasons, states } = classifyScope(rows, now);
+  if (rows.length > 0 && live === 0) {
     throw new Error(
       `every one of the ${rows.length} open PR(s) in ${repo} classified as unmergeable, ` +
         `so no finding could fail this run. That is a scoping bug, not a clean repo: ` +
-        `check that gh pr list still returns isDraft/mergeStateStatus.`,
+        `check that gh pr list still returns isDraft/mergeStateStatus/updatedAt. ` +
+        `dormant by [${formatCounts(reasons)}]; merge states [${formatCounts(states)}].`,
     );
   }
   return rows;
@@ -736,7 +844,7 @@ export function assertLiveScopeNonVacuous(prs, repo) {
  * absent from the fetched set — stays in `failing`, because "I could not tell
  * whether this one matters" must not read as "this one does not matter".
  */
-export function partitionByMergeEligibility(failing, prs) {
+export function partitionByMergeEligibility(failing, prs, now = Date.now()) {
   const byNumber = new Map((prs ?? []).map((pr) => [String(pr?.number), pr]));
   const live = [];
   const deferred = [];
@@ -744,7 +852,7 @@ export function partitionByMergeEligibility(failing, prs) {
   for (const item of failing ?? []) {
     const number = String(item?.fingerprint ?? "").split(":")[1];
     const pr = byNumber.get(number);
-    const reason = pr ? prDormancy(pr) : null;
+    const reason = pr ? prDormancy(pr, now) : null;
     if (reason) {
       deferred.push({ ...item, reason });
     } else {
@@ -804,6 +912,38 @@ export function assertHeadSha(row, repo) {
   return row;
 }
 
+/**
+ * `prDormancy` reads an unresolved `mergeStateStatus` on an idle PR as dormant,
+ * and an absent key is indistinguishable from GitHub *reporting* `UNKNOWN` once
+ * it reaches the classifier. That direction defers real findings, so a row that
+ * lost the field entirely -- a `gh` or API shape change -- must stop the run here
+ * rather than be read as "not computed yet". `""`, `null` and `UNKNOWN` are values
+ * GitHub returns and stay in `UNRESOLVED_MERGE_STATES`; only a missing key throws.
+ */
+export function assertMergeStateFetched(row, repo) {
+  if (!Object.hasOwn(row ?? {}, "mergeStateStatus")) {
+    throw new Error(
+      `gh pr list returned no mergeStateStatus key for ${repo}#${row?.number}. ` +
+        `An absent state would classify an idle PR as dormant and demote its ` +
+        `findings to warnings; check that PR_LIST_FIELDS is still honoured.`,
+    );
+  }
+  return row;
+}
+
+/**
+ * The `gh pr list` fields the audit depends on.
+ *
+ * Exported so a test can assert every field `prDormancy` reads is actually
+ * fetched. Dropping one here does not fail anything loudly — it just feeds the
+ * classifier `undefined`. For `updatedAt` that is fail-closed (the PR stays
+ * live), so the staleness clause would go quietly inert; for `mergeStateStatus`
+ * it is fail-OPEN (an idle PR reads as dormant), which is why a missing key is
+ * refused at fetch by `assertMergeStateFetched`. Either way every unit test
+ * would keep passing against hand-built PR objects.
+ */
+export const PR_LIST_FIELDS = "number,headRefOid,author,isDraft,mergeStateStatus,updatedAt";
+
 function fetchOpenPrs(repo) {
   // number + headRefOid both come back from this one call; fetching the head
   // via `gh api repos/{repo}/pulls/{number}` instead would pull a ~22 KB
@@ -819,18 +959,19 @@ function fetchOpenPrs(repo) {
       "--limit",
       String(PR_LIST_LIMIT),
       "--json",
-      "number,headRefOid,author,isDraft,mergeStateStatus",
+      PR_LIST_FIELDS,
     ]),
   );
 
   assertPrListComplete(rows, repo);
 
   return rows.map((row) => ({
-    number: assertHeadSha(row, repo).number,
+    number: assertMergeStateFetched(assertHeadSha(row, repo), repo).number,
     headSha: row.headRefOid,
     author: row.author,
     isDraft: row.isDraft,
     mergeStateStatus: row.mergeStateStatus,
+    updatedAt: row.updatedAt,
     reviews: JSON.parse(
       gh(["api", `repos/${repo}/pulls/${row.number}/reviews`, "--paginate"]),
     ),
@@ -842,18 +983,111 @@ function loadBaseline() {
   return parseBaseline(readFileSync(path, "utf8"), BASELINE_PATH);
 }
 
-function main() {
-  const repo = process.env.ALLY_REVIEW_REPO || "Blockcast/paperclip";
-  const prs = fetchOpenPrs(repo);
-  assertLiveScopeNonVacuous(prs, repo);
+/**
+ * Classifies every PR exactly once: how many are live, why the rest are dormant,
+ * and what `mergeStateStatus` values GitHub actually reported.
+ *
+ * One pass, shared by `scopeSummary` and `assertLiveScopeNonVacuous`, so the
+ * histogram an operator reads is the same classification the run acted on rather
+ * than a re-derivation that could drift from it.
+ *
+ * The state key uses `||`, not `??`: `""` is a value `UNRESOLVED_MERGE_STATES`
+ * deliberately recognises, and `String("")` rendered a bare count with no label
+ * (`merge states [ 1, CLEAN 1]`). Absent, `null` and `""` all mean "GitHub told
+ * us nothing usable" and all belong under one `(ABSENT)` bucket, in the one line
+ * whose job is telling "classified nothing" from "nothing to classify".
+ */
+function classifyScope(prs, now) {
+  const rows = prs ?? [];
+  const reasons = new Map();
+  const states = new Map();
+  let live = 0;
+  for (const pr of rows) {
+    const reason = prDormancy(pr, now);
+    if (reason === null) {
+      live += 1;
+    } else {
+      const key = reason.startsWith("untouched") ? "untouched, merge state unresolved" : reason;
+      reasons.set(key, (reasons.get(key) ?? 0) + 1);
+    }
+    const state = String(pr?.mergeStateStatus || "(absent)").toUpperCase();
+    states.set(state, (states.get(state) ?? 0) + 1);
+  }
+  return { total: rows.length, live, reasons, states };
+}
+
+/** Counts as `key n, key n`, commonest first, ties broken by name. */
+function formatCounts(m) {
+  return (
+    [...m.entries()]
+      .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
+      .map(([k, v]) => `${k} ${v}`)
+      .join(", ") || "none"
+  );
+}
+
+/**
+ * One line describing what the liveness scope actually did this run, plus the
+ * live count the pass message reports.
+ *
+ * Printed unconditionally, on the failing path as well as the passing one.
+ * Before this existed the classification counts reached stdout only inside the
+ * pass message, and the deferred block only rendered when non-empty — so on a
+ * red run, which is every run this guard has had, "deferred nothing because
+ * nothing qualified" and "never classified anything" looked identical. That cost
+ * a full review cycle on PEN-2847: a reader saw `deferred = 0` on two runs and
+ * could not tell a working scope from a broken one without re-deriving the whole
+ * population by hand.
+ *
+ * `live` is returned rather than recomputed by the caller so the summary and the
+ * pass message cannot disagree about the same number.
+ *
+ * `assertLiveScopeNonVacuous` throws when *every* PR classifies dormant. There is
+ * deliberately no counterpart throw for zero dormant — an all-live repo is
+ * legitimate — so this line is the only thing that distinguishes it.
+ */
+export function scopeSummary(prs, deferred, now = Date.now()) {
+  const { total, live, reasons, states } = classifyScope(prs, now);
+  return {
+    live,
+    line:
+      `Liveness scope: ${live} live / ${total} open PR(s); ` +
+      `dormant by [${formatCounts(reasons)}]; merge states [${formatCounts(states)}]; ` +
+      `${(deferred ?? []).length} finding(s) deferred.`,
+  };
+}
+
+/**
+ * Runs the audit and reports it.
+ *
+ * Every collaborator is injectable so the reporting itself can be tested. The
+ * failing branch is the one this guard has taken on effectively every scheduled
+ * run since it was written, and until PEN-2847 it was the only branch with no
+ * test over its output at all — which is how `liveCount` came to be computed and
+ * then printed exclusively on the branch that never runs.
+ */
+export function main({
+  fetchPrs = fetchOpenPrs,
+  baseline = loadBaseline,
+  log = console.log,
+  err = console.error,
+  exit = process.exit,
+  now = Date.now(),
+  repo = process.env.ALLY_REVIEW_REPO || "Blockcast/paperclip",
+} = {}) {
+  const prs = fetchPrs(repo);
+  assertLiveScopeNonVacuous(prs, repo, now);
   const violations = findViolations(prs);
-  const baselined = applyBaseline(violations, loadBaseline());
+  const baselined = applyBaseline(violations, baseline());
   const { suppressed, staleEntries } = baselined;
-  const { failing, deferred } = partitionByMergeEligibility(baselined.failing, prs);
-  const liveCount = prs.filter((pr) => prDormancy(pr) === null).length;
+  const { failing, deferred } = partitionByMergeEligibility(baselined.failing, prs, now);
+  const { line: scopeLine, live: liveCount } = scopeSummary(prs, deferred, now);
+
+  log(scopeLine);
+  log("");
 
   for (const entry of staleEntries) {
-    console.log(
+    log(
       `::warning title=Stale ally-review-consistency baseline entry::` +
         `${BASELINE_PATH} still suppresses ${entry.fingerprint} (PR #${entry.pr}, ${entry.issue}) but no ` +
         `current violation matches it — the finding is resolved or the PR moved. Remove the entry.`,
@@ -861,47 +1095,48 @@ function main() {
   }
 
   if (suppressed.length > 0) {
-    console.log(`Suppressed by ${BASELINE_PATH} (${suppressed.length} known violation(s)):\n`);
+    log(`Suppressed by ${BASELINE_PATH} (${suppressed.length} known violation(s)):\n`);
     for (const { violation, entry } of suppressed) {
-      console.log(`  [${entry.issue}] ${violation}`);
+      log(`  [${entry.issue}] ${violation}`);
     }
-    console.log("");
+    log("");
   }
 
   if (deferred.length > 0) {
-    console.log(
+    log(
       `Deferred (${deferred.length}) — real, unbaselined findings on PR(s) GitHub will not ` +
         `merge from. Each returns to failing the moment its PR becomes mergeable:\n`,
     );
     for (const { violation, fingerprint, reason } of deferred) {
-      console.log(
+      log(
         `::warning title=Ally review-consistency finding on an unmergeable PR::` +
           `${violation} [${reason}]`,
       );
-      console.log(`    fingerprint: ${fingerprint}`);
+      log(`    fingerprint: ${fingerprint}`);
     }
-    console.log("");
+    log("");
   }
 
   if (failing.length > 0) {
-    console.error(
+    err(
       `Ally review-consistency guard FAILED for ${repo} (${failing.length} unbaselined violation(s) on mergeable PR(s)):\n`,
     );
     for (const { violation, fingerprint } of failing) {
-      console.error(`  ${violation}`);
-      console.error(`    fingerprint: ${fingerprint}`);
+      err(`  ${violation}`);
+      err(`    fingerprint: ${fingerprint}`);
     }
-    console.error(
+    err(
       "\nA violation means a PR may present as reviewed or approved without a single " +
         "operative attestation backing its current head. See BLO-19778.\n" +
         `Fix the PR, or — only if the finding is genuinely accepted — add its fingerprint to ` +
         `${BASELINE_PATH} with the PR number, the owning issue, and a note. A baseline entry is ` +
         `pinned to the head SHA and review IDs above, so it expires the moment the PR is touched.`,
     );
-    process.exit(1);
+    exit(1);
+    return;
   }
 
-  console.log(
+  log(
     `Ally review-consistency guard passed: no unbaselined attestation conflicts found across ` +
       `${liveCount} mergeable PR(s) of ${prs.length} open in ${repo}` +
       `${deferred.length > 0 ? `, ${deferred.length} finding(s) deferred on unmergeable PRs` : ""}.`,
