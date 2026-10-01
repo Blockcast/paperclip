@@ -325,9 +325,12 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
+    await vi.waitFor(() => {
+      const el = container.querySelector('[data-testid="document-annotation-count-plan"]');
+      expect(el).not.toBeNull();
+      expect(el!.textContent).toContain("1");
+    });
     const chip = container.querySelector('[data-testid="document-annotation-count-plan"]');
-    expect(chip).not.toBeNull();
-    expect(chip!.textContent).toContain("1");
     expect(mockAnnotationsApi.list).toHaveBeenCalledTimes(1);
 
     await act(async () => {
@@ -561,6 +564,9 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
+    await vi.waitFor(() => {
+      expect(container.querySelectorAll("[data-thread-id]")).toHaveLength(3);
+    });
     const order = Array.from(container.querySelectorAll("[data-thread-id]"))
       .map((el) => el.getAttribute("data-thread-id"));
     expect(order).toEqual(["thread-early", "thread-mid", "thread-late"]);
@@ -640,6 +646,9 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
 
     // Click the open thread to expand it.
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-thread-id="open-1"]')).not.toBeNull();
+    });
     const threadCard = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
     expect(threadCard).not.toBeNull();
     await act(async () => threadCard!.click());
@@ -770,7 +779,9 @@ describe("IssueDocumentAnnotations", () => {
       selector: mockPendingAnchor.selector,
       body: "New anchored comment",
     });
-    expect(mockAnnotationsApi.list.mock.calls.length).toBeGreaterThan(1);
+    await vi.waitFor(() => {
+      expect(mockAnnotationsApi.list.mock.calls.length).toBeGreaterThan(1);
+    });
   });
 
   it("keeps the composer visible with the draft when creating a thread fails", async () => {
@@ -875,6 +886,9 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-thread-id="open-1"]')).not.toBeNull();
+    });
     const openThread = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
     await act(async () => openThread!.click());
     await flush();
@@ -911,8 +925,10 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-thread-id="open-1"]')).not.toBeNull();
+    });
     const openThread = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
-    expect(openThread).not.toBeNull();
     await act(async () => openThread!.click());
     await flush();
 
@@ -960,8 +976,10 @@ describe("IssueDocumentAnnotations", () => {
     await flush();
     await flush();
 
+    await vi.waitFor(() => {
+      expect(container.querySelector('[data-thread-id="open-1"]')).not.toBeNull();
+    });
     const openThread = container.querySelector('[data-thread-id="open-1"]') as HTMLElement | null;
-    expect(openThread).not.toBeNull();
     await act(async () => openThread!.click());
     await flush();
 
