@@ -70,6 +70,16 @@ describe("classifyFdTarget", () => {
     expect(classifyFdTarget("anon_inode:[" + "x".repeat(64) + "]")).toBe("anon_inode");
   });
 
+  it("keeps the hyphenated subtypes the kernel actually uses", () => {
+    // `bpf-map` / `bpf-prog` / `bpf-link` are real kernel anon_inode names. A
+    // lowercase-and-underscore-only alphabet collapsed all of them to bare
+    // `anon_inode`, discarding real information, and made the `bpf-map:`
+    // example in classifyFdTarget's own comment describe behaviour the code
+    // did not have. The alphabet stays closed — it just includes `-`.
+    expect(classifyFdTarget("anon_inode:[bpf-map]")).toBe("anon_inode:bpf-map");
+    expect(classifyFdTarget("bpf-map:[7]")).toBe("bpf-map");
+  });
+
   it("bounds a file path to its directory at a fixed depth", () => {
     // Real shape: the label must stop before the company UUID, which churns.
     expect(
@@ -235,6 +245,36 @@ describe("collectFdClassSnapshot", () => {
     expect(snapshot!.classes.get(FD_CLASS_TRUNCATED)).toBe(40);
     const summed = [...snapshot!.classes.values()].reduce((a, b) => a + b, 0);
     expect(summed).toBe(50);
+  });
+
+  it("truncates by descriptor NUMBER, not by readdir's lexicographic order", () => {
+    // `readdirSync` on procfs returns lexicographic order under Node —
+    // measured: 0,1,10,11,…,2,20,21,3. (The kernel iterates numerically, so
+    // sampling this in Python shows numeric order and hides it.) Slicing that
+    // raw takes a prefix biased toward low leading digits rather than the
+    // lowest-numbered descriptors, and it does so precisely when truncation
+    // engages — the leak scenario, where a biased sample of the table is the
+    // one thing this must not report.
+    const inspectedFds: number[] = [];
+    const snapshot = collectFdClassSnapshot({
+      dir: "/fake",
+      // 25 descriptors handed back in the order procfs+Node really produce.
+      readdir: () => [...Array.from({ length: 25 }, (_, i) => String(i))].sort(),
+      readlink: (path) => {
+        inspectedFds.push(Number(path.slice("/fake/".length)));
+        return "socket:[1]";
+      },
+      maxEntries: 5,
+    });
+
+    expect([...inspectedFds].sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4]);
+    // Asserted against a literal: lexicographic slicing would have inspected
+    // 0,1,10,11,12 instead, which is a different and biased sample.
+    expect(inspectedFds).not.toContain(10);
+    expect(snapshot!.total).toBe(25);
+    expect(snapshot!.classes.get(FD_CLASS_TRUNCATED)).toBe(20);
+    const summed = [...snapshot!.classes.values()].reduce((a, b) => a + b, 0);
+    expect(summed).toBe(25);
   });
 
   it("folds the long tail into `other` so the series count stays bounded", () => {
