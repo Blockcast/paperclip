@@ -179,3 +179,68 @@ describe("PEN-2462: provider_throttled_no_progress resolves from errorCode alone
     ).toBe("transient_upstream");
   });
 });
+
+// BLO-35668 — the same drift as BLO-28924 above, one engine over.
+//
+// `skill_materialization_pending` (BLO-32055, #1669) replaced `adapter_failed` at
+// the claude-k8s emit site. The PR argued retryability was "preserved exactly"
+// because the new code joined TRANSIENT_INFRA_CONTINUATION_ERROR_CODES, and
+// recovery-classifiers.test.ts asserts that parity — in the issue CONTINUATION
+// sweep. That sweep is issue-scoped. A pr_review run is not an issue run, so
+// `shouldScheduleAutomaticRunRetry` is its ONLY retry path, and there
+// `adapter_failed` is admitted by a literal that the rename did not update.
+//
+// Net effect measured 2026-10-01 over 18h of Ally runs: 13 failures, 0 retries,
+// against 24 `transient_failure_retry` runs for its sibling codes in the same
+// window. The PR under-specified its own claim and the test followed it, so the
+// parity below is asserted in BOTH engines deliberately — classification in one
+// is not enrolment in the other.
+describe("BLO-35668: skill_materialization_pending retries wherever adapter_failed does", () => {
+  const prReview = { reviewKind: "pr_review" };
+
+  it("schedules a retry for a pr_review run", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "skill_materialization_pending",
+        resultJson: null,
+        contextSnapshot: prReview,
+      }),
+    ).toBe(true);
+  });
+
+  // The actual invariant the #1669 comment asserts. Written as a comparison
+  // rather than a literal `true` so it keeps holding if `adapter_failed`'s own
+  // gating is ever narrowed — the two must move together or not at all.
+  it.each([
+    ["pr_review context", prReview],
+    ["issue context", { issueId: "issue-a" }],
+    ["neither", {}],
+  ])("matches adapter_failed exactly (%s)", (_label, contextSnapshot) => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "skill_materialization_pending",
+        resultJson: null,
+        contextSnapshot,
+      }),
+    ).toBe(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "adapter_failed",
+        resultJson: null,
+        contextSnapshot,
+      }),
+    );
+  });
+
+  // Negative control. `skill_not_found` is the non-catalog-backed half of the
+  // same adapter ternary and is a permanent configuration fault; if the fix above
+  // had been written as "any skill_* code retries", this is what it would break.
+  it("does not extend to the permanent skill_not_found", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "skill_not_found",
+        resultJson: null,
+        contextSnapshot: prReview,
+      }),
+    ).toBe(false);
+  });
+});
