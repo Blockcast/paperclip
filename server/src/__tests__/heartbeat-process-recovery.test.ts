@@ -7088,6 +7088,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.escalated).toBe(0);
     expect(result.issueIds).not.toContain(issueId);
 
+    // Deliberately sweep-global: this counts `db.transaction` across the whole
+    // `reconcileStrandedAssignedIssues` pass, not just this candidate's escalation.
+    // If you are adding legitimate transactional work elsewhere in the sweep, this
+    // will go red on your change without the hoisted gate having regressed — widen
+    // the fixture rather than reading it as a PEN-3636 regression.
     expect(transactionCalls).toBe(0);
 
     // And the suppression is still inert on the row itself.
@@ -7564,12 +7569,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           .set({ status: "in_progress", completedAt: null })
           .where(eq(issues.id, blockerIssueId));
       }
-      const blockerMutationApplied = true;
 
       heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
       const result = await heartbeat.reconcileStrandedAssignedIssues();
 
-      expect(blockerMutationApplied).toBe(true);
       expect(result.escalated).toBe(0);
       expect(result.issueIds).not.toContain(issueId);
 
@@ -7577,6 +7580,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(source?.status).toBe("in_progress");
       expect(source?.assigneeAgentId).toBe(agentId);
       await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([blockerIssueId]);
+
+      // Witness the injected mutation itself. `sourceBlockerIssueIds` reads only
+      // `issueRelations`, so it proves the "added" arm (which inserts the relation)
+      // but cannot see the "reopened" arm, whose relation already existed and whose
+      // mutation is a status change. Asserting the blocker is open covers both arms:
+      // "added" inserts it `in_progress`, "reopened" updates it back to `in_progress`.
+      const blocker = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, blockerIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(blocker?.status).toBe("in_progress");
+      expect(blocker?.completedAt).toBeNull();
 
       const recoveryActions = await db
         .select()

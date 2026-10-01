@@ -7697,22 +7697,12 @@ export function recoveryService(
     // *before* the transaction opens rather than inside it.
     //
     // It used to sit ~150 lines below, after the transaction had taken two
-    // advisory locks and two round-trips. That made it the single most expensive
-    // no-op in the recovery chain. Measured on one production pass 2026-09-29:
-    // this arm suppressed 994 of 2,234 candidates while the whole pass acted on
-    // 4 rows and ran 29m21s — 85% of a 34m31s chain. For each of those 994 the
-    // sweep opened a transaction, took `lockIssueOwnership`, took
-    // `lockIssueParentMutationCompany`, ran `SELECT … FOR UPDATE` and
-    // `getLatestIssueRun`, then evaluated a condition on values it already held
-    // before any of it, bumped three counters and returned null. Zero writes.
-    //
-    // The second lock is the one that matters. `lockIssueOwnership` is per-issue,
-    // so it contends only with concurrent work on that same issue and does not
-    // scale with the candidate population. `lockIssueParentMutationCompany` is a
-    // single *company-global* mutex (`issues.ts`), taken by every create/update/
-    // parent mutation in the company. Queueing behind it once per candidate, with
-    // a median ~45 concurrent runs, is a mechanism that scales superlinearly with
-    // population — which is the shape this pass regressed into.
+    // advisory locks (one of them `lockIssueParentMutationCompany`, a
+    // company-global mutex) and two reads, to evaluate a condition on values it
+    // already held — making it the most expensive no-op in the recovery chain.
+    // The measurements that motivated the hoist are on PEN-3636; they are not
+    // restated here because they date a single production pass and will not be
+    // re-verified against this code.
     //
     // Hoisting is return-value-identical for every candidate. The three early
     // returns the transaction can take before reaching this point (`!fresh`, the
