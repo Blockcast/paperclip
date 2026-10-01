@@ -53,6 +53,15 @@ interface UpgradeContext {
    * board watcher as a viewer.
    */
   membershipRole?: string | null;
+  /**
+   * PEN-3142: the actor source the upgrade authenticated with, in the REST
+   * vocabulary, so the transcript gate asks the same question the REST twin
+   * does (it refuses the operator short-circuit to `cloud_tenant`). Set
+   * explicitly rather than defaulted in the gate — no upgrade path produces
+   * `cloud_tenant` today, and this is what makes that a property of this file
+   * rather than an assumption downstream.
+   */
+  actorSource?: "local_implicit" | "session" | "cloud_tenant";
   /** The `local_trusted` board, which has no membership row to carry. */
   trustedLocal?: boolean;
 }
@@ -186,6 +195,7 @@ async function authorizeUpgrade(
       companyId,
       actorType: "board",
       actorId: userId,
+      actorSource: "session",
       // Null for an instance admin with no membership in this company: the
       // transcript gate then falls through to the authorization service, which
       // answers that case on `allow_instance_admin` rather than on a role.
