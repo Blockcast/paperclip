@@ -242,12 +242,16 @@ const LATE_BACKPRESSURE_RUN: StalledRun = {
  *
  * Both halves are load-bearing, and `setImmediate` specifically. Blocking leaves the
  * child's stdout unread in the pipe. Which phase you block in then decides the release
- * order, because libuv samples `loop->time` once per iteration: block inside a timers-
- * or poll-phase callback and that sample is stale, so the overdue timer cannot fire
- * until the *next* iteration — which is after the poll that delivers the buffered read.
- * From the check phase the block ends the iteration, so the next one re-samples the
- * clock and runs timers first. Measured on Node 24, 5/5 runs each way; it is also why a
- * plain `await` here passed in isolation and failed in a full file run.
+ * order, because timers *run* at exactly one point per loop iteration — `uv__run_timers`,
+ * ahead of the poll. (Note the weaker-looking claim that libuv samples `loop->time` once
+ * per iteration is not the invariant and is falsifiable: `uv__io_poll` does re-call
+ * `uv__update_time` while recomputing its timeout across partial waits. The run-point
+ * invariant is the one this depends on, and it is stronger.) Block inside a timers- or
+ * poll-phase callback and the rest of that same iteration — including its poll — runs
+ * first, delivering the buffered read before the overdue timer. From the check phase the
+ * block ends the iteration, so the next one runs timers before polling. Measured on
+ * Node 24, 5/5 runs each way; it is also why a plain `await` here passed in isolation
+ * and failed in a full file run.
  */
 async function holdEventLoopAfterPoll(ms: number): Promise<void> {
   await new Promise((resolve) => setImmediate(resolve));
