@@ -11468,29 +11468,39 @@ describe("PR review convergence signal (BLO-35909)", () => {
     expect(__test_bodyReRaisesPriorFinding(undefined)).toBe(false);
   });
 
-  // BLO-38809: the resolve site must CLASSIFY, not just forward the body.
+  // BLO-38809: a resolve site must CLASSIFY, not just forward the body.
   // reRaisesPriorFinding falls back to `bodyReRaisesPriorFinding(prFeedbackBody(context))`
-  // when the field is absent, so dropping the resolve-time line still yields a
+  // when the field is absent, so dropping a resolve-time line still yields a
   // boolean and nothing goes red — it just re-derives the verdict off the
   // CLAMPED body, which is the pre-BLO-35909 behaviour. Only a ledger past the
   // clamp boundary can tell the two paths apart, so this fixture puts one there
   // (frr#61's buckets sat at bytes 4248/4273 against the 4096-byte clamp).
+  //
+  // Shared by both producers' guards below. The Important bucket is what makes
+  // the body actionable feedback, which the `issue_comment` resolve branch
+  // requires before it will return a context at all.
+  const stillPresent = "- **prior:de0d81ab important 1** — still-present — head has moved on";
+  const ledgerPastTheClamp = [
+    "## Ally — Consolidated PR Review",
+    "",
+    "### Important Issues (1)",
+    "",
+    "- **[tests]** a finding, so this body reads as actionable feedback.",
+    "",
+    "### Suggestions (60)",
+    "",
+    ...Array.from(
+      { length: 60 },
+      (_, i) => `- nit ${i}: prose padding so the ledger below lands past the 4096-byte clamp boundary.`,
+    ),
+    "",
+    "### Prior Findings Dispositioned",
+    "",
+    stillPresent,
+  ].join("\n");
+
   it("classifies the ledger off the RAW review body, past the clamp boundary (BLO-38809)", () => {
-    const stillPresent = "- **prior:de0d81ab important 1** — still-present — head has moved on";
-    const pastTheClamp = [
-      "## Ally — Consolidated PR Review",
-      "",
-      "### Suggestions (60)",
-      "",
-      ...Array.from(
-        { length: 60 },
-        (_, i) => `- nit ${i}: prose padding so the ledger below lands past the 4096-byte clamp boundary.`,
-      ),
-      "",
-      "### Prior Findings Dispositioned",
-      "",
-      stillPresent,
-    ].join("\n");
+    const pastTheClamp = ledgerPastTheClamp;
 
     const ctx = __test_resolveEventContext("pull_request_review", {
       action: "submitted",
@@ -11514,6 +11524,41 @@ describe("PR review convergence signal (BLO-35909)", () => {
 
     // The guard: the field must be PRESENT on the resolved context. `toBe(true)`
     // rather than a truthiness check so the absent-field case (undefined) fails.
+    expect(ctx!.reviewReRaisesPriorFinding).toBe(true);
+  });
+
+  // The SECOND producer of the same field, and the one that bites in practice:
+  // Ally frequently answers as a plain PR comment and files no review object at
+  // all, so this is a live surface rather than a symmetry exercise. Identical
+  // hazard and identical direction — `commentBody` is clamped on the context, so
+  // without the resolve-time classification the `??` fallback re-derives `false`
+  // ("no finding re-raised") and the escalation is suppressed.
+  it("classifies the ledger off the RAW comment body, past the clamp boundary (BLO-38809)", () => {
+    const ctx = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 61,
+        title: "fix(frr): BLO-35909 convergence signal",
+        body: null,
+        html_url: "https://github.com/Blockcast/frr/pull/61",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/frr/pulls/61" },
+      },
+      comment: {
+        id: 987654,
+        body: ledgerPastTheClamp,
+        html_url: "https://github.com/Blockcast/frr/pull/61#issuecomment-987654",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/frr" },
+    });
+    expect(ctx).not.toBeNull();
+
+    // Same control, same reason: prFeedbackBody is `reviewBody ?? commentBody`
+    // and `reviewBody` is undefined on an issue_comment context, so this is
+    // exactly what the fallback would read.
+    expect(ctx!.commentBody).not.toContain("still-present");
+    expect(__test_bodyReRaisesPriorFinding(ctx!.commentBody)).toBe(false);
+
     expect(ctx!.reviewReRaisesPriorFinding).toBe(true);
   });
 });
