@@ -87,9 +87,9 @@ import {
   heapSnapshotSweepKeep,
   listHeapSnapshots,
   listResidualHeapSnapshots,
-  newestHeapSnapshotStampMs,
   planHeapSnapshotStartup,
   pruneHeapSnapshots,
+  seedLastAutoSnapshotAtMs,
   takeHeapSnapshot,
 } from "./services/heap-snapshot.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -2512,6 +2512,24 @@ export async function startServer(): Promise<StartedServer> {
       maxAgeMs: config.heapSnapshotMaxAgeMinutes * 60 * 1000,
     };
     const heapSnapshotPollIntervalMs = config.heapSnapshotPollIntervalSeconds * 1000;
+    // Resolved before the state literal so the failure has somewhere to be
+    // reported from. `seedLastAutoSnapshotAtMs` never throws, which is the whole
+    // reason it exists: this read is the only one on this path that runs ABOVE
+    // the `config.heapSnapshotEnabled` branch below, so it is reached on every
+    // worker boot including every deployment that never enabled the feature.
+    // Read bare, an unreadable snapshot directory rejected startServer() — which
+    // is invoked as `void startServer().catch(() => process.exit(1))` — and so
+    // crash-looped the worker tier over a switched-off diagnostic.
+    const autoSnapshotSeed = seedLastAutoSnapshotAtMs(heapSnapshotConfig.dir);
+    if (autoSnapshotSeed.readError !== null) {
+      logger.error(
+        { err: autoSnapshotSeed.readError, snapshotDir: heapSnapshotConfig.dir },
+        "Heap snapshot directory could not be read at startup — the automatic trigger's cross-restart spacing is " +
+          "unseeded for this boot, so the first automatic capture after a restart is unthrottled and may land close " +
+          "enough to its predecessor that the retained pair is not hours apart",
+      );
+    }
+
     const heapSnapshotState: {
       lastAutoSnapshotAtMs: number | null;
       lastSentinelSnapshotAtMs: number | null;
@@ -2525,7 +2543,14 @@ export async function startServer(): Promise<StartedServer> {
       // `prunedCount` moves, and `findConcurrentSnapshotWriters` cannot see it
       // because a restart's predecessor wrote before our start and the
       // successor shares no pid with it. (Ally review, PEN-3631.)
-      lastAutoSnapshotAtMs: newestHeapSnapshotStampMs(heapSnapshotConfig.dir),
+      //
+      // The seed reads the whole directory, so on the ReadWriteMany claim a peer
+      // replica's capture throttles this one's first automatic capture too. That
+      // is intended rather than incidental: `keep` is a directory-wide cap, so
+      // peer captures are what this replica's would be pruned against, and
+      // spacing only against our own would let two replicas restart into a pair
+      // minutes apart — the exact outcome the seed exists to prevent.
+      lastAutoSnapshotAtMs: autoSnapshotSeed.stampMs,
       // Left null deliberately: a human request after a restart should be
       // honoured promptly. See `newestHeapSnapshotStampMs`.
       lastSentinelSnapshotAtMs: null,
