@@ -225,9 +225,23 @@ env:
 ports:
   - { name: http,   containerPort: 8080 }
   - { name: health, containerPort: 8081 }
-readinessProbe: { httpGet: { path: /healthz, port: health } }
-livenessProbe:  { httpGet: { path: /healthz, port: health } }
+readinessProbe:
+  httpGet: { path: /healthz, port: health }
+  periodSeconds: 5
+  timeoutSeconds: 1
+  failureThreshold: 3
+livenessProbe:
+  httpGet: { path: /healthz, port: health }
+  periodSeconds: 15
+  timeoutSeconds: 1
+  failureThreshold: 3
 ```
+
+The probe fields are spelled out rather than left to defaults because the
+reasoning elsewhere in this file depends on their values: `timeoutSeconds: 1` is
+what the accept probe's own 250ms connect timeout sits inside, and
+`failureThreshold: 3` is why three consecutive failures restart the
+authenticated proxy rather than drop a sample.
 
 Four properties this port is required to keep, all pinned in `server.test.ts`:
 
@@ -306,8 +320,17 @@ remote-node]` does not match traffic the pod originates to itself — so this
 costs no policy surface. The result is cached for 1s so that an unauthenticated
 flood of health requests cannot amplify into the accept queue it measures.
 
-A blocked event loop is caught separately and for free: the health handler runs
-on that same loop, so it simply stops answering.
+A blocked event loop is caught separately: the health handler runs on that same
+loop, so it simply stops answering, and the kubelet's own `timeoutSeconds`
+decides. The accept probe deliberately does **not** tighten that. Its timeout
+defers one loop turn (`setImmediate`) before reporting failure, because Node
+services timers before poll: without the deferral, a loop that had been blocked
+past the probe's 250ms delivered the expired timer ahead of a connect the kernel
+had already completed, and the probe reported a healthy listener wedged — 20 of
+40 trials against a real `http.Server` under a 400ms stall. That would have put
+a 250ms verdict, cached for 1s, on the liveness path in place of the kubelet's
+1s one, and three of them restart the authenticated proxy. Transient loop
+latency is not what this probe is for.
 
 The value must be a plain integer in 1–65535 and must differ from `PORT`.
 Anything else fails startup rather than falling back — a port that silently

@@ -1489,8 +1489,23 @@ export function createHealthServer(isServing: () => boolean | Promise<boolean>):
  *     is full (`tcp_abort_on_overflow=0`), the connect never completes, the
  *     timeout fires, 503.
  *   - **Blocked event loop** → caught, but by the health handler sharing that
- *     loop, not by this probe; the kernel completes the handshake without the
- *     process, so the connect alone would succeed.
+ *     loop, not by this probe. The kernel completes the handshake without the
+ *     process, so the connect itself is unaffected by the stall — but the
+ *     *verdict* was, until the `setImmediate` at the timeout below. Node
+ *     services the timers phase before the poll phase, so a loop that was
+ *     blocked past `timeoutMs` delivers the expired timer first and the
+ *     already-completed connect second; `finish(false)` won that race and the
+ *     probe reported a healthy listener wedged. Measured on a healthy
+ *     `http.Server` under a 400ms synchronous stall: 20 of 40 trials `false`
+ *     before the deferral, 0 of 40 after (PEN-3052 review).
+ *
+ *     That verdict mattered more than a dropped sample, which is why it is
+ *     fixed rather than noted: this probe's 250ms timeout is 4x stricter than
+ *     the kubelet's 1s default `timeoutSeconds`, and the result is cached for
+ *     `ttlMs`, so one stall could outlive the request that caused it. The
+ *     handler going quiet under the kubelet's own timeout is the intended
+ *     detection for a blocked loop; this probe must not quietly tighten it
+ *     into a restart on transient loop latency.
  *
  * The result is cached for `ttlMs` because nothing in front of this port
  * authenticates. Without it, each unauthenticated health request would open a
@@ -1511,7 +1526,8 @@ export function createHealthServer(isServing: () => boolean | Promise<boolean>):
  *     behaviour: unbounded concurrent connects, worst exactly when the accept
  *     queue is wedged and every connect is running to its full timeout. This
  *     cannot pin a stale result, because `connectOnce` always settles within
- *     `timeoutMs` — the socket timeout is armed before any await point.
+ *     `timeoutMs` plus one loop turn — the socket timeout is armed before any
+ *     await point, and the `setImmediate` below adds that single turn.
  */
 export function createProxyAcceptProbe(
   port: number,
@@ -1533,7 +1549,16 @@ export function createProxyAcceptProbe(
         socket.destroy();
         resolve(ok);
       };
-      socket.setTimeout(timeoutMs, () => finish(false));
+      // `setImmediate` rather than deciding in the timer callback (PEN-3052
+      // review). A fired timer means `timeoutMs` elapsed; it does NOT mean the
+      // accept queue is wedged, because the loop being blocked expires the
+      // timer just as readily. Node runs timers before poll, so on resume the
+      // expired timer is serviced before a connect the kernel already
+      // completed. Deferring to the check phase puts the decision after poll,
+      // so that connect lands first; `finish` is idempotent via `settled`, so
+      // this becomes a no-op rather than a second verdict. Costs one loop turn
+      // on a genuine timeout, against 250ms.
+      socket.setTimeout(timeoutMs, () => setImmediate(() => finish(false)));
       socket.once("connect", () => finish(true));
       socket.once("error", () => finish(false));
     });

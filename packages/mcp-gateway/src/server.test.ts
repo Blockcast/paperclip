@@ -2199,6 +2199,34 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
       }
     });
 
+    // A fired timer means `timeoutMs` elapsed, not that the accept queue is
+    // wedged — a blocked event loop expires it just as readily, and Node runs
+    // the timers phase before the poll phase, so on resume the expired timer is
+    // delivered before a connect the kernel already completed. Without the
+    // `setImmediate` in the timeout handler, `finish(false)` wins that race and
+    // the probe reports a healthy listener dead. Against a real `http.Server`
+    // under a 400ms synchronous stall that was 20 of 40 trials; a restart of
+    // the authenticated proxy needs three.
+    //
+    // Pinned on emit order rather than on a real stall, which is a genuine race
+    // and would land here as a flaky test. Emitting both events in one turn,
+    // timeout first, is exactly the ordering the loop produces on resume.
+    it("prefers a connect that lands in the same turn as an expired timeout", async () => {
+      const socket = new net.Socket();
+      const connect = vi.spyOn(net, "connect").mockImplementation(() => socket);
+      try {
+        const probe = createProxyAcceptProbe(9, { timeoutMs: 50, ttlMs: 0 });
+        const result = probe();
+
+        socket.emit("timeout");
+        socket.emit("connect");
+
+        expect(await result).toBe(true);
+      } finally {
+        connect.mockRestore();
+      }
+    });
+
     // Nothing in front of the health port authenticates, so without the cache
     // each unauthenticated request would open a fresh connection into the very
     // accept queue being measured.
