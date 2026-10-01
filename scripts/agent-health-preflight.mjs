@@ -859,7 +859,31 @@ export function sevenDayWindowKeys(end = "2026-08-31T06:00:00.000Z") {
   return Array.from({ length: 28 }, (_, index) => windowKey(endMs - (27 - index) * SIX_HOURS_MS));
 }
 
-/** Newest six-hour boundary at or before `now`. */
+/**
+ * Newest six-hour boundary at or before `now`.
+ *
+ * Despite the name this floors ANY instant to the grid, and that is the second
+ * job it is here to do: it is also how a caller derives a row's `windowKey`
+ * from the instant its run fired. The name says "current" because the census
+ * end was the first caller; reach for it whenever an instant has to become a
+ * window key, rather than rounding by hand.
+ *
+ * This matters because the two grids do not coincide. The agent-health routine
+ * fires on a six-hourly cron at minute 7, so every `triggeredAt` is at :07,
+ * while the census grid is :00 — and `placeWindowKey` rejects anything off-grid
+ * as `malformed`, which hard-forces `complete: false`. Mapping `windowKey` from
+ * a raw `triggeredAt` therefore fails CLOSED on every row at once: measured over
+ * 26 real runs, 26 of 26 malformed, 0/28 observed, `silent: 28` — a permanent
+ * red reporting the opposite of the truth (CTO, against live BLO-3202 data,
+ * 2026-10-01). `currentWindowEnd(row.triggeredAt)` is the whole fix, and the
+ * receipt convention already keys this way (a :07 trigger files a :00 receipt).
+ *
+ * The flooring belongs HERE, at the caller's seam, and emphatically not inside
+ * `placeWindowKey`: that function's strictness is load-bearing — it is what
+ * catches the hour-24 key that `Date.parse` rolls silently into the next day —
+ * so teaching it to accept and floor off-grid keys would delete a real guard to
+ * paper over a wiring mistake.
+ */
 export function currentWindowEnd(now = Date.now()) {
   const ms = typeof now === "number" ? now : Date.parse(now);
   if (!Number.isFinite(ms)) throw new Error(`invalid census now: ${now}`);
@@ -983,14 +1007,52 @@ function hasAnyReceipt(row) {
  *
  * `silent` and `classification-producing` are mutually exclusive by
  * construction — a classification receipt has a `commentId`, so a window
- * carrying one can never be silent — which is what keeps published coverage
- * ratios for historical windows unmoved by this change.
+ * carrying one can never be silent.
  *
  * Both the `completed-without-comment` and `silent` branches below route their
  * "is there a receipt?" question through `hasAnyReceipt`, deliberately: when
  * they tested it independently they disagreed on a blank id, and a slot that is
  * receiptless for one term and receipted for the other is exactly the false
  * green this precedence exists to prevent.
+ *
+ * THE RECEIPT AXIS IS TOTAL, and that is why the terminal push below is
+ * conditioned on `hasAnyReceipt` rather than on `states.length === 0`. The three
+ * receipt states partition every window: `silent` (no receipt),
+ * `classification-producing` (a receipt that classified), `receipt-only` (a
+ * receipt that did not). `silent`'s guard is the exact complement of the
+ * terminal guard, and `candidates` is non-empty here, so each window gets
+ * EXACTLY ONE of the three — asserted directly by test.
+ *
+ * Gating the terminal push on an empty `states` made the healthy end of that
+ * axis conditional on no shape finding having fired, so a window that genuinely
+ * emitted a classification but carried a shape finding was dropped from
+ * coverage entirely. `runless` was the live case (CTO, measured against real
+ * BLO-3202 data, 2026-10-01): the agent-health routine posts its receipt as a
+ * comment, and a window whose `/routines/{id}/runs` row is missing — a known,
+ * separately-tracked platform defect — still has its receipt. Two such windows
+ * reported `['runless']` with no `classification-producing` beside them, and
+ * coverage read 7/28 where the fleet had actually emitted 9. `duplicate`,
+ * `coalesced` and `completed-without-comment` all masked it the same way.
+ *
+ * This is the same masking the PR #1571 review chain found three times and the
+ * BLO-31838 `silent` fix a fourth; the lesson that generalizes is that a state
+ * computed in an `else` of unrelated findings is not a state, it is a default.
+ * Shape findings (`duplicate`, `coalesced`, `runless`) and emission findings
+ * (the receipt axis) answer independent questions and must both be recorded.
+ *
+ * `state` — the single display value — is deliberately UNCHANGED by this: the
+ * terminal push stays last, so `states[0]` still prefers the most specific
+ * problem, and a window that is both `runless` and `classification-producing`
+ * still displays as `runless`. Only `counts`, which aggregates over `states`,
+ * gains the dropped emissions.
+ *
+ * `counts.silent` is untouched, so `census.complete` and the gate verdict are
+ * unaffected — this corrects under-reported coverage, it does not open or close
+ * a red. It DOES move published `classification-producing` figures upward,
+ * which BLO-31838's AC5 ("no change to `classification-producing`") forbade on
+ * the strength of that number being right. It was not: the old number counted
+ * emissions the fleet made and the census discarded. Correcting it upward is
+ * the point, and is recorded on the row rather than slipped in.
  */
 function classifyWindowRows(candidates) {
   const fingerprints = candidates
@@ -1005,7 +1067,7 @@ function classifyWindowRows(candidates) {
   if (new Set(fingerprints).size !== fingerprints.length) states.push("duplicate");
   if (candidates.some((row) => row.coalescedIntoRunId != null)) states.push("coalesced");
   if (candidates.every((row) => row.runId == null)) states.push("runless");
-  if (states.length === 0) {
+  if (candidates.some(hasAnyReceipt)) {
     states.push(candidates.some(hasClassificationReceipt) ? "classification-producing" : "receipt-only");
   }
   return { state: states[0], states };
