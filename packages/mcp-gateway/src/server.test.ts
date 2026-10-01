@@ -2341,6 +2341,62 @@ describe("PEN-3052: probe-only health listener on a second port", () => {
         skewed.mockRestore();
       }
     });
+
+    // The in-flight share — the one documented cache property the three
+    // collapse tests above do not reach (PEN-3052 review). Each of them runs
+    // at a `ttlMs` at or above the connect duration, so their second call
+    // lands on an already-settled entry and collapses through
+    // `now - cached.at < ttlMs` instead. Measured: deleting `cached.pending ||`
+    // outright leaves all 415 tests in this package green.
+    //
+    // `ttlMs: 0` is what makes this assertion exclusive rather than merely
+    // consistent with the term — the TTL comparison can never be true, so
+    // sharing is the only thing left that can hold the connect count at one.
+    // It is also the shape the docblock warns about: `ttlMs` and `timeoutMs`
+    // are independent options, and a caller passing `timeoutMs > ttlMs` gets
+    // unbounded concurrent connects without the share, worst exactly when the
+    // accept queue is wedged and every connect is running to its full timeout
+    // — i.e. precisely when this probe must not be adding load to the queue it
+    // is measuring.
+    //
+    // The socket emits neither `connect` nor `error` until this test says so,
+    // so the first probe is genuinely still in flight when the second call
+    // arrives. That is the saturated-accept-queue fixture from the timeout
+    // test above, reused in preference to a real address whose behaviour
+    // depends on host egress.
+    //
+    // `timeoutMs` is 5s rather than the 50ms the sibling tests use, and the
+    // connect is settled by hand rather than by waiting it out. Both halves of
+    // that are deliberate: the in-flight window has to outlast the gap below
+    // under a descheduled event loop, and a 50ms window would need the 10ms
+    // sleep to overrun only 5x to settle early and collapse through the wrong
+    // branch — on a CPU-throttled runner that is a flake, not a hypothetical.
+    // Widening the window costs nothing here precisely because the test does
+    // not wait for it.
+    it("shares an in-flight connect when the TTL cannot collapse the call", async () => {
+      const socket = new net.Socket();
+      const connect = vi.spyOn(net, "connect").mockImplementation(() => socket);
+      try {
+        const probe = createProxyAcceptProbe(9, { timeoutMs: 5_000, ttlMs: 0 });
+        const first = probe();
+        // Long enough that the second call is a genuinely later turn, and that
+        // `now - cached.at` is strictly positive rather than resting on the
+        // same-turn reading of a monotonic clock.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const second = probe();
+
+        // Promise identity, not merely an equal verdict: a second connect that
+        // happened to agree would satisfy a matching pair just as well, and it
+        // is the extra connect this term exists to prevent.
+        expect(second).toBe(first);
+        expect(connect).toHaveBeenCalledTimes(1);
+
+        socket.emit("connect");
+        expect(await Promise.all([first, second])).toEqual([true, true]);
+      } finally {
+        connect.mockRestore();
+      }
+    });
   });
 
   // This listener sits OUTSIDE the deny by construction — that is why it
