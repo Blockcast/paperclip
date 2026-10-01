@@ -63,6 +63,7 @@ import {
   isClaudeMaxTurnsResult,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
+  isClaudeTerminalResultEvent,
   isClaudeTransientUpstreamError,
   isClaudeSilentFailure,
   isClaudeUnknownSessionError,
@@ -1195,6 +1196,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stdout: proc.stdout,
       stderr: proc.stderr,
     });
+    // PEN-3259: this file's own veto, and the one that actually decides the label.
+    // `isClaudeTransientUpstreamError` narrows its internal login veto to the
+    // terminal-result surfaces, but every classifier below is gated on
+    // `requiresLogin` FIRST (:1406-1431, :1450), so a transcript-only auth token
+    // suppressed the real verdict before the narrowed rule was ever consulted —
+    // which left the parse.ts change a no-op at every production call site. The
+    // same narrowing has to be applied here or it does not take effect.
+    //
+    // Gated on `isClaudeTerminalResultEvent`, not on `parsed` truthiness, because
+    // this file derives `parsed` as `parsedStream.resultJson ?? parseJson(stdout)`
+    // (:1181) and that second arm admits any parseable object. On the `!parsed`
+    // path the two agree by construction, so this is provably inert there and
+    // changes only the result-event population.
+    //
+    // `loginMeta` above is deliberately NOT narrowed: `detectClaudeLoginRequired`
+    // derives `loginUrl` from `[stdout, stderr]` independently of `requiresLogin`
+    // (parse.ts:193), so narrowing it wholesale would also drop the login URL
+    // surfaced to the operator in `errorMeta` — a separate regression from the one
+    // being fixed. What is narrowed is the CLASSIFICATION input only.
+    const requiresLogin = detectClaudeLoginRequired({
+      parsed,
+      stdout: isClaudeTerminalResultEvent(parsed) ? "" : proc.stdout,
+      stderr: proc.stderr,
+    }).requiresLogin;
     const errorMeta =
       loginMeta.loginUrl != null
         ? {
@@ -1229,7 +1254,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
       const providerQuota =
-        !loginMeta.requiresLogin &&
+        !requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeProviderQuotaError({
           parsed: null,
@@ -1238,7 +1263,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
-        !loginMeta.requiresLogin &&
+        !requiresLogin &&
         !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeTransientUpstreamError({
@@ -1255,7 +1280,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             errorMessage: fallbackErrorMessage,
           })
         : null;
-      const errorCode = loginMeta.requiresLogin
+      const errorCode = requiresLogin
         ? "claude_auth_required"
         : isClaudeModelNotFoundError({
           parsed: null,
@@ -1376,22 +1401,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // retry at line ~898 below NEVER fires because errorCode isn't
     // claude_auth_required. So a stale-active-account bug masquerades
     // as an inert "adapter failed" loop and the pool never advances.
-    // Override claudeReportedSuccess when loginMeta says auth is needed.
+    // Override claudeReportedSuccess when the narrowed login veto says auth is
+    // needed (`requiresLogin`, PEN-3259 — result-event surfaces, not the transcript).
     const claudeReportedSuccess =
-      asString(parsed.subtype, "") === "success" && !parsedIsError && !loginMeta.requiresLogin;
+      asString(parsed.subtype, "") === "success" && !parsedIsError && !requiresLogin;
     const failed =
-      parsedIsError || loginMeta.requiresLogin || ((proc.exitCode ?? 0) !== 0 && !claudeReportedSuccess);
+      parsedIsError || requiresLogin || ((proc.exitCode ?? 0) !== 0 && !claudeReportedSuccess);
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
     const quotaExhausted =
-      failed && !loginMeta.requiresLogin && isClaudeQuotaExhausted(parsed);
+      failed && !requiresLogin && isClaudeQuotaExhausted(parsed);
     // Quota messages ("out of extra usage", "weekly limit reached", etc.) also
     // match the transient-upstream regex; classify quota first so the retry
     // schedule doesn't burn attempts against an already rate-limited account.
     const providerQuota =
       failed &&
-      !loginMeta.requiresLogin &&
+      !requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
       isClaudeProviderQuotaError({
@@ -1402,7 +1428,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     const transientUpstream =
       failed &&
-      !loginMeta.requiresLogin &&
+      !requiresLogin &&
       !quotaExhausted &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
@@ -1421,7 +1447,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
-    const resolvedErrorCode = loginMeta.requiresLogin
+    const resolvedErrorCode = requiresLogin
       ? "claude_auth_required"
       : quotaExhausted
       ? "provider_quota_exhausted"
