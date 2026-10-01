@@ -53,12 +53,12 @@ const STDERR_FD = 2;
  * the exit proceeds anyway.
  *
  * Exported because it is the only constant that governs the stderr-stall
- * component of crash-guard exit latency: the fatal path awaits two sequential
- * bounded writes, so that component is 2x this value. It is not the whole exit
- * latency — when an `onCrash` is supplied, those writes are not reached until
- * bookkeeping settles or `DEFAULT_CRASH_GUARD_TIMEOUT_MS` fires. The deadline in
- * `process-crash-guard-exit.test.ts` is derived from this constant rather than
- * restating a literal, and that fixture installs no `onCrash` (BLO-37311).
+ * component of crash-guard exit latency. The fatal path starts one bounded
+ * write immediately and awaits a second only after bookkeeping, so with no
+ * `onCrash` — this fixture's shape — that component is 2x this value; with an
+ * `onCrash`, the first write's budget overlaps bookkeeping and only the second
+ * adds to it. The deadline in `process-crash-guard-exit.test.ts` is derived
+ * from this constant rather than restating a literal (BLO-37311).
  */
 export const MAX_WRITE_WAIT_MS = 100;
 
