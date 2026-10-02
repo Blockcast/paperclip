@@ -86,11 +86,11 @@ import { fileURLToPath } from "node:url";
 const ALLY_APP_LOGIN_RE = /^(?:allyblockcast\[bot\]|app\/allyblockcast)$/;
 const ALLY_APP_REVIEW_LOGIN_RE = /^allyblockcast\[bot\]$/;
 const ALLY_SEAT_LOGIN_RE = /^allyblockcast$/;
-const CANONICAL_REVIEW_HEADING_RE = /^## Ally — Consolidated PR Review[ \t]*$/gim;
+const CANONICAL_REVIEW_HEADING_RE = /(?:^|\n)## Ally — Consolidated PR Review[ \t]*(?=\n|$)/gi;
 
 /** A heading like `### Important Issues (2)` — but not `(0)`. */
 const BLOCKING_SECTION_RE =
-  /^#+[ \t]*(critical|important)[^\n]*\((?!0\))\d+\)/im;
+  /(?:^|\n)#+[ \t]*(critical|important)[^\n]*\((?!0\))\d+\)/i;
 
 /**
  * Leading whitespace that CommonMark would render as an indented code block,
@@ -112,6 +112,18 @@ const BLOCKING_SECTION_RE =
  * The attestation is matched over fence-stripped text, as the gate matches it
  * (attestedHeadFrom), so a *fenced* paste is not an attestation here either.
  */
+// Line anchors here are spelled `(?:^|\n)` and `(?=\n|$)`, and no pattern in
+// this file carries the `m` flag. JS's `m` also stops at `\r`, U+2028 and
+// U+2029; Python's re.MULTILINE -- and CommonMark -- recognise only `\n`, and
+// `\r` is normalised away at entry by `reviewText`. An `m` here is therefore a silent
+// divergence from the sweep, and the loop it opens is the one this row exists
+// to close: the gate counts a bucket the sweep cannot see and reds the head,
+// while the sweep reads the head as attested and suppresses the re-request
+// that would clear the red (Ally, #1721 at 1bc85198, Important 1).
+//
+// Pinned for patterns added later -- including ones using a shape nobody has
+// written yet -- by "no reader pattern may treat U+2028/U+2029 as a line
+// break" in scripts/check-ally-review-consistency.test.mjs.
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 
 /**
@@ -171,12 +183,12 @@ const ATTESTED_HEAD_RE = new RegExp(
 // cannot disagree about which tree was reviewed. The prose line above is the
 // fallback for a body carrying no block.
 const VERDICT_BLOCK_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:[ \t]*(\d+)([\s\S]*?)-->`,
-  "gm",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:[ \t]*(\d+)([\s\S]*?)-->`,
+  "g",
 );
 const VERDICT_OPENER_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict\b`,
-  "gm",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict\b`,
+  "g",
 );
 const SUPPORTED_VERDICT_VERSION = 1;
 

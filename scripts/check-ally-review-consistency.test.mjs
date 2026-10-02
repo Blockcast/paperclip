@@ -209,16 +209,24 @@ describe("hasStillPresentDisposition", () => {
       "NOT_INDENTED_CODE must not drift between the gate and this auditor",
     );
     const tsRaw = tsSource.match(
-      /PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"gi",/,
+      /PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"([dgimsuvy]+)",/,
     );
     assert.ok(tsRaw, "ally-review-detection.ts still defines PRIOR_FINDING_DISPOSITION_PATTERN");
+    // Capture the flags; do not pin them. Spelling `"gim"` inline here compared
+    // the pattern *source* across the readers while silently supplying the
+    // flags itself, so it could not see the axis Important 1 of #1721 at
+    // 1bc85198 found diverged -- and the literal then broke the moment the `m`
+    // came off, which is how the hole surfaced. The rule it belongs to is
+    // pinned at the bottom of this file.
+    assert.ok(tsRaw[2].includes("g"), "the ledger pattern must stay global for matchAll");
+    assert.ok(!tsRaw[2].includes("m"), "the gate's ledger pattern must not carry `m`");
     // Function replacement, not a string one: a string replacement interprets
     // `$&`/`` $` ``/`$'`/`$$` in the spliced-in source text, so a future
     // NOT_INDENTED_CODE containing `$` would be silently mangled rather than
     // failing loudly. `$&` alone would rebuild the literal `${NOT_INDENTED_CODE}`.
     const gatePattern = new RegExp(
       tsRaw[1].replace("${NOT_INDENTED_CODE}", () => tsNotIndented[1]),
-      "gi",
+      tsRaw[2],
     );
 
     const pySource = readFileSync(
@@ -229,6 +237,10 @@ describe("hasStillPresentDisposition", () => {
       /PRIOR_FINDING_DISPOSITION_PATTERN = re\.compile\(\n\s*r"([^"]+)"\n\s*r"([^"]+)",/,
     );
     assert.ok(pyRaw, "sweep-stalled-ally-reviews.py still defines PRIOR_FINDING_DISPOSITION_PATTERN");
+    // The sweep's own source still spells `^` under re.MULTILINE, which is the
+    // correct Python reading, so emulating that source in JS legitimately keeps
+    // `m` here. Only the JS readers changed: they now spell the anchor out. The
+    // corpus below is LF-only, where the two readings coincide.
     const sweepPattern = new RegExp(pyRaw[1] + pyRaw[2], "gim");
 
     const blocksUnder = (pattern, verbGroup, text) =>
@@ -447,16 +459,46 @@ describe("attestedHead", () => {
     assert.equal(attestedHead(body), null);
   });
 
-  it("reads U+2028-separated buckets and ledger entries as the sweep does", () => {
-    // Ally, #1721 at 1bc85198, Important 1: under `m` both read here and not in
-    // the sweep, whose re.MULTILINE breaks lines at `\n` only.
+  // Ally, #1721 at 1bc85198, Important 1. The pass above took `m` off the
+  // attestation pattern and left it on the count and ledger patterns -- the two
+  // that drive the new cross-checks -- so the same divergence survived where it
+  // does the most harm. The loop it opens is the one this row exists to close:
+  // over a body whose block states 0 and whose bucket is U+2028-terminated, the
+  // gate counts the bucket and reds the head, while the sweep counts nothing,
+  // reads the head as attested, and suppresses the re-request that would clear
+  // the red. Python's re.MULTILINE recognises only `\n`, and U+2028 is not a
+  // CommonMark line ending, so Python was the correct reading throughout.
+  it("does not read a U+2028-terminated bucket as an emitted bucket", () => {
+    const body = counted('{"critical":0,"important":0}', "### Critical Issues (3)\u2028trailing prose");
+    assert.equal(attestedHead(body), HEAD);
+  });
+
+  it("does not read a U+2028-introduced ledger entry as a disposition", () => {
+    const body = [
+      "## Ally \u2014 Consolidated PR Review",
+      `Reviewed head: ${HEAD}`,
+      "intro\u2028- **prior:abc1234 critical 1** \u2014 still-present \u2014 not mirrored",
+    ].join("\n");
+    assert.equal(hasStillPresentDisposition(body), false);
+  });
+
+  it("control: the same two shapes on `\\n` are still read", () => {
+    // Without these, the pair above also passes on a reader that stopped
+    // matching altogether -- the other way to make the two readers agree.
     assert.equal(
-      attestedHead(counted('{"critical":0,"important":0}', "### Critical Issues (3)\u2028trailing prose")),
-      HEAD,
+      attestedHead(counted('{"critical":0,"important":0}', "### Critical Issues (3)")),
+      null,
     );
     assert.equal(
-      hasStillPresentDisposition("intro\u2028- **prior:354d5b9 important 1** \u2014 still-present \u2014 not mirrored"),
-      false,
+      hasStillPresentDisposition(
+        [
+          "## Ally \u2014 Consolidated PR Review",
+          `Reviewed head: ${HEAD}`,
+          "intro",
+          "- **prior:abc1234 critical 1** \u2014 still-present \u2014 not mirrored",
+        ].join("\n"),
+      ),
+      true,
     );
   });
 
@@ -1728,5 +1770,69 @@ describe("BLO-32695 — a fenced example of the marker is not a second block", (
     // `ok`. Same assertion as the real-second-block control because the harm is
     // masking exactly that.
     assert.equal(attestedHead(body("``` `example` is prose, not a fence opener", block(HEAD))), null);
+  });
+});
+
+// Ally, #1721 at 1bc85198, Important 1 + Suggestion 1. The rule, not the
+// instances.
+//
+// Every pattern in the two JS readers is a markdown line-structure reader over
+// the same review bodies. JS's `m` makes `^`/`$` stop at `\r`, U+2028 and
+// U+2029 as well as `\n`; Python's re.MULTILINE and CommonMark both recognise
+// only `\n`, and `\r` is normalised away at entry by reviewBody/reviewText. So
+// an `m` here is a divergence from the sweep in the silent direction, and the
+// deadlock it opens is the one this row exists to close.
+//
+// Pinned as a rule because the previous pass fixed the attestation pattern
+// alone and left thirteen siblings, four of which drive these cross-checks --
+// enumerating the instances you have seen guarantees a next round. This fails
+// for a pattern added later, including one using a shape nobody has written
+// yet. Mirrors TestPatternCharacterClassesAreAsciiOnly in
+// .github/scripts/test_sweep_stalled_ally_reviews.py, which pins the same kind
+// of rule on the Python side for re.ASCII.
+describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break", () => {
+  // Both construction forms: a quoted flags argument to `new RegExp`, and the
+  // suffix of a regex literal.
+  const flagClusters = (source) =>
+    source.split("\n").flatMap((line, i) =>
+      [/"([dgimsuvy]+)"/g, /\/([dgimsuvy]+)(?=[\s;,)\].]|$)/g].flatMap((re) => {
+        re.lastIndex = 0;
+        const out = [];
+        let m;
+        while ((m = re.exec(line)) !== null) out.push({ line: i + 1, flags: m[1], text: line.trim() });
+        return out;
+      }),
+    );
+
+  // A floor, not an exact count: an exact count churns on every unrelated
+  // regex, while a floor still fails if the scan stops matching -- which is the
+  // way every source-text guard dies. Real counts at this head are 18 and 11.
+  for (const [rel, floor] of [
+    ["../server/src/services/ally-review-detection.ts", 12],
+    ["./check-ally-review-consistency.mjs", 8],
+  ]) {
+    it(`carries no \`m\` flag in ${rel}`, () => {
+      const clusters = flagClusters(readFileSync(new URL(rel, import.meta.url), "utf8"));
+      assert.ok(
+        clusters.length >= floor,
+        `the flag scan found ${clusters.length} clusters in ${rel}, under the ${floor} floor -- the scan broke rather than the file getting cleaner`,
+      );
+      assert.deepEqual(
+        clusters.filter((c) => c.flags.includes("m")).map((c) => `${rel}:${c.line}: ${c.text}`),
+        [],
+      );
+    });
+  }
+
+  it("control: the scan sees an `m` in both construction forms", () => {
+    // Without this the assertions above pass on a scan that matches nothing,
+    // and so does the whole rule. The third row pins that a flag cluster
+    // without `m` is reported but not flagged.
+    const injected = [
+      'const A = new RegExp(String.raw`^a`, "gim");',
+      "const B = /^b$/im;",
+      "const C = /^c$/i;",
+    ].join("\n");
+    assert.deepEqual(flagClusters(injected).map((c) => c.flags), ["gim", "im", "i"]);
   });
 });

@@ -132,6 +132,18 @@ function emittedReviewText(body: string | null | undefined): string | null {
 // bound is a lookahead rather than a counted run because the emphasis and
 // spacing that follow would otherwise absorb the fourth space and re-open the
 // hole.
+// Line anchors here are spelled `(?:^|\n)` and `(?=\n|$)`, and no pattern in
+// this file carries the `m` flag. JS's `m` also stops at `\r`, U+2028 and
+// U+2029; Python's re.MULTILINE -- and CommonMark -- recognise only `\n`, and
+// `\r` is normalised away at entry by `reviewBody`. An `m` here is therefore a silent
+// divergence from the sweep, and the loop it opens is the one this row exists
+// to close: the gate counts a bucket the sweep cannot see and reds the head,
+// while the sweep reads the head as attested and suppresses the re-request
+// that would clear the red (Ally, #1721 at 1bc85198, Important 1).
+//
+// Pinned for patterns added later -- including ones using a shape nobody has
+// written yet -- by "no reader pattern may treat U+2028/U+2029 as a line
+// break" in scripts/check-ally-review-consistency.test.mjs.
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 
 // Ally's own output has this heading on its own line, as a Markdown heading
@@ -139,8 +151,8 @@ const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 // rather than a code block). A prose mention or quoted heading must not count
 // as the review itself.
 const ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}(?:#{1,6}[ \t]+|\*\*[ \t]*)?Ally[ \t]*(?:—|–|-|:)[ \t]*Consolidated[ \t]+PR[ \t]+Review\b`,
-  "im",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}(?:#{1,6}[ \t]+|\*\*[ \t]*)?Ally[ \t]*(?:—|–|-|:)[ \t]*Consolidated[ \t]+PR[ \t]+Review\b`,
+  "i",
 );
 
 export function hasAllyConsolidatedReviewHeading(body: string | null | undefined): boolean {
@@ -290,8 +302,8 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
  * holding a diff hunk or a regex) could, and would have to encode it.
  */
 const ALLY_VERDICT_BLOCK_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:[ \t]*(\d+)([\s\S]*?)-->`,
-  "gm",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:[ \t]*(\d+)([\s\S]*?)-->`,
+  "g",
 );
 
 // The opener alone, anchored identically to the block above so the two agree
@@ -321,8 +333,8 @@ const ALLY_VERDICT_BLOCK_PATTERN = new RegExp(
 // a review *of this file* mint a phantom opener out of a quoted marker and
 // wedge its own gate, which is the worse failure.
 const ALLY_VERDICT_OPENER_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict\b`,
-  "gm",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict\b`,
+  "g",
 );
 
 /** The block schema this parser understands. A future shape must bump this. */
@@ -760,7 +772,7 @@ const NEGATION_LOOKBACK_WORDS = 8;
 // Uncounted findings must begin a heading/list line. An unanchored pattern
 // would incorrectly flag prose such as "No Critical or Important issues".
 const UNCOUNTED_FINDINGS_HEADING_REGEX =
-  /^[ \t]*(?:[#>]+[ \t]*)?(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(?:Critical|Important)[ \t]+Issues\b(?![*_]*[ \t]*\()/im;
+  /(?:^|\n)[ \t]*(?:[#>]+[ \t]*)?(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(?:Critical|Important)[ \t]+Issues\b(?![*_]*[ \t]*\()/i;
 
 function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
   const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
@@ -949,8 +961,8 @@ const COUNTED_SEVERITIES = ["critical", "important"] as const;
 // one marker per iteration removes the ambiguity; the accepted language is
 // unchanged, since a run of markers is still matched one character at a time.
 const COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}(?:[#>][ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(${COUNTED_SEVERITIES.join("|")})[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
-  "gim",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}(?:[#>][ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(${COUNTED_SEVERITIES.join("|")})[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
+  "gi",
 );
 
 // The same buckets, but only where the review *emits* one as a heading of its
@@ -1246,7 +1258,7 @@ function carriesBlockingFeedback(text: string, options?: ActionableFeedbackOptio
   const declaresNoFindings = COUNTED_SEVERITIES.every((severity) => zeroedSeverities.has(severity));
 
   if (UNCOUNTED_FINDINGS_HEADING_REGEX.test(text)) return true;
-  if (/^[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*$/im.test(text)) return true;
+  if (/(?:^|\n)[ \t]*decision[ \t]*:[ \t]*changes_requested[ \t]*(?=\n|$)/i.test(text)) return true;
   if (hasNonNegatedMatch(text, /\bchanges\s+requested\b/i)) return true;
   if (hasNonNegatedMatch(text, /\brequest(?:ed|s)?\s+changes\b/i)) return true;
   // A `still-present` ledger entry positively asserts that a prior finding
