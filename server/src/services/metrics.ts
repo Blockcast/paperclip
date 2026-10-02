@@ -4024,8 +4024,10 @@ function ensureRegistry(): {
         "Count of HTTP requests served by this process, labeled by matched Express route "
         + "template, method, and status code (PEN-3702). The route label is the declared "
         + "template, never a concrete URL, so path parameters do not mint series; requests "
-        + `that matched no route collapse to "${HTTP_ROUTE_UNMATCHED}". No user, company, `
-        + "agent, query string, or other unbounded label is exposed.",
+        + `that matched no route collapse to "${HTTP_ROUTE_UNMATCHED}". A status of "0" means `
+        + "the response never completed -- a client abort or an ingress timeout -- rather "
+        + "than any code the server chose; it can appear on any route label. No user, "
+        + "company, agent, query string, or other unbounded label is exposed.",
       labelNames: ["route", "method", "status"],
       registers: [registry],
     });
