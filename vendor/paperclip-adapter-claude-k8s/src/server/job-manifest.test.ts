@@ -776,13 +776,51 @@ describe("buildJobManifest", () => {
         secretName: "paperclip-github-merge-token",
         mountPath: "/paperclip/.secrets/github-merge-token",
         defaultMode: 292,
+        optional: true,
       }];
       const { job } = buildJobManifest({ ctx, selfPod });
       const vol = job.spec?.template?.spec?.volumes?.find((v) => v.name === "github-merge-token");
       expect(vol?.secret?.items).toBeUndefined();
-      // Still optional, so a Secret absent in the agent namespace cannot
-      // hard-fail the Job.
+      // The source declared this one optional, so it stays optional.
       expect(vol?.secret?.optional).toBe(true);
+    });
+
+    // PEN-3705. The agent Job used to force `optional: true` on every
+    // propagated Secret regardless of what the source said. For a credential
+    // mount that is not graceful degradation: PAPERCLIP_GITHUB_TOKEN_FILE
+    // points *inside* the github-token mount, so an absent mount leaves the
+    // path resolving to the bare shared-PVC directory underneath — mode 2775,
+    // writable by uid 1000, the uid every agent runs as, on a CephFS volume
+    // shared fleet-wide. Failing open moved the credential path somewhere any
+    // agent could write it.
+    it("does not mark a source-required Secret optional on the agent Job", () => {
+      selfPod.secretVolumes = [{
+        volumeName: "github-mcp-token",
+        secretName: "paperclip-github-mcp-token",
+        mountPath: "/paperclip/.secrets/github-token",
+        defaultMode: 292,
+        // The chart declares this volume with no `optional:`, which upstream
+        // reads as required. Propagation must not soften that.
+      }];
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const vol = job.spec?.template?.spec?.volumes?.find((v) => v.name === "github-mcp-token");
+      // Absent rather than `false`: upstream already reads an unset `optional`
+      // as required, so the source's silence is preserved verbatim. What must
+      // never hold again is `optional === true`.
+      expect(vol?.secret?.optional).toBeUndefined();
+    });
+
+    it("carries an explicit optional:false through unchanged", () => {
+      selfPod.secretVolumes = [{
+        volumeName: "github-mcp-token",
+        secretName: "paperclip-github-mcp-token",
+        mountPath: "/paperclip/.secrets/github-token",
+        defaultMode: 292,
+        optional: false,
+      }];
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const vol = job.spec?.template?.spec?.volumes?.find((v) => v.name === "github-mcp-token");
+      expect(vol?.secret?.optional).toBe(false);
     });
   });
 
