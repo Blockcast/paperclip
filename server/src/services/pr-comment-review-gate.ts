@@ -460,10 +460,20 @@ function headsWithUndispositionedFinding(
   // asymmetry is BLO-31446's, and it survives the tied-set rewrite unchanged:
   // the option narrows what each candidate *asserts*, the tie-break decides
   // *which* candidates are eligible to assert it, and neither reads the other.
+  //
+  // The precedence stops unreadable reviews *displacing* an attested one, not
+  // *adding* to it. An unreadable review at least as new as the attested winner
+  // may still carry a finding, or an older attested clean review would hide a
+  // newer unreadable one that counts a finding -- exactly what every review
+  // becomes on a SUPPORTED_ALLY_VERDICT_VERSION bump (Ally, #1721 at 5f4d5302,
+  // Critical 2).
   const carried: { attesting: AttestingComment; timeMs: number }[] = [];
   for (const candidates of byHead.values()) {
     const tied = topTiedBy(candidates, (candidate) => [candidate.attested ? 1 : 0, candidate.timeMs]);
-    const blocking = tied.find(
+    const eligible = tied[0]!.attested
+      ? [...tied, ...candidates.filter((c) => !c.attested && c.timeMs >= tied[0]!.timeMs)]
+      : tied;
+    const blocking = eligible.find(
       (entry) =>
         hasActionablePrReviewFeedback(entry.attesting.comment.body, undefined, {
           countInheritedLedgerAssertion: false,
