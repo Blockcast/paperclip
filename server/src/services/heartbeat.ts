@@ -1696,7 +1696,42 @@ export function shouldScheduleAutomaticRunRetry(
   }
 
   if (run.errorCode === "session_unavailable") return true;
-  if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") return false;
+  // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) rides this arm
+  // because it REPLACED `adapter_failed` at the claude-k8s emit site. Its author
+  // reasoned that retryability was "preserved exactly" on the strength of the new
+  // code being a member of recovery/service.ts's
+  // TRANSIENT_INFRA_CONTINUATION_ERROR_CODES — true, but that is the issue
+  // CONTINUATION sweep, a different engine from this one, and it is issue-scoped.
+  // A pr_review run is not an issue run, so this gate is its only retry path, and
+  // here `adapter_failed` is admitted by nothing but the literal below. Renaming
+  // the code therefore silently dropped it: measured 2026-10-01 over an 18h
+  // window on Ally, 13 failures / 0 retries, while every sibling transient code
+  // in the same window retried normally (24 `transient_failure_retry` runs).
+  // Classification is not enrolment, and nothing failed loudly when the two
+  // diverged — see the parity test in heartbeat-recoverable-error-family.test.ts.
+  //
+  // The rename had THREE enrolment sites, not two (Ally, #2159). All are now
+  // aligned: TRANSIENT_INFRA_CONTINUATION_ERROR_CODES (#1669 got this one), the
+  // literal below, and ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES in
+  // recovery/zero-token-startup-failure.ts — the last decides owner-vs-manager
+  // routing, so missing it sent an assignee's stranded issue up the manager
+  // ladder. Both of the sites that test can reach are asserted there by
+  // comparison against `adapter_failed`, so a rename applied UNEVENLY ACROSS
+  // THOSE TWO fails CI rather than being measured 18 hours later. A rename at
+  // the adapter emit site alone does not: it leaves both gates holding the old
+  // literal, mutually consistent and green, while production emits a code no
+  // gate admits — #1669's exact shape, and the reason the directive comment
+  // lives at the emit site rather than here. A fourth enrolment SITE is
+  // likewise unasserted: those assertions are keyed on the two literals and
+  // cannot see a set they do not name, so enumerate consumers by hand. Site 1
+  // is not exported from recovery/service.ts and is unasserted either way.
+  if (
+    run.errorCode !== "adapter_failed" &&
+    run.errorCode !== "process_lost" &&
+    run.errorCode !== "skill_materialization_pending"
+  ) {
+    return false;
+  }
 
   // BLO-9147 AC1: gate on wakeReason/reviewKind/taskKey from the persisted
   // contextSnapshot, NOT on githubPrNumber presence. derivePaperclipPrReview

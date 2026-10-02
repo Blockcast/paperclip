@@ -134,6 +134,35 @@ export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   "job_failed",
   "k8s_pod_schedule_failed",
   "adapter_failed",
+  // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) is not a new
+  // fault — it is the RENAME of the `adapter_failed` directly above, at the one
+  // claude-k8s emit site that names a skill-source fault
+  // (vendor/paperclip-adapter-claude-k8s/src/server/execute.ts, the sole emitter).
+  // It therefore inherits `adapter_failed`'s membership here for the same
+  // BLO-20933 reason: the throw is pre-`buildJobManifest`, so no Job, no Secret
+  // and no CLI spawn ever happened and the assignee had no part in it.
+  //
+  // Missing it was the third and last site of this rename's drift. Consequence,
+  // for issue runs rather than the pr_review ones the rest of BLO-35668 covers:
+  // once the three continuation attempts are exhausted the run strands as
+  // `stranded_assigned_issue`, and the routing union at recovery/service.ts
+  // `resolveStrandedRecoveryRouting` is this set OR `isInfraClassStrandedFailure`
+  // — whose arms are `k8s_job_deleted_externally`, the git-transport predicate,
+  // and `claude_truncated` + pod-removal wording. A `ClaudeSkillSourceUnavailableError`
+  // matches none, so `ownerAgentId` transferred UP the manager ladder for a
+  // materialization race nobody on this side caused, and stamped
+  // `infraClassCauseByErrorCode: false` into the recovery audit row.
+  //
+  // Membership has a THIRD consequence, in this file: `isInfraClassErrorCodeRun`
+  // below is a `.has()` on this set and nothing else, so adding a code also
+  // reclassifies it for the productivity review. Correct here — the throw is
+  // pre-`buildJobManifest`, so a run that left no comment was killed before it
+  // could write one, which is infrastructure rather than agent silence. Check all
+  // three consumers before adding a code, not the two above.
+  //
+  // Raised by Ally as an Important finding on #2159. The pairing is asserted in
+  // heartbeat-recoverable-error-family.test.ts so the next rename fails CI.
+  "skill_materialization_pending",
   "external_lifecycle_stale_killed",
   "k8s_concurrency_guard_unreachable",
   // BLO-27463: provider capacity throttling. Both codes carry errorFamily
