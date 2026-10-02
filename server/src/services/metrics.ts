@@ -26,6 +26,11 @@ import { logger } from "../middleware/logger.js";
 // reaper (which imports the recorder below). Structurally restating the result
 // shape here would let a NEW result field be added and silently go unrecorded.
 import type { IsolationWorkspaceReapResult } from "./isolation-workspace-reaper.js";
+// Type-only for the same reason as the reaper result above: erased at runtime,
+// so it creates no import cycle with the collector (which imports the recorder
+// below), while still making a NEW result field a compile error here rather
+// than a silently unrecorded one.
+import type { ExecutionWorkspaceCleanupResult } from "./execution-workspace-cleanup.js";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {
   resetBlockerResolvedWakeMetrics,
@@ -126,6 +131,185 @@ export const ISOLATION_WORKSPACE_REAPER_STOP_REASONS = [
   "lookup_faulted",
   "root_absent",
 ] as const;
+/**
+ * Execution-workspace teardown work (PEN-3692).
+ *
+ * PEN-3692 measured the paperclip worker's cgroup sitting pinned at its 10 GiB
+ * `memory.max` on reclaimable kernel slab, and attributed the fill to FAILED
+ * runs by magnitude: across two regimes the slab fill ratio was 0.058
+ * (CI 0.043–0.074) and of seven candidate drivers only `heartbeat_run_failed`
+ * (x0.045) was consistent — all starts (x0.286), successful starts (x0.584)
+ * and capacity-deferrals (x0.228) were excluded by magnitude, concurrency
+ * (x1.055) and enqueued (x3.129) by sign, with `heartbeat_timer_checked`
+ * (x1.005) as the flat positive control.
+ *
+ * That attribution rests on **two episodes either side of one regime
+ * boundary**, so every signal stepped at the same time and the discrimination
+ * is by magnitude alone — an unmeasured driver that also fell ~20x would fit
+ * equally well. It is a natural experiment nobody controlled. These series
+ * exist to replace it with a continuous one: they count the teardown work
+ * itself rather than a proxy for it, so the slab residual can be regressed
+ * against measured recursive-delete seconds instead of against a run-failure
+ * counter that merely correlates.
+ *
+ * `trigger` is the label that earns its place. PEN-3692 could NOT say whether
+ * the periodic collector or the per-failure run teardown is the dominant term
+ * — both are live, both call the same function, and the row recorded that as
+ * an open question. Splitting on trigger answers it directly.
+ */
+export const EXECUTION_WORKSPACE_TEARDOWN_METRIC = "paperclip_execution_workspace_teardown_total";
+export const EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC =
+  "paperclip_execution_workspace_teardown_duration_seconds";
+/**
+ * Which caller asked for the removal. `unknown` is not padding: it is how an
+ * unlabelled future call site shows up, and a rising `unknown` share means
+ * this split has quietly stopped partitioning the work.
+ *
+ * ⛔ `persist_rollback` was called `run_teardown` until 2026-10-02, and that
+ * name was a lie worth understanding before trusting this split. Its one call
+ * site (`heartbeat.ts`) sits inside the `catch` wrapping the execution-workspace
+ * persist step and fires only `if (executionWorkspace.created)` — i.e. the tree
+ * reached disk but its ROW could not be written. It counts DB-write failures, a
+ * rare population that sits near zero.
+ *
+ * **Run end performs no inline teardown at all.** It stamps
+ * `cleanupEligibleAt = now + grace` with `cleanupReason: "run_ended"` and hands
+ * the work to the collector — so per-failure run teardown is already INSIDE
+ * `trigger="collector"`, and is separated from idle reclamation by
+ * `cleanup_reason`, not by this label. Reading a flat `run_teardown` against a
+ * large `collector` as "per-failure teardown is negligible" was therefore
+ * attribution by magnitude against an uninstrumented alternative — the PEN-3692
+ * error in a new costume. Found by Ally on this PR.
+ */
+export const EXECUTION_WORKSPACE_TEARDOWN_TRIGGERS = [
+  "persist_rollback",
+  "collector",
+  "operator",
+  "unknown",
+] as const;
+export type ExecutionWorkspaceTeardownTrigger =
+  (typeof EXECUTION_WORKSPACE_TEARDOWN_TRIGGERS)[number];
+/**
+ * Why the workspace was eligible for collection — the split that actually
+ * answers PEN-3692's question, since run-end teardown is deferred into
+ * `trigger="collector"` (see above).
+ *
+ * `run_ended` is failed-and-succeeded-run-attributable work; `idle_backfill` is
+ * reclamation of the pre-existing population. `not_applicable` is every
+ * non-collector caller, which has no eligibility reason at all.
+ *
+ * `unknown` is a THIRD state and not a synonym for either: the row was made
+ * eligible by a writer that recorded no reason (`cleanup_reason is null` with a
+ * stamp set — today only the operator PATCH, plus rows a pre-PEN-3692 writer
+ * stripped). That is a different silence from `not_applicable`, which says "this
+ * caller has no eligibility reason by construction", and folding it into
+ * `idle_backfill` would assert idle reclamation about work whose origin nobody
+ * recorded. It carries the same meaning the trigger enum's `unknown` does — a
+ * writer did not classify itself — which is why it reuses the name.
+ *
+ * It is a POPULATION, not a defect signal (Ally, review of 68b9cad). An earlier
+ * draft of this block said the opposite — "after the heartbeat fix no production
+ * writer should produce one" — which contradicted the two producers named three
+ * lines above it, and in the direction a reader acts on: someone watching
+ * `unknown` climb would go hunting a regression that does not exist. Both
+ * producers are real and both are by design:
+ *
+ *   - The operator PATCH spreads `cleanupReason` and `cleanupEligibleAt` as
+ *     INDEPENDENT optional fields (`routes/execution-workspaces.ts`), so
+ *     `PATCH {cleanupEligibleAt: <past>}` stamps a row collectable while leaving
+ *     the reason untouched, and `selectEligible` does not filter on the reason.
+ *   - Rows the pre-PEN-3692 heartbeat writer already stripped are sitting in the
+ *     table now with a stamp and no reason. They do not heal —
+ *     `stampIdleLegacyWorkspaces` only rewrites rows whose `cleanupEligibleAt`
+ *     is null — so they drain through `unknown` after deploy. Non-zero on the
+ *     first pass that touches one, regardless of operator behaviour.
+ *
+ * What WOULD be a defect is a *NEW* code writer producing one, which is the
+ * narrower thing `execution-workspace-cleanup-reason-writers.test.ts` guards.
+ */
+export const EXECUTION_WORKSPACE_CLEANUP_REASONS = [
+  "run_ended",
+  "idle_backfill",
+  "unknown",
+  "not_applicable",
+] as const;
+export type ExecutionWorkspaceCleanupReason =
+  (typeof EXECUTION_WORKSPACE_CLEANUP_REASONS)[number];
+/**
+ * Which piece of tree-walking work was done. The first two are removals and are
+ * not interchangeable work: a `git worktree remove` shells out and lets git walk
+ * the tree, `remove_local_fs` is an in-process `fs.rm(recursive)`. Both end in
+ * per-entry `unlink`, which is the dentry/inode pressure this row is chasing,
+ * but only the second holds a libuv threadpool thread while doing it.
+ *
+ * `inspect_safety` is NOT a removal — it is `inspectWorktreeReclaimSafety`'s
+ * `git status --porcelain`, a full tree walk the collector performs up to twice
+ * per candidate (once to prove the tree safe to remove, once to prove it gone).
+ * It is in this enum because it charges the same readdir/lstat pressure to the
+ * same cgroup, so an integral that omits it omits what may be its largest term
+ * — PEN-3692 §3(b) regresses slab residual against that integral, and a missing
+ * dominant term would reproduce the mis-attribution the row exists to replace.
+ *
+ * ⚠️ Consequence, deliberate: summing the duration histogram over ALL methods is
+ * the work integral, but `..._duration_seconds_count` therefore EXCEEDS
+ * `..._teardown_total`, which counts removals only. Filter to the two removal
+ * methods to compare the two metrics.
+ */
+export const EXECUTION_WORKSPACE_TEARDOWN_METHODS = [
+  "worktree_remove",
+  "remove_local_fs",
+  "inspect_safety",
+] as const;
+export type ExecutionWorkspaceTeardownMethod =
+  (typeof EXECUTION_WORKSPACE_TEARDOWN_METHODS)[number];
+export const EXECUTION_WORKSPACE_TEARDOWN_OUTCOMES = ["succeeded", "failed"] as const;
+
+/**
+ * Periodic execution-workspace collector pass census (PEN-3692).
+ *
+ * `reconcileExecutionWorkspaceCleanup` already returns this shape and
+ * `index.ts` already logs it unconditionally. Logs answer "what happened in
+ * this pass"; these answer "at what rate, over a week, against the slab
+ * residual" — which is the question PEN-3692 needs and the one a log with
+ * normal retention cannot be regressed against.
+ */
+export const EXECUTION_WORKSPACE_COLLECTOR_SCANNED_METRIC =
+  "paperclip_execution_workspace_collector_scanned_total";
+export const EXECUTION_WORKSPACE_COLLECTOR_CANDIDATES_METRIC =
+  "paperclip_execution_workspace_collector_candidates_total";
+export const EXECUTION_WORKSPACE_COLLECTOR_STAMPED_METRIC =
+  "paperclip_execution_workspace_collector_stamped_total";
+export const EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC =
+  "paperclip_execution_workspace_collector_passes_total";
+export const EXECUTION_WORKSPACE_COLLECTOR_LAST_PASS_METRIC =
+  "paperclip_execution_workspace_collector_last_pass_timestamp_seconds";
+/**
+ * Per-candidate dispositions. These partition `scanned`; `stamped` does NOT
+ * belong here because it counts rows the *backfill* made eligible, a different
+ * population that this pass did not examine.
+ */
+export const EXECUTION_WORKSPACE_COLLECTOR_OUTCOMES = [
+  "collected",
+  "skipped",
+  "failed",
+] as const;
+/**
+ * How a collector pass ended. `skipped_saturated` is the entry gate: abandoned
+ * fs calls already hold the threadpool, so the pass examined nothing. That is
+ * the wedged-mount regime in which teardown stops and trees accumulate — the
+ * condition PEN-3692 exists to explain — so it must be a counted reason, not a
+ * missing record that reads like a dead worker. `ended_saturated` and
+ * `ended_wedged` stopped part-way with candidates left unexamined.
+ */
+export const EXECUTION_WORKSPACE_COLLECTOR_STOP_REASONS = [
+  "complete",
+  "skipped_saturated",
+  "ended_saturated",
+  "ended_wedged",
+] as const;
+export type ExecutionWorkspaceCollectorStopReason =
+  (typeof EXECUTION_WORKSPACE_COLLECTOR_STOP_REASONS)[number];
+
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
 export const BACKSTOP_SKIP_REASONS = [
   "not_ready", "existing_wake", "live_path", "pause_hold", "interaction",
@@ -2580,6 +2764,13 @@ let isolationReaperRetainedResurrected: Counter<"dry_run"> | null = null;
 let isolationReaperEntries: Counter<"dry_run" | "outcome"> | null = null;
 let isolationReaperSweeps: Counter<"dry_run" | "stop_reason"> | null = null;
 let isolationReaperLastSweep: Gauge<"dry_run"> | null = null;
+let executionWorkspaceTeardown: Counter<"trigger" | "method" | "outcome" | "cleanup_reason"> | null = null;
+let executionWorkspaceTeardownDuration: Histogram<"trigger" | "method" | "cleanup_reason"> | null = null;
+let executionWorkspaceCollectorScanned: Counter<string> | null = null;
+let executionWorkspaceCollectorCandidates: Counter<"outcome"> | null = null;
+let executionWorkspaceCollectorStamped: Counter<string> | null = null;
+let executionWorkspaceCollectorPasses: Counter<"stop_reason"> | null = null;
+let executionWorkspaceCollectorLastPass: Gauge<string> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -2657,6 +2848,13 @@ function ensureRegistry(): {
   isolationReaperEntriesCounter: Counter<"dry_run" | "outcome">;
   isolationReaperSweepsCounter: Counter<"dry_run" | "stop_reason">;
   isolationReaperLastSweepGauge: Gauge<"dry_run">;
+  executionWorkspaceTeardownCounter: Counter<"trigger" | "method" | "outcome" | "cleanup_reason">;
+  executionWorkspaceTeardownDurationHistogram: Histogram<"trigger" | "method" | "cleanup_reason">;
+  executionWorkspaceCollectorScannedCounter: Counter<string>;
+  executionWorkspaceCollectorCandidatesCounter: Counter<"outcome">;
+  executionWorkspaceCollectorStampedCounter: Counter<string>;
+  executionWorkspaceCollectorPassesCounter: Counter<"stop_reason">;
+  executionWorkspaceCollectorLastPassGauge: Gauge<string>;
 } {
   if (
     !registry
@@ -2732,6 +2930,13 @@ function ensureRegistry(): {
     || !isolationReaperEntries
     || !isolationReaperSweeps
     || !isolationReaperLastSweep
+    || !executionWorkspaceTeardown
+    || !executionWorkspaceTeardownDuration
+    || !executionWorkspaceCollectorScanned
+    || !executionWorkspaceCollectorCandidates
+    || !executionWorkspaceCollectorStamped
+    || !executionWorkspaceCollectorPasses
+    || !executionWorkspaceCollectorLastPass
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -3734,6 +3939,97 @@ function ensureRegistry(): {
       labelNames: ["dry_run"],
       registers: [registry],
     });
+    executionWorkspaceTeardown = new Counter({
+      name: EXECUTION_WORKSPACE_TEARDOWN_METRIC,
+      help:
+        "Execution-workspace tree removals attempted, labeled by trigger "
+        + "(persist_rollback, collector, operator, unknown), method (worktree_remove, "
+        + "remove_local_fs), cleanup_reason and outcome (PEN-3692). \u26d4 READ "
+        + "cleanup_reason, NOT trigger, to attribute work to runs: run end performs no "
+        + "inline teardown, so run-attributable removal is inside trigger=\"collector\" "
+        + "with cleanup_reason=\"run_ended\", and trigger=\"persist_rollback\" counts "
+        + "only the rare DB-write-failure path. outcome=\"failed\" counts a removal that threw; on "
+        + "the worktree path that is caught and demoted to a warning, so the tree is "
+        + "still on disk and a sustained non-zero rate means reclamation is silently "
+        + "not happening.",
+      labelNames: ["trigger", "method", "outcome", "cleanup_reason"],
+      registers: [registry],
+    });
+    executionWorkspaceTeardownDuration = new Histogram({
+      name: EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC,
+      help:
+        "Seconds spent walking one execution-workspace tree (PEN-3692), split by "
+        + "`method`: the `worktree_remove` / `remove_local_fs` removal calls, and the "
+        + "`inspect_safety` git-status walks the collector makes up to twice per "
+        + "candidate. Summed over ALL methods the _sum is the quantity this row needs "
+        + "— the work integral to regress the cgroup's reclaimable-slab residual "
+        + "against, replacing the n=2 natural experiment that attributed fill to run "
+        + "failures by magnitude alone. Summed over the two removal methods alone it "
+        + "omits the safety walks, which may be the largest term. ⚠️ Because "
+        + "`inspect_safety` is not a removal, this _count exceeds the teardown _total; "
+        + "filter to the removal methods to compare them. Duration is used as the "
+        + "proxy for tree size ON PURPOSE: counting entries unlinked would mean "
+        + "walking the tree ourselves, i.e. performing the very readdir/lstat work "
+        + "being measured, so the instrument would create the pressure it reports. "
+        + "Buckets run to 60s because these trees sit on a network mount where a "
+        + "removal can block for a long time.",
+      labelNames: ["trigger", "method", "cleanup_reason"],
+      buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60],
+      registers: [registry],
+    });
+    executionWorkspaceCollectorScanned = new Counter({
+      name: EXECUTION_WORKSPACE_COLLECTOR_SCANNED_METRIC,
+      help:
+        "Eligible execution-workspace rows the periodic collector examined, summed over "
+        + "passes (PEN-3692). The denominator for the candidates counter. Each scanned "
+        + "git_worktree candidate costs two full `git status` tree walks before any "
+        + "removal, so this — not the collected count — is the collector's tree-walking "
+        + "load.",
+      registers: [registry],
+    });
+    executionWorkspaceCollectorCandidates = new Counter({
+      name: EXECUTION_WORKSPACE_COLLECTOR_CANDIDATES_METRIC,
+      help:
+        "Per-candidate dispositions of the periodic execution-workspace collector, "
+        + "labeled by outcome (collected, skipped, failed) (PEN-3692). These partition "
+        + "the scanned total. A `skipped` candidate was deliberately retained — dirty, "
+        + "unpushed, or unverifiable — and is re-examined next window, so a high "
+        + "skipped rate is repeated tree-walk cost that frees nothing.",
+      labelNames: ["outcome"],
+      registers: [registry],
+    });
+    executionWorkspaceCollectorStamped = new Counter({
+      name: EXECUTION_WORKSPACE_COLLECTOR_STAMPED_METRIC,
+      help:
+        "Long-idle unstamped execution-workspace rows the backfill newly made eligible "
+        + "(PEN-3692). Deliberately its own series rather than a candidates outcome: it "
+        + "counts rows this pass did NOT examine, so summing it with the dispositions "
+        + "would double-count the population.",
+      registers: [registry],
+    });
+    executionWorkspaceCollectorPasses = new Counter({
+      name: EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC,
+      help:
+        "Periodic execution-workspace collector passes, labeled by how the pass ended "
+        + "(PEN-3692): complete, skipped_saturated (abandoned fs calls held the threadpool "
+        + "at entry, so nothing was examined), ended_saturated or ended_wedged (stopped "
+        + "part-way). A pass that threw does not reach this counter, so comparing its rate "
+        + "against the ~30s scheduler interval is how a collector that is failing every "
+        + "tick is distinguished from one that is running and finding nothing, and the "
+        + "skipped_saturated rate is how one deliberately standing down on a wedged mount "
+        + "is distinguished from both.",
+      labelNames: ["stop_reason"],
+      registers: [registry],
+    });
+    executionWorkspaceCollectorLastPass = new Gauge({
+      name: EXECUTION_WORKSPACE_COLLECTOR_LAST_PASS_METRIC,
+      help:
+        "Unix timestamp of the last periodic execution-workspace collector pass of any "
+        + "stop_reason, including a skipped one (PEN-3692). The liveness signal no counter "
+        + "can express: a healthy idle pass and a collector that has stopped ticking both "
+        + "add zero to every counter above.",
+      registers: [registry],
+    });
     pluginWebhookDeliveryRejected = new Counter({
       name: PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC,
       help:
@@ -3868,6 +4164,13 @@ function ensureRegistry(): {
     isolationReaperEntriesCounter: isolationReaperEntries,
     isolationReaperSweepsCounter: isolationReaperSweeps,
     isolationReaperLastSweepGauge: isolationReaperLastSweep,
+    executionWorkspaceTeardownCounter: executionWorkspaceTeardown,
+    executionWorkspaceTeardownDurationHistogram: executionWorkspaceTeardownDuration,
+    executionWorkspaceCollectorScannedCounter: executionWorkspaceCollectorScanned,
+    executionWorkspaceCollectorCandidatesCounter: executionWorkspaceCollectorCandidates,
+    executionWorkspaceCollectorStampedCounter: executionWorkspaceCollectorStamped,
+    executionWorkspaceCollectorPassesCounter: executionWorkspaceCollectorPasses,
+    executionWorkspaceCollectorLastPassGauge: executionWorkspaceCollectorLastPass,
   };
 }
 
@@ -5353,6 +5656,138 @@ export function recordIsolationWorkspaceReapSweep(
 }
 
 /**
+ * Record one execution-workspace tree removal (PEN-3692).
+ *
+ * Called from the completion path of a removal that has already done its
+ * irreversible work, so it must not throw — a metrics fault has no business
+ * turning a successful teardown into a warning the caller records against the
+ * workspace.
+ *
+ * Deliberately NOT pre-seeded. An absent series means this process has torn
+ * down no workspace of that shape; a zero series would mean it tried and the
+ * work was free. On a row whose whole question is "how much teardown work is
+ * happening", those two must stay distinguishable — the same reasoning the
+ * reaper counters above are built on.
+ */
+export function recordExecutionWorkspaceTeardown(input: {
+  trigger: ExecutionWorkspaceTeardownTrigger;
+  method: ExecutionWorkspaceTeardownMethod;
+  succeeded: boolean;
+  durationMs: number;
+  /**
+   * Why the workspace was eligible. Only the collector has one; every other
+   * caller is `not_applicable`. This — not `trigger` — is the run-attribution
+   * split, because run end defers its teardown into the collector.
+   */
+  cleanupReason?: ExecutionWorkspaceCleanupReason;
+}): void {
+  try {
+    const m = ensureRegistry();
+    const labels = {
+      trigger: input.trigger,
+      method: input.method,
+      cleanup_reason: input.cleanupReason ?? "not_applicable",
+    };
+    m.executionWorkspaceTeardownCounter.inc(
+      { ...labels, outcome: input.succeeded ? "succeeded" : "failed" },
+      1,
+    );
+    // Observed for failures too: a removal that threw still walked whatever it
+    // walked before throwing, and that work is charged to the cgroup either
+    // way. Excluding it would bias the integral downward exactly when
+    // reclamation is going wrong.
+    m.executionWorkspaceTeardownDurationHistogram.observe(labels, input.durationMs / 1000);
+  } catch (error) {
+    logger.error({ err: error }, "failed to record execution-workspace teardown metrics");
+  }
+}
+
+/**
+ * Observe one `inspectWorktreeReclaimSafety` tree walk into the teardown
+ * duration histogram under `method: "inspect_safety"` (PEN-3692).
+ *
+ * Deliberately observes the histogram but does NOT touch
+ * `..._teardown_total`: an inspection is not a removal, and counting it as one
+ * would corrupt the removal rate. The per-method `_count` on the histogram
+ * already gives the inspection count, so nothing is lost.
+ *
+ * This lives inside `inspectWorktreeReclaimSafety` rather than at its call
+ * sites so a future caller cannot silently omit the walk from the integral —
+ * which is exactly the gap Ally's Important #2 found on the first revision of
+ * this PR, where the help text claimed a whole integral the measured region
+ * did not cover.
+ */
+export function recordExecutionWorkspaceReclaimInspection(input: {
+  trigger: ExecutionWorkspaceTeardownTrigger;
+  durationMs: number;
+  cleanupReason?: ExecutionWorkspaceCleanupReason;
+}): void {
+  try {
+    const m = ensureRegistry();
+    // Observed for failures too, for the same reason the removal path is: an
+    // inspection that timed out still walked whatever it walked before giving
+    // up, and that work is charged to the cgroup either way. On a wedged mount
+    // the abandoned call is precisely the expensive case.
+    m.executionWorkspaceTeardownDurationHistogram.observe(
+      {
+        trigger: input.trigger,
+        method: "inspect_safety",
+        cleanup_reason: input.cleanupReason ?? "not_applicable",
+      },
+      input.durationMs / 1000,
+    );
+  } catch (error) {
+    logger.error({ err: error }, "failed to record execution-workspace reclaim inspection metrics");
+  }
+}
+
+/**
+ * Record one periodic execution-workspace collector pass (PEN-3692), including
+ * one the entry gate skipped — see {@link EXECUTION_WORKSPACE_COLLECTOR_STOP_REASONS}.
+ *
+ * Takes the whole result rather than individual fields so a new field added to
+ * {@link ExecutionWorkspaceCleanupResult} is a compile error here instead of a
+ * silently unrecorded one.
+ *
+ * Must not throw: it runs after the pass has already archived rows and removed
+ * trees, and a metrics fault must not be logged as a failed collection.
+ */
+export function recordExecutionWorkspaceCollectorPass(
+  result: ExecutionWorkspaceCleanupResult,
+  options: { stopReason: ExecutionWorkspaceCollectorStopReason; now?: () => number },
+): void {
+  try {
+    const m = ensureRegistry();
+    m.executionWorkspaceCollectorScannedCounter.inc(result.scanned);
+    m.executionWorkspaceCollectorStampedCounter.inc(result.stamped);
+    // Every stop_reason child materialized, as the reaper sweep counter does,
+    // so a dashboard reads "0 skipped passes" rather than no data.
+    for (const reason of EXECUTION_WORKSPACE_COLLECTOR_STOP_REASONS) {
+      m.executionWorkspaceCollectorPassesCounter.inc(
+        { stop_reason: reason },
+        reason === options.stopReason ? 1 : 0,
+      );
+    }
+
+    const byOutcome: Record<(typeof EXECUTION_WORKSPACE_COLLECTOR_OUTCOMES)[number], number> = {
+      collected: result.collected,
+      skipped: result.skipped,
+      failed: result.failed,
+    };
+    // Every child materialized, including the zeros: a dashboard should be able
+    // to read "0 failed" rather than no data, which is the state that makes a
+    // quiet collector and a broken one look alike.
+    for (const outcome of EXECUTION_WORKSPACE_COLLECTOR_OUTCOMES) {
+      m.executionWorkspaceCollectorCandidatesCounter.inc({ outcome }, byOutcome[outcome]);
+    }
+
+    m.executionWorkspaceCollectorLastPassGauge.set(Math.floor((options.now ?? Date.now)() / 1000));
+  } catch (error) {
+    logger.error({ err: error }, "failed to record execution-workspace collector pass metrics");
+  }
+}
+
+/**
  * Record a worker-tier proxy relay failure (BLO-31945).
  *
  * Paired with the existing log line, same division of labour as the webhook
@@ -5458,6 +5893,13 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
 /** Test-only: drop the registry so each test starts from a clean counter. */
 export function __resetMetricsForTest(): void {
   registry = null;
+  executionWorkspaceTeardown = null;
+  executionWorkspaceTeardownDuration = null;
+  executionWorkspaceCollectorScanned = null;
+  executionWorkspaceCollectorCandidates = null;
+  executionWorkspaceCollectorStamped = null;
+  executionWorkspaceCollectorPasses = null;
+  executionWorkspaceCollectorLastPass = null;
   concurrentRunBlocked = null;
   isolatedRunStarted = null;
   heartbeatRunFailed = null;
