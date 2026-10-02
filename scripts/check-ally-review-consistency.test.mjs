@@ -2006,4 +2006,32 @@ describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break
       "the `${}` hole does not blind the scan to a wildcard beside it",
     );
   });
+
+  // Moving the scan to the whole source made `\n` load-bearing in the literal
+  // body: a JS regex literal cannot carry a raw newline, so without that
+  // exclusion a `/` that never closes on its own line runs on until it finds
+  // one further down and swallows whatever lies between. Measured: with the
+  // exclusion removed, all other assertions in this file -- including the
+  // real-source injections above -- still pass, so nothing else pins it.
+  //
+  // Both directions are asserted because the mutation fails both ways, and the
+  // first is the silent one: the runaway match consumes the genuine wildcard
+  // below it and the scan reports nothing at all.
+  it("control: the literal body stops at a newline, both directions", () => {
+    const sites = (src) => bareDotSites(src).map((c) => c.text);
+
+    // Dangerous direction -- a real bare dot goes UNREPORTED.
+    assert.deepEqual(
+      sites('const A = /a\nconst B = "x";\nconst C = /^c.d$/;'),
+      ["const C = /^c.d$/;"],
+      "an unclosed `/` above must not swallow the wildcard below it",
+    );
+
+    // Noisy direction -- a span that is not a regex literal at all is reported.
+    assert.deepEqual(
+      sites('const A = /start\nconst B = ".";\nconst C = /end/;'),
+      [],
+      "a match must not span lines to manufacture a literal",
+    );
+  });
 });
