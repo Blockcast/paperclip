@@ -50,6 +50,7 @@ export interface LiveEventSubscriberContext {
 }
 
 type RunTranscriptDecider = Parameters<typeof decideRunTranscriptRead>[1];
+type MembershipReader = () => Promise<{ membershipRole: string | null; status: string } | null>;
 
 /**
  * How long one allow/deny decision may be reused on a socket.
@@ -140,18 +141,50 @@ function syntheticRequest(context: LiveEventSubscriberContext): Request {
  * That is the fail-OPEN direction, so the reuse window is bounded in time
  * rather than by the connection (Ally review 5375217878).
  *
+ * Re-deciding alone does not bound a board operator. The operator
+ * short-circuit in `decideRunTranscriptRead` answers from the actor's
+ * membership role and returns before the decider runs, so re-deciding against
+ * the upgrade-time role would re-derive the same allow for the life of the
+ * socket — a board user demoted to `viewer`, or deactivated, would keep the
+ * stream. The membership row is therefore re-read once the TTL has passed, and
+ * a board decision is stamped with the age of the role it was made from, so the
+ * role arm is bounded by the same window as the decider arm (Ally review
+ * 5386746244). The trusted local board has no membership row and is not
+ * re-read.
+ *
  * The entry is stamped when the decision STARTS, not when it resolves, so a
  * slow authorizer shortens the window rather than extending it.
  */
 export function createLiveEventTranscriptGate(
   db: Db,
   context: LiveEventSubscriberContext,
-  deps?: { access?: RunTranscriptDecider; now?: () => number; ttlMs?: number },
+  deps?: { access?: RunTranscriptDecider; now?: () => number; ttlMs?: number; readMembership?: MembershipReader },
 ): (event: LiveEvent) => Promise<LiveEvent> {
   const access = deps?.access ?? (accessService(db) as RunTranscriptDecider);
   const now = deps?.now ?? (() => Date.now());
   const ttlMs = deps?.ttlMs ?? DECISION_TTL_MS;
-  const req = syntheticRequest(context);
+  const readMembership =
+    deps?.readMembership ?? (() => accessService(db).getMembership(context.companyId, "user", context.actorId));
+  const rereadsMembership = context.actorType === "board" && !context.trustedLocal;
+  // The upgrade read the membership just before this gate was built, so the
+  // first window reuses it rather than reading it twice.
+  let actor = { readAt: now(), req: Promise.resolve(syntheticRequest(context)) };
+  const actorAt = (startedAt: number) => {
+    if (rereadsMembership && startedAt - actor.readAt >= ttlMs) {
+      actor = {
+        readAt: startedAt,
+        req: Promise.resolve()
+          .then(readMembership)
+          .then((membership) =>
+            syntheticRequest({
+              ...context,
+              membershipRole: membership?.status === "active" ? membership.membershipRole : null,
+            }),
+          ),
+      };
+    }
+    return actor;
+  };
   const cache = new Map<string, { decidedAt: number; allowed: Promise<boolean> }>();
 
   const canRead = (agentId: string | null): Promise<boolean> => {
@@ -159,13 +192,13 @@ export function createLiveEventTranscriptGate(
     const startedAt = now();
     const cached = cache.get(key);
     if (cached && startedAt - cached.decidedAt < ttlMs) return cached.allowed;
-    const pending = decideRunTranscriptRead(req, access, {
-      companyId: context.companyId,
-      agentId,
-    })
+    const { readAt, req } = actorAt(startedAt);
+    const pending = req
+      .then((request) => decideRunTranscriptRead(request, access, { companyId: context.companyId, agentId }))
       .then((outcome) => outcome.allowed)
-      // Fail closed. An authorization error must not become a transcript read;
-      // the subscriber still receives the event, just without the content.
+      // Fail closed. An authorization error — or a failed membership re-read —
+      // must not become a transcript read; the subscriber still receives the
+      // event, just without the content.
       //
       // Logged for the reason the REST twin gives at `routes/authz.ts`: a
       // broken authorizer that failed silently would be indistinguishable from
@@ -180,7 +213,10 @@ export function createLiveEventTranscriptGate(
         );
         return false;
       });
-    cache.set(key, { decidedAt: startedAt, allowed: pending });
+    // A board decision is no fresher than the role it was made from: stamping
+    // it with `startedAt` would let a decision started late in a role window
+    // outlive that window by up to a further TTL.
+    cache.set(key, { decidedAt: rereadsMembership ? readAt : startedAt, allowed: pending });
     // Drop entries that can no longer be reused. The map is bounded by the
     // company's agent count rather than by event volume, so this is small — but
     // the entries are timestamped now, so evicting is nearly free and keeps a
