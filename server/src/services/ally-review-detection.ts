@@ -63,9 +63,17 @@
 const FENCE_DELIMITER_PATTERN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const FENCE_CLOSE_PATTERN = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
-function withoutFencedCodeBlocks(body: string): string {
+// `keepUnterminated` leaves a fence that never closes as emitted text. Only the
+// fail-closed cross-checks in parseAllyVerdictBlock read that way: a closed
+// fence is a deliberate quote, but an unterminated one is not evidence of
+// quoting, and blanking it hid the counted bucket below it from the check that
+// stands between that bucket and a block stating fewer (Ally, #1721 at
+// 5f4d5302, Important 1). Restored verbatim, so a fence nested inside the
+// unterminated span reads as text too.
+function withoutFencedCodeBlocks(body: string, keepUnterminated = false): string {
   if (!body.includes("```") && !body.includes("~~~")) return body;
   const lines = body.split("\n");
+  let openedAt = -1;
   let open: { char: string; length: number } | null = null;
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i]!;
@@ -82,16 +90,37 @@ function withoutFencedCodeBlocks(body: string): string {
     // fence that would blank the rest of a genuine review.
     if (fence && !(fence[1]![0] === "`" && fence[2]!.includes("`"))) {
       open = { char: fence[1]![0]!, length: fence[1]!.length };
+      openedAt = i;
       lines[i] = "";
     }
   }
   // An unclosed fence blanks to end of body, matching how GitHub renders it.
+  if (open && keepUnterminated) {
+    return [...lines.slice(0, openedAt), ...body.split("\n").slice(openedAt)].join("\n");
+  }
   return lines.join("\n");
+}
+
+/**
+ * The review body with every line ending normalized to `\n`, or null for a
+ * non-string. The single entry point for every reader in this module.
+ *
+ * GitHub stores whatever line endings the client sent, and the readers do not
+ * agree on what `\r` is: JS `.` excludes it while Python's matches it, and JS
+ * `$` under `m` stops before it while the gate's `(?=\n|$)` does not. On a CRLF
+ * body that split one review into three verdicts (gate unreadable, auditor
+ * null, sweep the head) and made fence-stripping a no-op here (Ally, #1721 at
+ * 5f4d5302, Critical 3). Normalizing once, in all three readers, makes the
+ * line the same thing to every pattern.
+ */
+function reviewBody(body: string | null | undefined): string | null {
+  return typeof body === "string" ? body.replace(/\r\n?/g, "\n") : null;
 }
 
 /** Review text with quoted (fenced) spans removed, or null for a non-string. */
 function emittedReviewText(body: string | null | undefined): string | null {
-  return typeof body === "string" ? withoutFencedCodeBlocks(body) : null;
+  const raw = reviewBody(body);
+  return raw === null ? null : withoutFencedCodeBlocks(raw);
 }
 
 // CommonMark starts an indented code block at four columns, and a tab always
@@ -553,10 +582,16 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
     };
   }
 
-  const countDisagreement = proseCountContradicting(text, counts);
+  // Closed fences blanked, an unterminated one kept: emitted-only let an
+  // unclosed fence blank the counted bucket below it, so a block stating zero
+  // read `ok` on a body that blocks without the block (Ally, #1721 at
+  // 5f4d5302, Important 1). A superset of the emitted text's lines, so nothing
+  // the emitted reading catches is lost.
+  const crossCheckText = withoutFencedCodeBlocks(reviewBody(body)!, true);
+  const countDisagreement = proseCountContradicting(crossCheckText, counts);
   if (countDisagreement !== null) return { kind: "unreadable", reason: countDisagreement };
 
-  const ledgerDisagreement = proseDispositionContradicting(text, ledger);
+  const ledgerDisagreement = proseDispositionContradicting(crossCheckText, ledger);
   if (ledgerDisagreement !== null) return { kind: "unreadable", reason: ledgerDisagreement };
 
   return {
@@ -638,29 +673,35 @@ export function allyClaimedReviewHead(body: string | null | undefined): string |
  * window.
  *
  * Asymmetric exactly like the head rule, and for the same reason: only a
- * *positive* prose count against a stated zero is fatal. An absent or
- * unparseable bucket is the #1675 case the block exists to survive, and a
- * block reporting more than the prose does cannot fail open. The #1675 body
- * reads `Critical Issues (0)` / `Important Issues (0)`, so this never fires on
- * it — the fixture is the control.
+ * prose count *above* the block's is fatal. An absent or unparseable bucket is
+ * the #1675 case the block exists to survive, and a block reporting more than
+ * the prose does cannot fail open. The #1675 body reads `Critical Issues (0)`
+ * / `Important Issues (0)`, so this never fires on it — the fixture is the
+ * control.
  *
- * Reads the emitted text, so a quoted or fenced bucket cannot fail a block
- * closed. Unlike `hasActionablePrReviewFeedback`, which reads the raw body
- * too, the fail-open direction here is already covered: the block itself is
- * the claim, and this only cross-checks it.
+ * Reads closed fences as quotes, so a quoted example bucket cannot fail a
+ * block closed, but reads an unterminated fence as emitted text: blanked, it
+ * hides every bucket below it, and this cross-check is the only thing standing
+ * between those buckets and a block that states fewer.
  */
 function proseCountContradicting(text: string, counts: Map<string, number>): string | null {
   for (const [, severity, count] of text.matchAll(EMITTED_COUNTED_FINDINGS_BUCKET_PATTERN)) {
     const key = severity!.toLowerCase();
     if (!BLOCKING_SEVERITIES.has(key)) continue;
-    if (Number(count) > 0 && counts.get(key) === 0) {
+    // Any shortfall, not only a stated zero. A block under-counting a
+    // `### Critical Issues (3)` as `1` mints one finding identity, so one
+    // `fixed` entry retired the head with two Criticals still open (Ally,
+    // #1721 at 5f4d5302, Important 2). A block reporting *more* than the prose
+    // still cannot fail open.
+    const stated = counts.get(key)!;
+    if (Number(count) > stated) {
       // `count` is the `(\d+)` capture over model-authored review text, so it
       // is digits-only but unbounded in length, and this reason reaches the
       // check-run summary, which has no cap of its own. A noise bound, not a
       // security one — digits cannot carry a credential — so it is the same
       // call already made for `rawVersion` at :495 and for token length in
       // asPublishableToken, applied here for the symmetry.
-      return `ally-verdict states 0 \`${key}\` but the review enumerates ${count!.slice(0, PUBLISHABLE_TOKEN_BUDGET)}`;
+      return `ally-verdict states ${stated} \`${key}\` but the review enumerates ${count!.slice(0, PUBLISHABLE_TOKEN_BUDGET)}`;
     }
   }
   return null;
@@ -1136,13 +1177,14 @@ export function extractAllyReportedFindingRefs(
   // together — the carried-finding path asks *both* whether a review blocks and
   // which identities it raised, so a body that blocks here while enumerating
   // `null` there would carry a head no ledger entry could ever retire.
-  if (typeof body !== "string") return null;
+  const raw = reviewBody(body);
+  if (raw === null) return null;
 
   // Highest count seen per severity, across both readings. Findings are
   // identified by (severity, index), so a bucket of N contributes indices
   // 1..N; taking the maximum yields a superset of either reading alone.
   const highestCount = new Map<string, number>();
-  for (const text of [body, withoutFencedCodeBlocks(body)]) {
+  for (const text of [raw, withoutFencedCodeBlocks(raw)]) {
     for (const [, severity, count] of text.matchAll(COUNTED_FINDINGS_BUCKET_PATTERN)) {
       const key = severity!.toLowerCase();
       highestCount.set(
@@ -1352,7 +1394,7 @@ export function hasActionablePrReviewFeedback(
   // opposite: prose that positively states a count, on a body whose structured
   // block is the part that failed. At the head under evaluation the
   // unreadable_verdict branch still runs first and still wins.
-  const text = body.trim();
+  const text = reviewBody(body)!.trim();
   if (!text) return false;
 
   // Deliberately the one predicate that reads the raw body as well as the

@@ -1551,6 +1551,33 @@ describe("BLO-32695 — the block and the prose must not name different counts",
     expect(parseAllyVerdictBlock(suggestions).kind).toBe("ok");
   });
 
+  /**
+   * Ally, #1721 at 5f4d5302, Important 1 and 2. Emitted-only let an
+   * unterminated fence blank the bucket below it, and the stated-zero-only rule
+   * let a block under-count without contradiction -- one identity minted, one
+   * `fixed` retires the head, two Criticals left open.
+   */
+  it("does not let an unterminated fence hide a bucket the block undercounts", () => {
+    const hidden = body({ head: PR1675_HEAD, findings: { critical: 0, important: 0 } }, "```ts", "### Critical Issues (1)");
+    expect(parseAllyVerdictBlock(hidden).kind).toBe("unreadable");
+    expect(hasActionablePrReviewFeedback(hidden)).toBe(true);
+  });
+
+  it("fails closed on any block count below the emitted bucket, not only zero", () => {
+    const under = body({ head: PR1675_HEAD, findings: { critical: 1, important: 0 } }, "### Critical Issues (3)");
+    expect(parseAllyVerdictBlock(under)).toMatchObject({
+      kind: "unreadable",
+      reason: expect.stringContaining("states 1 `critical`"),
+    });
+    // Controls: agreeing, and a block reporting more, both stay readable.
+    for (const [critical, bucket] of [[3, 3], [3, 1]] as const) {
+      const parsed = parseAllyVerdictBlock(
+        body({ head: PR1675_HEAD, findings: { critical, important: 0 } }, `### Critical Issues (${bucket})`),
+      );
+      expect(parsed.kind).toBe("ok");
+    }
+  });
+
   it("ignores a fenced bucket, so a quoted example cannot red a clean block", () => {
     const quoted = body(
       { head: PR1675_HEAD, findings: { critical: 0, important: 0 } },
@@ -1773,5 +1800,38 @@ describe("BLO-32695 — prefix drift fails closed rather than vanishing", () => 
 
   it("still counts the emitter's own exact form as one block, not two", () => {
     expect(parseAllyVerdictBlock(`${verdictBlock(PR1675_VERDICT)}${prose}`).kind).toBe("ok");
+  });
+});
+
+/**
+ * Ally, #1721 at 5f4d5302, Critical 3 and Important 4. JS `.` excludes `\r`, so
+ * on a CRLF body no fence opened and fence-stripping was a no-op, and the
+ * attestation's `(?=\n|$)` could not cross `\r`: a clean review read
+ * unreadable, and a block-less one attested nothing. The CRLF twin of every
+ * body must read exactly as the LF one.
+ */
+describe("BLO-32695 — a CRLF body reads exactly as its LF twin", () => {
+  const HEAD = PR1675_HEAD;
+  const clean = { head: HEAD, findings: { critical: 0, important: 0 } };
+  const lfBodies = [
+    [verdictBlock(clean), "## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`, "```ts", "### Critical Issues (2)", "```"],
+    ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`, "### Critical Issues (0)", "### Important Issues (0)"],
+    ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`, "### Important Issues (1)", "1. Open."],
+  ].map((lines) => lines.join("\n"));
+
+  it.each(lfBodies.map((lf) => [lf]))("body %#", (lf) => {
+    const crlf = lf.replace(/\n/g, "\r\n");
+    const gate = (b: string) =>
+      evaluateCommentReviewGate({
+        headSha: HEAD,
+        reviewerBotLogin: ALLY_BOT_LOGIN,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
+        comments: [allyComment(b, "2026-09-07T15:41:42Z")],
+      });
+    expect(extractAllyReviewedHeadSha(lf)).toBe(HEAD);
+    expect(extractAllyReviewedHeadSha(crlf)).toBe(HEAD);
+    expect(parseAllyVerdictBlock(crlf).kind).toBe(parseAllyVerdictBlock(lf).kind);
+    expect(hasActionablePrReviewFeedback(crlf)).toBe(hasActionablePrReviewFeedback(lf));
+    expect(gate(crlf)).toEqual(gate(lf));
   });
 });
