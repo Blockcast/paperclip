@@ -442,20 +442,36 @@ function isApproved(review) {
  * `null` when there is no block and the prose fallback should answer instead.
  *
  * The block is authoritative when present. Its `findings` counts are the
- * producer's own tally, and the review template heads its buckets
- * `### 🚨 Critical` with no `(N)`, so the prose readers see a blocking review as
- * clean — that gap is the whole reason this reader exists.
+ * producer's own tally, and a review may head its buckets `### 🚨 Critical`
+ * with no `(N)` -- the form the template prescribed until #1721 corrected it to
+ * the counted one -- so the prose readers see a blocking review as clean. That
+ * gap is the whole reason this reader exists, and historical bodies keep it
+ * live whatever the template now says.
  *
- * An unreadable block returns `true` rather than falling back. Every caller
- * reads `true` as "report a violation", so that is the direction that cannot
- * mask a finding, and it matches the gate: a block Ally tried and failed to
- * state is not the same fact as a review that predates the block.
+ * An unreadable block answers `false` to every *field* query and is reported
+ * once by I2e instead. It previously answered `true` to all of them, so a
+ * single unreadable verdict surfaced under both I2a and I2c with two mutually
+ * exclusive and factually false causes -- the body cannot both report an open
+ * finding and mark a prior one still-present when nothing in it was read at
+ * all (Ally, #1721 at 5f4d5302, Suggestion 1). Nothing is masked: `I2e` states
+ * the true cause, and `hasBlockingVerdict` keeps counting unreadable as
+ * blocking, so every fail-closed consumer is unchanged.
+ *
+ * `false`, not `null`: `null` would hand the question to the prose fallback,
+ * and a block Ally tried and failed to state is not the same fact as a review
+ * that predates the block. The gate refuses that same fallback for that same
+ * reason (`parseAllyVerdictBlock`, ally-review-detection.ts).
  */
 function structuredBlocking(body, field) {
   const block = structuredVerdict(reviewText(body));
-  if (block.kind === "unreadable") return true;
+  if (block.kind === "unreadable") return false;
   if (block.kind === "absent") return null;
   return block[field];
+}
+
+/** I2e's fact: the body carries a block, and none of it could be read. */
+function structuredUnreadable(body) {
+  return structuredVerdict(reviewText(body)).kind === "unreadable";
 }
 
 /**
@@ -473,8 +489,14 @@ function reportsStillPresent(body) {
   return structuredBlocking(body, "stillPresent") ?? hasStillPresentDisposition(body);
 }
 
+/**
+ * The fail-closed roll-up. `structuredUnreadable` is a term in its own right
+ * because the field queries above deliberately stopped answering for it: drop
+ * it and an unreadable block would read as a clean verdict here, which is the
+ * one direction that masks a finding.
+ */
 function hasBlockingVerdict(body) {
-  return reportsBlockingFindings(body) || reportsStillPresent(body);
+  return structuredUnreadable(body) || reportsBlockingFindings(body) || reportsStillPresent(body);
 }
 
 function reviewDetails(reviews) {
@@ -761,6 +783,11 @@ export function findPrViolations(pr) {
         );
       }
 
+      if (isApproved(review) && structuredUnreadable(review.body)) {
+        violations.push(
+          `I2e PR #${pr.number} @${short}: ${label} review ${review.id} is APPROVED but its ally-verdict block is unreadable — the approval rests on a verdict nothing could read`,
+        );
+      }
       if (isApproved(review) && reportsBlockingFindings(review.body)) {
         violations.push(
           `I2a PR #${pr.number} @${short}: ${label} review ${review.id} is APPROVED but its body reports a Critical/Important finding`,
