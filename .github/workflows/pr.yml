@@ -196,19 +196,22 @@ jobs:
         run: node --test ./scripts/check-db-transaction-alias.test.mjs
         timeout-minutes: 1
 
-      - name: Guard drizzle migration journal (BLO-39490)
-        # Three open PRs each appended `idx: 248` and all three were green:
-        # every required check passed because each PR is individually
-        # consistent. Needs PR_BASE_SHA -- a branch cut before the colliding
-        # entry landed looks fine on its own. Also runs on merge_group, which
-        # is what rejects the second claimant at the queue front rather than
-        # letting it land a conflict or a silently-dropped migration.
+      - name: Guard migration-number collision with base (BLO-39490)
+        # The one migration check that cannot be made from a single tree.
+        # packages/db/src/check-migration-numbering.ts (BLO-27927) covers
+        # everything visible in one tree; it cannot see a collision that does
+        # not exist yet. Three open PRs each appended `idx: 248` and all three
+        # were green, because each tree is individually consistent -- the
+        # collision only arrives when the second branch meets the first, as a
+        # merge-queue conflict that ejects the PR (BLO-26675) rather than a
+        # red the author can act on. Needs PR_BASE_SHA; also runs on
+        # merge_group, which is where the second claimant is rejected.
         if: ${{ !cancelled() }}
-        run: node ./scripts/check-migration-journal.mjs "$PR_BASE_SHA"
+        run: node ./scripts/check-migration-journal-base.mjs "$PR_BASE_SHA"
 
-      - name: Test migration-journal guard (BLO-39490)
+      - name: Test migration-number base guard (BLO-39490)
         if: ${{ !cancelled() }}
-        run: node --test ./scripts/check-migration-journal.test.mjs
+        run: node --test ./scripts/check-migration-journal-base.test.mjs
         timeout-minutes: 1
 
       - name: Validate Dockerfile deps stage
