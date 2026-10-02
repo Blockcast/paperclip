@@ -359,12 +359,23 @@ test("the uid and panel titles that onprem-k8s alerts hard-code are pinned (BLO-
   //
   // The uid appears twice per alert -- once in the `dashboard:` annotation and
   // again in an inline https://stats.orc8r.blockcast.net/d/<uid> URL inside the
-  // description -- so renaming it 404s all four links. The panel titles are
-  // named in that description prose as navigation ("the `Unresolved
-  // dead-letters` stat tells you which arm of this two-armed rule fired";
-  // "read the firing cause from the summary above, not from the `Terminal
-  // suppression by cause` panel"), so renaming one silently sends a paged
-  // operator to a panel that no longer exists.
+  // description -- so renaming it 404s four links per file, eight across the
+  // ConfigMap and the CRD mirror.
+  //
+  // The two panel titles are both named in that description prose, but they
+  // fail differently, so they get separate assertions:
+  //
+  //   'Unresolved dead-letters' is positive navigation -- it is the
+  //   discriminator for which arm of a two-armed rule fired ("the `Unresolved
+  //   dead-letters` stat tells you which arm of this two-armed rule fired").
+  //   Renaming it sends a paged operator to a panel that is not there.
+  //
+  //   'Terminal suppression by cause' is a caveat steering the operator AWAY
+  //   ("read the firing cause from the summary above, not from the `Terminal
+  //   suppression by cause` panel: it is unfiltered and also charts benign
+  //   causes such as `reviewer_lock_contended`"). Renaming it leaves a warning
+  //   about a panel nobody can find -- so the operator reads the unfiltered
+  //   panel under its new name and mistakes a benign cause for the outage.
   //
   // The guard belongs here rather than in onprem-k8s: the dashboard JSON is not
   // in that repo, so an assertion there compares its own constant to itself and
@@ -379,13 +390,13 @@ test("the uid and panel titles that onprem-k8s alerts hard-code are pinned (BLO-
   );
 
   const titles = dashboard.panels.map((panel) => panel.title);
-  for (const title of [
-    "Unresolved dead-letters",
-    "Terminal suppression by cause",
-  ]) {
-    assert.ok(
-      titles.includes(title),
-      `onprem-k8s alert runbook prose sends the operator to the '${title}' panel by name; renaming or removing it breaks that instruction`,
-    );
-  }
+
+  assert.ok(
+    titles.includes("Unresolved dead-letters"),
+    "onprem-k8s PaperclipGithubReviewRequestDeadLettered tells the operator to read this panel to decide which arm of the rule fired; renaming it sends them to a panel that is not there",
+  );
+  assert.ok(
+    titles.includes("Terminal suppression by cause"),
+    "onprem-k8s PaperclipGithubReviewRequestSuppressionOutage warns the operator off this panel by name because it is unfiltered; renaming it strands the warning and they read the unfiltered panel anyway",
+  );
 });
