@@ -39,17 +39,31 @@ const COMMAND_AUTHORIZATION_BEARER_RE = /(\bAuthorization\s*:\s*Bearer\s+)[^\s"'
  * transcript.
  */
 const COMMAND_OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{12,}\b/g;
-const COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g;
+// SELF-SUFFICIENT (BLO-29553). The `(?:\.…)*` tail means this rule consumes a
+// whole composite `ghs_<seg>.<b64>.<b64>` on its own, without depending on
+// COMMAND_JWT_RE to cover the dotted remainder. That dependency was the leak:
+// JWT requires every segment to be >=8 chars, so a composite with a short
+// middle segment, or a 2-segment composite, has no JWT match at all and the
+// tail went out in the clear. The tail class admits `-` because base64url
+// payloads do; the prefix class does not, matching GitHub's own token alphabet.
+//
+// "Self-sufficient" is CONDITIONAL, not unconditional: it holds only while the
+// token body stays inside `[A-Za-z0-9_]`. If GitHub ever issues a `gh*_` token
+// containing a character outside that class (a `-`, or a second `.`), the
+// `{20,}` run stops early, this rule reverts to matching a PREFIX of the value,
+// and the 2-of-3-segment leak this fix closed is back — because a prefix
+// replacement inserts `*` and destroys the structure the later rules match on.
+// Widen the body class in step with any such change, and re-run
+// blo29553-composite-token-redaction.test.ts.
+const COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}(?:\.[A-Za-z0-9_-]+)*\b/g;
 /**
- * OVERLAPS OPEN PR #1683 (BLO-29553), which introduces this same constant and
- * the same `github_pat_` hint. The form here is copied from that PR — the
- * `(?:\.…)*` tail makes the rule self-sufficient over a dotted composite
- * instead of leaning on `COMMAND_JWT_RE` to finish it. If #1683 lands first,
- * take its version wholesale on conflict; the two are equivalent here and its
- * accompanying ordering invariant is the authority.
+ * Fine-grained PAT. Deliberately its own rule rather than widening the class in
+ * COMMAND_GITHUB_TOKEN_RE: that pattern is `gh[pousr]_`, and `github_pat_` has
+ * `i` in the third position, so it matches nothing there and the prefix went out
+ * in the clear (BLO-29553). Same self-sufficient tail, same conditional caveat.
  *
- * Kept in this PR rather than deferred because this branch is master-based and
- * has to close `github_pat_` on its own: on master today the shape leaks.
+ * Landed ahead of this change by PEN-3139 (#1736), which copied it from the
+ * BLO-29553 branch; the two are byte-identical here.
  */
 const COMMAND_GITHUB_FINE_GRAINED_PAT_RE = /\bgithub_pat_[A-Za-z0-9_]{20,}(?:\.[A-Za-z0-9_-]+)*\b/g;
 /**
@@ -97,8 +111,12 @@ const COMMAND_SLACK_TOKEN_RE = /\bxox[baprs]-[A-Za-z0-9-]{10,}/g;
  */
 const COMMAND_PEM_PRIVATE_KEY_RE =
   /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----(?:[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|(?:(?:\s|\\[rn])+[A-Za-z0-9+/=]{16,})*(?:(?:\s|\\[rn])+[A-Za-z0-9+/=]{1,15}(?:\s|\\[rn])*$)?)/g;
+// The tail repetition is unbounded (`*`, not `?`). A 4-segment cap made JWT
+// greedily consume the leftmost four segments of a longer dotted run and strand
+// whatever followed, which in a run containing a token is a surviving token
+// segment (BLO-29553).
 const COMMAND_JWT_RE =
-  /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b/g;
+  /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})*\b/g;
 const COMMAND_SECRET_HINTS = [
   "api",
   "key",
@@ -146,25 +164,45 @@ export function redactCommandText(command: string, redactedValue = REDACTED_COMM
       (_match, prefix: string, quote: string | undefined) =>
         quote ? `${prefix}${quote}${redactedValue}${quote}` : `${prefix}${redactedValue}`,
     )
-    .replace(COMMAND_OPENAI_KEY_RE, redactedValue)
-    .replace(COMMAND_GITHUB_TOKEN_RE, redactedValue)
-    // PEN-3139 rules sit ahead of COMMAND_JWT_RE deliberately. `redactedValue`
-    // contains `*`, which is outside `[A-Za-z0-9_-]`, so an earlier replacement
-    // can destroy a later rule's match — ordering here is load-bearing. Each of
-    // these five is self-sufficient: the value it matches carries no dotted
-    // tail (AWS, Google and Slack keys are undotted; a PEM body is base64, which
-    // excludes `.`), so none of them strands a remainder for JWT to finish, and
-    // none can be stranded by JWT running later.
+    // ORDERING INVARIANT (BLO-29553) — self-sufficient prefix-anchored rules,
+    // then JWT, then prefix rules that cover no dotted tail. `redactedValue`
+    // contains `*`, which is outside `[A-Za-z0-9_-]`, so any replacement made
+    // here can destroy a LATER rule's match. The three rules above each consume
+    // their whole value, so they are safe in any order; the value-shape rules
+    // below are not.
     //
-    // Open PR #1683 (BLO-29553) rewrites this chain around the same invariant
-    // and additionally moves COMMAND_OPENAI_KEY_RE last. That reordering is
-    // theirs, measured against their 90-case suite; this PR does not touch it.
-    // On conflict, take #1683's chain and re-insert these five in this relative
-    // position — before JWT, after the GitHub rules.
+    // The token `gh auth status` emits is a composite — `ghs_<seg>.<b64>.<b64>`.
+    // Originally the prefix rules ran first and replaced only the `ghs_` head,
+    // breaking the three-segment structure COMMAND_JWT_RE needed; payload and
+    // signature persisted verbatim (2 of 3 segments surviving). Putting JWT
+    // first fixed that case and opened two others, because JWT is shape-only: it
+    // requires every segment to be >=8 chars and so stops mid-composite on a
+    // short segment, and it cannot start on a 2-segment composite at all — in
+    // both cases it strands the tail. Only a rule that knows where the token
+    // begins AND carries its own dotted tail can own the whole run, which is why
+    // the two GitHub rules are self-sufficient and sit ahead of JWT.
+    //
+    // COMMAND_OPENAI_KEY_RE stays LAST precisely because it is prefix-anchored
+    // and NOT self-sufficient: ahead of JWT it would reintroduce the original
+    // bug on a dotted value. `sk-` keys are not dotted, so it strands nothing.
+    //
+    // The five PEN-3139 rules keep their relative position — before JWT, after
+    // the GitHub rules — exactly as #1736 asked for on conflict. Each is
+    // self-sufficient too: the value it matches carries no dotted tail (AWS,
+    // Google and Slack keys are undotted; a PEM body is base64, which excludes
+    // `.`), so none strands a remainder for JWT and none is stranded by it.
+    //
+    // Measured over the enumerated composite family (2-6 segments x short middle
+    // segment x 0-2 context segments each side, 90 cases): this order leaves 0
+    // surviving token segments; JWT first leaves 3. Do not reorder these without
+    // re-running blo29553-composite-token-redaction.test.ts, which asserts the
+    // invariant executably — a deliberately wrong order must leak.
     .replace(COMMAND_GITHUB_FINE_GRAINED_PAT_RE, redactedValue)
+    .replace(COMMAND_GITHUB_TOKEN_RE, redactedValue)
     .replace(COMMAND_AWS_ACCESS_KEY_ID_RE, redactedValue)
     .replace(COMMAND_GOOGLE_API_KEY_RE, redactedValue)
     .replace(COMMAND_SLACK_TOKEN_RE, redactedValue)
     .replace(COMMAND_PEM_PRIVATE_KEY_RE, redactedValue)
-    .replace(COMMAND_JWT_RE, redactedValue);
+    .replace(COMMAND_JWT_RE, redactedValue)
+    .replace(COMMAND_OPENAI_KEY_RE, redactedValue);
 }
