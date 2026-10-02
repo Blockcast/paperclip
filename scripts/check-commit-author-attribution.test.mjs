@@ -102,15 +102,17 @@ test("findAttributionOffenses fails closed on the graphify name when no paths ar
 });
 
 test("findAttributionOffenses flags every observed spelling of the App noreply address (BLO-26647)", () => {
-  // Measured on origin/master, non-merge commits since 2026-07-01: 192 carried
-  // the id-prefixed form and were caught; 15 carried a variant and were not.
+  // Measured on origin/master, non-merge commits since 2026-07-01: at filing
+  // (2026-08-12) 192 carried the id-prefixed form and were caught, 15 carried a
+  // variant and were not; re-measured 2026-10-02 the split was 194 against 288.
   // Each of these resolves via GET /repos/{owner}/{repo}/commits/{sha} to the
-  // same installation (id 290875700) as the id-prefixed form — or, for
-  // `220200645+`, to no account at all, which erases the author even harder.
+  // same installation (id 290875700) as the id-prefixed form — or, for the two
+  // wrong-prefix forms, to no account at all, which erases the author harder.
   const spellings = [
     APP_NOREPLY_EMAIL,
     "allyblockcast[bot]@users.noreply.github.com", // 6c0e9c336 — author.id 290875700
     "220200645+allyblockcast[bot]@users.noreply.github.com", // d41030016 — resolves to nothing
+    "218837398+allyblockcast[bot]@users.noreply.github.com", // 8afd2b4c0 — resolves to nothing
     "ALLYBLOCKCAST[BOT]@Users.NoReply.GitHub.com", // casing is not a write path this gate may miss
     "290875700+allyblockcast[bot]+agent@users.noreply.github.com", // subaddressed
   ];
