@@ -1232,10 +1232,10 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   // (~390/day). That agent count slides with the 7d window -- re-measured
   // 22 of 23 on 2026-09-26 -- so cite it with its date and never as "all
   // agents". Holds past 300s are routine, not exceptional. Blockcast's live
-  // rule is therefore being retuned to a fleet-count expression, with the
-  // log/alert numbers deliberately UNPINNED (Blockcast/onprem-k8s#3985,
-  // unmerged; until it lands the live rule is still > 300 and the two still
-  // share 300); see deploy/helm/paperclip/values.yaml
+  // rules therefore no longer use 300: Blockcast/onprem-k8s#4036 split the
+  // page into Wedged (> 14400 for 5m) and FleetStall (>= 3 agents past 900s
+  // for 10m), with the log/alert numbers deliberately UNPINNED (the earlier
+  // single-rule retune, #3985, closed unmerged); see deploy/helm/paperclip/values.yaml
   // (agentStartLockHeldSeconds) and runbooks/queued-run-stranded.md. This
   // assertion still stands because THIS chart copy was not retuned -- it
   // guards the 300 that is still rendered here, not the deployed policy.
@@ -1288,19 +1288,18 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
 test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)", () => {
   // Nothing renders from these two passages, so only an assertion catches them
   // drifting. values.yaml is read by third parties enabling this chart
-  // elsewhere: calling the fleet-count retune Blockcast's live rule while
-  // Blockcast/onprem-k8s#3985 is unmerged hands them an unproven expression as
-  // proven -- and the mirror error, still calling it pending after #3985 lands,
-  // hands them `> 300` when the live rule is `> 900`.
+  // elsewhere, immediately before they set prometheusRule.enabled: true, so a
+  // stale live threshold here is the number they port.
   //
-  // This test CANNOT observe #3985's state (CI has no read of onprem-k8s), so
-  // it deliberately enforces only that the prose stays DEFINITE about that
-  // state, in EITHER direction. Pinning it to "pending" would make the correct
-  // post-merge edit a red build whose failure message argues the now-false
-  // claim back in. The gate on which direction is true is the must-update
-  // checklist on Blockcast/onprem-k8s#3985, which names this file by path --
-  // that is where the merge event actually happens, and this repo has no
-  // signal for it.
+  // This pin previously accepted either outcome of Blockcast/onprem-k8s#3985
+  // (pending with `> 300`, or merged with `> 900`). #3985 resolved to a third
+  // outcome that pin could not express: it closed unmerged on 2026-09-28, and
+  // Blockcast/onprem-k8s#4036 landed the same day with a SPLIT instead --
+  // Wedged at `> 14400` for 5m and a separate FleetStall at `>= 3` for 10m.
+  // Both PRs are terminal, so the WARNING is now pinned to that landed state.
+  // CI has no read of onprem-k8s and cannot see a later move; if those rules
+  // change again, read the two lockstep alert files there and update the
+  // WARNING, the runbook's KNOWN DIVERGENCE, and these patterns together.
   const values = readFileSync(
     path.join(repoRoot, "deploy/helm/paperclip/values.yaml"),
     "utf8",
@@ -1315,27 +1314,36 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
   const warning = values.slice(warningIndex, warningEnd === -1 ? undefined : warningEnd);
   assert.match(
     warning,
-    /in Blockcast\/onprem-k8s#3985, (?:not yet merged; until it lands the live rule is still `> 300`|merged; the live rule is now `> 900`)/,
-    "values.yaml must state #3985's status definitely: pending with the live rule still > 300, or merged with it now > 900",
+    /Blockcast\/onprem-k8s#3985[^.]*closed unmerged/,
+    "values.yaml must say Blockcast/onprem-k8s#3985 closed unmerged",
   );
-  // Only meaningful while the prose claims pending -- after #3985 lands, saying
-  // the retune is deployed is the correct statement, not the forbidden one.
-  if (/not yet merged/.test(warning)) {
-    assert.doesNotMatch(
-      warning,
-      /live rule in Blockcast\/onprem-k8s is now|NO LONGER the deployed policy/,
-      "values.yaml must not describe the unmerged retune as deployed",
-    );
-  }
+  assert.match(
+    warning,
+    // Pin the metric name, not just the threshold: an unconstrained `[^`]*`
+    // here passes a WARNING that quotes a completely wrong series, which is the
+    // one element of this block that fails silently in the operator's hands.
+    /Blockcast\/onprem-k8s#4036[^.]*PaperclipAgentStartLockWedged at `max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > 14400` for 5m/,
+    "values.yaml must give the live Wedged rule landed by #4036: max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400 for 5m",
+  );
+  assert.match(
+    warning,
+    /SEPARATE alert, PaperclipAgentStartLockFleetStall, at `count\(max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > 900\) >= 3` for 10m/,
+    "values.yaml must name FleetStall as a separate live alert: count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3 for 10m",
+  );
+  assert.doesNotMatch(
+    warning,
+    /not yet merged|until it lands|being retuned/i,
+    "values.yaml must not describe the start-lock retune as pending; #3985 closed and #4036 landed the split",
+  );
 
-  // The 2h14m 2026-09-24 episode was three agents in lockstep, i.e. the
-  // fleet-scope regime, and it self-healed. Calling 09-15/16 the only
-  // fleet-scope instance erases the page's strongest datum and leaves a
-  // restart as the sole precedent for the condition now paging.
   const runbook = readFileSync(
     path.join(repoRoot, "runbooks/queued-run-stranded.md"),
     "utf8",
   );
+  // The 2h14m 2026-09-24 episode was three agents in lockstep, i.e. the
+  // fleet-scope regime, and it self-healed. Calling 09-15/16 the only
+  // fleet-scope instance erases the page's strongest datum and leaves a
+  // restart as the sole precedent for the condition now paging.
   const sectionIndex = runbook.indexOf("## Agent start lock wedged (PEN-3305)");
   assert.notStrictEqual(sectionIndex, -1, "runbook must keep the start-lock section heading");
   const nextSection = runbook.indexOf("\n## ", sectionIndex + 1);
@@ -1439,6 +1447,128 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
         + "and 22 of 23 on 2026-09-26 -- a sliding window, cite it with its date)",
     );
   }
+});
+
+test("the start-lock runbook routes its two arms on agent count, not on an alert name (BLO-36922)", () => {
+  // The two arms have opposite remedies: the one-agent wedge ends in replacing
+  // the process, while a fleet stall self-clears and the restart destroys its
+  // only evidence. Each way this routing has been written wrong fails toward
+  // the restart, and nothing rendered breaks when it rots (the chart does not
+  // read the runbook), so only an assertion catches it.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/queued-run-stranded.md"),
+    "utf8",
+  );
+  // Blockquote markers and line wraps are layout, not content; match on the
+  // prose so a re-wrap cannot make an assertion pass or fail.
+  const flat = (text) => text.replace(/^> ?/gm, "").replace(/\s+/g, " ");
+  const wedgedAt = runbook.indexOf("\n## Agent start lock wedged (PEN-3305)\n");
+  const referencesAt = runbook.indexOf("\n## References\n");
+  const [fleetHeading] = runbook.match(/^#+ Fleet stall: .*$/m) ?? [];
+  assert.ok(
+    wedgedAt !== -1 && referencesAt !== -1 && fleetHeading,
+    "runbook must keep the one-agent, fleet-stall and References headings -- "
+      + "the assertions below scope themselves to them by name",
+  );
+
+  // A sibling `##`, not nested inside the section that opens by saying it is
+  // the one-agent arm only, and after that section's own liveness check,
+  // whose closing paragraph describes the Wedged rule alone.
+  assert.match(
+    fleetHeading,
+    /^## /,
+    "fleet stall must be a sibling ## of the one-agent section, not nested inside it",
+  );
+  const fleetAt = runbook.indexOf(`\n${fleetHeading}\n`);
+  assert.ok(wedgedAt < fleetAt && fleetAt < referencesAt, "fleet stall must follow the one-agent section");
+  const wedged = runbook.slice(wedgedAt, fleetAt);
+  const fleet = runbook.slice(fleetAt, referencesAt);
+  assert.match(
+    wedged,
+    /\n### Verifying the signal is live\n/,
+    "the one-agent section must close with its own liveness check before the fleet arm opens",
+  );
+
+  const routingEnd = wedged.indexOf("\n### ");
+  const fleetIntroEnd = fleet.indexOf("\n### ");
+  assert.ok(routingEnd !== -1 && fleetIntroEnd !== -1, "both arms must keep their subsections");
+  const routing = flat(wedged.slice(0, routingEnd));
+  const fleetIntro = flat(fleet.slice(0, fleetIntroEnd));
+
+  // Step 0 is the agent count, which keys on shape and so survives the alert
+  // names' semantics moving (they moved twice in four days). Since
+  // onprem-k8s #4036 (BLO-35571) the split is live: a fleet stall pages
+  // `PaperclipAgentStartLockFleetStall` (unlabelled count, one page per
+  // episode) and `PaperclipAgentStartLockWedged` only past 4 h, longer than any
+  // measured fleet stall. The runbook still has to say which arm wins.
+  // Scope step 0 to the routing blockquote: `routing` also spans the Trigger,
+  // which quotes FleetStall's count, so asserting on `routing` let the step-0
+  // block be deleted with the test still green.
+  const blockquoteAt = wedged.indexOf("This section is the ONE-AGENT arm only");
+  assert.ok(
+    blockquoteAt !== -1 && blockquoteAt < routingEnd,
+    "the one-agent section must keep its routing blockquote before its first subsection",
+  );
+  assert.ok(
+    flat(wedged.slice(blockquoteAt, routingEnd)).includes(
+      "count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900)",
+    ),
+    "the one-agent section must open with the agent-count query as step 0",
+  );
+  // The Trigger is the section's entry point, read before the blockquote. It
+  // must give Wedged its own landed rule (the solo 4 h arm), not FleetStall's
+  // count, and no start-lock text may still wait on #3985: it closed unmerged
+  // and #4036 landed the split instead.
+  assert.match(
+    flat(wedged.slice(0, blockquoteAt)),
+    /alert `PaperclipAgentStartLockWedged`[^.]*`max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > 14400`/,
+    "the Trigger must give PaperclipAgentStartLockWedged its landed solo rule (> 14400), not FleetStall's count",
+  );
+  assert.doesNotMatch(
+    flat(wedged + fleet),
+    /#3985(?![^.]*closed unmerged)/,
+    "every #3985 mention in the start-lock runbook must say it closed unmerged; the live split is onprem-k8s #4036",
+  );
+  // Pin every remedy sentence's direction, not just its words. Inverting or
+  // deleting any of the fleet-side ones tells a responder to restart during a
+  // fleet stall; inverting the below-3 row withholds the one-agent remedy.
+  for (const [text, pattern, message] of [
+    [routing, /\*\*The fleet arm takes precedence\.\*\*/, "routing must say the fleet arm wins when both alerts fire"],
+    [routing, /\| `>= 3` \|[^|]*\| do \*\*not\*\* replace the process \|/, "the `>= 3` row's remedy must say do not replace the process"],
+    [routing, /\| below 3, or no data \|[^|]*\| this section, which ends with replacing the process \|/, "the below-3 row's remedy must be this section, which ends with replacing the process"],
+    [routing, /While the count reads `>= 3`, do not apply this section's remedy to any agent/, "routing must say not to apply the one-agent remedy while the count reads >= 3"],
+    [fleetIntro, /\*\*Do NOT replace the process\.\*\*/, "the fleet-stall section must say do NOT replace the process"],
+  ]) {
+    assert.match(text, pattern, message);
+  }
+
+  // FleetStall landed in onprem-k8s #4036 and is in the deployed rules, but
+  // not in this chart. Both texts must name it, say where to verify what is
+  // live, and not resurrect the "not deployed" wording whose premise expired
+  // when #4036 merged (2026-09-28).
+  for (const [where, text] of [["the routing block", routing], ["the fleet-stall trigger", fleetIntro]]) {
+    assert.match(
+      text,
+      /`PaperclipAgentStartLockFleetStall`[^.]*(?:once|one page) per episode/,
+      `${where} must say a fleet stall pages PaperclipAgentStartLockFleetStall, once per episode`,
+    );
+    assert.doesNotMatch(
+      text,
+      /not deployed/,
+      `${where} must not call PaperclipAgentStartLockFleetStall not deployed; it landed in onprem-k8s #4036`,
+    );
+    assert.match(text, /\/api\/v1\/rules/, `${where} must say where to verify which rules are live`);
+  }
+
+  // Both arms are one continuous hold per agent, so `heldMs` grows line over
+  // line in either (agent-start-lock.ts: one interval per acquisition,
+  // `heldMs = nowMs - startedAtMs`). It separates a continuous hold from
+  // sequential short ones, not a fleet stall from a wedge.
+  assert.doesNotMatch(
+    flat(wedged + fleet),
+    /`heldMs`[^.]*discriminat/,
+    "runbook must not offer heldMs as the discriminator between the two arms -- it grows in both",
+  );
 });
 
 test("PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained} key on the never_delivered series only and take their thresholds from values (PEN-3000)", () => {
