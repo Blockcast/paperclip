@@ -35,9 +35,17 @@ Consequences:
 - The row is still required: the certifier rejects a SystemPrincipal CSR
   whose `sp_uuid` has no row, so NOP cannot obtain its bridge cert without it.
 - Neither the soft-disable nor the blocklist INSERT below stops `MintMember`
-  today. The only takedown in this runbook that does not depend on the
-  missing enforcement is reissuing the bridge cert and expiring/removing the
-  old one.
+  today.
+- Wave 1 has no mechanism that invalidates an already-issued bridge cert
+  before its `notAfter`. The orc8r code at `a68ad7e` has no CRL or OCSP check
+  for client certs. The certifier's `RevokeCertificate` only deletes the
+  serial from the certifier store, and that store's reader on this path, the
+  shared orc8r identity interceptor
+  (`orc8r/cloud/go/service/middleware/unary/identity_decorator.go`), resolves
+  gateway identities only, so it is not a takedown for `sp_nop_bridge`.
+  Reissuing the bridge cert does not stop a holder of the old key. Planned
+  maintenance is therefore cooperative (see "Disabling") and incident
+  containment is at the network layer (see "Revocation").
 
 This runbook specifies the NOP-side E2 completeness delta rather than
 restating the servicer implementation.
@@ -200,10 +208,10 @@ BEGIN
       FROM system_principals
      WHERE sp_uuid = 'sp_00000000-0000-4000-8000-000000000002';
 
-    IF actual_kind <> 'nop_bridge'
-       OR actual_scope <> 'global'
+    IF actual_kind IS DISTINCT FROM 'nop_bridge'
+       OR actual_scope IS DISTINCT FROM 'global'
        OR actual_scope_target IS NOT NULL
-       OR actual_display_name <> 'NOP bridge for BEACON'
+       OR actual_display_name IS DISTINCT FROM 'NOP bridge for BEACON'
        OR actual_approval_required IS DISTINCT FROM false THEN
         RAISE EXCEPTION
           'sp_uuid exists but is not the expected NOP bridge principal';
@@ -271,10 +279,13 @@ After BLO-5389 lands:
 > today (see "BLO-5410 shipped status"). Setting it does NOT pause
 > onboarding: NOP keeps minting `individual_beacon` members. Until a
 > `tenants_beacon` caller check reads this column, take NOP down for a
-> maintenance window the same way as a revocation: reissue the bridge cert
-> and expire/remove the old one, then issue a fresh cert per the Cert
-> issuance section to bring NOP back. Treat the rest of this section as
-> "after-enforcement" guidance.
+> maintenance window by removing the bridge cert and private key from NOP's
+> secret store (the path in Cert issuance step 4) and restarting NOP so its
+> outbound mTLS client stops presenting them. This is cooperative: it stops a
+> well-behaved NOP, not a holder of a copy of the key, which is acceptable
+> for planned maintenance. To bring NOP back, put the cert and key back (or
+> issue a fresh cert per the Cert issuance section) and restart NOP. Treat
+> the rest of this section as "after-enforcement" guidance.
 
 For graceful, reversible takedowns (planned maintenance, paused
 onboarding window), prefer a soft-disable over revocation:
@@ -299,10 +310,14 @@ reissue needed.
 > does not have (see "BLO-5410 shipped status"), and (b) a Redis-backed
 > reseed reader. [BLO-5412](https://paperclip/BLO/issues/BLO-5412) closed as
 > a JWKS JWT verifier with TTL-only replay protection and no Redis store, so
-> no reseed reader exists either. Until both land, **revocation requires
-> reissuing the bridge cert and expiring/removing the old one**: a
-> `revocation_blocklist` INSERT alone will NOT stop in-flight calls. Treat
-> this section as "after-enforcement" guidance.
+> no reseed reader exists either. Until both land, a `revocation_blocklist`
+> INSERT will NOT stop calls, and reissuing the bridge cert will NOT stop a
+> holder of the old key either: Wave 1 cannot invalidate an issued cert
+> before its `notAfter` (see "BLO-5410 shipped status"). **To contain NOP
+> during an incident, cut its network path to orc8r**: stop NOP's outbound
+> traffic to the orc8r endpoint, or block NOP's source at the orc8r edge.
+> Then escalate to the orc8r platform owner (the BLO-5410 / BLO-5412 track).
+> Treat the rest of this section as "after-enforcement" guidance.
 
 To revoke NOP's bridge identity (e.g. during an incident):
 
@@ -325,9 +340,15 @@ INSERT INTO revocation_blocklist (
    `tenants_beacon` mTLS caller verify will reject the cert on the
    next call.
 
-3. To re-enable NOP, delete the `revocation_blocklist` row. If the
-   cert was rotated as part of the revocation, re-issue the new cert
-   per the Cert issuance section.
+3. To re-enable NOP, delete only its `revocation_blocklist` row:
+
+```sql
+DELETE FROM revocation_blocklist
+ WHERE principal_uuid = 'sp_00000000-0000-4000-8000-000000000002';
+```
+
+   If the cert was rotated as part of the revocation, re-issue the new
+   cert per the Cert issuance section.
 
 ## Verification
 
