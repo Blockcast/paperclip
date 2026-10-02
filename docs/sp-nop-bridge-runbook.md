@@ -211,10 +211,17 @@ BEGIN
     IF actual_kind IS DISTINCT FROM 'nop_bridge'
        OR actual_scope IS DISTINCT FROM 'global'
        OR actual_scope_target IS NOT NULL
-       OR actual_display_name IS DISTINCT FROM 'NOP bridge for BEACON'
        OR actual_approval_required IS DISTINCT FROM false THEN
         RAISE EXCEPTION
-          'sp_uuid exists but is not the expected NOP bridge principal';
+          'sp_uuid exists but is not the expected NOP bridge principal: kind=%, scope=%, scope_target=%, approval_required=%',
+          actual_kind, actual_scope, actual_scope_target, actual_approval_required;
+    END IF;
+
+    -- display_name is a cosmetic label (editable from the Portal), not an
+    -- identity attribute, so a rename is reported but does not abort.
+    IF actual_display_name IS DISTINCT FROM 'NOP bridge for BEACON' THEN
+        RAISE WARNING 'NOP bridge principal display_name is %, not the seeded label',
+          actual_display_name;
     END IF;
 END $$;
 ```
@@ -225,14 +232,16 @@ END $$;
 |---|---|---|
 | `sp_uuid` | `sp_00000000-0000-4000-8000-000000000002` | Stable across environments. `...001` is reserved for the first `platform_admin` singleton if/when we mint one (the `sp_` and `st_` namespaces number independently — there's no symmetry-with-st_public constraint). Format is enforced by the `sp_uuid_t` DOMAIN. |
 | `kind` | `nop_bridge` | Pinned in `system_principals.kind` CHECK enum by magma#847; mints alongside `platform_admin`, `sre`, `migration_job`, `extcdn_coordinator`, `break_glass`. |
-| `scope` | `global` | NOP bridge is not tenant-scoped; it mints under any `st_public`-class tenant the caller-policy lets it touch. |
+| `scope` | `global` | `global` means the principal is not tenant-scoped. The caller policy then narrows it to the single seeded `st_public` identity, where it may mint only the `individual_beacon` member shape (see "Explicit tenant-target rule"). |
 | `scope_target` | `NULL` | Required by the `system_principals_scope_target_shape` CHECK when `scope = 'global'`. |
 | `display_name` | `NOP bridge for BEACON` | Human-readable label for audit logs / Portal. |
 | `approval_required` | `false` | NOP-bridge cert issuance is one-time at NOP go-live; ongoing rotations don't require human approval. (Contrast: `break_glass` requires per-issuance approval; gated by the certifier-validator once BLO-5389 lands.) |
 
 The `INSERT` plus assertion is idempotent and safe to re-run during a
 re-deploy or after a partial failure, while failing closed on a conflicting
-row with the wrong principal attributes.
+row with the wrong principal attributes (`kind`, `scope`, `scope_target`,
+`approval_required`); the exception names the values it found. A renamed
+`display_name` only raises a `WARNING`.
 
 ## Cert issuance
 
@@ -279,15 +288,19 @@ After BLO-5389 lands:
 > today (see "BLO-5410 shipped status"). Setting it does NOT pause
 > onboarding: NOP keeps minting `individual_beacon` members. Until a
 > `tenants_beacon` caller check reads this column, take NOP down for a
-> maintenance window in two steps. First, **copy the bridge cert and private
-> key to a secure location** (or confirm NOP's secret store keeps the prior
-> version): the private key may exist nowhere else. Then remove them from
-> NOP's secret store (the secret-store path identified in Cert issuance
-> step 4, per BLO-5413) and restart NOP so its outbound mTLS client stops
-> presenting them. This is cooperative: it stops a well-behaved NOP, not a
-> holder of a copy of the key, which is acceptable for planned maintenance.
-> To bring NOP back, put the saved cert and key back and restart NOP. If the
-> copy is lost, the only other path is a fresh cert per the Cert issuance
+> maintenance window as follows. The private key may exist nowhere else, so
+> **before removing anything, confirm NOP's secret store keeps the prior
+> version** of the cert and key (the default path: no second copy of the key
+> is made). Only if it does not, copy them to a secure location instead.
+> Then remove them from NOP's secret store (the secret-store path identified
+> in Cert issuance step 4, per BLO-5413) and restart NOP so its outbound mTLS
+> client stops presenting them. This is cooperative: it stops a well-behaved
+> NOP, not a holder of a copy of the key, which is acceptable for planned
+> maintenance. To bring NOP back, restore the prior version (or the saved
+> copy) and restart NOP. If you made a copy, **securely destroy it** once NOP
+> is back: Wave 1 cannot invalidate an issued cert before its `notAfter` (see
+> "Rotation"), so a stray copy stays a working credential until then. If the
+> material is lost, the only other path is a fresh cert per the Cert issuance
 > section, which needs **manual approval** (step 3) until BLO-5389 lands, so
 > it is not a quick restore. Treat the rest of this section as
 > "after-enforcement" guidance.
