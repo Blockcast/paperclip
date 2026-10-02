@@ -135,6 +135,7 @@ function makeJob(opts: {
   isolationKey?: string;
   adapterType?: string;
   terminal?: boolean;
+  podLogPath?: string;
 }): k8s.V1Job {
   const labels: Record<string, string> = {
     "paperclip.io/adapter-type": opts.adapterType ?? "claude_k8s",
@@ -146,7 +147,13 @@ function makeJob(opts: {
   if (opts.isolationMode) labels["paperclip.io/isolation-mode"] = opts.isolationMode;
   if (opts.isolationKey) labels["paperclip.io/isolation-key"] = opts.isolationKey;
   return {
-    metadata: { name: opts.name ?? "ac-job", uid: opts.uid, namespace: "paperclip", labels },
+    metadata: {
+      name: opts.name ?? "ac-job",
+      uid: opts.uid,
+      namespace: "paperclip",
+      labels,
+      ...(opts.podLogPath ? { annotations: { "paperclip.io/pod-log-path": opts.podLogPath } } : {}),
+    },
     status: opts.terminal
       ? { conditions: [{ type: "Complete", status: "True" }] }
       : { conditions: [] },
@@ -740,6 +747,40 @@ describe("execute: concurrency guard", () => {
     });
     expect(result.errorCode).toBe("k8s_job_create_failed");
     expect(result.errorMessage).toContain("create reached");
+  });
+
+  // BLO-39114: this path reaps *another* run's Job, and it is the only code
+  // that will ever delete that run's pod log — the run died before reaching
+  // its own cleanupJob.  It omitted podLogPath, so the file leaked forever.
+  it("reaps the stale run's pod log when it deletes that run's Job", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    const tmpRoot = path.join(os.tmpdir(), "blo-39114-admission");
+    await mkdir(tmpRoot, { recursive: true });
+    const stalePodLog = path.join(tmpRoot, "prior-run.pod.ndjson");
+    await writeFile(stalePodLog, '{"type":"system"}\n', "utf-8");
+    try {
+      const orphan = makeJob({
+        runId: "prior-run",
+        agentId: "agent-abc",
+        taskId: "task-current",
+        podLogPath: stalePodLog,
+      });
+      mockBatchListJobs.mockResolvedValue({ items: [orphan] });
+      mockBatchDeleteJob.mockResolvedValue({});
+      mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+      mockPrepareBundle.mockResolvedValue(makeBundle());
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "prior-run", status: "failed", finishedAt: "2026-05-25T00:00:00.000Z" }),
+      }));
+
+      await execute(makeCtx({ context: { taskId: "task-current" }, authToken: "token-1" } as Partial<AdapterExecutionContext>));
+
+      expect(await stat(stalePodLog).then(() => true, () => false)).toBe(false);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 
   it("deletes stale orphan and proceeds when the run-id lookup is missing", async () => {
@@ -2421,6 +2462,39 @@ describe("cleanupJob pod-log reaping", () => {
   it("does nothing when podLogPath is undefined", async () => {
     mockBatchDeleteJob.mockResolvedValueOnce({});
     await expect(cleanupJob("ns", "job-undef", vi.fn(), undefined, undefined)).resolves.toBeUndefined();
+  });
+
+  // BLO-39114: on the foreign-run reap the caller asked for a specific file by
+  // reading the Job's annotation, so a miss is information rather than the
+  // routine no-op it is for the owning run.  Two different misses, two
+  // different meanings, deliberately on two different streams — so neither
+  // branch can be reverted without exactly one of these reddening.
+  it("warns when asked to reap authoritatively and the Job carries no pod-log annotation", async () => {
+    mockBatchDeleteJob.mockResolvedValueOnce({});
+    const onLog = vi.fn();
+
+    await cleanupJob("ns", "job-noann", onLog, undefined, undefined, true);
+
+    // We knowingly left a file on the shared PVC — that is the leak, and it
+    // must not be silent.
+    expect(onLog).toHaveBeenCalledWith(
+      "stderr",
+      expect.stringContaining("carries no paperclip.io/pod-log-path annotation"),
+    );
+  });
+
+  it("notes, without warning, an authoritative reap whose pod log is already gone", async () => {
+    mockBatchDeleteJob.mockResolvedValueOnce({});
+    const onLog = vi.fn();
+    const absent = path.join(tmpRoot, "never-written.pod.ndjson");
+
+    await cleanupJob("ns", "job-absent", onLog, undefined, absent, true);
+
+    // Reported, not swallowed...
+    expect(onLog).toHaveBeenCalledWith("stdout", expect.stringContaining("was already gone"));
+    // ...but not a warning: an orphan whose pod died before it ever wrote a
+    // log is the common case, and nothing leaked.
+    expect(onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining("pod log"));
   });
 
   // cleanupJob's docstring promises "failures are logged but not thrown", and
