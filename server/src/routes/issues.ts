@@ -48,6 +48,7 @@ import {
   feedbackVoteValueSchema,
   upsertIssueFeedbackVoteSchema,
   upsertIssueWatchdogSchema,
+  issueExecutionMonitorPolicySchema,
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
@@ -218,12 +219,14 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  applyIssueMonitorPolicyTransition,
   isMonitorNextCheckAtLive,
   mergeIssueExecutionPolicyMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
+  stripMonitorFromExecutionPolicy,
   type IssueMonitorConvergence,
 } from "../services/issue-execution-policy.js";
 import { monitorConvergenceComment } from "../services/issue-monitor-convergence-message.js";
@@ -627,6 +630,7 @@ async function listIssueLinkedCases(db: Db, companyId: string, issueId: string) 
 }
 
 type ParsedExecutionState = NonNullable<ReturnType<typeof parseIssueExecutionState>>;
+type IssueExecutionMonitorPolicyInput = z.infer<typeof issueExecutionMonitorPolicySchema>;
 type NormalizedExecutionPolicy = NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>;
 type IssueRouteSnapshot = typeof issueRows.$inferSelect;
 type RecoveryRevalidationTrigger =
@@ -11646,6 +11650,196 @@ export function issueRoutes(
     res.json({ ok: true });
   });
 
+  /**
+   * BLO-18294: the arm was refused and the issue is now `blocked`. Name who can
+   * actually unblock it so the blocker set becomes routed work rather than a
+   * stalled timer nobody reads. Shared by `PATCH /issues/:id` and the
+   * monitor-only write path, so an arm refused through either one escalates the
+   * same way.
+   */
+  async function recordMonitorConvergenceEscalation(input: {
+    issue: { id: string; companyId: string };
+    convergence: IssueMonitorConvergence;
+    blockerIssueIds: readonly string[];
+    actor: ReturnType<typeof getActorInfo>;
+  }) {
+    const { issue, convergence, blockerIssueIds, actor } = input;
+    try {
+      const unblockOwners = await loadIssueUnblockOwners(issue.companyId, blockerIssueIds);
+      await svc.addComment(issue.id, monitorConvergenceComment({
+        convergence,
+        unblockOwners,
+      }), {
+        runId: actor.runId,
+      }, {
+        authorType: "system",
+      });
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.monitor_convergence_stalled",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          gateSource: convergence.source,
+          convergenceCount: convergence.count,
+          threshold: convergence.threshold,
+          unresolvedBlockerIssueIds: blockerIssueIds,
+          unblockOwners,
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "failed to record monitor convergence escalation side effects");
+    }
+  }
+
+  /**
+   * BLO-18816 — monitor-only write path.
+   *
+   * `PATCH /issues/:id` replaces `executionPolicy` wholesale, so arming a
+   * monitor through it is a read-modify-write: re-send the complete current
+   * policy or you silently delete another agent's `stages`, `reviewPreset` and
+   * `authorizationPolicy`. These two routes write the monitor and nothing else,
+   * so there is no policy to read, nothing to lose, and no lost-update race on
+   * the hottest agent-facing write in the fleet.
+   *
+   * `PATCH /issues/:id` keeps its replace semantics for back-compat.
+   */
+  async function writeIssueMonitor(
+    req: Request,
+    res: Response,
+    monitor: IssueExecutionMonitorPolicyInput | null,
+  ) {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!existing) return;
+    // `assertCanManageIssueMonitor` is the whole gate here, matching
+    // `POST /issues/:id/monitor/check-now`. Deliberately NOT also
+    // `assertLowTrustControlPlaneDenied`: `PATCH /issues/:id` applies that only
+    // to reopen/resume/blocker writes, never to monitor writes, and a low-trust
+    // issue's own assignee arming its monitor is how that issue stays live.
+    await assertCanManageIssueMonitor(access, req, existing.companyId, existing, true);
+
+    const actor = getActorInfo(req);
+    const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+    const previousMonitor = summarizeIssueMonitor(existing, previousExecutionPolicy);
+    // Nullable on purpose: `null` means "no blocker edges were loaded", which
+    // `applyMonitorTransition` reads as "do not score convergence this time".
+    // Coercing it to `[]` would score the arm against an empty gate set.
+    const unresolvedBlockerIssueIds = monitor
+      ? await loadUnresolvedBlockerIssueIds(existing.companyId, existing.id)
+      : [];
+    // Merge rather than replace: `mergeIssueExecutionPolicyMonitor` keeps every
+    // other field of the stored policy byte-identical (BLO-22860 built it for
+    // the manager re-arm, which has the same "touch only the monitor" need).
+    const nextExecutionPolicy = monitor
+      ? applyActorMonitorScheduledBy(
+        mergeIssueExecutionPolicyMonitor(
+          previousExecutionPolicy,
+          normalizeIssueExecutionPolicy({ monitor })?.monitor ?? null,
+        ),
+        actor.actorType === "user" ? "user" : "agent",
+      )
+      : previousExecutionPolicy;
+
+    const transition = applyIssueMonitorPolicyTransition({
+      issue: existing,
+      policy: monitor ? nextExecutionPolicy : stripMonitorFromExecutionPolicy(previousExecutionPolicy),
+      previousPolicy: previousExecutionPolicy,
+      requestedAssigneePatch: {},
+      unresolvedBlockerIssueIds,
+      actor: {
+        agentId: actor.agentId ?? null,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      },
+      // The whole point of this route: the caller wrote the monitor, explicitly.
+      // On a clear that is what reaches the `executionState`-keyed branch in
+      // `applyMonitorTransition`, so a `triggered` (and even an exhausted)
+      // monitor clears here where `PATCH {"executionPolicy": {}}` used to no-op.
+      monitorExplicitlyUpdated: true,
+    });
+
+    const patch: Record<string, unknown> = { ...transition.patch };
+    if (transition.patch.executionPolicy === undefined) {
+      // `applyMonitorTransition` only writes `executionPolicy` on the branches
+      // that refuse the arm (invalid / bounds-exhausted / convergence-stalled),
+      // where it has already stripped the monitor for its own reasons — leave
+      // those alone. Every other outcome needs the merged policy carried through
+      // explicitly, or the stored `executionPolicy.monitor` keeps the previous
+      // `nextCheckAt` while the columns move.
+      patch.executionPolicy = monitor
+        ? nextExecutionPolicy
+        : stripMonitorFromExecutionPolicy(previousExecutionPolicy);
+    }
+
+    const issue = await svc.update(id, {
+      ...patch,
+      actorAgentId: actor.agentId ?? null,
+      actorUserId: actor.actorType === "user" ? actor.actorId : null,
+    });
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+
+    const nextMonitor = summarizeIssueMonitor(issue, normalizeIssueExecutionPolicy(issue.executionPolicy ?? null));
+    if (transition.monitorConvergence?.converged) {
+      await recordMonitorConvergenceEscalation({
+        issue,
+        convergence: transition.monitorConvergence,
+        blockerIssueIds: unresolvedBlockerIssueIds ?? [],
+        actor,
+      });
+    }
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: monitor ? "issue.monitor_scheduled" : "issue.monitor_cleared",
+      entityType: "issue",
+      entityId: issue.id,
+      details: monitor
+        ? {
+            identifier: issue.identifier,
+            nextCheckAt: nextMonitor.nextCheckAt,
+            previousNextCheckAt: previousMonitor.nextCheckAt,
+            notes: nextMonitor.notes,
+            scheduledBy: nextMonitor.scheduledBy,
+            serviceName: nextMonitor.serviceName,
+            timeoutAt: nextMonitor.timeoutAt,
+            maxAttempts: nextMonitor.maxAttempts,
+            recoveryPolicy: nextMonitor.recoveryPolicy,
+            via: "issue_monitor_route",
+          }
+        : {
+            identifier: issue.identifier,
+            previousNextCheckAt: previousMonitor.nextCheckAt,
+            previousStatus: previousMonitor.status,
+            reason: nextMonitor.clearReason ?? "manual",
+            notes: previousMonitor.notes,
+            via: "issue_monitor_route",
+          },
+    });
+
+    res.json(issue);
+  }
+
+  router.patch("/issues/:id/monitor", validate(issueExecutionMonitorPolicySchema), async (req, res) => {
+    await writeIssueMonitor(req, res, req.body as IssueExecutionMonitorPolicyInput);
+  });
+
+  router.delete("/issues/:id/monitor", async (req, res) => {
+    await writeIssueMonitor(req, res, null);
+  });
+
   router.post("/issues/:id/scheduled-retry/retry-now", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
@@ -12151,7 +12345,16 @@ export function issueRoutes(
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
       updateFields.assigneeUserId = null;
     }
-    const monitorChanged = monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false;
+    const liveMonitorStatus = summarizeIssueMonitor(existing, previousExecutionPolicy).status;
+    const monitorChanged =
+      monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false ||
+      // BLO-18816 / BLO-27586 AC1: a monitor that has already fired was stripped
+      // out of `executionPolicy` by the trigger, so `monitorPoliciesEqual` diffs
+      // null against null and reports "unchanged" — which is why
+      // `PATCH {"executionPolicy": {}}` against a `triggered` monitor returned
+      // 200 with the monitor byte-identical. An explicit executionPolicy write
+      // that carries no monitor while one is still live IS a clear.
+      (nextExecutionPolicy?.monitor == null && liveMonitorStatus != null && liveMonitorStatus !== "cleared");
     await assertCanManageIssueMonitor(
       access,
       req,
@@ -12548,39 +12751,12 @@ export function issueRoutes(
     // unblock it so the blocker set becomes routed work rather than a stalled
     // timer nobody reads.
     if (transition.monitorConvergence?.converged) {
-      try {
-        const blockerIssueIds = unresolvedBlockerIssueIds ?? [];
-        const unblockOwners = await loadIssueUnblockOwners(existing.companyId, blockerIssueIds);
-        await svc.addComment(issue.id, monitorConvergenceComment({
-          convergence: transition.monitorConvergence,
-          unblockOwners,
-        }), {
-          runId: actor.runId,
-        }, {
-          authorType: "system",
-        });
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action: "issue.monitor_convergence_stalled",
-          entityType: "issue",
-          entityId: issue.id,
-          issueId: issue.id,
-          details: {
-            gateSource: transition.monitorConvergence.source,
-            convergenceCount: transition.monitorConvergence.count,
-            threshold: transition.monitorConvergence.threshold,
-            unresolvedBlockerIssueIds: blockerIssueIds,
-            unblockOwners,
-          },
-        });
-      } catch (err) {
-        logger.warn({ err, issueId: issue.id }, "failed to record monitor convergence escalation side effects");
-      }
+      await recordMonitorConvergenceEscalation({
+        issue,
+        convergence: transition.monitorConvergence,
+        blockerIssueIds: unresolvedBlockerIssueIds ?? [],
+        actor,
+      });
     }
 
     let cancelledStatusRunId: string | null = null;
