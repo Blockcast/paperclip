@@ -481,6 +481,36 @@ function withholdsEnvInputDefault(key: string, defaultValue: string): boolean {
   return isSensitiveEnvKey(key) || isPlausiblySensitiveEnvValue(defaultValue);
 }
 
+/**
+ * Why only the value-shape branch warns.
+ *
+ * Not because the two branches export differently — they do not. Either arm of
+ * `withholdsEnvInputDefault` yields `kind: "secret"` with an empty `defaultValue`, so the
+ * classification is identical and the warning marks no difference in what is emitted.
+ *
+ * What differs is how LEGIBLE the omission is to whoever reads the bundle. A sensitive-NAMED key
+ * explains itself: `API_KEY` arriving with no default is self-describing, and the name alone tells
+ * an operator both why it is empty and that they must supply it. A benign-named key does not —
+ * `BOOTSTRAP` with an empty default is indistinguishable from `BOOTSTRAP` that was simply never
+ * set, and `kind: "secret"` does not disambiguate the two because it is equally present on the
+ * self-describing case. Naming the reason is the only signal that separates withheld from absent.
+ *
+ * Lives here rather than inline because the `plain` and bare-string branches below would otherwise
+ * each carry their own copy of this literal and its guard — the exact duplicate-spelling shape
+ * this change exists to remove from the key denylist.
+ */
+function pushWithheldEnvDefaultWarning(
+  warnings: string[],
+  warningPrefix: string,
+  key: string,
+  isSensitive: boolean,
+): void {
+  if (!isSensitive || isSensitiveEnvKey(key)) return;
+  warnings.push(
+    `${warningPrefix} env ${key} default was withheld because its value has the shape of a credential; re-supply it after import.`,
+  );
+}
+
 function normalizePortableProjectEnv(value: unknown): AgentEnvConfig | null {
   const parsed = envConfigSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
@@ -533,16 +563,8 @@ function extractPortableScopedEnvInputs(
       if (portability === "system_dependent") {
         warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
       }
-      // Warn only on the value-shape branch. A sensitive-NAMED key withholding its default is
-      // self-describing — the entry it writes carries `kind: "secret"`, so the import already
-      // prompts for it. A benign-named key whose value merely LOOKS like a credential still
-      // exports as `kind: "plain"`, so without this line its default would just be missing and the
-      // operator would have no way to tell a withheld value from one that was never set.
-      if (!isSensitiveEnvKey(key) && isSensitive) {
-        warnings.push(
-          `${scope.warningPrefix} env ${key} default was withheld because its value has the shape of a credential; re-supply it after import.`,
-        );
-      }
+      // Warn only on the value-shape branch; see `pushWithheldEnvDefaultWarning`.
+      pushWithheldEnvDefaultWarning(warnings, scope.warningPrefix, key, isSensitive);
       inputs.push({
         key,
         description: `Optional default for ${key} on ${scope.label}`,
@@ -562,11 +584,7 @@ function extractPortableScopedEnvInputs(
       if (portability === "system_dependent") {
         warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
       }
-      if (!isSensitiveEnvKey(key) && isSensitive) {
-        warnings.push(
-          `${scope.warningPrefix} env ${key} default was withheld because its value has the shape of a credential; re-supply it after import.`,
-        );
-      }
+      pushWithheldEnvDefaultWarning(warnings, scope.warningPrefix, key, isSensitive);
       inputs.push({
         key,
         description: `Optional default for ${key} on ${scope.label}`,

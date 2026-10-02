@@ -1494,6 +1494,13 @@ describe("company portability", () => {
   describe("env input defaults use the shared scrubber, not a per-surface denylist (PEN-3701)", () => {
     const CREDENTIAL_SHAPED = "Zq7mWp2Lx9Rt4Nv8Bc3Hj6Kd1Fg5Ys0Ae";
     const BENIGN = "debug";
+    /**
+     * Benign, but 33 chars — PAST `isPlausiblySensitiveEnvValue`'s ≥24 length gate. It stays plain
+     * only because `:` is outside the allowed `[A-Za-z0-9+/=_\-.]` charset. Two jobs: it isolates
+     * the key arm without letting the value arm pass a test by accident, and it pins the heuristic
+     * where its boundary actually sits rather than at a 5-char word.
+     */
+    const BENIGN_LONG = "https://api.example.com/v1/ingest";
 
     async function exportEnvInputs(env: Record<string, unknown>) {
       agentSvc.list.mockResolvedValue([
@@ -1526,25 +1533,37 @@ describe("company portability", () => {
       // The retired local list matched `token` only as the whole key or a `_token`/`-token`
       // SUFFIX. `GITHUB_TOKEN_B64` is neither, so its value exported in the clear; the shared
       // regex matches the stem followed by a separator.
+      //
+      // The value is BENIGN on purpose, and that is the whole point of this case. With a
+      // credential-shaped value `isPlausiblySensitiveEnvValue` returns true as well, so the
+      // assertion passes on the VALUE arm alone and the key-stem fix this test is named for has
+      // no guard: tighten `token(?:$|[-_])` back toward a suffix match and it stays green. Here
+      // `key=true, value=false`, so that mutation turns it red — which is the only reason the
+      // test is worth having.
       const exported = await exportEnvInputs({
-        GITHUB_TOKEN_B64: { type: "plain", value: CREDENTIAL_SHAPED },
+        GITHUB_TOKEN_B64: { type: "plain", value: BENIGN_LONG },
       });
 
       expect(inputFor(exported as never, "GITHUB_TOKEN_B64")).toMatchObject({
         kind: "secret",
         defaultValue: "",
       });
-      expect(JSON.stringify(exported.files)).not.toContain(CREDENTIAL_SHAPED);
+      expect(JSON.stringify(exported.files)).not.toContain(BENIGN_LONG);
     });
 
     it("withholds a credential-SHAPED default under a key no name list would catch", async () => {
       // The axis no key vocabulary can cover. `BOOTSTRAP` is not credential-named by any spelling,
-      // so only a value test closes this.
+      // so only a value test closes this. Pinning `kind` as well as `defaultValue` matters: both
+      // arms of `withholdsEnvInputDefault` emit `kind: "secret"`, and asserting only the empty
+      // default would not catch a regression that stopped marking the entry as one.
       const exported = await exportEnvInputs({
         BOOTSTRAP: { type: "plain", value: CREDENTIAL_SHAPED },
       });
 
-      expect(inputFor(exported as never, "BOOTSTRAP")).toMatchObject({ defaultValue: "" });
+      expect(inputFor(exported as never, "BOOTSTRAP")).toMatchObject({
+        kind: "secret",
+        defaultValue: "",
+      });
       expect(JSON.stringify(exported.files)).not.toContain(CREDENTIAL_SHAPED);
     });
 
@@ -1566,6 +1585,22 @@ describe("company portability", () => {
       expect(inputFor(exported as never, "LOG_LEVEL")).toMatchObject({
         kind: "plain",
         defaultValue: BENIGN,
+      });
+    });
+
+    it("carries a LONG portable default too — the heuristic's real boundary, not a short word", async () => {
+      // `LOG_LEVEL=debug` above clears the value heuristic on LENGTH (5 < 24), which is the least
+      // interesting way to pass and pins nothing near the line this predicate actually draws.
+      // This value is past the length gate and stays plain only on the charset test, so it is the
+      // case that fails if the charset is ever widened. Worth pinning because the heuristic does
+      // withhold real config — a 40-hex `APP_COMMIT` already trips it — so the boundary is live,
+      // not theoretical, and a future widening should be visible here rather than silently
+      // reclassifying every endpoint URL in a bundle.
+      const exported = await exportEnvInputs({ INGEST_URL: { type: "plain", value: BENIGN_LONG } });
+
+      expect(inputFor(exported as never, "INGEST_URL")).toMatchObject({
+        kind: "plain",
+        defaultValue: BENIGN_LONG,
       });
     });
 
