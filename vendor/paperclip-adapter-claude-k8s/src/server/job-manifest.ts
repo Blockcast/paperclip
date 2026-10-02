@@ -1251,6 +1251,18 @@ function buildEnvVars(
   // CLOBBER the image's own `ENV PATH` — an explicit container env entry wins
   // outright — and leave the agent unable to resolve any other binary. Fall
   // back to the system default in that case rather than to one directory.
+  //
+  // The third option is to leave `merged.PATH` unset and let the image's own
+  // `ENV PATH` stand, which preserves whatever toolchain directories the agent
+  // image adds that this hand-written constant does not know about. It is
+  // rejected because it silently declines to enforce the ordering in exactly
+  // the case where nothing else does: no env entry means no chart guard and no
+  // inherited value either, so the wrapper directory would be absent rather
+  // than merely late. A missing toolchain entry breaks a build step loudly; a
+  // missing wrapper directory routes GitHub traffic around the egress scrub
+  // and reports healthy. This branch is in practice unreachable — layer 3
+  // `inheritedEnv` carries the server pod's PATH — so the cost is theoretical
+  // and the exposure is not.
   const pathEntries = (existingPath || GITHUB_WRAPPER_FALLBACK_PATH).split(":");
   if (pathEntries[0] !== GITHUB_WRAPPER_BIN_DIR) {
     merged.PATH = [
