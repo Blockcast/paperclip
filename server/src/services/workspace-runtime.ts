@@ -5213,6 +5213,15 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
    * the per-failure run teardown, which PEN-3692 could not do because both
    * reach this function identically. A rising `unknown` share means a new call
    * site was added without being classified.
+   *
+   * ⚠️ Asymmetry worth knowing, since both paths land in the same histogram:
+   * `inspectWorktreeReclaimSafety` makes `trigger` REQUIRED, so its drift
+   * detector is opt-out (a new caller is a compile error), while this one's is
+   * opt-in (a new caller silently lands in `unknown`). Defaulting here was
+   * deliberate — making it required would have been a breaking change to an
+   * existing entry point — but it means an `unknown` on the removal methods is
+   * a missed classification, whereas `unknown` cannot arise on `inspect_safety`
+   * from `src/` at all.
    */
   trigger?: ExecutionWorkspaceTeardownTrigger;
   /**

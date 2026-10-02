@@ -19,6 +19,12 @@ import {
   resolvePathForWorktreeComparison,
 } from "../services/workspace-runtime.ts";
 import { findGitWorktreeRegistration, lockGitWorktreeForOwner } from "../services/git-worktree-ownership.ts";
+import {
+  EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC,
+  EXECUTION_WORKSPACE_TEARDOWN_METRIC,
+  __resetMetricsForTest,
+  renderMetrics,
+} from "../services/metrics.ts";
 
 /**
  * BLO-22984. A collector fails silently exactly like a detector: one that never
@@ -443,6 +449,87 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     expect(row?.cleanupReason).toBe("retained_dirty");
     // Deferred, not abandoned: re-checked next window so it collects once pushed.
     expect(row?.cleanupEligibleAt?.getTime() ?? 0).toBeGreaterThan(Date.now());
+    // Idle-origin rows are byte-identical to what they were before the
+    // run-attribution suffix landed, and still match the documented census.
+    expect(row?.cleanupReason?.startsWith("retained_")).toBe(true);
+  });
+
+  it("keeps run attribution across a deferral, so a failed run's tree is not relabelled idle when it finally collects", async () => {
+    // PEN-3692 asks how much teardown work FAILED runs cause, and a failed run
+    // leaves its tree dirty or unpushed — i.e. the population most likely to be
+    // DEFERRED. Overwriting `cleanup_reason` with the retain reason destroyed
+    // the `run_ended` origin permanently: nothing restores it, because
+    // `stampIdleLegacyWorkspaces` only writes rows whose `cleanupEligibleAt` is
+    // null and a deferred row's is set. Every later pass then charged the work
+    // to `idle_backfill` — including each window's `inspect_safety` walks, so a
+    // tree deferred ten times contributed one pass of `run_ended` and ten of
+    // `idle_backfill`. The bias ran one way only: downward, on exactly the
+    // population the row exists to measure. Found by Ally on PR #2175.
+    const { repo } = createRepoWithRemote();
+    const worktreePath = path.join(path.dirname(repo), "wt-run-ended");
+    const id = randomUUID();
+    await addOwnedWorktree({ repo, worktreePath, branchName: "wt-run-ended", executionWorkspaceId: id });
+    // Uncommitted work: what a failed run leaves behind.
+    fs.writeFileSync(path.join(worktreePath, "scratch.txt"), "failed run\n", "utf8");
+    await db.insert(executionWorkspaces).values({
+      id,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "wt-run-ended",
+      status: "active",
+      cwd: worktreePath,
+      providerType: "git_worktree",
+      providerRef: worktreePath,
+      branchName: "wt-run-ended",
+      // What run end stamps; the collector does the removal.
+      cleanupReason: "run_ended",
+      cleanupEligibleAt: hourAgo(),
+      lastUsedAt: hourAgo(),
+    });
+
+    // Pass 1: dirty, so it defers rather than collecting.
+    const first = await cleanup.reconcileExecutionWorkspaceCleanup();
+    expect(first.skipped).toBe(1);
+    expect(first.collected).toBe(0);
+
+    const [deferred] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
+    // Both facts survive: the retain reason AND the run origin. The origin is a
+    // SUFFIX so the `cleanup_reason like 'retained_%'` census documented at the
+    // defer site still matches this row — a `run_ended_retained_` prefix would
+    // have dropped run-origin retains out of that census silently.
+    expect(deferred?.cleanupReason).toBe("retained_dirty_run_ended");
+    expect(deferred?.cleanupReason?.startsWith("retained_")).toBe(true);
+
+    // The work is finished and pushed, so next window the tree is reclaimable.
+    git(["add", "."], worktreePath);
+    git(["commit", "-qm", "finished"], worktreePath);
+    git(["push", "-q", "origin", "HEAD"], worktreePath);
+    // Undo only the grace window the defer added; the row is otherwise untouched.
+    await db.update(executionWorkspaces)
+      .set({ cleanupEligibleAt: hourAgo() })
+      .where(eq(executionWorkspaces.id, id));
+
+    __resetMetricsForTest();
+    const second = await cleanup.reconcileExecutionWorkspaceCleanup();
+    expect(second.collected).toBe(1);
+    expect(fs.existsSync(worktreePath)).toBe(false);
+
+    // The removal is charged to the run that caused it, one deferral later.
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="collector",method="worktree_remove",cleanup_reason="run_ended",outcome="succeeded"} 1`,
+    );
+    // And so are the safety walks, which the previous round established may be
+    // the largest term in the integral this row reads.
+    expect(body).toMatch(
+      new RegExp(`${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_count\\{trigger="collector",method="inspect_safety",cleanup_reason="run_ended"\\} [1-9]`),
+    );
+    // The negative control, and the assertion that fails without the fix: this
+    // pass touched exactly one workspace, and that workspace's work is NOT
+    // idle reclamation. Before the fix every series here read `idle_backfill`.
+    expect(body).not.toContain('cleanup_reason="idle_backfill"');
   });
 
   it("never archives a workspace whose worktree removal was declined", async () => {

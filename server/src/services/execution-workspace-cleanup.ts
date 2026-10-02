@@ -5,6 +5,7 @@ import { and, asc, eq, isNull, lte, ne, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import {
   recordExecutionWorkspaceCollectorPass,
+  type ExecutionWorkspaceCleanupReason,
   type ExecutionWorkspaceCollectorStopReason,
 } from "./metrics.js";
 import {
@@ -89,6 +90,52 @@ export function classifyRemovalProof(
   if (!cleaned) return "uncleaned";
   if (proofReason && proofReason !== "missing") return proofReason;
   return null;
+}
+
+/**
+ * How run-attribution survives a deferral (PEN-3692, found by Ally on this PR).
+ *
+ * `cleanup_reason` carries WHY a row became eligible, and deferring overwrites
+ * it with the retain reason. Those are two different facts, and the naive write
+ * destroys the first: a `run_ended` row deferred once reads back `retained_dirty`
+ * forever, because `stampIdleLegacyWorkspaces` only rewrites rows whose
+ * `cleanupEligibleAt` is null and a deferred row's is set. It would then be
+ * labelled `idle_backfill` on every subsequent pass — and `dirty`/`unpushed` is
+ * exactly the state a FAILED run leaves its tree in, so the loss lands squarely
+ * on the population this row exists to measure, and only ever in the direction
+ * that understates it. A tree deferred for ten windows and then collected would
+ * contribute one pass of `run_ended` and ten of `idle_backfill`.
+ *
+ * So the origin is preserved as a SUFFIX. Ally suggested a `run_ended_retained_`
+ * prefix; that would silently break the `cleanup_reason like 'retained_%'` census
+ * documented at the defer site, which is the other consumer of this column, since
+ * a run-origin retain would no longer match it. A suffix keeps every retained row
+ * under the `retained_` prefix and keeps idle-origin values byte-identical to
+ * what they were before this change.
+ *
+ * `decodeRunAttribution` takes the STORED string and `encodeRetainedReason` takes
+ * the DECODED origin, so re-deferring an already-suffixed row re-derives the same
+ * value rather than stacking suffixes. No safety reason (`dirty`, `unpushed`,
+ * `unverifiable`, `uncleaned`, …) ends in this suffix, so the split is unambiguous.
+ */
+const RUN_ATTRIBUTED_RETAIN_SUFFIX = "_run_ended";
+
+export function encodeRetainedReason(
+  reason: string,
+  origin: ExecutionWorkspaceCleanupReason,
+): string {
+  return origin === "run_ended"
+    ? `retained_${reason}${RUN_ATTRIBUTED_RETAIN_SUFFIX}`
+    : `retained_${reason}`;
+}
+
+export function decodeRunAttribution(
+  storedCleanupReason: string | null,
+): ExecutionWorkspaceCleanupReason {
+  if (storedCleanupReason === "run_ended") return "run_ended";
+  return storedCleanupReason?.endsWith(RUN_ATTRIBUTED_RETAIN_SUFFIX)
+    ? "run_ended"
+    : "idle_backfill";
 }
 
 function readDurationEnv(name: string, fallback: number): number {
@@ -261,7 +308,10 @@ export function executionWorkspaceCleanupService(db: Db) {
      *
      * Retained rows stay visible — each logs every window, and
      * `cleanup_reason like 'retained_%'` is a one-query census of the subset
-     * the collector is choosing not to reclaim.
+     * the collector is choosing not to reclaim. That census is why the
+     * run-attribution origin is encoded as a suffix rather than a prefix; see
+     * `encodeRetainedReason`. Split the census by origin with
+     * `cleanup_reason like 'retained\_%\_run\_ended'` if you need it.
      *
      * `ne(status, 'archived')` is the same evidence rule the other two writers
      * carry (`:124`, `:171`), applied to the third. This writer deliberately
@@ -277,12 +327,16 @@ export function executionWorkspaceCleanupService(db: Db) {
      * cannot be corrupted by any future writer that reaches this path from
      * somewhere the latch does not cover.
      */
-    const deferCandidate = async (id: string, reason: string) => {
+    const deferCandidate = async (
+      id: string,
+      reason: string,
+      origin: ExecutionWorkspaceCleanupReason,
+    ) => {
       await db
         .update(executionWorkspaces)
         .set({
           cleanupEligibleAt: new Date(now.getTime() + EXECUTION_WORKSPACE_IDLE_GRACE_MS),
-          cleanupReason: `retained_${reason}`,
+          cleanupReason: encodeRetainedReason(reason, origin),
           updatedAt: now,
         })
         .where(and(
@@ -326,14 +380,15 @@ export function executionWorkspaceCleanupService(db: Db) {
       // other reason (today `idle_backfill`, and anything added later) is
       // reclamation of the pre-existing population. Mapped to the bounded enum
       // rather than passed through, so a new DB value cannot widen cardinality.
-      const candidateCleanupReason = candidate.cleanupReason === "run_ended"
-        ? "run_ended" as const
-        : "idle_backfill" as const;
+      // Reads through a prior deferral's retain reason — see
+      // `decodeRunAttribution` for why that is not the same as reading the
+      // column directly.
+      const candidateCleanupReason = decodeRunAttribution(candidate.cleanupReason);
       // A sibling of a tree whose stat was abandoned is on the same wedged
       // mount, so probing it would hold a second thread to learn the same
       // thing. The hold clears when that syscall answers.
       if (worktreePath && isReclaimFsWedgedDir(path.dirname(path.resolve(worktreePath)))) {
-        await deferCandidate(candidate.id, "unverifiable");
+        await deferCandidate(candidate.id, "unverifiable", candidateCleanupReason);
         skipped += 1;
         continue;
       }
@@ -341,7 +396,7 @@ export function executionWorkspaceCleanupService(db: Db) {
         if (candidate.providerType === "git_worktree" && worktreePath) {
           const safety = await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector", cleanupReason: candidateCleanupReason });
           if (!safety.safe) {
-            await deferCandidate(candidate.id, safety.reason);
+            await deferCandidate(candidate.id, safety.reason, candidateCleanupReason);
             skipped += 1;
             logger.info(
               {
@@ -413,7 +468,7 @@ export function executionWorkspaceCleanupService(db: Db) {
           : null;
         const retainReason = classifyRemovalProof(cleanup.cleaned, removalProof?.reason ?? null);
         if (retainReason) {
-          await deferCandidate(candidate.id, retainReason);
+          await deferCandidate(candidate.id, retainReason, candidateCleanupReason);
           skipped += 1;
           logger.warn(
             {
