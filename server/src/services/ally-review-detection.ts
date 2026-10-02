@@ -60,7 +60,16 @@
 // pattern below is line-anchored, and hasNonNegatedMatch's lookback walks
 // back to the previous newline, so collapsing lines here would silently
 // re-point those anchors at unrelated text.
-const FENCE_DELIMITER_PATTERN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+// The info string is `[^\n]*`, never `.`: JS's `.` excludes `\r`, U+2028 and
+// U+2029 as well as `\n`, while Python's -- and CommonMark's line definition --
+// exclude only `\n`. So a fence opener whose info string carries U+2028 opened a
+// fence for the sweep and opened nothing here, and the sweep then read a head as
+// reviewed while this gate reddened it over a bucket the sweep could not see:
+// the same deadlock as the `m` flag above, re-entered through the character
+// class. `\r` is normalised away at entry by reviewBody, and these patterns run
+// per line after a split on `\n`, so the class can never actually meet a `\n` --
+// it is spelled this way to match Python exactly rather than approximately.
+const FENCE_DELIMITER_PATTERN = /^ {0,3}(`{3,}|~{3,})([^\n]*)$/;
 const FENCE_CLOSE_PATTERN = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
 // `keepUnterminated` leaves a fence that never closes as emitted text. Only the
@@ -132,18 +141,22 @@ function emittedReviewText(body: string | null | undefined): string | null {
 // bound is a lookahead rather than a counted run because the emphasis and
 // spacing that follow would otherwise absorb the fourth space and re-open the
 // hole.
-// Line anchors here are spelled `(?:^|\n)` and `(?=\n|$)`, and no pattern in
-// this file carries the `m` flag. JS's `m` also stops at `\r`, U+2028 and
-// U+2029; Python's re.MULTILINE -- and CommonMark -- recognise only `\n`, and
-// `\r` is normalised away at entry by `reviewBody`. An `m` here is therefore a silent
-// divergence from the sweep, and the loop it opens is the one this row exists
-// to close: the gate counts a bucket the sweep cannot see and reds the head,
-// while the sweep reads the head as attested and suppresses the re-request
-// that would clear the red (Ally, #1721 at 1bc85198, Important 1).
+// Line anchors here are spelled `(?:^|\n)` and `(?=\n|$)`, no pattern in this
+// file carries the `m` flag, and no pattern uses a wildcard `.`. U+2028/U+2029
+// reach a pattern through either: JS's `m` stops at `\r`, U+2028 and U+2029,
+// and JS's `.` excludes the same three, while Python's re.MULTILINE and `.` --
+// and CommonMark -- recognise only `\n`. `\r` is normalised away at entry by
+// `reviewBody`. Either one is therefore a silent divergence from the sweep, and
+// the loop it opens is the one this row exists to close: the gate counts a
+// bucket the sweep cannot see and reds the head, while the sweep reads the head
+// as attested and suppresses the re-request that would clear the red (Ally,
+// #1721 at 1bc85198 and 068806d6, Important 1 both times -- the second arrived
+// through the character class after the flag axis was closed).
 //
-// Pinned for patterns added later -- including ones using a shape nobody has
-// written yet -- by "no reader pattern may treat U+2028/U+2029 as a line
-// break" in scripts/check-ally-review-consistency.test.mjs.
+// Pinned for patterns added later by "no reader pattern may treat U+2028/U+2029
+// as a line break" in scripts/check-ally-review-consistency.test.mjs, which
+// scans both axes. That guard states its own reach; it is not a promise about
+// an axis nobody has named yet.
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 
 // Ally's own output has this heading on its own line, as a Markdown heading

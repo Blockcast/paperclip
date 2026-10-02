@@ -1903,4 +1903,30 @@ describe("BLO-32695 -- U+2028 is not a line break in any reader", () => {
       ),
     ).toHaveLength(1);
   });
+
+  // Ally, #1721 at 068806d6, Important 1. The flag axis above is only half the
+  // rule: JS's `.` also excludes U+2028/U+2029 where Python's excludes only
+  // `\n`, so a bare `.` in a line-structure pattern re-opens the identical
+  // deadlock through the character class. FENCE_DELIMITER_PATTERN was the one
+  // instance; its info string is now `[^\n]*`.
+  it("opens a fence whose info string carries U+2028, as the sweep does", () => {
+    // Before the fix this fence did not open here and did open for the sweep:
+    // the bucket survived as emitted text and reddened the head, while the
+    // sweep read the head as attested and suppressed the re-request.
+    expect(
+      parseAllyVerdictBlock(blocked("```ts\u2028junk", "### Critical Issues (3)", "```")).kind,
+    ).toBe("ok");
+  });
+
+  it("control: the same fence with a plain info string also opens", () => {
+    expect(
+      parseAllyVerdictBlock(blocked("```ts junk", "### Critical Issues (3)", "```")).kind,
+    ).toBe("ok");
+  });
+
+  it("control: that bucket outside a fence still contradicts the block", () => {
+    // Without this both assertions above pass on a reader that stopped counting
+    // buckets at all, which is the other way to make the two readers agree.
+    expect(parseAllyVerdictBlock(blocked("### Critical Issues (3)")).kind).toBe("unreadable");
+  });
 });

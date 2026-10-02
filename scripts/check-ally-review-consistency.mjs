@@ -112,18 +112,21 @@ const BLOCKING_SECTION_RE =
  * The attestation is matched over fence-stripped text, as the gate matches it
  * (attestedHeadFrom), so a *fenced* paste is not an attestation here either.
  */
-// Line anchors here are spelled `(?:^|\n)` and `(?=\n|$)`, and no pattern in
-// this file carries the `m` flag. JS's `m` also stops at `\r`, U+2028 and
-// U+2029; Python's re.MULTILINE -- and CommonMark -- recognise only `\n`, and
-// `\r` is normalised away at entry by `reviewText`. An `m` here is therefore a silent
-// divergence from the sweep, and the loop it opens is the one this row exists
-// to close: the gate counts a bucket the sweep cannot see and reds the head,
-// while the sweep reads the head as attested and suppresses the re-request
-// that would clear the red (Ally, #1721 at 1bc85198, Important 1).
+// Line anchors here are spelled `(?:^|\n)` and `(?=\n|$)`, no pattern in this
+// file carries the `m` flag, and no pattern uses a wildcard `.`. U+2028/U+2029
+// reach a pattern through either: JS's `m` stops at `\r`, U+2028 and U+2029,
+// and JS's `.` excludes the same three, while Python's re.MULTILINE and `.` --
+// and CommonMark -- recognise only `\n`. `\r` is normalised away at entry by
+// `reviewText`. Either one is therefore a silent divergence from the sweep, and
+// the loop it opens is the one this row exists to close: the gate counts a
+// bucket the sweep cannot see and reds the head, while the sweep reads the head
+// as attested and suppresses the re-request that would clear the red (Ally,
+// #1721 at 1bc85198 and 068806d6, Important 1 both times -- the second arrived
+// through the character class after the flag axis was closed).
 //
-// Pinned for patterns added later -- including ones using a shape nobody has
-// written yet -- by "no reader pattern may treat U+2028/U+2029 as a line
-// break" in scripts/check-ally-review-consistency.test.mjs.
+// Pinned for patterns added later by "no reader pattern may treat U+2028/U+2029
+// as a line break" in scripts/check-ally-review-consistency.test.mjs, which
+// scans both axes and states its own reach.
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 
 /**
@@ -273,7 +276,13 @@ function reviewText(body) {
   return String(body ?? "").replace(/\r\n?/g, "\n");
 }
 
-const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+// The info string is `[^\n]*`, never `.` -- see FENCE_DELIMITER_PATTERN in
+// ally-review-detection.ts. JS's `.` excludes `\r`, U+2028 and U+2029 as well as
+// `\n`; Python's FENCE_OPEN_PATTERN and CommonMark exclude only `\n`. A bare `.`
+// here opens no fence on an info string carrying U+2028 while the sweep opens
+// one, which is the gate-red/sweep-satisfied deadlock through the character
+// class instead of the `m` flag.
+const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})([^\n]*)$/;
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
 // `keepUnterminated` mirrors the gate's: a fence that never closes is left as
