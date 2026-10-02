@@ -206,30 +206,56 @@ the reviewed boundary for this binding.
 {{- end }}
 
 {{/*
-The directories the seed init container publishes the GitHub egress wrappers
-into, in the order they must appear on PATH. Derived from persistence.mountPath
-because the seed derives them the same way (`BASE={{ .Values.persistence.mountPath }}`);
-a hardcoded /paperclip would silently miss every deployment that relocates the PVC.
+The image directory holding the root-owned GitHub egress wrappers (PEN-3713).
+
+Hardcoded on purpose, unlike the PVC directories below: this one is a path
+inside the image, fixed by the Dockerfile `COPY` that installs it, so deriving
+it from a value would let an operator point PATH at a directory no image has.
+*/}}
+{{- define "paperclip.imageWrapperBinDir" -}}
+/usr/local/libexec/paperclip/bin
+{{- end }}
+
+{{/*
+The directories holding the GitHub egress wrappers, in the order they must
+appear on PATH.
+
+First the root-owned image directory (PEN-3713), which is where the wrappers
+now actually come from. Then the two PVC directories the seed init container
+still publishes into, derived from persistence.mountPath because the seed
+derives them the same way (`BASE={{ .Values.persistence.mountPath }}`); a
+hardcoded /paperclip would silently miss every deployment that relocates the
+PVC.
+
+Both generations are listed deliberately, and the ordering is the whole
+migration plan. A chart that rolls before the images would otherwise resolve
+`gh` past an image directory that does not exist yet and land on the
+unscrubbed /usr/bin/gh — a silent PEN-2527 regression. With the PVC entries
+retained behind it, an old image falls back to the copies it already has and
+a new image wins outright, so neither rollout order has a window. Dropping the
+PVC entries is the follow-up, once the fleet is known to be on new images.
 */}}
 {{- define "paperclip.wrapperBinDirs" -}}
 {{- $base := .Values.persistence.mountPath | trimSuffix "/" -}}
-{{- printf "%s/.local/bin,%s/bin" $base $base -}}
+{{- printf "%s,%s/.local/bin,%s/bin" (include "paperclip.imageWrapperBinDir" .) $base $base -}}
 {{- end }}
 
 {{/*
 PATH for containers that run agent tooling.
 
 PEN-2527/PEN-2526: agent-authored GitHub content is scrubbed of credential-shaped
-material by wrapper binaries the seed init container publishes into
-`<mountPath>/.local/bin` and `<mountPath>/bin`. The scrubber only sits on the
-traffic path if those directories precede /usr/bin, where the unscrubbed image
-`gh` lives. `.local/bin` is prepended by the PVC's `.profile`/`.bashrc`, which
-only a *login* shell sources; agent tool harnesses spawn non-login shells. So the
-PATH the container itself carries is the only thing that reaches the scrubber,
+material by wrapper binaries in `paperclip.wrapperBinDirs`. The scrubber only sits
+on the traffic path if those directories precede /usr/bin, where the unscrubbed
+image `gh` lives. The PVC's `.local/bin` is prepended by its `.profile`/`.bashrc`,
+which only a *login* shell sources; agent tool harnesses spawn non-login shells. So
+the PATH the container itself carries is the only thing that reaches the scrubber,
 which makes it a chart-level invariant rather than one operator's values file.
 
+PEN-3713: the root-owned image directory leads, so the wrappers that execute are
+the ones uid 1000 cannot rewrite.
+
 Override with `env.path`. The override is validated rather than trusted: it must
-keep both wrapper directories ahead of /usr/bin or the render fails, because the
+keep every wrapper directory ahead of /usr/bin or the render fails, because the
 failure mode being prevented is an agent that looks healthy while publishing
 unscrubbed.
 */}}
@@ -240,7 +266,7 @@ unscrubbed.
 {{- fail "env.extra must not define PATH: a duplicate env var would silently override the chart-managed PATH that keeps the GitHub egress scrubber (PEN-2527) ahead of /usr/bin. Set env.path instead, which is validated." -}}
 {{- end -}}
 {{- end -}}
-{{- $path := .Values.env.path | default (printf "%s:%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" (index $wrapperDirs 0) (index $wrapperDirs 1)) -}}
+{{- $path := .Values.env.path | default (printf "%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" (join ":" $wrapperDirs)) -}}
 {{- $entries := splitList ":" $path -}}
 {{- $systemIdx := -1 -}}
 {{- range $i, $entry := $entries -}}
