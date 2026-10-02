@@ -104,8 +104,8 @@ The canonical redactors are `server/src/redaction.ts` (`redactAgentConfigPayload
 | plugin config | `routes/plugins.ts:2687, 2866` | `maskPluginConfigJson` | covered |
 | activity | `routes/activity.ts:163` | `sanitizeRecord` | covered |
 | **company export bundle — agent `adapterConfig`** | `routes/companies.ts:256, 319, 330` | `redactPortableAgentRecord` → `redactAgentConfigPayload` | covered |
-| **company export bundle — agent `inputs.env.*.default`** | `company-portability.ts:2025` → `extractPortableScopedEnvInputs` | shared `isSensitiveEnvKey` + `isPlausiblySensitiveEnvValue` | **covered as of PEN-3701** (was a local substring denylist) |
-| **company export bundle — project `inputs.env.*.default`** | `company-portability.ts:2042` → same extractor | same | **covered as of PEN-3701**, by sharing the extractor — not separately fixed |
+| **company export bundle — agent `inputs.env.*.default`** | `extractPortableEnvInputs` (`company-portability.ts:2032`, call at `:2037`) → `extractPortableScopedEnvInputs` | shared `isSensitiveEnvKey` + `isPlausiblySensitiveEnvValue` | **covered as of PEN-3701** (was a local substring denylist) |
+| **company export bundle — project `inputs.env.*.default`** | `extractPortableProjectEnvInputs` (`company-portability.ts:2049`, call at `:2054`) → same extractor | same | **covered as of PEN-3701**, by sharing the extractor — not separately fixed |
 | **routine list / detail / revisions** | `routes/routines.ts:155, 202, 212, 458, 502, 630` | `maskProjectEnv` on `detail.project` **only** | **NOT COVERED** → PEN-3707 |
 | **pipeline stage automation env** | `routes/pipelines.ts:1057, 1290` | none on `automation.env` | **NOT COVERED** → PEN-3707 |
 | invite / join-request adapter defaults | `routes/access.ts:4377, 4391, 4539, 4587` | none | **NOT COVERED**, conditional on an agent holding `users:invite` / `joins:approve` → PEN-3707 |

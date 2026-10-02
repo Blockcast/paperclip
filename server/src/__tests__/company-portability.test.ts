@@ -1624,6 +1624,22 @@ describe("company portability", () => {
       }
     });
 
+    it("does not claim a sensitive-NAMED absolute path was exported when its default is withheld", async () => {
+      // The key arm withholds `TOKEN_FILE` before the `system_dependent` check is reached, so the
+      // default is emptied; the "exported as system-dependent" warning must not then claim it shipped.
+      const TOKEN_FILE = "/etc/paperclip/token_file";
+      for (const binding of [{ type: "plain", value: TOKEN_FILE }, TOKEN_FILE]) {
+        const exported = await exportEnvInputs({ TOKEN_FILE: binding });
+
+        expect(inputFor(exported as never, "TOKEN_FILE")).toMatchObject({
+          kind: "secret",
+          defaultValue: "",
+          portability: "system_dependent",
+        });
+        expect(exported.warnings.filter((warning: string) => warning.includes("env TOKEN_FILE "))).toEqual([]);
+      }
+    });
+
     it("keeps a sensitive-NAMED key with an empty default classified as a secret", async () => {
       // Why this is not plain `isSensitiveEnv(key, value)`: that helper returns false for an empty
       // value, which would flip this entry to `kind: "plain"` and change what the import prompts
