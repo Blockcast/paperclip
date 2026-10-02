@@ -1589,14 +1589,31 @@ async function logQuietly(
  * problem — warning on both would cry wolf on every orphan whose pod died
  * before it ever wrote a log, which is the common case.
  */
+/**
+ * Is this string plausibly a pod log we are allowed to unlink?
+ *
+ * Only the foreign-reap path needs this: it reads the path off a mutable
+ * Kubernetes object, whereas the three own-run callers pass
+ * `buildJobManifest`'s own return value.  Every path `buildPodLogPath`
+ * produces satisfies all three clauses, so this rejects nothing the producer
+ * can emit — it just stops `fs.unlink` being aimed at something that is not a
+ * pod log at all, without the delete having to trust a second file.
+ */
+export function isReapablePodLogPath(podLogPath: string): boolean {
+  return podLogPath.startsWith("/")
+    && podLogPath.endsWith(".pod.ndjson")
+    && !podLogPath.split("/").includes("..");
+}
+
 async function reapPodLogFile(
   podLogPath: string | undefined,
+  jobName: string,
   onLog: AdapterExecutionContext["onLog"],
-  reportMissing = false,
+  reportMissing: boolean,
 ): Promise<void> {
   if (!podLogPath) {
     if (reportMissing) {
-      await logQuietly(onLog, "stderr", `[paperclip] Warning: cannot reap pod log — Job carries no ${POD_LOG_PATH_ANNOTATION} annotation; its log is left on the shared PVC\n`);
+      await logQuietly(onLog, "stderr", `[paperclip] Warning: cannot reap pod log for Job ${jobName} — it carries no ${POD_LOG_PATH_ANNOTATION} annotation; its log is left on the shared PVC\n`);
     }
     return;
   }
@@ -1605,7 +1622,7 @@ async function reapPodLogFile(
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
       if (reportMissing) {
-        await logQuietly(onLog, "stdout", `[paperclip] Pod log ${podLogPath} was already gone — nothing to reap.\n`);
+        await logQuietly(onLog, "stdout", `[paperclip] Pod log ${podLogPath} for Job ${jobName} was already gone — nothing to reap.\n`);
       }
       return;
     }
@@ -1649,7 +1666,7 @@ export async function cleanupJob(
   }
   // Unconditional: the pod log's lifetime is not a function of whether the
   // Kubernetes Job could be deleted.  They are unrelated resources.
-  await reapPodLogFile(podLogPath, onLog, reportMissingPodLog);
+  await reapPodLogFile(podLogPath, jobName, onLog, reportMissingPodLog);
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -1830,8 +1847,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // annotation's comment in job-manifest.ts for why rebuilding it
           // fails silently.  `reportMissingPodLog` is on because here a miss
           // is information, not the routine no-op it is for the owning run.
-          const stalePodLogPath = readOptionalString(job.metadata?.annotations?.[POD_LOG_PATH_ANNOTATION]) ?? undefined;
-          await cleanupJob(jobNamespace, jobName, onLog, kubeconfigPath, stalePodLogPath, true);
+          //
+          // This is the one `cleanupJob` call whose path is externally
+          // sourced — the other three pass `buildJobManifest`'s own return
+          // value — so it is the one that owes a check before handing a
+          // string to `fs.unlink` on the shared multi-tenant PVC.  The check
+          // is on the *shape* rather than the run-logs root: every path
+          // `buildPodLogPath` emits ends in `.pod.ndjson`, so requiring that
+          // suffix (plus absolute, no `..`) means this unlink cannot be aimed
+          // at a kubeconfig, a secret, or anyone's source, while staying
+          // assertable from a tmpdir in the tests below.
+          const annotated = readOptionalString(job.metadata?.annotations?.[POD_LOG_PATH_ANNOTATION]) ?? undefined;
+          const reapable = annotated === undefined || isReapablePodLogPath(annotated);
+          if (!reapable) {
+            await logQuietly(onLog, "stderr", `[paperclip] Warning: Job ${jobName} has an implausible ${POD_LOG_PATH_ANNOTATION} (${annotated}); refusing to unlink it\n`);
+          }
+          await cleanupJob(jobNamespace, jobName, onLog, kubeconfigPath, reapable ? annotated : undefined, /* reportMissingPodLog */ reapable);
           await onLog("stdout", `[paperclip] Ignoring stale Job ${jobName}: run ${jobRunId} is terminal or missing in Paperclip.\n`);
           continue;
         }
