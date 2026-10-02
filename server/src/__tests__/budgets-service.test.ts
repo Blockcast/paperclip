@@ -775,8 +775,11 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     // What makes two rows correct here is that exactly one is outstanding.
     expect(new Set(cards.map((card) => card.idempotencyKey)).size).toBe(1);
     expect(cards.map((card) => card.status).sort()).toEqual(["pending", "rejected"]);
+    // Pin *which* card, not just that it is one of the two: `toContain` would also
+    // pass if the reopened incident still pointed at the rejected card, which is the
+    // precise state the paragraph above says must not happen.
     const reopened = incidentRows.find((row) => row.status === "open");
-    expect(cards.map((card) => card.id)).toContain(reopened!.approvalId);
+    expect(reopened!.approvalId).toBe(cards.find((card) => card.status === "pending")!.id);
   });
 
   it("files the override card at warnPercent with multi-day runway, once, while the scope is still running (BLO-28793)", async () => {
