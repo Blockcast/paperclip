@@ -753,9 +753,26 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           }),
         });
         cleanupWarnings = cleanupResult.warnings;
+        // PEN-3692 (found by Ally on PR #2175): `cleanup_reason` records WHY a row
+        // became collector-eligible — it is not a teardown diagnostic. This used to
+        // overwrite it with the joined warnings, or `null` when there were none.
+        //
+        // That is safe only while the row stays out of the collector's scope, and
+        // the `!cleaned` branch below takes it back IN: `cleanup_failed` is not
+        // `archived`, nothing on this path clears `cleanupEligibleAt`, and the
+        // archive at the top of this branch has already nulled the reason. So a row
+        // stamped `run_ended` by run teardown came back selectable with its origin
+        // destroyed — decoding as `idle_backfill` (free text) or `unknown` (null) on
+        // every later pass. Same erasure as the heartbeat sibling fixed earlier on
+        // this branch, biased the same way: against the failed-run population this
+        // row exists to measure.
+        //
+        // Preserving the origin loses no diagnostics. The warnings are recorded
+        // durably in the activity log below (`details.cleanupWarnings`), which is
+        // where a human looks for them; the column answers the other question.
         const cleanupPatch: Record<string, unknown> = {
           closedAt,
-          cleanupReason: cleanupWarnings.length > 0 ? cleanupWarnings.join(" | ") : null,
+          cleanupReason: existing.cleanupReason,
         };
         if (!cleanupResult.cleaned) {
           cleanupPatch.status = "cleanup_failed";
@@ -765,11 +782,28 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         }
       } catch (error) {
         const failureReason = error instanceof Error ? error.message : String(error);
+        // This path returns before the `logActivity` call below, so unlike the
+        // warnings above the thrown message has no durable home once it stops
+        // being written to `cleanup_reason`. Log it here rather than leaving the
+        // 500 body as the only record.
+        logger.warn(
+          {
+            executionWorkspaceId: existing.id,
+            companyId: existing.companyId,
+            failureReason,
+          },
+          "execution workspace operator archive: cleanup threw; row left collector-eligible",
+        );
         workspace =
           (await svc.update(id, {
             status: "cleanup_failed",
             closedAt,
-            cleanupReason: failureReason,
+            // PEN-3692: same rule as the patch above, and this site is the clearer
+            // case — it always demotes to `cleanup_failed`, so it always hands a
+            // selectable row back to the collector. The thrown message is a
+            // teardown diagnostic; writing it here relabelled a `run_ended` row
+            // `idle_backfill` on every pass that touched it afterwards.
+            cleanupReason: existing.cleanupReason,
           })) ?? workspace;
         res.status(500).json({
           error: `Failed to archive execution workspace: ${failureReason}`,

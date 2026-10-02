@@ -65,6 +65,14 @@ export const EXECUTION_WORKSPACE_LEGACY_IDLE_MS = readDurationEnv(
 const EXECUTION_WORKSPACE_MIN_IDLE_MS = 10 * 60 * 1000;
 
 /**
+ * The one retain reason that is not a `WorktreeReclaimSafety` verdict: the
+ * removal itself did not report success, so there is no proof to classify.
+ * Named here so the suffix-collision test can enumerate the full input domain
+ * of `encodeRetainedReason` without hardcoding it.
+ */
+export const UNCLEANED_RETAIN_REASON = "uncleaned";
+
+/**
  * Why a proven-removal check needs two inputs, not one.
  *
  * `cleanupExecutionWorkspaceArtifacts` reports `cleaned`, but computes it as
@@ -83,18 +91,10 @@ const EXECUTION_WORKSPACE_MIN_IDLE_MS = 10 * 60 * 1000;
  * a tree that *was* removed is free — the next window stats it, gets ENOENT and
  * archives it — so this is fail-closed in the cheap direction.
  */
-/**
- * The one retain reason that is not a `WorktreeReclaimSafety` verdict: the
- * removal itself did not report success, so there is no proof to classify.
- * Named here so the suffix-collision test can enumerate the full input domain
- * of `encodeRetainedReason` without hardcoding it.
- */
-export const UNCLEANED_RETAIN_REASON = "uncleaned";
-
 export function classifyRemovalProof(
   cleaned: boolean,
   proofReason: WorktreeReclaimSafety["reason"] | null,
-): string | null {
+): WorktreeReclaimSafety["reason"] | typeof UNCLEANED_RETAIN_REASON | null {
   if (!cleaned) return UNCLEANED_RETAIN_REASON;
   if (proofReason && proofReason !== "missing") return proofReason;
   return null;
@@ -151,9 +151,22 @@ export const RETAIN_ORIGIN_SUFFIXES = [
   UNATTRIBUTED_RETAIN_SUFFIX,
 ] as const;
 
+/**
+ * The origins that can actually round-trip through the suffix encoding.
+ *
+ * `not_applicable` is excluded deliberately (Ally, review of d55f513): it is
+ * the metric's "this series is not a collection" filler, never a stored
+ * `cleanup_reason`, and it is the ONE input that would break the round trip —
+ * `encodeRetainedReason` emits it bare and `decodeRunAttribution` reads a bare
+ * value back as `idle_backfill`. No caller passes it today, since the only
+ * producer of an origin is `decodeRunAttribution`, which cannot return it.
+ * Narrowing here keeps that true by construction rather than by inspection.
+ */
+export type RunAttributionOrigin = Exclude<ExecutionWorkspaceCleanupReason, "not_applicable">;
+
 export function encodeRetainedReason(
   reason: string,
-  origin: ExecutionWorkspaceCleanupReason,
+  origin: RunAttributionOrigin,
 ): string {
   if (origin === "run_ended") return `retained_${reason}${RUN_ATTRIBUTED_RETAIN_SUFFIX}`;
   if (origin === "unknown") return `retained_${reason}${UNATTRIBUTED_RETAIN_SUFFIX}`;
@@ -162,7 +175,7 @@ export function encodeRetainedReason(
 
 export function decodeRunAttribution(
   storedCleanupReason: string | null,
-): ExecutionWorkspaceCleanupReason {
+): RunAttributionOrigin {
   if (storedCleanupReason === null) return "unknown";
   if (storedCleanupReason === "run_ended") return "run_ended";
   if (storedCleanupReason.endsWith(RUN_ATTRIBUTED_RETAIN_SUFFIX)) return "run_ended";
@@ -362,7 +375,7 @@ export function executionWorkspaceCleanupService(db: Db) {
     const deferCandidate = async (
       id: string,
       reason: string,
-      origin: ExecutionWorkspaceCleanupReason,
+      origin: RunAttributionOrigin,
     ) => {
       await db
         .update(executionWorkspaces)
