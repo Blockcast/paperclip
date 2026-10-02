@@ -326,7 +326,7 @@ export function executionWorkspaceCleanupService(db: Db) {
       }
       try {
         if (candidate.providerType === "git_worktree" && worktreePath) {
-          const safety = await inspectWorktreeReclaimSafety(worktreePath);
+          const safety = await inspectWorktreeReclaimSafety(worktreePath, "collector");
           if (!safety.safe) {
             await deferCandidate(candidate.id, safety.reason);
             skipped += 1;
@@ -395,7 +395,7 @@ export function executionWorkspaceCleanupService(db: Db) {
         // persist-rollback and operator-PATCH callers of
         // `cleanupExecutionWorkspaceArtifacts` keep their existing contract.
         const removalProof = cleanup.cleaned && worktreePath
-          ? await inspectWorktreeReclaimSafety(worktreePath)
+          ? await inspectWorktreeReclaimSafety(worktreePath, "collector")
           : null;
         const retainReason = classifyRemovalProof(cleanup.cleaned, removalProof?.reason ?? null);
         if (retainReason) {

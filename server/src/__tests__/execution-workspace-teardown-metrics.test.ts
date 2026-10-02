@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   cleanupExecutionWorkspaceArtifacts,
+  inspectWorktreeReclaimSafety,
   RECLAIM_FS_OUTSTANDING_LIMIT,
 } from "../services/workspace-runtime.js";
 import { executionWorkspaceCleanupService } from "../services/execution-workspace-cleanup.js";
@@ -126,15 +127,22 @@ describe("execution-workspace teardown metrics", () => {
   });
 
   it("bounds every label to its allowlist, so no call site can widen cardinality", () => {
-    // Worst case is triggers x methods x outcomes = 4 x 2 x 2 = 16 series on the
-    // counter. Bounded by these constants, never by a caller-supplied string.
+    // Worst case on the counter is triggers x methods x outcomes, but only the
+    // two REMOVAL methods ever reach it — 4 x 2 x 2 = 16 series. The histogram
+    // additionally carries `inspect_safety`, so its worst case is triggers x
+    // methods = 4 x 3 = 12. Bounded by these constants, never by a
+    // caller-supplied string.
     expect(EXECUTION_WORKSPACE_TEARDOWN_TRIGGERS).toEqual([
       "run_teardown",
       "collector",
       "operator",
       "unknown",
     ]);
-    expect(EXECUTION_WORKSPACE_TEARDOWN_METHODS).toEqual(["worktree_remove", "remove_local_fs"]);
+    expect(EXECUTION_WORKSPACE_TEARDOWN_METHODS).toEqual([
+      "worktree_remove",
+      "remove_local_fs",
+      "inspect_safety",
+    ]);
   });
 });
 
@@ -196,6 +204,47 @@ describe("cleanupExecutionWorkspaceArtifacts wiring", () => {
     expect(body).toContain(
       `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="unknown",method="remove_local_fs",outcome="succeeded"} 1`,
     );
+  });
+});
+
+describe("reclaim-safety inspection is in the work integral", () => {
+  // Ally's Important #2 on this PR: the duration histogram's _sum was called
+  // "the work integral to regress the cgroup's reclaimable-slab residual
+  // against", but the measured region excluded `inspectWorktreeReclaimSafety`'s
+  // `git status --porcelain` tree walk — which the collector runs up to twice
+  // per candidate and which the PR itself called the largest term. PEN-3692
+  // §3(b) makes that integral the row's closing criterion, so an integral
+  // missing its dominant term would reproduce the mis-attribution the row
+  // exists to replace. These two assertions are the contract that fix created.
+
+  it("observes the safety walk into the duration histogram under its own method", async () => {
+    // Driven through the real exported function, matching this file's rule that
+    // a recorder-only test proves the metric can be written, not that the real
+    // path reaches it.
+    const absent = path.join(os.tmpdir(), `pen3692-absent-${Date.now()}`);
+    await inspectWorktreeReclaimSafety(absent, "collector");
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_count{trigger="collector",method="inspect_safety"} 1`,
+    );
+  });
+
+  it("does NOT count an inspection as a removal", async () => {
+    // The reason the fix is histogram-only. `teardown_total` means "removals
+    // attempted"; booking a tree walk there would corrupt the removal rate and
+    // make a wedged mount — which inspects repeatedly and removes nothing —
+    // read as a burst of teardown activity.
+    const absent = path.join(os.tmpdir(), `pen3692-absent-${Date.now()}`);
+    await inspectWorktreeReclaimSafety(absent, "collector");
+
+    const { body } = await renderMetrics();
+    expect(body).not.toContain(`method="inspect_safety",outcome=`);
+    for (const line of body.split("\n")) {
+      if (line.startsWith(`${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{`)) {
+        expect(line).not.toContain("inspect_safety");
+      }
+    }
   });
 });
 
