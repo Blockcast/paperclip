@@ -112,18 +112,19 @@
  * installation also lands commits under a bare `allyblockcast[bot]@…` with no
  * numeric prefix, and twice under a WRONG numeric prefix
  * (`220200645+allyblockcast[bot]@…`, `218837398+allyblockcast[bot]@…`). The
- * numeric prefix is caller-supplied at
- * commit time — whatever `git config user.email` or the REST payload said — not
- * a verified property of the write, so it varies by write path even though
- * every one of these is the same shared credential.
+ * numeric prefix is caller-supplied at commit time — whatever
+ * `git config user.email` or the REST payload said — not a verified property
+ * of the write, so it varies by write path even though every one of these is
+ * the same shared credential.
  * `APP_NOREPLY_EMAIL_PATTERN` therefore matches the `allyblockcast[bot]`
  * local-part on the `users.noreply.github.com` domain with an OPTIONAL numeric
  * prefix of ANY digits, an OPTIONAL `+tag` subaddress, and case-insensitively.
  *
  * Measured on `origin/master`, non-merge commits since 2026-07-01, at the time
- * this was written (2026-08-12): 192 caught by the old literal, 15 missed
- * purely on spelling (13 bare, 1 wrong-prefix, 1 no-`[bot]`), 2 of the missed
- * landing AFTER this gate's own cutoff.
+ * this was written (2026-08-12): 192 caught by the old literal, 15 missed (13
+ * bare and 1 wrong-prefix, both spelling; 1 no-`[bot]`, a different account
+ * that stays unmatched, see below), 2 of the missed landing AFTER this gate's
+ * own cutoff.
  *
  * RE-MEASURED 2026-10-02, the day the widened matcher merged, over 3181
  * non-merge commits via the GitHub API: 194 caught by the old literal, 288 by
@@ -160,10 +161,10 @@
  * second). GitHub could resolve neither `220200645` nor `218837398` to any
  * account, App or user. They read as hand-typed or copy-paste-mangled
  * `--author` overrides that got the prefix wrong, and they erase the true
- * author exactly as badly
- * (worse — it does not even resolve), so the any-digits prefix catches it
- * deliberately. If a genuinely second App installation ever appears, name it
- * here explicitly rather than leaning on this catch-all.
+ * author exactly as badly (worse — they do not even resolve), so the
+ * any-digits prefix catches them deliberately. If a genuinely second App
+ * installation ever appears, name it here explicitly rather than leaning on
+ * this catch-all.
  *
  * ### `allyblockcast@users.noreply.github.com` (no `[bot]`) is a DIFFERENT real
  * ### account — deliberately NOT matched
