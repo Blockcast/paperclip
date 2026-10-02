@@ -65,10 +65,24 @@ const pendingReadRegion = (() => {
  * lose their second source. Scoping to the pipeline is what lets that guard fire.
  */
 const pendingReadPipeline = (() => {
-  const start = pendingReadRegion.indexOf('gh api');
+  // Anchor the start to the brace group that feeds `jq -s`, NOT the first `gh api`
+  // in the region. A diagnostic read placed before the group — say a `per_page=1`
+  // count for the step summary — otherwise lands inside the slice and satisfies the
+  // per-status query requirement on the union's behalf, so a real union member can
+  // be dropped and the suite stays green. Measured at 4c85cde3: the diagnostic alone
+  // is 26/0 and dropping `status=waiting` alone is 25/1, but anchored at the first
+  // `gh api` the two TOGETHER are 26/0 — leaving `waiting` single-sourced on the read
+  // measured to go stale, which is BLO-38907 itself. Anchored here, both are 25/1.
+  // A missing `} | jq -s` needs no separate arm: indexOf returns -1, lastIndexOf
+  // clamps that fromIndex to 0, and the region never starts with `{`, so `start`
+  // is -1 and the check below throws. Verified — an explicit -1 arm has no failing
+  // mutation, so it would be decoration (2026-09-17 CEO ruling on guard tests).
+  const start = pendingReadRegion.lastIndexOf('{', pendingReadRegion.indexOf('} | jq -s'));
   const end = pendingReadRegion.indexOf('> "$PENDING_JSON_PATH"');
   if (start === -1 || end === -1 || end <= start) {
-    throw new Error('expected guard (1) to pipe `gh api` reads into "$PENDING_JSON_PATH"');
+    throw new Error(
+      'expected guard (1) to pipe a `{ ... } | jq -s` brace group of `gh api` reads into "$PENDING_JSON_PATH"',
+    );
   }
   return pendingReadRegion.slice(start, end);
 })();
