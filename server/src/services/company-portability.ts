@@ -46,6 +46,8 @@ import {
   ROUTINE_TRIGGER_SIGNING_MODES,
   deriveProjectUrlKey,
   envConfigSchema,
+  isPlausiblySensitiveEnvValue,
+  isSensitiveEnvKey,
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
@@ -443,33 +445,40 @@ function buildSkillExportDirMap(skills: CompanySkill[], companyIssuePrefix: stri
   return keyToDir;
 }
 
-function isSensitiveEnvKey(key: string) {
-  const normalized = key.trim().toLowerCase();
-  return (
-    normalized === "token" ||
-    normalized.endsWith("_token") ||
-    normalized.endsWith("-token") ||
-    normalized.includes("apikey") ||
-    normalized.includes("api_key") ||
-    normalized.includes("api-key") ||
-    normalized.includes("access_token") ||
-    normalized.includes("access-token") ||
-    normalized.includes("auth") ||
-    normalized.includes("auth_token") ||
-    normalized.includes("auth-token") ||
-    normalized.includes("authorization") ||
-    normalized.includes("bearer") ||
-    normalized.includes("secret") ||
-    normalized.includes("passwd") ||
-    normalized.includes("password") ||
-    normalized.includes("credential") ||
-    normalized.includes("jwt") ||
-    normalized.includes("privatekey") ||
-    normalized.includes("private_key") ||
-    normalized.includes("private-key") ||
-    normalized.includes("cookie") ||
-    normalized.includes("connectionstring")
-  );
+/**
+ * Should this env input's `default` be withheld from the exported bundle?
+ *
+ * PEN-3701. This surface used to carry its own hand-rolled substring denylist over the key name —
+ * a second, weaker spelling of `@paperclipai/shared`'s `isSensitiveEnvKey`, sitting in the same
+ * file whose `redactPortableAgentRecord` docblock argues that "a per-surface denylist can never
+ * promise" coverage. It was that denylist. Measured divergence against the shared regex, on a
+ * 43-key corpus: the local copy classified 7 keys as plain that the shared one classifies as
+ * secret — `MYTOKEN`, `TOKEN_FILE`, `TOKEN_PATH`, `ACCESSTOKEN`, `GITHUB_TOKEN_B64`,
+ * `REFRESH_TOKEN_V2`, `SLACK_TOKEN_RAW` — because it matched `token` only as a whole key or a
+ * `_token`/`-token` suffix, where the shared rule matches the stem followed by a separator or
+ * end-of-key. It was never stricter on any key, so this is a one-directional loss.
+ *
+ * The second axis is the one no key list can cover: the local copy had no VALUE test at all, so a
+ * credential stored under an innocuous name (`BOOTSTRAP`, `CFG`, `SETTINGS`) exported its literal
+ * value into `inputs.env.<KEY>.default`. `isPlausiblySensitiveEnvValue` closes that by shape —
+ * `sk-…`, `ghp_…`, `AKIA…`, a JWT, or a long mixed-class opaque token.
+ *
+ * Why this is not simply `isSensitiveEnv(key, value)`, which is the OR of the same two helpers:
+ * that function returns `false` for an empty value, which would reclassify a sensitive-NAMED key
+ * with no stored default from `kind: "secret"` to `kind: "plain"` and change what the import
+ * prompts the operator for. The key test has to stand on its own.
+ *
+ * Why this surface keeps a predicate at all, where the sibling `redactPortableAgentRecord` path
+ * masks every env value unconditionally: these two emissions have different jobs. That one exports
+ * an agent's live `adapterConfig`, where a plain binding IS credential material by construction.
+ * This one exports re-import DEFAULTS, whose whole purpose is to carry portable non-secret config
+ * (`LOG_LEVEL`, `REGION`) across the bundle so an import does not have to re-supply everything.
+ * Masking unconditionally here would not be a stricter version of the same control — it would
+ * delete the feature. The fix is to stop this surface owning its own vocabulary, not to remove its
+ * predicate.
+ */
+function withholdsEnvInputDefault(key: string, defaultValue: string): boolean {
+  return isSensitiveEnvKey(key) || isPlausiblySensitiveEnvValue(defaultValue);
 }
 
 function normalizePortableProjectEnv(value: unknown): AgentEnvConfig | null {
@@ -517,12 +526,22 @@ function extractPortableScopedEnvInputs(
 
     if (isPlainRecord(binding) && binding.type === "plain") {
       const defaultValue = asString(binding.value);
-      const isSensitive = isSensitiveEnvKey(key);
+      const isSensitive = withholdsEnvInputDefault(key, defaultValue ?? "");
       const portability = defaultValue && isAbsoluteCommand(defaultValue)
         ? "system_dependent"
         : "portable";
       if (portability === "system_dependent") {
         warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
+      }
+      // Warn only on the value-shape branch. A sensitive-NAMED key withholding its default is
+      // self-describing — the entry it writes carries `kind: "secret"`, so the import already
+      // prompts for it. A benign-named key whose value merely LOOKS like a credential still
+      // exports as `kind: "plain"`, so without this line its default would just be missing and the
+      // operator would have no way to tell a withheld value from one that was never set.
+      if (!isSensitiveEnvKey(key) && isSensitive) {
+        warnings.push(
+          `${scope.warningPrefix} env ${key} default was withheld because its value has the shape of a credential; re-supply it after import.`,
+        );
       }
       inputs.push({
         key,
@@ -538,18 +557,24 @@ function extractPortableScopedEnvInputs(
     }
 
     if (typeof binding === "string") {
+      const isSensitive = withholdsEnvInputDefault(key, binding);
       const portability = isAbsoluteCommand(binding) ? "system_dependent" : "portable";
       if (portability === "system_dependent") {
         warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
+      }
+      if (!isSensitiveEnvKey(key) && isSensitive) {
+        warnings.push(
+          `${scope.warningPrefix} env ${key} default was withheld because its value has the shape of a credential; re-supply it after import.`,
+        );
       }
       inputs.push({
         key,
         description: `Optional default for ${key} on ${scope.label}`,
         agentSlug: scope.agentSlug,
         projectSlug: scope.projectSlug,
-        kind: isSensitiveEnvKey(key) ? "secret" : "plain",
+        kind: isSensitive ? "secret" : "plain",
         requirement: "optional",
-        defaultValue: isSensitiveEnvKey(key) ? "" : binding,
+        defaultValue: isSensitive ? "" : binding,
         portability,
       });
     }
