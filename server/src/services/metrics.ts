@@ -336,15 +336,29 @@ export const EXECUTION_WORKSPACE_TEARDOWN_TRIGGERS = [
 export type ExecutionWorkspaceTeardownTrigger =
   (typeof EXECUTION_WORKSPACE_TEARDOWN_TRIGGERS)[number];
 /**
- * How the tree was removed. The two are not interchangeable work: a
- * `git worktree remove` shells out and lets git walk the tree, `remove_local_fs`
- * is an in-process `fs.rm(recursive)`. Both end in per-entry `unlink`, which is
- * the dentry/inode pressure this row is chasing, but only the second holds a
- * libuv threadpool thread while doing it.
+ * Which piece of tree-walking work was done. The first two are removals and are
+ * not interchangeable work: a `git worktree remove` shells out and lets git walk
+ * the tree, `remove_local_fs` is an in-process `fs.rm(recursive)`. Both end in
+ * per-entry `unlink`, which is the dentry/inode pressure this row is chasing,
+ * but only the second holds a libuv threadpool thread while doing it.
+ *
+ * `inspect_safety` is NOT a removal — it is `inspectWorktreeReclaimSafety`'s
+ * `git status --porcelain`, a full tree walk the collector performs up to twice
+ * per candidate (once to prove the tree safe to remove, once to prove it gone).
+ * It is in this enum because it charges the same readdir/lstat pressure to the
+ * same cgroup, so an integral that omits it omits what may be its largest term
+ * — PEN-3692 §3(b) regresses slab residual against that integral, and a missing
+ * dominant term would reproduce the mis-attribution the row exists to replace.
+ *
+ * ⚠️ Consequence, deliberate: summing the duration histogram over ALL methods is
+ * the work integral, but `..._duration_seconds_count` therefore EXCEEDS
+ * `..._teardown_total`, which counts removals only. Filter to the two removal
+ * methods to compare the two metrics.
  */
 export const EXECUTION_WORKSPACE_TEARDOWN_METHODS = [
   "worktree_remove",
   "remove_local_fs",
+  "inspect_safety",
 ] as const;
 export type ExecutionWorkspaceTeardownMethod =
   (typeof EXECUTION_WORKSPACE_TEARDOWN_METHODS)[number];
@@ -4501,18 +4515,21 @@ function ensureRegistry(): {
     executionWorkspaceTeardownDuration = new Histogram({
       name: EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC,
       help:
-        "Seconds spent in the removal call itself — the `git worktree remove` or the "
-        + "`fs.rm` — for one execution-workspace tree (PEN-3692). The collector's "
-        + "`git status` safety walks before and after a removal are NOT timed here: that "
-        + "walk cost is counted (the collector scanned total), not timed, so this _sum is "
-        + "the removal term of the work integral, not the whole integral, and regressing "
-        + "the cgroup's reclaimable-slab residual against it alone omits that term. "
-        + "Duration is used as the proxy for tree size ON PURPOSE: counting entries "
-        + "unlinked would mean walking the tree ourselves, i.e. performing the very "
-        + "readdir/lstat work being "
-        + "measured, so the instrument would create the pressure it reports. Buckets "
-        + "run to 60s because these trees sit on a network mount where a removal can "
-        + "block for a long time.",
+        "Seconds spent walking one execution-workspace tree (PEN-3692), split by "
+        + "`method`: the `worktree_remove` / `remove_local_fs` removal calls, and the "
+        + "`inspect_safety` git-status walks the collector makes up to twice per "
+        + "candidate. Summed over ALL methods the _sum is the quantity this row needs "
+        + "— the work integral to regress the cgroup's reclaimable-slab residual "
+        + "against, replacing the n=2 natural experiment that attributed fill to run "
+        + "failures by magnitude alone. Summed over the two removal methods alone it "
+        + "omits the safety walks, which may be the largest term. ⚠️ Because "
+        + "`inspect_safety` is not a removal, this _count exceeds the teardown _total; "
+        + "filter to the removal methods to compare them. Duration is used as the "
+        + "proxy for tree size ON PURPOSE: counting entries unlinked would mean "
+        + "walking the tree ourselves, i.e. performing the very readdir/lstat work "
+        + "being measured, so the instrument would create the pressure it reports. "
+        + "Buckets run to 60s because these trees sit on a network mount where a "
+        + "removal can block for a long time.",
       labelNames: ["trigger", "method"],
       buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60],
       registers: [registry],
@@ -6401,6 +6418,40 @@ export function recordExecutionWorkspaceTeardown(input: {
     m.executionWorkspaceTeardownDurationHistogram.observe(labels, input.durationMs / 1000);
   } catch (error) {
     logger.error({ err: error }, "failed to record execution-workspace teardown metrics");
+  }
+}
+
+/**
+ * Observe one `inspectWorktreeReclaimSafety` tree walk into the teardown
+ * duration histogram under `method: "inspect_safety"` (PEN-3692).
+ *
+ * Deliberately observes the histogram but does NOT touch
+ * `..._teardown_total`: an inspection is not a removal, and counting it as one
+ * would corrupt the removal rate. The per-method `_count` on the histogram
+ * already gives the inspection count, so nothing is lost.
+ *
+ * This lives inside `inspectWorktreeReclaimSafety` rather than at its call
+ * sites so a future caller cannot silently omit the walk from the integral —
+ * which is exactly the gap Ally's Important #2 found on the first revision of
+ * this PR, where the help text claimed a whole integral the measured region
+ * did not cover.
+ */
+export function recordExecutionWorkspaceReclaimInspection(input: {
+  trigger: ExecutionWorkspaceTeardownTrigger;
+  durationMs: number;
+}): void {
+  try {
+    const m = ensureRegistry();
+    // Observed for failures too, for the same reason the removal path is: an
+    // inspection that timed out still walked whatever it walked before giving
+    // up, and that work is charged to the cgroup either way. On a wedged mount
+    // the abandoned call is precisely the expensive case.
+    m.executionWorkspaceTeardownDurationHistogram.observe(
+      { trigger: input.trigger, method: "inspect_safety" },
+      input.durationMs / 1000,
+    );
+  } catch (error) {
+    logger.error({ err: error }, "failed to record execution-workspace reclaim inspection metrics");
   }
 }
 

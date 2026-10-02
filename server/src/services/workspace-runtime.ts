@@ -49,6 +49,7 @@ import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import {
   recordExecutionWorkspaceTeardown,
+  recordExecutionWorkspaceReclaimInspection,
   type ExecutionWorkspaceTeardownTrigger,
 } from "./metrics.js";
 
@@ -5086,8 +5087,38 @@ async function withReclaimFsDeadline<T>(operation: Promise<T>, target: string): 
  * anything it cannot *prove* clean alone. Every failure mode returns
  * `unverifiable`, never `clean`: an unreadable tree is a reason to skip, not a
  * reason to proceed.
+ *
+ * PEN-3692: the `git status --porcelain` below is a full tree walk charged to
+ * the worker's own cgroup, and the collector makes it up to twice per candidate
+ * — so it is observed into the teardown duration histogram under
+ * `method: "inspect_safety"`. `trigger` is required rather than defaulted
+ * precisely so a new PRODUCTION call site has to declare itself instead of
+ * silently landing in an `unknown` bucket nobody reads. ⚠️ That guarantee stops
+ * at `src/`: `server/tsconfig.json` excludes `src/__tests__`, so a test calling
+ * this with one argument is NOT a compile error (BLO-24983) — it would record
+ * `trigger=undefined`. Pass a trigger in tests too.
  */
-export async function inspectWorktreeReclaimSafety(worktreePath: string): Promise<WorktreeReclaimSafety> {
+export async function inspectWorktreeReclaimSafety(
+  worktreePath: string,
+  trigger: ExecutionWorkspaceTeardownTrigger,
+): Promise<WorktreeReclaimSafety> {
+  const inspectionStartedAt = Date.now();
+  try {
+    return await inspectWorktreeReclaimSafetyInner(worktreePath);
+  } finally {
+    // In `finally` so an inspection that threw still contributes the walking it
+    // did before throwing — excluding it would bias the integral downward
+    // exactly when the mount is misbehaving, which is the regime this measures.
+    recordExecutionWorkspaceReclaimInspection({
+      trigger,
+      durationMs: Date.now() - inspectionStartedAt,
+    });
+  }
+}
+
+async function inspectWorktreeReclaimSafetyInner(
+  worktreePath: string,
+): Promise<WorktreeReclaimSafety> {
   // Deliberately not `directoryExists`, which is `stat().catch(() => false)`:
   // that collapses EACCES/EIO/ESTALE into "missing" and so returns `safe` for a
   // tree it never read. Only an errno that *proves* nothing is there counts as
