@@ -50,9 +50,15 @@ const COMMAND_OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{12,}\b/g;
 // "Self-sufficient" is CONDITIONAL, not unconditional: it holds only while the
 // token body stays inside `[A-Za-z0-9_]`. If GitHub ever issues a `gh*_` token
 // containing a character outside that class (a `-`, or a second `.`), the
-// `{20,}` run stops early, this rule reverts to matching a PREFIX of the value,
-// and the 2-of-3-segment leak this fix closed is back — because a prefix
+// `{20,}` run stops early and the damage depends on WHERE that character falls.
+// At or after the 20th body character, this rule reverts to matching a PREFIX
+// of the value, and the 2-of-3-segment leak this fix closed is back — a prefix
 // replacement inserts `*` and destroys the structure the later rules match on.
+// INSIDE the first 20 body characters it is strictly worse: `{20,}` fails
+// outright, this rule matches NOTHING, and the `gh*_` head goes out in the clear
+// alongside the whole tail. Measured — nothing in the chain redacts
+// `ghs_NOTAREAL-TOKEN0123456789abcdef.ab.<sig>`, because JWT cannot cover it
+// either (its `ab` segment is under 8 chars).
 // Widen the body class in step with any such change, and re-run
 // blo29553-composite-token-redaction.test.ts.
 const COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}(?:\.[A-Za-z0-9_-]+)*\b/g;
@@ -186,11 +192,20 @@ export function redactCommandText(command: string, redactedValue = REDACTED_COMM
     // and NOT self-sufficient: ahead of JWT it would reintroduce the original
     // bug on a dotted value. `sk-` keys are not dotted, so it strands nothing.
     //
-    // The five PEN-3139 rules keep their relative position — before JWT, after
-    // the GitHub rules — exactly as #1736 asked for on conflict. Each is
-    // self-sufficient too: the value it matches carries no dotted tail (AWS,
-    // Google and Slack keys are undotted; a PEM body is base64, which excludes
-    // `.`), so none strands a remainder for JWT and none is stranded by it.
+    // FOUR of the five PEN-3139 rules keep their relative position — AWS,
+    // Google, Slack and PEM, before JWT and after the GitHub rules — exactly as
+    // #1736 asked for on conflict. The fifth it shipped,
+    // COMMAND_GITHUB_FINE_GRAINED_PAT_RE, moves up to sit beside
+    // COMMAND_GITHUB_TOKEN_RE and is covered by "the two GitHub rules" above:
+    // it is prefix-anchored and self-sufficient, and the two never compete for
+    // the same run, because `gh[pousr]_` cannot match a prefix of `github_pat_`
+    // (`i` is not in `[pousr]`), so their order relative to each other is free.
+    // The four are self-sufficient too: the value each matches carries no dotted
+    // tail (AWS, Google and Slack keys are undotted; a PEM body is base64, which
+    // excludes `.`), so none strands a remainder for JWT and none is stranded by
+    // it — which is why their order among themselves is free as well. The only
+    // load-bearing positions are the two GitHub rules AHEAD of JWT and
+    // COMMAND_OPENAI_KEY_RE AFTER it; both are pinned executably by the suite.
     //
     // Measured over the enumerated composite family (2-6 segments x short middle
     // segment x 0-2 context segments each side, 90 cases): this order leaves 0

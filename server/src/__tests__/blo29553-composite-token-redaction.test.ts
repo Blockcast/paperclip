@@ -117,6 +117,33 @@ describe("BLO-29553: composite token redaction", () => {
     }
   });
 
+  // The benign list above tops out at four short labels, so it never reaches the
+  // boundary the `?`->`*` widening on COMMAND_JWT_RE's tail actually moved. That
+  // boundary is pinned here instead of left incidental: the tail is unbounded
+  // now, so a benign dotted run of >=5 segments of >=8 chars is redacted WHOLE,
+  // where under `?` everything past the 4th segment survived.
+  //
+  // This over-redaction is INTENDED, not a defect. For a redaction function,
+  // losing a benign dotted string from a transcript is far cheaper than
+  // stranding a segment of a live token, which is the exact failure BLO-29553
+  // was filed for. Asserting it here makes that trade a decision on the record,
+  // so a future reader meets it as a choice rather than as a surprise.
+  it("over-redacts a long benign dotted run -- accepted cost of the unbounded JWT tail", () => {
+    // 4 segments: redacted whole under BOTH `?` and `*`. Pre-existing on master,
+    // untouched by this PR -- included so the 5-segment case below is read as a
+    // boundary that MOVED, not as a cost this PR introduced from nothing.
+    expect(redactSensitiveText("staging-blockcastd.staging-orc8r.staging-infra.rks-staging")).toBe(
+      "***REDACTED***",
+    );
+    // 5 segments: redacted whole ONLY because the tail group is now `*`. This is
+    // the case the widening changed; under `?` it kept `production-orc8r`.
+    expect(
+      redactSensitiveText(
+        "staging-blockcastd.staging-orc8r.staging-infra.rks-staging.production-orc8r",
+      ),
+    ).toBe("***REDACTED***");
+  });
+
   describe("AC1(a) composite shape family", () => {
     // Enumerated deliberately rather than stated as an unbounded absolute: "no
     // segment of any composite ever survives" is not provable over arbitrary
@@ -312,6 +339,14 @@ describe("BLO-29553: composite token redaction", () => {
       // Inputs deliberately carry no `-flag`/`name=` shape, so only the
       // value-shape rules the mirror models can fire; any divergence therefore
       // means the modelled rules themselves diverged.
+      //
+      // SCOPE, so "pins the mirror" is not trusted further than it reaches:
+      // `currentChain` models TWO of the eight rules in redactCommandText -- the
+      // two this fix touches. It is deliberately not a model of the whole chain,
+      // and it cannot notice a divergence introduced in any of the other six
+      // (AWS, Google, Slack, PEM, the fine-grained PAT rule, OpenAI). What this
+      // test pins is that the two modelled rules still behave as the leak
+      // assertions below assume -- nothing wider.
       for (const input of [
         COMPOSITE,
         `Token ${COMPOSITE}`,
