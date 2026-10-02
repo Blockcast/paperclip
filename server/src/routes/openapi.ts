@@ -1542,7 +1542,10 @@ registry.registerPath({
     "always set, and `X-Result-Truncated: true` appears only when matching rows exist past the " +
     "page. Page the remainder with `offset`. The returned length is NOT a truncation signal — " +
     "eligibility filters (foreign-run holds, worktree cutoff) only shorten the page, so a " +
-    "truncated response routinely returns fewer than `X-Applied-Limit` rows.",
+    "truncated response routinely returns fewer than `X-Applied-Limit` rows. Paging makes the " +
+    "tail reachable but does NOT make the paged union a census: offset paging over a mutating " +
+    "collection duplicates and drops rows, and the within-band sort key is last-activity. For an " +
+    "exact per-agent open count read `/api/companies/{companyId}/issues/open-assignment-census`.",
   request: {
     query: z.object({
       offset: z.string().optional().describe("Rows to skip; offset += X-Applied-Limit to page."),
