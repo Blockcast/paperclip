@@ -770,12 +770,20 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         // Preserving the origin loses no diagnostics. The warnings are recorded
         // durably in the activity log below (`details.cleanupWarnings`), which is
         // where a human looks for them; the column answers the other question.
-        const cleanupPatch: Record<string, unknown> = {
-          closedAt,
-          cleanupReason: existing.cleanupReason,
-        };
+        //
+        // The restore is scoped to `!cleaned` on purpose. A CLEAN teardown that
+        // merely warned also reaches this update, and there the archive's `null`
+        // is correct and must stand: the row ends `archived`, which
+        // `selectEligible` excludes outright, so the column has no collector
+        // meaning left to preserve. Re-asserting it would still SHOW —
+        // `ExecutionWorkspaceDetail` renders the Cleanup row as
+        // `<cleanupEligibleAt> · <cleanupReason>` whenever the stamp is set
+        // (the archive does not clear it), so a collected workspace would read
+        // `· run_ended` as though it were still pending collection.
+        const cleanupPatch: Record<string, unknown> = { closedAt };
         if (!cleanupResult.cleaned) {
           cleanupPatch.status = "cleanup_failed";
+          cleanupPatch.cleanupReason = existing.cleanupReason;
         }
         if (cleanupResult.warnings.length > 0 || !cleanupResult.cleaned) {
           workspace = (await svc.update(id, cleanupPatch)) ?? workspace;
@@ -799,8 +807,13 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             status: "cleanup_failed",
             closedAt,
             // PEN-3692: same rule as the patch above, and this site is the clearer
-            // case — it always demotes to `cleanup_failed`, so it always hands a
-            // selectable row back to the collector. The thrown message is a
+            // case — the demotion to `cleanup_failed` is unconditional, so a
+            // STAMPED row always comes back to the collector. Selectability needs
+            // `cleanupEligibleAt is not null` too, as the sibling comment above
+            // states: an operator archiving a never-stamped workspace whose
+            // cleanup throws leaves a `cleanup_failed` row the collector never
+            // selects. Preserving `null` is still right there — it decodes to
+            // `unknown` if the row is ever stamped later. The thrown message is a
             // teardown diagnostic; writing it here relabelled a `run_ended` row
             // `idle_backfill` on every pass that touched it afterwards.
             cleanupReason: existing.cleanupReason,
