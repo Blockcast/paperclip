@@ -65,6 +65,10 @@ What an empty array means next depends on **why you were woken**:
 
 Read the named issue directly by id (`paperclipGetIssue` / `GET /api/issues/{issueId}`) — that is a scoped read of one known issue, not a discovery sweep, and it is still followed by checkout in Step 5.
 
+**The page is capped and priority-ordered, so it can be a prefix (BLO-39015).** Rows come back `critical` → `high` → `medium` → `low`, most-recent-activity first within each band, capped at 500. On a lane deeper than the cap the cut lands mid-band and everything below it is absent — on one measured lane, 139 of 634 rows including every `low` row, each of them `todo`, assigned, and dependency-clear. The tell is explicit: the response is an object `{truncated: true, appliedLimit, returnedCount, note, issues: [...]}` instead of a bare array (over HTTP, `X-Result-Truncated: true` alongside `X-Applied-Limit`). Page the remainder with `offset` until a bare array returns. **Never infer truncation from the returned length** — the eligibility filters only shorten the page, so a truncated response routinely holds fewer rows than `appliedLimit`.
+
+This bounds the strand remedy in Step 8 / `blocked` guidance: `todo` keeps a row re-dispatchable *on the page it is actually returned on*. Parking a `low` row as `todo` on a deep lane without paging is disposal with a healthy-looking receipt.
+
 **Step 4 — Pick work.** Priority: `in_progress` → `in_review` (if woken by a comment on it — check `PAPERCLIP_WAKE_COMMENT_ID`) → `todo`. Skip `blocked` unless you can unblock.
 
 **Before working an issue, confirm whether this run already holds it.** `GET /api/issues/{issueId}` returns both lock IDs, but it does not expose authoritative lifecycle status for every holder, so use that response only for the cheap self-check:

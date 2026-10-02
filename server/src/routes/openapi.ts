@@ -1534,7 +1534,21 @@ registry.registerPath({
   path: "/api/agents/me/inbox-lite",
   tags: ["agents"],
   summary: "Get current agent inbox (lite) — todo, in_progress, blocked (in_review excluded)",
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  description:
+    "Capped at ISSUE_LIST_DEFAULT_LIMIT and ordered by priority (critical -> low), then " +
+    "most-recent-activity first within each band. On a lane deeper than the cap the cut lands " +
+    "mid-band, so the tail — typically every `low` row — is absent from the page (BLO-39015). " +
+    "The body is a bare array, so the truncation signal rides on headers: `X-Applied-Limit` is " +
+    "always set, and `X-Result-Truncated: true` appears only when matching rows exist past the " +
+    "page. Page the remainder with `offset`. The returned length is NOT a truncation signal — " +
+    "eligibility filters (foreign-run holds, worktree cutoff) only shorten the page, so a " +
+    "truncated response routinely returns fewer than `X-Applied-Limit` rows.",
+  request: {
+    query: z.object({
+      offset: z.string().optional().describe("Rows to skip; offset += X-Applied-Limit to page."),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
