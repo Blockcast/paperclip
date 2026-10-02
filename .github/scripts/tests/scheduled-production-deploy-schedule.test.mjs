@@ -64,7 +64,7 @@ const pendingReadRegion = (() => {
  * `counted.length > 0` fail-safe never fires, and `queued`/`in_progress` quietly
  * lose their second source. Scoping to the pipeline is what lets that guard fire.
  */
-const pendingReadPipeline = (() => {
+const pendingReadPipeline = () => {
   // Anchor the start to the brace group that feeds `jq -s`, NOT the first `gh api`
   // in the region. A diagnostic read placed before the group — say a `per_page=1`
   // count for the step summary — otherwise lands inside the slice and satisfies the
@@ -77,6 +77,9 @@ const pendingReadPipeline = (() => {
   // clamps that fromIndex to 0, and the region never starts with `{`, so `start`
   // is -1 and the check below throws. Verified — an explicit -1 arm has no failing
   // mutation, so it would be decoration (2026-09-17 CEO ruling on guard tests).
+  // Derived lazily, not at module scope: a broken boundary should fail THIS test,
+  // not abort the import and take the other 25 guards' signal with it — which is
+  // what happens when the read is restructured, i.e. when that signal is most wanted.
   const start = pendingReadRegion.lastIndexOf('{', pendingReadRegion.indexOf('} | jq -s'));
   const end = pendingReadRegion.indexOf('> "$PENDING_JSON_PATH"');
   if (start === -1 || end === -1 || end <= start) {
@@ -85,7 +88,7 @@ const pendingReadPipeline = (() => {
     );
   }
   return pendingReadRegion.slice(start, end);
-})();
+};
 
 /**
  * The entries of the workflow's TOP-LEVEL `permissions:` block, in order.
@@ -620,7 +623,8 @@ test('guard (1) unions independent run queries, so a stale slice cannot zero it'
   // sound: a stale slice can only REMOVE rows from a result, so a union of
   // differently-filtered reads cannot produce a false zero. One read alone can.
   // Dropping a query, or collapsing the union, restores the defect silently.
-  const queries = [...pendingReadPipeline.matchAll(/actions\/workflows\/[^/]+\/runs\?([^"'\s]+)/g)].map(
+  const pipeline = pendingReadPipeline();
+  const queries = [...pipeline.matchAll(/actions\/workflows\/[^/]+\/runs\?([^"'\s]+)/g)].map(
     (m) => m[1],
   );
   assert.ok(
@@ -639,7 +643,7 @@ test('guard (1) unions independent run queries, so a stale slice cannot zero it'
   // `or .status == "x"` arm land with no query. That arm is then single-sourced on
   // the stale event read, which fails as a silent false zero rather than an error,
   // so nothing else would catch it.
-  const counted = [...new Set([...pendingReadPipeline.matchAll(/\.status\s*==\s*"([a-z_]+)"/g)].map((m) => m[1]))];
+  const counted = [...new Set([...pipeline.matchAll(/\.status\s*==\s*"([a-z_]+)"/g)].map((m) => m[1]))];
   assert.ok(counted.length > 0, 'expected guard (1) to filter on `.status == "..."`');
   for (const status of counted) {
     assert.ok(
