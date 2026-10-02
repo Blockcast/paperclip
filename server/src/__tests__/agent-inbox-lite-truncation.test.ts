@@ -273,7 +273,10 @@ describe("agent inbox-lite truncation signal (BLO-39015)", () => {
  *   - drop `res.setHeader(ISSUE_LIST_TRUNCATED_HEADER)` -> the cap+1 case fails;
  *   - drop `res.setHeader(ISSUE_LIST_APPLIED_LIMIT_HEADER)` -> both cap cases fail;
  *   - drop the `parseOffsetParam === null` 400 -> both rejection cases fail;
- *   - pass a literal `0` instead of `parsedOffset` -> the paging case fails.
+ *   - pass a literal `0` instead of `parsedOffset` -> the paging case fails;
+ *   - weaken `parseOffsetParam`'s `Number.isSafeInteger` to `Number.isFinite`
+ *     or `Number.isInteger` -> the 308-nines rejection case fails (309 nines
+ *     parses to `Infinity` and fails all three, so it cannot catch this).
  */
 describe("REST — GET /api/agents/me/inbox-lite (BLO-39015)", () => {
   const CAP = ISSUE_LIST_DEFAULT_LIMIT;
@@ -370,10 +373,15 @@ describe("REST — GET /api/agents/me/inbox-lite (BLO-39015)", () => {
     );
   });
 
-  // The 309-digit case passes `^\d+$` and parses to Infinity, so it is the only
-  // one here that can tell "rejects bad offsets" from "rejects offsets that
-  // fail the regex": the other four never reach the parse.
-  it.each(["-1", "abc", "1.5", "", "9".repeat(309)])(
+  // The two digit-string cases are the only ones that reach the parse at all —
+  // the other four are rejected by `^\d+$` — and they pin different guards:
+  //   309 nines parses to `Infinity`, so it separates "rejects bad offsets"
+  //     from "rejects offsets that fail the regex";
+  //   308 nines parses to `1e+308`, which is finite AND an integer but NOT
+  //     safe, so it is the only input here that separates the shipped
+  //     `Number.isSafeInteger` from `Number.isFinite`/`Number.isInteger`.
+  //     Without it that guard has no failing mutation.
+  it.each(["-1", "abc", "1.5", "", "9".repeat(308), "9".repeat(309)])(
     "rejects offset=%j with 400 rather than silently serving window 0",
     async (offset) => {
       serveRestPopulation(CAP + 1);
