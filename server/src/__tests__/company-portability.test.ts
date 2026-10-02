@@ -1483,6 +1483,109 @@ describe("company portability", () => {
     ]);
   });
 
+  /**
+   * PEN-3701 — the export path owned a second, weaker spelling of the shared env scrubber.
+   *
+   * Both fixture values below are invented. The credential-shaped one is an opaque high-entropy
+   * token with no vendor prefix on purpose: it has to trip `isPlausiblySensitiveEnvValue`'s generic
+   * mixed-class branch without being a pasteable literal that a secret scanner would flag on this
+   * file itself.
+   */
+  describe("env input defaults use the shared scrubber, not a per-surface denylist (PEN-3701)", () => {
+    const CREDENTIAL_SHAPED = "Zq7mWp2Lx9Rt4Nv8Bc3Hj6Kd1Fg5Ys0Ae";
+    const BENIGN = "debug";
+
+    async function exportEnvInputs(env: Record<string, unknown>) {
+      agentSvc.list.mockResolvedValue([
+        {
+          id: "agent-1",
+          name: "ClaudeCoder",
+          status: "idle",
+          role: "engineer",
+          title: "Software Engineer",
+          icon: "code",
+          reportsTo: null,
+          capabilities: "Writes code",
+          adapterType: "claude_local",
+          adapterConfig: { env },
+          runtimeConfig: {},
+          metadata: null,
+        },
+      ]);
+      const portability = companyPortabilityService({} as any);
+      return portability.exportBundle("company-1", {
+        include: { company: true, agents: true, projects: false, issues: false },
+      });
+    }
+
+    function inputFor(exported: { manifest: { envInputs: Array<{ key: string }> } }, key: string) {
+      return exported.manifest.envInputs.find((entry) => entry.key === key);
+    }
+
+    it("withholds a default under a token-stem key the old substring list classified as plain", async () => {
+      // The retired local list matched `token` only as the whole key or a `_token`/`-token`
+      // SUFFIX. `GITHUB_TOKEN_B64` is neither, so its value exported in the clear; the shared
+      // regex matches the stem followed by a separator.
+      const exported = await exportEnvInputs({
+        GITHUB_TOKEN_B64: { type: "plain", value: CREDENTIAL_SHAPED },
+      });
+
+      expect(inputFor(exported as never, "GITHUB_TOKEN_B64")).toMatchObject({
+        kind: "secret",
+        defaultValue: "",
+      });
+      expect(JSON.stringify(exported.files)).not.toContain(CREDENTIAL_SHAPED);
+    });
+
+    it("withholds a credential-SHAPED default under a key no name list would catch", async () => {
+      // The axis no key vocabulary can cover. `BOOTSTRAP` is not credential-named by any spelling,
+      // so only a value test closes this.
+      const exported = await exportEnvInputs({
+        BOOTSTRAP: { type: "plain", value: CREDENTIAL_SHAPED },
+      });
+
+      expect(inputFor(exported as never, "BOOTSTRAP")).toMatchObject({ defaultValue: "" });
+      expect(JSON.stringify(exported.files)).not.toContain(CREDENTIAL_SHAPED);
+    });
+
+    it("names the withheld value in warnings so an import is not silently short a default", async () => {
+      const exported = await exportEnvInputs({
+        BOOTSTRAP: { type: "plain", value: CREDENTIAL_SHAPED },
+      });
+
+      expect(
+        exported.warnings.some((warning: string) => warning.includes("BOOTSTRAP") && warning.includes("withheld")),
+      ).toBe(true);
+    });
+
+    it("still carries a genuinely portable default — the feature this surface exists for", async () => {
+      // The guard against over-correcting into the sibling `redactPortableAgentRecord` behaviour,
+      // which masks unconditionally. Doing that here would delete re-import defaults entirely.
+      const exported = await exportEnvInputs({ LOG_LEVEL: { type: "plain", value: BENIGN } });
+
+      expect(inputFor(exported as never, "LOG_LEVEL")).toMatchObject({
+        kind: "plain",
+        defaultValue: BENIGN,
+      });
+    });
+
+    it("keeps a sensitive-NAMED key with an empty default classified as a secret", async () => {
+      // Why this is not plain `isSensitiveEnv(key, value)`: that helper returns false for an empty
+      // value, which would flip this entry to `kind: "plain"` and change what the import prompts
+      // the operator to supply.
+      const exported = await exportEnvInputs({ API_KEY: { type: "plain", value: "" } });
+
+      expect(inputFor(exported as never, "API_KEY")).toMatchObject({ kind: "secret" });
+    });
+
+    it("applies the same rule to the bare-string binding shorthand", async () => {
+      const exported = await exportEnvInputs({ BOOTSTRAP: CREDENTIAL_SHAPED });
+
+      expect(inputFor(exported as never, "BOOTSTRAP")).toMatchObject({ defaultValue: "" });
+      expect(JSON.stringify(exported.files)).not.toContain(CREDENTIAL_SHAPED);
+    });
+  });
+
   it("materializes required agent env inputs from import secretValues as company secrets", async () => {
     const portability = companyPortabilityService({} as any);
     agentSvc.list.mockResolvedValue([]);
