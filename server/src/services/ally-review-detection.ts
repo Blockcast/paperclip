@@ -676,7 +676,7 @@ export function allyClaimedReviewHead(body: string | null | undefined): string |
  * prose count *above* the block's is fatal. An absent or unparseable bucket is
  * the #1675 case the block exists to survive, and a block reporting more than
  * the prose does cannot fail open. The #1675 body reads `Critical Issues (0)`
- * / `Important Issues (0)`, so this never fires on it — the fixture is the
+ * / `Important Issues (0)`, so this never fires on it -- the fixture is the
  * control.
  *
  * Reads closed fences as quotes, so a quoted example bucket cannot fail a

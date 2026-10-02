@@ -137,7 +137,7 @@ function toEpochMs(value: string | Date): number {
  * let array order decide the verdict whenever two comments shared a second:
  * latestAttestingAllyComment flipped clean/blocking_finding,
  * headsWithUndispositionedFinding flipped not_evaluated/carried_finding,
- * newestInScopeAllyReviewComments flipped clean/unreadable_verdict — all
+ * newestInScopeAllyReviewComments flipped clean/unreadable_verdict -- all
  * three reproduced in both orders, all three fail *open*. Nothing establishes
  * that order: executeCommentReviewGateCheck concatenates two independently
  * ordered GitHub surfaces, and GitHub's created_at is second-resolution, so a

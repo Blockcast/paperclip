@@ -429,7 +429,7 @@ describe("attestedHead", () => {
   it("reads a CRLF body exactly as its LF twin", () => {
     const bodies = [
       counted('{"critical":0,"important":0}', `Reviewed head: ${HEAD}`, "```ts", "x", "```"),
-      ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`, "### Critical Issues (0)"].join("\n"),
+      ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD}`, "### Critical Issues (0)"].join("\n"),
       counted('{"critical":0,"important":0}', `Reviewed head: ${HEAD}`, "```ts", "### Critical Issues (2)", "```"),
     ];
     for (const lf of bodies) {
@@ -443,7 +443,7 @@ describe("attestedHead", () => {
   it("anchors the attestation on `\\n` exactly as the gate does", () => {
     // JS's multiline `$` also stops before U+2028, which the gate's
     // `(?=\n|$)` does not, so this credited a line the gate cannot read.
-    const body = ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}\u2028trailing`].join("\n");
+    const body = ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD}\u2028trailing`].join("\n");
     assert.equal(attestedHead(body), null);
   });
 

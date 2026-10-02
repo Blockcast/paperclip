@@ -1245,10 +1245,10 @@ describe("BLO-32695 — an unreadable block reds only the head it concerns", () 
    * above is the one that does.
    */
   it.each([
-    ["a later comment that only quotes the heading", ["## Ally — Consolidated PR Review", "Replying to the review above."].join("\n")],
+    ["a later comment that only quotes the heading", ["## Ally \u2014 Consolidated PR Review", "Replying to the review above."].join("\n")],
     [
       "a later clean review of another head",
-      ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD_B}`, "### Critical Issues (0)", "### Important Issues (0)"].join("\n"),
+      ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD_B}`, "### Critical Issues (0)", "### Important Issues (0)"].join("\n"),
     ],
   ])("is not displaced by %s", (_label, later) => {
     for (const order of [
@@ -1320,10 +1320,10 @@ describe("BLO-32695 — an unreadable block may carry a finding, never retire on
    * the newer unreadable review counting a Critical was never consulted.
    */
   describe("an older attested clean review of the same head", () => {
-    const olderClean = ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD_A}`, "### Critical Issues (0)", "### Important Issues (0)"].join("\n");
+    const olderClean = ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD_A}`, "### Critical Issues (0)", "### Important Issues (0)"].join("\n");
 
     it.each([
-      ["prose only — master's behaviour", proseOnly],
+      ["prose only, master's behaviour", proseOnly],
       ["prose + a malformed block", malformedBlock],
     ])("does not hide a newer review carrying a finding: %s", (_label, newer) => {
       for (const order of [
@@ -1810,13 +1810,13 @@ describe("BLO-32695 — prefix drift fails closed rather than vanishing", () => 
  * unreadable, and a block-less one attested nothing. The CRLF twin of every
  * body must read exactly as the LF one.
  */
-describe("BLO-32695 — a CRLF body reads exactly as its LF twin", () => {
+describe("BLO-32695 -- a CRLF body reads exactly as its LF twin", () => {
   const HEAD = PR1675_HEAD;
   const clean = { head: HEAD, findings: { critical: 0, important: 0 } };
   const lfBodies = [
-    [verdictBlock(clean), "## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`, "```ts", "### Critical Issues (2)", "```"],
-    ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`, "### Critical Issues (0)", "### Important Issues (0)"],
-    ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`, "### Important Issues (1)", "1. Open."],
+    [verdictBlock(clean), "## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD}`, "```ts", "### Critical Issues (2)", "```"],
+    ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD}`, "### Critical Issues (0)", "### Important Issues (0)"],
+    ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD}`, "### Important Issues (1)", "1. Open."],
   ].map((lines) => lines.join("\n"));
 
   it.each(lfBodies.map((lf) => [lf]))("body %#", (lf) => {
