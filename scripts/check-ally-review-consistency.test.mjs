@@ -1771,31 +1771,64 @@ describe("BLO-32695 — a fenced example of the marker is not a second block", (
     // masking exactly that.
     assert.equal(attestedHead(body("``` `example` is prose, not a fence opener", block(HEAD))), null);
   });
+
+  // Ally, #1721 at 068806d6, Important 1. JS's `.` excludes U+2028/U+2029 and
+  // Python's does not, so with a bare `.` this opener skipped a fence the
+  // sweep's FENCE_OPEN_PATTERN opened: the quoted block counted as a second
+  // block here, the head went unreadable, and the sweep read it as attested and
+  // never re-requested the review that would clear the red. The info string is
+  // `[^\n]*` at both JS sites now.
+  it("opens a fence whose info string carries U+2028, as the sweep does", () => {
+    assert.equal(attestedHead(body("As emitted:", "", "```markdown\u2028x", block(HEAD), "```")), HEAD);
+  });
+
+  it("control: the same fence with a plain info string also opens", () => {
+    // Pins that the assertion above turns on the character, not the fixture.
+    assert.equal(attestedHead(body("As emitted:", "", "```markdown x", block(HEAD), "```")), HEAD);
+  });
 });
 
 // Ally, #1721 at 1bc85198, Important 1 + Suggestion 1. The rule, not the
 // instances.
 //
 // Every pattern in the two JS readers is a markdown line-structure reader over
-// the same review bodies. JS's `m` makes `^`/`$` stop at `\r`, U+2028 and
-// U+2029 as well as `\n`; Python's re.MULTILINE and CommonMark both recognise
-// only `\n`, and `\r` is normalised away at entry by reviewBody/reviewText. So
-// an `m` here is a divergence from the sweep in the silent direction, and the
-// deadlock it opens is the one this row exists to close.
+// the same review bodies, and U+2028 reaches them through TWO doors:
+//
+//   flag axis  JS's `m` makes `^`/`$` stop at `\r`, U+2028 and U+2029 as well
+//              as `\n`, where Python's re.MULTILINE and CommonMark recognise
+//              only `\n`.
+//   dot axis   JS's `.` excludes `\r`, U+2028 and U+2029, where Python's
+//              excludes only `\n` -- so a bare `.` diverges with no `m`
+//              anywhere (Ally, #1721 at 068806d6, Important 1).
+//
+// `\r` is normalised away at entry by reviewBody/reviewText, so U+2028/U+2029
+// are what is left. Either door opens the same deadlock this row exists to
+// close, in the silent direction.
 //
 // Pinned as a rule because the previous pass fixed the attestation pattern
 // alone and left thirteen siblings, four of which drive these cross-checks --
-// enumerating the instances you have seen guarantees a next round. This fails
-// for a pattern added later, including one using a shape nobody has written
-// yet. Mirrors TestPatternCharacterClassesAreAsciiOnly in
+// enumerating the instances you have seen guarantees a next round. The dot axis
+// is the proof: the flag scan below read green over a live instance of it for a
+// whole cycle, because a scan is only a rule over the axis it reads.
+//
+// Reach, so the next reader does not have to infer it: the flag scan sees a
+// quoted flags argument and a regex-literal suffix; the dot scan sees a regex
+// literal bound to a name and a String.raw template. Neither sees an inline
+// regex passed straight to a call, and neither sees a third axis nobody has
+// named yet. Mirrors TestPatternCharacterClassesAreAsciiOnly in
 // .github/scripts/test_sweep_stalled_ally_reviews.py, which pins the same kind
 // of rule on the Python side for re.ASCII.
 describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break", () => {
   // Both construction forms: a quoted flags argument to `new RegExp`, and the
   // suffix of a regex literal.
+  // Ally, #1721 at 068806d6, Suggestion 1. The literal-form boundary carries
+  // `}` and `:` so `{re:/^a$/im}` is seen, not just the space-separated
+  // `{ re: /^a$/im }`. Kept as an explicit terminator set rather than
+  // `(?![dgimsuvy])`: that negative form also matches inside a path like
+  // `server/dist/...`, which costs false clusters for no extra reach.
   const flagClusters = (source) =>
     source.split("\n").flatMap((line, i) =>
-      [/"([dgimsuvy]+)"/g, /\/([dgimsuvy]+)(?=[\s;,)\].]|$)/g].flatMap((re) => {
+      [/"([dgimsuvy]+)"/g, /\/([dgimsuvy]+)(?=[\s;,)\].}:]|$)/g].flatMap((re) => {
         re.lastIndex = 0;
         const out = [];
         let m;
@@ -1832,7 +1865,84 @@ describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break
       'const A = new RegExp(String.raw`^a`, "gim");',
       "const B = /^b$/im;",
       "const C = /^c$/i;",
+      "const D = {re:/^d$/im};",
     ].join("\n");
-    assert.deepEqual(flagClusters(injected).map((c) => c.flags), ["gim", "im", "i"]);
+    assert.deepEqual(flagClusters(injected).map((c) => c.flags), ["gim", "im", "i", "im"]);
+  });
+
+  // Ally, #1721 at 068806d6, Important 1. The flag scan above is one axis of
+  // the rule and cannot reach the other: JS's `.` excludes U+2028/U+2029 where
+  // Python's `.` excludes only `\n`, so a bare `.` in a line-structure pattern
+  // re-opens the identical gate-red/sweep-satisfied deadlock with no `m`
+  // anywhere. The scan above read green over a live instance of it
+  // (FENCE_DELIMITER_PATTERN / FENCE_OPEN_RE) while its comment claimed to fail
+  // for "a shape nobody has written yet".
+  //
+  // Reach, stated rather than implied: this scans regex literals bound to a
+  // name and String.raw templates, which is how every named pattern in both
+  // files is declared. An inline regex passed straight to a call -- `.replace(
+  // /\r\n?/g, ...)` -- is NOT covered. That is deliberate: those are not line-
+  // structure readers, and widening to every `/.../ ` in the source means
+  // parsing JS to tell a regex from a division.
+  const bareDotSites = (source) =>
+    source.split("\n").flatMap((line, i) =>
+      [/=\s*(\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\])+\/)/g, /String\.raw`((?:[^`\\]|\\.)*)`/g].flatMap(
+        (re) => {
+          re.lastIndex = 0;
+          const out = [];
+          let m;
+          while ((m = re.exec(line)) !== null) {
+            // `${...}` first: its body is a JS expression, not regex source, so
+            // the dot in `COUNTED_SEVERITIES.join("|")` is not a wildcard. The
+            // interpolated constants are themselves String.raw templates and
+            // are scanned where they are declared, so dropping the hole here
+            // loses no coverage. Then strip escapes, then character classes:
+            // what survives is a wildcard `.`, while `\.` and `[.)]` are
+            // literal dots and fine.
+            const wildcards = m[1]
+              .replace(/\$\{[^}]*\}/g, "")
+              .replace(/\\./g, "")
+              .replace(/\[(?:[^\]\\]|\\.)*\]/g, "");
+            if (wildcards.includes(".")) out.push({ line: i + 1, text: line.trim() });
+          }
+          return out;
+        },
+      ),
+    );
+
+  for (const rel of [
+    "../server/src/services/ally-review-detection.ts",
+    "./check-ally-review-consistency.mjs",
+  ]) {
+    it(`uses no wildcard \`.\` in a named pattern in ${rel}`, () => {
+      assert.deepEqual(
+        bareDotSites(readFileSync(new URL(rel, import.meta.url), "utf8")).map(
+          (c) => `${rel}:${c.line}: ${c.text}`,
+        ),
+        [],
+      );
+    });
+  }
+
+  it("control: the dot scan catches both construction forms and spares literal dots", () => {
+    // No floor is possible here -- the correct count is zero -- so the scan's
+    // liveness has to be pinned by injection instead. Rows 3-5 are the ways a
+    // naive `includes(".")` would fire on a pattern that is already correct.
+    const caught = (src) => bareDotSites(src).length;
+    assert.equal(caught("const A = /^a.*$/;"), 1, "regex literal");
+    assert.equal(caught('const B = new RegExp(String.raw`^b.+$`, "g");'), 1, "String.raw");
+    assert.equal(caught("const C = /^c\\.d$/;"), 0, "escaped dot is a literal");
+    assert.equal(caught("const D = /^[.]e$/;"), 0, "dot in a character class is a literal");
+    assert.equal(caught("const E = /^f[^\\n]*$/;"), 0, "the shape this rule asks for");
+    assert.equal(
+      caught("const F = new RegExp(String.raw`^g${SEVERITIES.join(\"|\")}$`);"),
+      0,
+      "a dot inside `${}` is JS, not regex source",
+    );
+    assert.equal(
+      caught("const G = new RegExp(String.raw`^h${X}.*$`);"),
+      1,
+      "the `${}` hole does not blind the scan to a wildcard beside it",
+    );
   });
 });
