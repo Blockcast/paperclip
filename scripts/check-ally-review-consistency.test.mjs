@@ -631,9 +631,11 @@ describe("findPrViolations", () => {
     assert.match(violations[0], /^I2c PR #5 @ff1c72db: Ally App review 12 is APPROVED/);
   });
 
-  // The producer's own template heads its buckets `### 🚨 Critical` with no
-  // `(N)`, so every prose reader here sees a blocking review as clean. The
-  // structured counts are the only place the finding is actually stated.
+  // A review may head its buckets `### 🚨 Critical` with no `(N)` -- the form the
+  // producer template prescribed until #1721 corrected it to the counted one,
+  // and the form every body posted before that correction still carries. Every
+  // prose reader here sees such a review as clean, so the structured counts are
+  // the only place the finding is actually stated.
   it("I2a: catches a structured blocking verdict whose prose carries no counted headings", () => {
     const pr = {
       number: 1721,
@@ -689,7 +691,14 @@ describe("findPrViolations", () => {
 
   // A block Ally tried and failed to state is not a review that predates the
   // block, so it must not reach the prose path the block exists to replace.
-  it("I2a: fails closed on an APPROVED whose verdict block omits a blocking count", () => {
+  //
+  // Reported as I2e, and as I2e ONLY. It used to raise I2a *and* I2c, whose
+  // texts assert two mutually exclusive things -- an open finding, and a prior
+  // finding marked still-present -- neither of which was read off a body that
+  // could not be read at all (Ally, #1721 at 5f4d5302, Suggestion 1). The
+  // negative assertions are the point of the test: dropping them lets the
+  // fan-out come back while the positive one still passes.
+  it("I2e: fails closed on an APPROVED whose verdict block omits a blocking count", () => {
     const pr = {
       number: 1724,
       headSha: HEAD,
@@ -702,7 +711,33 @@ describe("findPrViolations", () => {
       ],
     };
     const violations = findPrViolations(pr);
-    assert.ok(violations.some((v) => /^I2a PR #1724 /.test(v)), violations.join("\n"));
+    assert.ok(violations.some((v) => /^I2e PR #1724 /.test(v)), violations.join("\n"));
+    assert.deepEqual(violations.filter((v) => /^I2a |^I2c /.test(v)), []);
+  });
+
+  // The other half of the same change, and the half with no natural assertion:
+  // the field queries stopped answering for `unreadable`, so `hasBlockingVerdict`
+  // has to name it as a term of its own. Drop that term and an unreadable block
+  // reads as a *clean* verdict in the roll-up -- I4 then fires on a COMMENTED
+  // review that is correctly withholding approval, and `appBlockers` stops
+  // counting it. That mutation left the whole suite green before this test
+  // existed, which is the only reason it is here rather than being obvious.
+  it("I4: an unreadable block still counts as blocking, so a COMMENTED review is not reported", () => {
+    const pr = {
+      number: 1725,
+      // Not App-authored, so the clean-self-review exemption cannot be what
+      // suppresses I4 here -- only the blocking roll-up can.
+      author: { login: "kkroo", is_bot: false },
+      headSha: HEAD,
+      reviews: [
+        appReview({
+          id: 25,
+          state: "COMMENTED",
+          body: verdictBody({ suggestions: 0 }, "\n### ✅ Strengths\n- clean\n"),
+        }),
+      ],
+    };
+    assert.deepEqual(findPrViolations(pr).filter((v) => /^I4 /.test(v)), []);
   });
 
   it("I3: catches an App review whose body attests a head other than the recorded commit", () => {
