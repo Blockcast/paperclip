@@ -50,6 +50,7 @@ import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-c
 import {
   recordExecutionWorkspaceTeardown,
   recordExecutionWorkspaceReclaimInspection,
+  type ExecutionWorkspaceCleanupReason,
   type ExecutionWorkspaceTeardownTrigger,
 } from "./metrics.js";
 
@@ -5100,7 +5101,10 @@ async function withReclaimFsDeadline<T>(operation: Promise<T>, target: string): 
  */
 export async function inspectWorktreeReclaimSafety(
   worktreePath: string,
-  trigger: ExecutionWorkspaceTeardownTrigger,
+  options: {
+    trigger: ExecutionWorkspaceTeardownTrigger;
+    cleanupReason?: ExecutionWorkspaceCleanupReason;
+  },
 ): Promise<WorktreeReclaimSafety> {
   const inspectionStartedAt = Date.now();
   try {
@@ -5110,7 +5114,8 @@ export async function inspectWorktreeReclaimSafety(
     // did before throwing — excluding it would bias the integral downward
     // exactly when the mount is misbehaving, which is the regime this measures.
     recordExecutionWorkspaceReclaimInspection({
-      trigger,
+      trigger: options.trigger,
+      cleanupReason: options.cleanupReason,
       durationMs: Date.now() - inspectionStartedAt,
     });
   }
@@ -5210,8 +5215,19 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
    * site was added without being classified.
    */
   trigger?: ExecutionWorkspaceTeardownTrigger;
+  /**
+   * Why this workspace became eligible, for the `cleanup_reason` label. Only
+   * the collector can supply one; the persist-rollback and operator callers
+   * have no eligibility reason and default to `not_applicable`.
+   *
+   * ⛔ This, not `trigger`, is the run-attribution split: run end stamps
+   * `cleanupReason: "run_ended"` and defers the removal to the collector, so
+   * run-attributable work arrives here as `trigger="collector"`.
+   */
+  cleanupReason?: ExecutionWorkspaceCleanupReason;
 }) {
   const trigger = input.trigger ?? "unknown";
+  const cleanupReason = input.cleanupReason ?? "not_applicable";
   const warnings: string[] = [];
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
   const repoRoot = input.workspace.providerType === "git_worktree" && workspacePath
@@ -5318,6 +5334,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
             // throwing.
             recordExecutionWorkspaceTeardown({
               trigger,
+              cleanupReason,
               method: "worktree_remove",
               succeeded: removalSucceeded,
               durationMs: Date.now() - startedAt,
@@ -5377,6 +5394,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         // threadpool thread throughout.
         recordExecutionWorkspaceTeardown({
           trigger,
+          cleanupReason,
           method: "remove_local_fs",
           succeeded: removalSucceeded,
           durationMs: Date.now() - startedAt,

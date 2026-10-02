@@ -16,6 +16,7 @@ import {
   EXECUTION_WORKSPACE_COLLECTOR_SCANNED_METRIC,
   EXECUTION_WORKSPACE_COLLECTOR_STAMPED_METRIC,
   EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC,
+  EXECUTION_WORKSPACE_CLEANUP_REASONS,
   EXECUTION_WORKSPACE_TEARDOWN_METHODS,
   EXECUTION_WORKSPACE_TEARDOWN_METRIC,
   EXECUTION_WORKSPACE_TEARDOWN_TRIGGERS,
@@ -58,7 +59,7 @@ describe("execution-workspace teardown metrics", () => {
     // The question PEN-3692 could not answer: both callers reach the same
     // removal function, so without this label their work is one undivided sum.
     recordExecutionWorkspaceTeardown({
-      trigger: "run_teardown",
+      trigger: "persist_rollback",
       method: "worktree_remove",
       succeeded: true,
       durationMs: 1500,
@@ -72,17 +73,17 @@ describe("execution-workspace teardown metrics", () => {
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="run_teardown",method="worktree_remove",outcome="succeeded"} 1`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="persist_rollback",method="worktree_remove",cleanup_reason="not_applicable",outcome="succeeded"} 1`,
     );
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="collector",method="worktree_remove",outcome="succeeded"} 1`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="collector",method="worktree_remove",cleanup_reason="not_applicable",outcome="succeeded"} 1`,
     );
     // The removal term of the work integral, split by caller.
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_sum{trigger="run_teardown",method="worktree_remove"} 1.5`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_sum{trigger="persist_rollback",method="worktree_remove",cleanup_reason="not_applicable"} 1.5`,
     );
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_sum{trigger="collector",method="worktree_remove"} 0.4`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_sum{trigger="collector",method="worktree_remove",cleanup_reason="not_applicable"} 0.4`,
     );
   });
 
@@ -100,13 +101,13 @@ describe("execution-workspace teardown metrics", () => {
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="collector",method="remove_local_fs",outcome="failed"} 1`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="collector",method="remove_local_fs",cleanup_reason="not_applicable",outcome="failed"} 1`,
     );
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_sum{trigger="collector",method="remove_local_fs"} 2`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_sum{trigger="collector",method="remove_local_fs",cleanup_reason="not_applicable"} 2`,
     );
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_count{trigger="collector",method="remove_local_fs"} 1`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_count{trigger="collector",method="remove_local_fs",cleanup_reason="not_applicable"} 1`,
     );
   });
 
@@ -127,13 +128,17 @@ describe("execution-workspace teardown metrics", () => {
   });
 
   it("bounds every label to its allowlist, so no call site can widen cardinality", () => {
-    // Worst case on the counter is triggers x methods x outcomes, but only the
-    // two REMOVAL methods ever reach it — 4 x 2 x 2 = 16 series. The histogram
-    // additionally carries `inspect_safety`, so its worst case is triggers x
-    // methods = 4 x 3 = 12. Bounded by these constants, never by a
-    // caller-supplied string.
+    // Worst case on the counter is triggers x removal-methods x cleanup_reasons
+    // x outcomes = 4 x 2 x 3 x 2 = 48; the histogram adds `inspect_safety` and
+    // drops outcome, so 4 x 3 x 3 = 36. Both are worst cases, not expected
+    // counts: cleanup_reason only varies under trigger="collector", and every
+    // other caller pins it to `not_applicable`. Bounded by these constants,
+    // never by a caller-supplied string — in particular `cleanup_reason` is
+    // mapped from the DB column through a two-way branch rather than passed
+    // through, so adding a new `cleanupReason` value in the schema cannot
+    // widen this.
     expect(EXECUTION_WORKSPACE_TEARDOWN_TRIGGERS).toEqual([
-      "run_teardown",
+      "persist_rollback",
       "collector",
       "operator",
       "unknown",
@@ -143,6 +148,47 @@ describe("execution-workspace teardown metrics", () => {
       "remove_local_fs",
       "inspect_safety",
     ]);
+    expect(EXECUTION_WORKSPACE_CLEANUP_REASONS).toEqual([
+      "run_ended",
+      "idle_backfill",
+      "not_applicable",
+    ]);
+  });
+
+  it("keeps run-attributable teardown separable from idle reclamation", () => {
+    // The defect Ally found on d729b09: `trigger` cannot answer PEN-3692's
+    // question, because run end performs NO inline teardown — it stamps
+    // cleanupReason="run_ended" and defers to the collector. So both
+    // run-attributable and idle work arrive as trigger="collector" and are
+    // distinguishable only here. Reading a flat `persist_rollback` (the old
+    // `run_teardown`) against a large `collector` and concluding "per-failure
+    // teardown is negligible" is attribution by magnitude against an
+    // uninstrumented alternative — the PEN-3692 error in a new costume.
+    __resetMetricsForTest();
+    recordExecutionWorkspaceTeardown({
+      trigger: "collector",
+      method: "worktree_remove",
+      succeeded: true,
+      durationMs: 3000,
+      cleanupReason: "run_ended",
+    });
+    recordExecutionWorkspaceTeardown({
+      trigger: "collector",
+      method: "worktree_remove",
+      succeeded: true,
+      durationMs: 1000,
+      cleanupReason: "idle_backfill",
+    });
+
+    return renderMetrics().then(({ body }) => {
+      // Same trigger, same method — separated only by cleanup_reason.
+      expect(body).toContain(
+        `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_sum{trigger="collector",method="worktree_remove",cleanup_reason="run_ended"} 3`,
+      );
+      expect(body).toContain(
+        `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_sum{trigger="collector",method="worktree_remove",cleanup_reason="idle_backfill"} 1`,
+      );
+    });
   });
 });
 
@@ -177,7 +223,7 @@ describe("cleanupExecutionWorkspaceArtifacts wiring", () => {
     // written, not that the removal path reaches it with the right label.
     const dir = await makeDisposableWorkspace();
     const result = await cleanupExecutionWorkspaceArtifacts({
-      trigger: "run_teardown",
+      trigger: "persist_rollback",
       workspace: localFsWorkspace(dir),
     });
 
@@ -186,10 +232,10 @@ describe("cleanupExecutionWorkspaceArtifacts wiring", () => {
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="run_teardown",method="remove_local_fs",outcome="succeeded"} 1`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="persist_rollback",method="remove_local_fs",cleanup_reason="not_applicable",outcome="succeeded"} 1`,
     );
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_count{trigger="run_teardown",method="remove_local_fs"} 1`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_count{trigger="persist_rollback",method="remove_local_fs",cleanup_reason="not_applicable"} 1`,
     );
   });
 
@@ -202,7 +248,7 @@ describe("cleanupExecutionWorkspaceArtifacts wiring", () => {
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="unknown",method="remove_local_fs",outcome="succeeded"} 1`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="unknown",method="remove_local_fs",cleanup_reason="not_applicable",outcome="succeeded"} 1`,
     );
   });
 });
@@ -222,11 +268,11 @@ describe("reclaim-safety inspection is in the work integral", () => {
     // a recorder-only test proves the metric can be written, not that the real
     // path reaches it.
     const absent = path.join(os.tmpdir(), `pen3692-absent-${Date.now()}`);
-    await inspectWorktreeReclaimSafety(absent, "collector");
+    await inspectWorktreeReclaimSafety(absent, { trigger: "collector" });
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_count{trigger="collector",method="inspect_safety"} 1`,
+      `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_count{trigger="collector",method="inspect_safety",cleanup_reason="not_applicable"} 1`,
     );
   });
 
@@ -236,7 +282,7 @@ describe("reclaim-safety inspection is in the work integral", () => {
     // make a wedged mount — which inspects repeatedly and removes nothing —
     // read as a burst of teardown activity.
     const absent = path.join(os.tmpdir(), `pen3692-absent-${Date.now()}`);
-    await inspectWorktreeReclaimSafety(absent, "collector");
+    await inspectWorktreeReclaimSafety(absent, { trigger: "collector" });
 
     const { body } = await renderMetrics();
     expect(body).not.toContain(`method="inspect_safety",outcome=`);
