@@ -373,15 +373,28 @@ DELETE FROM revocation_blocklist
 After running the INSERT, confirm:
 
 ```sql
-SELECT sp_uuid, kind, scope, scope_target, display_name, approval_required
+SELECT sp_uuid, kind, scope, scope_target, display_name, approval_required,
+       disabled_at
   FROM system_principals
  WHERE sp_uuid = 'sp_00000000-0000-4000-8000-000000000002';
 ```
 
-Expected: exactly one row, `kind = 'nop_bridge'`, `scope = 'global'`,
-`scope_target IS NULL`, `display_name = 'NOP bridge for BEACON'`, and
-`approval_required = false`. Any other result is a bootstrap failure; do
-not issue or use a certificate for that UUID.
+Expected: exactly one row with `kind = 'nop_bridge'`, `scope = 'global'`,
+`scope_target IS NULL`, and `approval_required = false`. These are the same
+four attributes the assertion fails closed on. If the row is missing, or any
+of the four differs, the bootstrap failed: do not issue or use a certificate
+for that UUID.
+
+Two other columns are things to reconcile, not failures:
+
+- `display_name`: expected `'NOP bridge for BEACON'`. A different value is
+  label drift, for example a rename in the Portal. The assertion only raises
+  a `WARNING` for it. Reconcile the label; the certificate is still fine to
+  issue.
+- `disabled_at`: expected `NULL`. A non-NULL value means the principal was
+  soft-disabled (see "Disabling (planned maintenance)") and was not re-enabled. Nothing reads it
+  today, but once enforcement lands every call from this UUID will be
+  refused. Set `disabled_at = NULL` if the principal should be live.
 
 ## Troubleshooting
 
