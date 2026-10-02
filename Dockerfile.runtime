@@ -85,9 +85,17 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   && node /tmp/opencode-responses-replay.mjs \
   && rm /tmp/opencode-responses-replay.mjs
 
+# /opt/paperclip-bundled-adapters is deliberately NOT chowned to node. It holds
+# the GitHub egress scrub runtimes, which the wrappers exec by absolute path,
+# and the agent runs as uid 1000 — so a node-owned tree lets the agent rewrite
+# the control that is supposed to constrain it (PEN-3715). Nothing writes this
+# tree at runtime: the Helm seed only reads package.json out of it, and the
+# agent entrypoint never touches /opt. The directory inode matters as much as
+# its contents, because a root-owned file inside a node-owned directory can
+# still be replaced by rename(2).
 RUN mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
   && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \
-  && chown -R node:node /paperclip /opt/paperclip-bundled-adapters
+  && chown -R node:node /paperclip
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/paperclip-consult-codex.sh /usr/local/bin/paperclip-consult-codex

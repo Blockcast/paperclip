@@ -80,6 +80,52 @@ describe("paperclip agent Dockerfile", () => {
     expect(dockerfileServer).not.toContain("find /app -name node_modules");
   });
 
+  it("keeps the bundled adapter tree root-owned so the agent cannot rewrite the egress scrubber", () => {
+    // PEN-3715. The five GitHub wrappers are one-line execs into
+    // /opt/paperclip-bundled-adapters/.../github-{cli,mcp}-egress-runtime.js.
+    // Every other absolute path in that chain is root-owned; when the tree was
+    // chowned to node:node the agent could rewrite the scrub logic that
+    // PEN-2527's threat model names it as the adversary of.
+    //
+    // Comments are stripped before scanning. Measured: this changes no verdict
+    // today — the negative regex requires a literal `node:node`, which none of
+    // the prose contains — so it is defensive, not load-bearing. It is here so
+    // that a future comment naming the path cannot quietly satisfy a scan that
+    // is supposed to be reading directives.
+    const directivesOnly = (dockerfile: string): string =>
+      dockerfile
+        .split("\n")
+        .filter((line) => !/^\s*#/.test(line))
+        .join("\n");
+
+    const agent = directivesOnly(dockerfileAgent);
+    const runtime = directivesOnly(dockerfileRuntime);
+    const server = directivesOnly(dockerfileServer);
+
+    // No stage may hand the tree to uid 1000, in any of the three images.
+    const chownsTreeToNode = /chown\b[^\n]*\bnode:node\b[^\n]*\/opt\/paperclip-bundled-adapters/;
+    expect(agent).not.toMatch(chownsTreeToNode);
+    expect(runtime).not.toMatch(chownsTreeToNode);
+    expect(server).not.toMatch(chownsTreeToNode);
+
+    // The agent image copies the contents root-owned...
+    expect(agent).toContain(
+      "COPY --chown=root:root --from=server /opt/paperclip-bundled-adapters /opt/paperclip-bundled-adapters",
+    );
+
+    // ...and the server image produces them root-owned and not group/other
+    // writable in the first place.
+    expect(server).toContain("chown -R root:root /opt/paperclip-bundled-adapters");
+    expect(server).toContain("chmod -R go-w /opt/paperclip-bundled-adapters");
+
+    // The directory's own inode is the other half: a root-owned file inside a
+    // node-owned directory is still replaceable by rename(2). The runtime
+    // image creates the directory, so it must create it and leave it to root
+    // while still chowning the PVC home to node.
+    expect(runtime).toContain("mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters");
+    expect(runtime).toContain("chown -R node:node /paperclip\n");
+  });
+
   it("builds the UI concurrently with the serial server/plugin chain", () => {
     const sdkBuildIndex = dockerfileServer.indexOf(
       "RUN pnpm --filter @paperclipai/plugin-sdk build",
