@@ -129,7 +129,10 @@ import {
   withRecoveryModelProfileHint,
   withStrandedRecoveryWakeWorkClass,
 } from "./model-profile-hint.js";
-import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import {
+  createActivePauseHoldPrefilter,
+  isAutomaticRecoverySuppressedByPauseHold,
+} from "./pause-hold-guard.js";
 import {
   resolveStrandedEscalationStatus,
   shouldReuseStrandedRecoveryAction,
@@ -8744,6 +8747,16 @@ export function recoveryService(
     const openPullRequestAttendanceGraceMs = recoverySweepConfig.openPullRequestAttendanceGraceMs;
     const pendingBoardApprovalAttendanceGraceMs =
       recoverySweepConfig.pendingBoardApprovalAttendanceGraceMs;
+    // PEN-3636: same shape as `recoverySweepConfig` above — a read whose answer is
+    // constant across candidates, hoisted so its cost is O(companies) rather than
+    // O(candidates). The pause-hold guard below runs once per candidate and its first
+    // query is scoped to the *company*, so a pass over ~3.2k candidates issued ~3.2k
+    // reads that are byte-identical within each company. At the measured ~110 ms per
+    // round-trip (queueing, not execution — Done-when #2) that is minutes of a single
+    // pass spent re-asking one question. Constructed per pass, never module-level, and
+    // bounded by its own TTL so a long pass cannot widen the staleness window; see
+    // `createActivePauseHoldPrefilter` for the freshness trade this makes.
+    const activePauseHoldPrefilter = createActivePauseHoldPrefilter();
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -8775,7 +8788,14 @@ export function recoveryService(
         return;
       }
 
-      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+      if (await isAutomaticRecoverySuppressedByPauseHold(
+        db,
+        issue.companyId,
+        issue.id,
+        treeControlSvc,
+        db,
+        activePauseHoldPrefilter,
+      )) {
         result.skipped += 1;
         return;
       }
