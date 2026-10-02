@@ -1236,6 +1236,28 @@ describe("BLO-32695 — an unreadable block reds only the head it concerns", () 
       ]),
     ).toMatchObject({ state: "success", outcome: "clean" });
   });
+
+  /**
+   * Ally, #1721 at 5f4d5302, Critical 1. The newest pick ran before the head
+   * filter, so any later Ally comment took the newest slot and was then scoped
+   * out, and the unreadable review of this head was never examined. Only a
+   * comment that says something about this tree may displace it; the control
+   * above is the one that does.
+   */
+  it.each([
+    ["a later comment that only quotes the heading", ["## Ally — Consolidated PR Review", "Replying to the review above."].join("\n")],
+    [
+      "a later clean review of another head",
+      ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD_B}`, "### Critical Issues (0)", "### Important Issues (0)"].join("\n"),
+    ],
+  ])("is not displaced by %s", (_label, later) => {
+    for (const order of [
+      [allyComment(brokenNamingHeadA, "2026-09-07T03:46:19Z"), allyComment(later, "2026-09-07T15:41:42Z")],
+      [allyComment(later, "2026-09-07T15:41:42Z"), allyComment(brokenNamingHeadA, "2026-09-07T03:46:19Z")],
+    ]) {
+      expect(gateAt(HEAD_A, order)).toMatchObject({ state: "failure", outcome: "unreadable_verdict" });
+    }
+  });
 });
 
 /**
