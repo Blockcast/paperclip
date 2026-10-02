@@ -3,7 +3,10 @@ import type { Db } from "@paperclipai/db";
 import { companies, executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
 import { and, asc, eq, isNull, lte, ne, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
-import { recordExecutionWorkspaceCollectorPass } from "./metrics.js";
+import {
+  recordExecutionWorkspaceCollectorPass,
+  type ExecutionWorkspaceCollectorStopReason,
+} from "./metrics.js";
 import {
   cleanupExecutionWorkspaceArtifacts,
   inspectWorktreeReclaimSafety,
@@ -212,7 +215,12 @@ export function executionWorkspaceCleanupService(db: Db) {
         { outstanding: outstandingAtEntry, limit: RECLAIM_FS_OUTSTANDING_LIMIT },
         "reconcileExecutionWorkspaceCleanup: abandoned filesystem calls still hold threadpool threads; skipping this pass",
       );
-      return { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 };
+      const skippedResult = { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 };
+      // PEN-3692: a skipped pass is still recorded — this is the wedged-mount
+      // regime the census exists to explain, and an absent record here reads
+      // exactly like a dead worker.
+      recordExecutionWorkspaceCollectorPass(skippedResult, { stopReason: "skipped_saturated" });
+      return skippedResult;
     }
 
     let stamped = 0;
@@ -278,6 +286,7 @@ export function executionWorkspaceCleanupService(db: Db) {
     };
 
     let scanned = 0;
+    let stopReason: ExecutionWorkspaceCollectorStopReason = "complete";
     for (const candidate of candidates) {
       // The gate above bounds where a pass *starts*; this bounds where it ends.
       // Sampling it only at entry let one pass outrun the threadpool: the
@@ -302,6 +311,7 @@ export function executionWorkspaceCleanupService(db: Db) {
           { outstanding, limit: RECLAIM_FS_OUTSTANDING_LIMIT, scanned },
           "reconcileExecutionWorkspaceCleanup: abandoned filesystem calls hold the threadpool; ending this pass",
         );
+        stopReason = "ended_saturated";
         break;
       }
       scanned += 1;
@@ -344,7 +354,10 @@ export function executionWorkspaceCleanupService(db: Db) {
             // `cleanupExecutionWorkspaceArtifacts`, so a count would let an
             // unrelated concurrent teardown end this pass and be logged as the
             // collector's own wedge.
-            if (isReclaimFsWedgedDir(path.dirname(path.resolve(worktreePath)))) break;
+            if (isReclaimFsWedgedDir(path.dirname(path.resolve(worktreePath)))) {
+              stopReason = "ended_wedged";
+              break;
+            }
             continue;
           }
         }
@@ -433,7 +446,7 @@ export function executionWorkspaceCleanupService(db: Db) {
     // PEN-3692: recorded here rather than at the `index.ts` call site so the
     // census cannot be lost by a future caller that forgets, and so it sits
     // next to the `return` any new field would also have to pass through.
-    recordExecutionWorkspaceCollectorPass(result);
+    recordExecutionWorkspaceCollectorPass(result, { stopReason });
     return result;
   }
 
