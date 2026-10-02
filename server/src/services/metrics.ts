@@ -43,6 +43,38 @@ export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_
 export const ROUTINE_DISPATCH_METRIC = "paperclip_routine_dispatch_total";
 export const AUTH_REQUEST_METRIC = "paperclip_auth_request_total";
 /**
+ * Per-route, per-status request counter (PEN-3702).
+ *
+ * Before this existed, `paperclip_auth_request_total` was the *only* request
+ * counter in the process, and it is scoped to Better Auth operations — so no
+ * query could characterise an episodic fault on an ordinary API route. The
+ * concrete failure that motivated this: four list-route calls returned zero
+ * rows during a database-pool excursion on 2026-09-24T04:05-04:11Z, and
+ * because nothing retained per-request status it was never provable whether
+ * those were empty `200`s or `5xx`s that the caller's row-counting script
+ * rendered as `0`. A strong correlation that can never be promoted to a
+ * measurement is the defect this closes.
+ *
+ * The access log cannot substitute. It carries the *raw URL*
+ * (`GET /heartbeat-runs/<uuid> 200`), not the route template, and
+ * `shouldSilenceHttpSuccessLog` drops successful requests on the hottest API
+ * paths outright — so it is both unaggregatable and sampled by policy.
+ */
+export const HTTP_REQUESTS_METRIC = "paperclip_http_requests_total";
+/**
+ * Zero-row responses, as a strict subset of {@link HTTP_REQUESTS_METRIC}
+ * (PEN-3702). Incremented only when a handler serialized a **bare empty
+ * array**, so `empty / requests` is the empty-response rate for a route and
+ * the `status` label says what an empty body was served *with*.
+ *
+ * This is what makes "I am broken" distinguishable from "you have nothing" at
+ * the moment it is served: an empty `200` increments both families, while a
+ * `503` increments only the request counter (its body is an error envelope,
+ * not an array). Retrospectively the two are indistinguishable, which is why
+ * the distinction has to be recorded live.
+ */
+export const HTTP_EMPTY_LIST_RESPONSES_METRIC = "paperclip_http_empty_list_responses_total";
+/**
  * Project primary-workspace fallback counter (BLO-26184). Incremented once
  * per resolution of a project that has >=1 workspace but no row flagged
  * `isPrimary` — i.e. `pickPrimaryWorkspace` fell through to the
@@ -1861,6 +1893,87 @@ export function normalizeWorkflowRunSupersession(supersession: string | null | u
     : "none";
 }
 
+/**
+ * Bounded label normalization for {@link HTTP_REQUESTS_METRIC} (PEN-3702).
+ *
+ * Cardinality is the only real risk an app-wide request counter carries, so
+ * every label here is bounded, and the one that could in principle grow is
+ * bounded by an enforced cap rather than by an argument that it cannot.
+ *
+ * Measured baseline before shipping this: a 365-second slice of production
+ * `paperclip-api` logs (2026-10-02T08:50:12Z-08:56:17Z, 5000 lines, 4611
+ * parsed request lines) carried **35 distinct (method, route) pairs and 36
+ * distinct (method, route, status) triples**. That is a lower bound — the
+ * access log silences successful requests on the hottest API paths, so those
+ * routes are invisible to it — but it sizes the counter at dozens of series,
+ * against a fleet baseline of 2416 `paperclip_*` series.
+ */
+export const KNOWN_HTTP_METHODS = [
+  "GET",
+  "HEAD",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "OPTIONS",
+] as const;
+export type KnownHttpMethod = (typeof KNOWN_HTTP_METHODS)[number];
+
+const knownHttpMethodSet: ReadonlySet<string> = new Set(KNOWN_HTTP_METHODS);
+
+/** Label value for a request that matched no route (404s, and anything that
+ * unwound before Express bound `req.route`). Collapsing these to one series is
+ * what keeps an arbitrary-URL scan from minting unbounded labels. */
+export const HTTP_ROUTE_UNMATCHED = "<unmatched>";
+/** Label value for a route seen after {@link HTTP_ROUTE_LABEL_CAP} distinct
+ * routes have already been recorded. Routes come from a finite set of declared
+ * Express templates, so this should never fire; it exists so that a future
+ * dynamically-registered route cannot turn this counter into a cardinality
+ * incident, and a non-zero value here is the signal that one tried. */
+export const HTTP_ROUTE_OVERFLOW = "<overflow>";
+/** Hard ceiling on distinct `route` label values. Sized well above the ~300
+ * declared GET templates so it is inert in normal operation. */
+export const HTTP_ROUTE_LABEL_CAP = 512;
+/** Defensive ceiling on a single route label's length. */
+const HTTP_ROUTE_MAX_LENGTH = 200;
+
+const seenHttpRouteLabels = new Set<string>();
+
+export function normalizeHttpMethod(method: string | null | undefined): string {
+  const upper = typeof method === "string" ? method.toUpperCase() : "";
+  return knownHttpMethodSet.has(upper) ? upper : "OTHER";
+}
+
+/**
+ * Normalize a status code to a 3-digit label. Anything outside the valid HTTP
+ * range -- including a response that was destroyed before a status was set --
+ * lands on `"0"` rather than minting a series from a bogus value.
+ */
+export function normalizeHttpStatus(status: number | null | undefined): string {
+  return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599
+    ? String(status)
+    : "0";
+}
+
+/**
+ * Normalize a route label, enforcing the cardinality cap.
+ *
+ * The input is expected to be an Express route *template*
+ * (`/api/companies/:companyId/approvals`), never a concrete URL -- templates
+ * are what make this bounded, since `/issues/:id` stays one label no matter
+ * how many ids are requested.
+ */
+export function normalizeHttpRoute(route: string | null | undefined): string {
+  const trimmed = typeof route === "string" ? route.trim() : "";
+  if (!trimmed) return HTTP_ROUTE_UNMATCHED;
+  const bounded =
+    trimmed.length > HTTP_ROUTE_MAX_LENGTH ? trimmed.slice(0, HTTP_ROUTE_MAX_LENGTH) : trimmed;
+  if (seenHttpRouteLabels.has(bounded)) return bounded;
+  if (seenHttpRouteLabels.size >= HTTP_ROUTE_LABEL_CAP) return HTTP_ROUTE_OVERFLOW;
+  seenHttpRouteLabels.add(bounded);
+  return bounded;
+}
+
 export const KNOWN_AUTH_OPERATIONS = [
   "oidc_start",
   "oidc_callback",
@@ -2558,6 +2671,8 @@ const pluginMetricNames = new Map<string, Set<string>>();
 let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
 let prReviewQueueWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
+let httpRequests: Counter<"route" | "method" | "status"> | null = null;
+let httpEmptyListResponses: Counter<"route" | "method" | "status"> | null = null;
 let gbrainRecallTotal: Counter<"status"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
@@ -2637,6 +2752,8 @@ function ensureRegistry(): {
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
   prReviewQueueWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
+  httpRequestsCounter: Counter<"route" | "method" | "status">;
+  httpEmptyListResponsesCounter: Counter<"route" | "method" | "status">;
   gbrainRecallCounter: Counter<"status">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
@@ -2712,6 +2829,8 @@ function ensureRegistry(): {
     || !pluginStatusCollectorLastSuccess
     || !prReviewQueueWait
     || !authRequest
+    || !httpRequests
+    || !httpEmptyListResponses
     || !gbrainRecallTotal
     || !agentHeartbeatAge
     || !agentHeartbeatInterval
@@ -3471,6 +3590,32 @@ function ensureRegistry(): {
         authRequest.inc({ operation, outcome }, 0);
       }
     }
+    httpRequests = new Counter({
+      name: HTTP_REQUESTS_METRIC,
+      help:
+        "Count of HTTP requests served by this process, labeled by matched Express route "
+        + "template, method, and status code (PEN-3702). The route label is the declared "
+        + "template, never a concrete URL, so path parameters do not mint series; requests "
+        + `that matched no route collapse to "${HTTP_ROUTE_UNMATCHED}". A status of "0" means `
+        + "the response never completed -- a client abort or an ingress timeout -- rather "
+        + "than any code the server chose; it can appear on any route label. No user, "
+        + "company, agent, query string, or other unbounded label is exposed.",
+      labelNames: ["route", "method", "status"],
+      registers: [registry],
+    });
+    httpEmptyListResponses = new Counter({
+      name: HTTP_EMPTY_LIST_RESPONSES_METRIC,
+      help:
+        "Count of responses whose JSON body was a bare empty array, labeled identically to "
+        + `${HTTP_REQUESTS_METRIC} (PEN-3702). A strict subset of that counter, so `
+        + "empty/total is a route's empty-response rate. This is what separates "
+        + '"I am broken" from "you have nothing": an empty 200 increments both families, '
+        + "while a 5xx increments only the request counter, because its body is an error "
+        + "envelope rather than an array. Responses that are not bare arrays are not "
+        + "counted here at all.",
+      labelNames: ["route", "method", "status"],
+      registers: [registry],
+    });
     gbrainRecallTotal = new Counter({
       name: GBRAIN_RECALL_METRIC,
       help:
@@ -3848,6 +3993,8 @@ function ensureRegistry(): {
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
     prReviewQueueWaitHistogram: prReviewQueueWait,
     authRequestCounter: authRequest,
+    httpRequestsCounter: httpRequests,
+    httpEmptyListResponsesCounter: httpEmptyListResponses,
     gbrainRecallCounter: gbrainRecallTotal,
     agentHeartbeatAgeGauge: agentHeartbeatAge,
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
@@ -5144,6 +5291,37 @@ export function recordAuthRequest(input: {
 }
 
 /**
+ * Record one served HTTP response (PEN-3702).
+ *
+ * `emptyList` must be true only when the handler serialized a **bare empty
+ * array** -- that is the zero-row signal. It is deliberately not inferred from
+ * the status code or from a wrapped body shape: a `{ count: 0 }` or
+ * `{ issues: [] }` envelope is a different claim, and guessing would make the
+ * one distinction this counter exists to record unreliable.
+ *
+ * Returns the normalized labels so callers (and tests) can assert what was
+ * actually recorded rather than what was passed in.
+ */
+export function recordHttpRequest(input: {
+  route: string | null | undefined;
+  method: string | null | undefined;
+  status: number | null | undefined;
+  emptyList: boolean;
+}): { route: string; method: string; status: string } {
+  const labels = {
+    route: normalizeHttpRoute(input.route),
+    method: normalizeHttpMethod(input.method),
+    status: normalizeHttpStatus(input.status),
+  };
+  const registered = ensureRegistry();
+  registered.httpRequestsCounter.inc(labels);
+  if (input.emptyList) {
+    registered.httpEmptyListResponsesCounter.inc(labels);
+  }
+  return labels;
+}
+
+/**
  * Record one gbrain-context recall-prefetch outcome (BLO-25892). `status` is
  * normalized into the bounded label set, so an unrecognized value from a newer
  * plugin build lands on "other" rather than minting an unbounded series.
@@ -5509,6 +5687,9 @@ export function __resetMetricsForTest(): void {
   pluginStatusCollectorLastSuccess = null;
   prReviewQueueWait = null;
   authRequest = null;
+  httpRequests = null;
+  httpEmptyListResponses = null;
+  seenHttpRouteLabels.clear();
   agentHeartbeatAge = null;
   agentHeartbeatInterval = null;
   agentErrorDuration = null;
