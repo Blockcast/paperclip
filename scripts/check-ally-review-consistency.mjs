@@ -15,11 +15,33 @@
  * Observed on Blockcast/paperclip#876 (BLO-19778): two runs dispatched 43 ms
  * apart both submitted at head ff1c72db, 34 s apart, with opposite verdicts.
  *
- *   I1  At most one operative review per lane per (PR, head SHA). A same-lane
- *       duplicate also reports whether the bodies are identical or differ
+ *   I1  At most one operative review per lane per (PR, head SHA), EXCEPT where
+ *       the App lane's duplicates all carry distinct bodies — see below. A
+ *       same-lane duplicate reports whether the bodies are identical or differ
  *       (`sameLaneBodyRelation`), because that — not the gap between
  *       submissions — is what says whether the missing control is submit
  *       idempotency or reviewer exclusion.
+ *
+ *       On the App-lane `recompute` exemption (BLO-25764). Ally may re-review
+ *       an unchanged head: a finding whose remedy is not a code change (a
+ *       wrong PR description, a rebase that moved nothing) is addressed
+ *       without moving the head, so the re-review lands at the same SHA and
+ *       supersedes its predecessor. That is correct behaviour, and it is
+ *       observationally identical to the concurrent-run race in the paragraph
+ *       above: both yield N canonical App verdicts at one head with differing
+ *       bodies and possibly differing dispositions. Measured over every
+ *       same-head App duplicate pair on the open PRs (2026-09-23, n=15), the
+ *       gap between submissions runs 3 s → 33.6 h with no separation, so no
+ *       time threshold distinguishes them either. Asserting `at most 1` over
+ *       that shape is therefore unsatisfiable while re-review is permitted —
+ *       which is why this guard failed 99/99 scheduled runs from 2026-08-07.
+ *       Differing App bodies at one head are reported as a notice
+ *       (`findPrNotices`) and the latest submission is the standing verdict;
+ *       I2/I3/I4 still evaluate EVERY operative review, so a superseded review
+ *       that approves over a blocker is still fatal. Identical bodies keep
+ *       failing: one verdict submitted twice has no legitimate explanation.
+ *       The exclusion control this gave up belongs at dispatch, where the
+ *       concurrency is visible — see BLO-20074.
  *
  *       Three arms here can only fire when an operative seat review exists —
  *       I1 over the seat lane, I1 for one body submitted under two
@@ -29,8 +51,10 @@
  *       lane still carries a permitted shape.
  *   I2  No operative APPROVED review whose own body reports a Critical or
  *       Important finding, no User-seat APPROVED review coexisting with a
- *       blocking App review, and no App approval without a `Reviewed head:`
- *       attestation.
+ *       blocking App review, no App APPROVED coexisting with a different
+ *       blocking App review at one head unless it follows every such blocker
+ *       and retires, by name, a finding raised against that head (I2e), and no
+ *       App approval without a `Reviewed head:` attestation.
  *   I3  An operative App review has exactly one canonical body and its
  *       body-attested `Reviewed head:` matches the commit GitHub recorded it
  *       against.
@@ -113,22 +137,128 @@ const BLOCKING_SECTION_RE =
  * comment exists to prevent.
  *
  * Residual, stated rather than implied: the gate additionally blanks fenced
- * spans before matching, and this script does not, so a *fenced* paste is
- * still read here as an attestation while the gate ignores it. The extra
- * attestation is not quietly absorbed — canonicalReviewHead requires exactly
- * one, so it returns null and the review is reported as an I3 "not canonical"
- * violation. (I3, not I1: I1 caps operative reviews per lane, not attestations
- * within a body.) The direction is still the safe one for an auditor, because
- * the consequence is a false red against an otherwise-valid review rather than
- * a missed one, but it is a real remaining divergence, not parity.
+ * spans before matching. For the attestation and bucket sites this script
+ * does not, so a *fenced* paste is still read here as an attestation while the
+ * gate ignores it. The extra attestation is not quietly absorbed —
+ * canonicalReviewHead requires exactly one, so it returns null and the review
+ * is reported as an I3 "not canonical" violation. (I3, not I1: I1 caps
+ * operative reviews per lane, not attestations within a body.) For those sites
+ * the direction is the safe one for an auditor, because the consequence is a
+ * false red against an otherwise-valid review rather than a missed one.
+ *
+ * It is NOT safe for the retiring site. A fenced retiring entry read here but
+ * not by the gate retires a finding the gate still counts, which lets
+ * supersedesBlocker exempt an approval the gate holds: fail-open. So
+ * retiredFindingKeys strips fences first with withoutFencedCodeBlocks, as the
+ * gate's extractAllyPriorFindingDispositions does.
+ *
+ * hasStillPresentDisposition deliberately does NOT strip. It mirrors a
+ * blocking predicate, and the gate's rule (ally-review-detection.ts header:
+ * "Quoted text may never *reduce* what the gate blocks on; only emitted text
+ * may retire a finding") puts blocking predicates in the detecting group,
+ * which reads emitted and raw text and blocks if either does
+ * (hasActionablePrReviewFeedback). A fenced still-present entry therefore
+ * blocks at the gate, and must block here; stripping it would go silent on a
+ * PR the gate holds red.
  */
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4}) {0,3}`;
 
+/**
+ * Blanks fenced code spans, line for line. A verbatim mirror of
+ * withoutFencedCodeBlocks in server/src/services/ally-review-detection.ts,
+ * which the gate applies before reading the prior-finding ledger; mirrored
+ * rather than imported for the same unpinned-`node` reason as the patterns
+ * here. Lines are blanked, not removed, so line-anchored patterns keep their
+ * anchors. An unclosed fence blanks to end of body, as GitHub renders it.
+ */
+const FENCE_DELIMITER_PATTERN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_CLOSE_PATTERN = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+
+function withoutFencedCodeBlocks(body) {
+  if (!body.includes("```") && !body.includes("~~~")) return body;
+  const lines = body.split("\n");
+  let open = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (open) {
+      const close = FENCE_CLOSE_PATTERN.exec(line);
+      const closes = close && close[1][0] === open.char && close[1].length >= open.length;
+      lines[i] = "";
+      if (closes) open = null;
+      continue;
+    }
+    const fence = FENCE_DELIMITER_PATTERN.exec(line);
+    // Per CommonMark a backtick fence's info string may not contain a backtick.
+    if (fence && !(fence[1][0] === "`" && fence[2].includes("`"))) {
+      open = { char: fence[1][0], length: fence[1].length };
+      lines[i] = "";
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Every counted bucket, with its severity and count. The `(0)` case is kept
+ * here — unlike BLOCKING_SECTION_RE, which asks "does this block?" — so that
+ * enumerating a body's findings sees an explicit empty bucket and simply
+ * contributes no indices for it.
+ *
+ * Must stay equivalent to COUNTED_FINDINGS_BUCKET_PATTERN in
+ * server/src/services/ally-review-detection.ts, which decides what a review
+ * raised for the merge gate. Mirrored rather than imported because the
+ * scheduled guard runs this file under the runner's unpinned `node`, which is
+ * not guaranteed to load a `.ts` module. The module's leading ` {0,3}` is
+ * folded into NOT_INDENTED_CODE here, as described above. A narrower copy
+ * under-counts a blocker, which lets supersedesBlocker exempt an approval that
+ * retired only part of it: the fail-open direction. The suite runs both
+ * against the shapes where they used to diverge.
+ *
+ * The gate reads the raw and the fence-stripped body and keeps the higher
+ * count per severity. Reading raw alone is equivalent: every part of this
+ * pattern is line-local, and fence stripping only blanks whole lines, so the
+ * stripped reading's matches are a subset of the raw reading's.
+ */
+const COUNTED_SECTION_GLOBAL_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}(?:[#>][ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(critical|important)[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
+  "gim",
+);
+
 /** A prior-finding disposition that says the blocker is still present. */
 const STILL_PRESENT_DISPOSITION_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present[ \t]*(?:—|-)`,
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present(?![a-z-])[ \t]*(?:—|-)`,
   "im",
 );
+
+/**
+ * A prior-finding disposition, capturing the head it was raised against, the
+ * `(severity, index)` pair naming it, and the whole verb. The verb is captured
+ * the way the gate's PRIOR_FINDING_DISPOSITION_PATTERN captures it,
+ * `([a-z][a-z-]*)`, and retiredFindingKeys tests it for membership in
+ * RETIRING_DISPOSITIONS. Alternating the retiring verbs inside the pattern
+ * instead let a hyphenated verb that merely begins with one (`fixed-upstream`)
+ * retire a finding the gate does not, because the trailing separator class
+ * absorbed the rest of the verb: fail-open. An unrecognized verb is captured
+ * but is not a member, so I2e fails closed on it.
+ *
+ * Severity and index are required rather than skipped over, because I2e checks
+ * ledger *coverage* of the blocker's counted findings, not merely that the head
+ * was named once. An entry too malformed to identify a finding therefore
+ * retires nothing — a false red on an otherwise-valid supersession, which is
+ * the direction an auditor may fail in.
+ *
+ * The separator alternation and the space allowed after `**` track the gate's
+ * PRIOR_FINDING_DISPOSITION_PATTERN. Both shapes are ones the gate accepts, so
+ * omitting them here would let the gate read an entry as retiring while I2e did
+ * not — a fatal red on a supersession the gate is happy with, which is the
+ * failure class this script exists to remove.
+ */
+const RETIRING_DISPOSITION_GLOBAL_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
+  "gim",
+);
+
+/** The retiring verbs: the gate's RESOLVED_PRIOR_DISPOSITIONS, verbatim. */
+const RETIRING_DISPOSITIONS = new Set(["fixed", "no-longer-applicable"]);
 
 /** The single standalone attestation line Ally is required to emit. */
 const ATTESTED_HEAD_RE = new RegExp(
@@ -166,6 +296,14 @@ function isApproved(review) {
 
 function hasBlockingVerdict(body) {
   return hasBlockingFindings(body) || hasStillPresentDisposition(body);
+}
+
+// submitted_at has 1 s resolution, so ties fall back to the monotonic id.
+function bySubmission(a, b) {
+  return (
+    String(a?.submitted_at ?? "").localeCompare(String(b?.submitted_at ?? "")) ||
+    Number(a?.id ?? 0) - Number(b?.id ?? 0)
+  );
 }
 
 function reviewDetails(reviews) {
@@ -244,6 +382,72 @@ export function hasBlockingFindings(body) {
 
 export function hasStillPresentDisposition(body) {
   return STILL_PRESENT_DISPOSITION_RE.test(String(body ?? ""));
+}
+
+/**
+ * The findings a body declares in its own counted buckets, as `severity index`
+ * keys. A bucket of N contributes indices 1..N, the same `(severity, index)`
+ * identity the merge gate enumerates in extractAllyReportedFindingRefs. The
+ * two agree on what a review raised only because COUNTED_SECTION_GLOBAL_RE
+ * mirrors the gate's bucket pattern; see the note there.
+ */
+export function countedFindingKeys(body) {
+  const keys = new Set();
+  for (const [, severity, count] of String(body ?? "").matchAll(COUNTED_SECTION_GLOBAL_RE)) {
+    for (let index = 1; index <= Number(count); index += 1) {
+      keys.add(`${severity.toLowerCase()} ${index}`);
+    }
+  }
+  return keys;
+}
+
+/** The findings a body retires by name against `head`, in the same key space. */
+export function retiredFindingKeys(body, head) {
+  const normalizedHead = String(head ?? "").toLowerCase();
+  const keys = new Set();
+  for (const [, prefix, severity, index, verb] of withoutFencedCodeBlocks(
+    String(body ?? ""),
+  ).matchAll(RETIRING_DISPOSITION_GLOBAL_RE)) {
+    if (!RETIRING_DISPOSITIONS.has(verb.toLowerCase())) continue;
+    if (normalizedHead.startsWith(prefix.toLowerCase())) {
+      keys.add(`${severity.toLowerCase()} ${Number(index)}`);
+    }
+  }
+  return keys;
+}
+
+/**
+ * True when `approval` retires, by name and against this head, EVERY finding
+ * `blocker` counted.
+ *
+ * Coverage rather than presence: a blocker may raise several findings at one
+ * head, and an approval retiring 1 of N would otherwise stand green over the
+ * N-1 nobody dispositioned — I2e's own harm class, reached through its exemption.
+ *
+ * A blocker with no counted findings is never superseded. That is a blocker
+ * blocking solely on a `still-present` entry, which asserts a finding raised at
+ * an *earlier* head; it has no (severity, index) at this head for a ledger to
+ * name, and it is enumerated on its own account at the head that raised it.
+ * Fail closed.
+ *
+ * A blocker that MIRRORS that still-present finding into its counted bucket, as
+ * the reviewer contract asks, keeping its original `prior:<earlier> ...` label,
+ * is keyed here by position at THIS head all the same. That is deliberate, and
+ * it is a known false red: an approval retiring the finding only under its
+ * original name does not supersede the blocker. Keying the slot on the name it
+ * carries would clear it, and would also clear the #876 / #1220 race, because an
+ * earlier head's finding is exactly the name both racing runs can produce. It
+ * proves nothing about having read the blocker. A this-head name does, so an
+ * approval that also retires `prior:<this head> <severity> <index>` still
+ * supersedes; otherwise a new head is the exit. Ally's audit at 37522699 found
+ * the shape in none of 64 real bodies.
+ */
+function supersedesBlocker(approval, blocker, head) {
+  const raised = countedFindingKeys(blocker?.body);
+  if (raised.size === 0) return false;
+  const retired = retiredFindingKeys(approval?.body, head);
+  for (const key of raised) if (!retired.has(key)) return false;
+  return true;
 }
 
 export function attestedHead(body) {
@@ -351,6 +555,46 @@ export function sameLaneBodyRelation(operative) {
   return anyPairIdentical ? "mixed" : "recompute";
 }
 
+/**
+ * True when a same-head App-lane duplicate is a re-review superseding its
+ * predecessor rather than a defect.
+ *
+ * Scoped to the App lane deliberately: the User seat may not submit a verdict
+ * at all (I6/R4), so a seat duplicate has no legitimate reading and keeps
+ * failing. `recompute` — every body distinct — is the only exempt relation.
+ * `resubmit` and `mixed` both contain a byte-identical pair, which is one
+ * verdict delivered more than once and is always a submit-side defect, and a
+ * `null` relation means an empty body, which is an attestation defect.
+ *
+ * This exempts the shape from I1 only. Every review in the set is still
+ * carried through I2/I3/I4/I5, so a superseded review that approves over a
+ * blocking finding remains fatal.
+ */
+export function isSupersedingAppRereview(lane, operative) {
+  return lane === "app" && sameLaneBodyRelation(operative) === "recompute";
+}
+
+/**
+ * Non-fatal observations. Supersession is legitimate but it is still two runs
+ * doing one PR's work, so it is reported rather than dropped: silence here
+ * would make a re-review storm indistinguishable from a quiet week.
+ *
+ * @returns {string[]}
+ */
+export function findPrNotices(pr) {
+  const head = pr.headSha;
+  const short = String(head ?? "").slice(0, 8);
+  const reviews = operativeAllyReviews(pr.reviews, head, "app");
+  if (!isSupersedingAppRereview("app", reviews)) return [];
+  const latest = [...reviews].sort(bySubmission).at(-1);
+  return [
+    `PR #${pr.number} @${short}: ${reviews.length} operative Ally App reviews (${reviewDetails(reviews)}) with distinct bodies — ` +
+      `treating the latest (${latest?.id}, ${latest?.submitted_at}) as the standing verdict. Legitimate for a re-review of an ` +
+      `unchanged head; also the signature of two concurrent runs, which review data cannot distinguish (BLO-25764). ` +
+      `Exclusion belongs at dispatch — see BLO-20074.`,
+  ];
+}
+
 const SAME_LANE_RELATION_NOTES = {
   resubmit:
     "the bodies are identical — one verdict submitted more than once, so the submit step is at-least-once",
@@ -389,7 +633,7 @@ export function findPrViolations(pr) {
     const reviews = reviewsByLane.get(lane);
     const label = laneLabel(lane);
 
-    if (reviews.length > 1) {
+    if (reviews.length > 1 && !isSupersedingAppRereview(lane, reviews)) {
       const relation = SAME_LANE_RELATION_NOTES[sameLaneBodyRelation(reviews)];
       violations.push(
         `I1 PR #${pr.number} @${short}: ${reviews.length} operative ${label} reviews (${reviewDetails(reviews)}) — expected at most 1 in the ${lane} lane` +
@@ -483,6 +727,42 @@ export function findPrViolations(pr) {
   if (seatApprovals.length > 0 && appBlockers.length > 0) {
     violations.push(
       `I2b PR #${pr.number} @${short}: User-seat APPROVED (${seatApprovals.map((review) => review.id).join(", ")}) coexists with a blocking Ally App review (${appBlockers.map((review) => review.id).join(", ")}) — the User seat cannot mask the App blocker`,
+    );
+  }
+  // I2e: the I1 supersession exemption lets differing App bodies at one head
+  // stand as a re-review, so I1 no longer catches the BLO-19778 shape: a clean
+  // App APPROVED beside a DIFFERENT App review that blocks. I2a sees a blocker
+  // only inside the approving body itself. An undismissed APPROVED counts
+  // toward reviewDecision and a COMMENTED blocker does not, so the approval
+  // would outrank it. A re-review that supersedes a blocker dismisses the stale
+  // approval, which leaves it non-operative, so this does not fire there.
+  //
+  // The other order has no such exit: a COMMENTED blocker cannot be dismissed,
+  // so a clean approval that supersedes it at an unchanged head would fail here
+  // forever. That approval is exempt from a given blocker when it retires, by
+  // name, every finding that blocker counted at this head, and lands after it.
+  // Naming is the test: only a run that read the blocker can name its findings,
+  // and a racing run never saw them. Merely carrying a ledger is not enough,
+  // because both racing reviews on #876 (ff1c72db) and on #1220 (a9ee094a)
+  // carried one, for findings raised at an earlier head. Naming the head once is
+  // not enough either: a blocker may raise several findings at it, and retiring
+  // 1 of N would leave the approval standing over the rest. Order alone is not
+  // the test (a race can land its approval last); it only keeps a blocker that
+  // follows the approval fatal, since dismissing the approval is the exit there.
+  // Residual: two runs racing after a same-head predecessor can both name it, so
+  // this cannot separate them; that exclusion belongs at dispatch (BLO-20074).
+  const appApprovals = appReviews.filter(isApproved);
+  const otherAppBlockers = appBlockers.filter((review) => !appApprovals.includes(review));
+  const unsupersedingApprovals = appApprovals.filter((review) =>
+    otherAppBlockers.some(
+      (blocker) =>
+        bySubmission(blocker, review) > 0 || !supersedesBlocker(review, blocker, head),
+    ),
+  );
+
+  if (unsupersedingApprovals.length > 0 && otherAppBlockers.length > 0) {
+    violations.push(
+      `I2e PR #${pr.number} @${short}: Ally App APPROVED (${unsupersedingApprovals.map((review) => review.id).join(", ")}) coexists with a different blocking Ally App review (${otherAppBlockers.map((review) => review.id).join(", ")}) at one head; the standing approval outranks the blocker`,
     );
   }
   return violations;
@@ -851,6 +1131,12 @@ function main() {
   const { suppressed, staleEntries } = baselined;
   const { failing, deferred } = partitionByMergeEligibility(baselined.failing, prs);
   const liveCount = prs.filter((pr) => prDormancy(pr) === null).length;
+
+  for (const pr of prs) {
+    for (const notice of findPrNotices(pr)) {
+      console.log(`::notice title=Superseded Ally review at one head::${notice}`);
+    }
+  }
 
   for (const entry of staleEntries) {
     console.log(
