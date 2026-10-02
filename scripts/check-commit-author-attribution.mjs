@@ -496,6 +496,57 @@ export function findMergeAttributionOffense({ mergeCommit, prCommits = [] } = {}
   };
 }
 
+/**
+ * Flatten `gh api --paginate` output: each page is a complete top-level JSON
+ * array and the pages are concatenated back-to-back, not merged.
+ *
+ * Scans for the page boundary with a depth counter that is aware of strings
+ * and backslash escapes, rather than splitting on a `]`-then-`[` regex. The
+ * regex form was wrong and had been live since the audit mode was written:
+ * ANY commit message containing `] [` — `"fix: handle arr[0] [BLO-123]"` is
+ * the shape, and this repo has them — splits a page in the middle of a string
+ * and the audit dies with `Unterminated string in JSON`.
+ *
+ * It had never been caught because nothing ran `--audit-merged` on a
+ * schedule; found 2026-10-02 (BLO-39345) the first time it was run over a
+ * window wide enough to contain one. It fails loudly rather than silently,
+ * but a guard that crashes on ordinary input is a guard nobody keeps.
+ *
+ * `gh --slurp` would do this server-side and is NOT available here (gh 2.46.0
+ * rejects the flag), so the scan stays.
+ */
+export function parseConcatenatedJsonArrays(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return [];
+  const out = [];
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let start = -1;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "[" || ch === "{") {
+      if (depth === 0 && ch === "[") start = i;
+      depth += 1;
+    } else if (ch === "]" || ch === "}") {
+      depth -= 1;
+      if (depth === 0 && start !== -1) {
+        out.push(...JSON.parse(text.slice(start, i + 1)));
+        start = -1;
+      }
+    }
+  }
+  if (depth !== 0) throw new Error("truncated JSON in paginated gh output");
+  return out;
+}
+
 function parseLocalGitLog(rawOutput) {
   return rawOutput
     .split(RECORD_SEPARATOR)
@@ -639,12 +690,7 @@ export async function auditRepoCommitAttribution({ repo, since, ghApi }) {
       `repos/${repo}/pulls/${pr.number}/commits`,
       "--paginate",
     ]);
-    // `gh api --paginate` concatenates each page's JSON array back-to-back
-    // rather than merging them into one array — split on the page boundary.
-    const commits = commitsJson
-      .trim()
-      .split(/(?<=])\s*(?=\[)/)
-      .flatMap((page) => (page ? JSON.parse(page) : []));
+    const commits = parseConcatenatedJsonArrays(commitsJson);
     totalCommits += commits.length;
     if (commits.length >= COMMITS_API_MAX) {
       truncated.push({ repo, prNumber: pr.number, prTitle: pr.title, commitsSeen: commits.length });
