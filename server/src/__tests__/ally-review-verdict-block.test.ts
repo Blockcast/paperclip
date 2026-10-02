@@ -1468,7 +1468,7 @@ describe("BLO-32695 — the block and the prose must not name different counts",
   it("reads a bucket terminated by U+2028 as the sweep does", () => {
     const separated = body(
       { head: PR1675_HEAD, findings: { critical: 0, important: 0 } },
-      "### Critical Issues (3) trailing prose",
+      "### Critical Issues (3)\u2028trailing prose",
     );
     expect(parseAllyVerdictBlock(separated).kind).toBe("ok");
   });
@@ -1476,7 +1476,7 @@ describe("BLO-32695 — the block and the prose must not name different counts",
   it("reads a ledger entry introduced by U+2028 as the sweep does", () => {
     const separated = body(
       PR1675_VERDICT,
-      "intro - **prior:583085ded important 1** — still-present — not mirrored",
+      "intro\u2028- **prior:583085ded important 1** — still-present — not mirrored",
     );
     expect(parseAllyVerdictBlock(separated).kind).toBe("ok");
   });
