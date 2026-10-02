@@ -1313,6 +1313,37 @@ describe("BLO-32695 — an unreadable block may carry a finding, never retire on
     });
   });
 
+  /**
+   * Ally, #1721 at 5f4d5302, Critical 2. The attested-first precedence stops an
+   * unreadable review displacing an attested one; it must not stop one adding
+   * a finding. An older attested *clean* review of HEAD_A won the tie-break and
+   * the newer unreadable review counting a Critical was never consulted.
+   */
+  describe("an older attested clean review of the same head", () => {
+    const olderClean = ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD_A}`, "### Critical Issues (0)", "### Important Issues (0)"].join("\n");
+
+    it.each([
+      ["prose only — master's behaviour", proseOnly],
+      ["prose + a malformed block", malformedBlock],
+    ])("does not hide a newer review carrying a finding: %s", (_label, newer) => {
+      for (const order of [
+        [allyComment(olderClean, "2026-09-07T03:46:19Z"), allyComment(newer, "2026-09-07T15:41:42Z")],
+        [allyComment(newer, "2026-09-07T15:41:42Z"), allyComment(olderClean, "2026-09-07T03:46:19Z")],
+      ]) {
+        expect(gateAt(HEAD_B, order)).toMatchObject({ state: "failure", outcome: "carried_finding" });
+      }
+    });
+
+    it("control: a NEWER attested clean review still supersedes the unreadable one", () => {
+      expect(
+        gateAt(HEAD_B, [
+          allyComment(malformedBlock, "2026-09-07T03:46:19Z"),
+          allyComment(olderClean, "2026-09-07T15:41:42Z"),
+        ]),
+      ).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    });
+  });
+
   it("carries it as identities a ledger entry can name, not as an unretirable head", () => {
     // The two readers have to move together. Blocking while enumerating `null`
     // would carry a head that no disposition could ever retire — the
