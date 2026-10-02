@@ -208,27 +208,6 @@ function readSeededGitHubMcpCommand(): string {
   return (match as RegExpExecArray)[1] as string;
 }
 
-// Since PEN-3713 the seeded command is a shell variable, chosen at run time
-// between the root-owned image wrapper and the PVC fallback. Both candidates
-// have to be wrappers; reading just the literal would see neither.
-//
-// This file reads the Helm TEMPLATE, not a render, so one candidate still
-// carries an unexpanded `{{ include … }}` containing its own double quotes.
-// Capturing greedily to the last quote on the line keeps that expression
-// intact — a `[^"]+` capture truncates it at the first inner quote and the
-// basename check then silently compares against a fragment.
-function readSeededGitHubMcpCandidates(): string[] {
-  const source = readFileSync(statefulSetPath, "utf8");
-  const candidates = [...source.matchAll(/^[ \t]*GH_MCP_WRAPPER="(.+)"[ \t]*$/gm)].map(
-    (match) => match[1] as string,
-  );
-  expect(
-    candidates.length,
-    "the seed no longer chooses a github MCP wrapper",
-  ).toBeGreaterThan(0);
-  return candidates;
-}
-
 /**
  * Every non-test TypeScript file under `server/src`, and the subset of them
  * this scan cannot prove is read-only.
@@ -315,24 +294,20 @@ describe("outbound GitHub egress coverage", () => {
       // `github` straight at /usr/local/bin/github-mcp-server would bypass the
       // scrub while leaving every wrapper assertion above green.
       //
-      // PEN-3713 made the choice conditional — root-owned image wrapper when
-      // the image carries one, PVC copy otherwise — so BOTH branches have to
-      // be checked. Asserting only the preferred one would let the fallback
-      // regress to the unscrubbed server unnoticed on exactly the images that
-      // take it.
-      expect(readSeededGitHubMcpCommand()).toBe("${GH_MCP_WRAPPER}");
-      for (const candidate of readSeededGitHubMcpCandidates()) {
-        expect(candidate, `${candidate} is the unscrubbed image server`).not.toBe(
-          "/usr/local/bin/github-mcp-server",
-        );
-        expect(path.basename(candidate)).toBe("github-mcp-server");
-      }
+      // PEN-3713 moved the other four wrappers into the image but deliberately
+      // left this one dialling the PVC copy. The command is ABSOLUTE, so PATH
+      // ordering cannot absorb a skew, and the seed that writes it runs in the
+      // server pod while the file is read by agent Job pods on an
+      // independently pinned image — so the server carrying a root-owned
+      // wrapper is no evidence the agent does. It reaches LOCAL_BIN rather than
+      // a hardcoded /paperclip so it tracks persistence.mountPath, exactly as
+      // the seed's own wrapper install does.
+      expect(readSeededGitHubMcpCommand()).toBe("${LOCAL_BIN}/github-mcp-server");
     });
 
     it("is a wrapper the seed actually writes", () => {
-      for (const candidate of readSeededGitHubMcpCandidates()) {
-        expect(readWrapperNames()).toContain(path.basename(candidate));
-      }
+      const command = readSeededGitHubMcpCommand();
+      expect(readWrapperNames()).toContain(path.basename(command));
     });
   });
 

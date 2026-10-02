@@ -48,11 +48,34 @@ on drift. Deleting the seed block, dropping the PVC entries from PATH, and
 removing the stale files from the volume is the PEN-3713 follow-up, gated on the
 fleet being on images that carry this directory.
 
+### `github-mcp-server` is the exception: it is still dialled on the PVC
+
+PATH ordering is what makes the fallback above safe in both directions, and the
+seeded `.mcp.json` does not get it — it names an **absolute** command, so
+whatever it names is what runs. That choice cannot be made correctly where it is
+currently written: the `seed` initContainer runs in the **server** pod, while
+the `.mcp.json` it writes is consumed by **agent Job** pods running a different
+image, pinned by `adapterConfig.image` — a database value that moves on an image
+bump, not on a chart deploy. A test against the server's own filesystem reports
+on the wrong machine.
+
+So `.mcp.json` deliberately keeps naming the PVC copy, and
+`github-mcp-server` is the one wrapper whose agent-writable copy is still on the
+traffic path after this change. Pointing it at this directory as soon as the
+*server* image carries it would break the github MCP server on every agent pod
+still on an older image, fleet-wide, with no reachable fallback. The flip
+belongs in the same follow-up that deletes the seed install: that is already
+gated on the whole fleet carrying this directory, which is exactly the condition
+that makes the absolute path safe.
+
 ## Editing one
 
 Edit the file here, and make the matching edit to the heredoc in
 `deploy/helm/paperclip/templates/statefulset.yaml` — the drift test will tell
-you if you forget. The only difference the two copies may carry is the directory
-they reference for each other (`/usr/local/libexec/paperclip/bin` here,
-`/paperclip/.local/bin` there); the test normalises exactly that and nothing
-else.
+you if you forget. The comparison is not byte-exact: it substitutes the
+directory the two copies reference for each other
+(`/usr/local/libexec/paperclip/bin` here, `/paperclip/.local/bin` there), and it
+trims each line on both sides, so it is blind to leading and trailing
+whitespace. The per-line trim is load-bearing rather than incidental — the seed
+copy is a heredoc nested inside YAML and carries that indentation — but it does
+mean a pure-indentation change will not be reported as drift.
