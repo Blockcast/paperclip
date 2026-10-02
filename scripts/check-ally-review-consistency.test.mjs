@@ -1879,36 +1879,42 @@ describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break
   // for "a shape nobody has written yet".
   //
   // Reach, stated rather than implied: this scans regex literals bound to a
-  // name and String.raw templates, which is how every named pattern in both
-  // files is declared. An inline regex passed straight to a call -- `.replace(
+  // name, including one on the line after its `=`, and String.raw templates,
+  // including multi-line ones. That is how every named pattern in both files
+  // is declared. It runs over the whole source rather than line by line,
+  // because a line split cannot see a literal whose `=` is on the line above
+  // (Ally, #1721 at b8322735, Important 2); `\n` is excluded from the literal
+  // body instead. An inline regex passed straight to a call -- `.replace(
   // /\r\n?/g, ...)` -- is NOT covered. That is deliberate: those are not line-
   // structure readers, and widening to every `/.../ ` in the source means
   // parsing JS to tell a regex from a division.
-  const bareDotSites = (source) =>
-    source.split("\n").flatMap((line, i) =>
-      [/=\s*(\/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\])+\/)/g, /String\.raw`((?:[^`\\]|\\.)*)`/g].flatMap(
-        (re) => {
-          re.lastIndex = 0;
-          const out = [];
-          let m;
-          while ((m = re.exec(line)) !== null) {
-            // `${...}` first: its body is a JS expression, not regex source, so
-            // the dot in `COUNTED_SEVERITIES.join("|")` is not a wildcard. The
-            // interpolated constants are themselves String.raw templates and
-            // are scanned where they are declared, so dropping the hole here
-            // loses no coverage. Then strip escapes, then character classes:
-            // what survives is a wildcard `.`, while `\.` and `[.)]` are
-            // literal dots and fine.
-            const wildcards = m[1]
-              .replace(/\$\{[^}]*\}/g, "")
-              .replace(/\\./g, "")
-              .replace(/\[(?:[^\]\\]|\\.)*\]/g, "");
-            if (wildcards.includes(".")) out.push({ line: i + 1, text: line.trim() });
-          }
-          return out;
-        },
-      ),
-    );
+  const bareDotSites = (source) => {
+    const lines = source.split("\n");
+    return [
+      /=\s*(\/(?:\\.|\[(?:\\.|[^\]\\\n])*\]|[^/\\\n])+\/)/g,
+      /String\.raw`((?:[^`\\]|\\.)*)`/g,
+    ].flatMap((re) => {
+      const out = [];
+      for (const m of source.matchAll(re)) {
+        // `${...}` first: its body is a JS expression, not regex source, so
+        // the dot in `COUNTED_SEVERITIES.join("|")` is not a wildcard. The
+        // interpolated constants are themselves String.raw templates and
+        // are scanned where they are declared, so dropping the hole here
+        // loses no coverage. Then strip escapes, then character classes:
+        // what survives is a wildcard `.`, while `\.` and `[.)]` are
+        // literal dots and fine.
+        const wildcards = m[1]
+          .replace(/\$\{[^}]*\}/g, "")
+          .replace(/\\./g, "")
+          .replace(/\[(?:[^\]\\]|\\.)*\]/g, "");
+        if (!wildcards.includes(".")) continue;
+        // The line the pattern itself starts on, not the `=` before it.
+        const line = source.slice(0, m.index + m[0].indexOf(m[1])).split("\n").length;
+        out.push({ line, text: lines[line - 1].trim() });
+      }
+      return out;
+    });
+  };
 
   for (const rel of [
     "../server/src/services/ally-review-detection.ts",
@@ -1955,6 +1961,29 @@ describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break
     assert.match(first, /\(\[\^\\n\]\*\)\$\/$/);
   });
 
+  // Ally, #1721 at b8322735, Important 2. Three named patterns in the two
+  // scanned files put the literal on the line after its `=`, and BLOCKING_SECTION_RE
+  // is the in-file precedent for `[^\n]*`. A line-split scan cannot see any of
+  // them, so the injection runs against the real declarations, not a fixture.
+  it("control: the dot scan sees a literal declared on the line after its `=`", () => {
+    for (const [rel, name, from, to] of [
+      ["./check-ally-review-consistency.mjs", "BLOCKING_SECTION_RE", "[^\\n]*", "."],
+      ["../server/src/services/ally-review-detection.ts", "UNCOUNTED_FINDINGS_HEADING_REGEX", "[ \\t]+", ".+"],
+    ]) {
+      const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+      const decl = new RegExp(`const ${name} =\\n[^\\n]*\\n`).exec(src);
+      assert.ok(decl, `${name} is no longer split across two lines in ${rel} -- re-aim this control`);
+      const injected = src.replace(decl[0], decl[0].replace(from, to));
+      assert.notEqual(injected, src, `${from} not found in ${name} -- the injection is a no-op`);
+      const line = src.slice(0, decl.index).split("\n").length + 1;
+      assert.deepEqual(
+        bareDotSites(injected).map((c) => `${rel}:${c.line}`),
+        [`${rel}:${line}`],
+        `a wildcard \`.\` injected into ${name} was not reported`,
+      );
+    }
+  });
+
   it("control: the dot scan catches both construction forms and spares literal dots", () => {
     // No floor is possible here -- the correct count is zero -- so the scan's
     // liveness has to be pinned by injection instead. Rows 3-5 are the ways a
@@ -1965,6 +1994,7 @@ describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break
     assert.equal(caught("const C = /^c\\.d$/;"), 0, "escaped dot is a literal");
     assert.equal(caught("const D = /^[.]e$/;"), 0, "dot in a character class is a literal");
     assert.equal(caught("const E = /^f[^\\n]*$/;"), 0, "the shape this rule asks for");
+    assert.equal(caught("const H =\n  /^h.*$/;"), 1, "a literal on the line after its `=`");
     assert.equal(
       caught("const F = new RegExp(String.raw`^g${SEVERITIES.join(\"|\")}$`);"),
       0,
