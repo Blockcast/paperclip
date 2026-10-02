@@ -184,6 +184,16 @@ function findUnprovenAccumulatorReturns(functionSource: string): number[] {
           && !lines.slice(close, index + 1).some((l) => isCode(l) && indentOf(l) < guardIndent)
           // An `=== 0` guard proves nothing unless its block actually exits;
           // one that falls through vouches for the return beneath it.
+          //
+          // ponytail: this is a textual exit test, not dominance analysis, so
+          // three shapes read wrong. Two are false negatives — a conditional-only
+          // exit (`if (rare) return [];` as the block's sole exit) and the bare
+          // word inside a string (`logger.warn("...will return nothing")`) both
+          // read as proven although the block can fall through. One is a false
+          // positive — a block exiting via `continue` inside a loop reads as
+          // unproven. None occurs in the real slice today, and the false
+          // positive fails loudly rather than silently, which is the safe
+          // direction; closing the two false negatives needs a parser.
           && lines.slice(back, close).some((l) => /\b(?:return|throw)\b/.test(l));
       break;
     }
