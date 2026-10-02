@@ -26,9 +26,13 @@ export function parseUnsupportedPaginationParams(query: {
  * a non-negative integer — callers reject that with a 400 rather than silently
  * replaying window 0, which is the BLO-24495 failure one param over.
  *
- * `^\d+$` already guarantees integrality and sign, so there is no second
- * `Number.isInteger`/`< 0` arm: the two route copies this replaces both carried
- * one and it was unreachable in both.
+ * `^\d+$` guarantees sign but NOT a usable number: it passes a digit string
+ * of any length, and `Number.parseInt` of one past `Number.MAX_VALUE` (e.g.
+ * 309 nines) is `Infinity`. The services gate `offset` on `Number.isFinite`
+ * and fall back to 0, so without the `Number.isSafeInteger` check below that
+ * input is a 200 serving window 0. The same check rejects digit strings past
+ * `Number.MAX_SAFE_INTEGER`, which cannot be represented exactly, and covers
+ * the `Number.isInteger`/`< 0` arm the two route copies this replaces carried.
  *
  * Lives here, not in services/issues.ts, for the same reason as
  * {@link parseUnsupportedPaginationParams} — that module is wholesale-mocked by
@@ -36,7 +40,9 @@ export function parseUnsupportedPaginationParams(query: {
  */
 export function parseOffsetParam(raw: unknown): number | null {
   if (raw === undefined) return 0;
-  return typeof raw === "string" && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : null;
+  if (typeof raw !== "string" || !/^\d+$/.test(raw)) return null;
+  const offset = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(offset) ? offset : null;
 }
 
 // BLO-33741: the same endpoint clamps an oversized `limit` to
