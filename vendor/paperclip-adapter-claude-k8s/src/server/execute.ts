@@ -1577,7 +1577,6 @@ async function warnQuietly(
  * Any other failure is surfaced, because a log we failed to delete for a real
  * reason accumulates on the shared PVC and nothing else reports it.
  */
-
 async function reapPodLogFile(
   podLogPath: string | undefined,
   onLog: AdapterExecutionContext["onLog"],
