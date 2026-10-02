@@ -79,10 +79,15 @@ function assertSafeAbsolutePath(field: string, value: string): void {
   }
 }
 
+/** Every pod log lives under here.  Exported so a consumer that reads a path
+ *  back off a mutable Kubernetes object can check it against the same literal
+ *  the builder used, rather than a second copy that can drift (BLO-39114). */
+export const POD_LOG_ROOT = "/paperclip/instances/default/data/run-logs";
+
 export function buildPodLogPath(companyId: string, agentId: string, runId: string, isolationKey?: string): string {
   const dir = isolationKey
-    ? `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/isolated/${isolationKey}`
-    : `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}`;
+    ? `${POD_LOG_ROOT}/${companyId}/${agentId}/isolated/${isolationKey}`
+    : `${POD_LOG_ROOT}/${companyId}/${agentId}`;
   return `${dir}/${runId}.pod.ndjson`;
 }
 
