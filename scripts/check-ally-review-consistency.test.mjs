@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 
+import { extractAllyReportedFindingRefs } from "../server/src/services/ally-review-detection.ts";
 import {
   ALLY_APP_REVIEWER_ID,
   ALLY_APP_REVIEWER_LOGIN,
@@ -15,6 +16,7 @@ import {
   assertLiveScopeNonVacuous,
   assertPrListComplete,
   attestedHead,
+  countedFindingKeys,
   duplicateBodyAcrossIdentities,
   findPrNotices,
   findPrViolations,
@@ -775,6 +777,15 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
   });
 
+  it("still fires I2e when a second, emphasised bucket raises more than the heading", () => {
+    // The merge gate reads `**Important Issues (3)**` as a bucket too and keeps
+    // the higher count, so this blocker raised three findings, not one.
+    const blocker = appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (1)\n- one\n**Important Issues (3)**\n- two\n- three") });
+    const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — one done`);
+    const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blocker, approval] });
+    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+  });
+
   it("still fires I2e when the blocker blocks only on a still-present entry", () => {
     // No counted bucket at this head, so no (severity, index) a ledger can name.
     const blocker = appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, `- **prior:${OTHER.slice(0, 7)} important 1** — still-present — stands`) });
@@ -847,6 +858,32 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     assert.equal(violationFingerprint(identical), "I1:1220:ff1c72db:5124949902,5124950225");
     assert.equal(violationFingerprint(identical), violationFingerprint(bodiless));
   });
+});
+
+describe("countedFindingKeys", () => {
+  // Must agree with the merge gate on what a review raised, or supersedesBlocker
+  // can exempt an approval the gate would still hold (BLO-25764). Each shape is
+  // one where the two used to disagree, plus controls on either side.
+  const gateKeys = (body) =>
+    new Set((extractAllyReportedFindingRefs(body) ?? []).map(({ severity, index }) => `${severity} ${index}`));
+  const upTo = (n) => new Set(Array.from({ length: n }, (_, i) => `important ${i + 1}`));
+
+  for (const [shape, body, expected] of [
+    ["a bold bucket beside a smaller heading bucket", "### Important Issues (1)\n**Important Issues (3)**", 3],
+    ["a blockquoted bucket beside a smaller heading bucket", "### Important Issues (1)\n> Important Issues (4)", 4],
+    ["a list-marker bucket beside a smaller heading bucket", "### Important Issues (1)\n- Important Issues (5)", 5],
+    ["a heading without the word Issues", "### Important findings (2)", 0],
+    ["a bucket heading indented one space", " ### Important Issues (2)", 2],
+    ["a bucket heading indented three spaces", "   ### Important Issues (2)", 2],
+    ["a bucket heading indented four spaces (code)", "    ### Important Issues (2)", 0],
+    ["a bucket inside a closed fence", "```\n### Important Issues (2)\n```", 2],
+    ["a bucket after an unclosed fence", "```\n### Important Issues (2)", 2],
+  ]) {
+    it(`matches the merge gate on ${shape}`, () => {
+      assert.deepEqual(gateKeys(body), upTo(expected), "gate fixture drifted");
+      assert.deepEqual(countedFindingKeys(body), upTo(expected));
+    });
+  }
 });
 
 describe("duplicateBodyAcrossIdentities", () => {

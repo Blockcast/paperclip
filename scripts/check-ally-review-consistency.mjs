@@ -117,17 +117,6 @@ const BLOCKING_SECTION_RE =
   /^#+[ \t]*(critical|important)[^\n]*\((?!0\))\d+\)/im;
 
 /**
- * Every counted bucket heading, with its severity and count. The `(0)` case is
- * kept here — unlike BLOCKING_SECTION_RE, which asks "does this block?" — so
- * that enumerating a body's findings sees an explicit empty bucket and simply
- * contributes no indices for it.
- *
- * The count is captured lazily so `### Important Issues (2)` yields 2 rather
- * than some later parenthesized number on the same line.
- */
-const COUNTED_SECTION_GLOBAL_RE = /^#+[ \t]*(critical|important)[^\n]*?\((\d+)\)/gim;
-
-/**
  * Leading whitespace that CommonMark would render as an indented code block,
  * i.e. quoted text rather than emitted structure. Four spaces reach column
  * four, and so does a tab however few spaces precede it.
@@ -158,6 +147,32 @@ const COUNTED_SECTION_GLOBAL_RE = /^#+[ \t]*(critical|important)[^\n]*?\((\d+)\)
  * a missed one, but it is a real remaining divergence, not parity.
  */
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4}) {0,3}`;
+
+/**
+ * Every counted bucket, with its severity and count. The `(0)` case is kept
+ * here — unlike BLOCKING_SECTION_RE, which asks "does this block?" — so that
+ * enumerating a body's findings sees an explicit empty bucket and simply
+ * contributes no indices for it.
+ *
+ * Must stay equivalent to COUNTED_FINDINGS_BUCKET_PATTERN in
+ * server/src/services/ally-review-detection.ts, which decides what a review
+ * raised for the merge gate. Mirrored rather than imported because the
+ * scheduled guard runs this file under the runner's unpinned `node`, which is
+ * not guaranteed to load a `.ts` module. The module's leading ` {0,3}` is
+ * folded into NOT_INDENTED_CODE here, as described above. A narrower copy
+ * under-counts a blocker, which lets supersedesBlocker exempt an approval that
+ * retired only part of it: the fail-open direction. The suite runs both
+ * against the shapes where they used to diverge.
+ *
+ * The gate reads the raw and the fence-stripped body and keeps the higher
+ * count per severity. Reading raw alone is equivalent: every part of this
+ * pattern is line-local, and fence stripping only blanks whole lines, so the
+ * stripped reading's matches are a subset of the raw reading's.
+ */
+const COUNTED_SECTION_GLOBAL_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}(?:[#>][ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(critical|important)[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
+  "gim",
+);
 
 /** A prior-finding disposition that says the blocker is still present. */
 const STILL_PRESENT_DISPOSITION_RE = new RegExp(
@@ -316,11 +331,12 @@ export function hasStillPresentDisposition(body) {
 
 /**
  * The findings a body declares in its own counted buckets, as `severity index`
- * keys. A bucket of N contributes indices 1..N, which is the same
- * `(severity, index)` identity the merge gate enumerates in
- * extractAllyReportedFindingRefs, so the two agree on what a review raised.
+ * keys. A bucket of N contributes indices 1..N, the same `(severity, index)`
+ * identity the merge gate enumerates in extractAllyReportedFindingRefs. The
+ * two agree on what a review raised only because COUNTED_SECTION_GLOBAL_RE
+ * mirrors the gate's bucket pattern; see the note there.
  */
-function countedFindingKeys(body) {
+export function countedFindingKeys(body) {
   const keys = new Set();
   for (const [, severity, count] of String(body ?? "").matchAll(COUNTED_SECTION_GLOBAL_RE)) {
     for (let index = 1; index <= Number(count); index += 1) {
@@ -514,7 +530,7 @@ export function findPrNotices(pr) {
   const short = String(head ?? "").slice(0, 8);
   const reviews = operativeAllyReviews(pr.reviews, head, "app");
   if (!isSupersedingAppRereview("app", reviews)) return [];
-  const latest = [...reviews].sort(bySubmission)[reviews.length - 1];
+  const latest = [...reviews].sort(bySubmission).at(-1);
   return [
     `PR #${pr.number} @${short}: ${reviews.length} operative Ally App reviews (${reviewDetails(reviews)}) with distinct bodies — ` +
       `treating the latest (${latest?.id}, ${latest?.submitted_at}) as the standing verdict. Legitimate for a re-review of an ` +
