@@ -2709,48 +2709,73 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     return recovery.reconcileStrandedAssignedIssues();
   }
 
-  describe("PEN-2791 open pull request as an attendance path", () => {
+  // Built through the real producer, not hand-written literals: the predicate filters
+  // on the webhook's metadata source and system source-trust, so if either constant
+  // moves, this seeding moves with it and a stale filter fails loudly instead of
+  // silently matching nothing.
+  //
+  // Shared by the PEN-2791 and BLO-38061 blocks below, for the same reason
+  // `seedSeizableProductiveRow` is shared: both measure exemptions keyed off the SAME
+  // work-product row, and PEN-3198's rule that two gates asking one question must not
+  // answer it differently applies to the fixtures that pin them too.
+  async function insertPullRequestWorkProduct(input: {
+    companyId: string;
+    issueId: string;
+    prNumber: number;
+    merged?: boolean;
+    updatedAt?: Date;
+    /** Simulates a hand-created row: no webhook metadata, no system source-trust. */
+    handCreated?: boolean;
+    /**
+     * BLO-38061. The identifiers the PR OWNS, as the webhook resolved them. Omitting the
+     * key reproduces a row written before the field existed — the shape every PEN-2791
+     * test seeds, and the one that must stay exempt.
+     */
+    owningIdentifiers?: readonly string[] | null;
+    /**
+     * BLO-38061. Deletes `owningIdentifiers` from the built metadata entirely, which is
+     * NOT the same row as passing `null`. The current producer always emits the key with
+     * an explicit JSON `null`, so `metadata->'owningIdentifiers'` yields `'null'::jsonb`
+     * and `jsonb_typeof` returns the STRING `'null'`. A row written before the field
+     * existed has no key at all, `->` yields SQL NULL, and `jsonb_typeof` returns SQL
+     * NULL — which is what the predicate's `coalesce(..., 'null')` exists to normalise.
+     * Seeding only the producer's shape would leave that coalesce untested, and 15 of the
+     * 167 open PR work products measured on 2026-09-29 are exactly this older shape.
+     */
+    stripOwningIdentifiersKey?: boolean;
+  }) {
+    const fields = buildPullRequestWorkProductFields({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: input.prNumber,
+      prTitle: "Scrub secret material from k8s MCP responses",
+      prUrl: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}`,
+      headSha: "0b11256d0a5dccad3d26bb9756d02294c231988f",
+      prBranch: "security/scrub-k8s-mcp-env",
+      prDraft: false,
+      prMerged: input.merged === true,
+      prUpdatedAt: new Date().toISOString(),
+      action: input.merged === true ? "closed" : "synchronize",
+      owningIdentifiers: input.owningIdentifiers,
+    });
+    const metadata = { ...fields.metadata };
+    if (input.stripOwningIdentifiersKey) delete metadata.owningIdentifiers;
+    await db.insert(issueWorkProducts).values({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      provider: "github",
+      type: "pull_request",
+      externalId: fields.externalId,
+      title: fields.title,
+      url: fields.url,
+      status: fields.status,
+      metadata: input.handCreated ? null : metadata,
+      sourceTrust: input.handCreated ? null : fields.sourceTrust,
+      ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
+    });
+    return fields;
+  }
 
-    // Built through the real producer, not hand-written literals: the predicate filters
-    // on the webhook's metadata source and system source-trust, so if either constant
-    // moves, this seeding moves with it and a stale filter fails loudly instead of
-    // silently matching nothing.
-    async function insertPullRequestWorkProduct(input: {
-      companyId: string;
-      issueId: string;
-      prNumber: number;
-      merged?: boolean;
-      updatedAt?: Date;
-      /** Simulates a hand-created row: no webhook metadata, no system source-trust. */
-      handCreated?: boolean;
-    }) {
-      const fields = buildPullRequestWorkProductFields({
-        repoFullName: "Blockcast/paperclip",
-        prNumber: input.prNumber,
-        prTitle: "Scrub secret material from k8s MCP responses",
-        prUrl: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}`,
-        headSha: "0b11256d0a5dccad3d26bb9756d02294c231988f",
-        prBranch: "security/scrub-k8s-mcp-env",
-        prDraft: false,
-        prMerged: input.merged === true,
-        prUpdatedAt: new Date().toISOString(),
-        action: input.merged === true ? "closed" : "synchronize",
-      });
-      await db.insert(issueWorkProducts).values({
-        companyId: input.companyId,
-        issueId: input.issueId,
-        provider: "github",
-        type: "pull_request",
-        externalId: fields.externalId,
-        title: fields.title,
-        url: fields.url,
-        status: fields.status,
-        metadata: input.handCreated ? null : fields.metadata,
-        sourceTrust: input.handCreated ? null : fields.sourceTrust,
-        ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
-      });
-      return fields;
-    }
+  describe("PEN-2791 open pull request as an attendance path", () => {
 
     it("escalates the PEN-2370 shape when no pull request is recorded (control)", async () => {
       const { sourceIssueId } = await seedSeizableProductiveRow();
@@ -2920,6 +2945,131 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(result.escalated).toBe(1);
       const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(updated?.status).toBe("blocked");
+    });
+  });
+
+  // BLO-38061. A third axis, orthogonal to both blocks above: not "which PRs count" and
+  // not "which runs let the question be asked", but "is this PR's wake aimed at THIS
+  // issue at all".
+  //
+  // The predicate used to treat any open PR row as proof of a wake, on the premise that
+  // whoever holds the row is by construction the actor the webhook will wake. That is
+  // false. `routes/github-webhook.ts` writes a PR work product for EVERY issue the PR
+  // references — the row is evidence about the PR, not a wake — but narrows the author
+  // wake to `matched.filter((m) => owning.includes(m.identifier))`, and drops it outright
+  // (`suppressionReason: "no_owning_reference"`) when the owning set is empty. So a row
+  // mentioned by somebody else's PR was exempted from seizure while nothing would ever
+  // wake it: a silent strand, which is the expensive direction and the same one BLO-32679
+  // produced from the opposite side.
+  //
+  // Measured on company `aaced805` 2026-09-29 across 494 inbox rows: 116 satisfied every
+  // other clause of the predicate, of which 82 (71%) were genuinely owned and 34 (29%)
+  // were not — 32 mention-only plus 2 carrying an authoritative empty owner set.
+  describe("BLO-38061 an open pull request must OWN the issue to be an attendance path", () => {
+    // Seeds the PEN-2370-shaped seizable row and hangs one fresh, open, webhook-written PR
+    // off it, varying ONLY the recorded owning set. Every other clause of the predicate is
+    // held at its exempting value, so the owning set is the single variable across the
+    // four tests below and each one measures the new clause rather than a row that was
+    // never at risk (the control for which is the first test in the PEN-2791 block).
+    async function sweepWithOwners(
+      resolveOwners: (seeded: { prefix: string; identifier: string }) =>
+        readonly string[] | null | undefined,
+      options: { stripOwningIdentifiersKey?: boolean } = {},
+    ) {
+      const seeded = await seedSeizableProductiveRow();
+      const identifier = seeded.sourceIssue.identifier!;
+      const owningIdentifiers = resolveOwners({ prefix: seeded.prefix, identifier });
+      const fields = await insertPullRequestWorkProduct({
+        companyId: seeded.companyId,
+        issueId: seeded.sourceIssueId,
+        prNumber: 2087,
+        // Spread rather than passed, so `undefined` reaches the producer as an ABSENT key
+        // — the legacy shape — instead of an explicit undefined that would read the same
+        // here but not in every caller.
+        ...(owningIdentifiers === undefined ? {} : { owningIdentifiers }),
+        ...options,
+      });
+      // Guard the guard, as in the PEN-2791 block: if the producer ever stops emitting an
+      // open status, these pass for the wrong reason — a terminal row, not the owner
+      // clause.
+      expect(fields.status).toBe("ready_for_review");
+      const result = await sweep();
+      // ⚠️ THE LOAD-BEARING ASSERTION, and it is not defensive tidying. The sweep catches
+      // per-candidate errors and counts them in `reconcileErrors` (see the boundary added
+      // after a single thrower silently truncated every later candidate), so a query that
+      // THROWS produces `escalated: 0` — indistinguishable at the call site from a row
+      // that was deliberately exempted. While writing this block a malformed cast made the
+      // predicate throw on every candidate, and the two exemption tests below passed
+      // anyway, measuring nothing. Assert the sweep actually ran before reading its
+      // verdict.
+      expect(result.reconcileErrors).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, seeded.sourceIssueId));
+      return { ...seeded, result, updated };
+    }
+
+    it("exempts a row whose open pull request names it as an owner", async () => {
+      const { result, updated, coderId } = await sweepWithOwners(({ identifier }) => [identifier]);
+
+      expect(result.escalated).toBe(0);
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.assigneeAgentId).toBe(coderId);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    });
+
+    it("seizes a row whose open pull request names ONLY another issue", async () => {
+      // The 32-row bucket, and the defect itself. Every clause the predicate used to check
+      // is satisfied — the PR is open, fresh and webhook-written — but its author wake is
+      // addressed to `-2`, so this row is dark and must not be spared.
+      const { result, updated } = await sweepWithOwners(({ prefix }) => [`${prefix}-2`]);
+
+      expect(result.escalated).toBe(1);
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("seizes a row whose open pull request recorded an authoritative EMPTY owner set", async () => {
+      // The 2-row bucket, and the one the null arm below must never be collapsed into. An
+      // empty ARRAY means the webhook resolved ownership and found none in the branch,
+      // title or labeled body — exactly the `no_owning_reference` case where it drops the
+      // author wake outright. Absence of the field is a different claim entirely.
+      const { result, updated } = await sweepWithOwners(() => []);
+
+      expect(result.escalated).toBe(1);
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still exempts a row whose open pull request recorded NO owner set at all", async () => {
+      // The null arm, asserted on its own because it is the one that must NOT change.
+      // `owningIdentifiers` is absent on rows written before the field existed, and
+      // absence is evidence of nothing — seizing on it would be the same
+      // reasoning-from-absence error this whole family of predicates exists to avoid.
+      // Distinguished from the empty array above only by `jsonb_typeof`, which is what
+      // makes that operator load-bearing rather than defensive.
+      //
+      // This is the CURRENT producer's null: the key is present carrying JSON `null`.
+      const { result, updated, coderId } = await sweepWithOwners(() => undefined);
+
+      expect(result.escalated).toBe(0);
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.assigneeAgentId).toBe(coderId);
+    });
+
+    it("still exempts a row written before `owningIdentifiers` existed at all", async () => {
+      // The same claim as above but the OTHER null shape, and the two are not
+      // interchangeable in SQL: a present-but-JSON-null key makes `jsonb_typeof` return
+      // the string 'null', while a missing key makes it return SQL NULL, which would
+      // render the whole disjunct NULL and silently drop the row from the exemption.
+      // `coalesce(..., 'null')` is what collapses them, and without a test on this shape
+      // that coalesce has no failing mutation. 15 of the 167 open PR work products
+      // measured on 2026-09-29 predate the field, so this is a live population, not a
+      // hypothetical one.
+      const { result, updated, coderId } = await sweepWithOwners(
+        () => undefined,
+        { stripOwningIdentifiersKey: true },
+      );
+
+      expect(result.escalated).toBe(0);
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.assigneeAgentId).toBe(coderId);
     });
   });
 
