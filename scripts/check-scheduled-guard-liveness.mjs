@@ -134,6 +134,23 @@ export const WATCHED_GUARDS = [
   // this guard — disabled, renamed, never completed — are decided on their own
   // branches and are threshold-independent.
   { workflow: "production-environment-protection-guard.yml", staleHours: 16 },
+
+  // Twice daily (cron "13 7,19"), BLO-39345. Shares the 16h bar above, and
+  // that number is ADOPTED, not measured: this guard has no run history yet,
+  // so there is no jitter distribution to place a bar inside. It is the same
+  // cadence as the row above, so the same bar is the least-invented choice
+  // available — but it has not earned the argument that row carries, and
+  // saying so is the point. Re-derive it from this workflow's own measured
+  // gaps once ~30 cycles (about two weeks) have run; if its ordinary band
+  // tops out well below 14.6h, tighten it rather than leaving a borrowed
+  // number in place.
+  //
+  // What makes a borrowed bar tolerable in the meantime: the audit runs a 2d
+  // window on a 12h cadence, so each merged PR is examined by roughly three
+  // consecutive runs. A missed cycle loses no coverage, which is exactly the
+  // property the threshold is protecting — unlike the hourly guards, where a
+  // skipped tick is a real gap.
+  { workflow: "commit-attribution-audit.yml", staleHours: 16 },
 ];
 
 /** Back-compat / convenience view: just the workflow filenames. */
