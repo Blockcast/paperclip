@@ -30645,7 +30645,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (executionWorkspace.created) {
         try {
           await cleanupExecutionWorkspaceArtifacts({
-            trigger: "run_teardown",
+            trigger: "persist_rollback",
             workspace: {
               id:
                 reusableExistingExecutionWorkspace?.id

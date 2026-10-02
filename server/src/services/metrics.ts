@@ -164,15 +164,49 @@ export const EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC =
  * Which caller asked for the removal. `unknown` is not padding: it is how an
  * unlabelled future call site shows up, and a rising `unknown` share means
  * this split has quietly stopped partitioning the work.
+ *
+ * ⛔ `persist_rollback` was called `run_teardown` until 2026-10-02, and that
+ * name was a lie worth understanding before trusting this split. Its one call
+ * site (`heartbeat.ts`) sits inside the `catch` wrapping the execution-workspace
+ * persist step and fires only `if (executionWorkspace.created)` — i.e. the tree
+ * reached disk but its ROW could not be written. It counts DB-write failures, a
+ * rare population that sits near zero.
+ *
+ * **Run end performs no inline teardown at all.** It stamps
+ * `cleanupEligibleAt = now + grace` with `cleanupReason: "run_ended"` and hands
+ * the work to the collector — so per-failure run teardown is already INSIDE
+ * `trigger="collector"`, and is separated from idle reclamation by
+ * `cleanup_reason`, not by this label. Reading a flat `run_teardown` against a
+ * large `collector` as "per-failure teardown is negligible" was therefore
+ * attribution by magnitude against an uninstrumented alternative — the PEN-3692
+ * error in a new costume. Found by Ally on this PR.
  */
 export const EXECUTION_WORKSPACE_TEARDOWN_TRIGGERS = [
-  "run_teardown",
+  "persist_rollback",
   "collector",
   "operator",
   "unknown",
 ] as const;
 export type ExecutionWorkspaceTeardownTrigger =
   (typeof EXECUTION_WORKSPACE_TEARDOWN_TRIGGERS)[number];
+/**
+ * Why the workspace was eligible for collection — the split that actually
+ * answers PEN-3692's question, since run-end teardown is deferred into
+ * `trigger="collector"` (see above).
+ *
+ * `run_ended` is failed-and-succeeded-run-attributable work; `idle_backfill` is
+ * reclamation of the pre-existing population. `not_applicable` is every
+ * non-collector caller, which has no eligibility reason at all — deliberately
+ * not `unknown`, so it cannot be confused with the trigger enum's "a call site
+ * forgot to classify itself" signal.
+ */
+export const EXECUTION_WORKSPACE_CLEANUP_REASONS = [
+  "run_ended",
+  "idle_backfill",
+  "not_applicable",
+] as const;
+export type ExecutionWorkspaceCleanupReason =
+  (typeof EXECUTION_WORKSPACE_CLEANUP_REASONS)[number];
 /**
  * Which piece of tree-walking work was done. The first two are removals and are
  * not interchangeable work: a `git worktree remove` shells out and lets git walk
@@ -2673,8 +2707,8 @@ let isolationReaperRetainedResurrected: Counter<"dry_run"> | null = null;
 let isolationReaperEntries: Counter<"dry_run" | "outcome"> | null = null;
 let isolationReaperSweeps: Counter<"dry_run" | "stop_reason"> | null = null;
 let isolationReaperLastSweep: Gauge<"dry_run"> | null = null;
-let executionWorkspaceTeardown: Counter<"trigger" | "method" | "outcome"> | null = null;
-let executionWorkspaceTeardownDuration: Histogram<"trigger" | "method"> | null = null;
+let executionWorkspaceTeardown: Counter<"trigger" | "method" | "outcome" | "cleanup_reason"> | null = null;
+let executionWorkspaceTeardownDuration: Histogram<"trigger" | "method" | "cleanup_reason"> | null = null;
 let executionWorkspaceCollectorScanned: Counter<string> | null = null;
 let executionWorkspaceCollectorCandidates: Counter<"outcome"> | null = null;
 let executionWorkspaceCollectorStamped: Counter<string> | null = null;
@@ -2757,8 +2791,8 @@ function ensureRegistry(): {
   isolationReaperEntriesCounter: Counter<"dry_run" | "outcome">;
   isolationReaperSweepsCounter: Counter<"dry_run" | "stop_reason">;
   isolationReaperLastSweepGauge: Gauge<"dry_run">;
-  executionWorkspaceTeardownCounter: Counter<"trigger" | "method" | "outcome">;
-  executionWorkspaceTeardownDurationHistogram: Histogram<"trigger" | "method">;
+  executionWorkspaceTeardownCounter: Counter<"trigger" | "method" | "outcome" | "cleanup_reason">;
+  executionWorkspaceTeardownDurationHistogram: Histogram<"trigger" | "method" | "cleanup_reason">;
   executionWorkspaceCollectorScannedCounter: Counter<string>;
   executionWorkspaceCollectorCandidatesCounter: Counter<"outcome">;
   executionWorkspaceCollectorStampedCounter: Counter<string>;
@@ -3852,15 +3886,16 @@ function ensureRegistry(): {
       name: EXECUTION_WORKSPACE_TEARDOWN_METRIC,
       help:
         "Execution-workspace tree removals attempted, labeled by trigger "
-        + "(run_teardown, collector, operator, unknown), method (worktree_remove, "
-        + "remove_local_fs) and outcome (PEN-3692). The trigger split is the point: "
-        + "PEN-3692 attributed slab fill to FAILED runs but could not say whether the "
-        + "per-failure teardown or the periodic collector does the work, because both "
-        + "call the same function. outcome=\"failed\" counts a removal that threw; on "
+        + "(persist_rollback, collector, operator, unknown), method (worktree_remove, "
+        + "remove_local_fs), cleanup_reason and outcome (PEN-3692). \u26d4 READ "
+        + "cleanup_reason, NOT trigger, to attribute work to runs: run end performs no "
+        + "inline teardown, so run-attributable removal is inside trigger=\"collector\" "
+        + "with cleanup_reason=\"run_ended\", and trigger=\"persist_rollback\" counts "
+        + "only the rare DB-write-failure path. outcome=\"failed\" counts a removal that threw; on "
         + "the worktree path that is caught and demoted to a warning, so the tree is "
         + "still on disk and a sustained non-zero rate means reclamation is silently "
         + "not happening.",
-      labelNames: ["trigger", "method", "outcome"],
+      labelNames: ["trigger", "method", "outcome", "cleanup_reason"],
       registers: [registry],
     });
     executionWorkspaceTeardownDuration = new Histogram({
@@ -3881,7 +3916,7 @@ function ensureRegistry(): {
         + "being measured, so the instrument would create the pressure it reports. "
         + "Buckets run to 60s because these trees sit on a network mount where a "
         + "removal can block for a long time.",
-      labelNames: ["trigger", "method"],
+      labelNames: ["trigger", "method", "cleanup_reason"],
       buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60],
       registers: [registry],
     });
@@ -5575,10 +5610,20 @@ export function recordExecutionWorkspaceTeardown(input: {
   method: ExecutionWorkspaceTeardownMethod;
   succeeded: boolean;
   durationMs: number;
+  /**
+   * Why the workspace was eligible. Only the collector has one; every other
+   * caller is `not_applicable`. This — not `trigger` — is the run-attribution
+   * split, because run end defers its teardown into the collector.
+   */
+  cleanupReason?: ExecutionWorkspaceCleanupReason;
 }): void {
   try {
     const m = ensureRegistry();
-    const labels = { trigger: input.trigger, method: input.method };
+    const labels = {
+      trigger: input.trigger,
+      method: input.method,
+      cleanup_reason: input.cleanupReason ?? "not_applicable",
+    };
     m.executionWorkspaceTeardownCounter.inc(
       { ...labels, outcome: input.succeeded ? "succeeded" : "failed" },
       1,
@@ -5611,6 +5656,7 @@ export function recordExecutionWorkspaceTeardown(input: {
 export function recordExecutionWorkspaceReclaimInspection(input: {
   trigger: ExecutionWorkspaceTeardownTrigger;
   durationMs: number;
+  cleanupReason?: ExecutionWorkspaceCleanupReason;
 }): void {
   try {
     const m = ensureRegistry();
@@ -5619,7 +5665,11 @@ export function recordExecutionWorkspaceReclaimInspection(input: {
     // up, and that work is charged to the cgroup either way. On a wedged mount
     // the abandoned call is precisely the expensive case.
     m.executionWorkspaceTeardownDurationHistogram.observe(
-      { trigger: input.trigger, method: "inspect_safety" },
+      {
+        trigger: input.trigger,
+        method: "inspect_safety",
+        cleanup_reason: input.cleanupReason ?? "not_applicable",
+      },
       input.durationMs / 1000,
     );
   } catch (error) {

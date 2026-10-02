@@ -152,6 +152,12 @@ export function executionWorkspaceCleanupService(db: Db) {
         sourceIssueId: executionWorkspaces.sourceIssueId,
         metadata: executionWorkspaces.metadata,
         cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt,
+        // PEN-3692: the run-attribution split. Ally's review of d729b09 called
+        // this "a column selectEligible already reads" — it was not; only
+        // `cleanupEligibleAt` was. Added here so the collector can label its
+        // teardowns by WHY the row became eligible, which is the only place
+        // run-attributable removal is distinguishable from idle reclamation.
+        cleanupReason: executionWorkspaces.cleanupReason,
         projectWorkspaceCwd: projectWorkspaces.cwd,
       })
       .from(executionWorkspaces)
@@ -316,6 +322,13 @@ export function executionWorkspaceCleanupService(db: Db) {
       }
       scanned += 1;
       const worktreePath = candidate.providerRef ?? candidate.cwd;
+      // PEN-3692 run attribution. Only `run_ended` is run-attributable; every
+      // other reason (today `idle_backfill`, and anything added later) is
+      // reclamation of the pre-existing population. Mapped to the bounded enum
+      // rather than passed through, so a new DB value cannot widen cardinality.
+      const candidateCleanupReason = candidate.cleanupReason === "run_ended"
+        ? "run_ended" as const
+        : "idle_backfill" as const;
       // A sibling of a tree whose stat was abandoned is on the same wedged
       // mount, so probing it would hold a second thread to learn the same
       // thing. The hold clears when that syscall answers.
@@ -326,7 +339,7 @@ export function executionWorkspaceCleanupService(db: Db) {
       }
       try {
         if (candidate.providerType === "git_worktree" && worktreePath) {
-          const safety = await inspectWorktreeReclaimSafety(worktreePath, "collector");
+          const safety = await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector", cleanupReason: candidateCleanupReason });
           if (!safety.safe) {
             await deferCandidate(candidate.id, safety.reason);
             skipped += 1;
@@ -364,6 +377,7 @@ export function executionWorkspaceCleanupService(db: Db) {
 
         const cleanup = await cleanupExecutionWorkspaceArtifacts({
           trigger: "collector",
+          cleanupReason: candidateCleanupReason,
           workspace: {
             id: candidate.id,
             cwd: candidate.cwd,
@@ -395,7 +409,7 @@ export function executionWorkspaceCleanupService(db: Db) {
         // persist-rollback and operator-PATCH callers of
         // `cleanupExecutionWorkspaceArtifacts` keep their existing contract.
         const removalProof = cleanup.cleaned && worktreePath
-          ? await inspectWorktreeReclaimSafety(worktreePath, "collector")
+          ? await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector", cleanupReason: candidateCleanupReason })
           : null;
         const retainReason = classifyRemovalProof(cleanup.cleaned, removalProof?.reason ?? null);
         if (retainReason) {

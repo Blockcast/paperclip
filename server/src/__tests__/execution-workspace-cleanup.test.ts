@@ -87,7 +87,7 @@ describe("inspectWorktreeReclaimSafety", () => {
     const worktreePath = path.join(path.dirname(repo), "wt-clean");
     await addOwnedWorktree({ repo, worktreePath, branchName: "wt-clean", executionWorkspaceId: randomUUID() });
 
-    expect(await inspectWorktreeReclaimSafety(worktreePath, "collector")).toMatchObject({ safe: true, reason: "clean" });
+    expect(await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector" })).toMatchObject({ safe: true, reason: "clean" });
   });
 
   it("refuses a worktree holding uncommitted work", async () => {
@@ -96,7 +96,7 @@ describe("inspectWorktreeReclaimSafety", () => {
     await addOwnedWorktree({ repo, worktreePath, branchName: "wt-dirty", executionWorkspaceId: randomUUID() });
     fs.writeFileSync(path.join(worktreePath, "README.md"), "edited but never committed\n", "utf8");
 
-    const verdict = await inspectWorktreeReclaimSafety(worktreePath, "collector");
+    const verdict = await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector" });
     expect(verdict.safe).toBe(false);
     expect(verdict.reason).toBe("dirty");
   });
@@ -107,7 +107,7 @@ describe("inspectWorktreeReclaimSafety", () => {
     await addOwnedWorktree({ repo, worktreePath, branchName: "wt-untracked", executionWorkspaceId: randomUUID() });
     fs.writeFileSync(path.join(worktreePath, "scratch.txt"), "not added\n", "utf8");
 
-    expect(await inspectWorktreeReclaimSafety(worktreePath, "collector")).toMatchObject({ safe: false, reason: "dirty" });
+    expect(await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector" })).toMatchObject({ safe: false, reason: "dirty" });
   });
 
   it("refuses a worktree whose commits reached no remote", async () => {
@@ -118,7 +118,7 @@ describe("inspectWorktreeReclaimSafety", () => {
     git(["add", "."], worktreePath);
     git(["commit", "-qm", "local work"], worktreePath);
 
-    const verdict = await inspectWorktreeReclaimSafety(worktreePath, "collector");
+    const verdict = await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector" });
     expect(verdict.safe).toBe(false);
     expect(verdict.reason).toBe("unpushed");
   });
@@ -127,11 +127,11 @@ describe("inspectWorktreeReclaimSafety", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-ws-collector-nongit-"));
     tempRoots.add(root);
     // A directory that exists but is not a git worktree: every git probe fails.
-    expect(await inspectWorktreeReclaimSafety(root, "collector")).toMatchObject({ safe: false, reason: "unverifiable" });
+    expect(await inspectWorktreeReclaimSafety(root, { trigger: "collector" })).toMatchObject({ safe: false, reason: "unverifiable" });
   });
 
   it("treats an unmaterialized path as registry-only", async () => {
-    const verdict = await inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-absent-${randomUUID()}`), "collector");
+    const verdict = await inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-absent-${randomUUID()}`), { trigger: "collector" });
     expect(verdict).toMatchObject({ safe: true, reason: "missing" });
   });
 
@@ -143,7 +143,7 @@ describe("inspectWorktreeReclaimSafety", () => {
     const filePath = path.join(root, "not-a-directory");
     fs.writeFileSync(filePath, "\n", "utf8");
 
-    expect(await inspectWorktreeReclaimSafety(filePath, "collector")).toMatchObject({ safe: false, reason: "unverifiable" });
+    expect(await inspectWorktreeReclaimSafety(filePath, { trigger: "collector" })).toMatchObject({ safe: false, reason: "unverifiable" });
   });
 
   it("gives up on a stat that never returns instead of hanging the collector", async () => {
@@ -159,7 +159,7 @@ describe("inspectWorktreeReclaimSafety", () => {
       () => new Promise((resolve) => { unwedge = () => resolve(undefined as never); }),
     );
     try {
-      const pending = inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-wedged-${randomUUID()}`), "collector");
+      const pending = inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-wedged-${randomUUID()}`), { trigger: "collector" });
       await vi.runOnlyPendingTimersAsync();
       expect(await pending).toMatchObject({ safe: false, reason: "unverifiable", detail: "stat failed: ETIMEDOUT" });
     } finally {
@@ -185,8 +185,8 @@ describe("inspectWorktreeReclaimSafety", () => {
       () => new Promise((resolve) => { unwedge.push(() => resolve(undefined as never)); }),
     );
     try {
-      const first = inspectWorktreeReclaimSafety(path.join(dir, "wt-a"), "collector");
-      const second = inspectWorktreeReclaimSafety(path.join(dir, "wt-b"), "collector");
+      const first = inspectWorktreeReclaimSafety(path.join(dir, "wt-a"), { trigger: "collector" });
+      const second = inspectWorktreeReclaimSafety(path.join(dir, "wt-b"), { trigger: "collector" });
       await vi.runOnlyPendingTimersAsync();
       await Promise.all([first, second]);
       expect(reclaimFsOutstandingCount()).toBe(2);
