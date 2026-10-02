@@ -2269,6 +2269,68 @@ class TestVerdictCountsMirrorTheGate(unittest.TestCase):
             self.assertIsNone(sweep.parse_reviewed_head(self.body(findings)), findings)
 
 
+class TestVerdictMirrorsTheGateAt5f4d5302(unittest.TestCase):
+    """Ally, #1721 at 5f4d5302: Critical 3 and Important 1-3, this reader's half.
+
+    Each is a body the gate reds on `unreadable_verdict` while this sweep read
+    a review that already happened, so it never re-requested the one that
+    would clear the red.
+    """
+
+    HEAD = "c" * 40
+    OTHER = "b" * 40
+
+    def body(self, findings, *prose):
+        return "\n".join(
+            [
+                '<!-- ally-verdict:1\n{"head":"%s","findings":%s}\n-->' % (self.HEAD, findings),
+                "",
+                "## Ally — Consolidated PR Review",
+            ]
+            + list(prose)
+        )
+
+    def test_an_unterminated_fence_does_not_hide_an_undercounted_bucket(self):
+        body = self.body('{"critical":0,"important":0}', "Reviewed head: %s" % self.HEAD, "```ts",
+                         "### Critical Issues (1)")
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+
+    def test_a_block_counting_fewer_than_the_bucket_is_unreadable(self):
+        self.assertIsNone(sweep.parse_reviewed_head(
+            self.body('{"critical":1,"important":0}', "### Critical Issues (3)")))
+        # Controls: agreeing, and a block reporting more, both still attest.
+        for findings, bucket in (('{"critical":3,"important":0}', "### Critical Issues (3)"),
+                                 ('{"critical":3,"important":0}', "### Critical Issues (1)")):
+            self.assertEqual(sweep.parse_reviewed_head(self.body(findings, bucket)), self.HEAD)
+
+    def test_the_prose_head_is_read_over_fence_stripped_text(self):
+        line = "Reviewed head: %s" % self.OTHER
+        body = self.body('{"critical":0,"important":0}', line, "```", line, "```")
+        self.assertIsNone(sweep.parse_reviewed_head(body))
+        self.assertFalse(sweep.attests_head(body, self.HEAD))
+
+    def test_a_crlf_body_reads_exactly_as_its_lf_twin(self):
+        for lf in (
+            self.body('{"critical":0,"important":0}', "Reviewed head: %s" % self.HEAD, "```ts", "x", "```"),
+            "## Ally — Consolidated PR Review\nReviewed head: %s\n### Critical Issues (0)" % self.HEAD,
+            self.body('{"critical":0,"important":0}', "Reviewed head: %s" % self.HEAD, "```ts",
+                      "### Critical Issues (2)", "```"),
+        ):
+            crlf = lf.replace("\n", "\r\n")
+            self.assertEqual(sweep.parse_reviewed_head(lf), self.HEAD, lf)
+            self.assertEqual(sweep.parse_reviewed_head(crlf), self.HEAD, crlf)
+            self.assertTrue(sweep.is_consolidated_ally_comment_for_head(crlf, self.HEAD), crlf)
+
+    def test_a_crlf_fence_does_not_blank_to_end_of_body(self):
+        # The fence opened on `\r` and never closed, so a bucket after it that
+        # the block contradicts was blanked and the block read ok.
+        lf = self.body('{"critical":0,"important":0}', "Reviewed head: %s" % self.HEAD, "```ts", "x",
+                       "```", "### Critical Issues (1)")
+        crlf = lf.replace("\n", "\r\n")
+        self.assertIsNone(sweep.parse_reviewed_head(lf))
+        self.assertIsNone(sweep.parse_reviewed_head(crlf))
+
+
 class TestVerdictLedgerMirrorsTheGate(unittest.TestCase):
     """Peer review of #1721 at 1d6f3785 -- the count rule's twin on the other
     field the gate decides from.

@@ -109,15 +109,8 @@ const BLOCKING_SECTION_RE =
  * way, but a same-named mirror constant holding different content is the drift
  * vector this file exists to close (Ally review of #1721 at bbe6d640).
  *
- * Residual, stated rather than implied: the gate additionally blanks fenced
- * spans before matching, and this script does not, so a *fenced* paste is
- * still read here as an attestation while the gate ignores it. The extra
- * attestation is not quietly absorbed — canonicalReviewHead requires exactly
- * one, so it returns null and the review is reported as an I3 "not canonical"
- * violation. (I3, not I1: I1 caps operative reviews per lane, not attestations
- * within a body.) The direction is still the safe one for an auditor, because
- * the consequence is a false red against an otherwise-valid review rather than
- * a missed one, but it is a real remaining divergence, not parity.
+ * The attestation is matched over fence-stripped text, as the gate matches it
+ * (attestedHeadFrom), so a *fenced* paste is not an attestation here either.
  */
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 
@@ -159,12 +152,16 @@ const PRIOR_FINDING_DISPOSITION_RE = new RegExp(
  */
 const MARKDOWN_EMPHASIS_RUN = String.raw`[*_\`]{0,3}`;
 const ATTESTATION_WRAPPER_RUN = String.raw`[*_\`\t ]{0,6}`;
+// The gate's exact anchors, `(?:^|\n)` ... `(?=\n|$)` with no `m` flag, not
+// `^`/`$` under `m`: JS's multiline `$` also stops before `\r`, `\u2028` and
+// `\u2029`, so on a CRLF body this credited an attestation the gate cannot read
+// -- the missed-red direction, inverting this auditor's safe one (Ally, #1721
+// at 5f4d5302, Important 4).
 const ATTESTED_HEAD_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \t]{0,3}reviewed head:[ \t]*` +
-    String.raw`${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}[ \t]*$`,
-  "im",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \t]{0,3}reviewed head:[ \t]*` +
+    String.raw`${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}[ \t]*(?=\n|$)`,
+  "gi",
 );
-const ATTESTED_HEAD_GLOBAL_RE = new RegExp(ATTESTED_HEAD_RE.source, "gim");
 
 // Ally's structured verdict block — the primary source, mirroring
 // server/src/services/ally-review-detection.ts so this reader and the gate
@@ -245,20 +242,33 @@ const EMITTED_BUCKET_RE = new RegExp(
  * not a scoping choice but a divergence: the two readers then disagree about
  * how many blocks a body contains, which is the BLO-31730 cross-reader failure
  * one layer down, and it fires first on a review that quotes the marker
- * template. Applied to this cross-check and to the block and opener counts in
- * structuredVerdict, not to the prose attestation pattern above, whose own
- * fence divergence is the documented residual on NOT_INDENTED_CODE and is
- * unchanged by this.
+ * template. Applied to this cross-check, to the block and opener counts in
+ * structuredVerdict, and to the prose attestation in attestedHeadFrom.
  */
+/**
+ * The body with every line ending normalized to `\n` -- the single entry point
+ * for every reader below, mirroring reviewBody in ally-review-detection.ts and
+ * review_text in sweep-stalled-ally-reviews.py. JS `.` excludes `\r` and
+ * Python's matches it, so on a CRLF body fence-stripping was a no-op here and
+ * the three readers returned three verdicts (Ally, #1721 at 5f4d5302,
+ * Critical 3).
+ */
+function reviewText(body) {
+  return String(body ?? "").replace(/\r\n?/g, "\n");
+}
+
 const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
-function withoutFencedSpans(text) {
+// `keepUnterminated` mirrors the gate's: a fence that never closes is left as
+// emitted text, for the fail-closed count and ledger cross-checks only.
+function withoutFencedSpans(text, keepUnterminated = false) {
   if (!text.includes("```") && !text.includes("~~~")) return text;
   let open = null;
-  return text
+  let openedAt = -1;
+  const lines = text
     .split("\n")
-    .map((line) => {
+    .map((line, i) => {
       if (open) {
         const close = FENCE_CLOSE_RE.exec(line);
         if (close && close[1][0] === open.char && close[1].length >= open.length) open = null;
@@ -270,18 +280,25 @@ function withoutFencedSpans(text) {
       // blank the rest of a genuine review.
       if (fence && !(fence[1][0] === "`" && fence[2].includes("`"))) {
         open = { char: fence[1][0], length: fence[1].length };
+        openedAt = i;
         return "";
       }
       return line;
-    })
-    .join("\n");
+    });
+  if (open && keepUnterminated) {
+    return [...lines.slice(0, openedAt), ...text.split("\n").slice(openedAt)].join("\n");
+  }
+  return lines.join("\n");
 }
 
+// Any emitted count above the block's, not only against a stated zero --
+// mirroring the gate (Ally, #1721 at 5f4d5302, Important 2). The caller passes
+// the cross-check reading (an unterminated fence kept, Important 1).
 function proseCountContradicts(text, counts) {
-  for (const [, severity, count] of withoutFencedSpans(text).matchAll(EMITTED_BUCKET_RE)) {
+  for (const [, severity, count] of text.matchAll(EMITTED_BUCKET_RE)) {
     const key = severity.toLowerCase();
     if (!BLOCKING_SEVERITIES.includes(key)) continue;
-    if (Number(count) > 0 && counts.get(key) === 0) return true;
+    if (Number(count) > counts.get(key)) return true;
   }
   return false;
 }
@@ -321,9 +338,9 @@ function stillPresentIn(raw) {
  * likeliest shape for a review *of this feature* (found in peer review of
  * #1721 at 97b4ddd1).
  *
- * Scoped to the block and opener count. The prose attestation below still
- * matches raw text; that fence divergence is the pre-existing documented
- * residual and is deliberately not widened here.
+ * The count and ledger cross-checks keep an unterminated fence as emitted
+ * text, as the gate's do: blanked, it would hide the bucket that contradicts
+ * the block.
  */
 function structuredVerdict(rawText) {
   const text = withoutFencedSpans(rawText);
@@ -348,7 +365,8 @@ function structuredVerdict(rawText) {
   const counts = severityCountsIn(parsed?.findings);
   const stillPresent = stillPresentIn(parsed?.dispositions);
   if (counts === null || stillPresent === null) return { kind: "unreadable" };
-  if (proseCountContradicts(text, counts)) return { kind: "unreadable" };
+  const crossCheckText = withoutFencedSpans(rawText, true);
+  if (proseCountContradicts(crossCheckText, counts)) return { kind: "unreadable" };
   // The same rule on the other field, mirroring proseDispositionContradicting
   // in ally-review-detection.ts. `structuredBlocking(body, "stillPresent") ??
   // hasStillPresentDisposition(body)` in reportsStillPresent gives the block
@@ -359,7 +377,7 @@ function structuredVerdict(rawText) {
   // Asymmetric like the count rule: only a *blocking* prose entry against a
   // block that retires everything is fatal, so `stillPresent` true short-
   // circuits and a `fixed` prose entry the block omits still reads clean.
-  if (!stillPresent && hasStillPresentDisposition(text)) return { kind: "unreadable" };
+  if (!stillPresent && hasStillPresentDisposition(crossCheckText)) return { kind: "unreadable" };
   return {
     kind: "ok",
     head: head.trim().toLowerCase(),
@@ -382,7 +400,11 @@ function structuredVerdict(rawText) {
 function attestedHeadFrom(text) {
   const block = structuredVerdict(text);
   if (block.kind === "unreadable") return null;
-  const attestations = Array.from(text.matchAll(ATTESTED_HEAD_GLOBAL_RE));
+  // Over the fence-stripped text, as the gate reads it. The raw body let one
+  // fenced copy of the attestation make the prose ambiguous here while the
+  // gate read the emitted line and failed the block on disagreement, so the
+  // two returned opposite verdicts (Ally, #1721 at 5f4d5302, Important 3).
+  const attestations = Array.from(withoutFencedSpans(text).matchAll(ATTESTED_HEAD_RE));
   const proseHead = attestations.length === 1 ? attestations[0][1].toLowerCase() : null;
   if (block.kind === "absent") return proseHead;
   return proseHead !== null && proseHead !== block.head ? null : block.head;
@@ -430,7 +452,7 @@ function isApproved(review) {
  * state is not the same fact as a review that predates the block.
  */
 function structuredBlocking(body, field) {
-  const block = structuredVerdict(String(body ?? ""));
+  const block = structuredVerdict(reviewText(body));
   if (block.kind === "unreadable") return true;
   if (block.kind === "absent") return null;
   return block[field];
@@ -460,7 +482,7 @@ function reviewDetails(reviews) {
 }
 
 export function canonicalReviewHead(body) {
-  const text = String(body ?? "");
+  const text = reviewText(body);
   const headings = Array.from(text.matchAll(CANONICAL_REVIEW_HEADING_RE));
   if (headings.length !== 1) return null;
   return attestedHeadFrom(text);
@@ -525,18 +547,18 @@ export function allyReviewLane(user) {
 }
 
 export function hasBlockingFindings(body) {
-  return BLOCKING_SECTION_RE.test(String(body ?? ""));
+  return BLOCKING_SECTION_RE.test(reviewText(body));
 }
 
 export function hasStillPresentDisposition(body) {
-  for (const match of String(body ?? "").matchAll(PRIOR_FINDING_DISPOSITION_RE)) {
+  for (const match of reviewText(body).matchAll(PRIOR_FINDING_DISPOSITION_RE)) {
     if (BLOCKING_PRIOR_DISPOSITIONS.has(match[4].toLowerCase())) return true;
   }
   return false;
 }
 
 export function attestedHead(body) {
-  return attestedHeadFrom(String(body ?? ""));
+  return attestedHeadFrom(reviewText(body));
 }
 
 export function operativeAllyReviews(reviews, headSha, lane = null) {

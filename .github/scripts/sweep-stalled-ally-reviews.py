@@ -184,8 +184,27 @@ FENCE_OPEN_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$", ASCII_RE)
 FENCE_CLOSE_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$", ASCII_RE)
 
 
-def without_fenced_spans(text):
+def review_text(body):
+    """The body with every line ending normalized to `\\n`.
+
+    The single entry point for every reader below, mirroring reviewBody in
+    ally-review-detection.ts and reviewText in check-ally-review-consistency.mjs.
+    Python's `.` matches `\\r` where JS's does not, so on a CRLF body
+    FENCE_OPEN_PATTERN opened a fence FENCE_CLOSE_PATTERN could never close and
+    this blanked to end of body while both JS readers blanked nothing: one
+    review, three verdicts, and this sweep never re-requested the review that
+    would clear the gate's red (Ally, #1721 at 5f4d5302, Critical 3).
+    """
+    return re.sub(r"\r\n?", "\n", body or "")
+
+
+def without_fenced_spans(text, keep_unterminated=False):
     """Blank fenced spans so a quoted bucket cannot fail a block closed.
+
+    `keep_unterminated` mirrors the gate's: a fence that never closes is left
+    as emitted text, for the fail-closed count and ledger cross-checks only,
+    because blanking it hid the bucket that contradicts the block (Ally, #1721
+    at 5f4d5302, Important 1).
 
     Mirrors withoutFencedCodeBlocks in the gate exactly -- tilde fences, fence
     length matching and the backtick info-string rule. A simpler toggle here is
@@ -193,14 +212,15 @@ def without_fenced_spans(text):
     how many blocks a body contains, which is the BLO-31730 cross-reader
     failure one layer down, and it fires first on a review that quotes the
     marker template -- the likeliest shape for a review of this feature.
-    Applied to the count cross-check and to the block and opener counts in
-    parse_verdict_block_head, not to the prose attestation pattern, whose own
-    fence handling is the residual documented on parse_reviewed_head.
+    Applied to the count cross-check, to the block and opener counts in
+    parse_verdict_block_head, and to the prose attestation in
+    parse_reviewed_head.
     """
     if "```" not in text and "~~~" not in text:
         return text
     lines = []
     open_fence = None
+    opened_at = -1
     for line in text.split("\n"):
         if open_fence:
             close = FENCE_CLOSE_PATTERN.match(line)
@@ -214,10 +234,13 @@ def without_fenced_spans(text):
         # fence that would blank the rest of a genuine review.
         if fence and not (fence.group(1)[0] == "`" and "`" in fence.group(2)):
             open_fence = (fence.group(1)[0], len(fence.group(1)))
+            opened_at = len(lines)
             lines.append("")
         else:
             lines.append(line)
     # An unclosed fence blanks to end of body, matching how GitHub renders it.
+    if open_fence and keep_unterminated:
+        return "\n".join(lines[:opened_at] + text.split("\n")[opened_at:])
     return "\n".join(lines)
 
 
@@ -362,11 +385,12 @@ def dispositions_ok(payload):
 
 
 def prose_count_contradicts(text, counts):
-    """A positive emitted bucket against a stated zero -- mirrors
-    proseCountContradicting in ally-review-detection.ts."""
-    for severity, count in EMITTED_BUCKET_PATTERN.findall(without_fenced_spans(text)):
+    """An emitted bucket counting more than the block states -- mirrors
+    proseCountContradicting in ally-review-detection.ts. Any shortfall, not
+    only against a stated zero (Ally, #1721 at 5f4d5302, Important 2)."""
+    for severity, count in EMITTED_BUCKET_PATTERN.findall(without_fenced_spans(text, keep_unterminated=True)):
         key = severity.lower()
-        if key in BLOCKING_SEVERITIES and int(count) > 0 and counts.get(key) == 0:
+        if key in BLOCKING_SEVERITIES and int(count) > counts[key]:
             return True
     return False
 
@@ -390,7 +414,7 @@ def prose_disposition_contradicts(text, payload):
         verb = entry.get("verb") if isinstance(entry, dict) else None
         if isinstance(verb, str) and js_trim(verb).lower() in BLOCKING_PRIOR_DISPOSITIONS:
             return False
-    for verb in PRIOR_FINDING_DISPOSITION_PATTERN.findall(without_fenced_spans(text)):
+    for verb in PRIOR_FINDING_DISPOSITION_PATTERN.findall(without_fenced_spans(text, keep_unterminated=True)):
         if verb.lower() in BLOCKING_PRIOR_DISPOSITIONS:
             return True
     return False
@@ -423,11 +447,11 @@ def parse_verdict_block_head(body):
     which is the likeliest shape for a review *of this feature* (found in peer
     review of #1721 at 97b4ddd1).
 
-    Scoped to the block and opener count. parse_reviewed_head still matches the
-    prose attestation against raw text; that fence divergence is the pre-existing
-    documented residual and is deliberately not widened here.
+    The count and ledger cross-checks read the body with an unterminated fence
+    kept as emitted text, as the gate's do.
     """
-    text = without_fenced_spans(body or "")
+    body = review_text(body)
+    text = without_fenced_spans(body)
     blocks = VERDICT_BLOCK_PATTERN.findall(text)
     openers = VERDICT_OPENER_PATTERN.findall(text)
     # An opener with no terminator is a truncated payload, not an older review.
@@ -464,10 +488,10 @@ def parse_verdict_block_head(body):
     # The other field the payload carries, held to the same rule.
     if not dispositions_ok(parsed):
         return ("unreadable", None)
-    if prose_count_contradicts(text, counts):
+    if prose_count_contradicts(body, counts):
         return ("unreadable", None)
     # The same rule on the other field the payload carries.
-    if prose_disposition_contradicts(text, parsed):
+    if prose_disposition_contradicts(body, parsed):
         return ("unreadable", None)
     return ("ok", js_trim(head).lower())
 
@@ -488,7 +512,12 @@ def parse_reviewed_head(body):
     kind, block_head = parse_verdict_block_head(body)
     if kind == "unreadable":
         return None
-    matches = REVIEWED_HEAD_PATTERN.findall(body or "")
+    # Over the fence-stripped text, as the gate reads it. The raw body let one
+    # fenced copy of the attestation make the prose ambiguous here while the
+    # gate read the emitted line and failed the block on disagreement, so the
+    # sweep saw a review the gate cannot read and never re-requested it (Ally,
+    # #1721 at 5f4d5302, Important 3).
+    matches = REVIEWED_HEAD_PATTERN.findall(without_fenced_spans(review_text(body)))
     prose_head = matches[0].lower() if len(matches) == 1 else None
     if kind == "absent":
         return prose_head
@@ -513,7 +542,7 @@ def is_consolidated_ally_comment_for_head(body, head_sha):
     # anchoring on "## Ally" being the first byte misses Ally's own emitted
     # bodies. Require the heading on its own line instead.
     return (
-        CONSOLIDATED_HEADING_PATTERN.search(body or "") is not None
+        CONSOLIDATED_HEADING_PATTERN.search(review_text(body)) is not None
         and attests_head(body, head_sha)
     )
 

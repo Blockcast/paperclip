@@ -15,6 +15,7 @@ import {
   assertLiveScopeNonVacuous,
   assertPrListComplete,
   attestedHead,
+  canonicalReviewHead,
   duplicateBodyAcrossIdentities,
   findPrViolations,
   findViolations,
@@ -400,6 +401,50 @@ describe("attestedHead", () => {
       attestedHead(counted('{"critical":0,"important":0}', "### Critical Issues (0)")),
       HEAD,
     );
+  });
+
+  // Ally, #1721 at 5f4d5302, Important 1 and 2 -- the gate's two count gaps.
+  it("fails closed when an unterminated fence hides a bucket the block undercounts", () => {
+    const body = counted('{"critical":0,"important":0}', `Reviewed head: ${HEAD}`, "```ts", "### Critical Issues (1)");
+    assert.equal(attestedHead(body), null);
+  });
+
+  it("fails closed when the block counts fewer than the emitted bucket, not only zero", () => {
+    assert.equal(attestedHead(counted('{"critical":1,"important":0}', "### Critical Issues (3)")), null);
+    // Controls: agreeing, and a block reporting more, both still attest.
+    assert.equal(attestedHead(counted('{"critical":3,"important":0}', "### Critical Issues (3)")), HEAD);
+    assert.equal(attestedHead(counted('{"critical":3,"important":0}', "### Critical Issues (1)")), HEAD);
+  });
+
+  // Ally, #1721 at 5f4d5302, Important 3: the head rule must compare the bytes
+  // the gate reads. A fenced copy of the emitted line made the raw prose
+  // ambiguous, so this fell back to the block head the gate refuses.
+  it("reads the prose attestation over fence-stripped text", () => {
+    const OTHER = "b".repeat(40);
+    const line = `Reviewed head: ${OTHER}`;
+    assert.equal(attestedHead(counted('{"critical":0,"important":0}', line, "```", line, "```")), null);
+  });
+
+  // Ally, #1721 at 5f4d5302, Critical 3 and Important 4.
+  it("reads a CRLF body exactly as its LF twin", () => {
+    const bodies = [
+      counted('{"critical":0,"important":0}', `Reviewed head: ${HEAD}`, "```ts", "x", "```"),
+      ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`, "### Critical Issues (0)"].join("\n"),
+      counted('{"critical":0,"important":0}', `Reviewed head: ${HEAD}`, "```ts", "### Critical Issues (2)", "```"),
+    ];
+    for (const lf of bodies) {
+      const crlf = lf.replace(/\n/g, "\r\n");
+      assert.equal(attestedHead(crlf), attestedHead(lf), JSON.stringify(crlf));
+      assert.equal(canonicalReviewHead(crlf), canonicalReviewHead(lf), JSON.stringify(crlf));
+      assert.notEqual(attestedHead(lf), null, JSON.stringify(lf));
+    }
+  });
+
+  it("anchors the attestation on `\\n` exactly as the gate does", () => {
+    // JS's multiline `$` also stops before U+2028, which the gate's
+    // `(?=\n|$)` does not, so this credited a line the gate cannot read.
+    const body = ["## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}\u2028trailing`].join("\n");
+    assert.equal(attestedHead(body), null);
   });
 
   it("does not fail closed on a referenced, quoted or fenced bucket", () => {
