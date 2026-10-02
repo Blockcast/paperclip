@@ -2517,6 +2517,70 @@ export function normalizeHttpRoute(route: string | null | undefined): string {
   return bounded;
 }
 
+/**
+ * One increment per inbound GitHub webhook delivery, whatever the event and
+ * whatever the outcome (BLO-39378). This is the *delivery* counter, not a
+ * consumer-side one: it is incremented by the receiver itself, so its
+ * flatlining is the fault rather than a symptom of one.
+ *
+ * It exists because {@link GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC} cannot see
+ * the failure shape where the api is healthy but GitHub stops delivering —
+ * secret rotated, hook disabled, endpoint 404ing, GitHub-side incident. That
+ * counter has no denominator for deliveries that *should* have arrived, so a
+ * dead webhook and a genuinely quiet CI window emit a byte-identical flat
+ * series and no threshold on it can separate them. `absent()` is the wrong
+ * instrument there too: the series is present (zero-initialised on every
+ * replica), it just stops moving. Across *all* event types the fleet pushes
+ * continuously, so "zero deliveries of any kind in N minutes" is actionable
+ * where "zero workflow_run completions" is not.
+ *
+ * `outcome="rejected_signature"` is deliberately a first-class value rather
+ * than folded into `error`: a rotated-or-mismatched secret is one of the
+ * named shape-B causes, and it presents as healthy delivery *volume* with
+ * nothing accepted — invisible to a count that only measures arrival.
+ *
+ * Cardinality ceiling: KNOWN_GITHUB_WEBHOOK_EVENTS (9, including the
+ * `other` bucket) x KNOWN_GITHUB_WEBHOOK_OUTCOMES (3) = 27 series per
+ * replica, fixed at compile time. No repo, PR number, sender or SHA label —
+ * and `event` is normalized against the allowlist precisely because it
+ * originates in the attacker-controlled `x-github-event` header on a request
+ * that is counted *before* its signature is verified.
+ */
+export const GITHUB_WEBHOOK_DELIVERY_METRIC = "paperclip_github_webhook_delivery_total";
+
+// Every event this receiver branches on today, plus `ping` — which GitHub
+// sends on hook (re)creation and is the one delivery that is literal proof
+// the hook is alive. Unrecognized values collapse into `other`; growing this
+// list is a deliberate act, which is the point.
+export const KNOWN_GITHUB_WEBHOOK_EVENTS = [
+  "check_run",
+  "check_suite",
+  "dependabot_alert",
+  "issue_comment",
+  "ping",
+  "pull_request",
+  "pull_request_review",
+  "workflow_run",
+] as const;
+
+export const UNKNOWN_GITHUB_WEBHOOK_EVENT = "other";
+
+export const KNOWN_GITHUB_WEBHOOK_OUTCOMES = [
+  "accepted",
+  "rejected_signature",
+  "error",
+] as const;
+
+export type GithubWebhookDeliveryOutcome = (typeof KNOWN_GITHUB_WEBHOOK_OUTCOMES)[number];
+
+const knownGithubWebhookEventSet: ReadonlySet<string> = new Set(KNOWN_GITHUB_WEBHOOK_EVENTS);
+
+export function normalizeGithubWebhookEvent(event: string | null | undefined): string {
+  return typeof event === "string" && knownGithubWebhookEventSet.has(event)
+    ? event
+    : UNKNOWN_GITHUB_WEBHOOK_EVENT;
+}
+
 export const KNOWN_AUTH_OPERATIONS = [
   "oidc_start",
   "oidc_callback",
@@ -3248,6 +3312,7 @@ let githubReviewCompletion: Counter<"status"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
+let githubWebhookDelivery: Counter<"event" | "outcome"> | null = null;
 let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
@@ -3396,6 +3461,7 @@ function ensureRegistry(): {
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
+  githubWebhookDeliveryCounter: Counter<"event" | "outcome">;
   queuedRunOldestAgeGauge: Gauge<"agent_id">;
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
@@ -3497,6 +3563,7 @@ function ensureRegistry(): {
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
+    || !githubWebhookDelivery
     || !queuedRunOldestAge
     || !overdueScheduledRetryOldestAge
     || !overdueScheduledRetryAgeMetricsRefreshSuccess
@@ -4192,6 +4259,31 @@ function ensureRegistry(): {
     for (const conclusion of [...KNOWN_WORKFLOW_RUN_CONCLUSIONS, UNKNOWN_WORKFLOW_RUN_CONCLUSION]) {
       for (const supersession of KNOWN_WORKFLOW_RUN_SUPERSESSIONS) {
         githubWorkflowRunConclusion.inc({ conclusion, supersession }, 0);
+      }
+    }
+    githubWebhookDelivery = new Counter({
+      name: GITHUB_WEBHOOK_DELIVERY_METRIC,
+      help:
+        "Count of inbound GitHub webhook deliveries at the receiver, labeled by bounded "
+        + "event and outcome (BLO-39378). One increment per delivery, whatever the event "
+        + "and whatever the outcome -- including signature rejections, which are counted "
+        + "because a rotated secret presents as healthy delivery volume with nothing "
+        + "accepted. Unlike " + GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC + ", which counts "
+        + "only what a healthy webhook delivered, the FLATLINING of this counter is "
+        + "itself the fault: `sum(increase(...[window])) == 0` says 'we received zero "
+        + "deliveries of any kind', which is actionable because the fleet pushes "
+        + "continuously. Zero-initialized across the full event x outcome grid on every "
+        + "replica so that `== 0` evaluates rather than returning an empty vector -- do "
+        + "NOT alert on absent() here, which that zero-init deliberately defeats. "
+        + "`event` is normalized against a compile-time allowlist because it originates "
+        + "in the x-github-event header of a request counted before its signature is "
+        + "verified; cardinality is fixed at 9 x 3 regardless of fleet growth.",
+      labelNames: ["event", "outcome"],
+      registers: [registry],
+    });
+    for (const event of [...KNOWN_GITHUB_WEBHOOK_EVENTS, UNKNOWN_GITHUB_WEBHOOK_EVENT]) {
+      for (const outcome of KNOWN_GITHUB_WEBHOOK_OUTCOMES) {
+        githubWebhookDelivery.inc({ event, outcome }, 0);
       }
     }
     queuedRunOldestAge = new Gauge({
@@ -4908,6 +5000,7 @@ function ensureRegistry(): {
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
+    githubWebhookDeliveryCounter: githubWebhookDelivery,
     queuedRunOldestAgeGauge: queuedRunOldestAge,
     overdueScheduledRetryOldestAgeGauge: overdueScheduledRetryOldestAge,
     overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
@@ -6114,6 +6207,28 @@ export function recordGithubWorkflowRunConclusion(
 }
 
 /**
+ * Record one inbound GitHub webhook delivery (BLO-39378). Call exactly once
+ * per delivery, on every exit path including signature rejection and
+ * unhandled error — a delivery that is counted only when it succeeds cannot
+ * distinguish "deliveries stopped" from "deliveries are all being rejected",
+ * and both are shape-B faults.
+ *
+ * `event` is normalized against the allowlist here rather than at the call
+ * site, so an untrusted `x-github-event` header can never mint a new series.
+ */
+export function recordGithubWebhookDelivery(input: {
+  event: string | null | undefined;
+  outcome: GithubWebhookDeliveryOutcome;
+}): string {
+  const eventLabel = normalizeGithubWebhookEvent(input.event);
+  ensureRegistry().githubWebhookDeliveryCounter.inc({
+    event: eventLabel,
+    outcome: input.outcome,
+  });
+  return eventLabel;
+}
+
+/**
  * Snapshot the oldest-overdue-`scheduled_retry`-row age per agent (BLO-22094).
  * Same reset-then-set contract as {@link setQueuedRunOldestAgeMetrics}: an
  * agent absent from `entries` must read back an explicit 0, not a frozen
@@ -7016,6 +7131,7 @@ export function __resetMetricsForTest(): void {
   agentWakeupTerminalFailedUnresolved = null;
   agentWakeupTerminalFailedOldestAge = null;
   githubWorkflowRunConclusion = null;
+  githubWebhookDelivery = null;
   queuedRunOldestAge = null;
   overdueScheduledRetryOldestAge = null;
   overdueScheduledRetryAgeMetricsRefreshSuccess = null;
