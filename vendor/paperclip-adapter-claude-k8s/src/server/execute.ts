@@ -1575,21 +1575,6 @@ async function logQuietly(
 }
 
 /**
- * Reap the on-disk pod log for a finished run.  Best-effort: a missing file is
- * the normal case (the pod may never have written one), so ENOENT is silent.
- * Any other failure is surfaced, because a log we failed to delete for a real
- * reason accumulates on the shared PVC and nothing else reports it.
- *
- * `reportMissing` flips the silence off for the *foreign*-run reap (BLO-39114).
- * There the caller is deleting another run's Job and gets the path from that
- * Job's `paperclip.io/pod-log-path` annotation, so "no path" and "path not
- * there" are states worth naming: the first means we knowingly leaked a file
- * (a Job predating the annotation), the second means there was nothing to
- * leak.  They are reported on different streams because only the first is a
- * problem — warning on both would cry wolf on every orphan whose pod died
- * before it ever wrote a log, which is the common case.
- */
-/**
  * Is this string plausibly a pod log we are allowed to unlink?
  *
  * Only the foreign-reap path needs this: it reads the path off a mutable
@@ -1605,6 +1590,21 @@ export function isReapablePodLogPath(podLogPath: string): boolean {
     && !podLogPath.split("/").includes("..");
 }
 
+/**
+ * Reap the on-disk pod log for a finished run.  Best-effort: a missing file is
+ * the normal case (the pod may never have written one), so ENOENT is silent.
+ * Any other failure is surfaced, because a log we failed to delete for a real
+ * reason accumulates on the shared PVC and nothing else reports it.
+ *
+ * `reportMissing` flips the silence off for the *foreign*-run reap (BLO-39114).
+ * There the caller is deleting another run's Job and gets the path from that
+ * Job's `paperclip.io/pod-log-path` annotation, so "no path" and "path not
+ * there" are states worth naming: the first means we knowingly leaked a file
+ * (a Job predating the annotation), the second means there was nothing to
+ * leak.  They are reported on different streams because only the first is a
+ * problem — warning on both would cry wolf on every orphan whose pod died
+ * before it ever wrote a log, which is the common case.
+ */
 async function reapPodLogFile(
   podLogPath: string | undefined,
   jobName: string,
