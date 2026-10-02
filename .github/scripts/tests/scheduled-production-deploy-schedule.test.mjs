@@ -55,6 +55,25 @@ const pendingReadRegion = (() => {
 })();
 
 /**
+ * Just the read itself: the `gh api` reads through the `jq -s` that writes
+ * `$PENDING_JSON_PATH`. The query/status assertions scope HERE, not to the whole
+ * region, because the region also holds the step-summary line
+ * `WAITING="$(jq '[.[] | select(.status == "waiting")] | length' ...)"`. That line
+ * always contributes `waiting`, so a filter rewritten in a form the derivation
+ * cannot read (`IN(...)`, `test("x")`) still yields a non-empty `counted` — the
+ * `counted.length > 0` fail-safe never fires, and `queued`/`in_progress` quietly
+ * lose their second source. Scoping to the pipeline is what lets that guard fire.
+ */
+const pendingReadPipeline = (() => {
+  const start = pendingReadRegion.indexOf('gh api');
+  const end = pendingReadRegion.indexOf('> "$PENDING_JSON_PATH"');
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error('expected guard (1) to pipe `gh api` reads into "$PENDING_JSON_PATH"');
+  }
+  return pendingReadRegion.slice(start, end);
+})();
+
+/**
  * The entries of the workflow's TOP-LEVEL `permissions:` block, in order.
  *
  * Scoped deliberately. Matching `actions:\s*write` against the whole file lets a
@@ -587,7 +606,7 @@ test('guard (1) unions independent run queries, so a stale slice cannot zero it'
   // sound: a stale slice can only REMOVE rows from a result, so a union of
   // differently-filtered reads cannot produce a false zero. One read alone can.
   // Dropping a query, or collapsing the union, restores the defect silently.
-  const queries = [...pendingReadRegion.matchAll(/actions\/workflows\/[^/]+\/runs\?([^"'\s]+)/g)].map(
+  const queries = [...pendingReadPipeline.matchAll(/actions\/workflows\/[^/]+\/runs\?([^"'\s]+)/g)].map(
     (m) => m[1],
   );
   assert.ok(
@@ -606,7 +625,7 @@ test('guard (1) unions independent run queries, so a stale slice cannot zero it'
   // `or .status == "x"` arm land with no query. That arm is then single-sourced on
   // the stale event read, which fails as a silent false zero rather than an error,
   // so nothing else would catch it.
-  const counted = [...new Set([...pendingReadRegion.matchAll(/\.status\s*==\s*"([a-z_]+)"/g)].map((m) => m[1]))];
+  const counted = [...new Set([...pendingReadPipeline.matchAll(/\.status\s*==\s*"([a-z_]+)"/g)].map((m) => m[1]))];
   assert.ok(counted.length > 0, 'expected guard (1) to filter on `.status == "..."`');
   for (const status of counted) {
     assert.ok(
@@ -628,5 +647,5 @@ test('guard (1) step sets pipefail, so a failed read aborts instead of reading a
   // pipeline's status is jq's, which succeeds on empty input: a failed read becomes
   // PENDING=0, the BLO-38907 false zero. `set -e` alone does not catch it.
   const step = pendingReadRegion.slice(pendingReadRegion.lastIndexOf('run: |'));
-  assert.match(step, /^\s*set\s+-\w*o\s+pipefail\b/m, 'guard (1) step must `set -o pipefail`');
+  assert.match(step, /^\s*set\s+-[\w\s-]*o\s+pipefail\b/m, 'guard (1) step must `set -o pipefail`');
 });
