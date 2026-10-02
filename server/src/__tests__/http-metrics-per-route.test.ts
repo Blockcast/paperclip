@@ -1,3 +1,6 @@
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -320,6 +323,75 @@ describe("per-route HTTP status instrumentation (PEN-3702)", () => {
 
     const empty = await call(buildApp(), "get", "/api/companies/c1/approvals", 200);
     expect(empty.body).toEqual([]);
+  });
+
+  /**
+   * A request the client abandons (or the ingress times out) never emits
+   * `finish`, so a finish-only listener drops it from the counter entirely --
+   * in exactly the hung-request regime a pool excursion produces.
+   */
+  describe("aborted and completed responses", () => {
+    function deferred() {
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => {
+        resolve = r;
+      });
+      return { promise, resolve };
+    }
+
+    const total = async () =>
+      (await seriesFor(HTTP_REQUESTS_METRIC)).reduce((s, v) => s + v.value, 0);
+
+    it('counts a client-aborted request exactly once, on the "0" status sentinel', async () => {
+      const arrived = deferred();
+      const closed = deferred();
+      const app = express();
+      app.use(httpMetricsMiddleware());
+      app.get("/hangs", (_req, res) => {
+        // Registered after the middleware's listeners, so it fires after them.
+        res.once("close", closed.resolve);
+        arrived.resolve();
+        // Never responds: the shape of a request stuck on an exhausted pool.
+      });
+
+      const server = http.createServer(app);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const { port } = server.address() as AddressInfo;
+        const clientReq = http.get({ host: "127.0.0.1", port, path: "/hangs" });
+        clientReq.on("error", () => {
+          // The abort below surfaces client-side as a socket hang up.
+        });
+        await arrived.promise;
+        clientReq.destroy();
+        await closed.promise;
+      } finally {
+        server.closeAllConnections();
+        await new Promise((resolve) => server.close(resolve));
+      }
+
+      expect(await requests({ route: "/hangs", method: "GET", status: "0" })).toBe(1);
+      // Node's default statusCode is 200; an abort must not masquerade as one.
+      expect(await requests({ status: "200" })).toBe(0);
+      expect(await total()).toBe(1);
+    });
+
+    it("counts a completed response once even though close also fires", async () => {
+      const closed = deferred();
+      const app = express();
+      app.use(httpMetricsMiddleware());
+      app.get("/items", (_req, res) => {
+        res.once("close", closed.resolve);
+        res.json([]);
+      });
+
+      await call(app, "get", "/items", 200);
+      await closed.promise;
+
+      expect(await requests({ route: "/items", method: "GET", status: "200" })).toBe(1);
+      expect(await empties({ route: "/items", status: "200" })).toBe(1);
+      expect(await total()).toBe(1);
+    });
   });
 
   /**
