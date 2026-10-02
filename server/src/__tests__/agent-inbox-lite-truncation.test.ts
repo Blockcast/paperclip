@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ISSUE_LIST_APPLIED_LIMIT_HEADER,
   ISSUE_LIST_TRUNCATED_HEADER,
@@ -317,8 +317,17 @@ describe("REST — GET /api/agents/me/inbox-lite (BLO-39015)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // The route reads PAPERCLIP_IN_WORKTREE straight off process.env, so the
+    // `isWorktreeRuntime` argument the service tests above pass cannot reach
+    // it. Left set by the caller, it empties every page while the header
+    // assertions still pass.
+    vi.stubEnv("PAPERCLIP_IN_WORKTREE", "");
     mockIssueService.listDependencyReadiness.mockResolvedValue(new Map());
     mockRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it("at cap + 1 available rows: returns exactly cap rows and sets both headers", async () => {
@@ -361,7 +370,10 @@ describe("REST — GET /api/agents/me/inbox-lite (BLO-39015)", () => {
     );
   });
 
-  it.each(["-1", "abc", "1.5", ""])(
+  // The 309-digit case passes `^\d+$` and parses to Infinity, so it is the only
+  // one here that can tell "rejects bad offsets" from "rejects offsets that
+  // fail the regex": the other four never reach the parse.
+  it.each(["-1", "abc", "1.5", "", "9".repeat(309)])(
     "rejects offset=%j with 400 rather than silently serving window 0",
     async (offset) => {
       serveRestPopulation(CAP + 1);
