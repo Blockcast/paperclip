@@ -1,4 +1,11 @@
+import express from "express";
+import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  ISSUE_LIST_APPLIED_LIMIT_HEADER,
+  ISSUE_LIST_TRUNCATED_HEADER,
+} from "../lib/issue-list-query.js";
+import { ISSUE_LIST_DEFAULT_LIMIT } from "../services/issues.js";
 import { loadAgentInboxLite } from "../services/agent-inbox-lite.js";
 
 // BLO-39015: `inbox-lite` is capped and ordered `priority` ASC, so on a lane
@@ -23,6 +30,29 @@ const mockIssueService = {
 const mockRecoveryActionService = {
   listActiveForIssues: vi.fn(),
 };
+
+// The REST block below drives the real `routes/agents.ts` handler, so the two
+// services it reaches for have to come back from the module graph rather than
+// from a hand-passed argument. `loadAgentInboxLite` is imported directly from
+// `../services/agent-inbox-lite.js` by both the route and this file, so it
+// stays REAL under these mocks — which is the point: the probe, the filters and
+// the header emission are all exercised as shipped.
+vi.mock("../services/index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/index.js")>();
+  return {
+    ...actual,
+    issueService: () => mockIssueService,
+    issueRecoveryActionService: () => mockRecoveryActionService,
+  };
+});
+
+vi.mock("../services/instance-settings.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/instance-settings.js")>();
+  return {
+    ...actual,
+    instanceSettingsService: () => ({ getExperimental: async () => ({}) }),
+  };
+});
 
 type LoadInboxInput = Parameters<typeof loadAgentInboxLite>[0];
 
@@ -229,3 +259,120 @@ describe("agent inbox-lite truncation signal (BLO-39015)", () => {
 // The MCP half of this contract — headers -> an object the agent cannot read past —
 // is pinned in packages/mcp-server/src/tools.test.ts, where the tool is exercised
 // against a mocked fetch. The contract is the pair; keep them in step.
+
+/**
+ * The glue between the two halves above, which neither of them covers.
+ *
+ * `routes/agents.ts` is the ONLY place `inbox.truncated` becomes
+ * `X-Result-Truncated`, and the only place `offset` is validated. Without this
+ * block you can delete the `res.setHeader` call and every other test in this PR
+ * still passes while the MCP envelope silently never fires — i.e. the exact
+ * silent-prefix defect BLO-39015 exists to kill, restored with a green suite.
+ *
+ * Mutation-checked per the 2026-09-17 rule, each guard reverted ALONE:
+ *   - drop `res.setHeader(ISSUE_LIST_TRUNCATED_HEADER)` -> the cap+1 case fails;
+ *   - drop `res.setHeader(ISSUE_LIST_APPLIED_LIMIT_HEADER)` -> both cap cases fail;
+ *   - drop the `parseOffsetParam === null` 400 -> both rejection cases fail;
+ *   - pass a literal `0` instead of `parsedOffset` -> the paging case fails.
+ */
+describe("REST — GET /api/agents/me/inbox-lite (BLO-39015)", () => {
+  const CAP = ISSUE_LIST_DEFAULT_LIMIT;
+
+  function restRow(index: number) {
+    return row(`rest-${String(index).padStart(4, "0")}`, "medium");
+  }
+
+  /** Honour whatever limit AND offset the route asks for: a mock that ignored
+   *  `limit` would make the suite pass against a route that never over-fetches,
+   *  and one that ignored `offset` would replay window 0 forever. */
+  function serveRestPopulation(population: number) {
+    mockIssueService.list.mockImplementation(
+      async (_companyId: string, filters: { limit?: number; offset?: number }) => {
+        const offset = filters.offset ?? 0;
+        const limit = filters.limit ?? population;
+        return Array.from({ length: population }, (_, i) => restRow(i)).slice(offset, offset + limit);
+      },
+    );
+  }
+
+  async function buildApp() {
+    const { agentRoutes } = await import("../routes/agents.js");
+    const { errorHandler } = await import("../middleware/index.js");
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as unknown as { actor: unknown }).actor = {
+        type: "agent",
+        agentId: "22222222-2222-4222-8222-222222222222",
+        companyId: "company-1",
+        source: "agent_key",
+        runId: "run-1",
+      };
+      next();
+    });
+    app.use("/api", agentRoutes({} as never, {} as never));
+    app.use(errorHandler);
+    return app;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockIssueService.listDependencyReadiness.mockResolvedValue(new Map());
+    mockRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
+  });
+
+  it("at cap + 1 available rows: returns exactly cap rows and sets both headers", async () => {
+    serveRestPopulation(CAP + 1);
+
+    const res = await request(await buildApp()).get("/api/agents/me/inbox-lite");
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body).toHaveLength(CAP);
+    expect(res.headers[ISSUE_LIST_TRUNCATED_HEADER.toLowerCase()]).toBe("true");
+    expect(res.headers[ISSUE_LIST_APPLIED_LIMIT_HEADER.toLowerCase()]).toBe(String(CAP));
+  });
+
+  it("at cap - 1 available rows: returns every row and OMITS the truncation header", async () => {
+    serveRestPopulation(CAP - 1);
+
+    const res = await request(await buildApp()).get("/api/agents/me/inbox-lite");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(CAP - 1);
+    // Absence is the contract: no header is what a caller reads as "you have
+    // every row". A header that is always present carries no information.
+    expect(res.headers[ISSUE_LIST_TRUNCATED_HEADER.toLowerCase()]).toBeUndefined();
+    expect(res.headers[ISSUE_LIST_APPLIED_LIMIT_HEADER.toLowerCase()]).toBe(String(CAP));
+  });
+
+  it("pages the tail with offset rather than replaying window 0", async () => {
+    serveRestPopulation(CAP + 3);
+
+    const res = await request(await buildApp())
+      .get("/api/agents/me/inbox-lite")
+      .query({ offset: String(CAP) });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(3);
+    expect(res.headers[ISSUE_LIST_TRUNCATED_HEADER.toLowerCase()]).toBeUndefined();
+    expect(res.body.map((r: { id: string }) => r.id)).toEqual(
+      [CAP, CAP + 1, CAP + 2].map((i) => restRow(i).id),
+    );
+  });
+
+  it.each(["-1", "abc", "1.5", ""])(
+    "rejects offset=%j with 400 rather than silently serving window 0",
+    async (offset) => {
+      serveRestPopulation(CAP + 1);
+
+      const res = await request(await buildApp())
+        .get("/api/agents/me/inbox-lite")
+        .query({ offset });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/offset/);
+      expect(mockIssueService.list).not.toHaveBeenCalled();
+    },
+  );
+});

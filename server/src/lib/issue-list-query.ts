@@ -19,6 +19,26 @@ export function parseUnsupportedPaginationParams(query: {
   ];
 }
 
+/**
+ * Parse an `offset` query param for a paged issue-list surface.
+ *
+ * Returns the offset, or `null` when the caller supplied something that is not
+ * a non-negative integer — callers reject that with a 400 rather than silently
+ * replaying window 0, which is the BLO-24495 failure one param over.
+ *
+ * `^\d+$` already guarantees integrality and sign, so there is no second
+ * `Number.isInteger`/`< 0` arm: the two route copies this replaces both carried
+ * one and it was unreachable in both.
+ *
+ * Lives here, not in services/issues.ts, for the same reason as
+ * {@link parseUnsupportedPaginationParams} — that module is wholesale-mocked by
+ * the route suites and a hot-path import from it resolves to undefined there.
+ */
+export function parseOffsetParam(raw: unknown): number | null {
+  if (raw === undefined) return 0;
+  return typeof raw === "string" && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : null;
+}
+
 // BLO-33741: the same endpoint clamps an oversized `limit` to
 // ISSUE_LIST_MAX_LIMIT and returns a bare JSON array — no total, no cursor. A
 // caller that asks for 3000 and gets 1000 cannot tell "that is all of them"
