@@ -29,7 +29,7 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stable-enumeration-");
     db = createDb(tempDb.connectionString);
     // No per-hook override: embedded Postgres takes ~40s to start on a contended runner,
-    // so the 20s this file used to pin here timed the hook out and skipped all 12 tests
+    // so the 20s this file used to pin here timed the hook out and skipped the whole file
     // while reporting a failed suite. vitest.config.ts already sets hookTimeout to 120s
     // for exactly this reason; inherit it rather than re-pinning a tighter one.
   });
@@ -392,10 +392,9 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     // short-return fires BEFORE the keyset branch can dereference, on the first page at the
     // default size (2 < 1000, so no empty page is ever fetched) and on the empty page at
     // `pageSize <= 2` — so `?? 1` and `?? ISSUE_LIST_MAX_LIMIT` are indistinguishable to this
-    // assertion. Pinning
-    // the value needs the ISSUE_LIST_MAX_LIMIT + 1 fixture this file deliberately does not
-    // seed — that fixture is what forced the `120_000` timeout this PR removed, so the trade
-    // is deliberate.
+    // assertion. Pinning the value needs the ISSUE_LIST_MAX_LIMIT + 1 fixture this file
+    // deliberately does not seed — that fixture is what forced the `120_000` timeout this PR
+    // removed, so the trade is deliberate.
     //
     // Deleting the `??` outright is caught by the type checker rather than by this test:
     // walkIssueListPages takes `pageSize: number` while `opts.issueCountWalk?.pageSize` is
