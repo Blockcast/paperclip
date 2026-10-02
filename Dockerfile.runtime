@@ -92,10 +92,13 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # tree at runtime: the Helm seed only reads package.json out of it, and the
 # agent entrypoint never touches /opt. The directory inode matters as much as
 # its contents, because a root-owned file inside a node-owned directory can
-# still be replaced by rename(2).
+# still be replaced by rename(2). The trailing `stat` asserts the inode we
+# actually produced: a RUNTIME_BASE_IMAGE that began shipping this directory
+# node-owned would satisfy every source-text check without the build failing.
 RUN mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
   && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \
-  && chown -R node:node /paperclip
+  && chown -R node:node /paperclip \
+  && test "$(stat -c %U:%G /opt/paperclip-bundled-adapters)" = root:root
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/paperclip-consult-codex.sh /usr/local/bin/paperclip-consult-codex
