@@ -2322,6 +2322,21 @@ const STARVATION_RECOVERY_ESCALATION_MS = 10 * 60 * 1000;
 // If another process has just finalized a run while its k8s Job is still
 // visible, do not immediately delete that live Job. The adapter process may
 // still be awaiting/synchronizing the Job and should be allowed to finish.
+//
+// PEN-3674: this constant now backs three call sites with related but not
+// identical semantics. Read all three before changing the value.
+//   1. Job deletion (the original case above) — a grace after finalization,
+//      protecting a Job that already EXISTS.
+//   2. `isolationSetupGraceActive` in the reservation reclaim sweep — keyed on
+//      `reservation.updatedAt`, which last moves at
+//      `markExternalRuntimeReservationLaunching`.
+//   3. The orphaned-lease reclaim sweep — keyed on the newer of the lease's
+//      `acquired_at`/`last_used_at`, which is strictly LATER than (2)'s clock.
+// (2) and (3) are the inverse of (1): they bound a runtime that is STARTING,
+// not one that has stopped, and for them the value is a floor on how long a
+// pre-Job launch may take. So SHORTENING it widens their exposure — it does not
+// merely reclaim sooner — while lengthening it slows every reclaim this sweep
+// exists for. Neither direction is free.
 const EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS = 5 * 60 * 1000;
 // PEN-3640: how long an unreleased external-runtime reservation may sit before
 // the reclaim sweep names the branch that is refusing it. Every skip in
@@ -26492,6 +26507,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterType: agents.adapterType,
         status: heartbeatRuns.status,
         error: heartbeatRuns.error,
+        leaseAcquiredAt: environmentLeases.acquiredAt,
+        leaseLastUsedAt: environmentLeases.lastUsedAt,
       })
       .from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
@@ -26503,8 +26520,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       );
 
+    // PEN-3674: the lease clock this sweep judges against is the NEWER of
+    // `acquired_at` and `last_used_at`. `acquired_at` never moves after the
+    // lease is taken; `last_used_at` is refreshed by `updateLeaseMetadata`
+    // when realization metadata is persisted mid-setup, so the pair is the
+    // closest thing the lease row has to a liveness signal. Taking the max
+    // can only ever defer a release, never hasten one.
+    const leaseClockMs = (row: { leaseAcquiredAt: Date; leaseLastUsedAt: Date }) =>
+      Math.max(new Date(row.leaseAcquiredAt).getTime(), new Date(row.leaseLastUsedAt).getTime());
+
+    // PEN-3674: keep the NEWEST lease per run, by that same expression.
+    // Release is per-run and all-or-nothing (`releaseEnvironmentLeasesForRun`
+    // below releases every active lease the run holds), so the launch-window
+    // grace has to be judged against the youngest of them: deferring a pass on
+    // an old lease costs one pass, releasing a young one cannot be undone.
     const uniqueRuns = new Map<string, (typeof orphanedRows)[number]>();
-    for (const row of orphanedRows) uniqueRuns.set(row.runId, row);
+    for (const row of orphanedRows) {
+      const seen = uniqueRuns.get(row.runId);
+      if (!seen || leaseClockMs(row) > leaseClockMs(seen)) uniqueRuns.set(row.runId, row);
+    }
 
     let releasedRunCount = 0;
     for (const run of uniqueRuns.values()) {
@@ -26548,6 +26582,90 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // across the pair, but do not rely on the Job arm being live here.
         if (!hasExternalLifecycle(run.adapterType) && activeRunExecutions.has(run.runId)) continue;
         if (hasExternalLifecycle(run.adapterType)) {
+          // PEN-3674: launch-window grace, and it has to come BEFORE the
+          // quiescence probe because the probe cannot see this hazard.
+          //
+          // `confirmStaleKilledJobQuiesced` is fail-closed against an
+          // *unobservable* runtime (a null kube read keeps the lease), but it
+          // is not fail-closed against a *not-yet-existent* one. A lease is
+          // acquired on the launch path strictly before the Job is created, so
+          // inside that window a run that is already status-terminal — a
+          // cancel racing its own launch — presents with no reservation
+          // `jobName` (so the Job arm is skipped entirely and `quiesced` stays
+          // true) and no run-labelled pods (so the pod arm reads an observable
+          // empty list). Both arms therefore report "quiesced" for a runtime
+          // that is still on its way up, and the sweep releases the lease out
+          // from under a Job that is about to start.
+          //
+          // Before BLO-32052 narrowed the guard above, the stale
+          // `activeRunExecutions` entry masked this: such a run was in the Set
+          // and skipped outright. Narrowing the guard is correct and is what
+          // unwedges the 100h+ strands this sweep exists for — but it is also
+          // what exposes this window, so the two changes belong together.
+          //
+          // ⛔ This is a bounded floor, NOT a setup-activity grace, and it does
+          // NOT cover an arbitrarily long pre-Job setup. Ally raised exactly
+          // that on #2179 and the finding is correct; what follows is the
+          // measured ordering, because the parity direction in the finding is
+          // inverted and that changes what the remaining exposure is.
+          //
+          // The four launch-path anchors are straight-line inside `executeRun`:
+          //   1. `markExternalRuntimeReservationLaunching` — the last
+          //      `reservation.updatedAt` bump before the Job.
+          //   2. `acquireForRun` — lease created, `acquired_at` =
+          //      `last_used_at` = now.
+          //   3. `realizeForRun` — realize → provision (`timeoutMs: 300_000`,
+          //      i.e. the whole of this constant), then `updateLeaseMetadata`
+          //      bumps `last_used_at`.
+          //   4. `recordExpectedExternalRuntimeJobName` — sets `expectedJobName`
+          //      and ends the sibling's grace.
+          //
+          // Nothing writes the reservation between (1) and (4). So the
+          // sibling's clock is frozen at (1), strictly EARLIER than this arm's
+          // (2): `isolationSetupGraceActive` lapses FIRST, not last. This arm
+          // is the later-expiring of the two, not the laggard — so do not
+          // "restore parity" by shortening it.
+          //
+          // Taking the newer of `acquired_at`/`last_used_at` closes the (3)→(4)
+          // tail for free, and the dedup above keys off the same expression.
+          // It does NOT rescue the cited slow-provision case: the only refresh
+          // in that span lands at the END of (3), after provision returns, so
+          // at the moment the floor lapses the clock is still `acquired_at`. A
+          // run whose provision burns the full 300 s can therefore still reach
+          // the floor with no Job. This SHRINKS the window; it does not close
+          // it. Closing it needs a positive "not yet launched" signal — the
+          // reservation's own pre-Job state — not a longer timer, and
+          // lengthening the constant here would trade this race for a slower
+          // reclaim of the strands the sweep exists for.
+          //
+          // The constant is shared with `isolationSetupGraceActive` in the
+          // sibling reservation sweep above, which declines to act on a pre-Job
+          // (`!jobName`) row this recently touched. Same defect class, same
+          // remedy, same tunable — but see the ordering above: the reference
+          // timestamps differ, so this is not a claim of equivalent coverage.
+          // Gating on age alone — rather than also re-deriving `jobName` here —
+          // needs no extra query; a Job that does exist and is still active is
+          // retained by the probe below regardless.
+          const leaseAgeMs = Date.now() - leaseClockMs(run);
+          if (leaseAgeMs < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS) {
+            // PEN-3674: the production frequency of this window is unmeasured —
+            // the row proves it reachable, not common. Log the deferral so it
+            // becomes a countable event once deployed rather than staying a
+            // hypothesis. The sibling is silent, but this is the change that
+            // raised the question.
+            logger.debug(
+              {
+                runId: run.runId,
+                companyId: run.companyId,
+                agentId: run.agentId,
+                adapterType: run.adapterType,
+                leaseAgeMs,
+                graceMs: EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS,
+              },
+              "orphaned_lease_launch_grace_deferred",
+            );
+            continue;
+          }
           // Background Job deletion does not prove that the Job or its
           // run-labelled pods have stopped. Reuse the same fail-closed probe as
           // cancellation: an active or unobservable external runtime keeps the
