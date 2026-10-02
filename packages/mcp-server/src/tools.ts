@@ -6,6 +6,7 @@ import {
   createApprovalSchema,
   createIssueInputSchema,
   createMilestoneSchema,
+  issueExecutionMonitorPolicySchema,
   issueThreadInteractionContinuationPolicySchema,
   requestCheckboxConfirmationPayloadSchema,
   requestConfirmationPayloadSchema,
@@ -170,6 +171,10 @@ const checkoutIssueToolSchema = z.object({
   agentId: agentIdOptional,
   expectedStatuses: checkoutIssueSchema.shape.expectedStatuses.optional(),
 });
+
+const setIssueMonitorToolSchema = z.object({
+  issueId: issueIdSchema,
+}).merge(issueExecutionMonitorPolicySchema);
 
 const addCommentToolSchema = z.object({
   issueId: issueIdSchema,
@@ -677,6 +682,20 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
             expectedStatuses: expectedStatuses ?? ["todo", "backlog", "blocked", "in_review"],
           },
         }),
+    ),
+    makeTool(
+      "paperclipSetIssueMonitor",
+      "Arm or re-arm an issue monitor (wake) and NOTHING ELSE. Prefer this over `paperclipUpdateIssue`'s `executionPolicy.monitor`: that path REPLACES the whole `executionPolicy`, so arming through it means read-modify-write — re-send the complete current policy or you silently delete another agent's `stages`, `reviewPreset` and `authorizationPolicy`, and you race whoever else is writing the row. This call touches the monitor only, so there is nothing to read first and nothing to lose. Same authorization as the legacy path (assignee agent, the agent holding the current execution run, or a board user). Re-arming supersedes a `triggered` monitor, but `attemptCount` survives, so re-sending a `maxAttempts` at or below that count (or a past `timeoutAt`) is still rejected 422 as exhausted — use paperclipClearIssueMonitor for a wedged one. Monitors only hold on an `in_progress`/`in_review` issue assigned to an agent, and an unresolved `blockedBy` edge suppresses the wake, so ALWAYS re-read `monitorNextCheckAt` and treat `null` as failure rather than reporting success off a 200. The BLO-18294 convergence guard applies unchanged: an assignee-scheduled monitor that re-checks the same gate set 3 times running is refused on the 4th and the issue moves to `blocked`.",
+      setIssueMonitorToolSchema,
+      async ({ issueId, ...monitor }) =>
+        client.requestJson("PATCH", `/issues/${encodeURIComponent(issueId)}/monitor`, { body: monitor }),
+    ),
+    makeTool(
+      "paperclipClearIssueMonitor",
+      "Clear an issue monitor and NOTHING ELSE, leaving `stages`, `reviewPreset` and `authorizationPolicy` untouched. This is the only reliable exit for a WEDGED monitor: once a monitor fires it is stripped out of `executionPolicy` and survives only in `executionState`, so `paperclipUpdateIssue({executionPolicy:{}})` used to return 200 having changed nothing, while a re-arm 422s as soon as `attemptCount >= maxAttempts` — no exit in either direction. This call keys on `executionState`, so it clears a `triggered` and even an exhausted monitor, and it nulls `monitorNotes` so the next run does not inherit a retired monitor's notes as a live gate. Read back `monitorNextCheckAt` (null) and `executionState.monitor.status` (`cleared`) to confirm.",
+      z.object({ issueId: issueIdSchema }),
+      async ({ issueId }) =>
+        client.requestJson("DELETE", `/issues/${encodeURIComponent(issueId)}/monitor`),
     ),
     makeTool(
       "paperclipReleaseIssue",
