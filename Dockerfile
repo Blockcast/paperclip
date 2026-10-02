@@ -635,7 +635,8 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps --cache /root/.npm /tmp/paperclip-bundled-adapters/*.tgz \
   && rm -rf /tmp/paperclip-bundled-adapters \
   && chown -R root:root /opt/paperclip-bundled-adapters \
-  && chmod -R go-w /opt/paperclip-bundled-adapters
+  && chmod -R go-w /opt/paperclip-bundled-adapters \
+  && test -z "$(find /opt/paperclip-bundled-adapters ! -user root -print -quit)"
 
 # Keep dependency trees in their own stable layer. Ordinary source edits only
 # replace the much smaller source/compiled payload and do not re-upload pnpm's
