@@ -45,6 +45,7 @@ import {
   resetRoutineDispatchMetrics,
 } from "../services/routine-dispatch-metrics.js";
 import { secretService } from "../services/secrets.js";
+import { REDACTED_SENTINEL } from "../services/secret-sentinel.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -738,6 +739,137 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const runAfter = await svc.runRoutine(routine.id, { source: "manual" });
     expect(runAfter.routineRevisionId).toBe(updated?.latestRevisionId);
     expect(runAfter.dispatchFingerprint).not.toBe(runBefore.dispatchFingerprint);
+  });
+
+  it("restores a masked env binding to its stored value on save, and still refuses a placeholder with nothing behind it (PEN-3707)", async () => {
+    // The half of the PEN-3707 fix that is NOT about disclosure. The read side now masks plain
+    // values, and the routine env editor re-emits EVERY row on save, so an untouched row comes back
+    // carrying the placeholder it was rendered with. Without the merge in `update`,
+    // `normalizeEnvConfig` refuses that placeholder and 422s the WHOLE save — so masking the read
+    // alone would not be a partial fix, it would make routine env uneditable while any plain
+    // binding existed, and a client that retried past the 422 would overwrite a live credential
+    // with the literal string `***REDACTED***`.
+    const { agentId, companyId, projectId, svc } = await seedFixture();
+    const secrets = secretService(db);
+    const secret = await secrets.create(companyId, {
+      name: `routine-roundtrip-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "secret-value",
+    });
+    const storedPlain = "stored-plain-value-that-must-survive-the-round-trip";
+
+    const routine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "round trip routine",
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "always_enqueue",
+        catchUpPolicy: "skip_missed",
+        variables: [],
+        env: {
+          UNTOUCHED: { type: "plain", value: storedPlain },
+          EDITED: { type: "plain", value: "original-value" },
+          REF: { type: "secret_ref", secretId: secret.id, version: "latest" },
+        },
+      },
+      {},
+    );
+
+    const saved = await svc.update(
+      routine.id,
+      {
+        env: {
+          // Rendered masked, handed back untouched.
+          UNTOUCHED: { type: "plain", value: REDACTED_SENTINEL },
+          EDITED: { type: "plain", value: "edited-value" },
+          REF: { type: "secret_ref", secretId: secret.id, version: "latest" },
+        },
+      },
+      {},
+    );
+
+    const savedEnv = saved?.env as Record<string, unknown>;
+    expect(savedEnv.UNTOUCHED).toEqual({ type: "plain", value: storedPlain });
+    // The edited row still takes the new value — the merge must not pin everything to storage.
+    expect(savedEnv.EDITED).toEqual({ type: "plain", value: "edited-value" });
+
+    // Asserted against the ROW, not only the return value: the return value could be right while
+    // the persisted column holds the placeholder.
+    const [persisted] = await db.select().from(routines).where(eq(routines.id, routine.id));
+    const persistedEnv = persisted?.env as Record<string, unknown>;
+    expect(persistedEnv.UNTOUCHED).toEqual({ type: "plain", value: storedPlain });
+    expect(persistedEnv.EDITED).toEqual({ type: "plain", value: "edited-value" });
+
+    // The merge is deliberately narrow: a placeholder for a key with nothing stored behind it has
+    // nothing to restore, so it must still reach the refusal rather than installing itself as a
+    // real value. This is what keeps the merge from becoming a way to write the sentinel.
+    await expect(
+      svc.update(routine.id, { env: { NEW_KEY: { type: "plain", value: REDACTED_SENTINEL } } }, {}),
+    ).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("projects the routine-detail assignee to its declared summary fields instead of the whole agent row (PEN-3707)", async () => {
+    // `getDetail` built `assignee` from a bare full-row `db.select()` while the declared type
+    // (`RoutineAgentSummary`) names four fields and no config — and TypeScript strips nothing at
+    // runtime, so the agent's live `adapterConfig` crossed to every same-company agent that could
+    // read the routine. Asserted on the VALUE rather than on a redactor call, because the fix is a
+    // column projection: the point is that the material is never fetched, not that it is masked
+    // after the fact.
+    const { agentId, companyId, projectId, svc } = await seedFixture();
+    const agentSecret = "sentinel-assignee-adapter-config-must-not-egress";
+    await db
+      .update(agents)
+      .set({
+        adapterConfig: {
+          apiKey: agentSecret,
+          env: { AGENT_TOKEN: { type: "plain", value: agentSecret } },
+          mcpServers: { upstream: { headers: { authorization: `Bearer ${agentSecret}` } } },
+        },
+        runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { env: { X: agentSecret } } } } },
+        metadata: { operatorNote: agentSecret },
+      })
+      .where(eq(agents.id, agentId));
+
+    const routine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "assignee projection routine",
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "always_enqueue",
+        catchUpPolicy: "skip_missed",
+        variables: [],
+        env: null,
+      },
+      {},
+    );
+
+    const detail = await svc.getDetail(routine.id);
+
+    // The whole response, not just the assignee: the material must not reach the wire by any route.
+    expect(JSON.stringify(detail)).not.toContain(agentSecret);
+    // Identity survives — the field still does the job it is read for.
+    expect(detail?.assignee).toEqual({
+      id: agentId,
+      name: "CodexCoder",
+      role: "engineer",
+      title: null,
+    });
+    // Named individually so a future column that is NOT in the projection cannot ride back in on a
+    // spread without this failing.
+    const assignee = detail?.assignee as Record<string, unknown>;
+    expect(Object.keys(assignee).sort()).toEqual(["id", "name", "role", "title"]);
   });
 
   it("rejects stale routine baseRevisionId updates", async () => {
