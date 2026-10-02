@@ -1888,9 +1888,29 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         // into every key of that Secret, so the agent pod ends up holding more
         // key material than the container the mount was copied from.
         ...(sv.items ? { items: sv.items } : {}),
-        // Deliberately always optional, regardless of the source's setting: a
-        // propagated Secret that is absent must not hard-fail the agent Job.
-        optional: true,
+        // Carry the source's `optional` through for the same reason, instead of
+        // forcing `true` (PEN-3705). This used to read:
+        //
+        //   // Deliberately always optional, regardless of the source's
+        //   // setting: a propagated Secret that is absent must not hard-fail
+        //   // the agent Job.
+        //   optional: true,
+        //
+        // which silently downgraded a Secret the chart declares as required.
+        // For a credential mount that is not graceful degradation, because the
+        // env var pointing into the mount keeps resolving after the mount is
+        // gone: PAPERCLIP_GITHUB_TOKEN_FILE is /paperclip/.secrets/github-token
+        // /token, and without the mount that is the bare shared-PVC directory —
+        // mode 2775, writable by uid 1000, the uid every agent runs as, on a
+        // CephFS volume shared by the whole fleet. So failing open did not give
+        // the agent "no credential"; it moved the credential path somewhere any
+        // agent can write. Fail closed: a missing GitHub token must stop the
+        // Job loudly, not start an agent pointed at a writable token path.
+        //
+        // `undefined` is left as-is rather than coerced: upstream reads an
+        // absent `optional` as `false`, so omitting it preserves the source's
+        // "required" meaning without this code having to restate it.
+        ...(sv.optional === undefined ? {} : { optional: sv.optional }),
       },
     });
     volumeMounts.push({

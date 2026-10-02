@@ -332,6 +332,33 @@ describe("getSelfPodInfo inheritance allowlist (BLO-22514)", () => {
     );
   });
 
+  // PEN-3705: job-manifest.ts replays this onto the agent Job, and it used to
+  // force `optional: true` there. It can only stop doing that if the source's
+  // setting survives the read, so this is the other half of that fix.
+  it("carries each source volume's optional setting", async () => {
+    podFixtures[KC] = podWithEnv([], {
+      volumes: [
+        // No `optional:` — the chart's real shape for this volume. Upstream
+        // reads that as required, and `undefined` is how that is preserved.
+        { name: "github-token", secret: { secretName: "paperclip-github-mcp-token" } },
+        {
+          name: "gbrain-authbot-service-key",
+          secret: { secretName: "authbot-mcp-consumer-service-keys", optional: true },
+        },
+      ],
+      volumeMounts: [
+        { name: "github-token", mountPath: "/paperclip/.secrets/github-token" },
+        { name: "gbrain-authbot-service-key", mountPath: "/var/run/authbot" },
+      ],
+    });
+    const { getSelfPodInfo } = await import("./k8s-client.js");
+    const info = await getSelfPodInfo(KC);
+
+    const byName = new Map(info.secretVolumes.map((v) => [v.secretName, v]));
+    expect(byName.get("paperclip-github-mcp-token")?.optional).toBeUndefined();
+    expect(byName.get("authbot-mcp-consumer-service-keys")?.optional).toBe(true);
+  });
+
   it("drops every envFrom source by default", async () => {
     // envFrom injects whole objects under names the allowlist never observes,
     // so it cannot be reconciled with per-name filtering.
