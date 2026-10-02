@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import {
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
+  hasActionablePrReviewFeedback,
 } from "../server/src/services/ally-review-detection.ts";
 import {
   ALLY_APP_REVIEWER_ID,
@@ -173,14 +174,22 @@ describe("hasStillPresentDisposition", () => {
     );
   });
 
-  it("does NOT fire on a still-present entry quoted inside a fence, as the gate does not", () => {
-    assert.equal(
-      hasStillPresentDisposition(
-        "```\n- **prior:354d5b9 important 1** — still-present — the issue remains\n```",
-      ),
-      false,
-    );
-  });
+  // Must agree with the merge gate, which treats still-present as a blocking
+  // predicate and so reads it from the raw body as well as the fence-stripped
+  // one: a fenced still-present entry blocks there and must fire here.
+  const entry = "- **prior:354d5b9 important 1** — still-present — the issue remains";
+  for (const [shape, body] of [
+    ["a plain entry (control)", entry],
+    ["an entry inside a closed backtick fence", `\`\`\`\n${entry}\n\`\`\``],
+    ["an entry inside a closed tilde fence", `~~~\n${entry}\n~~~`],
+    ["an entry inside an md-tagged fence", `\`\`\`md\n${entry}\n\`\`\``],
+    ["an entry after an unclosed fence", `\`\`\`\n${entry}`],
+  ]) {
+    it(`matches the merge gate on ${shape}`, () => {
+      assert.equal(hasActionablePrReviewFeedback(body), true, "gate fixture drifted");
+      assert.equal(hasStillPresentDisposition(body), true);
+    });
+  }
 });
 
 describe("attestedHead", () => {

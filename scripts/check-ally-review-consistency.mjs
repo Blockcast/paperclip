@@ -146,12 +146,20 @@ const BLOCKING_SECTION_RE =
  * the direction is the safe one for an auditor, because the consequence is a
  * false red against an otherwise-valid review rather than a missed one.
  *
- * It is NOT safe for the disposition sites. A fenced retiring entry read here
- * but not by the gate retires a finding the gate still counts, which lets
- * supersedesBlocker exempt an approval the gate holds: fail-open. So the
- * disposition readers (retiredFindingKeys, hasStillPresentDisposition) strip
- * fences first with withoutFencedCodeBlocks, as the gate's
- * extractAllyPriorFindingDispositions does.
+ * It is NOT safe for the retiring site. A fenced retiring entry read here but
+ * not by the gate retires a finding the gate still counts, which lets
+ * supersedesBlocker exempt an approval the gate holds: fail-open. So
+ * retiredFindingKeys strips fences first with withoutFencedCodeBlocks, as the
+ * gate's extractAllyPriorFindingDispositions does.
+ *
+ * hasStillPresentDisposition deliberately does NOT strip. It mirrors a
+ * blocking predicate, and the gate's rule (ally-review-detection.ts header:
+ * "Quoted text may never *reduce* what the gate blocks on; only emitted text
+ * may retire a finding") puts blocking predicates in the detecting group,
+ * which reads emitted and raw text and blocks if either does
+ * (hasActionablePrReviewFeedback). A fenced still-present entry therefore
+ * blocks at the gate, and must block here; stripping it would go silent on a
+ * PR the gate holds red.
  */
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4}) {0,3}`;
 
@@ -373,7 +381,7 @@ export function hasBlockingFindings(body) {
 }
 
 export function hasStillPresentDisposition(body) {
-  return STILL_PRESENT_DISPOSITION_RE.test(withoutFencedCodeBlocks(String(body ?? "")));
+  return STILL_PRESENT_DISPOSITION_RE.test(String(body ?? ""));
 }
 
 /**
