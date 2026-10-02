@@ -1460,6 +1460,27 @@ describe("BLO-32695 — the block and the prose must not name different counts",
     });
   });
 
+  // Ally, #1721 at 1bc85198, Important 1. Under the `m` flag JS breaks lines at
+  // U+2028 and the sweep's re.MULTILINE does not, so each of these read as a
+  // contradiction here and as nothing in the sweep: the gate went red while the
+  // sweep saw a clean, attesting review and never re-requested one. U+2028 is
+  // not a markdown line ending, so the sweep's reading is the one to match.
+  it("reads a bucket terminated by U+2028 as the sweep does", () => {
+    const separated = body(
+      { head: PR1675_HEAD, findings: { critical: 0, important: 0 } },
+      "### Critical Issues (3) trailing prose",
+    );
+    expect(parseAllyVerdictBlock(separated).kind).toBe("ok");
+  });
+
+  it("reads a ledger entry introduced by U+2028 as the sweep does", () => {
+    const separated = body(
+      PR1675_VERDICT,
+      "intro - **prior:583085ded important 1** — still-present — not mirrored",
+    );
+    expect(parseAllyVerdictBlock(separated).kind).toBe("ok");
+  });
+
   // Peer review of #1721, Suggestion 1. The count is a `(\d+)` capture over
   // model-authored text: digits-only, but unbounded in length, and this reason
   // reaches the check-run summary, which has no cap of its own. A noise bound

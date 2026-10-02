@@ -123,9 +123,12 @@ const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
  * than embedded in the pattern. The cross-reader corpus in the test file drives
  * the same ledger strings through all three sources.
  */
+// `(?:^|\n)` with no `m` flag, matching the gate: JS's multiline `^` also
+// starts a line after U+2028/U+2029, which the sweep's re.MULTILINE does not
+// (Ally, #1721 at 1bc85198, Important 1).
 const PRIOR_FINDING_DISPOSITION_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
-  "gim",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
+  "gi",
 );
 
 /**
@@ -228,10 +231,11 @@ function severityCountsIn(raw) {
  * unanchored bucket matches a sentence *referencing* an earlier pass's counts,
  * and over-matching fails a clean review closed.
  */
+// The gate's anchors, as at PRIOR_FINDING_DISPOSITION_RE and ATTESTED_HEAD_RE.
 const EMITTED_BUCKET_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}(?:#{1,6}[ \t]*)?[*_]{0,3}` +
-    String.raw`(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*$`,
-  "gim",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}(?:#{1,6}[ \t]*)?[*_]{0,3}` +
+    String.raw`(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*(?=\n|$)`,
+  "gi",
 );
 
 /**

@@ -869,9 +869,16 @@ export function asPublishableToken(token: string): string {
 // The two copies cannot drift: "the publisher's alphabet is the parser's
 // alphabet" in pr-comment-review-gate.test.ts drives the real parser over a
 // verb corpus and asserts isPublishableToken agrees on every one.
+//
+// Anchored on `(?:^|\n)` with no `m` flag, not `^` under `m`: JS's multiline
+// `^` also starts a line after U+2028/U+2029, which Python's re.MULTILINE (the
+// sweep's mirror) does not, so a ledger entry introduced by U+2028 read as
+// still-present here and as nothing in the sweep (Ally, #1721 at 1bc85198,
+// Important 1). Same anchors as REVIEWED_HEAD_ATTESTATION_PATTERN; the group is
+// non-capturing, so no capture index moves.
 const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
-  "gim",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
+  "gi",
 );
 
 // The severities Ally tallies in a counted bucket. Single source for both the
@@ -968,10 +975,15 @@ const COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
 // the rule stops firing and the block is trusted as it was before this
 // cross-check existed; that degrades to the prior behaviour rather than
 // opening something new, whereas a loose pattern reds clean reviews.
+//
+// `(?:^|\n)` ... `(?=\n|$)` with no `m` flag, for the reason given at
+// PRIOR_FINDING_DISPOSITION_PATTERN: under `m` a bucket terminated by U+2028
+// counted here and not in the sweep, so the gate went red on a contradiction the
+// sweep could not see and never re-requested the review that would clear it.
 const EMITTED_COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}(?:#{1,6}[ \t]*)?[*_]{0,3}` +
-    String.raw`(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*$`,
-  "gim",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}(?:#{1,6}[ \t]*)?[*_]{0,3}` +
+    String.raw`(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*(?=\n|$)`,
+  "gi",
 );
 
 // The severities that block a merge, named once so the structured path and the

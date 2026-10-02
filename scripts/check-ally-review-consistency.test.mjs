@@ -209,7 +209,7 @@ describe("hasStillPresentDisposition", () => {
       "NOT_INDENTED_CODE must not drift between the gate and this auditor",
     );
     const tsRaw = tsSource.match(
-      /PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"gim",/,
+      /PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"gi",/,
     );
     assert.ok(tsRaw, "ally-review-detection.ts still defines PRIOR_FINDING_DISPOSITION_PATTERN");
     // Function replacement, not a string one: a string replacement interprets
@@ -218,7 +218,7 @@ describe("hasStillPresentDisposition", () => {
     // failing loudly. `$&` alone would rebuild the literal `${NOT_INDENTED_CODE}`.
     const gatePattern = new RegExp(
       tsRaw[1].replace("${NOT_INDENTED_CODE}", () => tsNotIndented[1]),
-      "gim",
+      "gi",
     );
 
     const pySource = readFileSync(
@@ -445,6 +445,19 @@ describe("attestedHead", () => {
     // `(?=\n|$)` does not, so this credited a line the gate cannot read.
     const body = ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD}\u2028trailing`].join("\n");
     assert.equal(attestedHead(body), null);
+  });
+
+  it("reads U+2028-separated buckets and ledger entries as the sweep does", () => {
+    // Ally, #1721 at 1bc85198, Important 1: under `m` both read here and not in
+    // the sweep, whose re.MULTILINE breaks lines at `\n` only.
+    assert.equal(
+      attestedHead(counted('{"critical":0,"important":0}', "### Critical Issues (3)\u2028trailing prose")),
+      HEAD,
+    );
+    assert.equal(
+      hasStillPresentDisposition("intro\u2028- **prior:354d5b9 important 1** \u2014 still-present \u2014 not mirrored"),
+      false,
+    );
   });
 
   it("does not fail closed on a referenced, quoted or fenced bucket", () => {
