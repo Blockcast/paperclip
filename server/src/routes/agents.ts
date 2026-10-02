@@ -115,6 +115,7 @@ import { loadAgentInboxLite } from "../services/agent-inbox-lite.js";
 import {
   ISSUE_LIST_APPLIED_LIMIT_HEADER,
   ISSUE_LIST_TRUNCATED_HEADER,
+  parseOffsetParam,
 } from "../lib/issue-list-query.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { logger } from "../middleware/logger.js";
@@ -2728,11 +2729,8 @@ export function agentRoutes(
     // remainder; the headers say when there IS a remainder. Same contract as
     // `GET /companies/:id/issues` (BLO-33741) — bare-array body, signal on
     // headers — so one envelope helper covers both on the MCP side.
-    const rawOffset = req.query.offset as string | undefined;
-    const parsedOffset = rawOffset !== undefined && /^\d+$/.test(rawOffset)
-      ? Number.parseInt(rawOffset, 10)
-      : null;
-    if (rawOffset !== undefined && (parsedOffset === null || !Number.isInteger(parsedOffset) || parsedOffset < 0)) {
+    const parsedOffset = parseOffsetParam(req.query.offset);
+    if (parsedOffset === null) {
       res.status(400).json({ error: "offset must be a non-negative integer" });
       return;
     }
@@ -2748,7 +2746,7 @@ export function agentRoutes(
       agentId: req.actor.agentId,
       callerRunId,
       limit: ISSUE_LIST_DEFAULT_LIMIT,
-      offset: parsedOffset ?? 0,
+      offset: parsedOffset,
       isWorktreeRuntime,
       worktreeActivation,
       onWithheldForeignRun: (issue) => {
