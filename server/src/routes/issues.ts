@@ -3043,6 +3043,16 @@ function logIssueListRequest(input: {
 }
 
 /**
+ * Page-count ceiling for walkIssueListPages.
+ *
+ * Deliberately its own constant rather than a reuse of ISSUE_LIST_MAX_LIMIT, which is a
+ * rows-per-PAGE request limit: the two are unrelated dimensions that merely happen to share
+ * a value today. Tying them together would make the walk's row ceiling — their product —
+ * shrink quadratically if that request-facing limit were ever tuned down.
+ */
+export const WALK_MAX_PAGES = 1000;
+
+/**
  * Pages through `fetchPage` until it returns a short page, handing each page to `visit`.
  *
  * attention=blocked is served by listBlockedInboxIssues, which pages by offset only and
@@ -3050,6 +3060,14 @@ function logIssueListRequest(input: {
  * re-read page one forever. Every other path walks the immutable id order with a keyset
  * cursor, because offset paging over the mutable activity order re-ranks rows touched
  * mid-walk, which both double-counts and skips them.
+ *
+ * Termination depends on `opts.blocked` mirroring list()'s internal routing, and that
+ * mirror spans two files: list() picks the blocked branch at an early return that lands
+ * BEFORE the afterId predicate, so a new early return added above it would silently make
+ * afterId a no-op here — no conflict, no type error, an unbounded loop. Each branch below
+ * therefore asserts its own cursor actually moved, so that mistake surfaces on page two as
+ * an error rather than as a request that never returns. A page cap backstops both, since
+ * the blocked assertion compares consecutive pages and churn can differ them indefinitely.
  */
 export async function walkIssueListPages<Row extends { id: string }>(
   fetchPage: (page: { offset?: number; afterId?: string }) => Promise<Row[]>,
@@ -3058,12 +3076,42 @@ export async function walkIssueListPages<Row extends { id: string }>(
 ): Promise<void> {
   let offset = 0;
   let afterId: string | undefined;
-  while (true) {
+  let previousPageIds: string | undefined;
+  // Backstop for both branches. The per-branch assertions below catch the mirror breaking
+  // on page two, but the blocked one compares only the immediately previous page: a dropped
+  // `offset` combined with churn at the head of the mutable activity order can serve
+  // differing pages forever and slip past it. This cap cannot, and cannot false-positive
+  // either — the walk's own caller caps a page at ISSUE_LIST_MAX_LIMIT, so at that page size
+  // the ceiling is WALK_MAX_PAGES * ISSUE_LIST_MAX_LIMIT rows before firing.
+  for (let page = 0; ; page += 1) {
+    if (page >= WALK_MAX_PAGES) {
+      throw new Error(
+        `walkIssueListPages: exceeded ${WALK_MAX_PAGES} pages, so the walk is not terminating`,
+      );
+    }
     const rows = await fetchPage(opts.blocked ? { offset } : { afterId });
     await visit(rows);
     if (rows.length < opts.pageSize) return;
-    if (opts.blocked) offset += rows.length;
-    else afterId = rows[rows.length - 1]!.id;
+    if (opts.blocked) {
+      // The blocked listing pages by offset, so non-advance here means the caller dropped
+      // `offset` on its way to list() and every fetch re-serves page one. Compare the whole
+      // page, not its last id: this order is the mutable activity order, and a re-rank can
+      // legitimately repeat one row across pages — it cannot reproduce the entire page.
+      const pageIds = rows.map((row) => row.id).join(",");
+      if (pageIds === previousPageIds) {
+        throw new Error("walkIssueListPages: blocked page repeated, so offset is not reaching list()");
+      }
+      previousPageIds = pageIds;
+      offset += rows.length;
+    } else {
+      // list() honoring afterId returns only rows with id > afterId, so the last id of a
+      // full page is always past the cursor we sent. Equal means the predicate never ran.
+      const next = rows[rows.length - 1]!.id;
+      if (next === afterId) {
+        throw new Error("walkIssueListPages: keyset cursor did not advance, so afterId is not reaching list()");
+      }
+      afterId = next;
+    }
   }
 }
 
@@ -3106,6 +3154,14 @@ export function issueRoutes(
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
     createIssueBeforeResponseHook?: () => Promise<void>;
+    /**
+     * Test seam for the restricted-actor count walk. `pageSize` shrinks the page so a
+     * multi-page walk costs a handful of rows instead of ISSUE_LIST_MAX_LIMIT + 1, and
+     * `onPage` runs after each page is counted so a test can mutate an already-returned
+     * row mid-walk and prove the enumeration is stable under re-ranking rather than only
+     * that the cursor advances.
+     */
+    issueCountWalk?: { pageSize?: number; onPage?: () => Promise<void> };
     registerCommentEffectProcessor?: (processor: (commentId: string) => Promise<unknown>) => void;
   } = {},
 ) {
@@ -8814,18 +8870,20 @@ export function issueRoutes(
       }
 
       const blocked = countFilters.attention === "blocked";
+      const pageSize = opts.issueCountWalk?.pageSize ?? ISSUE_LIST_MAX_LIMIT;
       let visibleCount = 0;
       await walkIssueListPages(
         (page) =>
           svc.list(
             companyId,
             blocked
-              ? { ...countFilters, limit: ISSUE_LIST_MAX_LIMIT, offset: page.offset }
-              : { ...countFilters, limit: ISSUE_LIST_MAX_LIMIT, sortField: "id", afterId: page.afterId },
+              ? { ...countFilters, limit: pageSize, offset: page.offset }
+              : { ...countFilters, limit: pageSize, sortField: "id", afterId: page.afterId },
           ),
-        { blocked, pageSize: ISSUE_LIST_MAX_LIMIT },
+        { blocked, pageSize },
         async (rows) => {
           visibleCount += (await filterIssuesForActor(req, rows)).length;
+          await opts.issueCountWalk?.onPage?.();
         },
       );
       res.json({ count: visibleCount });
