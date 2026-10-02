@@ -97,6 +97,7 @@ import {
   recordGithubReviewRequestDelivery,
   recordGithubReviewRequestSuppressed,
   recordGithubReviewPosted,
+  recordGithubWebhookDelivery,
   recordGithubWorkflowRunConclusion,
   type GithubReviewSurface,
 } from "../services/metrics.js";
@@ -5000,6 +5001,33 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
   const router = Router();
 
   router.post("/", async (req, res) => {
+    // BLO-39378: count EVERY inbound delivery, on every exit path, from one
+    // listener. `close` always fires — unlike `finish`, which an aborted
+    // response never reaches — so a delivery cannot escape uncounted and
+    // read back later as "GitHub stopped delivering". Counting here rather
+    // than at each `res.status(...)` call site is also what keeps a future
+    // early return from silently falling out of the denominator; this
+    // counter's whole job is that its flatline is the fault.
+    res.on("close", () => {
+      // A throw here is an uncaught exception, not a 500: this listener runs
+      // outside Express's error handling, so an unguarded metrics fault would
+      // take the api down on the delivery path it exists to measure.
+      try {
+        recordGithubWebhookDelivery({
+          event: req.header("x-github-event"),
+          outcome: !res.writableEnded
+            ? "error"
+            : res.statusCode === 401
+              ? "rejected_signature"
+              : res.statusCode < 400
+                ? "accepted"
+                : "error",
+        });
+      } catch (err) {
+        logger.warn({ err }, "failed to record github webhook delivery metric");
+      }
+    });
+
     if (!config.webhookSecret) {
       logger.warn("github webhook received but GITHUB_WEBHOOK_SECRET is not configured; refusing");
       res.status(503).json({ error: "github webhook not configured" });
