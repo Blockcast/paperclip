@@ -3976,7 +3976,50 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
   });
 
-  // The surface is wider than the PATCH path: three of the five gate callers
+  // BLO-18816 review, Important 1. The same rule has to hold on the dedicated
+  // clear route, and it does not come for free: `assertCanManageIssueMonitor`'s
+  // `monitorArmed` option defaults to "treat as arming" (fail-closed), so a
+  // route that passes no options at all runs the arming refusal on its clears.
+  // The actor class that meets a wedged monitor most often is precisely the
+  // cheap status-only recovery run, and the MCP tool tells it this call is the
+  // only reliable exit — so refusing it here reinstates the strand the route
+  // exists to end.
+  it("still lets a status-only recovery run clear a monitor through the dedicated route", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_progress",
+      executionPolicy: { monitor: { nextCheckAt: "2026-09-20T00:00:00.000Z", scheduledBy: "assignee" } },
+    }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "in_progress" }),
+      ...patch,
+    }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    containedBy(makeRecoveryAction({ status: "active" }));
+    const app = await createApp(ownerActor(), createRunContextDb(statusOnlyRecoveryContext));
+
+    const res = await request(app).delete(`/api/issues/${issueId}/monitor`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  // The mutation that case above cannot catch on its own: `monitorArmed: false`
+  // unconditionally would make it pass while opening the arm. The new route's
+  // arming half must still refuse a contained run exactly as the legacy PATCH
+  // does.
+  it("still refuses a status-only recovery run arming a monitor through the dedicated route", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", executionPolicy: null }));
+    mockAccessService.decide.mockImplementation(decideWithRuntimeManage);
+    containedBy(makeRecoveryAction({ status: "active" }));
+    const app = await createApp(ownerActor(), createRunContextDb(statusOnlyRecoveryContext));
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}/monitor`)
+      .send({ nextCheckAt: "2026-09-20T00:00:00.000Z", notes: "self-armed", scheduledBy: "assignee" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Cheap status-only recovery runs cannot arm issue monitors");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
   // pass a *synthetic* issue built from the request body, so the assignee
   // comparison runs against a name the caller supplies rather than persisted
   // state. A status-only run can therefore reach the gate on a brand-new issue

@@ -51,6 +51,16 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
   hasPermission: vi.fn(async () => false),
 }));
+
+// BLO-18816 review (Critical 1): `monitorChanged` reaches recovery revalidation
+// raw, so cancelling an active action is the observable that discriminates.
+// Hoisted rather than built per-call so a test can seed the action and then
+// assert whether the route resolved it.
+const mockIssueRecoveryActionService = vi.hoisted(() => ({
+  getActiveForIssue: vi.fn(async () => null as unknown),
+  listActiveForIssues: vi.fn(async () => new Map()),
+  resolveActiveForIssue: vi.fn(async () => null as unknown),
+}));
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
   then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
     Promise.resolve([{
@@ -150,10 +160,7 @@ function registerModuleMocks() {
       syncDocument: async () => undefined,
       syncIssue: async () => undefined,
     }),
-    issueRecoveryActionService: () => ({
-      getActiveForIssue: vi.fn(async () => null),
-      listActiveForIssues: vi.fn(async () => new Map()),
-    }),
+    issueRecoveryActionService: () => mockIssueRecoveryActionService,
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,
@@ -217,6 +224,9 @@ describe("issue execution policy routes", () => {
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockIssueRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
+    mockIssueRecoveryActionService.resolveActiveForIssue.mockResolvedValue(null);
     mockIssueService.addComment.mockResolvedValue({
       id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
       issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1554,6 +1564,112 @@ describe("issue execution policy routes", () => {
 
         expect(res.status).toBe(403);
         expect(mockIssueService.update).not.toHaveBeenCalled();
+      });
+    });
+
+    // BLO-18816 review, Critical 1 + Important 2. The clause that lets
+    // `PATCH {"executionPolicy": {}}` reach a *fired* monitor is route-level, and
+    // every case above exercises the service layer or the new route — so the
+    // clause itself had no coverage. It has three consumers, only two of which
+    // re-gate it on `req.body.executionPolicy !== undefined`; the third hands it
+    // to recovery revalidation raw.
+    describe("the triggered-monitor clear clause does not leak onto unrelated writes", () => {
+      // `wedgedIssue`'s `executionState` carries only `status` + `monitor`, which
+      // `issueExecutionStateSchema` REJECTS — every stage field on it is nullable
+      // but required. `derivePersistedMonitorState` still reads "triggered" off
+      // the columns, so the service-layer cases above are unaffected; but the
+      // route reads the live status through `summarizeIssueMonitor`, which goes
+      // via `parseIssueExecutionState` and therefore sees `null`. Asserting
+      // against the short fixture passes whatever the route does — a vacuous
+      // green. This is the shape the trigger actually persists.
+      const wedgedExecutionState = () => ({
+        status: "idle" as const,
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: wedgedIssue().executionState.monitor,
+      });
+      const seedWedged = (overrides: Record<string, unknown> = {}) => {
+        const issue = { ...wedgedIssue(), executionState: wedgedExecutionState(), ...overrides };
+        mockIssueService.getById.mockResolvedValue(issue);
+        mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+          ...issue,
+          ...patch,
+          updatedAt: new Date(),
+        }));
+        return issue;
+      };
+      const lastPatch = () => mockIssueService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+
+      // Critical 1. `revalidateActiveSourceRecovery` folds `monitorChanged` into
+      // `durableSourceChange` with no `executionPolicy` gate of its own, and an
+      // `in_progress` agent-owned row then resolves the action `cancelled`. An
+      // active recovery action is one of the five wake paths, so a title or
+      // priority edit was deleting a live wake path on every issue whose monitor
+      // had fired — estate-wide, nowhere near a monitor write.
+      it("does not cancel an active recovery action on a PATCH that never mentions the policy", async () => {
+        seedWedged();
+        mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+          id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          sourceIssueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          status: "active",
+        });
+
+        const res = await patchIssue({ priority: "high" });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
+        expect(res.body.activeRecoveryAction).not.toBeNull();
+      });
+
+      // Important 2. The PR's own documented read-modify-write for a stage edit:
+      // read the policy, change `stages`, re-send it complete. The trigger already
+      // stripped `monitor` out, so the re-sent policy legitimately carries none —
+      // and the wide clause read that absence as "the caller cleared the monitor",
+      // taking down the `tickExpiredIssueMonitors` sweep that still owes this row
+      // its `recoveryPolicy`.
+      it("leaves a triggered monitor alone when an explicit policy write only edits stages", async () => {
+        const strippedPolicy = normalizeIssueExecutionPolicy({
+          mode: "normal",
+          commentRequired: true,
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] }],
+        });
+        const issue = seedWedged({ executionPolicy: strippedPolicy });
+
+        const res = await patchIssue({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [
+              { type: "review", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] },
+              { type: "approval", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] },
+            ],
+          },
+        });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        const nextState = lastPatch().executionState as { monitor?: { status?: string } } | undefined;
+        // Still triggered: the sweep that owes this monitor a `recoveryPolicy`
+        // keys on exactly this state.
+        expect(nextState?.monitor?.status ?? issue.executionState.monitor.status).toBe("triggered");
+      });
+
+      // Negative control for both cases above: narrowing the clause must not take
+      // BLO-27586 AC1 down with it. `{"executionPolicy": {}}` is the documented
+      // monitor-clear and is the one body that still has to reach a fired monitor
+      // through the legacy path.
+      it("still clears a triggered monitor on the documented bare executionPolicy write", async () => {
+        seedWedged();
+
+        const res = await patchIssue({ executionPolicy: {} });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect((lastPatch().executionState as { monitor: { status: string } }).monitor.status).toBe("cleared");
       });
     });
   });

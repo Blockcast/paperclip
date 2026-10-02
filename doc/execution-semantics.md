@@ -476,6 +476,11 @@ Both carry the same authorization as the legacy path (`assertCanManageIssueMonit
 
 Back-compat: `PATCH /api/issues/:id` still accepts `executionPolicy.monitor` and still **replaces** `executionPolicy` wholesale. That applies to arming and re-arming as much as to clearing, so through that path you must read the current policy and re-send it complete with `monitor` swapped in — a monitor-only body is a policy with no stages, and it erases `stages`, `reviewPreset` and `authorizationPolicy`. That read-modify-write also races any concurrent writer. Prefer the monitor path above; use the policy path only when you are genuinely rewriting the policy.
 
+Two sharp edges on that legacy path, neither of which the monitor path has:
+
+- `{"executionPolicy": {}}` is still destructive. It clears the monitor, but `normalizeIssueExecutionPolicy` collapses a stage-less, monitor-less policy to `null`, so it takes `stages`, `reviewPreset` and `authorizationPolicy` with it. That has not changed — use `DELETE /api/issues/:id/monitor` for a clear that leaves the rest of the policy alone.
+- Re-sending the policy complete *without* `monitor` is how you clear a **scheduled** monitor, and only that. On an issue whose monitor has already fired, the trigger has already stripped `monitor` out of the stored policy, so such a write is an ordinary policy edit and deliberately leaves the `triggered` state alone — `tickExpiredIssueMonitors` still owes that monitor its `recoveryPolicy`. Clearing a fired monitor is `DELETE /api/issues/:id/monitor`, or the bare `{"executionPolicy": {}}` above.
+
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
 Because `serviceName` and `notes` remain visible in issue activity and wake context, operators should keep them short and non-secret. Put enough context for the assignee to know what to inspect, but do not include signed URLs, bearer tokens, customer secrets, tenant-private identifiers, or provider links with embedded credentials.
