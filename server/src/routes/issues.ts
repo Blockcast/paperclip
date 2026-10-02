@@ -12078,14 +12078,22 @@ export function issueRoutes(
     // `assertLowTrustControlPlaneDenied`: `PATCH /issues/:id` applies that only
     // to reopen/resume/blocker writes, never to monitor writes, and a low-trust
     // issue's own assignee arming its monitor is how that issue stays live.
-    await assertCanManageIssueMonitor(access, req, existing.companyId, existing, true);
+    //
+    // BLO-32774: `monitorArmed` must be named, exactly as the legacy path names
+    // it. The option defaults to "treat as arming" (fail-closed), so omitting it
+    // runs the run-class refusal on `DELETE` too — and a cheap status-only
+    // recovery run clearing the wedged monitor it was woken for would get
+    // `403 "Cheap status-only recovery runs cannot arm issue monitors"`, which
+    // is the strand this route exists to end.
+    await assertCanManageIssueMonitor(access, req, existing.companyId, existing, true, {
+      monitorArmed: monitor !== null,
+    });
 
     const actor = getActorInfo(req);
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
     const previousMonitor = summarizeIssueMonitor(existing, previousExecutionPolicy);
-    // Nullable on purpose: `null` means "no blocker edges were loaded", which
-    // `applyMonitorTransition` reads as "do not score convergence this time".
-    // Coercing it to `[]` would score the arm against an empty gate set.
+    // BLO-18294: convergence is only scored on an arm, so a clear skips the
+    // query entirely — same rule as `PATCH /issues/:id`.
     const unresolvedBlockerIssueIds = monitor
       ? await loadUnresolvedBlockerIssueIds(existing.companyId, existing.id)
       : [];
@@ -12708,9 +12716,26 @@ export function issueRoutes(
       // out of `executionPolicy` by the trigger, so `monitorPoliciesEqual` diffs
       // null against null and reports "unchanged" — which is why
       // `PATCH {"executionPolicy": {}}` against a `triggered` monitor returned
-      // 200 with the monitor byte-identical. An explicit executionPolicy write
-      // that carries no monitor while one is still live IS a clear.
-      (nextExecutionPolicy?.monitor == null && liveMonitorStatus != null && liveMonitorStatus !== "cleared");
+      // 200 with the monitor byte-identical.
+      //
+      // Scoped to the body that collapses the *whole* policy — `{}` or `null`,
+      // the documented monitor-clear — rather than to any policy write that
+      // happens to carry no monitor. Both wider readings were live defects:
+      //   - no `executionPolicy` in the body at all (`PATCH {"priority":...}`)
+      //     still reaches `revalidateActiveSourceRecoveryAfterCommittedWrite`
+      //     below, which folds `monitorChanged` into `durableSourceChange` and
+      //     cancels an *active recovery action* — one of the five wake paths —
+      //     on every unrelated edit to a fired-monitor issue;
+      //   - a read-modify-write that edits `stages` and re-sends the policy
+      //     complete would read as "the caller wrote the monitor", clearing a
+      //     `triggered` monitor and with it the `tickExpiredIssueMonitors`
+      //     sweep that still owes it a `recoveryPolicy`.
+      // `DELETE /issues/:id/monitor` is the unambiguous clear for everything
+      // this narrowing excludes, so no caller loses a path.
+      (req.body.executionPolicy !== undefined &&
+        nextExecutionPolicy == null &&
+        liveMonitorStatus != null &&
+        liveMonitorStatus !== "cleared");
     await assertCanManageIssueMonitor(
       access,
       req,
