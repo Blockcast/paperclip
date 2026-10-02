@@ -83,11 +83,19 @@ const EXECUTION_WORKSPACE_MIN_IDLE_MS = 10 * 60 * 1000;
  * a tree that *was* removed is free — the next window stats it, gets ENOENT and
  * archives it — so this is fail-closed in the cheap direction.
  */
+/**
+ * The one retain reason that is not a `WorktreeReclaimSafety` verdict: the
+ * removal itself did not report success, so there is no proof to classify.
+ * Named here so the suffix-collision test can enumerate the full input domain
+ * of `encodeRetainedReason` without hardcoding it.
+ */
+export const UNCLEANED_RETAIN_REASON = "uncleaned";
+
 export function classifyRemovalProof(
   cleaned: boolean,
   proofReason: WorktreeReclaimSafety["reason"] | null,
 ): string | null {
-  if (!cleaned) return "uncleaned";
+  if (!cleaned) return UNCLEANED_RETAIN_REASON;
   if (proofReason && proofReason !== "missing") return proofReason;
   return null;
 }
@@ -130,6 +138,18 @@ export function classifyRemovalProof(
  */
 const RUN_ATTRIBUTED_RETAIN_SUFFIX = "_run_ended";
 const UNATTRIBUTED_RETAIN_SUFFIX = "_unknown";
+
+/**
+ * Both origin suffixes, exported so the collision test iterates the real values
+ * rather than a mirror of them. The split is only unambiguous while no retain
+ * reason ENDS in one of these; that held by inspection when the suffixes were
+ * chosen, and `execution-workspace-retain-suffix-collision.test.ts` is what
+ * keeps it holding when someone adds a reason.
+ */
+export const RETAIN_ORIGIN_SUFFIXES = [
+  RUN_ATTRIBUTED_RETAIN_SUFFIX,
+  UNATTRIBUTED_RETAIN_SUFFIX,
+] as const;
 
 export function encodeRetainedReason(
   reason: string,

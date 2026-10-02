@@ -4987,10 +4987,26 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   };
 }
 
+/**
+ * The reasons `inspectWorktreeReclaimSafety` can give. A runtime array rather
+ * than a bare string-literal union because the collector encodes a retained
+ * row's origin as a SUFFIX on these values (`encodeRetainedReason` in
+ * `execution-workspace-cleanup.ts`), so the suffixes must stay collision-free
+ * against every member. A hand-maintained mirror in the test would pass while
+ * going stale; iterating this does not.
+ */
+export const WORKTREE_RECLAIM_SAFETY_REASONS = [
+  "missing",
+  "clean",
+  "dirty",
+  "unpushed",
+  "unverifiable",
+] as const;
+
 export type WorktreeReclaimSafety = {
   /** True only when reclaiming the disk provably discards no work. */
   safe: boolean;
-  reason: "missing" | "clean" | "dirty" | "unpushed" | "unverifiable";
+  reason: (typeof WORKTREE_RECLAIM_SAFETY_REASONS)[number];
   detail: string | null;
 };
 

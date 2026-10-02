@@ -80,6 +80,13 @@ describe("writers that null cleanup_reason", () => {
     const offenders: string[] = [];
     let found = 0;
     for (const { file, text } of sources) {
+      // Matches the SPELLING, not the shape (Ally, review of 68b9cad). A writer
+      // passing a variable (`cleanupReason: nextReason`), `undefined`, or a
+      // Drizzle `sql` fragment setting `cleanup_reason = null` is invisible to
+      // this scan. That is deliberate: the stated target is a third writer added
+      // in the same literal form as the two that exist, and widening the pattern
+      // to catch identifiers would flag every legitimate dynamic write. Read a
+      // green result as "no new literal-null writer", not as "no new null writer".
       const pattern = /cleanupReason:\s*null/g;
       for (let m = pattern.exec(text); m; m = pattern.exec(text)) {
         found += 1;
