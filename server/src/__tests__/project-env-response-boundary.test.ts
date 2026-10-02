@@ -10,6 +10,7 @@ import {
   maskProjectEnv,
   restoreMaskedEnvBindings,
 } from "../routes/project-env-response.js";
+import { maskRoutineRevisionEnv } from "../routes/routine-env-response.js";
 import { publicProject } from "../routes/workspace-response.js";
 import { REDACTED_SENTINEL } from "../services/secrets.js";
 
@@ -23,6 +24,8 @@ import { REDACTED_SENTINEL } from "../services/secrets.js";
 
 const PLAIN_SENTINEL = "sentinel-project-env-value-must-not-egress";
 const SECOND_SENTINEL = "sentinel-second-project-env-value-must-not-egress";
+/** The acting agent on {@link createRoutinesApp}; a UUID because the create schema demands one. */
+const ROUTINE_ACTOR_AGENT_ID = "11111111-2222-4333-8444-555555555555";
 
 const mockProjectService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -35,7 +38,21 @@ const mockProjectService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({ decide: vi.fn() }));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
-const mockRoutineService = vi.hoisted(() => ({ getDetail: vi.fn() }));
+const mockRoutineService = vi.hoisted(() => ({
+  getDetail: vi.fn(),
+  // PEN-3707 added the routine-env exits below; `get` backs the `assertCanManageExistingRoutine`
+  // gate that most of them run first.
+  get: vi.fn(),
+  getTrigger: vi.fn(),
+  getDescriptionDocument: vi.fn(async () => null),
+  list: vi.fn(),
+  create: vi.fn(),
+  update: vi.fn(),
+  listRevisions: vi.fn(),
+  restoreRevision: vi.fn(),
+  createTrigger: vi.fn(),
+  rotateTriggerSecret: vi.fn(),
+}));
 const mockSecretService = vi.hoisted(() => ({
   normalizeEnvBindingsForPersistence: vi.fn(),
   syncEnvBindingsForTarget: vi.fn(async () => undefined),
@@ -108,7 +125,10 @@ function createRoutinesApp() {
   app.use((req, _res, next) => {
     (req as any).actor = {
       type: "agent",
-      agentId: "agent-1",
+      // A real UUID rather than a readable label: `createRoutineSchema` declares
+      // `assigneeAgentId: z.string().uuid()`, and the agent-authored create path requires the
+      // assignee to BE the acting agent, so a label here 400s before any exit is reached.
+      agentId: ROUTINE_ACTOR_AGENT_ID,
       companyId: "company-1",
       companyIds: ["company-1"],
       source: "api_key",
@@ -426,3 +446,275 @@ describe("project env disclosure boundary (PEN-3033)", () => {
     });
   });
 });
+
+/**
+ * PEN-3707 (door #18) — the SAME `EnvBinding` union on `routines.env`, which is where the PEN-3033
+ * enumeration said to look next.
+ *
+ * Two things make this worth a block of its own rather than more cases above.
+ *
+ * First, the carrier is doubled: the live row carries `env`, and every stored revision carries it
+ * again under `snapshot.routine.env` because `routineRevisionSnapshotRoutine` copies it into each
+ * snapshot. Masking the row alone leaves the same material one request away on
+ * `GET /routines/:id/revisions`.
+ *
+ * Second, the ticket's own enumeration of the exits was INCOMPLETE — it named six and missed
+ * `POST /companies/:id/routines` and `PATCH /routines/:id`, both of which answer with the full
+ * routine row. The cases below are per-exit for exactly that reason: a count agreed in prose is not
+ * what keeps this closed.
+ */
+const ROUTINE_PLAIN_SENTINEL = "sentinel-routine-env-value-must-not-egress";
+const ROUTINE_SHORTHAND_SENTINEL = "sentinel-routine-shorthand-env-value-must-not-egress";
+
+function routineEnvFixture() {
+  return {
+    ROUTINE_PLAIN: { type: "plain", value: ROUTINE_PLAIN_SENTINEL },
+    ROUTINE_SHORTHAND: ROUTINE_SHORTHAND_SENTINEL,
+    ROUTINE_REF: { type: "secret_ref", secretId: "secret-2", version: "latest" },
+  } as Record<string, unknown>;
+}
+
+function routineRowFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "routine-1",
+    companyId: "company-1",
+    title: "Nightly",
+    assigneeAgentId: ROUTINE_ACTOR_AGENT_ID,
+    latestRevisionId: "rev-1",
+    latestRevisionNumber: 1,
+    env: routineEnvFixture(),
+    ...overrides,
+  };
+}
+
+function routineRevisionFixture() {
+  return {
+    id: "rev-1",
+    routineId: "routine-1",
+    revisionNumber: 1,
+    changeSummary: "Created routine",
+    snapshot: {
+      routine: { id: "routine-1", title: "Nightly", env: routineEnvFixture() },
+      triggers: [],
+    },
+  };
+}
+
+/** Every routine sentinel, absent from the serialized body. */
+function expectNoRoutineSentinels(body: unknown) {
+  const wire = JSON.stringify(body);
+  expect(wire).not.toContain(ROUTINE_PLAIN_SENTINEL);
+  expect(wire).not.toContain(ROUTINE_SHORTHAND_SENTINEL);
+}
+
+describe("routine env disclosure boundary (PEN-3707)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: true,
+      action: input.action,
+      reason: "test",
+      explanation: "Allowed by test mock.",
+    }));
+    mockRoutineService.get.mockResolvedValue(routineRowFixture());
+    mockRoutineService.getDescriptionDocument.mockResolvedValue(null);
+    mockSecretService.normalizeEnvBindingsForPersistence.mockImplementation(
+      async (_companyId: string, env: unknown) => env,
+    );
+  });
+
+  describe("route exits that carry the live routine row", () => {
+    it("masks on GET /companies/:companyId/routines", async () => {
+      mockRoutineService.list.mockResolvedValue([routineRowFixture()]);
+
+      const res = await request(createRoutinesApp()).get("/api/companies/company-1/routines");
+
+      expect(res.status).toBe(200);
+      expectNoRoutineSentinels(res.body);
+      // Names survive — knowing WHICH variables are bound stays diagnosable.
+      expect(Object.keys(res.body[0].env)).toContain("ROUTINE_PLAIN");
+      // Pointers are not material, so they are passed through rather than masked.
+      expect(res.body[0].env.ROUTINE_REF).toEqual({
+        type: "secret_ref",
+        secretId: "secret-2",
+        version: "latest",
+      });
+    });
+
+    it("masks on GET /routines/:id — the row's OWN env, alongside the project mask already there", async () => {
+      const project = projectFixture();
+      mockRoutineService.getDetail.mockResolvedValue({ ...routineRowFixture(), project });
+
+      const res = await request(createRoutinesApp()).get("/api/routines/routine-1");
+
+      expect(res.status).toBe(200);
+      // Both carriers on one response: the routine's env and the project's.
+      expectNoRoutineSentinels(res.body);
+      expect(JSON.stringify(res.body)).not.toContain(PLAIN_SENTINEL);
+      expect(Object.keys(res.body.env)).toContain("ROUTINE_PLAIN");
+      expect(Object.keys(res.body.project.env)).toContain("PLAIN_FIXTURE");
+    });
+
+    it("masks on POST /companies/:companyId/routines — an exit the ticket's enumeration missed", async () => {
+      mockRoutineService.create.mockResolvedValue(routineRowFixture());
+
+      const res = await request(createRoutinesApp())
+        .post("/api/companies/company-1/routines")
+        .send({ title: "Nightly", assigneeAgentId: ROUTINE_ACTOR_AGENT_ID });
+
+      expect(res.status).toBe(201);
+      expectNoRoutineSentinels(res.body);
+    });
+
+    it("masks on PATCH /routines/:id — the other exit the ticket's enumeration missed", async () => {
+      // The sharp case: an assignee agent edits only the title and is handed back every plain env
+      // value the routine holds, including ones it never supplied.
+      mockRoutineService.update.mockResolvedValue(routineRowFixture({ title: "Renamed" }));
+
+      const res = await request(createRoutinesApp())
+        .patch("/api/routines/routine-1")
+        .send({ title: "Renamed" });
+
+      expect(res.status).toBe(200);
+      expectNoRoutineSentinels(res.body);
+      expect(res.body.title).toBe("Renamed");
+    });
+
+    it("still answers when the routine has no env at all", async () => {
+      // The mask's early return. A row with `env: null` must survive unchanged rather than acquiring
+      // an empty object, which the editor would read as "all bindings deleted".
+      mockRoutineService.update.mockResolvedValue(routineRowFixture({ env: null }));
+
+      const res = await request(createRoutinesApp())
+        .patch("/api/routines/routine-1")
+        .send({ title: "Renamed" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.env).toBeNull();
+    });
+  });
+
+  describe("route exits that carry a revision snapshot", () => {
+    it("masks snapshot.routine.env on GET /routines/:id/revisions", async () => {
+      mockRoutineService.listRevisions.mockResolvedValue([routineRevisionFixture()]);
+
+      const res = await request(createRoutinesApp()).get("/api/routines/routine-1/revisions");
+
+      expect(res.status).toBe(200);
+      expectNoRoutineSentinels(res.body);
+      expect(Object.keys(res.body[0].snapshot.routine.env)).toContain("ROUTINE_PLAIN");
+    });
+
+    it("masks BOTH carriers on the revision-restore exit", async () => {
+      // `restoreRevision` is the only exit that returns the live row and a snapshot together, so a
+      // fix that covered one shape and not the other would still pass every other case here.
+      mockRoutineService.restoreRevision.mockResolvedValue({
+        routine: routineRowFixture(),
+        revision: routineRevisionFixture(),
+        restoredFromRevisionId: "rev-0",
+        restoredFromRevisionNumber: 0,
+        secretMaterials: [],
+      });
+
+      const res = await request(createRoutinesApp())
+        .post("/api/routines/routine-1/revisions/rev-0/restore");
+
+      expect(res.status).toBe(200);
+      expectNoRoutineSentinels(res.body);
+      expect(Object.keys(res.body.routine.env)).toContain("ROUTINE_PLAIN");
+      expect(Object.keys(res.body.revision.snapshot.routine.env)).toContain("ROUTINE_PLAIN");
+    });
+
+    it("masks the snapshot on trigger creation — a request that was not about env at all", async () => {
+      mockRoutineService.createTrigger.mockResolvedValue({
+        trigger: { id: "trigger-1", kind: "schedule", routineId: "routine-1" },
+        secretMaterial: null,
+        revision: routineRevisionFixture(),
+      });
+
+      const res = await request(createRoutinesApp())
+        .post("/api/routines/routine-1/triggers")
+        .send({ kind: "schedule", cronExpression: "0 9 * * *", timezone: "UTC" });
+
+      expect(res.status).toBe(201);
+      expectNoRoutineSentinels(res.body);
+    });
+
+    it("masks the snapshot on secret rotation while still returning the new webhook secret", async () => {
+      // The one value on these envelopes that MUST survive: show-once material the caller asked
+      // for, which exists nowhere else by the time the response is written. A mask that blanked it
+      // would be a silent functional regression rather than a visible one.
+      mockRoutineService.getTrigger.mockResolvedValue({
+        id: "trigger-1",
+        routineId: "routine-1",
+        kind: "webhook",
+      });
+      mockRoutineService.rotateTriggerSecret.mockResolvedValue({
+        trigger: { id: "trigger-1", kind: "webhook", routineId: "routine-1" },
+        secretMaterial: { webhookUrl: "https://example.test/fire", webhookSecret: "fresh-secret" },
+        revision: routineRevisionFixture(),
+      });
+
+      const res = await request(createRoutinesApp())
+        .post("/api/routine-triggers/trigger-1/rotate-secret")
+        .send({});
+
+      expect(res.status).toBe(200);
+      expectNoRoutineSentinels(res.body);
+      expect(res.body.secretMaterial.webhookSecret).toBe("fresh-secret");
+    });
+  });
+
+  describe("the mask is non-destructive upstream", () => {
+    it("leaves the row the service handed over holding its real values", async () => {
+      // Without this, every "does not contain" above could be satisfied by a fixture that never
+      // carried the value — and an in-place mutation would corrupt the row the dispatch path reads
+      // (`createRoutineEnvFingerprint`, `syncEnvBindingsForTarget`) rather than only the response.
+      const row = routineRowFixture();
+      mockRoutineService.list.mockResolvedValue([row]);
+
+      await request(createRoutinesApp()).get("/api/companies/company-1/routines");
+
+      expect((row.env as Record<string, unknown>).ROUTINE_PLAIN).toEqual({
+        type: "plain",
+        value: ROUTINE_PLAIN_SENTINEL,
+      });
+      expect((row.env as Record<string, unknown>).ROUTINE_SHORTHAND).toBe(
+        ROUTINE_SHORTHAND_SENTINEL,
+      );
+    });
+  });
+
+  describe("the revision-snapshot mask helper", () => {
+    it("leaves a revision whose snapshot carries no routine alone", () => {
+      // Guards the early returns: a malformed or future snapshot shape must pass through rather
+      // than throw on a read path.
+      expect(maskRoutineRevisionEnv({ id: "r", snapshot: { triggers: [] } })).toEqual({
+        id: "r",
+        snapshot: { triggers: [] },
+      });
+      expect(maskRoutineRevisionEnv({ id: "r", snapshot: null })).toEqual({
+        id: "r",
+        snapshot: null,
+      });
+    });
+
+    it("masks a `__proto__` env key as an OWN property, the same way the project mask does", () => {
+      // `ENV_KEY_RE` admits `__proto__`, and JSON.parse hands it over as an ordinary own property.
+      // The routine path reaches the same accumulator, so the own-property guarantee has to hold
+      // here too or a binding vanishes silently.
+      const revision = {
+        id: "r",
+        snapshot: {
+          routine: {
+            env: JSON.parse(`{"__proto__":{"type":"plain","value":"${ROUTINE_PLAIN_SENTINEL}"}}`),
+          },
+        },
+      };
+      const masked = maskRoutineRevisionEnv(revision) as any;
+      expect(Object.hasOwn(masked.snapshot.routine.env, "__proto__")).toBe(true);
+      expect(JSON.stringify(masked)).not.toContain(ROUTINE_PLAIN_SENTINEL);
+    });
+  });
+});
+
