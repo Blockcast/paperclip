@@ -347,6 +347,53 @@ describe("buildJobManifest", () => {
       expect(job.metadata?.annotations?.["paperclip.io/adapter-type"]).toBe("claude_k8s");
       expect(job.metadata?.annotations?.["paperclip.io/agent-name"]).toBe("Test Agent");
     });
+
+    // BLO-39114.  A foreign run reaping this Job gets the pod-log path from
+    // this annotation, so the annotation has to BE the path the pod writes to
+    // — not a value that merely looks like it.  Comparing against the builder's
+    // own returned `podLogPath` is what makes that identity, rather than an
+    // assumption that two sanitizers agree; that assumption is false in
+    // general (sanitizeForK8sPath strips `.`/`_`, sanitizeLabelValue keeps them
+    // and truncates at 63), which is why the path is stamped instead of rebuilt.
+    it("stamps the pod-log path the pod actually writes to", () => {
+      const { job, podLogPath } = buildJobManifest({ ctx, selfPod });
+      expect(podLogPath).toBeTruthy();
+      expect(job.metadata?.annotations?.["paperclip.io/pod-log-path"]).toBe(podLogPath);
+    });
+
+    it("stamps the isolated pod-log path when the Job is isolated", () => {
+      ctx.config = { isolationMode: "isolated", isolationKey: "pr-review-123" };
+      const { job, podLogPath } = buildJobManifest({ ctx, selfPod });
+      // The isolated branch puts the key *inside* the path, so this is the
+      // variant most at risk from a label-based reconstruction.
+      expect(podLogPath).toContain("/isolated/pr-review-123/");
+      expect(job.metadata?.annotations?.["paperclip.io/pod-log-path"]).toBe(podLogPath);
+    });
+
+    // The reason the path is stamped rather than rebuilt from labels.
+    // `runId`, `agentId` and `companyId` each reach the PATH through
+    // `sanitizeForK8sPath` and the LABEL through `sanitizeLabelValue`, from the
+    // same raw value — and those two disagree on `_` and `.` (and on length,
+    // above 63 chars).  A label-based reconstruction would compute a path that
+    // does not exist, and a missing file is indistinguishable from a successful
+    // reap, so it would fail silently.  That is the leak, not a cosmetic issue.
+    //
+    // Today every such id is a UUID, for which the two agree — so this is a
+    // latent divergence, which is exactly why it needs pinning rather than
+    // trusting.  `isolationKey` is NOT in this class: it is pre-sanitized with
+    // `sanitizeForK8sPath` in `resolveJobIsolation` and both consumers use that
+    // one value, so for it alone the label does equal the path component.
+    it("pins that the pod-log path and the run-id label can disagree", () => {
+      ctx.runId = "run_a.1";
+      const { job, podLogPath } = buildJobManifest({ ctx, selfPod });
+
+      expect(job.metadata?.labels?.["paperclip.io/run-id"]).toBe("run_a.1");
+      expect(podLogPath).toContain("/runa1.pod.ndjson");
+      expect(podLogPath).not.toContain("run_a.1");
+
+      // ...and the annotation still tracks the real path, which is the point.
+      expect(job.metadata?.annotations?.["paperclip.io/pod-log-path"]).toBe(podLogPath);
+    });
   });
 
   describe("pod spec", () => {
