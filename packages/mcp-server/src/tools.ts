@@ -383,9 +383,25 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipInboxLite",
-      "Get your compact assignment list for prioritizing this heartbeat. Returns ONLY issues assigned to you in todo, in_progress, or blocked. `in_review` is deliberately excluded: review/approval waits resume via comment, interaction, and monitor wakes rather than being re-picked every heartbeat. So an empty array means \"nothing to pick\" — NOT that the call failed. On an unscoped heartbeat wake, exit. If the wake NAMES an issue (PAPERCLIP_TASK_ID set, or a comment/mention/interaction/approval/monitor/recovery wake), do NOT exit on empty — read that issue by id with paperclipGetIssue and work it; empty is the expected response when the named issue is `in_review`. Either way, never fall back to a raw paperclipListIssues sweep to find work: it is checkout-lock-blind and can duplicate a concurrent run's work. Each entry carries `activeRun`, `dependencyReady`, and `unresolvedBlockerCount` so you can skip work another run already owns. It also carries all three wake-path fields, `activeRun`, `monitorNextCheckAt`, and `scheduledRetryAt` (plus `scheduledRetryReason`/`scheduledRetryAttempt`), each explicitly `null` when unset, so the attendance predicate is computable per row and agrees with paperclipListIssues for rows both surfaces return (BLO-34421). It is NOT a lane-wide attendance census: rows held by another running run, `in_review` rows, and pre-cutoff worktree rows are withheld, and all three skew attended. A live monitor means `monitorNextCheckAt` in the future; an overdue one is a wake that did not happen. Prefer this over paperclipListIssues(assigneeAgentId=me) for the normal heartbeat inbox check — it's the cheaper, purpose-built call.",
-      z.object({}),
-      async () => client.requestJson("GET", "/agents/me/inbox-lite"),
+      "Get your compact assignment list for prioritizing this heartbeat. Returns ONLY issues assigned to you in todo, in_progress, or blocked. `in_review` is deliberately excluded: review/approval waits resume via comment, interaction, and monitor wakes rather than being re-picked every heartbeat. So an empty array means \"nothing to pick\" — NOT that the call failed. On an unscoped heartbeat wake, exit. If the wake NAMES an issue (PAPERCLIP_TASK_ID set, or a comment/mention/interaction/approval/monitor/recovery wake), do NOT exit on empty — read that issue by id with paperclipGetIssue and work it; empty is the expected response when the named issue is `in_review`. Either way, never fall back to a raw paperclipListIssues sweep to find work: it is checkout-lock-blind and can duplicate a concurrent run's work. Each entry carries `activeRun`, `dependencyReady`, and `unresolvedBlockerCount` so you can skip work another run already owns. It also carries all three wake-path fields, `activeRun`, `monitorNextCheckAt`, and `scheduledRetryAt` (plus `scheduledRetryReason`/`scheduledRetryAttempt`), each explicitly `null` when unset, so the attendance predicate is computable per row and agrees with paperclipListIssues for rows both surfaces return (BLO-34421). It is NOT a lane-wide attendance census: rows held by another running run, `in_review` rows, and pre-cutoff worktree rows are withheld, and all three skew attended. A live monitor means `monitorNextCheckAt` in the future; an overdue one is a wake that did not happen. Prefer this over paperclipListIssues(assigneeAgentId=me) for the normal heartbeat inbox check — it's the cheaper, purpose-built call.\n\n⚠ THIS PAGE IS CAPPED (500) AND ORDERED BY PRIORITY — `critical` → `high` → `medium` → `low`, then most-recent-activity first WITHIN each band. On a lane deeper than the cap the cut lands mid-band and every row below it is absent, so on a deep lane `low` rows can be entirely unreachable from page 1. The rows are still perfectly healthy — `todo`, assigned, dependency-clear — which is why nothing downstream notices (BLO-39015: 139 of 634 rows invisible on one lane, including all 44 `low`).\n\nTHE TELL: when the cap bites, the response is an OBJECT `{truncated: true, appliedLimit, returnedCount, note, issues: [...]}` instead of the usual bare array. A bare array is the proof you have every row; an object means you are holding a PREFIX. Page the remainder with `offset` (offset += appliedLimit) until a bare array comes back. Do NOT infer truncation from the returned length: eligibility filters (foreign-run holds, worktree cutoff) only ever SHORTEN the page, so a truncated page routinely returns fewer than `appliedLimit` rows — `returnedCount < appliedLimit` with `truncated: true` is normal, not a contradiction.\n\nThis matters for BLO-27553's strand remedy, which says to park unreachable work as `todo` because `todo` keeps a row here and re-dispatchable. That holds only for the rows this page actually returns: on a deep lane, demoting a `low` row to `todo` without paging is disposal with a healthy-looking receipt.",
+      z.object({
+        offset: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Rows to skip. Use to page past a truncated page: offset += appliedLimit, repeat until a bare array returns.",
+          ),
+      }),
+      async ({ offset }) => {
+        const suffix = offset === undefined ? "" : `?offset=${offset}`;
+        const { data, headers } = await client.requestJsonWithHeaders(
+          "GET",
+          `/agents/me/inbox-lite${suffix}`,
+        );
+        return applyIssueListTruncationEnvelope(data, headers);
+      },
     ),
     makeTool(
       "paperclipListAgents",
