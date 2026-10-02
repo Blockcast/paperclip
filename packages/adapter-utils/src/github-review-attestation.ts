@@ -326,7 +326,15 @@ function parseBodyField(expression: string): ReviewBodySource | null {
 // lines in prose, and flagging those would refuse honest reviews of exactly
 // the code that does the refusing. Lines are blanked rather than removed so
 // the line anchors below keep pointing at the same text.
-const FENCE_DELIMITER_PATTERN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+//
+// The info string is `[^\n]*`, never `.`. JS's `.` excludes `\r`, U+2028 and
+// U+2029 where Python's and CommonMark's exclude only `\n`, so a bare `.` here
+// opens no fence on an info string carrying U+2028 while the gate and the
+// sweep open one -- and the three readers of one review body then disagree
+// about which `Reviewed head:` lines are quoted. That is the BLO-32695
+// cross-reader divergence, and this file is in its mirror set (Ally, #1721 at
+// 068806d6, Important 1).
+const FENCE_DELIMITER_PATTERN = /^ {0,3}(`{3,}|~{3,})([^\n]*)$/;
 const FENCE_CLOSE_PATTERN = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
 function withoutFencedCodeBlocks(body: string): string {
