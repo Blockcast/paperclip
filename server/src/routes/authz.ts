@@ -233,7 +233,7 @@ type RunTranscriptReadDecider = {
  * `normalizeHumanRole` folds it to `operator`, so matching the stored string
  * would make one membership row an operator for default-grant seeding and a
  * non-operator here — the same "two places naming the human set differently"
- * that migration 0248's comment exists to remove (Ally review 5381822720).
+ * that migration 0251's comment exists to remove (Ally review 5381822720).
  * Typing the set to the normalized union also makes a future role addition a
  * compile error here rather than a silent denial.
  */
@@ -284,8 +284,15 @@ function normalizedTranscriptRole(value: unknown): HumanCompanyMembershipRole {
  * `companyIds: [companyId]`, so they clear `hasCompanyAccess` and then match
  * the operator set. Falling through costs them nothing a grant cannot restore
  * (Ally review 5381822720).
+ *
+ * Exported, and false for any non-board actor, so a caller that must answer
+ * without the decider — an operation with no resolvable owner, see
+ * `withholdUnentitledWorkspaceOperationOutput` — asks this same question
+ * instead of re-deriving "is this human an operator?" from `req.actor.type`
+ * (Ally review 5386746244).
  */
-function boardActorIsTranscriptOperator(req: Request, companyId: string): boolean {
+export function boardActorIsTranscriptOperator(req: Request, companyId: string): boolean {
+  if (req.actor.type !== "board") return false;
   if (req.actor.source === "cloud_tenant") return false;
   if (req.actor.source === "local_implicit") return true;
   return (req.actor.memberships ?? []).some(

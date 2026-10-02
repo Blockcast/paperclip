@@ -935,7 +935,7 @@ draws for `workspace_runtime:read`, which guards less sensitive material. That
 is a default rather than a lockout: such an actor falls through to the
 authorization service, so an explicit `runs:read_transcript` grant admits one,
 and the denial carries the named boundary reason either way. The gate is the
-only place the human operator set is written down; migration 0248 seeds the
+only place the human operator set is written down; migration 0251 seeds the
 grant for `ceo` / `cto` agents and deliberately says nothing about humans.
 
 Run *state* is unchanged and stays company-readable: `GET

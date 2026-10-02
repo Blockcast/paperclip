@@ -1010,6 +1010,74 @@ describe("run transcript scoping (PEN-3142)", () => {
     });
 
     /**
+     * Ally review 5386746244 (Important #1). The null-owner fallback used to keep
+     * the read for every board actor (`req.actor.type === "board"`), which is the
+     * predicate the transcript gate narrowed away from — so a viewer was denied
+     * the owned row and handed the RUN-LESS one unprojected. It now takes the
+     * same operator test as `decideRunTranscriptRead`, on both list routes.
+     */
+    const viewerBoardActor = {
+      type: "board",
+      userId: "user-1",
+      companyIds: ["company-1"],
+      source: "session",
+      isInstanceAdmin: false,
+      memberships: [{ companyId: "company-1", membershipRole: "viewer", status: "active" }],
+    };
+
+    function allowCompanyScopeOnly() {
+      mockDecide.mockImplementation(async (input: { action?: string }) => (
+        input.action === "company_scope:read"
+          ? { allowed: true, action: input.action, reason: "allow_company_member", explanation: "Company member." }
+          : {
+            allowed: false,
+            action: input.action,
+            reason: "deny_missing_grant",
+            explanation: "Missing permission: runs:read_transcript.",
+          }
+      ));
+    }
+
+    for (const [route, build] of [
+      ["/api/heartbeat-runs/run-1/workspace-operations", createApp],
+      ["/api/execution-workspaces/workspace-1/workspace-operations", createWorkspaceApp],
+    ] as const) {
+      it(`withholds the run-less row from a viewer-role board actor on ${route}`, async () => {
+        allowCompanyScopeOnly();
+        const res = await requestApp(
+          await build(viewerBoardActor),
+          (baseUrl) => request(baseUrl).get(route),
+        );
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        const runless = res.body.find((op: { id: string }) => op.id === "op-2");
+        expect(runless.heartbeatRunId).toBeNull();
+        expect(runless.stdoutExcerpt).toBeNull();
+        expect(runless.stderrExcerpt).toBeNull();
+        expectStateSurvived(runless);
+        expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
+      });
+
+      // Counterweight: the human operator arm still keeps the run-less row, so
+      // the case above cannot pass by withholding it from everyone.
+      it(`keeps the run-less row for an admin-role board actor on ${route}`, async () => {
+        allowCompanyScopeOnly();
+        const res = await requestApp(
+          await build({
+            ...viewerBoardActor,
+            memberships: [{ companyId: "company-1", membershipRole: "admin", status: "active" }],
+          }),
+          (baseUrl) => request(baseUrl).get(route),
+        );
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        const runless = res.body.find((op: { id: string }) => op.id === "op-2");
+        expect(runless.stdoutExcerpt).toBe(WORKSPACE_OP_CANARY);
+        expect(runless.withheldFields).toBeUndefined();
+      });
+    }
+
+    /**
      * PEN-3204 / merge of 2026-09-20: the four cases that pinned a
      * `decideRunTranscriptRead` gate on `GET /workspace-operations/:operationId/log`
      * were REMOVED here rather than repaired, because the route they described is no
