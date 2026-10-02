@@ -2805,5 +2805,57 @@ class TestPatternCharacterClassesAreAsciiOnly(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
+class TestFenceOpenerAgreesWithTheJsReaders(unittest.TestCase):
+    """Ally's review of #1721 at b8322735, Suggestion 1 -- the cross-language half.
+
+    check-ally-review-consistency.test.mjs pins the three JS fence openers
+    byte-identical to each other, but the reader they ultimately have to agree
+    with is this one, and nothing asserted across the language boundary. Today
+    they do agree: JS spells the info string `[^\\n]*` and Python spells it
+    `.*`, and under re.ASCII (which governs `\\w`/`\\d`/`\\s`/`\\b`, not `.`)
+    Python's `.` is exactly `[^\\n]`.
+
+    That equivalence is a property of the FLAGS, not of the pattern text, so it
+    is one `re.DOTALL` away from silently reopening the BLO-32695 divergence
+    with all three JS assertions still green. The hazard is concrete rather
+    than theoretical: re.DOTALL is already in use on another pattern in this
+    same module.
+
+    Both harms are silent: a fence that opens in one reader and not another
+    makes the three readers of one review body disagree about which
+    `Reviewed head:` lines are quoted, which is a gate red over a bucket the
+    sweep cannot see, and a sweep that reads the head as attested and
+    suppresses the re-request that would clear it.
+    """
+
+    def test_the_info_string_is_dot_and_dot_still_means_not_newline(self):
+        import re as _re
+
+        self.assertEqual(
+            sweep.FENCE_OPEN_PATTERN.pattern,
+            r"^ {0,3}(`{3,}|~{3,})(.*)$",
+            "the fence opener must stay byte-identical to the three JS readers "
+            "with `[^\\n]` spelled as `.`",
+        )
+        self.assertFalse(
+            sweep.FENCE_OPEN_PATTERN.flags & _re.DOTALL,
+            "re.DOTALL would make `.` match a newline, so this reader would open "
+            "fences the JS readers do not",
+        )
+
+    def test_control_the_info_string_stops_at_a_newline(self):
+        # Without this the assertions above pass on a pattern whose text and
+        # flags are right for a reason that no longer holds -- they are claims
+        # about the source, this is a claim about the behaviour.
+        self.assertIsNone(sweep.FENCE_OPEN_PATTERN.match("```ts\njunk"))
+        self.assertIsNotNone(sweep.FENCE_OPEN_PATTERN.match("```ts"))
+
+    def test_the_info_string_does_not_stop_at_u2028(self):
+        # The axis the row is about, asserted from this side: U+2028 is an
+        # ordinary character to Python's `.` and to JS's `[^\n]`, and a line
+        # terminator to JS's bare `.`. All four readers must agree it opens.
+        self.assertIsNotNone(sweep.FENCE_OPEN_PATTERN.match("```ts\u2028junk"))
+
+
 if __name__ == "__main__":
     unittest.main()
