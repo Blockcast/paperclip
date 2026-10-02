@@ -572,7 +572,7 @@ function extractPortableScopedEnvInputs(
         ? "system_dependent"
         : "portable";
       const isSensitive = withholdsEnvInputDefault(key, defaultValue ?? "", portability);
-      if (portability === "system_dependent") {
+      if (portability === "system_dependent" && !isSensitive) {
         warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
       }
       // Warn only on the value-shape branch; see `pushWithheldEnvDefaultWarning`.
@@ -593,7 +593,7 @@ function extractPortableScopedEnvInputs(
     if (typeof binding === "string") {
       const portability = isAbsoluteCommand(binding) ? "system_dependent" : "portable";
       const isSensitive = withholdsEnvInputDefault(key, binding, portability);
-      if (portability === "system_dependent") {
+      if (portability === "system_dependent" && !isSensitive) {
         warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
       }
       pushWithheldEnvDefaultWarning(warnings, scope.warningPrefix, key, isSensitive);
