@@ -284,8 +284,15 @@ function normalizedTranscriptRole(value: unknown): HumanCompanyMembershipRole {
  * `companyIds: [companyId]`, so they clear `hasCompanyAccess` and then match
  * the operator set. Falling through costs them nothing a grant cannot restore
  * (Ally review 5381822720).
+ *
+ * Exported, and false for any non-board actor, so a caller that must answer
+ * without the decider — an operation with no resolvable owner, see
+ * `withholdUnentitledWorkspaceOperationOutput` — asks this same question
+ * instead of re-deriving "is this human an operator?" from `req.actor.type`
+ * (Ally review 5386746244).
  */
-function boardActorIsTranscriptOperator(req: Request, companyId: string): boolean {
+export function boardActorIsTranscriptOperator(req: Request, companyId: string): boolean {
+  if (req.actor.type !== "board") return false;
   if (req.actor.source === "cloud_tenant") return false;
   if (req.actor.source === "local_implicit") return true;
   return (req.actor.memberships ?? []).some(

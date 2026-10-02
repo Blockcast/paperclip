@@ -62,7 +62,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
-import { assertBoard, assertCompanyAccess, assertInstanceAdmin, decideRunTranscriptRead, getAccessibleResource, getActorInfo, hasCompanyAccess, runTranscriptReadGate } from "./authz.js";
+import { assertBoard, assertCompanyAccess, assertInstanceAdmin, boardActorIsTranscriptOperator, decideRunTranscriptRead, getAccessibleResource, getActorInfo, hasCompanyAccess, runTranscriptReadGate } from "./authz.js";
 import type { RunTranscriptReadOutcome } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -5403,7 +5403,7 @@ export function agentRoutes(
       publicWorkspaceOperations(operations, viewer),
       owners,
       runTranscriptReadGate(req, access, run.companyId),
-      req.actor.type === "board",
+      boardActorIsTranscriptOperator(req, run.companyId),
     );
     res.json(redactCurrentUserValue(
       projected,
