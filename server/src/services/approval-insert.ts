@@ -1,4 +1,4 @@
-import type { Db } from "@paperclipai/db";
+import type { Db, DbTransaction } from "@paperclipai/db";
 import { approvals } from "@paperclipai/db";
 
 type ApprovalInsertValues = typeof approvals.$inferInsert;
@@ -10,9 +10,13 @@ type ApprovalInsertValues = typeof approvals.$inferInsert;
  * `payload.title` in this function's own type turns a forgotten title into
  * a compile error instead of an untitled, structurally-undecidable board
  * card. See BLO-21032 (blank-title cards) and BLO-22705 (this guard).
+ *
+ * Accepts a transaction handle as well as the pool: budgets.ts files its card in
+ * the same transaction that claims the incident, and a `tx as unknown as Db` cast
+ * there would silently absorb any later drift in this signature (BLO-37275).
  */
 export function insertApproval(
-  db: Db,
+  db: Db | DbTransaction,
   values: Omit<ApprovalInsertValues, "payload"> & {
     payload: ApprovalInsertValues["payload"] & { title: string };
   },
