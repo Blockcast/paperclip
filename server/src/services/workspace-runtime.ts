@@ -5106,7 +5106,11 @@ export async function inspectWorktreeReclaimSafety(
     cleanupReason?: ExecutionWorkspaceCleanupReason;
   },
 ): Promise<WorktreeReclaimSafety> {
-  const inspectionStartedAt = Date.now();
+  // PEN-3692: `performance.now()` rather than `Date.now()` at all three sites
+  // that feed this histogram. Its `_sum` IS the work integral §3(b) regresses
+  // slab residual against, so a wall-clock step (NTP, suspend) would land
+  // directly in the headline quantity as phantom or negative walking time.
+  const inspectionStartedAt = performance.now();
   try {
     return await inspectWorktreeReclaimSafetyInner(worktreePath);
   } finally {
@@ -5116,7 +5120,7 @@ export async function inspectWorktreeReclaimSafety(
     recordExecutionWorkspaceReclaimInspection({
       trigger: options.trigger,
       cleanupReason: options.cleanupReason,
-      durationMs: Date.now() - inspectionStartedAt,
+      durationMs: performance.now() - inspectionStartedAt,
     });
   }
 }
@@ -5311,7 +5315,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         });
         warnings.push(...authorization.warnings);
         if (authorization.authorized) {
-          const startedAt = Date.now();
+          // Monotonic, for the reason given at `inspectWorktreeReclaimSafety`.
+          const startedAt = performance.now();
           let removalSucceeded = false;
           try {
             const removeForceArgs = authorization.removeForce === "double"
@@ -5346,7 +5351,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
               cleanupReason,
               method: "worktree_remove",
               succeeded: removalSucceeded,
-              durationMs: Date.now() - startedAt,
+              durationMs: performance.now() - startedAt,
             });
           }
         }
@@ -5389,7 +5394,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     if (containsProjectWorkspace) {
       warnings.push(`Refusing to remove path "${workspacePath}" because it contains the project workspace.`);
     } else {
-      const startedAt = Date.now();
+      // Monotonic, for the reason given at `inspectWorktreeReclaimSafety`.
+      const startedAt = performance.now();
       let removalSucceeded = false;
       try {
         await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
@@ -5406,7 +5412,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
           cleanupReason,
           method: "remove_local_fs",
           succeeded: removalSucceeded,
-          durationMs: Date.now() - startedAt,
+          durationMs: performance.now() - startedAt,
         });
       }
       if (input.recorder) {

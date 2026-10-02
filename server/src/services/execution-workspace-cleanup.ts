@@ -116,26 +116,38 @@ export function classifyRemovalProof(
  * `decodeRunAttribution` takes the STORED string and `encodeRetainedReason` takes
  * the DECODED origin, so re-deferring an already-suffixed row re-derives the same
  * value rather than stacking suffixes. No safety reason (`dirty`, `unpushed`,
- * `unverifiable`, `uncleaned`, …) ends in this suffix, so the split is unambiguous.
+ * `unverifiable`, `uncleaned`, …) ends in either suffix, so the split is unambiguous.
+ *
+ * A null `cleanup_reason` on an ELIGIBLE row is a third origin, not a synonym for
+ * `idle_backfill` (Ally, review of 50628a4). The backfill stamps its own reason and
+ * run teardown stamps `run_ended`, so a stamped row with no reason means some writer
+ * made it collectable without recording why — today only the operator PATCH, since
+ * the heartbeat writer that did it is fixed in this commit. It gets its own suffix
+ * for the same reason `run_ended` does: without one, the first deferral would silently
+ * relabel it `idle_backfill`, which is the collapse this whole mechanism exists to
+ * prevent, one origin over. Only `idle_backfill` stays unsuffixed, so the dominant
+ * population's stored values remain byte-identical to what they were before.
  */
 const RUN_ATTRIBUTED_RETAIN_SUFFIX = "_run_ended";
+const UNATTRIBUTED_RETAIN_SUFFIX = "_unknown";
 
 export function encodeRetainedReason(
   reason: string,
   origin: ExecutionWorkspaceCleanupReason,
 ): string {
-  return origin === "run_ended"
-    ? `retained_${reason}${RUN_ATTRIBUTED_RETAIN_SUFFIX}`
-    : `retained_${reason}`;
+  if (origin === "run_ended") return `retained_${reason}${RUN_ATTRIBUTED_RETAIN_SUFFIX}`;
+  if (origin === "unknown") return `retained_${reason}${UNATTRIBUTED_RETAIN_SUFFIX}`;
+  return `retained_${reason}`;
 }
 
 export function decodeRunAttribution(
   storedCleanupReason: string | null,
 ): ExecutionWorkspaceCleanupReason {
+  if (storedCleanupReason === null) return "unknown";
   if (storedCleanupReason === "run_ended") return "run_ended";
-  return storedCleanupReason?.endsWith(RUN_ATTRIBUTED_RETAIN_SUFFIX)
-    ? "run_ended"
-    : "idle_backfill";
+  if (storedCleanupReason.endsWith(RUN_ATTRIBUTED_RETAIN_SUFFIX)) return "run_ended";
+  if (storedCleanupReason.endsWith(UNATTRIBUTED_RETAIN_SUFFIX)) return "unknown";
+  return "idle_backfill";
 }
 
 function readDurationEnv(name: string, fallback: number): number {
@@ -376,13 +388,13 @@ export function executionWorkspaceCleanupService(db: Db) {
       }
       scanned += 1;
       const worktreePath = candidate.providerRef ?? candidate.cwd;
-      // PEN-3692 run attribution. Only `run_ended` is run-attributable; every
-      // other reason (today `idle_backfill`, and anything added later) is
-      // reclamation of the pre-existing population. Mapped to the bounded enum
-      // rather than passed through, so a new DB value cannot widen cardinality.
-      // Reads through a prior deferral's retain reason — see
-      // `decodeRunAttribution` for why that is not the same as reading the
-      // column directly.
+      // PEN-3692 run attribution. Only `run_ended` is run-attributable; a named
+      // non-run reason (today `idle_backfill`, and anything added later) is
+      // reclamation of the pre-existing population, and NO reason at all is
+      // `unknown` rather than either — see `decodeRunAttribution`. Mapped to the
+      // bounded enum rather than passed through, so a new DB value cannot widen
+      // cardinality. Reads through a prior deferral's retain reason, which is
+      // not the same as reading the column directly.
       const candidateCleanupReason = decodeRunAttribution(candidate.cleanupReason);
       // A sibling of a tree whose stat was abandoned is on the same wedged
       // mount, so probing it would hold a second thread to learn the same
