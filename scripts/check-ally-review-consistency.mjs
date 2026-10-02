@@ -135,6 +135,10 @@ const BLOCKING_SECTION_RE =
  *
  * The attestation is matched over fence-stripped text, as the gate matches it
  * (attestedHeadFrom), so a *fenced* paste is not an attestation here either.
+ * Disposition readers have different contracts: retiredFindingKeys reads
+ * emitted text because only emitted entries may retire a finding, while
+ * hasStillPresentDisposition reads raw text because quoted blocking feedback
+ * must not make the gate look clean.
  */
 // Line anchors here are spelled `(?:^|\n)` and `(?=\n|$)`, no pattern in this
 // file carries the `m` flag, and no pattern uses a wildcard `.`. U+2028/U+2029
@@ -154,7 +158,6 @@ const BLOCKING_SECTION_RE =
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 
 /**
-/**
  * A prior-finding ledger entry. Composed character-for-character with
  * PRIOR_FINDING_DISPOSITION_PATTERN in server/src/services/ally-review-detection.ts
  * (mirrored verbatim in .github/scripts/sweep-stalled-ally-reviews.py).
@@ -166,19 +169,13 @@ const PRIOR_FINDING_DISPOSITION_RE = new RegExp(
 
 /** Every counted bucket, including `(0)`, used for finding coverage. */
 const COUNTED_SECTION_GLOBAL_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?:[#>][ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(critical|important)[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
-  "gim",
-);
-
-/** A prior-finding disposition that says the blocker is still present. */
-const STILL_PRESENT_DISPOSITION_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present(?![a-z-])[ \t]*(?:—|-)`,
-  "im",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}(?:[#>][ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(critical|important)[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
+  "gi",
 );
 
 /**
  * A prior-finding disposition that defers an accepted finding to a follow-up
- * issue (`tracked`, BLO-36903). Unlike STILL_PRESENT_DISPOSITION_RE this one
+ * issue (`tracked`, BLO-36903). Unlike hasStillPresentDisposition this one
  * EXEMPTS (I4), so the loose `prior:[^\n]*` convention, fail-safe in a
  * trigger, would be fail-open here: it must not match a ledger entry the gate
  * would not count as a deferral. So the ref, severity and index use the gate's
@@ -228,11 +225,6 @@ const ATTESTATION_WRAPPER_RUN = String.raw`[*_\`\t ]{0,6}`;
 // `\u2029`, so on a CRLF body this credited an attestation the gate cannot read
 // -- the missed-red direction, inverting this auditor's safe one (Ally, #1721
 // at 5f4d5302, Important 4).
-const RETIRING_DISPOSITION_GLOBAL_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
-  "gim",
-);
-
 /** The retiring verbs: the gate's RESOLVED_PRIOR_DISPOSITIONS, verbatim. */
 const RETIRING_DISPOSITIONS = new Set(["fixed", "no-longer-applicable"]);
 
@@ -437,7 +429,7 @@ function stillPresentIn(raw) {
  * `{ kind: "absent" }` when no block is present (fall back to prose),
  * `{ kind: "unreadable" }` when one is present but cannot be trusted (fail
  * closed — never fall back), or
- * `{ kind: "ok", head, blockingFindings, stillPresent }`.
+ * `{ kind: "ok", head, counts, dispositions, blockingFindings, stillPresent }`.
  *
  * Counted over fence-stripped text, because the gate counts over fence-stripped
  * text: `parseAllyVerdictBlock` reads `emittedReviewText(body)`. Reading the raw
@@ -494,6 +486,8 @@ function structuredVerdict(rawText) {
   return {
     kind: "ok",
     head: head.trim().toLowerCase(),
+    counts,
+    dispositions: parsed.dispositions ?? [],
     blockingFindings: BLOCKING_SEVERITIES.some((severity) => counts.get(severity) > 0),
     stillPresent,
   };
@@ -728,22 +722,42 @@ export function hasDeferredDisposition(body) {
  * mirrors the gate's bucket pattern; see the note there.
  */
 export function countedFindingKeys(body) {
+  const verdict = structuredVerdict(reviewText(body));
   const keys = new Set();
-  for (const [, severity, count] of String(body ?? "").matchAll(COUNTED_SECTION_GLOBAL_RE)) {
-    for (let index = 1; index <= Number(count); index += 1) {
+  if (verdict.kind === "ok") {
+    for (const severity of BLOCKING_SEVERITIES) {
+      for (let index = 1; index <= (verdict.counts.get(severity) ?? 0); index += 1) {
+        keys.add(`${severity} ${index}`);
+      }
+    }
+    return keys;
+  }
+  for (const [, severity, count] of reviewText(body).matchAll(COUNTED_SECTION_GLOBAL_RE)) {
+    for (let index = 1; index <= Math.min(Number(count), MAX_VERDICT_FINDING_COUNT); index += 1) {
       keys.add(`${severity.toLowerCase()} ${index}`);
     }
   }
   return keys;
 }
 
-/** The findings a body retires by name against `head`, in the same key space. */
+/** Only emitted ledger entries may retire findings; quoted still-present entries keep blocking. */
 export function retiredFindingKeys(body, head) {
   const normalizedHead = String(head ?? "").toLowerCase();
   const keys = new Set();
-  for (const [, prefix, severity, index, verb] of String(body ?? "").matchAll(
-    RETIRING_DISPOSITION_GLOBAL_RE,
-  )) {
+  const verdict = structuredVerdict(reviewText(body));
+  if (verdict.kind === "unreadable") return keys;
+  if (verdict.kind === "ok") {
+    for (const entry of verdict.dispositions) {
+      if (!RETIRING_DISPOSITIONS.has(entry.verb.trim().toLowerCase())) continue;
+      if (normalizedHead.startsWith(entry.head.trim().toLowerCase())) {
+        keys.add(`${entry.severity.trim().toLowerCase()} ${entry.index}`);
+      }
+    }
+    return keys;
+  }
+  for (const [, prefix, severity, index, verb] of withoutFencedSpans(
+    reviewText(body),
+  ).matchAll(PRIOR_FINDING_DISPOSITION_RE)) {
     if (!RETIRING_DISPOSITIONS.has(verb.toLowerCase())) continue;
     if (normalizedHead.startsWith(prefix.toLowerCase())) {
       keys.add(`${severity.toLowerCase()} ${Number(index)}`);

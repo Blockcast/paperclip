@@ -5,6 +5,7 @@ import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import {
+  hasActionablePrReviewFeedback,
   extractAllyPriorFindingDispositions,
   extractAllyReportedFindingRefs,
 } from "../server/src/services/ally-review-detection.ts";
@@ -191,6 +192,23 @@ describe("hasStillPresentDisposition", () => {
       false,
     );
   });
+
+  // Must agree with the merge gate, which treats still-present as a blocking
+  // predicate and so reads it from the raw body as well as the fence-stripped
+  // one: a fenced still-present entry blocks there and must fire here.
+  const entry = "- **prior:354d5b9 important 1** — still-present — the issue remains";
+  for (const [shape, body] of [
+    ["a plain entry (control)", entry],
+    ["an entry inside a closed backtick fence", `\`\`\`\n${entry}\n\`\`\``],
+    ["an entry inside a closed tilde fence", `~~~\n${entry}\n~~~`],
+    ["an entry inside an md-tagged fence", `\`\`\`md\n${entry}\n\`\`\``],
+    ["an entry after an unclosed fence", `\`\`\`\n${entry}`],
+  ]) {
+    it(`matches the merge gate on ${shape}`, () => {
+      assert.equal(hasActionablePrReviewFeedback(body), true, "gate fixture drifted");
+      assert.equal(hasStillPresentDisposition(body), true);
+    });
+  }
 
   // The gate (ally-review-detection.ts) and the sweep (sweep-stalled-ally-reviews.py)
   // read the prose ledger with PRIOR_FINDING_DISPOSITION_PATTERN; this auditor
@@ -1404,6 +1422,21 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     assert.deepEqual(violations, []);
   });
 
+  it("requires complete structured coverage and rejects prose fallback from a broken ledger", () => {
+    const blocker = { ...multiFindingBlocker(), body: verdictBody({ critical: 0, important: 2 }) };
+    const ledger = [1, 2].map((index) => ({ head: HEAD, severity: "important", index, verb: "fixed" }));
+    for (const [label, body, blocked] of [
+      ["complete", verdictBody({ critical: 0, important: 0 }, "", ledger), false],
+      ["partial", verdictBody({ critical: 0, important: 0 }, "", ledger.slice(0, 1)), true],
+      ["absent", `<!-- ally-verdict:1\n${JSON.stringify({ head: HEAD, findings: { critical: 0, important: 0 } })}\n-->`, true],
+      ["malformed", verdictBody({ critical: 0 }, ledger.map(({ index }) => `- **prior:${HEAD} important ${index}** — fixed — done`).join("\n")), true],
+    ]) {
+      const approval = { ...approvalWithLedger(""), body };
+      const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blocker, approval] });
+      assert.equal(violations.some((v) => /^I2e /.test(v)), blocked, label);
+    }
+  });
+
   it("counts a bucket by the number after its heading, not a later parenthesized one", () => {
     // The merge gate reads the count straight after `Issues`, so this heading
     // raises two findings. A greedy capture would read `(1)` and let one
@@ -1515,6 +1548,8 @@ describe("countedFindingKeys", () => {
     ["a bucket heading indented four spaces (code)", "    ### Important Issues (2)", 0],
     ["a bucket inside a closed fence", "```\n### Important Issues (2)\n```", 2],
     ["a bucket after an unclosed fence", "```\n### Important Issues (2)", 2],
+    ["a structured verdict bucket", verdictBody({ critical: 0, important: 2, suggestions: 0 }), 2],
+    ["a bounded prose count", "### Important Issues (9999999999999)", 1000],
   ]) {
     it(`matches the merge gate on ${shape}`, () => {
       assert.deepEqual(gateKeys(body), upTo(expected), "gate fixture drifted");
@@ -1537,6 +1572,40 @@ describe("retiredFindingKeys", () => {
     );
   const entry = (verb, separator = "—") =>
     `### Prior Findings Dispositioned (1)\n- **prior:e3e84e2 important 1** ${separator} ${verb} ${separator} reason`;
+
+  it("reads a structured retirement ledger like the merge gate", () => {
+    const body = verdictBody(
+      { critical: 0, important: 0, suggestions: 0 },
+      "",
+      [{ head: PRIOR, severity: "important", index: 1, verb: "fixed" }],
+    );
+    const expected = new Set(["important 1"]);
+    assert.deepEqual(
+      new Set(
+        extractAllyPriorFindingDispositions(body)
+          .filter(({ shortSha, kind }) => kind === "retires" && PRIOR.startsWith(shortSha))
+          .map(({ severity, index }) => `${severity} ${index}`),
+      ),
+      expected,
+    );
+    assert.deepEqual(retiredFindingKeys(body, PRIOR), expected);
+  });
+
+  const line = entry("fixed").split("\n")[1];
+  for (const [shape, body, retires] of [
+    ["a plain entry (control)", entry("fixed"), true],
+    ["an entry inside a closed backtick fence", `\`\`\`\n${line}\n\`\`\``, false],
+    ["an entry inside a closed tilde fence", `~~~\n${line}\n~~~`, false],
+    ["an entry inside an md-tagged fence", `\`\`\`md\n${line}\n\`\`\``, false],
+    ["an entry after an unclosed fence", `\`\`\`\n${line}`, false],
+    ["an entry after a closed fence (control)", `\`\`\`\nx\n\`\`\`\n${line}`, true],
+  ]) {
+    it(`matches the merge gate on ${shape}`, () => {
+      const expected = retires ? new Set(["important 1"]) : new Set();
+      assert.deepEqual(gateKeys(body), expected, "gate fixture drifted");
+      assert.deepEqual(retiredFindingKeys(body, PRIOR), expected);
+    });
+  }
 
   for (const separator of ["—", "–", "-"]) {
     for (const [verb, retires] of [
