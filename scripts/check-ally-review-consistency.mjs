@@ -117,17 +117,6 @@ const BLOCKING_SECTION_RE =
   /(?:^|\n)#+[ \t]*(critical|important)[^\n]*\((?!0\))\d+\)/i;
 
 /**
- * Every counted bucket heading, with its severity and count. The `(0)` case is
- * kept here — unlike BLOCKING_SECTION_RE, which asks "does this block?" — so
- * that enumerating a body's findings sees an explicit empty bucket and simply
- * contributes no indices for it.
- *
- * The count is captured lazily so `### Important Issues (2)` yields 2 rather
- * than some later parenthesized number on the same line.
- */
-const COUNTED_SECTION_GLOBAL_RE = /^#+[ \t]*(critical|important)[^\n]*?\((\d+)\)/gim;
-
-/**
  * Leading whitespace that CommonMark would render as an indented code block,
  * i.e. quoted text rather than emitted structure. Four spaces reach column
  * four, and so does a tab however few spaces precede it.
@@ -165,20 +154,27 @@ const COUNTED_SECTION_GLOBAL_RE = /^#+[ \t]*(critical|important)[^\n]*?\((\d+)\)
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 
 /**
+/**
  * A prior-finding ledger entry. Composed character-for-character with
  * PRIOR_FINDING_DISPOSITION_PATTERN in server/src/services/ally-review-detection.ts
- * (mirrored verbatim in .github/scripts/sweep-stalled-ally-reviews.py), so the
- * three readers accept exactly the same entries. Group 4 is the disposition
- * verb; whether it blocks is decided against BLOCKING_PRIOR_DISPOSITIONS rather
- * than embedded in the pattern. The cross-reader corpus in the test file drives
- * the same ledger strings through all three sources.
+ * (mirrored verbatim in .github/scripts/sweep-stalled-ally-reviews.py).
  */
-// `(?:^|\n)` with no `m` flag, matching the gate: JS's multiline `^` also
-// starts a line after U+2028/U+2029, which the sweep's re.MULTILINE does not
-// (Ally, #1721 at 1bc85198, Important 1).
 const PRIOR_FINDING_DISPOSITION_RE = new RegExp(
   String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
   "gi",
+);
+
+/** Every counted bucket, including `(0)`, used for finding coverage. */
+const COUNTED_SECTION_GLOBAL_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}(?:[#>][ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(critical|important)[ \t]+Issues\b[*_]*[ \t]*\((\d+)\)`,
+  "gim",
+);
+
+/** A prior-finding disposition that says the blocker is still present. */
+const STILL_PRESENT_DISPOSITION_RE = new RegExp(
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present[ \t]*(?:—|-)`,
+  "im",
+);
 );
 
 /**
@@ -725,11 +721,12 @@ export function hasDeferredDisposition(body) {
 
 /**
  * The findings a body declares in its own counted buckets, as `severity index`
- * keys. A bucket of N contributes indices 1..N, which is the same
- * `(severity, index)` identity the merge gate enumerates in
- * extractAllyReportedFindingRefs, so the two agree on what a review raised.
+ * keys. A bucket of N contributes indices 1..N, the same `(severity, index)`
+ * identity the merge gate enumerates in extractAllyReportedFindingRefs. The
+ * two agree on what a review raised only because COUNTED_SECTION_GLOBAL_RE
+ * mirrors the gate's bucket pattern; see the note there.
  */
-function countedFindingKeys(body) {
+export function countedFindingKeys(body) {
   const keys = new Set();
   for (const [, severity, count] of String(body ?? "").matchAll(COUNTED_SECTION_GLOBAL_RE)) {
     for (let index = 1; index <= Number(count); index += 1) {
@@ -922,7 +919,7 @@ export function findPrNotices(pr) {
   const short = String(head ?? "").slice(0, 8);
   const reviews = operativeAllyReviews(pr.reviews, head, "app");
   if (!isSupersedingAppRereview("app", reviews)) return [];
-  const latest = [...reviews].sort(bySubmission)[reviews.length - 1];
+  const latest = [...reviews].sort(bySubmission).at(-1);
   return [
     `PR #${pr.number} @${short}: ${reviews.length} operative Ally App reviews (${reviewDetails(reviews)}) with distinct bodies — ` +
       `treating the latest (${latest?.id}, ${latest?.submitted_at}) as the standing verdict. Legitimate for a re-review of an ` +
