@@ -129,7 +129,10 @@ import {
   withRecoveryModelProfileHint,
   withStrandedRecoveryWakeWorkClass,
 } from "./model-profile-hint.js";
-import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import {
+  createActivePauseHoldPrefilter,
+  isAutomaticRecoverySuppressedByPauseHold,
+} from "./pause-hold-guard.js";
 import { createPassTimer, type PassTimer } from "./pass-timing.js";
 import {
   resolveStrandedEscalationStatus,
@@ -8964,6 +8967,16 @@ export function recoveryService(
     const openPullRequestAttendanceGraceMs = recoverySweepConfig.openPullRequestAttendanceGraceMs;
     const pendingBoardApprovalAttendanceGraceMs =
       recoverySweepConfig.pendingBoardApprovalAttendanceGraceMs;
+    // PEN-3636: same shape as `recoverySweepConfig` above — a read whose answer is
+    // constant across candidates, hoisted so its cost is O(companies) rather than
+    // O(candidates). The pause-hold guard below runs once per candidate and its first
+    // query is scoped to the *company*, so a pass over ~3.2k candidates issued ~3.2k
+    // reads that are byte-identical within each company. At the measured ~110 ms per
+    // round-trip (queueing, not execution — Done-when #2) that is minutes of a single
+    // pass spent re-asking one question. Constructed per pass, never module-level, and
+    // bounded by its own TTL so a long pass cannot widen the staleness window; see
+    // `createActivePauseHoldPrefilter` for the freshness trade this makes.
+    const activePauseHoldPrefilter = createActivePauseHoldPrefilter();
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -8998,9 +9011,24 @@ export function recoveryService(
         return;
       }
 
+      // Merge note (PEN-3636): #2128 landed this guard wrapped in a phase timer with the
+      // 4-arg signature; this PR REPLACES the call with the 6-arg prefiltered form. Both
+      // changes land on the same statement, so the resolution is replace-then-re-wrap, NOT
+      // "take both" — keeping both calls would run the pause-hold guard twice per candidate
+      // and cancel this PR's entire saving, while `prologue.pauseHoldGuard` went on
+      // reporting a timing that confirmed a fix that had not landed. Nothing catches that
+      // automatically: it typechecks, and the `pauseHoldPrefilterLiveReads === 1` assertion
+      // still passes because the duplicate would be the un-prefiltered 4-arg form.
       if (await passTimer.time(
         "prologue.pauseHoldGuard",
-        () => isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc),
+        () => isAutomaticRecoverySuppressedByPauseHold(
+          db,
+          issue.companyId,
+          issue.id,
+          treeControlSvc,
+          db,
+          activePauseHoldPrefilter,
+        ),
       )) {
         result.skipped += 1;
         return;

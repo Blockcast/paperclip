@@ -570,6 +570,34 @@ export function issueTreeControlService(db: Db) {
       .orderBy(asc(issueTreeHolds.createdAt), asc(issueTreeHolds.id));
   }
 
+  /**
+   * Whether the company has any active pause hold at all, ignoring which tree it roots.
+   *
+   * This is `getActivePauseHoldGate`'s own first question, asked on its own. That gate
+   * returns `null` before it ever looks at the issue when this is false, so a `false`
+   * here is a sound proof that the gate cannot fire for *any* issue in the company —
+   * which is what lets a sweep answer thousands of per-candidate gate calls from one
+   * company-scoped read. `true` proves nothing about a given issue: the ancestor walk
+   * still has to run, so callers must fall through to the full gate.
+   */
+  async function hasAnyActivePauseHold(
+    companyId: string,
+    dbOrTx: Pick<Db, "select"> = db,
+  ): Promise<boolean> {
+    return dbOrTx
+      .select({ id: issueTreeHolds.id })
+      .from(issueTreeHolds)
+      .where(
+        and(
+          eq(issueTreeHolds.companyId, companyId),
+          eq(issueTreeHolds.status, "active"),
+          eq(issueTreeHolds.mode, "pause"),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows.length > 0);
+  }
+
   async function getActivePauseHoldGate(
     companyId: string,
     issueId: string,
@@ -1213,6 +1241,7 @@ export function issueTreeControlService(db: Db) {
     getHold,
     listHolds,
     getActivePauseHoldGate,
+    hasAnyActivePauseHold,
     releaseHold,
     cancelUnclaimedWakeupsForTree,
   };
