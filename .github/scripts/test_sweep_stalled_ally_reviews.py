@@ -2285,7 +2285,7 @@ class TestVerdictMirrorsTheGateAt5f4d5302(unittest.TestCase):
             [
                 '<!-- ally-verdict:1\n{"head":"%s","findings":%s}\n-->' % (self.HEAD, findings),
                 "",
-                "## Ally — Consolidated PR Review",
+                "## Ally \u2014 Consolidated PR Review",
             ]
             + list(prose)
         )
@@ -2312,7 +2312,7 @@ class TestVerdictMirrorsTheGateAt5f4d5302(unittest.TestCase):
     def test_a_crlf_body_reads_exactly_as_its_lf_twin(self):
         for lf in (
             self.body('{"critical":0,"important":0}', "Reviewed head: %s" % self.HEAD, "```ts", "x", "```"),
-            "## Ally — Consolidated PR Review\nReviewed head: %s\n### Critical Issues (0)" % self.HEAD,
+            "## Ally \u2014 Consolidated PR Review\nReviewed head: %s\n### Critical Issues (0)" % self.HEAD,
             self.body('{"critical":0,"important":0}', "Reviewed head: %s" % self.HEAD, "```ts",
                       "### Critical Issues (2)", "```"),
         ):
