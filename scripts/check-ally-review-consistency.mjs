@@ -137,16 +137,57 @@ const BLOCKING_SECTION_RE =
  * comment exists to prevent.
  *
  * Residual, stated rather than implied: the gate additionally blanks fenced
- * spans before matching, and this script does not, so a *fenced* paste is
- * still read here as an attestation while the gate ignores it. The extra
- * attestation is not quietly absorbed — canonicalReviewHead requires exactly
- * one, so it returns null and the review is reported as an I3 "not canonical"
- * violation. (I3, not I1: I1 caps operative reviews per lane, not attestations
- * within a body.) The direction is still the safe one for an auditor, because
- * the consequence is a false red against an otherwise-valid review rather than
- * a missed one, but it is a real remaining divergence, not parity.
+ * spans before matching. For the attestation and bucket sites this script
+ * does not, so a *fenced* paste is still read here as an attestation while the
+ * gate ignores it. The extra attestation is not quietly absorbed —
+ * canonicalReviewHead requires exactly one, so it returns null and the review
+ * is reported as an I3 "not canonical" violation. (I3, not I1: I1 caps
+ * operative reviews per lane, not attestations within a body.) For those sites
+ * the direction is the safe one for an auditor, because the consequence is a
+ * false red against an otherwise-valid review rather than a missed one.
+ *
+ * It is NOT safe for the disposition sites. A fenced retiring entry read here
+ * but not by the gate retires a finding the gate still counts, which lets
+ * supersedesBlocker exempt an approval the gate holds: fail-open. So the
+ * disposition readers (retiredFindingKeys, hasStillPresentDisposition) strip
+ * fences first with withoutFencedCodeBlocks, as the gate's
+ * extractAllyPriorFindingDispositions does.
  */
 const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4}) {0,3}`;
+
+/**
+ * Blanks fenced code spans, line for line. A verbatim mirror of
+ * withoutFencedCodeBlocks in server/src/services/ally-review-detection.ts,
+ * which the gate applies before reading the prior-finding ledger; mirrored
+ * rather than imported for the same unpinned-`node` reason as the patterns
+ * here. Lines are blanked, not removed, so line-anchored patterns keep their
+ * anchors. An unclosed fence blanks to end of body, as GitHub renders it.
+ */
+const FENCE_DELIMITER_PATTERN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_CLOSE_PATTERN = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+
+function withoutFencedCodeBlocks(body) {
+  if (!body.includes("```") && !body.includes("~~~")) return body;
+  const lines = body.split("\n");
+  let open = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (open) {
+      const close = FENCE_CLOSE_PATTERN.exec(line);
+      const closes = close && close[1][0] === open.char && close[1].length >= open.length;
+      lines[i] = "";
+      if (closes) open = null;
+      continue;
+    }
+    const fence = FENCE_DELIMITER_PATTERN.exec(line);
+    // Per CommonMark a backtick fence's info string may not contain a backtick.
+    if (fence && !(fence[1][0] === "`" && fence[2].includes("`"))) {
+      open = { char: fence[1][0], length: fence[1].length };
+      lines[i] = "";
+    }
+  }
+  return lines.join("\n");
+}
 
 /**
  * Every counted bucket, with its severity and count. The `(0)` case is kept
@@ -332,7 +373,7 @@ export function hasBlockingFindings(body) {
 }
 
 export function hasStillPresentDisposition(body) {
-  return STILL_PRESENT_DISPOSITION_RE.test(String(body ?? ""));
+  return STILL_PRESENT_DISPOSITION_RE.test(withoutFencedCodeBlocks(String(body ?? "")));
 }
 
 /**
@@ -356,9 +397,9 @@ export function countedFindingKeys(body) {
 export function retiredFindingKeys(body, head) {
   const normalizedHead = String(head ?? "").toLowerCase();
   const keys = new Set();
-  for (const [, prefix, severity, index, verb] of String(body ?? "").matchAll(
-    RETIRING_DISPOSITION_GLOBAL_RE,
-  )) {
+  for (const [, prefix, severity, index, verb] of withoutFencedCodeBlocks(
+    String(body ?? ""),
+  ).matchAll(RETIRING_DISPOSITION_GLOBAL_RE)) {
     if (!RETIRING_DISPOSITIONS.has(verb.toLowerCase())) continue;
     if (normalizedHead.startsWith(prefix.toLowerCase())) {
       keys.add(`${severity.toLowerCase()} ${Number(index)}`);

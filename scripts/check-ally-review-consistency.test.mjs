@@ -172,6 +172,15 @@ describe("hasStillPresentDisposition", () => {
       false,
     );
   });
+
+  it("does NOT fire on a still-present entry quoted inside a fence, as the gate does not", () => {
+    assert.equal(
+      hasStillPresentDisposition(
+        "```\n- **prior:354d5b9 important 1** — still-present — the issue remains\n```",
+      ),
+      false,
+    );
+  });
 });
 
 describe("attestedHead", () => {
@@ -904,6 +913,22 @@ describe("retiredFindingKeys", () => {
     );
   const entry = (verb, separator = "—") =>
     `### Prior Findings Dispositioned (1)\n- **prior:e3e84e2 important 1** ${separator} ${verb} ${separator} reason`;
+
+  const line = entry("fixed").split("\n")[1];
+  for (const [shape, body, retires] of [
+    ["a plain entry (control)", entry("fixed"), true],
+    ["an entry inside a closed backtick fence", `\`\`\`\n${line}\n\`\`\``, false],
+    ["an entry inside a closed tilde fence", `~~~\n${line}\n~~~`, false],
+    ["an entry inside an md-tagged fence", `\`\`\`md\n${line}\n\`\`\``, false],
+    ["an entry after an unclosed fence", `\`\`\`\n${line}`, false],
+    ["an entry after a closed fence (control)", `\`\`\`\nx\n\`\`\`\n${line}`, true],
+  ]) {
+    it(`matches the merge gate on ${shape}`, () => {
+      const expected = retires ? new Set(["important 1"]) : new Set();
+      assert.deepEqual(gateKeys(body), expected, "gate fixture drifted");
+      assert.deepEqual(retiredFindingKeys(body, PRIOR), expected);
+    });
+  }
 
   for (const separator of ["—", "–", "-"]) {
     for (const [verb, retires] of [
