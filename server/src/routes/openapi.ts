@@ -166,6 +166,7 @@ import {
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
   cancelIssueThreadInteractionSchema,
+  issueExecutionMonitorPolicySchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
   updateSecretProviderConfigSchema,
@@ -6137,6 +6138,21 @@ registerCurrentRoute({
   path: "/api/issues/{id}/monitor/check-now",
   tags: ["issues"],
   summary: "Run an issue monitor check now",
+});
+
+registerCurrentRoute({
+  method: "patch",
+  path: "/api/issues/{id}/monitor",
+  tags: ["issues"],
+  summary: "Arm or re-arm an issue monitor without replacing the rest of the execution policy",
+  body: issueExecutionMonitorPolicySchema,
+});
+
+registerCurrentRoute({
+  method: "delete",
+  path: "/api/issues/{id}/monitor",
+  tags: ["issues"],
+  summary: "Clear an issue monitor without replacing the rest of the execution policy",
 });
 
 registerCurrentRoute({
