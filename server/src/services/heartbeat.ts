@@ -428,6 +428,7 @@ import {
   recordHeartbeatTimerTick,
   recordRetryScheduleOutcome,
   recordConcurrentRunBlocked,
+  recordAgentDispatchDeclined,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
   recordProcessLost,
@@ -450,6 +451,7 @@ import {
   setOrphanedRuntimeResourceMetricsRefreshSuccess,
   setCrashRecoveryCandidateIndexPresent,
 } from "./metrics.js";
+import type { DispatchDeclineReason } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
 import { mapAdapterToCcrotateTarget, mapPenstockProviderToCcrotateTarget } from "./ccrotate-target.js";
@@ -27921,6 +27923,100 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     dispatchAdmissionRetryTimersByAgent.set(agentId, timer);
   }
 
+  /**
+   * Rate-limit the per-decline log lines to at most one per (agent, reason)
+   * per {@link DISPATCH_DECLINE_LOG_INTERVAL_MS}.
+   *
+   * `resumeQueuedRuns` drives a dispatch pass for every agent holding a queued
+   * run, on every scheduler tick — 30 s in `index.ts`. So a decline that
+   * PERSISTS logs on every tick for as long as the condition holds: ~2 880
+   * lines per agent per day, and the motivating incident held one shape for
+   * 73.6 h (~8 800 lines). The scenario this instrumentation exists to
+   * illuminate is precisely the scenario that would drown the log it writes to.
+   *
+   * The counter carries the sustained rate, which is what it is for. The log's
+   * job is the unbounded detail that cannot be a metric label
+   * (`invokabilityReason`, `queuedRunCount`) — and that detail does not need
+   * re-emitting every 30 s to be useful. `suppressedSincePreviousLog` keeps the
+   * emitted line honest about how much it stands for, so a throttled line is
+   * never mistaken for an isolated event.
+   *
+   * Bounded by construction: one entry per (agent, reason), agents come from
+   * our own `agents` table and reasons from the closed
+   * `KNOWN_DISPATCH_DECLINE_REASONS`. No caller-influenced key can enter it, so
+   * unlike `webhookRejectionLogState` in `metrics.ts` — whose plugin keys are
+   * externally supplied and therefore capped — this needs no overflow bucket.
+   * Entries for deleted agents linger for the process lifetime; that is a few
+   * bytes each against a set that is already bounded by the roster.
+   */
+  const DISPATCH_DECLINE_LOG_INTERVAL_MS = 10 * 60_000;
+  const dispatchDeclineLogState = new Map<
+    string,
+    { lastLoggedAt: number; suppressed: number }
+  >();
+
+  function takeDispatchDeclineLogSlot(
+    agentId: string,
+    reason: DispatchDeclineReason,
+  ): { log: false } | { log: true; suppressedSincePreviousLog: number } {
+    const key = `${agentId}:${reason}`;
+    const now = Date.now();
+    const previous = dispatchDeclineLogState.get(key);
+    if (previous && now - previous.lastLoggedAt < DISPATCH_DECLINE_LOG_INTERVAL_MS) {
+      previous.suppressed += 1;
+      return { log: false };
+    }
+    dispatchDeclineLogState.set(key, { lastLoggedAt: now, suppressed: 0 });
+    return { log: true, suppressedSincePreviousLog: previous?.suppressed ?? 0 };
+  }
+
+  /**
+   * PEN-3607: a dispatch pass that declines to start a run must say so.
+   *
+   * `startNextQueuedRunForAgent` declines through its `return []` sites. Before
+   * this, exactly one of them recorded anything an operator could read — the
+   * `availableSlots <= 0` refusal, via `recordConcurrentRunBlocked`. The others
+   * wrote no metric, no log above `debug`, and nothing to the run row,
+   * so a seat that was being considered and refused on every scheduler tick was
+   * indistinguishable from a seat nothing was looking at. Measured cost of that
+   * gap: agent `bcba1cc7` held four `queued` runs for 73.6 h with no `startedAt`
+   * while `resumeQueuedRuns` reached it every tick, and two separate code-trace
+   * localizations of the bail were both wrong because the only signal available
+   * was a *different* counter that had stopped incrementing.
+   *
+   * That is why this records on every decline rather than only on the ones that
+   * look pathological. A silent path cannot be ruled out by measurement, so
+   * narrowing by elimination is the only tool left, and it is a bad one.
+   *
+   * `knownAgentIds` is resolved lazily and only when a decline actually happens:
+   * the roster read is cached (`getActiveAgentIds`), but the pass should not pay
+   * for it on the hot success path. For the process-wide guards that fire before
+   * the agent row is loaded there is no company to scope, so the label collapses
+   * to the bounded `unknown` — those refusals are facts about the process, and
+   * labelling them per-agent would invite exactly the wrong query.
+   */
+  async function noteDispatchDeclined(
+    agentId: string,
+    reason: DispatchDeclineReason,
+    companyId: string | null,
+  ): Promise<void> {
+    try {
+      const knownAgentIds = companyId
+        ? await getActiveAgentIds(db, companyId)
+        : new Set<string>();
+      recordAgentDispatchDeclined({ agentId, reason, knownAgentIds });
+    } catch (error) {
+      // Instrumentation must never be able to fail dispatch. A rejected roster
+      // read here would otherwise convert an ordinary decline into a thrown
+      // pass, which `resumeQueuedRuns` collects and rethrows — turning a
+      // reporting improvement into a fleet-wide dispatch fault.
+      logger.debug(
+        { agentId, reason, error },
+        "startNextQueuedRunForAgent: failed to record dispatch decline",
+      );
+    }
+  }
+
   async function startNextQueuedRunForAgent(
     agentId: string,
     dispatchPassOptions: {
@@ -27931,7 +28027,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reason?: string;
     } = {},
   ) {
-    if (options.skipQueuedRunDispatch || dispatchStopped) return [];
+    if (options.skipQueuedRunDispatch || dispatchStopped) {
+      await noteDispatchDeclined(agentId, "dispatch_stopped", null);
+      return [];
+    }
     if (
       dispatchPassOptions.reason !== "resume_critical_lane"
       && !dispatchPassOptions.suppressCriticalLaneHeadRescanDemand
@@ -27965,13 +28064,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         { agentId, role: paperclipNodeRole },
         "startNextQueuedRunForAgent: dispatch fenced off on the API tier (workers tier owns run execution)",
       );
+      await noteDispatchDeclined(agentId, "api_tier_fence", null);
       return [];
     }
-    if ((await getSchedulingSuppression()).suppressed) return [];
+    if ((await getSchedulingSuppression()).suppressed) {
+      await noteDispatchDeclined(agentId, "scheduling_suppressed", null);
+      return [];
+    }
     const cutoff = await getWorktreeExecutionCutoff();
 
     return withAgentStartLock(agentId, async () => {
-      if (dispatchStopped) return [];
+      if (dispatchStopped) {
+        await noteDispatchDeclined(agentId, "dispatch_stopped", null);
+        return [];
+      }
       await options.beforeQueuedDispatchPassForTest?.({
         agentId,
         reason: dispatchPassOptions.reason ?? "direct",
@@ -27979,12 +28085,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         suppressHeadRescanDemand: dispatchPassOptions.suppressHeadRescanDemand === true,
       });
       let agent = await getAgent(agentId);
-      if (!agent) return [];
+      if (!agent) {
+        await noteDispatchDeclined(agentId, "agent_missing", null);
+        return [];
+      }
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         if (shouldCancelRunsForNonInvokableAgent(invokability)) {
           await cancelActiveForAgentInternal(agentId, `Cancelled because the agent is not invokable: ${invokability.reason}`);
         }
+        // `reason` here is the invokability verdict (paused / terminated /
+        // manager_terminated / …), which is what an operator needs and which
+        // nothing else on this path emits. It is deliberately NOT a metric
+        // label: the verdict set is open-ended enough that folding it in would
+        // widen the series, and the bounded decline reason plus this line
+        // together answer the question.
+        //
+        // Level is split by verdict rather than fixed at `warn`. Paused and
+        // terminated are INTENDED operator actions, not anomalies, and `warn`
+        // is the level that feeds dashboards and alert routes — a deliberately
+        // paused agent should not page anyone every 30 s. An invalid reporting
+        // chain is a genuine fault nobody asked for, so it keeps `warn`.
+        // Either way the line is throttled and the counter carries the rate.
+        const invokableLogSlot = takeDispatchDeclineLogSlot(agentId, "agent_not_invokable");
+        if (invokableLogSlot.log) {
+          const invokableLogDetails = {
+            agentId,
+            invokabilityReason: invokability.reason,
+            invalidOrgChain: invokability.invalidOrgChain,
+            suppressedSincePreviousLog: invokableLogSlot.suppressedSincePreviousLog,
+          };
+          const invokableLogMessage =
+            "startNextQueuedRunForAgent: declined because the agent is not invokable";
+          if (invokability.invalidOrgChain) {
+            logger.warn(invokableLogDetails, invokableLogMessage);
+          } else {
+            logger.debug(invokableLogDetails, invokableLogMessage);
+          }
+        }
+        await noteDispatchDeclined(agentId, "agent_not_invokable", agent.companyId);
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
@@ -28075,6 +28214,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { agentId, adapterType: agent.adapterType },
           "startNextQueuedRunForAgent: untracked Kubernetes Job or Pod still holds the agent",
         );
+        await noteDispatchDeclined(agentId, "untracked_external_job", agent.companyId);
         return [];
       }
       const availableSlots = Math.max(0, effectiveMaxConcurrentRuns - runningCount);
@@ -28091,6 +28231,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             knownAgentIds: await getActiveAgentIds(db, agent.companyId),
           });
         }
+        // Recorded here as well as on the adapter-scoped counter above. That
+        // one is external-lifecycle-only and carries an isolation dimension;
+        // this one covers every adapter and sits in the same series as the
+        // other decline reasons, so "why is this seat not dispatching"
+        // is one query rather than a join across two metrics with different
+        // population rules.
+        await noteDispatchDeclined(agentId, "no_available_slots", agent.companyId);
         return [];
       }
       if (externalLifecycle) {
@@ -28121,7 +28268,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Image changes are agent-wide. Drain all active slots before applying
         // the bump so a concurrent dispatch cannot launch an older image after
         // the operator requested convergence.
-        if (runningCount > 0 || hasActiveExternalJob) return [];
+        if (runningCount > 0 || hasActiveExternalJob) {
+          await noteDispatchDeclined(agentId, "pending_image_bump", agent.companyId);
+          return [];
+        }
         await processPendingImageBumpForAgent(db, agentId);
         agent = (await getAgent(agentId)) ?? agent;
       }
@@ -28391,6 +28541,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_critical_lane",
         });
+        await noteDispatchDeclined(agentId, "critical_lane_continuation", agent.companyId);
         return [];
       }
       dispatchCriticalLaneCursorByAgent.delete(agentId);
@@ -28400,7 +28551,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_critical_lane",
         });
-        if (!foundReadyCritical) return [];
+        if (!foundReadyCritical) {
+          await noteDispatchDeclined(agentId, "critical_lane_continuation", agent.companyId);
+          return [];
+        }
       }
 
       // Lane B — recovery-action wakes. Recovery-ness is a property of the RUN,
@@ -28506,6 +28660,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_recovery_lane",
         });
+        await noteDispatchDeclined(agentId, "recovery_lane_continuation", agent.companyId);
         return [];
       }
       dispatchRecoveryLaneCursorByAgent.delete(agentId);
@@ -28515,7 +28670,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_recovery_lane",
         });
-        if (!foundReadyRecovery) return [];
+        if (!foundReadyRecovery) {
+          await noteDispatchDeclined(agentId, "recovery_lane_continuation", agent.companyId);
+          return [];
+        }
       }
 
       // Lane C — absolute starvation floor. BLO-21792 (second and third review
@@ -28831,6 +28989,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
           scheduleDelayedAdmissionRetry(agentId);
         }
+        await noteDispatchDeclined(agentId, "no_queued_candidates", agent.companyId);
         return [];
       }
 
@@ -29138,13 +29297,65 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (scheduledEmergencyContinuationAfterRefusal) {
         if (claimedRuns.length > 0) {
           launchClaimedRuns();
+          return claimedRuns;
         }
-        return claimedRuns;
+        // PEN-3607 (review follow-up): this branch used to `return claimedRuns`
+        // for BOTH cases, above the `claimedRuns.length === 0` block below that
+        // carries `no_claimable_run`. So the empty case returned an empty array
+        // having recorded nothing — and the source scanner could not see it,
+        // because the line read `return claimedRuns;` rather than `return [];`.
+        // It was the worst path to have dark: a candidate refused AND the pass
+        // escalated, which is the strongest signal the pass itself can give
+        // that this seat is in trouble, and it is the exact refusal shape
+        // PEN-3607 was filed about.
+        //
+        // Returning `[]` here rather than the (empty) accumulator is load
+        // bearing, not cosmetic: it puts the exit back in the idiom the scanner
+        // enforces, so the next decline added beside it cannot go silent the
+        // same way.
+        const emergencyLogSlot = takeDispatchDeclineLogSlot(
+          agentId,
+          "emergency_continuation_scheduled",
+        );
+        if (emergencyLogSlot.log) {
+          logger.warn(
+            {
+              agentId,
+              queuedRunCount: queuedRuns.length,
+              availableSlots,
+              suppressedSincePreviousLog: emergencyLogSlot.suppressedSincePreviousLog,
+            },
+            "startNextQueuedRunForAgent: declined — a candidate refused and an emergency continuation was scheduled",
+          );
+        }
+        await noteDispatchDeclined(agentId, "emergency_continuation_scheduled", agent.companyId);
+        return [];
       }
       if (claimedRuns.length === 0) {
         if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
           scheduleDelayedAdmissionRetry(agentId);
         }
+        // The pass had slots, scanned the queue, ranked candidates, and every
+        // one of them refused to claim. This is the shape a wedged seat takes:
+        // reached every tick, refused every tick, previously recording nothing
+        // anywhere. `queuedRunCount` is on the log line rather than the metric
+        // because it is unbounded; the series carries only the bounded reason.
+        // Throttled for the reason given on takeDispatchDeclineLogSlot: a
+        // wedged seat holds this shape for as long as it stays wedged, so an
+        // unthrottled line here scales with the incident it is reporting.
+        const noClaimLogSlot = takeDispatchDeclineLogSlot(agentId, "no_claimable_run");
+        if (noClaimLogSlot.log) {
+          logger.warn(
+            {
+              agentId,
+              queuedRunCount: queuedRuns.length,
+              availableSlots,
+              suppressedSincePreviousLog: noClaimLogSlot.suppressedSincePreviousLog,
+            },
+            "startNextQueuedRunForAgent: declined — candidates were ranked but none could be claimed",
+          );
+        }
+        await noteDispatchDeclined(agentId, "no_claimable_run", agent.companyId);
         return [];
       }
       // Settle continuation bookkeeping for a pass that DID claim. A pass that

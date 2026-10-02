@@ -37,6 +37,32 @@ import {
 } from "./routine-dispatch-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
+/**
+ * PEN-3607: every reason `startNextQueuedRunForAgent` can decline to start a
+ * queued run, counted per agent.
+ *
+ * This exists because a dark seat was previously unexplainable from outside the
+ * process. Before this metric, exactly one of that dispatch pass's `return []`
+ * sites recorded anything ({@link CONCURRENT_RUN_BLOCKED_METRIC},
+ * which covers only the slot-ceiling refusal), and the rest were silent — no
+ * metric, no log above `debug`, no write to the run row. Measured consequence:
+ * agent `bcba1cc7` sat 73.6 h with four `queued` runs and no `startedAt`, and
+ * two successive code-trace localizations of the bail were both wrong because
+ * the only available signal was another counter that had *stopped*.
+ *
+ * A stopped counter is the trap this one is shaped to avoid. Dispatch is
+ * re-attempted every scheduler tick, so a genuinely wedged seat increments this
+ * counter continuously with the reason that is wedging it. Read it as a rate, and
+ * prefer a present-and-rising series over inferring anything from an absence:
+ *
+ *     sum by (agent_id, reason) (rate(paperclip_agent_dispatch_declined_total[15m]))
+ *
+ * `agent_id` is bounded by the active company roster exactly as
+ * {@link CONCURRENT_RUN_BLOCKED_METRIC} bounds it, and collapses to
+ * {@link UNKNOWN_AGENT_ID} for the process-wide guards that fire before the
+ * agent row is loaded (those are not per-agent facts and must not look like it).
+ */
+export const AGENT_DISPATCH_DECLINED_METRIC = "paperclip_agent_dispatch_declined_total";
 // BLO-23379: routine dispatch bypassed a long-parked execution issue instead of
 // letting it gate the fire. Non-zero means a quota/capacity park was overridden;
 // zero while a routine is quiet means it is genuinely gated on in-flight work.
@@ -2085,6 +2111,110 @@ export const UNKNOWN_AGENT_ID = "unknown";
 const knownReasonSet: ReadonlySet<string> = new Set(KNOWN_BLOCKED_REASONS);
 
 /**
+ * Bounded `reason` allow-list for {@link AGENT_DISPATCH_DECLINED_METRIC}.
+ *
+ * One entry per decline site in `startNextQueuedRunForAgent`, in the order
+ * dispatch reaches them. Keep them in that order and keep the set closed —
+ * adding a decline path without adding its reason here silently collapses it to
+ * {@link UNKNOWN_DISPATCH_DECLINE_REASON}, which reintroduces exactly the blind
+ * spot this metric was added to close.
+ *
+ * "Decline site" is not quite "`return []` site", in both directions, and the
+ * gaps are deliberate:
+ *
+ *   - `emergency_continuation_scheduled` returns the (empty) `claimedRuns`
+ *     accumulator rather than a `[]` literal. That shape is why the source
+ *     scanner in `dispatch-decline-instrumentation.test.ts` checks returns of
+ *     the accumulator as well as of the literal: keying only on `return [];`
+ *     left this exact path dark.
+ *   - The `onCoalesced` hook passed to `withAgentStartLock` returns `[]` from
+ *     three sites in `agent-start-lock.ts` (re-entrant coalesce, depth guard,
+ *     deadlock guard) and is INTENTIONALLY not a decline. A coalesced call runs
+ *     no queue-selection pass of its own; the pass it folded into claims the
+ *     work, so "no runs claimed by this call" is the honest answer rather than
+ *     a refusal. Do not add a reason for it — recording one would double-count
+ *     a single pass and label a successful dispatch as declined.
+ *
+ * The first FOUR collapse to {@link UNKNOWN_AGENT_ID}, not the first three.
+ * `dispatch_stopped`, `api_tier_fence` and `scheduling_suppressed` do so
+ * because they are process-wide: they fire identically for every agent in the
+ * instance, so they pass `companyId: null` and the roster read is skipped.
+ *
+ * `agent_missing` collapses for a different and more permanent reason, and it
+ * is NOT fixable by passing a company id. The bound is membership of the
+ * `agents` table: `getActiveAgentIds` selects the ids present for a company,
+ * and `agent_missing` is emitted precisely when `SELECT * FROM agents WHERE
+ * id = ?` returned no row. A row that does not exist cannot be in any
+ * company's set, so {@link normalizeAgentId} would return
+ * {@link UNKNOWN_AGENT_ID} for it whatever company were supplied. It is
+ * structurally unscopeable; do not "fix" it by threading a company id through.
+ *
+ * Operator consequence: filtering `agent_id!="unknown"` to get per-agent facts
+ * drops `agent_missing` entirely — and that is the one reason where *which*
+ * agent vanished is the whole datum. Read that reason from the logs, which
+ * carry the id.
+ */
+export const KNOWN_DISPATCH_DECLINE_REASONS = [
+  /** Dispatch disabled for this process (`skipQueuedRunDispatch` / `dispatchStopped`). */
+  "dispatch_stopped",
+  /** BLO-9089 fence: the api tier never claims runs; the workers tier owns them. */
+  "api_tier_fence",
+  /** Worktree/db-restore scheduling suppression is active process-wide. */
+  "scheduling_suppressed",
+  /** The agent row vanished between the queue read and the dispatch pass. */
+  "agent_missing",
+  /** Paused, terminated, pending approval, or an invalid reporting chain. */
+  "agent_not_invokable",
+  /** An untracked k8s Job or Pod still holds the agent (BLO-12990 gate). */
+  "untracked_external_job",
+  /** No free slot. Paired with {@link CONCURRENT_RUN_BLOCKED_METRIC}. */
+  "no_available_slots",
+  /** A pending image bump is draining the agent's slots before it applies. */
+  "pending_image_bump",
+  /**
+   * A bounded critical-lane pass is still walking; lower lanes wait.
+   * Split from the recovery lane deliberately: a seat starved by a walking
+   * critical pass and one starved by the recovery lane are different faults,
+   * and collapsing them would put the "which lane holds this seat" question
+   * back behind a log join — the exact cost this metric exists to remove.
+   */
+  "critical_lane_continuation",
+  /** As above, for the recovery-action lane. */
+  "recovery_lane_continuation",
+  /** The queue was scanned and held no candidate row at all. */
+  "no_queued_candidates",
+  /**
+   * A candidate refused to claim and the pass escalated: it scheduled an
+   * emergency continuation for a run that is still `queued`, then broke out of
+   * the candidate loop.
+   *
+   * Split from `no_claimable_run` rather than folded into it because the two
+   * are different faults. "Refused, and something is still trying" and
+   * "refused, with nothing left to try" want different operator responses, and
+   * this one is the stronger distress signal of the pair — it is the case the
+   * pass itself judged bad enough to escalate. Collapsing them would hide that
+   * behind the louder, more common reason.
+   */
+  "emergency_continuation_scheduled",
+  /** Candidates existed and every one of them refused to claim. */
+  "no_claimable_run",
+] as const;
+
+export const UNKNOWN_DISPATCH_DECLINE_REASON = "other";
+
+const knownDispatchDeclineReasonSet: ReadonlySet<string> = new Set(
+  KNOWN_DISPATCH_DECLINE_REASONS,
+);
+
+export type DispatchDeclineReason = (typeof KNOWN_DISPATCH_DECLINE_REASONS)[number];
+
+export function normalizeDispatchDeclineReason(reason: string | null | undefined): string {
+  return typeof reason === "string" && knownDispatchDeclineReasonSet.has(reason)
+    ? reason
+    : UNKNOWN_DISPATCH_DECLINE_REASON;
+}
+
+/**
  * Bounded `invocation_source` allow-list for `paperclip_heartbeat_run_failed_total`.
  * Anything outside this set collapses to "other".
  */
@@ -2411,6 +2541,7 @@ export const AGENT_ERROR_REASON_OLDEST_AGE_METRIC =
 
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
+let agentDispatchDeclined: Counter<"agent_id" | "reason"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
 type HeartbeatRunFailedLabel =
   | "agent_id"
@@ -2555,6 +2686,7 @@ let isolationReaperLastSweep: Gauge<"dry_run"> | null = null;
 function ensureRegistry(): {
   registry: Registry;
   counter: Counter<"agent_id" | "reason" | "isolation_mode">;
+  dispatchDeclinedCounter: Counter<"agent_id" | "reason">;
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
@@ -2632,6 +2764,7 @@ function ensureRegistry(): {
   if (
     !registry
     || !concurrentRunBlocked
+    || !agentDispatchDeclined
     || !isolatedRunStarted
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
@@ -2713,6 +2846,19 @@ function ensureRegistry(): {
         + "isolation_key/task_key/session_id are emitted on the structured guard-decision "
         + "log line (not as labels) to keep series cardinality bounded (BLO-12212).",
       labelNames: ["agent_id", "reason", "isolation_mode"],
+      registers: [registry],
+    });
+    agentDispatchDeclined = new Counter({
+      name: AGENT_DISPATCH_DECLINED_METRIC,
+      help:
+        "Count of queued-run dispatch passes that declined to start a run, labeled by "
+        + "bounded agent_id and the reason the pass bailed (PEN-3607). Every `return []` "
+        + "in startNextQueuedRunForAgent increments this; before it, fourteen of the "
+        + "fifteen were silent and a wedged seat was unexplainable from outside the "
+        + "process. Dispatch retries every scheduler tick, so a wedged seat shows as a "
+        + "SUSTAINED RATE on one reason rather than as an absence — read it with "
+        + "rate()/increase(), and never infer a cause from a series that stopped.",
+      labelNames: ["agent_id", "reason"],
       registers: [registry],
     });
     isolatedRunStarted = new Counter({
@@ -3767,6 +3913,7 @@ function ensureRegistry(): {
   return {
     registry,
     counter: concurrentRunBlocked,
+    dispatchDeclinedCounter: agentDispatchDeclined,
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
@@ -3873,6 +4020,36 @@ export function recordConcurrentRunBlocked(
     isolation_mode: normalizeIsolationMode(input.isolationMode),
   };
   ensureRegistry().counter.inc(labels);
+  return labels;
+}
+
+export interface RecordAgentDispatchDeclinedInput {
+  /** Agent whose dispatch pass declined. */
+  agentId: string | null | undefined;
+  /** One of {@link KNOWN_DISPATCH_DECLINE_REASONS}; anything else collapses. */
+  reason: string | null | undefined;
+  /**
+   * Active company agent roster used to bound the `agent_id` label. Pass an
+   * empty set for the process-wide guards that fire before the agent row is
+   * loaded — the label then collapses to {@link UNKNOWN_AGENT_ID}, which is the
+   * honest answer: those refusals are facts about the process, not the agent.
+   */
+  knownAgentIds: ReadonlySet<string>;
+}
+
+/**
+ * Increment {@link AGENT_DISPATCH_DECLINED_METRIC}. Call once per dispatch pass
+ * that returns without claiming a run, at the site that made that decision.
+ * Returns the normalized labels emitted (useful for logging/tests).
+ */
+export function recordAgentDispatchDeclined(
+  input: RecordAgentDispatchDeclinedInput,
+): { agent_id: string; reason: string } {
+  const labels = {
+    agent_id: normalizeAgentId(input.agentId, input.knownAgentIds),
+    reason: normalizeDispatchDeclineReason(input.reason),
+  };
+  ensureRegistry().dispatchDeclinedCounter.inc(labels);
   return labels;
 }
 
