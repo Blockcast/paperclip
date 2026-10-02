@@ -783,8 +783,43 @@ describe("execute: concurrency guard", () => {
     }
   });
 
-  it("deletes stale orphan and proceeds when the run-id lookup is missing", async () => {
+  // BLO-39114 review: the annotation is read verbatim off a mutable Job, so
+  // this is the one cleanupJob call whose path is externally sourced.  An
+  // annotation that is not shaped like a pod log must not reach fs.unlink.
+  it("refuses to unlink a stale Job's annotation that is not shaped like a pod log", async () => {
     process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    const tmpRoot = path.join(os.tmpdir(), "blo-39114-implausible");
+    await mkdir(tmpRoot, { recursive: true });
+    const bystander = path.join(tmpRoot, "not-a-pod-log.yaml");
+    await writeFile(bystander, "kind: Config\n", "utf-8");
+    const onLog = vi.fn();
+    try {
+      mockBatchListJobs.mockResolvedValue({
+        items: [makeJob({ runId: "prior-run", agentId: "agent-abc", taskId: "task-current", podLogPath: bystander })],
+      });
+      mockBatchDeleteJob.mockResolvedValue({});
+      mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+      mockPrepareBundle.mockResolvedValue(makeBundle());
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "prior-run", status: "failed", finishedAt: "2026-05-25T00:00:00.000Z" }),
+      }));
+
+      await execute(makeCtx({ context: { taskId: "task-current" }, onLog, authToken: "token-1" } as Partial<AdapterExecutionContext>));
+
+      // The file survives...
+      expect(await stat(bystander).then(() => true, () => false)).toBe(true);
+      // ...and the refusal is reported, not silent.
+      expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining("refusing to unlink it"));
+      // The Job itself is still reaped — the guard is about the file only.
+      expect(mockBatchDeleteJob).toHaveBeenCalled();
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("deletes stale orphan and proceeds when the run-id lookup is missing", async () => {    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
     const orphan = makeJob({ runId: "missing-run", agentId: "agent-abc", taskId: "task-current" });
     mockBatchListJobs.mockResolvedValue({ items: [orphan] });
     mockBatchDeleteJob.mockResolvedValue({});
@@ -2457,11 +2492,19 @@ describe("cleanupJob pod-log reaping", () => {
     // ENOENT is the normal case (the pod may never have written one) and must
     // not produce a warning, or every clean run would emit noise.
     expect(onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining("pod log"));
+    // ...and must not produce a *note* either.  This is the assertion that
+    // kills `reportMissing = false` -> `true`: the flipped default reports the
+    // ENOENT miss on stdout, which the stderr assertion above sails past.
+    expect(onLog).not.toHaveBeenCalledWith("stdout", expect.stringContaining("was already gone"));
   });
 
   it("does nothing when podLogPath is undefined", async () => {
     mockBatchDeleteJob.mockResolvedValueOnce({});
-    await expect(cleanupJob("ns", "job-undef", vi.fn(), undefined, undefined)).resolves.toBeUndefined();
+    const onLog = vi.fn();
+    await expect(cleanupJob("ns", "job-undef", onLog, undefined, undefined)).resolves.toBeUndefined();
+    // The other half of the default: a flipped `reportMissing` warns on stderr
+    // here, so this pins the no-annotation branch to opt-in as well.
+    expect(onLog).not.toHaveBeenCalled();
   });
 
   // BLO-39114: on the foreign-run reap the caller asked for a specific file by
