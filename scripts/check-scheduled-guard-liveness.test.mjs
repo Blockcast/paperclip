@@ -1431,6 +1431,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         "adapter-pin-drift-monitor.yml",
         "ally-review-consistency.yml",
         "codeowners-guard.yml",
+        "commit-attribution-audit.yml",
         "lockfile-drift-monitor.yml",
         "master-health.yml",
         "production-environment-protection-guard.yml",
@@ -1441,14 +1442,33 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     );
   });
 
-  it("gives the twice-daily guard a threshold its own cadence justifies", () => {
+  it("gives the twice-daily guards a threshold their own cadence justifies", () => {
     const byWorkflow = new Map(WATCHED_GUARDS.map((g) => [g.workflow, g.staleHours]));
+
+    // Keyed on CADENCE, not on one hardcoded filename. The original form
+    // excluded production-environment-protection-guard.yml by name and put
+    // every other guard on the hourly bar, so adding a second twice-daily
+    // guard (commit-attribution-audit.yml, BLO-39345) red-flagged it as
+    // mis-barred rather than recognising its cadence.
+    const TWICE_DAILY = new Set([
+      "production-environment-protection-guard.yml",
+      "commit-attribution-audit.yml",
+      // BLO-26736. Landed on master while this branch was open, with its own
+      // name-keyed assertion below. Folded into the set instead, which is the
+      // whole point of keying on cadence: a third twice-daily guard should not
+      // need a third bespoke assertion.
+      "review-gate-consumer-protection-guard.yml",
+    ]);
 
     // Measured 39 gaps: ordinary band tops out at 14.60h, the two outage
     // outliers are 17.71h and 22.21h. The bar must sit strictly between.
-    const twiceDaily = byWorkflow.get("production-environment-protection-guard.yml");
-    assert.ok(twiceDaily > 14.6, "would red on ordinary twice-daily jitter");
-    assert.ok(twiceDaily < 17.71, "would sail over the 2026-09-15 outage it must catch");
+    // commit-attribution-audit.yml ADOPTS this band rather than having
+    // measured its own — see the note on its WATCHED_GUARDS entry.
+    for (const workflow of TWICE_DAILY) {
+      const bar = byWorkflow.get(workflow);
+      assert.ok(bar > 14.6, `${workflow} would red on ordinary twice-daily jitter`);
+      assert.ok(bar < 17.71, `${workflow} would sail over the 2026-09-15 outage it must catch`);
+    }
 
     // BLO-38228: the daily clock-rot guard is on 48h, deliberately loose because
     // its schedule is new and has no measured gap distribution yet. Asserted
@@ -1458,26 +1478,13 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(dailyClockRot > 24, "a daily cron must clear one full cycle plus GitHub's delay");
     assert.ok(dailyClockRot <= 48, "looser than two missed cycles stops being a backstop at all");
 
-    // BLO-26736: the consumer merge-control guard shares the twice-daily
-    // cadence and INHERITS the same bar. Asserted equal to the measured one
-    // rather than to a second literal, so that if the 14.60h/17.71h band is
-    // ever re-derived both move together — the alternative is a copy that rots
-    // out of the band silently.
-    assert.equal(
-      byWorkflow.get("review-gate-consumer-protection-guard.yml"),
-      twiceDaily,
-      "the twice-daily guards must share one bar until this one has gaps of its own",
-    );
-
     // The hourly six share one bar; a shared GLOBAL threshold across cadences is
     // the bug this replaced. Asserted against DEFAULT_STALE_HOURS rather than a
     // literal so moving the bar stays a one-line change with a reason attached
     // (PEN-3379 moved it 4h -> 2.75h).
-    const notHourly = new Set([
-      "production-environment-protection-guard.yml",
-      "review-gate-consumer-protection-guard.yml",
-      "master-health.yml",
-    ]);
+    // Derived from TWICE_DAILY rather than re-listed, so adding a twice-daily
+    // guard above cannot leave it wrongly asserted against the hourly bar here.
+    const notHourly = new Set([...TWICE_DAILY, "master-health.yml"]);
     for (const workflow of WATCHED_WORKFLOWS) {
       if (notHourly.has(workflow)) continue;
       assert.equal(
