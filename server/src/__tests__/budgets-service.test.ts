@@ -929,6 +929,32 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     const hardAfterStale = afterStale.find((row) => row.id === hardCard.id)!;
     expect(hardAfterStale.status).toBe("withdrawn");
     expect(afterStale.filter((row) => row.status === "pending")).toHaveLength(0);
+
+    // Mirror direction (#2190 review): the same stale client submits `keep_paused`
+    // against that same resolved incident. The dismiss branch used to update by id
+    // with no status filter, so this rewrote a decided crossing to `dismissed` and
+    // overwrote its `resolvedAt` -- while the `pending` guard in `markApprovalStatus`
+    // left the card as it was, producing a dismissed incident with a non-rejected
+    // card for a scope the dismiss branch never paused.
+    const resolvedAtBeforeKeepPaused = (await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.id, staleSoftIncident.id))
+      .then((rows) => rows[0]!)).resolvedAt;
+    const afterKeepPaused = await service.resolveIncident(
+      companyId,
+      staleSoftIncident.id,
+      { action: "keep_paused", decisionNote: "stale keep_paused" },
+      "user-stale",
+    );
+    expect(afterKeepPaused).toMatchObject({ id: staleSoftIncident.id, status: "resolved" });
+    const softRowAfterKeepPaused = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.id, staleSoftIncident.id))
+      .then((rows) => rows[0]!);
+    expect(softRowAfterKeepPaused.status).toBe("resolved");
+    expect(softRowAfterKeepPaused.resolvedAt).toEqual(resolvedAtBeforeKeepPaused);
   });
 
   it("files no warn card when one cost event jumps straight past the hard cap (BLO-28793 review)", async () => {

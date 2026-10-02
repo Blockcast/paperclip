@@ -1341,7 +1341,14 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             resolvedAt: new Date(),
             updatedAt: new Date(),
           })
-          .where(eq(budgetIncidents.id, incident.id));
+          // Same `status = "open"` filter the raise branch uses above. Without it a
+          // stale `keep_paused` against an already-`resolved` incident rewrites that
+          // decided crossing to `dismissed` and overwrites its `resolvedAt`, while
+          // `markApprovalStatus`'s `pending` guard leaves the card `approved` -- a
+          // dismissed incident carrying an approved card, for a scope that is
+          // running, because the dismiss branch never pauses (#2190 review).
+          // No legitimate dismissal targets a non-open incident.
+          .where(and(eq(budgetIncidents.id, incident.id), eq(budgetIncidents.status, "open")));
         await markApprovalStatus(db, incident.approvalId ?? null, "rejected", input.decisionNote, actorUserId);
       }
 
@@ -1361,7 +1368,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       });
 
       // Report the row as it actually is now, not as the requested action implies.
-      // The raise path closes incidents with a `status = "open"` filter, so a submit
+      // Both branches close incidents under a `status = "open"` filter, so a submit
       // against an already-resolved or dismissed incident id leaves that row
       // untouched -- it resolves whatever was open, resumes the scope and withdraws
       // the other cards, all correctly, but the incident named in the request did not
