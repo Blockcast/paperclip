@@ -721,9 +721,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runId: string;
     issueId: string;
     provider?: string;
+    // PEN-3674: lets a test state the lease's age as the thing under test
+    // rather than inherit it from the fixed `now` below. The default is ~6
+    // months in the past, so it clears the launch grace — but only by accident
+    // of the calendar, which is exactly why the grace tests set this
+    // explicitly instead of leaning on the default.
+    acquiredAt?: Date;
   }) {
     const leaseId = randomUUID();
     const now = new Date("2026-03-19T00:00:00.000Z");
+    const acquiredAt = input.acquiredAt ?? now;
     const existingLocalEnvironment = await db
       .select({ id: environments.id })
       .from(environments)
@@ -753,7 +760,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       leasePolicy: "ephemeral",
       provider: input.provider ?? "local",
       providerLeaseId: null,
-      acquiredAt: now,
+      acquiredAt,
       lastUsedAt: now,
       metadata: {
         driver: "local",
@@ -8568,7 +8575,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .then((rows) => rows[0] ?? null);
     }
 
-    async function seedTerminalExternalRunWithLease() {
+    async function seedTerminalExternalRunWithLease(leaseInput: { acquiredAt?: Date } = {}) {
       const fixture = await seedRunFixture({
         adapterType: "claude_k8s",
         runStatus: "failed",
@@ -8585,6 +8592,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         companyId: fixture.companyId,
         runId: fixture.runId,
         issueId: fixture.issueId,
+        acquiredAt: leaseInput.acquiredAt,
       });
       return { ...fixture, reservation, leaseId };
     }
@@ -8698,6 +8706,129 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(0);
 
       expect((await getLease(leaseId))?.status).toBe("active");
+    });
+
+    // ---------------------------------------------------------------------
+    // PEN-3674: the launch-window grace. BLO-32052 above narrowed the
+    // `activeRunExecutions` guard so external-lifecycle runs fall through to
+    // the quiescence probe. That is what unwedges the multi-day strands — and
+    // it is also what exposes the window these three tests pin, because the
+    // probe is fail-closed against an UNOBSERVABLE runtime but not against a
+    // NOT-YET-EXISTENT one. A lease is acquired before the Job is created, so
+    // a cancel racing its own launch presents with no reservation jobName and
+    // no pods, and both probe arms report "quiesced" for a runtime still on
+    // its way up.
+    // ---------------------------------------------------------------------
+    it("keeps a freshly-acquired external-lifecycle lease that the quiescence probe would call quiesced (PEN-3674)", async () => {
+      // No reservation is seeded, so there is no jobName: exactly the pre-Job
+      // window. Pods are observable and empty — NOT null — so the probe's
+      // fail-closed arm is not what retains this lease. Without the grace both
+      // arms pass and the sweep releases a lease whose Job is about to start.
+      const { companyId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({
+        companyId,
+        runId,
+        issueId,
+        acquiredAt: new Date(Date.now() - 60_000),
+      });
+      mockListManagedAgentPods.mockResolvedValue([]);
+
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(0);
+
+      expect((await getLease(leaseId))?.status).toBe("active");
+      // The grace must short-circuit BEFORE the probe, not merely override its
+      // verdict: the probe sleeps between attempts, so a sweep that still ran
+      // it would pay that cost on every pass for every launching run.
+      expect(mockListManagedAgentPods).not.toHaveBeenCalled();
+    });
+
+    it("still releases an external-lifecycle lease once it is past the launch grace (PEN-3674)", async () => {
+      // The other half of the discrimination. Same fixture shape as the test
+      // above and the same empty-pod probe result — only the lease age
+      // differs, so a grace that simply never released anything fails here.
+      // Age is set explicitly rather than inherited from the fixture default,
+      // which clears the grace only by an accident of the calendar.
+      const { companyId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({
+        companyId,
+        runId,
+        issueId,
+        acquiredAt: new Date(Date.now() - 6 * 60 * 60 * 1000),
+      });
+      mockListManagedAgentPods.mockResolvedValue([]);
+
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(1);
+
+      expect((await getLease(leaseId))?.status).toBe("failed");
+    });
+
+    it("applies the launch grace per run against its NEWEST lease (PEN-3674)", async () => {
+      // `releaseEnvironmentLeasesForRun` is per-run and all-or-nothing, so one
+      // run holding an old lease AND a fresh one must be deferred whole. A
+      // sweep that keyed on the oldest lease — the field the orphan-age gauge
+      // reports — would release both and take the fresh one with it.
+      const { companyId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const old = await seedEnvironmentLeaseFixture({
+        companyId,
+        runId,
+        issueId,
+        acquiredAt: new Date(Date.now() - 6 * 60 * 60 * 1000),
+      });
+      const fresh = await seedEnvironmentLeaseFixture({
+        companyId,
+        runId,
+        issueId,
+        acquiredAt: new Date(Date.now() - 60_000),
+      });
+      mockListManagedAgentPods.mockResolvedValue([]);
+
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(0);
+
+      expect((await getLease(old.leaseId))?.status).toBe("active");
+      expect((await getLease(fresh.leaseId))?.status).toBe("active");
+    });
+
+    it("does not apply the launch grace to a LOCAL adapter lease (PEN-3674 negative control)", async () => {
+      // The grace is scoped to the arm BLO-32052 opened. A local run is still
+      // governed by in-process ownership, and with nothing in
+      // `activeRunExecutions` a fresh local lease must still release — so the
+      // grace discriminates on adapter type rather than deferring everything
+      // young.
+      const { companyId, runId, issueId } = await seedRunFixture({
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({
+        companyId,
+        runId,
+        issueId,
+        acquiredAt: new Date(Date.now() - 60_000),
+      });
+      mockListManagedAgentPods.mockResolvedValue([]);
+
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(1);
+
+      expect((await getLease(leaseId))?.status).toBe("failed");
     });
 
     it("falls back to the pod arm alone once the reservation is released, and is fail-closed there (BLO-32052)", async () => {

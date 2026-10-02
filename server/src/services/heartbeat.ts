@@ -24953,6 +24953,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterType: agents.adapterType,
         status: heartbeatRuns.status,
         error: heartbeatRuns.error,
+        leaseAcquiredAt: environmentLeases.acquiredAt,
       })
       .from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
@@ -24964,8 +24965,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       );
 
+    // PEN-3674: keep the NEWEST lease per run. Release is per-run and
+    // all-or-nothing (`releaseEnvironmentLeasesForRun` below releases every
+    // active lease the run holds), so the launch-window grace has to be
+    // judged against the youngest of them: deferring a pass on an old lease
+    // costs one pass, releasing a young one cannot be undone.
     const uniqueRuns = new Map<string, (typeof orphanedRows)[number]>();
-    for (const row of orphanedRows) uniqueRuns.set(row.runId, row);
+    for (const row of orphanedRows) {
+      const seen = uniqueRuns.get(row.runId);
+      if (!seen || row.leaseAcquiredAt > seen.leaseAcquiredAt) uniqueRuns.set(row.runId, row);
+    }
 
     let releasedRunCount = 0;
     for (const run of uniqueRuns.values()) {
@@ -25009,6 +25018,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // across the pair, but do not rely on the Job arm being live here.
         if (!hasExternalLifecycle(run.adapterType) && activeRunExecutions.has(run.runId)) continue;
         if (hasExternalLifecycle(run.adapterType)) {
+          // PEN-3674: launch-window grace, and it has to come BEFORE the
+          // quiescence probe because the probe cannot see this hazard.
+          //
+          // `confirmStaleKilledJobQuiesced` is fail-closed against an
+          // *unobservable* runtime (a null kube read keeps the lease), but it
+          // is not fail-closed against a *not-yet-existent* one. A lease is
+          // acquired on the launch path strictly before the Job is created, so
+          // inside that window a run that is already status-terminal — a
+          // cancel racing its own launch — presents with no reservation
+          // `jobName` (so the Job arm is skipped entirely and `quiesced` stays
+          // true) and no run-labelled pods (so the pod arm reads an observable
+          // empty list). Both arms therefore report "quiesced" for a runtime
+          // that is still on its way up, and the sweep releases the lease out
+          // from under a Job that is about to start.
+          //
+          // Before BLO-32052 narrowed the guard above, the stale
+          // `activeRunExecutions` entry masked this: such a run was in the Set
+          // and skipped outright. Narrowing the guard is correct and is what
+          // unwedges the 100h+ strands this sweep exists for — but it is also
+          // what exposes this window, so the two changes belong together.
+          //
+          // Same constant and same purpose as `isolationSetupGraceActive` in
+          // the sibling reservation sweep above, which already declines to act
+          // on a pre-Job (`!jobName`) row this recently touched. That guard is
+          // this one's precedent: the two sweeps share a defect class and
+          // should share its remedy. Gating on age alone — rather than also
+          // re-deriving `jobName` here — is the more conservative half of that
+          // shape and needs no extra query; a Job that does exist and is still
+          // active is retained by the probe below regardless.
+          const leaseAgeMs = Date.now() - new Date(run.leaseAcquiredAt).getTime();
+          if (leaseAgeMs < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS) continue;
           // Background Job deletion does not prove that the Job or its
           // run-labelled pods have stopped. Reuse the same fail-closed probe as
           // cancellation: an active or unobservable external runtime keeps the
