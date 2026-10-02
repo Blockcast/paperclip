@@ -546,7 +546,7 @@ test('the pending-runs JSON carries headSha for the stall-clock derivation', () 
   // and for `databaseId` is a cancel call against `undefined`.
   for (const field of ['databaseId', 'status', 'createdAt', 'url', 'headSha']) {
     assert.match(
-      pendingReadRegion,
+      pendingReadPipeline(),
       new RegExp(`\\b${field}\\s*:`),
       `pending-runs JSON must carry ${field}`,
     );
@@ -634,6 +634,11 @@ test('guard (1) unions independent run queries, so a stale slice cannot zero it'
   assert.ok(
     queries.some((q) => q.includes('event=workflow_dispatch')),
     'one query must select the dispatch event',
+  );
+  assert.match(
+    pipeline,
+    /select\(\.event\s*==\s*"workflow_dispatch"\)/,
+    'guard (1) must drop non-dispatch runs returned by the unfiltered status queries',
   );
   // GitHub's `status` filter takes ONE value, so each non-terminal status guard (1)
   // counts needs its own query. A status read only through the event query is
