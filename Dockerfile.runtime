@@ -92,13 +92,17 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # tree at runtime: the Helm seed only reads package.json out of it, and the
 # agent entrypoint never touches /opt. The directory inode matters as much as
 # its contents, because a root-owned file inside a node-owned directory can
-# still be replaced by rename(2). The trailing `stat` asserts the inode we
-# actually produced: a RUNTIME_BASE_IMAGE that began shipping this directory
-# node-owned would satisfy every source-text check without the build failing.
+# still be replaced by rename(2) — and so does its mode, because a root-owned
+# but group/other-writable directory is just as replaceable. The trailing
+# `find` asserts the inode we actually produced, on both axes: a
+# RUNTIME_BASE_IMAGE that began shipping this directory node-owned, or
+# world-writable, would satisfy every source-text check without the build
+# failing. It tests `! -user root -o -perm /022` rather than a literal mode so
+# that tightening the directory further stays green while loosening it fails.
 RUN mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
   && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \
   && chown -R node:node /paperclip \
-  && test "$(stat -c %U:%G /opt/paperclip-bundled-adapters)" = root:root
+  && test -z "$(find /opt/paperclip-bundled-adapters \( ! -user root -o -perm /022 \) -print -quit)"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/paperclip-consult-codex.sh /usr/local/bin/paperclip-consult-codex

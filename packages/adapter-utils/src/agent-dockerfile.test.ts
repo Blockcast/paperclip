@@ -100,7 +100,7 @@ describe("paperclip agent Dockerfile", () => {
 
     // Scanning is per shell command, not per physical line. The two steps are
     // in tension and both are load-bearing:
-    //   - Join `\`-continuations FIRST. Every RUN in these three files is a
+    //   - Join `\`-continuations FIRST. Every RUN in these four files is a
     //     continuation chain, and the line this fix deleted was itself a
     //     wrapped `  && chown -R node:node /opt/paperclip-bundled-adapters`.
     //     Without the join, re-adding it one wrap over is invisible to a
@@ -119,6 +119,13 @@ describe("paperclip agent Dockerfile", () => {
     // matched adjacent to `chown` so that both `RUN chown -R node:node` and
     // `COPY --chown=1000:1000` count while an unrelated `--from=node:20` on a
     // root-owned COPY does not.
+    //
+    // Known ceiling, so the next reader does not assume this is exhaustive:
+    // the path is matched literally, so `chown -R node:node ${ADAPTER_DIR}` or
+    // any other build-ARG indirection is invisible here no matter how the owner
+    // is spelled. Catching that would mean teaching the matcher to expand ARGs,
+    // which is more machinery than the risk justifies — every form that
+    // actually occurs in these files names the path literally.
     const ownerIsUid1000 = /\bchown\b(?:=|\s+)(?:-\S+\s+)*(?:node|1000)\b/;
     const handsTreeToUid1000 = (command: string): boolean =>
       ownerIsUid1000.test(command) && command.includes("/opt/paperclip-bundled-adapters");
@@ -156,9 +163,19 @@ describe("paperclip agent Dockerfile", () => {
       expect(shellCommands(legitimate).some(handsTreeToUid1000)).toBe(false);
     }
 
-    // No stage may hand the tree to uid 1000, in any of the three images.
+    // No stage may hand the tree to uid 1000, in any of the four images that
+    // compose the agent filesystem. The chain is
+    // Dockerfile.runtime -> Dockerfile.agent-toolchain -> Dockerfile.agent,
+    // with the tree's contents arriving from Dockerfile (the server image) via
+    // `COPY --from=server`. The toolchain image is the easy one to omit — it
+    // has no `chown` today and never names the tree — but it sits between the
+    // image that creates the directory inode and the image that ships to the
+    // agent, so a `chown` added there lands in the final agent image by
+    // inheritance and reopens exactly the rename(2) exposure this test exists
+    // to pin. Scanning it costs one line; omitting it costs the whole guard.
     // `.filter(...)` rather than `.some(...)` so a failure prints the command.
     expect(shellCommands(dockerfileAgent).filter(handsTreeToUid1000)).toEqual([]);
+    expect(shellCommands(dockerfileToolchain).filter(handsTreeToUid1000)).toEqual([]);
     expect(shellCommands(dockerfileRuntime).filter(handsTreeToUid1000)).toEqual([]);
     expect(shellCommands(dockerfileServer).filter(handsTreeToUid1000)).toEqual([]);
 
@@ -173,21 +190,26 @@ describe("paperclip agent Dockerfile", () => {
 
     // ...and the server image produces them root-owned and not group/other
     // writable in the first place, then proves it against the real tree rather
-    // than only pinning the instruction that was supposed to do it.
+    // than only pinning the instruction that was supposed to do it. Ownership
+    // and mode are proved by one `find`, because `chmod -R go-w` is otherwise
+    // only text-pinned and the two halves of "the agent cannot write here"
+    // should not be held to different standards by the same commit.
+    const ownedByRootAndNotGroupOtherWritable =
+      'test -z "$(find /opt/paperclip-bundled-adapters \\( ! -user root -o -perm /022 \\) -print -quit)"';
     expect(server).toContain("chown -R root:root /opt/paperclip-bundled-adapters");
     expect(server).toContain("chmod -R go-w /opt/paperclip-bundled-adapters");
-    expect(server).toContain(
-      'test -z "$(find /opt/paperclip-bundled-adapters ! -user root -print -quit)"',
-    );
+    expect(server).toContain(ownedByRootAndNotGroupOtherWritable);
 
     // The directory's own inode is the other half: a root-owned file inside a
-    // node-owned directory is still replaceable by rename(2). The runtime
-    // image creates the directory, so it must create it and leave it to root
-    // while still chowning the PVC home to node — and assert the resulting
-    // inode, since a base image that already shipped it node-owned would
-    // satisfy every text pin here.
+    // node-owned directory is still replaceable by rename(2), and so is a file
+    // inside a root-owned but world-writable one. The runtime image creates the
+    // directory, so it must create it and leave it to root while still chowning
+    // the PVC home to node — and assert the resulting inode on both axes, since
+    // a base image that already shipped it node-owned or loosely-moded would
+    // satisfy every text pin here. Deliberately the same check as the server
+    // image above: one idiom, asserted wherever the tree is produced.
     expect(runtime).toContain("mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters");
-    expect(runtime).toContain('test "$(stat -c %U:%G /opt/paperclip-bundled-adapters)" = root:root');
+    expect(runtime).toContain(ownedByRootAndNotGroupOtherWritable);
 
     // The PVC home must stay node-owned — this fix must not have over-corrected
     // into a root-owned /paperclip. `/paperclip` is pinned as a whole path
