@@ -29,12 +29,15 @@ const inactiveWorktreeActivation: LoadInboxInput["worktreeActivation"] = {
   reason: "not_worktree_runtime",
 };
 
-function loadInbox(
+async function loadInbox(
   options: Partial<
     Pick<LoadInboxInput, "isWorktreeRuntime" | "worktreeActivation" | "callerRunId" | "nowMs">
   > = {},
 ) {
-  return loadAgentInboxLite({
+  // BLO-39015 moved the array behind `{ rows, truncated, appliedLimit }`. The
+  // existing contract assertions are about the ROWS, so unwrap here; truncation
+  // has its own suite in agent-inbox-lite-truncation.test.ts.
+  return (await loadAgentInboxLite({
     issuesSvc: mockIssueService as unknown as LoadInboxInput["issuesSvc"],
     recoveryActionsSvc: mockRecoveryActionService as unknown as LoadInboxInput["recoveryActionsSvc"],
     companyId: "company-1",
@@ -44,7 +47,7 @@ function loadInbox(
     isWorktreeRuntime: false,
     worktreeActivation: inactiveWorktreeActivation,
     ...options,
-  });
+  })).rows;
 }
 
 describe("agent inbox-lite status contract", () => {
@@ -347,7 +350,7 @@ describe("agent inbox-lite concurrent-claim guard (BLO-29965)", () => {
     mockIssueService.list.mockResolvedValue([parkedRetryRow()]);
     const onWithheldForeignScheduledRetry = vi.fn();
 
-    const items = await loadAgentInboxLite({
+    const { rows: items } = await loadAgentInboxLite({
       issuesSvc: mockIssueService as unknown as LoadInboxInput["issuesSvc"],
       recoveryActionsSvc:
         mockRecoveryActionService as unknown as LoadInboxInput["recoveryActionsSvc"],
@@ -425,7 +428,7 @@ describe("agent inbox-lite concurrent-claim guard (BLO-29965)", () => {
     ]);
     const onWithheldForeignScheduledRetry = vi.fn();
 
-    const items = await loadAgentInboxLite({
+    const { rows: items } = await loadAgentInboxLite({
       issuesSvc: mockIssueService as unknown as LoadInboxInput["issuesSvc"],
       recoveryActionsSvc:
         mockRecoveryActionService as unknown as LoadInboxInput["recoveryActionsSvc"],
@@ -471,7 +474,7 @@ describe("agent inbox-lite concurrent-claim guard (BLO-29965)", () => {
     ]);
     const onWithheldForeignScheduledRetry = vi.fn();
 
-    const items = await loadAgentInboxLite({
+    const { rows: items } = await loadAgentInboxLite({
       issuesSvc: mockIssueService as unknown as LoadInboxInput["issuesSvc"],
       recoveryActionsSvc:
         mockRecoveryActionService as unknown as LoadInboxInput["recoveryActionsSvc"],
