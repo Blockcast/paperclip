@@ -1483,6 +1483,66 @@ describe("buildJobManifest", () => {
       expect(entry?.valueFrom?.secretKeyRef?.key).toBe("HOME");
     });
 
+    // PEN-3713/PEN-2527. The chart's render guard keeps the GitHub egress
+    // wrappers ahead of /usr/bin on the StatefulSet and the api Deployment —
+    // and only there. An agent Job's PATH is whatever layer 3 inherited or
+    // layer 4 overwrote, with no shape check on any key, so the invariant was
+    // enforced everywhere except the containers that run agents. Measured on a
+    // live pod: PATH led with an agent-writable PVC directory and did not
+    // contain the wrapper directory at all.
+    //
+    // Read these four together. Drop the operator case and an implementation
+    // that only fixes the inherited path passes; drop the idempotence case and
+    // one that prepends unconditionally passes, growing PATH on every build;
+    // drop the no-PATH case and one that emits a lone directory passes, which
+    // clobbers the image's own ENV PATH and leaves nothing else resolvable.
+    const WRAPPER_BIN = "/usr/local/libexec/paperclip/bin";
+
+    function pathOf(result: ReturnType<typeof buildJobManifest>): string {
+      const entry = (result.job.spec?.template?.spec?.containers[0]?.env ?? []).find(
+        (e) => e.name === "PATH",
+      );
+      // Operator-set PATH is routed to the env Secret, so read both shapes.
+      return entry?.value ?? result.envSecret?.data.PATH ?? "";
+    }
+
+    it("prepends the root-owned wrapper directory to an inherited PATH", () => {
+      selfPod.inheritedEnv = { PATH: "/usr/local/bin:/usr/bin:/bin" };
+      const value = pathOf(buildJobManifest({ ctx, selfPod }));
+      expect(value).toBe(`${WRAPPER_BIN}:/usr/local/bin:/usr/bin:/bin`);
+    });
+
+    it("prepends it to an operator-set PATH too, which the merge does not validate", () => {
+      // The live shape: an adapterConfig.env PATH leading with an
+      // agent-writable PVC directory and omitting the wrappers entirely.
+      const withOperatorPath = {
+        ...ctx,
+        config: {
+          ...(ctx.config as Record<string, unknown>),
+          env: { PATH: "/paperclip/opencode-api-key-bin:/paperclip/bin:/usr/bin:/bin" },
+        },
+      };
+      const value = pathOf(buildJobManifest({ ctx: withOperatorPath, selfPod }));
+      expect(value.split(":")[0]).toBe(WRAPPER_BIN);
+      // The operator's own entries survive; this pins ordering, not content.
+      expect(value).toContain("/paperclip/opencode-api-key-bin");
+      expect(value).toContain("/usr/bin");
+    });
+
+    it("is idempotent when the wrapper directory already leads", () => {
+      const already = `${WRAPPER_BIN}:/usr/bin:/bin`;
+      selfPod.inheritedEnv = { PATH: already };
+      expect(pathOf(buildJobManifest({ ctx, selfPod }))).toBe(already);
+    });
+
+    it("falls back to the system PATH rather than emitting a lone directory", () => {
+      selfPod.inheritedEnv = {};
+      const value = pathOf(buildJobManifest({ ctx, selfPod }));
+      expect(value.split(":")[0]).toBe(WRAPPER_BIN);
+      expect(value.split(":").length).toBeGreaterThan(1);
+      expect(value).toContain("/usr/bin");
+    });
+
     it("leaves a non-operator, non-sensitive inherited var as a literal", () => {
       selfPod.inheritedEnv = { MY_PLAIN_VAR: "plain" };
       const { job } = buildJobManifest({ ctx, selfPod });

@@ -92,6 +92,15 @@ const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
+// PEN-3713. Where the image installs the root-owned GitHub egress wrappers
+// (Dockerfile `COPY docker/github-wrappers/`). Must match
+// `paperclip.imageWrapperBinDir` in the chart; the pair is pinned by
+// deploy/helm/paperclip/tests/agent-egress-path.test.mjs so the two cannot
+// drift into a PATH entry no image carries.
+const GITHUB_WRAPPER_BIN_DIR = "/usr/local/libexec/paperclip/bin";
+// Only used when the merged env carries no PATH at all; see the prepend below.
+const GITHUB_WRAPPER_FALLBACK_PATH =
+  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const RUNTIME_CACHE_ENV: Record<string, string> = {
   XDG_CACHE_HOME: `${RUNTIME_CACHE_MOUNT_PATH}/xdg`,
   GOCACHE: `${RUNTIME_CACHE_MOUNT_PATH}/go-build`,
@@ -610,6 +619,12 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
   },
 
   // --- SAFE_LITERAL: identity and run context ---------------------------
+  {
+    name: "PATH",
+    classification: "SAFE_LITERAL",
+    reason:
+      "Binary lookup order. Code-originated since PEN-3713, which prepends the root-owned GitHub egress wrapper directory to whatever PATH layers 3/4 produced. A list of directory names carries no credential, and burying it in a Secret would stop `GET Pod` answering 'which gh does this agent resolve?' — the exact question PEN-3713 was diagnosed by.",
+  },
   {
     name: "PAPERCLIP_AGENT_ID",
     classification: "SAFE_LITERAL",
@@ -1210,6 +1225,38 @@ function buildEnvVars(
     : RUNTIME_CACHE_ENV;
   for (const [key, value] of Object.entries(cacheEnv)) {
     if (!userEnvKeys.has(key)) merged[key] = value;
+  }
+
+  // PEN-3713/PEN-2527: keep the root-owned GitHub egress wrappers ahead of the
+  // image CLIs on the agent's PATH, whatever PATH it ended up with.
+  //
+  // The chart validates this invariant at render time ("paperclip.runtimePath"
+  // fails the render if a wrapper directory is missing or lands after
+  // /usr/bin), but that guard only reaches the long-lived server and api
+  // containers. An agent Job's PATH is whatever layer 3 inherited or layer 4
+  // (`adapterConfig.env.PATH`, an operator-set database value) overwrote — see
+  // the merge above, which applies no shape check to any key. Measured
+  // 2026-10-02 on a live agent pod: PATH began with an agent-writable PVC
+  // directory and did not contain the wrapper directory at all, so `git`
+  // resolved straight to /usr/bin/git and PEN-3156's wrapper was off the
+  // traffic path entirely while the chart's render guard reported healthy.
+  //
+  // Prepending rather than rejecting: a bad PATH here is an operator
+  // misconfiguration that would otherwise fail a Job that has nothing to do
+  // with GitHub, and the thing worth guaranteeing is the ordering, not the
+  // rest of the value. Idempotent, so a PATH that already leads with the
+  // directory is left exactly as it is.
+  const existingPath = merged.PATH;
+  // With no PATH to prepend to, emitting a bare wrapper directory would
+  // CLOBBER the image's own `ENV PATH` — an explicit container env entry wins
+  // outright — and leave the agent unable to resolve any other binary. Fall
+  // back to the system default in that case rather than to one directory.
+  const pathEntries = (existingPath || GITHUB_WRAPPER_FALLBACK_PATH).split(":");
+  if (pathEntries[0] !== GITHUB_WRAPPER_BIN_DIR) {
+    merged.PATH = [
+      GITHUB_WRAPPER_BIN_DIR,
+      ...pathEntries.filter((entry) => entry !== GITHUB_WRAPPER_BIN_DIR),
+    ].join(":");
   }
 
   // Convert literal env to V1EnvVar array. Names matching the sensitive
