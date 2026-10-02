@@ -191,20 +191,20 @@ _🔍 Automated Review — PR #<N> @ <sha-short>_
 
 Reviewed head: <full 40-character lowercase HEAD_SHA>
 
-### 🚨 Critical
+### Critical Issues (<n>)
 *(Must fix before merge. Bugs, security issues, broken contracts.)*
 - **[pipeline]** Description [file:line]
   > Quote of the offending lines.
 
-### ⚠️ Important
+### Important Issues (<n>)
 *(Should fix. Quality, maintainability, missed edge cases.)*
 - **[pipeline]** Description [file:line]
 
-### 💡 Suggestions
+### Suggestions (<n>)
 *(Nice-to-have. Style, simplifications, naming.)*
 - **[pipeline]** Description [file:line]
 
-### ✅ Strengths
+### Strengths
 - What's well-done.
 
 ### 🤖 Pipelines
@@ -226,8 +226,9 @@ Reviewed head: <full 40-character lowercase HEAD_SHA>
 
 **The `ally-verdict:1` block is mandatory, and it is ADDITIVE — it never replaces the `Reviewed head:` line.** It is the machine-readable source the comment-review gate reads first (`parseAllyVerdictBlock` in `server/src/services/ally-review-detection.ts`, BLO-32695). Prose parsing survives only as the fallback for bodies posted before the block existed, and that fallback is why the family of parser widenings kept growing: one clean review of paperclip#1675 (2026-09-07T15:41:42Z, 0 Critical / 0 Important, two findings explicitly retired) defeated **four** independent prose patterns at once — a parenthetical after the attested SHA, a bolded ledger verb, a comma where a dash was required, and a hyphenated severity — so the gate published a finding you had already withdrawn. Fields, not sentences, is the exit.
 
-Three rules bind:
+Four rules bind:
 
+- **Head each findings bucket `### <Severity> Issues (<n>)`, with the count.** This is the one rule the template itself used to break: it prescribed uncounted emoji buckets (`### 🚨 Critical`), which `EMITTED_COUNTED_FINDINGS_BUCKET_PATTERN` (`server/src/services/ally-review-detection.ts`) cannot match — so for the exact format this prompt mandated, the block-vs-prose count cross-check was **inert**, and a block under-counting its own buckets had nothing standing against it. Exposure was nil only by luck: all 64 buckets measured across six recent PRs were already emitted in the counted form, i.e. you were ignoring the template here and the template was wrong. It now says what you already do (Ally, #1721 at 5f4d5302, Suggestion 2). Decoration beyond emphasis is not covered by the pattern, so the rule degrades silently if you add any — keep the heading plain.
 - **Emit exactly one block per review.** Two blocks, an unknown version, malformed JSON, a `head` that is not a complete 40-hex SHA, or a **missing `findings` object** all resolve to a *fail-closed* `unreadable_verdict` red. That red is scoped to your newest review only, so posting one more readable review always clears it — but it is a red, not a green. `findings` is required even when you found nothing: emit `{ "critical": 0, "important": 0, "suggestions": 0 }`. Omitting the key is not the same as zero — zero is a clean verdict, so a block that never stated its counts would clear a head it made no claim about, and the parser refuses to read it rather than default it.
 - **Keep the prose `Reviewed head:` line.** Four independent readers parse that line and only the gate understands the block: this module, `commentAttestsHead` in `server/src/services/github-app-auth.ts`, `ATTESTED_HEAD_RE` in `scripts/check-ally-review-consistency.mjs`, and `REVIEWED_HEAD_PATTERN` in `.github/scripts/sweep-stalled-ally-reviews.py`. Drop the prose and readers 2–4 attest nothing — reader 2 raises `pr_review_output_missing` and posts a false "reviewer never finished".
 - **`findings` counts what you actually found; `dispositions` retires prior findings by name.** `blocking_finding` is now reachable only from a counted finding, so a zero-count block plus your usual "Recommended Action" boilerplate no longer reads as actionable. Verb vocabulary is unchanged — an unrecognised verb still fails closed rather than retiring anything.

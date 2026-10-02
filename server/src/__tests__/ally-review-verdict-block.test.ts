@@ -616,10 +616,12 @@ describe("BLO-32695 — an unknown severity key fails closed, not open", () => {
   // this code sees them — which is why case is the shape that matters.
   //
   // Found by Ally in review of #1721 at 8e6e84bd, who also established that
-  // `proseCountContradicting` cannot rescue it: the producer template heads
-  // buckets `### 🚨 Critical` with no `(N)`, which the emitted-bucket pattern
-  // requires. All three readers shared the bug identically, so no peer reader
-  // caught it either; the mjs and Python guards are pinned in their own suites.
+  // `proseCountContradicting` cannot rescue it: a body may head its buckets
+  // `### 🚨 Critical` with no `(N)`, which the emitted-bucket pattern requires.
+  // That was the producer template's own prescribed form until #1721 corrected
+  // it to the counted one, and every body posted before that still carries it.
+  // All three readers shared the bug identically, so no peer reader caught it
+  // either; the mjs and Python guards are pinned in their own suites.
   describe("two keys normalizing to one severity fail closed", () => {
     it("reads a case-variant duplicate as unreadable, not as the last value written", () => {
       expect(parseAllyVerdictBlock(agreeing({ critical: 0, Critical: 1, important: 0 }))).toMatchObject({
