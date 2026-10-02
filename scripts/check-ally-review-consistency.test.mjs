@@ -1924,6 +1924,37 @@ describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break
     });
   }
 
+  // The fence opener is the one pattern that exists in a THIRD JS reader of the
+  // same review bodies -- packages/adapter-utils/src/github-review-attestation.ts,
+  // whose own comment says it mirrors ally-review-detection.ts. A whole-file dot
+  // scan over that file would false-positive on its URL and argv regexes, where
+  // `.` is correct, so the mirror is pinned directly instead: all three sources
+  // byte-identical. Without this, fixing the two readers this row scopes would
+  // silently break the mirror the third one claims.
+  it("the fence opener is byte-identical across all three JS readers", () => {
+    const sources = [
+      ["../server/src/services/ally-review-detection.ts", "FENCE_DELIMITER_PATTERN"],
+      ["./check-ally-review-consistency.mjs", "FENCE_OPEN_RE"],
+      ["../packages/adapter-utils/src/github-review-attestation.ts", "FENCE_DELIMITER_PATTERN"],
+    ].map(([rel, name]) => {
+      const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+      const m = new RegExp(`const ${name} = (/.*/);`).exec(src);
+      assert.ok(m, `${name} not found in ${rel} -- the scan broke, not the file`);
+      return `${rel}: ${m[1]}`;
+    });
+    const [first] = sources;
+    for (const s of sources) {
+      assert.equal(
+        s.replace(/^[^:]*: /, ""),
+        first.replace(/^[^:]*: /, ""),
+        `fence openers diverged:\n${sources.join("\n")}`,
+      );
+    }
+    // Positive control: the shape this rule asks for, so the assertion above
+    // cannot pass on three readers that agreed on a bare `.`.
+    assert.match(first, /\(\[\^\\n\]\*\)\$\/$/);
+  });
+
   it("control: the dot scan catches both construction forms and spares literal dots", () => {
     // No floor is possible here -- the correct count is zero -- so the scan's
     // liveness has to be pinned by injection instead. Rows 3-5 are the ways a
