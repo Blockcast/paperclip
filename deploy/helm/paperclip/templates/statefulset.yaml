@@ -359,6 +359,23 @@ spec:
               # default token source — it exists so a caller can opt in for one
               # invocation, not so every call silently gains the PAT's broader
               # reach.
+              # PEN-3713: these five wrappers now ship in the image, root-owned,
+              # at {{ include "paperclip.imageWrapperBinDir" . }} — see
+              # docker/github-wrappers/, which is their single source of truth.
+              # The copies written below are a ROLLOUT FALLBACK only: an agent
+              # pod still running a pre-PEN-3713 image has no root-owned copy to
+              # resolve, and deleting these in the same change would drop it
+              # straight through to the unscrubbed /usr/bin/gh. They are reached
+              # only when the image directory is absent, because that directory
+              # precedes them on PATH ("paperclip.wrapperBinDirs").
+              #
+              # They are also still agent-writable, and nothing here can change
+              # that: this initContainer runs runAsUser 1000, the same uid every
+              # agent runs as, so the writer is the consumer. That is the defect,
+              # not an oversight — the fix is that nothing executes these any
+              # more. Removing this block, and the stale files on the volume, is
+              # the PEN-3713 follow-up, gated on the fleet being on images that
+              # carry the root-owned copies.
               LOCAL_BIN="${BASE}/.local/bin"
               mkdir -p "${LOCAL_BIN}"
               cat > "${LOCAL_BIN}/paperclip-github-token-env" <<'EOF'
@@ -661,6 +678,21 @@ spec:
                 # adapterConfig.mcpServers — this seed only writes the shared
                 # baseline. Re-runs overwrite to keep the file in sync with
                 # what's deployed.
+                #
+                # PEN-3713: this command is an ABSOLUTE path, so unlike `gh` it
+                # is not protected by PATH ordering — whatever it names is what
+                # runs. It named the PVC copy, which uid 1000 can rewrite.
+                # Prefer the root-owned image wrapper, and fall back to the PVC
+                # copy only when the image predates it. The test is on the file
+                # rather than on a chart value because the failure it prevents
+                # is a chart that rolls ahead of its images: an absolute path
+                # into a directory that does not exist yet would leave the
+                # github MCP server unable to start at all.
+                GH_MCP_WRAPPER="{{ include "paperclip.imageWrapperBinDir" . }}/github-mcp-server"
+                if [ ! -x "${GH_MCP_WRAPPER}" ]; then
+                  GH_MCP_WRAPPER="${LOCAL_BIN}/github-mcp-server"
+                  echo "seed: WARNING — root-owned github MCP wrapper absent from this image; falling back to the agent-writable PVC copy at ${GH_MCP_WRAPPER} (PEN-3713)"
+                fi
                 cat > "${MCP_FILE}" <<EOF
               {
                 "mcpServers": {
@@ -681,7 +713,7 @@ spec:
                     "url": "http://paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local:8080/k8s-ro/mcp"
                   },
                   "github": {
-                    "command": "/paperclip/.local/bin/github-mcp-server",
+                    "command": "${GH_MCP_WRAPPER}",
                     "args": ["stdio"]
                   },
                   "linear": {

@@ -628,6 +628,24 @@ COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bun
 # falling back to whatever npm publishes today.
 COPY --from=vendor /vendor/adapter-utils.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
+# PEN-3713: the GitHub egress wrappers live in the image, root-owned, not on
+# the fleet-shared PVC. They used to be written by the `seed` initContainer
+# into <mountPath>/.local/bin — but seed runs `runAsUser: 1000`, which is the
+# same uid every agent runs as, so the writer *was* the consumer and no mode
+# or chown could fix it: any agent could rewrite the script that holds the
+# GitHub App token, and it would then execute in every other agent's run
+# across every company sharing the volume.
+#
+# Baking them in costs nothing the PEN-2527 design relied on. Token freshness
+# comes from the wrapper re-reading the token file on every exec — a property
+# of the script's content, not of where the script is stored. The PVC was only
+# ever a convenient shared channel between two images; `COPY --from=server` in
+# Dockerfile.agent is a better one, because it cannot be written at runtime.
+#
+# /usr/local/libexec rather than /usr/local/bin: these are chain-loaded by
+# PATH/config indirection, not meant to be picked up by a human typing a name,
+# and keeping them out of the ordinary bin dirs makes the shadowing deliberate.
+COPY --chmod=0755 --exclude=README.md docker/github-wrappers/ /usr/local/libexec/paperclip/bin/
 COPY --from=penstock-agent-runtime /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
 COPY --from=caveman-proxy /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
 COPY --from=ponytail-marketplace /opt/penstock/ponytail /opt/penstock/ponytail

@@ -208,6 +208,27 @@ function readSeededGitHubMcpCommand(): string {
   return (match as RegExpExecArray)[1] as string;
 }
 
+// Since PEN-3713 the seeded command is a shell variable, chosen at run time
+// between the root-owned image wrapper and the PVC fallback. Both candidates
+// have to be wrappers; reading just the literal would see neither.
+//
+// This file reads the Helm TEMPLATE, not a render, so one candidate still
+// carries an unexpanded `{{ include … }}` containing its own double quotes.
+// Capturing greedily to the last quote on the line keeps that expression
+// intact — a `[^"]+` capture truncates it at the first inner quote and the
+// basename check then silently compares against a fragment.
+function readSeededGitHubMcpCandidates(): string[] {
+  const source = readFileSync(statefulSetPath, "utf8");
+  const candidates = [...source.matchAll(/^[ \t]*GH_MCP_WRAPPER="(.+)"[ \t]*$/gm)].map(
+    (match) => match[1] as string,
+  );
+  expect(
+    candidates.length,
+    "the seed no longer chooses a github MCP wrapper",
+  ).toBeGreaterThan(0);
+  return candidates;
+}
+
 /**
  * Every non-test TypeScript file under `server/src`, and the subset of them
  * this scan cannot prove is read-only.
@@ -293,12 +314,25 @@ describe("outbound GitHub egress coverage", () => {
       // The whole control rests on this indirection. A seed that pointed
       // `github` straight at /usr/local/bin/github-mcp-server would bypass the
       // scrub while leaving every wrapper assertion above green.
-      expect(readSeededGitHubMcpCommand()).toBe("/paperclip/.local/bin/github-mcp-server");
+      //
+      // PEN-3713 made the choice conditional — root-owned image wrapper when
+      // the image carries one, PVC copy otherwise — so BOTH branches have to
+      // be checked. Asserting only the preferred one would let the fallback
+      // regress to the unscrubbed server unnoticed on exactly the images that
+      // take it.
+      expect(readSeededGitHubMcpCommand()).toBe("${GH_MCP_WRAPPER}");
+      for (const candidate of readSeededGitHubMcpCandidates()) {
+        expect(candidate, `${candidate} is the unscrubbed image server`).not.toBe(
+          "/usr/local/bin/github-mcp-server",
+        );
+        expect(path.basename(candidate)).toBe("github-mcp-server");
+      }
     });
 
     it("is a wrapper the seed actually writes", () => {
-      const command = readSeededGitHubMcpCommand();
-      expect(readWrapperNames()).toContain(path.basename(command));
+      for (const candidate of readSeededGitHubMcpCandidates()) {
+        expect(readWrapperNames()).toContain(path.basename(candidate));
+      }
     });
   });
 
