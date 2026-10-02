@@ -379,6 +379,22 @@ export const EXECUTION_WORKSPACE_COLLECTOR_OUTCOMES = [
   "skipped",
   "failed",
 ] as const;
+/**
+ * How a collector pass ended. `skipped_saturated` is the entry gate: abandoned
+ * fs calls already hold the threadpool, so the pass examined nothing. That is
+ * the wedged-mount regime in which teardown stops and trees accumulate — the
+ * condition PEN-3692 exists to explain — so it must be a counted reason, not a
+ * missing record that reads like a dead worker. `ended_saturated` and
+ * `ended_wedged` stopped part-way with candidates left unexamined.
+ */
+export const EXECUTION_WORKSPACE_COLLECTOR_STOP_REASONS = [
+  "complete",
+  "skipped_saturated",
+  "ended_saturated",
+  "ended_wedged",
+] as const;
+export type ExecutionWorkspaceCollectorStopReason =
+  (typeof EXECUTION_WORKSPACE_COLLECTOR_STOP_REASONS)[number];
 
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
 export const BACKSTOP_SKIP_REASONS = [
@@ -3152,7 +3168,7 @@ let executionWorkspaceTeardownDuration: Histogram<"trigger" | "method"> | null =
 let executionWorkspaceCollectorScanned: Counter<string> | null = null;
 let executionWorkspaceCollectorCandidates: Counter<"outcome"> | null = null;
 let executionWorkspaceCollectorStamped: Counter<string> | null = null;
-let executionWorkspaceCollectorPasses: Counter<string> | null = null;
+let executionWorkspaceCollectorPasses: Counter<"stop_reason"> | null = null;
 let executionWorkspaceCollectorLastPass: Gauge<string> | null = null;
 
 function ensureRegistry(): {
@@ -3245,7 +3261,7 @@ function ensureRegistry(): {
   executionWorkspaceCollectorScannedCounter: Counter<string>;
   executionWorkspaceCollectorCandidatesCounter: Counter<"outcome">;
   executionWorkspaceCollectorStampedCounter: Counter<string>;
-  executionWorkspaceCollectorPassesCounter: Counter<string>;
+  executionWorkspaceCollectorPassesCounter: Counter<"stop_reason">;
   executionWorkspaceCollectorLastPassGauge: Gauge<string>;
 } {
   if (
@@ -4485,12 +4501,15 @@ function ensureRegistry(): {
     executionWorkspaceTeardownDuration = new Histogram({
       name: EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC,
       help:
-        "Seconds spent in one execution-workspace tree removal (PEN-3692). The _sum is "
-        + "the quantity this row needs — the work integral to regress the cgroup's "
-        + "reclaimable-slab residual against, replacing the n=2 natural experiment that "
-        + "attributed fill to run failures by magnitude alone. Duration is used as the "
-        + "proxy for tree size ON PURPOSE: counting entries unlinked would mean walking "
-        + "the tree ourselves, i.e. performing the very readdir/lstat work being "
+        "Seconds spent in the removal call itself — the `git worktree remove` or the "
+        + "`fs.rm` — for one execution-workspace tree (PEN-3692). The collector's "
+        + "`git status` safety walks before and after a removal are NOT timed here: that "
+        + "walk cost is counted (the collector scanned total), not timed, so this _sum is "
+        + "the removal term of the work integral, not the whole integral, and regressing "
+        + "the cgroup's reclaimable-slab residual against it alone omits that term. "
+        + "Duration is used as the proxy for tree size ON PURPOSE: counting entries "
+        + "unlinked would mean walking the tree ourselves, i.e. performing the very "
+        + "readdir/lstat work being "
         + "measured, so the instrument would create the pressure it reports. Buckets "
         + "run to 60s because these trees sit on a network mount where a removal can "
         + "block for a long time.",
@@ -4531,18 +4550,24 @@ function ensureRegistry(): {
     executionWorkspaceCollectorPasses = new Counter({
       name: EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC,
       help:
-        "Completed periodic execution-workspace collector passes (PEN-3692). A pass that "
-        + "threw does not reach this counter, so comparing its rate against the ~30s "
-        + "scheduler interval is how a collector that is failing every tick is "
-        + "distinguished from one that is running and finding nothing.",
+        "Periodic execution-workspace collector passes, labeled by how the pass ended "
+        + "(PEN-3692): complete, skipped_saturated (abandoned fs calls held the threadpool "
+        + "at entry, so nothing was examined), ended_saturated or ended_wedged (stopped "
+        + "part-way). A pass that threw does not reach this counter, so comparing its rate "
+        + "against the ~30s scheduler interval is how a collector that is failing every "
+        + "tick is distinguished from one that is running and finding nothing, and the "
+        + "skipped_saturated rate is how one deliberately standing down on a wedged mount "
+        + "is distinguished from both.",
+      labelNames: ["stop_reason"],
       registers: [registry],
     });
     executionWorkspaceCollectorLastPass = new Gauge({
       name: EXECUTION_WORKSPACE_COLLECTOR_LAST_PASS_METRIC,
       help:
-        "Unix timestamp of the last completed periodic execution-workspace collector pass "
-        + "(PEN-3692). The liveness signal no counter can express: a healthy idle pass and "
-        + "a collector that has stopped ticking both add zero to every counter above.",
+        "Unix timestamp of the last periodic execution-workspace collector pass of any "
+        + "stop_reason, including a skipped one (PEN-3692). The liveness signal no counter "
+        + "can express: a healthy idle pass and a collector that has stopped ticking both "
+        + "add zero to every counter above.",
       registers: [registry],
     });
     pluginWebhookDeliveryRejected = new Counter({
@@ -6380,7 +6405,8 @@ export function recordExecutionWorkspaceTeardown(input: {
 }
 
 /**
- * Record one completed periodic execution-workspace collector pass (PEN-3692).
+ * Record one periodic execution-workspace collector pass (PEN-3692), including
+ * one the entry gate skipped — see {@link EXECUTION_WORKSPACE_COLLECTOR_STOP_REASONS}.
  *
  * Takes the whole result rather than individual fields so a new field added to
  * {@link ExecutionWorkspaceCleanupResult} is a compile error here instead of a
@@ -6391,13 +6417,20 @@ export function recordExecutionWorkspaceTeardown(input: {
  */
 export function recordExecutionWorkspaceCollectorPass(
   result: ExecutionWorkspaceCleanupResult,
-  now: () => number = Date.now,
+  options: { stopReason: ExecutionWorkspaceCollectorStopReason; now?: () => number },
 ): void {
   try {
     const m = ensureRegistry();
     m.executionWorkspaceCollectorScannedCounter.inc(result.scanned);
     m.executionWorkspaceCollectorStampedCounter.inc(result.stamped);
-    m.executionWorkspaceCollectorPassesCounter.inc(1);
+    // Every stop_reason child materialized, as the reaper sweep counter does,
+    // so a dashboard reads "0 skipped passes" rather than no data.
+    for (const reason of EXECUTION_WORKSPACE_COLLECTOR_STOP_REASONS) {
+      m.executionWorkspaceCollectorPassesCounter.inc(
+        { stop_reason: reason },
+        reason === options.stopReason ? 1 : 0,
+      );
+    }
 
     const byOutcome: Record<(typeof EXECUTION_WORKSPACE_COLLECTOR_OUTCOMES)[number], number> = {
       collected: result.collected,
@@ -6411,7 +6444,7 @@ export function recordExecutionWorkspaceCollectorPass(
       m.executionWorkspaceCollectorCandidatesCounter.inc({ outcome }, byOutcome[outcome]);
     }
 
-    m.executionWorkspaceCollectorLastPassGauge.set(Math.floor(now() / 1000));
+    m.executionWorkspaceCollectorLastPassGauge.set(Math.floor((options.now ?? Date.now)() / 1000));
   } catch (error) {
     logger.error({ err: error }, "failed to record execution-workspace collector pass metrics");
   }

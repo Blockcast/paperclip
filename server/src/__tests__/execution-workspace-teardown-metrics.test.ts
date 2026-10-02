@@ -1,8 +1,12 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { cleanupExecutionWorkspaceArtifacts } from "../services/workspace-runtime.js";
+import {
+  cleanupExecutionWorkspaceArtifacts,
+  RECLAIM_FS_OUTSTANDING_LIMIT,
+} from "../services/workspace-runtime.js";
+import { executionWorkspaceCleanupService } from "../services/execution-workspace-cleanup.js";
 import {
   EXECUTION_WORKSPACE_COLLECTOR_CANDIDATES_METRIC,
   EXECUTION_WORKSPACE_COLLECTOR_LAST_PASS_METRIC,
@@ -32,7 +36,19 @@ import {
  * distinguishable from a dead one.
  */
 
+// Lets one test hold the collector's entry gate shut without parking real
+// threadpool threads; `null` defers to the real count.
+const reclaimFs = vi.hoisted(() => ({ outstanding: null as number | null }));
+vi.mock("../services/workspace-runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/workspace-runtime.js")>();
+  return {
+    ...actual,
+    reclaimFsOutstandingCount: () => reclaimFs.outstanding ?? actual.reclaimFsOutstandingCount(),
+  };
+});
+
 afterEach(() => {
+  reclaimFs.outstanding = null;
   __resetMetricsForTest();
 });
 
@@ -60,8 +76,7 @@ describe("execution-workspace teardown metrics", () => {
     expect(body).toContain(
       `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="collector",method="worktree_remove",outcome="succeeded"} 1`,
     );
-    // The work integral, split by caller — this is the quantity the slab
-    // residual gets regressed against.
+    // The removal term of the work integral, split by caller.
     expect(body).toContain(
       `${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_sum{trigger="run_teardown",method="worktree_remove"} 1.5`,
     );
@@ -188,13 +203,13 @@ describe("execution-workspace collector pass metrics", () => {
   it("records a pass census and materializes every outcome child", async () => {
     recordExecutionWorkspaceCollectorPass(
       { stamped: 3, scanned: 7, collected: 4, skipped: 2, failed: 1 },
-      () => 1_760_000_000_000,
+      { stopReason: "complete", now: () => 1_760_000_000_000 },
     );
 
     const { body } = await renderMetrics();
     expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_SCANNED_METRIC} 7`);
     expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_STAMPED_METRIC} 3`);
-    expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC} 1`);
+    expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC}{stop_reason="complete"} 1`);
     expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_CANDIDATES_METRIC}{outcome="collected"} 4`);
     expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_CANDIDATES_METRIC}{outcome="skipped"} 2`);
     expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_CANDIDATES_METRIC}{outcome="failed"} 1`);
@@ -206,7 +221,7 @@ describe("execution-workspace collector pass metrics", () => {
     // different statement from "this metric has never reported".
     recordExecutionWorkspaceCollectorPass(
       { stamped: 0, scanned: 2, collected: 2, skipped: 0, failed: 0 },
-      () => 1_760_000_000_000,
+      { stopReason: "complete", now: () => 1_760_000_000_000 },
     );
 
     const { body } = await renderMetrics();
@@ -222,7 +237,7 @@ describe("execution-workspace collector pass metrics", () => {
     // counter above. Only the timestamp separates them.
     recordExecutionWorkspaceCollectorPass(
       { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 },
-      () => 1_760_000_000_000,
+      { stopReason: "complete", now: () => 1_760_000_000_000 },
     );
     const first = await renderMetrics();
     expect(first.body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_SCANNED_METRIC} 0`);
@@ -230,11 +245,25 @@ describe("execution-workspace collector pass metrics", () => {
 
     recordExecutionWorkspaceCollectorPass(
       { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 },
-      () => 1_760_000_600_000,
+      { stopReason: "complete", now: () => 1_760_000_600_000 },
     );
     const second = await renderMetrics();
     expect(second.body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_SCANNED_METRIC} 0`);
-    expect(second.body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC} 2`);
+    expect(second.body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC}{stop_reason="complete"} 2`);
     expect(second.body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_LAST_PASS_METRIC} 1760000600`);
+  });
+
+  it("records a pass the threadpool gate skipped instead of going silent", async () => {
+    // The entry gate is the wedged-mount regime this census exists to explain.
+    // Driven through the real collector: the gate returns before any query, so
+    // no database is needed, and an unrecorded skip leaves no passes series.
+    reclaimFs.outstanding = RECLAIM_FS_OUTSTANDING_LIMIT;
+    const result = await executionWorkspaceCleanupService({} as never).reconcileExecutionWorkspaceCleanup();
+    expect(result.scanned).toBe(0);
+
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC}{stop_reason="skipped_saturated"} 1`);
+    expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC}{stop_reason="complete"} 0`);
+    expect(body).toMatch(new RegExp(`^${EXECUTION_WORKSPACE_COLLECTOR_LAST_PASS_METRIC} [1-9]\\d*$`, "m"));
   });
 });
