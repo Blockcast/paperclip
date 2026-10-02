@@ -62,7 +62,18 @@ import { recordHttpRequest } from "../services/metrics.js";
  * covers both genuine 404s and responses served by non-route middleware --
  * static assets and the SPA catch-all, whose path is a RegExp and so has no
  * stable template. The `status` label separates them: `<unmatched>` with a
- * 2xx/304 is asset traffic, with a 404 it is a real miss.
+ * 2xx/304 is asset traffic, with a 404 it is a real miss, and with a `0` the
+ * client went away before Express matched anything -- an abort or an ingress
+ * timeout, not a miss and not an asset.
+ *
+ * ## Reading the `0` status
+ *
+ * `0` is the sentinel for a response that never completed (see
+ * `normalizeHttpStatus`). It is not confined to `<unmatched>`: an abort after
+ * Express bound `req.route` carries the real route template, so `0` on a named
+ * route is that route's share of the hung-request regime. That regime is the
+ * one this counter exists to make visible, so a rising `0` rate is a signal in
+ * its own right rather than noise to filter out.
  */
 
 /** Marks a response as already instrumented, so a double mount cannot
