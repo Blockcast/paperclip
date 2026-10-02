@@ -205,10 +205,27 @@ export type ExecutionWorkspaceTeardownTrigger =
  * caller has no eligibility reason by construction", and folding it into
  * `idle_backfill` would assert idle reclamation about work whose origin nobody
  * recorded. It carries the same meaning the trigger enum's `unknown` does — a
- * writer did not classify itself — which is why it reuses the name, and why a
- * non-zero `cleanup_reason="unknown"` is a defect signal rather than a
- * population: after the heartbeat fix on PR #2175 no production writer should
- * produce one.
+ * writer did not classify itself — which is why it reuses the name.
+ *
+ * It is a POPULATION, not a defect signal (Ally, review of 68b9cad). An earlier
+ * draft of this block said the opposite — "after the heartbeat fix no production
+ * writer should produce one" — which contradicted the two producers named three
+ * lines above it, and in the direction a reader acts on: someone watching
+ * `unknown` climb would go hunting a regression that does not exist. Both
+ * producers are real and both are by design:
+ *
+ *   - The operator PATCH spreads `cleanupReason` and `cleanupEligibleAt` as
+ *     INDEPENDENT optional fields (`routes/execution-workspaces.ts`), so
+ *     `PATCH {cleanupEligibleAt: <past>}` stamps a row collectable while leaving
+ *     the reason untouched, and `selectEligible` does not filter on the reason.
+ *   - Rows the pre-PEN-3692 heartbeat writer already stripped are sitting in the
+ *     table now with a stamp and no reason. They do not heal —
+ *     `stampIdleLegacyWorkspaces` only rewrites rows whose `cleanupEligibleAt`
+ *     is null — so they drain through `unknown` after deploy. Non-zero on the
+ *     first pass that touches one, regardless of operator behaviour.
+ *
+ * What WOULD be a defect is a *NEW* code writer producing one, which is the
+ * narrower thing `execution-workspace-cleanup-reason-writers.test.ts` guards.
  */
 export const EXECUTION_WORKSPACE_CLEANUP_REASONS = [
   "run_ended",
