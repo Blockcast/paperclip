@@ -5112,8 +5112,11 @@ async function withReclaimFsDeadline<T>(operation: Promise<T>, target: string): 
  * precisely so a new PRODUCTION call site has to declare itself instead of
  * silently landing in an `unknown` bucket nobody reads. ⚠️ That guarantee stops
  * at `src/`: `server/tsconfig.json` excludes `src/__tests__`, so a test calling
- * this with one argument is NOT a compile error (BLO-24983) — it would record
- * `trigger=undefined`. Pass a trigger in tests too.
+ * this with one argument is NOT a compile error (BLO-24983). The runtime miss
+ * is loud rather than silent, though: `options` is then `undefined`, so the
+ * `finally` throws a `TypeError` dereferencing `options.trigger` *while
+ * building* the observation — the walk runs, nothing is recorded under a bogus
+ * label, and the call fails at that test. Pass a trigger in tests too.
  */
 export async function inspectWorktreeReclaimSafety(
   worktreePath: string,
