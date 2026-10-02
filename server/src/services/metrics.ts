@@ -358,13 +358,24 @@ export type ExecutionWorkspaceTeardownTrigger =
  *
  * `run_ended` is failed-and-succeeded-run-attributable work; `idle_backfill` is
  * reclamation of the pre-existing population. `not_applicable` is every
- * non-collector caller, which has no eligibility reason at all — deliberately
- * not `unknown`, so it cannot be confused with the trigger enum's "a call site
- * forgot to classify itself" signal.
+ * non-collector caller, which has no eligibility reason at all.
+ *
+ * `unknown` is a THIRD state and not a synonym for either: the row was made
+ * eligible by a writer that recorded no reason (`cleanup_reason is null` with a
+ * stamp set — today only the operator PATCH, plus rows a pre-PEN-3692 writer
+ * stripped). That is a different silence from `not_applicable`, which says "this
+ * caller has no eligibility reason by construction", and folding it into
+ * `idle_backfill` would assert idle reclamation about work whose origin nobody
+ * recorded. It carries the same meaning the trigger enum's `unknown` does — a
+ * writer did not classify itself — which is why it reuses the name, and why a
+ * non-zero `cleanup_reason="unknown"` is a defect signal rather than a
+ * population: after the heartbeat fix on PR #2175 no production writer should
+ * produce one.
  */
 export const EXECUTION_WORKSPACE_CLEANUP_REASONS = [
   "run_ended",
   "idle_backfill",
+  "unknown",
   "not_applicable",
 ] as const;
 export type ExecutionWorkspaceCleanupReason =

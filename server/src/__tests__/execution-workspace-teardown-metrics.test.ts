@@ -129,12 +129,12 @@ describe("execution-workspace teardown metrics", () => {
 
   it("bounds every label to its allowlist, so no call site can widen cardinality", () => {
     // Worst case on the counter is triggers x removal-methods x cleanup_reasons
-    // x outcomes = 4 x 2 x 3 x 2 = 48; the histogram adds `inspect_safety` and
-    // drops outcome, so 4 x 3 x 3 = 36. Both are worst cases, not expected
+    // x outcomes = 4 x 2 x 4 x 2 = 64; the histogram adds `inspect_safety` and
+    // drops outcome, so 4 x 3 x 4 = 48. Both are worst cases, not expected
     // counts: cleanup_reason only varies under trigger="collector", and every
     // other caller pins it to `not_applicable`. Bounded by these constants,
     // never by a caller-supplied string — in particular `cleanup_reason` is
-    // mapped from the DB column through a two-way branch rather than passed
+    // mapped from the DB column through a closed branch rather than passed
     // through, so adding a new `cleanupReason` value in the schema cannot
     // widen this.
     expect(EXECUTION_WORKSPACE_TEARDOWN_TRIGGERS).toEqual([
@@ -151,6 +151,7 @@ describe("execution-workspace teardown metrics", () => {
     expect(EXECUTION_WORKSPACE_CLEANUP_REASONS).toEqual([
       "run_ended",
       "idle_backfill",
+      "unknown",
       "not_applicable",
     ]);
   });
