@@ -127,13 +127,13 @@ jobs:
         # cap (10.22m step-time) regardless, and every checkout above 6.52m in
         # the window sits in a job that cap then killed. So no COMPLETED run
         # was at stake -- the bound governs the step, and 9m04s is what the
-        # step took. The reason to size above it is that now the cap is 22m and
+        # step took. The reason to size above it is that now the cap is 29m and
         # no longer truncates this distribution, the same draw lands in a run
         # that would otherwise finish.
         #
         # So do not read 12m as a safety factor over p100. `fetch-depth: 0`
         # cost grows with history, this term was censored by the old cap, and
-        # the 22m cap is what will let its real tail appear for the first time.
+        # the 29m cap is what will let its real tail appear for the first time.
         # Re-measure once it has; if a ratio is wanted against something that
         # does not move on one observation, p99 is 8.07m.
         uses: actions/checkout@v6
@@ -1517,10 +1517,12 @@ jobs:
     # cover the setup around it. This 10 is NOT derived by the BLO-35615 rule
     # that sizes `policy` above: W95 = 27 CPU-seconds, but over only n=3 runs
     # (2026-09-19..09-24), which is too few to be a usable p95. It is far below
-    # the 600 x 0.32 = 192 CPU-seconds this cap supplies at that rule's F = 0.32
-    # floor -- ~7x headroom -- so 10 cannot fire on a healthy run. Re-measure
-    # W95 and apply the rule before lowering it; do not tune it from observed
-    # durations.
+    # the 600 x 0.21 = 126 CPU-seconds this cap supplies at that rule's F = 0.21
+    # floor -- ~4.7x headroom -- so 10 cannot fire on a healthy run.
+    # RETRACTED: F = 0.32 / 0.3175 -- p05 of a series filtered to `rate > 0.25`,
+    # so >= 0.25 by construction. See the `policy` block above for the full note.
+    # Re-measure W95 and apply the rule before lowering it; do not tune it from
+    # observed durations.
     timeout-minutes: 10
     # BLO-28999: the classify step below is this workflow's first GITHUB_TOKEN
     # consumer, and `pr.yml` declares no workflow-level `permissions:`. Under a
