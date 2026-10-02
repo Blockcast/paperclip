@@ -1858,3 +1858,49 @@ describe("BLO-32695 -- a CRLF body reads exactly as its LF twin", () => {
     expect(gate(crlf)).toEqual(gate(lf));
   });
 });
+
+// Ally, #1721 at 1bc85198, Important 1. The CRLF block above is this same rule
+// one character class out. `reviewBody` normalises `\r\n?` to `\n` at entry so
+// CR never reaches a pattern -- but U+2028 and U+2029 do, and JS's `m` flag
+// treated them as line breaks while Python's re.MULTILINE and CommonMark do
+// not. Every pattern in this module now spells `(?:^|\n)` / `(?=\n|$)` and
+// carries no `m`, so the gate and the sweep read one line geometry. The flag
+// rule itself is pinned in scripts/check-ally-review-consistency.test.mjs.
+describe("BLO-32695 -- U+2028 is not a line break in any reader", () => {
+  const HEAD = PR1675_HEAD;
+  const clean = { head: HEAD, findings: { critical: 0, important: 0 } };
+  const blocked = (...lines: string[]) =>
+    [verdictBlock(clean), "## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD}`, ...lines].join("\n");
+  // The ledger cases carry no block on purpose: the block takes precedence over
+  // the prose ledger, so a block-bearing body would return [] whatever the
+  // pattern did and the control below would be vacuous.
+  const prose = (...lines: string[]) =>
+    ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD}`, ...lines].join("\n");
+
+  it("does not count a U+2028-terminated bucket against the block", () => {
+    // The deadlock this row exists to close: the gate counts the bucket and
+    // reds the head, while the sweep counts nothing, reads the head as
+    // attested, and suppresses the re-request that would clear the red.
+    expect(parseAllyVerdictBlock(blocked("### Critical Issues (3)\u2028trailing prose")).kind).toBe("ok");
+  });
+
+  it("control: the same bucket on `\\n` still contradicts the block", () => {
+    expect(parseAllyVerdictBlock(blocked("### Critical Issues (3)")).kind).toBe("unreadable");
+  });
+
+  it("does not read a U+2028-introduced ledger entry as a disposition", () => {
+    expect(
+      extractAllyPriorFindingDispositions(
+        prose("intro\u2028- **prior:abc1234 critical 1** \u2014 fixed \u2014 tail"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("control: the same ledger entry on `\\n` is read", () => {
+    expect(
+      extractAllyPriorFindingDispositions(
+        prose("intro", "- **prior:abc1234 critical 1** \u2014 fixed \u2014 tail"),
+      ),
+    ).toHaveLength(1);
+  });
+});
