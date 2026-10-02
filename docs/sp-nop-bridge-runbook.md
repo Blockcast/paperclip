@@ -279,13 +279,18 @@ After BLO-5389 lands:
 > today (see "BLO-5410 shipped status"). Setting it does NOT pause
 > onboarding: NOP keeps minting `individual_beacon` members. Until a
 > `tenants_beacon` caller check reads this column, take NOP down for a
-> maintenance window by removing the bridge cert and private key from NOP's
-> secret store (the path in Cert issuance step 4) and restarting NOP so its
-> outbound mTLS client stops presenting them. This is cooperative: it stops a
-> well-behaved NOP, not a holder of a copy of the key, which is acceptable
-> for planned maintenance. To bring NOP back, put the cert and key back (or
-> issue a fresh cert per the Cert issuance section) and restart NOP. Treat
-> the rest of this section as "after-enforcement" guidance.
+> maintenance window in two steps. First, **copy the bridge cert and private
+> key to a secure location** (or confirm NOP's secret store keeps the prior
+> version): the private key may exist nowhere else. Then remove them from
+> NOP's secret store (the secret-store path identified in Cert issuance
+> step 4, per BLO-5413) and restart NOP so its outbound mTLS client stops
+> presenting them. This is cooperative: it stops a well-behaved NOP, not a
+> holder of a copy of the key, which is acceptable for planned maintenance.
+> To bring NOP back, put the saved cert and key back and restart NOP. If the
+> copy is lost, the only other path is a fresh cert per the Cert issuance
+> section, which needs **manual approval** (step 3) until BLO-5389 lands, so
+> it is not a quick restore. Treat the rest of this section as
+> "after-enforcement" guidance.
 
 For graceful, reversible takedowns (planned maintenance, paused
 onboarding window), prefer a soft-disable over revocation:
