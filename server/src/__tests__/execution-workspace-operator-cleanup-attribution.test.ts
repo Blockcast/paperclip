@@ -235,4 +235,30 @@ describe.sequential("operator archive preserves run attribution on cleanup failu
     expect(firstPatch.status).toBe("archived");
     expect(firstPatch.cleanupReason).toBeNull();
   });
+
+  it("does not re-assert the origin when cleanup succeeds but warns", async () => {
+    // The only branch that reaches the SECOND update without failing: `cleaned`
+    // with warnings. The restore must not fire here — the row ends `archived`,
+    // so `selectEligible` excludes it and there is no collector question to
+    // answer, but the detail page renders `<cleanupEligibleAt> · <cleanupReason>`
+    // whenever the stamp is set. Re-asserting `run_ended` on a collected
+    // workspace would display it as though collection were still pending.
+    mockCleanupExecutionWorkspaceArtifacts.mockResolvedValue({
+      cleaned: true,
+      warnings: ["teardown command exited 1"],
+    });
+
+    const res = await request(createApp())
+      .patch("/api/execution-workspaces/workspace-1")
+      .send({ status: "archived" });
+
+    expect(res.status).toBe(200);
+    // The update does fire — this is the branch, not a case where it is skipped.
+    expect(mockExecutionWorkspaceService.update.mock.calls.length).toBe(2);
+    const secondPatch = mockExecutionWorkspaceService.update.mock.calls[1]![1] as Record<string, unknown>;
+    // ...and it leaves the archive's own writes alone: no demotion, and the
+    // reason is not touched, so the `null` written at archive time stands.
+    expect(secondPatch.status).toBeUndefined();
+    expect(secondPatch).not.toHaveProperty("cleanupReason");
+  });
 });
