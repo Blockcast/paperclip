@@ -136,7 +136,14 @@ export function httpMetricsMiddleware(): RequestHandler {
       return originalJson(body);
     }) as typeof res.json;
 
-    res.once("finish", () => {
+    // `finish` alone never fires for a request the client abandoned or the
+    // ingress timed out -- the hung-request regime a pool excursion produces.
+    // `close` fires on both normal completion and premature termination, so
+    // listen on both and latch to record exactly once.
+    let recorded = false;
+    const record = () => {
+      if (recorded) return;
+      recorded = true;
       try {
         const fallbackRoute = capturedRoute
           ? null
@@ -144,14 +151,18 @@ export function httpMetricsMiddleware(): RequestHandler {
         recordHttpRequest({
           route: capturedRoute ?? fallbackRoute,
           method: req.method,
-          status: res.statusCode,
+          // An aborted response still holds Node's default 200; report it on
+          // the "0" sentinel instead of as a success it never was.
+          status: res.writableFinished ? res.statusCode : null,
           emptyList,
         });
       } catch {
         // A metrics failure must never surface as a request failure. The
-        // response has already been sent by this point regardless.
+        // response has already been sent (or abandoned) by this point.
       }
-    });
+    };
+    res.once("finish", record);
+    res.once("close", record);
 
     next();
   };
