@@ -605,7 +605,7 @@ test('guard (1) unions independent run queries, so a stale slice cannot zero it'
   // Derived from the filter itself, not listed here: a hardcoded list lets a new
   // `or .status == "x"` arm land with no query, and the API answers an unbacked
   // `status=` with total_count=0, not an error, so nothing else would catch it.
-  const counted = [...new Set([...pendingReadRegion.matchAll(/\.status == "([a-z_]+)"/g)].map((m) => m[1]))];
+  const counted = [...new Set([...pendingReadRegion.matchAll(/\.status\s*==\s*"([a-z_]+)"/g)].map((m) => m[1]))];
   assert.ok(counted.length > 0, 'expected guard (1) to filter on `.status == "..."`');
   for (const status of counted) {
     assert.ok(
