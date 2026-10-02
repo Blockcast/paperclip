@@ -42,7 +42,17 @@ export interface SelfPodSecretVolume {
    * mount, so an absent mount does not leave the agent with "no token" — it
    * leaves the path resolving to the bare shared-PVC directory underneath,
    * which is mode 2775 and writable by uid 1000, the uid every agent runs as.
-   * Failing open on a credential mount hands its path to the agent.
+   * Failing open on a credential mount whose path is PVC-backed hands that path
+   * to the agent.
+   *
+   * The PVC-backed qualifier is load-bearing, not hedging: the allowlist
+   * currently covers one mount of each kind. `paperclip-github-mcp-token`
+   * mounts under `/paperclip`, so its fallback is fleet-shared and writable —
+   * that is the case this field exists for. `authbot-mcp-consumer-service-keys`
+   * mounts at `/run/authbot`, outside the PVC, so its fallback is the
+   * container's own ephemeral filesystem and reaches no other agent. Both are
+   * chart-declared required and both should stay that way, but only the first
+   * degrades into a credential-substitution path.
    */
   optional?: boolean;
 }
