@@ -16,6 +16,7 @@ import {
   findMergeAttributionOffense,
   GRANDFATHERED_OFFENSE_SHAS,
   parseCoAuthorEmails,
+  parseConcatenatedJsonArrays,
   resolveSince,
   runAudit,
   sortByMergedAtDesc,
@@ -999,4 +1000,27 @@ test("runAudit --gate merge still fails closed on an incomplete window", async (
   };
   const outcome = await runAudit({ repos: ["r/x"], since: "2026-09-01", ghApi, log: () => {}, gate: "merge" });
   assert.equal(outcome.passed, false, "an audit that could not complete has not cleared the merge side either");
+});
+
+test("parseConcatenatedJsonArrays survives a commit message containing '] ['", () => {
+  // The exact shape that crashed the first wide --audit-merged run (BLO-39345).
+  const page = JSON.stringify([
+    { sha: "a".repeat(40), commit: { author: { email: AGENT_A }, message: "fix: handle arr[0] [BLO-123]" } },
+  ]);
+  const rows = parseConcatenatedJsonArrays(page);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].commit.message, "fix: handle arr[0] [BLO-123]");
+});
+
+test("parseConcatenatedJsonArrays joins pages and handles escapes, brackets and empties", () => {
+  const p1 = JSON.stringify([{ sha: "1", m: 'quote \\" then a lone ] inside' }, { sha: "2", m: "and a lone { here" }]);
+  const p2 = JSON.stringify([{ sha: "3", m: "plain" }]);
+  const rows = parseConcatenatedJsonArrays(`${p1}\n${p2}`);
+  assert.deepEqual(rows.map((r) => r.sha), ["1", "2", "3"]);
+  assert.deepEqual(parseConcatenatedJsonArrays("[]"), []);
+  assert.deepEqual(parseConcatenatedJsonArrays(""), []);
+});
+
+test("parseConcatenatedJsonArrays throws on truncated output rather than silently dropping it", () => {
+  assert.throws(() => parseConcatenatedJsonArrays('[{"sha":"1"}'), /truncated JSON/);
 });
