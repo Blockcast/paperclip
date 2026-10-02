@@ -196,6 +196,21 @@ jobs:
         run: node --test ./scripts/check-db-transaction-alias.test.mjs
         timeout-minutes: 1
 
+      - name: Guard drizzle migration journal (BLO-39490)
+        # Three open PRs each appended `idx: 248` and all three were green:
+        # every required check passed because each PR is individually
+        # consistent. Needs PR_BASE_SHA -- a branch cut before the colliding
+        # entry landed looks fine on its own. Also runs on merge_group, which
+        # is what rejects the second claimant at the queue front rather than
+        # letting it land a conflict or a silently-dropped migration.
+        if: ${{ !cancelled() }}
+        run: node ./scripts/check-migration-journal.mjs "$PR_BASE_SHA"
+
+      - name: Test migration-journal guard (BLO-39490)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-migration-journal.test.mjs
+        timeout-minutes: 1
+
       - name: Validate Dockerfile deps stage
         if: ${{ !cancelled() }}
         run: |
