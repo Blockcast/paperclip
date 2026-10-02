@@ -477,8 +477,20 @@ function buildSkillExportDirMap(skills: CompanySkill[], companyIssuePrefix: stri
  * delete the feature. The fix is to stop this surface owning its own vocabulary, not to remove its
  * predicate.
  */
-function withholdsEnvInputDefault(key: string, defaultValue: string): boolean {
-  return isSensitiveEnvKey(key) || isPlausiblySensitiveEnvValue(defaultValue);
+function withholdsEnvInputDefault(
+  key: string,
+  defaultValue: string,
+  portability: CompanyPortabilityEnvInput["portability"],
+): boolean {
+  if (isSensitiveEnvKey(key)) return true;
+  // An absolute command path (`/Users/dotta/.local/bin/claude`) is usually all `[A-Za-z0-9/._-]`,
+  // so it clears the value heuristic's charset gate and reads as an opaque token. It is already
+  // marked `system_dependent`, which is the right reason; withholding it as a credential too would
+  // drop a default the export keeps and emit two contradictory warnings for one key.
+  // Known ceiling: a benign-named base64 secret that happens to start with "/" also skips the
+  // value arm here (the key arm above still applies); add a path-shape test if that ever matters.
+  if (portability === "system_dependent") return false;
+  return isPlausiblySensitiveEnvValue(defaultValue);
 }
 
 /**
@@ -556,10 +568,10 @@ function extractPortableScopedEnvInputs(
 
     if (isPlainRecord(binding) && binding.type === "plain") {
       const defaultValue = asString(binding.value);
-      const isSensitive = withholdsEnvInputDefault(key, defaultValue ?? "");
       const portability = defaultValue && isAbsoluteCommand(defaultValue)
         ? "system_dependent"
         : "portable";
+      const isSensitive = withholdsEnvInputDefault(key, defaultValue ?? "", portability);
       if (portability === "system_dependent") {
         warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
       }
@@ -579,8 +591,8 @@ function extractPortableScopedEnvInputs(
     }
 
     if (typeof binding === "string") {
-      const isSensitive = withholdsEnvInputDefault(key, binding);
       const portability = isAbsoluteCommand(binding) ? "system_dependent" : "portable";
+      const isSensitive = withholdsEnvInputDefault(key, binding, portability);
       if (portability === "system_dependent") {
         warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
       }

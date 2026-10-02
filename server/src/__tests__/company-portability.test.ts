@@ -1604,6 +1604,26 @@ describe("company portability", () => {
       });
     });
 
+    it("exports an absolute command path as system-dependent, not as a withheld credential", async () => {
+      // A POSIX path is all `[A-Za-z0-9/._-]` and this one is 30 chars with two case classes, so it
+      // trips the value heuristic on shape alone. It is the one value that reaches both the
+      // `system_dependent` branch and the value arm, and they must not both fire: that withheld the
+      // default while the first warning claimed it was exported, then called a binary path a
+      // credential. The path is the `command` fixture from the claudecoder export test above.
+      const CLAUDE_BIN = "/Users/dotta/.local/bin/claude";
+      for (const binding of [{ type: "plain", value: CLAUDE_BIN }, CLAUDE_BIN]) {
+        const exported = await exportEnvInputs({ CLAUDE_BIN: binding });
+
+        expect(inputFor(exported as never, "CLAUDE_BIN")).toMatchObject({
+          kind: "plain",
+          defaultValue: CLAUDE_BIN,
+          portability: "system_dependent",
+        });
+        const keyWarnings = exported.warnings.filter((warning: string) => warning.includes("env CLAUDE_BIN "));
+        expect(keyWarnings).toEqual(["Agent claudecoder env CLAUDE_BIN default was exported as system-dependent."]);
+      }
+    });
+
     it("keeps a sensitive-NAMED key with an empty default classified as a secret", async () => {
       // Why this is not plain `isSensitiveEnv(key, value)`: that helper returns false for an empty
       // value, which would flip this entry to `kind: "plain"` and change what the import prompts
