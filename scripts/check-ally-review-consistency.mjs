@@ -176,16 +176,20 @@ const COUNTED_SECTION_GLOBAL_RE = new RegExp(
 
 /** A prior-finding disposition that says the blocker is still present. */
 const STILL_PRESENT_DISPOSITION_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present[ \t]*(?:—|-)`,
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present(?![a-z-])[ \t]*(?:—|-)`,
   "im",
 );
 
 /**
- * A prior-finding disposition that retires the finding, capturing the head it
- * was raised against and the `(severity, index)` pair naming it. The verbs are
- * the retiring set the merge gate uses (RESOLVED_PRIOR_DISPOSITIONS in
- * server/src/services/ally-review-detection.ts); an unrecognized verb does not
- * match, so I2e fails closed on it.
+ * A prior-finding disposition, capturing the head it was raised against, the
+ * `(severity, index)` pair naming it, and the whole verb. The verb is captured
+ * the way the gate's PRIOR_FINDING_DISPOSITION_PATTERN captures it,
+ * `([a-z][a-z-]*)`, and retiredFindingKeys tests it for membership in
+ * RETIRING_DISPOSITIONS. Alternating the retiring verbs inside the pattern
+ * instead let a hyphenated verb that merely begins with one (`fixed-upstream`)
+ * retire a finding the gate does not, because the trailing separator class
+ * absorbed the rest of the verb: fail-open. An unrecognized verb is captured
+ * but is not a member, so I2e fails closed on it.
  *
  * Severity and index are required rather than skipped over, because I2e checks
  * ledger *coverage* of the blocker's counted findings, not merely that the head
@@ -200,10 +204,12 @@ const STILL_PRESENT_DISPOSITION_RE = new RegExp(
  * failure class this script exists to remove.
  */
 const RETIRING_DISPOSITION_GLOBAL_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*(?:fixed|no-longer-applicable)[ \t]*(?:—|–|-)`,
+  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
   "gim",
 );
 
+/** The retiring verbs: the gate's RESOLVED_PRIOR_DISPOSITIONS, verbatim. */
+const RETIRING_DISPOSITIONS = new Set(["fixed", "no-longer-applicable"]);
 
 /** The single standalone attestation line Ally is required to emit. */
 const ATTESTED_HEAD_RE = new RegExp(
@@ -347,12 +353,13 @@ export function countedFindingKeys(body) {
 }
 
 /** The findings a body retires by name against `head`, in the same key space. */
-function retiredFindingKeys(body, head) {
+export function retiredFindingKeys(body, head) {
   const normalizedHead = String(head ?? "").toLowerCase();
   const keys = new Set();
-  for (const [, prefix, severity, index] of String(body ?? "").matchAll(
+  for (const [, prefix, severity, index, verb] of String(body ?? "").matchAll(
     RETIRING_DISPOSITION_GLOBAL_RE,
   )) {
+    if (!RETIRING_DISPOSITIONS.has(verb.toLowerCase())) continue;
     if (normalizedHead.startsWith(prefix.toLowerCase())) {
       keys.add(`${severity.toLowerCase()} ${Number(index)}`);
     }

@@ -4,7 +4,10 @@ import { resolve } from "node:path";
 import { describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 
-import { extractAllyReportedFindingRefs } from "../server/src/services/ally-review-detection.ts";
+import {
+  extractAllyPriorFindingDispositions,
+  extractAllyReportedFindingRefs,
+} from "../server/src/services/ally-review-detection.ts";
 import {
   ALLY_APP_REVIEWER_ID,
   ALLY_APP_REVIEWER_LOGIN,
@@ -33,6 +36,7 @@ import {
   parseBaseline,
   partitionByMergeEligibility,
   prDormancy,
+  retiredFindingKeys,
   sameLaneBodyRelation,
   violationFingerprint,
 } from "./check-ally-review-consistency.mjs";
@@ -883,6 +887,42 @@ describe("countedFindingKeys", () => {
       assert.deepEqual(gateKeys(body), upTo(expected), "gate fixture drifted");
       assert.deepEqual(countedFindingKeys(body), upTo(expected));
     });
+  }
+});
+
+describe("retiredFindingKeys", () => {
+  // Must agree with the merge gate on which ledger entries retire a finding, or
+  // supersedesBlocker can exempt an approval the gate would still hold
+  // (BLO-25764). A hyphenated verb that only begins with a retiring one is the
+  // shape the two used to disagree on.
+  const PRIOR = "e3e84e2644aacaf68a0ad61eeb513882b7ee35b3";
+  const gateKeys = (body) =>
+    new Set(
+      extractAllyPriorFindingDispositions(body)
+        .filter(({ shortSha, kind }) => kind === "retires" && PRIOR.startsWith(shortSha))
+        .map(({ severity, index }) => `${severity} ${index}`),
+    );
+  const entry = (verb, separator = "—") =>
+    `### Prior Findings Dispositioned (1)\n- **prior:e3e84e2 important 1** ${separator} ${verb} ${separator} reason`;
+
+  for (const separator of ["—", "–", "-"]) {
+    for (const [verb, retires] of [
+      ["fixed", true],
+      ["no-longer-applicable", true],
+      ["fixed-upstream", false],
+      ["no-longer-applicable-here", false],
+      ["still-present", false],
+      ["deferred", false],
+      ["partially-fixed", false],
+      ["fixedx", false],
+    ]) {
+      it(`matches the merge gate on \`${verb}\` with a ${JSON.stringify(separator)} separator`, () => {
+        const expected = retires ? new Set(["important 1"]) : new Set();
+        const body = entry(verb, separator);
+        assert.deepEqual(gateKeys(body), expected, "gate fixture drifted");
+        assert.deepEqual(retiredFindingKeys(body, PRIOR), expected);
+      });
+    }
   }
 });
 
