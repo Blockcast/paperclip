@@ -488,107 +488,43 @@ function extractWrapperBody(rendered, name) {
   throw new Error(`${name} wrapper heredoc is not terminated`);
 }
 
-// The `github` upstream's command as the seeded .mcp.json carries it. Since
-// PEN-3713 this is a shell variable, not a literal: the seed chooses between the
-// root-owned image wrapper and the PVC fallback at run time.
+// The `github` upstream's command as the seeded .mcp.json carries it.
 function seededMcpGitHubCommand(rendered) {
   const match = /"github":\s*\{\s*"command":\s*"([^"]+)"/.exec(rendered);
   assert.notEqual(match, null, "the seeded mcpServers block no longer has a github command");
   return match[1];
 }
 
-// The seed's GH_MCP_WRAPPER selection, lifted from the rendered script so the
-// test runs the real branch rather than a restatement of it.
-function extractMcpWrapperSelection(rendered) {
-  const lines = rendered.split("\n");
-  const startIdx = lines.findIndex((line) =>
-    /^\s*GH_MCP_WRAPPER="/.test(line),
-  );
-  assert.notEqual(
-    startIdx,
-    -1,
-    "seed script no longer chooses a github MCP wrapper",
-  );
-  const indent = lines[startIdx].match(/^(\s*)/)[1];
-  const body = [];
-  for (let i = startIdx; i < lines.length; i += 1) {
-    const line = lines[i].slice(indent.length);
-    body.push(line);
-    if (/^fi$/.test(line)) return body.join("\n");
-  }
-  throw new Error("did not find the end of the GH_MCP_WRAPPER selection");
-}
-
-// Run that selection with a chosen image-wrapper location and report which path
-// it picked.
-function selectedMcpWrapper(rendered, { imageWrapperExists }) {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "gh-mcp-select-"));
-  const imageBin = path.join(base, "image-bin");
-  const localBin = path.join(base, "local-bin");
-  for (const dir of [imageBin, localBin]) fs.mkdirSync(dir, { recursive: true });
-  writeExecutable(localBin, "github-mcp-server", "#!/bin/sh\nexit 0\n");
-  if (imageWrapperExists) {
-    writeExecutable(imageBin, "github-mcp-server", "#!/bin/sh\nexit 0\n");
-  }
-
-  // Only the image directory is substituted; the fallback reaches LOCAL_BIN the
-  // same way the seed does, so a seed that stopped honouring LOCAL_BIN fails here.
-  const fragment = extractMcpWrapperSelection(rendered).replaceAll(
-    IMAGE_WRAPPER_BIN,
-    imageBin,
-  );
-  const result = spawnSync(
-    "sh",
-    [
-      "-c",
-      [
-        "set -eu",
-        `LOCAL_BIN=${JSON.stringify(localBin)}`,
-        fragment,
-        'printf "%s\\n" "${GH_MCP_WRAPPER}"',
-      ].join("\n"),
-    ],
-    { encoding: "utf8" },
-  );
-  assert.equal(result.status, 0, result.stderr);
-  const lines = result.stdout.trim().split("\n");
-  return {
-    // The seed logs its fallback to stdout alongside its other progress lines,
-    // so the selected path is the last line, not the whole stream.
-    selected: lines[lines.length - 1],
-    log: lines.slice(0, -1).join("\n"),
-    imageWrapper: path.join(imageBin, "github-mcp-server"),
-    pvcWrapper: path.join(localBin, "github-mcp-server"),
-  };
-}
-
-test("the seeded github MCP upstream prefers the root-owned image wrapper (PEN-3713)", () => {
+// PEN-3713 deliberately does NOT move this one wrapper, and the test exists to
+// keep the next editor from "finishing the job" and taking the fleet down.
+//
+// The seed runs in the SERVER pod. The .mcp.json it writes is consumed by agent
+// Job pods running a different image, pinned by `adapterConfig.image` — a
+// database value that moves on an image bump, not on a chart deploy. So the
+// server carrying the root-owned wrapper is no evidence that the agent does,
+// and an absolute command cannot fall back the way a PATH lookup can: pointing
+// this at the image directory the moment the server has it breaks the github
+// MCP server on every agent pod still on an older image.
+//
+// The flip belongs in the follow-up that deletes the seed install outright,
+// which is already gated on the whole fleet carrying the directory — at which
+// point there is no second copy and no skew window.
+test("the seeded github MCP upstream stays on the PVC wrapper until the seed install is deleted (PEN-3713)", () => {
   const rendered = render("templates/statefulset.yaml");
 
-  // The whole control rests on this indirection. Pointing the seed at
-  // /usr/local/bin/github-mcp-server restores the PEN-3152 gap exactly, while
-  // leaving every wrapper assertion in this file green.
-  assert.equal(seededMcpGitHubCommand(rendered), "${GH_MCP_WRAPPER}");
-
-  const chosen = selectedMcpWrapper(rendered, { imageWrapperExists: true });
   assert.equal(
-    chosen.selected,
-    chosen.imageWrapper,
-    "with a root-owned wrapper present the seed must dial it, not the agent-writable PVC copy",
+    seededMcpGitHubCommand(rendered),
+    "${LOCAL_BIN}/github-mcp-server",
+    "the seeded github MCP command must reach LOCAL_BIN, so the fallback tracks wherever the seed installs",
   );
-});
 
-// The branch that keeps the chart deployable ahead of its images. Without it an
-// absolute command into a directory no image carries would leave the github MCP
-// server unable to start — so this is a rollout-safety assertion, not a
-// security one, and the warning is what makes the degraded state visible.
-test("the seeded github MCP upstream falls back to the PVC wrapper on a pre-PEN-3713 image", () => {
-  const rendered = render("templates/statefulset.yaml");
-  const chosen = selectedMcpWrapper(rendered, { imageWrapperExists: false });
-  assert.equal(chosen.selected, chosen.pvcWrapper);
-  // The degraded state has to be legible in the pod log, or an image that never
-  // picked up the wrappers looks identical to one that did.
-  assert.match(chosen.log, /WARNING.*PEN-3713/);
+  // The actual regression guard. A chart that names the image directory in an
+  // absolute MCP command is deciding, from the server pod, a question only the
+  // agent pod can answer.
+  assert.ok(
+    !seededMcpGitHubCommand(rendered).includes(IMAGE_WRAPPER_BIN),
+    `the seeded github MCP command must not hardcode ${IMAGE_WRAPPER_BIN}: this seed runs in the server pod, but the file is consumed by agent pods on an independently pinned image`,
+  );
 });
 
 // The two halves that must agree for the preferred branch to resolve: the chart
