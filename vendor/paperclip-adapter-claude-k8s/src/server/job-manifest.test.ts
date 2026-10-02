@@ -781,6 +781,17 @@ describe("buildJobManifest", () => {
     });
 
     it("leaves items unset when the source volume projects the whole Secret", () => {
+      // The fixture names a volume that `isAgentInheritableSecretVolume`
+      // filters out upstream in k8s-client, so this exact input cannot occur in
+      // production. That is deliberate rather than an oversight: it is the only
+      // volume the chart actually declares `optional: true`, and the point of
+      // this test is that a source-declared `true` survives propagation.
+      // Substituting an allowlisted name would not make the premise real — no
+      // allowlisted volume is chart-declared optional — it would only move the
+      // fiction somewhere less visible, by having a fixture assert that a
+      // required credential volume is optional. `buildJobManifest` is tested in
+      // isolation here, where the allowlist does not apply, so the input is
+      // well-formed for the unit under test.
       selfPod.secretVolumes = [{
         volumeName: "github-merge-token",
         secretName: "paperclip-github-merge-token",
