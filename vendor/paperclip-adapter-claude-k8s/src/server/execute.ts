@@ -1555,11 +1555,29 @@ export function describeTruncationCause(
 }
 
 /**
+ * Emit a cleanup warning that can never throw.  `cleanupJob` runs inside the
+ * `finally` of the execute path, where an escaping rejection would mask the
+ * block's original outcome.  Swallows a rejecting sink *and* a sink that
+ * returns no promise at all — `.catch()` alone would TypeError on the latter.
+ */
+async function warnQuietly(
+  onLog: AdapterExecutionContext["onLog"],
+  message: string,
+): Promise<void> {
+  try {
+    await onLog("stderr", message);
+  } catch {
+    // The log sink is gone; there is nowhere left to report that it is gone.
+  }
+}
+
+/**
  * Reap the on-disk pod log for a finished run.  Best-effort: a missing file is
  * the normal case (the pod may never have written one), so ENOENT is silent.
  * Any other failure is surfaced, because a log we failed to delete for a real
  * reason accumulates on the shared PVC and nothing else reports it.
  */
+
 async function reapPodLogFile(
   podLogPath: string | undefined,
   onLog: AdapterExecutionContext["onLog"],
@@ -1570,7 +1588,7 @@ async function reapPodLogFile(
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return;
     const msg = err instanceof Error ? err.message : String(err);
-    await onLog("stderr", `[paperclip] Warning: failed to remove pod log ${podLogPath}: ${msg}\n`);
+    await warnQuietly(onLog, `[paperclip] Warning: failed to remove pod log ${podLogPath}: ${msg}\n`);
   }
 }
 
@@ -1604,7 +1622,7 @@ export async function cleanupJob(
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    await onLog("stderr", `[paperclip] Warning: failed to cleanup job ${jobName}: ${msg}\n`);
+    await warnQuietly(onLog, `[paperclip] Warning: failed to cleanup job ${jobName}: ${msg}\n`);
   }
   // Unconditional: the pod log's lifetime is not a function of whether the
   // Kubernetes Job could be deleted.  They are unrelated resources.

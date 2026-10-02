@@ -2240,4 +2240,38 @@ describe("cleanupJob pod-log reaping", () => {
     mockBatchDeleteJob.mockResolvedValueOnce({});
     await expect(cleanupJob("ns", "job-undef", vi.fn(), undefined, undefined)).resolves.toBeUndefined();
   });
+
+  // cleanupJob's docstring promises "failures are logged but not thrown", and
+  // the dominant call site is inside a `finally` where a throw would mask the
+  // block's original outcome.  Both warning paths therefore have to survive an
+  // onLog that rejects.  One test per path, each isolated so that reverting
+  // either guard reddens exactly one of them.
+  it("does not throw when onLog rejects while reporting a Job-delete failure", async () => {
+    const podLogPath = await makePodLog("logsink-job.pod.ndjson");
+    mockBatchDeleteJob.mockRejectedValueOnce(new Error("connection refused"));
+    const onLog = vi.fn().mockRejectedValue(new Error("log sink closed"));
+
+    await expect(
+      cleanupJob("ns", "job-logsink", onLog, undefined, podLogPath),
+    ).resolves.toBeUndefined();
+    // The unlink still ran: a rejecting log sink must not cost us the file.
+    expect(await exists(podLogPath)).toBe(false);
+  });
+
+  it("does not throw when onLog rejects while reporting a pod-log unlink failure", async () => {
+    // A directory makes unlink(2) fail with a real non-ENOENT errno (EISDIR /
+    // EPERM), so this exercises the warning path without mocking node:fs.
+    const podLogDir = path.join(tmpRoot, "logsink-unlink.pod.ndjson");
+    await mkdir(podLogDir, { recursive: true });
+    mockBatchDeleteJob.mockResolvedValueOnce({});
+    const onLog = vi.fn().mockRejectedValue(new Error("log sink closed"));
+
+    await expect(
+      cleanupJob("ns", "job-unlink-logsink", onLog, undefined, podLogDir),
+    ).resolves.toBeUndefined();
+    expect(onLog).toHaveBeenCalledWith(
+      "stderr",
+      expect.stringContaining("failed to remove pod log"),
+    );
+  });
 });
