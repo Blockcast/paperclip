@@ -184,6 +184,10 @@ jobs:
                 --jq '.workflow_runs[]'
           } | jq -s '[ .[]
                 | select(.event == "workflow_dispatch")
+                # Keep every arm in the .status == "x" form. The schedule test derives
+                # the required status= query set from THIS line; an arm written any other
+                # way (test("x"), IN(...)) is invisible to it and lands with no backing
+                # query, which the API answers with total_count=0 rather than an error.
                 | select(.status == "waiting" or .status == "in_progress" or .status == "queued")
                 | { databaseId: .id, status: .status, createdAt: .created_at,
                     url: .html_url, headSha: .head_sha } ]
