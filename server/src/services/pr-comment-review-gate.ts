@@ -137,7 +137,7 @@ function toEpochMs(value: string | Date): number {
  * let array order decide the verdict whenever two comments shared a second:
  * latestAttestingAllyComment flipped clean/blocking_finding,
  * headsWithUndispositionedFinding flipped not_evaluated/carried_finding,
- * newestAllyConsolidatedReviewComments flipped clean/unreadable_verdict — all
+ * newestInScopeAllyReviewComments flipped clean/unreadable_verdict — all
  * three reproduced in both orders, all three fail *open*. Nothing establishes
  * that order: executeCommentReviewGateCheck concatenates two independently
  * ordered GitHub surfaces, and GitHub's created_at is second-resolution, so a
@@ -488,35 +488,43 @@ function headsWithUndispositionedFinding(
 }
 
 /**
- * The newest Ally consolidated-review comments, whatever they attest — the
+ * The newest Ally consolidated-review comments *in scope for this head* -- the
  * whole set tied at that second, not a winner among them.
  *
- * Deliberately not filtered by attestation: the point is to reach a review
- * whose head could not be established, which is precisely the case
+ * In scope means the comment makes a statement about this tree: an unreadable
+ * verdict whose claimed head is this one or cannot be told (null fails closed,
+ * see the caller), or a readable review that attests this exact head. Nothing
+ * else may take the newest slot. Picking the globally newest first and scoping
+ * afterwards let any later Ally comment displace the unreadable review of this
+ * head -- a reply that merely quotes the heading, or a clean review of some
+ * other tree -- and the gate flipped red to green off a comment that says
+ * nothing about this head (Ally, #1721 at 5f4d5302, Critical 1). That is the
+ * same bucket-by-head rule headsWithUndispositionedFinding already applies.
+ *
+ * Deliberately not filtered by attestation alone: the point is to reach a
+ * review whose head could not be established, which is precisely the case
  * latestAttestingAllyComment skips.
  *
- * The tie is returned rather than resolved because the only caller's predicate
- * is strictly wider than the one this function could apply: it wants an
- * unreadable review that is *also* in scope for the head being evaluated, and
- * scope is not known here. Picking on the narrower predicate alone let `find`
- * hand the slot to an unreadable review naming some other tree, which the
- * caller then scopes out — so the in-scope unreadable review was never
- * examined and the gate went green off a candidate nobody consulted (Ally,
- * peer review of #1721 at 9fd4b499; the same shape as the mid-loop proxy at
- * headsWithUndispositionedFinding, and it fails open the same way). A
+ * The tie is returned rather than resolved: the caller asks "does any tied
+ * candidate carry an unreadable verdict?", which is order-independent. A
  * tie-break is order-independent only when its predicate is the caller's whole
- * predicate.
+ * predicate (Ally, peer review of #1721 at 9fd4b499).
  */
-function newestAllyConsolidatedReviewComments(
+function newestInScopeAllyReviewComments(
   comments: CommentReviewGateComment[],
   reviewerBotLogin: string,
+  normalizedHead: string,
 ): CommentReviewGateComment[] {
   const candidates: { comment: CommentReviewGateComment; timeMs: number }[] = [];
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
-    candidates.push({ comment, timeMs: commentTime });
+    const inScope =
+      parseAllyVerdictBlock(comment.body).kind === "unreadable"
+        ? [null, normalizedHead].includes(allyClaimedReviewHead(comment.body))
+        : extractAllyReviewedHeadSha(comment.body) === normalizedHead;
+    if (inScope) candidates.push({ comment, timeMs: commentTime });
   }
   return topTiedBy(candidates, (candidate) => [candidate.timeMs]).map(
     (candidate) => candidate.comment,
@@ -575,7 +583,7 @@ export function evaluateCommentReviewGate(input: {
   //
   // Scoped to this head, because "newest" is not "at this head" and the
   // difference is a real red on a tree nobody reviewed.
-  // newestAllyConsolidatedReviewComments has no head filter, so unscoped this
+  // Unscoped, the newest-review pick has no head filter, so this
   // branch lets a malformed block from three pushes ago decide the current
   // head — where the same PR with no comments at all is `not_evaluated`, i.e.
   // green. A stale broken block must not be worse for an author than no review
@@ -595,7 +603,7 @@ export function evaluateCommentReviewGate(input: {
   // Applied as one predicate over the whole tied set, because scope and
   // readability are both parts of the question and splitting them across the
   // helper and here is what let a tie go green (see
-  // newestAllyConsolidatedReviewComments). Among reviews we cannot order,
+  // newestInScopeAllyReviewComments). Among reviews we cannot order,
   // "does any of them make this claim?" is order-independent.
   //
   // The verdict is settled by that existential, but the *cause* is not: every
@@ -609,9 +617,7 @@ export function evaluateCommentReviewGate(input: {
   // chosen candidate so the two can never describe different comments
   // (Ally, #1721 at 31532b48).
   let unreadable: { reason: string; commentCreatedAt: string } | null = null;
-  for (const review of newestAllyConsolidatedReviewComments(comments, reviewerBotLogin)) {
-    const claimedHead = allyClaimedReviewHead(review.body);
-    if (claimedHead !== null && claimedHead !== normalizedHead) continue;
+  for (const review of newestInScopeAllyReviewComments(comments, reviewerBotLogin, normalizedHead)) {
     const block = parseAllyVerdictBlock(review.body);
     if (block.kind !== "unreadable") continue;
     if (unreadable === null || block.reason.localeCompare(unreadable.reason) < 0) {
