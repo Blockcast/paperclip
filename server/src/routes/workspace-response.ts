@@ -607,9 +607,12 @@ export function publicWorkspaceOperations(
  * the company-wide `runs:read_transcript` grant. `decideRunTranscriptRead` would fall
  * through to that grant when handed a null `agentId` (the two relational allows in
  * `authorization.ts` are both guarded on `resource.agentId` being set), so calling it
- * with an unresolved owner would NOT fail closed. Human operators keep the read,
- * matching the board carve-out the decider makes itself and the operator UI that
- * renders these excerpts.
+ * with an unresolved owner would NOT fail closed. Human operators keep the read —
+ * the operator UI renders these excerpts — and `actorIsHumanOperator` must be the
+ * decider's own operator test (`boardActorIsTranscriptOperator`), not
+ * `req.actor.type === "board"`: the decider no longer carves out every board actor,
+ * so a viewer or cloud-tenant actor denied the owned rows would otherwise get the
+ * unowned ones unprojected (Ally review 5386746244).
  *
  * The return type carries `withheldFields` optionally rather than dropping it:
  * an entitled row keeps the key absent, a withheld row carries the list, and

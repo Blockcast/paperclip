@@ -26,7 +26,7 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
 } from "../services/workspace-runtime.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, runTranscriptReadGate } from "./authz.js";
+import { assertBoard, assertCompanyAccess, boardActorIsTranscriptOperator, getAccessibleResource, getActorInfo, runTranscriptReadGate } from "./authz.js";
 import { logger } from "../middleware/logger.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -184,7 +184,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       publicWorkspaceOperations(operations, viewer),
       owners,
       runTranscriptReadGate(req, access, workspace.companyId),
-      req.actor.type === "board",
+      boardActorIsTranscriptOperator(req, workspace.companyId),
     );
     res.json(redactCurrentUserValue(
       projected,

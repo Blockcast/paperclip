@@ -362,6 +362,62 @@ describe("PEN-3142 live-event transcript gate", () => {
       expect(mockDecide).toHaveBeenCalledTimes(2);
     });
 
+    /**
+     * Ally review 5386746244 (Important #2). The case above drives the decider
+     * arm only. A board operator is answered by the short-circuit, which never
+     * reaches the decider, so re-deciding against the upgrade-time role would
+     * re-derive the same allow for the life of the socket. The membership is
+     * re-read once the TTL expires instead.
+     */
+    it("re-reads the membership after the TTL, so a board admin demoted to viewer stops the stream", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      mockDecide.mockResolvedValue({ allowed: false, reason: "deny_missing_grant", explanation: "viewer" });
+      const readMembership = vi.fn().mockResolvedValue({ membershipRole: "viewer", status: "active" });
+      let clock = 1_000;
+      const project = createLiveEventTranscriptGate(
+        {} as never,
+        { companyId, actorType: "board", actorId: boardUserId, actorSource: "session", membershipRole: "admin" },
+        { now: () => clock, ttlMs: 30_000, readMembership },
+      );
+      const otherOwnerEvent = () => {
+        const event = logEvent();
+        event.payload.agentId = "55555555-5555-4555-8555-555555555555";
+        return event;
+      };
+
+      expect(JSON.stringify(await project(logEvent() as never))).toContain(CANARY);
+      // Demoted admin -> viewer mid-connection. Inside the window the
+      // upgrade-time role still holds, including for an owner first seen late
+      // in that window.
+      clock += 29_999;
+      expect(JSON.stringify(await project(otherOwnerEvent() as never))).toContain(CANARY);
+      expect(readMembership).not.toHaveBeenCalled();
+
+      clock += 2;
+      expect(JSON.stringify(await project(logEvent() as never))).not.toContain(CANARY);
+      // The late decision expires with the role it was made from, not a full
+      // TTL after it started.
+      expect(JSON.stringify(await project(otherOwnerEvent() as never))).not.toContain(CANARY);
+      expect(readMembership).toHaveBeenCalledTimes(1);
+      expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({ action: "runs:read_transcript" }));
+    });
+
+    it("re-reads the membership after the TTL, so a deactivated board operator stops the stream", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      mockDecide.mockResolvedValue({ allowed: false, reason: "deny_missing_grant", explanation: "inactive" });
+      const readMembership = vi.fn().mockResolvedValue({ membershipRole: "admin", status: "suspended" });
+      let clock = 1_000;
+      const project = createLiveEventTranscriptGate(
+        {} as never,
+        { companyId, actorType: "board", actorId: boardUserId, actorSource: "session", membershipRole: "admin" },
+        { now: () => clock, ttlMs: 30_000, readMembership },
+      );
+
+      expect(JSON.stringify(await project(logEvent() as never))).toContain(CANARY);
+      clock += 30_001;
+      expect(JSON.stringify(await project(logEvent() as never))).not.toContain(CANARY);
+    });
+
     it("stamps the cache entry when the decision STARTS, not when it resolves", async () => {
       const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
       let clock = 1_000;
