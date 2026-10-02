@@ -30,6 +30,29 @@ import { describe, expect, it } from "vitest";
  * is precisely how the original one arrived. Test sources are excluded because
  * this asserts about production code — and because fixtures legitimately seed
  * `cleanupReason: null` on rows with no stamp at all.
+ *
+ * ⚠ SCOPE, and it is narrower than the invariant above (Ally, review of d55f513).
+ * This scan proves ONE thing: that no writer sets `cleanupReason` to a literal
+ * `null` while leaving the row selectable. It does NOT prove the general
+ * invariant, for two reasons:
+ *
+ *   - The pattern matches a spelling, so a write passing a variable or an
+ *     expression is invisible to it (see the comment at the regex below).
+ *   - Nulling is only the degenerate case. Overwriting the reason with the
+ *     WRONG value is the same defect — the origin is destroyed either way — and
+ *     a non-null overwrite cannot be expressed as a null-literal match at all.
+ *     Both forms existed in `routes/execution-workspaces.ts` when this guard was
+ *     first written: the operator archive's cleanup-failure patches wrote the
+ *     joined warnings (a ternary), the thrown error message (a variable), and
+ *     `null` (the ternary's other arm), all while demoting the row to
+ *     `cleanup_failed` — which is not `archived`, so the collector re-selected
+ *     it. Those are fixed, and `execution-workspace-operator-cleanup-attribution.test.ts`
+ *     pins the fix behaviourally, which is the level this class has to be caught at.
+ *
+ * So read a green run here as "no new literal-null writer", not as "the origin
+ * is intact everywhere". Widening the pattern to catch identifiers is not the
+ * answer — it would flag every legitimate dynamic write — which is exactly why
+ * the behavioural test exists alongside it.
  */
 describe("writers that null cleanup_reason", () => {
   it("never leave a row collector-eligible with no recorded reason", async () => {
@@ -83,10 +106,12 @@ describe("writers that null cleanup_reason", () => {
       // Matches the SPELLING, not the shape (Ally, review of 68b9cad). A writer
       // passing a variable (`cleanupReason: nextReason`), `undefined`, or a
       // Drizzle `sql` fragment setting `cleanup_reason = null` is invisible to
-      // this scan. That is deliberate: the stated target is a third writer added
+      // this scan. That is deliberate: the target here is a third writer added
       // in the same literal form as the two that exist, and widening the pattern
       // to catch identifiers would flag every legitimate dynamic write. Read a
-      // green result as "no new literal-null writer", not as "no new null writer".
+      // green result as "no new literal-null writer", not as "no new null
+      // writer" — and see the ⚠ SCOPE note above for the broader invariant this
+      // cannot reach, which the operator-attribution test covers instead.
       const pattern = /cleanupReason:\s*null/g;
       for (let m = pattern.exec(text); m; m = pattern.exec(text)) {
         found += 1;
