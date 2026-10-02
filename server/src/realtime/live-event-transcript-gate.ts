@@ -187,10 +187,9 @@ export function createLiveEventTranscriptGate(
   };
   const cache = new Map<string, { decidedAt: number; allowed: Promise<boolean> }>();
 
-  const canRead = (agentId: string | null): Promise<boolean> => {
-    const key = agentId ?? "";
+  const canRead = (agentId: string): Promise<boolean> => {
     const startedAt = now();
-    const cached = cache.get(key);
+    const cached = cache.get(agentId);
     if (cached && startedAt - cached.decidedAt < ttlMs) return cached.allowed;
     const { readAt, req } = actorAt(startedAt);
     const pending = req
@@ -216,14 +215,14 @@ export function createLiveEventTranscriptGate(
     // A board decision is no fresher than the role it was made from: stamping
     // it with `startedAt` would let a decision started late in a role window
     // outlive that window by up to a further TTL.
-    cache.set(key, { decidedAt: rereadsMembership ? readAt : startedAt, allowed: pending });
+    cache.set(agentId, { decidedAt: rereadsMembership ? readAt : startedAt, allowed: pending });
     // Drop entries that can no longer be reused. The map is bounded by the
     // company's agent count rather than by event volume, so this is small — but
     // the entries are timestamped now, so evicting is nearly free and keeps a
     // long-lived socket in a large company from retaining one entry per owning
     // agent ever seen (Ally review 5381822720).
     for (const [cachedKey, entry] of cache) {
-      if (cachedKey !== key && startedAt - entry.decidedAt >= ttlMs) cache.delete(cachedKey);
+      if (cachedKey !== agentId && startedAt - entry.decidedAt >= ttlMs) cache.delete(cachedKey);
     }
     return pending;
   };
@@ -235,7 +234,10 @@ export function createLiveEventTranscriptGate(
     // The owning agent is the resource the decision is scoped to. A
     // transcript-bearing payload that cannot name its owner is withheld rather
     // than guessed at — same posture as the workspace-operation path, which is
-    // deliberately tighter than the decider on an unresolved owner.
+    // deliberately tighter than the decider on an unresolved owner. `canRead`
+    // therefore takes a non-null owner: withholding here is the only outcome an
+    // unowned payload has, so no cache entry can stand for one (Ally review
+    // 5391609907).
     const rawAgentId = payload.agentId;
     const agentId = typeof rawAgentId === "string" && rawAgentId.length > 0 ? rawAgentId : null;
     if (agentId !== null && (await canRead(agentId))) return event;
