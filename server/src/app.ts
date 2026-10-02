@@ -79,6 +79,7 @@ import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
+import { httpMetricsMiddleware } from "./middleware/http-metrics.js";
 import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader } from "./services/plugin-loader.js";
 import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
@@ -384,6 +385,12 @@ export async function createApp(
 
   app.use("/api", apiCompression());
   app.use(httpLogger);
+  // Per-route HTTP status instrumentation (PEN-3702). Mounted beside the
+  // logger, which places it after /metrics and /healthz so a scrape does not
+  // increment the counters it is scraping. Unlike the access log, this is
+  // keyed on the Express route template and is not silenced for successful
+  // requests on hot paths, so it can report a rate per route and status.
+  app.use(httpMetricsMiddleware());
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
