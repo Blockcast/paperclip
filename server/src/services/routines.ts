@@ -80,6 +80,7 @@ import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./is
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { incrementRoutineDispatchMetric } from "./routine-dispatch-metrics.js";
+import { restoreMaskedEnvBindings } from "../env-binding-mask.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
@@ -2835,8 +2836,27 @@ export function routineService(
         row.projectId
           ? db.select().from(projects).where(eq(projects.id, row.projectId)).then((rows) => rows[0] ?? null)
           : null,
+        // PEN-3707: this was a bare full-row `db.select()`, returned as `detail.assignee` and
+        // serialized verbatim — so `adapterConfig` (live `{type:"plain",value}` env bindings,
+        // `apiKey`, `mcpServers.*.headers`), `runtimeConfig` and the free-form `metadata` bag all
+        // crossed to every same-company agent. `redactAgentSecrets`' docblock (`routes/agents.ts`)
+        // states the invariant this broke: every response serializing an agent must pass one of its
+        // three redactors. None is reachable from here — all three are closure-private to
+        // `agentRoutes` — so this projects the columns instead, which is the stronger answer: it
+        // emits exactly the `RoutineAgentSummary` the type already declared, and so cannot regain a
+        // credential-bearing column later the way a redactor-based fix would. Nothing reads the
+        // dropped fields: `detail.assignee` has no consumer in `server/` or `ui/`.
         row.assigneeAgentId
-          ? db.select().from(agents).where(eq(agents.id, row.assigneeAgentId)).then((rows) => rows[0] ?? null)
+          ? db
+              .select({
+                id: agents.id,
+                name: agents.name,
+                role: agents.role,
+                title: agents.title,
+              })
+              .from(agents)
+              .where(eq(agents.id, row.assigneeAgentId))
+              .then((rows) => rows[0] ?? null)
           : null,
         row.parentIssueId ? issueSvc.getById(row.parentIssueId) : null,
         getRoutineDescriptionDocument(row.id),
@@ -3007,10 +3027,22 @@ export function routineService(
         ? existing.env
         : patch.env === null
           ? null
-          : await secretsSvc.normalizeEnvBindingsForPersistence(existing.companyId, patch.env, {
-              strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
-              fieldPath: "env",
-            });
+          // PEN-3707: the read side masks plain values, and the routine env editor re-emits EVERY
+          // row on save (`ui/src/components/routine-sections/editable-sections.tsx` hands the whole
+          // map back), so an untouched row arrives carrying the placeholder it was rendered with.
+          // Merged BEFORE normalization, so `normalizeEnvBindingsForPersistence` still sees — and
+          // still refuses — a placeholder with no stored binding behind it. Without this the mask
+          // would 422 every save that touched any other key, and the disclosure fix would read as a
+          // credential-corruption bug. `existing.env` is the same pre-transaction read the
+          // `patch.env === undefined` branch above already trusts.
+          : await secretsSvc.normalizeEnvBindingsForPersistence(
+              existing.companyId,
+              restoreMaskedEnvBindings(patch.env, existing.env),
+              {
+                strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
+                fieldPath: "env",
+              },
+            );
       const requestedStatus = patch.status ?? existing.status;
       if (patch.status === "active") {
         assertRoutineCanEnable(patch.status, nextAssigneeAgentId);

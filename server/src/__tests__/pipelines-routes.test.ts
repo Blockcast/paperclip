@@ -657,6 +657,63 @@ describeEmbeddedPostgres("pipeline routes", () => {
     expect(execution!.error).toContain("Project workspace must belong to the selected project");
   });
 
+  it("masks the backing routine's env on the stage automation block (PEN-3707)", async () => {
+    // `withDerivedStageAutomation` grafts `routine.env` onto `config.automation`, so the same plain
+    // bindings reachable on the routine surface were reachable here too.
+    //
+    // Driven as the BOARD actor on purpose. `publicPipelineStageConfig` opens with
+    // `if (viewer.revealRuntimeConfig) return config`, which is true for this actor — so if the env
+    // mask had been added to that projection it would be skipped here and this test would fail.
+    // Masking before that call is what makes the env boundary unconditional, matching the project
+    // mask's "not entitlement-gated" rule rather than the workspace-runtime one.
+    const company = await seedCompany();
+    const http = request(app(boardActor));
+    const agent = await seedAutomationAgent(company.id);
+    const envSentinel = "sentinel-stage-automation-env-must-not-egress";
+
+    const pipeline = await http
+      .post(`/api/companies/${company.id}/pipelines`)
+      .send({ key: "automation-env-mask", name: "Automation env mask" })
+      .expect(201);
+    const stageId = pipeline.body.stages.find((stage: { key: string }) => stage.key === "in_progress").id as string;
+
+    await http
+      .patch(`/api/pipelines/${pipeline.body.id}/stages/${stageId}`)
+      .send({
+        config: { automation: { assigneeAgentId: agent.id, instructionsBody: "Env mask probe." } },
+      })
+      .expect(200);
+
+    const beforePlant = await http.get(`/api/pipelines/${pipeline.body.id}`).expect(200);
+    const routineId = beforePlant.body.stages
+      .find((stage: { key: string }) => stage.key === "in_progress")
+      .config.automation.routineId as string;
+
+    // Planted on the routine row directly: this models operator-authored env arriving by any of the
+    // several write paths, and keeps the test about the READ projection.
+    await db
+      .update(routines)
+      .set({
+        env: {
+          STAGE_PLAIN: { type: "plain", value: envSentinel },
+          STAGE_SHORTHAND: envSentinel,
+          STAGE_REF: { type: "secret_ref", secretId: randomUUID(), version: "latest" },
+        },
+      })
+      .where(eq(routines.id, routineId));
+
+    const detail = await http.get(`/api/pipelines/${pipeline.body.id}`).expect(200);
+    const automatedStage = detail.body.stages.find((stage: { key: string }) => stage.key === "in_progress");
+
+    expect(JSON.stringify(detail.body)).not.toContain(envSentinel);
+    // Key names survive, so an operator can still see WHICH variables a stage binds.
+    expect(Object.keys(automatedStage.config.automation.env)).toEqual(
+      expect.arrayContaining(["STAGE_PLAIN", "STAGE_SHORTHAND", "STAGE_REF"]),
+    );
+    // Pointers carry no material and are passed through rather than masked.
+    expect(automatedStage.config.automation.env.STAGE_REF.type).toBe("secret_ref");
+  });
+
   it("keeps legacy stage automation with only assignee and instructions compatible", async () => {
     const company = await seedCompany();
     const http = request(app(boardActor));

@@ -55,6 +55,7 @@ import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { redactRunError } from "../redaction.js";
+import { maskEnvBindings, restoreMaskedEnvBindings } from "../env-binding-mask.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
   formatPipelineCaseOutputContextMarkdown,
@@ -1145,7 +1146,12 @@ function derivedStageAutomationPayload(
     titleTemplate: routine.title,
     instructionsBody: routine.description ?? "",
     ...executionContext,
-    env: routine.env ?? null,
+    // PEN-3707: this payload is a RESPONSE body — its only caller is the tail of
+    // `updateStageAutomationEnv`, which returns it straight to `PATCH .../automation-env` with no
+    // projection in the route. Masking here rather than at that route keeps the single producer
+    // and the single consumer from drifting apart. Persistence upstream uses `normalizedEnv`, not
+    // this value, so nothing stored is affected.
+    env: maskEnvBindings(routine.env ?? null),
     latestRoutineRevisionId: routine.latestRevisionId,
     latestRoutineRevisionNumber: routine.latestRevisionNumber,
   };
@@ -4444,12 +4450,29 @@ export function pipelineService(
         });
       }
 
+      // PEN-3707: the read side masks plain values on `config.automation.env`, and
+      // `StageSecretsPanel` re-emits the WHOLE map on save, so an untouched row arrives carrying the
+      // placeholder it was rendered with. Restored before normalization, which still refuses a
+      // placeholder with no stored binding behind it. Read outside the transaction, the same shape
+      // `routes/projects.ts` uses; the `baseRoutineRevisionId` check below is what callers use to
+      // detect a concurrent edit between this read and the lock.
+      const storedRoutineEnv = input.env === null
+        ? null
+        : await db
+            .select({ env: routines.env })
+            .from(routines)
+            .where(and(eq(routines.id, routineId), eq(routines.companyId, input.companyId)))
+            .then((rows) => rows[0]?.env ?? null);
       const normalizedEnv = input.env === null
         ? null
-        : await secretsSvc.normalizeEnvBindingsForPersistence(input.companyId, input.env, {
-            strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
-            fieldPath: "env",
-          }) as Record<string, EnvBinding>;
+        : await secretsSvc.normalizeEnvBindingsForPersistence(
+            input.companyId,
+            restoreMaskedEnvBindings(input.env, storedRoutineEnv),
+            {
+              strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
+              fieldPath: "env",
+            },
+          ) as Record<string, EnvBinding>;
       const actorPatch = routineActorPatch(input.actor);
       // logActivity's publisher escapes the transaction (in-process emitter +
       // plugin outbox insert on its own handle), so it is returned from the
