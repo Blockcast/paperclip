@@ -637,7 +637,7 @@ test('guard (1) unions independent run queries, so a stale slice cannot zero it'
   );
   assert.match(
     pipeline,
-    /select\(\.event\s*==\s*"workflow_dispatch"\)/,
+    /select\(\.event\s*==\s*"workflow_dispatch"\)[\s\S]*\{\s*databaseId:/,
     'guard (1) must drop non-dispatch runs returned by the unfiltered status queries',
   );
   // GitHub's `status` filter takes ONE value, so each non-terminal status guard (1)
@@ -660,7 +660,7 @@ test('guard (1) unions independent run queries, so a stale slice cannot zero it'
   // event and status queries return the same waiting run on the common path, and WAITING is printed
   // to the step summary and read by the alert.
   assert.ok(
-    /unique_by\(\.databaseId\)/.test(pendingReadRegion),
+    /unique_by\(\.databaseId\)/.test(pipeline),
     'the union must be de-duplicated by run id',
   );
 });
