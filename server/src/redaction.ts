@@ -250,7 +250,7 @@ function redactUriCredentialsInValue(value: string): string {
  * Gating on this is necessary but not sufficient: where the caller's assignment
  * sits *inside* the gate, a failing gate leaves the raw value wherever it
  * already was. The value has to be replaced with a contained one. See
- * `containAgentConfig` in `routes/agents.ts`, which is the shared wrapper that
+ * `containAgentConfig` in `agent-redaction.ts`, which is the shared wrapper that
  * does both and is what call sites there should use.
  */
 export function isPlainObject(value: unknown): value is Record<string, unknown> {

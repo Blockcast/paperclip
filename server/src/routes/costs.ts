@@ -24,6 +24,7 @@ import {
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
 import { badRequest } from "../errors.js";
+import { redactAgentSecrets } from "../agent-redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import type { BudgetEnforcementScope } from "../services/budgets.js";
 
@@ -443,7 +444,13 @@ export function costRoutes(
       return;
     }
 
-    res.json(updated);
+    // Board-gated, so not agent-visible — but this is the exact shape
+    // BLO-18969 fixed on `PATCH /api/agents/:id`: a budget-only write handing
+    // back the agent's entire credential set. It was previously left alone
+    // because the redactor was closure-private to the `agentRoutes` factory;
+    // it is now a leaf import, so there is no reason not to contain it
+    // (PEN-3707 §5 / PEN-3726).
+    res.json(redactAgentSecrets(updated));
   });
 
   return router;

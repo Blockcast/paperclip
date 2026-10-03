@@ -7,6 +7,7 @@ import { accessService, instanceSettingsService, logActivity } from "../services
 import { builtInAgentService } from "../services/built-in-agents.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { containAgentMetadata } from "../agent-redaction.js";
 import type { BuiltInAgentState } from "../services/built-in-agents.js";
 
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -65,6 +66,23 @@ function redactBuiltInAgentListState(state: BuiltInAgentState): BuiltInAgentStat
       ...state.agent,
       adapterConfig: {},
       runtimeConfig: {},
+      // Same spread-with-an-override-list shape as `redactForRestrictedAgentView`,
+      // and the same hole: both config columns are withheld outright while the
+      // open bag sitting beside them went out as stored (PEN-3726). This is the
+      // projection where it is LEAST likely to be empty — built-in agents are
+      // precisely the ones carrying `paperclipBuiltInAgent` /
+      // `paperclipManagedResource` markers — and the two GET routes it reaches
+      // are gated only by `assertCompanyAccess`, so any same-company agent
+      // principal reads it. The marker keys survive containment; only
+      // credential-shaped values are masked.
+      //
+      // The cast restates the column's declared type, which `containAgentMetadata`
+      // cannot promise: it returns `unknown` because an array-valued or
+      // primitive `metadata` must survive as itself rather than be coerced, and
+      // `jsonb` can hold both despite the `Record<string, unknown>` annotation.
+      // Nothing is widened here — the value is whatever the shared containment
+      // already decided, and `BuiltInAgentState` is unchanged.
+      metadata: containAgentMetadata(state.agent.metadata) as typeof state.agent.metadata,
     },
   };
 }
