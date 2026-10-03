@@ -623,7 +623,7 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     name: "PATH",
     classification: "SAFE_LITERAL",
     reason:
-      "Binary lookup order. Code-originated since PEN-3713, which prepends the root-owned GitHub egress wrapper directory to whatever PATH layers 3/4 produced. A list of directory names carries no credential, and burying it in a Secret would stop `GET Pod` answering 'which gh does this agent resolve?' — the exact question PEN-3713 was diagnosed by.",
+      "Binary lookup order. Code-originated since PEN-3713, which prepends the root-owned GitHub egress wrapper directory to whatever PATH layers 3/4 produced. A list of directory names carries no credential, and burying it in a Secret would stop `GET Pod` answering 'which gh does this agent resolve?' — the exact question PEN-3713 was diagnosed by. That holds for an inherited (layer-3) PATH only: layer 4 is default-deny by NAME (BLO-22546), so an operator-set `adapterConfig.env.PATH` is in `userEnvKeys` and becomes a secretKeyRef regardless of this row — which is the configuration the PEN-3713 measurement actually found. This table is a record of classification, not a behaviour switch.",
   },
   {
     name: "PAPERCLIP_AGENT_ID",
