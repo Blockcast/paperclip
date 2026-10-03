@@ -1,4 +1,4 @@
-import { isPlainObject, redactAgentConfigPayload } from "./redaction.js";
+import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload } from "./redaction.js";
 
 /**
  * Containment helpers for anything that serializes an agent row.
@@ -172,4 +172,174 @@ export function redactAgentSecrets<
     result.metadata = containAgentMetadata(agent.metadata) as T["metadata"];
   }
   return result;
+}
+
+/* ---------------------------------------------------------------------------
+ * Write side: undo this module's own masking on the way back in.
+ *
+ * These live beside the redactors above rather than in `routes/agents.ts`
+ * because the mask and its inverse have to agree, and the inverse now has a
+ * caller that is not a route. `activatePendingApproval`
+ * (`services/agents.ts`) replays the board-approval snapshot over the agent
+ * row, and that snapshot is masked — so the service layer needs the restore.
+ * Reaching into `routes/agents.ts` from a service inverts the layering and
+ * would close an import cycle (`routes/agents.ts` imports `services/agents.js`
+ * already); this module imports only `./redaction.js`, so both sides can
+ * depend on it (PEN-3757).
+ * ------------------------------------------------------------------------- */
+
+export function isRedactedEnvBinding(binding: unknown): boolean {
+  if (typeof binding === "string") return binding === REDACTED_ENV_SENTINEL;
+  if (binding && typeof binding === "object") {
+    const b = binding as { type?: unknown; value?: unknown };
+    return b.type === "plain" && b.value === REDACTED_ENV_SENTINEL;
+  }
+  return false;
+}
+
+const OMIT_REDACTED_ADAPTER_VALUE = Symbol("omit-redacted-adapter-value");
+
+export function containsRedactedAdapterValue(value: unknown): boolean {
+  if (typeof value === "string") return value.includes(REDACTED_EVENT_VALUE);
+  if (Array.isArray(value)) return value.some(containsRedactedAdapterValue);
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value as Record<string, unknown>).some(containsRedactedAdapterValue);
+}
+
+/**
+ * Exported for `restoreRedactedRuntimeConfigValues` in `routes/agents.ts`,
+ * which restores `runtimeConfig` on the same rule. Prefer
+ * {@link restoreRedactedAgentMetadata} or
+ * {@link stripRedactedEnvBindingsFromAdapterConfig} where one fits — they pair
+ * this with the `containsRedactedAdapterValue` short-circuit that keeps an
+ * unmasked payload byte-identical.
+ *
+ * Caution if you call it directly: with a masked scalar and an `undefined`
+ * prior this returns the private `OMIT_REDACTED_ADAPTER_VALUE` symbol at the
+ * top level rather than a value. Nested occurrences are consumed by the
+ * object/array walk; only the top-level one can escape. Every call site in this
+ * repo passes a record for `existing`, so it does not arise today.
+ */
+export function restoreRedactedAdapterValue(incoming: unknown, existing: unknown): unknown {
+  // PEN-2747: the URI-credential rule masks only the credential *component* of
+  // a URL, so the round-tripped value is `https://user:***REDACTED***@host/mcp`
+  // — a string that merely CONTAINS the sentinel rather than equalling it. An
+  // equality test misses it and persists a broken upstream URL, which is the
+  // BLO-5xxx failure mode described above (a sentinel written back into live
+  // config killed every run) with a different shape. Substring-test instead:
+  // no legitimate configured value contains this sentinel.
+  if (typeof incoming === "string" && incoming.includes(REDACTED_EVENT_VALUE)) {
+    return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
+  }
+  if (
+    incoming
+    && typeof incoming === "object"
+    && !Array.isArray(incoming)
+    && (incoming as { type?: unknown; value?: unknown }).type === "plain"
+    && (incoming as { type?: unknown; value?: unknown }).value === REDACTED_EVENT_VALUE
+  ) {
+    return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
+  }
+  if (Array.isArray(incoming)) {
+    const existingArray = Array.isArray(existing) ? existing : [];
+    return incoming.flatMap((value, index) => {
+      const restored = restoreRedactedAdapterValue(value, existingArray[index]);
+      return restored === OMIT_REDACTED_ADAPTER_VALUE ? [] : [restored];
+    });
+  }
+  if (!incoming || typeof incoming !== "object") return incoming;
+
+  const existingRecord =
+    existing && typeof existing === "object" && !Array.isArray(existing)
+      ? (existing as Record<string, unknown>)
+      : {};
+  const restored: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(incoming as Record<string, unknown>)) {
+    const restoredValue = restoreRedactedAdapterValue(value, existingRecord[key]);
+    if (restoredValue !== OMIT_REDACTED_ADAPTER_VALUE) restored[key] = restoredValue;
+  }
+  return restored;
+}
+
+// The legacy name is retained for call-site compatibility; this now restores
+// both env sentinels and recursively redacted adapter values on API round-trips.
+export function stripRedactedEnvBindingsFromAdapterConfig(
+  incomingAdapterConfig: Record<string, unknown>,
+  existingAdapterConfig: Record<string, unknown> | null,
+): Record<string, unknown> {
+  const restoredAdapterConfig = containsRedactedAdapterValue(incomingAdapterConfig)
+    ? (restoreRedactedAdapterValue(
+        incomingAdapterConfig,
+        existingAdapterConfig ?? {},
+      ) as Record<string, unknown>)
+    : incomingAdapterConfig;
+  const incomingEnv = restoredAdapterConfig.env;
+  if (!incomingEnv || typeof incomingEnv !== "object" || Array.isArray(incomingEnv)) {
+    return restoredAdapterConfig;
+  }
+  const existingEnv =
+    existingAdapterConfig
+    && typeof existingAdapterConfig.env === "object"
+    && existingAdapterConfig.env !== null
+    && !Array.isArray(existingAdapterConfig.env)
+      ? (existingAdapterConfig.env as Record<string, unknown>)
+      : {};
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(incomingEnv as Record<string, unknown>)) {
+    if (isRedactedEnvBinding(value)) {
+      // UI round-trip: the GET response masks env values to the sentinel,
+      // and a naive save sends them back. Preserve the prior binding if we
+      // have one; drop the key entirely otherwise.
+      if (Object.prototype.hasOwnProperty.call(existingEnv, key)) {
+        cleaned[key] = existingEnv[key];
+      }
+    } else {
+      cleaned[key] = value;
+    }
+  }
+  return { ...restoredAdapterConfig, env: cleaned };
+}
+
+/**
+ * Undo this module's own `metadata` masking on an API round-trip.
+ *
+ * Containing `metadata` on the read paths (PEN-3726) gave it the same
+ * read-modify-write hazard `adapterConfig` has carried since BLO-5xxx, where a
+ * sentinel written back into live config killed every run: `GET` now masks
+ * credential-shaped values to `REDACTED_EVENT_VALUE`, `updateAgentSchema`
+ * accepts `metadata`, and `svc.update` persists whatever arrives. So a client
+ * that reads an agent, edits an unrelated field and `PATCH`es the object back
+ * overwrites the stored value with the placeholder. `adapterConfig` is guarded
+ * against exactly this by `stripRedactedEnvBindingsFromAdapterConfig`;
+ * `metadata` had no analogue.
+ *
+ * This composes the *same* `containsRedactedAdapterValue` /
+ * `restoreRedactedAdapterValue` pair rather than restating the sentinel rule.
+ * Both columns are masked by the one redactor, so a parallel implementation
+ * could drift from it — and a rule that drifts on the write side is how a
+ * column ends up sanitized on one path and inert on another, which is the
+ * defect PEN-3726 exists to close. In particular the PEN-2747 case (a URI
+ * whose credential *component* alone is masked, so the value contains the
+ * sentinel rather than equalling it) is handled because that helper
+ * substring-tests; an equality test written fresh here would miss it.
+ *
+ * Absent prior value: `restoreRedactedAdapterValue` drops the key rather than
+ * inventing one, so a masked key with nothing stored to restore is omitted
+ * instead of persisting the placeholder. On a create there is no prior value at
+ * all, so passing `null` there scrubs the whole payload on the same rule.
+ *
+ * Ceiling, inherited from that helper: arrays are matched to their prior values
+ * **positionally** (`existingArray[index]`). A client that reorders or inserts
+ * into an array holding a masked element restores the wrong stored element, and
+ * elements past the end of the prior array are dropped — stored
+ * `[secretA, secretB]` sent back as `[newItem, ***, ***]` yields
+ * `[newItem, secretB]`. Index-matching is about all a restore can do for an
+ * anonymous array, but it is worth knowing here specifically: unlike
+ * `adapterConfig.env`, `metadata` supports array values as a first-class shape
+ * (`keepSanitizedAgentMetadata` preserves them rather than flattening), so this
+ * is reachable on this column in a way it is not on the one it was written for.
+ */
+export function restoreRedactedAgentMetadata(incoming: unknown, existing: unknown): unknown {
+  if (!containsRedactedAdapterValue(incoming)) return incoming;
+  return restoreRedactedAdapterValue(incoming, existing ?? {});
 }
