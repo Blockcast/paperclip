@@ -107,7 +107,21 @@ describe("classifyGuard — reconstruction of the 2026-09-15 outage (PEN-3281)",
     };
   }
 
-  const outage = Object.fromEntries(WATCHED_WORKFLOWS.map((workflow) => [workflow, observed(workflow)]));
+  // The SEVEN guards watched at the time of the outage. Pinned explicitly
+  // rather than read from WATCHED_WORKFLOWS: this is a reconstruction of a
+  // dated event, so a guard added later (commit-attribution-audit.yml,
+  // BLO-39345) was not present and must not appear in it.
+  const PEN_3281_GUARDS = [
+    "review-gate-sweep.yml",
+    "ally-review-consistency.yml",
+    "codeowners-guard.yml",
+    "relay-ssl-multicert-guard.yml",
+    "lockfile-drift-monitor.yml",
+    "adapter-pin-drift-monitor.yml",
+    twiceDaily,
+  ];
+
+  const outage = Object.fromEntries(PEN_3281_GUARDS.map((workflow) => [workflow, observed(workflow)]));
 
   it("reds the six hourly guards at detection time", () => {
     const results = classifyAll(outage, now);
@@ -869,6 +883,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         "adapter-pin-drift-monitor.yml",
         "ally-review-consistency.yml",
         "codeowners-guard.yml",
+        "commit-attribution-audit.yml",
         "lockfile-drift-monitor.yml",
         "production-environment-protection-guard.yml",
         "relay-ssl-multicert-guard.yml",
@@ -877,21 +892,35 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     );
   });
 
-  it("gives the twice-daily guard a threshold its own cadence justifies", () => {
+  it("gives the twice-daily guards a threshold their own cadence justifies", () => {
     const byWorkflow = new Map(WATCHED_GUARDS.map((g) => [g.workflow, g.staleHours]));
+
+    // Keyed on CADENCE, not on one hardcoded filename. The original form
+    // excluded production-environment-protection-guard.yml by name and put
+    // every other guard on the hourly bar, so adding a second twice-daily
+    // guard (commit-attribution-audit.yml, BLO-39345) red-flagged it as
+    // mis-barred rather than recognising its cadence.
+    const TWICE_DAILY = new Set([
+      "production-environment-protection-guard.yml",
+      "commit-attribution-audit.yml",
+    ]);
 
     // Measured 39 gaps: ordinary band tops out at 14.60h, the two outage
     // outliers are 17.71h and 22.21h. The bar must sit strictly between.
-    const twiceDaily = byWorkflow.get("production-environment-protection-guard.yml");
-    assert.ok(twiceDaily > 14.6, "would red on ordinary twice-daily jitter");
-    assert.ok(twiceDaily < 17.71, "would sail over the 2026-09-15 outage it must catch");
+    // commit-attribution-audit.yml ADOPTS this band rather than having
+    // measured its own — see the note on its WATCHED_GUARDS entry.
+    for (const workflow of TWICE_DAILY) {
+      const bar = byWorkflow.get(workflow);
+      assert.ok(bar > 14.6, `${workflow} would red on ordinary twice-daily jitter`);
+      assert.ok(bar < 17.71, `${workflow} would sail over the 2026-09-15 outage it must catch`);
+    }
 
     // The hourly six share one bar; a shared GLOBAL threshold across cadences is
     // the bug this replaced. Asserted against DEFAULT_STALE_HOURS rather than a
     // literal so moving the bar stays a one-line change with a reason attached
     // (PEN-3379 moved it 4h -> 2.75h).
     for (const workflow of WATCHED_WORKFLOWS) {
-      if (workflow === "production-environment-protection-guard.yml") continue;
+      if (TWICE_DAILY.has(workflow)) continue;
       assert.equal(
         byWorkflow.get(workflow),
         DEFAULT_STALE_HOURS,
@@ -1006,6 +1035,9 @@ describe("summarize — 'could not read' is a different claim from 'stopped exec
     const summary = summarize(results);
 
     assert.equal(summary.exitCode, 0);
-    assert.match(summary.headline, /All 7 watched scheduled guards have completed/);
+    assert.match(
+      summary.headline,
+      new RegExp(`All ${WATCHED_WORKFLOWS.length} watched scheduled guards have completed`),
+    );
   });
 });

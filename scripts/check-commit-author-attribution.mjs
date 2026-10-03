@@ -24,9 +24,18 @@
  *
  *   1. Local range mode (default; no network; used as a per-PR CI gate).
  *      Reads non-merge commits already present in a local checkout across a
- *      base..head range via `git log --no-merges`. `--no-merges` is the
- *      authoritative merge-commit exclusion here (matches BLO-21416's scope
- *      boundary: merge/squash-merge commits are legitimately App-attributed).
+ *      base..head range via `git log --no-merges`. `--no-merges` excludes
+ *      TWO-PARENT merge commits, which are legitimately App-attributed
+ *      because they carry no authored content (BLO-21416's scope boundary).
+ *
+ *      It does NOT exclude a squash-merge commit: a squash has exactly ONE
+ *      parent, so `--no-merges` keeps it. This docblock previously claimed
+ *      "merge/squash-merge commits" were both excluded here and both
+ *      legitimate; that was wrong on the mechanism (BLO-39345). The reason
+ *      mode 1 never rejects a squash commit is not that it is excluded —
+ *      it is that the commit DOES NOT EXIST YET when this gate runs. GitHub
+ *      creates it at merge time, after the last `pull_request` run. Nothing
+ *      re-evaluates it afterwards, which is what mode 3 below is for.
  *
  *   2. `--audit-merged` mode (network via `gh`; the AC's "automated
  *      verifying signal"). Selects PRs by MERGE TIME — every PR merged on or
@@ -40,6 +49,41 @@
  *      merged since that date, or reports INCOMPLETE. It deliberately does not
  *      offer a "last N merged PRs" mode — `gh pr list` orders by creation, so
  *      no count-based window can establish which PRs merged most recently.
+ *
+ *   3. Merge-produced commit check, folded into mode 2 (BLO-39345). Modes 1
+ *      and 2 both read a PR's OWN commits, so neither can see the commit
+ *      GitHub creates AT merge time. A squash-merge of a PR whose commits
+ *      have two or more distinct authors is stamped with the PR author —
+ *      the shared App, for every agent PR — and because that commit is born
+ *      after the last `pull_request` run, no workflow ever evaluates it.
+ *
+ *      Measured 2026-10-02 over the 300 most recently updated merged PRs
+ *      (merged 2026-09-14 .. 2026-10-02), merge method classified from the
+ *      full commit message:
+ *
+ *        squash,  >=2 distinct commit authors    2 PRs   2 re-stamped (100%)
+ *        squash,  1 author                       1 PR    0
+ *        rebase,  >=2 distinct commit authors    82 PRs  0
+ *        rebase,  1 author                      213 PRs  0
+ *
+ *      The 82 multi-author rebases are the control: multi-authorship alone
+ *      does not cause it, and the master queue's REBASE path is clean. The
+ *      two instances are c3020290b (PR #1953, master) and 0c1a89128
+ *      (PR #1701, base `track-a-landing-log` — so this is NOT master-only).
+ *
+ *      `findMergeAttributionOffense` deliberately does NOT classify the merge
+ *      method. A rebase merge preserves the original author, so a rebased
+ *      merge commit is App-attributed only when its source commit already
+ *      was — which the head-side check already reports. Keying on
+ *      "merge commit is App-attributed AND the PR's own commits were not"
+ *      isolates re-stamping on any merge method, including ones GitHub has
+ *      not shipped yet, without a message-shape heuristic that would rot.
+ *
+ *      Severity note, so nobody over-reads a finding: GitHub puts every
+ *      original author in `Co-authored-by:` trailers on the squash commit
+ *      (3/3 and 2/2 on the two instances above). Attribution is DEMOTED out
+ *      of the author field, not erased as in BLO-21416, so the finding
+ *      reports whether the trailers still cover the lost authors.
  *
  * Both modes are read-only: this script never posts, comments, or writes.
  *
@@ -390,6 +434,119 @@ export function findAttributionOffenses(commits, { allowlist } = {}) {
   });
 }
 
+/**
+ * Every email in a `Co-authored-by: Name <email>` trailer, lowercased.
+ *
+ * Used only to REPORT whether a re-stamped merge commit still carries the
+ * authors it displaced — never to clear a finding. A trailer is part of the
+ * commit message and so is author-controlled; it is evidence about
+ * recoverability, not an attestation.
+ */
+export function parseCoAuthorEmails(message) {
+  const out = new Set();
+  for (const line of String(message ?? "").split("\n")) {
+    const match = /^\s*co-authored-by:\s*.*<([^>]+)>\s*$/i.exec(line);
+    if (match) out.add(match[1].trim().toLowerCase());
+  }
+  return out;
+}
+
+/**
+ * The merge-time re-attribution check (BLO-39345). Returns an offense object
+ * when `mergeCommit` — the commit GitHub creates AT merge, which no
+ * `pull_request` workflow can ever see — carries the shared App identity
+ * while the PR's own commits did not, i.e. authorship was lost at merge.
+ *
+ * `mergeCommit`: { sha, authorEmail, authorName, parentCount, message }.
+ * `prCommits`: the same normalized records mode 2 already builds.
+ *
+ * Deliberately method-agnostic — see the module docblock. Three guards:
+ *
+ *   - `parentCount > 1` is a true merge commit: no authored content, out of
+ *     scope, same boundary as `findAttributionOffenses`.
+ *   - If EVERY PR commit was already App-attributed there is nothing to lose
+ *     at merge; the head-side check owns that case and reporting it here
+ *     would double-count the same violation. This is also what keeps the
+ *     graphify-reindex process (App-stamped on both sides) from being
+ *     reported twice.
+ *   - An EMPTY `prCommits` fails CLOSED: with no head-side authorship to
+ *     compare against, an App-stamped content commit is exactly the shape
+ *     this check polices and "I could not look" is not "clean".
+ */
+export function findMergeAttributionOffense({ mergeCommit, prCommits = [] } = {}) {
+  if (!mergeCommit) return null;
+  if ((mergeCommit.parentCount ?? 1) > 1) return null;
+  const authorEmail = String(mergeCommit.authorEmail ?? "");
+  if (!APP_NOREPLY_EMAIL_PATTERN.test(authorEmail)) return null;
+
+  const headEmails = [...new Set(prCommits.map((c) => String(c.authorEmail ?? "")).filter(Boolean))];
+  if (headEmails.length > 0 && headEmails.every((e) => APP_NOREPLY_EMAIL_PATTERN.test(e))) return null;
+
+  const trailerEmails = parseCoAuthorEmails(mergeCommit.message);
+  const displaced = headEmails.filter((e) => !APP_NOREPLY_EMAIL_PATTERN.test(e));
+  return {
+    sha: mergeCommit.sha,
+    authorEmail,
+    authorName: mergeCommit.authorName ?? null,
+    message: String(mergeCommit.message ?? "").split("\n")[0],
+    displacedAuthors: displaced,
+    // Reported, never exculpatory: see parseCoAuthorEmails.
+    recoverableFromTrailers:
+      displaced.length > 0 && displaced.every((e) => trailerEmails.has(e.toLowerCase())),
+  };
+}
+
+/**
+ * Flatten `gh api --paginate` output: each page is a complete top-level JSON
+ * array and the pages are concatenated back-to-back, not merged.
+ *
+ * Scans for the page boundary with a depth counter that is aware of strings
+ * and backslash escapes, rather than splitting on a `]`-then-`[` regex. The
+ * regex form was wrong and had been live since the audit mode was written:
+ * ANY commit message containing `] [` — `"fix: handle arr[0] [BLO-123]"` is
+ * the shape, and this repo has them — splits a page in the middle of a string
+ * and the audit dies with `Unterminated string in JSON`.
+ *
+ * It had never been caught because nothing ran `--audit-merged` on a
+ * schedule; found 2026-10-02 (BLO-39345) the first time it was run over a
+ * window wide enough to contain one. It fails loudly rather than silently,
+ * but a guard that crashes on ordinary input is a guard nobody keeps.
+ *
+ * `gh --slurp` would do this server-side and is NOT available here (gh 2.46.0
+ * rejects the flag), so the scan stays.
+ */
+export function parseConcatenatedJsonArrays(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return [];
+  const out = [];
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let start = -1;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "[" || ch === "{") {
+      if (depth === 0 && ch === "[") start = i;
+      depth += 1;
+    } else if (ch === "]" || ch === "}") {
+      depth -= 1;
+      if (depth === 0 && start !== -1) {
+        out.push(...JSON.parse(text.slice(start, i + 1)));
+        start = -1;
+      }
+    }
+  }
+  if (depth !== 0) throw new Error("truncated JSON in paginated gh output");
+  return out;
+}
+
 function parseLocalGitLog(rawOutput) {
   return rawOutput
     .split(RECORD_SEPARATOR)
@@ -517,13 +674,14 @@ export async function auditRepoCommitAttribution({ repo, since, ghApi }) {
     "--limit",
     String(AUDIT_PR_LIST_MAX),
     "--json",
-    "number,title,mergedAt",
+    "number,title,mergedAt,mergeCommit",
   ]);
   const rawPrs = JSON.parse(prsJson);
   const windowTruncated = rawPrs.length >= AUDIT_PR_LIST_MAX;
   const prs = sortByMergedAtDesc(rawPrs);
 
   const offenses = [];
+  const mergeOffenses = [];
   const truncated = [];
   let totalCommits = 0;
   for (const pr of prs) {
@@ -532,12 +690,7 @@ export async function auditRepoCommitAttribution({ repo, since, ghApi }) {
       `repos/${repo}/pulls/${pr.number}/commits`,
       "--paginate",
     ]);
-    // `gh api --paginate` concatenates each page's JSON array back-to-back
-    // rather than merging them into one array — split on the page boundary.
-    const commits = commitsJson
-      .trim()
-      .split(/(?<=])\s*(?=\[)/)
-      .flatMap((page) => (page ? JSON.parse(page) : []));
+    const commits = parseConcatenatedJsonArrays(commitsJson);
     totalCommits += commits.length;
     if (commits.length >= COMMITS_API_MAX) {
       truncated.push({ repo, prNumber: pr.number, prTitle: pr.title, commitsSeen: commits.length });
@@ -558,6 +711,26 @@ export async function auditRepoCommitAttribution({ repo, since, ghApi }) {
     for (const offense of findAttributionOffenses(normalized)) {
       offenses.push({ ...offense, repo, prNumber: pr.number, prTitle: pr.title });
     }
+
+    // BLO-39345: the commit GitHub creates AT merge. Fetched separately
+    // because /pulls/{n}/commits cannot return it — it does not exist until
+    // the merge, which is also why no pull_request workflow sees it.
+    const mergeOid = pr.mergeCommit?.oid;
+    if (mergeOid) {
+      const mergeJson = await ghApi(["api", `repos/${repo}/commits/${mergeOid}`]);
+      const mc = JSON.parse(mergeJson);
+      const offense = findMergeAttributionOffense({
+        mergeCommit: {
+          sha: mc.sha,
+          authorEmail: mc.commit?.author?.email ?? null,
+          authorName: mc.commit?.author?.name ?? null,
+          parentCount: mc.parents?.length ?? 1,
+          message: mc.commit?.message ?? "",
+        },
+        prCommits: normalized,
+      });
+      if (offense) mergeOffenses.push({ ...offense, repo, prNumber: pr.number, prTitle: pr.title });
+    }
   }
 
   return {
@@ -566,6 +739,7 @@ export async function auditRepoCommitAttribution({ repo, since, ghApi }) {
     prsChecked: prs.length,
     commitsChecked: totalCommits,
     offenses,
+    mergeOffenses,
     truncated,
     windowTruncated,
     oldestMergedAt: prs.at(-1)?.mergedAt ?? null,
@@ -582,6 +756,29 @@ export async function runAudit({
   since,
   ghApi = defaultGhApi,
   log = console.log,
+  // Which findings decide the EXIT CODE. Everything is always reported; this
+  // only chooses what fails the process.
+  //
+  //   "all"   (default) — head-side offenses too. The historical contract, and
+  //                       the right one for a human running the audit by hand:
+  //                       a complete advisory record.
+  //   "merge"           — merge-produced commits only. What the scheduled
+  //                       workflow uses, and NOT a weakening:
+  //
+  // Mode 2 cannot evaluate the grandfather allowlist. That allowlist is keyed
+  // on patch-id (BLO-27142), patch-ids require a local checkout, and mode 2
+  // has none — so an enumerated, deliberately-unfixable pre-cutoff commit is
+  // reported as an offense on every single run. Gating on that would ship a
+  // guard that is red on day one and stays red forever, which is the
+  // ally-review-consistency failure mode (0 successes in 100 runs) that
+  // check-scheduled-guard-liveness.mjs exists to reason about: a permanently
+  // red check is an ignored check.
+  //
+  // Head-side commits are already gated at PR time by mode 1, which DOES have
+  // the checkout and DOES apply the allowlist correctly. Re-gating them here
+  // adds no coverage and costs the signal. The merge-produced commit is the
+  // one thing no other gate can see, so it is the one thing this gates on.
+  gate = "all",
 } = {}) {
   const window = resolveSince(since);
   const results = [];
@@ -599,6 +796,14 @@ export async function runAudit({
         `  VIOLATION ${repo}#${offense.prNumber} ${offense.sha.slice(0, 7)} "${offense.message}" — ${offense.authorEmail}`,
       );
     }
+    for (const offense of result.mergeOffenses) {
+      const recoverable = offense.recoverableFromTrailers
+        ? "authors still in Co-authored-by trailers"
+        : "NOT recoverable from trailers";
+      log(
+        `  MERGE-REATTRIBUTION ${repo}#${offense.prNumber} ${offense.sha.slice(0, 7)} "${offense.message}" — merge-time author ${offense.authorEmail} displaced ${offense.displacedAuthors.join(", ") || "(no head authors seen)"} (${recoverable})`,
+      );
+    }
     if (result.windowTruncated) {
       log(
         `  INCOMPLETE ${repo} — the window since ${window} contains at least ${AUDIT_PR_LIST_MAX} merged PRs, which is the fetch cap; merged PRs beyond it were NOT audited. Narrow --since.`,
@@ -611,13 +816,22 @@ export async function runAudit({
     }
   }
   const allOffenses = results.flatMap((r) => r.offenses);
+  const allMergeOffenses = results.flatMap((r) => r.mergeOffenses);
   const allTruncated = results.flatMap((r) => r.truncated);
   const windowTruncated = results.filter((r) => r.windowTruncated);
+  // Truncation always gates, under either mode: an audit that could not
+  // complete has not shown the merge side is clean either.
+  const complete = allTruncated.length === 0 && windowTruncated.length === 0;
   return {
-    passed: allOffenses.length === 0 && allTruncated.length === 0 && windowTruncated.length === 0,
+    passed:
+      complete &&
+      allMergeOffenses.length === 0 &&
+      (gate === "merge" || allOffenses.length === 0),
+    gate,
     since: window,
     results,
     offenses: allOffenses,
+    mergeOffenses: allMergeOffenses,
     truncated: allTruncated,
     windowTruncated,
   };
@@ -628,6 +842,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--audit-merged") args.mode = "audit";
+    else if (arg === "--gate") args.gate = argv[++i];
     else if (arg === "--repos") args.repos = argv[++i]?.split(",").map((r) => r.trim()).filter(Boolean);
     else if (arg === "--since") args.since = argv[++i];
     else if (arg === "--base") args.base = argv[++i];
@@ -644,9 +859,15 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.mode === "audit") {
-    const { passed, offenses, truncated, windowTruncated, since } = await runAudit({
+    if (args.gate !== undefined && args.gate !== "all" && args.gate !== "merge") {
+      console.error(`ERROR: --gate must be "all" or "merge", got ${JSON.stringify(args.gate)}.`);
+      process.exit(2);
+    }
+    const gate = args.gate ?? "all";
+    const { passed, offenses, mergeOffenses, truncated, windowTruncated, since } = await runAudit({
       repos: args.repos,
       since: args.since,
+      gate,
     });
     // Name which failure mode fired: an offense is a real violation, a
     // truncated result is an audit that could not complete. Reporting the
@@ -655,6 +876,16 @@ async function main() {
     if (offenses.length > 0) {
       console.error(
         `\n${offenses.length} non-merge commit(s) carry the shared App identity (${APP_NOREPLY_EMAIL}) instead of a per-agent author. See BLO-21416 / AGENTS.md §9.`,
+      );
+      if (gate === "merge") {
+        console.error(
+          "  (advisory under --gate merge: these do not fail this run. They are gated at PR time by the local-range mode, which has the checkout needed to apply the patch-id grandfather allowlist that this mode cannot evaluate.)",
+        );
+      }
+    }
+    if (mergeOffenses.length > 0) {
+      console.error(
+        `\n${mergeOffenses.length} merge-produced commit(s) were re-stamped with the shared App identity (${APP_NOREPLY_EMAIL}) at merge time, displacing the per-agent authors of the PR's own commits (BLO-39345).\n\nThis is a squash-merge of a PR whose commits have two or more distinct authors: GitHub attributes the squash commit to the PR author, which for an agent PR is the shared App. The commit is created AFTER the last pull_request run, so the per-PR gate cannot see it and nothing re-evaluates it.\n\nIt CANNOT be fixed in place — rewriting the base branch would relabel every other correctly-attributed commit on it. Prevent it instead: merge through the queue (merge_method REBASE, which preserves per-commit authorship — 0 of 82 multi-author rebases re-stamped in the 2026-10-02 measurement), or have a repo admin disable squash-merge. Where the trailers still carry the displaced authors the attribution is recoverable from the commit message; where they do not, it is lost.`,
       );
     }
     if (windowTruncated.length > 0) {

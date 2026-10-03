@@ -1,0 +1,90 @@
+name: Commit Attribution Audit
+
+# Post-merge half of the BLO-21416 commit-attribution gate.
+#
+# The per-PR gate in pr.yml reads `base..head` — the PR's OWN commits, before
+# merge. It is structurally unable to see the commit GitHub creates AT merge:
+# a squash-merge of a PR whose commits have two or more distinct authors is
+# stamped with the PR author, which for every agent PR is the shared App
+# identity. That commit is born after the last `pull_request` run and nothing
+# ever re-evaluates it (BLO-39345).
+#
+# Measured 2026-10-02 over the 300 most recently updated merged PRs:
+# squash + >=2 distinct authors re-stamped 2 of 2; the queue's REBASE path
+# re-stamped 0 of 82 multi-author PRs. The two live instances are c3020290b
+# (PR #1953, master) and 0c1a89128 (PR #1701, base `track-a-landing-log`) —
+# so this audit is deliberately NOT scoped to master.
+#
+# This DETECTS; it does not prevent. Prevention is `allow_squash_merge: false`,
+# a repo-settings change no agent identity can make (the App installation
+# reads admin/push false) and which must be preceded by switching
+# refresh-lockfile.yml off `gh pr merge --squash`. Recorded on BLO-39345.
+
+on:
+  schedule:
+    # Twice daily. NOT hourly: the audit costs ~2 API calls per merged PR in
+    # its window, and this repo merges ~17 PRs/day against a 9000/hr budget
+    # shared by the whole agent fleet — an hourly run at a 7d window would be
+    # ~6000 calls/hour on its own.
+    - cron: "13 7,19 * * *"
+  # The merge of this file runs it once, so the guard's first completed run lands
+  # at merge. scheduled-guard-liveness.yml counts a completed run from any event,
+  # and without this it reads this guard as `never-completed` for up to 12h,
+  # until the first scheduled tick.
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/commit-attribution-audit.yml
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "lookback window (e.g. 2d, 7d, or an ISO date)"
+        required: false
+        default: "2d"
+      repos:
+        description: "comma-separated owner/name list"
+        required: false
+        default: "Blockcast/paperclip"
+
+permissions:
+  contents: read
+  # `gh pr list` and `gh api repos/{repo}/pulls/{n}/commits` read the pulls API.
+  # An explicit block sets every unlisted scope to none, so without this the
+  # first call fails and the audit never produces a verdict.
+  pull-requests: read
+
+jobs:
+  audit-merged:
+    runs-on: default
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Audit merged PRs for App-attributed commits
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through env, not interpolated into `run:`. An expression is spliced
+          # into the script before the shell parses it, so a dispatched value
+          # could otherwise inject commands.
+          SINCE: ${{ inputs.since || '2d' }}
+          REPOS: ${{ inputs.repos || 'Blockcast/paperclip' }}
+        # --since 2d, not the 7d default: the scheduled cadence is 12h, so 2d
+        # overlaps three cycles. A single missed run therefore loses nothing,
+        # which is what keeps the liveness bar on this guard from needing to be
+        # tight. Widening it costs API budget linearly — see the cron note.
+        #
+        # --gate merge: head-side offenses are REPORTED in the log but do not
+        # fail this job. They are already gated at PR time by the local-range
+        # mode, which has the checkout needed to apply the patch-id grandfather
+        # allowlist that this mode structurally cannot evaluate. Verified
+        # 2026-10-02: without this flag the first scheduled run is red on
+        # cace65c3, an enumerated pre-cutoff commit that is deliberately
+        # unfixable — i.e. the guard would ship permanently red and be ignored.
+        # Truncated/incomplete windows still fail the job under either gate.
+        run: |
+          node ./scripts/check-commit-author-attribution.mjs \
+            --audit-merged \
+            --gate merge \
+            --since "$SINCE" \
+            --repos "$REPOS"

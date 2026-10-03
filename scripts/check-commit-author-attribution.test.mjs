@@ -13,7 +13,10 @@ import {
   COMMITS_API_MAX,
   findAttributionOffenses,
   findLocalRangeOffenses,
+  findMergeAttributionOffense,
   GRANDFATHERED_OFFENSE_SHAS,
+  parseCoAuthorEmails,
+  parseConcatenatedJsonArrays,
   resolveSince,
   runAudit,
   sortByMergedAtDesc,
@@ -824,4 +827,198 @@ test("runAudit passes when every PR is fully audited and clean", async () => {
 
   assert.equal(outcome.passed, true);
   assert.deepEqual(outcome.truncated, []);
+});
+
+// --- BLO-39345: merge-time re-attribution -----------------------------------
+//
+// The commit GitHub creates AT merge is invisible to every pull_request
+// workflow, so these are the only tests covering that write path. Each guard
+// in `findMergeAttributionOffense` has a case below that goes RED when that
+// guard alone is reverted — a fixture that passes either way is documentation.
+
+const AGENT_A = "staff-engineer@paperclip.blockcast.net";
+const AGENT_B = "cto@paperclip.blockcast.net";
+
+/** The real shape of c3020290b (PR #1953), trimmed. */
+function squashCommit({ email = APP_NOREPLY_EMAIL, parents = 1, trailers = [AGENT_A, AGENT_B] } = {}) {
+  return {
+    sha: "c3020290be4f5299de995422415516e621f43ade",
+    authorEmail: email,
+    authorName: "allyblockcast[bot]",
+    parentCount: parents,
+    message:
+      "refactor(ci): enforce the DbTransaction alias ban\n\n* first\n\n* second\n\n---------\n\n" +
+      trailers.map((t) => `Co-authored-by: Someone <${t}>`).join("\n") +
+      "\n",
+  };
+}
+
+const HEAD_COMMITS = [
+  { sha: "1".repeat(40), authorEmail: AGENT_A, parentCount: 1, message: "first" },
+  { sha: "2".repeat(40), authorEmail: AGENT_B, parentCount: 1, message: "second" },
+];
+
+test("findMergeAttributionOffense flags a squash commit that displaced per-agent authors", () => {
+  const offense = findMergeAttributionOffense({ mergeCommit: squashCommit(), prCommits: HEAD_COMMITS });
+  assert.ok(offense, "a squash re-stamped to the App must be an offense");
+  assert.equal(offense.authorEmail, APP_NOREPLY_EMAIL);
+  assert.deepEqual(offense.displacedAuthors.sort(), [AGENT_B, AGENT_A].sort());
+  assert.equal(offense.recoverableFromTrailers, true);
+});
+
+test("findMergeAttributionOffense reports NOT recoverable when the trailers drop a displaced author", () => {
+  const offense = findMergeAttributionOffense({
+    mergeCommit: squashCommit({ trailers: [AGENT_A] }),
+    prCommits: HEAD_COMMITS,
+  });
+  assert.ok(offense);
+  assert.equal(offense.recoverableFromTrailers, false);
+});
+
+test("findMergeAttributionOffense ignores a two-parent merge commit (no authored content)", () => {
+  // Guard: `parentCount > 1`. Revert it and this goes red.
+  assert.equal(findMergeAttributionOffense({ mergeCommit: squashCommit({ parents: 2 }), prCommits: HEAD_COMMITS }), null);
+});
+
+test("findMergeAttributionOffense does not double-count a PR whose own commits were already App-stamped", () => {
+  // Guard: the all-head-App short-circuit. The head-side check owns this
+  // case; without the guard the same violation is reported twice, and the
+  // graphify-reindex process is reported every single run.
+  const allApp = [{ sha: "9".repeat(40), authorEmail: APP_NOREPLY_EMAIL, parentCount: 1, message: "x" }];
+  assert.equal(findMergeAttributionOffense({ mergeCommit: squashCommit(), prCommits: allApp }), null);
+});
+
+test("findMergeAttributionOffense fails CLOSED when the PR's commit list is empty", () => {
+  const offense = findMergeAttributionOffense({ mergeCommit: squashCommit(), prCommits: [] });
+  assert.ok(offense, "no head-side authorship to compare against is not 'clean'");
+  assert.deepEqual(offense.displacedAuthors, []);
+  assert.equal(offense.recoverableFromTrailers, false);
+});
+
+test("findMergeAttributionOffense ignores a merge commit with a real per-agent author (rebase path)", () => {
+  // The 82 multi-author rebase merges measured on 2026-10-02 all land here.
+  assert.equal(
+    findMergeAttributionOffense({ mergeCommit: squashCommit({ email: AGENT_A }), prCommits: HEAD_COMMITS }),
+    null,
+  );
+});
+
+test("parseCoAuthorEmails reads every trailer, case-insensitively, and ignores prose", () => {
+  const emails = parseCoAuthorEmails(
+    "subject\n\nCo-authored-by: A <a@x.test>\nco-AUTHORED-by: B <B@X.test>\nNot a trailer: C <c@x.test> trailing\n",
+  );
+  assert.deepEqual([...emails].sort(), ["a@x.test", "b@x.test"]);
+});
+
+test("auditRepoCommitAttribution reports a merge-time re-attribution the PR's own commits cannot show", async () => {
+  const prCommits = JSON.stringify([
+    { sha: "1".repeat(40), parents: [{ sha: "base" }], commit: { author: { email: AGENT_A }, message: "first\n" } },
+    { sha: "2".repeat(40), parents: [{ sha: "1".repeat(40) }], commit: { author: { email: AGENT_B }, message: "second\n" } },
+  ]);
+  const mergeCommitJson = JSON.stringify({
+    sha: "c".repeat(40),
+    parents: [{ sha: "base" }],
+    commit: { author: { email: APP_NOREPLY_EMAIL, name: "allyblockcast[bot]" }, message: "squashed (#7)\n" },
+  });
+
+  const ghApi = async (args) => {
+    if (args[0] === "pr" && args[1] === "list") {
+      return JSON.stringify([
+        { number: 7, title: "multi-author PR", mergedAt: "2026-09-24", mergeCommit: { oid: "c".repeat(40) } },
+      ]);
+    }
+    if (args[0] === "api" && args[1].includes("/commits/")) return mergeCommitJson;
+    if (args[0] === "api") return prCommits;
+    throw new Error(`unexpected gh invocation: ${args.join(" ")}`);
+  };
+
+  const result = await auditRepoCommitAttribution({ repo: "Blockcast/example", since: "2026-09-01", ghApi });
+
+  // The whole point: the head-side check is legitimately clean here.
+  assert.equal(result.offenses.length, 0, "PR's own commits are correctly attributed");
+  assert.equal(result.mergeOffenses.length, 1);
+  assert.equal(result.mergeOffenses[0].prNumber, 7);
+  assert.deepEqual(result.mergeOffenses[0].displacedAuthors.sort(), [AGENT_B, AGENT_A].sort());
+
+  const outcome = await runAudit({ repos: ["Blockcast/example"], since: "2026-09-01", ghApi, log: () => {} });
+  assert.equal(outcome.passed, false, "a merge-time re-attribution must fail the audit");
+  assert.equal(outcome.mergeOffenses.length, 1);
+});
+
+test("runAudit --gate merge still fails on a merge-time re-attribution", async () => {
+  const ghApi = async (args) => {
+    if (args[0] === "pr" && args[1] === "list") {
+      return JSON.stringify([
+        { number: 7, title: "p", mergedAt: "2026-09-24", mergeCommit: { oid: "c".repeat(40) } },
+      ]);
+    }
+    if (args[0] === "api" && args[1].includes("/commits/")) {
+      return JSON.stringify({
+        sha: "c".repeat(40),
+        parents: [{ sha: "base" }],
+        commit: { author: { email: APP_NOREPLY_EMAIL }, message: "squashed\n" },
+      });
+    }
+    return JSON.stringify([
+      { sha: "1".repeat(40), parents: [{ sha: "b" }], commit: { author: { email: AGENT_A }, message: "x\n" } },
+    ]);
+  };
+  const outcome = await runAudit({ repos: ["r/x"], since: "2026-09-01", ghApi, log: () => {}, gate: "merge" });
+  assert.equal(outcome.passed, false, "--gate merge must still gate on the class it exists for");
+});
+
+test("runAudit --gate merge does NOT fail on a head-side offense it cannot allowlist", async () => {
+  // The grandfather allowlist is patch-id keyed and needs a checkout mode 2
+  // does not have, so gating here would be red forever on enumerated history.
+  const ghApi = async (args) => {
+    if (args[0] === "pr" && args[1] === "list") {
+      return JSON.stringify([{ number: 8, title: "p", mergedAt: "2026-09-24" }]);
+    }
+    return JSON.stringify([
+      { sha: "1".repeat(40), parents: [{ sha: "b" }], commit: { author: { email: APP_NOREPLY_EMAIL }, message: "old\n" } },
+    ]);
+  };
+  const merged = await runAudit({ repos: ["r/x"], since: "2026-09-01", ghApi, log: () => {}, gate: "merge" });
+  assert.equal(merged.offenses.length, 1, "still REPORTED, just not gating");
+  assert.equal(merged.passed, true);
+
+  // Default gate keeps the historical contract.
+  const all = await runAudit({ repos: ["r/x"], since: "2026-09-01", ghApi, log: () => {} });
+  assert.equal(all.passed, false, "--gate all must keep failing on head-side offenses");
+});
+
+test("runAudit --gate merge still fails closed on an incomplete window", async () => {
+  const ghApi = async (args) => {
+    if (args[0] === "pr" && args[1] === "list") {
+      return JSON.stringify(
+        Array.from({ length: AUDIT_PR_LIST_MAX }, (_, i) => ({ number: i + 1, title: "p", mergedAt: "2026-09-24" })),
+      );
+    }
+    return JSON.stringify([]);
+  };
+  const outcome = await runAudit({ repos: ["r/x"], since: "2026-09-01", ghApi, log: () => {}, gate: "merge" });
+  assert.equal(outcome.passed, false, "an audit that could not complete has not cleared the merge side either");
+});
+
+test("parseConcatenatedJsonArrays survives a commit message containing '] ['", () => {
+  // The exact shape that crashed the first wide --audit-merged run (BLO-39345).
+  const page = JSON.stringify([
+    { sha: "a".repeat(40), commit: { author: { email: AGENT_A }, message: "fix: handle arr[0] [BLO-123]" } },
+  ]);
+  const rows = parseConcatenatedJsonArrays(page);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].commit.message, "fix: handle arr[0] [BLO-123]");
+});
+
+test("parseConcatenatedJsonArrays joins pages and handles escapes, brackets and empties", () => {
+  const p1 = JSON.stringify([{ sha: "1", m: 'quote \\" then a lone ] inside' }, { sha: "2", m: "and a lone { here" }]);
+  const p2 = JSON.stringify([{ sha: "3", m: "plain" }]);
+  const rows = parseConcatenatedJsonArrays(`${p1}\n${p2}`);
+  assert.deepEqual(rows.map((r) => r.sha), ["1", "2", "3"]);
+  assert.deepEqual(parseConcatenatedJsonArrays("[]"), []);
+  assert.deepEqual(parseConcatenatedJsonArrays(""), []);
+});
+
+test("parseConcatenatedJsonArrays throws on truncated output rather than silently dropping it", () => {
+  assert.throws(() => parseConcatenatedJsonArrays('[{"sha":"1"}'), /truncated JSON/);
 });
