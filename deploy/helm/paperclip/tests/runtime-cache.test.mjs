@@ -311,7 +311,11 @@ test("Blockcast values route agent LLM traffic through Penstock gateway", () => 
     assertValueEnv(
       rendered,
       "PATH",
-      "/paperclip/.local/bin:/paperclip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      // PEN-3713 put the root-owned image wrapper directory at the front; the
+      // PVC entries behind it are the rollout fallback. The ordering invariant
+      // itself lives in agent-egress-path.test.mjs — this is a pin on the
+      // Blockcast overlay's rendered value, so it moves when that value moves.
+      "/usr/local/libexec/paperclip/bin:/paperclip/.local/bin:/paperclip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     );
     assertValueEnv(rendered, "ANTHROPIC_BASE_URL", "https://api.penstock.run/anthropic");
     assertPenstockOrgKeySecretEnv(rendered, "ANTHROPIC_AUTH_TOKEN");

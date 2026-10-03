@@ -13,6 +13,11 @@ USER root
 COPY --chown=node:node --from=server /app /app
 COPY --from=server /opt/paperclip-bundled-adapters /opt/paperclip-bundled-adapters
 COPY --from=server /usr/local/bin/github-mcp-server /usr/local/bin/github-mcp-server
+# PEN-3713. Taken from the server image rather than re-copied from the build
+# context so the two images cannot carry different wrapper bodies: one file in
+# the repo, one install, one rule. Root-owned by default (no --chown), which
+# is the whole point — uid 1000 must not be able to rewrite these.
+COPY --from=server /usr/local/libexec/paperclip/bin /usr/local/libexec/paperclip/bin
 COPY --from=server /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
 COPY --from=server /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
 COPY --from=server /opt/penstock/ponytail /opt/penstock/ponytail
