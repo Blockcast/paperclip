@@ -29,6 +29,42 @@
  * Stated explicitly because the next I1 red on `master` will otherwise read as
  * a regression here rather than as the known residual it is.
  *
+ * CORRECTION (PEN-3754): "it closes the wide ones" OVERSTATES this guard, and
+ * a wide gap is NOT evidence that it was consulted and answered wrongly.
+ *
+ * The paragraph above holds review-run duration (~45 min, measured on #2157:
+ * 11:48:35Z request → 12:30:34Z review) as the only thing between dispatch and
+ * post, and concludes that a gap of hours implies the first review was already
+ * visible at the second dispatch. QUEUE LATENCY breaks that step. A wake can
+ * clear this gate while no review exists, sit queued for hours, and post into a
+ * head that was attested in the meantime — so a long gap and a short gap can
+ * have the same cause, differing only in how long the second run waited.
+ *
+ * Measured on the three same-head pairs in PEN-3754 (#2121 `9190d265` 19.7 h,
+ * #2128 `621589ce` 6.6 h, #2157 `f03ade2f` 9.3 h): all 13 Ally reviews across
+ * those PRs parse cleanly under this module's own predicate — one well-formed
+ * attestation each, App identity — so every first review WOULD have returned
+ * `attested` had this been asked at post time. The predicate is sound; the
+ * timing assumption in its coverage claim is not.
+ *
+ * Do NOT conclude from that measurement that a post-time refusal is the
+ * remedy. It is not, and the reason generalises: a same-head re-review can be
+ * LEGITIMATE. When a finding lives in the PR description rather than the code,
+ * no commit can carry the fix and the head necessarily stays put — #2128's
+ * second review is exactly that case, preceded by "Description-only — no
+ * commit, head stays `621589ce`". Refusing it would strand the finding
+ * permanently, because the one remedy a refusal can suggest (move the head) is
+ * unavailable by construction. BLO-25764 measured the gap distribution across
+ * every same-head App pair (n=15, 3 s → 120971 s, continuous) and found no
+ * threshold separating race from re-review, which is why review data alone
+ * cannot classify these and why I1 is being re-specified to treat a
+ * distinct-body pair as supersession rather than as a violation.
+ *
+ * Exclusion therefore belongs at dispatch (BLO-20074), where the queueing
+ * above is the specific thing it has to survive: a check at wake time is not
+ * enough on its own, because the decision it makes can be hours stale by the
+ * time the run it authorises actually posts.
+ *
  * Why this must be enforced BEFORE the run rather than cleaned up after: a
  * COMMENTED review cannot be retracted. GitHub's dismiss endpoint rejects it
  * (`PUT .../reviews/{id}/dismissals` → 422 "Can not dismiss a commented pull
