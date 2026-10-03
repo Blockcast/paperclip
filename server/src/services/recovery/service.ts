@@ -2292,6 +2292,24 @@ export function recoveryService(
       issueId: string;
       blockedByIssueIds: string[];
     }) => Promise<void> | void;
+    /**
+     * Test-only clock for the sweep's two per-pass memos (PEN-3636), threaded into the
+     * `now` seam both factories already expose. Production leaves this unset and both
+     * take `Date.now`.
+     *
+     * ⚠️ Why this exists: the call-site tests assert `liveReads === 1`, which is a claim
+     * about WIRING, but against the real clock it is also a claim about SPEED — the
+     * memos' 5 s TTL is wall-clock, so a DB-backed sweep that stalls >5 s between two
+     * candidates re-reads and the assertion goes red for a reason unrelated to what it
+     * tests. Embedded Postgres under parallel vitest can do that, and this row's own
+     * production figure (~787 ms–1.77 s per candidate) is the same order as the budget.
+     *
+     * A FROZEN clock rather than an enormous `ttlMs`: freezing leaves the real default
+     * TTL in the comparison (`readAt - cached.readAt` is 0, still measured against
+     * `DEFAULT_*_TTL_MS`), where a huge TTL would route the tests past the expiry
+     * arithmetic entirely and stop exercising it.
+     */
+    perPassMemoClockForTest?: () => number;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -8810,14 +8828,16 @@ export function recoveryService(
     // actually removes is no longer projected: `pauseHoldPrefilterMemoHits` counts it.
     // Bound to the pool handle this sweep reads on, which is what keeps a memo entry from
     // crossing into a transactional caller — see `createActivePauseHoldPrefilter`.
-    const activePauseHoldPrefilter = createActivePauseHoldPrefilter(treeControlSvc, db);
+    const activePauseHoldPrefilter = createActivePauseHoldPrefilter(treeControlSvc, db, {
+      now: deps.perPassMemoClockForTest,
+    });
     // The sibling optimisation, on the OTHER per-candidate round-trip. The agent-evaluation
     // site below takes two reads per candidate; this collapses the one keyed by *company*
     // (the roster behind `evaluateAgentInvokabilityFromDb`, which has no id filter) and
     // leaves the per-agent `getAgent` read live. Bound to the same pool handle, for the
     // same reason. See `createAgentRosterMemo` for the freshness trade — it is narrower
     // than the prefilter's, because the subject agent's own row is never memoised.
-    const agentRosterMemo = createAgentRosterMemo(db);
+    const agentRosterMemo = createAgentRosterMemo(db, { now: deps.perPassMemoClockForTest });
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
