@@ -149,14 +149,19 @@ test("one entry that lost its `idx` does not strip the renumber suggestion from 
   // check runs, so a single entry missing `idx` used to make it NaN -- and the
   // "renumber to N" half of every OTHER message is the entire value this guard
   // adds over the merge-queue conflict it predicts.
+  // Both sides get one: the base-side filter is a separate guard from the
+  // head-side one, and mutating them together lets either hide behind the
+  // other's failing assertion.
   const lostIdx = { version: "7", when: 1789900100000, tag: "0248_lost_idx", breakpoints: true };
+  const baseLostIdx = { version: "7", when: 1789899900000, tag: "0246_base_lost_idx", breakpoints: true };
   const collide = { ...TAIL, tag: "0247_different_tag" };
+  const base = treeOf(TAIL, baseLostIdx);
   const head = {
     journal: journalOf(TAIL, lostIdx, collide),
-    sqlFiles: [...MASTER.sqlFiles, "0247_different_tag.sql"],
+    sqlFiles: [...base.sqlFiles, "0247_different_tag.sql"],
   };
 
-  const problems = check(head, MASTER);
+  const problems = check(head, base);
 
   assert.equal(problems.length, 3, problems.join("\n"));
   assert.doesNotMatch(problems.join("\n"), /NaN/, problems.join("\n"));
