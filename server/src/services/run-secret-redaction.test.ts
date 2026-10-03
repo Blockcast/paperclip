@@ -3,6 +3,7 @@ import { sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
 import {
   RUN_SECRET_MASK,
   buildRunSecretRedactionPlan,
+  createRunSecretBoundaryCarry,
   isRedactableSecretValue,
 } from "./run-secret-redaction.js";
 
@@ -287,5 +288,78 @@ describe("BLO-39715: encoding variants", () => {
     expect(
       buildRunSecretRedactionPlan({ env: { ODD_TOKEN: loneSurrogate } }, ["ODD_TOKEN"]).needles,
     ).toContain(loneSurrogate);
+  });
+});
+
+describe("BLO-39715: chunk-boundary splits", () => {
+  /**
+   * Run-log chunks are not token-aligned on any adapter path, so a secret can be cut in
+   * half by an arbitrary boundary. Before the carry, neither half contained the needle, so
+   * neither was redacted and the reassembled transcript held the plaintext — a silent miss
+   * that `uncoveredKeys`/`unresolvedKeys` cannot see, because the key resolved fine.
+   */
+  function drain(carry: ReturnType<typeof createRunSecretBoundaryCarry>, stream: string, chunks: string[]) {
+    const out = chunks.map((chunk) => sanitize(carry.take(stream, chunk)));
+    out.push(sanitize(carry.take(stream, "", { flush: true })));
+    return out.join("");
+  }
+
+  it("redacts a secret split across two successive chunks", () => {
+    const cut = 10;
+    const head = `writing ${SECRET.slice(0, cut)}`;
+    const tail = `${SECRET.slice(cut)} to config\n`;
+
+    // The premise: each half alone is invisible to a literal match.
+    expect(sanitize(head)).toContain(SECRET.slice(0, cut));
+    expect(sanitize(tail)).toContain(SECRET.slice(cut));
+
+    const transcript = drain(createRunSecretBoundaryCarry(PLAN.needles), "stdout", [head, tail]);
+    expect(transcript).not.toContain(SECRET);
+    expect(transcript).toContain(RUN_SECRET_MASK);
+    // The surrounding output is preserved, not eaten by the carry.
+    expect(transcript).toContain("writing ");
+    expect(transcript).toContain(" to config");
+  });
+
+  it("redacts a secret split one character at a time", () => {
+    const chunks = [...`prefix ${SECRET} suffix\n`];
+    const transcript = drain(createRunSecretBoundaryCarry(PLAN.needles), "stdout", chunks);
+    expect(transcript).not.toContain(SECRET);
+    expect(transcript).toContain(RUN_SECRET_MASK);
+    expect(transcript).toContain("prefix ");
+    expect(transcript).toContain("suffix");
+  });
+
+  it("does not lose the trailing held-back characters — the flush is required", () => {
+    const carry = createRunSecretBoundaryCarry(PLAN.needles);
+    expect(carry.holdbackChars).toBe(SECRET.length - 1);
+
+    // Without the flush the tail is still withheld: this is what makes the flush load-bearing
+    // rather than tidy-up, and why dropping it would trade a leak for silent truncation.
+    const withheld = carry.take("stdout", "trailing-marker\n");
+    expect(withheld).not.toContain("trailing-marker");
+
+    expect(carry.take("stdout", "", { flush: true })).toContain("trailing-marker\n");
+  });
+
+  it("keeps streams independent so stdout bytes cannot surface in stderr", () => {
+    const carry = createRunSecretBoundaryCarry(PLAN.needles);
+    carry.take("stdout", "OUT-ONLY");
+    expect(carry.take("stderr", "", { flush: true })).toBe("");
+    expect(carry.take("stdout", "", { flush: true })).toBe("OUT-ONLY");
+  });
+
+  it("is an identity function when there is nothing to redact", () => {
+    // A run with no secrets must be byte-for-byte unchanged and pay no streaming latency.
+    const carry = createRunSecretBoundaryCarry([]);
+    expect(carry.holdbackChars).toBe(0);
+    expect(carry.take("stdout", "immediate\n")).toBe("immediate\n");
+  });
+
+  it("sizes the window off the longest needle regardless of input order", () => {
+    // `buildRunSecretRedactionPlan` sorts longest-first, but this helper is exported; an
+    // unsorted caller must not silently get a too-short window.
+    expect(createRunSecretBoundaryCarry(["ab", "abcdef"]).holdbackChars).toBe(5);
+    expect(createRunSecretBoundaryCarry(["abcdef", "ab"]).holdbackChars).toBe(5);
   });
 });
