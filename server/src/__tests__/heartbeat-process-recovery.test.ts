@@ -2415,7 +2415,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       });
       const { body: metrics } = await renderMetrics();
       expect(metrics.split("\n")).toContain(
-        'paperclip_heartbeat_run_failed_total{agent_id="unknown",issue_id="none",adapter="opencode_k8s",error_code="job_missing",invocation_source="other",isolation_mode="unknown"} 1',
+        // BLO-17953 A1f: agent_id is retained for EVERY error code (roster-bounded),
+        // so job_missing now carries real agent attribution. issue_id stays "none" —
+        // it is the unbounded label and remains gated on k8s_pod_schedule_failed.
+        `paperclip_heartbeat_run_failed_total{agent_id="${agentId}",issue_id="none",adapter="opencode_k8s",error_code="job_missing",invocation_source="other",isolation_mode="unknown"} 1`,
       );
     } finally {
       updateSpy.mockRestore();
@@ -2506,7 +2509,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }) as typeof db.select);
 
     const sample =
-      'paperclip_heartbeat_run_failed_total{agent_id="unknown",issue_id="none",adapter="opencode_k8s",error_code="job_missing",invocation_source="other",isolation_mode="unknown"} 1';
+      // BLO-17953 A1f: agent_id retained for every error code; issue_id still gated.
+      `paperclip_heartbeat_run_failed_total{agent_id="${agentId}",issue_id="none",adapter="opencode_k8s",error_code="job_missing",invocation_source="other",isolation_mode="unknown"} 1`;
     try {
       const firstPass = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
       expect(firstPass.runIds).toContain(runId);

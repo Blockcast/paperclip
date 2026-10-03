@@ -440,7 +440,7 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
     "workspace_validation_failed",
     "setup_failed",
   ])(
-    "collapses issue_id/agent_id for pre-dispatch setup failure %s (BLO-28648)",
+    "collapses issue_id (but NOT agent_id) for pre-dispatch setup failure %s (BLO-28648)",
     async (errorCode) => {
       const labels = recordHeartbeatRunFailed({
         agentId: "agent-a",
@@ -450,22 +450,26 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
         invocationSource: "capacity_blocked_retry",
         isolationMode: "shared",
       });
-      // Only k8s_pod_schedule_failed keeps the real ids (in every isolation mode,
-      // BLO-17953). Every other code — including every workspace refusal —
-      // collapses them, so a Prometheus selector of the form
+      // Only k8s_pod_schedule_failed keeps the real issue_id (in every isolation
+      // mode, BLO-17953). Every other code — including every workspace refusal —
+      // collapses it, so a Prometheus selector of the form
       // `error_code="<workspace code>", issue_id!="none"` can never match.
       // BLO-28648 shipped exactly that alert; it loaded healthy and could not
       // fire. Assert the collapse so the impossibility stays documented.
       expect(labels.issue_id).toBe("none");
-      expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
+      // BLO-17953 A1f: agent_id is NOT collapsed — it is roster-bounded, so it
+      // is retained for every error code. "Which lane is losing runs to this
+      // workspace refusal" is answerable without touching the unbounded label.
+      expect(labels.agent_id).toBe("agent-a");
       expect(labels.error_code).toBe(errorCode);
     },
   );
 
-  // The cardinality bound is the error code, not the isolation mode: a
-  // non-pod-schedule failure must still collapse both source identifiers even
-  // in `run` isolation, or every historical issue retains a series.
-  it("still collapses source identifiers for non-pod-schedule failures in run isolation", async () => {
+  // The cardinality bound is the error code, and it binds `issue_id` ONLY: a
+  // non-pod-schedule failure must still collapse the unbounded identifier even
+  // in `run` isolation, or every historical issue retains a series. agent_id
+  // rides through because the roster bounds it (BLO-17953 A1f).
+  it("still collapses issue_id, but keeps agent_id, for non-pod-schedule failures in run isolation", async () => {
     const labels = recordHeartbeatRunFailed({
       agentId: "agent-a",
       issueId: "issue-a",
@@ -475,7 +479,7 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
       isolationMode: "run",
     });
 
-    expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
+    expect(labels.agent_id).toBe("agent-a");
     expect(labels.issue_id).toBe("none");
   });
 
@@ -492,7 +496,7 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",issue_id="none",adapter="claude_k8s",error_code="process_lost",invocation_source="${UNKNOWN_INVOCATION_SOURCE}",isolation_mode="workspace"} 1`,
+      `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="agent-a",issue_id="none",adapter="claude_k8s",error_code="process_lost",invocation_source="${UNKNOWN_INVOCATION_SOURCE}",isolation_mode="workspace"} 1`,
     );
   });
 
