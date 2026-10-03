@@ -1900,7 +1900,9 @@ describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break
         // the dot in `COUNTED_SEVERITIES.join("|")` is not a wildcard. The
         // interpolated constants are themselves String.raw templates and
         // are scanned where they are declared, so dropping the hole here
-        // loses no coverage. Then strip escapes, then character classes:
+        // loses no coverage (pinned by the attestation-fragment control
+        // below, which fails if one is a quoted string again). Then strip
+        // escapes, then character classes:
         // what survives is a wildcard `.`, while `\.` and `[.)]` are
         // literal dots and fine.
         const wildcards = m[1]
@@ -1976,6 +1978,32 @@ describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break
       const injected = src.replace(decl[0], decl[0].replace(from, to));
       assert.notEqual(injected, src, `${from} not found in ${name} -- the injection is a no-op`);
       const line = src.slice(0, decl.index).split("\n").length + 1;
+      assert.deepEqual(
+        bareDotSites(injected).map((c) => `${rel}:${c.line}`),
+        [`${rel}:${line}`],
+        `a wildcard \`.\` injected into ${name} was not reported`,
+      );
+    }
+  });
+
+  // Ally, #1721 at 1aaf72ac, Important 1. The attestation reader is composed
+  // from named fragments, and two of them were quoted strings, which neither
+  // scan form reaches. A wildcard there is fail-OPEN: an unattested review goes
+  // to not_evaluated instead of red. So each fragment, and the pattern that
+  // composes them, gets a dot injected into its real declaration.
+  it("control: the dot scan sees every fragment of the attestation pattern", () => {
+    const rel = "../server/src/services/ally-review-detection.ts";
+    const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+    for (const [name, from, to] of [
+      ["MARKDOWN_EMPHASIS_RUN", "{0,3}", ".{0,3}"],
+      ["ATTESTATION_WRAPPER_RUN", "{0,6}", ".{0,6}"],
+      ["REVIEWED_HEAD_ATTESTATION_PATTERN", "reviewed head:", "reviewed.head:"],
+    ]) {
+      const decl = new RegExp("const " + name + " = (?:new RegExp\\(\\n[ \\t]*)?String\\.raw`[^\\n]*").exec(src);
+      assert.ok(decl, `${name} is not declared as a String.raw template in ${rel}, so the dot scan cannot see it`);
+      const injected = src.replace(decl[0], decl[0].replace(from, to));
+      assert.notEqual(injected, src, `${from} not found in ${name} -- the injection is a no-op`);
+      const line = src.slice(0, decl.index + decl[0].lastIndexOf("String.raw")).split("\n").length;
       assert.deepEqual(
         bareDotSites(injected).map((c) => `${rel}:${c.line}`),
         [`${rel}:${line}`],

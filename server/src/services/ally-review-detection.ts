@@ -185,7 +185,7 @@ export function hasAllyConsolidatedReviewHeading(body: string | null | undefined
 // pairs: what protects a required check from being set on a guess is the
 // exactly-one rule below, not delimiter symmetry, and demanding symmetry only
 // reintroduces the brittleness this is widening away from.
-const MARKDOWN_EMPHASIS_RUN = "[*_`]{0,3}";
+const MARKDOWN_EMPHASIS_RUN = String.raw`[*_\`]{0,3}`;
 
 // Emphasis and whitespace interleave freely around the SHA, so they are matched
 // as one bounded run rather than as an emphasis run that may be followed by
@@ -200,7 +200,7 @@ const MARKDOWN_EMPHASIS_RUN = "[*_`]{0,3}";
 // what keeps this from reading a prose mention: widening the wrapper cannot
 // admit trailing text after the SHA, and the exactly-one rule below — not the
 // wrapper's tightness — is what stops a required check being set on a guess.
-const ATTESTATION_WRAPPER_RUN = "[*_`\\t ]{0,6}";
+const ATTESTATION_WRAPPER_RUN = String.raw`[*_\`\t ]{0,6}`;
 
 // Indentation is bounded to agree with the heading pattern above — see
 // NOT_INDENTED_CODE.
@@ -217,8 +217,8 @@ const ATTESTATION_WRAPPER_RUN = "[*_`\\t ]{0,6}";
 // reintroduce it one delimiter out. Regression cases for all three forms are
 // pinned in ally-review-detection.test.ts.
 const REVIEWED_HEAD_ATTESTATION_PATTERN = new RegExp(
-  `(?:^|\\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \\t]{0,3}reviewed head:[ \\t]*` +
-    `${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}[ \\t]*(?=\\n|$)`,
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \t]{0,3}reviewed head:[ \t]*` +
+    String.raw`${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}[ \t]*(?=\n|$)`,
   "gi",
 );
 
@@ -826,7 +826,7 @@ function hasNonNegatedMatch(text: string, pattern: RegExp): boolean {
 //
 // What the alphabet is needed for is publication: see asPublishableToken.
 const PUBLISHABLE_TOKEN_ALPHABET = String.raw`[a-z][a-z-]*`;
-const PUBLISHABLE_TOKEN_PATTERN = new RegExp(`^${PUBLISHABLE_TOKEN_ALPHABET}$`);
+const PUBLISHABLE_TOKEN_PATTERN = new RegExp(String.raw`^${PUBLISHABLE_TOKEN_ALPHABET}$`);
 
 // Characters of a single model-authored token the gate will quote. The
 // alphabet already rules out a credential; this only keeps one token from
