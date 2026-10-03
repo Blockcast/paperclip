@@ -2511,6 +2511,54 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(updatedIssue?.monitorNextCheckAt === null).toBe(providerQuotaMonitored === 0);
   });
 
+  // PEN-3636: pins the WIRING, which is the one part the prefilter's own suite cannot
+  // reach. `recovery-pause-hold-prefilter.test.ts` constructs its own prefilter and
+  // `isAutomaticRecoverySuppressedByPauseHold`'s no-prefilter path is deliberately
+  // behaviour-preserving, so dropping the `activePauseHoldPrefilter` argument from the
+  // sweep's guard call used to leave BOTH suites green while silently restoring the
+  // O(candidates) company read this whole change exists to remove. The counters make that
+  // observable: with two candidates in one company the company-scoped question is asked
+  // once and answered from the memo thereafter, so a dropped argument reads 0/0 here.
+  it("answers the sweep's per-candidate pause-hold guard from one company-scoped read", async () => {
+    const { companyId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const secondIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId,
+      title: "Second stranded candidate",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    for (const issueId of [sourceIssueId, secondIssueId]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "manual",
+        status: "failed",
+        error: "adapter crashed",
+        errorCode: "adapter_failed",
+        startedAt: new Date("2026-07-15T20:00:00.000Z"),
+        finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+        contextSnapshot: { issueId },
+      });
+    }
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // Both rows reached the guard, so the company question was genuinely asked twice.
+    expect(result.candidatesScanned).toBeGreaterThanOrEqual(2);
+    // Asked of the database exactly once, and served from the memo for every candidate
+    // after the first. `liveReads === 1` is the assertion that goes red if the sweep stops
+    // passing its prefilter; `memoHits` is what that saved.
+    expect(result.pauseHoldPrefilterLiveReads).toBe(1);
+    expect(result.pauseHoldPrefilterMemoHits).toBeGreaterThanOrEqual(1);
+  });
+
   it("schedules a provider-quota monitor for the original assignee without creating recovery work", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     const runId = randomUUID();

@@ -694,13 +694,19 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
   // whole optimisation rests on a DIRECTIONAL invariant — the prefilter's predicate must stay
   // a SUPERSET of the gate's, so that `false` is a proof the gate cannot fire for any issue.
   //
-  // This test exists because that invariant fails SILENTLY and fails OPEN. If a later change
-  // narrows the prefilter relative to the gate — a second `mode`, an expiry or `releasePolicy`
-  // condition added to one and not the other — the prefilter returns `false`, the stranded
-  // sweep auto-recovers issues sitting under a live human pause hold, and every mocked test in
-  // the repo still passes. That is a human stop control failing open, so it is pinned against
-  // real SQL rather than against a fake service.
-  it("keeps hasAnyActivePauseHold a superset of getActivePauseHoldGate", async () => {
+  // That invariant is NOT what this test defends, and the distinction matters enough to state:
+  // it is held by CONSTRUCTION, by both queries composing `activePauseHoldPredicate`
+  // (`issue-tree-control.ts`). A test cannot defend it, because the drift that breaks it is a
+  // term added to one query and not the other — and any fixture this test builds satisfies, or
+  // fails, both new terms together. Adding `isNull(expiresAt)` to the prefilter alone would
+  // leave this fixture's null-expiry hold matching, and every assertion below green, while a
+  // hold that *did* carry an expiry failed open.
+  //
+  // What this test genuinely pins is narrower and still worth having against real SQL rather
+  // than a fake service: a plain active pause hold makes the prefilter `true` while the gate
+  // declines an unrelated issue, and the prefilter is company-scoped. The second is a live
+  // check — drop the `companyId` term and it goes red.
+  it("reports a plain active pause hold to the prefilter, scoped to its own company", async () => {
     const companyId = randomUUID();
     const heldRootIssueId = randomUUID();
     const unrelatedIssueId = randomUUID();
@@ -741,11 +747,10 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
       actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
     });
 
-    // The invariant proper: a hold anywhere in the company makes the prefilter `true` even
-    // for an issue the gate declines. Asserting the gate is null for `unrelatedIssueId` is
-    // what makes this a superset check and not a restatement of the line above — a prefilter
-    // that merely mirrored the gate would return `false` here and the sweep would skip the
-    // ancestor walk for the genuinely held tree.
+    // A hold anywhere in the company makes the prefilter `true` even for an issue the gate
+    // declines. Asserting the gate is null for `unrelatedIssueId` is what keeps this from
+    // being a restatement of the line above — but note it exercises one plain hold, so it
+    // samples the construction-held invariant rather than guarding it.
     expect(await treeSvc.hasAnyActivePauseHold(companyId)).toBe(true);
     expect(await treeSvc.getActivePauseHoldGate(companyId, unrelatedIssueId)).toBeNull();
     expect(await treeSvc.getActivePauseHoldGate(companyId, heldRootIssueId)).not.toBeNull();
