@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { APPROVAL_UNDECIDED_STATUSES } from "@paperclipai/shared";
 import { PaperclipApiClient } from "./client.js";
 import { createToolDefinitions } from "./tools.js";
 
@@ -226,6 +227,31 @@ describe("paperclip MCP tools", () => {
     expect(tool.description).toContain("advisory `duplicateCandidates`");
     expect(tool.description).toContain("never refuse the create");
     expect(tool.description).toContain("independent of `allowDuplicate`");
+  });
+
+  it("documents withdraw as reaching every undecided status, and the note as preserved", () => {
+    const tool = getTool("paperclipApprovalDecision");
+
+    // Tie the prose to the constant the server actually guards on. If a third
+    // undecided status is ever added, this fails and forces the description to
+    // be updated rather than silently under-describing the reachable set.
+    for (const status of APPROVAL_UNDECIDED_STATUSES) {
+      expect(tool.description).toContain(`\`${status}\``);
+    }
+    // The loop alone also passes a description that names both statuses but
+    // ties `revision_requested` to `resubmit` only -- BLO-27406's defect,
+    // re-worded -- because the old text already backticked it. Pin the pairing
+    // that says withdraw reaches both.
+    expect(tool.description).toContain("`pending` **and** `revision_requested`");
+
+    // The exact claim that minted the 118-card revision_requested backlog:
+    // requesters believed a bounced card was unreachable (BLO-27406).
+    expect(tool.description).not.toContain("only while they are still pending");
+
+    // ...and the inverse error, which stops a requester withdrawing at all for
+    // fear of destroying the board's reasoning (BLO-27036).
+    expect(tool.description).toContain("byte-identical");
+    expect(tool.description).toContain("never destroys the board's reasoning");
   });
 
   it("defaults issue document format to markdown", async () => {
