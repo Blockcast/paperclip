@@ -9677,7 +9677,23 @@ export async function buildPaperclipWakePayload(input: {
   // itself: two comments 34s apart, `wakeCommentIds` holding both, the delivered
   // payload holding one, and `{requestedCount: 1, missingCount: 0}` reporting it
   // as whole.
-  const supersededCommentIds = requestedCommentIds.filter((id) => !commentIds.includes(id));
+  //
+  // "Superseded" means the body reaches the run on NEITHER surface, so subtract
+  // both of them. The payload inlines `commentIds` (the issue's newest row); the
+  // task prompt separately renders `deriveCommentId` -- the LAST ABSORBED wake
+  // comment -- and those two are different rows whenever a later non-wake
+  // comment exists, which is exactly the coalesce this fix targets. Subtracting
+  // only the inlined id would name, as "not shown", the one comment the prompt
+  // had just rendered: the count comes out one high and the run is sent to
+  // re-read what it was handed. Do the subtraction HERE rather than at the call
+  // site because this is the only place the pre-cap set exists -- the rendered
+  // id sorts last in `requestedCommentIds` order, so it is precisely the entry
+  // `SUPERSEDED_WAKE_COMMENT_ID_LIMIT` elides first, and a downstream filter
+  // could not then tell "already shown" from "capped away".
+  const renderedWakeCommentId = deriveCommentId(input.contextSnapshot, null);
+  const supersededCommentIds = requestedCommentIds.filter(
+    (id) => !commentIds.includes(id) && id !== renderedWakeCommentId,
+  );
   if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
 
   const commentRows =
@@ -9941,11 +9957,14 @@ export async function buildPaperclipWakePayload(input: {
       requestedCount: commentIds.length,
       includedCount: comments.length,
       missingCount: missingCommentCount,
-      // PEN-3743: absorbed by this wake but deliberately not inlined (see the
-      // freshness override above). `supersededCount` is exact; the id list is
-      // capped so a long coalesce cannot inflate the payload. Counting these
-      // into `fallbackFetchNeeded` is the point of the field -- a run holding
-      // only the newest comment must know to go read the rest.
+      // PEN-3743: absorbed by this wake and shown on NEITHER surface the run
+      // receives -- not inlined in `comments` above (the freshness override),
+      // and not the comment the task prompt renders (see
+      // `renderedWakeCommentId`). `supersededCount` is exact; only the id list
+      // is capped, so a long coalesce still reports its true size without
+      // inflating the payload. Counting these into `fallbackFetchNeeded` is the
+      // point of that field -- a run holding only the newest comment must know
+      // to go read the rest.
       supersededCount: supersededCommentIds.length,
       supersededCommentIds: supersededCommentIds.slice(0, SUPERSEDED_WAKE_COMMENT_ID_LIMIT),
     },
@@ -12140,9 +12159,10 @@ export function buildPaperclipTaskMarkdown(input: {
   if (supersededCount > 0) {
     const plural = supersededCount === 1 ? "comment" : "comments";
     const shown = supersededIds.length > 0 ? ` Ids: ${supersededIds.join(", ")}.` : "";
+    const elidedCount = supersededIds.length > 0 ? supersededCount - supersededIds.length : 0;
     const elided =
-      supersededIds.length > 0 && supersededCount > supersededIds.length
-        ? ` (${supersededCount - supersededIds.length} further id(s) not listed.)`
+      elidedCount > 0
+        ? ` (${elidedCount} further ${elidedCount === 1 ? "id" : "ids"} not listed.)`
         : "";
     lines.push(
       "",
@@ -30209,8 +30229,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ancestors: issueAncestors,
       wakeComment: safeWakeCommentContext,
       // PEN-3743: carry the absorbed-but-not-inlined ids from the payload we
-      // just built into the prompt. Both surfaces are derived from the same
-      // `commentWindow`, so they cannot disagree about what was dropped.
+      // just built into the prompt. The payload subtracts BOTH shown surfaces
+      // -- its own inlined `comments` and the `deriveCommentId` row this call
+      // site renders as `wakeComment` below -- so the list is disjoint from the
+      // body rendered here. It is computed from one `contextSnapshot` (the same
+      // `context` object `wakeCommentId` was derived from above), so the two
+      // surfaces cannot disagree about what was shown.
       supersededWakeCommentIds: paperclipWakePayload?.commentWindow?.supersededCommentIds ?? null,
       supersededWakeCommentCount: paperclipWakePayload?.commentWindow?.supersededCount ?? null,
       interaction: {
