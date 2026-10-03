@@ -419,6 +419,30 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
     adapter.includes(`const GITHUB_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`),
     "the claude_k8s adapter must prepend the same directory the chart names",
   );
+
+  // The third place the directory is named: inside the wrapper scripts
+  // themselves. `git` and `github-mcp-server` chain-load
+  // `<dir>/paperclip-github-token-env` as an ABSOLUTE path, so they do not
+  // track PATH the way their own resolution does — a directory move that
+  // misses them leaves a wrapper that resolves fine and then execs a path
+  // that no longer exists.
+  //
+  // This is deliberately asserted here rather than left to the drift test
+  // below. That test catches it only transitively and only by accident: it
+  // rewrites `/paperclip/.local/bin` to IMAGE_WRAPPER_BIN on the seeded copy
+  // before comparing, so a stale absolute path in the repo copy shows up as a
+  // mismatch. That cover disappears with the seed block in the PEN-3713
+  // follow-up — which is also the change most likely to tidy these paths.
+  for (const name of ["git", "github-mcp-server"]) {
+    const body = fs.readFileSync(
+      path.join(repoRoot, "docker/github-wrappers", name),
+      "utf8",
+    );
+    assert.ok(
+      body.includes(IMAGE_WRAPPER_BIN),
+      `the ${name} wrapper chain-loads an absolute path and must name ${IMAGE_WRAPPER_BIN}: it does not resolve this one through PATH, so a directory move that misses it execs a path that is not there`,
+    );
+  }
 });
 
 // While both generations exist, the repo files and the seed heredocs are two
