@@ -140,6 +140,7 @@ import {
   isAutomaticRecoverySuppressedByPauseHold,
 } from "./pause-hold-guard.js";
 import { createPassTimer, type PassTimer } from "./pass-timing.js";
+import { type AgentRosterMemo, createAgentRosterMemo } from "./agent-roster-memo.js";
 import {
   resolveStrandedEscalationStatus,
   shouldReuseStrandedRecoveryAction,
@@ -2359,8 +2360,19 @@ export function recoveryService(
   async function isAgentInvokable(
     agent: typeof agents.$inferSelect | null | undefined,
     dbOrTx: Db | DbTransaction = db,
+    // PEN-3636: optional, and omitting it preserves today's behaviour exactly — a live
+    // roster read per call. Only the stranded sweep passes one.
+    //
+    // ⚠️ A memo reads on the handle it was BOUND to at construction, which is not
+    // necessarily `dbOrTx`. Binding fixes the memo's own consistency, but it does NOT
+    // make a mismatch here unrepresentable — `AgentRosterMemo` carries no handle in its
+    // type, so a pool-bound memo passed alongside a transaction would serve a roster
+    // that cannot see that transaction's uncommitted writes. Pass a memo only where the
+    // two handles are known to agree; the sole call site today is the sweep, which is on
+    // the pool throughout.
+    rosterMemo?: AgentRosterMemo,
   ) {
-    return (await evaluateAgentInvokabilityFromDb(dbOrTx, agent)).invokable;
+    return (await evaluateAgentInvokabilityFromDb(dbOrTx, agent, rosterMemo)).invokable;
   }
 
   // Budget reads are pure reads, so the tx-scoped service is only ever used to
@@ -9018,6 +9030,13 @@ export function recoveryService(
       // optimisation removed, which turns its saving from a projection into a reading.
       pauseHoldPrefilterLiveReads: 0,
       pauseHoldPrefilterMemoHits: 0,
+      // Company-scoped agent-roster reads taken vs answered from the per-pass memo
+      // (PEN-3636). Counts the SECOND of the two round-trips `agentInvokabilityEvaluated`
+      // sizes; the first (`getAgent`, keyed by agent id) is not memoised and still runs
+      // per candidate. Same reason as the pair above: without this the saving is a
+      // projection rather than a reading.
+      agentRosterMemoLiveReads: 0,
+      agentRosterMemoHits: 0,
       issueIds: [] as string[],
     };
     // Resolved once for the whole pass, not once per candidate. See
@@ -9049,6 +9068,13 @@ export function recoveryService(
     // Bound to the pool handle this sweep reads on, which is what keeps a memo entry from
     // crossing into a transactional caller — see `createActivePauseHoldPrefilter`.
     const activePauseHoldPrefilter = createActivePauseHoldPrefilter(treeControlSvc, db);
+    // The sibling optimisation, on the OTHER per-candidate round-trip. The agent-evaluation
+    // site below takes two reads per candidate; this collapses the one keyed by *company*
+    // (the roster behind `evaluateAgentInvokabilityFromDb`, which has no id filter) and
+    // leaves the per-agent `getAgent` read live. Bound to the same pool handle, for the
+    // same reason. See `createAgentRosterMemo` for the freshness trade — it is narrower
+    // than the prefilter's, because the subject agent's own row is never memoised.
+    const agentRosterMemo = createAgentRosterMemo(db);
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -9185,7 +9211,10 @@ export function recoveryService(
       // are ordered by `companyId`. If this phase is a large share of the pass, the
       // fix is a per-pass memo, not an index.
       const agentInvokable = agent && agent.companyId === issue.companyId
-        ? await passTimer.time("prologue.isAgentInvokable", () => isAgentInvokable(agent))
+        ? await passTimer.time(
+          "prologue.isAgentInvokable",
+          () => isAgentInvokable(agent, db, agentRosterMemo),
+        )
         : false;
       const dependencyBlockedStrand = latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE &&
         (issue.status === "in_review" || !agentInvokable);
@@ -10661,15 +10690,20 @@ export function recoveryService(
     // the `finally` in `reconcileStrandedAssignedIssues`, so it also covers the passes that
     // throw before reaching this point — see the note at that emit site.
     const pauseHoldPrefilterStats = activePauseHoldPrefilter.stats();
+    const agentRosterMemoStats = agentRosterMemo.stats();
     result.candidatesScanned = candidates.length;
     result.pauseHoldPrefilterLiveReads = pauseHoldPrefilterStats.liveReads;
     result.pauseHoldPrefilterMemoHits = pauseHoldPrefilterStats.memoHits;
+    result.agentRosterMemoLiveReads = agentRosterMemoStats.liveReads;
+    result.agentRosterMemoHits = agentRosterMemoStats.memoHits;
     logger.info(
       {
         candidatesScanned: result.candidatesScanned,
         agentInvokabilityEvaluated: result.agentInvokabilityEvaluated,
         pauseHoldPrefilterLiveReads: result.pauseHoldPrefilterLiveReads,
         pauseHoldPrefilterMemoHits: result.pauseHoldPrefilterMemoHits,
+        agentRosterMemoLiveReads: result.agentRosterMemoLiveReads,
+        agentRosterMemoHits: result.agentRosterMemoHits,
         skipped: strandedLoopSkipped,
         reconcileErrors: result.reconcileErrors,
       },
