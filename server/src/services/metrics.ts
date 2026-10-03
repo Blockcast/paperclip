@@ -549,6 +549,32 @@ export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_externa
 // identifies which agent is starved.
 export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_seconds";
 export const QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_queued_run_age_metrics_refresh_success";
+// PEN-3734: age of the oldest *pending* `deferred_issue_execution` wake per
+// agent. A wake deferred behind an issue's execution lock is promoted only
+// when a run on that issue finalizes, one per finalization, and the lock is
+// held globally across agents -- so an agent's comment-delivery latency on a
+// row is bounded below by the queue wait of every other agent's run ahead of
+// it there, a quantity none of them can see or influence. Measured at 10h53m
+// on PEN-3164.
+//
+// Deliberately NOT covered by QUEUED_RUN_OLDEST_AGE_METRIC, and the gap is the
+// whole point: a deferred wake creates NO `heartbeat_runs` row at all (that is
+// the documented contract of the deferral, not an omission), so there is
+// nothing for a run-table gauge to age. Every other surface is blind too --
+// the recipient's seat has no row to find, and the issue's `lastActivityAt` is
+// ADVANCED by each undelivered comment, so staleness sweeps read a starving
+// row as freshly healthy. Only `agent_wakeup_requests` knows, and until this
+// gauge nothing read it.
+//
+// Labeled by bounded agent_id (same allow-list guardrail as
+// QUEUED_RUN_OLDEST_AGE_METRIC) so `max by (agent_id) (...) > threshold` names
+// whose wake is starving. The issue id is NOT a label -- it is unbounded
+// cardinality -- so the refresh logs it instead; see
+// refreshDeferredIssueExecutionWakeAgeMetrics.
+export const DEFERRED_ISSUE_EXECUTION_WAKE_OLDEST_AGE_METRIC =
+  "paperclip_deferred_issue_execution_wake_oldest_age_seconds";
+export const DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_deferred_issue_execution_wake_age_metrics_refresh_success";
 // BLO-28865. Deliberately NOT a threshold over the pre-existing
 // EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC: that gauge is unlabelled and
 // measures reservation age only, so it cannot separate a stranded row from a
@@ -2510,6 +2536,8 @@ let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
 let queuedRunAgeMetricsRefreshSuccess: Gauge | null = null;
+let deferredIssueExecutionWakeOldestAge: Gauge<"agent_id"> | null = null;
+let deferredIssueExecutionWakeAgeMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationsReleasePending: Gauge | null = null;
 let externalRuntimeReservationReleasePendingOldestAge: Gauge | null = null;
 let environmentLeasesOrphanedActive: Gauge | null = null;
@@ -2667,6 +2695,8 @@ function ensureRegistry(): {
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
   queuedRunOldestAgeGauge: Gauge<"agent_id">;
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
+  deferredIssueExecutionWakeOldestAgeGauge: Gauge<"agent_id">;
+  deferredIssueExecutionWakeAgeMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
   scheduledRetryParkHorizonGauge: Gauge<"agent_id" | "reason">;
@@ -2749,6 +2779,8 @@ function ensureRegistry(): {
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
     || !queuedRunOldestAge
+    || !deferredIssueExecutionWakeOldestAge
+    || !deferredIssueExecutionWakeAgeMetricsRefreshSuccess
     || !overdueScheduledRetryOldestAge
     || !overdueScheduledRetryAgeMetricsRefreshSuccess
     || !scheduledRetryParkHorizon
@@ -3382,6 +3414,39 @@ function ensureRegistry(): {
       labelNames: ["agent_id"],
       registers: [registry],
     });
+    deferredIssueExecutionWakeOldestAge = new Gauge({
+      name: DEFERRED_ISSUE_EXECUTION_WAKE_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds since `requested_at` of the oldest agent_wakeup_requests row still "
+        + "sitting in status='deferred_issue_execution' for an agent (PEN-3734). A wake is "
+        + "parked in that status while another run holds the issue's execution lock, and it "
+        + "is promoted ONLY when a run on that issue finalizes, one per finalization, with "
+        + "the lock held globally across agents -- so this age is one agent's wait behind "
+        + "every other agent's run ahead of it on the same row. Distinct from "
+        + QUEUED_RUN_OLDEST_AGE_METRIC
+        + ", which cannot see this at any age: a deferred wake deliberately creates no "
+        + "heartbeat_runs row, so there is nothing for a run-table gauge to age. Refreshed "
+        + "on the scrape-metrics collector tick from a live MIN(requested_at) aggregate, and "
+        + "reset-then-set every refresh (see setDeferredIssueExecutionWakeOldestAgeMetrics) "
+        + "so an agent with nothing deferred reads back an explicit 0 rather than a frozen "
+        + "stale value or an absent series. Ages off `requested_at`, which a coalescing "
+        + "wake does NOT reset, so the value is the full wait of the earliest undelivered "
+        + "comment rather than of the most recent one. Labeled by bounded agent_id; the "
+        + "issue id is unbounded cardinality and is logged by the refresh instead.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    deferredIssueExecutionWakeAgeMetricsRefreshSuccess = new Gauge({
+      name: DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent deferred-issue-execution-wake-age database refresh completed "
+        + "before metrics exposition; 0 when it failed, so stale deferred-wake ages cannot be "
+        + "read as fresh. Separate from " + QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC
+        + " because the two refreshes run different aggregates against different indexes and "
+        + "can fail independently.",
+      registers: [registry],
+    });
+    deferredIssueExecutionWakeAgeMetricsRefreshSuccess.set(0);
     overdueScheduledRetryOldestAge = new Gauge({
       name: OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC,
       help:
@@ -3909,6 +3974,9 @@ function ensureRegistry(): {
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
     queuedRunOldestAgeGauge: queuedRunOldestAge,
+    deferredIssueExecutionWakeOldestAgeGauge: deferredIssueExecutionWakeOldestAge,
+    deferredIssueExecutionWakeAgeMetricsRefreshSuccessGauge:
+      deferredIssueExecutionWakeAgeMetricsRefreshSuccess,
     overdueScheduledRetryOldestAgeGauge: overdueScheduledRetryOldestAge,
     overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
     scheduledRetryParkHorizonGauge: scheduledRetryParkHorizon,
@@ -4402,6 +4470,46 @@ export function setQueuedRunOldestAgeMetrics(
 /** Mark whether the queued-run age gauge was refreshed from the database. */
 export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/**
+ * Publish the oldest pending `deferred_issue_execution` wake age per agent
+ * (PEN-3734).
+ *
+ * Same reset-then-set contract as {@link setQueuedRunOldestAgeMetrics}, and it
+ * is load-bearing for the same reason: a deferred wake's defining property is
+ * that nothing else reports it, so if a promoted agent's series were merely
+ * left alone it would freeze at its last pre-promotion age — permanently above
+ * any threshold, so the page would never clear and the one signal for this
+ * condition would be the signal nobody trusts. Writing an explicit 0 is what
+ * lets the alert resolve.
+ *
+ * `knownAgentIds` bounds the label the same way, and the unknown-agent bucket
+ * is published only when something actually landed in it.
+ */
+export function setDeferredIssueExecutionWakeOldestAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().deferredIssueExecutionWakeOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByAgentId.get(agentId);
+    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  }
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+}
+
+/** Mark whether the deferred-issue-execution wake age gauge was refreshed from the database. */
+export function setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().deferredIssueExecutionWakeAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -5602,6 +5710,8 @@ export function __resetMetricsForTest(): void {
   agentWakeupTerminalFailedOldestAge = null;
   githubWorkflowRunConclusion = null;
   queuedRunOldestAge = null;
+  deferredIssueExecutionWakeOldestAge = null;
+  deferredIssueExecutionWakeAgeMetricsRefreshSuccess = null;
   overdueScheduledRetryOldestAge = null;
   overdueScheduledRetryAgeMetricsRefreshSuccess = null;
   scheduledRetryParkHorizon = null;

@@ -64,6 +64,16 @@ platform cannot resolve automatically. Each runbook should be:
   snapshot cannot be refreshed safely. Trigger: alert
   `PaperclipQueuedRunStranded`, `PaperclipQueuedRunAgeMetricsRefreshFailed`,
   or `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800`.
+- [`deferred-issue-execution-wake.md`](deferred-issue-execution-wake.md) — an
+  `agent_wakeup_requests` row sitting at `status='deferred_issue_execution'`
+  for a long time: one agent's comment to an issue is undeliverable behind
+  another agent's run on that same row, measured at 10h53m. No
+  `heartbeat_runs` row exists for it, so the queued-run runbook above cannot
+  see it at any age, and the issue's `lastActivityAt` is advanced by each
+  undelivered comment so staleness sweeps read the row as healthy. Trigger:
+  alert `PaperclipDeferredIssueExecutionWakeOverdue`,
+  `PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed`, or the log line
+  `deferred behind an issue execution lock`.
 - [`queued-run-stranded.md#agent-start-lock-wedged-pen-3305`](queued-run-stranded.md#agent-start-lock-wedged-pen-3305) —
   an agent has held its per-agent dispatch start lock past the point the code
   itself calls dispatch stopped. This is the *cause* side of the alert above:

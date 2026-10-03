@@ -1681,6 +1681,13 @@
       "when": 1789900000000,
       "tag": "0247_agent_wakeup_requests_timer_baseline_index",
       "breakpoints": true
+    },
+    {
+      "idx": 248,
+      "version": "7",
+      "when": 1790000000000,
+      "tag": "0248_agent_wakeup_requests_deferred_issue_execution_index",
+      "breakpoints": true
     }
   ]
 }

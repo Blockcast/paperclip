@@ -47,5 +47,21 @@ export const agentWakeupRequests = pgTable(
     timerBaselineIdx: index("agent_wakeup_requests_timer_baseline_idx")
       .on(table.agentId, table.requestedAt.desc())
       .where(sql`${table.source} = 'timer'`),
+    // PEN-3734: serves the oldest-pending-deferred-wake age aggregate
+    // (`MIN(requested_at) ... WHERE status = 'deferred_issue_execution'
+    //  GROUP BY agent_id`), run by the scrape-metrics collector every 15s.
+    // Neither index above can bound it: `companyAgentStatusIdx` leads with
+    // `company_id`, so a status-only predicate cannot probe it, and
+    // `agentRequestedIdx` carries no `status`. Without this the aggregate is a
+    // full scan of the largest table in the schema, on a 15s cadence.
+    //
+    // Partial on the one status, `requested_at` ASC after `agent_id` so each
+    // agent's MIN is the first entry under its key. The pending-deferred set is
+    // bounded by the number of issues under concurrent contention — a handful
+    // — and a row leaves the index the moment it is promoted, so the object
+    // stays tiny no matter how large the table grows.
+    deferredIssueExecutionIdx: index("agent_wakeup_requests_deferred_issue_execution_idx")
+      .on(table.agentId, table.requestedAt)
+      .where(sql`${table.status} = 'deferred_issue_execution'`),
   }),
 );
