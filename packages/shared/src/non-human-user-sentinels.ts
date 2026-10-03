@@ -17,6 +17,14 @@
  * `local-board`, each carrying the text "Board direction is required", none
  * ever delivered to a board member.
  *
+ * Not every owner pick routes through this set yet. Two server callers still
+ * pick a recipient by `principalType = "user"` and role rank alone:
+ * `resolveDigestOwnerUserId` (`server/src/services/human-gated-ageing-digest.ts`)
+ * and `resolveEscalationOwnerUserId` (`server/src/services/productivity-review.ts`).
+ * Both rank owners first, then by membership age, so they reach `local-board`
+ * only when no human owner membership predates it. BLO-39642 tracks moving
+ * them onto this set.
+ *
  * Adding an id here says "never hand work to this principal". It does not say
  * "ignore this principal" — agent attribution deliberately still derives
  * through these sentinels (`server/src/services/issues.ts`).
