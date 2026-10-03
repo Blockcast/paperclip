@@ -2870,10 +2870,14 @@ function ensureRegistry(): {
         "Count of heartbeat runs that reached terminal status 'failed', labeled by agent, source issue, "
         + "adapter, error_code, invocation_source (wake reason), and bounded isolation_mode. Used to "
         + "compute webhook-driven PR-review failure rate and detect repeated execution-pod "
-        + "failures (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
-        + "retained for k8s_pod_schedule_failed in every isolation mode (run, workspace and shared are "
-        + "all execution pods); other error codes collapse them to bounded fallbacks. Note issue_id is "
-        + "legitimately 'none' for stateless PR-review runs, which are issue-less by construction.",
+        + "failures (BLO-7457 / BLO-9147 / BLO-17953). agent_id is retained for EVERY error code "
+        + "and bounded to the company agent roster by normalizeAgentId, so agent_id='unknown' means "
+        + "the run carried no agent id or an id that is not a real agent — not that policy collapsed "
+        + "it. issue_id is unbounded and is retained only "
+        + "for k8s_pod_schedule_failed, in every isolation mode (run, workspace and shared are all "
+        + "execution pods); every other error code collapses it to 'none' (BLO-17953 A1f). Note "
+        + "issue_id is also legitimately 'none' for stateless PR-review runs, which are issue-less "
+        + "by construction — that is not an attribution defect.",
       labelNames: ["agent_id", "issue_id", "adapter", "error_code", "invocation_source", "isolation_mode"],
       registers: [registry],
     });
@@ -4094,6 +4098,8 @@ export interface RecordHeartbeatRunFailedInput {
   invocationSource: string | null | undefined;
   /** K8s workspace isolation mode; non-K8s and malformed values become unknown. */
   isolationMode: string | null | undefined;
+  /** Active company agent roster used to bound the `agent_id` label. */
+  knownAgentIds: ReadonlySet<string>;
 }
 
 /**
@@ -4104,34 +4110,44 @@ export interface RecordHeartbeatRunFailedInput {
 export function recordHeartbeatRunFailed(
   input: RecordHeartbeatRunFailedInput,
 ): Record<HeartbeatRunFailedLabel, string> {
-  // Per-issue labels are intentionally limited to the retry-loop failure this
-  // monitor needs. Keeping them on every terminal failure would retain one
-  // Prometheus counter series per historical issue for the process lifetime.
-  // The `error_code` gate alone supplies that bound: it is what confines the
-  // per-issue series to one failure mode.
+  // The two source identifiers have COMPLETELY DIFFERENT cardinality cost, so
+  // BLO-17953 A1f splits them rather than extending one allow-list code by code:
   //
-  // BLO-17953: this deliberately does NOT also gate on `isolationMode === "run"`.
+  //   `issue_id` is UNBOUNDED — it accrues a new permanent series for every
+  //   issue that ever fails — so it stays behind the narrow `error_code` gate
+  //   below. Keeping it on every terminal failure would retain one counter
+  //   series per historical issue for the process lifetime.
+  //
+  //   `agent_id` is BOUNDED BY THE ROSTER (tens) and is therefore retained for
+  //   EVERY error code. That bound is ENFORCED, not asserted: `normalizeAgentId`
+  //   collapses any id outside the company roster to `unknown`, exactly as the
+  //   seven other `agent_id`-labeled recorders in this module do. The roster is
+  //   membership, not runtime status (`agent-roster.ts`), so a paused or retired
+  //   agent still reports under its own id — the only thing that collapses is an
+  //   id that is not a real agent, which is the case worth collapsing. "Which
+  //   lane is losing runs to X" is a question worth answering for every failure
+  //   mode, and answering it per-code meant relitigating the allow-list each
+  //   time (BLO-33441 added exactly one code; A1c proposed another before its
+  //   premise was falsified ~1000x).
+  //
+  // Measured cost before this split (2026-10-03, 7d): 153 of 543 series sat at
+  // agent_id="unknown". They now fan out by the agents that actually produce
+  // them — bounded above by 153 x roster(~21), and in practice far less. The
+  // unbounded dimension is untouched, which is what makes that bound hold.
+  //
+  // BLO-17953: this deliberately does NOT gate on `isolationMode === "run"`.
   // `resolveK8sRunIsolationIdentity` returns run | workspace | shared for every
   // k8s adapter and all three are execution pods, so gating on "run" erased
-  // `agent_id` AND `issue_id` together — one boolean feeds both labels below —
-  // for the majority of the population the alert exists to catch (measured
-  // 2026-09-12: 54.1 of 96.2 pod-schedule failures over 24h sat in
-  // workspace/shared and were therefore unattributable). Narrowing by isolation
-  // mode never added a cardinality bound; the error code already was the bound.
+  // both labels together for the majority of the population the alert exists to
+  // catch (measured 2026-09-12: 54.1 of 96.2 pod-schedule failures over 24h sat
+  // in workspace/shared and were therefore unattributable). Narrowing by
+  // isolation mode never added a cardinality bound; the error code already was
+  // the bound — and it bounds `issue_id` only.
   const isolationMode = normalizeIsolationMode(input.isolationMode);
-  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed";
-  // BLO-33441: `agent_id` only — NOT `issue_id`. "Which lane is losing runs to
-  // proxy startup" is the question this code exists to answer, and the agent
-  // roster is bounded (tens), so the series count is bounded with it. `issue_id`
-  // is unbounded and stays collapsed, which is the distinction the comment above
-  // is really about.
-  const retainAgentId = retainSourceIds
-    || input.errorCode === CAVEMAN_PROXY_NOT_READY_ERROR_CODE;
+  const retainIssueId = input.errorCode === "k8s_pod_schedule_failed";
   const labels = {
-    agent_id: retainAgentId && typeof input.agentId === "string" && input.agentId.length > 0
-      ? input.agentId
-      : UNKNOWN_AGENT_ID,
-    issue_id: retainSourceIds && typeof input.issueId === "string" && input.issueId.length > 0
+    agent_id: normalizeAgentId(input.agentId, input.knownAgentIds),
+    issue_id: retainIssueId && typeof input.issueId === "string" && input.issueId.length > 0
       ? input.issueId
       : "none",
     adapter: typeof input.adapter === "string" && input.adapter.length > 0 ? input.adapter : "unknown",

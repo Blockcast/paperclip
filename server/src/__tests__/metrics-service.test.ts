@@ -361,6 +361,12 @@ describe("normalizeInvocationSource", () => {
 });
 
 describe("recordHeartbeatRunFailed + renderMetrics", () => {
+  // The roster that bounds `agent_id` (BLO-17953 A1f). `normalizeAgentId`
+  // enforces it, so anything outside this set collapses to UNKNOWN_AGENT_ID —
+  // see "collapses an off-roster agent id" below, which is what makes the
+  // "roster-bounded" claim in the HELP string testable rather than aspirational.
+  const ROSTER: ReadonlySet<string> = new Set(["agent-a", "agent-b"]);
+
   it("registers the counter so /metrics carries its TYPE line before any event", async () => {
     const { contentType, body } = await renderMetrics();
     expect(contentType).toContain("text/plain");
@@ -375,6 +381,7 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
       errorCode: "k8s_pod_schedule_failed",
       invocationSource: "github_pr_review_submitted",
       isolationMode: "run",
+      knownAgentIds: ROSTER,
     });
     expect(labels).toEqual({
       agent_id: "agent-a",
@@ -409,6 +416,7 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
         errorCode: "k8s_pod_schedule_failed",
         invocationSource: "github_pr_review_submitted",
         isolationMode,
+        knownAgentIds: ROSTER,
       });
 
       expect(labels).toEqual({
@@ -432,7 +440,7 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
     "workspace_validation_failed",
     "setup_failed",
   ])(
-    "collapses issue_id/agent_id for pre-dispatch setup failure %s (BLO-28648)",
+    "collapses issue_id (but NOT agent_id) for pre-dispatch setup failure %s (BLO-28648)",
     async (errorCode) => {
       const labels = recordHeartbeatRunFailed({
         agentId: "agent-a",
@@ -441,23 +449,28 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
         errorCode,
         invocationSource: "capacity_blocked_retry",
         isolationMode: "shared",
+        knownAgentIds: ROSTER,
       });
-      // Only k8s_pod_schedule_failed keeps the real ids (in every isolation mode,
-      // BLO-17953). Every other code — including every workspace refusal —
-      // collapses them, so a Prometheus selector of the form
+      // Only k8s_pod_schedule_failed keeps the real issue_id (in every isolation
+      // mode, BLO-17953). Every other code — including every workspace refusal —
+      // collapses it, so a Prometheus selector of the form
       // `error_code="<workspace code>", issue_id!="none"` can never match.
       // BLO-28648 shipped exactly that alert; it loaded healthy and could not
       // fire. Assert the collapse so the impossibility stays documented.
       expect(labels.issue_id).toBe("none");
-      expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
+      // BLO-17953 A1f: agent_id is NOT collapsed — it is roster-bounded, so it
+      // is retained for every error code. "Which lane is losing runs to this
+      // workspace refusal" is answerable without touching the unbounded label.
+      expect(labels.agent_id).toBe("agent-a");
       expect(labels.error_code).toBe(errorCode);
     },
   );
 
-  // The cardinality bound is the error code, not the isolation mode: a
-  // non-pod-schedule failure must still collapse both source identifiers even
-  // in `run` isolation, or every historical issue retains a series.
-  it("still collapses source identifiers for non-pod-schedule failures in run isolation", async () => {
+  // The cardinality bound is the error code, and it binds `issue_id` ONLY: a
+  // non-pod-schedule failure must still collapse the unbounded identifier even
+  // in `run` isolation, or every historical issue retains a series. agent_id
+  // rides through because the roster bounds it (BLO-17953 A1f).
+  it("still collapses issue_id, but keeps agent_id, for non-pod-schedule failures in run isolation", async () => {
     const labels = recordHeartbeatRunFailed({
       agentId: "agent-a",
       issueId: "issue-a",
@@ -465,10 +478,62 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
       errorCode: "job_failed",
       invocationSource: "github_pr_review_submitted",
       isolationMode: "run",
+      knownAgentIds: ROSTER,
+    });
+
+    expect(labels.agent_id).toBe("agent-a");
+    expect(labels.issue_id).toBe("none");
+  });
+
+  // BLO-17953 A1f: the capability this split buys is FAN-OUT — "which lane is
+  // losing runs to <code>" — so assert two agents on ONE non-allow-listed code
+  // render as two distinct series. Every other assertion in this block checks a
+  // single agent's label value and would still pass if per-agent attribution
+  // were re-collapsed at the registry level; this one would not.
+  it("fans a non-allow-listed error code out into one series per agent", async () => {
+    for (const agentId of ["agent-a", "agent-b"]) {
+      recordHeartbeatRunFailed({
+        agentId,
+        issueId: "issue-a",
+        adapter: "claude_k8s",
+        errorCode: "external_lifecycle_stale_killed",
+        invocationSource: "github_pr_review_submitted",
+        isolationMode: "run",
+        knownAgentIds: ROSTER,
+      });
+    }
+
+    const { body } = await renderMetrics();
+    const series = body
+      .split("\n")
+      .filter((line) =>
+        line.startsWith(`${HEARTBEAT_RUN_FAILED_METRIC}{`)
+        && line.includes(`error_code="external_lifecycle_stale_killed"`));
+    expect(series).toHaveLength(2);
+    expect(series.some((line) => line.includes(`agent_id="agent-a"`))).toBe(true);
+    expect(series.some((line) => line.includes(`agent_id="agent-b"`))).toBe(true);
+    // Fan-out is on the BOUNDED dimension only: the unbounded one stays collapsed.
+    expect(series.every((line) => line.includes(`issue_id="none"`))).toBe(true);
+  });
+
+  // The roster bound is ENFORCED, not merely documented. An id that is not a
+  // real agent — a retired row, a synthetic id from a future caller — collapses,
+  // so the HELP string's "bounded to the company agent roster" is true of the
+  // code and not only of today's three call sites, which all happen to pass a
+  // loaded `agents.id`. Membership is what the roster tracks, not runtime
+  // status, so a paused agent still reports under its own id.
+  it("collapses an off-roster agent id to the bounded fallback", async () => {
+    const labels = recordHeartbeatRunFailed({
+      agentId: "agent-not-on-the-roster",
+      issueId: "issue-a",
+      adapter: "claude_k8s",
+      errorCode: "job_failed",
+      invocationSource: "github_pr_review_submitted",
+      isolationMode: "run",
+      knownAgentIds: ROSTER,
     });
 
     expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
-    expect(labels.issue_id).toBe("none");
   });
 
   it("collapses unknown invocation source to the bounded fallback (cardinality guardrail)", async () => {
@@ -479,12 +544,13 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
       errorCode: "process_lost",
       invocationSource: "some_unlisted_source",
       isolationMode: "workspace",
+      knownAgentIds: ROSTER,
     });
     expect(labels.invocation_source).toBe(UNKNOWN_INVOCATION_SOURCE);
 
     const { body } = await renderMetrics();
     expect(body).toContain(
-      `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="${UNKNOWN_AGENT_ID}",issue_id="none",adapter="claude_k8s",error_code="process_lost",invocation_source="${UNKNOWN_INVOCATION_SOURCE}",isolation_mode="workspace"} 1`,
+      `${HEARTBEAT_RUN_FAILED_METRIC}{agent_id="agent-a",issue_id="none",adapter="claude_k8s",error_code="process_lost",invocation_source="${UNKNOWN_INVOCATION_SOURCE}",isolation_mode="workspace"} 1`,
     );
   });
 
@@ -496,6 +562,7 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
       errorCode: "",
       invocationSource: "capacity_blocked_retry",
       isolationMode: "invalid",
+      knownAgentIds: ROSTER,
     });
     expect(labels).toEqual({
       agent_id: UNKNOWN_AGENT_ID,
@@ -515,6 +582,7 @@ describe("recordHeartbeatRunFailed + renderMetrics", () => {
       errorCode: "k8s_pod_schedule_failed",
       invocationSource: "transient_failure_retry",
       isolationMode: "run",
+      knownAgentIds: ROSTER,
     };
     recordHeartbeatRunFailed(input);
     recordHeartbeatRunFailed(input);
