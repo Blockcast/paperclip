@@ -7107,6 +7107,8 @@ export function buildHeartbeatRunFailedMetricInput(input: {
   issueId: string | null;
   run: { errorCode: string | null; contextSnapshot: unknown };
   k8sRunIsolation: { isolationMode: string } | null;
+  /** Active company agent roster used to bound the `agent_id` label. */
+  knownAgentIds: ReadonlySet<string>;
 }) {
   const contextSnapshotObj = parseObject(input.run.contextSnapshot);
   const persistedIsolation = parseObject(contextSnapshotObj.paperclipK8sIsolation);
@@ -7115,6 +7117,7 @@ export function buildHeartbeatRunFailedMetricInput(input: {
     issueId: input.issueId,
     adapter: input.agent.adapterType,
     errorCode: input.run.errorCode,
+    knownAgentIds: input.knownAgentIds,
     invocationSource:
       readNonEmptyString(contextSnapshotObj.wakeReason) ??
       readNonEmptyString(contextSnapshotObj.retryReason),
@@ -25536,6 +25539,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId: readNonEmptyString(parseObject(finalizedRun.contextSnapshot).issueId),
         run: finalizedRun,
         k8sRunIsolation: null,
+        knownAgentIds: await getActiveAgentIds(db, finalizationAgent.companyId),
       }));
     }
 
@@ -34666,6 +34670,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueId,
             run: livenessRun,
             k8sRunIsolation,
+            knownAgentIds: await getActiveAgentIds(db, agent.companyId),
           }));
         }
         await recordZeroTokenCompletedRunStreak(agent);
@@ -35154,6 +35159,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   issueId: setupFailureIssueId,
                   run: livenessRun,
                   k8sRunIsolation: null,
+                  knownAgentIds: await getActiveAgentIds(db, failedAgent.companyId),
                 }));
                 await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
               }
