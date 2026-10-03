@@ -186,7 +186,12 @@ export async function evaluateAgentInvokabilityFromDb(
 
 export function listInvalidOrgChainDescendantIds(
   terminatedAgentId: string,
-  companyAgents: AgentOrgRow[],
+  // `readonly` for the same reason as `evaluateAgentInvokability` (PEN-3636): this is the
+  // module's other company-roster consumer, and a memo hands the SAME frozen array to
+  // every hit. Nothing here mutates the input — rows are pushed into map-owned arrays
+  // built locally and `stack` is a fresh spread — so this is a no-op for both existing
+  // callers, which pass mutable arrays. It only stops the type refusing a frozen roster.
+  companyAgents: readonly AgentOrgRow[],
 ): string[] {
   const byManager = new Map<string | null, AgentOrgRow[]>();
   for (const row of companyAgents) {

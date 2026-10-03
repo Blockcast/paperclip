@@ -2707,6 +2707,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(updatedIssue?.monitorNextCheckAt === null).toBe(providerQuotaMonitored === 0);
   });
 
+  // PEN-3636: a frozen clock for the two per-pass memos, shared by the two call-site tests
+  // below. Both assert `liveReads === 1`, which is meant to be a claim about WIRING; against
+  // the real clock it is also a claim about SPEED, because the memos' TTL is wall-clock and
+  // a sweep that stalls past it between two candidates re-reads. Embedded Postgres under
+  // parallel vitest can stall that long, so the assertion could go red for a reason that has
+  // nothing to do with what it tests. Frozen rather than a huge `ttlMs` on purpose: the
+  // expiry arithmetic still runs against the real `DEFAULT_*_TTL_MS`, it just cannot advance.
+  const frozenPerPassMemoClock = () => Date.parse("2026-07-15T20:30:00.000Z");
+
   // PEN-3636: pins the WIRING, which is the one part the prefilter's own suite cannot
   // reach. `recovery-pause-hold-prefilter.test.ts` constructs its own prefilter and
   // `isAutomaticRecoverySuppressedByPauseHold`'s no-prefilter path is deliberately
@@ -2742,7 +2751,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         contextSnapshot: { issueId },
       });
     }
-    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+      perPassMemoClockForTest: frozenPerPassMemoClock,
+    });
 
     const result = await recovery.reconcileStrandedAssignedIssues();
 
@@ -2796,7 +2808,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         contextSnapshot: { issueId },
       });
     }
-    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const recovery = recoveryService(db, {
+      enqueueWakeup: vi.fn(async () => null),
+      perPassMemoClockForTest: frozenPerPassMemoClock,
+    });
 
     const result = await recovery.reconcileStrandedAssignedIssues();
 
