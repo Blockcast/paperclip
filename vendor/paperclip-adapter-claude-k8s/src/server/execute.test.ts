@@ -125,6 +125,12 @@ const {
 // the `instanceof` guard under test compares against.
 const { ClaudeSkillSourceUnavailableError } = await import("./prompt-cache.js");
 
+// Not mocked (the only `vi.mock` above passes job-manifest's exports through),
+// so this is the exact producer the adapter stamps onto the Job.  The reap
+// guard's positive control calls it rather than restating its output — see
+// `isReapablePodLogPath` below.
+const { buildPodLogPath } = await import("./job-manifest.js");
+
 function makeJob(opts: {
   runId?: string;
   name?: string;
@@ -2439,10 +2445,14 @@ describe("isReapablePodLogPath", () => {
     expect(isReapablePodLogPath("/etc/kubernetes/admin.conf")).toBe(false);
   });
 
+  // The guard's only positive control, so it calls `buildPodLogPath` rather
+  // than restating what it emits.  A literal here would keep passing if the
+  // producer ever changed its root or suffix, while the guard started
+  // rejecting every real annotation and the foreign reap silently stopped
+  // unlinking — the exact producer/consumer drift this ticket is about.
   it("accepts what buildPodLogPath actually produces", () => {
-    expect(
-      isReapablePodLogPath("/paperclip/instances/default/data/run-logs/c/a/r.pod.ndjson"),
-    ).toBe(true);
+    expect(isReapablePodLogPath(buildPodLogPath("c", "a", "r"))).toBe(true);
+    expect(isReapablePodLogPath(buildPodLogPath("c", "a", "r", "iso"))).toBe(true);
   });
 });
 
