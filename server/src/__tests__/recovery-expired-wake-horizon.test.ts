@@ -53,10 +53,11 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     // One TRUNCATE ... CASCADE rooted at `companies` reaches every table this
     // suite writes, so cleanup cannot go stale against a new FK. The burst case
     // drives `reconcileStrandedBlockedIssues`, which writes an
-    // `issue.stranded_blocked_reconciled` activity_log row per issue it resumes
-    // — and `activity_log` FKs onto `companies`, `agents` AND `heartbeat_runs`,
-    // the last two without an `onDelete` action (BLO-22231). A hand-ordered
-    // delete list has to get all three right; this gets them for free.
+    // `issue.stranded_blocked_reconciled` activity_log row per issue it resumes.
+    // That row populates `company_id` only today, but `activity_log` carries FKs
+    // to `companies`, `agents` AND `heartbeat_runs`, the last two without an
+    // `onDelete` action (BLO-22231) — so a hand-ordered delete list has to track
+    // every FK this table grows; this gets them for free.
     await truncateCompanyScopedTestState(db);
   });
 
