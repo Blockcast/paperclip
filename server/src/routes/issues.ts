@@ -1409,6 +1409,30 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "heartbeat.disabled",
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
+  // PEN-3727: every reason below is written by `heartbeat.wakeup` on a path that
+  // deliberately produces NO `heartbeat_runs` row -- the wake is deferred behind the
+  // issue execution lock, merged into a live run, or suppressed outright. Those are
+  // exactly the cases an operator reaches this route to explain ("my comment woke
+  // nobody"), and this route is the only surface that can read `agent_wakeup_requests`
+  // at all. Projecting them to "other" erased the answer: a PEN-3164 comment wake sat
+  // `deferred_issue_execution` for 10h53m behind another agent's queued run, and the
+  // one row that said so reported `reason: "other"`. All are server-authored literals,
+  // so admitting them widens nothing -- the allowlist exists to keep operator- and
+  // adapter-supplied strings out of the response, not these.
+  "issue_execution_deferred",
+  "issue_execution_promoted",
+  "issue_execution_same_name",
+  "issue_execution_issue_not_found",
+  "issue_external_wait_wake_suppressed",
+  "issue_rewake_throttled",
+  "retry_execution_duplicate",
+  "github_state_change_queued_coalesced",
+  "task_scope_queued_coalesced",
+  "zero_token_session_reset_superseded",
+  "pipeline_stage_exit_cancellation_pending",
+  "provider_capacity_deferred",
+  "worktree_execution_cutoff",
+  "no_in_flight_work",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
