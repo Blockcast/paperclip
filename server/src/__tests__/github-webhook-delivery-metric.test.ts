@@ -32,7 +32,7 @@ import {
   normalizeGithubWebhookEvent,
   renderMetrics,
 } from "../services/metrics.js";
-import { githubWebhookRoutes } from "../routes/github-webhook.js";
+import { WAKE_DRIVING_EVENTS, githubWebhookRoutes } from "../routes/github-webhook.js";
 import type { Db } from "../db.js";
 
 const WEBHOOK_SECRET = "test-webhook-secret";
@@ -186,6 +186,23 @@ describe("paperclip_github_webhook_delivery_total", () => {
 
     expect(await deliveryLabelPairs()).toEqual(before);
     expect(await deliveryValue("other", "rejected_signature")).toBe(forgeries.length);
+  });
+
+  // The allowlist is `WAKE_DRIVING_EVENTS` + `ping`, and nothing but this
+  // test keeps it that way. Adding a wake-driving event without adding it to
+  // the allowlist compiles and ships: the counter keeps working, and the new
+  // event is silently bucketed into `other`, so per-event attribution for the
+  // one event someone just cared about is the thing that breaks. The failure
+  // is safe (no cardinality growth) and invisible, so it would outlive anyone
+  // remembering the invariant. Set comparison, not length — equal counts with
+  // a swapped member is exactly the drift being guarded against.
+  it("keeps the metric allowlist in lockstep with the events the receiver wakes on", () => {
+    expect(new Set(KNOWN_GITHUB_WEBHOOK_EVENTS)).toEqual(new Set([...WAKE_DRIVING_EVENTS, "ping"]));
+    // Positive control: `ping` is in the allowlist and deliberately NOT a
+    // wake-driving event, so a test that dropped the `"ping"` term would be
+    // asserting a falsehood rather than a weaker truth.
+    expect(WAKE_DRIVING_EVENTS.has("ping")).toBe(false);
+    expect(KNOWN_GITHUB_WEBHOOK_EVENTS).toContain("ping");
   });
 });
 

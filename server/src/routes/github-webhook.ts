@@ -263,7 +263,14 @@ export interface GithubWebhookConfig {
 
 // GitHub event names that should drive a wake. Anything not in this
 // set is acked with 200 + "ignored" so retries don't pile up.
-const WAKE_DRIVING_EVENTS = new Set([
+//
+// Exported solely so the delivery-counter test can assert
+// KNOWN_GITHUB_WEBHOOK_EVENTS === this set + "ping". That invariant was
+// true-by-inspection and unenforced: adding an event here would compile,
+// ship, and silently bucket it into `other`, leaving the counter working
+// and its per-event attribution quietly wrong. Safe-and-invisible is the
+// pairing that outlives whoever remembers it, hence the test.
+export const WAKE_DRIVING_EVENTS = new Set([
   "check_run",
   "check_suite",
   "dependabot_alert",
@@ -5022,7 +5029,14 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // refused at our own edge — one of the shape-B causes this counter is
     // for. Closing it means hoisting this listener into a middleware mounted
     // before the parser; deliberately not done here. GitHub does not emit
-    // malformed JSON, so the reachable half is the 10 MB cap.
+    // malformed JSON, so the reachable half is the 10 MB cap — and the
+    // reachable BAND is 10-25 MB: GitHub caps payloads at 25 MB and does not
+    // deliver at all above that, so >25 MB never reaches us to be counted,
+    // while 10-25 MB arrives and is 413'd here, uncounted. A `check_suite`
+    // or `workflow_run` body on a large matrix, or a `push` carrying many
+    // commits, is what lands in that band. Named explicitly so an operator
+    // debugging a flatline has a payload size to go check before concluding
+    // the hook is dead.
     res.on("close", () => {
       // A throw here is an uncaught exception, not a 500: this listener runs
       // outside Express's error handling, so an unguarded metrics fault would
