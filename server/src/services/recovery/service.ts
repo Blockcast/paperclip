@@ -129,7 +129,10 @@ import {
   withRecoveryModelProfileHint,
   withStrandedRecoveryWakeWorkClass,
 } from "./model-profile-hint.js";
-import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import {
+  createActivePauseHoldPrefilter,
+  isAutomaticRecoverySuppressedByPauseHold,
+} from "./pause-hold-guard.js";
 import { createPassTimer, type PassTimer } from "./pass-timing.js";
 import {
   resolveStrandedEscalationStatus,
@@ -8909,6 +8912,38 @@ export function recoveryService(
       // every candidate ordered after it.
       reconcileErrors: 0,
       skipped: 0,
+      // PEN-3636 — the pass's own cost, which the funnel never reported.
+      //
+      // This sweep is 85% of the recovery chain (29 m 21 s of a 34 m 31 s chain, measured
+      // 2026-09-29), and until now NOTHING it emitted said how much work it took on. Every
+      // other field here counts an OUTCOME; none counts an INPUT, so cost-per-candidate —
+      // the central quantity of PEN-3636 — was not derivable from a pass at all. The one
+      // place `candidates.length` surfaced was inside the dependency-wait log below, which
+      // fires only when `dependencyWaitEscalationSuppressed > 0`; a pass that purely skipped
+      // reported nothing. Worse, the funnel itself is logged by `index.ts` only when one of
+      // seven action counters is non-zero, so a slow pass that changed no state was silent
+      // end to end.
+      //
+      // ⚠️ Do not reconstruct this from `skipped`. `skipped` is one counter incremented at
+      // 39 distinct sites, and its arms overlap other fields — a suppressed dependency-wait
+      // escalation returns null from `escalateStrandedAssignedIssue` and every call site
+      // books that null as `skipped`, so `skipped + dependencyWaitEscalationSuppressed`
+      // double-counts. An earlier revision of PEN-3636's own notes made exactly that error.
+      candidatesScanned: 0,
+      // Candidates that reached the agent-evaluation site, i.e. survived every guard ahead
+      // of it. Named separately from `skipped` because it sizes the next per-candidate cost
+      // on this path: that site takes TWO round-trips (`getAgent`, then
+      // `evaluateAgentInvokabilityFromDb`, which re-reads the whole company agent roster
+      // with no id filter). Whether batching those is worth anything depends entirely on
+      // this number, and it was previously unobservable — `skipped` lumps the four guards
+      // ahead of it together with 35 later exits, so the deep-path population could not be
+      // separated from the shallow one.
+      agentInvokabilityEvaluated: 0,
+      // Company-scoped pause-hold reads taken vs answered from the per-pass memo (PEN-3636,
+      // #2194). `pauseHoldPrefilterMemoHits` is precisely the number of round-trips that
+      // optimisation removed, which turns its saving from a projection into a reading.
+      pauseHoldPrefilterLiveReads: 0,
+      pauseHoldPrefilterMemoHits: 0,
       issueIds: [] as string[],
     };
     // Resolved once for the whole pass, not once per candidate. See
@@ -8927,6 +8962,19 @@ export function recoveryService(
     const openPullRequestAttendanceGraceMs = recoverySweepConfig.openPullRequestAttendanceGraceMs;
     const pendingBoardApprovalAttendanceGraceMs =
       recoverySweepConfig.pendingBoardApprovalAttendanceGraceMs;
+    // PEN-3636: same shape as `recoverySweepConfig` above — a read whose answer is
+    // constant across candidates, hoisted so its cost is O(companies) rather than
+    // O(candidates). The pause-hold guard below runs once per candidate and its first
+    // query is scoped to the *company*, so a pass that skipped 2,234 candidates issued at
+    // least that many reads that are byte-identical within each company. At the measured
+    // ~110 ms per round-trip (queueing, not execution — Done-when #2) that is minutes of a
+    // single pass spent re-asking one question. Constructed per pass, never module-level,
+    // and bounded by its own TTL so a long pass cannot widen the staleness window; see
+    // `createActivePauseHoldPrefilter` for the freshness trade this makes. How much it
+    // actually removes is no longer projected: `pauseHoldPrefilterMemoHits` counts it.
+    // Bound to the pool handle this sweep reads on, which is what keeps a memo entry from
+    // crossing into a transactional caller — see `createActivePauseHoldPrefilter`.
+    const activePauseHoldPrefilter = createActivePauseHoldPrefilter(treeControlSvc, db);
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -8961,9 +9009,24 @@ export function recoveryService(
         return;
       }
 
+      // Merge note (PEN-3636): #2128 landed this guard wrapped in a phase timer with the
+      // 4-arg signature; this PR REPLACES the call with the 6-arg prefiltered form. Both
+      // changes land on the same statement, so the resolution is replace-then-re-wrap, NOT
+      // "take both" — keeping both calls would run the pause-hold guard twice per candidate
+      // and cancel this PR's entire saving, while `prologue.pauseHoldGuard` went on
+      // reporting a timing that confirmed a fix that had not landed. Nothing catches that
+      // automatically: it typechecks, and the `pauseHoldPrefilterLiveReads === 1` assertion
+      // still passes because the duplicate would be the un-prefiltered 4-arg form.
       if (await passTimer.time(
         "prologue.pauseHoldGuard",
-        () => isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc),
+        () => isAutomaticRecoverySuppressedByPauseHold(
+          db,
+          issue.companyId,
+          issue.id,
+          treeControlSvc,
+          db,
+          activePauseHoldPrefilter,
+        ),
       )) {
         result.skipped += 1;
         return;
@@ -9036,6 +9099,10 @@ export function recoveryService(
       // Non-null only on the handover path; every recovery mutation below CASes
       // against it so a lost race takes no side effect.
       const adoptionHandoverLockGuard = adoptionHandover?.lockOwnerState ?? null;
+      // Counted BEFORE the reads, for the same reason the prefilter counts on entry: this
+      // sizes the population that reaches the two round-trips below, and a candidate whose
+      // `getAgent` throws still paid for one.
+      result.agentInvokabilityEvaluated += 1;
       const agent = await passTimer.time("prologue.getAgent", () => getAgent(agentId));
       // Timed apart from `getAgent` on purpose: this one is not a primary-key read.
       // `evaluateAgentInvokabilityFromDb` selects EVERY agent row in the company to
@@ -10460,6 +10527,11 @@ export function recoveryService(
       "orphanBlockerSweep",
       () => reconcileUnassignedBlockingIssues(),
     );
+    // Snapshot BEFORE the merge below. `result.skipped` is about to absorb a different
+    // sweep's tally, and `candidatesScanned` counts only this one's candidates — logging
+    // the merged figure against it would invite a skip-rate that is not a rate of
+    // anything. PEN-3636.
+    const strandedLoopSkipped = result.skipped;
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
@@ -10500,9 +10572,35 @@ export function recoveryService(
       );
     }
 
-    // PEN-3636: the phase-timing line is NOT emitted here. It is emitted from the
-    // `finally` in `reconcileStrandedAssignedIssues`, which also covers the passes
-    // that throw before reaching this point — see the note at that emit site.
+    // PEN-3636: the pass's cost, emitted unconditionally and separately from the
+    // state-change logs.
+    //
+    // Deliberately NOT folded into the `dependencyWaitEscalationSuppressed > 0` line
+    // above, nor into `index.ts`'s "changed assigned issue state" warn: both are gated on
+    // something having *happened*, and the pass this row exists to explain is precisely
+    // the one where nothing happens for half an hour. Gating cost telemetry on state
+    // change is what made a 29-minute pass invisible. One INFO line per pass is negligible
+    // volume — the chain is serialized by `heartbeatRecoveryChainInFlight`, so this cannot
+    // fire more often than a pass completes.
+    //
+    // This funnel line is NOT the phase-timing line #2128 added. That one is emitted from
+    // the `finally` in `reconcileStrandedAssignedIssues`, so it also covers the passes that
+    // throw before reaching this point — see the note at that emit site.
+    const pauseHoldPrefilterStats = activePauseHoldPrefilter.stats();
+    result.candidatesScanned = candidates.length;
+    result.pauseHoldPrefilterLiveReads = pauseHoldPrefilterStats.liveReads;
+    result.pauseHoldPrefilterMemoHits = pauseHoldPrefilterStats.memoHits;
+    logger.info(
+      {
+        candidatesScanned: result.candidatesScanned,
+        agentInvokabilityEvaluated: result.agentInvokabilityEvaluated,
+        pauseHoldPrefilterLiveReads: result.pauseHoldPrefilterLiveReads,
+        pauseHoldPrefilterMemoHits: result.pauseHoldPrefilterMemoHits,
+        skipped: strandedLoopSkipped,
+        reconcileErrors: result.reconcileErrors,
+      },
+      "stranded assigned issue sweep completed",
+    );
 
     return result;
   }

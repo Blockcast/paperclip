@@ -78,6 +78,35 @@ const TERMINAL_ISSUE_STATUSES = new Set<IssueStatus>(["done", "cancelled"]);
 const ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const DEFAULT_RELEASE_POLICY: IssueTreeHoldReleasePolicy = { strategy: "manual" };
 const MAX_PAUSE_HOLD_ANCESTOR_DEPTH = 100;
+
+/**
+ * The one definition of "an active pause hold in this company".
+ *
+ * PEN-3636: `hasAnyActivePauseHold` is a company-scoped prefilter for
+ * `getActivePauseHoldGate`, and that optimisation is only sound while the prefilter's
+ * predicate is a SUPERSET of the gate's. Narrow the prefilter relative to the gate and
+ * `false` stops being a proof that the gate cannot fire, so the stranded sweep
+ * auto-recovers issues sitting under a live human pause hold — a stop control failing
+ * open, silently, with every mocked test still green.
+ *
+ * Composing both from this one expression is what makes the superset property hold by
+ * CONSTRUCTION rather than by test: a later term (a second `mode`, an expiry, a
+ * `releasePolicy` condition) necessarily lands on both or on neither. Do not re-inline
+ * it — a copy is exactly the drift this exists to make unrepresentable.
+ *
+ * `activePauseHoldsForIssueIds` composes it too, and deliberately NARROWS it with a
+ * further `inArray` on the root issue. That is a subset of the gate's population by
+ * construction as well, which is what that caller wants; it is not a third independent
+ * definition.
+ */
+function activePauseHoldPredicate(companyId: string) {
+  return and(
+    eq(issueTreeHolds.companyId, companyId),
+    eq(issueTreeHolds.status, "active"),
+    eq(issueTreeHolds.mode, "pause"),
+  );
+}
+
 export const ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS: ReadonlySet<string> = new Set([
   "issue_commented",
   "issue_reopened_via_comment",
@@ -561,13 +590,34 @@ export function issueTreeControlService(db: Db) {
       .from(issueTreeHolds)
       .where(
         and(
-          eq(issueTreeHolds.companyId, companyId),
-          eq(issueTreeHolds.status, "active"),
-          eq(issueTreeHolds.mode, "pause"),
+          activePauseHoldPredicate(companyId),
           inArray(issueTreeHolds.rootIssueId, issueIds),
         ),
       )
       .orderBy(asc(issueTreeHolds.createdAt), asc(issueTreeHolds.id));
+  }
+
+  /**
+   * Whether the company has any active pause hold at all, ignoring which tree it roots.
+   *
+   * This is `getActivePauseHoldGate`'s own first question, asked on its own — both read
+   * `activePauseHoldPredicate`, so the superset relation they depend on is structural and
+   * not merely asserted. That gate returns `null` before it ever looks at the issue when
+   * this is false, so a `false` here is a sound proof that the gate cannot fire for *any*
+   * issue in the company — which is what lets a sweep answer thousands of per-candidate
+   * gate calls from one company-scoped read. `true` proves nothing about a given issue:
+   * the ancestor walk still has to run, so callers must fall through to the full gate.
+   */
+  async function hasAnyActivePauseHold(
+    companyId: string,
+    dbOrTx: Pick<Db, "select"> = db,
+  ): Promise<boolean> {
+    return dbOrTx
+      .select({ id: issueTreeHolds.id })
+      .from(issueTreeHolds)
+      .where(activePauseHoldPredicate(companyId))
+      .limit(1)
+      .then((rows) => rows.length > 0);
   }
 
   async function getActivePauseHoldGate(
@@ -584,13 +634,7 @@ export function issueTreeControlService(db: Db) {
         releasePolicy: issueTreeHolds.releasePolicy,
       })
       .from(issueTreeHolds)
-      .where(
-        and(
-          eq(issueTreeHolds.companyId, companyId),
-          eq(issueTreeHolds.status, "active"),
-          eq(issueTreeHolds.mode, "pause"),
-        ),
-      )
+      .where(activePauseHoldPredicate(companyId))
       .orderBy(asc(issueTreeHolds.createdAt), asc(issueTreeHolds.id));
     if (activePauseHolds.length === 0) return null;
 
@@ -1213,6 +1257,7 @@ export function issueTreeControlService(db: Db) {
     getHold,
     listHolds,
     getActivePauseHoldGate,
+    hasAnyActivePauseHold,
     releaseHold,
     cancelUnclaimedWakeupsForTree,
   };
