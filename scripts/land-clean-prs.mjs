@@ -239,7 +239,7 @@ export function latestCheckStates(rollup) {
       context?.completedAt || context?.startedAt || context?.createdAt || "",
     );
     const stamp = Number.isFinite(at) ? at : 0;
-    const key = `${context?.__typename ?? ""} ${name}`;
+    const key = `${context?.__typename ?? ""}\u0000${name}`;
     const seen = latest.get(key);
     if (!seen || stamp >= seen.stamp) latest.set(key, { name, state, stamp });
   }
