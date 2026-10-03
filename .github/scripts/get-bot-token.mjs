@@ -52,6 +52,13 @@ export const RATE_LIMIT_RETRY_BUDGET_MS = 120_000;
 // never read as a quality or security verdict on the diff.
 export const RATE_LIMIT_NOT_EVALUATED = 'RATE_LIMIT_NOT_EVALUATED';
 
+// Same marker idea for a transient upstream failure (PEN-3760). A 5xx and an
+// exhausted rate limit evaluate exactly the same amount of the diff — nothing —
+// but only the rate limit used to say so, and the 5xx was reported as a
+// verdict. Separate constant because the two have different remedies: a rate
+// limit says "wait for the window", a 5xx says "re-run now".
+export const TRANSIENT_UPSTREAM_NOT_EVALUATED = 'TRANSIENT_UPSTREAM_NOT_EVALUATED';
+
 // A plain 403 is a permission denial and must NOT be retried, so a rate-limit
 // signal is required on top of the status.
 export function isRateLimited(status, headers, body) {
@@ -61,6 +68,16 @@ export function isRateLimited(status, headers, body) {
     headers.get('x-ratelimit-remaining') === '0' ||
     /rate limit/i.test(body)
   );
+}
+
+// 5xx is GitHub failing to answer, not an answer about the diff. Status alone
+// decides it: unlike isRateLimited there is no header or body corroboration to
+// look for, and no 5xx is a statement about the request's content. This only
+// classifies — it deliberately does not make the request retryable, because
+// sizing retries against the step budget is a separate judgement (see the
+// qualityRetryBudgetMs docblock) and mislabelling is the defect being fixed.
+export function isTransientUpstreamFailure(status) {
+  return status >= 500 && status <= 599;
 }
 
 export function rateLimitWaitMs(headers, now = Date.now()) {
@@ -122,7 +139,21 @@ export async function ghFetch(path, token, options = {}) {
     // over a newer run's. BLO-19827 re-baselined on exactly this: retry reads,
     // never writes.
     if (method !== 'GET' || !isRateLimited(res.status, res.headers, text)) {
-      throw new Error(`GitHub API ${method} ${path} → ${res.status}: ${text}`);
+      const err = new Error(`GitHub API ${method} ${path} → ${res.status}: ${text}`);
+      // A GET that 5xx'd returned no data, so whatever the caller was going to
+      // evaluate it never got to evaluate (PEN-3760). Mark it so exitFatal says
+      // "did not evaluate" instead of letting the workflow assert a finding and
+      // point at a commitperclip comment that was never posted.
+      //
+      // GET only, matching the read/write split above: a failed write can
+      // follow a verdict that WAS computed, so relabelling it would replace one
+      // misreport with its mirror image.
+      if (method === 'GET' && isTransientUpstreamFailure(res.status)) {
+        err.notEvaluated =
+          `${TRANSIENT_UPSTREAM_NOT_EVALUATED}: GitHub returned ${res.status} for ${path}, so the read never ` +
+          'completed and no gate ran. This is an upstream failure, not a finding — re-run the job.';
+      }
+      throw err;
     }
 
     const waitMs = rateLimitWaitMs(res.headers);
@@ -147,7 +178,8 @@ export async function ghFetch(path, token, options = {}) {
 
 // Every gate script funnels its fatal path through here so a failure that
 // evaluated nothing cannot be read as a verdict on the code: a rate-limit
-// exhaustion (ghFetch sets err.rateLimited), or any error a caller marks with
+// exhaustion (ghFetch sets err.rateLimited), a transient upstream 5xx on a read
+// (ghFetch sets err.notEvaluated, PEN-3760), or any error a caller marks with
 // err.notEvaluated = '<why no gate ran>'. Without this the failing check is
 // indistinguishable from a genuine finding (BLO-37010).
 export function exitFatal(err, gateLabel, exit = process.exit, outputFile = process.env.GITHUB_OUTPUT) {
