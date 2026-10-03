@@ -649,13 +649,21 @@ COPY --from=ponytail-marketplace /opt/penstock/ponytail /opt/penstock/ponytail
 # whose value is a command substitution adopts that command's exit status, so a
 # `find` that errors aborts the build instead of yielding an empty string that
 # `test -z` reads as success. See Dockerfile.runtime for the full argument.
+#
+# The offending path is echoed before failing because `-print` writes into the
+# command substitution, so without this the build log carries only a non-zero
+# exit for the whole RUN and the inode that tripped it is never named. This
+# guard aborts the image build when it fires, and the first time it did the
+# cause (`-perm /022` matching node_modules/.bin symlinks) took a round trip to
+# identify. `|| { ...; false; }` rather than `if`: the failing branch must keep
+# the RUN non-zero, and `echo` on its own would succeed and pass the build.
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps --cache /root/.npm /tmp/paperclip-bundled-adapters/*.tgz \
   && rm -rf /tmp/paperclip-bundled-adapters \
   && chown -R root:root /opt/paperclip-bundled-adapters \
   && chmod -R go-w /opt/paperclip-bundled-adapters \
   && offender="$(find /opt/paperclip-bundled-adapters \( ! -user root -o \( ! -type l -a -perm /022 \) \) -print -quit)" \
-  && test -z "$offender"
+  && { test -z "$offender" || { echo "PEN-3715: agent-writable inode in bundled adapter tree: $offender" >&2; false; }; }
 
 # Keep dependency trees in their own stable layer. Ordinary source edits only
 # replace the much smaller source/compiled payload and do not re-upload pnpm's

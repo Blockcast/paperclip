@@ -113,11 +113,17 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # GNU `-perm /022` or `-quit` spellings) aborts the build. Written the other
 # way the substitution yields an empty string, `test -z` succeeds, and the
 # check passes precisely in the base-image-swap scenario it exists for.
+#
+# The offending path is echoed before failing: `-print` writes into the command
+# substitution, so otherwise the build log shows only a bare non-zero exit for
+# the whole RUN and never names the inode. Kept identical to the server image's
+# spelling, which is the call site where the walk actually reaches a populated
+# tree and where the message therefore has something to disambiguate.
 RUN mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
   && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \
   && chown -R node:node /paperclip \
   && offender="$(find /opt/paperclip-bundled-adapters \( ! -user root -o \( ! -type l -a -perm /022 \) \) -print -quit)" \
-  && test -z "$offender"
+  && { test -z "$offender" || { echo "PEN-3715: agent-writable inode in bundled adapter tree: $offender" >&2; false; }; }
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/paperclip-consult-codex.sh /usr/local/bin/paperclip-consult-codex

@@ -213,8 +213,15 @@ describe("paperclip agent Dockerfile", () => {
     // abort the build; `test -z "$(find ...)"` discards find's exit status and
     // reads an empty-because-errored substitution as success. Both are
     // executed against a real fixture tree below, not merely pinned here.
+    //
+    // The `|| { echo ...; false; }` arm names the offending inode. It is
+    // pinned, not just tolerated: `-print` writes into the command
+    // substitution, so dropping the echo returns the guard to failing the
+    // whole RUN with no indication of which path tripped it. `false` is part
+    // of the pin too — an `echo` alone exits 0 and would turn the guard into
+    // a warning that passes the build.
     const ownedByRootAndNotGroupOtherWritable =
-      'offender="$(find /opt/paperclip-bundled-adapters \\( ! -user root -o \\( ! -type l -a -perm /022 \\) \\) -print -quit)" \\\n  && test -z "$offender"';
+      'offender="$(find /opt/paperclip-bundled-adapters \\( ! -user root -o \\( ! -type l -a -perm /022 \\) \\) -print -quit)" \\\n  && { test -z "$offender" || { echo "PEN-3715: agent-writable inode in bundled adapter tree: $offender" >&2; false; }; }';
     expect(server).toContain("chown -R root:root /opt/paperclip-bundled-adapters");
     expect(server).toContain("chmod -R go-w /opt/paperclip-bundled-adapters");
     expect(server).toContain(ownedByRootAndNotGroupOtherWritable);
@@ -302,6 +309,18 @@ describe("paperclip agent Dockerfile", () => {
         return (error as { status?: number }).status ?? 1;
       }
     };
+    // Same invocation, but captures stderr so the diagnostic arm can be proved
+    // to RESOLVE $offender rather than merely to be present in the file.
+    const guardStderrWith = (script: string, dir: string): string => {
+      try {
+        execFileSync("sh", ["-c", script.replace("/opt/paperclip-bundled-adapters", dir)], {
+          stdio: ["ignore", "ignore", "pipe"],
+        });
+        return "";
+      } catch (error) {
+        return String((error as { stderr?: Buffer }).stderr ?? "");
+      }
+    };
     const selfUid = process.getuid?.() ?? 0;
     const runGuard = (dir: string): number =>
       runGuardWith(guard.replace("! -user root", `! -uid ${selfUid}`), dir);
@@ -312,6 +331,8 @@ describe("paperclip agent Dockerfile", () => {
     // uids happen to be unused on the runner.
     const runGuardOwnershipArm = (dir: string): number =>
       runGuardWith(guard.replace("! -user root", `! -uid ${selfUid + 1}`), dir);
+    const guardStderr = (dir: string): string =>
+      guardStderrWith(guard.replace("! -user root", `! -uid ${selfUid}`), dir);
 
     const root = mkdtempSync(path.join(tmpdir(), "pen3715-guard-"));
     try {
@@ -373,9 +394,31 @@ describe("paperclip agent Dockerfile", () => {
       //    notice if `! -user root` were dropped from the `\( ... -o ... \)`
       //    grouping. Re-anchored to a uid the fixture cannot carry, it must
       //    report the very tree control 1 passes. That closes the one
-      //    restructuring the text pins at :293 would still accept: a rewrite
-      //    that keeps the substring but detaches it from the -o alternation.
+      //    restructuring the `expect(guard).toContain(...)` sanity pins above
+      //    would still accept: a rewrite that keeps the substring but
+      //    detaches it from the -o alternation.
       expect(runGuardOwnershipArm(root)).not.toBe(0);
+
+      // 7. The failure must NAME the offender, not merely be non-zero. Every
+      //    control above runs with stderr discarded and judges exit status
+      //    alone, so none of them would notice the `echo` being dropped — and
+      //    the guard would be back to aborting the whole RUN with no
+      //    indication of which inode tripped it, which is what cost a round
+      //    trip the first time it fired. The `ownedByRootAndNotGroupOtherWritable`
+      //    pin proves the echo was written; only executing it proves
+      //    `$offender` is in scope where it runs, which is the half a pin
+      //    cannot establish. Placed last so it cannot perturb 1-6, and it
+      //    removes its own file regardless.
+      const named = path.join(root, "named.js");
+      writeFileSync(named, "\n");
+      chmodSync(named, 0o664);
+      try {
+        expect(runGuard(root)).not.toBe(0);
+        expect(guardStderr(root)).toContain(named);
+      } finally {
+        rmSync(named);
+      }
+      expect(runGuard(root)).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
