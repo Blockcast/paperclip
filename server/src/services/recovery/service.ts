@@ -133,6 +133,7 @@ import {
   createActivePauseHoldPrefilter,
   isAutomaticRecoverySuppressedByPauseHold,
 } from "./pause-hold-guard.js";
+import { type AgentRosterMemo, createAgentRosterMemo } from "./agent-roster-memo.js";
 import {
   resolveStrandedEscalationStatus,
   shouldReuseStrandedRecoveryAction,
@@ -2291,6 +2292,24 @@ export function recoveryService(
       issueId: string;
       blockedByIssueIds: string[];
     }) => Promise<void> | void;
+    /**
+     * Test-only clock for the sweep's two per-pass memos (PEN-3636), threaded into the
+     * `now` seam both factories already expose. Production leaves this unset and both
+     * take `Date.now`.
+     *
+     * ⚠️ Why this exists: the call-site tests assert `liveReads === 1`, which is a claim
+     * about WIRING, but against the real clock it is also a claim about SPEED — the
+     * memos' 5 s TTL is wall-clock, so a DB-backed sweep that stalls >5 s between two
+     * candidates re-reads and the assertion goes red for a reason unrelated to what it
+     * tests. Embedded Postgres under parallel vitest can do that, and this row's own
+     * production figure (~787 ms–1.77 s per candidate) is the same order as the budget.
+     *
+     * A FROZEN clock rather than an enormous `ttlMs`: freezing leaves the real default
+     * TTL in the comparison (`readAt - cached.readAt` is 0, still measured against
+     * `DEFAULT_*_TTL_MS`), where a huge TTL would route the tests past the expiry
+     * arithmetic entirely and stop exercising it.
+     */
+    perPassMemoClockForTest?: () => number;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -2317,8 +2336,19 @@ export function recoveryService(
   async function isAgentInvokable(
     agent: typeof agents.$inferSelect | null | undefined,
     dbOrTx: Db | DbTransaction = db,
+    // PEN-3636: optional, and omitting it preserves today's behaviour exactly — a live
+    // roster read per call. Only the stranded sweep passes one.
+    //
+    // ⚠️ A memo reads on the handle it was BOUND to at construction, which is not
+    // necessarily `dbOrTx`. Binding fixes the memo's own consistency, but it does NOT
+    // make a mismatch here unrepresentable — `AgentRosterMemo` carries no handle in its
+    // type, so a pool-bound memo passed alongside a transaction would serve a roster
+    // that cannot see that transaction's uncommitted writes. Pass a memo only where the
+    // two handles are known to agree; the sole call site today is the sweep, which is on
+    // the pool throughout.
+    rosterMemo?: AgentRosterMemo,
   ) {
-    return (await evaluateAgentInvokabilityFromDb(dbOrTx, agent)).invokable;
+    return (await evaluateAgentInvokabilityFromDb(dbOrTx, agent, rosterMemo)).invokable;
   }
 
   // Budget reads are pure reads, so the tx-scoped service is only ever used to
@@ -8761,6 +8791,13 @@ export function recoveryService(
       // optimisation removed, which turns its saving from a projection into a reading.
       pauseHoldPrefilterLiveReads: 0,
       pauseHoldPrefilterMemoHits: 0,
+      // Company-scoped agent-roster reads taken vs answered from the per-pass memo
+      // (PEN-3636). Counts the SECOND of the two round-trips `agentInvokabilityEvaluated`
+      // sizes; the first (`getAgent`, keyed by agent id) is not memoised and still runs
+      // per candidate. Same reason as the pair above: without this the saving is a
+      // projection rather than a reading.
+      agentRosterMemoLiveReads: 0,
+      agentRosterMemoHits: 0,
       issueIds: [] as string[],
     };
     // Resolved once for the whole pass, not once per candidate. See
@@ -8791,7 +8828,16 @@ export function recoveryService(
     // actually removes is no longer projected: `pauseHoldPrefilterMemoHits` counts it.
     // Bound to the pool handle this sweep reads on, which is what keeps a memo entry from
     // crossing into a transactional caller — see `createActivePauseHoldPrefilter`.
-    const activePauseHoldPrefilter = createActivePauseHoldPrefilter(treeControlSvc, db);
+    const activePauseHoldPrefilter = createActivePauseHoldPrefilter(treeControlSvc, db, {
+      now: deps.perPassMemoClockForTest,
+    });
+    // The sibling optimisation, on the OTHER per-candidate round-trip. The agent-evaluation
+    // site below takes two reads per candidate; this collapses the one keyed by *company*
+    // (the roster behind `evaluateAgentInvokabilityFromDb`, which has no id filter) and
+    // leaves the per-agent `getAgent` read live. Bound to the same pool handle, for the
+    // same reason. See `createAgentRosterMemo` for the freshness trade — it is narrower
+    // than the prefilter's, because the subject agent's own row is never memoised.
+    const agentRosterMemo = createAgentRosterMemo(db, { now: deps.perPassMemoClockForTest });
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -8905,7 +8951,7 @@ export function recoveryService(
       result.agentInvokabilityEvaluated += 1;
       const agent = await getAgent(agentId);
       const agentInvokable = agent && agent.companyId === issue.companyId
-        ? await isAgentInvokable(agent)
+        ? await isAgentInvokable(agent, db, agentRosterMemo)
         : false;
       const dependencyBlockedStrand = latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE &&
         (issue.status === "in_review" || !agentInvokable);
@@ -10365,15 +10411,20 @@ export function recoveryService(
     // volume — the chain is serialized by `heartbeatRecoveryChainInFlight`, so this cannot
     // fire more often than a pass completes.
     const pauseHoldPrefilterStats = activePauseHoldPrefilter.stats();
+    const agentRosterMemoStats = agentRosterMemo.stats();
     result.candidatesScanned = candidates.length;
     result.pauseHoldPrefilterLiveReads = pauseHoldPrefilterStats.liveReads;
     result.pauseHoldPrefilterMemoHits = pauseHoldPrefilterStats.memoHits;
+    result.agentRosterMemoLiveReads = agentRosterMemoStats.liveReads;
+    result.agentRosterMemoHits = agentRosterMemoStats.memoHits;
     logger.info(
       {
         candidatesScanned: result.candidatesScanned,
         agentInvokabilityEvaluated: result.agentInvokabilityEvaluated,
         pauseHoldPrefilterLiveReads: result.pauseHoldPrefilterLiveReads,
         pauseHoldPrefilterMemoHits: result.pauseHoldPrefilterMemoHits,
+        agentRosterMemoLiveReads: result.agentRosterMemoLiveReads,
+        agentRosterMemoHits: result.agentRosterMemoHits,
         skipped: strandedLoopSkipped,
         reconcileErrors: result.reconcileErrors,
       },
