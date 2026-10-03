@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildLedger, readReport } from "../vitest-flake-ledger.mjs";
+import { buildLedger, classify, readReport } from "../vitest-flake-ledger.mjs";
 
 const runnerPath = (rel) => `/home/runner/_work/paperclip/paperclip/${rel}`;
 
@@ -74,6 +74,45 @@ test("buildLedger separates flaky from always-failing and drops always-passing",
     ],
     "always-passing tests must not appear at all",
   );
+});
+
+test("a test observed only once is not filed as broken, however large the batch", () => {
+  // Ally's reproduction on #2206. The batch has THREE runs, so a batch-level
+  // `total < 2` guard does not engage -- but `new one` is still 1/1, which is
+  // arithmetically identical to the most broken test in the batch. Filing it
+  // under "broken, not flaky" tells a reader someone already knows about it,
+  // which is the one heading that makes a row likely to be skipped.
+  const old = (s) => ["server/src/a.test.ts", "passed", [["old one", s]]];
+  const fresh = ["server/src/b.test.ts", "passed", [["new one", "failed"]]];
+  const rows = buildLedger([
+    { runId: 1, reports: [report([old("failed")])] },
+    { runId: 2, reports: [report([old("passed")])] },
+    { runId: 3, reports: [report([old("passed"), fresh])] },
+  ]);
+
+  assert.deepEqual(
+    rows.map((r) => [
+      r.key,
+      `${r.failedIn.length}/${r.observedIn.length}`,
+      classify(r),
+    ]),
+    [
+      ["server/src/a.test.ts > old one", "1/3", "flaky"],
+      ["server/src/b.test.ts > new one", "1/1", "unclassified"],
+    ],
+  );
+});
+
+test("classify subsumes the single-run batch without a special case", () => {
+  // Over one run every row is 1/1, so none of them can be classified -- which
+  // is what the deleted `total < 2` branch used to say at the batch level.
+  const rows = buildLedger([
+    {
+      runId: 1,
+      reports: [report([["server/src/a.test.ts", "passed", [["t", "failed"]]]])],
+    },
+  ]);
+  assert.deepEqual(rows.map(classify), ["unclassified"]);
 });
 
 test("a failure in any shard of a run counts once for that run", () => {
