@@ -236,7 +236,10 @@ export function buildAlert({
   // the lane has been refreshed. Saying only one of them would either understate
   // the outage or point at a run that no longer exists.
   const stallSince = stallStartedAt ?? oldest.createdAt;
-  const superseded = stallSince !== oldest.createdAt;
+  // Instants, not strings: selectStuckApproval normalizes stallStartedAt through
+  // toISOString() (`16:39:45.000Z`) while `gh run list` emits createdAt at second
+  // precision (`16:39:45Z`), so the same instant never compares equal as text.
+  const superseded = Date.parse(stallSince) !== Date.parse(oldest.createdAt);
 
   return {
     labels: {

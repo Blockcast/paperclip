@@ -235,6 +235,28 @@ test('buildAlert: no run-level identity reaches the alert — it is terminal sec
   assert.match(alert.annotations.summary, /10\.0h/);
 });
 
+test('buildAlert: an unsuperseded stall does not claim a supersede for a second-precision createdAt', () => {
+  // `gh run list` emits createdAt at second precision, and selectStuckApproval
+  // normalizes stallStartedAt through toISOString(), so the two spell the same
+  // instant differently. Every other fixture here is already `.000Z`, which makes
+  // that normalization a no-op; this one is not.
+  const verdict = selectStuckApproval({
+    pendingRuns: [waitingRun('2026-09-01T02:00:00Z')],
+    alertAfterHours: 6,
+    now: NOW,
+  });
+  assert.equal(verdict.stallStartedAt, '2026-09-01T02:00:00.000Z');
+  const alert = buildAlert({
+    ...verdict,
+    alertAfterHours: 6,
+    runUrl: 'https://github.com/Blockcast/paperclip/actions/runs/99',
+    repo: 'Blockcast/paperclip',
+    environment: 'paperclip-production',
+    now: NOW,
+  });
+  assert.doesNotMatch(alert.annotations.description, /superseded at least once/);
+});
+
 test('buildAlert: the call to action is the waiting-runs queue, never the perishable run url', () => {
   // BLO-26972. The escalate step runs BEFORE the supersede step that cancels the
   // run it names — measured 6s apart on 2026-09-19, and the alert then carried
