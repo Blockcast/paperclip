@@ -9,8 +9,9 @@ import {
 /**
  * PEN-3636. `reconcileStrandedAssignedIssues` calls the pause-hold guard once per
  * candidate, and the guard's first read is scoped to the *company* — identical for every
- * candidate of that company. At ~3.2k candidates and a measured ~110 ms per round-trip
- * (queueing, not execution) that one repeated question costs minutes of a single pass.
+ * candidate of that company. At a measured lower bound of 2,234 candidates in one pass and
+ * ~110 ms per round-trip (queueing, not execution) that one repeated question costs minutes
+ * of a single pass.
  *
  * These tests pin the three properties the optimisation rests on, because each of them
  * fails silently if broken: a prefilter that never caches is merely slow (invisible), one
@@ -19,9 +20,9 @@ import {
  * exactly the pass-duration-scaled staleness the TTL exists to cap.
  *
  * The directional invariant these rest on — that `hasAnyActivePauseHold`'s predicate stays a
- * SUPERSET of `getActivePauseHoldGate`'s — cannot be pinned here, because this file mocks the
- * service away. It is pinned against real SQL in `issue-tree-control-service.test.ts`
- * ("keeps hasAnyActivePauseHold a superset of getActivePauseHoldGate").
+ * SUPERSET of `getActivePauseHoldGate`'s — is not pinned here and is not pinned by any test.
+ * It holds by construction: both compose `activePauseHoldPredicate` in
+ * `issue-tree-control.ts`, so a new term lands on both queries or on neither.
  */
 
 type FakeSvc = {
@@ -43,7 +44,7 @@ const db = {} as never;
 describe("active pause-hold prefilter", () => {
   it("answers repeated candidates of one company from a single company-scoped read", async () => {
     const svc = fakeTreeControlSvc({ anyHold: false });
-    const prefilter = createActivePauseHoldPrefilter({ now: () => 1_000 });
+    const prefilter = createActivePauseHoldPrefilter(svc as never, db, { now: () => 1_000 });
 
     for (let i = 0; i < 50; i += 1) {
       const suppressed = await isAutomaticRecoverySuppressedByPauseHold(
@@ -65,7 +66,7 @@ describe("active pause-hold prefilter", () => {
 
   it("caches per company, so one company's answer never serves another", async () => {
     const svc = fakeTreeControlSvc({ anyHold: false });
-    const prefilter = createActivePauseHoldPrefilter({ now: () => 1_000 });
+    const prefilter = createActivePauseHoldPrefilter(svc as never, db, { now: () => 1_000 });
 
     await isAutomaticRecoverySuppressedByPauseHold(db, "company-1", "i1", svc as never, db, prefilter);
     await isAutomaticRecoverySuppressedByPauseHold(db, "company-2", "i2", svc as never, db, prefilter);
@@ -85,7 +86,7 @@ describe("active pause-hold prefilter", () => {
     // Note the memo does store `true` — what must never happen is the caller *acting* on it
     // without the walk, which is what this asserts.
     const svc = fakeTreeControlSvc({ anyHold: true, gate: null });
-    const prefilter = createActivePauseHoldPrefilter({ now: () => 1_000 });
+    const prefilter = createActivePauseHoldPrefilter(svc as never, db, { now: () => 1_000 });
 
     for (let i = 0; i < 5; i += 1) {
       const suppressed = await isAutomaticRecoverySuppressedByPauseHold(
@@ -105,7 +106,7 @@ describe("active pause-hold prefilter", () => {
   it("bounds staleness by the TTL rather than by pass duration", async () => {
     const svc = fakeTreeControlSvc({ anyHold: false });
     let clock = 0;
-    const prefilter = createActivePauseHoldPrefilter({ ttlMs: 5_000, now: () => clock });
+    const prefilter = createActivePauseHoldPrefilter(svc as never, db, { ttlMs: 5_000, now: () => clock });
 
     await isAutomaticRecoverySuppressedByPauseHold(db, "c", "i1", svc as never, db, prefilter);
     clock = 4_999;
@@ -128,7 +129,7 @@ describe("active pause-hold prefilter", () => {
       })),
     };
     let clock = 0;
-    const prefilter = createActivePauseHoldPrefilter({ ttlMs: 5_000, now: () => clock });
+    const prefilter = createActivePauseHoldPrefilter(svc as never, db, { ttlMs: 5_000, now: () => clock });
 
     expect(
       await isAutomaticRecoverySuppressedByPauseHold(db, "c", "i1", svc as never, db, prefilter),
@@ -174,7 +175,7 @@ describe("active pause-hold prefilter", () => {
     // number of company-scoped reads that did not happen, or the figure reported on the
     // issue is not a measurement of anything.
     const svc = fakeTreeControlSvc({ anyHold: false });
-    const prefilter = createActivePauseHoldPrefilter({ now: () => 1_000 });
+    const prefilter = createActivePauseHoldPrefilter(svc as never, db, { now: () => 1_000 });
 
     expect(prefilter.stats()).toEqual({ liveReads: 0, memoHits: 0 });
 
@@ -205,7 +206,7 @@ describe("active pause-hold prefilter", () => {
       }),
       getActivePauseHoldGate: vi.fn(async () => null),
     };
-    const prefilter = createActivePauseHoldPrefilter({ now: () => 1_000 });
+    const prefilter = createActivePauseHoldPrefilter(svc as never, db, { now: () => 1_000 });
 
     await expect(
       isAutomaticRecoverySuppressedByPauseHold(db, "c", "i1", svc as never, db, prefilter),
@@ -225,7 +226,7 @@ describe("active pause-hold prefilter", () => {
       }),
       getActivePauseHoldGate: vi.fn(async () => ({ holdId: "h1" })),
     };
-    const prefilter = createActivePauseHoldPrefilter({ now: () => 1_000 });
+    const prefilter = createActivePauseHoldPrefilter(svc as never, db, { now: () => 1_000 });
 
     await expect(
       isAutomaticRecoverySuppressedByPauseHold(db, "c", "i1", svc as never, db, prefilter),

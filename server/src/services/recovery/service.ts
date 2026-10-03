@@ -9009,7 +9009,9 @@ export function recoveryService(
     // and bounded by its own TTL so a long pass cannot widen the staleness window; see
     // `createActivePauseHoldPrefilter` for the freshness trade this makes. How much it
     // actually removes is no longer projected: `pauseHoldPrefilterMemoHits` counts it.
-    const activePauseHoldPrefilter = createActivePauseHoldPrefilter();
+    // Bound to the pool handle this sweep reads on, which is what keeps a memo entry from
+    // crossing into a transactional caller — see `createActivePauseHoldPrefilter`.
+    const activePauseHoldPrefilter = createActivePauseHoldPrefilter(treeControlSvc, db);
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)

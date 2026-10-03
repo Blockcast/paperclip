@@ -28,11 +28,7 @@ export type ActivePauseHoldPrefilterStats = {
 };
 
 export type ActivePauseHoldPrefilter = {
-  companyHasActivePauseHold(
-    companyId: string,
-    treeControlSvc: IssueTreeControlService,
-    dbOrTx: Pick<Db, "select">,
-  ): Promise<boolean>;
+  companyHasActivePauseHold(companyId: string): Promise<boolean>;
   stats(): ActivePauseHoldPrefilterStats;
 };
 
@@ -49,13 +45,12 @@ export type ActivePauseHoldPrefilter = {
  * scales with candidates-per-company, so it is largest exactly where the sweep is slowest;
  * it is not assumed to be one company.
  *
- * ⚠️ 2,234 is a **lower bound on candidates, not a count of them**, and an earlier revision
- * of this comment got that wrong — it read "~3.2k candidates (`skipped: 2234` plus 994
- * suppressed)", adding two populations that overlap. `dependencyWaitEscalationSuppressed`
- * counts suppressions *inside* `escalateStrandedAssignedIssue`, which returns null, and
- * every call site books that null as `result.skipped += 1`. The 994 are therefore a subset
- * of the 2,234, not a disjoint addend. The true candidate count is not derivable from the
- * funnel at all — which is why `candidatesScanned` is now a first-class field on it.
+ * ⚠️ 2,234 is a **lower bound on candidates, not a count of them**, and the two funnel
+ * populations must not be added: `dependencyWaitEscalationSuppressed` counts suppressions
+ * *inside* `escalateStrandedAssignedIssue`, which returns null, and every call site books
+ * that null as `result.skipped += 1`. The 994 are therefore a subset of the 2,234, not a
+ * disjoint addend. The true candidate count is not derivable from the funnel at all —
+ * which is why `candidatesScanned` is now a first-class field on it.
  *
  * Scope the memo to one pass and construct it there; a module-level cache would leak
  * across requests and across companies' lifetimes.
@@ -79,20 +74,23 @@ export type ActivePauseHoldPrefilter = {
  * Only the negative SHORT-CIRCUITS. Both outcomes are memoised — `cache.set` below runs
  * unconditionally — but only `false` ends the call there. When a company does have a hold
  * the caller falls through to the full gate, whose ancestor walk is per-issue and stays
- * entirely live, so the issue-specific half of the decision is never served from cache.
- * (An earlier revision of this comment said "only the negative is cached", which described
- * no conditional that exists. A memoised `true` costs one extra live gate call and decides
- * nothing by itself, which is why caching it is harmless; the load-bearing property is the
- * short-circuit, not the storage.)
+ * entirely live, so the issue-specific half of the decision is never served from cache. A
+ * memoised `true` costs one extra live gate call and decides nothing by itself, which is
+ * why caching it is harmless; the load-bearing property is the short-circuit, not the
+ * storage.
  *
- * ⚠️ Do not share a prefilter across different `dbOrTx` handles. The memo is keyed by
- * company alone, so an entry populated on the pool would be served to a caller running
- * inside a transaction — which `issue-tree-control-service.test.ts` ("routes
- * getActivePauseHoldGate through tx so callers see uncommitted txn state") exists to
- * guarantee against. The sweep reads on the pool throughout; a transactional caller
- * wanting this should construct its own, or pass none and keep the live read.
+ * `treeControlSvc` and `dbOrTx` are bound HERE, at construction, rather than taken per
+ * call. The memo is keyed by company alone, so a per-call handle would let an entry
+ * populated on the pool be served to a caller running inside a transaction — which
+ * `issue-tree-control-service.test.ts` ("routes getActivePauseHoldGate through tx so
+ * callers see uncommitted txn state") exists to guarantee against. Binding makes that
+ * entry unrepresentable instead of merely warned about: one prefilter answers on exactly
+ * one handle. The sweep reads on the pool throughout; a transactional caller wanting this
+ * should construct its own against its tx, or pass none and keep the live read.
  */
 export function createActivePauseHoldPrefilter(
+  treeControlSvc: IssueTreeControlService,
+  dbOrTx: Pick<Db, "select">,
   opts: { ttlMs?: number; now?: () => number } = {},
 ): ActivePauseHoldPrefilter {
   const ttlMs = opts.ttlMs ?? DEFAULT_ACTIVE_PAUSE_HOLD_PREFILTER_TTL_MS;
@@ -102,7 +100,7 @@ export function createActivePauseHoldPrefilter(
   let memoHits = 0;
 
   return {
-    async companyHasActivePauseHold(companyId, treeControlSvc, dbOrTx) {
+    async companyHasActivePauseHold(companyId) {
       const cached = cache.get(companyId);
       const readAt = now();
       if (cached && readAt - cached.readAt < ttlMs) {
@@ -140,7 +138,7 @@ export async function isAutomaticRecoverySuppressedByPauseHold(
   // call as its seam for "commit an adoption between the candidate snapshot and the
   // handover branch", and a call site that skipped the call would silently retire that
   // seam while leaving the test green.
-  if (prefilter && !(await prefilter.companyHasActivePauseHold(companyId, treeControlSvc, dbOrTx))) {
+  if (prefilter && !(await prefilter.companyHasActivePauseHold(companyId))) {
     return false;
   }
   // dbOrTx: pass tx from inside db.transaction() to reuse the txn connection (BLO-3855).
