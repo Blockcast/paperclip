@@ -227,9 +227,13 @@ export function buildAlert({
   // The split that makes this honest: the STALL is durable and survives a
   // supersede (PEN-3315), so `stall_since` and the age stay — during the TTL
   // ride-through "a human has been needed since X" is still true. An individual
-  // RUN is not durable, so it is reported only in this dispatcher run's own log,
-  // which is immutable and timestamped, and never in an alert that is re-read as
-  // if live. The queue filter is correct unconditionally: it lists whatever is on
+  // RUN is not durable, so it is reported in this dispatcher run's own log and in
+  // the append-only stall record (`upsertStallRecord`), both timestamped, and
+  // never in an alert that is re-read as if live. Those two are honest forensics
+  // — "at 23:33Z the oldest waiting run was X" stays true after X is cancelled;
+  // an annotation asserting it in the present tense does not. Do not "finish the
+  // job" by stripping the run out of them too.
+  // The queue filter is correct unconditionally: it lists whatever is on
   // the gate at READ time, so no step ordering and no supersede can stale it.
   const pendingQueueUrl = `https://github.com/${repo}/actions/workflows/${DEPLOY_WORKFLOW_FILE}?query=is%3Awaiting`;
   // A supersede replaces the run but not the stall, so these two differ whenever
@@ -270,7 +274,9 @@ export function buildAlert({
         'That link lists whatever is on the gate right now. A stale run is cancelled and ' +
         'replaced whenever master moves past it, so approve whichever run is waiting there. ' +
         'If that list is empty the replacement is still building and will arrive on the gate ' +
-        'shortly; the approval is still owed.\n\n' +
+        'once it passes; if its build fails the gate stays empty until a later dispatcher ' +
+        'slot replaces it — measured 1h26m on 2026-10-02. Either way the approval is still ' +
+        'owed.\n\n' +
         `${waitingCount} deploy(s) were waiting on this gate when this alert was raised.` +
         (stallRecordUrl ? `\n\nDurable record (survives this alert's TTL): ${stallRecordUrl}` : ''),
       pending_queue_url: pendingQueueUrl,

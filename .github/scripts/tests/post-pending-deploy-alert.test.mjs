@@ -222,8 +222,9 @@ test('buildAlert: no run-level identity reaches the alert — it is terminal sec
   );
   assert.ok(
     !blob.includes('2026-09-01T05:00:00.000Z'),
-    `no annotation may carry the pending run's own createdAt — the stall clock is the ` +
-      `durable one: ${blob}`,
+    `no annotation may carry the run's createdAt as run-level context — the stall clock is ` +
+      `the durable one. (\`stall_since\` legitimately equals the createdAt when no stall ` +
+      `start is recorded; this fixture supplies one, so they differ.): ${blob}`,
   );
   assert.equal(alert.annotations.pending_run_url, undefined);
   assert.equal(alert.annotations.pending_since, undefined);
