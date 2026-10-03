@@ -2425,6 +2425,63 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(result.pauseHoldPrefilterMemoHits).toBeGreaterThanOrEqual(1);
   });
 
+  // PEN-3636: the same wiring assertion for the OTHER per-candidate company read. Ally's
+  // review of #2202 reported this call site as untested and suggested documenting the gap
+  // instead; the premise was wrong — the sibling test immediately above shows the pattern
+  // already exists here, in the DB-backed suite rather than in the memo's own unit file.
+  // So this is the gap closed rather than annotated.
+  //
+  // What it pins that `recovery-agent-roster-memo.test.ts` structurally cannot: that the
+  // sweep PASSES its memo. That suite builds its own memo, and
+  // `evaluateAgentInvokabilityFromDb`'s no-reader path is deliberately behaviour-preserving
+  // (omitting the argument restores a live read per call and changes nothing observable),
+  // so deleting `agentRosterMemo` from the `isAgentInvokable` call leaves every other test
+  // in the repo green while silently restoring the O(candidates) roster read this change
+  // exists to remove. The counters are the only witness: two candidates in one company ask
+  // the company-scoped question twice, so an unwired sweep reads 0 live / 0 hits here.
+  it("answers the sweep's per-candidate invokability roster read once per company", async () => {
+    const { companyId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const secondIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId,
+      title: "Second stranded candidate",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    for (const issueId of [sourceIssueId, secondIssueId]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "manual",
+        status: "failed",
+        error: "adapter crashed",
+        errorCode: "adapter_failed",
+        startedAt: new Date("2026-07-15T20:00:00.000Z"),
+        finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+        contextSnapshot: { issueId },
+      });
+    }
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // Both rows reached the agent-evaluation site, so the roster question was genuinely
+    // asked twice. Asserted separately from the counters below because
+    // `agentInvokabilityEvaluated` sizes the population that pays, and a fixture that
+    // stopped reaching this site would otherwise satisfy `liveReads === 1` vacuously at 0.
+    expect(result.agentInvokabilityEvaluated).toBeGreaterThanOrEqual(2);
+    // Asked of the database exactly once; every candidate after the first is served from
+    // the memo. `liveReads === 1` goes red if the sweep stops passing it (that path reads
+    // N live and 0 hits), `memoHits` is what the memo removed.
+    expect(result.agentRosterMemoLiveReads).toBe(1);
+    expect(result.agentRosterMemoHits).toBeGreaterThanOrEqual(1);
+  });
+
   it("schedules a provider-quota monitor for the original assignee without creating recovery work", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     const runId = randomUUID();

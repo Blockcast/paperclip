@@ -25,7 +25,16 @@ export type AgentRosterMemoStats = {
 };
 
 export type AgentRosterMemo = {
-  companyAgents(companyId: string): Promise<AgentOrgRow[]>;
+  /**
+   * ⚠️ Returns the cached array BY REFERENCE — every hit within the TTL hands out the
+   * same instance, by design, because copying per hit would give back the cost this memo
+   * exists to remove. The entry is therefore `Object.freeze`d at `cache.set` and the type
+   * is `readonly`, so an in-place `sort`/`splice` by a future consumer is a compile error
+   * first and a `TypeError` second, rather than silent corruption of the entry for the
+   * rest of the window. Both halves are deliberate: the type catches the ordinary case,
+   * the freeze catches a caller that has widened or cast its way past it.
+   */
+  companyAgents(companyId: string): Promise<readonly AgentOrgRow[]>;
   stats(): AgentRosterMemoStats;
 };
 
@@ -106,6 +115,25 @@ export type AgentRosterMemo = {
  *
  * Scope to one pass and construct it there; a module-level cache would leak across
  * requests and across companies' lifetimes.
+ *
+ * ## Two properties of the bookkeeping worth knowing before reading `stats()`
+ *
+ * ⚠️ **`readAt` is stamped BEFORE the await, so a read slower than the TTL is born
+ * expired.** That direction is the conservative one — an entry is never treated as
+ * fresher than the data it holds — but it has a reporting consequence that matters
+ * precisely because this change leans on `memoHits` to turn its saving from a projection
+ * into a reading: on a database degraded enough that a roster read exceeds `ttlMs`, every
+ * entry expires on arrival, the memo falls to zero hits, and `agentRosterMemoHits: 0`
+ * reads **identically to "the sweep stopped passing its memo"**. Disambiguate with
+ * `agentRosterMemoLiveReads`: wired-but-degraded still climbs it once per candidate,
+ * unwired leaves both at 0. The call-site test in `issue-recovery-actions.test.ts` pins
+ * the unwired case from the other side.
+ *
+ * ⚠️ **Entries are never pruned**, so the map retains one roster per distinct company for
+ * the whole pass rather than for the TTL. Bounded by company count (not candidate count),
+ * which is small and is the same bound the pass's other per-company state already carries
+ * — but it is retained memory that did not exist before, so it is stated rather than
+ * left to be discovered. Prune only if company count per pass ever stops being small.
  */
 export function createAgentRosterMemo(
   dbOrTx: Pick<Db, "select">,
@@ -113,7 +141,7 @@ export function createAgentRosterMemo(
 ): AgentRosterMemo {
   const ttlMs = opts.ttlMs ?? DEFAULT_AGENT_ROSTER_MEMO_TTL_MS;
   const now = opts.now ?? Date.now;
-  const cache = new Map<string, { readAt: number; rows: AgentOrgRow[] }>();
+  const cache = new Map<string, { readAt: number; rows: readonly AgentOrgRow[] }>();
   let liveReads = 0;
   let memoHits = 0;
 
@@ -131,8 +159,16 @@ export function createAgentRosterMemo(
       // system degraded. Same rule as the pause-hold prefilter.
       liveReads += 1;
       const rows = await readCompanyAgentRoster(dbOrTx, companyId);
-      cache.set(companyId, { readAt, rows });
-      return rows;
+      // Frozen, not copied. Every hit returns this same instance (copying per hit would
+      // cost back what the memo saves), so one future consumer sorting in place would
+      // corrupt the entry for the rest of the window — silently, and only under the
+      // adjacency that makes the memo effective in the first place. `readonly` states the
+      // contract and `freeze` enforces it for anyone who casts past the type. Shallow is
+      // sufficient: `AgentOrgRow` is five scalars, and the hazard is reordering the array,
+      // not editing a row.
+      const frozen: readonly AgentOrgRow[] = Object.freeze(rows);
+      cache.set(companyId, { readAt, rows: frozen });
+      return frozen;
     },
     stats() {
       return { liveReads, memoHits };
