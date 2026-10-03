@@ -2,7 +2,14 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, isPlainObject, maskWorkspaceRuntimeTextForRead, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, isPlainObject, maskWorkspaceRuntimeTextForRead, redactEventPayload } from "../redaction.js";
+import {
+  REDACTED_ENV_SENTINEL,
+  containAgentConfig,
+  containAgentMetadata,
+  keepSanitizedAgentMetadata,
+  redactAgentSecrets,
+} from "../agent-redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, isNotNull, lte, not, or, sql } from "drizzle-orm";
@@ -134,13 +141,10 @@ const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
 const EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
 
-// Sentinel substituted into adapter_config.env values by redactAgentSecrets()
-// on the GET response. A naive UI/operator round-trip (read agent, edit, save)
-// posts the sentinel back as the literal env value; without a guard it lands
-// in the DB and breaks runs (BLO-5xxx: PATH=*** in opencode_k8s pods made
-// runc fail to find sh and every Staff Engineer run died as StartError).
-// Keep this in lockstep with the redactor.
-export const REDACTED_ENV_SENTINEL = "***";
+// Defined in `../agent-redaction.js` alongside the redactor it must stay in
+// lockstep with; re-exported here because this module is its established
+// import path.
+export { REDACTED_ENV_SENTINEL } from "../agent-redaction.js";
 
 export function isRedactedEnvBinding(binding: unknown): boolean {
   if (typeof binding === "string") return binding === REDACTED_ENV_SENTINEL;
@@ -2244,90 +2248,13 @@ export function agentRoutes(
       ...agent,
       adapterConfig: {},
       runtimeConfig: {},
+      // This is the LOWER-privilege projection — it withholds both config
+      // columns outright — yet it spread `metadata` exactly as stored, so a
+      // caller denied every config byte still received the open bag beside it
+      // (PEN-3726).
+      metadata: containAgentMetadata(agent.metadata),
     };
   }
-
-  /**
-   * The one admission gate for anything agent-config-shaped on its way out.
-   *
-   * `redactAgentConfigPayload` — and `sanitizeValue` beneath it — sanitize only
-   * `isPlainObject` values and return anything else *by reference*. A caller
-   * that admits on a weaker "is it an object" test, or hands the value straight
-   * in with no gate, therefore has a fail-open the redactor cannot see: it gets
-   * the raw value back and serializes it.
-   *
-   * The obvious repair — swap the caller's predicate to `isPlainObject` — does
-   * not work where the assignment sits inside the gate, as in
-   * `redactAgentSecrets`: a failing gate just leaves the raw value on the
-   * `{ ...agent }` spread, so the same bytes reach the wire by a different
-   * route. Containment has to be *written back*, which is why this returns a
-   * value rather than answering a question.
-   *
-   *   `undefined` — not object-like (`null`, `undefined`, a primitive). No
-   *                 config to contain; each caller keeps its own absence
-   *                 contract for these.
-   *   `{}`        — an object this file cannot sanitize (array or foreign
-   *                 prototype). Withheld rather than emitted uncontained.
-   *   otherwise   — the redacted record.
-   */
-  function containAgentConfig(value: unknown): Record<string, unknown> | undefined {
-    if (typeof value !== "object" || value === null) return undefined;
-    if (!isPlainObject(value)) return {};
-    return redactAgentConfigPayload(value) ?? {};
-  }
-
-  /**
-   * Strip credential material out of an agent row before it goes on the wire.
-   *
-   * `adapterConfig` holds live secrets — `{type:"plain",value}` env bindings and
-   * literal `Bearer …` values in `mcpServers.*.headers`. This used to be applied
-   * only on the read paths, so a budget-only `PATCH /api/agents/:id` handed the
-   * caller the agent's entire credential set, and it landed verbatim in agent
-   * transcripts and run logs, which are read far more widely than the secret
-   * store (BLO-18969).
-   *
-   * `secret_ref` / `user_secret_ref` bindings are pointers, not plaintext, so
-   * they survive — minus any resolved `value`, which the schema has no field
-   * for and which only ever means a secret leaked in.
-   *
-   * Redaction is structural, not key-name based: `redactAgentConfigPayload`
-   * masks every plain binding and every `env` value at any depth, so a nested
-   * `runtimeConfig.modelProfiles.*.adapterConfig.env` entry is covered too.
-   *
-   * Every response that serializes an agent MUST go through here,
-   * `redactForRestrictedAgentView`, or `redactAgentConfiguration`. Adding an
-   * agent-serializing route without one of them reopens this hole.
-   */
-  function redactAgentSecrets<T extends { adapterConfig?: unknown; runtimeConfig?: unknown }>(agent: T): T {
-    let result = { ...agent };
-    // `containAgentConfig`, not the local `asRecord`: `asRecord` admits any
-    // non-array object, and for a foreign-prototype config the redactor handed
-    // the argument straight back, so `result.adapterConfig` was assigned the
-    // raw record. See the helper for why swapping the predicate alone would
-    // have moved the leak rather than closed it.
-    const rawConfig = agent.adapterConfig;
-    const containedConfig = containAgentConfig(rawConfig);
-    if (containedConfig) {
-      const env = isPlainObject(rawConfig) ? asRecord(rawConfig.env) : null;
-      if (env) {
-        // The top-level env keeps the shorter `***` sentinel the UI and
-        // `stripRedactedEnvBindingsFromAdapterConfig` have always round-tripped.
-        const redactedEnv: Record<string, string> = {};
-        for (const key of Object.keys(env)) {
-          redactedEnv[key] = REDACTED_ENV_SENTINEL;
-        }
-        result.adapterConfig = { ...containedConfig, env: redactedEnv } as T["adapterConfig"];
-      } else {
-        result.adapterConfig = containedConfig as T["adapterConfig"];
-      }
-    }
-    const containedRuntime = containAgentConfig(agent.runtimeConfig);
-    if (containedRuntime) {
-      result.runtimeConfig = containedRuntime as T["runtimeConfig"];
-    }
-    return result;
-  }
-
 
   function redactAgentConfiguration(agent: Awaited<ReturnType<typeof svc.getById>>) {
     if (!agent) return null;
@@ -2403,22 +2330,11 @@ export function agentRoutes(
       ...contained,
       adapterConfig: isPlainObject(contained.adapterConfig) ? contained.adapterConfig : {},
       runtimeConfig: isPlainObject(contained.runtimeConfig) ? contained.runtimeConfig : {},
-      // `metadata` is NOT coerced to a record: an array-valued `metadata` must
-      // survive as the element-wise-sanitized array `sanitizeValue` produced,
-      // not be flattened to `null`. But it must still fail closed the same way
-      // the two lines above do. `metadata` matches no tier and no special case
-      // in `sanitizeRecord`, so it reaches `sanitizeValue`, which returns a
-      // non-plain non-array object BY REFERENCE — a foreign-prototype
-      // `metadata` arrived in `contained` unsanitized and `?? null` emitted it
-      // verbatim. Arrays and plain objects have been sanitized and pass; a
-      // primitive carries no binding for `sanitizeValue` to have missed and any
-      // string has already been through `redactUriCredentialsInValue`;
-      // everything else is withheld.
-      metadata:
-        meta === null || meta === undefined ? null
-        : typeof meta !== "object" ? meta
-        : isPlainObject(meta) || Array.isArray(meta) ? meta
-        : null,
+      // `metadata` gets the shared fail-closed rule rather than its own copy:
+      // `keepSanitizedAgentMetadata` is the single definition of what an
+      // already-sanitized `metadata` may become, so this path and the two
+      // spread-based redactors cannot drift apart on the same column.
+      metadata: keepSanitizedAgentMetadata(meta),
     };
   }
 

@@ -1587,3 +1587,142 @@ describe("agent self-service secret binding guard", () => {
     expect(mockAgentService.create).not.toHaveBeenCalled();
   });
 });
+
+// PEN-3726. `agents.metadata` is a caller-writable open bag — `jsonb` validated
+// only as `z.record(z.string(), z.unknown())`, with no secret-sentinel pass on
+// write the way `adapterConfig` gets one. Three of the five agent projections
+// already declined to emit it as stored (two enumerate their output, one
+// sanitizes it structurally); the two SPREAD-based helpers emitted it verbatim
+// across ~13 exits.
+//
+// The asymmetry that makes this worth pinning rather than tidying: the same
+// column was treated as needing a structural sanitize on the config-revision
+// path and as inert on the two common read paths, and the inert pair includes
+// the LOWER-privilege `redactForRestrictedAgentView` — which withholds both
+// config columns outright and still handed over the bag beside them.
+describe("agent metadata containment on the spread-based redactors", () => {
+  const METADATA_SECRET = "agent-metadata-secret-under-an-ordinary-key";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAgentService.getChainOfCommand.mockResolvedValue([]);
+    mockAccessService.getMembership.mockResolvedValue({
+      id: "membership-1",
+      companyId,
+      principalType: "agent",
+      principalId: agentId,
+      status: "active",
+      membershipRole: "member",
+      createdAt: new Date("2026-03-19T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+    mockAccessService.listPrincipalGrants.mockResolvedValue([]);
+    mockAccessService.canUser.mockResolvedValue(true);
+    mockAccessService.decide.mockResolvedValue({ allowed: true });
+    mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
+  });
+
+  function withMetadata(metadata: unknown) {
+    const agent = { ...baseAgent, metadata } as typeof baseAgent;
+    mockAgentService.getById.mockResolvedValue(agent);
+    mockAgentService.list.mockResolvedValue([agent]);
+    return agent;
+  }
+
+  // Drives the `redactForRestrictedAgentView` arm of
+  // `GET /companies/:companyId/agents`: a peer agent that may READ the agent
+  // (`agent:read` allowed) but may not read its configuration.
+  function denyConfigReadOnly() {
+    mockAccessService.decide.mockImplementation(async ({ action }: { action: string }) => ({
+      allowed: action !== "agent_config:read",
+    }));
+  }
+
+  describe("redactAgentSecrets", () => {
+    it("masks a plain binding planted in metadata", async () => {
+      withMetadata({ leaked: { type: "plain", value: METADATA_SECRET } });
+      const app = createApp(boardActor);
+      const res = await request(app).get(`/api/agents/${agentId}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.metadata).toEqual({ leaked: { type: "plain", value: "***REDACTED***" } });
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    it("masks a tier-1 key name nested at depth in metadata", async () => {
+      withMetadata({ a: { b: { apiKey: METADATA_SECRET } } });
+      const app = createApp(boardActor);
+      const res = await request(app).get(`/api/agents/${agentId}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.metadata).toEqual({ a: { b: { apiKey: "***REDACTED***" } } });
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    // Asserted as a pair with the foreign-prototype case below, for the same
+    // reason the config-revision tests are: the array case must SURVIVE as a
+    // masked array and the foreign-prototype case must be WITHHELD. A fix that
+    // collapses either into the other passes one assertion and fails the other.
+    it("keeps an ARRAY-valued metadata as an element-wise-masked array", async () => {
+      withMetadata([{ type: "plain", value: METADATA_SECRET }]);
+      const app = createApp(boardActor);
+      const res = await request(app).get(`/api/agents/${agentId}`);
+
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.metadata)).toBe(true);
+      expect(res.body.metadata).toEqual([{ type: "plain", value: "***REDACTED***" }]);
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    it("withholds a metadata whose prototype is not Object.prototype", async () => {
+      withMetadata(Object.assign(Object.create({ inherited: true }), {
+        leaked: { type: "plain", value: METADATA_SECRET },
+      }));
+      const app = createApp(boardActor);
+      const res = await request(app).get(`/api/agents/${agentId}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.metadata).toBeNull();
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    it("leaves the built-in marker readable", async () => {
+      withMetadata({ paperclipBuiltInAgent: "security-engineer" });
+      const app = createApp(boardActor);
+      const res = await request(app).get(`/api/agents/${agentId}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.metadata).toEqual({ paperclipBuiltInAgent: "security-engineer" });
+    });
+  });
+
+  describe("redactForRestrictedAgentView", () => {
+    it("masks a plain binding planted in metadata", async () => {
+      withMetadata({ leaked: { type: "plain", value: METADATA_SECRET } });
+      denyConfigReadOnly();
+      const app = createApp(agentActor);
+      const res = await request(app).get(`/api/companies/${companyId}/agents`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(1);
+      // Precondition: this really is the restricted arm, not the secrets arm.
+      expect(res.body[0].adapterConfig).toEqual({});
+      expect(res.body[0].metadata).toEqual({ leaked: { type: "plain", value: "***REDACTED***" } });
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    it("withholds a metadata whose prototype is not Object.prototype", async () => {
+      withMetadata(Object.assign(Object.create({ inherited: true }), {
+        leaked: { type: "plain", value: METADATA_SECRET },
+      }));
+      denyConfigReadOnly();
+      const app = createApp(agentActor);
+      const res = await request(app).get(`/api/companies/${companyId}/agents`);
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].adapterConfig).toEqual({});
+      expect(res.body[0].metadata).toBeNull();
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+  });
+});
