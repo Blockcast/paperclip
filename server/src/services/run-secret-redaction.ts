@@ -46,6 +46,13 @@ export const AMBIGUOUS_BAND_MIN_LENGTH = 8;
  * scores ~2.75 bits/char, as high as many real credentials. What distinguishes it is that it
  * is a plain lowercase word, i.e. spans one class.
  *
+ * `_` and `-` do not count as a class, so `traffic_ops` and `blockcast-prod` span one class
+ * and are spared alongside `postgres` — they are the same transcript vocabulary, and masking
+ * every occurrence of a hostname or a DB user is the same unusable artifact. Be exact about
+ * what that leaves: a lowercase-plus-digit identifier (`orc8r-staging`) still spans two and
+ * is still redacted, because that is also the shape of a real lowercase-alphanumeric
+ * password, and declining it would reopen the hole this band exists to close.
+ *
  * Anything this returns false for MUST be reported by key name — see
  * {@link buildRunSecretRedactionPlan}. A residual gap that announces itself is a different
  * object from one that does not.
@@ -61,7 +68,11 @@ function characterClassCount(value: string): number {
   if (/[a-z]/.test(value)) classes += 1;
   if (/[A-Z]/.test(value)) classes += 1;
   if (/[0-9]/.test(value)) classes += 1;
-  if (/[^a-zA-Z0-9]/.test(value)) classes += 1;
+  // `_` and `-` are deliberately NOT symbols here. They are the separators of ordinary
+  // transcript vocabulary — `traffic_ops`, `blockcast-prod` — and counting them promoted a
+  // plain lowercase identifier to two classes, which is the exact `postgres` failure the doc
+  // above argues against, just one punctuation mark along. `Tr0ub4dor&3` still scores 4.
+  if (/[^\w-]/.test(value)) classes += 1;
   return classes;
 }
 

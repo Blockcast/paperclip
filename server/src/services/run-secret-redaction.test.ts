@@ -105,6 +105,20 @@ describe("BLO-39715: the threshold, and what it declines to cover", () => {
     }
   });
 
+  it("spares a separator-bearing identifier in the band, which `-`/`_`-as-symbol would redact", () => {
+    // The negative case the band's two-class discriminator was missing: every other spared
+    // value here is single-class on length alone, so they pass whatever the symbol class is.
+    // These are in the 8-15 band and are only spared because `_` and `-` do not count — they
+    // are transcript vocabulary (a DB user, a cluster name) exactly as `postgres` is.
+    for (const identifier of ["traffic_ops", "blockcast-prod", "paperclip_api"]) {
+      expect(identifier.length).toBeGreaterThanOrEqual(8);
+      expect(identifier.length).toBeLessThan(16);
+      expect(isRedactableSecretValue(identifier)).toBe(false);
+    }
+    // ...without sparing a real password of the same length and band.
+    expect(isRedactableSecretValue("Tr0ub4dor&3")).toBe(true);
+  });
+
   it("never redacts below 8 chars", () => {
     expect(isRedactableSecretValue("true")).toBe(false);
     expect(isRedactableSecretValue("Ab3!")).toBe(false);
