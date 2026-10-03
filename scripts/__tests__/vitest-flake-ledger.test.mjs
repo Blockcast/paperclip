@@ -6,7 +6,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildLedger, classify, readReport } from "../vitest-flake-ledger.mjs";
+import {
+  buildLedger,
+  classify,
+  escapeCell,
+  readReport,
+} from "../vitest-flake-ledger.mjs";
 
 const runnerPath = (rel) => `/home/runner/_work/paperclip/paperclip/${rel}`;
 
@@ -131,4 +136,13 @@ test("a failure in any shard of a run counts once for that run", () => {
   assert.deepEqual(rows.map((r) => [r.failedIn.length, r.observedIn.length]), [
     [1, 1],
   ]);
+});
+
+test("a cell cannot add a column or end its row early", () => {
+  // `fullName` is author-controlled. A `|` adds a column; a newline ends the
+  // row, which drops every row printed after it -- a silent truncation of the
+  // ledger, not a cosmetic one.
+  assert.equal(escapeCell("a | b"), "a \\| b");
+  assert.equal(escapeCell("first\n  second"), "first second");
+  assert.equal(escapeCell("a|b\nc"), "a\\|b c");
 });
