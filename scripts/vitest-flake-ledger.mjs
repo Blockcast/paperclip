@@ -14,6 +14,13 @@
 // claim -- 1/1 is arithmetically identical for both -- so it gets a third
 // table rather than being filed under "broken" on one data point.
 //
+// A fourth table outranks all of them: a test that FAILED AND PASSED INSIDE ONE
+// RUN. Cross-run evidence is confounded by the code changing between runs;
+// within one run the code is fixed, so both outcomes at once is proof rather
+// than inference. It is also the shape the 1/1 table would otherwise swallow --
+// a retried run contributes one observation, so the strongest evidence the
+// dataset holds was being filed under "not enough runs to classify".
+//
 //   node scripts/vitest-flake-ledger.mjs                  # last 50 merge_group runs
 //   node scripts/vitest-flake-ledger.mjs --runs 30 --event pull_request
 //   node scripts/vitest-flake-ledger.mjs --dir ./already-downloaded
@@ -84,21 +91,44 @@ export function readReport(json) {
  * runs: [{ runId, reports }] -> ledger rows. A test counts as failed in a run
  * if ANY shard's report in that run saw it fail; the unit is the run, because
  * the run is what ejects a PR.
+ *
+ * `flakedInOneRun` records the stronger signal that unioning the reports would
+ * otherwise destroy: the same key seen FAILING in one report of a run and
+ * PASSING in another. pr.yml keeps both attempts of a retried run (the artifact
+ * name carries `github.run_attempt`, and its comment rejects `overwrite: true`
+ * for exactly this reason), so that pair reaches us and then collapses into a
+ * single observation.
+ *
+ * Keyed on the two outcomes themselves, NOT on parsing an attempt number out of
+ * the directory name: whatever produced both results, the code did not change
+ * between them, which is the whole claim. Under `--dir` the caller supplies the
+ * grouping -- the whole directory is one run -- so there the claim is only as
+ * good as the batch handed over.
  */
 export function buildLedger(runs) {
   const rows = new Map();
   for (const { runId, reports } of runs) {
     const observed = new Set();
     const failed = new Set();
+    const passed = new Set();
     for (const report of reports) {
       const r = readReport(report);
-      for (const k of r.observed) observed.add(k);
+      for (const k of r.observed) {
+        observed.add(k);
+        if (!r.failed.has(k)) passed.add(k);
+      }
       for (const k of r.failed) failed.add(k);
     }
     for (const key of observed) {
-      const row = rows.get(key) ?? { key, observedIn: [], failedIn: [] };
+      const row = rows.get(key) ?? {
+        key,
+        observedIn: [],
+        failedIn: [],
+        flakedInOneRun: false,
+      };
       row.observedIn.push(runId);
       if (failed.has(key)) row.failedIn.push(runId);
+      if (failed.has(key) && passed.has(key)) row.flakedInOneRun = true;
       rows.set(key, row);
     }
   }
@@ -106,7 +136,17 @@ export function buildLedger(runs) {
     .filter((row) => row.failedIn.length > 0)
     .sort(
       (a, b) =>
-        b.failedIn.length - a.failedIn.length || a.key.localeCompare(b.key),
+        // RATE first, not absolute count. Inside the flaky table the reader's
+        // question is "how often does this eject a PR", and a 2/3 ejects more
+        // often than a 3/10 while counting fewer. The count stays as the
+        // tiebreak, which is what orders the `broken` table (every row there is
+        // 100% by definition) and keeps the whole ordering deterministic. The
+        // printed `failed / observed` cell is what lets a reader discount a
+        // high rate drawn from few observations.
+        b.failedIn.length / b.observedIn.length -
+          a.failedIn.length / a.observedIn.length ||
+        b.failedIn.length - a.failedIn.length ||
+        a.key.localeCompare(b.key),
     );
 }
 
@@ -123,6 +163,11 @@ export function buildLedger(runs) {
  * observation, so every row lands in `unclassified` without a special case.
  */
 export function classify(row) {
+  // Checked before the observation count, because this is the one piece of
+  // evidence a second run cannot improve on. A retried run is ONE observation,
+  // so without this branch the strongest flake in the dataset reads 1/1 and
+  // lands under "not enough runs to classify".
+  if (row.flakedInOneRun) return "proven";
   if (row.observedIn.length < 2) return "unclassified";
   return row.failedIn.length === row.observedIn.length ? "broken" : "flaky";
 }
@@ -291,7 +336,9 @@ function main() {
 
   const bucket = (name) => table(ledger.filter((r) => classify(r) === name));
   const body =
-    `## Flaky -- failed in some runs, passed in others\n\n` +
+    `## Failed AND passed inside one run -- flaky, proven\n\n` +
+    bucket("proven") +
+    `\n## Flaky -- failed in some runs, passed in others\n\n` +
     bucket("flaky") +
     `\n## Failed in every run observed -- broken, not flaky\n\n` +
     bucket("broken") +
@@ -307,4 +354,10 @@ function main() {
   );
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) main();
+// `process.argv[1]` is undefined under `node -e`, `--eval` and the REPL, where
+// pathToFileURL would throw and take the whole import down with it. An import
+// from those contexts should load the exports and not run main(), which is what
+// the guard restores.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}
