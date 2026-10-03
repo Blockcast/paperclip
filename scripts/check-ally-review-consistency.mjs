@@ -205,6 +205,32 @@ const VERDICT_SEVERITIES = new Set([...BLOCKING_SEVERITIES, "suggestions"]);
 const BLOCKING_PRIOR_DISPOSITIONS = new Set(["still-present"]);
 
 /**
+ * The pre-structured still-present line, for the *verdict* question only.
+ *
+ * Two different questions were being asked of one function. "Is this a ledger
+ * entry?" must answer exactly what the gate and the sweep answer, or the
+ * three readers disagree about a body and the gate-red/sweep-satisfied
+ * deadlock opens — that is hasStillPresentDisposition, and it stays strict.
+ * "Does this review carry a blocking verdict?" is a fail-closed safety test
+ * with a different consumer (scripts/ally-review-de-dupe.mjs dismisses a
+ * review it reads as non-blocking), and there an entry whose label Ally wrote
+ * as prose rather than as the `prior:<sha> <severity> <index>` triple must
+ * still block. Narrowing the verdict question to the ledger pattern made that
+ * read clean (Ally, #1721 at 53ca8a92, Critical 1 — reproduced by
+ * scripts/ally-review-de-dupe.test.mjs:129 and :220).
+ *
+ * This is the shape master shipped, widened only in directions that add
+ * matches — leading indent up to 3, space after the `**`, en dash alongside em
+ * dash and hyphen — so every body the old reader blocked on still blocks.
+ * `(?:^|\n)` without `m`, per the U+2028/U+2029 rule the rest of this file and
+ * its test scan enforce.
+ */
+const LOOSE_STILL_PRESENT_RE = new RegExp(
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:[^\n]*\*\*[ \t]*(?:—|–|-)[ \t]*still-present[ \t]*(?:—|–|-)`,
+  "i",
+);
+
+/**
  * The block's per-severity counts, or `null` when the payload cannot be
  * trusted. Per-severity rather than a bare "does it block": the count rule
  * below needs to know which severity states zero, and a boolean cannot say.
@@ -511,7 +537,7 @@ function reportsBlockingFindings(body) {
 
 /** I2c's fact: the body marks a prior finding as still standing. */
 function reportsStillPresent(body) {
-  return structuredBlocking(body, "stillPresent") ?? hasStillPresentDisposition(body);
+  return structuredBlocking(body, "stillPresent") ?? proseStillPresent(body);
 }
 
 /**
@@ -519,8 +545,14 @@ function reportsStillPresent(body) {
  * because the field queries above deliberately stopped answering for it: drop
  * it and an unreadable block would read as a clean verdict here, which is the
  * one direction that masks a finding.
+ *
+ * Exported for scripts/ally-review-de-dupe.mjs, which asks exactly this
+ * question before dismissing a review. It used to compose its own from
+ * `hasBlockingFindings || hasStillPresentDisposition`, which reaches neither
+ * the verdict block nor an unreadable one — so a review whose only statement
+ * of a finding was the block read as dismissable.
  */
-function hasBlockingVerdict(body) {
+export function hasBlockingVerdict(body) {
   return structuredUnreadable(body) || reportsBlockingFindings(body) || reportsStillPresent(body);
 }
 
@@ -602,6 +634,16 @@ export function hasStillPresentDisposition(body) {
     if (BLOCKING_PRIOR_DISPOSITIONS.has(match[4].toLowerCase())) return true;
   }
   return false;
+}
+
+/**
+ * The prose arm of the verdict question: a ledger entry, or the older
+ * free-label line the ledger pattern cannot express. Union, never a
+ * replacement — see LOOSE_STILL_PRESENT_RE for why this is not
+ * hasStillPresentDisposition.
+ */
+function proseStillPresent(body) {
+  return hasStillPresentDisposition(body) || LOOSE_STILL_PRESENT_RE.test(reviewText(body));
 }
 
 export function attestedHead(body) {
