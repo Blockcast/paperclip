@@ -238,6 +238,11 @@ describe("paperclip MCP tools", () => {
     for (const status of APPROVAL_UNDECIDED_STATUSES) {
       expect(tool.description).toContain(`\`${status}\``);
     }
+    // The loop alone also passes a description that names both statuses but
+    // ties `revision_requested` to `resubmit` only -- BLO-27406's defect,
+    // re-worded -- because the old text already backticked it. Pin the pairing
+    // that says withdraw reaches both.
+    expect(tool.description).toContain("`pending` **and** `revision_requested`");
 
     // The exact claim that minted the 118-card revision_requested backlog:
     // requesters believed a bounced card was unreachable (BLO-27406).
