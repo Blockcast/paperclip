@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -425,6 +425,59 @@ describe("buildEnvGuardSetupShell", () => {
       expect(settings.hooks.Stop[0].hooks[0].command).toBe("echo stop");
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// BLO-29526. The block message used to build its remediation path from $HOME
+// while the installer writes to ${CLAUDE_CONFIG_DIR:-$HOME/.claude}. The pod
+// sets CLAUDE_CONFIG_DIR to a session dir OUTSIDE $HOME, so the suggested
+// command was always MODULE_NOT_FOUND. That is worse than a broken path:
+// agents pipe the suggestion into a filter (`... 2>/dev/null | grep -i FOO`),
+// so node's error went to the discarded stderr, grep read empty stdin, and the
+// empty output read as "no variable matches FOO" — a confident wrong negative.
+//
+// So this installs for real with the two directories deliberately APART, then
+// RUNS whatever the guard suggests. Asserting on the message string alone
+// would not catch a move of the install target.
+describe("block message resolves to the installed helper (BLO-29526)", () => {
+  it("suggests a command that actually executes", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pc-install-"));
+    try {
+      const home = path.join(root, "home");
+      const configDir = path.join(root, "session", ".claude");
+      mkdirSync(home, { recursive: true });
+      // Guard the guard: if these ever collapse to the same directory the test
+      // stops exercising the drift condition and silently passes on a revert.
+      expect(configDir).not.toBe(path.join(home, ".claude"));
+
+      const env = { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: configDir };
+      const setup = spawnSync("sh", ["-c", buildEnvGuardSetupShell()], { encoding: "utf8", env });
+      expect(setup.status).toBe(0);
+
+      const guardName = readdirSync(configDir).find((f) => f.startsWith("paperclip-env-guard."));
+      expect(guardName).toBeTruthy();
+
+      const blocked = spawnSync(process.execPath, [path.join(configDir, guardName!)], {
+        input: JSON.stringify({ tool_name: "Bash", tool_input: { command: "env" } }),
+        encoding: "utf8",
+        env,
+      });
+      expect(blocked.status).toBe(2);
+
+      const suggested = /run: node (\S+)/.exec(blocked.stderr)?.[1];
+      expect(suggested).toBeTruthy();
+
+      const helper = spawnSync(process.execPath, [suggested!], {
+        encoding: "utf8",
+        env: { ...env, PC_TEST_SECRET: "super-secret-value-xyz" },
+      });
+      expect(helper.stderr).not.toContain("MODULE_NOT_FOUND");
+      expect(helper.status).toBe(0);
+      expect(helper.stdout).toContain("PC_TEST_SECRET");
+      expect(helper.stdout).not.toContain("super-secret-value-xyz");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
