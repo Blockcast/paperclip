@@ -31826,18 +31826,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // decision, not a variant to bolt onto the list in `buildRunSecretRedactionPlan`.
     //
     // SINKS covered: the run-log chunk write path (`sanitizeRunLogChunkForStorage`) only. NOT
-    // covered: (1) the run row's own `error` and `resultJson` columns, which funnel through
-    // `sanitizeRunPatchForStorage` and are scrubbed by a DIFFERENT oracle — a key-name
-    // classifier plus a value heuristic, not this run's resolved secret set — and which are
-    // MORE durable than the log store, reaching backups, exports and the
-    // `result_summary`/`result_result` generated columns; (2) the process adapter's
-    // `meta.commandArgs` run-event payload; (3) the `workspace-operations` sinks, whose
-    // commands run with the SERVER environment rather than a run's resolved secret set, so
-    // this dictionary would be the wrong one for them. Threading the needles into
+    // covered by THIS dictionary — each is handled by a different, name-anchored oracle, so
+    // read these as "not value-anchored", not as "unprotected": (1) the run row's own `error`
+    // and `resultJson` columns, which funnel through `sanitizeRunPatchForStorage` — a
+    // key-name classifier plus a value heuristic, not this run's resolved secret set — and
+    // which are MORE durable than the log store, reaching backups, exports and the
+    // `result_summary`/`result_result` generated columns; (2) the adapter's `meta.command`
+    // and `meta.commandArgs` run-event payload, scrubbed by `redactSensitiveText` (shape-
+    // anchored) and `sanitizeCommandArgs` (flag-anchored) respectively — `command` is
+    // REQUIRED on `AdapterInvocationMeta` and `commandArgs` optional, so naming only the
+    // latter would read as the former being covered; (3) the `workspace-operations` sinks,
+    // whose commands run with the SERVER environment rather than a run's resolved secret set,
+    // so this dictionary would be the wrong one for them. Threading the needles into
     // `sanitizeRunPatchForStorage` is not the one-liner the `onLog` change was:
     // `setRunStatus(runId, …)` is also called by the BLO-16850 reaper and the
     // external-lifecycle finalizer, neither of which ran run setup and either of which may be
-    // a different process, so it needs a runId→needles store with a real lifecycle.
+    // a different process, so it needs a runId→needles store with a real lifecycle. Scope
+    // that reason precisely: `runSecretRedaction` IS lexically live at the two in-run
+    // terminal writes, so a partial fix by per-site argument was reachable and was declined —
+    // per-site threading is the shape PEN-3153 centralised away from, and partial coverage
+    // would make this block harder to state honestly, not easier.
     // Absence claims must be scoped accordingly.
     const runSecretRedaction = buildRunSecretRedactionPlan(
       resolvedConfig as Record<string, unknown>,
