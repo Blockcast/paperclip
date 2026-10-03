@@ -661,11 +661,31 @@ spec:
                 # adapterConfig.mcpServers — this seed only writes the shared
                 # baseline. Re-runs overwrite to keep the file in sync with
                 # what's deployed.
+                # PEN-3714: absolute, not the bare name. A bare "node" is
+                # resolved by execvp against the agent pod's PATH, whose first
+                # entry is /paperclip/opencode-api-key-bin — mode 2775 node:node
+                # on the fleet-shared PVC, holding a `node` shim whose body is
+                # `exec /usr/local/bin/node "$@"`. Measured 2026-10-02 from an
+                # agent pod: spawning the bare name the way an MCP launcher does
+                # yields argv[0] = "/usr/local/bin/node" in the child, which is
+                # the shim's exec signature and NOT what a shimless execvp
+                # produces (that would leave argv[0] as the literal "node").
+                # So the shim was on the launch chain of this very server — the
+                # one process holding PAPERCLIP_API_KEY.
+                #
+                # Unlike the "github" command below, this is safe to pin now and
+                # opens no image-skew window: /usr/local/bin/node is the node
+                # binary of the base image, present on every agent image old or
+                # new — including the one reading this file today, where the
+                # live process already execs exactly that path. The skew risk
+                # that defers "github" comes from naming a wrapper that exists
+                # in only some images; this names the interpreter every one of
+                # them already runs.
                 cat > "${MCP_FILE}" <<EOF
               {
                 "mcpServers": {
                   "paperclip": {
-                    "command": "node",
+                    "command": "/usr/local/bin/node",
                     "args": ["--import", "/app/server/node_modules/tsx/dist/loader.mjs", "${MCP_BRIDGE_JS}"]
                   },
                   "prometheus": {
@@ -695,6 +715,54 @@ spec:
                 # Report what actually landed rather than a hardcoded list, so
                 # a fail-closed gbrain omission is visible in this same line.
                 echo "seed: wrote ${MCP_FILE} with MCP servers: $(jq -r '.mcpServers | keys | join(", ")' "${MCP_FILE}" 2>/dev/null || echo '(unreadable)')"
+                {{- if .Values.runtimeConfig.enabled }}
+                # PEN-3714: the copy the adapter actually READS, on a volume no
+                # agent can reach.
+                #
+                # ${MCP_FILE} lives on the fleet-shared PVC at mode 644
+                # node:node, and uid 1000 is the uid every agent runs as — so
+                # any agent can rewrite it. That would be a contained problem if
+                # only this pod read it, but it is not: the claude_k8s adapter
+                # runs inside THIS StatefulSet pod and reads that same path as
+                # `loadSharedMcpBaseline()`, merging whatever it finds into the
+                # Secret-backed /tmp/prompt/mcp.json of every agent Job it
+                # launches, fleet-wide, across every company on the volume.
+                # `--strict-mcp-config` does not bound this and is not meant to:
+                # it stops *claude* re-reading the file after the server has
+                # already merged it.
+                #
+                # So the fix is to stop sourcing the baseline from a path the
+                # consumers of that baseline can write. This emptyDir is mounted
+                # only on this pod's seed and server containers; it is not part
+                # of the agent Job spec, and an agent pod has no /runtime-config
+                # at all (verified from an agent seat 2026-10-02, with
+                # /runtime-cache as the positive control to prove the probe can
+                # see an emptyDir when one is mounted).
+                #
+                # The PVC copy stays, unchanged, for the server pod's own
+                # interactive sessions and for any adapter still pointed at it;
+                # it is simply no longer the authority for Job-pod config.
+                # Nothing here is ordering-sensitive — this is an initContainer,
+                # so the file exists before the server container starts — and
+                # the two copies are written from the same heredoc, so they
+                # cannot describe different server sets.
+                BASELINE_FILE={{ printf "%s/mcp.json" (.Values.runtimeConfig.mountPath | trimSuffix "/") | quote }}
+                if cp "${MCP_FILE}" "${BASELINE_FILE}" 2>/dev/null; then
+                  chown 1000:1000 "${BASELINE_FILE}" 2>/dev/null || true
+                  chmod 0644 "${BASELINE_FILE}" 2>/dev/null || true
+                  echo "seed: wrote agent-unreachable MCP baseline at ${BASELINE_FILE} (PEN-3714)"
+                else
+                  # Loud, and deliberately NOT fatal. PAPERCLIP_SHARED_MCP_BASELINE_PATH
+                  # points at this file, and a missing baseline degrades to
+                  # per-agent overrides only (loadSharedMcpBaseline fails open to
+                  # {}). That is the right direction to fail: agents lose the
+                  # shared servers, which is visible immediately, rather than
+                  # silently falling back to the agent-writable copy — which
+                  # would reinstate the exact hole this block closes, and would
+                  # do it precisely when something is already wrong.
+                  echo "seed: WARNING could not write ${BASELINE_FILE} — agents will start with per-agent MCP servers only (PEN-3714)"
+                fi
+                {{- end }}
               else
                 echo "seed: skipping mcp.json — bridge stdio.js not found at ${MCP_BRIDGE_JS}"
               fi
@@ -871,6 +939,23 @@ spec:
               value: {{ include "paperclip.runtimePath" . | quote }}
             - name: PAPERCLIP_INSTANCE_ID
               value: {{ .Values.env.instanceId | quote }}
+            {{- if .Values.runtimeConfig.enabled }}
+            # PEN-3714: read the shared MCP baseline from this pod's own
+            # emptyDir instead of the default /paperclip/.mcp.json on the
+            # fleet-shared PVC, which every agent can write (mode 644 node:node,
+            # uid 1000 = the agent uid). The claude_k8s adapter merges that
+            # baseline into the Secret-backed mcp.json of every agent Job it
+            # launches, so a write there reaches the whole fleet rather than
+            # just the writer. The seed initContainer populates this file from
+            # the same heredoc that writes the PVC copy.
+            #
+            # Conditional on runtimeConfig.enabled because that is what mounts
+            # the volume. With it disabled there is nowhere unreachable to put
+            # the file, so the adapter keeps its existing default: today's
+            # behaviour, no regression, and no new exposure either.
+            - name: PAPERCLIP_SHARED_MCP_BASELINE_PATH
+              value: {{ printf "%s/mcp.json" (.Values.runtimeConfig.mountPath | trimSuffix "/") | quote }}
+            {{- end }}
             {{- if .Values.runtimeCache.enabled }}
             - name: XDG_CACHE_HOME
               value: {{ printf "%s/xdg" .Values.runtimeCache.mountPath | quote }}
