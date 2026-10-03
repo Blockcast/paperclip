@@ -488,11 +488,20 @@ function headsWithUndispositionedFinding(
   // in the commit-status text, so two heads carrying at the same second named
   // a different one on each run. The head is the final axis because it is a
   // strict total order and a second-resolution timestamp is not.
+  //
+  // Compared by code unit, not localeCompare: ICU collation is locale- and
+  // build-sensitive and may report 0 for distinct strings, which would restore
+  // the array-order dependence this axis exists to remove (Ally, #1721 at
+  // 1aaf72ac).
   return carried
     .sort(
       (a, b) =>
         b.timeMs - a.timeMs ||
-        a.attesting.attestedHeadSha.localeCompare(b.attesting.attestedHeadSha),
+        (a.attesting.attestedHeadSha < b.attesting.attestedHeadSha
+          ? -1
+          : a.attesting.attestedHeadSha > b.attesting.attestedHeadSha
+            ? 1
+            : 0),
     )
     .map((entry) => ({ ...entry.attesting, unrecognizedVerbs: unrecognizedVerbsBlocking(entry) }));
 }
@@ -625,12 +634,14 @@ export function evaluateCommentReviewGate(input: {
   // the cross-head tie-break at :429, which is a strict total order where a
   // second-resolution timestamp is not. commentCreatedAt travels with the
   // chosen candidate so the two can never describe different comments
-  // (Ally, #1721 at 31532b48).
+  // (Ally, #1721 at 31532b48). Compared by code unit for the same reason as
+  // that tie-break: localeCompare is ICU- and locale-sensitive and may report
+  // 0 for distinct strings, which is not a total order.
   let unreadable: { reason: string; commentCreatedAt: string } | null = null;
   for (const review of newestInScopeAllyReviewComments(comments, reviewerBotLogin, normalizedHead)) {
     const block = parseAllyVerdictBlock(review.body);
     if (block.kind !== "unreadable") continue;
-    if (unreadable === null || block.reason.localeCompare(unreadable.reason) < 0) {
+    if (unreadable === null || block.reason < unreadable.reason) {
       unreadable = {
         reason: block.reason,
         commentCreatedAt: new Date(toEpochMs(review.createdAt)).toISOString(),
