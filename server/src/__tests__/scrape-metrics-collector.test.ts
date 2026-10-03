@@ -24,6 +24,7 @@ const refreshExternalRuntimeReservationMetrics = vi.fn(async () => {});
 const refreshQueuedRunAgeMetrics = vi.fn(async () => {});
 const refreshOverdueScheduledRetryAgeMetrics = vi.fn(async () => {});
 const refreshScheduledRetryParkHorizonMetrics = vi.fn(async () => {});
+const refreshDeferredIssueExecutionWakeAgeMetrics = vi.fn(async () => {});
 const refreshExternalRuntimeReservationStrandMetrics = vi.fn(async () => {});
 
 vi.mock("../services/external-runtime-reservations.js", () => ({
@@ -40,6 +41,8 @@ vi.mock("../services/queued-run-age-metrics.js", () => ({
     refreshOverdueScheduledRetryAgeMetrics(db as never),
   refreshScheduledRetryParkHorizonMetrics: (db: unknown) =>
     refreshScheduledRetryParkHorizonMetrics(db as never),
+  refreshDeferredIssueExecutionWakeAgeMetrics: (db: unknown) =>
+    refreshDeferredIssueExecutionWakeAgeMetrics(db as never),
 }));
 
 const {
@@ -70,6 +73,7 @@ beforeEach(() => {
     refreshQueuedRunAgeMetrics,
     refreshOverdueScheduledRetryAgeMetrics,
     refreshScheduledRetryParkHorizonMetrics,
+    refreshDeferredIssueExecutionWakeAgeMetrics,
     refreshExternalRuntimeReservationStrandMetrics,
   ]) {
     fn.mockReset();
@@ -93,6 +97,7 @@ describe("startScrapeMetricsCollector", () => {
     expect(refreshQueuedRunAgeMetrics).toHaveBeenCalledTimes(1);
     expect(refreshOverdueScheduledRetryAgeMetrics).toHaveBeenCalledTimes(1);
     expect(refreshScheduledRetryParkHorizonMetrics).toHaveBeenCalledTimes(1);
+    expect(refreshDeferredIssueExecutionWakeAgeMetrics).toHaveBeenCalledTimes(1);
     expect(refreshExternalRuntimeReservationStrandMetrics).toHaveBeenCalledTimes(1);
   });
 
@@ -104,6 +109,7 @@ describe("startScrapeMetricsCollector", () => {
 
     expect(refreshOverdueScheduledRetryAgeMetrics).toHaveBeenCalledTimes(1);
     expect(refreshScheduledRetryParkHorizonMetrics).toHaveBeenCalledTimes(1);
+    expect(refreshDeferredIssueExecutionWakeAgeMetrics).toHaveBeenCalledTimes(1);
     expect(refreshExternalRuntimeReservationStrandMetrics).toHaveBeenCalledTimes(1);
   });
 
