@@ -49,15 +49,43 @@ test("ignores non-source paths so real binary assets never fail the check", () =
   assert.deepEqual(offenses, []);
 });
 
-test("skips files that cannot be read instead of throwing", () => {
+test("skips the deleted-file race (ENOENT) instead of throwing", () => {
   const offenses = findRawNulOffenses({
     files: ["deleted.ts"],
     read: () => {
-      throw new Error("ENOENT");
+      throw Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" });
     },
   });
 
   assert.deepEqual(offenses, []);
+});
+
+test("rethrows a non-ENOENT read error rather than passing the file", () => {
+  for (const code of ["EACCES", "EISDIR", "EMFILE", undefined]) {
+    assert.throws(
+      () =>
+        findRawNulOffenses({
+          files: ["locked.ts"],
+          read: () => {
+            throw Object.assign(new Error(`read failed: ${code}`), { code });
+          },
+        }),
+      (err) => err.code === code,
+      `a ${code} read error must fail the check, not silently pass the file`,
+    );
+  }
+});
+
+test("inspects .py / .mts / .cts / .go / .svg, which the repo actually contains", () => {
+  for (const relative of ["a.py", "a.mts", "a.cts", "a.go", "a.svg"]) {
+    assert.equal(isSourcePath(relative), true, `${relative} must be inspected`);
+
+    assert.deepEqual(
+      findRawNulOffenses({ files: [relative], read: () => bytes(`x\ny${NUL}\n`) }),
+      [{ relative, lineNumber: 2 }],
+      `a NUL in ${relative} must be detected`,
+    );
+  }
 });
 
 test("runCheck exits non-zero and names the offender", () => {
