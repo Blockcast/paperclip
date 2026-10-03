@@ -206,8 +206,10 @@ export function buildAlert({
   stallRecordUrl = null,
 }) {
   const hours = ageHours.toFixed(1);
-  // NO RUN-LEVEL IDENTITY GOES IN THIS ALERT — not in the call to action, not as
-  // demoted context, not in a machine annotation (BLO-26972, then BLO-39564).
+  // NO PENDING-DEPLOY RUN IDENTITY GOES IN THIS ALERT — not in the call to action,
+  // not as demoted context, not in a machine annotation (BLO-26972, then BLO-39564).
+  // `run_url` below is exempt and stays: it is THIS dispatcher run's own url
+  // (`github.run_id`), not the deploy's, so it is terminal-safe provenance.
   //
   // This step runs BEFORE the supersede step that cancels the very run it would
   // name, so any run id here is dead within seconds of every push: measured
@@ -233,6 +235,7 @@ export function buildAlert({
   // — "at 23:33Z the oldest waiting run was X" stays true after X is cancelled;
   // an annotation asserting it in the present tense does not. Do not "finish the
   // job" by stripping the run out of them too.
+  //
   // The queue filter is correct unconditionally: it lists whatever is on
   // the gate at READ time, so no step ordering and no supersede can stale it.
   const pendingQueueUrl = `https://github.com/${repo}/actions/workflows/${DEPLOY_WORKFLOW_FILE}?query=is%3Awaiting`;
@@ -273,9 +276,15 @@ export function buildAlert({
         `Approve or reject the pending deploy to clear it: ${pendingQueueUrl}\n` +
         'That link lists whatever is on the gate right now. A stale run is cancelled and ' +
         'replaced whenever master moves past it, so approve whichever run is waiting there. ' +
+        // The automatic bound is the DAILY slot, not the next hourly one: guard (1b)
+        // exits `checked-no-pending` for every cron but `23 7 * * *`, so an empty gate
+        // cannot be refilled by an hourly slot. The 2026-10-02 window was 1h26m only
+        // because a human kicked the dispatcher manually at 01:01:12Z — that number is
+        // kept in the provenance comment above and deliberately NOT quoted here, so no
+        // approver reads it as "this lane self-heals in about an hour" and waits.
         'If that list is empty the replacement is still building and will arrive on the gate ' +
-        'once it passes; if its build fails the gate stays empty until a later dispatcher ' +
-        'slot replaces it — measured 1h26m on 2026-10-02. Either way the approval is still ' +
+        'once it passes; if its build fails the gate stays empty until the next daily 07:23 ' +
+        'dispatch slot, unless someone re-dispatches sooner. Either way the approval is still ' +
         'owed.\n\n' +
         `${waitingCount} deploy(s) were waiting on this gate when this alert was raised.` +
         (stallRecordUrl ? `\n\nDurable record (survives this alert's TTL): ${stallRecordUrl}` : ''),
