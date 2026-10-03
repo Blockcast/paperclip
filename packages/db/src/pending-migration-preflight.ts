@@ -185,6 +185,15 @@ export const PRECREATE_REQUIRED_INDEXES: readonly PrecreateRequiredIndex[] = [
       "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_timer_baseline_idx " +
       "ON agent_wakeup_requests USING btree (agent_id, requested_at DESC) WHERE source = 'timer'",
   },
+  {
+    migration: "0250_agent_wakeup_requests_deferred_issue_execution_index.sql",
+    name: "agent_wakeup_requests_deferred_issue_execution_idx",
+    table: "agent_wakeup_requests",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_deferred_issue_execution_idx " +
+      "ON agent_wakeup_requests USING btree (agent_id, requested_at) " +
+      "WHERE status = 'deferred_issue_execution'",
+  },
 ];
 
 export type PreflightBlocker = {

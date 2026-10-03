@@ -30,6 +30,7 @@ import { describeHeldAgentStartLocks } from "./agent-start-lock.js";
 import { refreshExternalRuntimeReservationMetrics } from "./external-runtime-reservations.js";
 import { refreshExternalRuntimeReservationStrandMetrics } from "./external-runtime-reservation-strand-metrics.js";
 import {
+  refreshDeferredIssueExecutionWakeAgeMetrics,
   refreshOverdueScheduledRetryAgeMetrics,
   refreshQueuedRunAgeMetrics,
   refreshScheduledRetryParkHorizonMetrics,
@@ -37,6 +38,7 @@ import {
 import {
   setAgentStartLockHeldMetrics,
   setDbPoolStats,
+  setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
   setExternalRuntimeReservationStrandMetricsRefreshSuccess,
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
@@ -85,6 +87,15 @@ const REFRESHES: readonly ScrapeRefresh[] = [
     name: "overdue-scheduled-retry-age",
     run: (db) => refreshOverdueScheduledRetryAgeMetrics(db),
     setFresh: setOverdueScheduledRetryAgeMetricsRefreshSuccess,
+  },
+  {
+    // PEN-3734. Sits with the queued-run family because it answers the same
+    // question — "is something waiting and nothing reporting it?" — one table
+    // over. A deferred wake writes no `heartbeat_runs` row at all, so the
+    // three run-table refreshes around it are structurally blind to it.
+    name: "deferred-issue-execution-wake-age",
+    run: (db) => refreshDeferredIssueExecutionWakeAgeMetrics(db),
+    setFresh: setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
   },
   {
     name: "scheduled-retry-park-horizon",
