@@ -355,6 +355,60 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     });
   });
 
+  // PEN-3727 review follow-up. The third no-run-row family, and the one the
+  // writer-derived scan could not see: this writer passes a const identifier, not an
+  // inline literal, so it reached "other" through the very suite added to stop that.
+  // Its payload already carries `code` / `reason` / `remediation`, which this route
+  // does not expose -- so projecting the reason to "other" discarded the only part of
+  // the answer an operator could read. Serve it end to end rather than only anchoring
+  // the scan: the scan proves the spelling, this proves the route returns it.
+  it("names the suppression reason for a wake skipped by the worktree pre-flight", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Wake blocked by unrunnable workspace settings",
+      status: "blocked",
+      assigneeAgentId: agent.id,
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "automation",
+      reason: "workspace_worktree_requires_project",
+      status: "skipped",
+      payload: {
+        issueId: issue.id,
+        heartbeatSkip: {
+          code: "workspace_worktree_requires_project",
+          reason: "Worktree execution requires a project workspace.",
+          remediation: "Attach the issue to a project or switch it off worktree mode.",
+        },
+      },
+      runId: null,
+      requestedAt: new Date(Date.now() - 10_000),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    expect(res.body.events[0]).toMatchObject({
+      kind: "wake_request",
+      reason: "workspace_worktree_requires_project",
+      status: "skipped",
+      runId: null,
+    });
+    // The payload stays redacted -- admitting the reason must not widen the response.
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain("\"payload\"");
+    expect(serialized).not.toContain("remediation");
+  });
+
   it("returns null diagnosis for an unblocked issue with no wake history", async () => {
     const company = await seedCompany(db);
     const project = await seedProject(db, company.id, "Core");
@@ -659,15 +713,46 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
 // assert a static registry against its writer, need no database, and must not go
 // silently green on a host where embedded Postgres is unavailable.
 describe("issue wake diagnostic reason allowlist", () => {
-  const heartbeatSource = readFileSync(
-    fileURLToPath(new URL("../services/heartbeat.ts", import.meta.url)),
-    "utf8",
-  );
+  const heartbeatUrl = new URL("../services/heartbeat.ts", import.meta.url);
+  const heartbeatSource = readFileSync(fileURLToPath(heartbeatUrl), "utf8");
 
   // The two timer-scheduler skips this route cannot return. Hoisted so the positive
   // scan below and the negative test at the bottom carve out the SAME two names: if
   // one list grows and the other does not, the pair contradicts rather than drifts.
   const AGENT_SCOPED_UNREACHABLE = ["provider_capacity_deferred", "no_in_flight_work"];
+
+  // `reason:` is not always an inline literal. Two writers pass a `SCREAMING_SNAKE`
+  // const instead -- one declared in `heartbeat.ts`, one imported -- and the first
+  // revision of this scan skipped both as "cannot be resolved statically". It can:
+  // that shape is a module-level binding to a string literal, and skipping it is what
+  // let `workspace_worktree_requires_project` reach "other" through the very suite
+  // added to stop that. A lowercase identifier (`wakeReason`, `skipReason`,
+  // `dailyCapBlock.reason`, `opts.reason`) is the genuinely unresolvable shape and
+  // stays the documented, narrower gap.
+  //
+  // Lazy on purpose: only a name the scan actually meets is resolved, so this reads
+  // two files rather than all 43 of `heartbeat.ts`'s relative imports.
+  function resolveConstLiteral(name: string): string | null {
+    const local = heartbeatSource.match(
+      new RegExp(`(?:^|\\n)\\s*(?:export\\s+)?const\\s+${name}\\s*(?::[^=]+)?=\\s*"([^"]+)"`),
+    );
+    if (local) return local[1];
+
+    for (const imported of heartbeatSource.matchAll(
+      /import\s*\{([^}]*)\}\s*from\s*"(\.\.?\/[^"]+)"/g,
+    )) {
+      if (!new RegExp(`(^|[\\s,])${name}([\\s,]|$)`).test(imported[1])) continue;
+      const moduleSource = readFileSync(
+        fileURLToPath(new URL(imported[2].replace(/\.js$/, ".ts"), heartbeatUrl)),
+        "utf8",
+      );
+      const exported = moduleSource.match(
+        new RegExp(`(?:^|\\n)\\s*export\\s+const\\s+${name}\\s*(?::[^=]+)?=\\s*"([^"]+)"`),
+      );
+      if (exported) return exported[1];
+    }
+    return null;
+  }
 
   // `reason:` appears TWICE in most of these insert blocks -- once at the top level
   // (the `agent_wakeup_requests.reason` COLUMN) and once nested inside
@@ -678,6 +763,7 @@ describe("issue wake diagnostic reason allowlist", () => {
   // take `reason:` only at depth 1 of the `.values({ ... })` object.
   function columnReasonLiteralsFromDirectInserts() {
     const sites: { line: number; reasons: string[] }[] = [];
+    const unresolvedConsts: string[] = [];
     const openers = /insert\(agentWakeupRequests\)\s*\n?\s*\.?\s*values\(\{/g;
     let opener: RegExpExecArray | null;
     while ((opener = openers.exec(heartbeatSource))) {
@@ -707,15 +793,24 @@ describe("issue wake diagnostic reason allowlist", () => {
         const tail = block.slice(i + "reason:".length, i + 400);
         const literal = tail.match(/^\s*"([^"]+)"/);
         const ternary = tail.match(/^[^,]*?\?\s*\n?\s*"([^"]+)"\s*\n?\s*:\s*\n?\s*"([^"]+)"/);
-        // A non-literal `reason:` (a variable, a helper call) is skipped: it cannot be
-        // resolved statically. That is a known, narrower gap -- see the floor assertions.
+        const constIdentifier = tail.match(/^\s*([A-Z][A-Z0-9_]*)\s*,/);
+        // A lowercase/member-expression `reason:` is skipped: it cannot be resolved
+        // statically. That is a known, narrower gap -- see the floor assertions.
         if (literal) sites.push({ line: lineOf(opener.index), reasons: [literal[1]] });
         else if (ternary)
           sites.push({ line: lineOf(opener.index), reasons: [ternary[1], ternary[2]] });
+        else if (constIdentifier) {
+          const resolved = resolveConstLiteral(constIdentifier[1]);
+          // Fail loudly rather than widening the skip: a `SCREAMING_SNAKE` const the
+          // resolver cannot follow means the resolver broke, not that the site is
+          // dynamic. Silently skipping it is the exact failure this revision fixes.
+          if (resolved) sites.push({ line: lineOf(opener.index), reasons: [resolved] });
+          else unresolvedConsts.push(`${constIdentifier[1]} (heartbeat.ts:${lineOf(opener.index)})`);
+        }
         break;
       }
     }
-    return sites;
+    return { sites, unresolvedConsts };
   }
 
   function lineOf(index: number) {
@@ -754,15 +849,20 @@ describe("issue wake diagnostic reason allowlist", () => {
   // instead, including the coalesce ternary that writes
   // `github_state_change_queued_coalesced` / `issue_execution_same_name`, so a rename
   // at any of those would still have reached "other" undetected.
-  it("admits every literal reason a direct `insert(agentWakeupRequests)` writes to the column", () => {
-    const sites = columnReasonLiteralsFromDirectInserts();
+  it("admits every statically resolvable reason a direct `insert(agentWakeupRequests)` writes to the column", () => {
+    const { sites, unresolvedConsts } = columnReasonLiteralsFromDirectInserts();
+
+    // A `SCREAMING_SNAKE` const the resolver cannot follow is a broken resolver, not a
+    // dynamic site. Assert it before the floor: a resolver that silently returns null
+    // would otherwise just shrink the site count and read as a drifted floor.
+    expect(unresolvedConsts, "const-identifier reasons the resolver could not follow").toEqual([]);
 
     // Vacuity floors. `toBeGreaterThan(0)` would not catch the failure mode that
     // matters here -- a depth walk desynced by an unbalanced brace inside a string
     // still yields *some* sites while silently dropping others. So pin a count floor
     // and name the specific pair this test was added for.
     expect(sites.length, "direct-insert reason scan found too few sites").toBeGreaterThanOrEqual(
-      15,
+      17,
     );
     const found = new Set(sites.flatMap((site) => site.reasons));
     for (const anchor of [
@@ -770,6 +870,11 @@ describe("issue wake diagnostic reason allowlist", () => {
       "issue_execution_same_name",
       "issue_execution_deferred",
       "heartbeat.worktree_execution_cutoff",
+      // The two const-identifier sites. Anchored by their RESOLVED values, so this
+      // fails if the resolver regresses to skipping them -- which is how
+      // `workspace_worktree_requires_project` survived the previous revision.
+      "workspace_worktree_requires_project",
+      "execution_review_participant_recovery",
     ]) {
       expect(found.has(anchor), `direct-insert scan lost its anchor ${anchor}`).toBe(true);
     }
