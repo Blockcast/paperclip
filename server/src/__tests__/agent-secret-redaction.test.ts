@@ -610,6 +610,41 @@ describe("agent secret redaction on mutating responses", () => {
     expect(JSON.stringify(approvalPayload?.metadata)).not.toContain(REDACTED_EVENT_VALUE);
   });
 
+  // The negative control for the two cases above, and the branch none of them
+  // reaches. `restoreRedactedAgentMetadata` scrubs only when a sentinel is
+  // actually present — `containsRedactedAdapterValue` short-circuits and returns
+  // `incoming` untouched otherwise — and that short-circuit is the only thing
+  // standing between a create and "no prior value, therefore drop everything".
+  // Every assertion above drives a MASKED payload, so a future change that
+  // scrubbed unconditionally would keep this whole file green while silently
+  // dropping a legitimate credential on every create. Pin the other side: a real
+  // value, under a key the redactor would have masked on the way out, reaches the
+  // column byte-for-byte. The short-circuit is shared by all four call sites, so
+  // one case covers the branch for each.
+  it("POST /companies/:companyId/agents persists a genuine metadata credential unchanged", async () => {
+    const realMetadata = {
+      paperclipBuiltInAgent: "cto",
+      // Tier-1 key names, deliberately: these are exactly the keys that come back
+      // masked from a read, so they are the ones an over-eager scrub would eat.
+      token: { type: "plain", value: "metadata-create-real-secret-24681357" },
+      nested: { apiKey: "metadata-create-real-nested-86420975" },
+    };
+    expect(JSON.stringify(realMetadata)).not.toContain(REDACTED_EVENT_VALUE);
+
+    mockAgentService.create.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { ...baseAgent.adapterConfig, instructionsRootPath: "/workspace/instructions" },
+    });
+
+    const res = await request(createApp(boardActor))
+      .post(`/api/companies/${companyId}/agents`)
+      .send({ name: "Real", role: "engineer", adapterType: "claude_local", metadata: realMetadata });
+
+    expect(res.status).toBe(201);
+    const persisted = mockAgentService.create.mock.calls[0]?.[1] as { metadata?: Record<string, unknown> };
+    expect(persisted.metadata).toEqual(realMetadata);
+  });
+
   // The reported case: a patch that touches no credential field at all.
   it("PATCH /agents/:id redacts secrets on a patch touching no credential field", async () => {
     mockAgentService.update.mockResolvedValue({ ...baseAgent, spentMonthlyCents: 123_456 });
