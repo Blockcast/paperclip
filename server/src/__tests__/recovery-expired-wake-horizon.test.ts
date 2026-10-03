@@ -3,6 +3,7 @@ import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  activityLog,
   companies,
   createDb,
   heartbeatRuns,
@@ -20,6 +21,7 @@ import {
 } from "../services/issue-recovery-actions.js";
 import { attentionService } from "../services/attention.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { reconcileStrandedBlockedIssues } from "../services/stranded-blocked-issue-reconciler.js";
 import {
   RECOVERY_HORIZON_EXPIRED_METRIC,
   __resetMetricsForTest,
@@ -53,6 +55,11 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     await db.delete(issues);
     // Before `agents`/`companies`: heartbeat_runs has FKs onto both.
     await db.delete(heartbeatRuns);
+    // Likewise activity_log, which FKs onto companies. The burst case drives
+    // `reconcileStrandedBlockedIssues`, and that writes an `issue.stranded_blocked_reconciled`
+    // row per issue it resumes — so without this the next `delete from companies` trips
+    // `activity_log_company_id_companies_id_fk` and fails a test that already passed.
+    await db.delete(activityLog);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -570,12 +577,42 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     // `BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES` (issues.ts), and
     // `escalated` is deliberately not in that set. Leave 1 of 25 `active` and the
     // resumer skips that row forever — which is the pre-bounds strand.
+    //
+    // Kept as the narrow unit check, with signal (d) driven end to end below it. The two
+    // are not the same claim: this one proves the resumer is ALLOWED to run, not that any
+    // row ever leaves `blocked`.
     const stillSuppressing = rows.filter((row) =>
       (BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES as readonly string[]).includes(
         row.status,
       ),
     );
     expect(stillSuppressing).toHaveLength(0);
+
+    // Signal (d), driven rather than inferred: "no source issue is left `blocked` with
+    // `unresolvedBlockerCount == 0`".
+    //
+    // WHY THIS IS NOT CEREMONY ON TOP OF `stillSuppressing`. The CEO's 2026-10-01
+    // amendment replaced signal (b) with "the burst was retired on strictly fewer than N
+    // delivered wakes, and every action reached a terminal bound" — and attached a
+    // condition to it: scored together with (d), NEVER alone, because "scored alone, (b)
+    // would reward a mechanism that simply never wakes anybody". This burst is the
+    // extreme of exactly that: `enqueueWakeup` is asserted above to have been called
+    // ZERO times. So (b') here is satisfied by a mechanism that woke nobody at all, and
+    // (d) is the entire thing standing between that and a passing test over 25 issues
+    // sitting `blocked` with no blockers and no wake path. Inferring (d) from a released
+    // suppression does not discharge it: the resumer has its own candidate gate
+    // (stranded-blocked-issue-reconciler.ts) and an issue can clear the recovery
+    // suppression and still be held there. Both halves must be scored on ONE fixture,
+    // which is what the amendment asks for and what no single test did before.
+    const resumed = await reconcileStrandedBlockedIssues(db);
+    expect(resumed.reconciled).toBe(N);
+    const resumedIssues = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(inArray(issues.id, issueIds));
+    expect(resumedIssues).toHaveLength(N);
+    // Named per-row rather than as a count, so a failure says WHICH rows stranded.
+    expect(resumedIssues.filter((row) => row.status === "blocked").map((row) => row.id)).toEqual([]);
   });
 
   /**
