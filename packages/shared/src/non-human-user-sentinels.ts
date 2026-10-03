@@ -20,6 +20,14 @@
  * Adding an id here says "never hand work to this principal". It does not say
  * "ignore this principal" — agent attribution deliberately still derives
  * through these sentinels (`server/src/services/issues.ts`).
+ *
+ * Only principals that can never be a person belong here. A real member who
+ * has simply not been acting on what they are handed is not a sentinel:
+ * listing them would silently stop routing work to someone who can still
+ * answer it. The fix for an inactive recipient is picking a different
+ * recipient, not hiding this one. BLO-19560 is the case that prompted this
+ * note: the second `[user-cover]` recipient it found is a dormant human admin,
+ * so it stays off this list.
  */
 export const NON_HUMAN_USER_SENTINEL_IDS: ReadonlySet<string> = new Set(["local-board"]);
 
