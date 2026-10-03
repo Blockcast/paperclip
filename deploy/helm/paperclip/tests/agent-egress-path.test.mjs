@@ -594,14 +594,31 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
   // before comparing, so a stale absolute path in the repo copy shows up as a
   // mismatch. That cover disappears with the seed block in the PEN-3713
   // follow-up — which is also the change most likely to tidy these paths.
-  for (const name of ["git", "github-mcp-server"]) {
+  // The count, not merely the presence. `git` names the directory TWICE — once
+  // to chain-load paperclip-github-token-env, once to point
+  // credential.https://github.com.helper at github-token-credential-helper —
+  // and `.includes()` is satisfied by either one alone. A hand-edited directory
+  // move that updates the first and misses the second passes a presence check
+  // while leaving the helper pointing at a path that is not there, and git
+  // treats an unresolvable credential helper as NO credential helper: it keeps
+  // running, so the half-done move degrades silently rather than failing.
+  //
+  // The expected counts are per wrapper and are deliberately not derived from
+  // the file (a count read out of the body it is checking asserts nothing).
+  // They are small integers that change only when a wrapper is rewritten, which
+  // is exactly when a human should re-read this.
+  for (const [name, expected] of [
+    ["git", 2],
+    ["github-mcp-server", 1],
+  ]) {
     const body = fs.readFileSync(
       path.join(repoRoot, "docker/github-wrappers", name),
       "utf8",
     );
-    assert.ok(
-      body.includes(IMAGE_WRAPPER_BIN),
-      `the ${name} wrapper chain-loads an absolute path and must name ${IMAGE_WRAPPER_BIN}: it does not resolve this one through PATH, so a directory move that misses it execs a path that is not there`,
+    assert.equal(
+      body.split(IMAGE_WRAPPER_BIN).length - 1,
+      expected,
+      `the ${name} wrapper chain-loads an absolute path and must name ${IMAGE_WRAPPER_BIN} exactly ${expected} time(s): it does not resolve this one through PATH, so a directory move that misses it execs a path that is not there`,
     );
   }
 });
