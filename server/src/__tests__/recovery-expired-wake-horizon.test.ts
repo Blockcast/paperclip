@@ -3,7 +3,6 @@ import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
-  activityLog,
   companies,
   createDb,
   heartbeatRuns,
@@ -15,6 +14,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scoped-test-state.js";
 import {
   BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
   issueRecoveryActionService,
@@ -50,18 +50,14 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
   }, 120_000);
 
   afterEach(async () => {
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    // Before `agents`/`companies`: heartbeat_runs has FKs onto both.
-    await db.delete(heartbeatRuns);
-    // Likewise activity_log, which FKs onto companies. The burst case drives
-    // `reconcileStrandedBlockedIssues`, and that writes an `issue.stranded_blocked_reconciled`
-    // row per issue it resumes — so without this the next `delete from companies` trips
-    // `activity_log_company_id_companies_id_fk` and fails a test that already passed.
-    await db.delete(activityLog);
-    await db.delete(agents);
-    await db.delete(companies);
+    // One TRUNCATE ... CASCADE rooted at `companies` reaches every table this
+    // suite writes, so cleanup cannot go stale against a new FK. The burst case
+    // drives `reconcileStrandedBlockedIssues`, which writes an
+    // `issue.stranded_blocked_reconciled` activity_log row per issue it resumes
+    // — and `activity_log` FKs onto `companies`, `agents` AND `heartbeat_runs`,
+    // the last two without an `onDelete` action (BLO-22231). A hand-ordered
+    // delete list has to get all three right; this gets them for free.
+    await truncateCompanyScopedTestState(db);
   });
 
   afterAll(async () => {
