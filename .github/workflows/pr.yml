@@ -434,6 +434,15 @@ jobs:
         run: node --test ./scripts/check-no-git-push.test.mjs
         timeout-minutes: 1
 
+      - name: Reject raw NUL bytes in tracked source (BLO-39632)
+        if: ${{ !cancelled() }}
+        run: node ./scripts/check-no-raw-nul.mjs
+
+      - name: Test no-raw-nul check
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-no-raw-nul.test.mjs
+        timeout-minutes: 1
+
       - name: Reject App-attributed commits on the PR (BLO-21416)
         if: ${{ !cancelled() }}
         # Non-merge commits stamped with the shared allyblockcast[bot] App
