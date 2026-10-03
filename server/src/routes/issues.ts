@@ -1398,7 +1398,9 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_SOURCES = new Set([
   "automation",
 ]);
 
-export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
+// Exported only so the writer-derived tests can read membership; `ReadonlySet` keeps
+// that a read. Every consumer in and out of this module uses `.has()`.
+export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set([
   "issue_assigned",
   "issue_blockers_resolved",
   "issue_commented",
