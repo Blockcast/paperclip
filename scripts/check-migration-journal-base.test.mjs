@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { checkAgainstBase, readAtRef } from "./check-migration-journal-base.mjs";
 
@@ -124,12 +126,21 @@ for (const [label, journal] of [
   });
 }
 
-test("a malformed entry is reported, not skipped", () => {
+test("a malformed entry is reported once, not also compared to the base", () => {
   // Both halves of the shape check: non-integer idx, and non-string tag. An
   // entry missing either cannot be compared to the base at all.
-  for (const bad of [{ idx: "248", tag: "0248_x" }, { idx: 248, tag: null }]) {
+  //
+  // The second fixture collides with TAIL's idx ON PURPOSE. With an idx the
+  // base does not have, the comparison that follows the `malformed` push finds
+  // nothing either way, so dropping its `continue` changes no output and the
+  // guard has no failing mutation. At idx 247 the fall-through would add a
+  // second, nonsensical message (`adds idx 247 ("null") ... Renumber ... to
+  // 248`), so the exact count below is what pins the `continue` down.
+  for (const bad of [{ idx: "248", tag: "0248_x" }, { idx: 247, tag: null }]) {
     const head = { journal: journalOf(TAIL, bad), sqlFiles: MASTER.sqlFiles };
-    assert.match(check(head, MASTER).join("\n"), /malformed entry/, JSON.stringify(bad));
+    const problems = check(head, MASTER);
+    assert.equal(problems.length, 1, `${JSON.stringify(bad)} -> ${problems.join("\n")}`);
+    assert.match(problems[0], /malformed entry/, JSON.stringify(bad));
   }
 });
 
@@ -146,6 +157,29 @@ test("readAtRef throws on an unreadable ref instead of skipping the comparison",
       }),
     /cannot read x\.json at deadbeef/,
   );
+});
+
+// An absent base ref is the one path that reaches a green exit having compared
+// nothing. Locally that is fine; in CI it is a required check verifying nothing
+// while every sibling still runs. `pr.yml` populates PR_BASE_SHA on both of its
+// triggers, so this is unreachable today -- these two pin it shut by
+// construction rather than by workflow-level `env:` discipline.
+const runWithoutBase = (env) =>
+  spawnSync(process.execPath, [fileURLToPath(new URL("./check-migration-journal-base.mjs", import.meta.url))], {
+    encoding: "utf8",
+    env: { ...process.env, PR_BASE_SHA: "", GITHUB_ACTIONS: "", ...env },
+  });
+
+test("no base ref in CI fails rather than passing green having checked nothing", () => {
+  const { status, stderr } = runWithoutBase({ GITHUB_ACTIONS: "true" });
+  assert.equal(status, 1, stderr);
+  assert.match(stderr, /green check that verified nothing/);
+});
+
+test("no base ref outside CI stays a local convenience", () => {
+  const { status, stdout } = runWithoutBase({});
+  assert.equal(status, 0, stdout);
+  assert.match(stdout, /nothing was checked/);
 });
 
 // ---------------------------------------------------------------------------

@@ -158,8 +158,16 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   const baseRef = process.argv[2] || process.env.PR_BASE_SHA || "";
   if (!baseRef) {
-    // Local runs have no base. Say so loudly: this guard has no single-tree
-    // arm, so "no base" means it checked nothing at all.
+    // This guard has no single-tree arm, so "no base" means it checked nothing
+    // at all. Locally that is a convenience; in CI it is a required check
+    // passing green having done nothing, while every sibling check still runs
+    // -- exactly the silent no-op the header warns about. `pr.yml` populates
+    // PR_BASE_SHA for both of its triggers today, so this is unreachable; the
+    // throw is what keeps it unreachable when a third trigger is added.
+    if (process.env.GITHUB_ACTIONS) {
+      console.error("ERROR: no base ref (PR_BASE_SHA unset) in CI. This guard compares against the base only, so passing here would be a green check that verified nothing.");
+      process.exit(1);
+    }
     console.log("  –  No base ref (PR_BASE_SHA unset); this guard compares against the base only, so nothing was checked.");
     process.exit(0);
   }
