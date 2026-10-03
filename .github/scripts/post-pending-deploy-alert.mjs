@@ -206,18 +206,31 @@ export function buildAlert({
   stallRecordUrl = null,
 }) {
   const hours = ageHours.toFixed(1);
-  const pendingUrl = oldest.url ?? '(url unavailable)';
-  // The call to action must NOT be a run url. This step runs BEFORE the
-  // supersede step that cancels the very run it names, so `pendingUrl` is dead
-  // within seconds of every push and stays dead for the whole ~7h cycle —
-  // measured 2026-09-19: alert posted 23:31:17Z naming run 35455142403,
-  // cancelled 23:31:23Z, still named at 00:05Z. A human opening the link finds a
-  // cancelled run, which is this alert's own subject matter (BLO-26972).
+  // NO RUN-LEVEL IDENTITY GOES IN THIS ALERT — not in the call to action, not as
+  // demoted context, not in a machine annotation (BLO-26972, then BLO-39564).
   //
-  // The queue filter is correct unconditionally: it lists whatever is on the
-  // gate at READ time, so no step ordering, no write-back of the replacement run
-  // id, and no supersede can stale it. `pendingUrl` is kept as observed-at-alert
-  // context and in the machine annotation, where a perishable value is honest.
+  // This step runs BEFORE the supersede step that cancels the very run it would
+  // name, so any run id here is dead within seconds of every push: measured
+  // 2026-09-19, alert posted 23:31:17Z naming run 35455142403, cancelled
+  // 23:31:23Z, still named at 00:05Z. BLO-26972 moved the call to action to the
+  // queue filter but kept the run as "observed-at-alert context"; BLO-39564
+  // measured the rest of the harm. On 2026-10-02 a supersede at 23:33:47Z
+  // cancelled run 37035438983 and its replacement failed in `build-and-push`,
+  // so for 1h26m the only firing alert asserted `pending run waiting since
+  // 16:39:45Z` against a run with `pending_deployments: 0`. An approver
+  // following that pointer lands on a dead gate.
+  //
+  // Note that NO render-time freshness check can fix this: the run is live when
+  // we read it and terminal four seconds later, by the dispatcher's own design.
+  // Omitting is the only thing that holds.
+  //
+  // The split that makes this honest: the STALL is durable and survives a
+  // supersede (PEN-3315), so `stall_since` and the age stay — during the TTL
+  // ride-through "a human has been needed since X" is still true. An individual
+  // RUN is not durable, so it is reported only in this dispatcher run's own log,
+  // which is immutable and timestamped, and never in an alert that is re-read as
+  // if live. The queue filter is correct unconditionally: it lists whatever is on
+  // the gate at READ time, so no step ordering and no supersede can stale it.
   const pendingQueueUrl = `https://github.com/${repo}/actions/workflows/${DEPLOY_WORKFLOW_FILE}?query=is%3Awaiting`;
   // A supersede replaces the run but not the stall, so these two differ whenever
   // the lane has been refreshed. Saying only one of them would either understate
@@ -246,19 +259,18 @@ export function buildAlert({
         'fails (conclusion=failure) and this alert refreshes each slot, so the stall is ' +
         'visible — but only a reviewer approving or rejecting can clear it.\n\n' +
         (superseded
-          ? 'The pending run has been superseded at least once so the approvable head stays ' +
-            `current, so it is younger than the stall: it has been waiting since ${oldest.createdAt}. ` +
-            'Nothing has been approved — the age above is how long a human has been needed.\n\n'
+          ? 'The run on the gate has been superseded at least once so the approvable head stays ' +
+            'current, so whatever is waiting there now is younger than the stall above. ' +
+            'Nothing has been approved — that age is how long a human has been needed.\n\n'
           : '') +
         `Approve or reject the pending deploy to clear it: ${pendingQueueUrl}\n` +
-        'That link lists whatever is on the gate right now. Do not bookmark an individual run: ' +
-        'a stale one is cancelled and replaced whenever master moves past it, so approve ' +
-        `whichever run is waiting there. At the time of this alert that was ${pendingUrl}.\n\n` +
-        `${waitingCount} deploy(s) currently waiting on this gate.` +
+        'That link lists whatever is on the gate right now. A stale run is cancelled and ' +
+        'replaced whenever master moves past it, so approve whichever run is waiting there. ' +
+        'If that list is empty the replacement is still building and will arrive on the gate ' +
+        'shortly; the approval is still owed.\n\n' +
+        `${waitingCount} deploy(s) were waiting on this gate when this alert was raised.` +
         (stallRecordUrl ? `\n\nDurable record (survives this alert's TTL): ${stallRecordUrl}` : ''),
       pending_queue_url: pendingQueueUrl,
-      pending_run_url: pendingUrl,
-      pending_since: oldest.createdAt,
       stall_since: stallSince,
       ...(stallRecordUrl ? { stall_record_url: stallRecordUrl } : {}),
       run_url: runUrl,
@@ -481,7 +493,7 @@ async function main() {
   } catch (err) {
     console.error(
       `::error::ALERT DELIVERY FAILED: could not reach Alertmanager at ${url}: ${err.message}. ` +
-        `The stuck approval is still real — ${alert.annotations.pending_run_url}`,
+        `The stuck approval is still real — ${alert.annotations.pending_queue_url}`,
     );
     process.exit(1);
   }
@@ -495,10 +507,15 @@ async function main() {
   }
 
   setOutput('escalated', 'true');
+  // The run identity lives HERE and not in the alert (see buildAlert): this log
+  // line is immutable and carries its own timestamp, so naming a run that the
+  // supersede step cancels four seconds from now is honest forensics rather than
+  // a pointer someone follows later.
   console.log(
     `Pushed ${alert.labels.alertname} (severity=${alert.labels.severity}) to ${url}; ` +
       `firing until ${alert.endsAt}. Stall since ${alert.annotations.stall_since}; ` +
-      `pending run waiting since ${alert.annotations.pending_since}.`,
+      `at push time the oldest waiting run was ${verdict.oldest.url ?? '(url unavailable)'}, ` +
+      `waiting since ${verdict.oldest.createdAt}.`,
   );
   if (recordReadFailed || chainReadFailed) process.exit(1);
 }
