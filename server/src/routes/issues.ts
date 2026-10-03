@@ -1450,6 +1450,22 @@ export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set(
   "pipeline_stage_exit_cancellation_pending",
   "heartbeat.scheduling_suppressed",
   "heartbeat.worktree_execution_cutoff",
+  // Written as a const identifier rather than an inline literal, which is why the
+  // writer-derived scan missed them and `workspace_worktree_requires_project` survived
+  // the revision that added this list. Both resolve to server-authored literals; the
+  // scan now resolves `SCREAMING_SNAKE` consts, so these are protected from drift by
+  // the same control as every entry above rather than by being restated as symbols.
+  //
+  // `workspace_worktree_requires_project` is the same no-run-row family as the block
+  // above -- the worktree pre-flight marks the issue `blocked`, writes this row
+  // `skipped`, and returns without inserting into `heartbeat_runs`. It is also the
+  // most actionable of the set: its payload already carries a `remediation` string
+  // while the one surface that could print it reported `reason: "other"`.
+  // `execution_review_participant_recovery` is the exception that shows this list is
+  // not *only* no-run-row reasons (neither is `issue_commented`) -- it does queue a
+  // run, but it is issue-scoped and reachable here, so naming it beats "other".
+  "workspace_worktree_requires_project",
+  "execution_review_participant_recovery",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
