@@ -144,6 +144,27 @@ test("a malformed entry is reported once, not also compared to the base", () => 
   }
 });
 
+test("one entry that lost its `idx` does not strip the renumber suggestion from the others", () => {
+  // `nextFreeIdx` is computed over the whole journal before the per-entry shape
+  // check runs, so a single entry missing `idx` used to make it NaN -- and the
+  // "renumber to N" half of every OTHER message is the entire value this guard
+  // adds over the merge-queue conflict it predicts.
+  const lostIdx = { version: "7", when: 1789900100000, tag: "0248_lost_idx", breakpoints: true };
+  const collide = { ...TAIL, tag: "0247_different_tag" };
+  const head = {
+    journal: journalOf(TAIL, lostIdx, collide),
+    sqlFiles: [...MASTER.sqlFiles, "0247_different_tag.sql"],
+  };
+
+  const problems = check(head, MASTER);
+
+  assert.equal(problems.length, 3, problems.join("\n"));
+  assert.doesNotMatch(problems.join("\n"), /NaN/, problems.join("\n"));
+  assert.match(problems[0], /malformed entry/);
+  assert.match(problems[1], /renumber .*journal entry AND \.sql file -- to 248/i);
+  assert.match(problems[2], /renumber to 0248/i);
+});
+
 test("readAtRef throws on an unreadable ref instead of skipping the comparison", () => {
   assert.throws(
     () =>

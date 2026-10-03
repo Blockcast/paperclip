@@ -81,8 +81,17 @@ export function checkAgainstBase({
   const baseIdxByTag = new Map(baseEntries.map((e) => [e.tag, e.idx]));
 
   // The next number free on BOTH sides, so the suggestion survives the merge.
+  // Non-integer `idx` is dropped BEFORE the max: this runs ahead of the
+  // per-entry shape check below, so one entry that lost its `idx` in a
+  // hand-merge would otherwise make this NaN and strip the renumber-to-N
+  // suggestion out of every OTHER entry's message -- which is the one thing
+  // this guard exists to deliver over a merge-queue conflict.
   const nextFreeIdx =
-    Math.max(...baseEntries.map((e) => e.idx), ...entries.map((e) => e.idx), -1) + 1;
+    Math.max(
+      ...baseEntries.map((e) => e?.idx).filter(Number.isInteger),
+      ...entries.map((e) => e?.idx).filter(Number.isInteger),
+      -1,
+    ) + 1;
 
   // --- arm 1: journal idx / tag already taken on the base -----------------
   for (const entry of entries) {
