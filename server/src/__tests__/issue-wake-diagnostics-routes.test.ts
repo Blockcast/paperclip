@@ -659,6 +659,69 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
 // assert a static registry against its writer, need no database, and must not go
 // silently green on a host where embedded Postgres is unavailable.
 describe("issue wake diagnostic reason allowlist", () => {
+  const heartbeatSource = readFileSync(
+    fileURLToPath(new URL("../services/heartbeat.ts", import.meta.url)),
+    "utf8",
+  );
+
+  // The two timer-scheduler skips this route cannot return. Hoisted so the positive
+  // scan below and the negative test at the bottom carve out the SAME two names: if
+  // one list grows and the other does not, the pair contradicts rather than drifts.
+  const AGENT_SCOPED_UNREACHABLE = ["provider_capacity_deferred", "no_in_flight_work"];
+
+  // `reason:` appears TWICE in most of these insert blocks -- once at the top level
+  // (the `agent_wakeup_requests.reason` COLUMN) and once nested inside
+  // `payload.heartbeatSkip`, which `projectWakeDiagnosticReason` never reads. Reading
+  // the nested one is precisely the mistake that put bare `worktree_execution_cutoff`
+  // in the allowlist, so a regex that cannot tell them apart would re-seed this
+  // change's own defect into the test meant to catch it. Hence brace-depth tracking:
+  // take `reason:` only at depth 1 of the `.values({ ... })` object.
+  function columnReasonLiteralsFromDirectInserts() {
+    const sites: { line: number; reasons: string[] }[] = [];
+    const openers = /insert\(agentWakeupRequests\)\s*\n?\s*\.?\s*values\(\{/g;
+    let opener: RegExpExecArray | null;
+    while ((opener = openers.exec(heartbeatSource))) {
+      const open = opener.index + opener[0].length - 1;
+      let depth = 1;
+      let end = open + 1;
+      while (end < heartbeatSource.length && depth > 0) {
+        const ch = heartbeatSource[end];
+        if (ch === "{") depth++;
+        else if (ch === "}") depth--;
+        end++;
+      }
+      const block = heartbeatSource.slice(open, end);
+
+      let blockDepth = 0;
+      for (let i = 0; i < block.length; i++) {
+        const ch = block[i];
+        if (ch === "{") {
+          blockDepth++;
+          continue;
+        }
+        if (ch === "}") {
+          blockDepth--;
+          continue;
+        }
+        if (blockDepth !== 1 || !block.startsWith("reason:", i)) continue;
+        const tail = block.slice(i + "reason:".length, i + 400);
+        const literal = tail.match(/^\s*"([^"]+)"/);
+        const ternary = tail.match(/^[^,]*?\?\s*\n?\s*"([^"]+)"\s*\n?\s*:\s*\n?\s*"([^"]+)"/);
+        // A non-literal `reason:` (a variable, a helper call) is skipped: it cannot be
+        // resolved statically. That is a known, narrower gap -- see the floor assertions.
+        if (literal) sites.push({ line: lineOf(opener.index), reasons: [literal[1]] });
+        else if (ternary)
+          sites.push({ line: lineOf(opener.index), reasons: [ternary[1], ternary[2]] });
+        break;
+      }
+    }
+    return sites;
+  }
+
+  function lineOf(index: number) {
+    return heartbeatSource.slice(0, index).split("\n").length;
+  }
+
   // The first revision of the allowlist carried bare `worktree_execution_cutoff`,
   // which matches no row: every write of that suppression to the `reason` COLUMN uses
   // the dotted `heartbeat.worktree_execution_cutoff`, and the bare string exists only
@@ -670,10 +733,6 @@ describe("issue wake diagnostic reason allowlist", () => {
   // rename or a spelling drift on either side fails here instead of quietly
   // projecting a real suppression to "other".
   it("admits every reason `writeSkippedHeartbeatRequest` writes to the reason column", () => {
-    const heartbeatSource = readFileSync(
-      fileURLToPath(new URL("../services/heartbeat.ts", import.meta.url)),
-      "utf8",
-    );
     const written = [
       ...heartbeatSource.matchAll(/writeSkippedHeartbeatRequest\(\s*"([^"]+)"/g),
     ].map((match) => match[1]);
@@ -690,13 +749,55 @@ describe("issue wake diagnostic reason allowlist", () => {
     }
   });
 
+  // The scan above covers the `writeSkippedHeartbeatRequest` family only -- three call
+  // sites. Most reasons reach the column through a direct `insert(agentWakeupRequests)`
+  // instead, including the coalesce ternary that writes
+  // `github_state_change_queued_coalesced` / `issue_execution_same_name`, so a rename
+  // at any of those would still have reached "other" undetected.
+  it("admits every literal reason a direct `insert(agentWakeupRequests)` writes to the column", () => {
+    const sites = columnReasonLiteralsFromDirectInserts();
+
+    // Vacuity floors. `toBeGreaterThan(0)` would not catch the failure mode that
+    // matters here -- a depth walk desynced by an unbalanced brace inside a string
+    // still yields *some* sites while silently dropping others. So pin a count floor
+    // and name the specific pair this test was added for.
+    expect(sites.length, "direct-insert reason scan found too few sites").toBeGreaterThanOrEqual(
+      15,
+    );
+    const found = new Set(sites.flatMap((site) => site.reasons));
+    for (const anchor of [
+      "github_state_change_queued_coalesced",
+      "issue_execution_same_name",
+      "issue_execution_deferred",
+      "heartbeat.worktree_execution_cutoff",
+    ]) {
+      expect(found.has(anchor), `direct-insert scan lost its anchor ${anchor}`).toBe(true);
+    }
+    // The nested `payload.heartbeatSkip.reason` sibling of the anchor above. Its
+    // presence here would mean the depth walk is reading payloads as columns.
+    expect(
+      found.has("worktree_execution_cutoff"),
+      "scan read a nested payload.heartbeatSkip.reason as a column write",
+    ).toBe(false);
+
+    for (const site of sites) {
+      for (const reason of site.reasons) {
+        if (AGENT_SCOPED_UNREACHABLE.includes(reason)) continue;
+        expect(
+          ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(reason),
+          `${reason} (heartbeat.ts:${site.line}) is written to agent_wakeup_requests.reason but projects to "other"`,
+        ).toBe(true);
+      }
+    }
+  });
+
   // The converse, and the reason these two were dropped rather than corrected: both
   // are written only by the timer scheduler, onto agent-scoped rows whose payload
   // carries no `issueId`, `taskId` or `_paperclipWakeContext`. `wakeRequestTargetsIssue`
   // cannot return them, so admitting them would assert a reachability this route does
   // not have. If either writer ever gains issue scope, re-add it with a route test.
   it("does not admit timer-scheduler skips this route cannot return", () => {
-    for (const reason of ["provider_capacity_deferred", "no_in_flight_work"]) {
+    for (const reason of AGENT_SCOPED_UNREACHABLE) {
       expect(
         ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(reason),
         `${reason} is agent-scoped and unreachable on this route`,
