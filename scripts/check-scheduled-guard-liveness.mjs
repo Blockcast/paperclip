@@ -150,6 +150,10 @@ export const WATCHED_GUARDS = [
   // consecutive runs. A missed cycle loses no coverage, which is exactly the
   // property the threshold is protecting — unlike the hourly guards, where a
   // skipped tick is a real gap.
+  //
+  // Watched from the commit that creates it. The workflow's push trigger on its
+  // own file gives it a completed run at merge, so this row does not read
+  // `never-completed` while it waits for its first scheduled tick.
   { workflow: "commit-attribution-audit.yml", staleHours: 16 },
 ];
 

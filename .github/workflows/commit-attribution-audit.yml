@@ -27,6 +27,14 @@ on:
     # shared by the whole agent fleet — an hourly run at a 7d window would be
     # ~6000 calls/hour on its own.
     - cron: "13 7,19 * * *"
+  # The merge of this file runs it once, so the guard's first completed run lands
+  # at merge. scheduled-guard-liveness.yml counts a completed run from any event,
+  # and without this it reads this guard as `never-completed` for up to 12h,
+  # until the first scheduled tick.
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/commit-attribution-audit.yml
   workflow_dispatch:
     inputs:
       since:
@@ -40,6 +48,10 @@ on:
 
 permissions:
   contents: read
+  # `gh pr list` and `gh api repos/{repo}/pulls/{n}/commits` read the pulls API.
+  # An explicit block sets every unlisted scope to none, so without this the
+  # first call fails and the audit never produces a verdict.
+  pull-requests: read
 
 jobs:
   audit-merged:
@@ -52,6 +64,11 @@ jobs:
       - name: Audit merged PRs for App-attributed commits
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through env, not interpolated into `run:`. An expression is spliced
+          # into the script before the shell parses it, so a dispatched value
+          # could otherwise inject commands.
+          SINCE: ${{ inputs.since || '2d' }}
+          REPOS: ${{ inputs.repos || 'Blockcast/paperclip' }}
         # --since 2d, not the 7d default: the scheduled cadence is 12h, so 2d
         # overlaps three cycles. A single missed run therefore loses nothing,
         # which is what keeps the liveness bar on this guard from needing to be
@@ -69,5 +86,5 @@ jobs:
           node ./scripts/check-commit-author-attribution.mjs \
             --audit-merged \
             --gate merge \
-            --since "${{ inputs.since || '2d' }}" \
-            --repos "${{ inputs.repos || 'Blockcast/paperclip' }}"
+            --since "$SINCE" \
+            --repos "$REPOS"
