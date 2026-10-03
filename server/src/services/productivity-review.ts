@@ -1990,8 +1990,9 @@ function isUnchangedSampleClosableTriggerSet(triggers: unknown) {
 // `runtimeFailure` fires at `runtimeFailureStreak >= noCommentStreakRuns` and
 // `highChurn` at `runCountLastHour >= highChurnHourly` (one of its four
 // disjuncts; the six-hour arms only widen the overlap), both defaulting to 10,
-// and `countIssueRunsSince` is an unfiltered count — infra-failure runs count
-// toward churn in full. Ten fast infra-failing runs inside an hour trip both.
+// and `countIssueRunsSince` (BLO-36927) filters pre-dispatch cancellations out
+// but not infra failures — those burned a container, so they count toward churn
+// in full. Ten fast infra-failing runs inside an hour trip both.
 // Retiring that row would destroy the `high_churn` cost record permanently:
 // generation only scans `["todo", "in_progress"]` sources, so a `done` source
 // can never re-fire it.
@@ -2016,8 +2017,17 @@ function isTerminalSourceClosableTriggerSet(triggers: unknown) {
 //     defect BLO-20549 added this close path to fix.
 //   - `runtime_failure_streak` fails closed. For these rows we cannot tell
 //     whether `high_churn` co-fired, and falling back would reintroduce the
-//     hole above for exactly the rows we cannot inspect. It is also new, so
-//     there is no stranding risk to trade against: no legacy row carries it.
+//     hole above for exactly the rows we cannot inspect. There IS stranding
+//     risk on the other side of that trade: the trigger predates the
+//     provenance — live at `0bf4fa02` (2026-08-11) with zero `firedTriggers`
+//     in the file; persistence landed with BLO-22436 three days later — so a
+//     row minted in that window carries the trigger bare and stays open
+//     forever. Accepted anyway: no such row closed through this arm before
+//     this change either, so that subset is no worse off, and the `high_churn`
+//     hole is the worse failure. `createOrUpdateReview` narrows it further —
+//     an open review on a `todo`/`in_progress` source acquires `firedTriggers`
+//     on its next refresh, so the exposure is only rows that went terminal
+//     without ever being refreshed.
 //
 // ⚠ The first bullet depends on `runaway_execution` and `long_active_duration`
 // staying *below* the accountability triggers in `choosePrimaryTrigger`. If you
