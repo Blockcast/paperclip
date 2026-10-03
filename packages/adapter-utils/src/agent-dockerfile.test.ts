@@ -299,40 +299,36 @@ describe("paperclip agent Dockerfile", () => {
     // expression that passes for the wrong reason.
     expect(guard).toContain("! -user root");
     expect(guard).toContain('test -z "$offender"');
-    const runGuardWith = (script: string, dir: string): number => {
-      try {
-        execFileSync("sh", ["-c", script.replace("/opt/paperclip-bundled-adapters", dir)], {
-          stdio: ["ignore", "ignore", "ignore"],
-        });
-        return 0;
-      } catch (error) {
-        return (error as { status?: number }).status ?? 1;
-      }
-    };
-    // Same invocation, but captures stderr so the diagnostic arm can be proved
-    // to RESOLVE $offender rather than merely to be present in the file.
-    const guardStderrWith = (script: string, dir: string): string => {
+    // One invocation shape for every control. stderr is always piped rather
+    // than discarded so control 7 can prove the diagnostic arm RESOLVES
+    // $offender rather than merely being present in the file; the other
+    // controls simply do not read it. A second stderr-capturing helper was the
+    // obvious alternative and is the worse one — it would be this function with
+    // one `stdio` field changed, free to drift from it, and exercised by a
+    // single control. Piping unconditionally costs nothing here: the guard
+    // writes at most one line, and a piped stderr is no more visible in the
+    // runner's output than an ignored one.
+    const runGuardWith = (script: string, dir: string): { status: number; stderr: string } => {
       try {
         execFileSync("sh", ["-c", script.replace("/opt/paperclip-bundled-adapters", dir)], {
           stdio: ["ignore", "ignore", "pipe"],
         });
-        return "";
+        return { status: 0, stderr: "" };
       } catch (error) {
-        return String((error as { stderr?: Buffer }).stderr ?? "");
+        const failure = error as { status?: number; stderr?: Buffer };
+        return { status: failure.status ?? 1, stderr: String(failure.stderr ?? "") };
       }
     };
     const selfUid = process.getuid?.() ?? 0;
-    const runGuard = (dir: string): number =>
+    const runGuard = (dir: string): { status: number; stderr: string } =>
       runGuardWith(guard.replace("! -user root", `! -uid ${selfUid}`), dir);
     // The ownership arm, re-anchored so it FIRES instead of being vacuous.
     // `selfUid + 1` rather than a named uid such as 65534: the fixture is
     // created by this process, so every entry carries selfUid, and "nothing
     // here can match" is then arithmetic rather than an assumption about which
     // uids happen to be unused on the runner.
-    const runGuardOwnershipArm = (dir: string): number =>
+    const runGuardOwnershipArm = (dir: string): { status: number; stderr: string } =>
       runGuardWith(guard.replace("! -user root", `! -uid ${selfUid + 1}`), dir);
-    const guardStderr = (dir: string): string =>
-      guardStderrWith(guard.replace("! -user root", `! -uid ${selfUid}`), dir);
 
     const root = mkdtempSync(path.join(tmpdir(), "pen3715-guard-"));
     try {
@@ -362,13 +358,13 @@ describe("paperclip agent Dockerfile", () => {
 
       // 1. A clean tree carrying a .bin symlink must PASS. This is the control
       //    that fails if `! -type l` is ever dropped as redundant.
-      expect(runGuard(root)).toBe(0);
+      expect(runGuard(root).status).toBe(0);
 
       // 2. A group-writable regular file must still be caught...
       const groupWritable = path.join(root, "leaky.js");
       writeFileSync(groupWritable, "\n");
       chmodSync(groupWritable, 0o664);
-      expect(runGuard(root)).not.toBe(0);
+      expect(runGuard(root).status).not.toBe(0);
       rmSync(groupWritable);
 
       // 3. ...and so must a world-writable directory, which is the rename(2)
@@ -376,17 +372,17 @@ describe("paperclip agent Dockerfile", () => {
       const worldWritableDir = path.join(root, "wide");
       mkdirSync(worldWritableDir);
       chmodSync(worldWritableDir, 0o777);
-      expect(runGuard(root)).not.toBe(0);
+      expect(runGuard(root).status).not.toBe(0);
       rmSync(worldWritableDir, { recursive: true });
 
       // 4. Clean again, so 2 and 3 are shown to be the cause of their failures.
-      expect(runGuard(root)).toBe(0);
+      expect(runGuard(root).status).toBe(0);
 
       // 5. A `find` that cannot run must FAIL, not pass. `test -z "$(find ...)"`
       //    reports success here — an errored substitution is empty — which is
       //    vacuous in exactly the base-image-swap scenario the guard is for.
       //    The `offender=` assignment adopts find's exit status instead.
-      expect(runGuard(path.join(root, "does-not-exist"))).not.toBe(0);
+      expect(runGuard(path.join(root, "does-not-exist")).status).not.toBe(0);
 
       // 6. The OWNERSHIP arm must be live. Controls 1-5 all re-anchor it to
       //    our own uid to isolate the mode arm, which makes it vacuous there
@@ -397,28 +393,31 @@ describe("paperclip agent Dockerfile", () => {
       //    restructuring the `expect(guard).toContain(...)` sanity pins above
       //    would still accept: a rewrite that keeps the substring but
       //    detaches it from the -o alternation.
-      expect(runGuardOwnershipArm(root)).not.toBe(0);
+      expect(runGuardOwnershipArm(root).status).not.toBe(0);
 
       // 7. The failure must NAME the offender, not merely be non-zero. Every
-      //    control above runs with stderr discarded and judges exit status
-      //    alone, so none of them would notice the `echo` being dropped — and
-      //    the guard would be back to aborting the whole RUN with no
-      //    indication of which inode tripped it, which is what cost a round
-      //    trip the first time it fired. The `ownedByRootAndNotGroupOtherWritable`
-      //    pin proves the echo was written; only executing it proves
-      //    `$offender` is in scope where it runs, which is the half a pin
-      //    cannot establish. Placed last so it cannot perturb 1-6, and it
-      //    removes its own file regardless.
+      //    control above asserts on exit status alone and never reads stderr,
+      //    so none of them would notice the `echo` being dropped — and the
+      //    guard would be back to aborting the whole RUN with no indication of
+      //    which inode tripped it, which is what cost a round trip the first
+      //    time it fired. The `ownedByRootAndNotGroupOtherWritable` pin proves
+      //    the echo was written; only executing it proves `$offender` is in
+      //    scope where it runs, which is the half a pin cannot establish. One
+      //    invocation answers both halves, so the status and the diagnostic
+      //    are read from the SAME run rather than from two runs assumed to be
+      //    alike. Placed last so it cannot perturb 1-6, and it removes its own
+      //    file regardless.
       const named = path.join(root, "named.js");
       writeFileSync(named, "\n");
       chmodSync(named, 0o664);
       try {
-        expect(runGuard(root)).not.toBe(0);
-        expect(guardStderr(root)).toContain(named);
+        const fired = runGuard(root);
+        expect(fired.status).not.toBe(0);
+        expect(fired.stderr).toContain(named);
       } finally {
         rmSync(named);
       }
-      expect(runGuard(root)).toBe(0);
+      expect(runGuard(root).status).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
