@@ -1422,11 +1422,31 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "startup detached-queued-run sweeper failed");
         }
 
-        const promotion = await heartbeat.promoteDueScheduledRetries();
-        await heartbeat.resumeQueuedRuns();
+        // PEN-3582: the dispatch pair is isolated from the recovery passes that
+        // follow it, exactly like `sweepStaleIssueLocks` and
+        // `reconcileDetachedQueuedRuns` above. `resumeQueuedRuns` completes its
+        // pass and then rethrows by design (BLO-12990 contract; see the
+        // rationale beside it in heartbeat.ts), and this startup sequence is
+        // serial under the single terminal `.catch()` at the end of this IIFE —
+        // so an unwrapped rejection here skipped `reconcileStrandedAssignedIssues`
+        // and every pass after it. Suppressing stranded-issue repair is worst
+        // precisely at startup, when a just-restarted control plane is most
+        // likely to be holding strandings.
+        //
+        // Grouped rather than wrapped individually on purpose: a
+        // `promoteDueScheduledRetries` rejection already skips `resumeQueuedRuns`
+        // in the periodic chain, so this leaves both chains' dispatch semantics
+        // identical and only changes what happens AFTER the pair.
+        let promotion: Awaited<ReturnType<typeof heartbeat.promoteDueScheduledRetries>> | null = null;
+        try {
+          promotion = await heartbeat.promoteDueScheduledRetries();
+          await heartbeat.resumeQueuedRuns();
+        } catch (err) {
+          logger.error({ err }, "startup heartbeat dispatch resumption failed");
+        }
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
-          promotion.promoted > 0 ||
+          (promotion?.promoted ?? 0) > 0 ||
           reconciled.assignmentDispatched > 0 ||
           reconciled.dispatchRequeued > 0 ||
           reconciled.continuationRequeued > 0 ||
@@ -1436,7 +1456,13 @@ export async function startServer(): Promise<StartedServer> {
           reconciled.escalated > 0
         ) {
           logger.warn(
-            { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
+            {
+              // `null`, not 0, when the pair above rejected: a fabricated zero
+              // would read as "measured, nothing promoted".
+              promotedScheduledRetries: promotion?.promoted ?? null,
+              promotedScheduledRetryRunIds: promotion?.runIds ?? null,
+              ...reconciled,
+            },
             "startup heartbeat recovery changed assigned issue state",
           );
         }

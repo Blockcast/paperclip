@@ -513,7 +513,12 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import type { RecoveryRunWriteClassNoticeText } from "./recovery/model-profile-hint.js";
-import { recoveryService, STALE_PRE_CLAIM_ISSUE_LOCK_MS } from "./recovery/service.js";
+import {
+  EXTERNAL_WAIT_RESUME_WAKE_REASONS,
+  GITHUB_STATE_CHANGE_WAKE_REASONS,
+  recoveryService,
+  STALE_PRE_CLAIM_ISSUE_LOCK_MS,
+} from "./recovery/service.js";
 import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "./provider-capacity-horizon-bound.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
@@ -789,10 +794,11 @@ const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 // hardcoded literal in recovery/service.ts. Identical, with nothing holding them so.
 // recovery/service.js is the leaf (heartbeat imports it; it cannot import back) and now
 // owns both — see the rationale beside the declarations there.
-import {
-  EXTERNAL_WAIT_RESUME_WAKE_REASONS,
-  GITHUB_STATE_CHANGE_WAKE_REASONS,
-} from "./recovery/service.js";
+//
+// PEN-3582 (Ally non-blocking 3): the `import` that used to sit here has been folded
+// into the single `./recovery/service.js` import near the top of this file. The
+// re-export below is NOT redundant with it and must stay — it is what lets the
+// PEN-2400 divergence test reach the same set object through both modules.
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -27689,11 +27695,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // function rejects when a dispatch fails.
     //
     // Rethrowing is free HERE specifically because `resumeQueuedRuns` is the
-    // last pass in the periodic chain in index.ts — nothing downstream is
-    // skipped by it. That is exactly why `reapOrphanedRuns` below swallows
-    // instead: it sits MID-chain, so rethrowing there would abandon
-    // `promoteDueScheduledRetries` and this function for the whole tick,
-    // reproducing the same abandon-the-rest harm one level up.
+    // last pass in the PERIODIC chain in index.ts — that `.then()`'s only tail
+    // is logging, and `reconcileStrandedAssignedIssues` is a separately
+    // scheduled `trackHeartbeatSchedulerWork` call, so nothing downstream of
+    // the periodic chain is skipped by it. That is exactly why
+    // `reapOrphanedRuns` below swallows instead: it sits MID-chain, so
+    // rethrowing there would abandon `promoteDueScheduledRetries` and this
+    // function for the whole tick, reproducing the same abandon-the-rest harm
+    // one level up.
+    //
+    // PEN-3582 (Ally non-blocking 1): "periodic" is load-bearing. The STARTUP
+    // sequence in index.ts calls these same three passes serially under one
+    // terminal `.catch()`, so a rejection here DID skip every later pass there.
+    // That call site now wraps the dispatch pair in its own try/catch, the way
+    // its neighbours already did — do not read this paragraph as a claim that
+    // rethrowing is downstream-safe by construction.
     const dispatchFailures: unknown[] = [];
     for (const agentId of agentIds) {
       await startNextQueuedRunForAgent(agentId).catch((error: unknown) => {

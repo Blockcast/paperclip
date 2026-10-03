@@ -4121,6 +4121,103 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(source?.contextSnapshot).toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
   });
 
+  // PEN-3582 (carried from Ally's non-blocking review 2 on PR #2003).
+  //
+  // PR #2003 guarded three `startNextQueuedRunForAgent` call sites so one
+  // agent's rejecting dispatch could not abandon the batch around it. Two got
+  // discriminators; this one — the post-reap dispatch inside
+  // `for (const { run } of activeRuns)` — did not. Unguarded, the rejection
+  // escaped `reapOrphanedRuns` entirely: every orphan behind the failing one
+  // went unreaped, still holding its environment leases and issue lock, and
+  // even the run being reaped lost the `appendRunEvent` that sits AFTER the
+  // dispatch call — after its terminal status had already been persisted, so
+  // the row went terminal with no lifecycle event explaining why.
+  //
+  // Vacuous-pass hazard, the same one that applied to the sibling test:
+  // `startNextQueuedRunForAgent` returns `[]` early on several screens (the
+  // api-tier fence, scheduling suppression, `dispatchStopped`) before reaching
+  // anything observable from out here, so "dispatch succeeded" and "dispatch
+  // was never attempted" look identical to an outcome assertion. The injection
+  // hook is therefore also the attempt record: `beforeQueuedDispatchPassForTest`
+  // fires inside the per-agent start lock, past all three screens, so an agent
+  // in `attemptedAgentIds` is evidence its dispatch really ran rather than an
+  // assumption that it did.
+  it("reaps every orphan when one agent's post-reap dispatch rejects", async () => {
+    // Two orphans on two agents. `seedRunFixture` mints a fresh company+agent
+    // per call, so these are independent loop iterations of the same pass.
+    const first = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      includeIssue: false,
+    });
+    const second = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_998,
+      includeIssue: false,
+    });
+    const orphanAgentIds = new Set([first.agentId, second.agentId]);
+
+    // Fail whichever agent the pass reaches FIRST rather than naming one: the
+    // reap's row order is not pinned by this fixture, and pinning the failure
+    // to a specific agent would make the test pass vacuously on every run where
+    // that agent happened to sort last (there would then be no iteration behind
+    // it for the abort to destroy).
+    const attemptedAgentIds: string[] = [];
+    let failedAgentId: string | null = null;
+    const heartbeat = createHeartbeat({
+      beforeQueuedDispatchPassForTest: ({ agentId }) => {
+        // Other suites' agents can share the embedded database; scope both the
+        // injection and the attempt record to this fixture's two agents.
+        if (!orphanAgentIds.has(agentId)) return;
+        attemptedAgentIds.push(agentId);
+        if (failedAgentId !== null) return;
+        failedAgentId = agentId;
+        throw new Error("injected post-reap dispatch failure");
+      },
+    });
+
+    // Resolves rather than rejecting, and that asymmetry with `resumeQueuedRuns`
+    // is deliberate: this site sits MID-chain in the periodic tick, so
+    // rethrowing would skip `promoteDueScheduledRetries` and `resumeQueuedRuns`
+    // for the whole tick and discard the reap summary with them.
+    const result = await heartbeat.reapOrphanedRuns();
+
+    // The injection really bit, so nothing below is passing against a
+    // failure-free pass.
+    expect(failedAgentId).not.toBeNull();
+    const survivingAgentId = failedAgentId === first.agentId ? second.agentId : first.agentId;
+    const failedRunId = failedAgentId === first.agentId ? first.runId : second.runId;
+
+    // The discriminator: the orphan behind the throwing one was still reaped.
+    // Unguarded, `reapOrphanedRuns` rejects and the pass never gets here.
+    expect(result.runIds).toEqual(expect.arrayContaining([first.runId, second.runId]));
+    expect(result.reaped).toBe(2);
+
+    // ...and its dispatch was genuinely ATTEMPTED, not skipped by one of the
+    // early `return []` screens. Without this, a guard that silently stopped
+    // dispatching after the first failure would still satisfy the reap counts
+    // above.
+    expect(attemptedAgentIds).toContain(survivingAgentId);
+
+    // The failing run's own post-dispatch `appendRunEvent` still ran. This is
+    // the second harm in the unguarded shape and it is invisible to the reap
+    // counts: the throw landed between the terminal write and this event.
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, failedRunId));
+    expect(events.filter((event) => event.eventType === "lifecycle")).not.toHaveLength(0);
+
+    // Both rows reached a terminal status, so "reaped" is not merely a counter
+    // the pass incremented on its way out.
+    for (const runId of [first.runId, second.runId]) {
+      expect(await heartbeat.getRun(runId)).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
+      });
+    }
+  });
+
   it("does not retry a lost monitor dispatch while another monitor wake remains scheduled", async () => {
     const { companyId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
