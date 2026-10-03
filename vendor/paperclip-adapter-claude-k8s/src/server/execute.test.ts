@@ -2334,6 +2334,68 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
     }
   });
 
+  // Ally Suggestion on #2099: `cleanupJob`'s retention warning reads as
+  // deferred cleanup ("leaving Job and run Secrets for K8s GC"), which is true
+  // for `alive`/`unobserved` but not for `undeleted` — there nothing is pending
+  // deletion at all, because the pod was never marked. `teardownCancelledJob`'s
+  // doc records that pod-side cost; the normal teardown path did not.
+  it("names the pod-side retain cost when the pod delete was refused", async () => {
+    vi.useFakeTimers();
+    try {
+      // The delete is refused for the whole budget while the list keeps seeing
+      // the pod (the beforeEach default): `undeleted`. Nothing is Terminating,
+      // so there is no GC to defer to.
+      mockCoreDeleteCollectionPods.mockRejectedValue(
+        Object.assign(new Error("pods is forbidden"), { code: 403 }),
+      );
+
+      const ctx = makeCtx({
+        config: { podStartTimeoutSec: 0, env: { MY_API_KEY: "s3cret" } },
+      } as Partial<AdapterExecutionContext>);
+      const promise = execute(ctx);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      const warning = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls
+        .map(([, message]: [string, string]) => message)
+        .filter((message) => message.includes("leaving Job and run Secrets"))
+        .join("");
+      // Guard against a vacuous pass: the refused-delete branch must be the one
+      // that fired, not the plain still-present one.
+      expect(warning).toContain("the pod delete was refused");
+      expect(warning).toContain("keeps running until a later run's");
+      expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The negative control: on `alive` the pod IS Terminating, so the clause
+  // would be false there. Asserting its absence is what stops the branch being
+  // collapsed back into one unconditional string.
+  it("omits the retain-cost clause when the pod delete was accepted", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeleteCollectionPods.mockResolvedValue({});
+
+      const ctx = makeCtx({
+        config: { podStartTimeoutSec: 0, env: { MY_API_KEY: "s3cret" } },
+      } as Partial<AdapterExecutionContext>);
+      const promise = execute(ctx);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      const warning = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls
+        .map(([, message]: [string, string]) => message)
+        .filter((message) => message.includes("leaving Job and run Secrets"))
+        .join("");
+      expect(warning).toContain("still present after 60s");
+      expect(warning).not.toContain("keeps running until a later run's");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("logs once when it cannot list pods to confirm teardown", async () => {
     vi.useFakeTimers();
     try {
@@ -2623,6 +2685,141 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
       expect(unobserved).toContain("could not confirm pods");
       expect(unobserved).not.toContain("still present");
       expect(alive).not.toBe(unobserved);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Ally review on #2099 at a6ddd2b2: the two logs inside deleteJobPodsAndWait
+  // were the last unguarded `await onLog` on the cancel path, and that path has
+  // no supervision above it — the keepalive fires the teardown from a `void
+  // (async () => {…})()` with no `.catch`. A rejecting onLog therefore unwound
+  // past teardownCancelledJob before it could delete the Job, waitForJobCompletion
+  // never saw the 404, and the run hung. The log of the fault became the fault,
+  // with no warning line emitted because the rejection *is* the log attempt.
+  it("still deletes the cancelled Job when onLog rejects while logging a delete failure", async () => {
+    vi.useFakeTimers();
+    try {
+      // One transient refusal, then accepted → `alive` → the Job is deleted.
+      mockCoreDeleteCollectionPods
+        .mockRejectedValueOnce(Object.assign(new Error("service unavailable"), { code: 503 }))
+        .mockResolvedValue({});
+      mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
+      const onLog = vi.fn().mockRejectedValue(new Error("log transport closed"));
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await expect(promise).resolves.toBeUndefined();
+
+      // Guard against a vacuous pass: the rejecting log must have been reached.
+      expect(onLog).toHaveBeenCalled();
+      expect(mockBatchDeleteJob).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still deletes the cancelled Job when onLog rejects while logging a list failure", async () => {
+    vi.useFakeTimers();
+    try {
+      // Good reads, then the list starts refusing: `lastObserved` survives, so
+      // the outcome is `alive` and the Job must still be deleted.
+      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      let listCalls = 0;
+      mockCoreListPods.mockImplementation(async () => {
+        if (++listCalls > 3) throw Object.assign(new Error("pods is forbidden"), { code: 403 });
+        return { items: [{ metadata: { name: "pod-wedged" } }] };
+      });
+      const onLog = vi.fn().mockRejectedValue(new Error("log transport closed"));
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await expect(promise).resolves.toBeUndefined();
+
+      // Guard against a vacuous pass: the list must actually have started failing.
+      expect(listCalls).toBeGreaterThan(3);
+      expect(mockBatchDeleteJob).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Ally Suggestion on #2099: logging only the *first* delete failure was sound
+  // when the delete was issued once. Now that it is retried each poll, a 503 on
+  // poll 1 that degrades into a persistent 403 reported the 503 while the
+  // `undeleted` verdict was caused by the 403 — the logged cause and the cause
+  // of the outcome disagreed.
+  it("logs the final delete error at the deadline when the cause changed", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeleteCollectionPods
+        .mockRejectedValueOnce(Object.assign(new Error("service unavailable"), { code: 503 }))
+        .mockRejectedValue(Object.assign(new Error("pods is forbidden"), { code: 403 }));
+      mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
+      const onLog = vi.fn().mockResolvedValue(undefined);
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      const log = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
+      // Guard against a vacuous pass: the degradation must actually have happened.
+      expect(mockCoreDeleteCollectionPods.mock.calls.length).toBeGreaterThan(1);
+      expect(log).toContain("service unavailable");
+      expect(log).toContain("still refused at the teardown deadline: pods is forbidden");
+      // The deadline line is emitted once, not once per 2s poll.
+      expect(log.split("still refused at the teardown deadline").length - 1).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The deadline line added above runs on the same unsupervised cancel path as
+  // the two logs before it, so it needs the same guard — and a guard with no
+  // failing mutation is a comment, not a test.
+  it("still returns when onLog rejects while logging the deadline delete error", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeleteCollectionPods
+        .mockRejectedValueOnce(Object.assign(new Error("service unavailable"), { code: 503 }))
+        .mockRejectedValue(Object.assign(new Error("pods is forbidden"), { code: 403 }));
+      mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
+      const onLog = vi.fn().mockRejectedValue(new Error("log transport closed"));
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await expect(promise).resolves.toBeUndefined();
+
+      // Guard against a vacuous pass: the cause must actually have changed, or
+      // the deadline line is never reached and the test proves nothing.
+      expect(mockCoreDeleteCollectionPods.mock.calls.length).toBeGreaterThan(1);
+      // `undeleted` fails closed: the Job stays.
+      expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The negative control for the test above: a cause that never changes must
+  // not produce a second line. Without it, "log the final error" degenerates
+  // into the per-poll noise the one-shot flag exists to prevent.
+  it("does not re-log an unchanged delete error at the deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeleteCollectionPods.mockRejectedValue(
+        Object.assign(new Error("pods is forbidden"), { code: 403 }),
+      );
+      mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
+      const onLog = vi.fn().mockResolvedValue(undefined);
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      const log = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
+      expect(mockCoreDeleteCollectionPods.mock.calls.length).toBeGreaterThan(1);
+      expect(log).toContain("failed to delete pods for job");
+      expect(log).not.toContain("still refused at the teardown deadline");
     } finally {
       vi.useRealTimers();
     }

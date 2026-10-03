@@ -1690,7 +1690,13 @@ async function deleteJobPodsAndWait(
   // re-issued on every poll until accepted, so one transient fault heals into
   // `alive` and `undeleted` means refused for the whole budget.
   let deleteAccepted = false;
-  let deleteErrorLogged = false;
+  // The delete error already written to the log, and the most recent one.  They
+  // diverge when a transient fault degrades into a persistent one (503 on poll
+  // 1, then 403 to the deadline): the first explains why the retry started, the
+  // last explains why the verdict is `undeleted`.  Logging only the first left
+  // the warning naming a cause that had since been superseded.
+  let loggedDeleteError: string | null = null;
+  let lastDeleteError: string | null = null;
   let listErrorLogged = false;
   // Survives across polls: one late list failure after several good reads
   // still leaves us knowing pods were there, which is `alive`, not
@@ -1705,10 +1711,20 @@ async function deleteJobPodsAndWait(
         // A 404 means the namespace, and so its pods, are gone.
         if (isK8s404(err)) {
           deleteAccepted = true;
-        } else if (!deleteErrorLogged) {
-          deleteErrorLogged = true;
-          const msg = err instanceof Error ? err.message : String(err);
-          await onLog("stderr", `[paperclip] Warning: failed to delete pods for job ${jobName}: ${msg}\n`);
+        } else {
+          lastDeleteError = err instanceof Error ? err.message : String(err);
+          if (loggedDeleteError === null) {
+            loggedDeleteError = lastDeleteError;
+            // `.catch`: this runs on the cancel path under the keepalive's
+            // unsupervised `void (async () => {…})()`, so a rejecting onLog
+            // would unwind past `teardownCancelledJob` before it can delete the
+            // Job — the run then never settles.  That is the hang the fail-open
+            // exists to prevent, reached by the logging of it.
+            await onLog(
+              "stderr",
+              `[paperclip] Warning: failed to delete pods for job ${jobName}: ${lastDeleteError}\n`,
+            ).catch(() => undefined);
+          }
         }
       }
     }
@@ -1726,16 +1742,28 @@ async function deleteJobPodsAndWait(
       if (!listErrorLogged) {
         listErrorLogged = true;
         const msg = err instanceof Error ? err.message : String(err);
+        // `.catch`: see the delete-failure log above — a rejection here unwinds
+        // the cancel-path teardown before the Job is deleted.
         await onLog(
           "stderr",
           `[paperclip] Warning: cannot list pods for job ${jobName} to confirm teardown: ${msg}\n`,
-        );
+        ).catch(() => undefined);
       }
     }
     if (lastObserved === 0) return "gone";
     if (Date.now() >= deadline) {
       if (lastObserved === null) return "unobserved";
-      return deleteAccepted ? "alive" : "undeleted";
+      if (deleteAccepted) return "alive";
+      // Emitted at the deadline, not per poll, so this is bounded at one extra
+      // line and only when the cause actually changed.
+      if (lastDeleteError !== null && lastDeleteError !== loggedDeleteError) {
+        await onLog(
+          "stderr",
+          `[paperclip] Warning: pod delete for job ${jobName} still refused at the ` +
+            `teardown deadline: ${lastDeleteError}\n`,
+        ).catch(() => undefined);
+      }
+      return "undeleted";
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
@@ -1771,11 +1799,22 @@ async function cleanupJob(
   }
   const outcome = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
   if (outcome !== "gone") {
+    // On `undeleted` the pod was never marked for deletion, so "leaving … for
+    // K8s GC" would read as deferred cleanup when nothing is pending: the
+    // ownerReference GC that would have stopped the pod runs under the
+    // controller-manager's own credentials, and retaining the Job gives up that
+    // lever.  Same trade as `teardownCancelledJob`, and it is named on both
+    // paths so a postmortem is not left inferring it from one of them.
+    const retainCost =
+      outcome === "undeleted"
+        ? `; the pod is not Terminating and keeps running until a later run's ` +
+          `concurrency guard reaps the Job as stale`
+        : "";
     await onLog(
       "stderr",
       `[paperclip] Warning: ${podTeardownFailureClause(outcome, `job ${jobName}`)}; ` +
         `leaving Job and run Secrets for K8s GC ` +
-        `rather than deleting a Secret a live pod mounts\n`,
+        `rather than deleting a Secret a live pod mounts${retainCost}\n`,
     );
     return false;
   }
