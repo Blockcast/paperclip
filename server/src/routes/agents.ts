@@ -2252,6 +2252,13 @@ export function agentRoutes(
       // columns outright — yet it spread `metadata` exactly as stored, so a
       // caller denied every config byte still received the open bag beside it
       // (PEN-3726).
+      //
+      // Assigned unconditionally, unlike the `"metadata" in agent` guard on
+      // `redactAgentSecrets`: that helper is generic over any `T` that MIGHT
+      // carry the column and must not add one, whereas this takes a concrete
+      // agent row where the column always exists. The visible difference is
+      // only for an absent/`undefined` metadata, which becomes `null` here —
+      // unreachable from `svc.getById`, and the fail-closed direction anyway.
       metadata: containAgentMetadata(agent.metadata),
     };
   }

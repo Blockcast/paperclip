@@ -1711,6 +1711,23 @@ describe("agent metadata containment on the spread-based redactors", () => {
       expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
     });
 
+    // The array/foreign-prototype pair, asserted on this arm too. Both arms
+    // call one `containAgentMetadata`, so this is cheap insurance rather than
+    // a hole — but the pair is only self-checking when both halves are present
+    // on both arms, which is what the comment on the secrets arm asks for.
+    it("keeps an ARRAY-valued metadata as an element-wise-masked array", async () => {
+      withMetadata([{ type: "plain", value: METADATA_SECRET }]);
+      denyConfigReadOnly();
+      const app = createApp(agentActor);
+      const res = await request(app).get(`/api/companies/${companyId}/agents`);
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].adapterConfig).toEqual({});
+      expect(Array.isArray(res.body[0].metadata)).toBe(true);
+      expect(res.body[0].metadata).toEqual([{ type: "plain", value: "***REDACTED***" }]);
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
     it("withholds a metadata whose prototype is not Object.prototype", async () => {
       withMetadata(Object.assign(Object.create({ inherited: true }), {
         leaked: { type: "plain", value: METADATA_SECRET },

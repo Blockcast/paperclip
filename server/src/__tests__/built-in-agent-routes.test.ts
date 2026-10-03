@@ -440,3 +440,132 @@ describe("built-in agent routes", () => {
     expect(mockBuiltInAgentService.reset).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * PEN-3726 follow-up. `redactBuiltInAgentListState` is the SIXTH agent
+ * projection — the original issue's census counted five — and it has the same
+ * spread-with-an-override-list shape as `redactForRestrictedAgentView`: it
+ * blanks `adapterConfig`/`runtimeConfig` and used to pass `metadata` through
+ * exactly as stored, across all seven of its response exits.
+ *
+ * `metadata` is a caller-writable open bag (`jsonb`, validated only as
+ * `z.record(z.string(), z.unknown())`) that takes no secret-sentinel pass on
+ * write, and the two GET routes below are gated only by `assertCompanyAccess`
+ * — so any same-company AGENT principal reads them, which is why the actor
+ * here is an agent rather than the board actor the rest of this file uses.
+ *
+ * The four cases are the same disposition matrix the two helpers in
+ * `agent-redaction.ts` are pinned against, so a change to `containAgentMetadata`
+ * cannot satisfy one projection and silently regress this one.
+ */
+describe("built-in agent routes contain agent metadata", () => {
+  const METADATA_SECRET = "builtin-metadata-plaintext-secret-24680";
+
+  function sameCompanyAgentActor() {
+    return { type: "agent", agentId: "peer-agent", companyId, source: "agent_key" };
+  }
+
+  function stateWithMetadata(metadata: unknown) {
+    const state = builtInState();
+    return { ...state, agent: { ...state.agent, metadata } };
+  }
+
+  beforeEach(() => {
+    vi.resetModules();
+    registerModuleMocks();
+    vi.clearAllMocks();
+    mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableBuiltInAgents: true });
+  });
+
+  it("masks a plain binding planted in metadata on the list route", async () => {
+    mockBuiltInAgentService.list.mockResolvedValue([
+      stateWithMetadata({ leaked: { type: "plain", value: METADATA_SECRET } }),
+    ]);
+    const app = await createApp(sameCompanyAgentActor());
+
+    const res = await request(app).get(`/api/companies/${companyId}/built-in-agents`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    // Precondition: this really is the redacted projection.
+    expect(res.body[0].agent.adapterConfig).toEqual({});
+    expect(res.body[0].agent.metadata).toEqual({
+      leaked: { type: "plain", value: "***REDACTED***" },
+    });
+    expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+  });
+
+  it("masks a tier-1 key name nested at depth in metadata on the status route", async () => {
+    mockBuiltInAgentService.get.mockResolvedValue(
+      stateWithMetadata({ a: { b: { apiKey: METADATA_SECRET } } }),
+    );
+    const app = await createApp(sameCompanyAgentActor());
+
+    const res = await request(app).get(`/api/companies/${companyId}/built-in-agents/briefs/status`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.agent.adapterConfig).toEqual({});
+    expect(res.body.agent.metadata).toEqual({ a: { b: { apiKey: "***REDACTED***" } } });
+    expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+  });
+
+  // Asserted as a pair with the foreign-prototype case below: the array must
+  // SURVIVE element-wise masked and the foreign prototype must be WITHHELD. A
+  // fix collapsing either into the other passes one and fails the other.
+  it("keeps an ARRAY-valued metadata as an element-wise-masked array", async () => {
+    mockBuiltInAgentService.list.mockResolvedValue([
+      stateWithMetadata([{ type: "plain", value: METADATA_SECRET }]),
+    ]);
+    const app = await createApp(sameCompanyAgentActor());
+
+    const res = await request(app).get(`/api/companies/${companyId}/built-in-agents`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(Array.isArray(res.body[0].agent.metadata)).toBe(true);
+    expect(res.body[0].agent.metadata).toEqual([{ type: "plain", value: "***REDACTED***" }]);
+    expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+  });
+
+  it("withholds a metadata whose prototype is not Object.prototype", async () => {
+    mockBuiltInAgentService.list.mockResolvedValue([
+      stateWithMetadata(Object.assign(Object.create({ inherited: true }), {
+        leaked: { type: "plain", value: METADATA_SECRET },
+      })),
+    ]);
+    const app = await createApp(sameCompanyAgentActor());
+
+    const res = await request(app).get(`/api/companies/${companyId}/built-in-agents`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body[0].agent.metadata).toBeNull();
+    expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+  });
+
+  // Non-regression guard, not a containment assertion: these markers are the
+  // intended contents of the column and the reason it cannot simply be dropped.
+  // This is the projection where they are LEAST likely to be absent.
+  it("leaves the built-in and managed-resource markers readable", async () => {
+    mockBuiltInAgentService.list.mockResolvedValue([
+      stateWithMetadata({ paperclipBuiltInAgent: "briefs", paperclipManagedResource: true }),
+    ]);
+    const app = await createApp(sameCompanyAgentActor());
+
+    const res = await request(app).get(`/api/companies/${companyId}/built-in-agents`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body[0].agent.metadata).toEqual({
+      paperclipBuiltInAgent: "briefs",
+      paperclipManagedResource: true,
+    });
+  });
+
+  it("leaves a null-agent state untouched", async () => {
+    const state = builtInState();
+    mockBuiltInAgentService.list.mockResolvedValue([{ ...state, agent: null, agentId: null }]);
+    const app = await createApp(sameCompanyAgentActor());
+
+    const res = await request(app).get(`/api/companies/${companyId}/built-in-agents`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body[0].agent).toBeNull();
+  });
+});
