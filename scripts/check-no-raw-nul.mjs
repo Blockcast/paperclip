@@ -24,8 +24,9 @@ import { fileURLToPath } from "node:url";
 // Allowlist, not a binary denylist: an unknown new extension is skipped rather
 // than flagged, so this can only ever miss a file — never fail a real asset.
 export const SOURCE_EXTENSIONS = new Set([
-  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md", ".mdx",
+  ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md", ".mdx",
   ".yml", ".yaml", ".sh", ".bash", ".sql", ".css", ".scss", ".html", ".toml",
+  ".py", ".go", ".svg",
 ]);
 
 export function isSourcePath(relative) {
@@ -42,8 +43,19 @@ export function findRawNulOffenses({ files, read }) {
     let buffer;
     try {
       buffer = read(relative);
-    } catch {
-      continue; // deleted or unreadable in the working tree — not our concern
+    } catch (err) {
+      // Only the deleted-file race is benign. EACCES/EISDIR/EMFILE must be
+      // loud: a guard against silent skips cannot itself skip silently.
+      if (err?.code === "ENOENT") continue;
+      // Name the guard, or the operator sees a bare errno with no idea which
+      // check failed or why an unreadable file is fatal here.
+      const wrapped = new Error(
+        `check-no-raw-nul (BLO-39632): cannot read tracked source file ${relative}, so it` +
+          ` could not be cleared of NUL bytes: ${err?.message ?? err}`,
+        { cause: err },
+      );
+      wrapped.code = err?.code;
+      throw wrapped;
     }
 
     let index = buffer.indexOf(0);
