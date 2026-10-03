@@ -244,6 +244,38 @@ export function stripRedactedEnvBindingsFromAdapterConfig(
   return { ...restoredAdapterConfig, env: cleaned };
 }
 
+/**
+ * Undo this module's own `metadata` masking on an API round-trip.
+ *
+ * Containing `metadata` on the read paths (PEN-3726) gave it the same
+ * read-modify-write hazard `adapterConfig` has carried since BLO-5xxx, where a
+ * sentinel written back into live config killed every run: `GET` now masks
+ * credential-shaped values to `REDACTED_EVENT_VALUE`, `updateAgentSchema`
+ * accepts `metadata`, and `svc.update` persists whatever arrives. So a client
+ * that reads an agent, edits an unrelated field and `PATCH`es the object back
+ * overwrites the stored value with the placeholder. `adapterConfig` is guarded
+ * against exactly this by `stripRedactedEnvBindingsFromAdapterConfig`;
+ * `metadata` had no analogue.
+ *
+ * This composes the *same* `containsRedactedAdapterValue` /
+ * `restoreRedactedAdapterValue` pair rather than restating the sentinel rule.
+ * Both columns are masked by the one redactor, so a parallel implementation
+ * could drift from it — and a rule that drifts on the write side is how a
+ * column ends up sanitized on one path and inert on another, which is the
+ * defect PEN-3726 exists to close. In particular the PEN-2747 case (a URI
+ * whose credential *component* alone is masked, so the value contains the
+ * sentinel rather than equalling it) is handled because that helper
+ * substring-tests; an equality test written fresh here would miss it.
+ *
+ * Absent prior value: `restoreRedactedAdapterValue` drops the key rather than
+ * inventing one, so a masked key with nothing stored to restore is omitted
+ * instead of persisting the placeholder.
+ */
+export function restoreRedactedAgentMetadata(incoming: unknown, existing: unknown): unknown {
+  if (!containsRedactedAdapterValue(incoming)) return incoming;
+  return restoreRedactedAdapterValue(incoming, existing ?? {});
+}
+
 function readRunLogLimitBytes(value: unknown) {
   const parsed = Number(value ?? RUN_LOG_DEFAULT_LIMIT_BYTES);
   if (!Number.isFinite(parsed)) return RUN_LOG_DEFAULT_LIMIT_BYTES;
@@ -3924,6 +3956,13 @@ export function agentRoutes(
       if (mixesNonProfileKeys) await assertCanUpdateAgent(req, existing);
     } else {
       await assertCanUpdateAgent(req, existing);
+    }
+
+    // Deliberately after the authorization checks above and before `svc.update`:
+    // an unauthorized PATCH must still fail on its own terms, and no masked
+    // value may reach the column. See `restoreRedactedAgentMetadata`.
+    if (hasOwn(patchData, "metadata")) {
+      patchData.metadata = restoreRedactedAgentMetadata(patchData.metadata, existing.metadata);
     }
 
     const actor = getActorInfo(req);
