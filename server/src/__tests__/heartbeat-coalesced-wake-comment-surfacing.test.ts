@@ -5,7 +5,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { buildPaperclipWakePayload } from "../services/heartbeat.js";
+import { buildPaperclipTaskMarkdown, buildPaperclipWakePayload, extractWakeCommentIds } from "../services/heartbeat.js";
 
 // PEN-3743: a coalesced issue wake inlines only the issue's newest comment, so
 // every earlier order it absorbed reaches the agent as silence. The ids are NOT
@@ -142,11 +142,14 @@ describeEmbeddedPostgres("coalesced wake comment surfacing", () => {
     expect(payload?.fallbackFetchNeeded).toBe(false);
   });
 
-  it("counts a newer non-wake comment as superseding every absorbed id", async () => {
+  it("does not name the comment the task prompt renders, even when the inlined one differs", async () => {
     // The override re-queries the issue's newest comment, which need not be one
     // of the coalesced ones at all -- a comment posted after the wake was
-    // deferred displaces the entire absorbed set. Both absorbed orders must then
-    // be named, not just the older one.
+    // deferred displaces the entire absorbed set from the PAYLOAD. But the task
+    // prompt renders a different row again: `deriveCommentId`, i.e. the last
+    // absorbed wake comment. So `secondId` IS shown to the run, just on the
+    // other surface, and naming it as "not shown above" would overstate the
+    // count by one and send the run to re-read what it was handed.
     const { companyId, issueId, commentIds } = await seedIssueWithComments([
       "first order",
       "second order",
@@ -167,9 +170,60 @@ describeEmbeddedPostgres("coalesced wake comment surfacing", () => {
 
     expect(payload?.comments?.[0]?.body).toBe("unrelated later comment");
     expect(payload?.commentWindow).toMatchObject({
-      supersededCount: 2,
-      supersededCommentIds: [firstId, secondId],
+      supersededCount: 1,
+      supersededCommentIds: [firstId],
     });
+    expect(payload?.commentWindow?.supersededCommentIds).not.toContain(secondId);
     expect(payload?.fallbackFetchNeeded).toBe(true);
+  });
+
+  it("keeps the prompt's superseded list disjoint from the body the prompt renders", async () => {
+    // The seam the two unit suites straddle: `buildPaperclipWakePayload` decides
+    // what is superseded, `buildPaperclipTaskMarkdown` renders the wake comment,
+    // and the heartbeat call site threads one into the other. Nothing below the
+    // call site can observe a disagreement between them, so assert it here --
+    // building BOTH surfaces from one context snapshot, the way the call site
+    // does (`deriveCommentId` is the last entry of `wakeCommentIds`).
+    const { companyId, issueId, commentIds } = await seedIssueWithComments([
+      "first order",
+      "second order",
+      "unrelated later comment",
+    ]);
+    const [firstId, secondId] = commentIds as [string, string, string];
+    const contextSnapshot = {
+      issueId,
+      wakeReason: "issue_commented",
+      wakeCommentIds: [firstId, secondId],
+      wakeCommentId: secondId,
+    };
+
+    const payload = await buildPaperclipWakePayload({ db, companyId, contextSnapshot });
+
+    // Exactly the call site's derivation of the comment it renders.
+    const renderedId = extractWakeCommentIds(contextSnapshot).at(-1);
+    expect(renderedId).toBe(secondId);
+
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: issueId,
+        identifier: "CW-1",
+        title: "Coalesced wake surfacing",
+        workMode: "standard",
+        description: null,
+      },
+      wakeComment: { id: renderedId!, body: "second order" },
+      supersededWakeCommentIds: payload?.commentWindow?.supersededCommentIds ?? null,
+      supersededWakeCommentCount: payload?.commentWindow?.supersededCount ?? null,
+    });
+
+    // The prompt shows `second order`; the invariant is that it never then
+    // sends the run after a body it just rendered. Asserted FIRST so a
+    // regression reports as the disjointness failure it is.
+    expect(markdown).toContain("Latest wake comment:");
+    expect(markdown).toContain("second order");
+    expect(markdown).not.toContain(secondId);
+    // ...while still naming the one order that genuinely reached neither surface.
+    expect(markdown).toContain("Earlier wake comment NOT shown above (1):");
+    expect(markdown).toContain(firstId);
   });
 });
