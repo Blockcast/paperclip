@@ -8,6 +8,7 @@ export {
   isSensitiveEnvKey,
 } from "./sensitive-env.js";
 export { REDACTED_SENTINEL } from "./secret-sentinel.js";
+export { NON_HUMAN_USER_SENTINEL_IDS, isNonHumanUserSentinel } from "./non-human-user-sentinels.js";
 export {
   getAgentOrgChainHealth,
   getAgentWorkEligibility,
