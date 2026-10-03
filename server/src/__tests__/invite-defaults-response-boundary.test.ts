@@ -130,6 +130,26 @@ describe("invite / join-request adapter defaults — redaction unit", () => {
     expect(redactInviteRecord({ id: "a", tokenHash: "h" })).toEqual({ id: "a" });
   });
 
+  it("withholds a payload it cannot sanitize instead of spreading it back out", () => {
+    // `redactAgentConfigPayload` sanitizes only plain objects and returns anything else BY
+    // REFERENCE, and both halves admit on key presence — weaker than any object test. Without
+    // containment an array- or string-shaped `jsonb` column rode straight back out. Defence in
+    // depth: today's writers normalize through `{ ...defaultsPayload }`, which collapses an array.
+    const arrayShaped = redactInviteRecord({
+      tokenHash: TOKEN_HASH_SENTINEL,
+      defaultsPayload: [{ apiKey: HERMES_KEY_SENTINEL }],
+    });
+    expect(bodyText(arrayShaped)).not.toContain(HERMES_KEY_SENTINEL);
+    expect(arrayShaped).toEqual({ defaultsPayload: {} });
+
+    const stringShaped = redactJoinRequestRecord({
+      claimSecretHash: "h",
+      agentDefaultsPayload: OPENCLAW_TOKEN_SENTINEL,
+    });
+    expect(bodyText(stringShaped)).not.toContain(OPENCLAW_TOKEN_SENTINEL);
+    expect(stringShaped).toEqual({ agentDefaultsPayload: {} });
+  });
+
   it("POSITIVE CONTROL: the sentinels are present before redaction", () => {
     // Without this, every `not.toContain` above would pass just as happily against a fixture that
     // never carried the value in the first place.
@@ -162,7 +182,12 @@ describe("invite / join-request payloads do not round-trip", () => {
       .map((match) => `${match[1]} ${match[2]}`);
 
     // Positive control: the scan must actually be finding routes, or an empty result below would
-    // be the regex failing rather than the property holding.
+    // be the regex failing rather than the property holding. Pinned to a LOOSER count of the same
+    // registrations rather than `> 0`: a reformat that left the precise regex matching 1 of 5 would
+    // still satisfy `> 0`, and this tripwire is the only mechanical guard on the no-round-trip
+    // argument the whole module rests on. Both counts are 5 at this head.
+    const registrations = (accessSource.match(/router\.(patch|put|delete)\(/g) ?? []).length;
+    expect(mutatingRoutes.length).toBe(registrations);
     expect(mutatingRoutes.length).toBeGreaterThan(0);
     expect(mutatingRoutes.filter((route) => /invite|join-request/i.test(route))).toEqual([]);
   });

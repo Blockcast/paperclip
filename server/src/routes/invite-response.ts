@@ -1,4 +1,4 @@
-import { redactAgentConfigPayload } from "../redaction.js";
+import { isPlainObject, redactAgentConfigPayload } from "../redaction.js";
 
 /**
  * PEN-3725 — disclosure boundary for invite / join-request adapter defaults on response bodies.
@@ -9,7 +9,7 @@ import { redactAgentConfigPayload } from "../redaction.js";
  * `apiKey` for `hermes_gateway`, and `headers["x-openclaw-token"]` plus `devicePrivateKeyPem` for
  * `openclaw_gateway`. Every response that answered with the stored row spread those verbatim.
  *
- * Four properties drive the shape of this module:
+ * Five properties drive the shape of this module:
  *
  * 1. **The mask is unconditional — deliberately NOT entitlement-gated.** This is the same call
  *    `project-env-response.ts` made for door #17, and for the same reason: nothing needs an adapter
@@ -55,7 +55,42 @@ import { redactAgentConfigPayload } from "../redaction.js";
  *    while the six `access.ts` exits had none. This class of disclosure propagates by copying — the
  *    same reasoning `withholdAgentConfigKeys` records — so both callers share this implementation
  *    and a finding against it lands on every exit at once.
+ *
+ * 5. **Containment, not a bare sanitize call.** `redactAgentConfigPayload` sanitizes only
+ *    `isPlainObject` values and returns anything else *by reference* — a documented property that
+ *    `redaction.ts` itself warns about, and that `containAgentConfig` in `routes/agents.ts` exists
+ *    to absorb. Both halves below admit on key *presence*, which is weaker than any object test, so
+ *    an array- or string-shaped `jsonb` column would have been spread back out verbatim. The repair
+ *    is containment at this caller (`containDefaultsPayload`), deliberately NOT a change to the
+ *    shared sanitizer: four doc comments across `redaction.ts` and `routes/agents.ts` rest on that
+ *    passthrough, its declared return type is `Record<string, unknown> | null`, and its sibling
+ *    `redactEventPayload` behaves the same way — so masking inside it would make the type a lie and
+ *    silently invert an invariant two other modules gate on.
  */
+
+/**
+ * The admission gate for a `jsonb` defaults column on its way out.
+ *
+ * Mirrors `containAgentConfig` (`routes/agents.ts`) rather than re-deriving the reasoning:
+ *
+ *   `null` / absent — passed through unchanged. These are the ordinary "no defaults" states and
+ *                     the callers' shape contract depends on them surviving.
+ *   `{}`            — object-like but not sanitizable (array, foreign prototype), or a bare
+ *                     primitive. Withheld rather than emitted uncontained: `sanitizeValue` can walk
+ *                     an array element-wise, but `redactAgentConfigPayload`'s signature cannot
+ *                     return one, and a primitive here is a malformed row rather than a payload.
+ *   otherwise       — the sanitized record.
+ *
+ * Not reachable from today's writers — both invite write paths normalize through
+ * `{ ...defaultsPayload }`, which collapses an array into a plain object, and the column's
+ * validator is `z.record(z.string(), z.unknown())`. This is defence in depth against a future
+ * writer, and against rows already at rest that predate those normalizations.
+ */
+function containDefaultsPayload(payload: unknown): unknown {
+  if (payload === null || payload === undefined) return redactAgentConfigPayload(payload);
+  if (!isPlainObject(payload)) return {};
+  return redactAgentConfigPayload(payload);
+}
 
 /**
  * `tokenHash` is stripped rather than masked. It is the verifier for the invite's bearer token, it
@@ -72,7 +107,7 @@ export function redactInviteRecord<T extends object>(invite: T): Omit<T, "tokenH
   if (!("defaultsPayload" in rest)) return rest as Omit<T, "tokenHash">;
   return {
     ...rest,
-    defaultsPayload: redactAgentConfigPayload(rest.defaultsPayload),
+    defaultsPayload: containDefaultsPayload(rest.defaultsPayload),
   } as Omit<T, "tokenHash">;
 }
 
@@ -89,6 +124,6 @@ export function redactJoinRequestRecord<T extends object>(row: T): Omit<T, "clai
   if (!("agentDefaultsPayload" in rest)) return rest as Omit<T, "claimSecretHash">;
   return {
     ...rest,
-    agentDefaultsPayload: redactAgentConfigPayload(rest.agentDefaultsPayload),
+    agentDefaultsPayload: containDefaultsPayload(rest.agentDefaultsPayload),
   } as Omit<T, "claimSecretHash">;
 }
