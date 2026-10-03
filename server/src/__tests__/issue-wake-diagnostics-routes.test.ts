@@ -267,6 +267,49 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(serialized).not.toContain("\"error\"");
   });
 
+  // PEN-3727: the wake that produced no run row is the one an operator comes here to
+  // explain, and `issue_execution_deferred` used to project to "other" -- so the row
+  // that held the whole answer reported the same reason as a row holding none.
+  it("names the suppression reason for a wake deferred behind the issue execution lock", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Comment wake with no run row",
+      status: "in_review",
+      assigneeAgentId: agent.id,
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      coalescedCount: 3,
+      payload: { issueId: issue.id },
+      runId: null,
+      requestedAt: new Date(Date.now() - 10_000),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    expect(res.body.events[0]).toMatchObject({
+      kind: "wake_request",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      coalescedCount: 3,
+      runId: null,
+      claimedAt: null,
+    });
+    expect(res.body.diagnosis).toContain("deferred for issue_execution_deferred");
+  });
+
   it("returns null diagnosis for an unblocked issue with no wake history", async () => {
     const company = await seedCompany(db);
     const project = await seedProject(db, company.id, "Core");
