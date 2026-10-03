@@ -29,7 +29,7 @@
 // regardless of --runs.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -43,10 +43,16 @@ const RUNNER_PREFIX = /^.*?\/paperclip\/paperclip\//;
 /** Every *.json under `dir`, recursively. */
 export function reportFiles(dir) {
   const out = [];
-  for (const entry of readdirSync(dir)) {
-    const path = join(dir, entry);
-    if (statSync(path).isDirectory()) out.push(...reportFiles(path));
-    else if (entry.endsWith(".json")) out.push(path);
+  // Dirents rather than statSync: statSync FOLLOWS the link, so one dangling
+  // symlink throws ENOENT and aborts a batch whose downloads have already been
+  // paid for -- the same shape parseReports guards one layer down. A dangling
+  // `*.json` link now reaches parseReports and is skipped with a message.
+  // Tradeoff: a symlinked subdirectory is no longer traversed. Neither shape
+  // comes out of zip extraction; failing soft is the better default of the two.
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...reportFiles(path));
+    else if (entry.name.endsWith(".json")) out.push(path);
   }
   return out;
 }
@@ -78,11 +84,16 @@ export function readReport(json) {
         sawFailure = true;
       }
     }
-    if (file.status === "failed" && !sawFailure) {
-      const key = `${path} > (file failed with no failing test)`;
-      observed.add(key);
-      failed.add(key);
-    }
+    // OBSERVED for every file, FAILED only on the shape. Observing it inside
+    // the failure branch instead makes failedIn === observedIn by construction,
+    // so a crash that fires in 3 of 10 runs reads `3/3 broken` -- "someone
+    // already knows about this one" -- about the exact population this key
+    // exists to surface, and no suite-crash flake can reach the flaky table at
+    // any rate. buildLedger's `failedIn.length > 0` filter keeps the files that
+    // never crash out of the output, so the extra observation costs nothing.
+    const crashKey = `${path} > (file failed with no failing test)`;
+    observed.add(crashKey);
+    if (file.status === "failed" && !sawFailure) failed.add(crashKey);
   }
   return { observed, failed };
 }
@@ -104,6 +115,12 @@ export function readReport(json) {
  * between them, which is the whole claim. Under `--dir` the caller supplies the
  * grouping -- the whole directory is one run -- so there the claim is only as
  * good as the batch handed over.
+ *
+ * The pair must sit in two SIBLING reports to be seen. Two assertions sharing
+ * one `fullName` inside a single report (a `test.each` whose name template
+ * interpolates nothing) collapse to one key before this runs, and a fail+pass
+ * pair there records only the failure. Narrow, and fixable by naming the cases
+ * apart; deduping by key is what makes a key comparable across runs at all.
  */
 export function buildLedger(runs) {
   const rows = new Map();
@@ -348,7 +365,11 @@ function main() {
   process.stdout.write(
     `# vitest flake ledger\n\n` +
       (preDownloaded
-        ? `reports from ${preDownloaded}`
+        ? // The `proven` heading claims "inside one run", but --dir counts the
+          // whole directory as one run whatever the caller put there -- and
+          // downloadRuns lays artifacts out as root/<runId>/, so pointing --dir
+          // at that root is the natural mistake. Say so where the reader is.
+          `reports from ${preDownloaded}, counted as ONE run -- the \`proven\` table is only as good as that grouping`
         : `${total} of ${listed} run(s) carried reports (${listed - total} skipped), ${event}`) +
       `\n\n${body}`,
   );

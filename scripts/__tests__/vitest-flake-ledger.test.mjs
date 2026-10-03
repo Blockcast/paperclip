@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,6 +18,7 @@ import {
   classify,
   escapeCell,
   readReport,
+  reportFiles,
 } from "../vitest-flake-ledger.mjs";
 
 const SCRIPT = fileURLToPath(new URL("../vitest-flake-ledger.mjs", import.meta.url));
@@ -38,10 +39,68 @@ const report = (files) => ({
 });
 
 test("readReport strips the runner checkout prefix so keys compare across runs", () => {
-  const { observed } = readReport(
+  const { observed, failed } = readReport(
     report([["server/src/a.test.ts", "passed", [["does a thing", "passed"]]]]),
   );
-  assert.deepEqual([...observed], ["server/src/a.test.ts > does a thing"]);
+  // Both keys carry the stripped path. The crash key is OBSERVED on a passing
+  // file and not failed -- that asymmetry is what lets an intermittent crash
+  // reach the flaky table; see the test below.
+  assert.deepEqual(
+    [...observed],
+    [
+      "server/src/a.test.ts > does a thing",
+      "server/src/a.test.ts > (file failed with no failing test)",
+    ],
+  );
+  assert.deepEqual([...failed], []);
+});
+
+test("a crash in SOME runs is flaky, not broken", () => {
+  // The population this synthetic key exists to surface: an import-time or
+  // teardown crash that fires in 3 of 10 runs. Observing the key only inside
+  // the failure branch makes failedIn === observedIn by construction, so this
+  // reads `3/3 broken` -- filed under "someone already knows about this one" --
+  // and no suite-crash flake can reach the flaky table at any rate.
+  const crash = report([["server/src/setup.test.ts", "failed", []]]);
+  const ok = report([["server/src/setup.test.ts", "passed", [["t", "passed"]]]]);
+  const runs = Array.from({ length: 10 }, (_, i) => ({
+    runId: `r${i}`,
+    reports: [i < 3 ? crash : ok],
+  }));
+
+  const rows = buildLedger(runs);
+  assert.deepEqual(
+    rows.map((r) => [r.key, `${r.failedIn.length}/${r.observedIn.length}`, classify(r)]),
+    [["server/src/setup.test.ts > (file failed with no failing test)", "3/10", "flaky"]],
+  );
+});
+
+test("a file that never crashes contributes no row", () => {
+  // The cost of observing the crash key everywhere: every file now carries one.
+  // buildLedger's `failedIn.length > 0` filter is what keeps them out, so a
+  // clean batch must still render nothing rather than one row per file.
+  const ok = report([["server/src/a.test.ts", "passed", [["t", "passed"]]]]);
+  assert.deepEqual(buildLedger([{ runId: "r1", reports: [ok] }]), []);
+});
+
+test("one unreadable entry does not abort a batch already downloaded", () => {
+  // A dangling symlink is not a file and not a directory. statSync FOLLOWS it
+  // and throws ENOENT, discarding every report in the batch -- the same shape
+  // parseReports guards one layer down, one level up the call stack.
+  const dir = mkdtempSync(join(tmpdir(), "flake-ledger-dangling-"));
+  symlinkSync(join(dir, "gone.json"), join(dir, "dangling.json"));
+  writeFileSync(
+    join(dir, "real.json"),
+    JSON.stringify(report([["server/src/a.test.ts", "passed", [["t", "failed"]]]])),
+  );
+
+  assert.deepEqual(reportFiles(dir).map((p) => p.split("/").pop()).sort(), [
+    "dangling.json",
+    "real.json",
+  ]);
+  const r = runCli("--dir", dir);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /\| 1 \/ 1 \| server\/src\/a\.test\.ts > t \|/);
 });
 
 test("a suite that crashes before any test runs still counts as a failure", () => {
@@ -237,6 +296,10 @@ test("--dir renders a ledger from reports it CAN read", () => {
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /# vitest flake ledger/);
   assert.match(r.stdout, /\| 1 \/ 1 \| server\/src\/a\.test\.ts > t \|/);
+  // The `proven` heading claims "inside one run" unconditionally, but --dir
+  // counts whatever the caller put in the directory as that one run. The
+  // header has to say so or the strongest claim the tool makes is unqualified.
+  assert.match(r.stdout, /counted as ONE run/);
 });
 
 test("the module can be imported from an eval context without running main()", () => {
