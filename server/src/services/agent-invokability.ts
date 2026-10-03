@@ -72,7 +72,10 @@ function invalidChainReason(health: AgentOrgChainHealth): AgentInvokabilityBlock
 
 export function evaluateAgentInvokability(
   agent: AgentOrgRow | null | undefined,
-  companyAgents: AgentOrgRow[],
+  // `readonly` so a memoised roster (one frozen array shared by every hit within the TTL)
+  // can be passed without a defensive copy. This function only reads and `map`s, so the
+  // narrowing costs nothing and every existing mutable-array caller still type-checks.
+  companyAgents: readonly AgentOrgRow[],
 ): AgentInvokability {
   if (!agent) {
     return blocked("missing", "Agent no longer exists", {}, false);
@@ -153,7 +156,10 @@ export async function readCompanyAgentRoster(
  * no dependency on the recovery sweep and no caching policy of its own.
  */
 export type CompanyAgentRosterReader = {
-  companyAgents(companyId: string): Promise<AgentOrgRow[]>;
+  // `readonly` because a memo serves one array instance to every hit: see
+  // `AgentRosterMemo.companyAgents`. Widening it here would let a consumer sort the
+  // shared entry in place.
+  companyAgents(companyId: string): Promise<readonly AgentOrgRow[]>;
 };
 
 export async function evaluateAgentInvokabilityFromDb(

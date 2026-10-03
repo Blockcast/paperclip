@@ -71,6 +71,27 @@ describe("agent roster memo", () => {
     expect(reads()).toBe(1);
   });
 
+  // Ally review of #2202: every hit returns the SAME array instance (copying per hit would
+  // hand back the cost the memo exists to remove), so an in-place mutation by any consumer
+  // corrupts the entry for the rest of the window — silently, and only under the
+  // candidate adjacency that makes the memo effective. `readonly` states that contract and
+  // catches the ordinary case at compile time; this pins the runtime half, which is what a
+  // caller that has cast or widened its way past the type still hits.
+  it("hands out a frozen array, so a consumer cannot corrupt the cached entry", async () => {
+    const roster = [agent({ id: "a" }), agent({ id: "b" })];
+    const { db } = fakeRosterDb([roster]);
+    const memo = createAgentRosterMemo(db, { now: () => 1_000 });
+
+    const first = await memo.companyAgents("company-1");
+    expect(Object.isFrozen(first)).toBe(true);
+    // Shared by reference on purpose — asserted rather than left implicit, because it is
+    // exactly why the freeze is needed.
+    expect(await memo.companyAgents("company-1")).toBe(first);
+    // ESM is strict mode, so this throws rather than failing silently.
+    expect(() => (first as AgentOrgRow[]).sort(() => -1)).toThrow(TypeError);
+    expect((await memo.companyAgents("company-1")).map((row) => row.id)).toEqual(["a", "b"]);
+  });
+
   it("keys per company, and returns each company's own rows", async () => {
     const rosterA = [agent({ id: "a", companyId: "company-1" })];
     const rosterB = [agent({ id: "b", companyId: "company-2" })];
