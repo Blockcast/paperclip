@@ -34,8 +34,23 @@ test("a suite that crashes before any test runs still counts as a failure", () =
   const { observed, failed } = readReport(
     report([["server/src/boom.test.ts", "failed", []]]),
   );
-  const key = "server/src/boom.test.ts > (suite failed before any test ran)";
+  const key = "server/src/boom.test.ts > (file failed with no failing test)";
   assert.deepEqual([...observed], [key]);
+  assert.deepEqual([...failed], [key]);
+});
+
+test("a failed file whose assertions all PASSED still counts as a failure", () => {
+  // The afterAll/teardown-hook shape: every test passed, the file failed, the
+  // PR was ejected. Keying on "saw an assertion" rather than "saw a FAILING
+  // assertion" would record this as a clean observation of every test in it.
+  const { observed, failed } = readReport(
+    report([["server/src/teardown.test.ts", "failed", [["t", "passed"]]]]),
+  );
+  const key = "server/src/teardown.test.ts > (file failed with no failing test)";
+  assert.deepEqual(
+    [...observed].sort(),
+    ["server/src/teardown.test.ts > t", key].sort(),
+  );
   assert.deepEqual([...failed], [key]);
 });
 
