@@ -102,6 +102,11 @@ import {
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
 import { loadAgentInboxLite } from "../services/agent-inbox-lite.js";
+import {
+  ISSUE_LIST_APPLIED_LIMIT_HEADER,
+  ISSUE_LIST_TRUNCATED_HEADER,
+  parseOffsetParam,
+} from "../lib/issue-list-query.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { logger } from "../middleware/logger.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
@@ -2885,18 +2890,29 @@ export function agentRoutes(
 
     const issuesSvc = issueService(db);
     const recoveryActionsSvc = issueRecoveryActionService(db);
+    // BLO-39015: the inbox is capped and priority-ordered, so a lane deeper
+    // than the cap had its whole tail silently unreachable. `offset` pages the
+    // remainder; the headers say when there IS a remainder. Same contract as
+    // `GET /companies/:id/issues` (BLO-33741) — bare-array body, signal on
+    // headers — so one envelope helper covers both on the MCP side.
+    const parsedOffset = parseOffsetParam(req.query.offset);
+    if (parsedOffset === null) {
+      res.status(400).json({ error: "offset must be a non-negative integer" });
+      return;
+    }
     const worktreeActivation = await resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),
     });
     const isWorktreeRuntime = isTruthyRuntimeEnvValue(process.env.PAPERCLIP_IN_WORKTREE);
     const callerRunId = req.actor.runId ?? null;
-    res.json(await loadAgentInboxLite({
+    const inbox = await loadAgentInboxLite({
       issuesSvc,
       recoveryActionsSvc,
       companyId: req.actor.companyId,
       agentId: req.actor.agentId,
       callerRunId,
       limit: ISSUE_LIST_DEFAULT_LIMIT,
+      offset: parsedOffset,
       isWorktreeRuntime,
       worktreeActivation,
       onWithheldForeignRun: (issue) => {
@@ -2925,7 +2941,17 @@ export function agentRoutes(
           "inbox-lite: withheld issue attended by another run of this agent parked on a scheduled retry",
         );
       },
-    }));
+    });
+    // `X-Applied-Limit` is always set so a caller learns the cap even when it
+    // did not bite; `X-Result-Truncated` appears only when rows match past the
+    // page, so its ABSENCE is the "you have everything" signal. A truncated
+    // page can still be shorter than the limit — the eligibility filters only
+    // remove rows — so never infer either from the returned length.
+    res.setHeader(ISSUE_LIST_APPLIED_LIMIT_HEADER, String(inbox.appliedLimit));
+    if (inbox.truncated) {
+      res.setHeader(ISSUE_LIST_TRUNCATED_HEADER, "true");
+    }
+    res.json(inbox.rows);
   });
 
   // PEN-2756: a recovery action names an OWNER agent and a `nextAction` addressed

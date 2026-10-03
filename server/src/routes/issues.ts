@@ -186,6 +186,7 @@ import {
   ISSUE_LIST_APPLIED_LIMIT_HEADER,
   ISSUE_LIST_TRUNCATED_HEADER,
   issueListProbeLimit,
+  parseOffsetParam,
   parseUnsupportedPaginationParams,
   resolveIssueListTruncation,
 } from "../lib/issue-list-query.js";
@@ -8503,10 +8504,7 @@ export function issueRoutes(
       ? Number.parseInt(rawLimit, 10)
       : null;
     const limit = parsedLimit === null ? ISSUE_LIST_DEFAULT_LIMIT : clampIssueListLimit(parsedLimit);
-    const rawOffset = req.query.offset as string | undefined;
-    const parsedOffset = rawOffset !== undefined && /^\d+$/.test(rawOffset)
-      ? Number.parseInt(rawOffset, 10)
-      : null;
+    const parsedOffset = parseOffsetParam(req.query.offset);
     // BLO-24495: this endpoint only ever implemented limit/offset. `page`/`perPage`
     // were silently dropped (never read from req.query), so every page number
     // replayed the same limit/offset-default window with no error. Reject
@@ -8558,7 +8556,7 @@ export function issueRoutes(
       res.status(400).json({ error: `limit must be a positive integer up to ${ISSUE_LIST_MAX_LIMIT}` });
       return;
     }
-    if (rawOffset !== undefined && (parsedOffset === null || !Number.isInteger(parsedOffset) || parsedOffset < 0)) {
+    if (parsedOffset === null) {
       res.status(400).json({ error: "offset must be a non-negative integer" });
       return;
     }
@@ -8620,7 +8618,7 @@ export function issueRoutes(
         return;
       }
     }
-    const offset = parsedOffset ?? 0;
+    const offset = parsedOffset;
 
     const includeRoutineExecutionsExplicit =
       req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1";
