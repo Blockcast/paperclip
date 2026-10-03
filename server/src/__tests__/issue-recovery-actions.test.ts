@@ -37,6 +37,7 @@ import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService, reco
 import { issueService } from "../services/issues.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { BACKSTOP_CANDIDATES_SKIPPED_METRIC, renderMetrics } from "../services/metrics.js";
 import { buildPullRequestWorkProductFields } from "../services/pull-request-work-products.js";
 import { loadConfig } from "../config.js";
 import {
@@ -1016,10 +1017,143 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // a shape that changes with whichever gate happened to fire.
     expect(reported?.[0]).toMatchObject({
       livePathSkipped: expect.any(Number),
+      // Both arms of the live-path gate, present even at zero. This log line is the
+      // zero-safe surface for the split: the Prometheus series only exists once its arm
+      // first fires, so an arm that never fires is absent there and indistinguishable
+      // from an undeployed build (#1946 pre-seeds those counters; until it lands this
+      // line is the only place a genuine zero is legible).
+      livePathQueuedWakeSkipped: expect.any(Number),
       pauseHoldSkipped: expect.any(Number),
       exhaustedSkipped: expect.any(Number),
       candidateLimitSkipped: expect.any(Number),
       enqueueFailed: expect.any(Number),
+    });
+  });
+
+  /**
+   * BLO-19124. The live-path gate is two probes behind one `||` and used to be one counter.
+   * Because `hasActiveExecutionPath` is evaluated first and short-circuits, a candidate held
+   * by a live run never reaches `hasQueuedIssueWake` at all — so `live_path` could not say
+   * whether the queued-wake arm was doing any work. That matters because the proposed fix
+   * (age-bounding `hasQueuedIssueWake`, whose `queued` rows nothing reaps by age) moves
+   * exactly zero candidates if the active-run arm dominates, and the old counter could not
+   * have told anyone.
+   *
+   * Both arms are asserted because the halves must disagree: seeding only the queued wake
+   * still passes a collapsed implementation if you assert the union, and seeding only the
+   * live run cannot catch the two counters being swapped.
+   *
+   * The emitted Prometheus label is asserted alongside the sweep result, not instead of it,
+   * because they can disagree. The result fields are computed at the two gates; the labels
+   * are bound to them by a separate table at the end of the sweep. Swapping that table's two
+   * rows leaves every result field, log line and type correct and inverts only the deployed
+   * series — which is the series BLO-19124 is read from, i.e. the silent inversion this test
+   * exists to prevent, displaced one layer out onto the read surface. Read through
+   * `renderMetrics()` rather than a mock on the recorder: that is the exact text Prometheus
+   * scrapes, so it also pins the label *names*, and it cannot drift from the real registry.
+   * Deltas, not absolutes — the counter is process-wide and other cases in this file sweep too.
+   */
+  it("counts the live-run and queued-wake arms of the live-path gate apart", async () => {
+    // Absent and zero are the same reading for a delta: a series that has never fired does
+    // not exist yet, which is the very absent-vs-zero ambiguity #1946 fixes for the absolute.
+    const skipLabel = async (reason: string): Promise<number> => {
+      const { body } = await renderMetrics();
+      const line = new RegExp(
+        `^${BACKSTOP_CANDIDATES_SKIPPED_METRIC}\\{source="stranded_recovery_wake_backstop",reason="${reason}"\\} (\\d+)$`,
+        "m",
+      );
+      return Number(body.match(line)?.[1] ?? 0);
+    };
+    const armDeltas = async <T>(run: () => Promise<T>): Promise<{ result: T; livePath: number; queuedWake: number }> => {
+      const before = { livePath: await skipLabel("live_path"), queuedWake: await skipLabel("live_path_queued_wake") };
+      const result = await run();
+      return {
+        result,
+        livePath: (await skipLabel("live_path")) - before.livePath,
+        queuedWake: (await skipLabel("live_path_queued_wake")) - before.queuedWake,
+      };
+    };
+    const seedGatedCandidate = async (fingerprintSuffix: string) => {
+      const seeded = await seedCompany();
+      await db
+        .update(issues)
+        .set({ status: "blocked", assigneeAgentId: seeded.managerId })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      await db.insert(issueRecoveryActions).values({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        kind: "stranded_assigned_issue",
+        cause: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: seeded.managerId,
+        returnOwnerAgentId: null,
+        fingerprint: `source_scoped_recovery:${seeded.companyId}:${seeded.sourceIssueId}:${fingerprintSuffix}`,
+        evidence: {},
+        nextAction: "Wake the recovery owner.",
+        attemptCount: 0,
+        maxAttempts: defaultRecoveryActionMaxAttempts,
+        timeoutAt: new Date("2026-12-31T00:00:00.000Z"),
+        lastAttemptAt: null,
+      });
+      return seeded;
+    };
+    const sweep = (companyId: string) => {
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      return recoveryService(db, { enqueueWakeup }).reconcileStrandedRecoveryWakeBackstop({
+        companyId,
+        now: new Date("2026-08-26T00:00:00.000Z"),
+        cooldownMs: 30 * 60 * 1000,
+      });
+    };
+
+    // Arm 1: a live run, nothing queued. Pins the ordering — swapping the two counters
+    // fails here, and swapping the two label rows fails on `livePath`/`queuedWake`.
+    const liveRun = await seedGatedCandidate("live-run-arm");
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: liveRun.companyId,
+      agentId: liveRun.managerId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId: liveRun.sourceIssueId, wakeReason: "issue_assigned" },
+    });
+    const liveRunArm = await armDeltas(() => sweep(liveRun.companyId));
+    expect(liveRunArm.result).toMatchObject({
+      checked: 1,
+      healed: 0,
+      livePathSkipped: 1,
+      livePathQueuedWakeSkipped: 0,
+    });
+    expect({ livePath: liveRunArm.livePath, queuedWake: liveRunArm.queuedWake }).toEqual({
+      livePath: 1,
+      queuedWake: 0,
+    });
+
+    // Arm 2: a queued wake, no run. Pins the split — collapsing back to one counter
+    // attributes this to `livePathSkipped` and fails here. Dropping the
+    // `live_path_queued_wake` label row leaves both deltas at 0 and fails here too.
+    const queuedWake = await seedGatedCandidate("queued-wake-arm");
+    await db.insert(agentWakeupRequests).values({
+      companyId: queuedWake.companyId,
+      agentId: queuedWake.managerId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      status: "queued",
+      payload: { issueId: queuedWake.sourceIssueId },
+    });
+    const queuedWakeArm = await armDeltas(() => sweep(queuedWake.companyId));
+    expect(queuedWakeArm.result).toMatchObject({
+      checked: 1,
+      healed: 0,
+      livePathSkipped: 0,
+      livePathQueuedWakeSkipped: 1,
+    });
+    expect({ livePath: queuedWakeArm.livePath, queuedWake: queuedWakeArm.queuedWake }).toEqual({
+      livePath: 0,
+      queuedWake: 1,
     });
   });
 

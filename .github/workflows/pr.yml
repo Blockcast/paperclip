@@ -687,6 +687,15 @@ jobs:
         # mutation to the CODE line: every guard is quoted verbatim in the
         # comment above it, so a first-occurrence replace edits the prose and
         # reports a working guard as unkillable.
+        # Re-swept 2026-09-29 after BLO-37887 (pending_runs() + the NO-VERDICT
+        # END clause): 8/8 new guards killed, each confirmed to land on its code
+        # line and not on the prose quoting it. One further way to report a
+        # working guard as unkillable, found in this sweep and not covered
+        # above: an INERT mutation. The survivor-count mutation was first written
+        # as `n += k` inside the END block but placed AFTER the `if(!n)` that
+        # reads n, so it could not change any output and the suite stayed green —
+        # indistinguishable from an unkilled guard. Check that a surviving
+        # mutation could have changed behaviour at all before recording it.
         run: node --test ./scripts/merge-gate-read.test.mjs
         timeout-minutes: 1
 
@@ -846,6 +855,16 @@ jobs:
       - name: Test merge-queue ejection reporter (BLO-26675)
         if: ${{ !cancelled() }}
         run: node --test ./.github/scripts/tests/report-merge-queue-ejection.test.mjs
+        timeout-minutes: 1
+
+      # BLO-28886 AC3. Same silence-shaped failure mode one step earlier: the
+      # flake ledger is fed by an artifact, and every way of breaking it
+      # (dropping `if: always()`, dropping the env var, colliding the report
+      # filenames) produces NO artifact rather than a red run. Every assertion
+      # in here has been mutation-tested -- revert any one guard and this fails.
+      - name: Test vitest flake-report wiring (BLO-28886)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/vitest-flake-report.test.mjs
         timeout-minutes: 1
 
       - name: Validate dependency resolution when manifests change
@@ -1353,6 +1372,12 @@ jobs:
     # slow. Lower these only against observed `Vitest phase durations` rows
     # from three consecutive master-based runs, not against the prediction.
     timeout-minutes: ${{ matrix.timeout_minutes }}
+    # BLO-28886 AC3. Read by vitest.config.ts, which only registers the JSON
+    # reporter when this is set -- so a local `pnpm test` is unchanged. A
+    # literal /tmp path, not `${{ runner.temp }}`: the `runner` context is not
+    # available in a job-level `env:` block. Matches refresh-shard-manifest.yml.
+    env:
+      PAPERCLIP_VITEST_REPORT_DIR: /tmp/vitest-reports
     strategy:
       # BLO-33021: fail-fast is right for `pull_request` (one push, show the
       # author every red at once) and wrong for `merge_group`, where there is
@@ -1437,6 +1462,7 @@ jobs:
 
       - name: Run grouped general test suites
         run: |
+          mkdir -p "$PAPERCLIP_VITEST_REPORT_DIR"
           args=(--group '${{ matrix.group }}')
           if [ -n '${{ matrix.shard_count }}' ]; then
             args+=(--shard-index '${{ matrix.shard_index }}' --shard-count '${{ matrix.shard_count }}')
@@ -1449,6 +1475,44 @@ jobs:
       - name: Run serialized server test shard
         if: matrix.group == 'general-server'
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
+
+      # BLO-28886 AC3. `if: always()` is the whole point and is guarded by
+      # scripts/__tests__/vitest-flake-report.test.mjs: a flake ledger is built
+      # from the runs that FAILED, so an upload that only fires on success
+      # collects exactly the reports nobody needs. This lane is ~29% red on
+      # `merge_group`, and which shard goes red moves run to run.
+      #
+      # `if-no-files-found: ignore`, deliberately, NOT `error`: a shard killed
+      # at its timeout cap or evicted mid-run writes no report, and this step
+      # must never be able to turn an otherwise-green run red. Losing a report
+      # costs one row in the ledger; failing the job re-creates the blameless
+      # ejection this issue exists to stop.
+      #
+      # The name carries `github.run_attempt` because a re-run of a failed job
+      # is a new attempt of the SAME run, so the same leg would otherwise
+      # re-upload a name that already exists and collide. Absorbing that
+      # collision is not enough: the re-run is the single most informative
+      # event for a flake ledger -- fail->pass across attempts IS the flake
+      # signature, and fail->fail is the "genuinely broken" signature. Dropping
+      # attempt 2 removes the discriminator, silently, on the ~29%-red lane
+      # where re-running is the common path. Uniqueness per attempt keeps both.
+      # (`overwrite: true` also clears the collision, but it REPLACES attempt 1
+      # with attempt 2 -- the same lost discriminator.)
+      #
+      # `continue-on-error` then covers what a name cannot: a transient failure
+      # in the artifact service itself. Same pattern as the playwright-report
+      # upload below, though that step is on @v7 -- this one does not rest on
+      # any version's duplicate-name behaviour, because it never submits a
+      # duplicate name.
+      - name: Upload vitest JSON reports (flake ledger)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-report-${{ matrix.group }}-${{ matrix.shard_count == '' && 'all' || matrix.shard_index }}-${{ github.run_attempt }}
+          path: ${{ env.PAPERCLIP_VITEST_REPORT_DIR }}/*.json
+          retention-days: 14
+          if-no-files-found: ignore
 
   vendor_claude_k8s:
     # BLO-17980 / BLO-22506: the claude_k8s adapter templates every agent Job

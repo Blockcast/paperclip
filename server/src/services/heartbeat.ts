@@ -304,7 +304,10 @@ import {
 import { loadConfig } from "../config.js";
 import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import { resolveSharedDocSearchBoundaryPath } from "./shared-doc-search-boundary.js";
-import { pullRequestExternalId } from "./pull-request-work-products.js";
+import {
+  pullRequestExternalId,
+  recordedPullRequestOwners,
+} from "./pull-request-work-products.js";
 import {
   ensureReferencedSharedDocsMaterialized,
   normalizeInstructionsEntryFile,
@@ -1390,7 +1393,7 @@ export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
 const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
 const MAX_TURN_CONTINUATION_DEFAULT_DELAY_MS = 1_000;
-const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
+export const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = ["scheduled_retry", "queued", "running"] as const;
 type CodexTransientFallbackMode =
   | "same_session"
@@ -6922,15 +6925,19 @@ export function buildK8sRunIsolationDescriptor(input: {
   // control falls through to `return claimed`. That is deliberate — an
   // issue-interaction wake carrying a comment id is allowed to run while
   // another run holds the issue, so a human can talk to the assignee
-  // mid-flight.
+  // mid-flight. BLO-38064 added a SECOND population to `issueLockRequired`:
+  // `isNonOwnershipRetryLineage`, the promoted retry of such a wake. It reads
+  // the pinned `originWakeReason` and does NOT require a comment id, so
+  // "carrying a comment id" no longer describes the whole lock-less set.
   //
   // The second run therefore never acquires `issues.executionRunId` at all. It
   // is a deliberately lock-less run, not a competing lock holder, so there is
   // no lock-ordering or retry fix available and no configuration in which the
   // race closes.
   //
-  // Grep `executionRunClaimCondition`, `allowsIssueInteractionWake` and
-  // `issueLockRequired` rather than trusting line numbers. Each resolves to
+  // Grep `executionRunClaimCondition`, `allowsIssueInteractionWake`,
+  // `isNonOwnershipRetryLineage` and `issueLockRequired` rather than trusting
+  // line numbers. Each resolves to
   // exactly one definition site, and a line number cited from inside the file
   // it points into goes stale on the next edit to that same file.
   //
@@ -9066,6 +9073,262 @@ function isAutoCheckoutWakeReason(wakeReason: string | null | undefined) {
   if (wakeReason === "source_scoped_recovery_action") return false;
   if (wakeReason.startsWith("execution_")) return false;
   return true;
+}
+
+/**
+ * Wake reasons that address an agent PERSONALLY rather than as the issue's
+ * owner, and whose retry must therefore survive `assigneeAgentId !==
+ * run.agentId` (BLO-38064).
+ *
+ * You @-mention an agent precisely BECAUSE it does not own the issue, so for a
+ * mention wake that inequality is the steady state, not a reassignment. The
+ * retry guard read it as one, which made the loss unconditional for this shape:
+ * a mention whose first run hit any transient failure (a provider throttle, a
+ * `process_lost`) was cancelled `issue_reassigned` and never re-armed. Measured
+ * on BLO-3202 — run `5e54f30a` throttled at zero tokens, retry `ef0bd21e`
+ * cancelled 3 minutes later, and the mentioned agent was never told.
+ *
+ * An ALLOW-list, not the inverse of {@link isAutoCheckoutWakeReason}, even
+ * though that predicate answers the closely-related "does this wake confer
+ * ownership". That predicate denies exactly three shapes and this list takes
+ * only the first. Both exclusions below are decided, not missed.
+ *
+ * `execution_*` — whose stage participant is likewise routinely not the
+ * assignee — but the gate that protects those, the
+ * `issue_review_participant_changed` check, exists only in
+ * `evaluateScheduledRetryGate`. Promotion calls that helper unconditionally, so
+ * it is covered; the MINT site runs it only under `requiresIssueGate`, which a
+ * bounded transient retry does not satisfy. Exempting `execution_*` here would
+ * therefore clear the assignee check at mint with no participant check behind
+ * it. Add them once that check is replicated there.
+ *
+ * `source_scoped_recovery_action` — a recovery owner is the failed assignee's
+ * chain-of-command parent, so `assigneeAgentId !== run.agentId` is that wake's
+ * steady state too, and `claimQueuedRun` already exempts it unconditionally
+ * (`isRecoveryOwnerWake`). It stays out because the harm motivating this list
+ * does not apply to it: a mention has no other wake path, so losing its retry
+ * loses the message permanently, whereas a recovery action carries its own
+ * `attemptCount`/`maxAttempts` budget and the stranded sweep re-upserts it —
+ * incrementing that count and re-arming the wake — so its owner is re-driven
+ * without this retry. That re-drive is bounded, not unconditional: BLO-30743
+ * makes the sweep REUSE rather than re-upsert, and a reused `escalated` action
+ * is dropped at `exhaustedSkipped` so its owner stops being driven at all. But
+ * reuse is narrower than the status alone — `shouldReuseStrandedRecoveryAction`
+ * (recovery/stranded-escalation-status.ts:185-190) requires an UNCHANGED action
+ * (cause and fingerprint both match), and for the `escalated` shape an
+ * unchanged owner as well. Routing a NEW owner resets the wake budget and
+ * escalates normally, so a re-routed owner is still driven; only a standing
+ * escalation with the same owner strands. It also fails LOUDLY when it does:
+ * `issue.escalation.needs_human_decision` is emitted once at the escalation
+ * TRANSITION and forwarded to Slack, and reuse is precisely what stops that
+ * repeating on every later sweep (BLO-27999 measured 208 emissions in 10.3h
+ * before it). So the operator is told either way — which is exactly the
+ * contrast with a lost mention, whose failure is silent. Adding it would widen
+ * the exemption to a family with no measured loss; that is the whole reason,
+ * and one measured loss is enough to change it.
+ *
+ * This does leave the gate STRICTER than the claim screen here, which is safe
+ * in that direction only — but not by the mechanism a source read suggests. The
+ * retry IS armed: mint schedules it, and PROMOTION cancels it
+ * `issue_not_assigned_to_agent`. A cancelled retry never becomes a queued run,
+ * so `claimQueuedRun` is never reached and its exemption is unreachable rather
+ * than contradicted. (Measured, not predicted: a reading of the mint block said
+ * "rejected at mint" and the test below disproved it.) Pinned by the
+ * `source_scoped_recovery_action` gate-leg case in
+ * heartbeat-retry-scheduling.test.ts, so this decision survives the next read.
+ *
+ * Until either joins, their retries stay suppressed, and say so via the honest
+ * error code below rather than by mislabelling them a reassignment.
+ */
+const NON_OWNERSHIP_RETRY_WAKE_REASONS = new Set(["issue_comment_mentioned"]);
+
+/**
+ * The wake reason of the run that STARTED this retry lineage.
+ *
+ * Every retry mint overwrites `wakeReason` with its own (`transient_failure_retry`,
+ * `process_lost_retry`, `missing_issue_comment`), so by the time a parked retry is
+ * gated the reason that justified it is gone. {@link carryRetryContextSnapshot}
+ * stamps `originWakeReason` at mint so it survives; the `wakeReason` fallback
+ * covers the pre-stamp rows already parked when this shipped, and the
+ * originating run itself, which is what the mint-time site gates on.
+ */
+function originWakeReasonFromSnapshot(snapshot: Record<string, unknown> | null | undefined) {
+  return readNonEmptyString(snapshot?.originWakeReason) ?? readNonEmptyString(snapshot?.wakeReason) ?? null;
+}
+
+function originWakeReasonFromRun(run: { contextSnapshot: unknown }) {
+  return originWakeReasonFromSnapshot(parseObject(run.contextSnapshot));
+}
+
+/**
+ * Did this lineage start from a wake that never conferred ownership?
+ *
+ * THE single definition, deliberately. Two independent screens ask the
+ * `assigneeAgentId !== run.agentId` question about the same row — the retry
+ * gate ({@link evaluateScheduledRetryAssigneeMismatch}) and, one step later,
+ * the pre-start claim screen (`evaluateQueuedRunStaleness`). Both call this, so
+ * they agree by construction rather than by convention.
+ *
+ * That is not a stylistic preference; it is the defect this function was added
+ * to fix. The first cut of BLO-38064 exempted the gate only, and the claim
+ * screen — which reads raw `wakeReason`, by then overwritten to
+ * `transient_failure_retry` — cancelled the promoted retry three frames later
+ * as `issue_assignee_changed`. Net effect was a relabelling: same silent loss,
+ * new error code. Found in review at `1bc3502f`; see the note at
+ * `evaluateQueuedRunStaleness`'s assignee branch, and the same warning in its
+ * own words at the `claimQueuedRun` dependency screen.
+ *
+ * Note this is marginally wider than `allowsIssueInteractionWake` at the claim
+ * screen, which additionally requires a wake comment id: a mention wake that
+ * somehow carries none is exempt here and was not before. Accepted knowingly —
+ * routing a mention to a non-assignee is what that wake is FOR, and the comment
+ * id governs whether the agent has something to read, not whether it may run.
+ * Requiring it here would reintroduce exactly the gate/claim disagreement above
+ * for any mention lacking one.
+ */
+function isNonOwnershipRetryLineage(snapshot: Record<string, unknown> | null | undefined) {
+  const originWakeReason = originWakeReasonFromSnapshot(snapshot);
+  return originWakeReason !== null && NON_OWNERSHIP_RETRY_WAKE_REASONS.has(originWakeReason);
+}
+
+/**
+ * Copy a run's snapshot onto its retry, dropping run-scoped markers and pinning
+ * the lineage's origin wake reason before the caller overwrites `wakeReason`.
+ *
+ * Idempotent across a chain of retries: `originWakeReasonFromSnapshot` prefers
+ * an already-stamped `originWakeReason`, so attempt 3 still reports the mention
+ * that started it rather than attempt 2's retry wake.
+ */
+function carryRetryContextSnapshot(contextSnapshot: Record<string, unknown>): Record<string, unknown> {
+  const originWakeReason = originWakeReasonFromSnapshot(contextSnapshot);
+  return {
+    ...stripRunScopedSnapshotMarkers(contextSnapshot),
+    ...(originWakeReason ? { originWakeReason } : {}),
+  };
+}
+
+type ScheduledRetryAssigneeMismatch = {
+  reason: string;
+  errorCode: "issue_reassigned" | "issue_not_assigned_to_agent";
+  details: Record<string, unknown>;
+};
+
+/**
+ * Decide whether `assigneeAgentId !== run.agentId` should suppress a scheduled
+ * retry, and under which of the two distinct facts it hides (BLO-38064).
+ *
+ * Returns `null` — retry allowed — when the run holds the issue, or when the
+ * lineage started from a wake in {@link NON_OWNERSHIP_RETRY_WAKE_REASONS}. This
+ * clears only the ownership test, which such a wake was never subject to. What
+ * else still gates the retry depends on the site, because
+ * `evaluateScheduledRetryGate` — which carries the terminal-status,
+ * review-participant, pause-hold and dependency checks — runs UNCONDITIONALLY at
+ * promotion and only under `requiresIssueGate` at mint. A bounded transient
+ * retry does not satisfy `requiresIssueGate`, so at mint only terminal-status
+ * runs, via the mint block's own inline check rather than the shared gate; at
+ * promotion all four do. Review-participant, pause-hold and dependency exist
+ * only inside the shared gate and genuinely do not run at mint — which is what
+ * the `execution_*` exclusion above turns on.
+ *
+ * Two gates that do NOT cover an exempt retry, so do not lean on them here:
+ *
+ * - **The execution lock.** Not because the lock check is weak, but because
+ *   there is no lock to check: per BLO-25517 (see `requiresIssueExecutionRetryLock`)
+ *   `scheduleBoundedRetryForRun` always clears `issues.executionRunId` before
+ *   parking, and it stays null for the whole parked window. So at every gate
+ *   site reached from a parked retry, `issueExecutionRetryLockAvailable` passes
+ *   on its `== null` arm. Reachability compounds that: the shared gate's check
+ *   is opt-in via `enforceIssueExecutionLock`, and promotion's own inline check
+ *   sits inside a block gated on `requiresIssueExecutionRetryLock` — which a
+ *   bounded transient retry fails — so neither fires for this family at all.
+ *   The claim screen's pre-start availability check is gated the same way and
+ *   so is also dead here. Only the mint-site check runs unconditionally, and
+ *   there the lock is still this run's own.
+ *
+ *   Separately from availability, `claimQueuedRun` decides whether the lock is
+ *   REQUIRED at all (`issueLockRequired`). That is the fourth screen this
+ *   exemption has to reach, and it is not a gate you can lean on either: it
+ *   now honours this same lineage, because a mention wake does not require the
+ *   lock and its retry must not either. Left alone it cancelled the promoted
+ *   retry as `issue_execution_lock_not_acquired`.
+ * - **`in_progress`.** `requiresInProgressIssueRetry` is gated on
+ *   `requiresIssueExecutionRetryLock`, so a bounded transient retry never
+ *   reaches it (and within the reasons that do, it excludes
+ *   `session_unavailable` and `zero_token_session_reset`).
+ *
+ * RESIDUAL (accepted, BLO-38064 review): a mention-woken agent can still check
+ * out manually, which assigns it the issue and takes the lock. If its run then
+ * fails transiently and the issue is reassigned while the retry is parked, this
+ * exemption lets the retry promote and wake an agent that has genuinely lost
+ * ownership — the one case where `issue_reassigned` would have been the honest
+ * verdict. Nothing above catches it, because the lock was released at mint and
+ * the fact that this lineage once held it is gone by gate time. Closing it means
+ * stamping that fact at mint, the way `originWakeReason` is stamped. Judged not
+ * worth the plumbing for now, but note the bound is narrower than the lock gate
+ * would suggest: for this family no lock check fires at promotion (see above),
+ * so the new owner taking the lock does NOT stop the lineage. Nor does the
+ * pre-start claim screen, which now honours this same exemption — deliberately,
+ * since a screen that cancelled what the gate promoted is the very defect the
+ * shared predicate exists to prevent, but it does mean the residual now reaches
+ * the agent instead of dying one frame later.
+ *
+ * What bounds it is NOT "promotion writes no lock, so there is no concurrent
+ * execution": writing no lock is the mechanism that PRODUCES the concurrent
+ * run, not the one that prevents it. A promoted mention retry lands in exactly
+ * the state the `Same-issue concurrency is REACHABLE` block already maps (grep
+ * that phrase, above `resolveK8sRunIsolationIdentity`) — the claim UPDATE
+ * matches zero rows against the new owner's `executionRunId`, but
+ * `issueLockRequired` is false for this lineage, so the lock-not-acquired
+ * cancel is skipped and the run executes lock-lessly beside the owner's. That
+ * block asks not to have this re-derived as a live defect; it is the known
+ * shape, now reachable by one more population.
+ *
+ * The bounds that do hold, named exactly: there is no lock CONTENTION and no
+ * double acquisition, because this lineage never takes the lock at all; where
+ * the run is worktree-isolated under the default `per_issue` runScope,
+ * BLO-31443's tree-scoped writer key serialises the two against the shared
+ * tree, deferring the contender back to `queued` rather than dispatching it;
+ * and the retry is attempt-capped. The cost is a bounded number of wakes to an
+ * agent that will read the issue and find it reassigned.
+ *
+ * `issue_reassigned` now means what it says. It is kept for a wake that DID
+ * confer ownership — the assignee episode BLO-29729 wrote the guard for, where
+ * the issue genuinely moved — and for an unknown wake reason, which preserves
+ * the prior behaviour rather than guessing. A wake that never conferred
+ * ownership gets `issue_not_assigned_to_agent` instead, because an operator
+ * reading `issue_reassigned` on the measured trace went looking for a
+ * reassignment that had never happened.
+ */
+function evaluateScheduledRetryAssigneeMismatch(input: {
+  runAgentId: string;
+  currentAssigneeAgentId: string | null;
+  originWakeReason: string | null;
+  issueId: string;
+}): ScheduledRetryAssigneeMismatch | null {
+  if (input.currentAssigneeAgentId === input.runAgentId) return null;
+  if (isNonOwnershipRetryLineage({ originWakeReason: input.originWakeReason })) return null;
+
+  const details = {
+    issueId: input.issueId,
+    previousAssigneeAgentId: input.runAgentId,
+    currentAssigneeAgentId: input.currentAssigneeAgentId,
+    originWakeReason: input.originWakeReason,
+  };
+  // Unknown reason -> treat as an ownership wake: same verdict and same code as
+  // before this split, so a row minted without an origin cannot change meaning.
+  if (input.originWakeReason === null || isAutoCheckoutWakeReason(input.originWakeReason)) {
+    return {
+      reason: "Scheduled retry suppressed because issue ownership changed",
+      errorCode: "issue_reassigned",
+      details,
+    };
+  }
+  return {
+    reason:
+      "Scheduled retry suppressed because the agent is not the issue assignee and its wake never conferred ownership",
+    errorCode: "issue_not_assigned_to_agent",
+    details,
+  };
 }
 
 function shouldQueueFollowupForRunningIssueWake(input: {
@@ -13222,7 +13485,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * design, so a comment alone would leave exactly the silence this fixes).
    *
    * The link is the `pull_request` work product, matched on company + PR
-   * identity only. Deliberately NOT narrowed to system-promoted rows the way
+   * identity and then narrowed to the issues that work product records as its
+   * OWNERS (BLO-37225 — a row is written for every issue the PR merely
+   * mentions). Deliberately NOT narrowed to system-promoted rows the way
    * the webhook's `previouslyLinkedPullRequestIssues` lookup is: that lookup
    * gates a wake that acts on webhook-supplied content, whereas this one only
    * reports a fact this server itself just derived, and agent-registered PR work
@@ -13249,12 +13514,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
     reason: "retry_exhausted" | "non_retryable_external_lifecycle",
   ) {
-    const linked = await db
+    const linkedRows = await db
       .select({
         id: issues.id,
         identifier: issues.identifier,
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
+        owningIdentifiers: sql<unknown>`${issueWorkProducts.metadata}->'owningIdentifiers'`,
       })
       .from(issueWorkProducts)
       .innerJoin(
@@ -13275,6 +13541,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         ),
       );
+    // BLO-37225: a PR work product is written for EVERY issue the PR references
+    // anywhere -- the row is evidence about the PR, not a wake (see
+    // PullRequestWorkProductInput.owningIdentifiers). So the join above is the
+    // mention set, not the link set, and notifying all of it sends this notice
+    // to provenance citations and explicit "not touched, deliberately" scope
+    // notes. Measured on Blockcast/paperclip#2062: 7 issues, 2 lanes, ~10
+    // notices each over 91 minutes, one of them an issue whose only appearance
+    // in the body was a sentence saying the PR does not touch it.
+    //
+    // Narrowed to the owners the webhook resolved, which is the same field the
+    // evidence gate reads. `null` (row predates the field) keeps the row rather
+    // than dropping it: unlike the evidence gate, whose safe direction is to
+    // withhold a progress signal, this notifier's failure mode is the silence
+    // BLO-33589 exists to remove. Over-notifying a legacy row is the status quo;
+    // under-notifying one is a regression.
+    //
+    // An EMPTY recorded set is the opposite case, and the one arm where this
+    // notifier deliberately chooses silence. `[]` is authoritative: no tier of
+    // resolveOwningPaperclipIdentifiers named an owner, so the webhook dropped
+    // the author wake for this PR (`no_owning_reference`) and no lane is waiting
+    // on its review gate. Keeping the rows here would notify exactly the mention
+    // set this filter exists to exclude.
+    const linked = linkedRows.filter((row) => {
+      const owners = recordedPullRequestOwners(row.owningIdentifiers);
+      if (!owners) return true;
+      if (owners.length === 0) return false;
+      return row.identifier !== null && owners.includes(row.identifier);
+    });
     if (linked.length === 0) {
       logger.info(
         {
@@ -13283,6 +13577,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           companyScoped: true,
           repoFullName: target.repoFullName,
           prNumber: target.prNumber,
+          // Distinguishes "this PR is not in Paperclip at all" from "every row
+          // holding it is a mention, not an owner" (BLO-37225) — the same log
+          // line otherwise reads identically for both.
+          mentionRowCount: linkedRows.length,
         },
         "failed PR-review gate has no linked Paperclip issue in the reviewer run's company to notify",
       );
@@ -17696,7 +17994,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
-      ...stripRunScopedSnapshotMarkers(contextSnapshot),
+      ...carryRetryContextSnapshot(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason: "missing_issue_comment",
       retryReason: "missing_issue_comment",
@@ -18026,7 +18324,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const retryContextSnapshot = withRecoveryModelProfileHint({
-      ...stripRunScopedSnapshotMarkers(contextSnapshot),
+      ...carryRetryContextSnapshot(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason: "process_lost_retry",
       retryReason,
@@ -19585,6 +19883,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "budget_blocked"
           | "issue_not_found"
           | "issue_reassigned"
+          | "issue_not_assigned_to_agent"
           | "issue_cancelled"
           | "issue_terminal_status"
           | "issue_not_in_progress"
@@ -19666,17 +19965,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (issue.assigneeAgentId !== run.agentId) {
+    const assigneeMismatch = evaluateScheduledRetryAssigneeMismatch({
+      runAgentId: run.agentId,
+      currentAssigneeAgentId: issue.assigneeAgentId,
+      originWakeReason: originWakeReasonFromSnapshot(contextSnapshot),
+      issueId,
+    });
+    if (assigneeMismatch) {
       return {
         allowed: false,
-        reason: "Scheduled retry suppressed because issue ownership changed",
-        errorCode: "issue_reassigned",
+        reason: assigneeMismatch.reason,
+        errorCode: assigneeMismatch.errorCode,
         issueId,
-        details: {
-          issueId,
-          previousAssigneeAgentId: run.agentId,
-          currentAssigneeAgentId: issue.assigneeAgentId,
-        },
+        details: assigneeMismatch.details,
       };
     }
 
@@ -20498,6 +20799,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .for("update")
           .then((rows) => rows[0] ?? null);
 
+        const promotionAssigneeMismatch = lockedIssue
+          ? evaluateScheduledRetryAssigneeMismatch({
+              runAgentId: dueRun.agentId,
+              currentAssigneeAgentId: lockedIssue.assigneeAgentId,
+              originWakeReason: originWakeReasonFromSnapshot(contextSnapshot),
+              issueId: promotionIssueId,
+            })
+          : null;
+
         if (!lockedIssue) {
           promotionGate = {
             allowed: false,
@@ -20506,17 +20816,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueId: promotionIssueId,
             details: { issueId: promotionIssueId },
           };
-        } else if (lockedIssue.assigneeAgentId !== dueRun.agentId) {
+        } else if (promotionAssigneeMismatch) {
           promotionGate = {
             allowed: false,
-            reason: "Scheduled retry suppressed because issue ownership changed",
-            errorCode: "issue_reassigned",
+            reason: promotionAssigneeMismatch.reason,
+            errorCode: promotionAssigneeMismatch.errorCode,
             issueId: promotionIssueId,
-            details: {
-              issueId: promotionIssueId,
-              previousAssigneeAgentId: dueRun.agentId,
-              currentAssigneeAgentId: lockedIssue.assigneeAgentId,
-            },
+            details: promotionAssigneeMismatch.details,
           };
         } else if (lockedIssue.status === "cancelled" || lockedIssue.status === "done") {
           promotionGate = {
@@ -21050,7 +21356,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
-      ...stripRunScopedSnapshotMarkers(contextSnapshot),
+      ...carryRetryContextSnapshot(contextSnapshot),
       retryOfRunId: run.id,
       wakeReason,
       retryReason,
@@ -21110,6 +21416,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           errorCode:
             | "issue_not_found"
             | "issue_reassigned"
+            | "issue_not_assigned_to_agent"
             | "issue_cancelled"
             | "issue_terminal_status"
             | "issue_not_in_progress"
@@ -21303,17 +21610,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             };
           }
 
-          if (lockedIssue.assigneeAgentId !== run.agentId) {
+          const mintAssigneeMismatch = evaluateScheduledRetryAssigneeMismatch({
+            runAgentId: run.agentId,
+            currentAssigneeAgentId: lockedIssue.assigneeAgentId,
+            originWakeReason: originWakeReasonFromSnapshot(contextSnapshot),
+            issueId,
+          });
+          if (mintAssigneeMismatch) {
             return {
               outcome: "not_scheduled",
-              reason: "Scheduled retry suppressed because issue ownership changed",
-              errorCode: "issue_reassigned",
+              reason: mintAssigneeMismatch.reason,
+              errorCode: mintAssigneeMismatch.errorCode,
               issueId,
-              details: {
-                issueId,
-                previousAssigneeAgentId: run.agentId,
-                currentAssigneeAgentId: lockedIssue.assigneeAgentId,
-              },
+              details: mintAssigneeMismatch.details,
             };
           }
 
@@ -22482,7 +22791,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const claimedAgent = await getAgent(claimed.agentId);
-      const issueLockRequired = !allowsIssueInteractionWake(claimedContext);
+      // BLO-38064: a retry lineage inherits its ORIGIN wake's lock posture. A
+      // mention wake never requires the issue execution lock (that is what lets
+      // a non-assignee run at all), and `allowsIssueInteractionWake` reads the
+      // raw `wakeReason` — which the retry mint has overwritten to
+      // `transient_failure_retry`. Without the second clause a promoted mention
+      // retry clears the two assignee screens and is then cancelled here as
+      // `issue_execution_lock_not_acquired`: the same silent loss again, a
+      // third error code. Found by the claim-leg regression test in
+      // `heartbeat-stale-queue-invalidation.test.ts`, which is why that test
+      // drives `resumeQueuedRuns` to completion rather than asserting on
+      // promotion.
+      const issueLockRequired =
+        !allowsIssueInteractionWake(claimedContext) && !isNonOwnershipRetryLineage(claimedContext);
       const claimedRetryReason = readNonEmptyString(claimedContext.retryReason) ?? claimed.scheduledRetryReason;
       const executionRunClaimCondition =
         requiresIssueExecutionRetryLock(claimedRetryReason) && claimed.retryOfRunId
@@ -22858,6 +23179,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // issue-lock block (skips lock stamping for source_scoped_recovery_action).
     // Without this pre-claim exemption those later exemptions are unreachable.
     const isRecoveryOwnerWake = wakeReason === "source_scoped_recovery_action";
+    // BLO-38064: the same exemption the retry gate applied at promotion, read
+    // from the same predicate. A promoted mention retry arrives here with
+    // `wakeReason` rewritten to `transient_failure_retry`, so `isInteractionWake`
+    // above is false and this screen would cancel it as `issue_assignee_changed`
+    // — undoing the promotion three frames earlier and turning the fix into a
+    // relabelling. `isNonOwnershipRetryLineage` reads the pinned
+    // `originWakeReason` instead, which survives the rewrite.
+    const isNonOwnershipRetryWake = isNonOwnershipRetryLineage(context);
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);
     const hasResolvedInteractionEvidence = interactionResolvedAt !== null && !Number.isNaN(Date.parse(interactionResolvedAt));
 
@@ -22944,6 +23273,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issue.assigneeAgentId !== run.agentId &&
       !isInteractionWake &&
       !isRecoveryOwnerWake &&
+      !isNonOwnershipRetryWake &&
       !isCurrentReviewParticipant
     ) {
       return {
@@ -36042,29 +36372,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // belonged to the previous assignee, and charging the new one for time they never
         // waited would age-expire their first park on contact. Issue cancellation ends it
         // outright. Note the reset needs no code to enforce: this sets errorCode to
-        // `issue_reassigned` / `issue_cancelled`, so the most-recent-terminal-park rule in
-        // recoverDepBlockedParkOriginAcrossInteractionWake declines the lineage on its
-        // own. If you ever change that errorCode, re-check the recovery guard.
+        // `issue_reassigned` / `issue_cancelled` / `issue_not_assigned_to_agent`, none of
+        // which is the code the most-recent-terminal-park rule in
+        // recoverDepBlockedParkOriginAcrossInteractionWake allow-lists, so it declines the
+        // lineage on its own. If you ever change that errorCode, re-check the recovery guard.
+        //
+        // BLO-38064: "reassignment" is now decided by evaluateScheduledRetryAssigneeMismatch
+        // rather than by a bare `agentId !== assigneeAgentId`, so a mention-wake lineage no
+        // longer ends here on ownership alone. This is the site the measured mention loss ran
+        // through, but the exemption reaches past that bounded transient retry: the
+        // `wakeReason` fallback in originWakeReasonFromSnapshot means a dep-blocked park
+        // (`depBlockedSnapshot`) or a ccrotate capacity park that carries a mention wake is
+        // exempt here too. That is intended — such a park was never the assignee's either, so
+        // the "charging the new one for time they never waited" rationale above does not apply
+        // to it. An exempt retry is still cancelled when the ISSUE is cancelled; only the
+        // ownership arm is cleared.
         const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
           const issueCancelled = issue.status === "cancelled";
-          if (
-            scheduledRun.status !== "scheduled_retry" ||
-            (scheduledRun.agentId === issue.assigneeAgentId && !issueCancelled)
-          ) {
+          const assigneeMismatch = evaluateScheduledRetryAssigneeMismatch({
+            runAgentId: scheduledRun.agentId,
+            currentAssigneeAgentId: issue.assigneeAgentId,
+            originWakeReason: originWakeReasonFromRun(scheduledRun),
+            issueId: issue.id,
+          });
+          if (scheduledRun.status !== "scheduled_retry" || (!assigneeMismatch && !issueCancelled)) {
             return false;
           }
 
           const now = new Date();
           const reason = issueCancelled
             ? "Cancelled because the issue was cancelled before the scheduled retry became due"
-            : "Cancelled because the issue was reassigned before the scheduled retry became due";
+            : assigneeMismatch?.errorCode === "issue_not_assigned_to_agent"
+              ? "Cancelled because the agent is not the issue assignee and its wake never conferred ownership"
+              : "Cancelled because the issue was reassigned before the scheduled retry became due";
           const cancelled = await tx
             .update(heartbeatRuns)
             .set({
               status: "cancelled",
               finishedAt: now,
               error: sanitizeRunErrorForStorage(reason),
-              errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
+              errorCode: issueCancelled ? "issue_cancelled" : (assigneeMismatch?.errorCode ?? "issue_reassigned"),
               updatedAt: now,
             })
             .where(and(eq(heartbeatRuns.id, scheduledRun.id), eq(heartbeatRuns.status, "scheduled_retry")))

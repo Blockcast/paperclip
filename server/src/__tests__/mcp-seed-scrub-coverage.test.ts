@@ -63,9 +63,10 @@ const jobManifestPath = path.join(
 
 /**
  * Hosts that terminate inside `paperclip-mcp-gateway`, where `scrubResponseBody`
- * runs. Empty today and that is the finding, not an oversight: keeping the list
- * explicit means the day an upstream is moved behind the gateway, flipping it to
- * `gateway-scrubbed` is a one-line change that this file forces to be deliberate.
+ * runs. This list was empty when the audit was written, and each entry since is a
+ * completed migration rather than a default: keeping it explicit means the day an
+ * upstream is moved behind a gateway, flipping it to `gateway-scrubbed` is a
+ * one-line change that this file forces to be deliberate.
  *
  * ⚠️ This list is the audit's *oracle*, and it is hand-maintained — which host
  * names actually terminate in the gateway is deployment topology that lives in
@@ -77,17 +78,19 @@ const jobManifestPath = path.join(
  * touches this list is invisible to this file. So updating this list is part of
  * doing the migration, not paperwork after it.
  *
- * That obligation is written down on PEN-2370 as a rollout checklist item naming
- * PEN-2429 (the ticket that performs the migration), rather than only here — an
+ * That obligation is written down on the parent finding as a rollout checklist
+ * item naming the ticket that performs the migration — PEN-2429 on PEN-2370 for
+ * `k8s-ro`, PEN-2830 on PEN-2735 for `prometheus` — rather than only here. An
  * operator changing topology in `Blockcast/onprem-k8s` has no reason to be
  * reading a test file in this repo, and a note only they will never see is not a
- * control. The in-repo half is enforced rather than trusted: the rollout's last
- * step flips the `k8s-ro` URL in `statefulset.yaml`, which is in this repo, so it
- * trips the host assertion below and cannot land while this audit still describes
- * the old topology.
+ * control. The in-repo half is enforced rather than trusted, and identically for
+ * both: each rollout's last step flips that upstream's URL in `statefulset.yaml`,
+ * which is in this repo, so it trips the assertions below and cannot land while
+ * this audit still describes the old topology.
  */
 const SCRUBBING_GATEWAY_HOSTS: readonly string[] = [
   "paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local",
+  "paperclip-mcp-gateway-prometheus.paperclip.svc.cluster.local",
 ];
 
 type Coverage =
@@ -117,10 +120,14 @@ type Coverage =
  * that anything sensitive is known to be in them.
  *
  * PEN-2630's (b1) audit closed on 2026-08-30 and assessed the contents of
- * `prometheus`/`tempo`/`linear`, so their rationales below now record an outcome
- * rather than "unassessed", and each points at the child row that owns its
- * follow-up: PEN-2735 (prometheus, disclosure), PEN-2736 (linear, disclosure on
- * the grant axis), PEN-2737 (tempo, no-disclosure but unenforced).
+ * `prometheus`/`tempo`/`linear`, so their rationales record an outcome rather
+ * than "unassessed", and each points at the child row that owns its follow-up:
+ * PEN-2736 (linear, disclosure on the grant axis), PEN-2737 (tempo,
+ * no-disclosure but unenforced). `prometheus` was the third — PEN-2735,
+ * disclosure — and PEN-2830 has since reclassified it to `gateway-scrubbed`. A
+ * `gateway-scrubbed` entry carries no `ticket`/`why`, so its rationale moved
+ * into the inline comment on the entry itself; the content is preserved, only
+ * the shape changed.
  *
  * ⚠️ An `ASSESSED no-disclosure` rationale is NOT grounds to reclassify an entry
  * out of `unscrubbed`. The two axes are independent: `unscrubbed` describes
@@ -141,9 +148,19 @@ const SEED_COVERAGE: Readonly<Record<string, Coverage>> = {
     why: "github-mcp-server runs as a local stdio child process",
   },
   prometheus: {
-    kind: "unscrubbed",
-    ticket: "PEN-2735",
-    why: "direct to prometheus-mcp-server; ASSESSED disclosure (PEN-2630) — get_targets returns Prometheus's activeTargets/droppedTargets verbatim, and those carry discoveredLabels, which is pre-relabel and so includes __meta_kubernetes_*_annotation_* for every annotation on every scraped object across 12 namespaces incl. penstock and paperclip; kubectl.kubernetes.io/last-applied-configuration embeds inline env values, i.e. PEN-2370's material by a route no scrubber sits on",
+    // PEN-2830 moved this behind `paperclip-mcp-gateway-prometheus`, a
+    // single-upstream gateway, so responses now traverse `scrubResponseBody`.
+    //
+    // Note *which* control closes PEN-2735's door, because it is not the
+    // scrubber: the gateway's upstream map carries a five-tool allowlist
+    // (execute_query, execute_range_query, list_metrics, get_metric_metadata,
+    // health_check) and `get_targets` is absent from it, so the tool that
+    // returns `discoveredLabels` is never exposed to enumerate or call. The
+    // scrubber is defence in depth over the five that remain. Re-adding
+    // `get_targets` to that map would reopen the door with this entry still
+    // reading `gateway-scrubbed` and this file none the wiser — the allowlist
+    // lives in `Blockcast/onprem-k8s`, which no test here can read.
+    kind: "gateway-scrubbed",
   },
   tempo: {
     kind: "unscrubbed",
@@ -663,7 +680,42 @@ describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)",
     // the classification to be corrected with the topology change.
     const k8sRo = SEED_COVERAGE["k8s-ro"];
     expect(k8sRo.kind).toBe("gateway-scrubbed");
-    expect(hostOf(seeded["k8s-ro"]!)).toBe("paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local");
+
+    const entry = seeded["k8s-ro"]!;
+    expect(hostOf(entry)).toBe("paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local");
+    // Whole URL, not just the host, for the reason spelled out on the prometheus
+    // case below: `hostOf` reads only the hostname, so the assertion above alone
+    // would keep passing with the path prefix dropped, and the prefix is what
+    // `matchUpstream` routes on.
+    expect(typeof entry === "string" ? undefined : entry.url).toBe(
+      "http://paperclip-mcp-gateway-k8s-ro.paperclip.svc.cluster.local:8080/k8s-ro/mcp",
+    );
+  });
+
+  it("records that the prometheus seed now traverses the scrubbing gateway", () => {
+    // Pins the instance PEN-2735 was filed for, the same way the k8s-ro case
+    // above pins PEN-2370's.
+    //
+    // The URL is pinned whole, not just its host, because `hostOf` reads only
+    // the hostname — so the assertion above would keep passing if the path were
+    // dropped. That is not a security hole: `isToolAllowed` is asked at all four
+    // enforcement points, the gateway's aggregate `/mcp` route included. It is an
+    // availability one, and it holds for any prefixed upstream, not just this
+    // one: `matchUpstream` routes on that first path segment, and the aggregate
+    // route it falls back to renames every tool it does return to `prefix__name`,
+    // which is not the name any agent's tool config asks for. Measured
+    // 2026-09-30 for this upstream specifically, that route answered `tools/list`
+    // with zero tools where `/prometheus/mcp` returned the expected five — so a
+    // seed that kept the host and lost the prefix would silently hand every agent
+    // an empty prometheus toolset.
+    const prometheus = SEED_COVERAGE["prometheus"];
+    expect(prometheus.kind).toBe("gateway-scrubbed");
+
+    const entry = seeded["prometheus"]!;
+    expect(hostOf(entry)).toBe("paperclip-mcp-gateway-prometheus.paperclip.svc.cluster.local");
+    expect(typeof entry === "string" ? undefined : entry.url).toBe(
+      "http://paperclip-mcp-gateway-prometheus.paperclip.svc.cluster.local:8080/prometheus/mcp",
+    );
   });
 
   it("the per-agent override axis this audit does NOT cover is still shaped as documented", () => {

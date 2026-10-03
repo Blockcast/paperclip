@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Canonical fleet merge-gate reader
-# (BLO-26572 → BLO-34035 → BLO-34114 → BLO-34263 → BLO-34367).
+# (BLO-26572 → BLO-34035 → BLO-34114 → BLO-34263 → BLO-34367 → BLO-37887).
 #
 # Reads BOTH check surfaces at a head and prints one line per row that is not a
 # pass. Empty output means "nothing to stop on", and is trustworthy only because
@@ -20,6 +20,17 @@
 # in the CONCLUSION column ($3) under a $1 of STOP. A consumer filtering $1
 # for blocking labels must match STOP and will never see it; listing it here
 # as a label was wrong.
+# NO-VERDICT (BLO-37887) is blocking and is likewise NOT a label, for exactly
+# that reason: a run that has published nothing is ABSENT, and ABSENT is a stop
+# under BLO-26572, so it MUST be caught by a `$1 == "STOP"` filter. It carries
+# NO-VERDICT in the CONCLUSION column ($3) and names the workflow and the run
+# state in $2, which is the distinguishability the remedy needs — that state is
+# the run STATUS while it is in flight (`queued`, `pending`: WAIT for it) and the
+# run CONCLUSION once it is completed (`startup_failure`, `action_required`: it
+# will never report, so fix the workflow or approve the run and re-trigger).
+# Either way you do not re-request a review. Promoting it to a $1 label would
+# hide a real stop from every consumer following the mandated "any STOP line
+# blocks the merge" reading. Direction of that mistake: GREEN.
 #
 # The VERDICT IS THE LINES, never $?. rc 1 IMPLIES the ABSENT line, but NOT the
 # converse: `grep -v` returns 0 whenever any row survives, while the survivor
@@ -29,15 +40,18 @@
 # one-way signal at best. Never write `merge-gate-read.sh … && merge`.
 #
 #   merge-gate-read.sh <owner/repo> <sha|pr-head>     # live
-#   merge-gate-read.sh --rows <DEAD-alternation>      # fixture mode, rows on stdin
+#   merge-gate-read.sh --rows <DEAD> [PENDING]        # fixture mode, rows on stdin
 #   merge-gate-read.sh --dead                         # fixture mode, runs on stdin
+#   merge-gate-read.sh --pending                      # fixture mode, runs on stdin
 #   merge-gate-read.sh --extract                      # fixture mode, check-run JSON on stdin
 #   merge-gate-read.sh --status-extract               # fixture mode, status JSON on stdin
 #   merge-gate-read.sh --runs-extract                 # fixture mode, runs JSON on stdin
 #   merge-gate-read.sh --sha-guard <sha>              # fixture mode, validates one sha
 #
 # Row shape  (TSV): name <TAB> conclusion <TAB> timestamp <TAB> run-id|app:<slug>|status
-# Run shape  (TSV): workflow-id <TAB> event <TAB> run-id <TAB> conclusion <TAB> run-started-at
+# Run shape  (TSV): workflow-id <TAB> event <TAB> run-id <TAB> conclusion <TAB>
+#                   run-started-at <TAB> status <TAB> workflow-name
+# Pend shape (TSV): run-id <TAB> status-or-conclusion <TAB> workflow-name
 set -uo pipefail
 
 extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
@@ -63,7 +77,97 @@ run_extract() { # stdin: actions/runs API body (one object per page) -> run rows
   # Field ORDER is the contract with dead_runs(); a transposition here is
   # invisible at runtime and silently empties DEAD. @tsv renders a null as the
   # empty string, which dead_runs() treats as "no timestamp" and fails CLOSED.
-  jq -r '.workflow_runs[]|[.workflow_id,.event,.id,.conclusion,.run_started_at]|@tsv'
+  # status/name are APPENDED, never interleaved: dead_runs() reads $1..$5 and a
+  # 5-field fixture row must keep meaning what it meant.
+  jq -r '.workflow_runs[]|[.workflow_id,.event,.id,.conclusion,.run_started_at,
+                           .status,.name]|@tsv'
+}
+
+pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
+  # BLO-37887. A workflow run that has dispatched ZERO JOBS publishes ZERO
+  # check-runs, so it is invisible on BOTH surfaces this reader fetches — there
+  # is no row to keep, drop, or label. Measured at Network-Operator-Portal#1105
+  # @ 0897b91d: run 36563730733 (Go Unit Tests) sat `status: pending` with
+  # `jobs: 0` and appeared in NONE of the ~10 check-run rows at that head, while
+  # every other run there had >=1 job and did appear.
+  #
+  # DEAD does not cover it: DEAD holds runs a later same-lane success
+  # SUPERSEDED, which is a different question from "did this run publish". The
+  # BLO-34263 survivor guard does not fire either — it is written for "DEAD
+  # matched everything" and stays quiet while ~10 unrelated rows survive.
+  # Neither existing guard can express "a run here has published nothing".
+  #
+  # The hazard is the WINDOW, not a steady state: while other runs are still red
+  # the reader correctly stops. It fails GREEN in the interval where every
+  # VISIBLE stop clears and a zero-job run is still outstanding — the reader
+  # prints nothing, which BLO-26572 reads as "no stop", over a workflow that has
+  # produced no verdict at all. Self-closing (that run dispatched jobs minutes
+  # later and became visible), which is exactly why it has never been caught on
+  # a settled head and why its fixtures must be synthetic.
+  #
+  # How the state is MANUFACTURED, and why this is worth a guard rather than a
+  # note: the sanctioned draft->ready toggle creates it. The 11:45:30Z toggle on
+  # that PR cancelled run 36556420221 under `cancel-in-progress`, and the
+  # replacement was created 3s later and sat pre-dispatch. The mandated
+  # per-workflow in-flight check ran first and predicted the cancellation
+  # exactly. Two correct procedures composing into a blind spot neither has
+  # alone.
+  #
+  # NEGATE, never match a literal state. The documented status domain is queued /
+  # in_progress / completed / requested / waiting / pending; matching `pending`
+  # alone passes the measured fixture and silently admits every other
+  # pre-dispatch state plus any GitHub adds later. That is this file's own
+  # recurring defect — BLO-34367 exists because `cancelled` was keyed on without
+  # asking what the whole enum could mean.
+  #
+  # `completed` is NOT the whole answer, and reading it as one was the first cut
+  # of this guard. A run can reach `completed` having published nothing at all,
+  # and it is then invisible for exactly the reason above. Measured at
+  # onprem-k8s @ b763c490: 28 runs, 23 published 57 check-runs between them and
+  # 5 concluded `startup_failure` publishing ZERO — one of them `review-gate`.
+  # The reader printed two lines there, both unrelated legacy statuses, so in
+  # the window where those two clear the head reads merge-clean over five
+  # workflows that produced no verdict. Direction GREEN. Raised by @ally on
+  # #2112 and reproduced exactly as reported.
+  #
+  # So discriminate on "owes nothing", which is the conclusion, not the status:
+  # `success` and `skipped` are the two that settle a run. Every other
+  # conclusion — startup_failure / action_required / timed_out / stale /
+  # cancelled / failure / neutral — leaves a workflow with no verdict published,
+  # and a terminally-cancelled or failed run that published nothing is the same
+  # BLO-34367 hole arrived at from the other side. Keep `== success` and
+  # `== skipped` exact for the same reason dead_runs() keeps its own test exact:
+  # anything looser lets a non-verdict settle a run.
+  #
+  # A superseded run is completed, non-success and publishes nothing HERE — its
+  # rows are stripped by the DEAD grep before `contributed` is ever set — so it
+  # would emit a spurious NO-VERDICT. It is excluded in the END loop of
+  # verdicts(), NOT here: pending_runs() does not know DEAD, and doing it in the
+  # caller would put the guard outside `--rows` fixture reach. Direction of
+  # missing it is RED, but it breaks BLO-34114s own pinned control.
+  #
+  # That exclusion covers only the two conclusions dead_runs() admits as a
+  # victim, `cancelled`/`failure` — the other five emitted here fall through it
+  # and still print. See the third accepted residual in dead_runs() for the
+  # measurement and for why widening the victim test is refused.
+  #
+  # A missing status or conclusion ("" via @tsv on a null, or a short fixture
+  # row) is not `completed`/`success`, so it is kept and STOPs. Fails CLOSED, on
+  # the same grounds as the missing-timestamp rule in dead_runs(): an absent
+  # field must never be read as evidence that a verdict exists.
+  #
+  # The displayed state is the CONCLUSION once a run is completed. "run
+  # completed, no check-run published" tells a reader to wait for something that
+  # will never arrive; "run startup_failure" names the actual remedy, which is to
+  # fix the workflow file and re-run, not to wait.
+  #
+  # `$3 != ""` is the blank-line fence and is load-bearing on the live path: the
+  # reader pipes a shell variable in, and an empty variable arrives as one blank
+  # line whose $6 is "" — i.e. not `completed` — which would print a NO-VERDICT
+  # naming no workflow at all on every head that has no runs.
+  awk -F'\t' '$3 != "" && !($6 == "completed" && ($4 == "success" || $4 == "skipped")) {
+                s = ($6 == "completed" ? $4 : $6)
+                print $3 "\t" (s == "" ? "?" : s) "\t" $7 }'
 }
 
 require_sha() { # $1 = candidate -> stdout: a STOP line + rc 1 when not 40-hex
@@ -220,6 +324,28 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
   # victim decision into verdicts(). How often a later same-lane run drops a
   # name at one head is unmeasured; the mechanism is proven, the frequency is
   # not.
+  # Third residual, accepted: THE VICTIM TEST BELOW IS NARROWER THAN THE SET
+  # verdicts() EXEMPTS WITH IT, and the reuse is deliberately partial. This
+  # admits a victim only on `cancelled`/`failure`, while pending_runs() emits
+  # every conclusion outside `success`/`skipped`. So a run superseded by a later
+  # same-lane success whose conclusion is `startup_failure` / `timed_out` /
+  # `stale` / `action_required` / `neutral`, and which published nothing, is in
+  # the pend set, is NOT in DEAD, and prints a spurious NO-VERDICT for a lane
+  # that demonstrably spoke. Measured: runs 111 <conclusion> / 222 success in one
+  # pull_request lane -> `cancelled`/`failure` give DEAD=111 and print nothing;
+  # the other five give DEAD='' and print NO-VERDICT run=111.
+  # These two sets were disjoint by construction until BLO-37887 widened
+  # pending_runs() off `$6 != "completed"` onto the conclusion, so this is new
+  # surface, not a pre-existing residual. Direction is RED — it costs a wait,
+  # never a merge — and it was not found in the wild: 0 occurrences across 24
+  # heads (12 merged + 12 open, paperclip / onprem-k8s / Network-Operator-Portal).
+  # Mechanism proven, frequency not established, same footing as the two above.
+  # The fix is NOT to widen the victim test to match: every conclusion added here
+  # deletes more runs, which is the merge-authorizing direction, and would buy a
+  # measured-zero false RED with an unmeasured false GREEN. If it is ever seen in
+  # the wild, widen the exemption in verdicts() instead — recompute it from the
+  # pend set so verdicts() prints FEWER spurious lines, rather than widening what
+  # dead_runs() deletes.
   awk -F'\t' 'BEGIN { n = 0 }   # n MUST be seeded: implicit is "" , not 0
               { key = $1 FS $2
                 if ($4 == "success" && $5 > newest_pass[key]) newest_pass[key] = $5
@@ -231,7 +357,7 @@ dead_runs() { # stdin: run rows -> stdout: alternation of stale run ids
     | sort -n | paste -sd'|' -
 }
 
-verdicts() { # $1 = DEAD alternation (empty or '__none__' when nothing is stale)
+verdicts() { # $1 = DEAD alternation, $2 = PENDING rows (both may be empty)
   # Normalised HERE and nowhere else — the live path pipes dead_runs() straight
   # in, and it prints nothing when no run is stale. An empty alternation is not
   # inert: `()` is an empty sub-expression, which GNU grep reads as "matches
@@ -244,7 +370,46 @@ verdicts() { # $1 = DEAD alternation (empty or '__none__' when nothing is stale)
   grep -vE "	(${dead})$" \
     | sort -t$'\t' -k1,1 -k4,4 -k3,3r \
     | awk -F'\t' '!seen[$1 FS $4]++' \
-    | awk -F'\t' -v dead="$dead" 'NF==0{next}
+    | PEND="${2:-}" awk -F'\t' -v dead="$dead" '
+        # NO APOSTROPHES anywhere below: this awk program is single-quoted in the
+        # surrounding shell, so one inside a comment ends the script mid-word and
+        # bash reports a syntax error on an unrelated line further down.
+        #
+        # BLO-37887. Pend rows are carried as an ORDERED list, not an
+        # associative array: awk for-in order is unspecified, so iterating the
+        # map directly makes multi-run output nondeterministic and its fixture
+        # flaky. Keyed lookup still uses `contributed`, which is a map.
+        #
+        # Read from ENVIRON, NOT `-v pend=`: awk un-escapes a `-v` value, and a
+        # workflow name carrying a real tab or newline reaches us from `@tsv` as
+        # the two-character `\t`/`\n`. Round-tripping through `-v` turns those
+        # back into real separators, so a tab truncates the displayed name and a
+        # newline splits one run into two, emitting a spurious extra NO-VERDICT.
+        # Direction is RED — `prid` is field 1, so a real stop can never be
+        # suppressed — but the line then names a workflow that does not exist.
+        BEGIN{ np = split(ENVIRON["PEND"], pl, "\n"); k = 0
+               for (i = 1; i <= np; i++) if (pl[i] != "") {
+                 split(pl[i], f, "\t")
+                 # `--paginate` can repeat a run id when a run is created mid-walk
+                 # and shifts the page boundary. Idempotent, so one line per run.
+                 if (f[1] in pseen) continue
+                 pseen[f[1]] = 1; k++
+                 prid[k] = f[1]; pstat[k] = f[2]; pname[k] = f[3] } }
+        NF==0{next}
+        # Set on SURVIVING rows only — after DEAD, after dedup — so "contributed"
+        # means "this run published a check-run that is still standing", which is
+        # the question. Set BEFORE the label rules below so a row that is itself a
+        # STOP still counts as its run having spoken.
+        #
+        # The two exclusions are the SAME predicate the survivor count `n` uses,
+        # and they must stay aligned: `neutral` and a `${{`-bearing name are the
+        # two declared NON-verdicts here, both explicitly non-blocking. Crediting
+        # one as "this run spoke" suppresses NO-VERDICT for a run that has said
+        # nothing — the fail-GREEN class this guard exists to close, one row away
+        # from itself. `status`/`app:` rows need no exclusion: `$4` there is
+        # literal `status` or `app:<slug>`, never a numeric `actions/runs[].id`,
+        # so they cannot collide with a pend key.
+        $2!="neutral"&&$1!~/\$\{\{/{contributed[$4] = 1}
         # Survivors are check-run verdicts only. On a repo that publishes ONLY
         # legacy statuses this fires ABSENT on every head — the documented
         # single-surface false RED. Control: run the same read against 3-8
@@ -268,14 +433,36 @@ verdicts() { # $1 = DEAD alternation (empty or '__none__' when nothing is stale)
         $2!="success"&&$2!="skipped"{print ($1~/\$\{\{/?"MALFORMED":($2=="neutral"?"NOT-EVALUATED":"STOP"))"\t"$1"\t"$2"\trun="$4}
         END{if(!n) print "STOP\t<" (dead!="__none__" \
               ? "every check-run at this head dropped as superseded-run" \
-              : "no check-run verdict at this head") ">\tABSENT\trun=-"}'
+              : "no check-run verdict at this head") ">\tABSENT\trun=-"
+            # A run that contributed NOTHING is owed a verdict this reader cannot
+            # see. It does NOT count toward n: it is the absence of a verdict, so
+            # counting it would suppress the very ABSENT guard that covers the
+            # neighbouring case.
+            #
+            # DEAD runs are exempt, and the exemption is not cosmetic. A
+            # superseded run is completed and non-success, so pending_runs()
+            # emits it, and its rows were stripped by the grep at the top of this
+            # function before `contributed` could be set — so without this it
+            # prints NO-VERDICT for a run whose lane demonstrably spoke. The
+            # alternation is reused verbatim rather than restated, on the same
+            # grounds as the `contributed` predicate above: two encodings of one
+            # question drift, and the drift reads correctly on each side alone.
+            # The reuse is only PARTIAL, and deliberately so: dead_runs() admits
+            # a victim on a narrower conclusion set than pending_runs() emits, so
+            # five conclusions fall through this exemption. Third residual in
+            # dead_runs() has the measurement and why widening it is refused.
+            for (i = 1; i <= k; i++) if (!(prid[i] in contributed) \
+                                         && prid[i] !~ ("^(" dead ")$"))
+              printf "STOP\t<%s: run %s, no check-run published>\tNO-VERDICT\trun=%s\n", \
+                     (pname[i] == "" ? "?" : pname[i]), pstat[i], prid[i]}'
 }
 
 # `--rows` propagates the pipeline status rather than swallowing it. Hardcoding
 # `exit 0` here made the exit contract unobservable by construction, so no
 # fixture could catch the header claiming an exactness it did not have.
-if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}"; exit $?; fi
+if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}" "${3:-}"; exit $?; fi
 if [ "${1:-}" = "--dead" ]; then dead_runs; exit 0; fi
+if [ "${1:-}" = "--pending" ]; then pending_runs; exit 0; fi
 if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
 if [ "${1:-}" = "--status-extract" ]; then status_extract; exit 0; fi
 if [ "${1:-}" = "--runs-extract" ]; then run_extract; exit 0; fi
@@ -287,8 +474,16 @@ R="$1"
 H=$(gh api "repos/$R/commits/$2" --jq .sha 2>/dev/null)
 require_sha "$H" || exit 1
 
-DEAD=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate \
-        | run_extract | dead_runs)
+RUNS=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate \
+        | run_extract)
+# ZERO new API calls for BLO-37887: the runs body is already fetched, so the
+# pending set is a second pass over rows in hand. Extract ONCE into RUNS and fan
+# out; a second `gh api` here would double this reader's rate-limit cost on every
+# invocation, and `gh` shares one installation token fleet-wide.
+# An empty RUNS arrives as one blank line: dead_runs() matches nothing on it, and
+# pending_runs()'s `$3 != ""` fence drops it.
+DEAD=$(printf '%s\n' "$RUNS" | dead_runs)
+PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
 
 # BOTH surfaces paginate. GitHub's default page size is 30, so an unpaginated
 # status fetch silently drops the 31st context onward — and a dropped `failure`
@@ -296,4 +491,4 @@ DEAD=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate \
 # status rows from the survivor count, so one surviving check-run keeps the guard quiet.
 { gh api "repos/$R/commits/$H/status?per_page=100" --paginate | status_extract
   gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract
-} | verdicts "$DEAD"
+} | verdicts "$DEAD" "$PENDING"

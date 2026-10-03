@@ -38,11 +38,52 @@ import {
 
 const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
 
-// Characters of the unrecognized-verb list a carried-finding reason may spend.
-// Sized so the message stays inside GitHub's 140-character commit-status cap
-// with the head and the explanatory phrase intact, since those are what make
-// the red actionable.
-const UNRECOGNIZED_VERB_BUDGET = 48;
+/**
+ * Join quoted verbs into at most `budget` characters, cutting BETWEEN entries.
+ *
+ * Slicing the joined string cuts inside a verb and drops its closing quote, so
+ * the author reads a name that is not the one in their ledger — the same
+ * hazard `commentReviewGateRetirementDescription` refuses for the context
+ * name. On the between-entries path whatever did not fit is marked with ", …",
+ * because an author who fixes only the verbs shown would re-push into this
+ * same red, which is the loop the carried tail exists to close. That marker is
+ * scoped to that path and is NOT an invariant of this function: neither
+ * fallback below can afford it, because at the worst-case budget of 21 there
+ * is no room for both an entry and the 3-character reserve. There entries
+ * 2..n are dropped unmarked, deliberately — spending the reserve would buy the
+ * marker by losing the one verb name the author can actually act on.
+ *
+ * There is no separate standalone budget: the caller's cap is always the
+ * tighter one (the lead is 63-64 characters and the shortest tail is 38, so
+ * the most this can ever be handed is 39), and a second constant that never
+ * binds reads as load-bearing while doing nothing.
+ */
+function fitQuotedVerbs(quoted: string[], budget: number): string {
+  const whole = quoted.join(", ");
+  if (whole.length <= budget) return whole;
+  const kept: string[] = [];
+  let used = 0;
+  for (const entry of quoted) {
+    // +3 keeps room for the ", …" that marks the entries left out.
+    const cost = (kept.length ? 2 : 0) + entry.length;
+    if (used + cost + 3 > budget) break;
+    kept.push(entry);
+    used += cost;
+  }
+  if (kept.length) return `${kept.join(", ")}, …`;
+  // The first verb fits whole and was rejected only by the 3-character reserve
+  // for the ", …" marker. Return it as is: eliding it would slice through its
+  // closing quote when its length is exactly budget - 2 (three quotes in the
+  // render, the odd-quote defect the invariant test guards) and would mark a
+  // complete name as truncated while the other verbs vanish unmarked either
+  // way. Below this line quoted[0].length > budget > budget - 2, so the slice
+  // can no longer reach the closing quote.
+  if (quoted[0].length <= budget) return quoted[0];
+  // Not even the first verb fits whole. Elide inside its quotes so it still
+  // reads as truncated and keeps its closing quote, rather than rendering the
+  // lead with no verb at all.
+  return budget >= 3 ? `${quoted[0].slice(0, budget - 2)}…"` : "";
+}
 
 export interface CommentReviewGateComment {
   authorLogin: string | null | undefined;
@@ -438,12 +479,39 @@ export function evaluateCommentReviewGate(input: {
   const [carried] = headsWithUndispositionedFinding(comments, reviewerBotLogin);
   if (carried) {
     const shortHead = carried.attestedHeadSha.slice(0, 7);
-    // GitHub caps a commit-status description at 140 characters, so this is a
-    // replacement message rather than a suffix on the ordinary one: appending
-    // would push the part that explains the red past the cap and lose exactly
-    // the detail this branch exists to surface. The verb list is budgeted for
-    // the same reason — the regex accepts an arbitrarily long verb, and the
-    // head plus the "unrecognized ledger verb" phrase must survive intact.
+    // The tail is conditional because `withheldPositive` is exactly the state
+    // in which a comment DOES attest the current head. Saying "no comment
+    // attests the current head" there invites the author to post one — which
+    // they just did, and which cannot clear a carried finding. Naming why the
+    // attestation did not count is the difference between a red that routes
+    // the author to the reviewer and a red that routes them into a loop.
+    // Tails measure 38 / 54 / 55. That 55 bounds the NO-VERB branch below to
+    // 131 (its 76-character lead plus the tail), inside the 140 cap. It does
+    // not bound the verb branch directly beneath this comment: that one
+    // budgets the verb list against whatever the tail leaves, so it lands on
+    // exactly 140 whenever the list fills its allowance — which is what the
+    // exact-fit test pins. 131 is this branch's ceiling, not the file's.
+    const carriedTail = !withheldPositive
+      ? "; no comment attests the current head."
+      : withheldPositive.authorUnknown
+        ? "; its only attestation is not known to be independent."
+        : "; the only comment attesting it is the PR author's own.";
+    // Both clauses have to reach the author, and GitHub caps a commit-status
+    // description at 140 characters. The tail is the one an author is least
+    // likely to guess — it is the only thing that says why the attestation
+    // they just posted did not count — so it is never the part that gets cut.
+    //
+    // That forces two things. This lead is terser than the no-verb branch's:
+    // the ordinary "A finding from Ally's review of <head> is undispositioned:
+    // unrecognized ledger verbs " lead is 86 characters and leaves 0 and -1 for
+    // the two longest tails, i.e. the verb list it exists to introduce cannot be
+    // rendered at all. And the verb list is budgeted against what the tail
+    // actually leaves rather than against a standalone cap, because the regex
+    // behind `disposition` accepts an arbitrarily long verb. Worst case (plural
+    // lead, longest tail) still leaves 21 characters for it; the `Math.max(0,
+    // …)` floor is there because a negative budget would otherwise reach
+    // `fitQuotedVerbs` and elide against it, so a future longer tail would
+    // overflow the cap silently instead of dropping the verb list.
     //
     // PEN-3157 asked whether this republishes model-authored text to a public
     // commit status without a scrub, since the verb is lifted verbatim out of
@@ -460,25 +528,15 @@ export function evaluateCommentReviewGate(input: {
     // Defence in depth still applies: `githubPostCommitStatusDetailed` scrubs
     // every description on the way out, so widening the class would be caught
     // by the boundary even if that test were deleted.
-    const verbList = carried.unrecognizedVerbs
-      .map((verb) => `"${verb}"`)
-      .join(", ")
-      .slice(0, UNRECOGNIZED_VERB_BUDGET);
-    // The tail is conditional because `withheldPositive` is exactly the state
-    // in which a comment DOES attest the current head. Saying "no comment
-    // attests the current head" there invites the author to post one — which
-    // they just did, and which cannot clear a carried finding. Naming why the
-    // attestation did not count is the difference between a red that routes
-    // the author to the reviewer and a red that routes them into a loop.
-    // Longest rendering is 131 characters, inside the 140 cap.
-    const carriedTail = !withheldPositive
-      ? "; no comment attests the current head."
-      : withheldPositive.authorUnknown
-        ? "; its only attestation is not known to be independent."
-        : "; the only comment attesting it is the PR author's own.";
+    const verbLead =
+      `Undispositioned finding from ${shortHead}: unrecognized ledger ` +
+      `${carried.unrecognizedVerbs.length === 1 ? "verb" : "verbs"} `;
+    const verbList = fitQuotedVerbs(
+      carried.unrecognizedVerbs.map((verb) => `"${verb}"`),
+      Math.max(0, MAX_COMMIT_STATUS_DESCRIPTION - verbLead.length - carriedTail.length),
+    );
     const reason = carried.unrecognizedVerbs.length
-      ? `A finding from Ally's review of ${shortHead} is undispositioned: unrecognized ledger ` +
-        `${carried.unrecognizedVerbs.length === 1 ? "verb" : "verbs"} ${verbList}.`
+      ? verbLead + verbList + carriedTail
       : `An unresolved finding from Ally's review of ${shortHead} is still undispositioned` +
         carriedTail;
     return {
@@ -609,12 +667,31 @@ export function retiredCommentReviewGateContexts(
 const MAX_COMMIT_STATUS_DESCRIPTION = 140;
 
 /**
- * Description for a superseded context. Deliberately carries no claim about
- * whether anything reviewed the head — that claim under a `review/`-prefixed
- * green is the defect (BLO-29711) — only a pointer to where the verdict now
- * lives. `scripts/check-comment-review-gate-census.mjs` flags a green `review/`
- * status whose description admits nothing was evaluated; this text must not
- * match that pattern.
+ * Description for a superseded context, given the live verdict.
+ *
+ * Takes the whole verdict rather than just its state, because the state alone
+ * cannot distinguish the two greens. `clean` and `not_evaluated` both publish
+ * `success` — that collapse is deliberate and load-bearing (BLO-29711: no other
+ * legacy state is both honest and non-blocking) — so a retirement row rendered
+ * from the state alone says "findings now publish elsewhere" for a head nothing
+ * reviewed. Green, `review/`-namespaced, and claiming more than the gate knows:
+ * the exact shape `scripts/check-comment-review-gate-census.mjs` exists to
+ * count, and worded so that the census skipped it (BLO-34742).
+ *
+ * So the not-evaluated phrasing deliberately DOES trip the census's
+ * `admitsNothingEvaluated` pattern, and the other two deliberately do not. That
+ * is not a widening of what counts as a violation — the retired mirror of a
+ * not-evaluated verdict always was one — it is the row becoming visible to the
+ * audit. Fixed here rather than by adding a fourth alternative to the census
+ * regex, per BLO-32695: the gate owns the wording, so the gate is where the
+ * wording is made honest.
+ *
+ * "No INDEPENDENT … comment attests" rather than "no … comment attests": on the
+ * self-attested and author-unknown routes a comment does attest this head, and
+ * the objection is that its author wrote it. Saying nothing attests there is
+ * false, and invites the author to post another (the same reason
+ * `commentReviewGateCheckTitle` carries the qualifier, and the same loop the
+ * `carriedTail` above exists to close).
  *
  * The blocking phrasing exists because the retirement write mirrors the live
  * state (see `supersedeRetiredContexts`). A red row whose description only said
@@ -622,28 +699,40 @@ const MAX_COMMIT_STATUS_DESCRIPTION = 140;
  */
 export function commentReviewGateRetirementDescription(
   liveContext: string,
-  state: CommentReviewGateVerdict["state"] = "success",
+  verdict: Pick<CommentReviewGateVerdict, "state" | "outcome">,
 ): string {
   const target = liveContext.trim();
-  const renderShort = (name: string) =>
-    state === "failure"
-      ? `Retired. Unresolved finding; see "${name}".`
-      : `Retired. Findings now publish to "${name}".`;
-  const full =
-    state === "failure"
-      ? `Retired. Unresolved finding stands; "${target}" carries the verdict.`
-      : `Retired. Comment-shaped review findings now publish to "${target}".`;
+  // Both phrasings per case, so the overflow fallback below can shorten
+  // without changing which claim the row makes.
+  const phrasings = (name: string): { full: string; short: string } => {
+    if (verdict.state === "failure") {
+      return {
+        full: `Retired. Unresolved finding stands; "${name}" carries the verdict.`,
+        short: `Retired. Unresolved finding; see "${name}".`,
+      };
+    }
+    if (verdict.outcome === "not_evaluated") {
+      return {
+        full: `Retired. No independent Ally consolidated-review comment attests this head; "${name}" carries the verdict.`,
+        short: `Retired. No independent Ally consolidated-review comment attests this head; see "${name}".`,
+      };
+    }
+    return {
+      full: `Retired. Comment-shaped review findings now publish to "${name}".`,
+      short: `Retired. Findings now publish to "${name}".`,
+    };
+  };
+  const { full, short } = phrasings(target);
   if (full.length <= MAX_COMMIT_STATUS_DESCRIPTION) return full;
-  const short = renderShort(target);
   if (short.length <= MAX_COMMIT_STATUS_DESCRIPTION) return short;
   // Both phrasings overflow, so the context name itself is what is long.
   // Elide the NAME rather than slicing the rendered sentence: a blind slice
   // cuts the name mid-token and drops the closing quote, which is exactly the
   // "cut in half" outcome the fallback exists to avoid. Unreachable with
   // today's names; pinned by test so it stays true if a name grows.
-  const budget = MAX_COMMIT_STATUS_DESCRIPTION - renderShort("").length - 1;
+  const budget = MAX_COMMIT_STATUS_DESCRIPTION - phrasings("").short.length - 1;
   if (budget <= 0) return short.slice(0, MAX_COMMIT_STATUS_DESCRIPTION);
-  return renderShort(`${target.slice(0, budget)}…`);
+  return phrasings(`${target.slice(0, budget)}…`).short;
 }
 
 /**
@@ -657,11 +746,11 @@ export function commentReviewGateRetirementDescription(
  */
 export function commentReviewGateRetirementStatus(
   liveContext: string,
-  verdict: Pick<CommentReviewGateVerdict, "state">,
+  verdict: Pick<CommentReviewGateVerdict, "state" | "outcome">,
 ): { state: CommentReviewGateVerdict["state"]; description: string } {
   return {
     state: verdict.state,
-    description: commentReviewGateRetirementDescription(liveContext, verdict.state),
+    description: commentReviewGateRetirementDescription(liveContext, verdict),
   };
 }
 

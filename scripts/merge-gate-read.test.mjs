@@ -12,13 +12,13 @@ const READER = fileURLToPath(new URL("./merge-gate-read.sh", import.meta.url));
  * exit is an expected outcome here and must not be read as a harness failure —
  * the VERDICT IS THE LINES. Use `read()` unless you are asserting on rc itself.
  */
-function readRc(rows, dead = "__none__") {
+function readRc(rows, dead = "__none__", pend = "") {
   const stdin = rows.length ? rows.map((r) => r.join("\t")).join("\n") + "\n" : "";
   const opts = { input: stdin, encoding: "utf8" };
   let rc = 0;
   let out;
   try {
-    out = execFileSync("bash", [READER, "--rows", dead], opts);
+    out = execFileSync("bash", [READER, "--rows", dead, pend], opts);
   } catch (e) {
     rc = e.status;
     out = e.stdout;
@@ -27,9 +27,12 @@ function readRc(rows, dead = "__none__") {
 }
 
 /** Run the verdict pipeline and return only its lines. */
-function read(rows, dead = "__none__") {
-  return readRc(rows, dead).lines;
+function read(rows, dead = "__none__", pend = "") {
+  return readRc(rows, dead, pend).lines;
 }
+
+/** Render pend rows the way the live path hands them to verdicts(). */
+const pend = (...rows) => rows.map((r) => r.join("\t")).join("\n");
 
 /** Classify workflow runs at a head into the stale-run alternation. */
 function dead(runs) {
@@ -62,6 +65,13 @@ function runExtract(workflowRuns) {
     input: JSON.stringify({ workflow_runs: workflowRuns }),
     encoding: "utf8",
   });
+  return out.split("\n").filter(Boolean);
+}
+
+/** Classify workflow runs at a head into the pend rows verdicts() consumes. */
+function pending(runs) {
+  const stdin = runs.map((r) => r.join("\t")).join("\n") + "\n";
+  const out = execFileSync("bash", [READER, "--pending"], { input: stdin, encoding: "utf8" });
   return out.split("\n").filter(Boolean);
 }
 
@@ -684,6 +694,280 @@ describe("merge-gate reader", () => {
     });
   });
 
+  // BLO-37887. A run that has dispatched ZERO JOBS publishes ZERO check-runs, so
+  // it is invisible on both surfaces — there is no row to keep, drop, or label.
+  // Measured at Network-Operator-Portal#1105 @ 0897b91d: run 36563730733 (Go Unit
+  // Tests) sat `status: pending` with `jobs: 0` and appeared in NONE of the ~10
+  // check-run rows at that head. Neither existing guard can express it: DEAD only
+  // ever holds `completed` runs, and the BLO-34263 survivor guard fires on "kept
+  // nothing" while ~10 unrelated rows survived.
+  //
+  // Every fixture here is SYNTHETIC by necessity, not by laziness. The state is
+  // transient and self-closing — that run dispatched jobs minutes later and became
+  // visible — and both historical controls (penstock fbdb3477, 157589a6) carry
+  // ZERO non-completed runs, because every run on a settled head is `completed`.
+  // There is no real head to point at, which is also why this survived five
+  // rounds of fixes to this reader.
+  describe("a run that has published nothing is a stop it cannot otherwise see", () => {
+    const GO_UNIT = ["36563730733", "pending", "Go Unit Tests"];
+
+    // POSITIVE. The hazard is the WINDOW: while other runs are red the reader
+    // correctly stops, and it fails GREEN only in the interval where every
+    // VISIBLE stop clears while a zero-job run is still outstanding.
+    it("stops on a non-completed run that contributed no surviving row", () => {
+      const lines = read(
+        [["prepare-secrets", "success", "t1", "36556424142"]],
+        "__none__",
+        pend(GO_UNIT),
+      );
+      assert.deepEqual(lines, [
+        "STOP\t<Go Unit Tests: run pending, no check-run published>\tNO-VERDICT\trun=36563730733",
+      ]);
+    });
+
+    // NEGATIVE, and it is the load-bearing half. The naive reading — "any
+    // non-completed run is a STOP" — passes the positive fixture above and false-REDs
+    // every in-flight PR in the fleet, which is every PR for most of its life.
+    it("does not stop on a non-completed run that DID contribute a row", () => {
+      assert.deepEqual(
+        read(
+          [["mocked integration", "success", "t1", "36556420194"]],
+          "__none__",
+          pend(["36556420194", "queued", "Supply Portal Integration"]),
+        ),
+        [],
+      );
+    });
+
+    // The run spoke, and what it said was a stop. It must be reported ONCE, as the
+    // check-run it published — not twice, and not as a run that never reported.
+    it("counts a row that is itself a STOP as the run having spoken", () => {
+      assert.deepEqual(
+        read(
+          [["mocked integration", "failure", "t1", "36556420194"]],
+          "__none__",
+          pend(["36556420194", "queued", "Supply Portal Integration"]),
+        ),
+        ["STOP\tmocked integration\tfailure\trun=36556420194"],
+      );
+    });
+
+    // A `neutral` row and a `${{`-bearing one are this reader's two declared
+    // NON-verdicts, both explicitly non-blocking. Crediting either as "this run
+    // spoke" suppresses NO-VERDICT for a run that has said nothing — the same
+    // fail-GREEN class this guard exists to close, one row away from itself.
+    // `contributed` must therefore use the SAME predicate as the survivor count
+    // `n`; the naive `{contributed[$4]=1}` survives every other fixture here.
+    // Raised by @ally on #2112 and reproduced exactly as reported.
+    for (const [label, row] of [
+      ["NOT-EVALUATED", ["somegate", "neutral", "t1", "77"]],
+      ["MALFORMED", ["${{ matrix.name }}", "queued", "t1", "77"]],
+    ]) {
+      it(`does not credit a ${label} row as its run having spoken`, () => {
+        // A second, green run keeps the BLO-34263 ABSENT guard quiet, so
+        // NO-VERDICT is the only thing that can report run 77 here.
+        const lines = read(
+          [["verify", "success", "t1", "66"], row],
+          "__none__",
+          pend(["77", "queued", "Go Unit Tests"]),
+        );
+        assert.equal(stops(lines).length, 1);
+        assert.match(lines.join("\n"), /NO-VERDICT\trun=77$/m);
+      });
+    }
+
+    // `@tsv` renders a real tab or newline inside a workflow name as the two
+    // characters `\t`/`\n`. awk un-escapes a `-v` value, so round-tripping pend
+    // through `-v` turns those back into separators: a tab truncates the name
+    // and a newline splits ONE run into two, emitting a spurious extra line
+    // naming a workflow that does not exist. Read from ENVIRON instead, which
+    // does not un-escape. Direction is RED — `prid` is field 1, so a real stop
+    // can never be suppressed — which is why it rides here rather than above.
+    it("does not re-split a workflow name carrying escaped separators", () => {
+      const lines = read(
+        [["verify", "success", "t1", "66"]],
+        "__none__",
+        pend(["77", "queued", "Go\\tUnit\\nTests"]),
+      );
+      assert.deepEqual(lines, [
+        "STOP\t<Go\\tUnit\\nTests: run queued, no check-run published>\tNO-VERDICT\trun=77",
+      ]);
+    });
+
+    // pending_runs() already falls back to `?` on a missing status; the name had
+    // no such fallback, so a null `.name` printed `<: run queued, …>` — a stop
+    // that names nothing to wait for.
+    it("names a run whose workflow name is missing", () => {
+      assert.deepEqual(read([["verify", "success", "t1", "66"]], "__none__", pend(["77", "queued", ""])), [
+        "STOP\t<?: run queued, no check-run published>\tNO-VERDICT\trun=77",
+      ]);
+    });
+
+    // `--paginate` can repeat a run id when a run is created mid-walk and shifts
+    // the page boundary. Cosmetic and fail-RED, but one run owes one verdict.
+    it("emits one line per run id even when the pend list repeats it", () => {
+      assert.deepEqual(
+        read([["verify", "success", "t1", "66"]], "__none__", pend(["77", "queued", "wf"], ["77", "queued", "wf"])),
+        ["STOP\t<wf: run queued, no check-run published>\tNO-VERDICT\trun=77"],
+      );
+    });
+
+    // NEGATE on status; never match the literal `pending`. Keying on `pending`
+    // passes the measured fixture above and silently admits every other
+    // pre-dispatch state — and any state GitHub adds later. This is the same
+    // defect as BLO-34367, which exists because `cancelled` was keyed on without
+    // asking what the whole enum could mean.
+    for (const status of ["queued", "in_progress", "requested", "waiting", "pending"]) {
+      it(`stops on a silent \`${status}\` run, not just \`pending\``, () => {
+        assert.deepEqual(pending([["10", "pull_request", "77", "", "t", status, "wf"]]), [
+          `77\t${status}\twf`,
+        ]);
+      });
+    }
+
+    // `completed` is NOT the settling signal, and reading it as one was the
+    // first cut of this guard. Measured at onprem-k8s @ b763c490: 28 runs, 23
+    // published 57 check-runs and 5 concluded `startup_failure` publishing ZERO
+    // — one of them `review-gate`. The reader printed two lines there, both
+    // unrelated legacy statuses, so in the window where those clear the head
+    // reads merge-clean over five workflows that produced no verdict at all.
+    // Direction GREEN. Raised by @ally on #2112 and reproduced as reported.
+    for (const conclusion of [
+      "startup_failure",
+      "action_required",
+      "timed_out",
+      "stale",
+      "cancelled",
+      "failure",
+      "neutral",
+    ]) {
+      it(`keeps a completed \`${conclusion}\` run, which owes a verdict it never published`, () => {
+        assert.deepEqual(
+          pending([["10", "pull_request", "77", conclusion, "t", "completed", "wf"]]),
+          [`77\t${conclusion}\twf`],
+        );
+      });
+    }
+
+    // The other half of that negation, and the load-bearing one: `success` and
+    // `skipped` are the two conclusions that settle a run. Without them every
+    // green run on every head prints NO-VERDICT unless it happened to publish,
+    // which is a false RED on the whole fleet.
+    for (const conclusion of ["success", "skipped"]) {
+      it(`does not treat a completed \`${conclusion}\` run as owing a verdict`, () => {
+        assert.deepEqual(
+          pending([["10", "pull_request", "77", conclusion, "t", "completed", "wf"]]),
+          [],
+        );
+      });
+    }
+
+    // Once a run is completed the STATUS carries no information — every one of
+    // them reads `completed`. "run completed, no check-run published" sends a
+    // reader off to wait for something that will never arrive; the conclusion
+    // names the actual remedy, which is to fix the workflow file and re-run.
+    it("names the conclusion, not the status, once a run is completed", () => {
+      assert.deepEqual(
+        read([["verify", "success", "t1", "66"]], "__none__", pend(["77", "startup_failure", "review-gate"])),
+        ["STOP\t<review-gate: run startup_failure, no check-run published>\tNO-VERDICT\trun=77"],
+      );
+    });
+
+    // A superseded run is completed and non-success, so pending_runs() emits it
+    // — and the DEAD grep strips its rows before `contributed` can be set, so
+    // without the END-loop exemption it prints NO-VERDICT for a run whose lane
+    // demonstrably spoke. BLO-34114s own control is this shape: penstock
+    // fbdb3477, run 34542908750, cancelled with 6 dead `failure` rows superseded
+    // by a success 16s later. Direction RED, but it breaks a pinned control.
+    it("does not print NO-VERDICT for a run that DEAD already dropped", () => {
+      assert.deepEqual(
+        read(
+          [
+            ["verify", "failure", "t1", "111"],
+            ["verify", "success", "t2", "222"],
+          ],
+          "111",
+          pend(["111", "cancelled", "wf"]),
+        ),
+        [],
+      );
+    });
+
+    // The exemption is scoped to DEAD and must not leak: a completed non-success
+    // run that nothing superseded is exactly the onprem-k8s shape and still stops.
+    // Run id `1113` is chosen, not arbitrary — it CONTAINS the DEAD id `111`, so
+    // this also pins the `^(...)$` anchors on that dynamic regex. Unanchored, it
+    // matches as a substring and exempts a run nothing superseded. Direction GREEN.
+    it("still stops on a completed run that DEAD did not drop", () => {
+      const lines = read(
+        [
+          ["verify", "failure", "t1", "111"],
+          ["verify", "success", "t2", "222"],
+        ],
+        "111",
+        pend(["111", "cancelled", "wf"], ["1113", "startup_failure", "review-gate"]),
+      );
+      assert.deepEqual(lines.map((l) => l.split("\t")[3]), ["run=1113"]);
+    });
+
+    // `dead` is `__none__` whenever nothing was dropped, and run ids are numeric,
+    // so the regex can never match — but an inverted test (`~` for `!~`) exempts
+    // every run on every nothing-dropped head, which is most heads.
+    it("exempts nothing when DEAD is empty", () => {
+      assert.match(
+        read([["verify", "success", "t1", "66"]], "__none__", pend(["77", "cancelled", "wf"])).join("\n"),
+        /NO-VERDICT\trun=77$/m,
+      );
+    });
+
+    // Fails CLOSED on a missing status, on the same grounds as dead_runs()'s
+    // missing-timestamp rule: an absent field must never be read as evidence
+    // that a verdict exists.
+    it("keeps a run whose status is missing", () => {
+      assert.deepEqual(pending([["10", "pull_request", "77", "", "t"]]), ["77\t?\t"]);
+    });
+
+    // The live path pipes a shell variable in, so a head with no runs at all
+    // arrives as one blank line whose $6 is "" — i.e. not `completed`. Without the
+    // `$3 != ""` fence that prints a NO-VERDICT naming no workflow, on every such
+    // head. Direction: RED, but it would make the reader unusable.
+    it("does not read a blank line as a run owing a verdict", () => {
+      assert.deepEqual(pending([[""]]), []);
+      assert.deepEqual(read([["verify", "success", "t1", "111"]], "__none__", ""), []);
+    });
+
+    // NO-VERDICT is the ABSENCE of a verdict, so counting it toward the survivor
+    // total would suppress the very ABSENT guard covering the neighbouring case.
+    // Both lines must print on a head whose only run has published nothing.
+    it("does not count as a surviving verdict, so ABSENT still fires", () => {
+      const lines = read([], "__none__", pend(GO_UNIT));
+      assert.match(lines.join("\n"), /ABSENT/);
+      assert.match(lines.join("\n"), /NO-VERDICT/);
+    });
+
+    // $1 is STOP, deliberately, and NO-VERDICT rides in the CONCLUSION column
+    // exactly like LOOKUP-FAILED. The mandated reading is "any STOP line blocks
+    // the merge", so a consumer filtering $1 for blocking labels must catch this;
+    // promoting NO-VERDICT to a $1 label would hide a real stop from every such
+    // consumer. Direction of that mistake: GREEN.
+    it("is caught by a $1 == STOP filter", () => {
+      const lines = read([["x", "success", "t1", "1"]], "__none__", pend(GO_UNIT));
+      assert.equal(stops(lines).length, 1);
+      assert.equal(lines[0].split("\t")[2], "NO-VERDICT");
+    });
+
+    // awk for-in order is unspecified, so iterating the pend map directly makes
+    // multi-run output nondeterministic and this fixture flaky. Pinned to input
+    // order via an indexed array.
+    it("emits several silent runs in input order", () => {
+      assert.deepEqual(
+        read([["x", "success", "t1", "1"]], "__none__", pend(GO_UNIT, ["999", "queued", "Deploy"]))
+          .map((l) => l.split("\t")[3]),
+        ["run=36563730733", "run=999"],
+      );
+    });
+  });
+
   // The header used to claim the reader "exits 1 exactly when the ABSENT line
   // fires and 0 when real STOP lines print". The `exactly` half is FALSE in the
   // GREEN direction, and no fixture could catch it while every fixture entry
@@ -793,10 +1077,41 @@ describe("merge-gate reader", () => {
             id: 35408039808,
             conclusion: "success",
             run_started_at: "2026-09-19T00:04:04Z",
+            status: "completed",
+            name: "review-gate",
           },
         ]),
-        ["323092531\tpull_request_target\t35408039808\tsuccess\t2026-09-19T00:04:04Z"],
+        [
+          "323092531\tpull_request_target\t35408039808\tsuccess\t2026-09-19T00:04:04Z\t" +
+            "completed\treview-gate",
+        ],
       );
+    });
+
+    // BLO-37887 appended status+name. dead_runs() reads $1..$5 and every stale-run
+    // fixture in this file still passes 5-field rows, so this pins that the two new
+    // fields are APPENDED and not interleaved. A transposition would leave every
+    // dead_runs() fixture green while silently emptying DEAD on the live path.
+    it("appends status and name after the fields dead_runs() reads", () => {
+      const row = runExtract([
+        {
+          workflow_id: 10,
+          event: "pull_request",
+          id: 36563730733,
+          conclusion: null,
+          run_started_at: "2026-09-29T11:45:33Z",
+          status: "pending",
+          name: "Go Unit Tests",
+        },
+      ])[0].split("\t");
+      assert.deepEqual(row.slice(0, 5), [
+        "10",
+        "pull_request",
+        "36563730733",
+        "",
+        "2026-09-29T11:45:33Z",
+      ]);
+      assert.deepEqual(row.slice(5), ["pending", "Go Unit Tests"]);
     });
 
     // Composed across the seam: @tsv renders a null as the empty string, and
@@ -804,16 +1119,26 @@ describe("merge-gate reader", () => {
     // timestamp that compares low enough to retire it.
     it("renders a null run_started_at as empty, and that fails closed", () => {
       const rows = runExtract([
-        { workflow_id: 10, event: "push", id: 100, conclusion: "cancelled", run_started_at: null },
+        {
+          workflow_id: 10,
+          event: "push",
+          id: 100,
+          conclusion: "cancelled",
+          run_started_at: null,
+          status: "completed",
+          name: "ci",
+        },
         {
           workflow_id: 10,
           event: "push",
           id: 200,
           conclusion: "success",
           run_started_at: "2026-09-19T01:05:00Z",
+          status: "completed",
+          name: "ci",
         },
       ]);
-      assert.equal(rows[0], "10\tpush\t100\tcancelled\t");
+      assert.equal(rows[0], "10\tpush\t100\tcancelled\t\tcompleted\tci");
       assert.equal(dead(rows.map((r) => r.split("\t"))), "");
     });
   });
