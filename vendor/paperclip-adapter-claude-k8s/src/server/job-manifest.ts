@@ -79,10 +79,12 @@ function assertSafeAbsolutePath(field: string, value: string): void {
   }
 }
 
-/** Every pod log lives under here.  Exported so a consumer that reads a path
- *  back off a mutable Kubernetes object can check it against the same literal
- *  the builder used, rather than a second copy that can drift (BLO-39114). */
-export const POD_LOG_ROOT = "/paperclip/instances/default/data/run-logs";
+/** Every pod log lives under here.  Named only because the literal appears
+ *  twice below; it is deliberately not exported.  The one consumer that reads
+ *  a pod-log path back off a mutable Kubernetes object checks its *shape*
+ *  (`isReapablePodLogPath`, execute.ts) rather than this root — see the
+ *  reasoning at its call site (BLO-39114). */
+const POD_LOG_ROOT = "/paperclip/instances/default/data/run-logs";
 
 export function buildPodLogPath(companyId: string, agentId: string, runId: string, isolationKey?: string): string {
   const dir = isolationKey
