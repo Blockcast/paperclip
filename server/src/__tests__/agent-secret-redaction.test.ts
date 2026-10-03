@@ -1,7 +1,13 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { agentRoutes, stripRedactedEnvBindingsFromAdapterConfig } from "../routes/agents.js";
+import {
+  agentRoutes,
+  restoreRedactedAgentMetadata,
+  stripRedactedEnvBindingsFromAdapterConfig,
+} from "../routes/agents.js";
+import { containAgentMetadata } from "../agent-redaction.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { errorHandler } from "../middleware/index.js";
 
 const agentId = "11111111-1111-4111-8111-111111111111";
@@ -488,6 +494,33 @@ describe("agent secret redaction on mutating responses", () => {
     mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => config);
     mockSecretService.resolveAdapterConfigForRuntime.mockImplementation(async (_companyId, config) => ({ config }));
     mockLogActivity.mockResolvedValue(undefined);
+  });
+
+  // The write side of the containment this PR adds on the read side. Masking
+  // `metadata` on GET gave it the read-modify-write hazard `adapterConfig` has
+  // been guarded against since BLO-5xxx; this pins the PATCH wiring, which a
+  // unit test of `restoreRedactedAgentMetadata` alone would not notice missing.
+  it("PATCH /agents/:id does not persist a round-tripped metadata sentinel over the stored value", async () => {
+    const storedMetadata = {
+      paperclipBuiltInAgent: "cto",
+      token: { type: "plain", value: "metadata-patch-secret-24681357" },
+    };
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, metadata: storedMetadata });
+    mockAgentService.update.mockResolvedValue({ ...baseAgent, metadata: storedMetadata });
+
+    // Exactly what a client gets back from GET, fed straight back in.
+    const roundTripped = containAgentMetadata(storedMetadata);
+    expect(JSON.stringify(roundTripped)).toContain(REDACTED_EVENT_VALUE);
+
+    const app = createApp(boardActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ metadata: roundTripped });
+
+    expect(res.status).toBe(200);
+    const persisted = mockAgentService.update.mock.calls[0]?.[1] as { metadata?: unknown };
+    expect(persisted.metadata).toEqual(storedMetadata);
+    expect(JSON.stringify(persisted.metadata)).not.toContain(REDACTED_EVENT_VALUE);
   });
 
   // The reported case: a patch that touches no credential field at all.
@@ -1741,5 +1774,85 @@ describe("agent metadata containment on the spread-based redactors", () => {
       expect(res.body[0].metadata).toBeNull();
       expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
     });
+  });
+});
+
+describe("restoreRedactedAgentMetadata — metadata round-trip guard", () => {
+  // The containment this PR added (PEN-3726) masks `metadata` on the way out,
+  // which gave that column the same read-modify-write hazard `adapterConfig`
+  // has carried since BLO-5xxx: read an agent, edit an unrelated field, PATCH
+  // the object back, and the sentinel lands on top of the stored value.
+  // `stripRedactedEnvBindingsFromAdapterConfig` guards the sibling column; this
+  // is the `metadata` analogue, composed from the same primitives so the two
+  // cannot drift apart on the write side.
+  const STORED_SECRET = "metadata-roundtrip-secret-13572468";
+
+  // Positive control. Every case below feeds the read path's OWN output back in
+  // as the write payload rather than a hand-written "***REDACTED***" literal:
+  // if containment ever stopped masking this shape, a hand-written fixture
+  // would keep passing while the real round-trip quietly stopped being tested.
+  // This asserts the masking actually happened before anything is restored.
+  function maskedByReadPath(stored: unknown): unknown {
+    const masked = containAgentMetadata(stored);
+    expect(JSON.stringify(masked)).toContain(REDACTED_EVENT_VALUE);
+    expect(JSON.stringify(masked)).not.toContain(STORED_SECRET);
+    return masked;
+  }
+
+  it("restores the stored value when the read path's masked output is PATCHed back", () => {
+    const stored = { token: { type: "plain", value: STORED_SECRET }, paperclipBuiltInAgent: "cto" };
+    const incoming = maskedByReadPath(stored);
+
+    expect(restoreRedactedAgentMetadata(incoming, stored)).toEqual(stored);
+  });
+
+  it("keeps a genuine edit made in the same PATCH as a restored sentinel", () => {
+    // The failure this guards is over-restoring: reverting a field the caller
+    // deliberately changed, because it sat beside a masked one.
+    const stored = { token: { type: "plain", value: STORED_SECRET }, label: "before" };
+    const incoming = { ...(maskedByReadPath(stored) as Record<string, unknown>), label: "after" };
+
+    expect(restoreRedactedAgentMetadata(incoming, stored)).toEqual({
+      token: { type: "plain", value: STORED_SECRET },
+      label: "after",
+    });
+  });
+
+  it("restores sentinels nested under objects and arrays", () => {
+    const stored = {
+      nested: { deep: { type: "plain", value: STORED_SECRET } },
+      list: [{ type: "plain", value: STORED_SECRET }, "plain-element"],
+    };
+    const incoming = maskedByReadPath(stored);
+
+    expect(restoreRedactedAgentMetadata(incoming, stored)).toEqual(stored);
+  });
+
+  it("passes an ordinary no-sentinel write through untouched, by reference", () => {
+    // Identity, not just equality: a payload carrying no sentinel must not be
+    // rebuilt, so the guard cannot perturb a write it has no business touching.
+    const incoming = { paperclipBuiltInAgent: "cto", pluginManagedAgent: true };
+
+    expect(restoreRedactedAgentMetadata(incoming, { paperclipBuiltInAgent: "cto" })).toBe(incoming);
+  });
+
+  it("omits a masked key that has nothing stored to restore, rather than persisting the placeholder", () => {
+    // The whole point: when there is no prior value, writing the sentinel
+    // through would be the corruption. Dropping the key is the safe outcome.
+    const incoming = maskedByReadPath({ token: { type: "plain", value: STORED_SECRET } });
+
+    const restored = restoreRedactedAgentMetadata(incoming, {}) as Record<string, unknown>;
+    expect(restored).toEqual({});
+    expect(JSON.stringify(restored)).not.toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("restores a URI whose credential component alone was masked (PEN-2747)", () => {
+    // Here the round-tripped value CONTAINS the sentinel rather than equalling
+    // it, so an equality test would miss it and persist a broken upstream URL.
+    const stored = { endpoint: `https://user:${STORED_SECRET}@host/mcp` };
+    const incoming = maskedByReadPath(stored);
+
+    expect(JSON.stringify(incoming)).not.toBe(JSON.stringify(stored));
+    expect(restoreRedactedAgentMetadata(incoming, stored)).toEqual(stored);
   });
 });
