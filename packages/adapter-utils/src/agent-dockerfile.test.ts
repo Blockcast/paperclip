@@ -1,5 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -194,8 +203,18 @@ describe("paperclip agent Dockerfile", () => {
     // and mode are proved by one `find`, because `chmod -R go-w` is otherwise
     // only text-pinned and the two halves of "the agent cannot write here"
     // should not be held to different standards by the same commit.
+    //
+    // Two details that look like noise and are not. `! -type l` exempts
+    // symlinks from the MODE arm: a symlink's own mode is always 0777 on Linux
+    // and is never consulted for access control, so `chmod -R go-w` skips them
+    // and nothing can clear those bits — without the exemption this expression
+    // cannot pass over any npm tree, which populates node_modules/.bin with
+    // exactly these links. And `offender=` before `test` makes a failed `find`
+    // abort the build; `test -z "$(find ...)"` discards find's exit status and
+    // reads an empty-because-errored substitution as success. Both are
+    // executed against a real fixture tree below, not merely pinned here.
     const ownedByRootAndNotGroupOtherWritable =
-      'test -z "$(find /opt/paperclip-bundled-adapters \\( ! -user root -o -perm /022 \\) -print -quit)"';
+      'offender="$(find /opt/paperclip-bundled-adapters \\( ! -user root -o \\( ! -type l -a -perm /022 \\) \\) -print -quit)" \\\n  && test -z "$offender"';
     expect(server).toContain("chown -R root:root /opt/paperclip-bundled-adapters");
     expect(server).toContain("chmod -R go-w /opt/paperclip-bundled-adapters");
     expect(server).toContain(ownedByRootAndNotGroupOtherWritable);
@@ -208,6 +227,13 @@ describe("paperclip agent Dockerfile", () => {
     // a base image that already shipped it node-owned or loosely-moded would
     // satisfy every text pin here. Deliberately the same check as the server
     // image above: one idiom, asserted wherever the tree is produced.
+    //
+    // The sharing is narrower than it looks, so do not read this assertion as
+    // second coverage of the server image's behaviour. At this call site
+    // `mkdir -p` has just created the directory and nothing has populated it,
+    // so `find` reaches exactly one inode — the directory. The tree-walking
+    // half of the expression, and the symlink exemption in particular, is
+    // exercised only at the server call site and by the fixture run below.
     expect(runtime).toContain("mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters");
     expect(runtime).toContain(ownedByRootAndNotGroupOtherWritable);
 
@@ -219,6 +245,105 @@ describe("paperclip agent Dockerfile", () => {
     // already caught by the negative matcher above, so pinning the newline here
     // would add no coverage and would fail on a benign trailing edit.
     expect(runtime).toMatch(/\bchown -R node:node \/paperclip(?![\w./-])/);
+  });
+
+  it("runs the root-ownership guard against a real tree instead of only pinning its text", () => {
+    // The assertions above pin the guard as a STRING and never evaluate it, so
+    // they assert that the command was written, not that it can succeed. That
+    // gap shipped a guard that could never pass: `-perm /022` matches symlinks
+    // (always mode 0777 on Linux), `chmod -R go-w` deliberately skips symlinks,
+    // and `npm install` puts eight of them in node_modules/.bin — so the RUN
+    // aborted and the server image stopped building. Nothing caught it: pr.yml
+    // runs `pnpm build`, not `docker build`, so the expression first executes
+    // after merge on trunk.
+    //
+    // So: extract the guard out of the Dockerfile we actually ship and RUN it
+    // over a fixture tree shaped like the real one.
+    //
+    // One substitution is unavoidable. The guard's ownership arm is `! -user
+    // root`, and these tests do not run as root, so a fixture built here would
+    // trip that arm on every entry and the mode arm could never be observed in
+    // isolation. Re-anchoring it to the current uid makes the ownership arm
+    // vacuously satisfied — which is the point: it isolates the MODE arm, the
+    // half that was broken. The mode arm's text is used verbatim, uid 0
+    // included, so a regression there still fails here.
+    const guard = (() => {
+      // Comment lines are dropped first: the prose above the RUN discusses
+      // `offender=` by name, and a scan that reads prose as a directive is the
+      // failure mode the sibling test's `directivesOnly` already guards against.
+      const lines = dockerfileServer.split("\n").filter((line) => !/^\s*#/.test(line));
+      const start = lines.findIndex((line) =>
+        line.includes('offender="$(find /opt/paperclip-bundled-adapters'),
+      );
+      expect(start, "server Dockerfile no longer carries the find guard").toBeGreaterThan(-1);
+      // Both physical lines — the assignment AND the `test` that reads it.
+      // Taking only the first would leave the `test -z` half written out here
+      // instead of read from the file, so a regression in it would not fail.
+      return lines
+        .slice(start, start + 2)
+        .join("\n")
+        .replace(/^\s*&&\s*/, "")
+        .replace(/\s*\\\n\s*&&\s*/g, " && ")
+        .trim();
+    })();
+
+    // Guard against the substitution silently not applying — a renamed
+    // predicate would otherwise leave this suite testing an unmodified
+    // expression that passes for the wrong reason.
+    expect(guard).toContain("! -user root");
+    expect(guard).toContain('test -z "$offender"');
+    const runGuard = (dir: string): number => {
+      const script = guard
+        .replace("! -user root", `! -uid ${process.getuid?.() ?? 0}`)
+        .replace("/opt/paperclip-bundled-adapters", dir);
+      try {
+        execFileSync("sh", ["-c", script], { stdio: ["ignore", "ignore", "ignore"] });
+        return 0;
+      } catch (error) {
+        return (error as { status?: number }).status ?? 1;
+      }
+    };
+
+    const root = mkdtempSync(path.join(tmpdir(), "pen3715-guard-"));
+    try {
+      // A minimal npm tree: the .bin symlink is the shape that broke the build.
+      mkdirSync(path.join(root, "node_modules/.bin"), { recursive: true });
+      mkdirSync(path.join(root, "node_modules/tsx"), { recursive: true });
+      writeFileSync(path.join(root, "node_modules/tsx/cli.mjs"), "export {};\n");
+      symlinkSync("../tsx/cli.mjs", path.join(root, "node_modules/.bin/tsx"));
+      writeFileSync(path.join(root, "package.json"), "{}\n");
+      chmodSync(path.join(root, "package.json"), 0o644);
+
+      // 1. A clean tree carrying a .bin symlink must PASS. This is the control
+      //    that fails if `! -type l` is ever dropped as redundant.
+      expect(runGuard(root)).toBe(0);
+
+      // 2. A group-writable regular file must still be caught...
+      const groupWritable = path.join(root, "leaky.js");
+      writeFileSync(groupWritable, "\n");
+      chmodSync(groupWritable, 0o664);
+      expect(runGuard(root)).not.toBe(0);
+      rmSync(groupWritable);
+
+      // 3. ...and so must a world-writable directory, which is the rename(2)
+      //    exposure the whole fix exists to close.
+      const worldWritableDir = path.join(root, "wide");
+      mkdirSync(worldWritableDir);
+      chmodSync(worldWritableDir, 0o777);
+      expect(runGuard(root)).not.toBe(0);
+      rmSync(worldWritableDir, { recursive: true });
+
+      // 4. Clean again, so 2 and 3 are shown to be the cause of their failures.
+      expect(runGuard(root)).toBe(0);
+
+      // 5. A `find` that cannot run must FAIL, not pass. `test -z "$(find ...)"`
+      //    reports success here — an errored substitution is empty — which is
+      //    vacuous in exactly the base-image-swap scenario the guard is for.
+      //    The `offender=` assignment adopts find's exit status instead.
+      expect(runGuard(path.join(root, "does-not-exist"))).not.toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("builds the UI concurrently with the serial server/plugin chain", () => {

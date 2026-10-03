@@ -97,12 +97,27 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # `find` asserts the inode we actually produced, on both axes: a
 # RUNTIME_BASE_IMAGE that began shipping this directory node-owned, or
 # world-writable, would satisfy every source-text check without the build
-# failing. It tests `! -user root -o -perm /022` rather than a literal mode so
+# failing. It tests ownership and `-perm /022` rather than a literal mode so
 # that tightening the directory further stays green while loosening it fails.
+#
+# Scope note, because this call site and the server image's share one string:
+# here `find` walks a directory `mkdir -p` has just created and nothing has
+# populated, so the only inode it can reach is that directory itself. The
+# tree-walking half of the expression — the symlink exemption in particular —
+# is exercised only at the server image's call site, over the real npm tree.
+# Do not read a green build here as evidence that the walk was tested.
+#
+# `offender=` before `test`, not `test -z "$(find ...)"`: a POSIX assignment
+# whose value is a command substitution adopts that command's exit status, so
+# a `find` that errors (missing path, a base image whose `find` rejects the
+# GNU `-perm /022` or `-quit` spellings) aborts the build. Written the other
+# way the substitution yields an empty string, `test -z` succeeds, and the
+# check passes precisely in the base-image-swap scenario it exists for.
 RUN mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
   && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \
   && chown -R node:node /paperclip \
-  && test -z "$(find /opt/paperclip-bundled-adapters \( ! -user root -o -perm /022 \) -print -quit)"
+  && offender="$(find /opt/paperclip-bundled-adapters \( ! -user root -o \( ! -type l -a -perm /022 \) \) -print -quit)" \
+  && test -z "$offender"
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/paperclip-consult-codex.sh /usr/local/bin/paperclip-consult-codex
