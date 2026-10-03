@@ -127,6 +127,15 @@ export function classify(row) {
   return row.failedIn.length === row.observedIn.length ? "broken" : "flaky";
 }
 
+/**
+ * One markdown table cell. Both substitutions exist because `fullName` is
+ * attacker-free but author-controlled: a `|` would add a column, and a newline
+ * would end the row outright and silently drop every row after it.
+ */
+export function escapeCell(s) {
+  return s.replaceAll("|", "\\|").replace(/\s*\n\s*/g, " ");
+}
+
 function gh(args) {
   return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 << 20 });
 }
@@ -218,12 +227,26 @@ function main() {
   };
   const preDownloaded = arg("dir");
   const limit = Number(arg("runs", "50"));
+  // `Number("abc")` is NaN, which would otherwise reach gh as `--limit=NaN`.
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error("--runs needs a positive integer");
+  }
   const event = arg("event", "merge_group");
 
   let runs;
   let listed;
   if (preDownloaded) {
-    runs = [{ runId: preDownloaded, reports: parseReports(preDownloaded) }];
+    const reports = parseReports(preDownloaded);
+    // The download path skips a report-less run and says so on stderr, because
+    // other runs in the batch may still carry evidence. Here there is only one
+    // input, so skipping it would print three `_none_` tables and exit 0 -- "I
+    // read nothing" rendered as "no flakes found", which is the silent green
+    // this whole script exists to attack. An existing but empty directory is
+    // the only case: readdirSync already throws ENOENT on a missing one.
+    if (reports.length === 0) {
+      throw new Error(`--dir ${preDownloaded}: no readable vitest reports`);
+    }
+    runs = [{ runId: preDownloaded, reports }];
     listed = 1;
   } else {
     const ids = JSON.parse(
@@ -254,7 +277,6 @@ function main() {
   const ledger = buildLedger(runs);
   const total = runs.length;
 
-  const escape = (s) => s.replaceAll("|", "\\|");
   const table = (rows) =>
     rows.length === 0
       ? "_none_\n"
@@ -262,7 +284,7 @@ function main() {
         rows
           .map(
             (r) =>
-              `| ${r.failedIn.length} / ${r.observedIn.length} | ${escape(r.key)} |`,
+              `| ${r.failedIn.length} / ${r.observedIn.length} | ${escapeCell(r.key)} |`,
           )
           .join("\n") +
         "\n";
