@@ -44,6 +44,10 @@ import { describeAgentStartLockDispatchHealth } from "./agent-start-lock.js";
 import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
+// Leaf module (imports only `../redaction.js`), so this does not close an
+// import cycle the way reaching into `routes/agents.ts` would — that module
+// imports this one. See PEN-3757 at `activatePendingApproval`.
+import { restoreRedactedAgentMetadata } from "../agent-redaction.js";
 import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
 import { secretService } from "./secrets.js";
 import {
@@ -1098,6 +1102,34 @@ export function agentService(db: Db) {
             patch.adapterConfig,
             { adapterType: (patch.adapterType ?? existing.adapterType) as string },
           );
+        }
+        // PEN-3757: the hire-approval snapshot is built with `redactEventPayload`
+        // (`routes/agents.ts`, see the BLO-18969 rationale there), which masks on
+        // KEY NAME — so a hire whose `metadata` carried a value under a Tier-1 key
+        // (`token`, `apiKey`, `password`, …) has the sentinel in its snapshot while
+        // the `pending_approval` row holds the real value. Replaying the snapshot
+        // verbatim therefore destroys that value and persists `***REDACTED***` in
+        // its place: the BLO-5xxx corruption mode (a sentinel written back into
+        // live config killed every run), not a disclosure.
+        //
+        // The sibling column two blocks up is safe for a reason that does NOT
+        // transfer. `adapterConfig` is normalized to `secret_ref` POINTERS before
+        // storage and the redactor is pointer-preserving, so masking it is
+        // lossless. `metadata` takes no normalization pass at all (PEN-3726) — a
+        // credential there is raw plaintext under a caller-chosen key, so the mask
+        // is irreversible and the snapshot holds nothing to restore from.
+        //
+        // Restore from the stored row instead, which keeps the tamper control the
+        // replay exists for: `restoreRedactedAgentMetadata` rewrites ONLY the
+        // sentinel-bearing leaves, so every field the board could actually read in
+        // the card still replays verbatim over the row. The leaves it does take
+        // from `existing` are ones a pending agent cannot have moved: `metadata` is
+        // in `CONFIG_REVISION_FIELDS`, so `update` above refuses any change with
+        // `pending_approval_agent_config_frozen`, and the only two call sites that
+        // pass `allowPendingApprovalConfigUpdate` patch `adapterConfig` alone.
+        if (Object.prototype.hasOwnProperty.call(patch, "metadata")) {
+          const restored = restoreRedactedAgentMetadata(patch.metadata, existing.metadata);
+          patch.metadata = isPlainRecord(restored) ? restored : null;
         }
         if (patch.permissions !== undefined) {
           patch.permissions = normalizeAgentPermissions(
