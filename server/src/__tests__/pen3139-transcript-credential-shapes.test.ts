@@ -117,7 +117,7 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
         // contain the probe before sanitizing, or `not.toContain` proves nothing.
         expect(chunk).toContain(probe);
 
-        const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+        const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []);
 
         expect(sanitized).not.toContain(probe);
         expect(sanitized).toContain(REDACTED);
@@ -131,7 +131,7 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
     const body = "MIIEEXAMPLEfakebody0000000000000000";
     const chunk = `-----BEGIN RSA PRIVATE KEY-----\n${body}`;
 
-    const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+    const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []);
 
     expect(sanitized).not.toContain(body);
   });
@@ -151,7 +151,7 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
     it("masks the short final line and the footer, on real newlines", () => {
       const chunk = `-----BEGIN RSA PRIVATE KEY-----\n${FULL_LINE}\n${SHORT_FINAL_LINE}\n-----END RSA PRIVATE KEY-----`;
 
-      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []);
 
       expect(sanitized).not.toContain(SHORT_FINAL_LINE);
       expect(sanitized).not.toContain(FULL_LINE);
@@ -162,7 +162,7 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
     it("masks the short final line when the block arrives escaped inside a JSON tool result", () => {
       const chunk = `-----BEGIN RSA PRIVATE KEY-----\\n${FULL_LINE}\\n${SHORT_FINAL_LINE}\\n-----END RSA PRIVATE KEY-----`;
 
-      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []);
 
       expect(sanitized).not.toContain(SHORT_FINAL_LINE);
       expect(sanitized).not.toContain("-----END RSA PRIVATE KEY-----");
@@ -171,7 +171,7 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
     it("masks a body whose only line is shorter than the old 16-character floor", () => {
       const chunk = `-----BEGIN PRIVATE KEY-----\n${SHORT_FINAL_LINE}\n-----END PRIVATE KEY-----`;
 
-      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []);
 
       expect(sanitized).not.toContain(SHORT_FINAL_LINE);
     });
@@ -182,7 +182,7 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
       const fragment = "QUJ";
       const chunk = `-----BEGIN RSA PRIVATE KEY-----\n${FULL_LINE}\n${fragment}`;
 
-      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []);
 
       expect(sanitized).not.toContain(fragment);
     });
@@ -191,7 +191,7 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
       const fragment = "QUJ";
       const chunk = `-----BEGIN RSA PRIVATE KEY-----\\n${FULL_LINE}\\n${fragment}`;
 
-      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []);
 
       expect(sanitized).not.toContain(fragment);
     });
@@ -205,7 +205,7 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
       const prose = "the deploy then failed because the node was cordoned";
       const chunk = `-----BEGIN RSA PRIVATE KEY-----\n${FULL_LINE}\n${prose}`;
 
-      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []);
 
       expect(sanitized).not.toContain(FULL_LINE);
       expect(sanitized).toContain(prose);
@@ -218,7 +218,7 @@ describe("PEN-3139: run-log storage sanitizer masks vendor credential shapes wit
         `${prose}\n` +
         `-----BEGIN EC PRIVATE KEY-----\n${FULL_LINE}\nZZ=\n-----END EC PRIVATE KEY-----`;
 
-      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []);
 
       expect(sanitized).not.toContain(SHORT_FINAL_LINE);
       expect(sanitized).not.toContain("ZZ=");
@@ -251,7 +251,7 @@ describe("PEN-3139: free-text scrub stays in step with the shared whole-value sh
       for (const shape of matching) {
         const chunk = `tool result: the configured value is ${shape.value} and that is all`;
         expect(
-          sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION),
+          sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []),
           `${shape.label} matches CREDENTIAL_VALUE_RES #${index} but survives the run-log scrub`,
         ).not.toContain(probeOf(shape));
       }
@@ -280,7 +280,7 @@ describe("PEN-3139: widening the free-text scrub does not blank benign identifie
     it(`leaves ${label} intact`, () => {
       const chunk = `tool result: the cluster is reachable. the value is ${value} here`;
 
-      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION);
+      const sanitized = sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, []);
 
       expect(sanitized).toContain(value);
     });

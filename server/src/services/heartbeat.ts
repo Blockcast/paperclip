@@ -4491,6 +4491,7 @@ export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, 
 // Imported for local use below and re-exported so existing importers and tests keep
 // their current entry point.
 import { compactRunLogChunk, sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
+import { buildRunSecretRedactionPlan, createRunSecretBoundaryCarry } from "./run-secret-redaction.js";
 export { compactRunLogChunk, sanitizeRunLogChunkForStorage };
 
 /**
@@ -30771,6 +30772,76 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context.paperclipSecrets;
     }
+    // BLO-39715: build this run's secret-VALUE redaction dictionary here, because this is the
+    // one point where every value the run can see is simultaneously in memory. `secretManifest`
+    // deliberately carries no values, so it cannot serve — only `resolvedConfig` can.
+    //
+    // Scope honestly, because this block is the authoritative statement a later reader will
+    // rely on when deciding what is ALREADY covered — an overstated class here becomes someone
+    // else's false absence claim. Two axes, kept apart: conflating them is how a reader
+    // mistakes a list of value-classes for an inventory of sinks.
+    //
+    // VALUES covered: env-scope secret bindings (environment + agent + project + routine) and
+    // adapter top-level schema secret fields. NOT covered: `PAPERCLIP_API_KEY`, which the
+    // adapter injects later; server-pod inherited env; MCP header/arg credentials — none of
+    // these reach `resolvedConfig` on this path at all. Base64 is a known-uncovered ENCODING:
+    // `kubectl get secret -o yaml` emits it, but base64 is offset-sensitive, so matching a
+    // value embedded mid-stream needs all three alignment variants — a deliberate design
+    // decision, not a variant to bolt onto the list in `buildRunSecretRedactionPlan`.
+    //
+    // SINKS covered: the run-log chunk write path (`sanitizeRunLogChunkForStorage`) only. NOT
+    // covered by THIS dictionary — each is handled by a different, name-anchored oracle, so
+    // read these as "not value-anchored", not as "unprotected": (1) the run row's own `error`
+    // and `resultJson` columns, which funnel through `sanitizeRunPatchForStorage` — a
+    // key-name classifier plus a value heuristic, not this run's resolved secret set — and
+    // which are MORE durable than the log store, reaching backups, exports and the
+    // `result_summary`/`result_result` generated columns; (2) the adapter's `meta.command`
+    // and `meta.commandArgs` run-event payload, scrubbed by `redactSensitiveText` (shape-
+    // anchored) and `sanitizeCommandArgs` (flag-anchored) respectively — `command` is
+    // REQUIRED on `AdapterInvocationMeta` and `commandArgs` optional, so naming only the
+    // latter would read as the former being covered; (3) the `workspace-operations` sinks,
+    // whose commands run with the SERVER environment rather than a run's resolved secret set,
+    // so this dictionary would be the wrong one for them. Threading the needles into
+    // `sanitizeRunPatchForStorage` is not the one-liner the `onLog` change was:
+    // `setRunStatus(runId, …)` is also called by the BLO-16850 reaper and the
+    // external-lifecycle finalizer, neither of which ran run setup and either of which may be
+    // a different process, so it needs a runId→needles store with a real lifecycle. Scope
+    // that reason precisely: `runSecretRedaction` IS lexically live at the two in-run
+    // terminal writes, so a partial fix by per-site argument was reachable and was declined —
+    // per-site threading is the shape PEN-3153 centralised away from, and partial coverage
+    // would make this block harder to state honestly, not easier.
+    // Absence claims must be scoped accordingly.
+    const runSecretRedaction = buildRunSecretRedactionPlan(
+      resolvedConfig as Record<string, unknown>,
+      secretKeys,
+    );
+    if (runSecretRedaction.uncoveredKeys.length > 0) {
+      // Never silently skip: a value too short or too plain to replace literally would
+      // otherwise be an invisible hole, which is exactly the failure this control exists to
+      // close. Reported by KEY NAME only — never the value — so the gap is attributable and
+      // fixable by rotating to a longer value.
+      logger.warn(
+        {
+          runId: run.id,
+          agentId: agent.id,
+          uncoveredSecretKeys: runSecretRedaction.uncoveredKeys,
+        },
+        "run secret values below the transcript redaction threshold; rotate these to longer values",
+      );
+    }
+    if (runSecretRedaction.unresolvedKeys.length > 0) {
+      // Separate from the above because the remedy is different: this means a key was declared
+      // secret-backed but its value sits in a namespace the plan builder does not read, so the
+      // fix is in `run-secret-redaction.ts`, not in whoever owns the credential.
+      logger.warn(
+        {
+          runId: run.id,
+          agentId: agent.id,
+          unresolvedSecretKeys: runSecretRedaction.unresolvedKeys,
+        },
+        "run secret keys not locatable in the resolved adapter config; transcript redaction cannot cover them",
+      );
+    }
     const effectiveResolvedConfig = applyRunScopedMentionedSkillKeys(
       resolvedConfig,
       runScopedMentionedSkillKeys,
@@ -31962,8 +32033,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, runId));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+      // BLO-39715: a secret can straddle two chunks, and then neither chunk contains the
+      // needle so neither is redacted. See `createRunSecretBoundaryCarry` for why chunk
+      // boundaries are arbitrary on every adapter path, not just the sandbox tailer.
+      const runSecretBoundaryCarry = createRunSecretBoundaryCarry(runSecretRedaction.needles);
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const sanitizedChunk = sanitizeRunLogChunkForStorage(chunk, currentUserRedactionOptions);
+        // Hold-back is released once the adapter has settled: everything logged after that
+        // point is a complete in-process `[paperclip] …` string rather than a stream slice,
+        // and leaving the carry armed there would withhold the tail of a message with no
+        // later chunk to flush it.
+        const carried = runSecretBoundaryCarry.take(stream, chunk, { flush: adapterExecutionSettled });
+        if (!carried) return;
+        // The carry has already redacted run-secret values, so the needles below are a
+        // second, idempotent pass. That is deliberate and not an oversight: keeping them
+        // means deleting or bypassing the carry degrades to the pre-BLO-39715 behaviour
+        // (whole-chunk matches still redacted) rather than to no value redaction at all.
+        // The alternative — passing `[]` here — would make the carry line load-bearing in
+        // a way no reviewer of a later diff could see.
+        const sanitizedChunk = sanitizeRunLogChunkForStorage(
+          carried,
+          currentUserRedactionOptions,
+          runSecretRedaction.needles,
+        );
         const countsAsRunProgress = !isSyntheticNonProgressRunLogChunk(sanitizedChunk);
         if (countsAsRunProgress && stream === "stdout") {
           stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
@@ -32915,6 +33006,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // every ccrotate retry). Anything `onEvent` delivers from here on is a
         // late event from a continuation that outlived execute().
         adapterExecutionSettled = true;
+        // BLO-39715: flush the boundary carry. Streamed output has stopped, so the trailing
+        // `holdbackChars` of each stream have no later chunk to ride out on and would be
+        // silently dropped from the transcript. `adapterExecutionSettled` is already true
+        // above, so these calls take the flush path. Best-effort and logged rather than
+        // thrown: losing the run's last few characters must not convert a successful run
+        // into a failed one.
+        try {
+          await onLog("stdout", "");
+          await onLog("stderr", "");
+        } catch (flushErr) {
+          logger.warn(
+            { err: flushErr, runId: run.id },
+            "failed to flush run-secret boundary carry; trailing log characters may be missing",
+          );
+        }
         if (branchClaimRenewalTimer) {
           clearInterval(branchClaimRenewalTimer);
         }

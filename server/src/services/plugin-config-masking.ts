@@ -730,16 +730,25 @@ export function collectPluginConfigSecretValues(
  * Longest-first so that a secret which is a substring of another is not left
  * partially exposed by an earlier replacement. No minimum length: over-redacting
  * a diagnostic is harmless, under-redacting one is the bug.
+ *
+ * `mask` is parameterised so the run-transcript redactor (BLO-39715) can reuse this
+ * matching logic under its own marker instead of growing a second implementation —
+ * two independent redactors would be two oracles that can silently drift, and the
+ * weaker one would decide what a reader believes is covered. Note the "no minimum
+ * length" reasoning above is specific to short plugin diagnostics and does NOT
+ * transfer to transcripts; that caller applies its own threshold before calling in
+ * (see `isRedactableSecretValue`).
  */
 export function redactSecretValuesFromText<T extends string | undefined>(
   text: T,
   secretValues: readonly string[],
+  mask: string = PLUGIN_CONFIG_SECRET_MASK,
 ): T {
   if (typeof text !== "string" || text.length === 0) return text;
 
   let result: string = text;
   for (const secret of orderedSecrets(secretValues)) {
-    result = result.split(secret).join(PLUGIN_CONFIG_SECRET_MASK);
+    result = result.split(secret).join(mask);
   }
   return result as T;
 }

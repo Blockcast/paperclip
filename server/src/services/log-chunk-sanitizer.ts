@@ -1,5 +1,6 @@
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
+import { redactRunSecretValues } from "./run-secret-redaction.js";
 
 /**
  * Shared write-time sanitizer for captured command/agent output.
@@ -42,7 +43,20 @@ export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_C
 export function sanitizeRunLogChunkForStorage(
   chunk: string,
   currentUserRedactionOptions: Parameters<typeof redactCurrentUserText>[1],
+  // BLO-39715: REQUIRED, and ahead of `maxChars`, deliberately. A default would let the next
+  // sink added to this helper compile with no value redaction and announce nothing — the
+  // silent-gap shape the rest of this module exists to refuse. Passing `[]` is still allowed,
+  // but it is now an opt-out a reviewer can see at the call site.
+  runSecretNeedles: readonly string[],
   maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
 ) {
-  return compactRunLogChunk(redactCurrentUserText(chunk, currentUserRedactionOptions), maxChars);
+  // BLO-39715: run-scoped secret VALUES are replaced first, on the full chunk, before any
+  // truncation. Everything else here is name-anchored — it recognises credential-shaped
+  // *syntax* — so a high-entropy value with no secret-shaped name beside it survives it.
+  // This pass is value-anchored and needs no such recognition: the dictionary is the run's
+  // own resolved secret set. Running it before `compactRunLogChunk` matters because
+  // truncation can split a secret across the elided middle, leaving a prefix in the head
+  // and a suffix in the tail that no later literal match would catch.
+  const withoutRunSecrets = redactRunSecretValues(chunk, runSecretNeedles);
+  return compactRunLogChunk(redactCurrentUserText(withoutRunSecrets, currentUserRedactionOptions), maxChars);
 }
