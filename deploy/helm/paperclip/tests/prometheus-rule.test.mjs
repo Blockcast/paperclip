@@ -507,6 +507,54 @@ test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead
     /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md"/,
     "the freshness failure alert must route responders to the queued-run runbook",
   );
+
+  // BLO-26656. This alert carries no threshold -- `== 0` is the whole
+  // predicate -- so its `for:` IS its entire page delay, and it is the only
+  // thing standing between a dead refresh and a strand nobody can see. The
+  // gate on PaperclipQueuedRunStranded disqualifies a stale snapshot, which
+  // is right for the stale-HIGH direction and does nothing for stale-ZERO:
+  // a frozen 0 is byte-identical to a healthy idle fleet, so the strand
+  // alert's silence is not evidence either way and only this alert
+  // distinguishes them.
+  //
+  // Asserted against the strand alert's OWN total delay rather than a
+  // literal, for the same reason that one stacks threshold and `for:`
+  // instead of checking them independently: either number can be retuned
+  // alone and look compliant while the pair regresses. If this window ever
+  // exceeds the strand alert's first possible fire time, a refresh outage
+  // beginning at the same instant hides a real strand for the difference,
+  // and nothing in the rendered chart says so.
+  const [, refreshFor] = rendered.match(
+    /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  assert.ok(refreshFor, "the freshness failure alert must render a for window");
+  const refreshForMinutes = /^\d+m$/.test(refreshFor.trim())
+    ? Number(refreshFor.trim().slice(0, -1))
+    : /^\d+h$/.test(refreshFor.trim())
+      ? Number(refreshFor.trim().slice(0, -1)) * 60
+      : null;
+  assert.ok(
+    refreshForMinutes !== null && refreshForMinutes > 0,
+    `for window ${refreshFor} must be a positive minute/hour window`,
+  );
+
+  const [, strandThreshold] = rendered.match(
+    /alert: PaperclipQueuedRunStranded[\s\S]*?paperclip_queued_run_oldest_age_seconds[\s\S]*?> (\d+)\n/,
+  ) ?? [];
+  const [, strandFor] = rendered.match(
+    /alert: PaperclipQueuedRunStranded[\s\S]*?\n\s+for: (\d+)m\n/,
+  ) ?? [];
+  assert.ok(
+    strandThreshold && strandFor,
+    "could not read the strand alert's threshold and for window to bound this one against",
+  );
+  const strandTotalSeconds = Number(strandThreshold) + Number(strandFor) * 60;
+  assert.ok(
+    refreshForMinutes * 60 < strandTotalSeconds,
+    `refresh-failure for-window ${refreshFor} (${refreshForMinutes * 60}s) must page BEFORE the `
+      + `strand alert's first possible fire time (${strandThreshold}s + ${strandFor}m = `
+      + `${strandTotalSeconds}s); otherwise a refresh outage can hide a real strand for the difference`,
+  );
 });
 
 test("PaperclipPrReviewQueueWaitSaturated uses the bounded p95 histogram and runbook", () => {
