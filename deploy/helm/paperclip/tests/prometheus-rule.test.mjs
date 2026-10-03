@@ -509,6 +509,72 @@ test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead
   );
 });
 
+test("PaperclipDeferredIssueExecutionWakeOverdue is agent-keyed, freshness-gated, and links its own runbook (PEN-3734)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipDeferredIssueExecutionWakeOverdue/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipDeferredIssueExecutionWakeOverdue[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "deferred-wake alert must render an expr");
+
+  // Same per-replica freshness gate as the queued-run sibling: an `on()` join
+  // would let one healthy replica bless another replica's stale snapshot.
+  assert.match(
+    expr,
+    /^max by \(agent_id\) \(paperclip_deferred_issue_execution_wake_oldest_age_seconds and on\(instance\) \(paperclip_deferred_issue_execution_wake_age_metrics_refresh_success == 1\)\) > (\d+)$/,
+    "deferred-wake alert must gate each replica's age before taking the per-agent max",
+  );
+
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is reset-then-set to 0 for every known agent on each refresh, so
+  // a strictly positive threshold is the silent-in-steady-state guarantee.
+  assert.ok(
+    Number(ageThreshold) > 0,
+    "age threshold must be strictly positive so a zero-valued gauge is silent",
+  );
+  // Deliberately a BACKSTOP, not a fitted percentile: a deferral behind a
+  // legitimately long-running holder is correct behaviour and healthy runs in
+  // this fleet have been measured to ~9h. A threshold near the queued-run
+  // sibling's 1440s would page on ordinary work. Pinned so a later "make it
+  // consistent with its siblings" edit has to read why it is not.
+  assert.ok(
+    Number(ageThreshold) >= 3600,
+    "deferred-wake threshold must stay above the healthy long-run band; see values.yaml for why this is not fitted to a percentile",
+  );
+
+  assert.match(
+    rendered,
+    /alert: PaperclipDeferredIssueExecutionWakeOverdue[\s\S]*?runbook_url: "[^"]*runbooks\/deferred-issue-execution-wake\.md"/,
+    "the deferred-wake alert must route responders to its own runbook",
+  );
+});
+
+test("PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed exposes a stale snapshot instead of hiding it (PEN-3734)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(
+    rendered,
+    /alert: PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_deferred_issue_execution_wake_age_metrics_refresh_success == 0\n/,
+    "a failed deferred-wake-age refresh must have its own alert",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/deferred-issue-execution-wake\.md"/,
+    "the freshness failure alert must route responders to the deferred-wake runbook",
+  );
+});
+
 test("PaperclipPrReviewQueueWaitSaturated uses the bounded p95 histogram and runbook", () => {
   const rendered = renderChart(["--show-only", "templates/prometheusrule.yaml", "--set", "prometheusRule.enabled=true"]);
   assert.match(rendered, /alert: PaperclipPrReviewQueueWaitSaturated/);

@@ -604,6 +604,72 @@ spec:
             summary: "Paperclip queued-run age metric refresh is failing"
             description: "The most recent /metrics queued-run-age database refresh failed (BLO-21116), so queued-run ages may be stale and PaperclipQueuedRunStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty queue."
             runbook_url: {{ .Values.prometheusRule.queuedRunStrandedRunbookUrl | quote }}
+    - name: paperclip-deferred-issue-execution-wake
+      rules:
+        - alert: PaperclipDeferredIssueExecutionWakeOverdue
+          # PEN-3734. A wake is parked in `deferred_issue_execution` while
+          # another run holds the issue's execution lock. It is promoted ONLY
+          # when a run on that issue finalizes, one per finalization, and the
+          # lock is global across agents -- so an agent's comment-delivery
+          # latency on a row is bounded below by the queue wait of every other
+          # agent's run ahead of it there, which none of them can see or
+          # influence. Measured 2026-10-02 on PEN-3164: 10h53m, of which
+          # 10h35m was one foreign run sitting `queued` before it started.
+          #
+          # Why no sibling alert covers this. PaperclipQueuedRunStranded and
+          # PaperclipOverdueScheduledRetry both read heartbeat_runs, and a
+          # deferred wake deliberately creates NO run row -- that is the
+          # documented contract of the deferral, not an omission -- so neither
+          # can see it at any age. Nor can anything else: the recipient's seat
+          # has no row to find, and the issue's `lastActivityAt` is ADVANCED by
+          # each undelivered comment, so staleness sweeps read a starving row
+          # as freshly healthy. That is what made this cost a day.
+          #
+          # Same freshness gate and same `and on(instance)` reasoning as
+          # PaperclipQueuedRunStranded: a failed refresh leaves the previous
+          # value in memory, and an `on()` join would let one healthy replica
+          # bless another's stale snapshot.
+          #
+          # The threshold is a SAFETY BOUND, not a fitted percentile, and the
+          # distinction matters for anyone retuning it. The sibling thresholds
+          # here were derived from measured lag distributions; no equivalent
+          # population existed for this gauge at authorship, because the state
+          # was unobservable -- which is the defect. A deferral behind a
+          # legitimately long-running holder is correct behaviour and can last
+          # hours (healthy external-runtime runs have been measured at up to
+          # ~9h), so a tight threshold would page on normal work. 4h is set
+          # above the common healthy band and well below the 10h53m that went
+          # unnoticed. Re-fit it off
+          # paperclip_deferred_issue_execution_wake_oldest_age_seconds once
+          # this gauge has a week of history; until then it is a backstop.
+          #
+          # The forensic record does NOT depend on this threshold. From 30m of
+          # age the refresh logs the deferred wakes by wake id, agent, issue
+          # and coalesced count -- a full snapshot of current offenders, at
+          # most one per 15 minutes -- so the evidence exists long before this
+          # fires. That log, not this page, is what makes the state
+          # observable.
+          expr: max by (agent_id) (paperclip_deferred_issue_execution_wake_oldest_age_seconds and on(instance) (paperclip_deferred_issue_execution_wake_age_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.deferredIssueExecutionWakeAgeSeconds }}
+          for: {{ .Values.prometheusRule.deferredIssueExecutionWakeFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a wake deferred behind an issue execution lock for longer than {{ .Values.prometheusRule.deferredIssueExecutionWakeAgeSeconds }}s"
+            description: "Agent {{`{{ $labels.agent_id }}`}}'s oldest `deferred_issue_execution` wake has been pending for {{`{{ $value }}`}}s since requested_at (PEN-3734). The age is only trusted while paperclip_deferred_issue_execution_wake_age_metrics_refresh_success is 1. Nothing else reports this state: the wake has no heartbeat_runs row, and the issue's lastActivityAt is advanced by each undelivered comment, so the row reads as freshly healthy. Grep the Paperclip logs for 'deferred behind an issue execution lock' to get the wake id, issue id and coalesced count, then read GET /api/issues/{id}/diagnostics/wakes. See the runbook."
+            runbook_url: {{ .Values.prometheusRule.deferredIssueExecutionWakeRunbookUrl | quote }}
+        - alert: PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed
+          # Separate from the overdue alert for the same reason as the queued-run
+          # pair: a failed refresh means the age gauge is not fresh, not that
+          # nothing is deferred. Page on it so the freshness gate above cannot
+          # silently hide a real wait.
+          expr: paperclip_deferred_issue_execution_wake_age_metrics_refresh_success == 0
+          for: {{ .Values.prometheusRule.deferredIssueExecutionWakeAgeMetricsRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip deferred-issue-execution wake age metric refresh is failing"
+            description: "The most recent deferred-issue-execution-wake-age database refresh failed (PEN-3734), so deferred-wake ages may be stale and PaperclipDeferredIssueExecutionWakeOverdue is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as nothing being deferred."
+            runbook_url: {{ .Values.prometheusRule.deferredIssueExecutionWakeRunbookUrl | quote }}
     - name: paperclip-overdue-scheduled-retry
       rules:
         - alert: PaperclipOverdueScheduledRetry
