@@ -142,6 +142,10 @@ const mockCompanySkillService = vi.hoisted(() => ({
   resolveRequestedSkillKeys: vi.fn(),
 }));
 
+const mockBuiltInAgentService = vi.hoisted(() => ({
+  ensureCompanyDefaultAgentGrants: vi.fn(),
+}));
+
 const mockWorkspaceOperationService = vi.hoisted(() => ({}));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
@@ -150,6 +154,10 @@ vi.mock("../services/index.js", () => ({
   agentInstructionsService: () => mockAgentInstructionsService,
   accessService: () => mockAccessService,
   approvalService: () => mockApprovalService,
+  // Only reached on the direct-create path, which no test drove to a 2xx until
+  // PEN-3726 needed to assert what that path persists. Unmocked it throws, which
+  // is why the pre-existing create test could only ever assert its 403.
+  builtInAgentService: () => mockBuiltInAgentService,
   companySkillService: () => mockCompanySkillService,
   budgetService: () => mockBudgetService,
   heartbeatService: () => mockHeartbeatService,
@@ -491,6 +499,7 @@ describe("agent secret redaction on mutating responses", () => {
       wakeupsCancelled: 0,
     });
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
+    mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockResolvedValue(undefined);
     mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => config);
     mockSecretService.resolveAdapterConfigForRuntime.mockImplementation(async (_companyId, config) => ({ config }));
     mockLogActivity.mockResolvedValue(undefined);
@@ -521,6 +530,84 @@ describe("agent secret redaction on mutating responses", () => {
     const persisted = mockAgentService.update.mock.calls[0]?.[1] as { metadata?: unknown };
     expect(persisted.metadata).toEqual(storedMetadata);
     expect(JSON.stringify(persisted.metadata)).not.toContain(REDACTED_EVENT_VALUE);
+  });
+
+  // The same guard on the two CREATE paths. `stripRedactedEnvBindingsFromAdapterConfig`
+  // is applied at four call sites; the `metadata` analogue initially reached only
+  // the PATCH one, so the column was guarded on write via PATCH and unguarded via
+  // POST. These pin the remaining two.
+  //
+  // A create has no prior value, so the helper SCRUBS rather than restores: the
+  // masked key is dropped. Asserting the key is absent (not merely "not equal to
+  // the sentinel") is the point — persisting `{type:"plain",value:"***REDACTED***"}`
+  // as a real credential is the failure, and a junk value that merely differs from
+  // the stored one would still satisfy a weaker assertion.
+  const CLONED_SECRET = "metadata-create-clone-secret-97531864";
+
+  it("POST /companies/:companyId/agents drops a round-tripped metadata sentinel instead of storing it", async () => {
+    // The clone-an-agent flow: read an existing agent, paste its (masked)
+    // metadata into a create. Fed from the read path's own output so the
+    // fixture cannot rot into a hand-written literal.
+    const masked = containAgentMetadata({
+      paperclipBuiltInAgent: "cto",
+      token: { type: "plain", value: CLONED_SECRET },
+    });
+    expect(JSON.stringify(masked)).toContain(REDACTED_EVENT_VALUE);
+
+    mockAgentService.create.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { ...baseAgent.adapterConfig, instructionsRootPath: "/workspace/instructions" },
+    });
+
+    const res = await request(createApp(boardActor))
+      .post(`/api/companies/${companyId}/agents`)
+      .send({ name: "Clone", role: "engineer", adapterType: "claude_local", metadata: masked });
+
+    expect(res.status).toBe(201);
+    const persisted = mockAgentService.create.mock.calls[0]?.[1] as { metadata?: Record<string, unknown> };
+    expect(persisted.metadata).toEqual({ paperclipBuiltInAgent: "cto" });
+    expect(persisted.metadata).not.toHaveProperty("token");
+    expect(JSON.stringify(persisted.metadata)).not.toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("POST /companies/:companyId/agent-hires drops the sentinel from BOTH the agent row and the approval payload", async () => {
+    // The hire path persists `metadata` twice: once via `svc.create`, and again
+    // in the approval snapshot, which `activatePendingApproval` replays verbatim
+    // over the agent row. Scrubbing before `normalizedHireInput` is built is what
+    // makes the single pass cover both — a guard placed at `svc.create` alone
+    // would leave the sentinel to land on approval instead.
+    const masked = containAgentMetadata({
+      paperclipBuiltInAgent: "cto",
+      token: { type: "plain", value: CLONED_SECRET },
+    });
+    expect(JSON.stringify(masked)).toContain(REDACTED_EVENT_VALUE);
+
+    mockAgentService.create.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { ...baseAgent.adapterConfig, instructionsRootPath: "/workspace/instructions" },
+      metadata: null,
+    });
+    mockApprovalService.create.mockImplementation(async (_companyId: string, row: unknown) => ({
+      id: "55555555-5555-4555-8555-555555555555",
+      status: "pending",
+      ...(row as Record<string, unknown>),
+    }));
+
+    const res = await request(createApp(boardActor, true))
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({ name: "Hire", role: "engineer", adapterType: "claude_local", metadata: masked });
+
+    expect(res.status).toBe(201);
+
+    const persisted = mockAgentService.create.mock.calls[0]?.[1] as { metadata?: Record<string, unknown> };
+    expect(persisted.metadata).toEqual({ paperclipBuiltInAgent: "cto" });
+    expect(persisted.metadata).not.toHaveProperty("token");
+
+    const approvalPayload = (
+      mockApprovalService.create.mock.calls[0]?.[1] as { payload?: { metadata?: Record<string, unknown> } }
+    )?.payload;
+    expect(approvalPayload?.metadata).not.toHaveProperty("token");
+    expect(JSON.stringify(approvalPayload?.metadata)).not.toContain(REDACTED_EVENT_VALUE);
   });
 
   // The reported case: a patch that touches no credential field at all.
@@ -1844,6 +1931,29 @@ describe("restoreRedactedAgentMetadata — metadata round-trip guard", () => {
     const restored = restoreRedactedAgentMetadata(incoming, {}) as Record<string, unknown>;
     expect(restored).toEqual({});
     expect(JSON.stringify(restored)).not.toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("scrubs on a `null` prior, which is how the create paths call it", () => {
+    // The create paths have no prior row at all, so they pass `null` rather
+    // than `{}`. That must behave the same way — drop the masked key, keep the
+    // rest — and not throw or pass the sentinel through. `null` reaching the
+    // object branch as a prior is the case a `?? {}` omission would break.
+    const incoming = maskedByReadPath({
+      paperclipBuiltInAgent: "cto",
+      token: { type: "plain", value: STORED_SECRET },
+    });
+
+    const restored = restoreRedactedAgentMetadata(incoming, null) as Record<string, unknown>;
+    expect(restored).toEqual({ paperclipBuiltInAgent: "cto" });
+    expect(JSON.stringify(restored)).not.toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("leaves a null or absent metadata alone on a create", () => {
+    // `metadata` is `.optional().nullable()`, so both reach the helper. Neither
+    // carries a sentinel, so both must round-trip unchanged rather than being
+    // coerced into an object the caller never sent.
+    expect(restoreRedactedAgentMetadata(null, null)).toBeNull();
+    expect(restoreRedactedAgentMetadata(undefined, null)).toBeUndefined();
   });
 
   it("restores a URI whose credential component alone was masked (PEN-2747)", () => {

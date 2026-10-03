@@ -269,7 +269,19 @@ export function stripRedactedEnvBindingsFromAdapterConfig(
  *
  * Absent prior value: `restoreRedactedAdapterValue` drops the key rather than
  * inventing one, so a masked key with nothing stored to restore is omitted
- * instead of persisting the placeholder.
+ * instead of persisting the placeholder. On a create there is no prior value at
+ * all, so passing `null` there scrubs the whole payload on the same rule.
+ *
+ * Ceiling, inherited from that helper: arrays are matched to their prior values
+ * **positionally** (`existingArray[index]`). A client that reorders or inserts
+ * into an array holding a masked element restores the wrong stored element, and
+ * elements past the end of the prior array are dropped — stored
+ * `[secretA, secretB]` sent back as `[newItem, ***, ***]` yields
+ * `[newItem, secretB]`. Index-matching is about all a restore can do for an
+ * anonymous array, but it is worth knowing here specifically: unlike
+ * `adapterConfig.env`, `metadata` supports array values as a first-class shape
+ * (`keepSanitizedAgentMetadata` preserves them rather than flattening), so this
+ * is reachable on this column in a way it is not on the one it was written for.
  */
 export function restoreRedactedAgentMetadata(incoming: unknown, existing: unknown): unknown {
   if (!containsRedactedAdapterValue(incoming)) return incoming;
@@ -3105,6 +3117,15 @@ export function agentRoutes(
       (hireInput.adapterConfig ?? {}) as Record<string, unknown>,
       null,
     );
+    // Same `null` prior as the `adapterConfig` call above, and for the same
+    // reason: on a create there is nothing to restore, so the helper *scrubs* —
+    // a masked key is dropped rather than persisted as the placeholder. Runs
+    // here, before `normalizedHireInput` spreads `hireInput`, so the one pass
+    // covers both `svc.create` and the approval payload built from it below
+    // (that snapshot is replayed verbatim over the agent row on approval).
+    if (hasOwn(hireInput, "metadata")) {
+      hireInput.metadata = restoreRedactedAgentMetadata(hireInput.metadata, null);
+    }
     assertNoNewAgentLegacyPromptTemplate(
       hireInput.adapterType,
       rawHireAdapterConfig,
@@ -3332,6 +3353,12 @@ export function agentRoutes(
       (createInput.adapterConfig ?? {}) as Record<string, unknown>,
       null,
     );
+    // See the matching call on the hire path: `null` prior means scrub, not
+    // restore, so a payload copied from a masked `GET` (the clone-an-agent
+    // flow) drops the masked key instead of storing the placeholder.
+    if (hasOwn(createInput, "metadata")) {
+      createInput.metadata = restoreRedactedAgentMetadata(createInput.metadata, null);
+    }
     assertNoNewAgentLegacyPromptTemplate(
       createInput.adapterType,
       rawCreateAdapterConfig,
