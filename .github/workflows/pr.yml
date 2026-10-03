@@ -631,6 +631,17 @@ jobs:
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
         timeout-minutes: 1
 
+      # BLO-32837: the consistency guard's I1 caps operative reviews per head
+      # but says nothing about how a violation is remedied, and the obvious
+      # remedy is wrong. onprem-k8s#3281 dismissed the NEWER of two duplicate
+      # approvals, which satisfied I1 and left the PR at
+      # reviewDecision=REVIEW_REQUIRED — GitHub reads the reviewer's latest
+      # review, and that was now DISMISSED. It needed --admin to merge.
+      - name: Test Ally duplicate-review selection (BLO-32837)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/ally-review-de-dupe.test.mjs
+        timeout-minutes: 1
+
       - name: Test landing classifier
         if: ${{ !cancelled() }}
         # The classifier itself is not run here. It only ever reports in CI
@@ -676,6 +687,15 @@ jobs:
         # mutation to the CODE line: every guard is quoted verbatim in the
         # comment above it, so a first-occurrence replace edits the prose and
         # reports a working guard as unkillable.
+        # Re-swept 2026-09-29 after BLO-37887 (pending_runs() + the NO-VERDICT
+        # END clause): 8/8 new guards killed, each confirmed to land on its code
+        # line and not on the prose quoting it. One further way to report a
+        # working guard as unkillable, found in this sweep and not covered
+        # above: an INERT mutation. The survivor-count mutation was first written
+        # as `n += k` inside the END block but placed AFTER the `if(!n)` that
+        # reads n, so it could not change any output and the suite stayed green —
+        # indistinguishable from an unkilled guard. Check that a surviving
+        # mutation could have changed behaviour at all before recording it.
         run: node --test ./scripts/merge-gate-read.test.mjs
         timeout-minutes: 1
 
@@ -732,6 +752,11 @@ jobs:
       - name: Test vitest project coverage
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/vitest-project-coverage.test.mjs
+        timeout-minutes: 1
+
+      - name: Test merge-queue eviction detector (BLO-23395)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/merge-queue-eviction-detector.test.mjs
         timeout-minutes: 1
 
       - name: Test release verify workflow wiring

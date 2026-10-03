@@ -2802,6 +2802,41 @@ function buildRecoveredStateRecord(
 }
 
 /**
+ * The API tier's worker-proxy deadline, mirrored here for reporting only.
+ *
+ * Deliberately a mirrored literal and not an import: it lives in
+ * `PROXY_REQUEST_TIMEOUT_MS` (server/src/routes/worker-tier-proxy.ts), which is
+ * host-side code this plugin worker cannot import. Nothing here enforces it —
+ * it is used to label a delivery that has already blown past it, so a drift
+ * between the two values costs a mislabelled metric, never a behaviour change.
+ */
+const WORKER_PROXY_DEADLINE_MS = 120_000;
+
+/**
+ * Elapsed wall-clock at which a single delivery logs which alert it is on.
+ *
+ * Half the proxy deadline, deliberately. This handler has no deadline of its
+ * own — it always runs the whole batch to completion — so the 504 Alertmanager
+ * sees is emitted by the *API tier* while this loop is still running, and the
+ * worker has never recorded what it was doing at the time. That is why
+ * BLO-37485 read as "invisible from the worker side": the evidence was not
+ * missing, it was never written. Warning at the halfway mark is what makes a
+ * give-up attributable to a specific alert instead of inferred from the client.
+ */
+const SLOW_DELIVERY_WARN_MS = WORKER_PROXY_DEADLINE_MS / 2;
+
+/**
+ * The elapsed marks a delivery reports on, ascending. Each is reported once, by
+ * the alert whose work carried the delivery across it, so a 29-alert batch
+ * still logs at most one line per mark.
+ *
+ * The halfway mark alone is not enough: a later wedge would be masked by the
+ * earlier crossing. The deadline mark names the alert that was in flight when
+ * the API tier gave up, which is the one AC1 has to attribute.
+ */
+const SLOW_DELIVERY_MARKS_MS = [SLOW_DELIVERY_WARN_MS, WORKER_PROXY_DEADLINE_MS];
+
+/**
  * Top-level webhook handler. Pure-ish: takes ctx + config + an authentication
  * verdict + input, returns void. Throws `WebhookUnauthorizedError` when that
  * verdict is `false` — the worker's onWebhook re-throws this so the host
@@ -2873,7 +2908,53 @@ export async function handleWebhook(
   // so a wedged fence stays O(1) in batch size on the failure path.
   const fenceWedgedMemo: AggregateFenceWedgedMemo = new Set();
 
-  for (const alert of body.alerts) {
+  // `performance.now()`, not `Date.now()`: every value derived from these
+  // timestamps is a duration, and a wall-clock *step* mid-delivery corrupts
+  // exactly the two numbers this instrumentation exists to produce. A backward
+  // step writes a negative `duration_ms`, which `increase()` reads as a counter
+  // reset rather than as a small value; a forward step fabricates a
+  // `deadline_exceeded`, the counter AC3 is judged on. Slew over a 120s window
+  // is immaterial either way, but a step is not, and NTP steps correlate with
+  // the host pressure that makes deliveries slow in the first place. Clamping
+  // at 0 would only cover the backward half.
+  const deliveryStartedAt = performance.now();
+  let slowMarksReported = 0;
+  let inFlight:
+    | { alertIndex: number; alert: AlertmanagerAlert; startedAt: number }
+    | undefined;
+
+  // Evaluated after each alert's work, naming the alert just finished: the
+  // first alert whose completion crosses a mark is the one in flight when the
+  // mark passed. Sampling before an alert instead names whichever alert starts
+  // next, and never sees the last alert's work at all.
+  const reportIfSlow = (finished: NonNullable<typeof inFlight>): void => {
+    const finishedAt = performance.now();
+    // Rounded once here: `performance.now()` is fractional, and both values
+    // below are printed for an operator.
+    const elapsedMs = Math.round(finishedAt - deliveryStartedAt);
+    const crossed = SLOW_DELIVERY_MARKS_MS.filter((mark) => elapsedMs > mark).length;
+    if (crossed <= slowMarksReported) return;
+    slowMarksReported = crossed;
+    const { alertIndex, alert, startedAt } = finished;
+    const deadline =
+      elapsedMs > WORKER_PROXY_DEADLINE_MS
+        ? `The API tier abandoned this request at ${WORKER_PROXY_DEADLINE_MS}ms while this alert was in flight, so Alertmanager discards the whole batch.`
+        : `The API tier abandons this request at ${WORKER_PROXY_DEADLINE_MS}ms, after which Alertmanager discards the whole batch.`;
+    ctx.logger.warn(
+      `paperclip-plugin-alertmanager: slow delivery: ${elapsedMs}ms elapsed after ${alertIndex + 1} of ${body.alerts.length} alerts; ${
+        alert.labels.alertname ?? "unknown"
+      } (${alert.fingerprint}) took ${Math.round(finishedAt - startedAt)}ms. ${deadline}`,
+    );
+  };
+
+  for (const [alertIndex, alert] of body.alerts.entries()) {
+    // The previous alert's work ends here. Checked before the label filter so
+    // the warning fires on elapsed time rather than on reaching a billable
+    // alert: a batch can be slow and then spend its last seconds on filtered
+    // alerts, and that is still the delivery that gets abandoned.
+    if (inFlight) reportIfSlow(inFlight);
+    inFlight = { alertIndex, alert, startedAt: performance.now() };
+
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
       await ctx.metrics.write("alertmanager.webhook.filtered", 1, {
         alertname: alert.labels.alertname ?? "unknown",
@@ -3028,6 +3109,66 @@ export async function handleWebhook(
           `paperclip-plugin-alertmanager: failed to record alert error metric for ${alert.fingerprint}: ${String(metricErr)}`,
         );
       }
+    }
+  }
+
+  // The last alert's work ends here; without this a one-alert delivery that
+  // wedges past the deadline would never be attributed.
+  if (inFlight) reportIfSlow(inFlight);
+
+  // Per-delivery timing (BLO-37485).
+  //
+  // This runs even when the API tier gave up on the request long ago: nothing
+  // aborts the handler when the proxy's fetch is abandoned, so a delivery that
+  // blew the deadline still reaches this line and still reports. That is the
+  // only case worth measuring here, and it is precisely the case the host-side
+  // `plugin_webhook_deliveries.duration_ms` column records but does not expose
+  // — that column is readable only through the board-gated plugin dashboard
+  // route and is capped at the last 10 rows.
+  //
+  // Counters, not a histogram, because `ctx.metrics.write` is the only channel
+  // a plugin has. Mean delivery cost is
+  // `increase(duration_ms) / increase(completed)`; mean per-alert cost is
+  // `increase(duration_ms) / increase(alerts_received)`, which is the number
+  // that decides whether the deadline is mis-set for real batch cost.
+  //
+  // Untagged on purpose: promoted tag keys share a 50-slot per-name label
+  // budget (see manifest `metricLabels`), and an `alertname` tag here would
+  // spend it for an aggregate that is only ever read summed. The per-delivery
+  // attribution lives in the log line above, where cardinality is free.
+  const deliveryMs = Math.round(performance.now() - deliveryStartedAt);
+  const timingMetrics: Array<[name: string, value: number]> = [
+    ["alertmanager.webhook.duration_ms", deliveryMs],
+    ["alertmanager.webhook.completed", 1],
+    ["alertmanager.webhook.alerts_received", body.alerts.length],
+  ];
+  if (deliveryMs > WORKER_PROXY_DEADLINE_MS) {
+    // A worker-side LOWER BOUND on destroyed batches, not a count of them.
+    // `deliveryStartedAt` is handler entry, but the 120s deadline runs from
+    // request arrival at the API tier: transport, worker-tier dispatch and
+    // queueing, and host-side body parsing all happen first and are outside
+    // this measurement. `PluginWebhookInput` carries no arrival time, so the
+    // worker cannot see them. A batch destroyed after 25s of queueing plus 100s
+    // of handler work records `duration_ms: 100000` and no breach, and queueing
+    // shares its causes with slow deliveries, so the undercount is worst under
+    // load. Read 0 as "no delivery spent the whole deadline inside the
+    // handler", never as "no batch was destroyed". The Alertmanager-side grep
+    // this issue shipped with errs the other way, counting retry attempts as
+    // terminal give-ups.
+    timingMetrics.push(["alertmanager.webhook.deadline_exceeded", 1]);
+  }
+  // One `catch` per write, not one around all of them: a shared `try` lets the
+  // first failure skip every later write, dropping a denominator (`completed`)
+  // or the breach counter itself, and telemetry trouble and slow deliveries
+  // share causes. Best-effort, matching every other metric write in this
+  // handler: a telemetry outage must not change a delivery's outcome.
+  for (const [name, value] of timingMetrics) {
+    try {
+      await ctx.metrics.write(name, value);
+    } catch (metricErr) {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record delivery timing metric ${name}: ${String(metricErr)}`,
+      );
     }
   }
 

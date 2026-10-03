@@ -5432,13 +5432,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // so the two counts do sum, unlike the never-invoked/non-executing pair
       // below.
       `- Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — \`errorCode\` in the shared infra-class set, BLO-36535): ${evidence.infraClassKilledRunCount}`,
-      // BLO-29535 (Ally suggestion on a38c12fe2): "not excluded from the streak
+      // BLO-29535 (Ally suggestion on a38c12fe2): "eligible for the streak
       // walk", NOT "counted toward the streak". This count is taken over every
       // run in `noCommentEligibleRuns`, while `noCommentStreak` is only the
       // prefix of that list before the first commented run — so the two numbers
       // legitimately differ, and the old label invited a manager to read the
       // larger one as the streak length.
-      `- Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, not excluded from the streak walk — BLO-26165): ${evidence.commentExemptExecutedRunCount}`,
+      //
+      // BLO-37560: say "by design" and name the revert. The previous phrasing,
+      // "not excluded from the streak walk — BLO-26165", is equally true but
+      // reads as a confession of a known gap, and a CTO review run acted on it
+      // that way: it filed a `high` defect asking for these runs to be excluded,
+      // which is precisely the change BLO-26165 made and then reverted (see
+      // `isNeverInvokedRun` for why — excluding on this column blinds the
+      // detector to silence on almost every wake reason). An evidence line
+      // describing a deliberate decision must not read like a bug report.
+      `- Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, eligible for the streak walk by design — excluding them was BLO-26165's reverted regression, not a gap): ${evidence.commentExemptExecutedRunCount}`,
       ...(evidence.nonExecutingRunCount > 0
         ? [
             // BLO-22436 (Ally suggestion on 37c1bd65): one parenthetical group,
@@ -5590,9 +5599,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // BLO-29535: same wording fix as the description's evidence block — this
       // count is every streak-eligible exempt run, not the streak prefix, and
       // a bare "(counted)" sitting under "No-comment streak" read as "counted
-      // into that streak". The comment must tell the same story as the
-      // description it summarises.
-      `- Comment-policy-exempt runs that DID execute (not excluded from the streak walk): ${evidence.commentExemptExecutedRunCount}`,
+      // into that streak". BLO-37560: and "by design" for the same reason as
+      // there — "not excluded" reads as a known gap and got acted on as one.
+      // The comment must tell the same story as the description it summarises.
+      `- Comment-policy-exempt runs that DID execute (eligible for the streak walk by design, not a gap): ${evidence.commentExemptExecutedRunCount}`,
       // BLO-22436 (Ally suggestion on 37c1bd65): the never-invoked count is
       // ambiguous on its own — it says nothing about *why* those runs could not
       // comment. Carry the non-executing count and its overlap here too, so the

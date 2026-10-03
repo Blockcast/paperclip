@@ -51,6 +51,7 @@ import {
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
@@ -87,6 +88,7 @@ import {
   type IssueWakeDiagnosticWakeRequest,
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
+  type IssueRecoveryActionKind,
   type IssueWatchdogDiscoveryKind,
   type ProjectWorkspace,
   type SourceTrustMetadata,
@@ -3646,6 +3648,7 @@ export function issueRoutes(
 
   async function classifySourceRecoveryRevalidation(input: {
     issue: IssueRouteSnapshot;
+    kind: IssueRecoveryActionKind;
     trigger: RecoveryRevalidationTrigger;
     statusChanged?: boolean;
     assigneeChanged?: boolean;
@@ -3688,6 +3691,40 @@ export function issueRoutes(
       input.reopened === true;
     if (!durableSourceChange) return null;
 
+    // Parking an issue in `backlog` retires its recovery action (BLO-25907). `backlog` is
+    // deliberately not dispatchable, so an action left active there names an owner wake that
+    // no sweep will ever deliver — `reconcileStrandedAssignedIssues` covers only
+    // todo/in_progress/in_review. Folding here retires it at the moment of the park; the
+    // backstop sweep folds rows that were parked before this branch existed, or parked by a
+    // path that never reaches this classifier.
+    //
+    // This sits ABOVE the kind guard on purpose: it is a NON-DELIVERABILITY fold, the exact
+    // inverse of the wake-path-existence family below, so the kind carve-out must not reach
+    // it. `reconcileStrandedRecoveryWakeBackstop` folds `backlog` kind-blindly
+    // (`STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES`, ahead of its owner/cause/cooldown
+    // gates), so putting it below would only have deferred the same fold to the sweep and
+    // broken the write-time/sweep division of labour for one kind.
+    if (issue.status === "backlog") {
+      return "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.";
+    }
+
+    // BLO-37677: everything below this line is a wake-path-EXISTENCE test — "the source
+    // issue now has its own way of being re-driven, so this action is redundant". That is
+    // only true for kinds whose action IS a wake-path restoration. `pr_review_non_convergence`
+    // escalates a quality condition to a *different* owner and deliberately leaves the source
+    // issue `in_progress` with its agent owner, so it is born matching the agent-owner branch
+    // below and can never stop matching it. The branches ABOVE stay kind-blind on purpose,
+    // and they are three different reasons, not one: `done`/`cancelled` is genuinely terminal;
+    // the manual blocked→todo recovery is an OUT-OF-BAND signal that the recovery this action
+    // exists to perform has already happened; `backlog` is a NON-DELIVERABILITY fold. A new
+    // branch belongs above this line if it cancels because the issue is finished, because it
+    // CANNOT be driven, or because the action's work was already done by someone else — and
+    // below it only if it cancels because the issue now has its own wake path.
+    //
+    // `=== false` rather than a truthiness read: an off-enum `kind` from the DB keeps today's
+    // cancelling behaviour instead of silently becoming a new zombie-row class (BLO-16074).
+    if (ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION[input.kind] === false) return null;
+
     if (issue.status === "blocked") {
       const readiness = await svc.getDependencyReadiness(issue.id);
       if (readiness.unresolvedBlockerCount > 0) {
@@ -3698,16 +3735,6 @@ export function issueRoutes(
 
     if (issue.assigneeUserId && issue.status !== "done" && issue.status !== "cancelled") {
       return "Recovery action became stale because the source issue now has a human owner.";
-    }
-
-    // Parking an issue in `backlog` retires its recovery action (BLO-25907). `backlog` is
-    // deliberately not dispatchable, so an action left active there names an owner wake that
-    // no sweep will ever deliver — `reconcileStrandedAssignedIssues` covers only
-    // todo/in_progress/in_review. Folding here retires it at the moment of the park; the
-    // backstop sweep folds rows that were parked before this branch existed, or parked by a
-    // path that never reaches this classifier.
-    if (issue.status === "backlog") {
-      return "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.";
     }
 
     if ((issue.status === "todo" || issue.status === "in_progress") && issue.assigneeAgentId) {
@@ -3765,7 +3792,10 @@ export function issueRoutes(
         : input.activeRecoveryAction;
     if (!activeRecoveryAction) return null;
 
-    const resolutionNote = await classifySourceRecoveryRevalidation(input);
+    const resolutionNote = await classifySourceRecoveryRevalidation({
+      ...input,
+      kind: activeRecoveryAction.kind,
+    });
     if (!resolutionNote) return activeRecoveryAction;
 
     const resolved = await recoveryActionsSvc.resolveActiveForIssue({

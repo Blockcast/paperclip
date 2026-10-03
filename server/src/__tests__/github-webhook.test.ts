@@ -1173,6 +1173,90 @@ describe("github-webhook pure helpers", () => {
     );
   });
 
+  it("treats a merge-queue-eviction bot comment as an author wake, distinct from reviewer-request/feedback (BLO-23395)", () => {
+    const ctx = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 1092,
+        title: "BLO-17980 fix agent-job Pod credential injection",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/1092",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1092" },
+      },
+      comment: {
+        id: 999001,
+        body:
+          "<!-- paperclip:merge-queue-eviction -->\nPR #1092 was removed from the `master` merge queue and is " +
+          "**not merged**.\n\nCause: **conflict / un-stageable rebase** -- the queue never created a " +
+          "`merge_group` run for this PR's head (0 runs found).",
+        html_url: "https://github.com/Blockcast/paperclip/pull/1092#issuecomment-999001",
+        user: { login: "github-actions[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+
+    expect(ctx).toMatchObject({
+      identifiers: ["BLO-17980"],
+      wakeReason: "github_pr_merge_queue_evicted",
+      prNumber: 1092,
+      repoFullName: "Blockcast/paperclip",
+      commentAuthorLogin: "github-actions[bot]",
+    });
+    // Not a reviewer-facing wake: it must not be eligible for the reviewer
+    // dispatch path at all, only the generic PR-author wake below (isPrWake
+    // gates on the "github_pr_" prefix, which this reason satisfies).
+    expect(__test_shouldFirePrReviewerWake(ctx)).toBe(false);
+    expect(ctx?.wakeReason.startsWith("github_pr_")).toBe(true);
+  });
+
+  it("ignores a merge-queue-eviction marker from anyone other than github-actions[bot] (BLO-23395)", () => {
+    // The marker alone must not be trusted -- only the exact bot login that
+    // .github/workflows/merge-queue-eviction-detector.yml posts as can raise
+    // this wake, or any PR comment could spoof an eviction notice.
+    const ctx = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 1092,
+        title: "BLO-17980 fix agent-job Pod credential injection",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1092" },
+      },
+      comment: {
+        id: 999002,
+        body: "<!-- paperclip:merge-queue-eviction -->\nspoofed notice",
+        user: { login: "some-random-user" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    expect(ctx).toBeNull();
+  });
+
+  it("ignores a merge-queue-eviction marker that is not at literal byte 0 (BLO-23395)", () => {
+    // Leading whitespace in Markdown is an indented code block -- the canonical
+    // way to render "here is the marker" while DISCUSSING it, which is exactly
+    // what this repo's own review threads do. The marker is anchored for the
+    // same reason REVIEW_GATE_ESCALATION_MARKER_PATTERN is; a `trimStart()`
+    // spelling read such a quote as a real eviction, and the github-actions[bot]
+    // author guard does not help because that identity posts many unrelated
+    // comments here.
+    for (const body of [
+      "    <!-- paperclip:merge-queue-eviction -->\nquoted in a code block",
+      "\n<!-- paperclip:merge-queue-eviction -->\nleading newline",
+      "see this marker: <!-- paperclip:merge-queue-eviction -->",
+    ]) {
+      const ctx = __test_resolveEventContext("issue_comment", {
+        action: "created",
+        issue: {
+          number: 1092,
+          title: "BLO-17980 fix agent-job Pod credential injection",
+          pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1092" },
+        },
+        comment: { id: 999003, body, user: { login: "github-actions[bot]" } },
+        repository: { full_name: "Blockcast/paperclip" },
+      });
+      expect(ctx).toBeNull();
+    }
+  });
+
   it("treats @ally in a PR comment as an explicit reviewer wake request", () => {
     expect(__test_hasPrReviewerRequestMention("@ally re-review please")).toBe(true);
     expect(__test_hasPrReviewerRequestMention("cc @Ally after the fix")).toBe(true);
@@ -8074,6 +8158,87 @@ describeEmbeddedPostgres("github-webhook route", () => {
       ]),
     );
     expect(await authorHeartbeatRuns()).toHaveLength(1);
+  });
+
+  it("wakes the author for a SECOND merge-queue eviction while the first eviction's wake is still running (BLO-23395)", async () => {
+    // The remediation loop: evicted at head A -> author wakes, rebases,
+    // re-enqueues -> the queue evicts again while that run is still `running`.
+    // A repo+pr+reason `stable` key would dedup the second notice against the
+    // running first wake as `duplicate_pr_author_wake`, which is the silent
+    // eviction this PR exists to close. Each eviction is a NEW detector
+    // comment, so the key is comment-scoped; a redelivery of one comment must
+    // still dedup.
+    const { agentId } = await seedIssueWithIdentifier("BLO-9003");
+    const app = buildApp();
+    const evictionPayload = (commentId: number) => ({
+      action: "created",
+      issue: {
+        number: 1092,
+        title: "fix(merge-queue): re-enqueue after eviction (BLO-9003)",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/1092",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1092" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: commentId,
+        body:
+          "<!-- paperclip:merge-queue-eviction -->\nPR #1092 was removed from the `master` merge queue and is " +
+          "**not merged**.",
+        html_url: `https://github.com/Blockcast/paperclip/pull/1092#issuecomment-${commentId}`,
+        user: { login: "github-actions[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    const deliver = async (commentId: number, deliveryId: string) => {
+      const signed = signedRequest(evictionPayload(commentId));
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "issue_comment")
+        .set("x-hub-signature-256", signed.signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(signed.body);
+    };
+    const authorWakes = async () =>
+      db
+        .select({ status: agentWakeupRequests.status, idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+    const keyForComment = (commentId: number) =>
+      expect.stringContaining(`:Blockcast/paperclip:1092:github_pr_merge_queue_evicted:comment:${commentId}`);
+
+    const first = await deliver(4900000031, "delivery-eviction-1");
+    expect(first.status).toBe(200);
+    expect(first.body.wakes).toEqual([{ issueIdentifier: "BLO-9003", agentId }]);
+    expect(await authorWakes()).toEqual([{ status: "queued", idempotencyKey: keyForComment(4900000031) }]);
+
+    // The author's run picked the first eviction up and is still working it.
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "running" })
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    // A redelivery of the SAME eviction comment is a duplicate.
+    const redelivery = await deliver(4900000031, "delivery-eviction-1-retry");
+    expect(redelivery.status).toBe(200);
+    expect(redelivery.body.wakes).toEqual([]);
+    expect(redelivery.body.skipped).toContainEqual({
+      issueIdentifier: "BLO-9003",
+      reason: "duplicate_pr_author_wake",
+    });
+
+    // A NEW eviction comment is a new event and must reach the author.
+    const second = await deliver(4900000032, "delivery-eviction-2");
+    expect(second.status).toBe(200);
+    expect(second.body.wakes).toEqual([{ issueIdentifier: "BLO-9003", agentId }]);
+    expect(second.body.skipped ?? []).not.toContainEqual({
+      issueIdentifier: "BLO-9003",
+      reason: "duplicate_pr_author_wake",
+    });
+    expect((await authorWakes()).map((w) => w.idempotencyKey)).toEqual(
+      expect.arrayContaining([keyForComment(4900000031), keyForComment(4900000032)]),
+    );
   });
 
   it("drives the reviewer wake AND preserves the author wake for a marker-prefixed agent review request (BLO-18865)", async () => {

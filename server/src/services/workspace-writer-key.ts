@@ -77,43 +77,97 @@
  * rather than under-serializes. Serializing two runs that could have been
  * parallel costs latency; letting two runs share one tree corrupts a checkout.
  *
- * KNOWN GAP -- the first run of an un-backfilled issue is UNPROTECTED, and this
- * is accepted rather than fixed. The only source for `projectWorkspaceId` at
- * reservation-bind time is `issueRef`, but the run's actual workspace is not
- * resolved until ~600 lines later (`issueRef?.projectWorkspaceId ??
- * resolvedWorkspace.workspaceId`) and is written back onto the issue after
- * that. The id is a RESULT of the first run, not a precondition of it, so run 1
- * of a fresh issue keys null and only run 2 onward is excluded.
+ * FIRST RUN OF AN UN-BACKFILLED ISSUE (BLO-37188). `issue.projectWorkspaceId`
+ * is a RESULT of an issue's first run, not a precondition of it: it is written
+ * back as `issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId` only
+ * after the workspace is realized, ~600 lines below the bind. So on run 1 the
+ * issue carries null, and keying on it alone returned null -- no exclusion at
+ * all, on either branch. `projectWorkspaceFallbackId` closes that: the caller
+ * reproduces, at bind time, the same selection the late path will make when the
+ * issue names no workspace, and this coalesces onto it.
  *
- * Two consequences worth stating, because the second is a real (narrow) loss:
+ * That selection is FIRST ROW IN CREATION ORDER, not the `isPrimary` row. The
+ * two differ whenever a project flags a primary that is not its earliest row,
+ * and the late path does not consult the flag on this route:
+ * `prioritizeProjectWorkspaceCandidatesForRun(rows, null)` returns `rows`
+ * untouched, `isNonPrimaryWorkspaceTarget` is false with no preferred id so
+ * every row stays a candidate, and the realization loop takes the first one
+ * whose cwd resolves. `resolveProjectPrimaryWorkspaceId` is the wrong helper
+ * here and would key a different workspace than the run lands in.
  *
- * - There is no sound fix available at bind time. Every candidate is a proxy
- *   with its own gap, and the reservation MUST bind before the workspace is
- *   realized -- binding after it would mean the loser has already mutated the
- *   tree it was supposed to be excluded from. Closing this properly means
- *   hoisting the workspace-base resolution above the bind, which is a dispatch-
- *   path change and not this row's scope.
- * - Now that the `agent-shared` exit is tree-scoped too (BLO-19422), a null key
- *   falls back to `agent-shared:<agentId>` and therefore no longer collides
- *   with the SAME agent's tree-keyed runs on that tree. Pre-BLO-19422 it did.
- *   That window needs two concurrent runs of one agent at effective
- *   concurrency 1, which requires the BLO-12990 silent-run exclusion from
- *   `countRunsOccupyingSlots`, and one of the two to be an un-backfilled first
- *   run. It is strictly narrower than the cross-agent case it buys: that one
- *   needs no loophole at all and is the measured defect.
+ * It is still a proxy, because which row realizes is not knowable at bind time,
+ * and it has two residuals:
+ *
+ * - SOME rows fail and a later one wins: the run lands in that later tree while
+ *   holding row 0's key. It over-serializes against other runs on row 0 (costs
+ *   latency) and under-serializes against runs on the row that won -- exactly
+ *   the pre-BLO-37188 state, so no regression.
+ * - NO row realizes: `resolveWorkspaceForRun` does not fail, it falls back to
+ *   `resolveDefaultAgentWorkspaceDir(agent.id)`, the agent home. Pre-BLO-37188
+ *   that run keyed null and fell to `agent-shared:<agentId>`, the class that
+ *   names the agent home exactly. Now it keys `project-primary:<row0>`: it is
+ *   serialized against a project tree it never touches, and is NO LONGER
+ *   excluded against the same agent's null-keyed runs in that same agent home.
+ *   That mis-keys OFF `agent-shared`, in the UNSAFE direction (under-
+ *   serialization on a shared directory). It needs every candidate cwd to be
+ *   absent (the `missingProjectCwds` path), and is accepted because what it
+ *   trades against -- run 1 of every fresh issue going unexcluded -- is the
+ *   common case.
+ *
+ * Fully closing both needs the realized path itself, i.e. hoisting
+ * workspace-base resolution above the bind; the reservation MUST bind first,
+ * because binding after realization means the loser has already mutated the
+ * tree it was supposed to be excluded from.
+ *
+ * The caller must NOT pass a fallback for a run that resolves to the agent home
+ * rather than a project checkout (`agent_default` mode, where
+ * `resolveWorkspaceForRun` is called with `useProjectWorkspace: false` and
+ * considers no project workspace rows at all). Such a run shares no project
+ * tree, and keying it on one would serialize unrelated agents against each
+ * other for nothing. `resolveProjectIdNeedingWorkspaceFallback` is that gate.
  */
 export function resolveWorkspaceWriterTreeKey(input: {
   statelessPrReview: boolean;
   runResolvesToOwnTree: boolean;
   usesPerRunScope: boolean;
   issue: { id: string | null; projectWorkspaceId: string | null } | null;
+  /**
+   * Bind-time stand-in for `issue.projectWorkspaceId` while it is still null.
+   * Omit (or pass null) when the run resolves to no project checkout.
+   */
+  projectWorkspaceFallbackId?: string | null;
 }): string | null {
   if (input.statelessPrReview) return null;
+  const projectWorkspaceId = input.issue?.projectWorkspaceId ?? input.projectWorkspaceFallbackId ?? null;
   if (input.runResolvesToOwnTree) {
     if (input.usesPerRunScope) return null;
     if (!input.issue?.id) return null;
-    return `${input.issue.projectWorkspaceId ?? "no-project-workspace"}:${input.issue.id}`;
+    return `${projectWorkspaceId ?? "no-project-workspace"}:${input.issue.id}`;
   }
-  if (!input.issue?.projectWorkspaceId) return null;
-  return `project-primary:${input.issue.projectWorkspaceId}`;
+  if (!projectWorkspaceId) return null;
+  return `project-primary:${projectWorkspaceId}`;
+}
+
+/**
+ * Which project, if any, the caller must resolve a `projectWorkspaceFallbackId`
+ * for (BLO-37188). Null means "pass no fallback, and do not query for one":
+ *
+ * - a stateless PR review keys null on both branches regardless;
+ * - an issue that already names a workspace is authoritative;
+ * - `useProjectWorkspace` false (`agent_default`) means `resolveWorkspaceForRun`
+ *   considers no project workspace rows and lands in the agent home, so a
+ *   fallback would key the run on a project tree it never touches.
+ *
+ * `useProjectWorkspace` must be the SAME value the caller passes to
+ * `resolveWorkspaceForRun`, or the two can disagree about whether the run
+ * consults project workspaces at all.
+ */
+export function resolveProjectIdNeedingWorkspaceFallback(input: {
+  statelessPrReview: boolean;
+  issueProjectWorkspaceId: string | null;
+  useProjectWorkspace: boolean;
+  executionProjectId: string | null;
+}): string | null {
+  if (input.statelessPrReview || input.issueProjectWorkspaceId || !input.useProjectWorkspace) return null;
+  return input.executionProjectId;
 }

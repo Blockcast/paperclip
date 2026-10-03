@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
+import type { SQL } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -8,6 +9,7 @@ import {
   getAgentWorkEligibility,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueRecoveryActionKind,
   type IssueStatus,
 } from "@paperclipai/shared";
 import {
@@ -2962,8 +2964,73 @@ export function recoveryService(
    * postgres.js cannot serialize a Date interpolated into a raw `sql` fragment and throws
    * ERR_INVALID_ARG_TYPE at bind time. Same hazard as `hasPositiveRunEvidence` and the
    * work-product upsert, both of which were bitten by it.
+   *
+   * `issueIdentifierSql` is the OWNER-NARROWING clause and is not optional (BLO-38061).
+   * It is a parameter rather than a filter applied by one caller precisely so that adding
+   * a third consumer cannot silently reintroduce the assignee-agnostic read: the type
+   * checker makes supplying it unavoidable. Callers pass a bound value where the issue is
+   * already in hand, or the `issues.identifier` column where the pass classifies many rows
+   * at once.
+   *
+   * Why it must exist at all. Until BLO-38061 this predicate treated ANY open PR row on
+   * an issue as proof a wake would arrive, on the premise recorded (and now falsified) in
+   * `hasPendingBoardApprovalWakePath`'s docblock below:
+   *
+   *     "`hasOpenPullRequestWakePath` can be assignee-agnostic: whoever holds the row is
+   *      by construction the actor the webhook will wake."
+   *
+   * A PR work product is written for EVERY issue the PR references, deliberately — the row
+   * is evidence about the PR, not a wake. The wake is owner-narrowed:
+   * `routes/github-webhook.ts` resolves `owning = context.owningIdentifiers ?? []`, drops
+   * the author wake entirely with `suppressionReason: "no_owning_reference"` when that set
+   * is empty, and otherwise keeps only `matched.filter((m) => owning.includes(m.identifier))`.
+   * So a row whose PR merely MENTIONS it was exempted from seizure while no webhook would
+   * ever wake it — a silent strand, the same failure direction BLO-32679 produced from the
+   * opposite side.
+   *
+   * Measured on company `aaced805` 2026-09-29, one agent's lane, work products read per
+   * issue from `GET /api/issues/{id}/work-products` with the predicate applied exactly as
+   * written here. As filed (494 inbox rows): 116 satisfied every other clause, 82 (71%)
+   * genuinely owned, 34 (29%) not. Re-measured the same day over all 637 rows in the
+   * sweep's candidate statuses plus `blocked`, 637/637 read with no fetch failures: 125
+   * eligible, 81 still exempt, **44 lose the exemption**. Of those 44, 13 are `blocked` —
+   * not in `STRANDED_ASSIGNED_ISSUE_STATUSES`, so they are not sweep candidates and cannot
+   * be seized — and 3 of the rest carry a live run, future monitor, or scheduled retry.
+   * The seizure delta on that lane is therefore **28** (26 `todo`, 2 `in_review`), and it
+   * is an UPPER BOUND: the sweep's remaining gates (run status, recent visible progress,
+   * blockers) are evaluated afterwards and only ever subtract.
+   *
+   * ⚠️ Read that 28 honestly rather than as 28 rescued strands. 26 of them are `todo`,
+   * and a `todo` row with an assignee is still returned by `paperclipInboxLite`, so it is
+   * reachable by its owner's next heartbeat — it was never dark in the way an
+   * `in_progress` row with no run is. The defect this fixes is that the predicate asserted
+   * something false, and the honest benefit is concentrated in the `in_progress` and
+   * `in_review` rows, not in the `todo` bulk.
+   *
+   * THE NULL ARM IS LOAD-BEARING AND DEFAULTS TO EXEMPT. `owningIdentifiers` is absent on
+   * rows written before the field existed, and absence is evidence of nothing; seizing on
+   * it is the same reasoning-from-absence error BLO-32679 was filed about. An empty ARRAY
+   * is the opposite — authoritative, the PR named no owner in its branch, title, or
+   * labeled body — and does not exempt. `jsonb_typeof` is what keeps those two apart;
+   * `coalesce(..., 'null')` is required because the operator yields SQL NULL for an absent
+   * key, which would otherwise make the whole disjunct NULL rather than true.
+   *
+   * A NULL `issues.identifier` also exempts, for the same reason: with no identifier there
+   * is nothing to test membership against, so non-ownership is unproven. Note this is the
+   * OPPOSITE default to `pullRequestOwnsIssue` in productivity-review.ts, which returns
+   * false for a null identifier — deliberately, because there withholding the answer
+   * withholds a progress signal, and here withholding it takes an issue from its owner.
+   *
+   * ⚠️ `::text` on the null test is REQUIRED, not stylistic. A bare `$n is null` gives the
+   * planner no type context and postgres rejects the whole statement with
+   * `could not determine data type of parameter $n` — the same family as the
+   * `freshSinceIso` cast above. It fails in the worst possible way here: the sweep catches
+   * per-candidate errors into `reconcileErrors`, so a throwing predicate yields
+   * `escalated: 0`, which is indistinguishable from a deliberate exemption. Measured while
+   * writing this: every candidate threw and two exemption tests passed regardless. The
+   * fixture asserts `reconcileErrors === 0` for that reason.
    */
-  function openPullRequestWakePathConditions(freshSinceIso: string) {
+  function openPullRequestWakePathConditions(freshSinceIso: string, issueIdentifierSql: SQL) {
     return [
       eq(issueWorkProducts.provider, "github"),
       eq(issueWorkProducts.type, "pull_request"),
@@ -2972,6 +3039,11 @@ export function recoveryService(
       sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
       sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
       sql`${issueWorkProducts.updatedAt} > ${freshSinceIso}::timestamptz`,
+      sql`(
+        ${issueIdentifierSql}::text is null
+        or coalesce(jsonb_typeof(${issueWorkProducts.metadata}->'owningIdentifiers'), 'null') <> 'array'
+        or ${issueWorkProducts.metadata}->'owningIdentifiers' @> to_jsonb(${issueIdentifierSql}::text)
+      )`,
     ];
   }
 
@@ -2987,7 +3059,7 @@ export function recoveryService(
         and(
           eq(issueWorkProducts.companyId, issue.companyId),
           eq(issueWorkProducts.issueId, issue.id),
-          ...openPullRequestWakePathConditions(freshSinceIso),
+          ...openPullRequestWakePathConditions(freshSinceIso, sql`${issue.identifier}`),
         ),
       )
       .limit(1)
@@ -3013,9 +3085,14 @@ export function recoveryService(
    * ⚠️ The clause that makes this NOT a copy of the PR predicate, and the reason it must
    * not be written as one. The two wakes have different targets:
    *
-   *   - `github-webhook.ts` wakes `effectiveAssigneeAgentId` — the ISSUE'S ASSIGNEE. So
-   *     `hasOpenPullRequestWakePath` can be assignee-agnostic: whoever holds the row is
-   *     by construction the actor the webhook will wake.
+   *   - `github-webhook.ts` wakes `effectiveAssigneeAgentId` — the ISSUE'S ASSIGNEE, but
+   *     only for the issues the PR OWNS. ⚠️ This bullet used to read "so
+   *     `hasOpenPullRequestWakePath` can be assignee-agnostic: whoever holds the row is by
+   *     construction the actor the webhook will wake." That premise was false and
+   *     BLO-38061 falsified it: the PR row exists on every issue the PR references, while
+   *     the author wake is filtered to `owning`. The distinction below still stands — the
+   *     two wakes do have different targets — but the PR side is now narrowed too, by
+   *     recorded owner rather than by assignee. See `openPullRequestWakePathConditions`.
    *   - `approval-resolution.ts` wakes `approval.requestedByAgentId` — the REQUESTER, who
    *     need not hold the row and frequently does not.
    *
@@ -5820,14 +5897,36 @@ export function recoveryService(
     throw lastError ?? new Error("ensureStrandedIssueRecoveryIssue: exhausted retries with no winner");
   }
 
+  // BLO-37677 AC3.2: a `Record` over the full cause union, not a ternary chain ending in a
+  // bare `stranded_assigned_issue` fallthrough. Four causes — `process_lost`,
+  // `provider_quota`, `codex_output_inactivity_monitor`,
+  // `execution_review_participant_recovery` — reach that literal today, and did so by
+  // omission rather than by decision, so a guard that enumerates `IssueRecoveryActionKind`
+  // could never fire on any of them: adding a *cause* changed no *kind*. Adding a cause is
+  // now a compile error here instead. Their mapping is deliberately unchanged — this makes
+  // the collapse explicit, it does not re-kind anything.
+  // `Exclude<…, "pr_review_non_convergence">` rather than the bare kind union: the old `as const`
+  // ternary returned a 4-literal type, and widening it to all seven would have let the stranded
+  // path start minting the one kind this file makes semantically special. It provably never does —
+  // the only `kind: "pr_review_non_convergence"` literal in the repo is `escalateStalledSelfReviewPr`
+  // — so the invariant is encoded here instead of asserted. (This does NOT address the BLO-37934
+  // clobber, which overwrites *to* `stranded_assigned_issue` on an existing row.)
+  const STRANDED_RECOVERY_ACTION_KIND_BY_CAUSE: Record<
+    StrandedRecoveryCause,
+    Exclude<IssueRecoveryActionKind, "pr_review_non_convergence">
+  > = {
+    [SUCCESSFUL_RUN_MISSING_STATE_REASON]: "missing_disposition",
+    workspace_validation_failed: "workspace_validation",
+    configuration_incomplete: "configuration_validation",
+    stranded_assigned_issue: "stranded_assigned_issue",
+    process_lost: "stranded_assigned_issue",
+    provider_quota: "stranded_assigned_issue",
+    codex_output_inactivity_monitor: "stranded_assigned_issue",
+    execution_review_participant_recovery: "stranded_assigned_issue",
+  };
+
   function strandedRecoveryActionKind(cause: StrandedRecoveryCause) {
-    return cause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-      ? "missing_disposition" as const
-      : cause === "workspace_validation_failed"
-        ? "workspace_validation" as const
-      : cause === "configuration_incomplete"
-        ? "configuration_validation" as const
-      : "stranded_assigned_issue" as const;
+    return STRANDED_RECOVERY_ACTION_KIND_BY_CAUSE[cause];
   }
 
   function strandedRecoveryActionFingerprint(input: {
@@ -10393,6 +10492,12 @@ export function recoveryService(
       // the same pre-indexed `{companyId, issueId, status}` shape as every other waiting
       // path. Bounded by the grace window, so this is not a scan of every PR ever
       // recorded.
+      //
+      // BLO-38061 added the join. The owner-narrowing clause tests the PR's recorded
+      // owners against `issues.identifier`, which this pass does not otherwise carry, and
+      // the alternative — narrowing only the stranded-assigned sweep — is exactly the
+      // divergence PEN-3198 extracted this function to make unrepresentable. The join is
+      // on a primary key with an FK behind it, so it neither fans rows out nor drops any.
       db
         .select({
           companyId: issueWorkProducts.companyId,
@@ -10400,7 +10505,13 @@ export function recoveryService(
           status: issueWorkProducts.status,
         })
         .from(issueWorkProducts)
-        .where(and(...openPullRequestWakePathConditions(openPullRequestFreshSinceIso))),
+        .innerJoin(issues, eq(issues.id, issueWorkProducts.issueId))
+        .where(and(
+          ...openPullRequestWakePathConditions(
+            openPullRequestFreshSinceIso,
+            sql`${issues.identifier}`,
+          ),
+        )),
     ]);
 
     // Waiting paths contributed by OPEN liveness escalations, kept separate from every
@@ -13237,6 +13348,7 @@ export function recoveryService(
       exhaustedSkipped: 0,
       cooldownSkipped: 0,
       livePathSkipped: 0,
+      livePathQueuedWakeSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
       claimLost: 0,
@@ -13426,11 +13538,19 @@ export function recoveryService(
         result.cooldownSkipped += 1;
         continue;
       }
-      if (
-        await hasActiveExecutionPath(candidate.companyId, candidate.issueId, ownerAgentId) ||
-        await hasQueuedIssueWake(candidate.companyId, candidate.issueId, ownerAgentId)
-      ) {
+      // Split deliberately, and the order is load-bearing: this reproduces the exact
+      // short-circuit of the single `||` it replaces, so a candidate held by a live run
+      // still never evaluates the queued-wake probe. What changes is only that the two
+      // arms are now countable apart. One counter over a union could not say whether the
+      // queued-wake arm was doing any work at all, so BLO-19124 could not size a fix aimed
+      // at it -- if the active-run arm dominates, an age bound on `hasQueuedIssueWake`
+      // moves nothing and nobody could have told.
+      if (await hasActiveExecutionPath(candidate.companyId, candidate.issueId, ownerAgentId)) {
         result.livePathSkipped += 1;
+        continue;
+      }
+      if (await hasQueuedIssueWake(candidate.companyId, candidate.issueId, ownerAgentId)) {
+        result.livePathQueuedWakeSkipped += 1;
         continue;
       }
       if (await hasPendingWakeInteraction(candidate.companyId, candidate.issueId)) {
@@ -13616,6 +13736,7 @@ export function recoveryService(
           exhaustedSkipped: result.exhaustedSkipped,
           cooldownSkipped: result.cooldownSkipped,
           livePathSkipped: result.livePathSkipped,
+          livePathQueuedWakeSkipped: result.livePathQueuedWakeSkipped,
           interactionSkipped: result.interactionSkipped,
           pauseHoldSkipped: result.pauseHoldSkipped,
           claimLost: result.claimLost,
@@ -13631,7 +13752,9 @@ export function recoveryService(
     for (const [reason, count] of [
       ["no_owner", result.noOwnerSkipped], ["cause", result.causeSkipped],
       ["exhausted", result.exhaustedSkipped], ["cooldown", result.cooldownSkipped],
-      ["live_path", result.livePathSkipped], ["interaction", result.interactionSkipped],
+      ["live_path", result.livePathSkipped],
+      ["live_path_queued_wake", result.livePathQueuedWakeSkipped],
+      ["interaction", result.interactionSkipped],
       ["pause_hold", result.pauseHoldSkipped], ["claim_lost", result.claimLost],
       ["deferred_or_failed", result.deferredOrFailed], ["enqueue_failed", result.enqueueFailed],
     ] as const) {
@@ -13824,7 +13947,11 @@ export function recoveryService(
     result.strandedRecoveryWakesHealed = strandedRecoveryWakeBackstop.healed;
     result.strandedRecoveryWakeExhaustedSkipped = strandedRecoveryWakeBackstop.exhaustedSkipped;
     result.strandedRecoveryWakeCooldownSkipped = strandedRecoveryWakeBackstop.cooldownSkipped;
-    result.strandedRecoveryWakeLivePathSkipped = strandedRecoveryWakeBackstop.livePathSkipped;
+    // Stays the union total, which is what this field has always meant. The per-arm split
+    // lives on the sweep result and the metric; widening this roll-up would only add an
+    // unread field, while leaving it at the active-run arm alone would silently under-report.
+    result.strandedRecoveryWakeLivePathSkipped = strandedRecoveryWakeBackstop.livePathSkipped
+      + strandedRecoveryWakeBackstop.livePathQueuedWakeSkipped;
     result.strandedRecoveryWakeDeferredOrFailed = strandedRecoveryWakeBackstop.deferredOrFailed;
     result.strandedRecoveryWakeEnqueueFailed = strandedRecoveryWakeBackstop.enqueueFailed;
     result.strandedRecoveryWakeIssueIds = strandedRecoveryWakeBackstop.issueIds;

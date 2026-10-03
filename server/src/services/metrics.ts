@@ -128,7 +128,12 @@ export const ISOLATION_WORKSPACE_REAPER_STOP_REASONS = [
 ] as const;
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
 export const BACKSTOP_SKIP_REASONS = [
-  "not_ready", "existing_wake", "live_path", "pause_hold", "interaction",
+  // `live_path` is NOT comparable across sources, so do not `sum by (reason)` over both.
+  // For `stranded_recovery_wake_backstop` it is the active-run arm ALONE, with the
+  // queued-owner-wake arm split out as `live_path_queued_wake` (BLO-19124). For
+  // `issue_graph_liveness.backstop` it is still the union of both probes behind one `||`.
+  // Scope every query by `source`.
+  "not_ready", "existing_wake", "live_path", "live_path_queued_wake", "pause_hold", "interaction",
   "no_owner", "cause", "exhausted", "cooldown", "claim_lost",
   "deferred_or_failed", "enqueue_failed",
 ] as const;
@@ -576,6 +581,26 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC 
  * `max by (agent_id) (...)` over it is the whole detector.
  */
 export const AGENT_START_LOCK_HELD_SECONDS_METRIC = "paperclip_agent_start_lock_held_seconds";
+/**
+ * Which await a held start lock is sitting in, and for how long (BLO-36922).
+ *
+ * Companion to {@link AGENT_START_LOCK_HELD_SECONDS_METRIC}, which says an
+ * agent's dispatch has stopped but never which phase stopped it. Four measured
+ * fleet stalls (2026-09-21/22/26, 8-14 agents each, peak hold 2293s) were
+ * unnameable after the fact precisely because of that gap: container logs
+ * rotate in ~1h, paperclip emits no traces, and every downstream instrument
+ * went QUIETER during the stalls. A phase label retained at Prometheus
+ * resolution is the one surface that survives the window.
+ *
+ * Deliberately a SEPARATE series, not a `phase` label on the held gauge: a
+ * label that changes mid-hold starts a new series, which would destroy the
+ * "+scrape_interval per scrape on one continuous series" reading that is the
+ * held gauge's whole diagnostic value. Same no-zero-fill semantics as its
+ * companion -- series exist only while a lock is held, so absence is health.
+ * `phase` is a small closed set of static strings supplied by
+ * `markAgentStartLockPhase`; never let an id reach it.
+ */
+export const AGENT_START_LOCK_PHASE_SECONDS_METRIC = "paperclip_agent_start_lock_phase_seconds";
 /**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
@@ -2471,6 +2496,7 @@ let orphanedRuntimeResourceMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
+let agentStartLockPhaseSeconds: Gauge<"agent_id" | "phase"> | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -2635,6 +2661,7 @@ function ensureRegistry(): {
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
+  agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
   prReviewQueueWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   gbrainRecallCounter: Counter<"status">;
@@ -2684,6 +2711,7 @@ function ensureRegistry(): {
     || !externalRuntimeReservationStrandedOldestAge
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
     || !agentStartLockHeldSeconds
+    || !agentStartLockPhaseSeconds
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -2950,6 +2978,17 @@ function ensureRegistry(): {
         + "held, so absence means no hold, not a zero-length one. A healthy section is sub-second; "
         + "sustained tens of seconds is a wedge. Per-pod, because the lock is per-process.",
       labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    agentStartLockPhaseSeconds = new Gauge({
+      name: AGENT_START_LOCK_PHASE_SECONDS_METRIC,
+      help:
+        "Seconds the per-agent queued-run dispatch start lock has been in its current phase "
+        + "(BLO-36922). Names the await a held section is sitting in; pairs with "
+        + AGENT_START_LOCK_HELD_SECONDS_METRIC
+        + ". A phase age close to the hold age means the section never left that phase. Series "
+        + "exist only while a lock is held, so absence means no hold. Per-pod, like its companion.",
+      labelNames: ["agent_id", "phase"],
       registers: [registry],
     });
     externalRuntimeReservationsReleasePending = new Gauge({
@@ -3820,6 +3859,7 @@ function ensureRegistry(): {
     externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
       externalRuntimeReservationStrandMetricsRefreshSuccess,
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
+    agentStartLockPhaseSecondsGauge: agentStartLockPhaseSeconds,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -4398,13 +4438,21 @@ export function setDbPoolStats(stats: DbPoolStats): void {
  * DB-backed background collector would be stuck and publish nothing.
  */
 export function setAgentStartLockHeldMetrics(
-  held: ReadonlyArray<{ agentId: string; heldMs: number }>,
+  held: ReadonlyArray<{ agentId: string; heldMs: number; phase?: string; phaseMs?: number }>,
 ): void {
-  const gauge = ensureRegistry().agentStartLockHeldSecondsGauge;
+  const registry = ensureRegistry();
+  const gauge = registry.agentStartLockHeldSecondsGauge;
+  const phaseGauge = registry.agentStartLockPhaseSecondsGauge;
   gauge.reset();
+  phaseGauge.reset();
   for (const entry of held) {
     const heldMs = Number.isFinite(entry.heldMs) ? Math.max(0, entry.heldMs) : 0;
     gauge.set({ agent_id: entry.agentId }, heldMs / 1000);
+    const phase = entry.phase;
+    if (!phase) continue;
+    const rawPhaseMs = entry.phaseMs ?? 0;
+    const phaseMs = Number.isFinite(rawPhaseMs) ? Math.max(0, rawPhaseMs) : 0;
+    phaseGauge.set({ agent_id: entry.agentId, phase }, phaseMs / 1000);
   }
 }
 
@@ -5483,6 +5531,7 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationStrandedOldestAge = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
   agentStartLockHeldSeconds = null;
+  agentStartLockPhaseSeconds = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;

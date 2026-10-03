@@ -2243,8 +2243,12 @@ describeEmbeddedPostgres("productivity review service", () => {
       "Never-invoked runs excluded (terminal, no adapter ever created — `usageJson`/`logStore`/`logRef` null, `logBytes` null or 0, BLO-26165): 0",
     );
     expect(reviews[0]?.description).toContain(
-      `Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, not excluded from the streak walk — BLO-26165): ${DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS}`,
+      `Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, eligible for the streak walk by design — excluding them was BLO-26165's reverted regression, not a gap): ${DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS}`,
     );
+    // BLO-37560: the label must not read as a known gap. A CTO review run read
+    // the old "not excluded from the streak walk" wording as a defect report and
+    // filed a `high` ticket asking for the exclusion BLO-26165 already reverted.
+    expect(reviews[0]?.description).not.toContain("not excluded from the streak walk");
   });
 
   it("still fires no_comment_streak on a streak of executed, comment-required-but-missed runs (BLO-26165 control)", async () => {
@@ -3098,6 +3102,15 @@ describeEmbeddedPostgres("productivity review service", () => {
     const refreshComments = await listRefreshComments(review!.id);
     expect(refreshComments.length).toBeGreaterThan(0);
     expect(refreshComments.at(-1)?.body).toContain(DEPENDENCY_LINE_ONE_BLOCKER);
+    // BLO-37560 (Ally suggestion on c69c6cdd): the compact comment was the one
+    // render site with no assertion at all, so its exempt-executed line could
+    // drift back to gap-sounding phrasing while the description's pin stayed
+    // green. Pin the property here too — the comment must tell the same story
+    // as the description it summarises.
+    expect(refreshComments.at(-1)?.body).toContain(
+      "Comment-policy-exempt runs that DID execute (eligible for the streak walk by design, not a gap):",
+    );
+    expect(refreshComments.at(-1)?.body).not.toContain("not excluded from the streak walk");
   });
 
   // BLO-22436: once the blocker resolves (or the edge is removed), the same

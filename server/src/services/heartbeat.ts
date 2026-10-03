@@ -366,7 +366,7 @@ import {
 } from "./issue-tree-control.js";
 import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import { describeSharedCheckoutOccupancy } from "./shared-checkout-occupancy.js";
-import { resolveWorkspaceWriterTreeKey } from "./workspace-writer-key.js";
+import { resolveProjectIdNeedingWorkspaceFallback, resolveWorkspaceWriterTreeKey } from "./workspace-writer-key.js";
 import {
   countRunsOccupyingSlots,
   resolveAgentConcurrencyPolicy,
@@ -513,7 +513,12 @@ import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "./provider-capacity-horizon-bo
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
-import { LOCK_HELD_WARN_MS, runDetachedFromAgentStartLock, withAgentStartLock } from "./agent-start-lock.js";
+import {
+  LOCK_HELD_WARN_MS,
+  markAgentStartLockPhase,
+  runDetachedFromAgentStartLock,
+  withAgentStartLock,
+} from "./agent-start-lock.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -4960,6 +4965,34 @@ export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWork
   return [rows[preferredIndex]!, ...rows.slice(0, preferredIndex), ...rows.slice(preferredIndex + 1)];
 }
 
+/**
+ * A project's workspace rows in the order `resolveWorkspaceForRun` tries to
+ * realize them. The bind-time writer-key fallback (BLO-37188) reads this SAME
+ * list, so the row the reservation keys on and the row the run lands in cannot
+ * drift apart onto two independently written orderings.
+ */
+export function listProjectWorkspacesInRealizationOrder(db: Db, companyId: string, projectId: string) {
+  return db
+    .select()
+    .from(projectWorkspaces)
+    .where(and(eq(projectWorkspaces.companyId, companyId), eq(projectWorkspaces.projectId, projectId)))
+    .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
+}
+
+/**
+ * The row `resolveWorkspaceForRun` tries FIRST when the run names no preferred
+ * workspace (BLO-37188): `prioritizeProjectWorkspaceCandidatesForRun(rows,
+ * null)` keeps creation order, and `isNonPrimaryWorkspaceTarget` is false with
+ * no preferred id so every row stays a candidate. Deliberately NOT
+ * `resolveProjectPrimaryWorkspaceId`, which consults `isPrimary` and names a
+ * different row whenever a project flags a primary that is not its earliest.
+ */
+export function selectBindTimeProjectWorkspaceFallbackId(
+  rowsInRealizationOrder: ProjectWorkspaceCandidate[],
+): string | null {
+  return prioritizeProjectWorkspaceCandidatesForRun(rowsInRealizationOrder, null)[0]?.id ?? null;
+}
+
 // [PRACTICO-PATCH] Detect empty agent results (#1117)
 export function isEmptyResult(
   resultJson: Record<string, unknown> | null | undefined,
@@ -7183,10 +7216,17 @@ export function resolveK8sRunIsolationIdentity(input: {
  * while `runningCount` collapses to 0, so `availableSlots = 1 - 0 = 1` and a
  * second run IS admitted at effective concurrency 1. In exactly that case
  * `agent-shared` was not a belt over braces -- it was the sole restraint, and
- * widening the key gives it up. That narrow loss is stated as a KNOWN GAP on
- * `resolveWorkspaceWriterTreeKey`; it needs a silent run AND an un-backfilled
- * issue, where the cross-agent case this buys needs no loophole at all and is
- * the measured default defect. The trade is deliberate, not an oversight.
+ * widening the key gives it up. That loss was originally stated as a KNOWN GAP
+ * on `resolveWorkspaceWriterTreeKey` needing a silent run AND an un-backfilled
+ * issue; BLO-37188 closed the second half by resolving a bind-time fallback
+ * workspace. What still keys null is a run the caller resolves to no project
+ * checkout BEFORE realization -- chiefly `agent_default`, which lands in the
+ * agent home, precisely the class `agent-shared:<agentId>` names. That is not
+ * every run that ends up in the agent home: one whose project candidates ALL
+ * fail to realize lands there too, but was keyed at bind time on its first
+ * project row, so it is serialized against that row instead of against
+ * `agent-shared` (the unsafe-direction residual stated on
+ * `resolveWorkspaceWriterTreeKey`). The trade is deliberate, not an oversight.
  *
  * The cost is real and deliberate: this serializes ALL issues of one project
  * workspace across ALL agents, because they are one mutable directory. That is
@@ -9243,6 +9283,7 @@ const GITHUB_PR_CONTEXT_KEYS = [
   "githubPrReviewRequestBody",
   "githubPrReviewRequestAuthorLogin",
   "githubReviewFeedbackActionable",
+  "githubMergeQueueEvictionBody",
   "prRole",
   "reviewKind",
 ] as const;
@@ -9266,6 +9307,17 @@ const GITHUB_PR_REVIEW_CONTENT_KEYS = [
   "githubReviewFeedbackActionable",
   "githubReviewFeedbackCommentId",
 ] as const;
+
+// BLO-23395: the same instance-ownership rule as BLO-22229 above, for
+// merge-queue evictions. A PR can be evicted from the queue more than once
+// (a failing check, then a fix, then an un-stageable rebase), and each
+// `github_pr_merge_queue_evicted` wake carries the notice for exactly one of
+// those evictions. Without this, an eviction wake whose notice comment could
+// not be captured would inherit the PREVIOUS eviction's body and the
+// directive would state a cause that belongs to a different eviction — the
+// stale-content failure this key was added to avoid, not create.
+const GITHUB_PR_MERGE_QUEUE_EVICTION_WAKE_REASONS = new Set(["github_pr_merge_queue_evicted"]);
+const GITHUB_PR_MERGE_QUEUE_EVICTION_KEYS = ["githubMergeQueueEvictionBody"] as const;
 
 function readGithubPrIdentity(contextSnapshot: Record<string, unknown>) {
   const raw = contextSnapshot.githubPrNumber;
@@ -9484,6 +9536,15 @@ export function mergeCoalescedContextSnapshot(
   const declaresRecoveryWorkClass = readNonEmptyString(incoming[RECOVERY_WORK_CLASS_KEY]) !== null;
   if (declaresRecoveryWorkClass) {
     for (const key of RECOVERY_GUARD_CONTEXT_KEYS) {
+      if (!(key in incoming)) delete merged[key];
+    }
+  }
+  // BLO-23395: each merge-queue-eviction wake owns its notice body outright,
+  // for the same reason a review-instance wake owns the review-content block.
+  const isNewMergeQueueEviction =
+    incomingWakeReason !== null && GITHUB_PR_MERGE_QUEUE_EVICTION_WAKE_REASONS.has(incomingWakeReason);
+  if (isNewMergeQueueEviction) {
+    for (const key of GITHUB_PR_MERGE_QUEUE_EVICTION_KEYS) {
       if (!(key in incoming)) delete merged[key];
     }
   }
@@ -10176,6 +10237,13 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     reviewAuthorLogin: readNonEmptyString(contextSnapshot.githubPrReviewAuthorLogin),
     requestCommentBody: readNonEmptyString(contextSnapshot.githubPrReviewRequestBody),
     requestCommentAuthorLogin: readNonEmptyString(contextSnapshot.githubPrReviewRequestAuthorLogin),
+    // BLO-23395: the eviction-notice comment posted by
+    // .github/workflows/merge-queue-eviction-detector.yml, inlined by the
+    // webhook on a `github_pr_merge_queue_evicted` wake. Surfacing it here is
+    // what lets the directive state WHY the queue dropped the PR
+    // (conflict/un-stageable vs. failing check vs. manual dequeue) instead of
+    // sending the woken agent to fetch `githubEventUrl` to find out.
+    mergeQueueEvictionBody: readNonEmptyString(contextSnapshot.githubMergeQueueEvictionBody),
     // BLO-9293: the PR author login from the signed webhook (`pull_request.user.login`).
     // Used by the reviewer-output gate to anchor an intentional self-review skip:
     // Ally reviews every PR including ones it authored itself, and GitHub forbids
@@ -11755,6 +11823,11 @@ export function buildPaperclipTaskMarkdown(input: {
     reviewAuthorLogin?: string | null;
     requestCommentBody?: string | null;
     requestCommentAuthorLogin?: string | null;
+    // BLO-23395: the merge-queue eviction notice posted by
+    // .github/workflows/merge-queue-eviction-detector.yml, inlined by the
+    // webhook so the eviction directive can state the cause without the woken
+    // agent fetching githubEventUrl.
+    mergeQueueEvictionBody?: string | null;
     // BLO-20886 AC3: `pull_request.user.login` from the signed webhook. Gates
     // the "YOUR pull request" possessive and the push instruction — see
     // resolveThirdPartyPrAuthor.
@@ -11837,6 +11910,46 @@ export function buildPaperclipTaskMarkdown(input: {
       );
       if (prReview.requestCommentBody) {
         lines.push("", "The request comment:", fenceTaskText(prReview.requestCommentBody));
+      }
+    } else if (prReview.wakeReason === "github_pr_merge_queue_evicted") {
+      // BLO-23395: PR #1092 sat evicted from the merge queue for 9h13m
+      // unnoticed. This wake is what closes that gap, so the directive has to
+      // say what happened and what to do — the generic author-lifecycle
+      // directive below would tell the agent only that no review findings
+      // exist, which is true and useless here.
+      //
+      // Deliberately NOT added to AUTHOR_REVIEW_CONTENT_WAKE_REASONS: no
+      // review exists on this wake, so it must never reach the
+      // review-feedback directive's "a reviewer just posted findings"
+      // string. This branch is placed ahead of that allowlist check so the
+      // eviction gets its own text either way, and it renders the notice body
+      // inline so the agent does not have to fetch `githubEventUrl` just to
+      // learn the cause.
+      //
+      // BLO-20886: the wake is author-directed by construction (the webhook
+      // stamps `prRole: "author"` on every PR-shaped wake), but "author-
+      // directed" only means the PR is owned by this agent's ISSUE — the PR
+      // itself can have been authored by someone else, linked only because it
+      // references that issue. Telling that agent to rebase and re-enqueue a
+      // third party's branch is the #953 damage path, so drop the remediation
+      // instruction in that case and route it as a comment instead.
+      const evictionThirdPartyAuthor = resolveThirdPartyPrAuthor(prReview);
+      lines.push(
+        "",
+        "GitHub merge-queue eviction directive:",
+        `Pull request #${prReview.prNumber} was REMOVED from the merge queue without being merged. It is NOT going to land on its own: nothing re-enqueues it, and no failing check may exist to explain the removal (an un-stageable rebase evicts a queue entry with zero \`merge_group\` runs, which is why this notification exists at all).`,
+        "No review has been submitted by this event — do not read it as review findings.",
+        evictionThirdPartyAuthor
+          ? `This PR was authored by ${quoteTaskScalar(evictionThirdPartyAuthor)}, NOT by you — it is linked to you only because it references your issue. Do NOT push to its branch or re-enqueue it. Confirm state with \`gh pr view ${prReview.prNumber} --repo ${prReview.repoFullName ?? "<owner>/<repo>"} --json state,mergeable,mergeStateStatus,mergedAt\`, then say on the PR (or on your issue) that it was evicted and is not landing, so its author can act.`
+          : `Confirm current state, then act: \`gh pr view ${prReview.prNumber} --repo ${prReview.repoFullName ?? "<owner>/<repo>"} --json state,mergeable,mergeStateStatus,mergedAt\`. If the cause below is a conflict or un-stageable rebase, rebase the branch (on a REBASE-method queue do NOT merge the base branch in — that makes it less landable, see runbooks/merge-queue-stalled-head.md) and re-enqueue. If it is a failing check, fix the check first. If it was a manual dequeue, find out why before re-enqueueing.`,
+      );
+      if (prReview.mergeQueueEvictionBody) {
+        lines.push("", "The eviction notice:", fenceTaskText(prReview.mergeQueueEvictionBody));
+      } else if (prReview.eventUrl) {
+        lines.push(
+          "",
+          `The eviction notice body was not captured on this wake; read it at ${prReview.eventUrl}.`,
+        );
       }
     } else if (prReview.prRole === "author" && !AUTHOR_REVIEW_CONTENT_WAKE_REASONS.has(prReview.wakeReason)) {
       // BLO-20886 generalizes the BLO-19522 branch above. That branch names one
@@ -12702,6 +12815,20 @@ export interface HeartbeatServiceOptions {
     taskKey: string | null;
   }) => Promise<void> | void;
 }
+
+/**
+ * Freshness window for the shared start-lock orphan reap (BLO-36922).
+ *
+ * Default `0`: single-flight coalescing only, no TTL skip. A skipped reap is
+ * not just a delayed slot release. When a run's Job dies inside the window,
+ * the dead run still reads `running`, so dispatch cancels queued work for the
+ * same issue as `duplicate_dispatch_suppressed` instead of running it
+ * ("reaps orphaned k8s runs before dispatching queued work for the same
+ * issue" in heartbeat-process-recovery.test.ts). Set
+ * `AGENT_START_LOCK_REAP_TTL_MS` to a positive value only as an incident knob
+ * that accepts that risk.
+ */
+const START_LOCK_REAP_TTL_DEFAULT_MS = 0;
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
@@ -15953,16 +16080,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
 
     const unorderedProjectWorkspaceRows = workspaceProjectId
-      ? await db
-          .select()
-          .from(projectWorkspaces)
-          .where(
-            and(
-              eq(projectWorkspaces.companyId, agent.companyId),
-              eq(projectWorkspaces.projectId, workspaceProjectId),
-            ),
-          )
-          .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+      ? await listProjectWorkspacesInRealizationOrder(db, agent.companyId, workspaceProjectId)
       : [];
     const projectWorkspaceRows = prioritizeProjectWorkspaceCandidatesForRun(
       unorderedProjectWorkspaceRows,
@@ -25515,6 +25633,99 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
+  /**
+   * Start-lock sweep state (BLO-36922). `joinableStartLockReap` is a sweep that
+   * has not read fleet state yet, so a caller that joins it still gets a
+   * snapshot taken after it arrived. `inFlightStartLockReap` has already read,
+   * so its result can predate a caller and must not be shared with one. See
+   * {@link reapOrphanedRunsForStartLock}.
+   */
+  let joinableStartLockReap: Promise<unknown> | null = null;
+  let inFlightStartLockReap: Promise<unknown> | null = null;
+  let sharedStartLockReapCompletedAtMs = 0;
+
+  function scheduleStartLockReap(after: Promise<unknown>) {
+    const sweep = after.then(() => {
+      // The sweep reads fleet state from here on, so a later arrival must not
+      // join it. `.finally` stamps the completion time on failure too, so with
+      // a TTL set a failing sweep backs off instead of being retried by every
+      // waking agent.
+      joinableStartLockReap = null;
+      const running: Promise<unknown> = reapOrphanedRuns({ suppressDispatchAfterReap: true }).finally(() => {
+        sharedStartLockReapCompletedAtMs = Date.now();
+        if (inFlightStartLockReap === running) inFlightStartLockReap = null;
+      });
+      inFlightStartLockReap = running;
+      return running;
+    });
+    // Assigned before any await, so callers arriving in the same tick join
+    // this sweep rather than scheduling another.
+    joinableStartLockReap = sweep;
+    return sweep;
+  }
+
+  /**
+   * Coalescing wrapper for the reap on the queued-run dispatch critical path
+   * (BLO-36922).
+   *
+   * `startNextQueuedRunForAgent` calls `reapOrphanedRuns` from *inside*
+   * `withAgentStartLock`, and the reap is FLEET-WIDE, not agent-scoped: every
+   * `running` row joined to `agents`, a namespace-wide `listManagedAgentJobs`,
+   * `cleanupManagedJobsWithoutRun`, then per-run reservation reads and per-Job
+   * deletes. So N agents waking together run N identical whole-fleet sweeps
+   * concurrently, each holding a different agent's lock, each slowing the rest
+   * through the one shared in-pod Kubernetes client. That is self-amplifying,
+   * and it produces exactly the measured signature: agents entering the stall
+   * staggered over ~13 minutes (3 -> 6 -> 8 -> 11 -> 14) and releasing in a
+   * single step, with the DB pool idle and apiserver latency at its LOWEST
+   * throughout -- work queued client-side never reaches the server. Same window
+   * showed 8 `k8s_concurrency_guard_unreachable` trips from in-pod calls while
+   * `kubectl` from outside answered in 1.6s.
+   *
+   * A fleet sweep has no per-agent semantics, so callers can share one, but
+   * only one that read fleet state after they arrived. A caller joins a sweep
+   * that has not started reading yet. A caller arriving while a sweep is
+   * already reading waits for it, then shares the single sweep chained after
+   * it with everyone else who arrived meanwhile. Joining the reading sweep
+   * instead would hand back a snapshot from before the caller woke: a run whose
+   * Job died since still reads `running`, and dispatch then cancels same-issue
+   * queued work as `duplicate_dispatch_suppressed`. A wake wave therefore costs
+   * at most two sweeps, not N.
+   *
+   * The optional freshness TTL is off by default: see
+   * {@link START_LOCK_REAP_TTL_DEFAULT_MS} for why a sequential caller does
+   * need its own sweep.
+   *
+   * ponytail: TTL is wall-clock, not a real invalidation. A skipped caller
+   * dispatches against reap state up to TTL old, and a run whose Job died
+   * inside that window makes dispatch cancel same-issue queued work. If a TTL
+   * is ever needed by default, key it on a fleet-state version instead of a
+   * timestamp.
+   *
+   * Direct callers of `reapOrphanedRuns` (the periodic reaper, tests) are
+   * deliberately left alone: this is a dispatch-path fix, and the row-level
+   * dedup those callers rely on is a separate, still-tested invariant.
+   */
+  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh"> {
+    if (joinableStartLockReap) {
+      await joinableStartLockReap;
+      return "joined";
+    }
+    if (inFlightStartLockReap) {
+      // The reading sweep's own failure belongs to its callers. This caller is
+      // served by the chained sweep, so it must not inherit that rejection.
+      await scheduleStartLockReap(inFlightStartLockReap.catch(() => undefined));
+      return "ran";
+    }
+    const configuredTtlMs = Number.parseInt(process.env.AGENT_START_LOCK_REAP_TTL_MS ?? "", 10);
+    const ttlMs = Number.isFinite(configuredTtlMs) && configuredTtlMs >= 0
+      ? configuredTtlMs
+      : START_LOCK_REAP_TTL_DEFAULT_MS;
+    if (ttlMs > 0 && Date.now() - sharedStartLockReapCompletedAtMs < ttlMs) return "skipped_fresh";
+    await scheduleStartLockReap(Promise.resolve());
+    return "ran";
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -28020,6 +28231,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         resumeContinuation: dispatchPassOptions.resumeContinuation === true,
         suppressHeadRescanDemand: dispatchPassOptions.suppressHeadRescanDemand === true,
       });
+      markAgentStartLockPhase(agentId, "agent_load");
       let agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -28056,18 +28268,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Timed in `finally` so a sweep that stalls and then throws (its first
         // `running` select sits outside its per-stage catches, so a slow pool
         // acquire that rejects propagates) still logs its duration.
+        //
+        // BLO-36922: the sweep below is single-flight across agents, so a wake
+        // wave now shares one sweep; `reapMs` then includes time spent joined to
+        // another agent's in-flight sweep, which is still time this lock was held.
+        markAgentStartLockPhase(agentId, "reap");
         const reapStartedAtMs = Date.now();
+        let reapDisposition: "ran" | "joined" | "skipped_fresh" | undefined;
         try {
-          await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+          reapDisposition = await reapOrphanedRunsForStartLock();
         } finally {
           const reapMs = Date.now() - reapStartedAtMs;
           if (reapMs >= LOCK_HELD_WARN_MS) {
             logger.warn(
-              { agentId, reapMs, warnAfterMs: LOCK_HELD_WARN_MS },
+              { agentId, reapMs, reapDisposition, warnAfterMs: LOCK_HELD_WARN_MS },
               "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
             );
           }
         }
+        logger.debug(
+          { agentId, reapDisposition },
+          "startNextQueuedRunForAgent: start-lock orphan reap disposition (BLO-36922)",
+        );
       }
       // BLO-12990 Fix #1 / BLO-20775: stale/silent running runs must not block new
       // high-priority work. Fetch full run rows so `isRunOccupyingSlot` can partition
@@ -28076,6 +28298,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // against, so the productivity review reports the same slot population dispatch
       // enforces (BLO-27698 C1) — its rationale, including why this uses the NEWEST
       // stamp rather than the first non-null, is documented there.
+      markAgentStartLockPhase(agentId, "slot_check");
       const dispatchNow = new Date();
       const runningRunRows = await listRunningRunsForAgent(agentId);
       const runningCount = countRunsOccupyingSlots(runningRunRows, dispatchNow.getTime());
@@ -28177,6 +28400,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // applies to a prefix that is entirely prunable. Paging with a keyset
       // cursor lets one pass walk past a wall of invalid or blocked rows and
       // still reach real work.
+      markAgentStartLockPhase(agentId, "queue_scan");
       const issueById = new Map<string, { id: string; status: string; priority: string | null }>();
       const dependencyReadiness = new Map<
         string,
@@ -29159,6 +29383,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // concurrently with the review that already owns this PR task.
             continue;
           }
+          markAgentStartLockPhase(agentId, "claim");
           const claimed = await claimQueuedRun(queuedRun, companyAgents);
           if (!claimed) {
             if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
@@ -29989,6 +30214,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
         issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
       });
+    // BLO-37188: on an issue's FIRST run `issueRef.projectWorkspaceId` is still
+    // null -- it is backfilled from the realized workspace far below -- so the
+    // key above had nothing to bind to and the run went unexcluded. Reproduce
+    // here the row `resolveWorkspaceForRun` will try first with no preferred
+    // workspace: the same `listProjectWorkspacesInRealizationOrder` list, through
+    // `selectBindTimeProjectWorkspaceFallbackId` (see both for why that is the
+    // earliest row, not the `isPrimary` one).
+    //
+    // `useProjectWorkspace` is ONE value, passed both to the gate here and to
+    // `resolveWorkspaceForRun` below, so the two cannot disagree about whether
+    // this run consults project workspaces at all. When it is false
+    // (`agent_default`) the run lands in the agent home, and keying it on a
+    // project tree it never touches would serialize unrelated agents for nothing.
+    const useProjectWorkspace = requestedExecutionWorkspaceMode !== "agent_default";
+    const projectIdNeedingWorkspaceFallback = resolveProjectIdNeedingWorkspaceFallback({
+      statelessPrReview: paperclipPrReview !== null,
+      issueProjectWorkspaceId: issueRef?.projectWorkspaceId ?? null,
+      useProjectWorkspace,
+      executionProjectId,
+    });
+    const projectWorkspaceFallbackId = projectIdNeedingWorkspaceFallback
+      ? selectBindTimeProjectWorkspaceFallbackId(
+          await listProjectWorkspacesInRealizationOrder(db, agent.companyId, projectIdNeedingWorkspaceFallback),
+        )
+      : null;
     const perIssueWorkspaceTreeKey = resolveWorkspaceWriterTreeKey({
       statelessPrReview: paperclipPrReview !== null,
       runResolvesToOwnTree,
@@ -29996,6 +30246,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issue: issueRef
         ? { id: issueRef.id ?? null, projectWorkspaceId: issueRef.projectWorkspaceId ?? null }
         : null,
+      projectWorkspaceFallbackId,
     });
     const k8sIsolationIdentity = resolveK8sRunIsolationIdentity({
       adapterType: agent.adapterType,
@@ -30398,7 +30649,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           context,
           previousSessionParams,
           {
-            useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default",
+            useProjectWorkspace,
             k8sIsolationMode: k8sIsolationIdentity?.isolationMode ?? null,
           },
         ),
@@ -40053,6 +40304,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
+    // Exposed so the dispatch-path coalescing (BLO-36922) is directly testable;
+    // production callers reach it through `startNextQueuedRunForAgent`.
+    reapOrphanedRunsForStartLock,
     reconcileOrphanedEnvironmentLeases,
     refreshOrphanedRuntimeResourceMetrics,
     resumeRunningExternalRuntimeRuns,

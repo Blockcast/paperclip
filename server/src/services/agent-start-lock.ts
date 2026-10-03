@@ -117,7 +117,27 @@ const followUpByAgent = new Map<string, Promise<unknown>>();
  * marker-identity guard on delete — so the two cannot disagree about whether an
  * agent's lock is held.
  */
-const heldSinceByAgent = new Map<string, number>();
+const heldSinceByAgent = new Map<string, {
+  startedAtMs: number;
+  /**
+   * The phase the section last reported, and when it entered it (BLO-36922).
+   *
+   * The overrun line carried `agentId` and `heldMs` but never said what the
+   * section was *awaiting*, so a fleet stall was unreadable after the fact:
+   * four measured episodes (2026-09-21/22/26) all aged out of the ~1h container
+   * log before anyone could name the blocker, and every downstream instrument
+   * -- DB pool, apiserver latency, event-loop lag, reaper counter -- got
+   * *quieter* during them, which excludes causes without naming one.
+   *
+   * Deliberately a field on this entry rather than a parallel map keyed the
+   * same way: the phase has exactly the lock's lifetime, so a second map is a
+   * leak waiting for someone to forget one `delete` -- in a process already
+   * measured leaking ~1 GiB/h (BLO-30203). One entry cannot disagree with
+   * itself, and there is nothing left to leak.
+   */
+  phase: string;
+  phaseSinceMs: number;
+}>();
 
 /**
  * Follow-up passes that were scheduled without a waiter, because scheduling
@@ -163,7 +183,7 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
     settleMarker = resolve;
   });
   runningByAgent.set(agentId, marker);
-  heldSinceByAgent.set(agentId, startedAtMs);
+  heldSinceByAgent.set(agentId, { startedAtMs, phase: "enter", phaseSinceMs: startedAtMs });
 
   // Wrap so a synchronous throw from `fn` surfaces as a rejection rather than
   // escaping before the lock bookkeeping below is installed.
@@ -192,7 +212,17 @@ async function runExclusively<T>(agentId: string, fn: () => Promise<T>): Promise
     // and gating it behind the backoff would push it ~2x past the threshold.
     if (stopped && loggedStopped && nowMs - lastLoggedAtMs < LOCK_HELD_ERROR_MS) return;
     lastLoggedAtMs = nowMs;
-    const fields = { agentId, heldMs, warnAfterMs: LOCK_HELD_WARN_MS };
+    const entry = heldSinceByAgent.get(agentId);
+    const fields = {
+      agentId,
+      heldMs,
+      warnAfterMs: LOCK_HELD_WARN_MS,
+      // Which await the section is sitting in, and for how long. `phaseMs`
+      // close to `heldMs` means the section has been stuck in that one phase
+      // for its whole hold — that is the line that names the blocker.
+      phase: entry?.phase ?? "unknown",
+      phaseMs: entry ? nowMs - entry.phaseSinceMs : null,
+    };
     if (stopped) {
       loggedStopped = true;
       logger.error(
@@ -365,13 +395,50 @@ export function runDetachedFromAgentStartLock<T>(fn: () => T): T {
  * exactly when a DB-backed collector would itself be stuck and report nothing.
  * Same reasoning as `refreshDbPoolMetrics`.
  */
-export function describeHeldAgentStartLocks(): Array<{ agentId: string; heldMs: number }> {
+export function describeHeldAgentStartLocks(): Array<{
+  agentId: string;
+  heldMs: number;
+  phase: string;
+  phaseMs: number;
+}> {
   const nowMs = Date.now();
-  const held: Array<{ agentId: string; heldMs: number }> = [];
-  for (const [agentId, startedAtMs] of heldSinceByAgent) {
-    held.push({ agentId, heldMs: Math.max(0, nowMs - startedAtMs) });
+  const held: Array<{ agentId: string; heldMs: number; phase: string; phaseMs: number }> = [];
+  for (const [agentId, entry] of heldSinceByAgent) {
+    held.push({
+      agentId,
+      heldMs: Math.max(0, nowMs - entry.startedAtMs),
+      phase: entry.phase,
+      phaseMs: Math.max(0, nowMs - entry.phaseSinceMs),
+    });
   }
   return held;
+}
+
+/**
+ * Record which await the current critical section is sitting in (BLO-36922).
+ *
+ * Callers pass a short, bounded, static phase name — it becomes a metric label,
+ * so it must never carry an agent id, run id, or any other unbounded value.
+ *
+ * No-op when this agent's lock is not held, so a mark that lands after the
+ * section released cannot create a phantom entry.
+ *
+ * Re-marking the phase the section is already in is also a no-op, because
+ * `phaseSinceMs` means "since this phase was entered".
+ * `startNextQueuedRunForAgent` marks `claim` once per candidate inside its
+ * loop, so an unconditional reset would restart the clock on every iteration:
+ * a stall spent grinding 200 candidates would report a small `phaseMs`
+ * throughout, and only a single hung `claimQueuedRun` could ever show
+ * `phaseMs` close to `heldMs` — defeating the reading documented above, which
+ * is the line that names the blocker. Guarding here rather than at that one
+ * call site covers every looped mark, including future ones.
+ */
+export function markAgentStartLockPhase(agentId: string, phase: string): void {
+  const entry = heldSinceByAgent.get(agentId);
+  if (!entry) return;
+  if (entry.phase === phase) return;
+  entry.phase = phase;
+  entry.phaseSinceMs = Date.now();
 }
 
 /**

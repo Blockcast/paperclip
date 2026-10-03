@@ -495,6 +495,26 @@ function isReviewGateEscalationProducer(
   return normalized === normalizeGithubLogin(REVIEW_GATE_ESCALATION_PRODUCER_LOGIN);
 }
 
+// BLO-23395: posted by .github/workflows/merge-queue-eviction-detector.yml
+// (scripts/merge-queue-eviction-detector.mjs) via the default GITHUB_TOKEN
+// whenever a PR is removed from the merge queue without being merged. Gated
+// on the exact github-actions[bot] login below (not just the marker) so an
+// arbitrary commenter cannot spoof a merge-queue-eviction wake.
+//
+// Anchored at literal byte 0, for the reason stated at length on
+// REVIEW_GATE_ESCALATION_MARKER_PATTERN above: leading whitespace in Markdown
+// is an indented code block, i.e. the canonical way to render "here is the
+// marker" while merely DISCUSSING it. The previous `trimStart()` spelling read
+// such a quote as a real eviction. The author guard bounds the blast radius to
+// github-actions[bot], but that identity posts many unrelated comments in this
+// repo, so the tolerance bought nothing and cost a spoofing shape.
+const MERGE_QUEUE_EVICTION_MARKER = "<!-- paperclip:merge-queue-eviction -->";
+const MERGE_QUEUE_EVICTION_BOT_LOGIN = "github-actions[bot]";
+
+function hasMergeQueueEvictionMarker(body: string | null | undefined): boolean {
+  return typeof body === "string" && body.startsWith(MERGE_QUEUE_EVICTION_MARKER);
+}
+
 // BLO-23059: Claude Code Review posts its "this integration is paused/disabled"
 // org-settings notice as a FORMAL pull_request_review (state COMMENTED, commit_id
 // = current head), not as a plain comment. Measured 2026-08-07:
@@ -1709,12 +1729,23 @@ function resolveEventContextRaw(
           });
         }
       }
+      // BLO-23395: a merge-queue eviction notice is its own actionable
+      // signal, independent of the reviewer-request/feedback detection above
+      // (it is not authored by the reviewer bot at all).
+      const mergeQueueEvictionNotice =
+        commentAuthorLogin === MERGE_QUEUE_EVICTION_BOT_LOGIN && hasMergeQueueEvictionMarker(commentBody);
       // PEN-3383: report the structureless-feedback drop only when it actually
       // changes the outcome — i.e. when nothing else claims this delivery. A
       // body that is also a review REQUEST or an ESCALATION still produces a
       // context on those paths and loses nothing, and reporting it there would
       // make this signal noise instead of the template-drift alarm it exists to
       // be.
+      //
+      // `mergeQueueEvictionNotice` is deliberately NOT a term here: the verdict
+      // can only be `suppressed_unstructured` for the configured reviewer
+      // identity (classifyPrReviewComment), and an eviction notice is authored
+      // by github-actions[bot], so the conjunction is unreachable. Adding it
+      // would assert a coupling that does not exist.
       if (
         reviewFeedbackVerdict === "suppressed_unstructured" &&
         !reviewerRequest &&
@@ -1728,7 +1759,8 @@ function resolveEventContextRaw(
           commentUrl: readStringField(comment, "html_url"),
         });
       }
-      if (!reviewerRequest && !reviewFeedback && !reviewGateEscalation) return null;
+      if (!reviewerRequest && !reviewFeedback && !reviewGateEscalation && !mergeQueueEvictionNotice)
+        return null;
       // BLO-9293: on a PR's issue_comment payload, `issue.user.login` is the PR
       // author (the comment author is `comment.user.login`, captured separately).
       const issueUser = issue.user as Record<string, unknown> | undefined;
@@ -1765,6 +1797,11 @@ function resolveEventContextRaw(
           issue.body as string | undefined,
         ),
         owningIdentifiers: owning.owning,
+        // Escalation and merge-queue eviction are mutually exclusive by
+        // construction — both markers are anchored at byte 0, so a body can
+        // lead with only one — which is why their relative order here is
+        // immaterial. Both must outrank `reviewerRequest`.
+        //
         // Escalation takes precedence over `reviewerRequest` deliberately, and
         // this ternary is the whole enforcement of "an escalation never
         // dispatches a review": shouldFirePrReviewerWake keys on wakeReason
@@ -1774,9 +1811,11 @@ function resolveEventContextRaw(
         // mention suppression instead would be a silent coupling.
         wakeReason: reviewGateEscalation
           ? "github_pr_review_gate_escalation"
-          : reviewerRequest
-            ? "github_pr_review_requested"
-            : "github_pr_review_feedback",
+          : mergeQueueEvictionNotice
+            ? "github_pr_merge_queue_evicted"
+            : reviewerRequest
+              ? "github_pr_review_requested"
+              : "github_pr_review_feedback",
         prNumber,
         repoFullName,
         // An issue_comment payload carries no `pull_request.head.sha` (see the
@@ -2769,7 +2808,16 @@ function wakeIdempotencySuffix(
 ): { suffix: string; scope: WakeIdempotencyScope } {
   const scopeFor = (identity: string | number | null): WakeIdempotencyScope =>
     identity === null || identity === "" ? "stable" : "request";
-  if (context.wakeReason === "github_pr_review_requested") {
+  // BLO-23395: a merge-queue eviction is comment-scoped for the same reason.
+  // The detector posts a NEW comment per eviction, so the comment id is the
+  // per-event identity. The default repo+pr+reason `stable` key would collide
+  // a second eviction with the first one's still-running author wake (the
+  // evict -> rebase -> re-enqueue -> evict loop) and drop it as a duplicate.
+  // Head-scoping would be wrong: an eviction can recur on an unchanged head.
+  if (
+    context.wakeReason === "github_pr_review_requested" ||
+    context.wakeReason === "github_pr_merge_queue_evicted"
+  ) {
     const identity = context.commentId ?? deliveryId ?? null;
     return {
       suffix: `${context.wakeReason}:comment:${identity ?? "unknown"}`,
@@ -2873,7 +2921,8 @@ const REVIEWER_HEAD_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
 ]);
 
 // The PR-author wake keeps repo+pr+reason keys for everything except the
-// comment-scoped @ally request; widening it is a separate behavior change.
+// comment-scoped @ally request and merge-queue eviction; widening it is a
+// separate behavior change.
 const AUTHOR_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set();
 
 function prReviewerWakeIdempotencyScope(
@@ -6950,6 +6999,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               : {}),
             ...(context.wakeReason === "github_pr_review_requested" && context.commentAuthorLogin
               ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
+              : {}),
+            // BLO-23395: inline the eviction-cause comment so the woken agent
+            // doesn't have to fetch githubEventUrl just to learn why.
+            ...(context.wakeReason === "github_pr_merge_queue_evicted" && context.commentBody
+              ? { githubMergeQueueEvictionBody: context.commentBody }
               : {}),
           },
           // Coalesce rapid bursts on the same PR/event so a single review

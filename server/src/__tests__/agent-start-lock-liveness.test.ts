@@ -4,10 +4,12 @@ import {
   _resetAgentStartLocksForTesting,
   describeHeldAgentStartLocks,
   LOCK_HELD_WARN_MS,
+  markAgentStartLockPhase,
   withAgentStartLock,
 } from "../services/agent-start-lock.js";
 import {
   AGENT_START_LOCK_HELD_SECONDS_METRIC,
+  AGENT_START_LOCK_PHASE_SECONDS_METRIC,
   __resetMetricsForTest,
   getMetricsRegistry,
   setAgentStartLockHeldMetrics,
@@ -65,10 +67,12 @@ describe("agent start lock liveness reporting (PEN-3305)", () => {
     const held = withAgentStartLock(agentId, () => gate.promise, coalesced);
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(describeHeldAgentStartLocks()).toEqual([{ agentId, heldMs: 0 }]);
+    expect(describeHeldAgentStartLocks()).toEqual([{ agentId, heldMs: 0, phase: "enter", phaseMs: 0 }]);
 
     await vi.advanceTimersByTimeAsync(90_000);
-    expect(describeHeldAgentStartLocks()).toEqual([{ agentId, heldMs: 90_000 }]);
+    expect(describeHeldAgentStartLocks()).toEqual([
+      { agentId, heldMs: 90_000, phase: "enter", phaseMs: 90_000 },
+    ]);
 
     gate.resolve("done");
     await held;
@@ -91,6 +95,113 @@ describe("agent start lock liveness reporting (PEN-3305)", () => {
     await expect(held).rejects.toThrow("boom");
 
     expect(describeHeldAgentStartLocks()).toEqual([]);
+  });
+
+  /**
+   * BLO-36922. The overrun line said an agent's dispatch had stopped but never
+   * which await stopped it, so four measured fleet stalls were unnameable once
+   * the ~1h container log rotated. These pin the breadcrumb that closes that.
+   */
+  it("names the phase a held section is sitting in, in the log and the snapshot", async () => {
+    vi.useFakeTimers();
+    const agentId = randomUUID();
+    const gate = deferred<string>();
+
+    const held = withAgentStartLock(agentId, async () => {
+      markAgentStartLockPhase(agentId, "reap");
+      return gate.promise;
+    }, coalesced);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The phase clock is independent of the hold clock: a section that entered
+    // `reap` 20s into a 50s hold reports phaseMs 30_000, not 50_000. That
+    // difference is the whole signal — phaseMs ~= heldMs means the section
+    // never left the phase.
+    await vi.advanceTimersByTimeAsync(20_000);
+    markAgentStartLockPhase(agentId, "queue_scan");
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(describeHeldAgentStartLocks()).toEqual([
+      { agentId, heldMs: 50_000, phase: "queue_scan", phaseMs: 30_000 },
+    ]);
+    expect(warn).toHaveBeenLastCalledWith(
+      // The overrun line fired at heldMs 30_000, by which point the section had
+      // been in `queue_scan` for 10_000 — the two clocks must not be the same
+      // number, or the phase age is not being tracked separately.
+      expect.objectContaining({ agentId, heldMs: 30_000, phase: "queue_scan", phaseMs: 10_000 }),
+      expect.stringContaining("agent start lock held longer than expected"),
+    );
+
+    gate.resolve("done");
+    await held;
+
+    // Cleared with the lock, under the same identity guard — a released
+    // section must not leave a phase behind for the next holder to inherit.
+    expect(describeHeldAgentStartLocks()).toEqual([]);
+    markAgentStartLockPhase(agentId, "reap");
+    expect(describeHeldAgentStartLocks()).toEqual([]);
+  });
+
+  /**
+   * BLO-36922. `startNextQueuedRunForAgent` marks `claim` once per candidate
+   * inside its loop, so an unconditional `phaseSinceMs` reset would restart
+   * the clock every iteration: a stall grinding a long queue would report a
+   * small `phaseMs` forever, and only a single hung `claimQueuedRun` could
+   * ever show `phaseMs` close to `heldMs`.
+   */
+  it("does not restart the phase clock when the section re-marks the phase it is already in", async () => {
+    vi.useFakeTimers();
+    const agentId = randomUUID();
+    const gate = deferred<string>();
+
+    const held = withAgentStartLock(agentId, async () => {
+      markAgentStartLockPhase(agentId, "claim");
+      return gate.promise;
+    }, coalesced);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Re-mark `claim` on every iteration, exactly as the claim loop does.
+    for (let i = 0; i < 10; i += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+      markAgentStartLockPhase(agentId, "claim");
+    }
+
+    // phaseMs must span the whole loop, not the last iteration (5_000).
+    expect(describeHeldAgentStartLocks()).toEqual([
+      { agentId, heldMs: 50_000, phase: "claim", phaseMs: 50_000 },
+    ]);
+
+    // A genuine phase change still restarts the clock.
+    markAgentStartLockPhase(agentId, "slot_check");
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(describeHeldAgentStartLocks()).toEqual([
+      { agentId, heldMs: 57_000, phase: "slot_check", phaseMs: 7_000 },
+    ]);
+
+    gate.resolve("done");
+    await held;
+  });
+
+  it("publishes the phase as its own series, leaving the held gauge single-series", async () => {
+    __resetMetricsForTest();
+    setAgentStartLockHeldMetrics([
+      { agentId: "agent-a", heldMs: 930_000, phase: "reap", phaseMs: 925_000 },
+    ]);
+
+    let text = await getMetricsRegistry().metrics();
+    expect(text).toContain(`${AGENT_START_LOCK_PHASE_SECONDS_METRIC}{agent_id="agent-a",phase="reap"} 925`);
+    // The held gauge must stay unlabelled by phase: a label that changes
+    // mid-hold would start a new series and destroy the "+scrape_interval per
+    // scrape on one continuous series" reading this alert family depends on.
+    expect(text).toContain(`${AGENT_START_LOCK_HELD_SECONDS_METRIC}{agent_id="agent-a"} 930`);
+    expect(text).not.toMatch(
+      new RegExp(`${AGENT_START_LOCK_HELD_SECONDS_METRIC}\\{[^}]*phase=`),
+    );
+
+    // Same no-zero-fill semantics as its companion: released means absent.
+    setAgentStartLockHeldMetrics([]);
+    text = await getMetricsRegistry().metrics();
+    expect(text).not.toContain(`${AGENT_START_LOCK_PHASE_SECONDS_METRIC}{`);
   });
 
   it("tracks each agent independently", async () => {
