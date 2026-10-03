@@ -111,6 +111,7 @@ const {
   buildPartialRunError,
   classifyOrphan,
   cleanupJob,
+  isReapablePodLogPath,
   describePodTerminatedError,
   describeTruncationCause,
   extractContainerLogDiagnostic,
@@ -819,7 +820,8 @@ describe("execute: concurrency guard", () => {
     }
   });
 
-  it("deletes stale orphan and proceeds when the run-id lookup is missing", async () => {    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+  it("deletes stale orphan and proceeds when the run-id lookup is missing", async () => {
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
     const orphan = makeJob({ runId: "missing-run", agentId: "agent-abc", taskId: "task-current" });
     mockBatchListJobs.mockResolvedValue({ items: [orphan] });
     mockBatchDeleteJob.mockResolvedValue({});
@@ -2234,6 +2236,31 @@ describe("execute: per-agent creation mutex prevents TOCTOU race", () => {
     // Let A complete so the promises settle cleanly.
     resolveAgentAList({ items: [] });
     await Promise.allSettled([pA, pB]);
+  });
+});
+
+// BLO-39114: the integration test that exercises this guard feeds it
+// `…/not-a-pod-log.yaml`, which is already absolute and `..`-free — so it
+// pins only the suffix clause and the other two survive being deleted.  One
+// assertion per clause, so reverting any one of the three reddens exactly one
+// line here.
+describe("isReapablePodLogPath", () => {
+  it("rejects a relative path", () => {
+    expect(isReapablePodLogPath("relative/r.pod.ndjson")).toBe(false);
+  });
+
+  it("rejects a path that traverses upward", () => {
+    expect(isReapablePodLogPath("/a/../../etc/r.pod.ndjson")).toBe(false);
+  });
+
+  it("rejects anything that is not a pod log", () => {
+    expect(isReapablePodLogPath("/etc/kubernetes/admin.conf")).toBe(false);
+  });
+
+  it("accepts what buildPodLogPath actually produces", () => {
+    expect(
+      isReapablePodLogPath("/paperclip/instances/default/data/run-logs/c/a/r.pod.ndjson"),
+    ).toBe(true);
   });
 });
 
