@@ -1903,8 +1903,9 @@ export function normalizeWorkflowRunSupersession(supersession: string | null | u
  * named shape-B causes, and it presents as healthy delivery *volume* with
  * nothing accepted — invisible to a count that only measures arrival.
  *
- * Cardinality ceiling: KNOWN_GITHUB_WEBHOOK_EVENTS (9, including the
- * `other` bucket) x KNOWN_GITHUB_WEBHOOK_OUTCOMES (3) = 27 series per
+ * Cardinality ceiling: KNOWN_GITHUB_WEBHOOK_EVENTS (8) plus the separate
+ * UNKNOWN_GITHUB_WEBHOOK_EVENT `other` bucket = 9 event values, x
+ * KNOWN_GITHUB_WEBHOOK_OUTCOMES (3) = 27 series per
  * replica, fixed at compile time. No repo, PR number, sender or SHA label —
  * and `event` is normalized against the allowlist precisely because it
  * originates in the attacker-controlled `x-github-event` header on a request

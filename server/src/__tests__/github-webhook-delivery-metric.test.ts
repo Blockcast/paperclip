@@ -27,7 +27,9 @@ import {
   GITHUB_WEBHOOK_DELIVERY_METRIC,
   KNOWN_GITHUB_WEBHOOK_EVENTS,
   KNOWN_GITHUB_WEBHOOK_OUTCOMES,
+  UNKNOWN_GITHUB_WEBHOOK_EVENT,
   __resetMetricsForTest,
+  normalizeGithubWebhookEvent,
   renderMetrics,
 } from "../services/metrics.js";
 import { githubWebhookRoutes } from "../routes/github-webhook.js";
@@ -146,14 +148,34 @@ describe("paperclip_github_webhook_delivery_total", () => {
     expect(await deliveryValue("ping", "accepted")).toBe(0);
   });
 
-  it("buckets an unrecognised x-github-event into `other` and mints no new series", async () => {
+  // Two of the forgeries that most motivate this guard cannot be tested over
+  // HTTP at all: Node's client refuses to transmit them. `setHeader` throws
+  // ERR_INVALID_CHAR against `headerCharRegex = /[^\t\x20-\x7e\x80-\xff]/`,
+  // so a multi-byte value and a bare-newline header-injection value both
+  // reject before the request is sent. Asserting the normalizer directly is
+  // the stronger test anyway — a reverse proxy, or any future non-HTTP
+  // caller, can still hand us those exact bytes.
+  it("normalizes a forged event to `other`, including values HTTP cannot carry", () => {
+    for (const forged of ["🐫".repeat(50), "workflow_run\nevil", "", "\u0000", "WORKFLOW_RUN"]) {
+      expect(normalizeGithubWebhookEvent(forged)).toBe(UNKNOWN_GITHUB_WEBHOOK_EVENT);
+    }
+    expect(normalizeGithubWebhookEvent(undefined)).toBe(UNKNOWN_GITHUB_WEBHOOK_EVENT);
+    expect(normalizeGithubWebhookEvent(null)).toBe(UNKNOWN_GITHUB_WEBHOOK_EVENT);
+    // Positive control: without this, a normalizer that returned `other`
+    // unconditionally would satisfy every assertion above.
+    expect(normalizeGithubWebhookEvent("workflow_run")).toBe("workflow_run");
+  });
+
+  it("buckets a transmissible unrecognised x-github-event into `other` and mints no new series", async () => {
     // The increment runs BEFORE signature verification, so this header is
     // unauthenticated attacker input. Unbounded, it is a remote cardinality
-    // bomb against the whole registry.
+    // bomb against the whole registry. Only values Node will actually put on
+    // the wire belong here; the rest are covered by the normalizer test above.
     const before = await deliveryLabelPairs();
     const body = JSON.stringify({});
+    const forgeries = ["sponsorship", randomish()];
 
-    for (const forged of ["🐫".repeat(50), "workflow_run\nevil", randomish(), "sponsorship"]) {
+    for (const forged of forgeries) {
       await request(buildApp(WEBHOOK_SECRET))
         .post("/api/webhooks/github")
         .set("x-github-event", forged)
@@ -163,7 +185,7 @@ describe("paperclip_github_webhook_delivery_total", () => {
     }
 
     expect(await deliveryLabelPairs()).toEqual(before);
-    expect(await deliveryValue("other", "rejected_signature")).toBe(4);
+    expect(await deliveryValue("other", "rejected_signature")).toBe(forgeries.length);
   });
 });
 
