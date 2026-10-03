@@ -706,6 +706,11 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_released",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+// PEN-3743: cap on the superseded-comment id list inlined into the wake payload
+// and the task markdown. The COUNT is always exact; only the enumeration is
+// capped, so a wake that coalesced hundreds of comments still reports the true
+// size while the payload stays bounded.
+const SUPERSEDED_WAKE_COMMENT_ID_LIMIT = 20;
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
@@ -10120,6 +10125,22 @@ export async function buildPaperclipWakePayload(input: {
   // payload construction, inline only the current newest comment so an agent
   // never receives an hours-old answer while retaining a freshness anchor.
   const commentIds = latestIssueComment ? [latestIssueComment] : requestedCommentIds;
+  // PEN-3743: the override above is correct, but it is the point at which a
+  // coalesced wake stops carrying the orders it absorbed. `requestedCommentIds`
+  // IS the complete accumulated set -- `mergeCoalescedContextSnapshot` keeps it
+  // in `wakeCommentIds` and it survives deferral and promotion intact -- so the
+  // ids are not lost, only un-delivered. Name the difference here so the run is
+  // told what it does not have.
+  //
+  // Without this the loss is actively disguised rather than merely unreported:
+  // `requestedCount` below was computed from the POST-override list, so it could
+  // never exceed `includedCount` from this cause, and `fallbackFetchNeeded` was
+  // correspondingly false -- an explicit assertion of completeness aimed at the
+  // one reader who would otherwise go and check. Measured 2026-10-03 on PEN-3743
+  // itself: two comments 34s apart, `wakeCommentIds` holding both, the delivered
+  // payload holding one, and `{requestedCount: 1, missingCount: 0}` reporting it
+  // as whole.
+  const supersededCommentIds = requestedCommentIds.filter((id) => !commentIds.includes(id));
   if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
 
   const commentRows =
@@ -10383,9 +10404,17 @@ export async function buildPaperclipWakePayload(input: {
       requestedCount: commentIds.length,
       includedCount: comments.length,
       missingCount: missingCommentCount,
+      // PEN-3743: absorbed by this wake but deliberately not inlined (see the
+      // freshness override above). `supersededCount` is exact; the id list is
+      // capped so a long coalesce cannot inflate the payload. Counting these
+      // into `fallbackFetchNeeded` is the point of the field -- a run holding
+      // only the newest comment must know to go read the rest.
+      supersededCount: supersededCommentIds.length,
+      supersededCommentIds: supersededCommentIds.slice(0, SUPERSEDED_WAKE_COMMENT_ID_LIMIT),
     },
     truncated: payloadTruncated,
-    fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    fallbackFetchNeeded:
+      payloadTruncated || missingCommentCount > 0 || supersededCommentIds.length > 0,
   };
 }
 
@@ -12308,6 +12337,13 @@ export function buildPaperclipTaskMarkdown(input: {
     id: string;
     body: string;
   } | null;
+  // PEN-3743: comment ids this wake absorbed but whose bodies are NOT inlined
+  // above, because the freshness override in `buildPaperclipWakePayload` kept
+  // only the newest. The ids survive on the run row (`wakeCommentIds`); what
+  // was missing was any route from there into the one surface the agent
+  // reliably reads, which is this prompt.
+  supersededWakeCommentIds?: string[] | null;
+  supersededWakeCommentCount?: number | null;
   interaction?: {
     kind?: string | null;
     status?: string | null;
@@ -12670,6 +12706,28 @@ export function buildPaperclipTaskMarkdown(input: {
   }
   if (wakeComment?.body.trim()) {
     lines.push("", "Latest wake comment:", fenceTaskText(wakeComment.body.trim()));
+  }
+  // PEN-3743: a coalesced wake inlines only the newest comment, so every earlier
+  // order it absorbed reaches the agent as silence. Name them. The ids are the
+  // replay path -- they are durably on the run row and readable over the issue
+  // comments API -- so the only thing that was missing is this sentence.
+  const supersededIds = (input.supersededWakeCommentIds ?? []).filter(
+    (id) => typeof id === "string" && id.trim().length > 0,
+  );
+  const supersededCount = input.supersededWakeCommentCount ?? supersededIds.length;
+  if (supersededCount > 0) {
+    const plural = supersededCount === 1 ? "comment" : "comments";
+    const shown = supersededIds.length > 0 ? ` Ids: ${supersededIds.join(", ")}.` : "";
+    const elided =
+      supersededIds.length > 0 && supersededCount > supersededIds.length
+        ? ` (${supersededCount - supersededIds.length} further id(s) not listed.)`
+        : "";
+    lines.push(
+      "",
+      `Earlier wake ${plural} NOT shown above (${supersededCount}):`,
+      `This wake absorbed ${supersededCount} earlier ${plural} whose ${supersededCount === 1 ? "body is" : "bodies are"} not included here.${shown}${elided}`,
+      `Read ${supersededCount === 1 ? "it" : "them"} on the issue before acting -- ${supersededCount === 1 ? "it may carry an order" : "they may carry orders"} the comment above does not repeat.`,
+    );
   }
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
@@ -31613,6 +31671,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       ancestors: issueAncestors,
       wakeComment: safeWakeCommentContext,
+      // PEN-3743: carry the absorbed-but-not-inlined ids from the payload we
+      // just built into the prompt. Both surfaces are derived from the same
+      // `commentWindow`, so they cannot disagree about what was dropped.
+      supersededWakeCommentIds: paperclipWakePayload?.commentWindow?.supersededCommentIds ?? null,
+      supersededWakeCommentCount: paperclipWakePayload?.commentWindow?.supersededCount ?? null,
       interaction: {
         kind: readNonEmptyString(context.interactionKind),
         status: readNonEmptyString(context.interactionStatus),
