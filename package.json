@@ -51,6 +51,7 @@
     "test:browserslist-security-override": "node --test scripts/browserslist-security-override.test.js",
     "test:multer-security-override": "node --test scripts/multer-security-override.test.js",
     "test:js-yaml-security-override": "node --test scripts/js-yaml-security-override.test.js",
+    "test:http-cache-semantics-security-override": "node --test scripts/http-cache-semantics-security-override.test.js",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
@@ -142,6 +143,15 @@
           "GHSA-g7r4-m6w7-qqqr"
         ]
       }
+    },
+    "BLO-39519": {
+      "sqlite3>node-gyp": {
+        "patchedRange": ">=13",
+        "advisories": [
+          "GHSA-ch52-4w7c-c8xp"
+        ],
+        "note": "GHSA-ch52-4w7c-c8xp (CVE-2026-93748) affects http-cache-semantics <= 4.2.0. npm's latest http-cache-semantics IS 4.2.0 and the advisory carries no first_patched_version, so NO patched version exists and this advisory cannot be remediated by raising a floor. The only consumer chain was sqlite3 -> (optionalDependencies) node-gyp@8.4.1 -> make-fetch-happen@9.1.0 -> http-cache-semantics. Every make-fetch-happen release still pins http-cache-semantics ^4.1.1, so overriding it does not help; node-gyp >=13 drops make-fetch-happen entirely, which removes http-cache-semantics from the graph. This override therefore remediates by REMOVAL, not by patched range -- patchedRange here is the node-gyp floor that achieves it, not an http-cache-semantics version."
+      }
     }
   },
   "pnpm": {
@@ -178,6 +188,7 @@
       "@connectrpc/connect-node>undici": ">=6.27.0 <7",
       "jsdom>undici": ">=7.29.0 <8",
       "multer": ">=2.3.0 <3",
+      "sqlite3>node-gyp": ">=13",
       "browserslist": ">=4.28.7 <5",
       "react": "^19.2.7",
       "react-dom": "^19.2.7",
