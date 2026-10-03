@@ -24,7 +24,7 @@ const NO_CURRENT_USER_REDACTION = { enabled: false } as const;
 /** 24 chars, 4 character classes — unconditionally redactable, and name-anchor-invisible. */
 const SECRET = "Kf9!xQm2vTz7-Rb4Lw8pNc6D";
 
-const PLAN = buildRunSecretRedactionPlan({ TO_DB_PASS: SECRET }, ["TO_DB_PASS"]);
+const PLAN = buildRunSecretRedactionPlan({ env: { TO_DB_PASS: SECRET } }, ["TO_DB_PASS"]);
 
 function sanitize(chunk: string) {
   return sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, undefined, PLAN.needles);
@@ -71,7 +71,7 @@ describe("BLO-39715: mechanism independence", () => {
     // match on the plaintext misses it SILENTLY — the same failure shape as the 2026-08-06
     // `sed` mask that was keyed on the wrong variable name.
     const quoted = 'Ab3"cD4\\eF5!gH6?jK7#mN8';
-    const plan = buildRunSecretRedactionPlan({ PGPASSWORD: quoted }, ["PGPASSWORD"]);
+    const plan = buildRunSecretRedactionPlan({ env: { PGPASSWORD: quoted } }, ["PGPASSWORD"]);
     const escaped = JSON.stringify(quoted).slice(1, -1);
 
     expect(escaped).not.toEqual(quoted); // guard: the fixture must actually exercise escaping
@@ -115,7 +115,7 @@ describe("BLO-39715: the threshold, and what it declines to cover", () => {
     // This is what stops the control being trivially defeated by choosing a short secret: the
     // gap becomes a visible, attributable finding fixed by rotation, not an invisible hole.
     const plan = buildRunSecretRedactionPlan(
-      { SHORT_PASS: "abc", PG_USER: "postgres", REAL_TOKEN: SECRET },
+      { env: { SHORT_PASS: "abc", PG_USER: "postgres", REAL_TOKEN: SECRET } },
       ["SHORT_PASS", "PG_USER", "REAL_TOKEN"],
     );
 
@@ -129,11 +129,16 @@ describe("BLO-39715: the threshold, and what it declines to cover", () => {
     const shortSecret = "Qw3!rTy9Zx2@Vb5";
     const longSecret = `${shortSecret}Nm8$Kp1`;
     const plan = buildRunSecretRedactionPlan(
-      { A_TOKEN: shortSecret, B_TOKEN: longSecret },
+      { env: { A_TOKEN: shortSecret, B_TOKEN: longSecret } },
       ["A_TOKEN", "B_TOKEN"],
     );
 
-    expect(plan.needles[0]).toEqual(longSecret);
+    // Assert the INVARIANT, not a literal position: encoding variants are longer than their
+    // plaintext and legitimately sort ahead of it, so pinning `needles[0]` would pin an
+    // implementation detail. What must hold is that the longer plaintext is replaced before
+    // the shorter one it contains.
+    expect(plan.needles.indexOf(longSecret)).toBeLessThan(plan.needles.indexOf(shortSecret));
+    expect(plan.needles).toEqual([...plan.needles].sort((a, b) => b.length - a.length));
 
     const sanitized = sanitizeRunLogChunkForStorage(
       `value=${longSecret}`,
@@ -156,5 +161,104 @@ describe("BLO-39715: the control is inert when it has nothing to do", () => {
   it("does not mangle a transcript that merely resembles a secret", () => {
     const chunk = "retrying with backoff=true user=postgres host=localhost";
     expect(sanitize(chunk)).toEqual(chunk);
+  });
+});
+
+describe("BLO-39715: secretKeys is a mixed namespace", () => {
+  /**
+   * `resolveAdapterConfigForRuntime` puts two different kinds of key into one `Set`:
+   * env-binding keys, whose value lands in `resolved.env[key]`, and adapter top-level schema
+   * secret fields (`meta.secret === true`, plus `FALLBACK_ADAPTER_SCHEMA_SECRET_FIELDS`),
+   * whose value lands in `resolved[key]`. Reading only the env map dropped the second class
+   * on BOTH paths — not redacted and not reported — which is the one failure this module's
+   * contract forbids outright.
+   */
+
+  it("covers an adapter top-level schema secret field, not just env bindings", () => {
+    const plan = buildRunSecretRedactionPlan(
+      { adapterType: "hermes_gateway", apiKey: SECRET, env: {} },
+      ["apiKey"],
+    );
+
+    expect(plan.needles).toContain(SECRET);
+    expect(plan.uncoveredKeys).toEqual([]);
+    expect(plan.unresolvedKeys).toEqual([]);
+  });
+
+  it("covers both namespaces in one plan", () => {
+    const topLevel = "Zx8@Qw1!Nm4%Vb7Kp0Rt3";
+    const plan = buildRunSecretRedactionPlan(
+      { apiKey: topLevel, env: { TO_DB_PASS: SECRET } },
+      ["apiKey", "TO_DB_PASS"],
+    );
+
+    expect(plan.needles).toContain(SECRET);
+    expect(plan.needles).toContain(topLevel);
+  });
+
+  it("REPORTS a secret key whose value is in neither namespace rather than dropping it", () => {
+    // "too short to replace literally" and "declared secret but not locatable" are different
+    // findings with different remedies — rotate the credential vs fix this module — so they
+    // must not share a bucket. Silence here is the shape the whole control exists to refuse.
+    const plan = buildRunSecretRedactionPlan({ env: { TO_DB_PASS: SECRET } }, [
+      "TO_DB_PASS",
+      "MCP_HEADER_TOKEN",
+    ]);
+
+    expect(plan.unresolvedKeys).toEqual(["MCP_HEADER_TOKEN"]);
+    expect(plan.uncoveredKeys).toEqual([]);
+    expect(plan.needles).toContain(SECRET);
+  });
+
+  it("does not report an empty value as unresolved — it is located and discloses nothing", () => {
+    const plan = buildRunSecretRedactionPlan({ env: { OPTIONAL_TOKEN: "" } }, ["OPTIONAL_TOKEN"]);
+
+    expect(plan.unresolvedKeys).toEqual([]);
+    expect(plan.uncoveredKeys).toEqual([]);
+    expect(plan.needles).toEqual([]);
+  });
+});
+
+describe("BLO-39715: encoding variants", () => {
+  it("redacts the percent-encoded form where no URI carrier anchors the existing scrub", () => {
+    // The sibling of the JSON-escaped case, but scoped honestly. The URI-form DSN
+    // (`postgres://user:p%40ss@host`) is NOT the gap: the pre-existing credentialed-URI scrub
+    // already replaces that whole userinfo segment with no dictionary at all — asserted below
+    // so this stays true if that scrub changes. The residue is the encoded value standing
+    // alone, where nothing name-anchored has anything to anchor on.
+    const pw = "Ab3@cD4!eF5#gH6$jK7%mN8";
+    const encoded = encodeURIComponent(pw);
+    const plan = buildRunSecretRedactionPlan({ env: { PGPASSWORD: pw } }, ["PGPASSWORD"]);
+
+    expect(encoded).not.toEqual(pw); // guard: the fixture must actually exercise encoding
+    expect(plan.needles).toContain(encoded);
+
+    // Control: with NO needles the bare encoded value survives the existing scrub entirely,
+    // which is what makes the assertion below a test of this change rather than of that one.
+    const carrierless = `decoded payload ${encoded} end`;
+    expect(
+      sanitizeRunLogChunkForStorage(carrierless, NO_CURRENT_USER_REDACTION, undefined, []),
+    ).toContain(encoded);
+
+    const sanitized = sanitizeRunLogChunkForStorage(
+      carrierless,
+      NO_CURRENT_USER_REDACTION,
+      undefined,
+      plan.needles,
+    );
+    expect(sanitized).not.toContain(encoded);
+    expect(sanitized).toContain("decoded payload");
+  });
+
+  it("does not throw on a value encodeURIComponent cannot encode", () => {
+    // A lone surrogate raises URIError. A malformed secret must not be able to abort run setup.
+    const loneSurrogate = `Ab3!cD4\uD800eF5#gH6$jK7`;
+
+    expect(() =>
+      buildRunSecretRedactionPlan({ env: { ODD_TOKEN: loneSurrogate } }, ["ODD_TOKEN"]),
+    ).not.toThrow();
+    expect(
+      buildRunSecretRedactionPlan({ env: { ODD_TOKEN: loneSurrogate } }, ["ODD_TOKEN"]).needles,
+    ).toContain(loneSurrogate);
   });
 });

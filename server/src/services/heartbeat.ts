@@ -30774,13 +30774,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     // BLO-39715: build this run's secret-VALUE redaction dictionary here, because this is the
     // one point where every value the run can see is simultaneously in memory. `secretManifest`
-    // deliberately carries no values, so it cannot serve — only `resolvedConfig.env` can.
+    // deliberately carries no values, so it cannot serve — only `resolvedConfig` can.
     //
-    // Scope honestly: this covers env-scope bindings (environment + agent + project + routine)
-    // and MCP header/arg credentials. It does NOT cover `PAPERCLIP_API_KEY`, which the adapter
-    // injects later, nor server-pod inherited env. Absence claims must be scoped accordingly.
+    // Scope honestly, because this block is the authoritative statement a later reader will
+    // rely on when deciding what is ALREADY covered — an overstated class here becomes someone
+    // else's false absence claim. Covered: env-scope secret bindings (environment + agent +
+    // project + routine) and adapter top-level schema secret fields. NOT covered:
+    // `PAPERCLIP_API_KEY`, which the adapter injects later; server-pod inherited env; MCP
+    // header/arg credentials, which do not reach `resolvedConfig` on this path at all; and the
+    // `workspace-operations` sinks, whose commands run with the SERVER environment rather than
+    // a run's resolved secret set, so this dictionary would be the wrong one for them.
+    // Absence claims must be scoped accordingly.
     const runSecretRedaction = buildRunSecretRedactionPlan(
-      (resolvedConfig.env ?? {}) as Record<string, string | undefined>,
+      resolvedConfig as Record<string, unknown>,
       secretKeys,
     );
     if (runSecretRedaction.uncoveredKeys.length > 0) {
@@ -30795,6 +30801,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           uncoveredSecretKeys: runSecretRedaction.uncoveredKeys,
         },
         "run secret values below the transcript redaction threshold; rotate these to longer values",
+      );
+    }
+    if (runSecretRedaction.unresolvedKeys.length > 0) {
+      // Separate from the above because the remedy is different: this means a key was declared
+      // secret-backed but its value sits in a namespace the plan builder does not read, so the
+      // fix is in `run-secret-redaction.ts`, not in whoever owns the credential.
+      logger.warn(
+        {
+          runId: run.id,
+          agentId: agent.id,
+          unresolvedSecretKeys: runSecretRedaction.unresolvedKeys,
+        },
+        "run secret keys not locatable in the resolved adapter config; transcript redaction cannot cover them",
       );
     }
     const effectiveResolvedConfig = applyRunScopedMentionedSkillKeys(

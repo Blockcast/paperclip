@@ -77,6 +77,28 @@ function jsonEscapedBody(value: string): string {
   return encoded.slice(1, encoded.length - 1);
 }
 
+/**
+ * The percent-encoded form, for the same reason as {@link jsonEscapedBody}.
+ *
+ * Be precise about what this buys, because the obvious motivating example is already covered:
+ * a credential inside a URI-form DSN (`postgres://user:p%40ss@host/db`) is caught TODAY by the
+ * pre-existing credentialed-URI scrub, which keys on the `scheme://user:…@host` shape and
+ * needs no dictionary — measured, not assumed. The residue this closes is the encoded value
+ * with no URI carrier beside it: a query-string fragment, a form body, a decoded-then-logged
+ * payload. There the name-anchored scrub has nothing to anchor on and the plaintext needle
+ * misses the encoded bytes silently.
+ *
+ * Returns null rather than throwing: `encodeURIComponent` raises `URIError` on a lone
+ * surrogate, and a malformed secret must not be able to abort run setup.
+ */
+function percentEncoded(value: string): string | null {
+  try {
+    return encodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
 export interface RunSecretRedactionPlan {
   /** Literal needles to replace, longest-first. Never logged. */
   needles: string[];
@@ -85,25 +107,48 @@ export interface RunSecretRedactionPlan {
    * to a longer value. Contains key NAMES only — never a value.
    */
   uncoveredKeys: string[];
+  /**
+   * Keys named as secret-backed whose value could not be located in the resolved config at
+   * all. Distinct from {@link uncoveredKeys}, and deliberately so: "too short to replace
+   * literally" is fixed by rotating to a longer value, whereas "present in `secretKeys` but
+   * nowhere in the config" means this module is reading the wrong namespace and the remedy is
+   * a code change here. Conflating them would file a correct gap under a wrong remedy.
+   * Key NAMES only — never a value.
+   */
+  unresolvedKeys: string[];
 }
 
 /**
  * Build the per-run redaction dictionary from the run's own resolved secret set.
  *
- * `secretEnv` is the plaintext env of the resolved adapter config; `secretKeys` names which of
- * those keys are secret-backed. Both come from `resolveExecutionRunAdapterConfig`, which is the
- * one point where every value for a run is simultaneously in memory.
+ * Takes the WHOLE resolved adapter config, not just its env map, because `secretKeys` is a
+ * mixed namespace: `resolveAdapterConfigForRuntime` adds env-binding keys, whose value lands
+ * in `resolved.env[key]`, AND adapter top-level schema secret fields (every config field with
+ * `meta.secret === true`, plus `FALLBACK_ADAPTER_SCHEMA_SECRET_FIELDS`), whose value lands in
+ * `resolved[key]`. Reading only the env map dropped the second class silently — neither
+ * redacted nor reported — which is precisely what this module's own contract forbids.
+ *
+ * `resolvedConfig` comes from `resolveExecutionRunAdapterConfig`, the one point where every
+ * value for a run is simultaneously in memory.
  */
 export function buildRunSecretRedactionPlan(
-  secretEnv: Readonly<Record<string, string | undefined>>,
+  resolvedConfig: Readonly<Record<string, unknown>>,
   secretKeys: Iterable<string>,
 ): RunSecretRedactionPlan {
   const needles = new Set<string>();
   const uncoveredKeys = new Set<string>();
+  const unresolvedKeys = new Set<string>();
+  const env = (resolvedConfig.env ?? {}) as Record<string, unknown>;
 
   for (const key of secretKeys) {
-    const value = secretEnv[key];
-    if (typeof value !== "string" || value.length === 0) continue;
+    const value = typeof env[key] === "string" ? (env[key] as string) : resolvedConfig[key];
+    if (typeof value !== "string") {
+      unresolvedKeys.add(key);
+      continue;
+    }
+    // An empty value is located and carries nothing to disclose, so it is neither a gap nor
+    // an unresolved key.
+    if (value.length === 0) continue;
 
     // Decide on the ORIGINAL value — an encoded variant is longer and differently shaped, so
     // thresholding the variant would quietly promote a value the rule just declined.
@@ -113,13 +158,15 @@ export function buildRunSecretRedactionPlan(
     }
 
     needles.add(value);
-    const escaped = jsonEscapedBody(value);
-    if (escaped !== value) needles.add(escaped);
+    for (const variant of [jsonEscapedBody(value), percentEncoded(value)]) {
+      if (variant && variant !== value) needles.add(variant);
+    }
   }
 
   return {
     needles: [...needles].sort((a, b) => b.length - a.length),
     uncoveredKeys: [...uncoveredKeys].sort(),
+    unresolvedKeys: [...unresolvedKeys].sort(),
   };
 }
 
