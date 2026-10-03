@@ -200,3 +200,88 @@ export function redactRunSecretValues(text: string, needles: readonly string[]):
   if (needles.length === 0) return text;
   return redactSecretValuesFromText(text, needles, RUN_SECRET_MASK);
 }
+
+/**
+ * BLO-39715: reassemble secret values that straddle two run-log chunks.
+ *
+ * {@link redactRunSecretValues} is a literal match, so it can only redact a needle wholly
+ * contained in the chunk it is handed. Run-log chunks are not token-aligned on ANY path:
+ * the sandbox tailer hands over byte-offset slices of a file being appended to live
+ * (`sandbox-run-log-stream.ts`, 250 ms poll), and the local/k8s adapters forward whatever
+ * Node's `stdout`/`stderr` `"data"` event produced (`server-utils.ts`), which is an
+ * arbitrary buffer boundary. So a cut mid-value is the normal case, not an edge case, and
+ * when it happens neither chunk contains the needle, neither is redacted, and the
+ * reassembled transcript contains the plaintext.
+ *
+ * That miss is invisible: the key resolved fine and cleared the threshold, so it is absent
+ * from both `uncoveredKeys` and `unresolvedKeys`. Nothing reports it. This is the same
+ * failure `sanitizeRunLogChunkForStorage` already closes one layer down by redacting before
+ * truncation — a split across the elided middle — and the identical reasoning applies to a
+ * split across the chunk boundary upstream of it.
+ *
+ * The carry is the standard streaming-match fix: hold back the trailing
+ * `longest needle - 1` characters and prepend them to the next chunk, so every byte is
+ * matched in a window that could contain a complete needle.
+ *
+ * Two deliberate costs, stated rather than silently tuned away:
+ *
+ * 1. Persistence and the live log view lag by up to `holdbackChars`. That bound is the
+ *    longest needle, so a large secret (a PEM key) holds back correspondingly more. It is
+ *    NOT capped: a cap below the longest needle would reintroduce exactly the silent split
+ *    this closes, for precisely the largest secrets. The lag is bounded in time by the
+ *    flush at adapter settle, not just in size.
+ * 2. The flush is required. Without it the final `holdbackChars` of a run's output would be
+ *    dropped, so the caller MUST call `take(stream, "", { flush: true })` once output has
+ *    settled — trading a leak for silent log truncation would be a bad bargain, and callers
+ *    get `holdbackChars` so a test can assert the flush actually happens.
+ *
+ * `holdbackChars === 0` (no needles, or a single one-character needle) makes `take` an
+ * identity function, so a run with nothing to redact is byte-for-byte unchanged and pays
+ * no latency.
+ */
+export interface RunSecretBoundaryCarry {
+  /** Trailing characters withheld per stream. `0` disables the carry entirely. */
+  readonly holdbackChars: number;
+  /**
+   * Returns text with run-secret values already redacted, ready to persist; may be empty
+   * while the window is still filling. The carry redacts rather than returning a raw slice
+   * for the ordering reason documented at the call site below — a caller that masked the
+   * returned slice itself would leak any occurrence straddling the split.
+   */
+  take(stream: string, chunk: string, opts?: { flush?: boolean }): string;
+}
+
+export function createRunSecretBoundaryCarry(needles: readonly string[]): RunSecretBoundaryCarry {
+  // Computed, not read off `needles[0]`. `buildRunSecretRedactionPlan` does sort
+  // longest-first, but this helper is exported and a caller passing an unsorted array
+  // would silently get a too-short window — a correctness bug that reads as working.
+  const longestNeedle = needles.reduce((max, needle) => Math.max(max, needle.length), 0);
+  const holdbackChars = Math.max(0, longestNeedle - 1);
+  const carried = new Map<string, string>();
+
+  return {
+    holdbackChars,
+    take(stream, chunk, opts) {
+      const pending = (carried.get(stream) ?? "") + chunk;
+      if (holdbackChars === 0 || opts?.flush) {
+        carried.delete(stream);
+        return redactRunSecretValues(pending, needles);
+      }
+      // Redact the WHOLE window before splitting it, not the emitted slice afterwards.
+      // This ordering is the correctness argument, and getting it backwards is a silent
+      // leak that still passes a two-chunk test: with a needle of length L <= K, any
+      // occurrence starting before the split point `len - (K - 1)` necessarily ENDS at or
+      // before `len` (p + L < len - K + 1 + K = len + 1), so it is complete inside
+      // `pending` and merely straddles the split. Masking the emitted slice alone would
+      // therefore persist that occurrence's prefix in plaintext. Masking `pending` first
+      // means the split can only ever fall inside a mask.
+      const masked = redactRunSecretValues(pending, needles);
+      const hold = Math.min(holdbackChars, masked.length);
+      // The retained tail may hold the prefix of a needle whose remainder has not arrived.
+      // It is left as-is and re-matched next round; a prefix cannot match, so nothing is
+      // lost by deferring it, and re-masking already-masked text is idempotent.
+      carried.set(stream, masked.slice(masked.length - hold));
+      return masked.slice(0, masked.length - hold);
+    },
+  };
+}

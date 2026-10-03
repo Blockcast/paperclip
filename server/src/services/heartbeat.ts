@@ -4592,7 +4592,7 @@ export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, 
 // Imported for local use below and re-exported so existing importers and tests keep
 // their current entry point.
 import { compactRunLogChunk, sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
-import { buildRunSecretRedactionPlan } from "./run-secret-redaction.js";
+import { buildRunSecretRedactionPlan, createRunSecretBoundaryCarry } from "./run-secret-redaction.js";
 export { compactRunLogChunk, sanitizeRunLogChunkForStorage };
 
 /**
@@ -33080,9 +33080,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, runId));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+      // BLO-39715: a secret can straddle two chunks, and then neither chunk contains the
+      // needle so neither is redacted. See `createRunSecretBoundaryCarry` for why chunk
+      // boundaries are arbitrary on every adapter path, not just the sandbox tailer.
+      const runSecretBoundaryCarry = createRunSecretBoundaryCarry(runSecretRedaction.needles);
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+        // Hold-back is released once the adapter has settled: everything logged after that
+        // point is a complete in-process `[paperclip] …` string rather than a stream slice,
+        // and leaving the carry armed there would withhold the tail of a message with no
+        // later chunk to flush it.
+        const carried = runSecretBoundaryCarry.take(stream, chunk, { flush: adapterExecutionSettled });
+        if (!carried) return;
+        // The carry has already redacted run-secret values, so the needles below are a
+        // second, idempotent pass. That is deliberate and not an oversight: keeping them
+        // means deleting or bypassing the carry degrades to the pre-BLO-39715 behaviour
+        // (whole-chunk matches still redacted) rather than to no value redaction at all.
+        // The alternative — passing `[]` here — would make the carry line load-bearing in
+        // a way no reviewer of a later diff could see.
         const sanitizedChunk = sanitizeRunLogChunkForStorage(
-          chunk,
+          carried,
           currentUserRedactionOptions,
           runSecretRedaction.needles,
         );
@@ -34037,6 +34053,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // every ccrotate retry). Anything `onEvent` delivers from here on is a
         // late event from a continuation that outlived execute().
         adapterExecutionSettled = true;
+        // BLO-39715: flush the boundary carry. Streamed output has stopped, so the trailing
+        // `holdbackChars` of each stream have no later chunk to ride out on and would be
+        // silently dropped from the transcript. `adapterExecutionSettled` is already true
+        // above, so these calls take the flush path. Best-effort and logged rather than
+        // thrown: losing the run's last few characters must not convert a successful run
+        // into a failed one.
+        try {
+          await onLog("stdout", "");
+          await onLog("stderr", "");
+        } catch (flushErr) {
+          logger.warn(
+            { err: flushErr, runId: run.id },
+            "failed to flush run-secret boundary carry; trailing log characters may be missing",
+          );
+        }
         if (branchClaimRenewalTimer) {
           clearInterval(branchClaimRenewalTimer);
         }
