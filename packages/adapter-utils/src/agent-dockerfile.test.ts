@@ -292,17 +292,26 @@ describe("paperclip agent Dockerfile", () => {
     // expression that passes for the wrong reason.
     expect(guard).toContain("! -user root");
     expect(guard).toContain('test -z "$offender"');
-    const runGuard = (dir: string): number => {
-      const script = guard
-        .replace("! -user root", `! -uid ${process.getuid?.() ?? 0}`)
-        .replace("/opt/paperclip-bundled-adapters", dir);
+    const runGuardWith = (script: string, dir: string): number => {
       try {
-        execFileSync("sh", ["-c", script], { stdio: ["ignore", "ignore", "ignore"] });
+        execFileSync("sh", ["-c", script.replace("/opt/paperclip-bundled-adapters", dir)], {
+          stdio: ["ignore", "ignore", "ignore"],
+        });
         return 0;
       } catch (error) {
         return (error as { status?: number }).status ?? 1;
       }
     };
+    const selfUid = process.getuid?.() ?? 0;
+    const runGuard = (dir: string): number =>
+      runGuardWith(guard.replace("! -user root", `! -uid ${selfUid}`), dir);
+    // The ownership arm, re-anchored so it FIRES instead of being vacuous.
+    // `selfUid + 1` rather than a named uid such as 65534: the fixture is
+    // created by this process, so every entry carries selfUid, and "nothing
+    // here can match" is then arithmetic rather than an assumption about which
+    // uids happen to be unused on the runner.
+    const runGuardOwnershipArm = (dir: string): number =>
+      runGuardWith(guard.replace("! -user root", `! -uid ${selfUid + 1}`), dir);
 
     const root = mkdtempSync(path.join(tmpdir(), "pen3715-guard-"));
     try {
@@ -312,6 +321,22 @@ describe("paperclip agent Dockerfile", () => {
       writeFileSync(path.join(root, "node_modules/tsx/cli.mjs"), "export {};\n");
       symlinkSync("../tsx/cli.mjs", path.join(root, "node_modules/.bin/tsx"));
       writeFileSync(path.join(root, "package.json"), "{}\n");
+      // Every mode below is pinned, because mkdirSync and writeFileSync create
+      // at the AMBIENT UMASK (0o777/0o666 minus it) while the clean-tree
+      // controls assert the absence of group/other write. Measured: under
+      // umask 002 the fixture is built 775/664, and controls 1 and 4 invert.
+      // That failure is safe in direction — a looser umask only adds writable
+      // bits, so `-perm /022` matches more and 2/3/5 cannot false-pass — but
+      // it is not harmless: the suite goes red claiming the guard rejects a
+      // clean tree, the symlink exemption this block exists to prove is never
+      // exercised, and the presenting symptom invites loosening the GUARD
+      // rather than fixing the fixture. mkdtempSync needs no pin; mkdtemp(3)
+      // always creates 0700 irrespective of umask. The shipped tree gets these
+      // same modes from `chmod -R go-w`, so pinning them matches the artifact.
+      chmodSync(path.join(root, "node_modules"), 0o755);
+      chmodSync(path.join(root, "node_modules/.bin"), 0o755);
+      chmodSync(path.join(root, "node_modules/tsx"), 0o755);
+      chmodSync(path.join(root, "node_modules/tsx/cli.mjs"), 0o644);
       chmodSync(path.join(root, "package.json"), 0o644);
 
       // 1. A clean tree carrying a .bin symlink must PASS. This is the control
@@ -341,6 +366,16 @@ describe("paperclip agent Dockerfile", () => {
       //    vacuous in exactly the base-image-swap scenario the guard is for.
       //    The `offender=` assignment adopts find's exit status instead.
       expect(runGuard(path.join(root, "does-not-exist"))).not.toBe(0);
+
+      // 6. The OWNERSHIP arm must be live. Controls 1-5 all re-anchor it to
+      //    our own uid to isolate the mode arm, which makes it vacuous there
+      //    by design (see the substitution note above) — so none of them would
+      //    notice if `! -user root` were dropped from the `\( ... -o ... \)`
+      //    grouping. Re-anchored to a uid the fixture cannot carry, it must
+      //    report the very tree control 1 passes. That closes the one
+      //    restructuring the text pins at :293 would still accept: a rewrite
+      //    that keeps the substring but detaches it from the -o alternation.
+      expect(runGuardOwnershipArm(root)).not.toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
