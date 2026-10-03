@@ -141,25 +141,33 @@ export function buildRunSecretRedactionPlan(
   const env = (resolvedConfig.env ?? {}) as Record<string, unknown>;
 
   for (const key of secretKeys) {
-    const value = typeof env[key] === "string" ? (env[key] as string) : resolvedConfig[key];
-    if (typeof value !== "string") {
+    // Read BOTH namespaces rather than preferring one. A key can exist as an env binding AND
+    // as an adapter top-level schema field carrying a different value; a precedence rule would
+    // leave the loser neither redacted nor reported, which is the same hole one level down.
+    const values = [env[key], resolvedConfig[key]].filter(
+      (candidate): candidate is string => typeof candidate === "string",
+    );
+    if (values.length === 0) {
       unresolvedKeys.add(key);
       continue;
     }
-    // An empty value is located and carries nothing to disclose, so it is neither a gap nor
-    // an unresolved key.
-    if (value.length === 0) continue;
 
-    // Decide on the ORIGINAL value — an encoded variant is longer and differently shaped, so
-    // thresholding the variant would quietly promote a value the rule just declined.
-    if (!isRedactableSecretValue(value)) {
-      uncoveredKeys.add(key);
-      continue;
-    }
+    for (const value of values) {
+      // An empty value is located and carries nothing to disclose, so it is neither a gap nor
+      // an unresolved key.
+      if (value.length === 0) continue;
 
-    needles.add(value);
-    for (const variant of [jsonEscapedBody(value), percentEncoded(value)]) {
-      if (variant && variant !== value) needles.add(variant);
+      // Decide on the ORIGINAL value — an encoded variant is longer and differently shaped, so
+      // thresholding the variant would quietly promote a value the rule just declined.
+      if (!isRedactableSecretValue(value)) {
+        uncoveredKeys.add(key);
+        continue;
+      }
+
+      needles.add(value);
+      for (const variant of [jsonEscapedBody(value), percentEncoded(value)]) {
+        if (variant && variant !== value) needles.add(variant);
+      }
     }
   }
 

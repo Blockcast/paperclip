@@ -31814,12 +31814,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     //
     // Scope honestly, because this block is the authoritative statement a later reader will
     // rely on when deciding what is ALREADY covered — an overstated class here becomes someone
-    // else's false absence claim. Covered: env-scope secret bindings (environment + agent +
-    // project + routine) and adapter top-level schema secret fields. NOT covered:
-    // `PAPERCLIP_API_KEY`, which the adapter injects later; server-pod inherited env; MCP
-    // header/arg credentials, which do not reach `resolvedConfig` on this path at all; and the
-    // `workspace-operations` sinks, whose commands run with the SERVER environment rather than
-    // a run's resolved secret set, so this dictionary would be the wrong one for them.
+    // else's false absence claim. Two axes, kept apart: conflating them is how a reader
+    // mistakes a list of value-classes for an inventory of sinks.
+    //
+    // VALUES covered: env-scope secret bindings (environment + agent + project + routine) and
+    // adapter top-level schema secret fields. NOT covered: `PAPERCLIP_API_KEY`, which the
+    // adapter injects later; server-pod inherited env; MCP header/arg credentials — none of
+    // these reach `resolvedConfig` on this path at all. Base64 is a known-uncovered ENCODING:
+    // `kubectl get secret -o yaml` emits it, but base64 is offset-sensitive, so matching a
+    // value embedded mid-stream needs all three alignment variants — a deliberate design
+    // decision, not a variant to bolt onto the list in `buildRunSecretRedactionPlan`.
+    //
+    // SINKS covered: the run-log chunk write path (`sanitizeRunLogChunkForStorage`) only. NOT
+    // covered: (1) the run row's own `error` and `resultJson` columns, which funnel through
+    // `sanitizeRunPatchForStorage` and are scrubbed by a DIFFERENT oracle — a key-name
+    // classifier plus a value heuristic, not this run's resolved secret set — and which are
+    // MORE durable than the log store, reaching backups, exports and the
+    // `result_summary`/`result_result` generated columns; (2) the process adapter's
+    // `meta.commandArgs` run-event payload; (3) the `workspace-operations` sinks, whose
+    // commands run with the SERVER environment rather than a run's resolved secret set, so
+    // this dictionary would be the wrong one for them. Threading the needles into
+    // `sanitizeRunPatchForStorage` is not the one-liner the `onLog` change was:
+    // `setRunStatus(runId, …)` is also called by the BLO-16850 reaper and the
+    // external-lifecycle finalizer, neither of which ran run setup and either of which may be
+    // a different process, so it needs a runId→needles store with a real lifecycle.
     // Absence claims must be scoped accordingly.
     const runSecretRedaction = buildRunSecretRedactionPlan(
       resolvedConfig as Record<string, unknown>,
@@ -33058,7 +33076,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const sanitizedChunk = sanitizeRunLogChunkForStorage(
           chunk,
           currentUserRedactionOptions,
-          undefined,
           runSecretRedaction.needles,
         );
         const countsAsRunProgress = !isSyntheticNonProgressRunLogChunk(sanitizedChunk);

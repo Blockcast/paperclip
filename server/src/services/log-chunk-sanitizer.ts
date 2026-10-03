@@ -43,8 +43,12 @@ export function compactRunLogChunk(chunk: string, maxChars = MAX_PERSISTED_LOG_C
 export function sanitizeRunLogChunkForStorage(
   chunk: string,
   currentUserRedactionOptions: Parameters<typeof redactCurrentUserText>[1],
+  // BLO-39715: REQUIRED, and ahead of `maxChars`, deliberately. A default would let the next
+  // sink added to this helper compile with no value redaction and announce nothing — the
+  // silent-gap shape the rest of this module exists to refuse. Passing `[]` is still allowed,
+  // but it is now an opt-out a reviewer can see at the call site.
+  runSecretNeedles: readonly string[],
   maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
-  runSecretNeedles: readonly string[] = [],
 ) {
   // BLO-39715: run-scoped secret VALUES are replaced first, on the full chunk, before any
   // truncation. Everything else here is name-anchored — it recognises credential-shaped
