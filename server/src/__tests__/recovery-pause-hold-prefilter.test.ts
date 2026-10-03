@@ -14,9 +14,14 @@ import {
  *
  * These tests pin the three properties the optimisation rests on, because each of them
  * fails silently if broken: a prefilter that never caches is merely slow (invisible), one
- * that caches the positive answer skips the per-issue ancestor walk (wrongly suppresses
- * recovery for unaffected issues), and one with an unbounded window reintroduces exactly
- * the pass-duration-scaled staleness the TTL exists to cap.
+ * that short-circuits on the positive answer skips the per-issue ancestor walk (wrongly
+ * suppresses recovery for unaffected issues), and one with an unbounded window reintroduces
+ * exactly the pass-duration-scaled staleness the TTL exists to cap.
+ *
+ * The directional invariant these rest on — that `hasAnyActivePauseHold`'s predicate stays a
+ * SUPERSET of `getActivePauseHoldGate`'s — cannot be pinned here, because this file mocks the
+ * service away. It is pinned against real SQL in `issue-tree-control-service.test.ts`
+ * ("keeps hasAnyActivePauseHold a superset of getActivePauseHoldGate").
  */
 
 type FakeSvc = {
@@ -73,10 +78,12 @@ describe("active pause-hold prefilter", () => {
     ]);
   });
 
-  it("never serves the positive answer from cache — the per-issue ancestor walk stays live", async () => {
+  it("never short-circuits on the positive answer — the per-issue ancestor walk stays live", async () => {
     // A company WITH a hold proves nothing about any particular issue: only the ancestor
-    // walk inside `getActivePauseHoldGate` can decide that. Caching the positive would
-    // suppress recovery for every issue in the company, including unaffected trees.
+    // walk inside `getActivePauseHoldGate` can decide that. Short-circuiting the positive
+    // would suppress recovery for every issue in the company, including unaffected trees.
+    // Note the memo does store `true` — what must never happen is the caller *acting* on it
+    // without the walk, which is what this asserts.
     const svc = fakeTreeControlSvc({ anyHold: true, gate: null });
     const prefilter = createActivePauseHoldPrefilter({ now: () => 1_000 });
 
@@ -160,5 +167,76 @@ describe("active pause-hold prefilter", () => {
     // window the TTL exists to bound span a whole tick.
     expect(DEFAULT_ACTIVE_PAUSE_HOLD_PREFILTER_TTL_MS).toBeGreaterThan(0);
     expect(DEFAULT_ACTIVE_PAUSE_HOLD_PREFILTER_TTL_MS).toBeLessThanOrEqual(10_000);
+  });
+
+  it("counts the round-trips it took and the ones it removed", async () => {
+    // PEN-3636: without this the saving is a projection. `memoHits` must equal exactly the
+    // number of company-scoped reads that did not happen, or the figure reported on the
+    // issue is not a measurement of anything.
+    const svc = fakeTreeControlSvc({ anyHold: false });
+    const prefilter = createActivePauseHoldPrefilter({ now: () => 1_000 });
+
+    expect(prefilter.stats()).toEqual({ liveReads: 0, memoHits: 0 });
+
+    for (let i = 0; i < 10; i += 1) {
+      await isAutomaticRecoverySuppressedByPauseHold(
+        db,
+        "company-1",
+        `issue-${i}`,
+        svc as never,
+        db,
+        prefilter,
+      );
+    }
+    await isAutomaticRecoverySuppressedByPauseHold(db, "company-2", "x", svc as never, db, prefilter);
+
+    // Two companies ⇒ two live reads; the other nine calls were answered from the memo.
+    expect(prefilter.stats()).toEqual({ liveReads: 2, memoHits: 9 });
+    // The counters must agree with the collaborator rather than merely be self-consistent.
+    expect(svc.hasAnyActivePauseHold).toHaveBeenCalledTimes(2);
+  });
+
+  it("books a failed read as a round-trip taken, not as a saving", async () => {
+    // Counting on return would flatter the saving on exactly the passes where the database
+    // is in trouble — the reading would improve as the system degraded.
+    const svc: FakeSvc = {
+      hasAnyActivePauseHold: vi.fn(async () => {
+        throw new Error("connection terminated");
+      }),
+      getActivePauseHoldGate: vi.fn(async () => null),
+    };
+    const prefilter = createActivePauseHoldPrefilter({ now: () => 1_000 });
+
+    await expect(
+      isAutomaticRecoverySuppressedByPauseHold(db, "c", "i1", svc as never, db, prefilter),
+    ).rejects.toThrow("connection terminated");
+
+    expect(prefilter.stats()).toEqual({ liveReads: 1, memoHits: 0 });
+  });
+
+  it("does not memoise a read that threw", async () => {
+    // A failed read must not populate the cache: serving `present: false` from a read that
+    // never returned would suppress the guard on evidence that does not exist.
+    let fail = true;
+    const svc: FakeSvc = {
+      hasAnyActivePauseHold: vi.fn(async () => {
+        if (fail) throw new Error("connection terminated");
+        return true;
+      }),
+      getActivePauseHoldGate: vi.fn(async () => ({ holdId: "h1" })),
+    };
+    const prefilter = createActivePauseHoldPrefilter({ now: () => 1_000 });
+
+    await expect(
+      isAutomaticRecoverySuppressedByPauseHold(db, "c", "i1", svc as never, db, prefilter),
+    ).rejects.toThrow("connection terminated");
+
+    fail = false;
+    // Same company, same instant — a cached entry would short-circuit here and return
+    // `false`. It must re-read instead and observe the hold.
+    expect(
+      await isAutomaticRecoverySuppressedByPauseHold(db, "c", "i2", svc as never, db, prefilter),
+    ).toBe(true);
+    expect(svc.hasAnyActivePauseHold).toHaveBeenCalledTimes(2);
   });
 });
