@@ -4491,6 +4491,7 @@ export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, 
 // Imported for local use below and re-exported so existing importers and tests keep
 // their current entry point.
 import { compactRunLogChunk, sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
+import { buildRunSecretRedactionPlan } from "./run-secret-redaction.js";
 export { compactRunLogChunk, sanitizeRunLogChunkForStorage };
 
 /**
@@ -30771,6 +30772,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context.paperclipSecrets;
     }
+    // BLO-39715: build this run's secret-VALUE redaction dictionary here, because this is the
+    // one point where every value the run can see is simultaneously in memory. `secretManifest`
+    // deliberately carries no values, so it cannot serve — only `resolvedConfig.env` can.
+    //
+    // Scope honestly: this covers env-scope bindings (environment + agent + project + routine)
+    // and MCP header/arg credentials. It does NOT cover `PAPERCLIP_API_KEY`, which the adapter
+    // injects later, nor server-pod inherited env. Absence claims must be scoped accordingly.
+    const runSecretRedaction = buildRunSecretRedactionPlan(
+      (resolvedConfig.env ?? {}) as Record<string, string | undefined>,
+      secretKeys,
+    );
+    if (runSecretRedaction.uncoveredKeys.length > 0) {
+      // Never silently skip: a value too short or too plain to replace literally would
+      // otherwise be an invisible hole, which is exactly the failure this control exists to
+      // close. Reported by KEY NAME only — never the value — so the gap is attributable and
+      // fixable by rotating to a longer value.
+      logger.warn(
+        {
+          runId: run.id,
+          agentId: agent.id,
+          uncoveredSecretKeys: runSecretRedaction.uncoveredKeys,
+        },
+        "run secret values below the transcript redaction threshold; rotate these to longer values",
+      );
+    }
     const effectiveResolvedConfig = applyRunScopedMentionedSkillKeys(
       resolvedConfig,
       runScopedMentionedSkillKeys,
@@ -31963,7 +31989,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const sanitizedChunk = sanitizeRunLogChunkForStorage(chunk, currentUserRedactionOptions);
+        const sanitizedChunk = sanitizeRunLogChunkForStorage(
+          chunk,
+          currentUserRedactionOptions,
+          undefined,
+          runSecretRedaction.needles,
+        );
         const countsAsRunProgress = !isSyntheticNonProgressRunLogChunk(sanitizedChunk);
         if (countsAsRunProgress && stream === "stdout") {
           stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
