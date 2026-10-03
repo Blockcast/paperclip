@@ -471,7 +471,7 @@ function AddAgentPicker({
 /** Order-insensitive comparison of desired skill sets by (key, versionId). */
 function desiredSetsEqual(a: AgentDesiredSkillEntry[], b: AgentDesiredSkillEntry[]): boolean {
   if (a.length !== b.length) return false;
-  const encode = (entry: AgentDesiredSkillEntry) => `${entry.key} ${entry.versionId ?? ""}`;
+  const encode = (entry: AgentDesiredSkillEntry) => `${entry.key}\u0000${entry.versionId ?? ""}`;
   const setA = new Set(a.map(encode));
   return b.every((entry) => setA.has(encode(entry)));
 }

@@ -5325,7 +5325,7 @@ export function setScheduledRetryParkHorizonMetrics(
     const horizonSeconds = Number.isFinite(entry.horizonSeconds) ? Math.max(0, entry.horizonSeconds) : 0;
     // Distinct reasons can fold to the same `other` label, so re-max here
     // rather than trusting the query's GROUP BY to have produced unique keys.
-    const key = `${agentId} ${reason}`;
+    const key = `${agentId}\u0000${reason}`;
     const current = maxByLabels.get(key);
     if (current === undefined || horizonSeconds > current.horizonSeconds) {
       maxByLabels.set(key, { agentId, reason, horizonSeconds });
