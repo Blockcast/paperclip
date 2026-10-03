@@ -133,7 +133,10 @@ export function workspaceOperationService(db: Db) {
             // Sanitize ONCE, before the excerpt fork, so the excerpt columns and the
             // log-store body cannot diverge — scrubbing one and not the other is the exact
             // half-control this replaced.
-            const sanitizedChunk = sanitizeRunLogChunkForStorage(chunk, currentUserRedactionOptions);
+            // BLO-39715: `[]` is deliberate, not an omission. These commands run with the
+            // SERVER environment, not a run's resolved secret set, so a run's needles would
+            // be the wrong dictionary here.
+            const sanitizedChunk = sanitizeRunLogChunkForStorage(chunk, currentUserRedactionOptions, []);
             if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
             if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
             await logStore.append(handle, {
@@ -158,7 +161,7 @@ export function workspaceOperationService(db: Db) {
             // to the value, it does not reclassify an empty command as an absent one.
             command: recordInput.command == null
               ? null
-              : sanitizeRunLogChunkForStorage(recordInput.command, currentUserRedactionOptions),
+              : sanitizeRunLogChunkForStorage(recordInput.command, currentUserRedactionOptions, []),
             cwd: recordInput.cwd == null
               ? null
               : redactCurrentUserText(recordInput.cwd, currentUserRedactionOptions),

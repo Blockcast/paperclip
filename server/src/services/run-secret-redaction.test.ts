@@ -27,7 +27,7 @@ const SECRET = "Kf9!xQm2vTz7-Rb4Lw8pNc6D";
 const PLAN = buildRunSecretRedactionPlan({ env: { TO_DB_PASS: SECRET } }, ["TO_DB_PASS"]);
 
 function sanitize(chunk: string) {
-  return sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, undefined, PLAN.needles);
+  return sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, PLAN.needles);
 }
 
 describe("BLO-39715: mechanism independence", () => {
@@ -80,7 +80,6 @@ describe("BLO-39715: mechanism independence", () => {
     const sanitized = sanitizeRunLogChunkForStorage(
       chunk,
       NO_CURRENT_USER_REDACTION,
-      undefined,
       plan.needles,
     );
 
@@ -143,7 +142,6 @@ describe("BLO-39715: the threshold, and what it declines to cover", () => {
     const sanitized = sanitizeRunLogChunkForStorage(
       `value=${longSecret}`,
       NO_CURRENT_USER_REDACTION,
-      undefined,
       plan.needles,
     );
     expect(sanitized).not.toContain(shortSecret);
@@ -153,7 +151,7 @@ describe("BLO-39715: the threshold, and what it declines to cover", () => {
 describe("BLO-39715: the control is inert when it has nothing to do", () => {
   it("leaves output untouched when the run has no resolved secrets", () => {
     const chunk = "the deploy then failed because the node was cordoned";
-    expect(sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, undefined, [])).toEqual(
+    expect(sanitizeRunLogChunkForStorage(chunk, NO_CURRENT_USER_REDACTION, [])).toEqual(
       chunk,
     );
   });
@@ -194,6 +192,22 @@ describe("BLO-39715: secretKeys is a mixed namespace", () => {
 
     expect(plan.needles).toContain(SECRET);
     expect(plan.needles).toContain(topLevel);
+  });
+
+  it("covers BOTH values when one key is shadowed across namespaces", () => {
+    // A precedence rule (env wins, or top level wins) would make one of these a needle and
+    // leave the other neither redacted nor reported — an invisible hole with no key name to
+    // attribute it to, which is exactly what `unresolvedKeys` exists to make impossible.
+    const shadowed = "Zx8@Qw1!Nm4%Vb7Kp0Rt3";
+    expect(shadowed).not.toEqual(SECRET);
+    const plan = buildRunSecretRedactionPlan(
+      { TO_DB_PASS: shadowed, env: { TO_DB_PASS: SECRET } },
+      ["TO_DB_PASS"],
+    );
+
+    expect(plan.needles).toContain(SECRET);
+    expect(plan.needles).toContain(shadowed);
+    expect(plan.unresolvedKeys).toEqual([]);
   });
 
   it("REPORTS a secret key whose value is in neither namespace rather than dropping it", () => {
@@ -237,13 +251,12 @@ describe("BLO-39715: encoding variants", () => {
     // which is what makes the assertion below a test of this change rather than of that one.
     const carrierless = `decoded payload ${encoded} end`;
     expect(
-      sanitizeRunLogChunkForStorage(carrierless, NO_CURRENT_USER_REDACTION, undefined, []),
+      sanitizeRunLogChunkForStorage(carrierless, NO_CURRENT_USER_REDACTION, []),
     ).toContain(encoded);
 
     const sanitized = sanitizeRunLogChunkForStorage(
       carrierless,
       NO_CURRENT_USER_REDACTION,
-      undefined,
       plan.needles,
     );
     expect(sanitized).not.toContain(encoded);

@@ -82,6 +82,7 @@ describe("compactRunLogChunk", () => {
     const sanitized = sanitizeRunLogChunkForStorage(
       `PAPERCLIP_SYNTHETIC_TOKEN=${fakeSecret}\nSAFE_ENV_NAME=visible\n`,
       { enabled: false },
+      [],
     );
 
     expect(sanitized).toContain("PAPERCLIP_SYNTHETIC_TOKEN=***REDACTED***");
