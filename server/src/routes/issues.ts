@@ -1396,7 +1396,7 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_SOURCES = new Set([
   "automation",
 ]);
 
-const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
+export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "issue_assigned",
   "issue_blockers_resolved",
   "issue_commented",
@@ -1419,6 +1419,20 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   // one row that said so reported `reason: "other"`. All are server-authored literals,
   // so admitting them widens nothing -- the allowlist exists to keep operator- and
   // adapter-supplied strings out of the response, not these.
+  //
+  // Spelling is load-bearing, which is why the skip family below is asserted against
+  // its writer in `issue-wake-diagnostics-routes.test.ts` rather than restated here.
+  // `writeSkippedHeartbeatRequest` puts the DOTTED `heartbeat.*` form in the `reason`
+  // COLUMN and the bare form only in nested `payload.heartbeatSkip.reason`, which
+  // `projectWakeDiagnosticReason` never reads -- so a bare entry is inert while
+  // looking admitted. The first revision of this list carried bare
+  // `worktree_execution_cutoff` and left exactly the defect this list exists to fix.
+  //
+  // Deliberately NOT admitted: the timer-scheduler skips `provider_capacity_deferred`
+  // and `no_in_flight_work`. Both are agent-scoped rows whose payload carries no
+  // `issueId`, `taskId` or `_paperclipWakeContext`, so `wakeRequestTargetsIssue` can
+  // never return them on this route. Listing them would assert a reachability this
+  // route does not have.
   "issue_execution_deferred",
   "issue_execution_promoted",
   "issue_execution_same_name",
@@ -1430,9 +1444,8 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "task_scope_queued_coalesced",
   "zero_token_session_reset_superseded",
   "pipeline_stage_exit_cancellation_pending",
-  "provider_capacity_deferred",
-  "worktree_execution_cutoff",
-  "no_in_flight_work",
+  "heartbeat.scheduling_suppressed",
+  "heartbeat.worktree_execution_cutoff",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([

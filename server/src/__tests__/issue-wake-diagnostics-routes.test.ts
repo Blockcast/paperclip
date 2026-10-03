@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
@@ -20,7 +22,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
-import { issueRoutes } from "../routes/issues.js";
+import { issueRoutes, ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS } from "../routes/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -308,6 +310,49 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
       claimedAt: null,
     });
     expect(res.body.diagnosis).toContain("deferred for issue_execution_deferred");
+  });
+
+  // The other no-run-row family, and the one whose spelling the first revision of this
+  // change got wrong: `writeSkippedHeartbeatRequest` writes the DOTTED literal to the
+  // `reason` column while the bare form lives only in nested `payload.heartbeatSkip`.
+  // Serve the row end to end so the column spelling is exercised, not just asserted.
+  it("names the suppression reason for a wake skipped by the worktree execution cutoff", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Wake skipped before any run",
+      status: "in_review",
+      assigneeAgentId: agent.id,
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "automation",
+      reason: "heartbeat.worktree_execution_cutoff",
+      status: "skipped",
+      payload: {
+        issueId: issue.id,
+        heartbeatSkip: { reason: "worktree_execution_cutoff", issueId: issue.id },
+      },
+      runId: null,
+      requestedAt: new Date(Date.now() - 10_000),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    expect(res.body.events[0]).toMatchObject({
+      kind: "wake_request",
+      reason: "heartbeat.worktree_execution_cutoff",
+      status: "skipped",
+      runId: null,
+    });
   });
 
   it("returns null diagnosis for an unblocked issue with no wake history", async () => {
@@ -607,5 +652,55 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(res.body.truncatedSections).toEqual({ wakeRequests: true, activityRecords: false });
     expect(res.body.diagnosis).toContain("truncated to 50 wake requests");
     expect(res.body.caps).toEqual({ maxWakeRequests: 50, maxActivityRecords: 50, lookbackDays: 14 });
+  });
+});
+
+// PEN-3727 review follow-up. Deliberately OUTSIDE `describeEmbeddedPostgres`: these
+// assert a static registry against its writer, need no database, and must not go
+// silently green on a host where embedded Postgres is unavailable.
+describe("issue wake diagnostic reason allowlist", () => {
+  // The first revision of the allowlist carried bare `worktree_execution_cutoff`,
+  // which matches no row: every write of that suppression to the `reason` COLUMN uses
+  // the dotted `heartbeat.worktree_execution_cutoff`, and the bare string exists only
+  // as nested `payload.heartbeatSkip.reason`, which `projectWakeDiagnosticReason`
+  // never reads. The entry was inert while looking admitted -- leaving exactly the
+  // defect this route change exists to fix, in the route that exists to explain it.
+  //
+  // So derive the expected literals from the writer rather than restating them: a
+  // rename or a spelling drift on either side fails here instead of quietly
+  // projecting a real suppression to "other".
+  it("admits every reason `writeSkippedHeartbeatRequest` writes to the reason column", () => {
+    const heartbeatSource = readFileSync(
+      fileURLToPath(new URL("../services/heartbeat.ts", import.meta.url)),
+      "utf8",
+    );
+    const written = [
+      ...heartbeatSource.matchAll(/writeSkippedHeartbeatRequest\(\s*"([^"]+)"/g),
+    ].map((match) => match[1]);
+
+    // Guard against the scan itself going vacuous: if the helper is renamed, this
+    // fails loudly rather than passing over an empty set.
+    expect(written.length, "no writeSkippedHeartbeatRequest call sites found").toBeGreaterThan(0);
+
+    for (const reason of written) {
+      expect(
+        ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(reason),
+        `${reason} is written to agent_wakeup_requests.reason on an issue-scoped skip path but projects to "other"`,
+      ).toBe(true);
+    }
+  });
+
+  // The converse, and the reason these two were dropped rather than corrected: both
+  // are written only by the timer scheduler, onto agent-scoped rows whose payload
+  // carries no `issueId`, `taskId` or `_paperclipWakeContext`. `wakeRequestTargetsIssue`
+  // cannot return them, so admitting them would assert a reachability this route does
+  // not have. If either writer ever gains issue scope, re-add it with a route test.
+  it("does not admit timer-scheduler skips this route cannot return", () => {
+    for (const reason of ["provider_capacity_deferred", "no_in_flight_work"]) {
+      expect(
+        ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(reason),
+        `${reason} is agent-scoped and unreachable on this route`,
+      ).toBe(false);
+    }
   });
 });
