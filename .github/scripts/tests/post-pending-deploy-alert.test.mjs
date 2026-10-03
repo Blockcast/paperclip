@@ -178,16 +178,34 @@ test('buildAlert: carries severity=critical so Alertmanager routes it to slack-r
   assert.equal(alert.labels.namespace, 'paperclip');
 });
 
-test('buildAlert: names the pending run so the reader can act without opening the dispatcher log', () => {
-  const verdict = selectStuckApproval({
-    pendingRuns: [
-      waitingRun('2026-09-01T02:00:00.000Z', {
-        url: 'https://github.com/Blockcast/paperclip/actions/runs/33456522759',
-      }),
-    ],
-    alertAfterHours: 6,
-    now: NOW,
-  });
+test('buildAlert: no run-level identity reaches the alert — it is terminal seconds after the push (BLO-39564)', () => {
+  // THE GUARD. The escalate step runs BEFORE the supersede step that cancels the
+  // run it would name, so any run id or run-level timestamp in this payload is
+  // dead within seconds of every push, by the dispatcher's own design. Measured
+  // 2026-10-02: supersede at 23:33:47Z cancelled run 37035438983, its
+  // replacement failed in `build-and-push` at 23:46:08Z, and for 1h26m the only
+  // firing alert asserted `pending run waiting since 16:39:45Z` against a run
+  // with `pending_deployments: 0`.
+  //
+  // Asserted over the WHOLE annotation blob, not over the two field names that
+  // carried it when this was written: the defect is "run identity is published",
+  // and a reader who adds a third annotation next year should fail here too.
+  //
+  // The two values must be distinguishable from the stall clock for this to
+  // discriminate, so the verdict is a SUPERSEDED one — stall start 02:00 is
+  // three hours earlier than the run's own 05:00.
+  const verdict = {
+    ...selectStuckApproval({
+      pendingRuns: [
+        waitingRun('2026-09-01T05:00:00.000Z', {
+          url: 'https://github.com/Blockcast/paperclip/actions/runs/37035438983',
+        }),
+      ],
+      alertAfterHours: 6,
+      now: NOW,
+      stallStartedAt: '2026-09-01T02:00:00.000Z',
+    }),
+  };
   const alert = buildAlert({
     ...verdict,
     alertAfterHours: 6,
@@ -197,10 +215,23 @@ test('buildAlert: names the pending run so the reader can act without opening th
     now: NOW,
   });
 
-  assert.equal(alert.annotations.pending_run_url, verdict.oldest.url);
-  assert.equal(alert.annotations.pending_since, '2026-09-01T02:00:00.000Z');
-  assert.match(alert.annotations.description, /Approve or reject/);
-  assert.match(alert.annotations.description, /33456522759/);
+  const blob = JSON.stringify(alert.annotations);
+  assert.ok(
+    !blob.includes('37035438983'),
+    `no annotation may carry the pending run id — it is cancelled by supersede: ${blob}`,
+  );
+  assert.ok(
+    !blob.includes('2026-09-01T05:00:00.000Z'),
+    `no annotation may carry the pending run's own createdAt — the stall clock is the ` +
+      `durable one: ${blob}`,
+  );
+  assert.equal(alert.annotations.pending_run_url, undefined);
+  assert.equal(alert.annotations.pending_since, undefined);
+
+  // Positive control: the DURABLE half is still published, so this test fails on
+  // a gutted alert as well as on a reverted guard.
+  assert.equal(alert.annotations.stall_since, '2026-09-01T02:00:00.000Z');
+  assert.match(alert.annotations.description, /superseded at least once/);
   assert.match(alert.annotations.summary, /10\.0h/);
 });
 
@@ -212,9 +243,9 @@ test('buildAlert: the call to action is the waiting-runs queue, never the perish
   // inside the sanctioned supersede path.
   //
   // The assertion is on the line the reader ACTS on, not on the url appearing
-  // somewhere in the body: `pendingUrl` is still quoted as observed-at-alert
-  // context, so a test that merely greps for the queue url would pass on a
-  // reverted call to action.
+  // somewhere in the body. That distinction mattered when BLO-26972 still quoted
+  // the run as observed-at-alert context; BLO-39564 removed the quote entirely,
+  // so both halves are now asserted — the CTA here, the whole payload above.
   const verdict = selectStuckApproval({
     pendingRuns: [
       waitingRun('2026-09-01T02:00:00.000Z', {
@@ -251,9 +282,14 @@ test('buildAlert: the call to action is the waiting-runs queue, never the perish
     `the call to action must not link an individual run — it is cancelled by supersede: ${cta}`,
   );
 
-  // The specific run stays visible, just demoted out of the actionable line.
-  assert.match(alert.annotations.description, /33456522759/);
-  assert.equal(alert.annotations.pending_run_url, verdict.oldest.url);
+  // BLO-39564 removed the demotion: the run is not quoted anywhere now, so this
+  // test no longer needs to distinguish "in the CTA" from "elsewhere in the
+  // body". The whole-payload guard is the test above; this one stays pointed at
+  // the line the reader ACTS on, which is the invariant BLO-26972 bought.
+  assert.ok(
+    !alert.annotations.description.includes('33456522759'),
+    'the run must not be quoted anywhere in the description (BLO-39564)',
+  );
 });
 
 test('buildAlert: endsAt brackets the hourly schedule — outlives a missed slot, resolves same-day', () => {
