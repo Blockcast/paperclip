@@ -85,9 +85,45 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   && node /tmp/opencode-responses-replay.mjs \
   && rm /tmp/opencode-responses-replay.mjs
 
+# /opt/paperclip-bundled-adapters is deliberately NOT chowned to node. It holds
+# the GitHub egress scrub runtimes, which the wrappers exec by absolute path,
+# and the agent runs as uid 1000 — so a node-owned tree lets the agent rewrite
+# the control that is supposed to constrain it (PEN-3715). Nothing writes this
+# tree at runtime: the Helm seed only reads package.json out of it, and the
+# agent entrypoint never touches /opt. The directory inode matters as much as
+# its contents, because a root-owned file inside a node-owned directory can
+# still be replaced by rename(2) — and so does its mode, because a root-owned
+# but group/other-writable directory is just as replaceable. The trailing
+# `find` asserts the inode we actually produced, on both axes: a
+# RUNTIME_BASE_IMAGE that began shipping this directory node-owned, or
+# world-writable, would satisfy every source-text check without the build
+# failing. It tests ownership and `-perm /022` rather than a literal mode so
+# that tightening the directory further stays green while loosening it fails.
+#
+# Scope note, because this call site and the server image's share one string:
+# here `find` walks a directory `mkdir -p` has just created and nothing has
+# populated, so the only inode it can reach is that directory itself. The
+# tree-walking half of the expression — the symlink exemption in particular —
+# is exercised only at the server image's call site, over the real npm tree.
+# Do not read a green build here as evidence that the walk was tested.
+#
+# `offender=` before `test`, not `test -z "$(find ...)"`: a POSIX assignment
+# whose value is a command substitution adopts that command's exit status, so
+# a `find` that errors (missing path, a base image whose `find` rejects the
+# GNU `-perm /022` or `-quit` spellings) aborts the build. Written the other
+# way the substitution yields an empty string, `test -z` succeeds, and the
+# check passes precisely in the base-image-swap scenario it exists for.
+#
+# The offending path is echoed before failing: `-print` writes into the command
+# substitution, so otherwise the build log shows only a bare non-zero exit for
+# the whole RUN and never names the inode. Kept identical to the server image's
+# spelling, which is the call site where the walk actually reaches a populated
+# tree and where the message therefore has something to disambiguate.
 RUN mkdir -p /paperclip /paperclip/.local/bin /opt/paperclip-bundled-adapters \
   && ln -sf /usr/local/bin/claude /paperclip/.local/bin/claude \
-  && chown -R node:node /paperclip /opt/paperclip-bundled-adapters
+  && chown -R node:node /paperclip \
+  && offender="$(find /opt/paperclip-bundled-adapters \( ! -user root -o \( ! -type l -a -perm /022 \) \) -print -quit)" \
+  && { test -z "$offender" || { echo "PEN-3715: agent-writable inode in bundled adapter tree: $offender" >&2; false; }; }
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/paperclip-consult-codex.sh /usr/local/bin/paperclip-consult-codex
