@@ -1123,6 +1123,23 @@ jobs:
       - name: Test undefined-identifier guard failure modes
         run: node --test scripts/check-test-undefined-symbols.test.mjs
 
+      # BLO-38582: server's `typecheck` script runs this config, but NOTHING on
+      # pull_request or merge_group runs that script -- `typecheck:build-gaps`
+      # filters server out (its build already contains `tsc`), and the only
+      # `pnpm -r typecheck` lives in release-verify.yml, which is
+      # workflow_call-only. Without this step the allowlist is enforced solely
+      # at release, so a regression merges green. Sibling of the guard above:
+      # same file class, same job.
+      #
+      # `ensure-build-deps` is NOT redundant with `typecheck:build-gaps`: that
+      # script only runs it inside `if (buildGapPackages.length > 0)`
+      # (scripts/run-typecheck-build-gaps.mjs:178-179), so the prerequisite is
+      # contingent on an unrelated set being non-empty. Declare it here, exactly
+      # as server's own `typecheck` script does (server/package.json:43) -- it is
+      # a no-op once satisfied.
+      - name: Typecheck allowlisted server tests
+        run: pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && pnpm --filter @paperclipai/server exec tsc --noEmit -p tsconfig.tests.json
+
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry
 

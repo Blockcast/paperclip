@@ -1,0 +1,10 @@
+{
+  "//": "Typechecks an ALLOWLIST of server test files, gated on tsc's exit code. tsconfig.json excludes src/__tests__ so tests stay out of dist/, and because `typecheck` and `build` share that one config, nothing ever typechecked a test -- so a required-and-nullable contract like evaluateCommentReviewGate's `prAuthorLogin` was unenforced at 41 of its 59 call sites (BLO-38582). This is NOT tsconfig.typecheck.json: that one deliberately sees ALL tests, carries ~1140 pre-existing fixture-typing errors, and must never be gated on its exit code. This one is gated, so `include` may only ever list files that are already error-free. Add a file here once you have cleaned it; that is the ratchet. Do not wire this into `build`.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".."
+  },
+  "include": ["src/__tests__/pr-comment-review-gate.test.ts"],
+  "exclude": ["node_modules", "dist"]
+}
