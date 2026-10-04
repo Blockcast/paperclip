@@ -870,8 +870,13 @@ let s={};try{s=JSON.parse(fs.readFileSync(f,"utf8"))||{}}catch(e){}
 if(typeof s!=="object"||s===null)s={};
 s.hooks=s.hooks||{};
 const guard=process.env.PAPERCLIP_GUARD_FILE||p.join(dir,"paperclip-env-guard.mjs");
-const cmd="node "+guard;
-const GUARD_RE=/paperclip-env-guard[^\s"']*\.mjs$/;
+// POSIX single-quote: a CLAUDE_CONFIG_DIR containing a space must reach the
+// shell as ONE argument. GUARD_RE below must stay in lockstep — it is anchored
+// at $ and its class excludes ', so quoting alone would stop it matching and
+// every hash rotation would APPEND a guard hook instead of replacing the old
+// one. The optional trailing quote also prunes pre-quoting entries on rollout.
+const cmd="node '"+guard.replace(/'/g,"'\\''")+"'";
+const GUARD_RE=/paperclip-env-guard[^\s"']*\.mjs'?$/;
 const list=(Array.isArray(s.hooks.PreToolUse)?s.hooks.PreToolUse:[])
   .map(function(g){
     if(!g||!Array.isArray(g.hooks))return g;

@@ -417,12 +417,56 @@ describe("buildEnvGuardSetupShell", () => {
         (g: { matcher?: string }) => g.matcher === "Bash",
       );
       expect(guardEntries).toHaveLength(1);
-      expect(guardEntries[0].hooks[0].command).toBe(`node ${guardFile}`);
+      expect(guardEntries[0].hooks[0].command).toBe(`node '${guardFile}'`);
       // The stale fixed-name guard hook is gone, not merely deduplicated.
       const raw = readFileSync(path.join(dir, "settings.json"), "utf8");
       expect(raw).not.toContain(`${path.join(dir, "paperclip-env-guard.mjs")}`);
       // Existing Stop hook survived.
       expect(settings.hooks.Stop[0].hooks[0].command).toBe("echo stop");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Both halves of BLO-39898, in one test on purpose. Quoting `cmd` without
+  // widening GUARD_RE silently breaks pruning (the class excludes ' and the
+  // pattern is $-anchored), so a hash rotation APPENDS a second live guard hook
+  // — quieter and worse than the unquoted bug. Assert (a) and (b) together so
+  // either mutation alone turns this red.
+  it("quotes the hook command AND still prunes across a hash rotation", () => {
+    const mergeScript = decodedBlobs(buildEnvGuardSetupShell())[2]!;
+    // mkdtemp appends to the prefix, so the resulting path contains a space.
+    const dir = mkdtempSync(path.join(tmpdir(), "pc settings "));
+    expect(dir).toContain(" ");
+    try {
+      const guardA = path.join(dir, "paperclip-env-guard.aaaaaaaaaaaa.mjs");
+      const guardB = path.join(dir, "paperclip-env-guard.bbbbbbbbbbbb.mjs");
+      // A stub standing in for the real guard: argv.length is 2 only when the
+      // shell got the path as a SINGLE argument.
+      writeFileSync(guardB, "console.log(process.argv.length);\n");
+      const merge = (guard: string) =>
+        spawnSync(process.execPath, ["-"], {
+          input: mergeScript,
+          encoding: "utf8",
+          env: { ...process.env, CLAUDE_CONFIG_DIR: dir, PAPERCLIP_GUARD_FILE: guard },
+        });
+      expect(merge(guardA).status).toBe(0);
+      expect(merge(guardB).status).toBe(0); // hash rotation
+
+      const settings = JSON.parse(readFileSync(path.join(dir, "settings.json"), "utf8"));
+      const hooks = settings.hooks.PreToolUse.flatMap(
+        (g: { hooks?: { command?: string }[] }) => g.hooks ?? [],
+      ).filter((h: { command?: string }) => h.command?.includes("paperclip-env-guard"));
+      // (b) exactly one guard hook survives the rotation — not two.
+      expect(hooks).toHaveLength(1);
+
+      // (a) that recorded command runs, as one argument, through a real shell.
+      const ran = spawnSync("/bin/sh", ["-c", hooks[0].command], { encoding: "utf8" });
+      expect(ran.stderr).toBe("");
+      expect(ran.status).toBe(0);
+      expect(ran.stdout.trim()).toBe("2");
+
+      expect(hooks[0].command).toBe(`node '${guardB}'`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
