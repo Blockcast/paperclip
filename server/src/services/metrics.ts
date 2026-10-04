@@ -4140,6 +4140,14 @@ export function recordHeartbeatRunFailed(
   // them — bounded above by 153 x roster(~21), and in practice far less. The
   // unbounded dimension is untouched, which is what makes that bound hold.
   //
+  // That bound is a SNAPSHOT of today's error-code population, not an enforced
+  // ceiling: `error_code` is a raw pass-through. It is safe today because every
+  // source stamps a code-literal (`classifyAgentJobFailureErrorCode` returns a
+  // 3-value union or null; `dailyCapBlock.reason` is one literal). Retaining
+  // `agent_id` for every code multiplied this dimension's cost by the roster,
+  // so the day anything stamps a TEMPLATED or caller-supplied code, gate it
+  // through a KNOWN_ERROR_CODES set here before it ships.
+  //
   // BLO-17953: this deliberately does NOT gate on `isolationMode === "run"`.
   // `resolveK8sRunIsolationIdentity` returns run | workspace | shared for every
   // k8s adapter and all three are execution pods, so gating on "run" erased
