@@ -441,10 +441,16 @@ test('PEN-3744: machine annotations carry the gap for anyone querying /api/v2/al
   assert.equal(alert.annotations.delivery_gap_unavailable, undefined);
 });
 
-test('PEN-3744: with NO gap the alert is byte-identical to the pre-change wording', () => {
+test('PEN-3744: with NO gap the SUMMARY and LEAD are byte-identical to the pre-change wording', () => {
   // The enrichment must degrade to today's behaviour, never to silence and
   // never to a confusing half-sentence: an unmeasured gap is a GitHub blip on
   // the one path that reaches a human.
+  //
+  // Scoped deliberately to the summary and the LEAD PARAGRAPH, which are the
+  // two things the Slack relay forwards. The description as a whole is NOT
+  // byte-identical — it gains a paragraph explaining that neither surface is
+  // reporting the gap — and the looser `startsWith` this used to assert let
+  // exactly that change through unnoticed (Ally review of #2225).
   const alert = stuckAlert();
 
   assert.equal(
@@ -452,8 +458,30 @@ test('PEN-3744: with NO gap the alert is byte-identical to the pre-change wordin
     'Blockcast/paperclip production deploy has been awaiting human approval for 10.0h — ' +
       'the daily dispatcher is a no-op until it clears',
   );
-  assert.ok(alert.annotations.description.startsWith('A docker.yml deploy has been parked on'));
+  assert.equal(
+    slackLead(alert.annotations.description),
+    'A docker.yml deploy has been parked on the paperclip-production reviewer gate since ' +
+      '2026-09-01T02:00:00.000Z (10.0h; threshold 6h).',
+  );
   assert.equal(alert.annotations.delivery_gap_commits, undefined);
+});
+
+test('PEN-3744: with no gap the alert does not claim to be carrying one', () => {
+  // The inhibition paragraph used to assert "this is the only notification
+  // carrying that figure" unconditionally — including on the branch whose own
+  // lead says the gap could not be measured. Two paragraphs apart, flatly
+  // contradictory (Ally review of #2225).
+  const withGap = stuckAlert({ deliveryGap: STALLED_GAP }).annotations.description;
+  const without = stuckAlert({ deliveryGapReason: 'lookup failed: 503 upstream' }).annotations
+    .description;
+
+  assert.match(withGap, /this is the only notification carrying that figure/);
+  assert.doesNotMatch(without, /is the only notification carrying that figure/);
+  assert.match(without, /would carry that figure/);
+  // The warning itself must survive — it matters MORE when nothing is
+  // reporting the gap, not less.
+  assert.match(without, /NO surface is currently reporting the gap/);
+  assert.match(without, /Do not read either silence as the gap being small/);
 });
 
 test('PEN-3744: a FAILED lookup is reported on the alert, not silently absent', () => {

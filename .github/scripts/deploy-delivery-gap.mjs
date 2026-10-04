@@ -74,11 +74,46 @@
 import { DEPLOY_WORKFLOW_FILE } from './deploy-stall-record.mjs';
 
 /**
- * Mirrors guard (2)'s `--limit 20` so both instruments give up at the same
- * point and cannot disagree about whether a deploy exists in history. A pruned
- * history is indistinguishable from "never deployed" in both.
+ * GitHub caps `per_page` at 100, so any depth beyond that must be paged for.
+ * Passing a larger `per_page` is silently clamped, not rejected — which is how
+ * a "deeper scan" can look configured and not be.
  */
-export const DEFAULT_DEPLOY_SCAN_LIMIT = 20;
+export const DEPLOY_SCAN_PAGE_SIZE = 100;
+
+/**
+ * How many runs back to look for a shipped deploy.
+ *
+ * DELIBERATELY DECOUPLED FROM GUARD (2)'s `--limit 20`, which this used to
+ * mirror. The two scans ask different questions and the depth that serves one
+ * is wrong for the other:
+ *
+ *   guard (2)            "has anything EVER deployed?"  — a yes/no that any
+ *                        non-empty window answers; 20 is ample.
+ *   findLastSuccessfulDeploy
+ *                        "how far behind are we?"       — needs to reach PAST
+ *                        the stall to find the last real deploy.
+ *
+ * The stall consumes the window, and that is the defect this depth fixes
+ * (PEN-3744, Ally review of #2225). Every day a stall persists, the dispatcher
+ * adds one `workflow_dispatch` run that concludes `success` with `deploy`
+ * SKIPPED. Measured 2026-10-04 at 13 days of stall: the last real deploy
+ * (`f06c717a`, run 35623928344) sat at position 6, behind 5 skipped-deploy runs
+ * dated 09-27 through 10-01 — one per day. At ~1 run/day a 20-run window is
+ * exhausted at ~20 days of stall, at which point this returns `null` and the
+ * alert degrades to its pre-PEN-3744 wording — precisely as the gap becomes
+ * most worth reporting.
+ *
+ * Scanning deeper can only improve that answer; it cannot make guard (2)'s
+ * answer wrong, because finding a deploy further back still means one exists.
+ * The divergence is safe in one direction only, which is why it is recorded
+ * here rather than left to look like drift.
+ *
+ * 300 runs tolerates ~300 days of daily skipped dispatches, ~23x the worst
+ * stall yet observed. Cost is bounded and scales with the stall, not with this
+ * number: finding a deploy D positions back costs D+1 job probes, so a healthy
+ * lane pays ~1 and only a genuinely never-deployed history pays the full 300.
+ */
+export const DEFAULT_DEPLOY_SCAN_LIMIT = 300;
 
 /**
  * The newest `workflow_dispatch` run of the deploy workflow whose `deploy` JOB
@@ -97,21 +132,36 @@ export async function findLastSuccessfulDeploy({
   workflowFile = DEPLOY_WORKFLOW_FILE,
   scanLimit = DEFAULT_DEPLOY_SCAN_LIMIT,
 }) {
-  const path =
-    `/actions/workflows/${encodeURIComponent(workflowFile)}/runs` +
-    `?event=workflow_dispatch&status=success&per_page=${scanLimit}`;
-  const body = await client.request('GET', path);
-  const runs = [...(body?.workflow_runs ?? [])];
+  const runs = [];
+  // Page until we hold `scanLimit` runs or the API runs out. A short page means
+  // the history ended; stopping there keeps a healthy lane at one list call.
+  for (let page = 1; runs.length < scanLimit; page += 1) {
+    const perPage = Math.min(DEPLOY_SCAN_PAGE_SIZE, scanLimit - runs.length);
+    const path =
+      `/actions/workflows/${encodeURIComponent(workflowFile)}/runs` +
+      `?event=workflow_dispatch&status=success&per_page=${perPage}&page=${page}`;
+    const body = await client.request('GET', path);
+    const batch = body?.workflow_runs ?? [];
+    runs.push(...batch);
+    if (batch.length < perPage) break;
+  }
 
   // Sort explicitly rather than trusting list order. The API returns newest
   // `created_at` first today, but nothing in the contract says so, and an
   // ordering change would silently pick an OLDER deploy — which overstates the
-  // gap, i.e. fails in the safe direction but for an invisible reason.
+  // gap, i.e. fails in the safe direction but for an invisible reason. Sorting
+  // AFTER accumulating every page keeps that guarantee global: a per-page sort
+  // would still trust the API to have paged in order.
   runs.sort((a, b) => Date.parse(b?.created_at ?? 0) - Date.parse(a?.created_at ?? 0));
 
   for (const run of runs) {
     if (!run?.id || !run?.head_sha) continue;
     const jobs = await client.request('GET', `/actions/runs/${run.id}/jobs?per_page=100`);
+    // Exact match, and it is load-bearing: if `deploy` ever gains a matrix the
+    // job names become `deploy (...)` and this silently finds nothing, taking
+    // the fail-open branch. Guard (2) of scheduled-production-deploy.yml makes
+    // the identical assumption, so the two stay consistent — but the coupling
+    // is to the JOB NAME, not to either scan's depth. Widen both together.
     const shipped = (jobs?.jobs ?? []).some(
       (job) => job?.name === 'deploy' && job?.conclusion === 'success',
     );

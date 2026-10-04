@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_DEPLOY_SCAN_LIMIT,
+  DEPLOY_SCAN_PAGE_SIZE,
   findLastSuccessfulDeploy,
   formatDeliveryGap,
   gapDays,
@@ -94,14 +95,146 @@ test('findLastSuccessfulDeploy: an all-skipped history returns null, not a guess
   assert.equal(await findLastSuccessfulDeploy({ client }), null);
 });
 
-test('findLastSuccessfulDeploy: scans the same depth as the dispatcher guard', async () => {
-  const client = stubClient({
-    '/actions/workflows/docker.yml/runs': { workflow_runs: [] },
+/**
+ * Page-aware runs stub. `pages` is an array of run arrays, served in order as
+ * `page=1`, `page=2`, ...; anything past the end is an empty page. This is the
+ * shape the real API has and the flat stub above cannot express.
+ */
+function pagedRunsRoute(pages) {
+  return (path) => {
+    const page = Number(new URL(`https://x${path}`).searchParams.get('page') ?? '1');
+    return { workflow_runs: pages[page - 1] ?? [] };
+  };
+}
+
+test('findLastSuccessfulDeploy: a long stall does not consume the scan window (PEN-3744)', async () => {
+  // THE REGRESSION THIS DEPTH EXISTS FOR. Every day a stall persists the
+  // dispatcher adds one run that concludes `success` with `deploy` SKIPPED, so
+  // the skipped runs push the last real deploy further back at ~1/day. At the
+  // old 20-run depth a stall past ~20 days returned null and the alert
+  // silently degraded to its pre-PEN-3744 wording — exactly when the gap was
+  // most worth reporting. 60 days of stall must still find the deploy.
+  const skipped = Array.from({ length: 60 }, (_, i) =>
+    run(1000 + i, `skip${i}`, `2026-11-${String(30 - (i % 28)).padStart(2, '0')}T00:00:00Z`),
+  );
+  // Date them strictly newest-first so position, not timestamp luck, is what
+  // this test exercises.
+  skipped.forEach((r, i) => {
+    r.created_at = new Date(Date.parse('2026-12-01T00:00:00Z') - i * 86_400_000).toISOString();
+    r.updated_at = r.created_at;
   });
+  const real = run(1, 'aaaa', '2026-09-21T16:10:46Z', '2026-09-21T16:38:56Z');
+
+  const client = stubClient({
+    '/actions/workflows/docker.yml/runs': pagedRunsRoute([[...skipped, real]]),
+    '/actions/runs/': (path) =>
+      path.includes('/actions/runs/1/jobs')
+        ? jobs(['guard', 'success'], ['deploy', 'success'])
+        : jobs(['guard', 'success'], ['deploy', 'skipped']),
+  });
+
+  const last = await findLastSuccessfulDeploy({ client });
+
+  assert.equal(last.headSha, 'aaaa');
+  assert.equal(last.landedAt, '2026-09-21T16:38:56Z');
+  // And it is genuinely past the depth this used to stop at.
+  assert.ok(60 > 20, 'the stall must exceed the retired 20-run window for this to prove anything');
+});
+
+test('findLastSuccessfulDeploy: pages at per_page=100 rather than asking for an impossible page', async () => {
+  // GitHub CLAMPS per_page to 100 instead of rejecting it, so a depth beyond
+  // 100 expressed as a single per_page looks configured and is not.
+  const full = Array.from({ length: 100 }, (_, i) =>
+    run(200 + i, `s${i}`, new Date(Date.parse('2026-12-01T00:00:00Z') - i * 3_600_000).toISOString()),
+  );
+  const real = run(1, 'aaaa', '2026-09-21T16:10:46Z', '2026-09-21T16:38:56Z');
+
+  const client = stubClient({
+    '/actions/workflows/docker.yml/runs': pagedRunsRoute([full, [real]]),
+    '/actions/runs/': (path) =>
+      path.includes('/actions/runs/1/jobs')
+        ? jobs(['deploy', 'success'])
+        : jobs(['deploy', 'skipped']),
+  });
+
+  const last = await findLastSuccessfulDeploy({ client });
+
+  assert.equal(last.headSha, 'aaaa');
+  const listCalls = client.calls.filter((c) => c.includes('/runs?'));
+  assert.ok(listCalls.every((c) => /per_page=(100|\d{1,2})\b/.test(c)), listCalls.join('\n'));
+  assert.ok(listCalls.some((c) => c.includes('page=1')));
+  assert.ok(
+    listCalls.some((c) => c.includes('page=2')),
+    'a full first page must be followed by a second',
+  );
+});
+
+test('findLastSuccessfulDeploy: a short page ends the scan, so a healthy lane pays one list call', async () => {
+  // Cost must scale with the stall, not with the depth ceiling.
+  const client = stubClient({
+    '/actions/workflows/docker.yml/runs': pagedRunsRoute([
+      [run(1, 'aaaa', '2026-09-21T16:10:46Z', '2026-09-21T16:38:56Z')],
+    ]),
+    '/actions/runs/1/jobs': jobs(['deploy', 'success']),
+  });
+
   await findLastSuccessfulDeploy({ client });
-  assert.equal(DEFAULT_DEPLOY_SCAN_LIMIT, 20);
-  assert.ok(client.calls[0].includes(`per_page=${DEFAULT_DEPLOY_SCAN_LIMIT}`));
-  assert.ok(client.calls[0].includes('event=workflow_dispatch'));
+
+  assert.equal(client.calls.filter((c) => c.includes('/runs?')).length, 1);
+});
+
+test('findLastSuccessfulDeploy: never requests more runs than the scan limit', async () => {
+  const page = Array.from({ length: 100 }, (_, i) =>
+    run(300 + i, `s${i}`, new Date(Date.parse('2026-12-01T00:00:00Z') - i * 3_600_000).toISOString()),
+  );
+  const client = stubClient({
+    '/actions/workflows/docker.yml/runs': pagedRunsRoute([page, page, page, page]),
+    '/actions/runs/': jobs(['deploy', 'skipped']),
+  });
+
+  assert.equal(await findLastSuccessfulDeploy({ client, scanLimit: 150 }), null);
+
+  const requested = client.calls
+    .filter((c) => c.includes('/runs?'))
+    .map((c) => Number(new URL(`https://x${c.split(' ')[1]}`).searchParams.get('per_page')));
+  assert.equal(
+    requested.reduce((a, b) => a + b, 0),
+    150,
+    'the final page must be narrowed so the scan cannot overshoot its limit',
+  );
+});
+
+test('findLastSuccessfulDeploy: the newest-first sort spans pages, not just within one', async () => {
+  // A per-page sort would still trust the API to have PAGED in order. Here the
+  // newest shipped run is on page 2, behind an older shipped run on page 1.
+  const older = run(1, 'old', '2026-09-01T00:00:00Z');
+  const filler = Array.from({ length: 99 }, (_, i) =>
+    run(500 + i, `f${i}`, new Date(Date.parse('2026-09-02T00:00:00Z') + i * 3_600_000).toISOString()),
+  );
+  const newest = run(9, 'zzzz', '2026-10-01T00:00:00Z', '2026-10-01T00:05:00Z');
+
+  const client = stubClient({
+    '/actions/workflows/docker.yml/runs': pagedRunsRoute([[older, ...filler], [newest]]),
+    '/actions/runs/': (path) =>
+      /\/actions\/runs\/(1|9)\/jobs/.test(path) ? jobs(['deploy', 'success']) : jobs(['deploy', 'skipped']),
+  });
+
+  const last = await findLastSuccessfulDeploy({ client });
+
+  assert.equal(last.headSha, 'zzzz', 'the newest shipped run wins even when it lands on a later page');
+  assert.ok(!client.calls.some((c) => c.includes('/actions/runs/1/jobs')));
+});
+
+test('findLastSuccessfulDeploy: the depth is DECOUPLED from guard (2) and deeper on purpose', async () => {
+  // Guard (2) asks "has anything ever deployed" (20 is ample); this asks "how
+  // far behind are we", which must reach past the stall. Deeper can only
+  // improve the second and cannot make the first wrong.
+  assert.ok(
+    DEFAULT_DEPLOY_SCAN_LIMIT > 20,
+    'the scan must reach past guard (2)s depth or a long stall goes unmeasured',
+  );
+  assert.equal(DEFAULT_DEPLOY_SCAN_LIMIT % DEPLOY_SCAN_PAGE_SIZE, 0);
+  assert.ok(DEPLOY_SCAN_PAGE_SIZE <= 100, 'GitHub clamps per_page above 100');
 });
 
 test('measureDeliveryGap: ahead_by is the count of commits production is missing', async () => {

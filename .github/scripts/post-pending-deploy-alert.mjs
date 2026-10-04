@@ -295,8 +295,16 @@ export function buildAlert({
         'conclusion=success. Nothing else escalates this.\n\n' +
         'PaperclipApiProductionDeployStalled, the Prometheus rule that reports the delivery ' +
         'gap on its own, is INHIBITED by this alert while it fires (onprem-k8s BLO-37835), so ' +
-        'this is the only notification carrying that figure. Do not read its silence as the ' +
-        'gap being small.\n\n' +
+        (gapPhrase
+          ? 'this is the only notification carrying that figure. Do not read its silence as the ' +
+            'gap being small.\n\n'
+          : // The lookup failed, so the lead carries no figure. Claiming this alert
+            // carries one would contradict its own first paragraph — and the
+            // "silence is not smallness" warning matters MORE here, not less:
+            // neither surface is reporting the gap.
+            'this is the only notification that would carry that figure — and here it could ' +
+            'not be measured, so NO surface is currently reporting the gap. Do not read ' +
+            'either silence as the gap being small.\n\n') +
         (superseded
           ? 'The pending run has been superseded at least once so the approvable head stays ' +
             `current, so it is younger than the stall: it has been waiting since ${oldest.createdAt}. ` +
