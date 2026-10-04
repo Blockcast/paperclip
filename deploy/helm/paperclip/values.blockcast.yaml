@@ -727,7 +727,25 @@ githubApp:
   #    rollout, so old replicas keep capturing while workers drain the backlog.
   # 6. Trigger a full reconciliation and verify statuses are authored by App 3966421.
   # 7. Bind branch protection to review/ally-complete from App 3966421, then lift the freeze.
-  reviewGateCaptureEnabled: false
+  #
+  # Step 3 taken 2026-10-04 (BLO-38934, CTO ruling). Capture-only writes NOTHING
+  # to GitHub: `reviewGateCaptureEnabled` alone constructs the config object
+  # (server/src/app.ts), leaving `enqueueGithubReviewGateDelivery` — a database
+  # insert. Both GitHub writers stay gated on `reviewGateEnabled`/`authorityEnabled`
+  # (app.ts, github-webhook.ts), so there are zero API calls, zero status writes,
+  # zero repository_dispatch and zero extra sweeps until step 5. That is why
+  # step 1's merge freeze does not bind here — no status is written, so no merge
+  # control can move. Steps 1 and 7 remain operator actions on penstock classic
+  # branch protection.
+  #
+  # Watch during the soak, because this is a soak and not a flip-and-forget: for
+  # repos in reviewGateRepositories the webhook handler now returns 202 with a
+  # receipt, and an insert failure returns 503/409 and SHORT-CIRCUITS the handler
+  # before any other webhook processing (server/src/services/github-webhook.ts).
+  # It fails loud — GitHub retries a 503 — but while it fails, other
+  # webhook-driven behaviour for that repo stops too, including agent PR wakes.
+  # Step 5 is not pre-authorized; it needs the soak numbers first.
+  reviewGateCaptureEnabled: true
   reviewGateEnabled: false
   reviewGateRepositories:
     - Blockcast/penstock-llm-proxy-core
@@ -746,10 +764,11 @@ githubApp:
   #     (`review_gate_reconcile`) to the consumer in the Penstock repo. That
   #     external consumer is the success writer for this context; nothing in
   #     this repo, server or workflow, ever posts success for it.
-  # Both flags above are false today, so only the legacy failure writer can
-  # fire; the authority is pre-configured for the rollout, not yet live.
-  # Therefore: do NOT mark this context required on paperclip `master`. With no
-  # in-repo success writer, every healthy PR would sit at "Expected — waiting
+  # `reviewGateEnabled` is still false (capture-only, step 3), so only the
+  # legacy failure writer can fire; the authority captures deliveries to the
+  # database and posts nothing. Therefore, unchanged by step 3: do NOT mark
+  # this context required on paperclip `master`. With no in-repo success
+  # writer, every healthy PR would sit at "Expected — waiting
   # for status" forever. Requiring it is correct only where an external producer
   # posts success — step 7 of the rollout above, on penstock-llm-proxy-core, or
   # a pre-existing external writer as on onprem-k8s.
