@@ -248,7 +248,8 @@ describe("buildExecutionPolicy", () => {
       expect(Object.keys(next ?? {}).sort()).toEqual(["commentRequired", "mode", "stages"]);
     });
 
-    it("rebuilt fields win over the carried copy", () => {      const next = buildExecutionPolicy({
+    it("rebuilt fields win over the carried copy", () => {
+      const next = buildExecutionPolicy({
         existingPolicy: policy({
           commentRequired: false,
           stages: [{

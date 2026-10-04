@@ -996,22 +996,51 @@ export function IssueProperties({
     const nextCheckAt = new Date(monitorAtInput);
     if (Number.isNaN(nextCheckAt.getTime())) return;
     const serviceName = monitorServiceInput.trim() || null;
+    const carried = issue.executionPolicy?.monitor;
+    // BLO-40082: carry the two bounds forward, but drop one that is already
+    // spent. A board "Schedule" always sets `monitorExplicitlyUpdated`
+    // server-side (routes/issues.ts), and on that path
+    // `applyIssueExecutionPolicyTransition` *throws* 422 "Monitor bounds are
+    // already exhausted" rather than stripping them
+    // (services/issue-execution-policy.ts). The dialog renders no control for
+    // either field, so re-sending a lapsed `timeoutAt` or a `maxAttempts` the
+    // monitor has already reached would leave the board unable to reset exactly
+    // the wedged monitors it exists to reset — the "omit `maxAttempts` when
+    // resetting a wedged monitor" path the monitor contract documents, and the
+    // BLO-18294 convergence-stall reset that requires a non-assignee actor.
+    // `null` is how you omit here: the server replaces the monitor wholesale and
+    // `exhaustedMonitorClearReason` reads both through `?? null`.
+    const attemptCount = issue.monitorAttemptCount ?? issue.executionState?.monitor?.attemptCount ?? 0;
+    const timeoutAt = carried?.timeoutAt ?? null;
+    const maxAttempts = carried?.maxAttempts ?? null;
     updateMonitor({
-      // BLO-40082: the same clobber one nesting level down. This literal used to
-      // re-emit 6 of the 11 fields on IssueExecutionMonitorPolicy, so a board
-      // user changing the next-check time silently cleared `timeoutAt`,
+      // The same clobber one nesting level down. This literal used to re-emit
+      // 6 of the 11 fields on IssueExecutionMonitorPolicy, so a board user
+      // changing the next-check time silently cleared `timeoutAt`,
       // `maxAttempts`, `recoveryPolicy`, `gateSignals`, `externalRef` and the
       // nested `productivityReviewDisabled`. `gateSignals` is the sharp one:
       // losing it drops the convergence guard back onto the free-form `notes`
       // signature, which is the precise failure BLO-18294 added it to prevent.
-      // Spread first, then override only the fields this dialog actually has a
-      // control for.
-      ...issue.executionPolicy?.monitor,
+      // Spread first, then override only the fields this dialog authors.
+      ...carried,
       nextCheckAt: nextCheckAt.toISOString(),
       notes: monitorNotesInput.trim() || null,
       scheduledBy: "board",
       kind: serviceName ? "external_service" : null,
       serviceName,
+      // `kind`/`serviceName`/`externalRef` are one cluster describing an
+      // external wait. Clearing a service name that WAS set is the one case
+      // where the user has expressed intent about the cluster, so do not leave
+      // a reference to a wait that no longer exists. An empty input over a
+      // monitor that never had a `serviceName` expresses nothing — clearing
+      // there would be the same silent drop as the rest of this fix.
+      ...(carried?.serviceName && !serviceName && carried.externalRef != null
+        ? { externalRef: null }
+        : {}),
+      // Override only to DROP a spent bound — never to invent a key the stored
+      // monitor did not carry, which is what the negative-control tests pin.
+      ...(timeoutAt && new Date(timeoutAt).getTime() <= Date.now() ? { timeoutAt: null } : {}),
+      ...(maxAttempts !== null && maxAttempts <= attemptCount ? { maxAttempts: null } : {}),
     });
     setMonitorOpen(false);
   };
