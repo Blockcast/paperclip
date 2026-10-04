@@ -28,7 +28,7 @@ const { companies, createDb, pullRequestReviewState } = await import("@paperclip
 const { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } = await import(
   "./helpers/embedded-postgres.js"
 );
-const { reconcileRepoReviewState, selectReviewStateTargets } = await import(
+const { reconcileRepoReviewState, listOpenPullRequests, selectReviewStateTargets } = await import(
   "../services/pr-review-state-reconciler.js"
 );
 
@@ -93,6 +93,34 @@ function openPr(number: number, overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+describe("open-PR enumeration: head sha capture (BLO-39871)", () => {
+  // The gate re-drive probes the commit status at the head, so it needs a sha
+  // the enumeration is already being handed for free. The second case is the
+  // one with teeth: head sha must NOT be a required field, because `malformed`
+  // suppresses the prune — making a field only the re-drive reads able to stop
+  // rows being pruned would be a destructive coupling.
+  beforeEach(() => {
+    // Braces matter: a `beforeEach` that RETURNS a value has that value treated
+    // as a cleanup hook, and `mockReset()` returns the mock itself — vitest then
+    // calls the mock with no arguments during teardown.
+    ghFetchMock.mockReset();
+  });
+
+  it("captures the head sha from the list payload", async () => {
+    routeGithub({ openPrPages: [[openPr(2022, { head: { sha: "0ad8773c" } })]] });
+    const listed = await listOpenPullRequests({ repoFullName: REPO, token: "t", maxPullRequests: 10 });
+    expect(listed?.pullRequests[0]?.headSha).toBe("0ad8773c");
+  });
+
+  it("keeps a PR with no readable head sha, and does not call it malformed", async () => {
+    routeGithub({ openPrPages: [[openPr(2023, { head: null })]] });
+    const listed = await listOpenPullRequests({ repoFullName: REPO, token: "t", maxPullRequests: 10 });
+    expect(listed?.malformed).toBe(0);
+    expect(listed?.pullRequests).toHaveLength(1);
+    expect(listed?.pullRequests[0]?.headSha).toBeNull();
+  });
+});
 
 describeEmbeddedPostgres("pr-review-state reconciler", () => {
   let db!: ReturnType<typeof createDb>;
