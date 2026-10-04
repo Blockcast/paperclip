@@ -2854,11 +2854,20 @@ function activeRunMapKey(companyId: string, runId: string) {
  * Two things this function exists to guarantee, neither of which is visible at a
  * call site that spreads the row:
  *
- *  1. **`contextSnapshot` is dropped.** It is selected only so the containment
- *     class can be derived from it, and it must not reach a response — it carries
- *     the run's wake payload and task data, which is a far wider surface than the
- *     single derived enum any caller needs. Destructuring it out here means a new
- *     consumer cannot reintroduce the leak by forgetting to omit it.
+ *  1. **The response shape is an ALLOWLIST.** Every returned field is named
+ *     below; nothing reaches a response by being present on the row. This is
+ *     deliberately not the `...rest`-after-destructuring form, which is a
+ *     denylist: under that shape any column added to the select later lands in
+ *     the API response automatically, and because `activeRunMapForIssues` takes
+ *     `dbOrTx: any` its `rows` are `any`, so nothing — not the parameter type
+ *     here, not `tsc` — would flag it. The threat model is that the run payload
+ *     must not reach a response, and an allowlist holds it for the NEXT column
+ *     too, not just for `contextSnapshot`.
+ *
+ *     `contextSnapshot` is the live instance of that threat: it is selected only
+ *     so the containment class can be derived from it, and it carries the run's
+ *     wake payload and task data — a far wider surface than the single derived
+ *     enum any caller needs.
  *  2. **`writeContainment` is always present**, explicitly `null` when the run is
  *     unconstrained. See the field's comment on `IssueActiveRunRow`.
  *
@@ -2877,8 +2886,19 @@ export function toIssueActiveRunRow(
     contextSnapshot: Record<string, unknown> | null;
   },
 ): IssueActiveRunRow {
-  const { companyId: _companyId, contextSnapshot, ...rest } = row;
-  return { ...rest, writeContainment: readRecoveryRunWriteClass(contextSnapshot) };
+  return {
+    id: row.id,
+    status: row.status,
+    agentId: row.agentId,
+    invocationSource: row.invocationSource,
+    triggerDetail: row.triggerDetail,
+    startedAt: row.startedAt,
+    finishedAt: row.finishedAt,
+    createdAt: row.createdAt,
+    lastOutputAt: row.lastOutputAt,
+    lastUsefulActionAt: row.lastUsefulActionAt,
+    writeContainment: readRecoveryRunWriteClass(row.contextSnapshot),
+  };
 }
 
 async function activeRunMapForIssues(

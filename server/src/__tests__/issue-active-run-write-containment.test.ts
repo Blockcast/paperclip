@@ -104,6 +104,41 @@ describe("activeRun write-containment projection", () => {
     expect(JSON.stringify(projected)).not.toContain("must-not-be-returned");
   });
 
+  // The projection is an ALLOWLIST, and this is the mutation that distinguishes
+  // it from the denylist form it replaced. Under `...rest` after destructuring
+  // two keys, a column added to the select later rides into the API response
+  // automatically — and `activeRunMapForIssues` takes `dbOrTx: any`, so its
+  // `rows` are `any` and neither the parameter type nor `tsc` flags it. So the
+  // guarantee has to be tested at runtime, with a field the type does not know
+  // about: exactly what a future `.select()` addition looks like here.
+  it("returns only allowlisted fields, ignoring columns the select grows later", () => {
+    const withFutureColumn = {
+      ...row(null),
+      // Stand-in for a column someone adds to the select in six months.
+      promptTranscript: "must-not-be-returned",
+    } as unknown as Parameters<typeof toIssueActiveRunRow>[0];
+
+    const projected = toIssueActiveRunRow(withFutureColumn);
+
+    expect(Object.keys(projected)).not.toContain("promptTranscript");
+    expect(JSON.stringify(projected)).not.toContain("must-not-be-returned");
+    // Stated as an exact set, so adding a field to the response is a deliberate
+    // edit here rather than a side effect of touching the select.
+    expect(Object.keys(projected).sort()).toEqual([
+      "agentId",
+      "createdAt",
+      "finishedAt",
+      "id",
+      "invocationSource",
+      "lastOutputAt",
+      "lastUsefulActionAt",
+      "startedAt",
+      "status",
+      "triggerDetail",
+      "writeContainment",
+    ]);
+  });
+
   it("preserves the existing activeRun liveness fields unchanged", () => {
     const projected = toIssueActiveRunRow(row(null));
     expect(projected).toMatchObject({
