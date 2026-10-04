@@ -15,7 +15,18 @@
 # WHAT THIS DOES NOT DO
 # ---------------------
 # It does NOT approve anything. docker.yml's `deploy` job stays gated on the
-# paperclip-production environment and its three named human reviewers. This only
+# paperclip-production environment and its ONE ratified human reviewer.
+#
+# Until 2026-10-04 this read "its three named human reviewers". That was never a
+# ratified shape. Approval b75f8156 (2026-08-03) ratified TWO; an unratified
+# drift on 2026-08-08 added a third and flipped can_admins_bypass; the
+# environment was narrowed to [kkroo] on 2026-08-30; and card 60e271b7
+# (2026-09-14) ruled that narrowed shape intended — "reconcile the guard, not
+# the environment". RATIFIED_REVIEWERS in
+# .github/scripts/check-production-environment-protection.mjs is the
+# authoritative list; read it rather than re-deriving a count here. The residual
+# single-approver risk is already homed on BLO-22329 and PEN-2863 is RESOLVED on
+# it — do not re-file it. This only
 # performs the mechanical step (dispatch), so there is always a build ready to approve
 # and approving means reviewing a day of commits instead of a quarter's worth.
 #
@@ -58,10 +69,20 @@
 # the button; they press it on a current head, so the click that eventually lands
 # ships everything instead of a partial. See .github/scripts/supersede-stale-deploy.mjs.
 #
-# The escalation also writes a durable GitHub issue now, because an Alertmanager
+# The escalation also ATTEMPTS a durable GitHub issue, because an Alertmanager
 # alert is gone from /api/v2/alerts three hours after the last push and PEN-3289
-# could not audit the incident afterwards. That record doubles as the stall clock,
-# so superseding a run cannot reset the reported age.
+# could not audit the incident afterwards.
+#
+# Until 2026-10-04 these lines asserted that record exists and "doubles as the
+# stall clock". Neither is true here. Blockcast/paperclip has
+# `has_issues: false`, so POST /issues returns 410 on every escalation and no
+# token scope reaches it — and because the clock was sourced from that record,
+# the supersede below duly reset it: on 2026-09-18 a stall running since
+# 09-17T02:01:24Z reported "3.0h old, under the 6h threshold — not escalating"
+# on a GREEN dispatcher run while paperclip_api_deploy_commits_behind read 107.
+# A PEN-3315 follow-up repaired that by DERIVING the clock from Actions run
+# history instead. See deploy-stall-chain.mjs — that derivation, not the issue,
+# is what makes a supersede unable to reset the reported age.
 name: Scheduled production deploy dispatch
 
 on:
@@ -92,9 +113,11 @@ on:
 permissions:
   contents: read
   actions: write # required to dispatch docker.yml, and to cancel a stale dispatch
-  # PEN-3315: the escalation writes a durable GitHub issue alongside the
-  # Alertmanager push. This is the ONLY new permission the change needs — no new
-  # credential — which is why a GitHub issue was chosen over any external store.
+  # PEN-3315: the escalation ATTEMPTS a durable GitHub issue alongside the
+  # Alertmanager push. It needed no new credential, which is why a GitHub issue
+  # was chosen over any external store. Retained for repositories with Issues
+  # enabled; on Blockcast/paperclip (`has_issues: false`) that write returns 410
+  # and this grant is inert. The stall clock comes from deploy-stall-chain.mjs.
   issues: write
 
 concurrency:
@@ -318,11 +341,16 @@ jobs:
       # production-environment-protection-guard has been pushing to this same
       # endpoint from the same arc-runners network namespace.
       #
-      # PEN-3315 adds a durable GitHub issue alongside that push. The alert's
-      # own TTL is 3h, so PEN-3289 could not audit the 41.2h stall afterwards —
-      # the same query that returned 5 hits for a live alert returned 0 for this
-      # one. The issue is deduplicated on a label and also carries the stall
-      # start, so a supersede below cannot reset the reported age.
+      # PEN-3315 attempts a durable GitHub issue alongside that push. The
+      # alert's own TTL is 3h, so PEN-3289 could not audit the 41.2h stall
+      # afterwards — the same query that returned 5 hits for a live alert
+      # returned 0 for this one.
+      #
+      # On THIS repository that write returns 410 (`has_issues: false`), so no
+      # such record is ever created and the post-hoc audit artifact degrades to
+      # this run's own red conclusion. The stall start that survives a supersede
+      # comes from the run-history derivation in deploy-stall-chain.mjs, NOT
+      # from the issue. Until 2026-10-04 these lines claimed otherwise.
       - name: Escalate a production approval that is stuck past its threshold
         id: escalate
         if: steps.dispatch.outputs.outcome == 'skipped-pending'
