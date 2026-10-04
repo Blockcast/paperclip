@@ -20,14 +20,44 @@
  * recorded on BLO-34527. Three separate agent runs have now re-litigated this
  * question; the answer lives here so a fourth does not have to.
  *
- * WHY prevent_self_review IS NO LONGER ASSERTED. It was re-ratified as false by
- * 60e271b7, so asserting it would make the guard permanently red about a
- * deliberate board decision — which erodes the same slack-relay channel this
- * check depends on. It is still reported under `observed` so the single-approver
- * posture stays visible in every alert and run log. The residual risk (one
- * person can both dispatch and approve a production deploy, and their
- * unavailability is a total deploy outage) is recorded on BLO-22329, not here:
- * a detector should assert the ratified shape, not re-argue it.
+ * WHY prevent_self_review IS NO LONGER ASSERTED.
+ *
+ * ⛔ CORRECTED 2026-10-04 (CEO, PEN-2918): THIS PARAGRAPH'S PREMISE IS FALSE
+ * AGAINST THE LIVE ENVIRONMENT. The superseded sentence is kept here as a record
+ * rather than silently deleted:
+ *     "It was re-ratified as false by 60e271b7, so asserting it would make the
+ *      guard permanently red about a deliberate board decision."
+ * Live read of GET /repos/Blockcast/paperclip/environments/paperclip-production
+ * on 2026-10-04: prevent_self_review = TRUE, alongside reviewers=[kkroo],
+ * can_admins_bypass=false, protected_branches=true, updated_at=2026-08-30T07:13:06Z.
+ * So :15-16's "narrowed to [kkroo] with prevent_self_review=false" does not
+ * describe the environment either. Whether the 08-30 narrowing ever set it false
+ * or this header mis-transcribed it is NOT readable from an agent seat — a GitHub
+ * environment exposes no audit surface — so that half is left open, not guessed.
+ *
+ * The consequence is certain even though the history is not, and it is why this
+ * correction is worth making: asserting prevent_self_review === true would be
+ * GREEN today, not "permanently red". The field is therefore unasserted while
+ * sitting in the STRICTER state, so a future flip to false is uncaught BY
+ * CONSTRUCTION — and that is precisely the half of the 2026-08-08 drift the next
+ * paragraph describes as "route around prevent_self_review".
+ *
+ * ⛔ NOT CHANGED HERE, DELIBERATELY. Re-adding the assertion is a behaviour change
+ * and is this file owner's call, not a passing reader's. The argument for it is one
+ * line: ruling (A) says the narrowed shape IS the intended shape and the guard should
+ * reconcile to the environment — and the live narrowed shape carries
+ * prevent_self_review=true. This edit only removes the false premise so that decision
+ * is made against the real value instead of a mis-transcribed one.
+ *
+ * ⛔ This is NOT the single-approver question. That is settled (PEN-2863 RESOLVED,
+ * ruling (A) above), its residual risk is homed on BLO-22329, and nothing here
+ * reopens it or proposes a second reviewer. It is a different field.
+ *
+ * The field is still reported under `observed` so the single-approver posture stays
+ * visible in every alert and run log. The residual risk (one person can both dispatch
+ * and approve a production deploy, and their unavailability is a total deploy outage)
+ * is recorded on BLO-22329, not here: a detector should assert the ratified shape,
+ * not re-argue it.
  *
  * Why the reviewer set is compared by membership and not merely for
  * non-emptiness (BLO-22329): the 2026-08-08 drift *added* `kkroo` — a repo
@@ -234,7 +264,8 @@ async function main() {
         `(required_reviewers ${JSON.stringify(observed.reviewers)}, ` +
         `can_admins_bypass=false, deployment_branch_policy.protected_branches=true). ` +
         `Observed prevent_self_review=${JSON.stringify(observed.prevent_self_review)} ` +
-        '(re-ratified as permitted by approval 60e271b7; reported, not asserted).',
+        '(reported, not asserted — see this script\'s header: the "re-ratified as false" ' +
+          'premise behind dropping the assertion is corrected there, 2026-10-04).',
     );
     writeSummary({ status: 'compliant', repo, environment: environmentName, observed });
     process.exitCode = 0;
