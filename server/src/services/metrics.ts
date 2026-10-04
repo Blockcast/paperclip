@@ -1209,6 +1209,67 @@ export const DB_INHERITED_TIMEOUT_METRIC = "paperclip_db_inherited_timeout_secon
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
 /**
+ * BLO-25024. Time-to-dispatch for EVERY heartbeat run, not just PR-review ones.
+ *
+ * The metric above has the same shape but is gated on a `pr_review:` task key,
+ * so fleet-wide dispatch latency was measurable only by hand-reading one
+ * issue's run list — which is how multi-hour queue waits went unnoticed from
+ * 2026-08-10 to 2026-10-04. Observed at the same guarded queued-to-running
+ * transition, so the two cannot disagree about when a run started.
+ *
+ * Buckets deliberately start at 10s: healthy dispatch on this fleet is
+ * sub-minute (the week of 2026-08-24 ran a median of ~36s), so buckets that
+ * begin at 60s like the PR-review set above cannot distinguish "healthy" from
+ * "a minute late" and would make the recovery target unverifiable.
+ *
+ * `invocation_source` is the only label. It is bounded by
+ * HEARTBEAT_INVOCATION_SOURCES (4 values) and normalized against it, because
+ * the remedy differs by source: a slow `timer` run costs cadence, a slow
+ * `assignment` run costs a human waiting. No agent_id/company_id label — those
+ * grow without bound and this is a histogram.
+ */
+export const RUN_DISPATCH_WAIT_METRIC = "paperclip_run_dispatch_wait_seconds";
+/**
+ * Local copy of `HEARTBEAT_INVOCATION_SOURCES` from `@paperclip/shared`.
+ *
+ * Restated here rather than imported because this module deliberately keeps no
+ * runtime dependency outside prom-client and the logger (see the type-only
+ * import note at the top), and because every other label allow-list in this
+ * file — {@link KNOWN_BLOCKED_REASONS}, KNOWN_ISOLATION_MODES — is local for
+ * the same reason. The drift this invites is pinned by a test that asserts
+ * this array equals the shared constant, so a new invocation source fails CI
+ * here instead of silently collapsing into "other" in production.
+ *
+ * ⚠ NOT {@link KNOWN_INVOCATION_SOURCES}, despite the near-identical name.
+ * That list is the *wake-reason* vocabulary (`issue_assigned`,
+ * `github_pr_opened`, …); this one is the `heartbeat_runs.invocation_source`
+ * COLUMN vocabulary (`timer`, `assignment`, `on_demand`, `automation`). The
+ * two sets are disjoint, so normalizing this column through
+ * {@link normalizeInvocationSource} would collapse EVERY sample to "other" —
+ * a fully-populated histogram with one meaningless label. Do not merge them.
+ */
+export const RUN_DISPATCH_WAIT_INVOCATION_SOURCES = [
+  "timer",
+  "assignment",
+  "on_demand",
+  "automation",
+] as const;
+export const RUN_DISPATCH_WAIT_BUCKETS_SECONDS = [
+  10,
+  30,
+  60,
+  120,
+  300,
+  600,
+  900,
+  1800,
+  3600,
+  7200,
+  14400,
+  28800,
+  86400,
+];
+/**
  * BLO-21460 (2026-08-03 incident follow-up). Unlike the two metrics above
  * (which count every unreleased reservation, healthy in-flight ones
  * included), these two count only the backlog left AFTER each reconciliation
@@ -3252,6 +3313,7 @@ const pluginMetricCombinations = new Map<string, Set<string>>();
 const pluginMetricNames = new Map<string, Set<string>>();
 let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
 let prReviewQueueWait: Histogram | null = null;
+let runDispatchWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let httpRequests: Counter<"route" | "method" | "status"> | null = null;
 let httpEmptyListResponses: Counter<"route" | "method" | "status"> | null = null;
@@ -3348,6 +3410,7 @@ function ensureRegistry(): {
   agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
   agentStartLockAbortedTotalCounter: Counter<"agent_id">;
   prReviewQueueWaitHistogram: Histogram;
+  runDispatchWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   httpRequestsCounter: Counter<"route" | "method" | "status">;
   httpEmptyListResponsesCounter: Counter<"route" | "method" | "status">;
@@ -3440,6 +3503,7 @@ function ensureRegistry(): {
     || !pluginMetricDropped
     || !pluginStatusCollectorLastSuccess
     || !prReviewQueueWait
+    || !runDispatchWait
     || !authRequest
     || !httpRequests
     || !httpEmptyListResponses
@@ -4284,6 +4348,15 @@ function ensureRegistry(): {
       buckets: PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS,
       registers: [registry],
     });
+    runDispatchWait = new Histogram({
+      name: RUN_DISPATCH_WAIT_METRIC,
+      help:
+        "Seconds from creation until start for every heartbeat run (BLO-25024). "
+        + "Observed once at the guarded queued-to-running transition, labeled only by bounded invocation_source.",
+      labelNames: ["invocation_source"],
+      buckets: RUN_DISPATCH_WAIT_BUCKETS_SECONDS,
+      registers: [registry],
+    });
     authRequest = new Counter({
       name: AUTH_REQUEST_METRIC,
       help:
@@ -4841,6 +4914,7 @@ function ensureRegistry(): {
     pluginMetricDroppedCounter: pluginMetricDropped,
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
     prReviewQueueWaitHistogram: prReviewQueueWait,
+    runDispatchWaitHistogram: runDispatchWait,
     authRequestCounter: authRequest,
     httpRequestsCounter: httpRequests,
     httpEmptyListResponsesCounter: httpEmptyListResponses,
@@ -5678,6 +5752,43 @@ export function recordPrReviewQueueWait(input: {
   const waitSeconds = computePrReviewQueueWaitSeconds(input.taskKey, input.createdAt, input.startedAt);
   if (waitSeconds === null) return null;
   ensureRegistry().prReviewQueueWaitHistogram.observe(waitSeconds);
+  return waitSeconds;
+}
+
+/**
+ * Seconds a run spent queued before it started (BLO-25024).
+ *
+ * Unlike `computePrReviewQueueWaitSeconds` there is no task-key gate — every
+ * run counts. Returns null only when the interval is genuinely unmeasurable
+ * (a missing or unparseable timestamp), so an absent observation always means
+ * "no sample", never "a sample of zero". Clamped at 0 so clock skew between
+ * the inserting and claiming processes cannot emit a negative observation,
+ * which would corrupt the histogram sum and therefore any p95 derived from it.
+ */
+export function computeRunDispatchWaitSeconds(
+  createdAt: Date | string | null | undefined,
+  startedAt: Date | string | null | undefined,
+): number | null {
+  if (!createdAt || !startedAt) return null;
+  const createdMs = new Date(createdAt).getTime();
+  const startedMs = new Date(startedAt).getTime();
+  if (!Number.isFinite(createdMs) || !Number.isFinite(startedMs)) return null;
+  return Math.max(0, (startedMs - createdMs) / 1000);
+}
+
+export function recordRunDispatchWait(input: {
+  invocationSource: string | null | undefined;
+  createdAt: Date | string | null | undefined;
+  startedAt: Date | string | null | undefined;
+}): number | null {
+  const waitSeconds = computeRunDispatchWaitSeconds(input.createdAt, input.startedAt);
+  if (waitSeconds === null) return null;
+  const invocation_source = RUN_DISPATCH_WAIT_INVOCATION_SOURCES.includes(
+    input.invocationSource as (typeof RUN_DISPATCH_WAIT_INVOCATION_SOURCES)[number],
+  )
+    ? (input.invocationSource as string)
+    : "other";
+  ensureRegistry().runDispatchWaitHistogram.observe({ invocation_source }, waitSeconds);
   return waitSeconds;
 }
 
@@ -6898,6 +7009,7 @@ export function __resetMetricsForTest(): void {
   pluginMetricNames.clear();
   pluginStatusCollectorLastSuccess = null;
   prReviewQueueWait = null;
+  runDispatchWait = null;
   authRequest = null;
   httpRequests = null;
   httpEmptyListResponses = null;
