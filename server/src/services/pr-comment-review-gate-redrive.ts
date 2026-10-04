@@ -130,14 +130,20 @@ export type GateRedriveResult = {
   redriven: number;
   /**
    * Every re-drive whose live status published but whose retired-context
-   * cleanup failed — a SUPERSET of {@link GateRedriveResult.retirementRetryFailed},
-   * not a complement of it. It is incremented before the retry is attempted, so
-   * it says nothing about whether one was armed.
+   * cleanup failed. Counted per CANDIDATE, and incremented before the retry is
+   * attempted, so it says nothing about whether one was armed.
    *
-   * Read the pair, never this field alone: `retirementFailed` minus the
-   * candidates carrying a `retirementRetryFailed` is what actually converged.
-   * Alerting on `retirementFailed` by itself reads a stranded PR as recovered,
-   * which is the exact inversion the second counter exists to expose.
+   * Its candidates are a superset of the candidates behind
+   * {@link GateRedriveResult.retirementRetryFailed} — but that counter is
+   * incremented per DELIVERY, so the two are in different units and the NUMBERS
+   * do not nest: one candidate with two failed deliveries is `1` here and `2`
+   * there. Do not read `retirementFailed >= retirementRetryFailed`.
+   *
+   * Read the pair, never this field alone. Alerting on `retirementFailed` by
+   * itself reads a stranded PR as recovered, which is the exact inversion the
+   * second counter exists to expose; the unit mismatch is also why the
+   * alertable condition is `retirementRetryFailed != 0` rather than any
+   * arithmetic between the two.
    *
    * Counted separately from `failed` because the PR has converged, so `failed`
    * would state the opposite, and `redriven` alone cannot distinguish a clean
@@ -430,18 +436,35 @@ export async function redriveStaleCommentReviewGates(input: {
         );
         if (unarmed.length > 0) {
           result.retirementRetryFailed += unarmed.length;
-          log.warn(
-            {
-              repoFullName: input.repoFullName,
-              prNumber: candidate.prNumber,
-              contexts: unarmed.map((entry) => entry.context),
-              // Every cause, not `unarmed[0]`: N contexts can fail for N
-              // different reasons, and one cause attached to a list of all of
-              // them reads as covering all of them. The array is already built.
-              errs: unarmed.map((entry) => entry.err),
-            },
-            "comment-review gate retired-context retry enqueue failed; stale red may stand unrecovered",
-          );
+          const contexts = unarmed.map((entry) => entry.context);
+          // One line per cause, each with its cause under `err` — NOT one line
+          // carrying an `errs` array. Pino serialises the configured `errorKey`
+          // ("err") and nothing else, and `middleware/logger.ts` passes neither
+          // `serializers` nor `errorKey`; `message`/`stack` are non-enumerable
+          // on `Error`, so an array of them under any other key JSON-stringifies
+          // to `[{},{}]` — a line that looks populated and has had every cause
+          // erased. Measured on pino 9.14.0 with that exact config. Hand-rolling
+          // `String(err)` + `.stack` into a plain object would also work and is
+          // worse: it re-implements a serialiser pino already has, drops `type`,
+          // and silently stops matching the real one if `errorKey` is ever set.
+          // N is the retired-context count for ONE PR, so looping is cheap, and
+          // it pairs each cause to its own context instead of leaving two
+          // parallel arrays to be zipped by eye. `contexts` stays on every line
+          // so a single line still shows the whole blast radius. The alert is on
+          // the `retirementRetryFailed` counter, not on a line count, so emitting
+          // N lines does not inflate it.
+          for (const entry of unarmed) {
+            log.warn(
+              {
+                repoFullName: input.repoFullName,
+                prNumber: candidate.prNumber,
+                contexts,
+                context: entry.context,
+                err: entry.err,
+              },
+              "comment-review gate retired-context retry enqueue failed; stale red may stand unrecovered",
+            );
+          }
         }
         log.warn(
           { repoFullName: input.repoFullName, prNumber: candidate.prNumber, reason: check.reason },

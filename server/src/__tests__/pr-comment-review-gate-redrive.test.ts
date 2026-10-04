@@ -284,12 +284,15 @@ describe("comment-review gate lost-trigger re-drive", () => {
   });
 
   it("counts EVERY unarmed retry, so a first rejection cannot hide the rest", async () => {
-    // `retirementFailed` says the cleanup failed and a retry was armed. It reads
-    // identically whether the enqueue succeeded or threw, so without its own
-    // counter a dropped retry — which returns the PR to the pre-fix strand — is
-    // recoverable only from log text. Two deliveries, both rejecting: `all`
-    // short-circuits on the first and the second is subscribed-but-ignored, so
-    // the count is what distinguishes settling them all from stopping at one.
+    // `retirementFailed` says only that the cleanup failed: it is incremented
+    // BEFORE the enqueue, so it reads identically whether the enqueue succeeded
+    // or threw. Without its own counter a dropped retry — which returns the PR
+    // to the pre-fix strand — is recoverable only from log text. Note the two
+    // are in different units, and the assertions below are the proof: one
+    // candidate is `retirementFailed === 1` with `retirementRetryFailed === 2`.
+    // Two deliveries, both rejecting: `all` short-circuits on the first and the
+    // second is subscribed-but-ignored, so the count is what distinguishes
+    // settling them all from stopping at one.
     const enqueueDelivery = vi.fn(async () => {
       throw new Error("outbox unavailable");
     });
@@ -303,6 +306,54 @@ describe("comment-review gate lost-trigger re-drive", () => {
     // Still exactly one bucket for the candidate itself.
     expect(result.redriven).toBe(1);
     expect(result.failed).toBe(0);
+  });
+
+  it("logs each unarmed cause under `err`, the only key pino serialises", async () => {
+    // Not a style assertion — a guard on a measured failure. `middleware/logger.ts`
+    // builds pino with neither `serializers` nor `errorKey`, so ONLY the default
+    // `errorKey` ("err") is run through the error serialiser, and `message`/`stack`
+    // are non-enumerable on `Error`. A batch of causes under any other key
+    // (`errs: unarmed.map(e => e.err)`) therefore JSON-stringifies to `[{},{}]` —
+    // verified against pino 9.14.0 with that exact config. That shape shipped once
+    // already: it looks populated, and it erases every cause on the one path where
+    // the PR can be left with a stale red standing. Collapsing these N lines back
+    // into a single array field is the tidy-up that reintroduces it, so the `errs`
+    // arm below is the half that fails when someone does.
+    const warn = vi.fn();
+    // Distinct message per delivery: this is the discriminator that pins each
+    // cause to ITS OWN context. With both rejections carrying the same text,
+    // `err: unarmed[0].err` — the shape two revisions back, one cause stapled to
+    // a list of all of them — passes every other assertion here.
+    let attempt = 0;
+    const enqueueDelivery = vi.fn(async () => {
+      attempt += 1;
+      throw new Error(`outbox unavailable #${attempt}`);
+    });
+    await run(
+      { logger: { info: () => {}, warn } },
+      { runGateCheck: gateRunner(false, "retirement_failed"), enqueueDelivery },
+    );
+
+    const unarmedLines = warn.mock.calls.filter(([, msg]) =>
+      String(msg).startsWith("comment-review gate retired-context retry enqueue failed"),
+    );
+    // One line per cause, not one line for the batch.
+    expect(unarmedLines).toHaveLength(2);
+    for (const [fields] of unarmedLines) {
+      const line = fields as { err: unknown; context: string; contexts: string[] };
+      // An Error under `err` is what pino serialises; anything else is erased.
+      expect(line.err).toBeInstanceOf(Error);
+      // Each cause carries its OWN context, not just the aggregate list.
+      expect(line.contexts).toContain(line.context);
+    }
+    // Cause-to-context pairing: two distinct contexts AND two distinct causes,
+    // so neither the context nor the error can be the same one repeated.
+    expect(new Set(unarmedLines.map(([f]) => (f as { context: string }).context)).size).toBe(2);
+    expect(
+      new Set(unarmedLines.map(([f]) => ((f as { err: Error }).err).message)).size,
+    ).toBe(2);
+    // The batched-array shape must not come back under any message.
+    expect(warn.mock.calls.some(([f]) => "errs" in (f as object))).toBe(false);
   });
 
   it("leaves retirementRetryFailed at zero when the retries are armed", async () => {

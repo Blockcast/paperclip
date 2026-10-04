@@ -87,6 +87,19 @@ type OpenPullRequest = {
   headSha: string | null;
 };
 
+/**
+ * One pass's reconcile tallies.
+ *
+ * Merged field-by-field by {@link mergeSweepCounters}, so it is bound by the
+ * same load-bearing invariant stated on {@link GateRedriveResult}: every
+ * `number` here is ADDITIVE across repos and every `boolean` is "happened in at
+ * least one repo this tick". A field added here that breaks it (a ratio, an
+ * echoed-back ceiling, an epoch timestamp, an AND-shaped flag) is summed or
+ * OR'd into nonsense with no type error and no test failure. All seven below
+ * obey it. Add fields that obey it, or change the merge first.
+ *
+ * @see GateRedriveResult for the full statement of the invariant.
+ */
 export type ReviewStateReconcileResult = {
   enumerated: number;
   written: number;
