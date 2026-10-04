@@ -89,6 +89,13 @@ describe("PEN-1198 audit dependency remediation", () => {
         "GHSA-4cwx-7wf7-3272",
         "GHSA-vmh5-mc38-953g",
         "GHSA-hm92-r4w5-c3mj",
+        // These three also carry a 7.x arm, so they bind this path too and
+        // are recorded under both parents. GHSA-rfgv-xxqx-mfg5 patches at
+        // 7.29.1 — the same floor BLO-38290 already set, so it co-sets it
+        // rather than raising it; the other two patch at 7.24.0, lower.
+        "GHSA-rfgv-xxqx-mfg5",
+        "GHSA-vrm6-8vpv-qv8q",
+        "GHSA-v9p9-hfj2-hcw8",
       ]),
     });
     expect(remediations.multer).toMatchObject({
