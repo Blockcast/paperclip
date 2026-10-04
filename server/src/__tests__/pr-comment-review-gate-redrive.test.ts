@@ -53,11 +53,11 @@ function statusReader(createdAt: string | null, ok = true) {
   );
 }
 
-function gateRunner(posted = true) {
+function gateRunner(posted = true, reason: "fetch_failed" | "retirement_failed" = "fetch_failed") {
   return vi.fn(async () =>
     posted
       ? ({ posted: true as const, verdict: { state: "success" as const, description: "clean", context: CONTEXT } })
-      : ({ posted: false as const, reason: "fetch_failed" as const }),
+      : ({ posted: false as const, reason }),
   );
 }
 
@@ -154,7 +154,15 @@ describe("comment-review gate lost-trigger re-drive", () => {
   it("is a strict no-op when the gate context is not configured", async () => {
     const { result, readStatus } = await run({ statusContext: "   " });
 
-    expect(result).toEqual({ considered: 0, probed: 0, redriven: 0, failed: 0, capped: false });
+    expect(result).toEqual({
+      considered: 0,
+      probed: 0,
+      attempted: 0,
+      redriven: 0,
+      failed: 0,
+      headless: 0,
+      capped: false,
+    });
     expect(readStatus).not.toHaveBeenCalled();
   });
 
@@ -162,7 +170,19 @@ describe("comment-review gate lost-trigger re-drive", () => {
     const { result } = await run({}, { runGateCheck: gateRunner(false) });
 
     expect(result.redriven).toBe(0);
+    expect(result.attempted).toBe(1);
     expect(result.failed).toBe(1);
+  });
+
+  it("does not report a published-but-unretired re-drive as having written nothing", async () => {
+    // `retirement_failed` is the one `posted: false` reason where the live
+    // status DID publish; only the superseded-context cleanup failed. Counting
+    // it in `failed` states the opposite of what happened for the field that
+    // gets alerted on.
+    const { result } = await run({}, { runGateCheck: gateRunner(false, "retirement_failed") });
+
+    expect(result.redriven).toBe(1);
+    expect(result.failed).toBe(0);
   });
 
   it("isolates a throwing re-drive and keeps sweeping", async () => {
@@ -177,6 +197,8 @@ describe("comment-review gate lost-trigger re-drive", () => {
 
     expect(result.failed).toBe(1);
     expect(result.redriven).toBe(1);
+    // A throw still consumed an evaluation's worth of budget.
+    expect(result.attempted).toBe(2);
   });
 
   it("caps re-drives per repo per sweep", async () => {
@@ -187,6 +209,30 @@ describe("comment-review gate lost-trigger re-drive", () => {
     expect(result.redriven).toBe(2);
     expect(result.capped).toBe(true);
     expect(result.considered).toBe(4);
+  });
+
+  it("caps ATTEMPTS, so a repo whose re-drives all fail is bounded too", async () => {
+    // The all-posting fixture above passes identically whether the cap counts
+    // attempts or publishes, so it cannot fail on a cap keyed on `redriven`.
+    // This one can: with a success-keyed cap the counter never moves and every
+    // candidate runs a full gate evaluation, with `capped` reporting false.
+    const candidates = Array.from({ length: 4 }, (_, index) => candidate({ prNumber: 3000 + index }));
+    const { result, runGateCheck } = await run({ candidates, maxRedrives: 2 }, { runGateCheck: gateRunner(false) });
+
+    expect(runGateCheck).toHaveBeenCalledTimes(2);
+    expect(result.attempted).toBe(2);
+    expect(result.redriven).toBe(0);
+    expect(result.capped).toBe(true);
+  });
+
+  it("counts a candidate carrying no head sha instead of skipping it silently", async () => {
+    // If the list payload ever stops carrying `head.sha`, every other counter
+    // reads a healthy zero while the sweep re-drives nothing at all.
+    const { result, readStatus } = await run({ candidates: [candidate({ headSha: null })] });
+
+    expect(result.headless).toBe(1);
+    expect(result.probed).toBe(0);
+    expect(readStatus).not.toHaveBeenCalled();
   });
 
   it("defaults the cap rather than sweeping unbounded", () => {

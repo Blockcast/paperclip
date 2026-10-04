@@ -40,6 +40,16 @@
  * status already postdates its latest review is never probed past one cheap
  * status read, and a PR with no reviewer review at all costs nothing.
  *
+ * That argument holds only while the gate actually publishes, and one reachable
+ * path does not: an author-blind `success` with `authorUnknown` plus an
+ * unreadable `GET /pulls/{n}` returns `{posted: false, reason: "fetch_failed"}`
+ * before writing anything, and `githubFetchPrAuthorLogin` returns `null` on any
+ * non-ok response *or* a missing `user` — so that condition need not be
+ * transient. Such a PR stays stale and is re-attempted every sweep. The cap
+ * below is keyed on attempts precisely so that costs a bounded number of
+ * evaluations per sweep rather than one per candidate; retiring the PR itself
+ * needs the persisted per-PR attempt counter named there.
+ *
  * ## No fail-open
  *
  * This module decides *when* to ask, never *what* the answer is. The verdict
@@ -58,14 +68,15 @@ import { runPrCommentReviewGateCheck } from "./pr-comment-review-gate.js";
 import { logger as defaultLogger } from "../middleware/logger.js";
 
 /**
- * Re-drives attempted per repo per sweep.
+ * Gate evaluations *attempted* per repo per sweep.
  *
  * ponytail: a flat cap, not a backoff. It bounds the one branch that spends API
  * budget, which matters because the condition that strands a gate write —
  * installation rate-limit exhaustion — is also the condition under which a
- * re-drive is most likely to fail and be retried next sweep. If re-drives
- * routinely hit this cap, give each PR a persisted attempt counter rather than
- * raising it.
+ * re-drive is most likely to fail and be retried next sweep. It bounds cost per
+ * sweep, not repetition across sweeps: a PR whose re-drive never publishes is
+ * re-attempted forever. If re-drives routinely hit this cap, give each PR a
+ * persisted attempt counter rather than raising it.
  */
 export const DEFAULT_MAX_GATE_REDRIVES_PER_REPO = 20;
 
@@ -84,10 +95,18 @@ export type GateRedriveResult = {
   considered: number;
   /** Candidates that cost a commit-status read. */
   probed: number;
-  /** Gate evaluations actually driven. */
+  /**
+   * Gate evaluations started. This — not {@link GateRedriveResult.redriven} — is
+   * what the cap is keyed on: a `runGateCheck` call spends the same API budget
+   * whether or not it ends up publishing.
+   */
+  attempted: number;
+  /** Re-drives that published a status (so the next sweep skips the PR). */
   redriven: number;
-  /** Re-drives that threw or reported a non-post. */
+  /** Re-drives that threw or returned without writing anything. */
   failed: number;
+  /** Candidates skipped because the list payload carried no head sha. */
+  headless: number;
   /** True when {@link DEFAULT_MAX_GATE_REDRIVES_PER_REPO} stopped the pass early. */
   capped: boolean;
 };
@@ -97,8 +116,10 @@ type Logger = { info: (o: unknown, m?: string) => void; warn: (o: unknown, m?: s
 const EMPTY_RESULT: GateRedriveResult = {
   considered: 0,
   probed: 0,
+  attempted: 0,
   redriven: 0,
   failed: 0,
+  headless: 0,
   capped: false,
 };
 
@@ -190,11 +211,23 @@ export async function redriveStaleCommentReviewGates(input: {
     // An unreadable reviews probe is not "no reviews". Skipping is the only safe
     // reading: re-driving every PR on an unreadable repo is an evaluation storm,
     // and the next sweep re-reads.
-    if (!candidate.reviewsReadable || !candidate.headSha) continue;
+    if (!candidate.reviewsReadable) continue;
+    // Counted rather than skipped silently: if the list payload ever stops
+    // carrying `head.sha` the sweep stops re-driving entirely, and every other
+    // field in this result reads a healthy zero while it does.
+    if (!candidate.headSha) {
+      result.headless += 1;
+      continue;
+    }
     const latestReviewAt = latestReviewerReviewAt(candidate.reviews, reviewerBotLogin);
     if (!latestReviewAt) continue;
 
-    if (result.redriven >= maxRedrives) {
+    // Keyed on attempts, not on publishes. A `runGateCheck` that returns
+    // `posted: false` has already spent a full gate evaluation, so counting
+    // only the publishing ones leaves the budget unbounded in exactly the
+    // regime this cap exists for — a repo whose re-drives all fail would run
+    // one evaluation per candidate with `capped` reporting false.
+    if (result.attempted >= maxRedrives) {
       result.capped = true;
       break;
     }
@@ -212,6 +245,7 @@ export async function redriveStaleCommentReviewGates(input: {
     if (!gateStatusIsStale(status.status?.createdAt ?? null, latestReviewAt)) continue;
 
     try {
+      result.attempted += 1;
       const check = await runGateCheck({
         repoFullName: input.repoFullName,
         prNumber: candidate.prNumber,
@@ -230,6 +264,16 @@ export async function redriveStaleCommentReviewGates(input: {
             state: check.verdict.state,
           },
           "comment-review gate re-driven after an undelivered review event (BLO-39871)",
+        );
+      } else if (check.reason === "retirement_failed") {
+        // The live status DID publish; only the retired-context cleanup failed
+        // (`pr-comment-review-gate.ts`, `supersedeRetiredContexts`). So the PR
+        // has converged and this is not the thing `failed` is alerted on —
+        // reporting it there would state the opposite of what happened.
+        result.redriven += 1;
+        log.warn(
+          { repoFullName: input.repoFullName, prNumber: candidate.prNumber, reason: check.reason },
+          "comment-review gate re-driven, but retiring the superseded contexts failed",
         );
       } else {
         result.failed += 1;
