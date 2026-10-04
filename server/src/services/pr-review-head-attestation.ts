@@ -18,8 +18,10 @@
  * WHAT THIS CLOSES, AND WHAT IT DOES NOT. This is a check-then-act guard at
  * *dispatch* time, but the duplicate is created minutes later at *post* time,
  * so it can only close gaps wider than a review run. It closes the wide ones:
- * a wake that arrives after a review is already visible. (Narrowed — see
- * CORRECTION below.) It does NOT close concurrent dispatch at one head — for
+ * a wake that arrives after a review is already visible. (BOTH the "minutes"
+ * in the previous sentence and this coverage claim are narrowed — see
+ * CORRECTION below. The real figure is hours.) It does NOT close concurrent
+ * dispatch at one head — for
  * #1304's 53 s byte-identical pair the second run must already have been
  * running when the first review landed (a review run does not finish inside
  * 53 s), so its dispatch preceded any attestation and this predicate would
@@ -43,18 +45,28 @@
  * 9.3 h). In every one the second review was preceded by an EXPLICIT re-request
  * at the unchanged head, posted after the first review was already visible:
  *
- *   #2121  first 03:01:17Z → `paperclip:review-request` (kkroo) 17:52:18Z
+ *   #2121  first 03:01:17Z → `paperclip:review-request` (kkroo, HUMAN)
+ *                            17:52:18Z
  *                          → second 22:41:51Z
- *   #2128  first 15:44:37Z → "Response to review at `621589ce`" 16:18:00Z
+ *   #2128  first 15:44:37Z → "Response to review at `621589ce`"
+ *                            (allyblockcast[bot], SELF-WAKE) 16:18:00Z
  *                          → second 22:21:15Z
- *   #2157  first 12:30:34Z → "please re-review exact head `f03ade2f`" (kkroo)
- *                            17:44:25Z → `paperclip:review-request` 20:50:33Z
+ *   #2157  first 12:30:34Z → "please re-review exact head `f03ade2f`"
+ *                            (kkroo, HUMAN) 17:44:25Z
+ *                          → `paperclip:review-request`
+ *                            (allyblockcast[bot], SELF-WAKE) 20:50:33Z
  *                          → second 21:50:07Z
  *
  * So these are not the failure the coverage claim describes. They are DELIBERATE
  * re-reviews of a head that already carried a verdict — precisely the traffic
- * this guard must not refuse. The legitimate-re-review argument below was first
- * made for #2128 alone; the measurement extends it to all three.
+ * this guard must not refuse. Note the attributions above are NOT equal
+ * evidence: #2121's and #2157's first triggers are human requests, which are
+ * unambiguously deliberate, while #2128's only trigger and #2157's second are
+ * the reviewer re-waking itself — nearer the duplicate-generation mechanism
+ * under study than to an external ask. #2128 therefore does not rest on its
+ * trigger at all; it holds on the independent description-only ground stated
+ * below, where no commit can carry the fix. The legitimate-re-review argument
+ * below was first made for #2128 alone; the measurement extends it to all three.
  *
  * All 13 Ally reviews across those PRs parse cleanly under this module's own
  * predicate — one well-formed attestation each, App identity — so the predicate
@@ -62,16 +74,29 @@
  *
  * QUEUE LATENCY is real here but is NOT what produced these pairs, and the
  * distinction matters because the two point at different fixes. The quantity
- * actually measured is request→review, and across every such pair on these
- * three PRs it spans 0.7–6.1 h. That is the window a wake-time exclusion has to
- * hold across — hours, not minutes — and it needs no decomposition to say so.
+ * actually measured is request→review, over the FIVE pairs this docblock
+ * enumerates: the four in the table above, plus the 11:48:35Z→12:30:34Z
+ * first-review pair cited as "~42 min". Across those five it spans 0.7–6.1 h
+ * (0.700, 0.993, 4.095, 4.826, 6.054).
+ *
+ * Read that as a statement about THOSE FIVE PAIRS, never as a universal over
+ * the three PRs — the PRs carry faster pairs that are not in this population.
+ * #2128 alone has 06:58:11Z→07:19:12Z (0.350 h) and 10:18:56Z→10:52:03Z
+ * (0.552 h), and taking the `synchronize` push as the trigger instead of the
+ * comment does not lift them (`e0336557` committed 06:57:05Z → 0.369 h;
+ * `a8a417ac` 10:18:24Z → 0.561 h). Those are below the floor and change
+ * nothing: the window a wake-time exclusion has to hold across is governed by
+ * the MAXIMUM, 6.054 h, which is exact — hours, not minutes — and a lower
+ * floor cannot weaken a bound on how long a remedy must survive. It needs no
+ * decomposition to say so.
+ *
  * Do NOT read the ~42 min above as an independent measurement of run duration
- * and subtract it: it is one of those request→review pairs, and the fastest of
- * them. Nothing visible in the review API separates time spent queued from time
- * spent running, so that split is unmeasured here. Queue latency still does not
- * account for these three, because in each the first review predated the
- * re-request and so predated the wake. Treat it as a constraint on the remedy,
- * not as the diagnosis.
+ * and subtract it: it is one of those five request→review pairs, and the
+ * fastest of the five. Nothing visible in the review API separates time spent
+ * queued from time spent running, so that split is unmeasured here. Queue
+ * latency still does not account for these three, because in each the first
+ * review predated the re-request and so predated the wake. Treat it as a
+ * constraint on the remedy, not as the diagnosis.
  *
  * Do NOT conclude from that measurement that a post-time refusal is the
  * remedy. It is not, and the reason generalises: a same-head re-review can be
@@ -90,7 +115,7 @@
  * `pr-review-dispatch-lock.ts`), which observes strictly later than this
  * module does. How much later is exactly the unmeasured split above, so
  * BLO-20074 has to measure start→post for itself rather than inherit the
- * 0.7–6.1 h figure, which bounds wake→post. A vocabulary warning, because this
+ * five-pair 0.7–6.1 h figure, which bounds wake→post. A vocabulary warning, because this
  * docblock uses both words: "dispatch time" in the WHAT THIS CLOSES paragraph
  * and "wake time" here are the SAME instant for this module. It is called from
  * the webhook handler at the moment the wake is decided
