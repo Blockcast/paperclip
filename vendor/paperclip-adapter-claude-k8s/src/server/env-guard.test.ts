@@ -445,7 +445,10 @@ describe("block message resolves to the installed helper (BLO-29526)", () => {
     const root = mkdtempSync(path.join(tmpdir(), "pc-install-"));
     try {
       const home = path.join(root, "home");
-      const configDir = path.join(root, "session", ".claude");
+      // The space is deliberate. The suggestion is copy-pasted into a shell, so
+      // an unquoted path would emit an un-runnable command; this is what makes
+      // the quoting load-bearing rather than decorative.
+      const configDir = path.join(root, "session dir", ".claude");
       mkdirSync(home, { recursive: true });
       // Guard the guard: if these ever collapse to the same directory the test
       // stops exercising the drift condition and silently passes on a revert.
@@ -465,8 +468,9 @@ describe("block message resolves to the installed helper (BLO-29526)", () => {
       });
       expect(blocked.status).toBe(2);
 
-      const suggested = /run: node (\S+)/.exec(blocked.stderr)?.[1];
+      const suggested = /run: node '([^']+)'/.exec(blocked.stderr)?.[1];
       expect(suggested).toBeTruthy();
+      expect(suggested).toContain(" ");
 
       const helper = spawnSync(process.execPath, [suggested!], {
         encoding: "utf8",
@@ -476,6 +480,20 @@ describe("block message resolves to the installed helper (BLO-29526)", () => {
       expect(helper.status).toBe(0);
       expect(helper.stdout).toContain("PC_TEST_SECRET");
       expect(helper.stdout).not.toContain("super-secret-value-xyz");
+
+      // The guard must not block its own remediation. SAFE_ENV_INSPECTION_RE
+      // does NOT match the quoted form (the path group excludes spaces and the
+      // trailing quote), so what allows it is containsDump() — `node ...` is
+      // not a dump. Pinned because the allowlist looks like the thing keeping
+      // this working and is not, so a change there would read as safe.
+      for (const cmd of [`node '${suggested}'`, `node '${suggested}' 2>/dev/null | grep -i PC_`]) {
+        const again = spawnSync(process.execPath, [path.join(configDir, guardName!)], {
+          input: JSON.stringify({ tool_name: "Bash", tool_input: { command: cmd } }),
+          encoding: "utf8",
+          env,
+        });
+        expect(again.status, `guard blocked its own suggestion: ${cmd}`).toBe(0);
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

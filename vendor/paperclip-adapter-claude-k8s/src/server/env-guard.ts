@@ -578,7 +578,8 @@ import { fileURLToPath } from "node:url";
 // command was always MODULE_NOT_FOUND. Agents pipe that command into a filter,
 // so the error vanished into a discarded stderr and the empty stdout read as
 // "no variable matches" — a confident wrong negative, not a visible failure.
-const HELPER_PATH = fileURLToPath(new URL("safe-env-inspect.mjs", import.meta.url));
+// Derived inside the stdin handler, not here, so any throw lands in that
+// handler's fail-open catch instead of exiting before the guard ever runs.
 const SAFE_ENV_INSPECTION_RE =
   /^(?:node[ \t]+)?(?:[^\s;&|()<>]*\/)?(?:safe-env-inspect(?:\.mjs)?|paperclip-safe-env)(?:[ \t]+[^;&|()<>$\x60\r\n]*)?$/;
 // Shell-aware normalizer. Behaviourally identical to classifyAgentShellCommand
@@ -841,12 +842,16 @@ process.stdin.on("end", () => {
     const input = evt.tool_input || evt.toolInput || {};
     const command = input.command || input.cmd || "";
     if (/^(?:Bash|Shell)$/i.test(String(tool)) && command && isFullEnvDump(String(command))) {
+      const helperPath = fileURLToPath(new URL("safe-env-inspect.mjs", import.meta.url));
+      // Single-quoted: the suggestion is copy-pasted into a shell, so a path
+      // containing a space (or $, backtick, ;) must survive re-parsing intact.
+      const helperArg = "'" + helperPath.replace(/'/g, "'\\''") + "'";
       process.stderr.write(
         "Blocked by Paperclip env-guard (PEN-1305): full-environment dumps " +
           "(env/printenv/set/export -p/declare -x/cat /proc/*/environ) are disallowed " +
           "because they leak secret-bearing runtime variables into the run transcript. " +
           "To inspect environment variable NAMES safely, run: node " +
-          HELPER_PATH + "\n",
+          helperArg + "\n",
       );
       process.exit(2);
     }
