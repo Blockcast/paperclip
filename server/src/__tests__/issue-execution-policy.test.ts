@@ -8,6 +8,7 @@ import {
   isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
+  stripMonitorFromExecutionPolicy,
 } from "../services/issue-execution-policy.js";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
@@ -129,6 +130,43 @@ describe("normalizeIssueExecutionPolicy", () => {
 
   it("returns null when stages are empty", () => {
     expect(normalizeIssueExecutionPolicy({ stages: [] })).toBeNull();
+  });
+
+  // BLO-39945: the collapse guard directly above is the whole trap. A policy
+  // carrying only the opt-out must survive, or `PATCH` returns 200, stores
+  // null, and the opt-out silently never happened.
+  it("keeps a policy carrying only productivityReviewDisabled", () => {
+    const result = normalizeIssueExecutionPolicy({ productivityReviewDisabled: true });
+    expect(result).not.toBeNull();
+    expect(result?.productivityReviewDisabled).toBe(true);
+    expect(result?.monitor).toBeUndefined();
+    expect(result?.stages).toEqual([]);
+  });
+
+  it("still returns null when the flag is false and nothing else is set", () => {
+    expect(normalizeIssueExecutionPolicy({ productivityReviewDisabled: false })).toBeNull();
+  });
+
+  // Emitted only when true, so no existing policy gains a field.
+  it("omits the flag entirely from a policy that does not set it", () => {
+    const result = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: coderAgentId }] }],
+    });
+    expect(result).not.toBeNull();
+    expect(result && "productivityReviewDisabled" in result).toBe(false);
+  });
+
+  it("preserves the flag when a monitor is stripped from a stageless policy", () => {
+    const policy = normalizeIssueExecutionPolicy({
+      productivityReviewDisabled: true,
+      monitor: { nextCheckAt: "2026-08-31T17:00:00.000Z", scheduledBy: "assignee" },
+    });
+    expect(stripMonitorFromExecutionPolicy(policy)).toMatchObject({ productivityReviewDisabled: true });
+    // Control: the same strip on a stageless policy without the flag still collapses to null.
+    const bare = normalizeIssueExecutionPolicy({
+      monitor: { nextCheckAt: "2026-08-31T17:00:00.000Z", scheduledBy: "assignee" },
+    });
+    expect(stripMonitorFromExecutionPolicy(bare)).toBeNull();
   });
 
   it("throws when all participants are invalid (missing agentId)", () => {

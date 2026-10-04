@@ -616,11 +616,15 @@ function nextAssigneeIds(input: {
 export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | null): IssueExecutionPolicy | null {
   if (!policy) return null;
   if (!policy.monitor) return policy;
-  if (policy.stages.length === 0) return null;
+  // BLO-39945: clearing a monitor must not take the productivity-review opt-out
+  // with it. (This function also drops `reviewPreset`/`authorizationPolicy` —
+  // pre-existing, out of scope here, tracked separately.)
+  if (policy.stages.length === 0 && !policy.productivityReviewDisabled) return null;
   return {
     mode: policy.mode,
     commentRequired: policy.commentRequired,
     stages: policy.stages,
+    ...(policy.productivityReviewDisabled ? { productivityReviewDisabled: true } : {}),
   };
 }
 
@@ -717,8 +721,12 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
 
   const reviewPreset = parsed.data.reviewPreset;
   const authorizationPolicy = parsed.data.authorizationPolicy;
+  // BLO-39945: part of the collapse guard below, not an afterthought. A policy
+  // carrying ONLY this flag must survive normalization — otherwise the write
+  // returns 200, normalizes to null, and the opt-out silently never happened.
+  const productivityReviewDisabled = parsed.data.productivityReviewDisabled === true;
 
-  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy) return null;
+  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy && !productivityReviewDisabled) return null;
 
   return {
     mode: parsed.data.mode ?? "normal",
@@ -727,6 +735,8 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     ...(monitor ? { monitor } : {}),
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
+    // Emitted only when true, so every existing policy normalizes byte-identically.
+    ...(productivityReviewDisabled ? { productivityReviewDisabled: true } : {}),
   };
 }
 

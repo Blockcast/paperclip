@@ -5384,6 +5384,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
   function isProductivityReviewOptedOut(issue: IssueRow) {
     const policy = issue.executionPolicy;
     if (!policy || typeof policy !== "object" || Array.isArray(policy)) return false;
+    // BLO-39945: top-level form, reachable without arming a monitor.
+    if ((policy as Record<string, unknown>).productivityReviewDisabled === true) return true;
     const monitor = (policy as Record<string, unknown>).monitor;
     if (!monitor || typeof monitor !== "object" || Array.isArray(monitor)) return false;
     return (monitor as Record<string, unknown>).productivityReviewDisabled === true;
