@@ -407,11 +407,24 @@ async function probeOne(
     // artifact of record is a formal review, reads `review:ally-clean` for a
     // head with a live accepted residual (BLO-36903).
     //
-    // Keyed on `newest`, deliberately NOT on the head attestation the way
-    // `formalClean` is one line below: as a veto its fail direction is
-    // inverted, so a body that accepts a residual without attesting a head
-    // should still suppress the other surface's clean rather than be ignored.
-    // BLO-38032 tracks that asymmetry.
+    // NARROWED, not swapped (BLO-38032). `atHead` admits `newest` on
+    // `commit_id`, which GitHub re-anchors FORWARD onto the new head on a
+    // branch update (BLO-27234, n=128) — so a review of a tree that no longer
+    // exists can read its ledger into this veto and kill a genuine clean that
+    // this head's own reviewer published. The veto therefore drops on exactly
+    // one condition: the body POSITIVELY attests a DIFFERENT head.
+    //
+    // An UNATTESTED body keeps vetoing, and that is the whole reason this is
+    // `attested !== null &&` rather than the symmetric `=== normalizedHead`
+    // that `formalClean` uses one line below. As a veto the fail direction is
+    // inverted, so silence must not buy a pass — and the gap is reachable, not
+    // theoretical: `countAllyDeferredPriorFindings` reads the RAW body while
+    // `extractAllyReviewedHeadSha` reads the fence-stripped one, so an
+    // unbalanced fence can blank the attestation while the ledger survives.
+    // Requiring a positive match would publish `review:ally-clean` for a head
+    // with a live accepted residual on exactly that shape — reintroducing
+    // BLO-36903 through its own fix. Both arms are pinned by a failing
+    // mutation in `evidence-truth.test.ts` (BLO-34263).
     //
     // Enforced ONLY as the cross-surface veto on `out.clean` below, and NOT as
     // an extra condition on the `formalAttestingReview` guard. Two reasons, in
@@ -442,7 +455,11 @@ async function probeOne(
     // cause that did not decide anything. `out.clean` is false either way, so
     // the direction is safe, and the population is confined to bodies that fail
     // Surface 1's grammar. Paying it buys the mutation coverage in (2).
-    const formalDeferred = newest !== undefined && countAllyDeferredPriorFindings(newest.body) > 0;
+    const formalDeferredAttestedHead = newest === undefined ? null : extractAllyReviewedHeadSha(newest.body);
+    const formalDeferred =
+      newest !== undefined &&
+      countAllyDeferredPriorFindings(newest.body) > 0 &&
+      !(formalDeferredAttestedHead !== null && formalDeferredAttestedHead !== normalizedHead);
     if (formalAttestingReview !== undefined) {
       const prAuthorLogin = await readPrAuthor();
       // An unread author leaves this false: it cannot establish independence,
