@@ -718,6 +718,15 @@ export function isClaudeTransientUpstreamError(input: {
   // derived independently of `requiresLogin` (:193) and is operator-facing, not a
   // classification input.
   //
+  // `test.ts:488` is the one remaining wide read, and it is scoped OUT rather than
+  // missed. That is the connection-test hello probe: it runs a fixed one-line
+  // prompt ("Respond with hello.") and classifies the probe's own output, so its
+  // transcript is a controlled surface a few lines long, not an agent work log
+  // carrying git/gh/ssh/registry output. The poisoning class this change fixes
+  // cannot arise there, and the probe's whole purpose includes reporting that the
+  // CLI is asking for a login — which is emitted before any result event, exactly
+  // where the transcript is the only surface that carries it.
+  //
   // The quota veto below deliberately keeps the wide haystack: narrowing a second
   // veto in the same change would grant a second retry family off one measurement,
   // and `isClaudeProviderQuotaError` routes to a different outcome than this rule.
