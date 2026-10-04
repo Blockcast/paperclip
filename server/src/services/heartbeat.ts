@@ -19648,16 +19648,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn(
           {
             index: "heartbeat_runs_crash_recovery_pending_idx",
-            // Which caller probed. NOT a double-warn tag on THIS branch: the
-            // latch read and write above sit in one synchronous block with no
-            // `await` between them, and setCrashRecoveryCandidateIndexPresent
+            // Which caller probed — and on THIS branch that is the entire
+            // report. The latch above emits exactly one line per absence
+            // episode, so the caller that won is the only caller the episode
+            // ever names. That names the caller that observed the transition,
+            // NOT whether the replica is suppressed: both callers share this
+            // one latch in the same scheduler tick, and the gauge publisher is
+            // issued first, above both scheduler gates (see this function's
+            // doc comment), so `source: "gauge"` is the usual value whether or
+            // not the gate ran. `source: "gate"` only says the gate's probe saw
+            // the absence first, e.g. because the gauge's probe failed into the
+            // `catch` path below, which does not set the latch.
+            //
+            // It is not a double-warn tag here, which is the other reading:
+            // the latch read and write above sit in one synchronous block with
+            // no `await` between them, and setCrashRecoveryCandidateIndexPresent
             // is synchronous (metrics.ts), so on a single-threaded event loop
-            // the latch is atomic and the absent TRANSITION emits exactly one
-            // line per episode no matter which caller wins. Where the tag
-            // earns its place is the `catch` path below: that has no latch at
-            // all, so an unreadable catalog genuinely warns once per caller
-            // per tick, and `source` is what stops an operator reading those
-            // two lines as two distinct failures.
+            // the latch is atomic and this branch cannot emit twice. That
+            // reading belongs to the `catch` path below, which has no latch at
+            // all: an unreadable catalog genuinely warns once per caller per
+            // tick, and there `source` is what stops an operator reading two
+            // lines as two distinct failures.
             source,
             remediation:
               "CREATE INDEX CONCURRENTLY heartbeat_runs_crash_recovery_pending_idx ON heartbeat_runs USING btree (finished_at, id) WHERE error_code = 'worker_crashed' AND crash_recovery_completed_at IS NULL",
@@ -19686,6 +19697,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // this into a skipped tick. The ungated gauge publisher makes no
       // reconciliation decision at all — and on a suppressed replica there is
       // no periodic reconciliation for it to be skipping.
+      //
+      // `source` here is the double-warn tag the absent-transition branch
+      // above is NOT: this path has no latch, so both callers warn every tick
+      // and the field is what stops an operator reading those two lines as two
+      // distinct catalog failures.
       logger.warn(
         { err, source },
         source === "gate"

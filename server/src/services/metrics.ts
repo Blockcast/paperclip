@@ -442,14 +442,23 @@ export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_de
  * - Cache hits do **not** increment. Only real network probes are counted, so
  *   the ratio above is over re-probes rather than over gate calls.
  * - **The fail-open set is path-qualified:** `path="messages_fallback"` with
- *   `outcome=~"error|auth_fault"`. Only the fallback path returns `allow: true`
- *   without a verdict (`penstock-availability-gate.ts:762` for the auth fault,
- *   `:804`/`:813` for transport errors), so a *broken* probe is
- *   indistinguishable from a healthy one on every other signal and that pair is
- *   what an alert wants. The same two outcomes on `path="capacity"` are **not**
- *   fail-open: they yield no verdict and fall through to the fallback, which
- *   then decides. Alerting on `outcome="error"` alone both misses every
- *   entitlement fail-open and fires on capacity reads that allowed nothing.
+ *   `outcome=~"error|auth_fault"`, **plus `path="capacity"` with
+ *   `outcome="error"`** since BLO-29900 item 3 stopped that branch falling
+ *   through (a transport failure says nothing about the model, and the
+ *   fallback would reuse the transport that just failed). Those return
+ *   `allow: true` with no verdict — `penstock-availability-gate.ts:762` for the
+ *   auth fault, `:804`/`:813` for fallback transport errors, and
+ *   `capacityOutcomeJustifiesFallback` for the capacity one — so a *broken*
+ *   probe is indistinguishable from a healthy one on every other signal, and
+ *   that set is what an alert wants. `path="capacity"` with
+ *   `outcome="auth_fault"` (or `"inconclusive"`) is fail-open **only on a
+ *   provider with no fallback**: on `anthropic` it falls through and the
+ *   fallback decides, but `resolvePenstockCheck` sets `messagesUrl` for
+ *   anthropic alone, so on `codex` there is nothing to fall through *to* and
+ *   every verdict-less capacity outcome returns `allow: true` terminally.
+ *   Alerting on `outcome="error"` alone misses every entitlement fail-open;
+ *   alerting on the fallback path alone now misses the capacity-transport one,
+ *   and misses **all** of codex, which has no fallback series at all.
  *
  * Cardinality: `path` and `outcome` are fixed allow-lists (2 x 6), coerced
  * here. `provider` is deliberately **not** coerced: it is bounded by its
@@ -483,17 +492,23 @@ export type PenstockProbePathLabel = (typeof KNOWN_PENSTOCK_PROBE_PATHS)[number]
  * - `ok` — probe answered and capacity is available (the gate allows).
  * - `deny_capacity` — answered `penstock.model_capacity_unavailable`.
  * - `deny_temporary` — answered `penstock.model_temporarily_unavailable`.
- * - `inconclusive` — the capacity probe returned no verdict. This is the branch
- *   that triggers the messages fallback, so its rate is the fallback's cause.
+ * - `inconclusive` — the capacity probe returned no verdict. On a provider with
+ *   a fallback (`anthropic`) this is the branch that triggers it, so its rate
+ *   is the fallback's cause; on `codex` there is nothing to trigger and it is a
+ *   terminal fail-open — see "Reading it" above for why.
  *   Minted on `path="capacity"` only; the messages probe never returns it.
  * - `auth_fault` — 401/403. Kept separate from `error` because PEN-2513's whole
  *   finding is that an entitlement fault read as a capacity signal parks
  *   forever on a horizon that cannot expire it. Fails **open** on
  *   `path="messages_fallback"`; on `path="capacity"` it yields no verdict and
- *   falls through to the fallback.
- * - `error` — transport failure or timeout. Fails **open** on
- *   `path="messages_fallback"`; on `path="capacity"` it falls through to the
- *   fallback instead, so it is not a fail-open there.
+ *   falls through to the fallback **where one exists (`anthropic`); on `codex`
+ *   there is none, so it too is a terminal fail-open**.
+ * - `error` — transport failure or timeout. Fails **open** on **both** paths.
+ *   On `path="capacity"` it used to fall through to the fallback; BLO-29900
+ *   item 3 stopped that, because a transport failure says nothing about the
+ *   model and the fallback would reuse the transport that just failed. So
+ *   `path="capacity", outcome="error"` is now a terminal fail-open, and it is
+ *   the series to watch: it is the gate going blind, not the gate deciding.
  */
 export const KNOWN_PENSTOCK_PROBE_OUTCOMES = [
   "ok",
@@ -3015,9 +3030,12 @@ function ensureRegistry(): {
         + "advancing before reading that silence as health. Cache hits are not counted, so "
         + "the ratio is over real re-probes. The fail-open set is path-qualified: "
         + "path=messages_fallback with outcome=error|auth_fault allows dispatch with no "
-        + "verdict, and no other signal distinguishes that from a healthy probe. Those same "
-        + "outcomes on path=capacity are NOT fail-open - they fall through to the fallback, "
-        + "which decides.",
+        + "verdict, and so does path=capacity with outcome=error, which no longer falls "
+        + "through to the fallback (BLO-29900 item 3) - a transport failure says nothing "
+        + "about the model. path=capacity with outcome=auth_fault|inconclusive is fail-open "
+        + "only where there is no fallback: on anthropic it falls through and the fallback "
+        + "decides, but codex has no messagesUrl, so there every verdict-less capacity "
+        + "outcome is terminal fail-open and no messages_fallback series exists to alert on.",
       labelNames: ["path", "outcome", "provider", "model"],
       registers: [registry],
     });

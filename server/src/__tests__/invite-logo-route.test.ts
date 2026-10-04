@@ -3,6 +3,15 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+/**
+ * PEN-3658: `isInviteExpired` (routes/access.ts) is `expiresAt <= Date.now()`, so a
+ * fixed future date here is an *expiring* fixture — these cases turn 200 into 404 on
+ * the calendar day it passes, with nothing in the diff that changed. Derive it from
+ * the clock. Same defect class as the BLO-27912 park deadline, which lapsed at
+ * 2026-09-30T00:00:00Z and ejected six consecutive merge groups.
+ */
+const ACTIVE_INVITE_EXPIRES_AT = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
 const mockStorage = vi.hoisted(() => ({
   getObject: vi.fn(),
   headObject: vi.fn(),
@@ -76,7 +85,7 @@ describe("GET /invites/:token/logo", () => {
       allowedJoinTypes: "human",
       tokenHash: "hash",
       defaultsPayload: null,
-      expiresAt: new Date("2027-03-07T00:10:00.000Z"),
+      expiresAt: ACTIVE_INVITE_EXPIRES_AT,
       invitedByUserId: null,
       revokedAt: null,
       acceptedAt: null,
@@ -119,7 +128,7 @@ describe("GET /invites/:token/logo", () => {
       allowedJoinTypes: "human",
       tokenHash: "hash",
       defaultsPayload: null,
-      expiresAt: new Date("2027-03-07T00:10:00.000Z"),
+      expiresAt: ACTIVE_INVITE_EXPIRES_AT,
       invitedByUserId: null,
       revokedAt: null,
       acceptedAt: null,
