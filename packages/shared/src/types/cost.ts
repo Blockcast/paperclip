@@ -24,16 +24,23 @@ export interface BilledTokenCounts {
  * Excludes cache READS, which bill at ~0.1x and stay separate — callers that
  * want every prompt class add `cachedInputTokens` themselves, or use
  * `totalTokens`.
+ *
+ * The `?? 0` legs are NOT redundant despite the required types. Both helpers
+ * are called straight onto API-deserialized rows in the UI, and during the
+ * rolling deploy that ships this change a new bundle can reach an old pod whose
+ * response predates `cacheCreationInputTokens`. Bare `+` would turn the WHOLE
+ * total into `NaN` rather than dropping just the absent leg — a visible wrong
+ * number on every tile, where the honest degradation is the old total.
  */
 export function promptTokens(
   row: Pick<BilledTokenCounts, "inputTokens" | "cacheCreationInputTokens">,
 ): number {
-  return row.inputTokens + row.cacheCreationInputTokens;
+  return (row.inputTokens ?? 0) + (row.cacheCreationInputTokens ?? 0);
 }
 
 /** Every billed token class for a row: fresh input + cache write + cache read + output. */
 export function totalTokens(row: BilledTokenCounts): number {
-  return promptTokens(row) + row.cachedInputTokens + row.outputTokens;
+  return promptTokens(row) + (row.cachedInputTokens ?? 0) + (row.outputTokens ?? 0);
 }
 
 export interface CostEvent {
