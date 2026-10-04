@@ -3517,7 +3517,9 @@ function ensureRegistry(): {
         + "compute webhook-driven PR-review failure rate and detect repeated execution-pod "
         + "failures (BLO-7457 / BLO-9147 / BLO-17953). agent_id is retained for EVERY error code "
         + "and bounded to the company agent roster by normalizeAgentId, so agent_id='unknown' means "
-        + "the run carried no agent id or an id that is not a real agent — not that policy collapsed "
+        + "the run carried no agent id, an id that is not a real agent, or an id the 30s roster "
+        + "cache had not yet observed (reachable only for an agent's first failing run within 30s "
+        + "of its creation) — not that policy collapsed "
         + "it. issue_id is unbounded and is retained only "
         + "for k8s_pod_schedule_failed, in every isolation mode (run, workspace and shared are all "
         + "execution pods); every other error code collapses it to 'none' (BLO-17953 A1f). Note "
@@ -5002,8 +5004,11 @@ export function recordHeartbeatRunFailed(
   //   collapses any id outside the company roster to `unknown`, exactly as the
   //   seven other `agent_id`-labeled recorders in this module do. The roster is
   //   membership, not runtime status (`agent-roster.ts`), so a paused or retired
-  //   agent still reports under its own id — the only thing that collapses is an
-  //   id that is not a real agent, which is the case worth collapsing. "Which
+  //   agent still reports under its own id. Two ids collapse: one that is not a
+  //   real agent (the case worth collapsing), and — rarely — a real one the 30s
+  //   roster cache has not yet observed, i.e. an agent's first failing run inside
+  //   30s of its creation. The second is an accepted, self-correcting cost that
+  //   errs toward `unknown`, so it can never breach the bound. "Which
   //   lane is losing runs to X" is a question worth answering for every failure
   //   mode, and answering it per-code meant relitigating the allow-list each
   //   time (BLO-33441 added exactly one code; A1c proposed another before its
