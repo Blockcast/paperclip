@@ -177,6 +177,14 @@ export const PRECREATE_REQUIRED_INDEXES: readonly PrecreateRequiredIndex[] = [
       "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_company_agent_created_at_idx " +
       "ON heartbeat_runs USING btree (company_id, agent_id, created_at DESC, id DESC)",
   },
+  {
+    migration: "0247_agent_wakeup_requests_timer_baseline_index.sql",
+    name: "agent_wakeup_requests_timer_baseline_idx",
+    table: "agent_wakeup_requests",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_timer_baseline_idx " +
+      "ON agent_wakeup_requests USING btree (agent_id, requested_at DESC) WHERE source = 'timer'",
+  },
 ];
 
 export type PreflightBlocker = {

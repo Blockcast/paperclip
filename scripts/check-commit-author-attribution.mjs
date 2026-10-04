@@ -80,6 +80,109 @@
  * advisory only (never blocks a merge) and stays a complete historical
  * record, including pre-cutoff violations, so `findAttributionOffenses` only
  * filters by allowlist when a caller opts in via `{ allowlist }`.
+ *
+ * Patch-id keying is rebase-safe but deliberately NOT scope-change-safe: a
+ * grandfathered PR that is *edited* — a conflict resolution that drops a hunk,
+ * a review fixup — changes its patch and falls off the list by design. That is
+ * correct. The exemption was granted to one specific unrecoverable patch, not
+ * to a PR number, so it should not follow the patch as it becomes different
+ * work. The remedy for a dropped-off commit is the re-attribution check below,
+ * not a re-pin.
+ *
+ * ### Before treating an App-attributed commit as unfixable, look the author up
+ *
+ * The grandfather clause is for commits whose author is genuinely lost — NOT
+ * for commits nobody looked up. Query the Paperclip run record first: find the
+ * run whose comments describe this commit's work within minutes of its author
+ * date (runs routinely name the SHA they just created, so this is usually a
+ * citation rather than timestamp inference). If the author is recoverable,
+ * re-attribute the commit — `git commit --amend --author=…`, preserving the
+ * author date, proving the content is unchanged with `git patch-id --stable`
+ * on both sides — and do NOT request an allowlist entry. That path shrinks
+ * this list instead of growing it and touches no security control; it is how
+ * PRs #1126 and #1161 were landed (BLO-27142).
+ *
+ * ## The App stamps its noreply address in more than one spelling (BLO-26647)
+ *
+ * This predicate used to be a single `!==` against the one
+ * `290875700+allyblockcast[bot]@users.noreply.github.com` literal, so it
+ * measured SPELLING rather than identity. Confirmed against
+ * `GET /repos/{owner}/{repo}/commits/{sha}` (`author.login`, `author.id`,
+ * `author.type` all resolving to the App, id `290875700`), the same
+ * installation also lands commits under a bare `allyblockcast[bot]@…` with no
+ * numeric prefix, and once under a WRONG numeric prefix
+ * (`220200645+allyblockcast[bot]@…`). The numeric prefix is caller-supplied at
+ * commit time — whatever `git config user.email` or the REST payload said — not
+ * a verified property of the write, so it varies by write path even though
+ * every one of these is the same shared credential.
+ * `APP_NOREPLY_EMAIL_PATTERN` therefore matches the `allyblockcast[bot]`
+ * local-part on the `users.noreply.github.com` domain with an OPTIONAL numeric
+ * prefix of ANY digits, an OPTIONAL `+tag` subaddress, and case-insensitively.
+ *
+ * Measured on `origin/master`, non-merge commits since 2026-07-01: 192 caught
+ * by the old literal, 15 missed purely on spelling (13 bare, 1 wrong-prefix,
+ * 1 no-`[bot]`), 2 of the missed landing AFTER this gate's own cutoff.
+ *
+ * ### `220200645+allyblockcast[bot]@…` is NOT a second installation — it is a
+ * ### malformed stamp, and it IS matched
+ *
+ * The one commit carrying it (`d41030016`, merged 2026-08-10) has NO `author`
+ * object at all in `GET /repos/{owner}/{repo}/commits/{sha}` — only `committer`
+ * (a human, `kkroo`). GitHub could not resolve `220200645` to any account, App
+ * or user. It reads as a hand-typed or copy-paste-mangled `--author` override
+ * that got the prefix wrong, and it erases the true author exactly as badly
+ * (worse — it does not even resolve), so the any-digits prefix catches it
+ * deliberately. If a genuinely second App installation ever appears, name it
+ * here explicitly rather than leaning on this catch-all.
+ *
+ * ### `allyblockcast@users.noreply.github.com` (no `[bot]`) is a DIFFERENT real
+ * ### account — deliberately NOT matched
+ *
+ * Commits carrying that exact no-`[bot]` address resolve to
+ * `author.login: "allyblockcast"`, `author.id: 296676656` — a distinct GitHub
+ * account from the App (`allyblockcast[bot]`, id `290875700`). It has its own
+ * version of the shared-identity problem BLO-21416 describes, but not the one
+ * this gate is chartered to catch. Recorded rather than silently matched
+ * (which would misattribute it to the wrong installation) or silently dropped
+ * (which would hide a real second instance of the underlying problem).
+ *
+ * ## The bare spelling is shared with one non-agent process, so the carve-out
+ * ## is name-scoped AND path-scoped — the author name alone is forgeable
+ *
+ * Widening the match to the bare form catches the `graphify-reindex` bot, a
+ * scheduled knowledge-graph refresh (`origin/bot/graphify-reindex`) that pushes
+ * under `graphify-reindex (allyblockcast)
+ * <allyblockcast[bot]@users.noreply.github.com>`. It is not a per-agent write
+ * path and there is no agent behind it to recover, so it is genuinely exempt.
+ *
+ * But BOTH halves of a git author are caller-controlled, so exempting on the
+ * name alone would hand every agent a one-line bypass of this entire gate:
+ * set `user.name` to the bot's name, keep the bare email, done. The exemption
+ * in `NON_AGENT_PROCESS_EXEMPTIONS` therefore also pins the PATHS the process
+ * is allowed to touch: every file in the commit must be under
+ * `server/src/graphify-out/`, anchored at the repo root (measured: both
+ * graphify-authored commits in this repo's history, `514aefa72` and
+ * `206d6edaf`, touch only that directory). The anchor matters: a forger can
+ * create a NEW `graphify-out/` directory anywhere, so an unanchored
+ * `graphify-out/` match would let `server/src/services/graphify-out/x.ts`
+ * through. A commit wearing the bot's name that changes anything else is still
+ * an offense, which is what makes the forgery useless: it can only smuggle in
+ * generated graph data, never work.
+ *
+ * The anchor also depends on `pathsForCommit` passing `core.quotePath=false`:
+ * git's default quotes non-ASCII paths (`"server/src/graphify-out/\303\251.json"`),
+ * and the leading `"` would false-reject a real graphify commit.
+ *
+ * The path set is fail-closed — a caller that supplies no `paths` gets no
+ * exemption. So `--audit-merged` (which has no cheap path source) reports
+ * graphify commits as advisory findings; that is deliberate, the audit is a
+ * complete historical record and already declines to apply the allowlist for
+ * the same reason.
+ *
+ * `pr.yml` deliberately does not exempt by BRANCH name instead: `head_ref` is
+ * a fork bypass (it carries no repository identity, so any fork can name a
+ * branch `bot/graphify-reindex`) and is empty on `merge_group`, which would
+ * false-reject the whole queue.
  */
 import { execFileSync } from "node:child_process";
 import path from "node:path";
@@ -87,6 +190,56 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 export const APP_NOREPLY_EMAIL = "290875700+allyblockcast[bot]@users.noreply.github.com";
+
+/**
+ * Every observed spelling of the shared App noreply address (BLO-26647): an
+ * optional numeric prefix of ANY digits, the literal `allyblockcast[bot]`
+ * local-part, an optional `+tag` subaddress, on the `users.noreply.github.com`
+ * domain, case-insensitive. Each relaxation is load-bearing and argued in the
+ * module docblock — in particular this deliberately does NOT match
+ * `allyblockcast@users.noreply.github.com` (no `[bot]`), which is a different
+ * real account (id 296676656), so the `[bot]` boundary is the one part that
+ * must stay exact.
+ */
+export const APP_NOREPLY_EMAIL_PATTERN =
+  /^(?:\d+\+)?allyblockcast\[bot\](?:\+[^@]*)?@users\.noreply\.github\.com$/i;
+
+/**
+ * Non-agent automated processes that share the App's bare noreply email and
+ * so cannot be told apart from a genuine agent commit by email alone.
+ *
+ * Keyed by author name, but a name is caller-controlled and therefore NOT
+ * sufficient on its own — each entry also pins the paths that process is
+ * allowed to touch, and a commit touching anything outside them stays an
+ * offense however it is named. See the module docblock. Add a new entry with
+ * the real commit/branch that justifies it and the narrowest path scope that
+ * covers its output; never widen `APP_NOREPLY_EMAIL_PATTERN` to exclude one.
+ */
+export const NON_AGENT_PROCESS_EXEMPTIONS = new Map([
+  // origin/bot/graphify-reindex — scheduled knowledge-graph refresh.
+  // Both graphify-authored commits in this repo's history (514aefa72,
+  // 206d6edaf) touch only server/src/graphify-out/. Anchored at the repo
+  // root: an unanchored `graphify-out/` is a directory the forger can create.
+  ["graphify-reindex (allyblockcast)", /^server\/src\/graphify-out\//],
+]);
+
+/**
+ * True when `commit` is one of the `NON_AGENT_PROCESS_EXEMPTIONS` processes
+ * AND every path it touches is inside that process's pinned scope.
+ *
+ * Fail-closed on purpose: a commit with no `paths` (an unknown or absent file
+ * list) is never exempt, so a caller that cannot supply paths — `--audit-merged`
+ * — reports these rather than waving them through on the strength of a
+ * forgeable name.
+ */
+export function isExemptNonAgentProcessCommit(commit) {
+  const scope = NON_AGENT_PROCESS_EXEMPTIONS.get(commit.authorName ?? "");
+  if (scope === undefined) return false;
+  const paths = commit.paths;
+  if (!Array.isArray(paths) || paths.length === 0) return false;
+  return paths.every((filePath) => scope.test(filePath));
+}
+
 export const DEFAULT_AUDIT_REPOS = ["Blockcast/trafficcontrol", "Blockcast/paperclip"];
 
 /** Default lookback for `--audit-merged`, in days. */
@@ -145,9 +298,17 @@ export const ATTRIBUTION_GATE_CUTOFF_MS = Date.parse(ATTRIBUTION_GATE_CUTOFF);
  * above (a closed, non-growing condition) or for a grandfathered commit
  * whose SHA changed because it was rebased (see
  * the docblock trade-off) — never for an ordinary new PR.
+ *
+ * It SHRINKS, though, and should: an entry whose patch is on no ref any more
+ * is a standing exemption nobody needs on a security control. Two came out in
+ * BLO-26647 — `b22bed3ac5…` (keyed #1126's `cb120b0e3`) and `437abe8653…`
+ * (keyed #1161's `b54c3bc26`). Both PRs landed by RE-ATTRIBUTION instead, so
+ * the patches they keyed exist nowhere. Before removing one, verify no open PR
+ * still carries it: compute `git patch-id --stable` for every App-attributed
+ * non-merge commit across all open PRs and check membership. Done 2026-09-29
+ * over all 142 open PRs and all 13 such commits — neither key appeared.
  */
 export const GRANDFATHERED_OFFENSE_SHAS = new Set([
-  "b22bed3ac5812f8ba9b335b597accc2dbd59b9c8",
   "63b58b5df729db30d26325d3cb3349d6d07750ef",
   "87724aca1ceecc93d9a430029dd92362171650f0",
   "73661f1e600a5f4b71e993cb2933cea97564009e",
@@ -160,12 +321,38 @@ export const GRANDFATHERED_OFFENSE_SHAS = new Set([
   "11d7a79790aa8fc658cb164ce2f2b372e98bce07",
   "5d1fb094eb82d0f83fcd1f7d47a615936b68f273",
   "e6e8c25ae37b161b062ae67c95970c958f89198a",
-  "437abe8653d01a0dbbae17e8a2ed88477df9d46e",
   "8b7e81fde79203be6342c70c010928f154b1e2a0",
-].map((sha) => `${sha}|${APP_NOREPLY_EMAIL}`));
-// BLO-26647's matcher case is retained under the same patch-id key shape;
-// its bare bot identity is intentionally not an offense in this gate.
-GRANDFATHERED_OFFENSE_SHAS.add("3203ee89e7bbeef3cc7d34bc3fa0a84e26788387|allyblockcast[bot]@users.noreply.github.com");
+].map((patchId) => `${patchId}|${APP_NOREPLY_EMAIL}`));
+
+/**
+ * The same clause, for pre-cutoff commits carrying the BARE spelling of the
+ * App address. Before BLO-26647 widened `APP_NOREPLY_EMAIL_PATTERN` these
+ * were not offenses at all — they passed on a matcher bug, not on merit — so
+ * registering them is the same retro-break protection BLO-23894 exists to
+ * provide, applied to the cohort that tightening the matcher newly exposes.
+ *
+ * Enumerated by scanning the commits of all 142 open `Blockcast/paperclip`
+ * PRs on 2026-09-29 for the widened predicate, and keeping only those with
+ * `authorDate < ATTRIBUTION_GATE_CUTOFF`. It is closed for the same reason
+ * the list above is: the cutoff is in the past.
+ *
+ * ONE commit in that scan was deliberately left OFF — `7d8070c83` on #1278
+ * (`0f54e7c58624243b66149833ec3d5f7cd9947879`, authored 2026-08-18T16:58:55Z,
+ * nine days AFTER the cutoff). It is a live violation the gate is correctly
+ * enforcing on, not a grandfather candidate; its author re-attributes it per
+ * AGENTS.md §9.
+ */
+const BARE_APP_NOREPLY_EMAIL = "allyblockcast[bot]@users.noreply.github.com";
+for (const patchId of [
+  "3203ee89e7bbeef3cc7d34bc3fa0a84e26788387", // #1076 6e7440da2, 2026-08-07T04:47:38Z (BLO-26647)
+  "102821942f40ec00b8ad6caef30fdcf06d3d10a2", // #1140 cace65cf3, 2026-08-07T15:42:01Z
+  "6f68b4dc6658bff45a895cf4b917e64af4f76e9e", // #1183 47d44df5c, 2026-08-09T00:36:48Z
+  "4e5c4ab103c22ab8aa27ab6563219bb80061e00b", // #891  538563689, 2026-07-31T22:21:19Z
+  "c9ceb199c4c43b8ed690e53f16c699fb5fd8a343", // #891  8a7b9fe12, 2026-08-01T15:42:44Z
+  "6300049f135f0bda6f93cf2966563efe708328ed", // #929  2a97e098c, 2026-08-02T04:54:09Z
+]) {
+  GRANDFATHERED_OFFENSE_SHAS.add(`${patchId}|${BARE_APP_NOREPLY_EMAIL}`);
+}
 
 const UNIT_SEPARATOR = "\u001f";
 const RECORD_SEPARATOR = "\u001e";
@@ -173,10 +360,17 @@ const RECORD_SEPARATOR = "\u001e";
 /**
  * Shared assertion: given normalized non-merge-or-merge-tagged commit
  * records, return the ones stamped with the shared App identity.
- * `commits` entries: { sha, authorEmail, authorDate, parentCount, message,
- * context? }. A `parentCount` of 2+ is a merge commit and is always out of
- * scope, independent of which mode produced the record (defensive — mode 1
- * already excludes these via `--no-merges`).
+ * `commits` entries: { sha, authorEmail, authorName, authorDate, parentCount,
+ * message, paths?, patchId?, context? }. A `parentCount` of 2+ is a merge
+ * commit and is always out of scope, independent of which mode produced the
+ * record (defensive — mode 1 already excludes these via `--no-merges`).
+ *
+ * `authorEmail` is matched against `APP_NOREPLY_EMAIL_PATTERN`, not one
+ * literal — the App stamps several spellings of the same address (BLO-26647).
+ *
+ * `authorName` plus `paths` clear the one non-agent process that shares the
+ * bare spelling (`isExemptNonAgentProcessCommit`); the name alone never does,
+ * because a name is caller-controlled.
  *
  * `allowlist`, if given (a `Set` of `${patchId}|${authorEmail}` keys), clears
  * only an enumerated patch and author pair — BLO-23894's grandfather clause.
@@ -187,9 +381,11 @@ const RECORD_SEPARATOR = "\u001e";
 export function findAttributionOffenses(commits, { allowlist } = {}) {
   return commits.filter((commit) => {
     if ((commit.parentCount ?? 1) > 1) return false;
-    if (commit.authorEmail !== APP_NOREPLY_EMAIL) return false;
+    const authorEmail = String(commit.authorEmail ?? "");
+    if (!APP_NOREPLY_EMAIL_PATTERN.test(authorEmail)) return false;
+    if (isExemptNonAgentProcessCommit(commit)) return false;
     if (allowlist === undefined) return true;
-    const key = `${String(commit.patchId ?? "").toLowerCase()}|${commit.authorEmail}`;
+    const key = `${String(commit.patchId ?? "").toLowerCase()}|${authorEmail.toLowerCase()}`;
     return !allowlist.has(key);
   });
 }
@@ -200,8 +396,8 @@ function parseLocalGitLog(rawOutput) {
     .map((record) => record.trim())
     .filter(Boolean)
     .map((record) => {
-      const [sha, authorEmail, authorDate, subject] = record.split(UNIT_SEPARATOR);
-      return { sha, authorEmail, authorDate, parentCount: 1, message: subject ?? "" };
+      const [sha, authorEmail, authorName, authorDate, subject] = record.split(UNIT_SEPARATOR);
+      return { sha, authorEmail, authorName, authorDate, parentCount: 1, message: subject ?? "" };
     });
 }
 
@@ -218,6 +414,17 @@ function patchIdForCommit(repoRoot, sha, execFile = execFileSync) {
   }).trim().split(/\s+/)[0] ?? "";
 }
 
+function pathsForCommit(repoRoot, sha, execFile = execFileSync) {
+  // core.quotePath=false: the exemption scope is `^`-anchored, and git's
+  // default quoting of non-ASCII paths would prefix them with `"`.
+  const raw = execFile("git", ["-c", "core.quotePath=false", "show", "--format=", "--name-only", "--no-renames", sha], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  return raw.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
 /**
  * Local mode: non-merge commits in `base..head` of a checked-out repo.
  * `execFileSync` (argv array, no shell) — `base`/`head` are refs/SHAs from
@@ -225,6 +432,12 @@ function patchIdForCommit(repoRoot, sha, execFile = execFileSync) {
  * Applies the BLO-23894 grandfather allowlist by default — this is the gate
  * that actually blocks a PR, so pre-cutoff, allowlisted commits are out of
  * scope.
+ *
+ * The per-commit `git show` calls that produce `patchId` and `paths` run ONLY
+ * for commits whose author email already matches the App pattern: they exist
+ * to decide grandfathering and the non-agent-process exemption, and neither
+ * question arises otherwise. On an ordinary PR that is zero extra git
+ * invocations rather than two per commit.
  */
 export function findLocalRangeOffenses({
   repoRoot,
@@ -233,16 +446,21 @@ export function findLocalRangeOffenses({
   execFile = execFileSync,
   allowlist = GRANDFATHERED_OFFENSE_SHAS,
 } = {}) {
-  const format = `%H${UNIT_SEPARATOR}%ae${UNIT_SEPARATOR}%aI${UNIT_SEPARATOR}%s${RECORD_SEPARATOR}`;
+  const format = `%H${UNIT_SEPARATOR}%ae${UNIT_SEPARATOR}%an${UNIT_SEPARATOR}%aI${UNIT_SEPARATOR}%s${RECORD_SEPARATOR}`;
   const rawOutput = execFile(
     "git",
     ["log", "--no-merges", `--format=${format}`, `${base}..${head}`],
     { cwd: repoRoot, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
   );
-  const commits = parseLocalGitLog(rawOutput).map((commit) => ({
-    ...commit,
-    patchId: patchIdForCommit(repoRoot, commit.sha, execFile),
-  }));
+  const commits = parseLocalGitLog(rawOutput).map((commit) =>
+    APP_NOREPLY_EMAIL_PATTERN.test(String(commit.authorEmail ?? ""))
+      ? {
+          ...commit,
+          patchId: patchIdForCommit(repoRoot, commit.sha, execFile),
+          paths: pathsForCommit(repoRoot, commit.sha, execFile),
+        }
+      : commit,
+  );
   return findAttributionOffenses(commits, { allowlist });
 }
 
@@ -327,6 +545,12 @@ export async function auditRepoCommitAttribution({ repo, since, ghApi }) {
     const normalized = commits.map((commit) => ({
       sha: commit.sha,
       authorEmail: commit.commit?.author?.email ?? null,
+      // Carried so the audit REPORT names the author, not so it exempts:
+      // `paths` is deliberately absent here, and
+      // `isExemptNonAgentProcessCommit` fails closed without it — see the
+      // module docblock. The audit is a complete advisory record and already
+      // declines to apply the grandfather allowlist for the same reason.
+      authorName: commit.commit?.author?.name ?? null,
       authorDate: commit.commit?.author?.date ?? null,
       parentCount: commit.parents?.length ?? 1,
       message: (commit.commit?.message ?? "").split("\n")[0],
@@ -458,10 +682,11 @@ async function main() {
       `ERROR: ${offenses.length} commit(s) in ${base}..${head} carry the shared allyblockcast[bot] App identity instead of a per-agent author:\n`,
     );
     for (const offense of offenses) {
-      console.error(`  ${offense.sha.slice(0, 7)} "${offense.message}" — ${offense.authorEmail}`);
+      const author = offense.authorName ? `${offense.authorName} <${offense.authorEmail}>` : offense.authorEmail;
+      console.error(`  ${offense.sha.slice(0, 7)} "${offense.message}" — ${author}`);
     }
     console.error(
-      "\nThis almost certainly means the commit was created via the GitHub REST/MCP write path (contents API, merge API, or `create_or_update_file`/`push_files`, which always stamps the shared App credential). Fix: recreate it with `git push`, which carries your per-agent identity from the run environment.\n\nDo NOT try to fix this by setting `git config user.email`/`user.name` in the checkout. Since BLO-29050 every adapter process runs with a `GIT_AUTHOR_*`/`GIT_COMMITTER_*` overlay that outranks the local, global and system config files, so a config write changes nothing about what gets committed — and `git config user.email` correspondingly tells you nothing about what the gate saw. Diagnose from the commit instead: `git log -1 --pretty='%an <%ae>'`. (Earlier revisions of this message named a misconfigured local config as the second cause; that was true of the 2026-08-10 sweep and is not a live failure mode now.) See AGENTS.md §9 (BLO-21416).\n\nIf this commit genuinely predates the gate (authored before ATTRIBUTION_GATE_CUTOFF, e.g. it was already open and reviewed before the rule existed, or it's a grandfathered PR that got rebased and changed SHA) it is unfixable in place — file against BLO-23894's owner to add its SHA to GRANDFATHERED_OFFENSE_SHAS rather than rewriting history.",
+      "\nThis almost certainly means the commit was created via the GitHub REST/MCP write path (contents API, merge API, or `create_or_update_file`/`push_files`, which always stamps the shared App credential). Fix: recreate it with `git push`, which carries your per-agent identity from the run environment.\n\nDo NOT try to fix this by setting `git config user.email`/`user.name` in the checkout. Since BLO-29050 every adapter process runs with a `GIT_AUTHOR_*`/`GIT_COMMITTER_*` overlay that outranks the local, global and system config files, so a config write changes nothing about what gets committed — and `git config user.email` correspondingly tells you nothing about what the gate saw. Diagnose from the commit instead: `git log -1 --pretty='%an <%ae>'`. (Earlier revisions of this message named a misconfigured local config as the second cause; that was true of the 2026-08-10 sweep and is not a live failure mode now.) See AGENTS.md §9 (BLO-21416).\n\nIf this commit predates the gate (authored before ATTRIBUTION_GATE_CUTOFF, e.g. it was already open and reviewed before the rule existed, or it's a grandfathered PR that got rebased or edited and changed patch-id), LOOK THE AUTHOR UP BEFORE CALLING IT UNFIXABLE. Query the Paperclip run record for the run whose comments describe this commit's work within minutes of its author date — runs routinely name the SHA they just created. If the author is recoverable, re-attribute it (`git commit --amend --author=…`, preserving the author date, proving the content is unchanged with `git patch-id --stable` on both sides). That is how #1126 and #1161 landed, it shrinks the allowlist instead of growing it, and it touches no security control. Only when the author is genuinely lost is this a grandfather case — then file against BLO-23894's owner to register its PATCH-ID (not its SHA; the allowlist has been patch-id-keyed since BLO-27142) rather than rewriting history.",
     );
     process.exit(1);
   }

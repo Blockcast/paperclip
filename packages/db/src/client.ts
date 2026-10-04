@@ -60,7 +60,7 @@ export type ApplyPendingMigrationsOptions = {
 /**
  * Connection-pool ceiling for the application client.
  *
- * This was previously postgres.js's implicit default (also 10), which meant
+ * This was previously postgres.js's implicit default of 10, which meant
  * callers that must reason about pool capacity had no value to read and could
  * only restate the number in prose. Declaring it here makes it a single source
  * of truth: `PR_REVIEWER_WAKE_MAX_CONCURRENCY` in `routes/github-webhook.ts`
@@ -74,46 +74,80 @@ export type ApplyPendingMigrationsOptions = {
  *
  * ---
  *
- * BLO-35946 AC3 asked for this value to be reconciled against its consumers.
- * It has been measured, and the honest answer is that **10 is inherited, not
- * deliberate, and it is below steady-state demand.** Recorded here rather than
- * changed, because sizing it needs the server-side `max_connections` budget
- * across all replicas and no such budget is documented in either
- * `Blockcast/paperclip` or `Blockcast/onprem-k8s`. Changing the number without
- * it would trade a client-side queue for a server-side connection refusal.
+ * BLO-35946 AC3 asked for this value to be reconciled against its consumers,
+ * and BLO-37330 then sized it. The server-side ceiling it has to fit inside is
+ * written down in `doc/DATABASE-CONNECTION-BUDGET.md` — read that before
+ * changing this number, and re-derive it there rather than here.
  *
- * Measured against this constant (2026-09-24, single API/worker process, one
- * shared pool — note `server/src/index.ts:543` may create a *second* 10-slot
- * pool for `databaseMigrationUrl`):
+ * In short (measured 2026-09-28): `max_connections` 100 −
+ * `superuser_reserved_connections` 3 = 97 on a single `paperclip-pg` instance;
+ * ~17 of those go to the postgres-exporter, overlapping `psql` cronjob
+ * one-shots, transient `createUtilitySql` pools and operator headroom; the
+ * remaining 80, less an explicit 8-connection estimation margin, divides
+ * across a peak of **4** application processes (3 `paperclip-api` pods
+ * mid-rollout at `maxSurge: 1`, plus the 1 worker), which is what puts this at
+ * 18. The margin is a line in that document's arithmetic rather than a
+ * rounding habit: its inputs are declared configuration, not observed
+ * backends, so sizing to the exact ceiling would spend the entire server
+ * budget on estimates the document itself declines to vouch for. Raising this
+ * further needs `max_connections` raised on the server in the same change, or
+ * Postgres starts refusing connections instead of the client queueing — the
+ * worse failure.
+ *
+ * 10 was never deliberate: it was postgres.js's inherited default, and it sat
+ * below steady-state demand. Measured against a single process on 2026-09-24:
  *
  * | source                                              | connections |
  * |-----------------------------------------------------|-------------|
- * | PR-reviewer wakes: 4 slots x depth 2 (see below)     | 8           |
+ * | PR-reviewer wakes: 4 slots x depth 2 (the bound at the then-current pool of 10) | 8 |
  * | scheduler tick: ~11 unlatched concurrent chains      | ~11         |
  * | `plugin-job-scheduler.ts` `DEFAULT_MAX_CONCURRENT_JOBS` | 10       |
- * | one `getDeleteConstraints` precheck (`environments.ts:499`) | 8    |
+ * | one `getDeleteBlastRadius` precheck (`services/environments.ts`) | 8    |
  * | agent run executions                                 | unbounded  |
  *
  * These are not mutually exclusive — they share one pool in one process — so a
- * conservative floor is ~19 concurrent demands with zero API traffic.
+ * conservative floor is ~19 concurrent demands with zero API traffic. 18 does
+ * not clear that worst case, and deliberately so: the 19th caller *queues*
+ * (postgres.js waits rather than throwing), whereas a pool one over the
+ * server's ceiling makes Postgres *refuse*. Buying the last unit of the worst
+ * case would cost the margin that protects against the outage, so the
+ * remaining contention is left as latency on purpose.
+ *
+ * There is no second application pool in production: `server/src/index.ts`
+ * creates one only in the `config.databaseMigrationUrl` branch, and that
+ * resolves solely from `DATABASE_MIGRATION_URL`, which is unset on both
+ * workloads.
  *
  * {@link POSTGRES_POOL_MAX} has exactly one derived consumer,
- * `derivePrReviewerWakeMaxConcurrency` (`routes/github-webhook.ts:3013`), which
- * yields 4 and reserves 8 of the 10 on the reasoning that `2 * bound < poolMax`.
- * That derivation implicitly assumes the PR path is the only thing on the pool,
- * which the table above contradicts.
+ * `derivePrReviewerWakeMaxConcurrency` (`routes/github-webhook.ts`), which
+ * yields `floor(n/2) - 1` = 8 here. Be precise about what that leaves, because
+ * the obvious reading is wrong: each wake holds **2** connections, so the PR
+ * path reserves `2 * (floor(n/2) - 1) = n - 2` and the headroom for everything
+ * else under PR saturation is a *constant 2* at every even pool size — 2 at
+ * n=10, 2 at n=18, 2 at n=40. Scaling the pool does not widen it. The name
+ * reads like "half the pool"; because depth is 2 it means "all but two
+ * connections".
  *
- * Exactly one live nested acquire remains (`github-webhook.ts:3092` takes a
- * transaction-scoped advisory lock, then `heartbeat.wakeup()` inside it opens
- * its own claim transaction at `heartbeat.ts:23786`). Every other nesting path
- * — recovery, issues, environment leases, both outboxes — was converted to
- * thread `tx` through rather than take a second pooled connection, which is why
- * the two prior incidents at this number (`server/src/index.ts:1114`,
- * `services/issues.ts:5723`) were each fixed by removing a nest rather than by
- * sizing the pool. That is the pattern this note exists to flag: the number has
- * now been paid for twice and never re-derived.
+ * That is stated rather than fixed, and this row does not address it. Capping
+ * the bound to reserve more would convert a queue into a throttle on the one
+ * path that is already the most dispatch-starved in the fleet, to buy headroom
+ * against a saturation that costs latency rather than errors — the pool blocks,
+ * it does not refuse. Changing it is a scheduling-policy decision that wants
+ * its own measurement of observed contention, which the "Known gap" section of
+ * the budget document explains we currently cannot take.
+ *
+ * Exactly one live nested acquire remains (`withPrReviewerTaskLock` in
+ * `routes/github-webhook.ts` takes a transaction-scoped advisory lock, then
+ * `heartbeat.wakeup()` inside it opens its own claim transaction). Every other
+ * nesting path — recovery, issues, environment leases, both outboxes — was
+ * converted to thread `tx` through rather than take a second pooled connection,
+ * which is why the two prior incidents at this number (the stranded-reconcile
+ * chain latch in `server/src/index.ts`, and `issueService`'s instance-settings
+ * read in `services/issues.ts`) were each fixed by removing a nest rather than
+ * by sizing the pool. That last one is kept
+ * deliberately; the reason is recorded at its call site.
  */
-export const POSTGRES_POOL_MAX = 10;
+export const POSTGRES_POOL_MAX = 18;
 
 /**
  * How long a pooled application connection may sit inside an open transaction

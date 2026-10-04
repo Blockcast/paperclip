@@ -1,5 +1,7 @@
 {{/*
-  Grafana dashboard for the GitHub review-request delivery funnel (BLO-20171).
+  Grafana dashboards shipped by this chart. One ConfigMap per dashboard:
+  the GitHub review-request delivery funnel (BLO-20171) and the Paperclip
+  Platform dashboard (BLO-22498). Everything below applies to both.
 
   WHY THIS IS A ConfigMap AND NOT A PrometheusRule-SHAPED NO-OP
   -------------------------------------------------------------
@@ -61,6 +63,49 @@ metadata:
 data:
   github-review-request-funnel.json: |
     {{- .Files.Get "dashboards/github-review-request-funnel.json"
+          | replace "__PAPERCLIP_DS_UID__" .Values.grafanaDashboard.datasourceUid
+          | nindent 4 }}
+---
+{{/*
+  Paperclip Platform dashboard (BLO-22498). Carries the claude_k8s adapter
+  panels and the `Session unavailable` recovery row that is BLO-18012's
+  operational verifying signal: agents-in-error split by error_reason bucket,
+  and the oldest session_unavailable time-in-error against a dashed red
+  threshold at 120s -- BLO-18012's <=2 min recovery bound.
+
+  The panel JSON also lives in Blockcast/onprem-k8s at
+  monitoring/dashboards/paperclip-platform.json, but nothing renders that
+  directory into a ConfigMap, so the copy there is inert. This chart is the
+  only delivery path; keep this file as the source of truth and treat the
+  onprem-k8s copy as a stale mirror.
+
+  The import-time scaffolding the onprem-k8s copy carries (`__inputs`,
+  `__requires`, and the `DS_PROMETHEUS` datasource template variable) is
+  deliberately absent here. Those are honoured only by Grafana's import UI; a
+  sidecar-provisioned dashboard resolves `${DS_PROMETHEUS}` against the
+  default datasource instead, which is `thanos` and does not scrape the
+  paperclip control plane. The panels would render "No data" while looking
+  healthy in review. The uid is pinned through __PAPERCLIP_DS_UID__ for the
+  same reason the funnel dashboard is.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "paperclip.fullname" . }}-grafana-dashboard-platform
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "paperclip.labels" . | nindent 4 }}
+    {{ .Values.grafanaDashboard.sidecarLabel }}: {{ .Values.grafanaDashboard.sidecarLabelValue | quote }}
+    {{- with .Values.grafanaDashboard.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.grafanaDashboard.folder }}
+  annotations:
+    grafana_folder: {{ . | quote }}
+  {{- end }}
+data:
+  paperclip-platform.json: |
+    {{- .Files.Get "dashboards/paperclip-platform.json"
           | replace "__PAPERCLIP_DS_UID__" .Values.grafanaDashboard.datasourceUid
           | nindent 4 }}
 {{- end }}

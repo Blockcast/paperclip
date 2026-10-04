@@ -1674,6 +1674,13 @@
       "when": 1789541200000,
       "tag": "0246_issue_recovery_action_legacy_wake_bounds",
       "breakpoints": true
+    },
+    {
+      "idx": 247,
+      "version": "7",
+      "when": 1789900000000,
+      "tag": "0247_agent_wakeup_requests_timer_baseline_index",
+      "breakpoints": true
     }
   ]
 }

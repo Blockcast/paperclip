@@ -636,7 +636,17 @@ spec:
                 #   - paperclip   — stdio bridge to /api/plugins/tools/* and
                 #                    paperclip's first-class entity tools.
                 #   - prometheus  — pab1it0/prometheus-mcp-server, pointed at
-                #                    in-cluster prometheus.monitoring.
+                #                    in-cluster prometheus.monitoring. Traffic
+                #                    goes through a dedicated single-upstream
+                #                    scrubbing gateway carrying a five-tool
+                #                    allowlist (PEN-2735/PEN-2830); get_targets
+                #                    is absent from it, because its
+                #                    discoveredLabels are pre-relabel and carry
+                #                    every annotation on every scraped object.
+                #                    Direct ingress to the backing Service is
+                #                    denied to all but the two gateways
+                #                    (CiliumNetworkPolicy, BLO-24973), so this
+                #                    URL must stay on the gateway host.
                 #   - tempo       — Tempo 2.10's built-in MCP at /api/mcp.
                 #   - k8s-ro      — containers/kubernetes-mcp-server, READONLY
                 #                    tier (cluster-wide get/list/watch, no
@@ -670,7 +680,7 @@ spec:
                   },
                   "prometheus": {
                     "type": "http",
-                    "url": "http://prometheus-mcp-server.paperclip.svc.cluster.local:8080/mcp"
+                    "url": "http://paperclip-mcp-gateway-prometheus.paperclip.svc.cluster.local:8080/prometheus/mcp"
                   },
                   "tempo": {
                     "type": "http",

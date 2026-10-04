@@ -234,6 +234,36 @@ function deferred<T = void>() {
 }
 
 /**
+ * Poll until `condition` holds, reporting `describeFailure` rather than hanging
+ * to the vitest timeout.
+ *
+ * The deadline is a *diagnostic backstop*, not a correctness input: it exists so
+ * a genuine regression names itself instead of surfacing as an opaque timeout.
+ * Nothing this suite asserts may depend on the machine reaching a state within
+ * a particular wall-clock span — that dependency is exactly what ejected merge
+ * groups (PEN-3654), so the deadline is set far beyond any plausible CI stall.
+ *
+ * It must nonetheless stay strictly BELOW the enclosing test budget, or vitest
+ * kills the case first and the named message below is unreachable — which would
+ * reintroduce the opaque timeout this helper exists to remove. This package sets
+ * `testTimeout: 60_000` (vitest.config.ts, BLO-37114); the single case using
+ * this helper arms two backstops in sequence, so 15s each bounds the diagnostic
+ * path at 30s and leaves the same again for the PGlite work itself. Raising this
+ * past ~25s silently disarms the second one.
+ */
+async function waitUntil(
+  condition: () => boolean,
+  describeFailure: () => string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(describeFailure());
+    await new Promise((r) => setTimeout(r, 1));
+  }
+}
+
+/**
  * Built once per file rather than per test: the WASM Postgres boot plus the
  * migration replay cost ~1.6s each time and blew vitest's 10s hook timeout on a
  * saturated CI runner, reddening unrelated PRs (BLO-36739). Truncating gives
@@ -297,26 +327,69 @@ describe("PEN-3013 — two distinct objects under one alertname both deliver", (
     // issues.create (it threw earlier, or a future change stops routing
     // through it) this must report *that*, not hang to the vitest timeout and
     // surface as a timeout with the real defect invisible.
-    const barrierDeadline = Date.now() + 5_000;
-    while (!firstIsHoldingFence) {
-      if (Date.now() > barrierDeadline) {
-        throw new Error(
-          "delivery A never reached issues.create, so it never held the fence; " +
-            "the contention this test asserts was never set up",
-        );
-      }
-      await new Promise((r) => setTimeout(r, 1));
-    }
+    await waitUntil(
+      () => firstIsHoldingFence,
+      () =>
+        "delivery A never reached issues.create, so it never held the fence; " +
+        "the contention this test asserts was never set up",
+    );
 
+    // B's budget must not be able to expire while A is deliberately held. What
+    // this case asserts is that a refused claim WAITS and then succeeds — not
+    // how large the budget is, which is pinned on a virtual clock below.
+    //
+    // PEN-3654: the previous shape raced a 400ms wall-clock budget against A's
+    // real PGlite work, then released A on a fixed 60ms sleep. Measured on an
+    // IDLE 32-core box, B already consumed 46–202ms of that 400ms budget
+    // (max 51%), so under CI contention — workspaces-b runs packages
+    // concurrently on an ARC pod that PEN-3528 shows is scheduling-starved —
+    // a ~2x stretch made B exhaust its budget and reject. A merge-group
+    // ejection costs ~80 minutes of the whole organisation's merge throughput.
+    let bRefusals = 0;
     const b = deliver(
       ctxB,
       firingPayloadFor("ssh-bastion", "teleport-session-sync", "fp-b"),
       "req-b",
-      fastPolicy(),
+      fastPolicy({
+        budgetMs: 30_000,
+        sleep: async (ms) => {
+          bRefusals += 1;
+          await new Promise((r) => setTimeout(r, ms));
+        },
+      }),
     );
 
-    // Let B contend and back off a few times, then release A.
-    await new Promise((r) => setTimeout(r, 60));
+    // Release A on OBSERVED contention rather than on elapsed time: the policy
+    // only sleeps after a refused claim, so this is B being refused, not a
+    // guess about how long that takes.
+    let bSettled: "resolved" | "rejected" | null = null;
+    let bError: unknown;
+    void b.then(
+      () => {
+        bSettled = "resolved";
+      },
+      (err: unknown) => {
+        bSettled = "rejected";
+        bError = err;
+      },
+    );
+
+    // B cannot legitimately settle before A is released — A holds the fence
+    // under this same process identity, so the steal and backstop arms both
+    // exclude it. So a settled B here means the bounded wait is gone, which
+    // must fail loudly and immediately rather than stalling this barrier.
+    await waitUntil(
+      () => bRefusals >= 2 || bSettled !== null,
+      () =>
+        `delivery B neither retried nor settled while A held the fence ` +
+        `(refusals=${bRefusals})`,
+    );
+    expect(
+      bSettled,
+      `delivery B settled (${bSettled}) before ever retrying, so it did not ` +
+        `wait out the held fence: ${String(bError)}`,
+    ).toBeNull();
+
     holdFirst.resolve();
 
     // The headline criterion: neither delivery fails.

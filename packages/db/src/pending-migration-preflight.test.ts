@@ -346,6 +346,7 @@ describe("decidePreflightBlocker", () => {
 describe("collectPreflightBlockers", () => {
   const heartbeatSpecs = PRECREATE_REQUIRED_INDEXES.filter((spec) => spec.table === "heartbeat_runs");
   const issuesSpecs = PRECREATE_REQUIRED_INDEXES.filter((spec) => spec.table === "issues");
+  const wakeupRequestSpecs = PRECREATE_REQUIRED_INDEXES.filter((spec) => spec.table === "agent_wakeup_requests");
 
   // Both probes are reads with no effects, so their *verdict* is covered by
   // `decidePreflightBlocker` above and what is left to pin is how many times
@@ -406,11 +407,14 @@ describe("collectPreflightBlockers", () => {
 
     await collectPreflightBlockers(PRECREATE_REQUIRED_INDEXES, probes);
 
-    // Seven heartbeat_runs entries and two issues entries collapse to two
-    // probes. Asserted as a set-with-count so adding a registry entry on an
-    // existing table does not move this number.
-    expect(populationCalls.sort()).toEqual(["heartbeat_runs", "issues"]);
-    expect(heartbeatSpecs.length + issuesSpecs.length).toBe(PRECREATE_REQUIRED_INDEXES.length);
+    // Eight heartbeat_runs entries, two issues entries and one
+    // agent_wakeup_requests entry collapse to three probes. Asserted as a
+    // set-with-count so adding a registry entry on an existing table does not
+    // move this number.
+    expect(populationCalls.sort()).toEqual(["agent_wakeup_requests", "heartbeat_runs", "issues"]);
+    expect(heartbeatSpecs.length + issuesSpecs.length + wakeupRequestSpecs.length).toBe(
+      PRECREATE_REQUIRED_INDEXES.length,
+    );
   });
 
   it("memoizes an empty table rather than re-probing it per spec", async () => {

@@ -66,7 +66,7 @@ case "$cmd" in
       retry-pull)
         if [ "$attempts" -eq 1 ]; then exit 42; fi
         ;;
-      slow-pull) sleep 1 ;;
+      slow-pull) sleep 4 ;;
     esac
     ;;
   run)
@@ -88,7 +88,7 @@ case "$cmd" in
     printf 'missing:%s\\n' "$mode" > "$DOCKER_CIDFILE_STATE_FILE"
     printf 'paperclip-ffmpeg-probe-test\\n' > "$cidfile"
     case "$DOCKER_STUB_MODE" in
-      success|slow-pull|retry-pull)
+      success|retry-pull)
         printf ' E moq_mmt MMTP muxer\\n'
         i=0
         while [ "$i" -lt 5000 ]; do
@@ -96,6 +96,11 @@ case "$cmd" in
           i=$((i + 1))
         done
         ;;
+      # slow-pull runs under a deliberately short probe budget, so it emits the
+      # single muxer line instead of the 5000-line flood the success case uses
+      # to exercise truncation. The flood is ~8x the probe's cost on a loaded
+      # runner and nothing in the slow-pull assertions reads the output.
+      slow-pull) printf ' E moq_mmt MMTP muxer\\n' ;;
       missing) printf ' E matroska Matroska muxer\\n' ;;
       failed) exit 42 ;;
       timeout) sleep 1 ;;
@@ -126,8 +131,13 @@ esac
         DOCKER_CIDFILE_STATE_FILE: cidfileStateFile,
         DOCKER_STUB_MODE: mode,
         FFMPEG_PROBE_OUTPUT_BYTES: "256",
-        FFMPEG_PROBE_TIMEOUT_SECONDS: mode === "timeout" || mode === "slow-pull" ? "0.5" : "15",
-        FFMPEG_PULL_TIMEOUT_SECONDS: mode === "slow-pull" ? "2" : "15",
+        // slow-pull asserts an ordering, not a duration: probe budget < pull
+        // sleep < pull budget. Only `probe work < probe budget` can flake — a
+        // `sleep` never runs short — so the probe budget carries the headroom
+        // (3s against ~35ms of work) while the sleep stays clear above it.
+        FFMPEG_PROBE_TIMEOUT_SECONDS:
+          mode === "timeout" ? "0.5" : mode === "slow-pull" ? "3" : "15",
+        FFMPEG_PULL_TIMEOUT_SECONDS: "15",
         FFMPEG_PULL_ATTEMPTS: mode === "pull-failed" ? "1" : "3",
         ...overrides,
       },

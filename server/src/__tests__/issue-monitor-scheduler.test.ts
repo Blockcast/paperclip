@@ -16,6 +16,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  instanceSettings,
   issueComments,
   issueDocuments,
   issueRelations,
@@ -27,7 +28,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS } from "../services/heartbeat.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS } from "../services/heartbeat.js";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   normalizeIssueExecutionPolicy,
@@ -48,8 +50,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const seededAgentIds = new Set<string>();
   const heartbeatServices = new Set<ReturnType<typeof heartbeatService>>();
-  const createHeartbeat = () => {
-    const service = heartbeatService(db);
+  const createHeartbeat = (options?: Parameters<typeof heartbeatService>[1]) => {
+    const service = heartbeatService(db, options);
     heartbeatServices.add(service);
     return service;
   };
@@ -146,6 +148,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(agents);
     await db.delete(companySkills);
     await db.delete(companies);
+    await db.delete(instanceSettings);
   }
 
   afterEach(async () => {
@@ -1431,6 +1434,247 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(agentWakeupRequests.agentId, agentId))
       .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
     expect(recoveryWakeups).toHaveLength(0);
+  });
+
+  // BLO-35155: the grace window is a proxy for "the woken run never called back",
+  // and on a congested lane 38% of runs start AFTER it expires — so the sweep was
+  // clearing monitors whose own woken run was still queued and about to re-arm.
+  // Both directions are asserted here on purpose: a one-sided test passes on code
+  // that never reaps anything at all.
+  it("leaves a triggered monitor alone while its woken run is still queued past the grace", async () => {
+    const { companyId, agentId, issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const runId = randomUUID();
+    // Created just after the trigger, still undispatched 6h later — the measured
+    // shape (BLO-26675: created 09:26Z, startedAt 15:47Z).
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "scheduled",
+      createdAt: new Date(lastTriggeredAt.getTime() + 1000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 2 * 60 * 60 * 1000);
+    await heartbeat.tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      clearReason: null,
+    });
+    expect(issue.monitorWakeRequestedAt).toBeNull();
+
+    // Other direction: once that run reaches a terminal state nothing will re-arm
+    // the monitor, so BLO-29606's reap must still fire, unchanged.
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, runId));
+    const laterTick = new Date(tickAt.getTime() + 60 * 1000);
+    await heartbeat.tickTimers(laterTick);
+
+    const reaped = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(reaped.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "trigger_stalled",
+    });
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(1);
+  });
+
+  // AC3 / BLO-35155: the live-run guard is scoped to the no-`timeoutAt` fallback
+  // only. An explicit operator deadline is authoritative and still expires at its
+  // instant even with a queued run outstanding. This is what fails if the guard
+  // is attached to the wrong branch of the OR.
+  it("still expires a past explicit timeoutAt while a run for the issue is queued", async () => {
+    const { companyId, agentId, issueId, timeoutAt, lastTriggeredAt } = await seedExpiredTriggeredFixture();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "scheduled",
+      createdAt: new Date(lastTriggeredAt.getTime() + 1000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.tickTimers(new Date(timeoutAt!.getTime() + 60 * 1000));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      // Assert the ARM, not just the outcome: with only `status` asserted this
+      // passes whichever branch of the OR cleared the monitor, including the
+      // fallback the guard is supposed to be suppressing here.
+      clearReason: "timeout_exceeded",
+    });
+  });
+
+  // BLO-35155 (Ally review, Important 1): the live-consumer guard must be
+  // BOUNDED. A run that never reaches a terminal status would otherwise hold the
+  // monitor `triggered` forever — BLO-29606's permanent strand re-entered through
+  // a new door. The asymmetry is the point: a false reap self-corrects via the
+  // owner wake, a never-reap does not, so a wedged queue has to degrade back to
+  // bounded BLO-29606 behaviour. Every case below asserts the reap past a queued
+  // run older than the ceiling; they differ only in what the reap does to it.
+  //
+  // `runVsWorktreeCutoff` arms a worktree execution cutoff before or after that
+  // run's createdAt; omitted means production (no worktree runtime, no cutoff).
+  async function reapPastOverAgeQueuedRun(runVsWorktreeCutoff?: "run_before_cutoff" | "run_after_cutoff") {
+    const { companyId, agentId, issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const tickAt = new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000);
+    const overAgeRunId = randomUUID();
+    const overAgeCreatedAt = new Date(tickAt.getTime() - ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS - 60 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      id: overAgeRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "scheduled",
+      createdAt: overAgeCreatedAt,
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    let runtimeEnv: Record<string, string | undefined> | undefined;
+    if (runVsWorktreeCutoff) {
+      // The issue row is created at wall-clock now, after either cutoff, so its
+      // own system wakes (the recovery wake) are not cutoff-skipped.
+      runtimeEnv = { ...process.env, PAPERCLIP_IN_WORKTREE: "true", PAPERCLIP_INSTANCE_ID: "test-worktree" };
+      const cutoffOffsetMs = runVsWorktreeCutoff === "run_before_cutoff" ? 60 * 60 * 1000 : -60 * 60 * 1000;
+      const cutoff = new Date(overAgeCreatedAt.getTime() + cutoffOffsetMs);
+      await instanceSettingsService(db, { runtimeEnv, now: () => cutoff })
+        .updateExperimental({ enableWorktreeRunExecution: true });
+    }
+    await createHeartbeat({ runtimeEnv }).tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "trigger_stalled",
+    });
+    const overAgeRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, overAgeRunId)).then((rows) => rows[0]!);
+    const otherRecoveryRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows.filter((row) =>
+        row.id !== overAgeRunId &&
+        (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "issue_monitor_recovery"));
+    return { overAgeRun, otherRecoveryRuns };
+  }
+
+  // Ally review (7799aed9, Important 1): in production the dispatch scan has no
+  // age filter and is oldest-first, so an over-age queued run is at the head of
+  // the queue, not wedged. The reap must leave it, and the context coalesced into
+  // it, alone; the recovery wake rides on it instead of creating a second run.
+  it("reaps past an over-age queued run without cancelling it outside a worktree", async () => {
+    const { overAgeRun, otherRecoveryRuns } = await reapPastOverAgeQueuedRun();
+    expect(overAgeRun.status).not.toBe("cancelled");
+    expect(overAgeRun.errorCode).not.toBe("issue_monitor_live_consumer_expired");
+    expect((overAgeRun.contextSnapshot as Record<string, unknown> | null)?.wakeReason).toBe("issue_monitor_recovery");
+    expect(otherRecoveryRuns).toHaveLength(0);
+  });
+
+  // Same, in an armed worktree for a run created AFTER the cutoff: the dispatch
+  // scan admits it, so the cutoff bound on the cancel has to spare it.
+  it("reaps past an over-age queued run created after an armed worktree cutoff without cancelling it", async () => {
+    const { overAgeRun, otherRecoveryRuns } = await reapPastOverAgeQueuedRun("run_after_cutoff");
+    expect(overAgeRun.status).not.toBe("cancelled");
+    expect(overAgeRun.errorCode).not.toBe("issue_monitor_live_consumer_expired");
+    expect((overAgeRun.contextSnapshot as Record<string, unknown> | null)?.wakeReason).toBe("issue_monitor_recovery");
+    expect(otherRecoveryRuns).toHaveLength(0);
+  });
+
+  // Ally review (c0i1): a run created before an armed worktree's execution cutoff
+  // is filtered out of every dispatch scan, so it is never terminal. The reap's
+  // task-scoped recovery wake would coalesce into it (no age bound there) and
+  // never dispatch, so the reap retires it and the wake lands on a fresh run.
+  it("cancels an over-age queued run created before an armed worktree cutoff so the recovery wake gets a fresh run", async () => {
+    const { overAgeRun, otherRecoveryRuns } = await reapPastOverAgeQueuedRun("run_before_cutoff");
+    expect(overAgeRun).toMatchObject({ status: "cancelled", errorCode: "issue_monitor_live_consumer_expired" });
+    expect(otherRecoveryRuns).toHaveLength(1);
+  });
+
+  // BLO-35155 (Ally review, Important 2): `scheduled_retry` is excluded from
+  // ISSUE_MONITOR_LIVE_CONSUMER_RUN_STATUSES on purpose — a park can sit for days
+  // and counting it as live would restore the forever-`triggered` stranding. That
+  // decision sat between two near-identical status lists defended only by a
+  // comment, so the mutation "harmonize these lists" failed nothing. Pin it.
+  it("reaps a triggered monitor whose only run is parked in scheduled_retry", async () => {
+    const { companyId, agentId, issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "scheduled",
+      createdAt: new Date(lastTriggeredAt.getTime() + 1000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "trigger_stalled",
+    });
+
+    // Nothing promotes a synthetic park, so retire it or afterEach's
+    // settle-wait (which requires zero non-terminal runs) never returns.
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, runId));
+  });
+
+  // BLO-35155 (Ally review, Suggestion 2): the guard joins on the issue's CURRENT
+  // assignee, so a run queued by a previous assignee is not a live consumer — it
+  // can never re-arm this monitor. Untested behaviour change until now.
+  it("reaps a triggered monitor whose queued run belongs to a previous assignee", async () => {
+    const { companyId, agentId, issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "scheduled",
+      createdAt: new Date(lastTriggeredAt.getTime() + 1000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    const newAssigneeId = randomUUID();
+    await db.insert(agents).values({
+      id: newAssigneeId,
+      companyId,
+      name: "Monitor Bot II",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: { command: process.execPath, args: ["-e", ""], cwd: process.cwd() },
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+      permissions: {},
+    });
+    seededAgentIds.add(newAssigneeId);
+    await db.update(issues).set({ assigneeAgentId: newAssigneeId }).where(eq(issues.id, issueId));
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "trigger_stalled",
+    });
+
+    // The old assignee has no work left, so its queued run is never dispatched
+    // and afterEach's settle-wait would block on it. Retire it explicitly.
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, runId));
   });
 
   // Regression guard: an operator-supplied deadline stays authoritative. A monitor

@@ -301,7 +301,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
   });
 
   it("rate-limits skipped generic timer wakes by advancing the timer baseline", async () => {
-    const { agentId } = await seedCompanyAndAgent({
+    const { companyId, agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
         enabled: true,
         intervalSec: 60,
@@ -309,9 +309,25 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       },
     });
     const now = new Date();
+    const lastTimerTickAt = new Date(now.getTime() - 120_000);
+    // The timer baseline is the agent's last `source: "timer"` wakeup row, not
+    // `lastHeartbeatAt` (BLO-34578), so the tick is armed by seeding that row
+    // outside the 60s interval.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "timer",
+      triggerDetail: "system",
+      reason: "heartbeat_timer",
+      status: "completed",
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat_scheduler",
+      requestedAt: lastTimerTickAt,
+      finishedAt: lastTimerTickAt,
+    });
     await db
       .update(agents)
-      .set({ lastHeartbeatAt: new Date(now.getTime() - 120_000) })
+      .set({ lastHeartbeatAt: lastTimerTickAt })
       .where(eq(agents.id, agentId));
 
     const firstTick = await heartbeat.tickTimers(now);
@@ -324,16 +340,20 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     const wakeups = await db
       .select({ reason: agentWakeupRequests.reason })
       .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.agentId, agentId));
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .orderBy(agentWakeupRequests.requestedAt);
     const [agent] = await db
       .select({ lastHeartbeatAt: agents.lastHeartbeatAt })
       .from(agents)
       .where(eq(agents.id, agentId));
 
-    expect(wakeups).toHaveLength(1);
-    expect(wakeups[0]?.reason).toBe("heartbeat.timer.no_actionable_work");
+    // The seeded tick, then exactly one skip: the second pass wrote nothing.
+    expect(wakeups.map((wakeup) => wakeup.reason)).toEqual([
+      "heartbeat_timer",
+      "heartbeat.timer.no_actionable_work",
+    ]);
     expect(agent?.lastHeartbeatAt).toBeInstanceOf(Date);
-    expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThan(now.getTime() - 120_000);
+    expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThan(lastTimerTickAt.getTime());
   });
 
   it("allows generic timer wakes when the agent has assigned todo work", async () => {
@@ -1970,6 +1990,157 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(wakeup?.status).not.toBe("skipped");
     expect(wakeup?.error ?? "").not.toContain("assignee changed");
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs a promoted mention-wake retry even though the issue assignee is a different agent", async () => {
+    // BLO-38064 AC1, claim leg. The retry GATE exempts a mention lineage via
+    // the pinned `originWakeReason`, but this screen reads raw `wakeReason` —
+    // which every retry mint overwrites to `transient_failure_retry`. So the
+    // first cut of the fix promoted the retry and then cancelled it here three
+    // frames later as `issue_assignee_changed`: same silent loss the issue was
+    // filed for, new error code. Both screens now read
+    // `isNonOwnershipRetryLineage`, so they cannot disagree.
+    //
+    // Paired with the negative directly below: identical rows, and the origin
+    // wake reason is the only thing that differs. Revert the
+    // `isNonOwnershipRetryWake` arm alone and this test fails while that one
+    // still passes.
+    const { companyId, agentId: mentionedAgentId } = await seedCompanyAndAgent({
+      agentName: "ClaudeCoder-Mentioned",
+      agentRole: "engineer",
+    });
+    const assigneeAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder-Assignee",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Mention retry must survive the pre-claim screen",
+      status: "todo",
+      priority: "medium",
+      // A mention wake never confers ownership, so this inequality is the
+      // normal steady state for the shape — not a reassignment.
+      assigneeAgentId,
+    });
+
+    const { runId, wakeupRequestId } = await seedQueuedRun({
+      companyId,
+      agentId: mentionedAgentId,
+      issueId,
+      // Exactly what `scheduleBoundedRetryForRun` writes: the mint's own wake
+      // reason, with the lineage origin pinned alongside it.
+      wakeReason: "transient_failure_retry",
+      contextExtras: { originWakeReason: "issue_comment_mentioned" },
+      invocationSource: "automation",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    // Wait for any terminal state rather than for `succeeded`, so a regression
+    // reports WHICH screen cancelled the run. That distinction is the whole
+    // point of this test: three different screens can cancel this row, and
+    // each was wrong about a mention lineage for a different reason.
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded" || run?.status === "cancelled" || run?.status === "failed";
+    });
+
+    const [run, wakeup] = await Promise.all([
+      db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ status: agentWakeupRequests.status, error: agentWakeupRequests.error })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    expect(run).toEqual({ status: "succeeded", errorCode: null });
+    expect(wakeup?.status).not.toBe("skipped");
+    expect(wakeup?.error ?? "").not.toContain("assignee changed");
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it("still cancels a promoted retry whose lineage origin is not on the non-ownership allow-list", async () => {
+    // BLO-38064 AC2 at the claim leg. The exemption is an allow-list, so a
+    // lineage that began from a wake NOT on it stays cancelled here.
+    // `execution_review_requested` is the deliberate exclusion: its stage
+    // participant is also routinely not the assignee, but the check that
+    // protects it lives only in `evaluateScheduledRetryGate`.
+    const { companyId, agentId: reviewerAgentId } = await seedCompanyAndAgent({
+      agentName: "ClaudeCoder-Reviewer",
+      agentRole: "engineer",
+    });
+    const assigneeAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder-Assignee-Negative",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Non-exempt retry lineage stays cancelled at the claim screen",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId,
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId: reviewerAgentId,
+      issueId,
+      wakeReason: "transient_failure_retry",
+      contextExtras: { originWakeReason: "execution_review_requested" },
+      invocationSource: "automation",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    });
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
   it("still runs source_scoped_recovery_action wakes when the issue assignee has been re-set to the recovery owner mid-flight (idempotent)", async () => {

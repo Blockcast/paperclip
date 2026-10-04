@@ -51,6 +51,7 @@ import {
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
@@ -87,6 +88,7 @@ import {
   type IssueWakeDiagnosticWakeRequest,
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
+  type IssueRecoveryActionKind,
   type IssueWatchdogDiscoveryKind,
   type ProjectWorkspace,
   type SourceTrustMetadata,
@@ -144,7 +146,7 @@ import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/t
 import { logger } from "../middleware/logger.js";
 import { urlForLog } from "../middleware/http-log-policy.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
-import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -244,7 +246,9 @@ import {
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import {
+  isPlanningOnlyRecoveryContextSnapshot,
   isStatusOnlyRecoveryContextSnapshot,
+  statusOnlyEscalationSourceIssueId,
   STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
   statusOnlyMonitorArmResumeGuidance,
 } from "../services/recovery/model-profile-hint.js";
@@ -256,6 +260,10 @@ import {
   type CommentEffectIntent,
   type CommentEffectRow,
 } from "../services/issue-comment-effects.js";
+import {
+  evaluateAgentIssueApprovalLinkAuthorization,
+  type IssueApprovalLinkAuthorizationIssue,
+} from "./issue-approval-link-authorization.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP = 200;
@@ -519,6 +527,20 @@ function scheduleDuplicateCandidateShownActivity(input: {
 }
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+/**
+ * Query params that change which issues list() returns but that the general COUNT(*)
+ * path in issueService.count() does not express. Accepting one would return a count of
+ * a wider set than the caller asked for, with nothing in the response to reveal it.
+ */
+const COUNT_UNSUPPORTED_FILTERS = [
+  "q",
+  "descendantOf",
+  "labelId",
+  "participantAgentId",
+  "touchedByUserId",
+  "inboxArchivedByUserId",
+  "unreadForUserId",
+] as const;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -3024,6 +3046,31 @@ function logIssueListRequest(input: {
   });
 }
 
+/**
+ * Pages through `fetchPage` until it returns a short page, handing each page to `visit`.
+ *
+ * attention=blocked is served by listBlockedInboxIssues, which pages by offset only and
+ * ignores sortField/afterId, so that path advances `offset`; a keyset cursor there would
+ * re-read page one forever. Every other path walks the immutable id order with a keyset
+ * cursor, because offset paging over the mutable activity order re-ranks rows touched
+ * mid-walk, which both double-counts and skips them.
+ */
+export async function walkIssueListPages<Row extends { id: string }>(
+  fetchPage: (page: { offset?: number; afterId?: string }) => Promise<Row[]>,
+  opts: { blocked: boolean; pageSize: number },
+  visit: (rows: Row[]) => Promise<void>,
+): Promise<void> {
+  let offset = 0;
+  let afterId: string | undefined;
+  while (true) {
+    const rows = await fetchPage(opts.blocked ? { offset } : { afterId });
+    await visit(rows);
+    if (rows.length < opts.pageSize) return;
+    if (opts.blocked) offset += rows.length;
+    else afterId = rows[rows.length - 1]!.id;
+  }
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -3603,6 +3650,7 @@ export function issueRoutes(
 
   async function classifySourceRecoveryRevalidation(input: {
     issue: IssueRouteSnapshot;
+    kind: IssueRecoveryActionKind;
     trigger: RecoveryRevalidationTrigger;
     statusChanged?: boolean;
     assigneeChanged?: boolean;
@@ -3645,6 +3693,40 @@ export function issueRoutes(
       input.reopened === true;
     if (!durableSourceChange) return null;
 
+    // Parking an issue in `backlog` retires its recovery action (BLO-25907). `backlog` is
+    // deliberately not dispatchable, so an action left active there names an owner wake that
+    // no sweep will ever deliver — `reconcileStrandedAssignedIssues` covers only
+    // todo/in_progress/in_review. Folding here retires it at the moment of the park; the
+    // backstop sweep folds rows that were parked before this branch existed, or parked by a
+    // path that never reaches this classifier.
+    //
+    // This sits ABOVE the kind guard on purpose: it is a NON-DELIVERABILITY fold, the exact
+    // inverse of the wake-path-existence family below, so the kind carve-out must not reach
+    // it. `reconcileStrandedRecoveryWakeBackstop` folds `backlog` kind-blindly
+    // (`STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES`, ahead of its owner/cause/cooldown
+    // gates), so putting it below would only have deferred the same fold to the sweep and
+    // broken the write-time/sweep division of labour for one kind.
+    if (issue.status === "backlog") {
+      return "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.";
+    }
+
+    // BLO-37677: everything below this line is a wake-path-EXISTENCE test — "the source
+    // issue now has its own way of being re-driven, so this action is redundant". That is
+    // only true for kinds whose action IS a wake-path restoration. `pr_review_non_convergence`
+    // escalates a quality condition to a *different* owner and deliberately leaves the source
+    // issue `in_progress` with its agent owner, so it is born matching the agent-owner branch
+    // below and can never stop matching it. The branches ABOVE stay kind-blind on purpose,
+    // and they are three different reasons, not one: `done`/`cancelled` is genuinely terminal;
+    // the manual blocked→todo recovery is an OUT-OF-BAND signal that the recovery this action
+    // exists to perform has already happened; `backlog` is a NON-DELIVERABILITY fold. A new
+    // branch belongs above this line if it cancels because the issue is finished, because it
+    // CANNOT be driven, or because the action's work was already done by someone else — and
+    // below it only if it cancels because the issue now has its own wake path.
+    //
+    // `=== false` rather than a truthiness read: an off-enum `kind` from the DB keeps today's
+    // cancelling behaviour instead of silently becoming a new zombie-row class (BLO-16074).
+    if (ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION[input.kind] === false) return null;
+
     if (issue.status === "blocked") {
       const readiness = await svc.getDependencyReadiness(issue.id);
       if (readiness.unresolvedBlockerCount > 0) {
@@ -3655,16 +3737,6 @@ export function issueRoutes(
 
     if (issue.assigneeUserId && issue.status !== "done" && issue.status !== "cancelled") {
       return "Recovery action became stale because the source issue now has a human owner.";
-    }
-
-    // Parking an issue in `backlog` retires its recovery action (BLO-25907). `backlog` is
-    // deliberately not dispatchable, so an action left active there names an owner wake that
-    // no sweep will ever deliver — `reconcileStrandedAssignedIssues` covers only
-    // todo/in_progress/in_review. Folding here retires it at the moment of the park; the
-    // backstop sweep folds rows that were parked before this branch existed, or parked by a
-    // path that never reaches this classifier.
-    if (issue.status === "backlog") {
-      return "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.";
     }
 
     if ((issue.status === "todo" || issue.status === "in_progress") && issue.assigneeAgentId) {
@@ -3722,7 +3794,10 @@ export function issueRoutes(
         : input.activeRecoveryAction;
     if (!activeRecoveryAction) return null;
 
-    const resolutionNote = await classifySourceRecoveryRevalidation(input);
+    const resolutionNote = await classifySourceRecoveryRevalidation({
+      ...input,
+      kind: activeRecoveryAction.kind,
+    });
     if (!resolutionNote) return activeRecoveryAction;
 
     const resolved = await recoveryActionsSvc.resolveActiveForIssue({
@@ -3912,9 +3987,19 @@ export function issueRoutes(
    * The read-side half is `hasExplicitWaitingPath` in
    * services/recovery/issue-graph-liveness.ts. The two answer the same question and are
    * deliberately NOT the same predicate: the sweep accepts a superset, and that asymmetry
-   * is safe in exactly one direction — everything this validator admits, the sweep counts.
-   * Keep it that way. PEN-2853 records the first instance (a lapsed monitor the sweep had
-   * stopped counting still cleared this gate); BLO-33572 is the second, below.
+   * is safe in exactly one direction — everything this validator admits, the sweep counts,
+   * EXCEPT the typed participant (below). Keep it that way. PEN-2853 records the first
+   * instance (a lapsed monitor the sweep had stopped counting still cleared this gate);
+   * BLO-33572 is the second, below.
+   *
+   * BLO-35613 — the exception, and it runs the other way.
+   * `typed_execution_state_current_participant` is not an arm of `hasExplicitWaitingPath` at
+   * all; the sweep honours it in `reviewFinding`, and only when the participant is an
+   * invokable agent of this issue's company, where `hasExecutionParticipant` here admits any
+   * non-empty `agentId`. So on that one path the sweep is STRICTER, and a row this validator
+   * admits can still be reported `invalid_review_participant`. That fails safe — flagged,
+   * not silently unattended — and the `hasExplicitWaitingPath` docblock records why the
+   * participant must not be migrated onto that predicate to "complete" the subset.
    *
    * BLO-33572 — a live deliberate park (`parkedUntil` in the future) is a sweep satisfier
    * and is deliberately NOT a review path here, which is why this function never reads the
@@ -3992,7 +4077,7 @@ export function issueRoutes(
 
   async function logExpiredRequestConfirmations(input: {
     issue: { id: string; companyId: string; identifier?: string | null };
-    interactions: Array<{ id: string; kind: string; status: string; result?: unknown }>;
+    interactions: Array<{ id: string; kind: string; status: string; title?: string | null; result?: unknown }>;
     actor: ReturnType<typeof getActorInfo>;
     source: string;
   }) {
@@ -4016,6 +4101,95 @@ export function issueRoutes(
           result: interaction.result ?? null,
         },
       });
+    }
+
+    await postSupersededByCommentNotice(input);
+  }
+
+  /**
+   * BLO-35308: an activity_log row is not a signal anybody reads. A pending ask
+   * expiring on an unrelated user comment was invisible on every triage surface
+   * — the row still read `in_review`, the thread looked healthy, and the absence
+   * of a live card is exactly what made the next reader conclude nothing had
+   * ever been asked for. Three consecutive asks for one verdict died that way on
+   * BLO-26446 and cost 26 days.
+   *
+   * Keyed on the RESULT payload rather than on `input.source`, so it self-selects
+   * at every present call site (four comment paths) and at any future one, and so
+   * the document-driven `stale_target` expiries — a different reason with its own
+   * ledger — do not get swept in.
+   */
+  async function postSupersededByCommentNotice(input: {
+    issue: { id: string; companyId: string; identifier?: string | null };
+    interactions: Array<{ id: string; kind: string; status: string; title?: string | null; result?: unknown }>;
+    actor: ReturnType<typeof getActorInfo>;
+  }) {
+    const superseded = input.interactions.flatMap((interaction) => {
+      const result = interaction.result as Record<string, unknown> | null | undefined;
+      if (!result || typeof result !== "object") return [];
+      // ask_user_questions records the reason as `expirationReason`; every other
+      // supersedable kind uses `outcome`. Both carry the killing `commentId`.
+      const reason = result.outcome ?? result.expirationReason;
+      if (reason !== "superseded_by_comment") return [];
+      const commentId = typeof result.commentId === "string" ? result.commentId : null;
+      return [{ ...interaction, commentId }];
+    });
+
+    if (superseded.length === 0) return;
+
+    // One notice per killing comment, not per interaction and not per sweep.
+    // Several asks dying on one comment is a single event, but a catchup batch
+    // can span several comments (each ask dies on the earliest human comment
+    // after its own createdAt), and each notice names the comment it cites.
+    const byKillingComment = new Map<string | null, typeof superseded>();
+    for (const item of superseded) {
+      const group = byKillingComment.get(item.commentId);
+      if (group) group.push(item);
+      else byKillingComment.set(item.commentId, [item]);
+    }
+
+    for (const [killedBy, group] of byKillingComment) {
+      const lines = group.map((item) => {
+        const title = item.title?.trim();
+        return `- \`${item.kind}\` \`${item.id}\`${title ? ` — ${title}` : ""}`;
+      });
+
+      const body = [
+        "**Pending ask expired — superseded by a comment.**",
+        "",
+        group.length === 1
+          ? "This interaction was waiting for a human answer and has been expired unanswered:"
+          : `These ${group.length} interactions were waiting for a human answer and have been expired unanswered:`,
+        ...lines,
+        "",
+        killedBy
+          ? `Expired by comment \`${killedBy}\`, because the ask carried \`supersedeOnUserComment: true\` — which is the default when the field is omitted.`
+          : "Expired by a user comment, because the ask carried `supersedeOnUserComment: true` — which is the default when the field is omitted.",
+        "",
+        "**No answer was recorded.** If this gate still needs one, create a fresh interaction with `supersedeOnUserComment: false` so unrelated thread traffic cannot expire it again.",
+      ].join("\n");
+
+      try {
+        await svc.addComment(
+          input.issue.id,
+          body,
+          // `authorType: "system"` is rejected for any actor carrying an
+          // agentId or userId, so pass the run alone (as the monitor
+          // convergence notice does). Who triggered the sweep is already on
+          // the expiry (`resolvedBy*`) and on its activity_log row.
+          { runId: input.actor.runId },
+          {
+            authorType: "system",
+            // The supersession sweep is guarded on `authorUserId`, which a system
+            // comment does not have, so this notice cannot itself supersede
+            // anything. The key keeps a retried effect from double-posting.
+            idempotencyKey: killedBy ? `interaction-superseded:${killedBy}` : null,
+          },
+        );
+      } catch (error) {
+        // A missing notice must not roll back the expiry that already committed.
+        logger.error({ err: error, issueId: input.issue.id }, "failed to post interaction supersession notice");
+      }
     }
   }
 
@@ -4294,6 +4468,149 @@ export function issueRoutes(
     }
     if (actorAgent.role === "ceo" || Boolean(actorAgent.permissions?.canCreateAgents)) return true;
     res.status(403).json({ error: "Missing permission to link approvals" });
+    return false;
+  }
+
+  /**
+   * BLO-24699: the approval-side half of the attach boundary. Deliberately mirrors
+   * `assertApprovalAccessAllowed` in `routes/approvals.ts` — same action, same
+   * resource, same 403 body — because the point of this route's relaxation is that
+   * the two doors to a row in `issue_approvals` decide alike. Any drift here
+   * reopens the asymmetry the relaxation closed, just on the approval side instead
+   * of the issue side.
+   *
+   * Scoped to `issue.companyId` rather than reloading the approval: `link()` calls
+   * `assertIssueAndApprovalSameCompany` and rejects a cross-company pair with 422,
+   * so for every link that could succeed the two companies are the same one.
+   *
+   * Ordinary agents hold `company_scope:read`, so this is a no-op for them and the
+   * BLO-23036 escalation path is untouched. What it excludes is the scoped-key
+   * classes `authorization.ts` denies the action outright while still allowing
+   * `issue:mutate` on their own issue: task-bridge keys, skill-test run tokens, and
+   * low-trust-preset agents — all of which the dropped
+   * `assertCanManageIssueApprovalLinks` gate happened to keep off this route.
+   */
+  async function assertApprovalReadAllowed(req: Request, res: Response, companyId: string) {
+    if (await actorCanReadCompanyScope(req, companyId)) return true;
+    res.status(403).json({ error: "Approvals are outside this actor's authorization boundary" });
+    return false;
+  }
+
+  /**
+   * BLO-24699: the *attach* half of the approval-link boundary, decided through the
+   * same evaluator as `POST /companies/:companyId/approvals` so the two doors to a
+   * row in `issue_approvals` cannot reach different verdicts for the same
+   * (actor, issue) pair.
+   *
+   * ## Why this route no longer runs `assertCanManageIssueApprovalLinks`
+   *
+   * That gate is company-scoped — `role === "ceo" || permissions.canCreateAgents` —
+   * and never looks at the issue. It was not a boundary so much as an accident of
+   * which door an agent picked: the identical end state was always reachable by
+   * filing the approval with an `issueIds` array instead, which is the channel
+   * BLO-23036 requires for `request_board_approval` escalations. Measured against
+   * this company's roster on 2026-08-11, the gate admits 2 of 16 agents (CEO, CTO)
+   * on this route while excluding none of the other 14 from the create route.
+   *
+   * Copying the gate onto create instead (the symmetric fix) was rejected: it would
+   * let those 14 agents file an escalation card but not attach it to the issue it
+   * concerns, which is precisely the context-free escalation BLO-23036 exists to
+   * close.
+   *
+   * The only capability this relaxation adds is attaching a *pre-existing* approval.
+   * For an ordinary agent that discloses nothing new: `GET /approvals/:id` and
+   * `GET /companies/:companyId/approvals` are gated by the same `company_scope:read`
+   * as create, so any agent that can file an approval can already read every
+   * approval in its company.
+   *
+   * That argument covers ordinary agents and *only* ordinary agents. It does not
+   * hold for the scoped-key classes `authorization.ts` denies `company_scope:read`
+   * outright while still allowing `issue:mutate` on their own issue — task-bridge
+   * keys, skill-test run tokens, and low-trust-preset agents. For those, attaching
+   * would have been a genuinely new read: `GET /issues/:id/approvals` returns the
+   * linked approvals to any actor that can read the issue, so a guessed approval id
+   * attached to their own issue would come back readable. The dropped gate happened
+   * to exclude them; `assertApprovalReadAllowed` on the route now excludes them on
+   * purpose, which is also what makes the two doors actually equivalent rather than
+   * equivalent-for-agents. Found in review of PR #1293.
+   *
+   * `DELETE /issues/:id/approvals/:approvalId` deliberately keeps the privileged
+   * gate — see the note there.
+   */
+  async function assertIssueApprovalLinkAllowed(
+    req: Request,
+    res: Response,
+    issue: IssueApprovalLinkAuthorizationIssue,
+  ) {
+    // BLO-23763: this helper receives an already-looked-up issue, so answering a
+    // cross-tenant `issue.companyId` with `assertCompanyAccess`'s 403 would say
+    // "exists in another tenant" where a missing id says 404 — the existence
+    // oracle `hasCompanyAccess` documents in routes/authz.ts. The predecessor
+    // `assertCanManageIssueApprovalLinks` took a bare `companyId: string` and so
+    // never tripped that guard; taking the row itself does, which is a real
+    // widening of what this frame can leak, not just a lint shape.
+    //
+    // The sole caller reaches here through `getAccessibleResource`, which has
+    // already applied both halves, so for that path this is a no-op. It is kept
+    // rather than dropped so the helper closes the oracle on its own terms: the
+    // whole point of BLO-24699 is that two doors decide alike, and a second
+    // caller wiring itself up without the gate must not be able to reintroduce
+    // the leak here.
+    if (!hasCompanyAccess(req, issue.companyId)) {
+      res.status(404).json({ error: "Issue not found" });
+      return false;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    // BLO-24699 review: the evaluator reproduces the watchdog *subtree*
+    // confinement AND the freshness revalidation at every door — it reaches the
+    // plugin-provided service through `serviceIndex`, so `approvalRoutes` is not
+    // cut off from it (see the evaluator header, which rebuts the earlier claim
+    // that it was). This route keeps running the full gate anyway, because that
+    // is what preserves this door's `deny_task_watchdog_scope` audit row and its
+    // pre-refactor 409 staleness contract exactly as they were.
+    //
+    // Only its denial is terminal, though. Pre-refactor an in-subtree watchdog
+    // allow was still refused by `assertCanManageIssueApprovalLinks` unless the
+    // agent was privileged; returning it here would skip the evaluator and let a
+    // watchdog attach approvals to a peer's checked-out issue that the create
+    // door refuses for the same pair (Ally, PR #1271). So a watchdog allow falls
+    // through: the evaluator re-runs subtree and freshness (side-effect-free)
+    // and then applies the execution-run and assignee branches exactly as the
+    // create door does, so both doors reach the same 409/403 for that pair.
+    const watchdogDecision = await assertTaskWatchdogScopedIssueMutationAllowed(req, res, issue, {
+      deniedWriteAction: "issue:mutate",
+    });
+    if (watchdogDecision === false) return false;
+    const verdict = await evaluateAgentIssueApprovalLinkAuthorization({ access, db }, req, issue);
+    if (verdict.allowed) return true;
+    res.status(verdict.status).json({
+      error: verdict.error,
+      details: {
+        ...verdict.details,
+        reason: verdict.reason,
+        boundary: verdict.boundary,
+        securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+      },
+    });
+    // BLO-24699 review: dropping `assertAgentIssueMutationAllowed` also dropped
+    // its `recordDeniedIssueWrite` call, so boundary probing through this route
+    // stopped leaving an `issue_write_denied` row. The evaluator itself stays
+    // side-effect-free — the reason it does not record is that an approval-create
+    // body carries `payload`, which for `hire_agent` holds secrets. That argument
+    // is about the *create* route and does not transfer here: this body is
+    // `linkIssueApprovalSchema`-validated to `{approvalId}`, so recording it at
+    // this call site is safe and restores the trail.
+    await recordDeniedIssueWrite(req, issue, "issue:mutate", {
+      // The evaluator's refusal reasons are one of its own `deny_*` literals, a
+      // denied `IssueAccessDecision` reason, or, on the creator/manager-chain
+      // branch, the *allow* reason of a grant that is comment-only here. That
+      // last case does not narrow: `deniedBoundaryReason` maps it to its
+      // `deny_missing_grant` fallback, so `boundaryReason` carries the verbatim
+      // value, as at every sibling call site (Ally, PR #1271).
+      reason: deniedBoundaryReason(verdict.reason as IssueAccessDecision["reason"]),
+      boundaryReason: verdict.reason as IssueAccessDecision["reason"],
+      responseStatus: responseStatusForDeniedWrite(res, verdict.status),
+    });
     return false;
   }
 
@@ -6895,16 +7212,11 @@ export function issueRoutes(
   // BLO-32774: the five keys used to be repeated here. They are now derived from
   // `STATUS_ONLY_RECOVERY_GUARD_CONTEXT`, so editing the tuple can no longer
   // leave this guard testing a stale shape and quietly failing open.
+  //
+  // PEN-3275: the planning-only predicate below was still hand-written, carrying
+  // the same hazard for `PLANNING_ONLY_RECOVERY_GUARD_CONTEXT`. Both are now derived.
   const isStatusOnlyCheapRecoveryContext = isStatusOnlyRecoveryContextSnapshot;
-
-  function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
-    if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-    const context = contextSnapshot as Record<string, unknown>;
-    return context.recoveryIntent === "planning_only" &&
-      context.allowDeliverableWork === false &&
-      context.allowDocumentUpdates === true &&
-      context.resumeRequiresNormalModel === false;
-  }
+  const isPlanningOnlyRecoveryContext = isPlanningOnlyRecoveryContextSnapshot;
 
   function requestsCheapIssueAssigneeModelProfile(input: { assigneeAdapterOverrides?: unknown }) {
     const overrides = input.assigneeAdapterOverrides;
@@ -6932,6 +7244,10 @@ export function issueRoutes(
     return run;
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in prose, in the wake prompt, before the agent plans. Change the condition here
+  // and that sentence silently becomes a lie — which is how round 6 shipped a notice claiming a
+  // flat refusal for a guard BLO-34683 had already made conditional. Update both together.
   async function assertCheapRecoveryIssueAssigneeProfileAllowed(
     req: Request,
     res: Response,
@@ -7013,6 +7329,13 @@ export function issueRoutes(
    * and restores arming, and that write is a status-only run's one allowed
    * deliverable (BLO-25868). The row is only unreachable if this run declines to
    * dispose of it, which is the case the handoff detector already escalates.
+   *
+   * PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+   * this verdict in the wake prompt. This is the guard that proved the hazard — the BLO-34683
+   * change above made the refusal conditional, the notice kept saying "arming issue monitors"
+   * flatly, and the run dispatched to repair a cleared monitor read the notice and declined the
+   * arm this guard would have permitted. The notice now names the CONDITION; if that condition
+   * changes again, change the sentence in the same edit.
    */
   async function assertMonitorArmingAllowedByRunContext(
     req: Request,
@@ -7242,6 +7565,14 @@ export function issueRoutes(
     // `standard` in exactly the deadlocking case and queues another status-only
     // wake into the identical 403.
     //
+    // PEN-3275: the wake prompt now ANNOUNCES this refusal before the agent
+    // plans, which means a compliant agent would never reach this stamp — the
+    // announcement would silently disable the escalation. So
+    // `recoveryRunWriteClassNotice` tells the reader to attempt the write
+    // anyway, naming it as the escalation channel. That sentence and this stamp
+    // are one mechanism: removing either leaves the other inert, and nothing
+    // fails when it happens.
+    //
     // Documents only: the escalation target is `planning_only`, which permits
     // document updates but still bars deliverables and annotations, so a refused
     // deliverable write would be escalated onto a lane that still cannot perform
@@ -7325,6 +7656,9 @@ export function issueRoutes(
     return false;
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in the wake prompt, including the `request_board_approval` carve-out and its
+  // link-set exclusivity. Change what is admitted here and update that sentence in the same edit.
   async function assertApprovalMutationAllowedByRunContext(
     req: Request,
     res: Response,
@@ -7340,8 +7674,16 @@ export function issueRoutes(
       error:
         planningOnly
           ? "Planning-only recovery runs cannot link or unlink approvals"
-          : "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
-            "create a `request_board_approval` with the run context's source issue in `issueIds` instead",
+          // PEN-3275: the redirect is only offered when the guard would actually admit it.
+          // `approvals.ts` refuses the create when the run context carries no source issue, so on
+          // an issueless status-only run the old unconditional phrasing sent a refused caller
+          // straight into a second refusal.
+          : statusOnlyEscalationSourceIssueId(run.contextSnapshot)
+            ? "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
+              "create a `request_board_approval` with the run context's source issue in `issueIds` instead"
+            : "Cheap status-only recovery runs cannot link or unlink approvals, and this run context " +
+              "carries no source issue, so it cannot file a `request_board_approval` either; record a " +
+              "status disposition instead",
       details: {
         issueId: issue.id,
         runId: run.id,
@@ -8207,6 +8549,7 @@ export function issueRoutes(
     const attention = req.query.attention as string | undefined;
     const sortField = req.query.sortField as string | undefined;
     const sortDir = req.query.sortDir as string | undefined;
+    const afterId = req.query.afterId as string | undefined;
     const view = req.query.view as string | undefined;
     const compactView = view === "compact";
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
@@ -8246,13 +8589,38 @@ export function issueRoutes(
       res.status(400).json({ error: "offset must be a non-negative integer" });
       return;
     }
-    if (sortField !== undefined && sortField !== "updated") {
-      res.status(400).json({ error: "sortField must be 'updated' when provided" });
+    if (sortField !== undefined && sortField !== "updated" && sortField !== "id") {
+      res.status(400).json({ error: "sortField must be 'updated' or 'id' when provided" });
       return;
     }
     if (sortDir !== undefined && sortDir !== "asc" && sortDir !== "desc") {
       res.status(400).json({ error: "sortDir must be 'asc' or 'desc' when provided" });
       return;
+    }
+    if (afterId !== undefined) {
+      if (typeof afterId !== "string" || !isUuidLike(afterId.trim())) {
+        res.status(400).json({ error: "afterId must be an issue UUID" });
+        return;
+      }
+      // Keyset paging is only meaningful against the immutable id order; allowing it
+      // on the mutable activity order would hand back a cursor that silently skips rows.
+      if (sortField !== "id") {
+        res.status(400).json({ error: "afterId requires sortField=id" });
+        return;
+      }
+      // offset applies on top of the keyset predicate, so combining them would
+      // silently skip `offset` rows per page.
+      if (parsedOffset !== null && parsedOffset > 0) {
+        res.status(400).json({ error: "afterId cannot be combined with offset" });
+        return;
+      }
+      // attention=blocked is served by the blocked-inbox listing, which pages by
+      // offset only and ignores afterId, so a cursor there would return page one on
+      // every request and never advance.
+      if (attention === "blocked") {
+        res.status(400).json({ error: "afterId cannot be combined with attention=blocked" });
+        return;
+      }
     }
     if (hasPlanDocument === null) {
       res.status(400).json({ error: "hasPlanDocument must be true or false when provided" });
@@ -8320,8 +8688,9 @@ export function issueRoutes(
       q: req.query.q as string | undefined,
       limit,
       offset,
-      sortField: sortField === "updated" ? "updated" : undefined,
+      sortField: sortField === "updated" ? "updated" : sortField === "id" ? "id" : undefined,
       sortDir: sortDir === "asc" || sortDir === "desc" ? sortDir : undefined,
+      afterId: afterId?.trim() || undefined,
     };
     const requestKey = issueListRequestKey({
       req,
@@ -8507,8 +8876,8 @@ export function issueRoutes(
     }
     const attention = req.query.attention as string | undefined;
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
-    if (attention !== "blocked") {
-      res.status(400).json({ error: "issues/count currently requires attention=blocked" });
+    if (attention !== undefined && attention !== "blocked") {
+      res.status(400).json({ error: "attention must be 'blocked' when provided" });
       return;
     }
     if (req.query.limit !== undefined || req.query.offset !== undefined) {
@@ -8519,13 +8888,37 @@ export function issueRoutes(
       res.status(400).json({ error: "hasPlanDocument must be true or false when provided" });
       return;
     }
+    // The general (non-blocked) count is a single COUNT(*) over a narrower condition set
+    // than list(). Any filter it cannot express must 400 rather than be dropped: silently
+    // counting a wider set is worse than refusing, because the caller cannot tell.
+    if (attention === undefined) {
+      const unsupported = COUNT_UNSUPPORTED_FILTERS.filter((key) => {
+        const value = req.query[key];
+        return value !== undefined && value !== "";
+      });
+      if (unsupported.length > 0) {
+        res.status(400).json({
+          error: `issues/count cannot honor ${unsupported.join(", ")}; omit them or use attention=blocked`,
+        });
+        return;
+      }
+    }
+    const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
+    const assigneeUserId =
+      assigneeUserFilterRaw === "me" && req.actor.type === "board"
+        ? req.actor.userId
+        : assigneeUserFilterRaw;
+    if (assigneeUserFilterRaw === "me" && (!assigneeUserId || req.actor.type !== "board")) {
+      res.status(403).json({ error: "assigneeUserId=me requires board authentication" });
+      return;
+    }
 
-    const blockedCountFilters = {
-      attention: "blocked",
+    const countFilters = {
+      attention: attention === "blocked" ? "blocked" as const : undefined,
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
       participantAgentId: req.query.participantAgentId as string | undefined,
-      assigneeUserId: req.query.assigneeUserId as string | undefined,
+      assigneeUserId,
       projectId: req.query.projectId as string | undefined,
       workspaceId: req.query.workspaceId as string | undefined,
       executionWorkspaceId: req.query.executionWorkspaceId as string | undefined,
@@ -8541,8 +8934,8 @@ export function issueRoutes(
         req.query.excludeRoutineExecutions === "true" || req.query.excludeRoutineExecutions === "1",
       includePluginOperations:
         req.query.includePluginOperations === "true" || req.query.includePluginOperations === "1",
-      includeBlockedBy: true,
-      includeBlockedInboxAttention: true,
+      includeBlockedBy: attention === "blocked",
+      includeBlockedInboxAttention: attention === "blocked",
       hasPlanDocument,
       q: req.query.q as string | undefined,
     } as const;
@@ -8559,30 +8952,33 @@ export function issueRoutes(
       }
       if (trustResolution?.kind === "low_trust_review") {
         const count = await svc.count(companyId, {
-          ...blockedCountFilters,
+          ...countFilters,
           lowTrustBoundary: trustResolution.boundary,
         });
         res.json({ count });
         return;
       }
 
-      let offset = 0;
+      const blocked = countFilters.attention === "blocked";
       let visibleCount = 0;
-      while (true) {
-        const rows = await svc.list(companyId, {
-          ...blockedCountFilters,
-          limit: ISSUE_LIST_MAX_LIMIT,
-          offset,
-        });
-        visibleCount += (await filterIssuesForActor(req, rows)).length;
-        if (rows.length < ISSUE_LIST_MAX_LIMIT) break;
-        offset += rows.length;
-      }
+      await walkIssueListPages(
+        (page) =>
+          svc.list(
+            companyId,
+            blocked
+              ? { ...countFilters, limit: ISSUE_LIST_MAX_LIMIT, offset: page.offset }
+              : { ...countFilters, limit: ISSUE_LIST_MAX_LIMIT, sortField: "id", afterId: page.afterId },
+          ),
+        { blocked, pageSize: ISSUE_LIST_MAX_LIMIT },
+        async (rows) => {
+          visibleCount += (await filterIssuesForActor(req, rows)).length;
+        },
+      );
       res.json({ count: visibleCount });
       return;
     }
 
-    const count = await svc.count(companyId, blockedCountFilters);
+    const count = await svc.count(companyId, countFilters);
     res.json({ count });
   });
 
@@ -10675,9 +11071,32 @@ export function issueRoutes(
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
-    if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
+    // BLO-24699: the approval-side half, which create has always run and this route
+    // did not — so the doors were equivalent only for actors holding both halves.
+    // `GET /issues/:id/approvals` returns linked approvals to any actor that can
+    // read the issue, so without this an actor that may mutate its own issue but
+    // may not read approvals could attach an arbitrary approval id and read the row
+    // back. See `assertApprovalReadAllowed` for who that excludes and why ordinary
+    // agents (and so the BLO-23036 escalation path) are unaffected.
+    //
+    // Ordered *after* the run-context check, where create has it before: the two
+    // orderings differ only in which 403 an actor failing both is told about, never
+    // in the allow/deny verdict the equivalence contract is about. The cheap
+    // status-only refusal is the more specific of the two and names the delegation
+    // path an agent needs, and BLO-23036 AC #2 requires that constraint stay visible
+    // rather than being masked by a generic boundary message.
+    if (!(await assertApprovalReadAllowed(req, res, issue.companyId))) return;
+    // BLO-24699: the shared evaluator replaces the former
+    // `assertAgentIssueMutationAllowed` + `assertCanManageIssueApprovalLinks` pair,
+    // so this route and `POST /companies/:companyId/approvals` reach the same
+    // verdict. It is a faithful mirror of the mutation helper's boundary that
+    // additionally honours the productivity-review grant (BLO-23036), does not
+    // seize the issue's checkout lock merely to annotate it, and does not fence the
+    // assignee's other runs off a locked pending review (see the evaluator header).
+    // The 409 conflict contract for another agent's active checkout is preserved by
+    // the evaluator.
+    if (!(await assertIssueApprovalLinkAllowed(req, res, issue))) return;
 
     const actor = getActorInfo(req);
     await issueApprovalsSvc.link(id, req.body.approvalId, {
@@ -10711,6 +11130,14 @@ export function issueRoutes(
     if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
+    // BLO-24699: unlink deliberately keeps the privileged CEO/`canCreateAgents`
+    // gate that the attach route above dropped. The equivalence argument does not
+    // reach here: detaching is not reachable through approval create by any actor,
+    // so there is no second door for the two to agree with. It is also the
+    // destructive direction — removing a board escalation from the issue it
+    // concerns is the context-loss failure BLO-23036 exists to close, and no
+    // escalation path depends on an ordinary agent being able to do it. Curation
+    // stays privileged; attaching does not.
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
 
     await issueApprovalsSvc.unlink(id, approvalId);
@@ -12221,25 +12648,96 @@ export function issueRoutes(
         });
       }
     } catch (err) {
-      if (err instanceof HttpError && err.status === 422) {
-        logger.warn(
-          {
-            issueId: id,
-            companyId: existing.companyId,
-            assigneePatch: {
-              assigneeAgentId: normalizedAssigneeAgentId === undefined ? "__omitted__" : normalizedAssigneeAgentId,
-              assigneeUserId:
-                req.body.assigneeUserId === undefined ? "__omitted__" : req.body.assigneeUserId,
+      if (err instanceof HttpError) {
+        if (err.status === 422) {
+          logger.warn(
+            {
+              issueId: id,
+              companyId: existing.companyId,
+              assigneePatch: {
+                assigneeAgentId: normalizedAssigneeAgentId === undefined ? "__omitted__" : normalizedAssigneeAgentId,
+                assigneeUserId:
+                  req.body.assigneeUserId === undefined ? "__omitted__" : req.body.assigneeUserId,
+              },
+              currentAssignee: {
+                assigneeAgentId: existing.assigneeAgentId,
+                assigneeUserId: existing.assigneeUserId,
+              },
+              error: err.message,
+              details: err.details,
             },
-            currentAssignee: {
-              assigneeAgentId: existing.assigneeAgentId,
-              assigneeUserId: existing.assigneeUserId,
-            },
-            error: err.message,
-            details: err.details,
-          },
-          "issue update rejected with 422",
-        );
+            "issue update rejected with 422",
+          );
+        }
+        // PEN-3255: every `commentBody` write in this handler happens *below*
+        // the `svc.update` call above, so a refused write discards the comment
+        // the same PATCH carried — no row, no log line, and nothing in the
+        // response saying so. An operator who bundles "move this to
+        // in_progress" with the note explaining why loses the note and keeps
+        // only a 422 about blockers. That was the third Done-when on PEN-3255,
+        // found while the unresolved-blocker guard was refusing every status
+        // write on PEN-2976.
+        //
+        // The comment is deliberately NOT persisted. It almost always narrates
+        // a transition that did not happen ("moving to in_progress because …"),
+        // so writing it anyway would record a false narrative against the row;
+        // and writing it *before* the guard would strand an orphan comment on
+        // every other refusal too. Making the drop explicit is the honest fix —
+        // the caller learns the note needs re-posting, and
+        // `POST /issues/:id/comments` is a separate path this guard does not
+        // touch.
+        //
+        // Keyed on `err instanceof HttpError` rather than on a status, because
+        // the drop is a property of *where* the comment is written and not of
+        // which check refused: `commentPersisted: false` is unconditionally
+        // true for anything escaping this `try`. Narrowing it to 422 left the
+        // identical silent drop on the racier half of the very guard this fixes
+        // — `expectedNoUnresolvedBlockers` refuses with `conflict(...)` (409,
+        // `services/issues.ts`), as do the `expectedCurrentStatus` /
+        // `expectedCurrentAssigneeAgentId` / `expectedCurrent*RunId` /
+        // `expectedCurrentExecution{State,Policy}` preconditions this route
+        // sets above. Each of those snapshots the same row the route already
+        // read, so they fire only when a concurrent writer moves the row inside
+        // the window — a real production race, but one no single-request test
+        // can stage deterministically. The `logger.warn` above stays 422-scoped
+        // so this widening adds no log volume.
+        //
+        // Non-HttpError is rethrown untouched: wrapping an unexpected throw
+        // would rewrite its status and lose its stack for no gain.
+        if (commentBody) {
+          // A non-object `details` is preserved under `detail` rather than
+          // spread into nonsense. No producer on this path passes a scalar
+          // today, but discarding an unknown-typed field to tidy a branch is
+          // the same class of silent loss this change exists to remove — and
+          // the reachable producer set is every `unprocessable(...)` *and*
+          // `conflict(...)` in `svc.update`, so it is not a set this route can
+          // pin. `null` folds in with `undefined`: both mean "no details", and
+          // a literal `{ detail: null }` would be noise.
+          const refusalDetails =
+            typeof err.details === "object" && err.details !== null && !Array.isArray(err.details)
+              ? (err.details as Record<string, unknown>)
+              : err.details === undefined || err.details === null
+                ? {}
+                : { detail: err.details };
+          const wrapped = new HttpError(err.status, err.message, {
+            ...refusalDetails,
+            commentPersisted: false,
+            commentHint:
+              "The `comment` carried by this PATCH was not saved, because the update it accompanied did not land. " +
+              "Re-post it with POST /api/issues/:id/comments, which is a separate path and is not subject to this guard.",
+          });
+          // Re-wrapping resets the stack to this `catch`. That is harmless for
+          // the 4xx refusals this branch was written for, but the widening
+          // above from 422 to any `HttpError` also catches the done-gate's
+          // `HttpError(503, "Done-gate commit evidence verification
+          // unavailable", …)`, and `middleware/error-handler.ts` forwards
+          // `stack` into `attachErrorContext` and `trackErrorHandlerCrash` for
+          // `status >= 500` — so without this a 5xx from a PATCH carrying a
+          // comment would report this route's catch as its origin instead of
+          // the throw site.
+          wrapped.stack = err.stack;
+          throw wrapped;
+        }
       }
       throw err;
     }

@@ -78,6 +78,17 @@ const STALLED_EXIT_DEADLINE_MS = 1_500;
  * measured on the same runners needs the same, and at 2s it had 500ms.
  */
 const STALLED_EXIT_WATCHDOG_MS = STALLED_EXIT_DEADLINE_MS * 5;
+/**
+ * How long `readRemainingStderr` waits for the dead child's stderr to reach `end`
+ * before reporting whatever it has so far.
+ *
+ * Unlike every other budget in this file it bounds only the gathering of *failure*
+ * context, so overrunning it costs detail in a message that is already failing — it
+ * can neither fail a passing run nor pass a failing one. Every caller runs after the
+ * child is gone, so `end` is due within a scheduler tick; a full second is slack for
+ * a loaded runner rather than an expectation about one.
+ */
+const STDERR_DRAIN_BAIL_MS = 1_000;
 
 interface CrashResult {
   code: number | null;
@@ -158,7 +169,7 @@ function readRemainingStderr(stream: Readable): Promise<string> {
           : out,
       );
     };
-    const bail = setTimeout(finish, 1_000);
+    const bail = setTimeout(finish, STDERR_DRAIN_BAIL_MS);
     stream.setEncoding("utf8");
     stream.on("data", (chunk: string) => {
       out += chunk;
@@ -169,19 +180,70 @@ function readRemainingStderr(stream: Readable): Promise<string> {
   });
 }
 
-function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
+/**
+ * What to spawn for a stalled-stderr run. Parameterised only so the diagnostic test
+ * below can drive the startup-watchdog branch with a program that never reports
+ * backpressure; the crash test uses PREFILL_RUN and is unaffected.
+ */
+interface StalledRun {
+  command: string;
+  args: string[];
+  startupTimeoutMs: number;
+}
+
+/** The real crash fixture: fills stderr, announces BACKPRESSURE, then crashes on ack. */
+const PREFILL_RUN: StalledRun = {
+  command: tsx,
+  args: [fixture, "throw", "0", "prefill-stderr"],
+  startupTimeoutMs: FIXTURE_STARTUP_TIMEOUT_MS,
+};
+
+const STARTUP_STALL_SENTINEL = "STARTUP_STALL_SENTINEL";
+/**
+ * Drives the startup-watchdog branch: announces itself on stdout, then stays alive
+ * without ever writing BACKPRESSURE, so the watchdog is the only thing that can end
+ * the run. Plain `node` rather than the fixture under `tsx` because the budget below
+ * has to clear process startup, and `node -e` boots in tens of milliseconds where a
+ * cold `tsx` compile is measured in seconds.
+ *
+ * 2_000ms is therefore ~50x the time the sentinel needs to reach us, and it bounds a
+ * diagnostic assertion rather than the thing under test: a runner slow enough to miss
+ * it would report `its stdout said: <nothing>` and fail loudly with the full context,
+ * which is precisely the property this test pins. It cannot fail silently or pass
+ * wrongly.
+ */
+const STARTUP_STALL_RUN: StalledRun = {
+  command: process.execPath,
+  args: ["-e", `process.stdout.write("${STARTUP_STALL_SENTINEL}\\n"); setInterval(() => {}, 1_000);`],
+  startupTimeoutMs: 2_000,
+};
+
+function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<StalledCrashResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(tsx, [fixture, "throw", "0", "prefill-stderr"], {
+    const child = spawn(run.command, run.args, {
       stdio: ["pipe", "pipe", "pipe"],
     });
     child.stderr.pause();
 
     let startedAt: number | undefined;
     let watchdog: NodeJS.Timeout | undefined;
+    /**
+     * Set by the startup watchdog so the `exit` handler can name which way this run
+     * failed. The watchdog deliberately does not reject: it only SIGKILLs, and the
+     * kill raises `exit`, whose handler is the single place a never-reached-
+     * backpressure failure is formatted.
+     *
+     * It used to reject here with a bare string, and because first-settle-wins that
+     * bare string beat the rich message the `exit` handler was already building —
+     * so the branch most likely to fail was the one branch with no context
+     * (BLO-36057). Recording the reason rather than reporting it is what makes the
+     * two entry points unable to drift apart again: there is only one formatter.
+     */
+    let startupTimedOut = false;
     const startupWatchdog = setTimeout(() => {
+      startupTimedOut = true;
       child.kill("SIGKILL");
-      reject(new Error("fixture did not observe stderr backpressure"));
-    }, FIXTURE_STARTUP_TIMEOUT_MS);
+    }, run.startupTimeoutMs);
 
     child.stdout.setEncoding("utf8");
     // Captured for the failure path below. Once the fixture has deliberately filled
@@ -190,7 +252,11 @@ function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
     let stdout = "";
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
-      if (startedAt !== undefined || !chunk.includes("BACKPRESSURE")) return;
+      // Keep accumulating after a SIGKILL — late bytes are context for the message
+      // below — but do not start the deadline off them: the child is already dead,
+      // so `stdin.end` would write to a closed pipe and the elapsed time would be
+      // measured against a corpse.
+      if (startupTimedOut || startedAt !== undefined || !chunk.includes("BACKPRESSURE")) return;
       clearTimeout(startupWatchdog);
       startedAt = Date.now();
       watchdog = setTimeout(() => {
@@ -214,7 +280,12 @@ function runFixtureWithStalledStderr(): Promise<StalledCrashResult> {
           .then((stderr) => {
             reject(
               new Error(
-                `fixture exited before reporting stderr backpressure ` +
+                `${
+                  startupTimedOut
+                    ? `fixture did not report stderr backpressure within ${run.startupTimeoutMs}ms ` +
+                      `(SIGKILLed by the startup watchdog)`
+                    : "fixture exited before reporting stderr backpressure"
+                } ` +
                   `(code=${code}, signal=${signal}); its stdout said: ${stdout.trim() || "<nothing>"}; ` +
                   `its stderr said: ${stderr.trim() || "<nothing>"}`,
               ),
@@ -266,6 +337,25 @@ describe("process crash guard — real process exit", () => {
 
     expect(code).toBe(1);
     expect(elapsedMs).toBeLessThan(STALLED_EXIT_DEADLINE_MS);
+  });
+
+  /**
+   * Pins the diagnostic, not the guard: this is the branch BLO-36057 exists for.
+   * Before that fix the startup watchdog rejected with a bare
+   * `fixture did not observe stderr backpressure`, which beat the rich message the
+   * `exit` handler was concurrently building — the same unattributable-string defect
+   * that cost BLO-25854 five occurrences and ~51 minutes of CI per occurrence.
+   *
+   * Reverting the watchdog to a bare reject must fail this test; asserting on the
+   * passing path would not, which is why the assertion is on the failure text.
+   */
+  it("carries the captured stdout into the startup-watchdog failure", async () => {
+    await expect(runFixtureWithStalledStderr(STARTUP_STALL_RUN)).rejects.toThrow(
+      new RegExp(
+        `did not report stderr backpressure within ${STARTUP_STALL_RUN.startupTimeoutMs}ms` +
+          `[\\s\\S]*its stdout said: ${STARTUP_STALL_SENTINEL}`,
+      ),
+    );
   });
 
   it("flushes one complete crash record for a strict unhandled rejection", async () => {

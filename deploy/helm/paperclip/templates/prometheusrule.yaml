@@ -99,6 +99,27 @@
       the backlog metrics remain absent until this paperclip PR ships. The
       onprem PR must merge and the manual `monitoring-rules` Argo app must sync
       before treating the alert as live; the chart rule below is only a mirror.
+
+  STATUS of the BLO-36814 isolation-workspace-reaper-stopped alert, same
+  auditability rule:
+
+    - Proposed in Blockcast/onprem-k8s#4050 (branch
+      platform/blo-36814-reaper-alert-onprem), opened 2026-09-27. OPEN, not
+      merged, NOT live. It landed in this chart file first and nowhere else,
+      which is exactly the failure this header warns about -- caught in Ally
+      review on Blockcast/paperclip#2054, hence the companion PR. Verify:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
+          --jq '.content' | base64 -d | grep PaperclipIsolationWorkspaceReaperStopped
+
+    - It reads paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds,
+      which THIS PR adds, so the rule is inert until both land. Note the series
+      is also gated on the reaper being enabled at all
+      (isolationWorkspaceReaperEnabled, default false -- BLO-36735), so
+      "present in the ConfigMap" and "able to fire" are two more steps apart
+      here than for the alerts above.
+
+    - Same manual `monitoring-rules` Argo sync gate as above (BLO-19095)
+      applies after merge -- a merged rule is not a deployed one.
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
@@ -918,6 +939,48 @@ spec:
             summary: "Paperclip PR-review queue wait p95 exceeds 60 minutes"
             description: "The rolling p95 time from heartbeat_runs.created_at to started_at for sanctioned pr_review runs has exceeded {{ .Values.prometheusRule.prReviewQueueWaitThresholdSeconds }} seconds. Check reviewer concurrency, queued heartbeat_runs, and provider capacity."
             runbook_url: {{ .Values.prometheusRule.prReviewQueueWaitRunbookUrl | quote }}
+    - name: paperclip-isolation-workspace-reaper
+      rules:
+        - alert: PaperclipIsolationWorkspaceReaperStopped
+          # BLO-36814. The reaper (BLO-31222) is a DAILY IRREVERSIBLE-DELETE
+          # sweep over data/k8s-isolation/workspaces/. Before this metric
+          # existed its only signal was a pino log line on one pod, and it
+          # shipped opt-in and stayed off for 24 days with nothing anywhere
+          # showing that (BLO-36735).
+          #
+          # Silence is not health: a reaper that stopped ticking and one that
+          # ticks and finds nothing are identical on every counter, because
+          # both add zero. The gauge is the only series that separates them,
+          # which is why this rule reads the gauge and not a rate().
+          #
+          # NO absent_over_time() COMPANION, deliberately -- and this is the
+          # opposite call to PaperclipPluginStatusCollectorAbsent above, for a
+          # reason specific to this sweep rather than an oversight. That
+          # collector starts unconditionally on every worker, so an absent
+          # series there can only mean breakage. This reaper is OPT-IN
+          # (config.isolationWorkspaceReaperEnabled, default false), so an
+          # absent series is its ordinary disabled state and an absence rule
+          # would page continuously on every deployment that has not turned it
+          # on. The gap that leaves -- a worker pod that dies, dropping the
+          # series before `time() - gauge` can cross a ~2-day threshold -- is
+          # real and is already covered by PaperclipPluginStatusCollectorAbsent
+          # (critical), which watches a series that IS unconditional. Two
+          # alerts on one cause buys nothing; a false page on a deliberately
+          # disabled reaper costs trust in the rest of this file.
+          #
+          # Threshold is 2x the sweep interval so one missed tick (a rolling
+          # worker restart, a slow MDS) does not page, but two consecutive
+          # misses do.
+          expr: (time() - max by (dry_run) (paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds)) > {{ .Values.prometheusRule.isolationWorkspaceReaperStaleSeconds }}
+          for: {{ .Values.prometheusRule.isolationWorkspaceReaperStaleFor }}
+          labels:
+            severity: warning
+            service: paperclip
+            signal: isolation_workspace_reaper
+          annotations:
+            summary: "Paperclip isolation-workspace reaper (dry_run={{`{{ $labels.dry_run }}`}}) has not completed a sweep in over {{ .Values.prometheusRule.isolationWorkspaceReaperStaleSeconds }}s"
+            description: "paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds has not advanced in {{`{{ $value | printf \"%.0f\" }}`}}s (BLO-36814). This gauge advances at the END of every sweep including one that deletes nothing, so a stall means the sweep is not running -- not that the tree is clean. While it is stalled, data/k8s-isolation/workspaces/ grows unreclaimed on the CephFS ssd-fast pool that produced BLO-31222's write-block incident (0 -> 406.7 GiB in ~2 months with no reaper). Check the worker StatefulSet still has PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED=true, then grep worker logs for 'isolation-workspace reaper sweep failed'. If the reaper was deliberately disabled, this series stops being scraped and the alert resolves on its own -- it does not need silencing."
+            runbook_url: {{ .Values.prometheusRule.isolationWorkspaceReaperRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

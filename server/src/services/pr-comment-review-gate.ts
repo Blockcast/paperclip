@@ -24,23 +24,66 @@ import {
   type AllyPriorFindingDisposition,
 } from "./ally-review-detection.js";
 import {
+  githubFetchPrAuthorLogin,
   githubFetchPrHeadSha,
   githubListIssueCommentsWithTimestamps,
   githubListPrReviewsWithTimestamps,
   githubPostCheckRun,
   githubPostCommitStatusDetailed,
   githubReviewerIdentityMatches,
+  githubSharesReviewerIdentity,
   type GitHubCheckRunConclusion,
   type GitHubCommitStatusPostResult,
 } from "./github-app-auth.js";
 
 const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
 
-// Characters of the unrecognized-verb list a carried-finding reason may spend.
-// Sized so the message stays inside GitHub's 140-character commit-status cap
-// with the head and the explanatory phrase intact, since those are what make
-// the red actionable.
-const UNRECOGNIZED_VERB_BUDGET = 48;
+/**
+ * Join quoted verbs into at most `budget` characters, cutting BETWEEN entries.
+ *
+ * Slicing the joined string cuts inside a verb and drops its closing quote, so
+ * the author reads a name that is not the one in their ledger — the same
+ * hazard `commentReviewGateRetirementDescription` refuses for the context
+ * name. On the between-entries path whatever did not fit is marked with ", …",
+ * because an author who fixes only the verbs shown would re-push into this
+ * same red, which is the loop the carried tail exists to close. That marker is
+ * scoped to that path and is NOT an invariant of this function: neither
+ * fallback below can afford it, because at the worst-case budget of 21 there
+ * is no room for both an entry and the 3-character reserve. There entries
+ * 2..n are dropped unmarked, deliberately — spending the reserve would buy the
+ * marker by losing the one verb name the author can actually act on.
+ *
+ * There is no separate standalone budget: the caller's cap is always the
+ * tighter one (the lead is 63-64 characters and the shortest tail is 38, so
+ * the most this can ever be handed is 39), and a second constant that never
+ * binds reads as load-bearing while doing nothing.
+ */
+function fitQuotedVerbs(quoted: string[], budget: number): string {
+  const whole = quoted.join(", ");
+  if (whole.length <= budget) return whole;
+  const kept: string[] = [];
+  let used = 0;
+  for (const entry of quoted) {
+    // +3 keeps room for the ", …" that marks the entries left out.
+    const cost = (kept.length ? 2 : 0) + entry.length;
+    if (used + cost + 3 > budget) break;
+    kept.push(entry);
+    used += cost;
+  }
+  if (kept.length) return `${kept.join(", ")}, …`;
+  // The first verb fits whole and was rejected only by the 3-character reserve
+  // for the ", …" marker. Return it as is: eliding it would slice through its
+  // closing quote when its length is exactly budget - 2 (three quotes in the
+  // render, the odd-quote defect the invariant test guards) and would mark a
+  // complete name as truncated while the other verbs vanish unmarked either
+  // way. Below this line quoted[0].length > budget > budget - 2, so the slice
+  // can no longer reach the closing quote.
+  if (quoted[0].length <= budget) return quoted[0];
+  // Not even the first verb fits whole. Elide inside its quotes so it still
+  // reads as truncated and keeps its closing quote, rather than rendering the
+  // lead with no verb at all.
+  return budget >= 3 ? `${quoted[0].slice(0, budget - 2)}…"` : "";
+}
 
 export interface CommentReviewGateComment {
   authorLogin: string | null | undefined;
@@ -72,12 +115,27 @@ export type CommentReviewGateOutcome =
   | "blocking_finding"
   /** No comment attests this head, but a finding from an earlier head stands undispositioned. */
   | "carried_finding"
-  /** Nothing established a comment-shaped review of this head. Not evidence of review. */
+  /**
+   * Nothing established an *independent* comment-shaped review of this head.
+   * Not evidence of review. Covers both "no comment attests it" and "the only
+   * one that does is the PR author's own" (BLO-34316).
+   */
   | "not_evaluated";
 
 export type CommentReviewGateVerdict =
   | { state: "success"; outcome: "clean"; reason: string }
-  | { state: "success"; outcome: "not_evaluated"; reason: string }
+  | {
+      state: "success";
+      outcome: "not_evaluated";
+      reason: string;
+      /**
+       * Set only on the branch that would have been `clean` had the author been
+       * known. It is what lets the caller fetch the author on the one path that
+       * reads it, instead of making that fetch a precondition for publishing
+       * anything — see executeCommentReviewGateCheck.
+       */
+      authorUnknown?: true;
+    }
   | { state: "failure"; outcome: "blocking_finding"; reason: string; commentCreatedAt: string }
   | {
       state: "failure";
@@ -85,6 +143,15 @@ export type CommentReviewGateVerdict =
       reason: string;
       commentCreatedAt: string;
       carriedFromHeadSha: string;
+      /**
+       * Same meaning as on `not_evaluated`, and it has to exist here too: a
+       * carried finding CONSUMES the withheld positive rather than returning
+       * it, so without this flag the author-blind first pass pins the verdict
+       * and the caller never fetches the author — making `clean` unreachable
+       * for a distinct author whose at-head attestation should have cleared
+       * the carry, and leaving the self-attested tail below unrenderable.
+       */
+      authorUnknown?: true;
     };
 
 function toEpochMs(value: string | Date): number {
@@ -306,6 +373,19 @@ export function evaluateCommentReviewGate(input: {
   comments: CommentReviewGateComment[];
   headSha: string;
   reviewerBotLogin?: string | null;
+  /**
+   * The login that opened the PR. Required to reach `clean` (BLO-34316).
+   *
+   * Every attesting comment has already been established to come from the
+   * reviewer identity, so "this attestation is the author's own" reduces to
+   * "the PR author IS that identity" — which is the case on every agent PR
+   * here, where both sides are `allyblockcast[bot]`. Null is treated the same
+   * as self-attested: the positive claim is that someone other than the author
+   * examined this head, and an absent author cannot establish it. Required and
+   * explicitly nullable rather than optional, so a new call site has to state
+   * which it means instead of silently downgrading every `clean` to `neutral`.
+   */
+  prAuthorLogin: string | null;
 }): CommentReviewGateVerdict {
   const reviewerBotLogin = input.reviewerBotLogin?.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
   const headSha = input.headSha?.trim();
@@ -321,6 +401,28 @@ export function evaluateCommentReviewGate(input: {
   const normalizedHead = headSha.toLowerCase();
   const forHead = latestAttestingAllyComment(comments, reviewerBotLogin, normalizedHead);
 
+  // Set when an attestation for this head exists but its positive claim is
+  // withheld. HELD rather than returned: withholding a positive is not an
+  // all-clear, so the carried-finding check below still has to run. Returning
+  // here made the author better off posting a self-attestation that carries NO
+  // disposition ledger than posting nothing — either withheld positive silently
+  // converted a red carried from an earlier head into `neutral`, because
+  // `headsWithUndispositionedFinding` is only reached when NOTHING attests the
+  // current head. The `clean` return below is deliberately not held: an
+  // independent attestation of the current head does disposition an earlier
+  // head's finding, which is the pre-existing BLO-29711 behaviour.
+  //
+  // The LEDGER route is deliberately still author-blind and is not closed here:
+  // `headsWithUndispositionedFinding` credits a `prior:<A> critical 1 — fixed`
+  // entry from any comment passing `isAllyConsolidatedReviewComment`, so on an
+  // agent PR — where the reviewer identity IS the author — a self-authored
+  // ledger still retires a carried finding. Requiring independence there would
+  // make an agent PR permanently red once any finding is raised, because only
+  // the reviewer ever writes ledgers: the BLO-29711 deadlock this module exists
+  // to avoid. What this branch closes is the malformed-ledger shape, where the
+  // section parses as absent and the bare attestation was the whole claim.
+  let withheldPositive: Extract<CommentReviewGateVerdict, { outcome: "not_evaluated" }> | null = null;
+
   if (forHead) {
     if (hasActionablePrReviewFeedback(forHead.comment.body)) {
       return {
@@ -331,31 +433,85 @@ export function evaluateCommentReviewGate(input: {
         commentCreatedAt: new Date(toEpochMs(forHead.comment.createdAt)).toISOString(),
       };
     }
-    return {
-      state: "success",
-      outcome: "clean",
-      reason:
-        "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
-    };
+    // Only the POSITIVE claim is withheld for a self-attestation. The blocking
+    // branch above stays author-blind on purpose: a finding is a finding
+    // whoever wrote it, and failing closed there is the direction this module
+    // must not get wrong.
+    const prAuthorLogin = input.prAuthorLogin?.trim();
+    if (!prAuthorLogin) {
+      withheldPositive = {
+        state: "success",
+        outcome: "not_evaluated",
+        authorUnknown: true,
+        reason: "The PR author is unknown, so this head's attestation cannot be shown to be independent.",
+      };
+      // `githubSharesReviewerIdentity`, not `githubReviewerIdentityMatches`: the
+      // strict predicate exists to keep the bare `<slug>` user seat from being
+      // CREDITED as the reviewer, and that fail direction is inverted here. The
+      // seat and the App are one agent wearing two hats, so a PR opened by the
+      // seat and attested by the App is still a self-attestation.
+    } else if (githubSharesReviewerIdentity(prAuthorLogin, reviewerBotLogin)) {
+      withheldPositive = {
+        state: "success",
+        outcome: "not_evaluated",
+        reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
+      };
+    } else {
+      return {
+        state: "success",
+        outcome: "clean",
+        reason:
+          "Ally's most recent consolidated-review comment for this head reports no unresolved findings.",
+      };
+    }
   }
 
-  // Nothing attests this head. A finding raised against an earlier head is not
-  // dispositioned by replacing that head, so it carries forward rather than
-  // going green (BLO-29711). It is disposed by a later clean review of that
-  // same earlier head, or by a later review that names it as resolved in its
-  // prior-findings ledger — see headsWithUndispositionedFinding. It also clears
-  // the moment Ally attests the current head. Note that none of those routes
-  // exists while the reviewer itself is failing to run, which is the state that
-  // strands a PR here.
+  // Nothing attests this head, or what does cannot make the positive claim. A
+  // finding raised against an earlier head is not dispositioned by replacing
+  // that head, so it carries forward rather than going green (BLO-29711). It is
+  // disposed by a later clean review of that same earlier head, or by a later
+  // review that names it as resolved in its prior-findings ledger — see
+  // headsWithUndispositionedFinding. It also clears the moment an INDEPENDENT
+  // review attests the current head; the author's own attestation does not,
+  // which is why `withheldPositive` falls through to here rather than returning.
+  // Note that none of those routes exists while the reviewer itself is failing
+  // to run, which is the state that strands a PR here.
   const [carried] = headsWithUndispositionedFinding(comments, reviewerBotLogin);
   if (carried) {
     const shortHead = carried.attestedHeadSha.slice(0, 7);
-    // GitHub caps a commit-status description at 140 characters, so this is a
-    // replacement message rather than a suffix on the ordinary one: appending
-    // would push the part that explains the red past the cap and lose exactly
-    // the detail this branch exists to surface. The verb list is budgeted for
-    // the same reason — the regex accepts an arbitrarily long verb, and the
-    // head plus the "unrecognized ledger verb" phrase must survive intact.
+    // The tail is conditional because `withheldPositive` is exactly the state
+    // in which a comment DOES attest the current head. Saying "no comment
+    // attests the current head" there invites the author to post one — which
+    // they just did, and which cannot clear a carried finding. Naming why the
+    // attestation did not count is the difference between a red that routes
+    // the author to the reviewer and a red that routes them into a loop.
+    // Tails measure 38 / 54 / 55. That 55 bounds the NO-VERB branch below to
+    // 131 (its 76-character lead plus the tail), inside the 140 cap. It does
+    // not bound the verb branch directly beneath this comment: that one
+    // budgets the verb list against whatever the tail leaves, so it lands on
+    // exactly 140 whenever the list fills its allowance — which is what the
+    // exact-fit test pins. 131 is this branch's ceiling, not the file's.
+    const carriedTail = !withheldPositive
+      ? "; no comment attests the current head."
+      : withheldPositive.authorUnknown
+        ? "; its only attestation is not known to be independent."
+        : "; the only comment attesting it is the PR author's own.";
+    // Both clauses have to reach the author, and GitHub caps a commit-status
+    // description at 140 characters. The tail is the one an author is least
+    // likely to guess — it is the only thing that says why the attestation
+    // they just posted did not count — so it is never the part that gets cut.
+    //
+    // That forces two things. This lead is terser than the no-verb branch's:
+    // the ordinary "A finding from Ally's review of <head> is undispositioned:
+    // unrecognized ledger verbs " lead is 86 characters and leaves 0 and -1 for
+    // the two longest tails, i.e. the verb list it exists to introduce cannot be
+    // rendered at all. And the verb list is budgeted against what the tail
+    // actually leaves rather than against a standalone cap, because the regex
+    // behind `disposition` accepts an arbitrarily long verb. Worst case (plural
+    // lead, longest tail) still leaves 21 characters for it; the `Math.max(0,
+    // …)` floor is there because a negative budget would otherwise reach
+    // `fitQuotedVerbs` and elide against it, so a future longer tail would
+    // overflow the cap silently instead of dropping the verb list.
     //
     // PEN-3157 asked whether this republishes model-authored text to a public
     // commit status without a scrub, since the verb is lifted verbatim out of
@@ -372,29 +528,42 @@ export function evaluateCommentReviewGate(input: {
     // Defence in depth still applies: `githubPostCommitStatusDetailed` scrubs
     // every description on the way out, so widening the class would be caught
     // by the boundary even if that test were deleted.
-    const verbList = carried.unrecognizedVerbs
-      .map((verb) => `"${verb}"`)
-      .join(", ")
-      .slice(0, UNRECOGNIZED_VERB_BUDGET);
+    const verbLead =
+      `Undispositioned finding from ${shortHead}: unrecognized ledger ` +
+      `${carried.unrecognizedVerbs.length === 1 ? "verb" : "verbs"} `;
+    const verbList = fitQuotedVerbs(
+      carried.unrecognizedVerbs.map((verb) => `"${verb}"`),
+      Math.max(0, MAX_COMMIT_STATUS_DESCRIPTION - verbLead.length - carriedTail.length),
+    );
     const reason = carried.unrecognizedVerbs.length
-      ? `A finding from Ally's review of ${shortHead} is undispositioned: unrecognized ledger ` +
-        `${carried.unrecognizedVerbs.length === 1 ? "verb" : "verbs"} ${verbList}.`
-      : `An unresolved finding from Ally's review of ${shortHead} ` +
-        "is still undispositioned; no comment attests the current head.";
+      ? verbLead + verbList + carriedTail
+      : `An unresolved finding from Ally's review of ${shortHead} is still undispositioned` +
+        carriedTail;
     return {
       state: "failure",
       outcome: "carried_finding",
       reason,
       commentCreatedAt: new Date(toEpochMs(carried.comment.createdAt)).toISOString(),
       carriedFromHeadSha: carried.attestedHeadSha,
+      // Carried forward so the caller still fetches the author on this route.
+      // A distinct author's at-head attestation clears the carry outright (the
+      // `clean` return above), so pinning this red on the author-blind pass
+      // would publish a red the evidence does not support.
+      ...(withheldPositive?.authorUnknown ? { authorUnknown: true as const } : {}),
     };
   }
 
-  return {
-    state: "success",
-    outcome: "not_evaluated",
-    reason: "No Ally consolidated-review comment attests to reviewing this head.",
-  };
+  // The withheld positive is the accurate verdict only once no red carries: a
+  // comment DOES attest this head, so the generic "no comment attests" reason
+  // below would be false, and `authorUnknown` has to survive for the caller to
+  // know this is the one outcome worth a PR-author fetch.
+  return (
+    withheldPositive ?? {
+      state: "success",
+      outcome: "not_evaluated",
+      reason: "No Ally consolidated-review comment attests to reviewing this head.",
+    }
+  );
 }
 
 /**
@@ -431,7 +600,12 @@ export function commentReviewGateCheckTitle(
     case "carried_finding":
       return "Unresolved finding carried from an earlier head";
     case "not_evaluated":
-      return "Not evaluated — no comment-shaped review attests this head";
+      // "independent" carries the self-attested case (BLO-34316), where a
+      // comment DOES attest this head — the author's own. Saying "no
+      // comment-shaped review attests this head" there would be false, which is
+      // the same laundering one level down from the green it replaces. The
+      // summary (`verdict.reason`) names which of the two it was.
+      return "Not evaluated — no independent comment-shaped review attests this head";
   }
 }
 
@@ -493,12 +667,31 @@ export function retiredCommentReviewGateContexts(
 const MAX_COMMIT_STATUS_DESCRIPTION = 140;
 
 /**
- * Description for a superseded context. Deliberately carries no claim about
- * whether anything reviewed the head — that claim under a `review/`-prefixed
- * green is the defect (BLO-29711) — only a pointer to where the verdict now
- * lives. `scripts/check-comment-review-gate-census.mjs` flags a green `review/`
- * status whose description admits nothing was evaluated; this text must not
- * match that pattern.
+ * Description for a superseded context, given the live verdict.
+ *
+ * Takes the whole verdict rather than just its state, because the state alone
+ * cannot distinguish the two greens. `clean` and `not_evaluated` both publish
+ * `success` — that collapse is deliberate and load-bearing (BLO-29711: no other
+ * legacy state is both honest and non-blocking) — so a retirement row rendered
+ * from the state alone says "findings now publish elsewhere" for a head nothing
+ * reviewed. Green, `review/`-namespaced, and claiming more than the gate knows:
+ * the exact shape `scripts/check-comment-review-gate-census.mjs` exists to
+ * count, and worded so that the census skipped it (BLO-34742).
+ *
+ * So the not-evaluated phrasing deliberately DOES trip the census's
+ * `admitsNothingEvaluated` pattern, and the other two deliberately do not. That
+ * is not a widening of what counts as a violation — the retired mirror of a
+ * not-evaluated verdict always was one — it is the row becoming visible to the
+ * audit. Fixed here rather than by adding a fourth alternative to the census
+ * regex, per BLO-32695: the gate owns the wording, so the gate is where the
+ * wording is made honest.
+ *
+ * "No INDEPENDENT … comment attests" rather than "no … comment attests": on the
+ * self-attested and author-unknown routes a comment does attest this head, and
+ * the objection is that its author wrote it. Saying nothing attests there is
+ * false, and invites the author to post another (the same reason
+ * `commentReviewGateCheckTitle` carries the qualifier, and the same loop the
+ * `carriedTail` above exists to close).
  *
  * The blocking phrasing exists because the retirement write mirrors the live
  * state (see `supersedeRetiredContexts`). A red row whose description only said
@@ -506,28 +699,40 @@ const MAX_COMMIT_STATUS_DESCRIPTION = 140;
  */
 export function commentReviewGateRetirementDescription(
   liveContext: string,
-  state: CommentReviewGateVerdict["state"] = "success",
+  verdict: Pick<CommentReviewGateVerdict, "state" | "outcome">,
 ): string {
   const target = liveContext.trim();
-  const renderShort = (name: string) =>
-    state === "failure"
-      ? `Retired. Unresolved finding; see "${name}".`
-      : `Retired. Findings now publish to "${name}".`;
-  const full =
-    state === "failure"
-      ? `Retired. Unresolved finding stands; "${target}" carries the verdict.`
-      : `Retired. Comment-shaped review findings now publish to "${target}".`;
+  // Both phrasings per case, so the overflow fallback below can shorten
+  // without changing which claim the row makes.
+  const phrasings = (name: string): { full: string; short: string } => {
+    if (verdict.state === "failure") {
+      return {
+        full: `Retired. Unresolved finding stands; "${name}" carries the verdict.`,
+        short: `Retired. Unresolved finding; see "${name}".`,
+      };
+    }
+    if (verdict.outcome === "not_evaluated") {
+      return {
+        full: `Retired. No independent Ally consolidated-review comment attests this head; "${name}" carries the verdict.`,
+        short: `Retired. No independent Ally consolidated-review comment attests this head; see "${name}".`,
+      };
+    }
+    return {
+      full: `Retired. Comment-shaped review findings now publish to "${name}".`,
+      short: `Retired. Findings now publish to "${name}".`,
+    };
+  };
+  const { full, short } = phrasings(target);
   if (full.length <= MAX_COMMIT_STATUS_DESCRIPTION) return full;
-  const short = renderShort(target);
   if (short.length <= MAX_COMMIT_STATUS_DESCRIPTION) return short;
   // Both phrasings overflow, so the context name itself is what is long.
   // Elide the NAME rather than slicing the rendered sentence: a blind slice
   // cuts the name mid-token and drops the closing quote, which is exactly the
   // "cut in half" outcome the fallback exists to avoid. Unreachable with
   // today's names; pinned by test so it stays true if a name grows.
-  const budget = MAX_COMMIT_STATUS_DESCRIPTION - renderShort("").length - 1;
+  const budget = MAX_COMMIT_STATUS_DESCRIPTION - phrasings("").short.length - 1;
   if (budget <= 0) return short.slice(0, MAX_COMMIT_STATUS_DESCRIPTION);
-  return renderShort(`${target.slice(0, budget)}…`);
+  return phrasings(`${target.slice(0, budget)}…`).short;
 }
 
 /**
@@ -541,11 +746,11 @@ export function commentReviewGateRetirementDescription(
  */
 export function commentReviewGateRetirementStatus(
   liveContext: string,
-  verdict: Pick<CommentReviewGateVerdict, "state">,
+  verdict: Pick<CommentReviewGateVerdict, "state" | "outcome">,
 ): { state: CommentReviewGateVerdict["state"]; description: string } {
   return {
     state: verdict.state,
-    description: commentReviewGateRetirementDescription(liveContext, verdict.state),
+    description: commentReviewGateRetirementDescription(liveContext, verdict),
   };
 }
 
@@ -687,15 +892,41 @@ async function executeCommentReviewGateCheck(
     ]);
     if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
 
-    const verdict = evaluateCommentReviewGate({
-      comments: [...issueComments, ...prReviews].map((comment) => ({
-        authorLogin: comment.login,
-        body: comment.body,
-        createdAt: comment.createdAt,
-      })),
-      headSha,
-      reviewerBotLogin,
-    });
+    const comments = [...issueComments, ...prReviews].map((comment) => ({
+      authorLogin: comment.login,
+      body: comment.body,
+      createdAt: comment.createdAt,
+    }));
+
+    // Evaluate author-blind FIRST. Only `clean` reads the author, and both red
+    // outcomes stand on the comment surfaces alone — so fetching the author up
+    // front made an unreadable `GET /pulls/{n}` suppress a `blocking_finding`
+    // or `carried_finding` that was already fully justified, leaving the merge
+    // surface showing that finding as absent rather than red. A red going
+    // silent is the direction this module must not get wrong.
+    let verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin: null });
+
+    // `authorUnknown` marks every outcome the author could still change, which
+    // is both the withheld positive and the carried finding that consumed it —
+    // gating on the OUTCOME instead would never fetch on the carried route, and
+    // `clean` is unreachable on the author-blind pass by construction.
+    if ("authorUnknown" in verdict && verdict.authorUnknown) {
+      const prAuthorLogin = await withBoundedRetry(
+        () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+        (login) => login == null,
+      );
+      if (prAuthorLogin) {
+        verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin });
+      } else if (verdict.state === "success") {
+        // Publishing `neutral` on incomplete evidence would overwrite a correct
+        // earlier verdict with a weaker one on a transient 5xx. Not publishing
+        // leaves it standing, and the next webhook re-evaluates.
+        return { posted: false, reason: "fetch_failed" };
+      }
+      // A `failure` stands on the comment surfaces alone — the author can only
+      // ever soften it — so it publishes even with the author unread. Going
+      // silent there is the direction this module must not get wrong.
+    }
 
     warnOnceIfMisreadableContext(verdict, context);
     const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(

@@ -212,6 +212,52 @@ curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 | jq '[.[] | {agentId, reviewedIssues, passedReviews, reviewPassRate}]'
 ```
 
+### Recorded baseline — 2026-09-27T13:32:51Z
+
+⚠️ **This is a post-deploy, pre-flip baseline, and the pre-deploy one was
+missed.** The truth shapes were already evaluating in production by
+`2026-09-23T23:22Z`, so the deploy-day step-down this section warns about has
+already happened and is folded into the numbers below. The scorecard window is
+a rolling 30 days with no historical endpoint, so the pre-deploy figures are
+**not recoverable** — do not read a later comparison against this table as
+measuring the deploy. It is still the correct baseline for the seven-day
+measurement, which measures the **flip**, and it was taken before that window
+opened (`PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` still `"0"`).
+
+Window `2026-08-28T13:32:51Z` → `2026-09-27T13:32:51Z`. The table is keyed on
+display name; the `jq` above emits `agentId`, so map with
+`paperclipListAgents` (or `GET /api/companies/$PAPERCLIP_COMPANY_ID/agents`)
+before comparing.
+
+These 13 are the **complete** non-zero set for the window. The other 5 agents
+on the roster had `reviewedIssues: 0` and are omitted (`reviewPassRate: null`,
+nothing to step down): **Reflection Coach**, **Summarizer**, **Operator
+(devbox)**, **Caveman Canary Claude v2**, **Caveman Canary OpenCode v2** — all
+`pending_approval` or `paused`, all created before the capture. A name in the
+follow-up that is not in either list is a genuinely new agent, not a
+previously-omitted one.
+
+| agent | reviewedIssues | passedReviews | reviewPassRate |
+|---|---|---|---|
+| Players Engineer | 47 | 35 | 0.7447 |
+| TrafficOpsEngineer | 90 | 21 | 0.2333 |
+| QA Engineer | 9 | 2 | 0.2222 |
+| OCMBackendEngineer | 10 | 2 | 0.2000 |
+| PlatformSREEngineer | 265 | 52 | 0.1962 |
+| CEO | 20 | 3 | 0.1500 |
+| MulticastEngineer | 262 | 39 | 0.1489 |
+| Staff Engineer | 90 | 11 | 0.1222 |
+| UXDesigner | 22 | 2 | 0.0909 |
+| BackendEngineerGo | 80 | 6 | 0.0750 |
+| CTO | 79 | 4 | 0.0506 |
+| Release Engineer | 69 | 3 | 0.0435 |
+| Ally | 142 | 4 | 0.0282 |
+
+**The lesson for the next flag with a scorecard-visible effect:** the baseline
+has to be captured in the same change that ships the code, not in the runbook
+that describes it. A rolling window makes "we will grab it on deploy day" a
+one-shot opportunity with no retry.
+
 ## Measure daily for seven days
 
 **Before day 1, confirm the gate is actually installed.** The window is only

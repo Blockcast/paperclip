@@ -2,9 +2,10 @@
 /**
  * measure-general-server-shard-durations.mjs
  *
- * Measures real per-suite Vitest test-execution durations for the
- * general-server lane and folds them into
- * scripts/general-server-shard-durations.json.
+ * Measures real per-suite Vitest test-execution durations for every server
+ * suite -- both the general-server lane and the serialized route/authz lane --
+ * and folds them into scripts/general-server-shard-durations.json, which
+ * weights both shard partitions (BLO-24241, BLO-28956).
  *
  * These are the JSON reporter's per-file testResults[].startTime->endTime
  * spans, NOT full wall-clock: they exclude each file's transform/setup/import
@@ -24,7 +25,7 @@
  *                    (default: print the measured-only JSON to stdout so a
  *                    caller — e.g. a CI job merging several shards — can
  *                    combine results before writing).
- *   --all           Re-measure every general-server suite instead of only
+ *   --all           Re-measure every server suite instead of only
  *                    the ones currently missing from the manifest.
  *   --shard-index/--shard-count
  *                    Measure only this slice of the target file list, so a
@@ -43,7 +44,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { loadShardDurations } from "./general-server-shard.mjs";
-import { collectGeneralServerSuiteFiles } from "./run-vitest-stable-suites.mjs";
+import { collectAllServerSuiteFiles } from "./run-vitest-stable-suites.mjs";
 
 const MEASURE_VITEST_ARGS = ["--no-file-parallelism", "--maxWorkers=1"];
 
@@ -196,7 +197,11 @@ if (isMainModule()) {
   const manifestPath = path.join(repoRoot, "scripts", "general-server-shard-durations.json");
   const options = parseCliOptions(process.argv.slice(2));
 
-  const allFiles = collectGeneralServerSuiteFiles(repoRoot);
+  // BOTH server lanes (BLO-28956). The manifest weights the general-server
+  // shard partition AND the serialized route/authz one, so measuring only the
+  // general half would leave the serialized half on the median fallback --
+  // i.e. packed by file count, which is the defect this manifest exists to fix.
+  const allFiles = collectAllServerSuiteFiles(repoRoot);
   const durations = loadShardDurations(manifestPath);
   const targetFiles = selectTargetFiles({ allFiles, durations, ...options });
 

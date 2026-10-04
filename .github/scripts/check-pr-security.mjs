@@ -5,10 +5,13 @@
  * Creates a draft security advisory in the repo if any check fires.
  *
  * Env: GH_TOKEN, GH_REPO, PR_NUMBER, PR_AUTHOR
- * Exit: always 0 — security flags are silent, never block the PR visibly.
+ * Exit: 0 on any completed run, including one that flagged — security flags are
+ *   silent and never block the PR visibly, and the watchdog holds that at 90s.
+ *   1 only when the run did not complete: exitFatal, which also annotates that
+ *   no check evaluated the diff so the red step is not read as a finding.
  */
 import { fileURLToPath } from 'node:url';
-import { ghFetch } from './get-bot-token.mjs';
+import { ghFetch, exitFatal, GH_FETCH_DEFAULT_TIMEOUT_MS } from './get-bot-token.mjs';
 import { fetchAllPullRequestFiles } from './fetch-pr-files.mjs';
 import { resolveBaseRef } from './check-pr-dependencies.mjs';
 
@@ -163,9 +166,18 @@ export async function validateSensitivePaths(token, repo, prNumber, baseRef, fet
     try {
       await fetchFromGitHub(buildContentsPath(repo, path, resolvedBaseRef), token);
     } catch (err) {
-      // 404 means the file/directory no longer exists at this path
-      if (String(err.message).includes('404')) stale.push(path);
-      // Other errors (network, rate limit) — re-throw so we don't silently miss them
+      // A rate-limited read never completed, so it says nothing about the
+      // path. Re-throw it BEFORE the 404 match: its message carries wait and
+      // budget seconds, and any of them can be 404. ghFetch has already spent
+      // its retry budget, and the error carries RATE_LIMIT_NOT_EVALUATED so
+      // the fatal handler can say the gate never ran (BLO-37010).
+      if (err?.rateLimited) throw err;
+      // 404 means the file/directory no longer exists at this path. Match
+      // ghFetch's own "→ <status>" delimiter, not a bare "404": the message
+      // also carries the request URL, whose ref is a base SHA that can
+      // contain those digits.
+      if (String(err.message).includes('→ 404')) stale.push(path);
+      // Everything else re-throws so we don't silently miss it.
       else throw err;
     }
   }));
@@ -396,6 +408,21 @@ export function startScriptWatchdog(timeoutMs = SCRIPT_WATCHDOG_MS, exit = proce
   return timer;
 }
 
+// After a rate-limit sleep the retried read can still take a full per-call
+// timeout, so the budget must end at least that long before the watchdog.
+export const WATCHDOG_RETRY_RESERVE_MS = GH_FETCH_DEFAULT_TIMEOUT_MS + 5_000;
+
+// ghFetch's default retry budget is longer than SCRIPT_WATCHDOG_MS. A rate-limit
+// wait that crossed the watchdog would end in its silent exit(0), and the
+// not-evaluated annotation from exitFatal would never print. Each read gets
+// only the budget left before the watchdog, measured when that read starts.
+export function watchdogBoundFetch(startedAt, fetchImpl = ghFetch, now = Date.now) {
+  return (path, token, options = {}) => fetchImpl(path, token, {
+    retryBudgetMs: Math.max(0, startedAt + SCRIPT_WATCHDOG_MS - WATCHDOG_RETRY_RESERVE_MS - now()),
+    ...options,
+  });
+}
+
 async function warnOnFailure(label, promise) {
   try {
     await promise;
@@ -450,6 +477,7 @@ export async function postFlaggedSecurityResult(
 async function main() {
   const startedAt = Date.now();
   const watchdog = startScriptWatchdog();
+  const gh = watchdogBoundFetch(startedAt);
 
   const { GH_TOKEN, GH_REPO, PR_NUMBER, PR_HEAD_SHA } = process.env;
 
@@ -470,7 +498,7 @@ async function main() {
   }
 
   // Validate SENSITIVE_PATHS — fails loudly if any have been refactored away on the PR base branch
-  const stalePaths = await validateSensitivePaths(GH_TOKEN, GH_REPO, prNumber);
+  const stalePaths = await validateSensitivePaths(GH_TOKEN, GH_REPO, prNumber, undefined, gh);
   if (stalePaths.length > 0) {
     console.error('ERROR: Stale sensitive paths in check-pr-security.mjs:');
     for (const p of stalePaths) console.error(`  - ${p}`);
@@ -481,8 +509,8 @@ async function main() {
   }
 
   const [pr, files] = await Promise.all([
-    ghFetch(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
-    fetchAllPullRequestFiles(ghFetch, GH_REPO, prNumber, GH_TOKEN),
+    gh(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
+    fetchAllPullRequestFiles(gh, GH_REPO, prNumber, GH_TOKEN),
   ]);
 
   const allFlags = [
@@ -503,7 +531,7 @@ async function main() {
     // POST timeout plus cleanup, even if earlier GitHub reads were slow.
     const advisoryBudgetMs = Math.max(0, SCRIPT_WATCHDOG_MS - (Date.now() - startedAt) - 20_000);
     await postFlaggedSecurityResult(
-      ghFetch,
+      gh,
       GH_TOKEN,
       GH_REPO,
       { ...pr, number: prNumber },
@@ -513,7 +541,7 @@ async function main() {
     );
   } else {
     console.log('[security] all clear');
-    await warnOnFailure('security check-run update', postSecurityCheckRun(ghFetch, GH_TOKEN, GH_REPO, targetSha, false));
+    await warnOnFailure('security check-run update', postSecurityCheckRun(gh, GH_TOKEN, GH_REPO, targetSha, false));
   }
 
   // Always exit 0 — security flags are silent, never block the PR publicly
@@ -522,5 +550,5 @@ async function main() {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main().catch(e => { console.error(e.message); process.exit(1); });
+  main().catch(e => exitFatal(e, 'commitperclip security gates'));
 }

@@ -1,4 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// PEN-3314: deliberately the real metrics module, save for ONE pass-through
+// override — see the `vi.mock` below and the recovery-chain series test for why
+// a blanket spy would not prove anything.
+import {
+  HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
+  HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC,
+  recordHeartbeatRecoveryChainDuration,
+  recordHeartbeatRecoveryChainSkipped,
+  renderMetrics,
+} from "../services/metrics.js";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -223,6 +235,24 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
 }));
+
+// PEN-3314 review follow-up: a PASS-THROUGH partial mock, not a replacement.
+// Every export stays the genuine article — including `renderMetrics` and the
+// metric-name constants — so the recovery-chain series test below still drives
+// the real recorder all the way to the rendered `/metrics` body. The two
+// wrapped functions exist only so the wedge-safety tests can force them to
+// throw; their default implementations are the real ones, delegated to on every
+// call. They are the two recorders reached from inside the scheduler tick's
+// `void`-ed IIFE — the settle pair and the skip branch — which is exactly the
+// set whose throws have no caller to receive them.
+vi.mock("../services/metrics.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/metrics.js")>();
+  return {
+    ...actual,
+    recordHeartbeatRecoveryChainDuration: vi.fn(actual.recordHeartbeatRecoveryChainDuration),
+    recordHeartbeatRecoveryChainSkipped: vi.fn(actual.recordHeartbeatRecoveryChainSkipped),
+  };
+});
 
 vi.mock("../app.js", () => ({
   createApp: createAppMock,
@@ -1353,7 +1383,7 @@ describe("startServer feedback export wiring", () => {
   // bounding the convoy — a tail pass walks 147 stranded candidates
   // sequentially, each taking the company-wide issue-graph advisory lock,
   // against a 30 s tick, so two overlapping passes contend with EACH OTHER and
-  // starve `POSTGRES_POOL_MAX=10`. It had no regression guard, which is the
+  // starve `POSTGRES_POOL_MAX`. It had no regression guard, which is the
   // "test passes while missing the real failure mode" shape: every other test
   // in this file is satisfied by an unlatched implementation.
   //
@@ -1456,6 +1486,537 @@ describe("startServer feedback export wiring", () => {
       await tickUntilTailRuns(3);
       await tickUntilTailRuns(4);
     } finally {
+      releaseTail?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // PEN-3314 review follow-up: the latch must be cleared BEFORE the settle
+  // path's fallible recorders, so a throwing metrics call costs a sample rather
+  // than the chain.
+  //
+  // The test above proves the latch releases when the pass resolves and when it
+  // rejects. Both of those are the pass's own outcome. This one covers the third
+  // way `.finally` can exit — a throw raised INSIDE the `.finally` body itself —
+  // which neither of them reaches, because both recorders are called with real
+  // values that never throw. That is exactly why the original ordering shipped
+  // review-clean: no test made a recorder fail.
+  //
+  // The consequence being guarded is total and silent. `trackHeartbeatSchedulerWork`
+  // maps both settlement arms to `undefined`, so a throw here produces no
+  // unhandled rejection, no crash and no log; the only evidence would be every
+  // later tick taking the skip branch for the life of the process, halting
+  // orphan reaping, retry promotion, stranded-issue reconciliation and the
+  // watchdogs until restart.
+  //
+  // ⚠️ Whole-file run only, same `setInterval`/`unref` reason as the test above.
+  it("clears the recovery-chain latch even when a settle recorder throws", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    // Filter on the delay rather than taking the last registration: the
+    // watchdog and the two config-gated sweepers also call `setInterval`, and
+    // whether they register after the tick is outside this test's control.
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const durationMock = vi.mocked(recordHeartbeatRecoveryChainDuration);
+
+    // Same shape as the test above: the release is observable only by a LATER
+    // tick running the tail again, so tick until it does. A latch that never
+    // releases simply never satisfies this and times out.
+    const tickUntilTailRuns = async (times: number) =>
+      vi.waitFor(() => {
+        intervalCallback?.();
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(times);
+      });
+
+    try {
+      await startServer();
+      // Order against the startup recovery sequence before touching the latch —
+      // a tick returns early while `heartbeatStartupRecoveryPending` is true.
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+      durationMock.mockClear();
+
+      // Fail the FIRST recorder on the settle path, which is the worst case: it
+      // is the earliest fallible call, so an implementation that clears the latch
+      // after any of them is caught here.
+      durationMock.mockImplementationOnce(() => {
+        throw new Error("prom-client registry blew up");
+      });
+
+      // Pass 1 runs and settles straight through the throwing recorder.
+      await tickUntilTailRuns(1);
+      await vi.waitFor(() => expect(durationMock).toHaveBeenCalledTimes(1));
+
+      // Positive control. Without this the test would also pass if the recorder
+      // were never called at all — in which case nothing was proved about a
+      // throw, and the assertion below would be satisfied by an ordinary settle.
+      expect(durationMock.mock.results[0]?.type).toBe("throw");
+
+      // The assertion. The latch was cleared before the throw, so a later tick
+      // starts a new pass. With the clears back after the recorders this times
+      // out, because the chain is wedged for the life of the process.
+      await tickUntilTailRuns(2);
+    } finally {
+      durationMock.mockReset();
+      durationMock.mockImplementation(
+        (await vi.importActual<typeof import("../services/metrics.js")>("../services/metrics.js"))
+          .recordHeartbeatRecoveryChainDuration,
+      );
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // PEN-3314, from Ally's review of 0cbb0915 (Important): the counterpart to the
+  // test above, at the one recorder call site the settle fix did not reach.
+  //
+  // The asymmetry it closes is not cosmetic. The skip branch runs ONLY while a
+  // pass is already in flight — the degraded state this whole PR exists to make
+  // observable — so an unguarded throw there inverts the feature: the
+  // instrumentation added to keep a struggling worker visible becomes the thing
+  // that kills it, in precisely the window it was built to report on.
+  //
+  // "Kills it" is literal, and NOT via Node's default `ERR_UNHANDLED_REJECTION`
+  // as one might assume — `installWorkerCrashGuard()` arms an
+  // `unhandledRejection` handler at the entrypoint, and that handler
+  // terminalizes every in-flight run on the worker before exiting 1. So the
+  // blast radius of an unguarded throw here is every run in flight, not just
+  // this process.
+  //
+  // The `unhandledRejection` assertion is the one that would actually fail
+  // before the fix: the scheduler tick's IIFE is `void`-ed with no `.catch()`,
+  // so a throw from the recorder has nothing to receive it. The two assertions
+  // above it are positive controls — without them this would pass for the wrong
+  // reason if the recorder were never called, or if the skip branch were never
+  // reached, in which case nothing about a throw would have been proved.
+  it("survives a throwing skip recorder while a pass is in flight", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    // Delay-filtered as above. Since the watchdog moved to its own shorter
+    // period this now selects the scheduler tick unambiguously rather than
+    // relying on registration order.
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleReconcile = {
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    };
+
+    const skippedMock = vi.mocked(recordHeartbeatRecoveryChainSkipped);
+    const unhandledRejection = vi.fn();
+    process.on("unhandledRejection", unhandledRejection);
+
+    let releaseTail: (() => void) | null = null;
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+      heartbeatServiceMock.resumeQueuedRuns.mockClear();
+      skippedMock.mockClear();
+
+      // Park the tail so the pass is still in flight when the next tick fires —
+      // the only state in which the skip branch is reachable at all.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseTail = () => resolve(idleReconcile);
+        }),
+      );
+
+      // Tick 1 STARTS the pass. Not a skip, so the recorder must not be armed
+      // to throw yet.
+      intervalCallback?.();
+      await vi.waitFor(() => expect(releaseTail).not.toBeNull());
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1));
+      expect(skippedMock).not.toHaveBeenCalled();
+
+      skippedMock.mockImplementationOnce(() => {
+        throw new Error("prom-client registry blew up");
+      });
+
+      // Tick 2 finds the latch held and takes the skip branch.
+      intervalCallback?.();
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(skippedMock).toHaveBeenCalledTimes(1));
+
+      // Positive control 1: the recorder really threw. Without this the
+      // assertion below is satisfied by an ordinary, non-throwing skip.
+      expect(skippedMock.mock.results[0]?.type).toBe("throw");
+      // Positive control 2: the throw was caught HERE, rather than swallowed
+      // somewhere incidental.
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error) }),
+        "failed to record heartbeat recovery chain skip",
+      );
+
+      // The assertion. Give the rejection a macrotask to surface if the guard
+      // is ever removed; `process.on("unhandledRejection")` fires after the
+      // microtask queue drains.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandledRejection).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandledRejection);
+      releaseTail?.();
+      skippedMock.mockReset();
+      skippedMock.mockImplementation(
+        (await vi.importActual<typeof import("../services/metrics.js")>("../services/metrics.js"))
+          .recordHeartbeatRecoveryChainSkipped,
+      );
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // PEN-3314: the latch above is deployed and, until this, exported nothing.
+  // That is the actual finding on that row — a recurrence of the heap leak the
+  // latch was deployed against is currently UNDETECTABLE, because the only
+  // evidence the chain is overrunning was a log line nobody alerts on.
+  //
+  // This asserts against the rendered `/metrics` body rather than a spy on the
+  // recorder functions. A spy would pass with the metric registered but never
+  // exported, which is precisely the failure being fixed: the question is not
+  // "was the recorder called" but "does the series reach the endpoint an alert
+  // reads". `../services/metrics.js` is deliberately left unmocked for that.
+  //
+  // ⚠️ Like every other `setInterval`-spying test in this file, this one only
+  // passes as part of a whole-file run. The spy returns a bare number, and
+  // `startEventLoopStallLogging` calls `.unref()` on what `setInterval` returns
+  // — survivable only because an earlier, unmocked `startServer()` has already
+  // latched that module's `activeStop` singleton (event-loop-stall-log.ts:70),
+  // so this call returns early and never reaches `unref`. Running this test
+  // alone with `-t` makes the mocked call the first one and fails on
+  // `timer.unref is not a function`. That is the harness, not a regression.
+  it("exports recovery-chain skip, in-flight and duration series as the latch drives them", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    // Delay-filtered for the same reason as the test above: this must be the
+    // scheduler tick, not whichever timer happened to register last.
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleReconcile = {
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    };
+
+    // Read one unlabeled series out of the exposition body. Returns null when
+    // the series is absent, so "absent" and "zero" stay distinguishable — the
+    // whole point of the zero-initialization these metrics rely on.
+    const readSeries = async (metric: string): Promise<number | null> => {
+      const { body } = await renderMetrics();
+      const line = body
+        .split("\n")
+        .find((candidate) => candidate.startsWith(`${metric} `));
+      return line ? Number(line.slice(metric.length + 1)) : null;
+    };
+
+    let releaseTail: (() => void) | null = null;
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+      heartbeatServiceMock.resumeQueuedRuns.mockClear();
+
+      // Every series must already exist. An alert of the documented form
+      // ("inflight > heartbeatSchedulerIntervalMs") never evaluates against an
+      // absent series, so a worker whose FIRST chain wedges would be silent
+      // exactly when it matters most.
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)).not.toBeNull();
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC)).not.toBeNull();
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC)).not.toBeNull();
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)).not.toBeNull();
+
+      const skippedBefore = (await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)) ?? 0;
+
+      // Park the tail so it is still in flight when the next tick fires.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseTail = () => resolve(idleReconcile);
+        }),
+      );
+
+      intervalCallback?.();
+      await vi.waitFor(() => expect(releaseTail).not.toBeNull());
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1));
+
+      // A tick that STARTS a pass is not a skip. Without this the counter would
+      // be satisfied by incrementing on every tick, which would make the
+      // "chain is overrunning" signal indistinguishable from "the worker is up".
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)).toBe(skippedBefore);
+
+      // Second tick with the tail still parked: this one IS a skip.
+      intervalCallback?.();
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(2));
+      expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1);
+
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)).toBe(skippedBefore + 1);
+      // Still well inside the 10-tick stall threshold, so the skip must NOT be
+      // reported as a stall. These two mean different things: a skip is the
+      // chain running slow, a stall is it having stopped settling altogether,
+      // and only the second is a page.
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)).toBe(0);
+
+      // The pass settles: the in-flight gauge must return to 0, or the overlap
+      // alert keeps firing against a worker that has already recovered.
+      releaseTail?.();
+      releaseTail = null;
+      await vi.waitFor(async () => {
+        expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC)).toBe(0);
+      });
+      const duration = await readSeries(HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC);
+      expect(duration).not.toBeNull();
+      expect(duration).toBeGreaterThanOrEqual(0);
+    } finally {
+      releaseTail?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // PEN-3314, from Ally's review of 38422e1 (Important): a detector sitting
+  // downstream of the resource whose exhaustion it reports is silent in exactly
+  // the case it exists for. The heartbeat tick reaches the recovery-chain latch
+  // only after two `resolveSchedulingSuppression()` round-trips; when the pool
+  // saturates — the BLO-34207 state, `active` pinned at POSTGRES_POOL_MAX with a
+  // long `waiting` queue — every tick parks on those awaits and none arrives.
+  //
+  // The resulting signal is not merely missing, it is INVERTED: the in-flight
+  // gauge would hold the `0` written by the last settle, so a wedged worker
+  // exports a confident "no pass outstanding" for the duration of the incident.
+  // This pins the fix — in-flight and stall are driven by their own timer, which
+  // queries nothing and so cannot be starved by the pool.
+  //
+  // The skip assertion is the positive control, and it is load-bearing: without
+  // it this test would pass for the wrong reason if the suppression hang failed
+  // to actually starve the tick. Skips flat + in-flight climbing IS the
+  // saturation signature.
+  it("keeps reporting in-flight while pool saturation starves the heartbeat tick", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    // Every callback, not just the last: the point of this test is that more
+    // than one timer is now involved, so a last-wins capture would silently
+    // test the tick again and assert nothing new.
+    const intervalCallbacks: Array<() => void> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallbacks.push(callback);
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleReconcile = {
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    };
+
+    const readSeries = async (metric: string): Promise<number | null> => {
+      const { body } = await renderMetrics();
+      const line = body
+        .split("\n")
+        .find((candidate) => candidate.startsWith(`${metric} `));
+      return line ? Number(line.slice(metric.length + 1)) : null;
+    };
+
+    let releaseTail: (() => void) | null = null;
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+
+      // Park the tail so a pass is genuinely outstanding when saturation hits.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseTail = () => resolve(idleReconcile);
+        }),
+      );
+
+      // The scheduler tick is the last timer registered (every other
+      // `setInterval`-spying test in this file depends on that too).
+      const schedulerTick = intervalCallbacks[intervalCallbacks.length - 1];
+      schedulerTick?.();
+      await vi.waitFor(() => expect(releaseTail).not.toBeNull());
+
+      const skippedBefore = (await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)) ?? 0;
+
+      // Saturate: the suppression lookups never come back, so no tick body can
+      // reach the latch from here on.
+      resolveHeartbeatSchedulingSuppressionMock.mockImplementation(
+        () => new Promise(() => {}),
+      );
+
+      // Fire every timer. The scheduler parks on the hung lookup; the watchdog
+      // does not await anything and reports regardless.
+      for (const callback of intervalCallbacks) callback();
+
+      await vi.waitFor(async () => {
+        const inflight = await readSeries(HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC);
+        expect(inflight).not.toBeNull();
+        expect(inflight).toBeGreaterThan(0);
+      });
+
+      // Positive control: the tick really was starved, so the one series the
+      // tick still owns did NOT move. Were this to advance, the hang above
+      // failed to reproduce saturation and the in-flight assertion proves
+      // nothing about tick-independence.
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)).toBe(skippedBefore);
+    } finally {
+      releaseTail?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // PEN-3314, from Ally's review of 0cbb0915 (Suggestion): raising the stall
+  // report to `error` was right, but it fired once per watchdog sample for as
+  // long as the halt lasted. "Keeps saying so" is the correct intent — the halt
+  // does not resolve itself — but unbounded at `error` it is a page storm
+  // against a worker that is already down, and moving the watchdog to a shorter
+  // sampling period than the scheduler interval would have tripled it.
+  //
+  // This pins the compromise: the first crossing reports immediately, then at
+  // most one line per re-log window, on its OWN clock rather than the sample
+  // clock. The last assertion is what keeps the intent — without it a "log once
+  // per pass" implementation would also pass, and a halt lasting hours would
+  // leave a single line at the top of the incident and nothing after it.
+  it("re-logs a stalled recovery chain on a coarse clock, not once per watchdog sample", async () => {
+    const schedulerIntervalMs = 30000;
+    // Mirrors the production derivation: `max(1000, floor(interval / 3))`.
+    const watchdogIntervalMs = Math.max(1000, Math.floor(schedulerIntervalMs / 3));
+    const stallAfterMs = 10 * schedulerIntervalMs;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+
+    // The watchdog and the scheduler tick now register at DIFFERENT delays, so
+    // both are addressable without depending on registration order — which is
+    // what this test needs, since it starts a pass on one and samples it on the
+    // other.
+    let schedulerCallback: (() => void) | null = null;
+    let watchdogCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) schedulerCallback = callback;
+        if (delay === watchdogIntervalMs) watchdogCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleReconcile = {
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    };
+
+    const stallMessage =
+      "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running";
+    const stallLogCount = () =>
+      vi.mocked(logger.error).mock.calls.filter((call) => call[1] === stallMessage).length;
+
+    let releaseTail: (() => void) | null = null;
+    let dateNowSpy: { mockRestore(): void } | null = null;
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+
+      // Pin the clock BEFORE the pass starts so `heartbeatRecoveryChainStartedAt`
+      // is stamped at a known origin and every offset below is exact.
+      const startedAt = Date.now();
+      let clock = startedAt;
+      dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseTail = () => resolve(idleReconcile);
+        }),
+      );
+      schedulerCallback?.();
+      await vi.waitFor(() => expect(releaseTail).not.toBeNull());
+      vi.mocked(logger.error).mockClear();
+
+      // In flight, but under the threshold: not yet a stall.
+      clock = startedAt + stallAfterMs - 1;
+      watchdogCallback?.();
+      expect(stallLogCount()).toBe(0);
+
+      // First crossing reports immediately. A page-worthy state must not wait
+      // out a re-log window before it is ever said once.
+      clock = startedAt + stallAfterMs + 1;
+      watchdogCallback?.();
+      expect(stallLogCount()).toBe(1);
+
+      // Three more samples inside the window. Each of these logged before this
+      // change, which at the watchdog's period is where the volume came from.
+      for (let i = 1; i <= 3; i += 1) {
+        clock = startedAt + stallAfterMs + 1 + i * watchdogIntervalMs;
+        watchdogCallback?.();
+      }
+      expect(stallLogCount()).toBe(1);
+
+      // Past the re-log window it says so again: the halt is unresolved, and an
+      // operator reading the log hours in must still find it.
+      clock = startedAt + stallAfterMs + 1 + stallAfterMs;
+      watchdogCallback?.();
+      expect(stallLogCount()).toBe(2);
+      expect(logger.error).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          stallAfterMs,
+          relogAfterMs: stallAfterMs,
+          inFlightMs: expect.any(Number),
+        }),
+        stallMessage,
+      );
+    } finally {
+      dateNowSpy?.mockRestore();
       releaseTail?.();
       setIntervalSpy.mockRestore();
     }

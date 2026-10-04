@@ -63,15 +63,16 @@ const APP_SIDEBAR_EXPANDED_MARKER = "Open search";
 // navigating off a takeover route is satisfied by a blank page, so without this
 // gate those assertions could pass while the app had rendered nothing at all.
 //
-// Bounded by the per-test cap, not picked for headroom alone: the tests below
-// navigate at most twice, and the suite default is 60s
-// (`tests/e2e/playwright.config.ts`). At 30s a two-navigation test could spend
-// 2 x 30s and die on the generic Playwright timeout instead of this
-// precondition's self-describing `#main-content` message — losing the
-// diagnostic exactly in the slowest case it exists for. 20s keeps the
-// worst case (2 x 20s = 40s) inside the cap, so the precondition can always
-// expire on its own terms, while still giving 4x the 5s budget that made this
-// file flaky.
+// Must stay well under the per-test cap, so the precondition always expires on
+// its own terms rather than being cut off by the generic Playwright timeout —
+// which would lose the self-describing `#main-content` diagnostic in exactly
+// the slowest case it exists for. The tests below navigate at most twice, so
+// the worst case is 2 x 20s = 40s. This value was originally derived against
+// the 60s suite default (`tests/e2e/playwright.config.ts`); that is no longer
+// the binding constraint, because `test.setTimeout(180_000)` below overrides it
+// for this file (BLO-33320). 40s clears either figure, and 20s is kept for fast
+// failure — 4x the 5s budget that made this file flaky, without turning a red
+// into a three-minute one.
 const APP_SHELL_READY_TIMEOUT = 20_000;
 
 async function gotoAppRoute(page: Page, url: string) {

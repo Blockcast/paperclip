@@ -26,6 +26,15 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   linkManyForApproval: vi.fn(),
 }));
 
+// BLO-23763: the create route now resolves each `issueIds` entry to run the
+// issue-scoped boundary. Returning null here keeps these tests focused on
+// idempotency — an id that does not resolve is left to `linkManyForApproval`,
+// exactly as before. The authorization behaviour has its own suite in
+// `approval-create-issue-link-authorization.test.ts`.
+const mockIssueService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null),
+}));
+
 const mockSecretService = vi.hoisted(() => ({
   normalizeHireApprovalPayloadForPersistence: vi.fn(),
 }));
@@ -42,6 +51,7 @@ function registerModuleMocks() {
     approvalService: () => mockApprovalService,
     heartbeatService: () => mockHeartbeatService,
     issueApprovalService: () => mockIssueApprovalService,
+    issueService: () => mockIssueService,
     logActivity: mockLogActivity,
     secretService: () => mockSecretService,
   }));

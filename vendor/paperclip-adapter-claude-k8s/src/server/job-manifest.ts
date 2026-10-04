@@ -1168,10 +1168,25 @@ function buildEnvVars(
   // pattern (isSensitiveEnvName) are routed to a Secret referenced via
   // secretKeyRef instead of an inline literal `value`, so a read-only
   // `GET Pod` on the Job never returns their contents (BLO-17980/BLO-17973).
+  //
+  // Layer 4 (`adapterConfig.env`, the `userEnvKeys` set) is additionally
+  // DEFAULT-DENY: every operator-set key is materialized regardless of name
+  // (BLO-22546). A name pattern is the wrong instrument at this layer —
+  // `PENSTOCK_BOARD`, `GH_PAT`, `*_CRED` and `*_SESSION` all match nothing and
+  // would ship as literals. Operator env is a small map that is almost
+  // entirely credentials, so a false positive costs one secretKeyRef
+  // indirection while a false negative is a plaintext credential in the
+  // PodSpec, readable by any principal holding `get pods`.
+  //
+  // Provenance is keyed on the NAME being in `userEnvKeys`, never on
+  // `merged[name] === envConfig[name]`. Layers above rewrite operator values
+  // in place — `ANTHROPIC_CUSTOM_HEADERS` gets the x-penstock-session line
+  // appended after this merge — so value equality reports "not operator-set"
+  // for exactly the transformed values that still carry operator material.
   const sensitiveEnvData: Record<string, string> = {};
   const envVars: k8s.V1EnvVar[] = [];
   for (const [name, value] of Object.entries(merged)) {
-    if (isSensitiveEnvName(name) && value) {
+    if ((userEnvKeys.has(name) || isSensitiveEnvName(name)) && value) {
       sensitiveEnvData[name] = value;
       envVars.push({ name, valueFrom: { secretKeyRef: { name: envSecretName, key: name } } });
     } else {

@@ -92,9 +92,39 @@ jobs:
 
     steps:
       - name: Checkout repository
+        # `fetch-depth: 0` is load-bearing -- the lockfile guard below diffs
+        # PR_BASE_SHA...PR_HEAD_SHA and needs the merge base on disk -- and it
+        # makes this the dominant setup term (p100 9.07m, p50 2.08m). It
+        # previously carried no bound, so a wedged fetch could only ever surface
+        # as an unattributable job-cap cancellation.
+        #
+        # This is a HANG DETECTOR, like the job cap above: its only job is to
+        # make a wedged fetch fail as ITSELF rather than as an anonymous cap
+        # kill. Do not re-tune it down towards the observed p100 -- this bound
+        # has already been overtaken TWICE by its own p100 (6m by the 6.63m
+        # window, then 9m by this one, where run 35675464291 attempt 2 spent
+        # 9m04s here and the step still reported `conclusion: success`). A 9m
+        # bound would have truncated a step that was working, which the
+        # BLO-35615 rule calls strictly worse than the failure it prevents.
+        #
+        # Be precise about what that costs, because this term is CENSORED and
+        # the censoring cuts both ways: that job was cancelled at the old 10m
+        # cap (10.22m step-time) regardless, and every checkout above 6.52m in
+        # the window sits in a job that cap then killed. So no COMPLETED run
+        # was at stake -- the bound governs the step, and 9m04s is what the
+        # step took. The reason to size above it is that now the cap is 22m and
+        # no longer truncates this distribution, the same draw lands in a run
+        # that would otherwise finish.
+        #
+        # So do not read 12m as a safety factor over p100. `fetch-depth: 0`
+        # cost grows with history, this term was censored by the old cap, and
+        # the 22m cap is what will let its real tail appear for the first time.
+        # Re-measure once it has; if a ratio is wanted against something that
+        # does not move on one observation, p99 is 8.07m.
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+        timeout-minutes: 12
 
       - name: Block manual lockfile edits
         # Exemptions: (1) the dedicated chore/refresh-lockfile branch that CI
@@ -123,6 +153,11 @@ jobs:
 
       - name: Setup pnpm
         uses: ./.github/actions/setup-pnpm
+        # ~2.9x the 1.05m p100. Left unbounded while its ordinary cost was a
+        # 4.3m registry round-trip, because any bound had to clear the ~10.8m
+        # retry path too. Baking the pinned pnpm into the ARC image removed
+        # both, so the largest unbounded setup step now has a bound.
+        timeout-minutes: 3
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -410,20 +445,23 @@ jobs:
         # `git push` is not a guaranteed fix. See AGENTS.md §9. Uses the
         # already-checked-out history (fetch-depth: 0 above), no new token.
         #
-        # There is deliberately NO branch exemption. The graphify-reindex bot
-        # commits via `git push` under its own git identity
-        # (`allyblockcast[bot]@users.noreply.github.com`), which is not the
-        # REST-path stamp this gate matches
-        # (`290875700+allyblockcast[bot]@users.noreply.github.com`) — measured
-        # by running this script over the real graphify PRs #789 and #944:
-        # both pass. A `github.head_ref`-keyed exemption was therefore
-        # protecting against a rejection that never happens, while being both
-        # a fork bypass (any fork can name its branch `bot/graphify-reindex`,
-        # and `head_ref` carries no repository identity) and a merge-queue
-        # false-reject (`head_ref` is empty in `merge_group`). Pinned by the
-        # graphify-identity case in check-commit-author-attribution.test.mjs —
-        # if that test starts failing, the bot moved onto the REST write path
-        # and the right fix is to move it back, not to re-add an exemption.
+        # The App stamps this identity under several email spellings —
+        # id-prefixed, bare, wrong-prefix, any casing (BLO-26647) — and the
+        # matcher covers all of them, so which write path produced the commit
+        # no longer changes the verdict.
+        #
+        # There is still deliberately NO BRANCH exemption. The graphify-reindex
+        # bot shares the bare spelling, and it IS exempt, but by author name
+        # PLUS the paths it is allowed to touch (NON_AGENT_PROCESS_EXEMPTIONS in
+        # the script — email alone cannot tell it from a genuine agent commit,
+        # and a name alone is caller-controlled and so forgeable). Keying on
+        # `github.head_ref` here instead would be a fork bypass (any fork can
+        # name its branch `bot/graphify-reindex`, and `head_ref` carries no
+        # repository identity) and a merge-queue false-reject (`head_ref` is
+        # empty in `merge_group`). Pinned by the graphify cases in
+        # check-commit-author-attribution.test.mjs — if those start failing the
+        # bot's author name or output paths changed: update the exemption to
+        # match, do not re-add a branch exemption.
         run: node ./scripts/check-commit-author-attribution.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
 
       - name: Test commit-author-attribution check
@@ -452,6 +490,21 @@ jobs:
         if: ${{ !cancelled() }}
         run: node --test ./.github/scripts/tests/run-quality-gates.test.mjs
         timeout-minutes: 1
+
+      # BLO-37010. Same shape as BLO-26636 above: both suites existed and were
+      # wired into no workflow, so they had never run. get-bot-token's suite now
+      # holds the shared ghFetch rate-limit retry that keeps a 403 the gate never
+      # evaluated from reporting as a quality/security verdict — a guard nothing
+      # would enforce if the suite stayed unwired.
+      - name: Test commitperclip token + rate-limit retry (BLO-37010)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/get-bot-token.test.mjs
+        timeout-minutes: 1
+
+      - name: Test commitperclip security gate (BLO-37010)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/check-pr-security.test.mjs
+        timeout-minutes: 2
 
       # Guards the one property of the BLO-28888 soak workflow that cannot be
       # re-checked after the fact: that it stays dispatch-only. Adding its
@@ -528,6 +581,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+        # ~2.6x the 1.95m p100. This is a 100% tool-cache miss by
+        # construction -- both the fast and the slow run log "Version 3.10 was
+        # not found in the local cache" and then fetch the interpreter tarball
+        # from the python-versions release page -- i.e. an unconditional
+        # network draw on every run, which is exactly the degraded-registry
+        # mode this BLO-28813 -> BLO-31690 family is about. `setup-python`'s
+        # `cache:` input caches pip packages, not the interpreter, so it is a
+        # no-op against this term; bounding it is what makes a slow draw fail
+        # as itself.
+        timeout-minutes: 5
 
       - name: Test stalled-Ally-review sweep decision logic (BLO-28203)
         if: ${{ !cancelled() }}
@@ -566,6 +629,17 @@ jobs:
       - name: Test Ally review-consistency guard
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-ally-review-consistency.test.mjs
+        timeout-minutes: 1
+
+      # BLO-32837: the consistency guard's I1 caps operative reviews per head
+      # but says nothing about how a violation is remedied, and the obvious
+      # remedy is wrong. onprem-k8s#3281 dismissed the NEWER of two duplicate
+      # approvals, which satisfied I1 and left the PR at
+      # reviewDecision=REVIEW_REQUIRED — GitHub reads the reviewer's latest
+      # review, and that was now DISMISSED. It needed --admin to merge.
+      - name: Test Ally duplicate-review selection (BLO-32837)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/ally-review-de-dupe.test.mjs
         timeout-minutes: 1
 
       - name: Test landing classifier
@@ -613,6 +687,15 @@ jobs:
         # mutation to the CODE line: every guard is quoted verbatim in the
         # comment above it, so a first-occurrence replace edits the prose and
         # reports a working guard as unkillable.
+        # Re-swept 2026-09-29 after BLO-37887 (pending_runs() + the NO-VERDICT
+        # END clause): 8/8 new guards killed, each confirmed to land on its code
+        # line and not on the prose quoting it. One further way to report a
+        # working guard as unkillable, found in this sweep and not covered
+        # above: an INERT mutation. The survivor-count mutation was first written
+        # as `n += k` inside the END block but placed AFTER the `if(!n)` that
+        # reads n, so it could not change any output and the suite stayed green —
+        # indistinguishable from an unkilled guard. Check that a surviving
+        # mutation could have changed behaviour at all before recording it.
         run: node --test ./scripts/merge-gate-read.test.mjs
         timeout-minutes: 1
 
@@ -671,6 +754,11 @@ jobs:
         run: node --test ./scripts/__tests__/vitest-project-coverage.test.mjs
         timeout-minutes: 1
 
+      - name: Test merge-queue eviction detector (BLO-23395)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/merge-queue-eviction-detector.test.mjs
+        timeout-minutes: 1
+
       - name: Test release verify workflow wiring
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/release-verify-workflow.test.mjs
@@ -721,6 +809,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:js-yaml-security-override
 
+      - name: Test agent-health preflight fixtures
+        if: ${{ !cancelled() }}
+        run: pnpm run test:agent-health-preflight
+
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}
         run: |
@@ -763,6 +855,16 @@ jobs:
       - name: Test merge-queue ejection reporter (BLO-26675)
         if: ${{ !cancelled() }}
         run: node --test ./.github/scripts/tests/report-merge-queue-ejection.test.mjs
+        timeout-minutes: 1
+
+      # BLO-28886 AC3. Same silence-shaped failure mode one step earlier: the
+      # flake ledger is fed by an artifact, and every way of breaking it
+      # (dropping `if: always()`, dropping the env var, colliding the report
+      # filenames) produces NO artifact rather than a red run. Every assertion
+      # in here has been mutation-tested -- revert any one guard and this fails.
+      - name: Test vitest flake-report wiring (BLO-28886)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/vitest-flake-report.test.mjs
         timeout-minutes: 1
 
       - name: Validate dependency resolution when manifests change
@@ -1257,11 +1359,25 @@ jobs:
     # typecheck_release_registry above for the pool-occupancy model.
     #
     # 110 is a ceiling raise and not the durable fix for the server shards.
-    # BLO-28956 (the 2.0x serialized route/authz imbalance across those four
-    # shards) would LOWER their p100 instead of raising their ceiling. This row
-    # is deliberately NOT blocked on it: that row is unowned backlog, and these
-    # caps bite today. Bring 110 back down when it lands.
+    # BLO-28956 (the serialized route/authz imbalance across those four
+    # shards) is the fix that LOWERS their p100 instead of raising the
+    # ceiling, and it has now landed: phase 2 is partitioned by recorded
+    # duration like phase 1, and both phases write their own row to the job
+    # summary so a regression in either is legible without opening the log.
+    #
+    # These caps are deliberately UNCHANGED by that landing. The predicted
+    # balance is 1.00x on both lanes, but predicted is not measured -- the
+    # manifest models per-file test time, not the fixed import/setup cost or
+    # runner-to-runner speed, and a shard that is well-packed can still be
+    # slow. Lower these only against observed `Vitest phase durations` rows
+    # from three consecutive master-based runs, not against the prediction.
     timeout-minutes: ${{ matrix.timeout_minutes }}
+    # BLO-28886 AC3. Read by vitest.config.ts, which only registers the JSON
+    # reporter when this is set -- so a local `pnpm test` is unchanged. A
+    # literal /tmp path, not `${{ runner.temp }}`: the `runner` context is not
+    # available in a job-level `env:` block. Matches refresh-shard-manifest.yml.
+    env:
+      PAPERCLIP_VITEST_REPORT_DIR: /tmp/vitest-reports
     strategy:
       # BLO-33021: fail-fast is right for `pull_request` (one push, show the
       # author every red at once) and wrong for `merge_group`, where there is
@@ -1346,6 +1462,7 @@ jobs:
 
       - name: Run grouped general test suites
         run: |
+          mkdir -p "$PAPERCLIP_VITEST_REPORT_DIR"
           args=(--group '${{ matrix.group }}')
           if [ -n '${{ matrix.shard_count }}' ]; then
             args+=(--shard-index '${{ matrix.shard_index }}' --shard-count '${{ matrix.shard_count }}')
@@ -1358,6 +1475,44 @@ jobs:
       - name: Run serialized server test shard
         if: matrix.group == 'general-server'
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
+
+      # BLO-28886 AC3. `if: always()` is the whole point and is guarded by
+      # scripts/__tests__/vitest-flake-report.test.mjs: a flake ledger is built
+      # from the runs that FAILED, so an upload that only fires on success
+      # collects exactly the reports nobody needs. This lane is ~29% red on
+      # `merge_group`, and which shard goes red moves run to run.
+      #
+      # `if-no-files-found: ignore`, deliberately, NOT `error`: a shard killed
+      # at its timeout cap or evicted mid-run writes no report, and this step
+      # must never be able to turn an otherwise-green run red. Losing a report
+      # costs one row in the ledger; failing the job re-creates the blameless
+      # ejection this issue exists to stop.
+      #
+      # The name carries `github.run_attempt` because a re-run of a failed job
+      # is a new attempt of the SAME run, so the same leg would otherwise
+      # re-upload a name that already exists and collide. Absorbing that
+      # collision is not enough: the re-run is the single most informative
+      # event for a flake ledger -- fail->pass across attempts IS the flake
+      # signature, and fail->fail is the "genuinely broken" signature. Dropping
+      # attempt 2 removes the discriminator, silently, on the ~29%-red lane
+      # where re-running is the common path. Uniqueness per attempt keeps both.
+      # (`overwrite: true` also clears the collision, but it REPLACES attempt 1
+      # with attempt 2 -- the same lost discriminator.)
+      #
+      # `continue-on-error` then covers what a name cannot: a transient failure
+      # in the artifact service itself. Same pattern as the playwright-report
+      # upload below, though that step is on @v7 -- this one does not rest on
+      # any version's duplicate-name behaviour, because it never submits a
+      # duplicate name.
+      - name: Upload vitest JSON reports (flake ledger)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-report-${{ matrix.group }}-${{ matrix.shard_count == '' && 'all' || matrix.shard_index }}-${{ github.run_attempt }}
+          path: ${{ env.PAPERCLIP_VITEST_REPORT_DIR }}/*.json
+          retention-days: 14
+          if-no-files-found: ignore
 
   vendor_claude_k8s:
     # BLO-17980 / BLO-22506: the claude_k8s adapter templates every agent Job

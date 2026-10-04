@@ -77,6 +77,13 @@ jobs:
       # here and the gate comment is authored by `allyblockcast[bot]`.
       COMMITPERCLIP_ENABLED: ${{ secrets.COMMITPERCLIP_KEY != '' }}
     steps:
+      # First step, so the quality gates can size their retry budget from what
+      # is left of this job's timeout-minutes (qualityRetryBudgetMs).
+      - name: Record job start
+        # Whole seconds, not GNU-only %3N: a date without %N would emit a
+        # literal "%3N", and the floored stamp only makes the budget smaller.
+        run: echo "REVIEW_JOB_STARTED_AT_MS=$(( $(date +%s) * 1000 ))" >> "$GITHUB_ENV"
+
       - name: Checkout base branch (never PR or queue-candidate code)
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -144,6 +151,13 @@ jobs:
           (github.event.pull_request.user.login || steps.pr_context.outputs.author) != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
+        # Backstop only: every read in the script shares one budget
+        # (qualityRetryBudgetMs), sized from what this cap and the job's cap
+        # leave after the security step's cap below, so an exhausted budget
+        # ends in exitFatal's annotation first. QUALITY_STEP_TIMEOUT_MS,
+        # REVIEW_JOB_TIMEOUT_MS and SECURITY_STEP_TIMEOUT_MS mirror the three
+        # timeout-minutes; a test checks each.
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ steps.token.outputs.value }}
           GH_REPO: ${{ github.repository }}
@@ -173,6 +187,21 @@ jobs:
         if: >-
           (github.event.pull_request.user.login || steps.pr_context.outputs.author) != 'dependabot[bot]' &&
           steps.quality.outcome == 'failure'
+        env:
+          # Set by exitFatal when no gate ran (a rate limit outlived the retry
+          # budget, or the budget could not be sized). The step stays red either
+          # way; only its explanation changes, because no commitperclip comment
+          # exists for a run whose gates never ran.
+          QUALITY_NOT_EVALUATED: ${{ steps.quality.outputs.not_evaluated }}
+          # Set by deliverComment when the verdict exists but its comment
+          # could not be posted, so there is no comment to point at.
+          QUALITY_COMMENT_DELIVERED: ${{ steps.quality.outputs.comment_delivered }}
         run: |
-          echo "One or more quality gates failed. See commitperclip comment on the PR for details."
+          if [ "${QUALITY_NOT_EVALUATED}" = "true" ]; then
+            echo "Quality gates did not run (the ::error:: annotation from the step above says why). This is not a verdict on the diff."
+          elif [ "${QUALITY_COMMENT_DELIVERED}" = "false" ]; then
+            echo "One or more quality gates failed, but the commitperclip comment could not be posted (see the ::warning:: from the step above). The failures are listed in the 'Run quality gates' step log."
+          else
+            echo "One or more quality gates failed. See commitperclip comment on the PR for details."
+          fi
           exit 1

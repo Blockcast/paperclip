@@ -3588,7 +3588,21 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toContain(expectedError);
-    expect(mockIssueService.assertCheckoutOwner).toHaveBeenCalledWith(issueId, ownerAgentId, ownerRunId);
+    // BLO-24699: the approval *attach* route no longer runs
+    // `assertAgentIssueMutationAllowed`, so it no longer probes checkout ownership —
+    // it decides through the side-effect-free
+    // `evaluateAgentIssueApprovalLinkAuthorization` shared with approval create, and
+    // holding the run-level checkout lock is bookkeeping about who is *executing* an
+    // issue rather than who may annotate it. Asserted positively rather than skipped,
+    // so a reintroduced lock probe fails here. Every other case in this table —
+    // including approval *unlink*, which deliberately kept the old pair — still
+    // probes ownership, and the cheap/status-only refusal itself is unchanged for
+    // all of them.
+    if (_name === "issue approval link") {
+      expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    } else {
+      expect(mockIssueService.assertCheckoutOwner).toHaveBeenCalledWith(issueId, ownerAgentId, ownerRunId);
+    }
     expect(mockWorkProductService.createForIssue).not.toHaveBeenCalled();
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockWorkProductService.remove).not.toHaveBeenCalled();
@@ -4208,6 +4222,43 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.error).toContain("Planning-only recovery runs cannot link or unlink approvals");
     expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
+  });
+
+  // Ally review, PR #1271: a creator/manager-chain refusal carries the grant's
+  // *allow* reason, which `deniedBoundaryReason` maps to its `deny_missing_grant`
+  // fallback. Without `boundaryReason` the row claimed the actor held no grant when
+  // it held a comment-only one, and nothing on the row recovered the truth.
+  it("records the verbatim grant reason when refusing a manager-chain approval link", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action !== "tasks:manage_active_checkouts",
+      action: input.action,
+      reason:
+        input.action === "issue:mutate"
+          ? "allow_manager_chain"
+          : input.action === "tasks:manage_active_checkouts"
+          ? "deny_missing_grant"
+          : "allow_explicit_grant",
+      explanation: "Manager-chain test boundary.",
+    }));
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo" }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/approvals`)
+      .send({ approvalId: "88888888-8888-4888-8888-888888888888" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.reason).toBe("allow_manager_chain");
+    expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
+    const call = mockLogActivity.mock.calls.find(
+      ([, entry]) => (entry as { action?: string }).action === "issue_write_denied",
+    );
+    expect(call, "expected an issue_write_denied record for the manager-chain refusal").toBeTruthy();
+    expect((call![1] as { details: Record<string, unknown> }).details).toMatchObject({
+      attemptedAction: "issue:mutate",
+      reason: "deny_missing_grant",
+      boundaryReason: "allow_manager_chain",
+      responseStatus: 403,
+    });
   });
 
   it.each([
@@ -5723,6 +5774,24 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
     });
 
+    // A deliberate exception, named in the approval-link evaluator's header (Ally,
+    // PR #1271): an inert approval card is not a stage decision, and the fence's
+    // terminal-lock cleanup is a write the side-effect-free evaluator must not
+    // make. Pinned so reinstating the fence, or dropping it from the header, has to
+    // change this test too.
+    it("does not fence the assignee's second run off linking an approval to its own pending review", async () => {
+      allowCommentDecide();
+      mockIssueService.getById.mockResolvedValue(await lockedPendingReviewForOwner());
+
+      const res = await request(await createApp(ownerActorFromSweepRun()))
+        .post(`/api/issues/${issueId}/approvals`)
+        .send({ approvalId: "88888888-8888-4888-8888-888888888888" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueApprovalService.link).toHaveBeenCalled();
+      expect(mockIssueService.assertPendingReviewRunOwnership).not.toHaveBeenCalled();
+    });
+
     // The regression this fence must never cause. A peer reviewer holds no
     // checkout by construction, so widening the predicate past
     // `assigneeAgentId === actor` would deadlock every review stage.
@@ -6694,6 +6763,84 @@ describe("agent issue mutation checkout ownership", () => {
           recoveryActionStatus: null,
         },
       );
+    });
+
+    // BLO-24699 review: the shared approval-link evaluator initially carried no
+    // watchdog gate at all, so a watchdog run could attach approvals anywhere its
+    // agent would ordinarily pass issue:mutate. These two pin the gate AND its
+    // ordering: the issue below is owned by the watchdog's own run, so
+    // `isCurrentIssueExecutionRun` returns true and would allow the link outright
+    // if the subtree check were ordered after it rather than before.
+    it("denies a watchdog run linking an approval to an issue outside the watched subtree", async () => {
+      denyBaseBoundary();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        checkoutRunId: watchdogRunId,
+        executionRunId: watchdogRunId,
+      }));
+
+      const outsideWatched = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeef";
+      const app = await createApp(
+        watchdogActor(),
+        createWatchdogDb({ watchedIssueId: outsideWatched, ancestryParentId: null }),
+      );
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/approvals`)
+        .send({ approvalId: "88888888-8888-4888-8888-888888888888" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Task-watchdog runs can only mutate the watched issue subtree.");
+      expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
+    });
+
+    it("still allows a watchdog run to link an approval inside the watched subtree", async () => {
+      denyBaseBoundary();
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: peerAgentId,
+        checkoutRunId: watchdogRunId,
+        executionRunId: watchdogRunId,
+      }));
+
+      const app = await createApp(watchdogActor(), createWatchdogDb());
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/approvals`)
+        .send({ approvalId: "88888888-8888-4888-8888-888888888888" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueApprovalService.link).toHaveBeenCalled();
+    });
+
+    // BLO-24699 review (Ally, PR #1271): the case the two above do not cover. An
+    // in-subtree, fresh watchdog run used to short-circuit this route to "allow"
+    // before the evaluator ever ran, so a watchdog could link approvals to a
+    // peer's checked-out issue that the create door refuses for the same pair.
+    // The boundary is allowed here (and the checkout-management override is
+    // not) so the refusal provably comes from the evaluator's assignee branch,
+    // the same 409 the create door answers.
+    it("refuses a watchdog run linking an approval to an in-subtree issue whose checkout it does not own", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action !== "tasks:manage_active_checkouts",
+        action: input.action,
+        reason: input.action !== "tasks:manage_active_checkouts" ? "allow_explicit_grant" : "deny_missing_grant",
+        explanation: "Watchdog test boundary default.",
+      }));
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "in_progress",
+        assigneeAgentId: ownerAgentId,
+        checkoutRunId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc",
+        executionRunId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc",
+      }));
+
+      const app = await createApp(watchdogActor(), createWatchdogDb());
+      const res = await request(app)
+        .post(`/api/issues/${issueId}/approvals`)
+        .send({ approvalId: "88888888-8888-4888-8888-888888888888" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details.reason).toBe("deny_active_checkout");
+      expect(mockIssueApprovalService.link).not.toHaveBeenCalled();
     });
 
     it("still enforces normal assignment guards for watchdog reassignment", async () => {

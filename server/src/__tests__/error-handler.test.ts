@@ -221,4 +221,65 @@ describe("errorHandler", () => {
       expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
     });
   });
+
+  // PEN-3255 (#1895 review, third round). The route-level coverage of this
+  // short-circuit lives in `issue-blocked-patch-comment-drop.test.ts`, driven
+  // through a real PATCH. These are here instead of there because they pin the
+  // handler's contract against shapes the route's sole producer cannot emit —
+  // a malformed `commentHint` — so there is no way to stage them end-to-end.
+  describe("missing-evidence dropped-comment announcement", () => {
+    function refuse(details: unknown) {
+      const res = makeRes() as any;
+      errorHandler(
+        new HttpError(422, "missing-evidence", details),
+        makeReq(),
+        res,
+        vi.fn() as unknown as NextFunction,
+      );
+      expect(res.status).toHaveBeenCalledWith(422);
+      return res.json.mock.calls[0][0];
+    }
+
+    it("carries the announcement through the narrow body, which emits no `details`", () => {
+      const body = refuse({
+        code: "missing-evidence",
+        missing: ["screenshot:1440x900"],
+        commentPersisted: false,
+        commentHint: "Post it with POST /api/issues/:id/comments instead.",
+      });
+
+      expect(body.error).toBe("missing-evidence");
+      expect(body.missing).toEqual(["screenshot:1440x900"]);
+      // The narrow contract this branch exists to serve is intact.
+      expect(body).not.toHaveProperty("details");
+
+      expect(body.commentPersisted).toBe(false);
+      expect(body.commentHint).toContain("POST /api/issues/:id/comments");
+    });
+
+    it("drops a non-string `commentHint` but still announces the drop", () => {
+      // The asymmetry is the point, and it is why this is not the reviewer's
+      // literal one-clause suggestion: gating the pair together would let a
+      // malformed hint delete the announcement too, which is the silent drop
+      // this branch was added to close. Guard the convenience, never the
+      // announcement.
+      const body = refuse({
+        missing: ["screenshot:1440x900"],
+        commentPersisted: false,
+        commentHint: { href: "/api/issues/:id/comments" },
+      });
+
+      expect(
+        body.commentPersisted,
+        `a malformed hint must not suppress the announcement; got ${JSON.stringify(body)}`,
+      ).toBe(false);
+      expect(body).not.toHaveProperty("commentHint");
+    });
+
+    it("says nothing about comments when the refusal carried none", () => {
+      const body = refuse({ missing: ["screenshot:1440x900"] });
+
+      expect(body).toEqual({ error: "missing-evidence", missing: ["screenshot:1440x900"] });
+    });
+  });
 });

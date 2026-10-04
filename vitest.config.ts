@@ -7,8 +7,27 @@ import { defineConfig } from "vitest/config";
 // nothing ever ran it. Add new packages to BOTH files -- see BLO-20076, and
 // scripts/__tests__/vitest-project-coverage.test.mjs, which fails when the two
 // lists drift apart.
+
+// BLO-28886 AC3: a per-test flake ledger needs the failing TEST name, and the
+// only place that exists today is the job log -- 45-75s per download, and a
+// batch of 18 timed out. Setting PAPERCLIP_VITEST_REPORT_DIR turns each vitest
+// invocation into a machine-readable report that CI uploads as an artifact, so
+// the ledger over ~50 runs becomes a query.
+//
+// Keyed on `process.pid` because run-vitest-stable.mjs spawns vitest MANY times
+// per job (once per project for the workspaces groups, plus the serialized
+// shard), each a fresh process -- a fixed filename would leave only the last
+// invocation, and the one that matters is usually the one that exited first.
+const flakeReportDir = process.env.PAPERCLIP_VITEST_REPORT_DIR;
+
 export default defineConfig({
   test: {
+    ...(flakeReportDir
+      ? {
+          reporters: ["default", "json"],
+          outputFile: { json: `${flakeReportDir}/vitest-${process.pid}.json` },
+        }
+      : {}),
     projects: [
       "packages/shared",
       "packages/skills-catalog",

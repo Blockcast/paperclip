@@ -23,14 +23,14 @@ overrides:
   ip-address: ^10.3.1
   picomatch: ^4.0.4
   '@anthropic-ai/sdk': '>=0.91.1'
-  brace-expansion: 5.0.9
+  brace-expansion: 5.0.12
   '@tootallnate/once': ^2.0.1
   form-data: '>=4.0.6'
   '@babel/core': '>=7.29.7 <8'
   js-yaml: '>=4.3.2 <5'
   esbuild: '>=0.28.1 <0.29'
   '@connectrpc/connect-node>undici': '>=6.27.0 <7'
-  jsdom>undici: '>=7.29.0 <8'
+  jsdom>undici: '>=7.29.1 <8'
   multer: '>=2.3.0 <3'
   browserslist: '>=4.28.7 <5'
   react: ^19.2.7
@@ -47,9 +47,9 @@ overrides:
   '@lexical/utils': 0.46.0
 
 patchedDependencies:
-  brace-expansion@5.0.9:
-    hash: yzvloneeihtddj7j4e3qpeeoue
-    path: patches/brace-expansion@5.0.9.patch
+  brace-expansion@5.0.12:
+    hash: dqn63omzziki6x34dtwinp753q
+    path: patches/brace-expansion@5.0.12.patch
   embedded-postgres@18.1.0-beta.16:
     hash: 55uhvnotpqyiy37rn3pqpukhei
     path: patches/embedded-postgres@18.1.0-beta.16.patch
@@ -5298,8 +5298,8 @@ packages:
   bowser@2.14.1:
     resolution: {integrity: sha512-tzPjzCxygAKWFOJP011oxFHs57HzIhOEracIgAePE4pqB3LikALKnSzUyU4MGs9/iCEUuHlAJTjTc5M+u7YEGg==}
 
-  brace-expansion@5.0.9:
-    resolution: {integrity: sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==}
+  brace-expansion@5.0.12:
+    resolution: {integrity: sha512-YovQ3rzhaLMIrDjNDMkNS01tea93qhEhG5xy8f6+R0l+dw3Ki+5sCoIoI942iuLZTHWogWktgwVDhU09iNEimQ==}
     engines: {node: 20 || >=22}
 
   browserslist@4.28.8:
@@ -7166,6 +7166,7 @@ packages:
 
   opencode-ai@1.15.12:
     resolution: {integrity: sha512-Q7iid09tT6hDF9Np+asu+i554lNIaWEavh+Jdii9RNfjGdRwhXwS9mbIJjScp/UGjKkFOgWL7uMpbraHThX3UA==}
+    cpu: [arm64, x64]
     os: [darwin, linux, win32]
     hasBin: true
 
@@ -8159,8 +8160,8 @@ packages:
     resolution: {integrity: sha512-YmfV3YnEDzXRC5lZ2jWtWWHKGUm1zIt8AhesR1tens+HTNv+YZlN/dp6G727LOvMJ8xjP9Be7Y2Sdr96LDm+pg==}
     engines: {node: '>=18.17'}
 
-  undici@7.29.0:
-    resolution: {integrity: sha512-IDxfleLmmbSskfWSUATiN1nfn2rDuvnMOqb5CWR92iIfojA0Ud+ulOAAEQ57LPr9rWmsreUyf5lwyao+7GNNVw==}
+  undici@7.30.0:
+    resolution: {integrity: sha512-dkrQXeHSaoamnItlYbmzG0wFYrM0ZwDxCIg0A7aKjTyyhh9svRzCNFEzV+Vm05/yehjCzjDZ31KXfGEjYSztDQ==}
     engines: {node: '>=20.18.1'}
 
   unidiff@1.0.4:
@@ -13024,7 +13025,7 @@ snapshots:
 
   bowser@2.14.1: {}
 
-  brace-expansion@5.0.9(patch_hash=yzvloneeihtddj7j4e3qpeeoue):
+  brace-expansion@5.0.12(patch_hash=dqn63omzziki6x34dtwinp753q):
     dependencies:
       balanced-match: 4.0.4
 
@@ -14337,7 +14338,7 @@ snapshots:
       saxes: 6.0.0
       symbol-tree: 3.2.4
       tough-cookie: 6.0.1
-      undici: 7.29.0
+      undici: 7.30.0
       w3c-xmlserializer: 5.0.0
       webidl-conversions: 8.0.1
       whatwg-mimetype: 5.0.0
@@ -15059,16 +15060,16 @@ snapshots:
 
   minimatch@10.2.5:
     dependencies:
-      brace-expansion: 5.0.9(patch_hash=yzvloneeihtddj7j4e3qpeeoue)
+      brace-expansion: 5.0.12(patch_hash=dqn63omzziki6x34dtwinp753q)
 
   minimatch@3.1.5:
     dependencies:
-      brace-expansion: 5.0.9(patch_hash=yzvloneeihtddj7j4e3qpeeoue)
+      brace-expansion: 5.0.12(patch_hash=dqn63omzziki6x34dtwinp753q)
     optional: true
 
   minimatch@9.0.9:
     dependencies:
-      brace-expansion: 5.0.9(patch_hash=yzvloneeihtddj7j4e3qpeeoue)
+      brace-expansion: 5.0.12(patch_hash=dqn63omzziki6x34dtwinp753q)
 
   minimist@1.2.8: {}
 
@@ -16524,7 +16525,7 @@ snapshots:
 
   undici@6.27.0: {}
 
-  undici@7.29.0: {}
+  undici@7.30.0: {}
 
   unidiff@1.0.4:
     dependencies:

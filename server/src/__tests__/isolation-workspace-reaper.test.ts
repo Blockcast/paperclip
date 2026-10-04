@@ -3,6 +3,18 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ISOLATION_WORKSPACE_REAPER_DELETED_METRIC,
+  ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC,
+  ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES,
+  ISOLATION_WORKSPACE_REAPER_LAST_SWEEP_METRIC,
+  ISOLATION_WORKSPACE_REAPER_RETAINED_RESURRECTED_METRIC,
+  ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC,
+  ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC,
+  ISOLATION_WORKSPACE_REAPER_STOP_REASONS,
+  ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC,
+  getMetricsRegistry,
+} from "../services/metrics.js";
+import {
   DEFAULT_MAX_DELETES_PER_TICK,
   REAPABLE_LAYOUT,
   type WorkspaceUsageLookup,
@@ -605,5 +617,220 @@ describe("startIsolationWorkspaceReaper", () => {
 
     stop();
     expect(scheduler.clearInterval).toHaveBeenCalled();
+  });
+});
+
+/**
+ * Sweep metrics (BLO-36814).
+ *
+ * The case these exist for is the one a happy-path test never reaches: a tick
+ * that deletes nothing. A reaper that stopped ticking and a reaper that ticks
+ * and finds nothing are the same picture on every dashboard unless the idle
+ * tick emits, so every assertion below is about the *presence* of a series at
+ * a zero value, not about a non-zero count.
+ *
+ * The registry is process-global and has no reset, so values are read as
+ * deltas. Series presence is read absolutely — nothing pre-seeds these
+ * children, so a child exists only because a sweep emitted it.
+ */
+async function series(metric: string): Promise<Array<{ labels: Record<string, string>; value: number }>> {
+  const handle = getMetricsRegistry().getSingleMetric(metric);
+  if (!handle) throw new Error(`${metric} is not registered`);
+  const data = (await handle.get()) as {
+    values: Array<{ labels: Record<string, string>; value: number }>;
+  };
+  return data.values;
+}
+
+async function valueOf(metric: string, labels: Record<string, string>): Promise<number | undefined> {
+  const match = (await series(metric)).find((entry) =>
+    Object.entries(labels).every(([k, v]) => entry.labels[k] === v),
+  );
+  return match?.value;
+}
+
+describe("reapIsolationWorkspaces metrics", () => {
+  it("emits every series on a sweep that deletes nothing", async () => {
+    // Fresh and in use: scanned, retained, nothing eligible, nothing deleted.
+    await makeWorkspace("ws-live", [...REAPABLE_LAYOUT], 2);
+    const before = {
+      scanned: (await valueOf(ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC, { dry_run: "false" })) ?? 0,
+      sweeps:
+        (await valueOf(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC, {
+          dry_run: "false",
+          stop_reason: "complete",
+        })) ?? 0,
+    };
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({ "ws-live": { lastUsedDaysAgo: 2 } }),
+    });
+    expect(res).toMatchObject({ scanned: 1, deleted: 0, eligible: 0 });
+
+    // The load-bearing assertion: `deleted` is PRESENT at 0. A sweep that
+    // removed nothing must still be readable as a sweep that happened.
+    expect(await valueOf(ISOLATION_WORKSPACE_REAPER_DELETED_METRIC, { dry_run: "false" })).toBeDefined();
+    expect(await valueOf(ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC, { dry_run: "false" })).toBe(
+      before.scanned + 1,
+    );
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC, {
+        dry_run: "false",
+        stop_reason: "complete",
+      }),
+    ).toBe(before.sweeps + 1);
+
+    // Every bounded child is materialized, so a dashboard reads 0 rather than
+    // "no data" for outcomes this tick did not produce.
+    const outcomes = (await series(ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC))
+      .filter((entry) => entry.labels.dry_run === "false")
+      .map((entry) => entry.labels.outcome)
+      .sort();
+    expect(outcomes).toEqual([...ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES].sort());
+
+    const stops = (await series(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC))
+      .filter((entry) => entry.labels.dry_run === "false")
+      .map((entry) => entry.labels.stop_reason)
+      .sort();
+    expect(stops).toEqual([...ISOLATION_WORKSPACE_REAPER_STOP_REASONS].sort());
+
+    // Liveness: the gauge is what separates "swept and found nothing" from
+    // "never swept", because both leave the counters unmoved.
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_LAST_SWEEP_METRIC, { dry_run: "false" }),
+    ).toBe(Math.floor(NOW / 1000));
+  });
+
+  it("keeps skippedLayout and retainedResurrected as their own series", async () => {
+    // A stray git worktree — the wt-blo-19094 shape the allowlist caught.
+    await makeWorkspace("ws-worktree", ["home", "session", "wt-blo-19094"], 45);
+    const before = {
+      skipped: (await valueOf(ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC, { dry_run: "false" })) ?? 0,
+    };
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+    });
+    expect(res).toMatchObject({ skippedLayout: 1, deleted: 0 });
+
+    expect(await valueOf(ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC, { dry_run: "false" })).toBe(
+      before.skipped + 1,
+    );
+    // Both findings fields carry their own metric name, so no `sum by (...)`
+    // over the generic outcome counter can aggregate either of them away.
+    expect(
+      (await series(ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC)).map((e) => e.labels.outcome),
+    ).not.toContain("skipped_layout");
+    expect(
+      (await series(ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC)).map((e) => e.labels.outcome),
+    ).not.toContain("retained_resurrected");
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_RETAINED_RESURRECTED_METRIC, { dry_run: "false" }),
+    ).toBeDefined();
+  });
+
+  it("labels a dry-run tick so it cannot be read as a live one", async () => {
+    await makeWorkspace("ws-old", [...REAPABLE_LAYOUT], 45);
+    const before = {
+      dryEligible:
+        (await valueOf(ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC, {
+          dry_run: "true",
+          outcome: "eligible",
+        })) ?? 0,
+      liveEligible:
+        (await valueOf(ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC, {
+          dry_run: "false",
+          outcome: "eligible",
+        })) ?? 0,
+    };
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      dryRun: true,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+    });
+    // `deleted` counts real unlinks, so a dry run leaves it at 0 and the
+    // would-have-removed count lands on `eligible` instead.
+    expect(res).toMatchObject({ eligible: 1, deleted: 0 });
+    await expect(fs.stat(path.join(root, "ws-old"))).resolves.toBeTruthy();
+
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC, {
+        dry_run: "true",
+        outcome: "eligible",
+      }),
+    ).toBe(before.dryEligible + 1);
+    // The whole point of the label: a preview must not add to the live series.
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC, {
+        dry_run: "false",
+        outcome: "eligible",
+      }),
+    ).toBe(before.liveEligible);
+    expect(await valueOf(ISOLATION_WORKSPACE_REAPER_DELETED_METRIC, { dry_run: "true" })).toBe(0);
+  });
+
+  it("still emits series when the root does not exist, tagged root_absent", async () => {
+    // The blind spot this guards: an ENABLED reaper pointed at the WRONG path
+    // scans nothing and, before BLO-36814, returned without touching the
+    // registry — so it was indistinguishable from a DISABLED one on every
+    // dashboard while the real tree grew unreclaimed (the BLO-31222 shape).
+    const missing = path.join(root, "definitely-not-a-root");
+    const before = {
+      rootAbsent:
+        (await valueOf(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC, {
+          dry_run: "false",
+          stop_reason: "root_absent",
+        })) ?? 0,
+      complete:
+        (await valueOf(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC, {
+          dry_run: "false",
+          stop_reason: "complete",
+        })) ?? 0,
+    };
+
+    const res = await reapIsolationWorkspaces({
+      root: missing,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+    });
+    expect(res).toMatchObject({ scanned: 0, deleted: 0 });
+
+    // Liveness: the gauge advanced, so "enabled but pointed nowhere" is
+    // readable as a sweep that happened rather than as absence.
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_LAST_SWEEP_METRIC, { dry_run: "false" }),
+    ).toBe(Math.floor(NOW / 1000));
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC, { dry_run: "false" }),
+    ).toBeDefined();
+
+    // …and it is NOT folded into `complete`. Collapsing the two would let a
+    // misconfigured reaper read as a healthy sweep over an empty tree.
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC, {
+        dry_run: "false",
+        stop_reason: "root_absent",
+      }),
+    ).toBe(before.rootAbsent + 1);
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC, {
+        dry_run: "false",
+        stop_reason: "complete",
+      }),
+    ).toBe(before.complete);
   });
 });

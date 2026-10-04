@@ -7,7 +7,7 @@
 // allowance -- and a static assertion cannot tell that apart from a fix.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -70,7 +70,7 @@ if [ -f "$STUB_STATE/start" ]; then start=$(cat "$STUB_STATE/start"); else start
 elapsed=$(( now - start ))
 echo "$args" >> "$STUB_STATE/calls"
 case "$args" in
-  *"apply -f"*)            cat >/dev/null; exit 0 ;;
+  *"apply -f"*)            cat > "$STUB_STATE/manifest"; exit 0 ;;
   *"delete job"*)          exit 0 ;;
   *"get pods -l job-name"*) [ "\${STUB_NO_POD:-0}" = 1 ] || echo "preflight-pod-0"; exit 0 ;;
   *"startedAt"*)
@@ -85,6 +85,11 @@ case "$args" in
     if [ "$elapsed" -ge "\${STUB_READY_AFTER:-0}" ]; then echo "\${STUB_TERMINAL_PHASE:-Running}"; else echo "Pending"; fi
     exit 0 ;;
   *"waiting.reason"*)      echo "\${STUB_WAITING_REASON:-ContainerCreating}"; exit 0 ;;
+  *"{.status.reason}"*)
+    # STUB_POD_GONE models a pod deleted rather than stamped (API eviction,
+    # preemption, NodeLost GC): the read fails instead of printing a reason.
+    if [ "\${STUB_POD_GONE:-0}" = 1 ]; then echo "Error from server (NotFound)" >&2; exit 1; fi
+    echo "\${STUB_POD_REASON:-}"; exit 0 ;;
   *"get events"*)          echo "Normal Pulled Successfully pulled image in 3m3.14s. Image size: 1695082158 bytes"; exit 0 ;;
   *" logs "*)              echo "stub pre-flight output"; exit 0 ;;
   *"condition=complete"*)
@@ -121,6 +126,8 @@ exit 0
 function runPreflight(env = {}) {
   const dir = mkdtempSync(join(tmpdir(), "preflight-stub-"));
   const kubectl = join(dir, "kubectl");
+  const manifestPath = join(dir, "manifest");
+  const manifest = () => (existsSync(manifestPath) ? readFileSync(manifestPath, "utf8") : "");
   writeFileSync(kubectl, STUB);
   chmodSync(kubectl, 0o755);
 
@@ -143,9 +150,10 @@ function runPreflight(env = {}) {
   };
 
   try {
-    return { code: 0, output: execFileSync("bash", [SCRIPT], { ...options, stdio: "pipe" }) };
+    const output = execFileSync("bash", [SCRIPT], { ...options, stdio: "pipe" });
+    return { code: 0, output, manifest: manifest() };
   } catch (error) {
-    return { code: error.status ?? 1, output: `${error.stdout ?? ""}${error.stderr ?? ""}` };
+    return { code: error.status ?? 1, output: `${error.stdout ?? ""}${error.stderr ?? ""}`, manifest: manifest() };
   }
 }
 
@@ -215,6 +223,85 @@ test("a failing check still reports the migration verdict", () => {
   assert.equal(code, 1);
   assert.match(output, /FAILED — a pending migration needs its index precreated/);
   assert.match(output, /stub pre-flight output/, "the remediation logs must be surfaced");
+});
+
+test("an eviction AFTER the container starts is not reported as a migration verdict", () => {
+  // The companion to the never-started case below, and the one phase 1 cannot
+  // catch. A pod evicted while pulling can still have its container Created,
+  // Started and Killed within the same second once the pull lands, which
+  // stamps a real startedAt -- so phase 1 correctly reads "started" and hands
+  // phase 2 a Job whose `failed` condition is already true via
+  // BackoffLimitExceeded. Reading that as FAILED prints a migration verdict
+  // for a check that produced no logs at all.
+  //
+  // Measured in production on 2026-09-27 (run 36279683355, k8s-data-6 under
+  // ephemeral-storage DiskPressure): the deploy was refused with "a pending
+  // migration needs its index precreated" beside "(no logs available)".
+  const { code, output } = runPreflight({
+    STUB_POD_REASON: "Evicted",
+    STUB_JOB_RESULT: "failed",
+  });
+
+  assert.equal(code, 1, "an evicted check must still fail closed");
+  assert.doesNotMatch(
+    output,
+    /a pending migration needs its index precreated/,
+    "an evicted pod produced no verdict, so it must not be reported as one",
+  );
+  assert.match(output, /INCONCLUSIVE/);
+  assert.match(output, /stopped by the cluster \(status\.reason=Evicted\)/);
+  assert.match(output, /--- pod events ---/, "the operator needs the eviction message inline");
+});
+
+test("any disruption reason after the container starts is not reported as a migration verdict", () => {
+  // Eviction is one member of the class. Only an empty reason is a verdict, so
+  // reasons the script never names must still be treated as disruption:
+  // NodeLost is stamped by the node lifecycle controller and left for pod GC,
+  // and DeadlineExceeded is an activeDeadlineSeconds kill.
+  for (const reason of ["Preempting", "NodeLost", "DeadlineExceeded"]) {
+    const { code, output } = runPreflight({
+      STUB_POD_REASON: reason,
+      STUB_JOB_RESULT: "failed",
+    });
+
+    assert.equal(code, 1, `a check disrupted by ${reason} must still fail closed`);
+    assert.doesNotMatch(output, /a pending migration needs its index precreated/);
+    assert.match(output, new RegExp(`stopped by the cluster \\(status\\.reason=${reason}\\)`));
+  }
+});
+
+test("a pre-flight pod deleted after its container starts is not reported as a migration verdict", () => {
+  // An API-initiated eviction (drain, autoscaler, descheduler) deletes the pod
+  // instead of stamping status.reason, so the reason read fails. That must not
+  // collapse into the empty reason of a pod that ran and exited on its own.
+  const { code, output } = runPreflight({
+    STUB_POD_GONE: "1",
+    STUB_JOB_RESULT: "failed",
+  });
+
+  assert.equal(code, 1, "a vanished check must still fail closed");
+  assert.doesNotMatch(output, /a pending migration needs its index precreated/);
+  assert.match(output, /INCONCLUSIVE/);
+  assert.match(output, /pre-flight pod no longer exists/);
+});
+
+test("the job's TTL outlives the reads a raised run budget delays", () => {
+  // A failed Job is not seen by phase 2 until the run budget runs out (see the
+  // condition=complete stub note), and only then does the script read the logs
+  // and status.reason. A TTL counted from the Job finishing would cascade the
+  // pod away mid-wait once the budget approached it, and a genuine FAILED
+  // verdict would read as a vanished pod. 900s is three times the fixed 300s
+  // TTL the Job carried before; the stub's complete result returns at once, so
+  // the raised budget costs no wall clock.
+  const runBudget = 900;
+  const { code, output, manifest } = runPreflight({ PREFLIGHT_TIMEOUT_SECONDS: String(runBudget) });
+
+  assert.equal(code, 0, output);
+  const ttl = Number(manifest.match(/^\s*ttlSecondsAfterFinished:\s*(\d+)\s*$/m)?.[1]);
+  assert.ok(
+    ttl > runBudget,
+    `the Job must outlive a ${runBudget}s run budget, or the reads after it race the TTL (got ttlSecondsAfterFinished=${ttl})`,
+  );
 });
 
 test("a check that completes between polls is not mistaken for never having started", () => {

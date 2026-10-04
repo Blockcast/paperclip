@@ -22,6 +22,10 @@
 
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import { logger } from "../middleware/logger.js";
+// Type-only, so it is erased at runtime and creates no import cycle with the
+// reaper (which imports the recorder below). Structurally restating the result
+// shape here would let a NEW result field be added and silently go unrecorded.
+import type { IsolationWorkspaceReapResult } from "./isolation-workspace-reaper.js";
 import { resetDepBlockedMetrics, snapshotDepBlockedMetrics } from "./dep-blocked-metrics.js";
 import {
   resetBlockerResolvedWakeMetrics,
@@ -58,9 +62,182 @@ export const BACKSTOP_SOURCES = [
   "issue_graph_liveness.backstop",
   "stranded_recovery_wake_backstop",
 ] as const;
+/**
+ * Ticks on which the worker's periodic recovery chain was skipped because the
+ * previous pass was still running (PEN-3314).
+ *
+ * The chain is launched fire-and-forget from a fixed 30 s `setInterval`, so
+ * before the latch existed a pass that ran long simply overlapped its
+ * predecessor — invisibly. That invisibility is the reason this cost a
+ * multi-day fleet outage: each overlapping pass pins its own copy of the whole
+ * visible issue graph, so the only externally observable symptom was the worker
+ * heap climbing to the 6.2 GB V8 ceiling and aborting every few hours, with
+ * nothing anywhere naming overlap as the cause.
+ *
+ * Read it with {@link HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC}: a non-zero
+ * rate here means the chain is exceeding the scheduler interval, and the
+ * in-flight gauge says by how much. (Not the *duration* gauge, which describes
+ * the last pass to finish and so cannot see the one that is overrunning now.)
+ * Sustained skipping is not itself data loss — these passes are reconcilers, so
+ * a skipped tick is later work, not lost work — but it does mean recovery
+ * latency now tracks chain duration rather than the interval, which is worth an
+ * operator's attention well before the heap is.
+ *
+ * ⚠ This counter alone cannot tell "healthy" from "wedged", because it is the
+ * one series here that the heartbeat tick still writes: it counts ticks that
+ * reached the latch, so it goes FLAT both when the chain is comfortably keeping
+ * up and when no tick is arriving at all. Disambiguate against the in-flight
+ * gauge, which is refreshed independently of the tick — flat skips with a
+ * climbing in-flight gauge is the second case, and it is the more urgent one.
+ */
+export const HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC = "paperclip_heartbeat_recovery_chain_skipped_total";
+/**
+ * Wall-clock duration of the last COMPLETED periodic recovery chain, in seconds
+ * (PEN-3314).
+ *
+ * Read this for how long the chain takes when it works. Do NOT build the overlap
+ * alert on it: it is written only when a pass settles, so while a pass is
+ * overrunning it holds the previous pass's value — which is by construction a
+ * value *below* the interval, since that pass finished in time. A chain that is
+ * currently running long, or wedged outright, reports a healthy-looking number
+ * here. {@link HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} is the one that sees
+ * the pass you actually care about.
+ *
+ * A gauge rather than a histogram because the question is "is the chain
+ * outrunning the interval", not "what is the distribution of chain durations".
+ */
+export const HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC = "paperclip_heartbeat_recovery_chain_duration_seconds";
+/**
+ * How long the currently outstanding periodic recovery chain has been running,
+ * in seconds; `0` when no pass is outstanding (PEN-3314).
+ *
+ * This is the leading indicator the incident lacked, and the one to alert on:
+ * overlap begins precisely when this crosses `heartbeatSchedulerIntervalMs`
+ * (default 30 s), which is observable hours before the heap ceiling is reached.
+ * Unlike the duration gauge it describes the *live* pass, so it is also the only
+ * signal that distinguishes a chain taking 35 s from a chain that has been
+ * wedged for six hours — see {@link HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC}.
+ *
+ * It is refreshed by a dedicated timer of its own, NOT by the heartbeat tick, and
+ * that distinction is the whole reason the series can be trusted. The tick only
+ * reaches the recovery-chain latch after two `resolveSchedulingSuppression()`
+ * round-trips; under the pool saturation this metric exists to catch, every tick
+ * parks on those awaits, so a tick-driven refresh would freeze at whatever the
+ * last settle wrote — `0` — and the worker would read idle and healthy for the
+ * duration of the incident. The refreshing timer awaits nothing and queries
+ * nothing, so `0` here means "no pass outstanding" independently of whether any
+ * tick got far enough to say so, rather than "no pass outstanding as of the last
+ * tick that got far enough to say".
+ *
+ * That timer samples at a FRACTION of `heartbeatSchedulerIntervalMs`
+ * (`max(1s, interval / 3)`), deliberately finer than the threshold above:
+ * sampling at the same period as the quantity being thresholded would let this
+ * gauge lag the actual overlap crossing by up to a full interval. Treat that
+ * fraction as the resolution of the alert — a crossing is visible within one
+ * sample, not within one scheduler tick.
+ *
+ * Scope, so that `0` is not read more broadly than it holds: this covers the
+ * *periodic* chain only, which is what the metric name says. The startup
+ * recovery sequence runs several of the same reconcilers outside the latch, and
+ * this timer is armed while that pass may still be running, so during the
+ * startup window the gauge reports `0` with a recovery pass genuinely
+ * outstanding. That window is uncovered rather than misreported.
+ */
+export const HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC = "paperclip_heartbeat_recovery_chain_inflight_seconds";
+/**
+ * Recovery-chain passes that were still outstanding past the stall threshold
+ * (PEN-3314 / PEN-3365). Counted once per stalled pass, not once per tick.
+ *
+ * Non-zero means a pass stopped settling entirely — not merely ran slow, which
+ * shows up as skips instead — and therefore that **every recovery pass on this
+ * worker is halted**: orphan reaping, retry promotion, stranded-issue
+ * reconciliation, watchdogs, the lot. The latch deliberately does not self-clear
+ * (force-clearing would re-admit the overlapping passes that cause the heap
+ * leak, under exactly the saturated-pool conditions that raised the alarm), so
+ * this state persists until the chain returns or the process restarts.
+ *
+ * **Page on this.** It is rare by design and it does not resolve itself.
+ *
+ * The companion `error` log ("periodic heartbeat recovery chain still in flight
+ * across many ticks") reports the first crossing immediately and then re-reports
+ * at most once per stall threshold while the halt lasts. So log-line count is a
+ * measure of DURATION, not of severity or of how many passes stalled — read the
+ * count off this counter, and read "how long" off `inFlightMs` on the newest
+ * line.
+ */
+export const HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC = "paperclip_heartbeat_recovery_chain_stalled_total";
+
+/**
+ * Isolation-workspace reaper sweep metrics (BLO-36814).
+ *
+ * The reaper (BLO-31222) performs a daily **irreversible** delete pass over
+ * `data/k8s-isolation/workspaces/` and until now emitted a pino log line and
+ * nothing else. A reaper that stopped ticking looked identical on every
+ * dashboard to one that ticks and finds nothing — which is literally half of
+ * how BLO-36735 found that it had never been switched on at all.
+ *
+ * **Series presence is itself the liveness signal, so nothing here is
+ * pre-seeded at zero in `ensureRegistry()`.** Seeding would make "deployed but
+ * never ran" indistinguishable from "ran and found nothing" on every counter —
+ * reintroducing the exact blind spot this exists to remove. Instead
+ * `recordIsolationWorkspaceReapSweep` materializes every child, including the
+ * zero-valued ones, at the end of each sweep: after one tick the series exist
+ * with honest values, and before the first tick they do not exist at all.
+ *
+ * `scanned` and `deleted` are first-class names rather than `outcome` labels
+ * because they are the denominator and the headline of a destructive pass.
+ * `skipped_layout` and `retained_resurrected` are first-class for a different
+ * reason: non-zero on either is a *finding*, not routine, and folding them
+ * into a generic outcome label makes them vanish under any `sum by ()` an
+ * operator writes without thinking about it.
+ */
+export const ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC = "paperclip_isolation_workspace_reaper_scanned_total";
+export const ISOLATION_WORKSPACE_REAPER_DELETED_METRIC = "paperclip_isolation_workspace_reaper_deleted_total";
+export const ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC =
+  "paperclip_isolation_workspace_reaper_skipped_layout_total";
+export const ISOLATION_WORKSPACE_REAPER_RETAINED_RESURRECTED_METRIC =
+  "paperclip_isolation_workspace_reaper_retained_resurrected_total";
+export const ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC =
+  "paperclip_isolation_workspace_reaper_entries_total";
+export const ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC = "paperclip_isolation_workspace_reaper_sweeps_total";
+export const ISOLATION_WORKSPACE_REAPER_LAST_SWEEP_METRIC =
+  "paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds";
+/** Routine per-entry outcomes. The two *findings* fields are NOT in here. */
+export const ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES = [
+  "eligible",
+  "retained_in_use",
+  "retained_fresh",
+  "vanished",
+  "failed",
+] as const;
+/**
+ * How the pass ended. `capped` and `lookup_faulted` both stop with work
+ * remaining, but only the second means the remaining directories were never
+ * assessed at all — see `IsolationWorkspaceReapResult.lookupFaulted`.
+ *
+ * `root_absent` is deliberately NOT folded into `complete`, even though both
+ * scan zero directories. An absent root is the ordinary state on a
+ * non-k8s-isolation deployment, but it is ALSO what an enabled reaper pointed
+ * at the wrong path looks like — the BLO-31222 shape, where a real tree grows
+ * unreclaimed while the sweep reports success over an empty one. Collapsing
+ * the two would leave that case reading as a healthy `complete` sweep with
+ * `scanned=0`, which is the same blind spot BLO-36814 exists to remove, one
+ * layer in.
+ */
+export const ISOLATION_WORKSPACE_REAPER_STOP_REASONS = [
+  "complete",
+  "capped",
+  "lookup_faulted",
+  "root_absent",
+] as const;
 export type BackstopSource = (typeof BACKSTOP_SOURCES)[number];
 export const BACKSTOP_SKIP_REASONS = [
-  "not_ready", "existing_wake", "live_path", "pause_hold", "interaction",
+  // `live_path` is NOT comparable across sources, so do not `sum by (reason)` over both.
+  // For `stranded_recovery_wake_backstop` it is the active-run arm ALONE, with the
+  // queued-owner-wake arm split out as `live_path_queued_wake` (BLO-19124). For
+  // `issue_graph_liveness.backstop` it is still the union of both probes behind one `||`.
+  // Scope every query by `source`.
+  "not_ready", "existing_wake", "live_path", "live_path_queued_wake", "pause_hold", "interaction",
   "no_owner", "cause", "exhausted", "cooldown", "claim_lost",
   "deferred_or_failed", "enqueue_failed",
 ] as const;
@@ -166,6 +343,24 @@ export const KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS = [
 export type WorkerTierProxyFailureReason =
   (typeof KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS)[number];
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
+/**
+ * `error_code` booked when a `job_failed` run is proven to be the Caveman-proxy
+ * readiness timeout (BLO-33441). Classified in `k8s-job-liveness.ts`; declared
+ * here so the metric layer can key on it without importing
+ * `@kubernetes/client-node`.
+ *
+ * `error_code` on this counter is free-form (it is `heartbeat_runs.error_code`
+ * passed through), so this is a shared constant rather than an allow-list entry
+ * — there is no list to add it to.
+ *
+ * Exists because BLO-33279's AC5 ("zero occurrences for 7 days") was
+ * unverifiable: the failure fell into `job_failed`, a catch-all running ~8000
+ * per 7d against a defect firing ~10/day, so the query returned "clean" whether
+ * or not the defect recurred. With its own code the check is
+ * `increase(paperclip_heartbeat_run_failed_total{error_code="caveman_proxy_not_ready"}[7d]) == 0`
+ * and stays honest.
+ */
+export const CAVEMAN_PROXY_NOT_READY_ERROR_CODE = "caveman_proxy_not_ready";
 export const DEP_BLOCKED_WAKEUP_METRIC = "paperclip_dependency_blocked_wakeup_total";
 /**
  * Outcome counter for blocker-resolved dependent wakes (BLO-13250). Labeled
@@ -491,6 +686,26 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC 
  */
 export const AGENT_START_LOCK_HELD_SECONDS_METRIC = "paperclip_agent_start_lock_held_seconds";
 /**
+ * Which await a held start lock is sitting in, and for how long (BLO-36922).
+ *
+ * Companion to {@link AGENT_START_LOCK_HELD_SECONDS_METRIC}, which says an
+ * agent's dispatch has stopped but never which phase stopped it. Four measured
+ * fleet stalls (2026-09-21/22/26, 8-14 agents each, peak hold 2293s) were
+ * unnameable after the fact precisely because of that gap: container logs
+ * rotate in ~1h, paperclip emits no traces, and every downstream instrument
+ * went QUIETER during the stalls. A phase label retained at Prometheus
+ * resolution is the one surface that survives the window.
+ *
+ * Deliberately a SEPARATE series, not a `phase` label on the held gauge: a
+ * label that changes mid-hold starts a new series, which would destroy the
+ * "+scrape_interval per scrape on one continuous series" reading that is the
+ * held gauge's whole diagnostic value. Same no-zero-fill semantics as its
+ * companion -- series exist only while a lock is held, so absence is health.
+ * `phase` is a small closed set of static strings supplied by
+ * `markAgentStartLockPhase`; never let an id reach it.
+ */
+export const AGENT_START_LOCK_PHASE_SECONDS_METRIC = "paperclip_agent_start_lock_phase_seconds";
+/**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
  * correct and stays (Ally review, onprem-k8s#2013: without it, a retry
@@ -572,6 +787,12 @@ export const KNOWN_RETRY_SCHEDULE_OUTCOMES = [
   "issue_not_in_progress",
   "issue_paused",
   "issue_reassigned",
+  // BLO-38064: split out of `issue_reassigned`. The agent is not the assignee
+  // AND its wake never conferred ownership, so nothing was reassigned — keeping
+  // the two under one label is what sent operators looking for a reassignment
+  // that had not happened, and is exactly the distinction this metric exists to
+  // make.
+  "issue_not_assigned_to_agent",
   "issue_review_participant_changed",
   "issue_cancelled",
   "issue_terminal_status",
@@ -606,6 +827,28 @@ export const KNOWN_RETRY_SCHEDULE_REASONS = [
 ] as const;
 export type RetryScheduleReasonLabel = (typeof KNOWN_RETRY_SCHEDULE_REASONS)[number];
 /**
+ * Coerce a raw `scheduled_retry_reason` to the allow-list above. Shared by the
+ * outcome counter and the park-horizon gauge so the two cannot drift apart:
+ * a reason present on one and folded to `other` on the next would make a
+ * per-reason alert bound and its rate series disagree about the same park.
+ */
+export function coerceRetryScheduleReason(reason: string | null | undefined): RetryScheduleReasonLabel {
+  return (KNOWN_RETRY_SCHEDULE_REASONS as readonly string[]).includes(reason ?? "")
+    ? (reason as RetryScheduleReasonLabel)
+    : "other";
+}
+/**
+ * Per-agent zero-floor `reason`, emitted for EVERY known agent, including an
+ * agent that also carries live park series. It does not mean "no live park":
+ * `{reason="none"}` selects the whole fleet, so counting it yields fleet size,
+ * not drained agents. Keeps the BLO-25036 invariant that every known agent
+ * always carries a series, without zero-filling the agent x reason cross
+ * product. Deliberately outside {@link KNOWN_RETRY_SCHEDULE_REASONS}: it is not
+ * a park class, it is always 0, and an alert rule that bounded it would be
+ * bounding nothing.
+ */
+export const NO_SCHEDULED_RETRY_PARK_REASON = "none";
+/**
  * postgres.js connection-pool occupancy, by `state` (BLO-33243).
  *
  * There was no pool instrumentation anywhere in this fleet, which made pool
@@ -628,6 +871,57 @@ export const DB_POOL_CONNECTIONS_METRIC = "paperclip_db_pool_connections";
  * because it counts queries, not connections.
  */
 export const DB_POOL_WAITING_QUERIES_METRIC = "paperclip_db_pool_waiting_queries";
+/**
+ * The timeout environment the application pool inherits from the *server*, in
+ * seconds, by `setting` and by the `source` Postgres attributes it to
+ * (PEN-3365). `0` means the setting is disabled, matching Postgres' own
+ * encoding — so `statement_timeout` reading `0` is the unbounded case, not a
+ * missing measurement.
+ *
+ * ⚠️ INHERITED, NOT EFFECTIVE — and for one of the three settings those differ.
+ * `createDb` ships `idle_in_transaction_session_timeout: 120_000` in the pool's
+ * startup packet (`POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS`, #1921), and the
+ * probe behind this gauge deliberately reads on a `createUtilitySql`
+ * connection that carries none of those overrides — otherwise it would report
+ * our own value back to us and destroy the evidence it exists to collect. So
+ * `{setting="idle_in_transaction_session_timeout"}` is expected to read `0`
+ * `source="default"` while the pool is in fact bounded at 120 s. Do NOT read
+ * that series as "idle-in-transaction is unbounded"; for the pool's effective
+ * value, read `POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS`. `statement_timeout`
+ * and `lock_timeout` are not set pool-side, so for those two inherited *is*
+ * effective — which is what makes `statement_timeout` here the reading that
+ * gates PEN-3365 step 3. The metric is named `_inherited_` rather than
+ * `_effective_` precisely because the name is what lands in PromQL, dashboards
+ * and alert rules, where this doc comment is not read.
+ *
+ * This exists because the same reading already shipped as a one-shot startup
+ * log line (`Database timeout environment: …`) and that made it *write-only in
+ * practice*. Measured 2026-09-26: no `paperclip-api` or worker pod had
+ * restarted in over 2 days, the API log runs ~2.2 lines/sec (so the line sits
+ * ~390k lines behind the tail), `kubectl logs` is 403 from an agent seat, and
+ * the read-only k8s tooling exposes only `tail`. A value nobody can read
+ * cannot gate a decision, and PEN-3365 step 3 is explicitly gated on this
+ * reading.
+ *
+ * `source` is a label rather than a second series because it is the half that
+ * answers the actual question. The repo asserts a role-level 30 s
+ * `statement_timeout` in two places, but no `ALTER ROLE` exists in either
+ * `Blockcast/paperclip` or `Blockcast/onprem-k8s`; `source=default` means
+ * nothing sets it and the assertion is false, while `database`/`user` means we
+ * genuinely inherit a bound. Cardinality is bounded: 3 settings x the small
+ * fixed set of `pg_settings.source` values.
+ *
+ * ⚠️ Do NOT substitute `postgres_exporter`'s `pg_settings_statement_timeout_seconds`
+ * for this. That series reflects the *exporter's own session* (its labels carry
+ * its job name), so it reports whatever short timeout the exporter sets to
+ * bound its scrapes — 8 s when this was written — and says nothing about what
+ * the application pool inherits.
+ *
+ * Set once at startup, from the same probe that writes the log line. Absence of
+ * the series therefore means the probe did not complete (it is wrapped so it
+ * can never block startup), which is distinguishable from any reading.
+ */
+export const DB_INHERITED_TIMEOUT_METRIC = "paperclip_db_inherited_timeout_seconds";
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
@@ -1534,10 +1828,21 @@ export const PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC =
  * An unlisted code collapses to {@link UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE}
  * rather than growing the series set, so a new terminal code cannot blow up
  * cardinality — it shows up as `other` and gets triaged into this list.
+ *
+ * When you add a code here you must also add a row for it to the Step 2
+ * action table in `runbooks/agent-wakeup-terminal-failed.md`. Listing a code
+ * here removes it from the table's `other` escape hatch, so an operator paged
+ * on it would otherwise see a label with no row and no fallback. Nothing
+ * asserts the two match — the drift is silent.
  */
 export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   "external_lifecycle_stale_killed",
   "job_failed",
+  // BLO-33441: listed for the same reason it is listed in recovery's
+  // infra-routing set — these runs WERE `job_failed` (a member) before the
+  // relabel, so omitting it would silently move them to `other` and change
+  // this gauge's meaning without anything upstream having changed.
+  CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
   "job_missing",
   "adapter_failed",
   "process_lost",
@@ -2374,6 +2679,7 @@ let orphanedRuntimeResourceMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
+let agentStartLockPhaseSeconds: Gauge<"agent_id" | "phase"> | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -2395,6 +2701,7 @@ let scheduledRetryParkHorizon: Gauge<"agent_id"> | null = null;
 let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
 let dbPoolConnections: Gauge<"state"> | null = null;
 let dbPoolWaitingQueries: Gauge | null = null;
+let dbInheritedTimeout: Gauge<"setting" | "source"> | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let crashRecoveryCandidateIndexPresent: Gauge<"index"> | null = null;
 let pluginMetric: Counter<
@@ -2471,11 +2778,22 @@ let projectPrimaryWorkspaceFallback: Counter | null = null;
 let backstopDeferredCandidates: Gauge<"source"> | null = null;
 let backstopSweepCompleted: Counter<"source"> | null = null;
 let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
+let heartbeatRecoveryChainSkipped: Counter | null = null;
+let heartbeatRecoveryChainDuration: Gauge | null = null;
+let heartbeatRecoveryChainInflight: Gauge | null = null;
+let heartbeatRecoveryChainStalled: Counter | null = null;
 let pluginWebhookDeliveryRejected:
   | Counter<"plugin_key" | "response_class" | "plugin_status">
   | null = null;
 let recoveryHorizonExpired: Counter<"delivery"> | null = null;
 let workerTierProxyFailures: Counter<"reason"> | null = null;
+let isolationReaperScanned: Counter<"dry_run"> | null = null;
+let isolationReaperDeleted: Counter<"dry_run"> | null = null;
+let isolationReaperSkippedLayout: Counter<"dry_run"> | null = null;
+let isolationReaperRetainedResurrected: Counter<"dry_run"> | null = null;
+let isolationReaperEntries: Counter<"dry_run" | "outcome"> | null = null;
+let isolationReaperSweeps: Counter<"dry_run" | "stop_reason"> | null = null;
+let isolationReaperLastSweep: Gauge<"dry_run"> | null = null;
 
 function ensureRegistry(): {
   registry: Registry;
@@ -2517,10 +2835,11 @@ function ensureRegistry(): {
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
-  scheduledRetryParkHorizonGauge: Gauge<"agent_id">;
+  scheduledRetryParkHorizonGauge: Gauge<"agent_id" | "reason">;
   scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
   dbPoolConnectionsGauge: Gauge<"state">;
   dbPoolWaitingQueriesGauge: Gauge;
+  dbInheritedTimeoutGauge: Gauge<"setting" | "source">;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   crashRecoveryCandidateIndexPresentGauge: Gauge<"index">;
   pluginMetricCounter: Counter<
@@ -2531,6 +2850,7 @@ function ensureRegistry(): {
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
+  agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
   prReviewQueueWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   gbrainRecallCounter: Counter<"status">;
@@ -2543,9 +2863,20 @@ function ensureRegistry(): {
   backstopDeferredCandidatesGauge: Gauge<"source">;
   backstopSweepCompletedCounter: Counter<"source">;
   backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
+  heartbeatRecoveryChainSkippedCounter: Counter;
+  heartbeatRecoveryChainDurationGauge: Gauge;
+  heartbeatRecoveryChainInflightGauge: Gauge;
+  heartbeatRecoveryChainStalledCounter: Counter;
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
   workerTierProxyFailuresCounter: Counter<"reason">;
+  isolationReaperScannedCounter: Counter<"dry_run">;
+  isolationReaperDeletedCounter: Counter<"dry_run">;
+  isolationReaperSkippedLayoutCounter: Counter<"dry_run">;
+  isolationReaperRetainedResurrectedCounter: Counter<"dry_run">;
+  isolationReaperEntriesCounter: Counter<"dry_run" | "outcome">;
+  isolationReaperSweepsCounter: Counter<"dry_run" | "stop_reason">;
+  isolationReaperLastSweepGauge: Gauge<"dry_run">;
 } {
   if (
     !registry
@@ -2573,6 +2904,7 @@ function ensureRegistry(): {
     || !externalRuntimeReservationStrandedOldestAge
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
     || !agentStartLockHeldSeconds
+    || !agentStartLockPhaseSeconds
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -2594,6 +2926,7 @@ function ensureRegistry(): {
     || !scheduledRetryParkHorizonRefreshSuccess
     || !dbPoolConnections
     || !dbPoolWaitingQueries
+    || !dbInheritedTimeout
     || !pluginError
     || !crashRecoveryCandidateIndexPresent
     || !pluginMetric
@@ -2611,9 +2944,20 @@ function ensureRegistry(): {
     || !backstopDeferredCandidates
     || !backstopSweepCompleted
     || !backstopCandidatesSkipped
+    || !heartbeatRecoveryChainSkipped
+    || !heartbeatRecoveryChainDuration
+    || !heartbeatRecoveryChainInflight
+    || !heartbeatRecoveryChainStalled
     || !pluginWebhookDeliveryRejected
     || !recoveryHorizonExpired
     || !workerTierProxyFailures
+    || !isolationReaperScanned
+    || !isolationReaperDeleted
+    || !isolationReaperSkippedLayout
+    || !isolationReaperRetainedResurrected
+    || !isolationReaperEntries
+    || !isolationReaperSweeps
+    || !isolationReaperLastSweep
   ) {
     registry = new Registry();
     concurrentRunBlocked = new Counter({
@@ -2778,8 +3122,20 @@ function ensureRegistry(): {
     queuedRunAgeMetricsRefreshSuccess.set(0);
     scheduledRetryParkHorizon = new Gauge({
       name: SCHEDULED_RETRY_PARK_HORIZON_METRIC,
-      help: "Booked scheduled_retry park horizon in seconds, by agent.",
-      labelNames: ["agent_id"],
+      help:
+        "Booked scheduled_retry park horizon in seconds, by agent and park reason (BLO-31174). "
+        + "`reason` is load-bearing, not decoration: legitimate ceilings differ by class and span "
+        + "at least 289x (max_turns_continuation 300s, ccrotate_capacity 1080s as a 15min clamp plus "
+        + "20% forward jitter, dependency_blocked "
+        + "3600s, transient_failure 9000s on the backoff ladder but up to 86700s when it adopts an "
+        + "upstream retryNotBefore floor, 24h clamp plus 5min forward jitter, and unbounded for a "
+        + "provider_quota floor, which is never clamped), so any single threshold across all of "
+        + "them fires on designed backoff in one class while missing a 5x clamp breach in another. "
+        + "Bound each reason against its own ceiling. reason='none' is a per-agent zero floor emitted for every "
+        + "known agent, including agents with live parks, so it selects the whole fleet and does "
+        + "not mean the agent is drained; it is not a park class, is always 0, and must never "
+        + "carry a bound.",
+      labelNames: ["agent_id", "reason"],
       registers: [registry],
     });
     scheduledRetryParkHorizonRefreshSuccess = new Gauge({
@@ -2822,6 +3178,21 @@ function ensureRegistry(): {
         + "and a zero value rules it out.",
       registers: [registry],
     });
+    dbInheritedTimeout = new Gauge({
+      name: DB_INHERITED_TIMEOUT_METRIC,
+      help:
+        "Timeout environment the application pool INHERITS from the server, in seconds, by "
+        + "setting and by the pg_settings source that set it (PEN-3365). 0 means disabled, as "
+        + "Postgres encodes it, so statement_timeout=0 is the unbounded case. source=default "
+        + "means nothing sets it; database/user means a real inherited bound. NOT the effective "
+        + "value for idle_in_transaction_session_timeout: the pool sets that to 120s in its own "
+        + "startup packet, which this probe deliberately does not observe, so that series reads "
+        + "0/default while the pool is in fact bounded. statement_timeout and lock_timeout are "
+        + "not set pool-side, so for those inherited is effective. Do not read "
+        + "postgres_exporter's pg_settings_* for this -- that reports the exporter's own session.",
+      labelNames: ["setting", "source"],
+      registers: [registry],
+    });
     agentStartLockHeldSeconds = new Gauge({
       name: AGENT_START_LOCK_HELD_SECONDS_METRIC,
       help:
@@ -2832,6 +3203,17 @@ function ensureRegistry(): {
         + "held, so absence means no hold, not a zero-length one. A healthy section is sub-second; "
         + "sustained tens of seconds is a wedge. Per-pod, because the lock is per-process.",
       labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    agentStartLockPhaseSeconds = new Gauge({
+      name: AGENT_START_LOCK_PHASE_SECONDS_METRIC,
+      help:
+        "Seconds the per-agent queued-run dispatch start lock has been in its current phase "
+        + "(BLO-36922). Names the await a held section is sitting in; pairs with "
+        + AGENT_START_LOCK_HELD_SECONDS_METRIC
+        + ". A phase age close to the hold age means the section never left that phase. Series "
+        + "exist only while a lock is held, so absence means no hold. Per-pod, like its companion.",
+      labelNames: ["agent_id", "phase"],
       registers: [registry],
     });
     externalRuntimeReservationsReleasePending = new Gauge({
@@ -3469,6 +3851,53 @@ function ensureRegistry(): {
       labelNames: ["source", "reason"],
       registers: [registry],
     });
+    heartbeatRecoveryChainSkipped = new Counter({
+      name: HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
+      help:
+        "Scheduler ticks on which the periodic recovery chain was skipped because the "
+        + "previous pass was still running (PEN-3314). Zero in steady state. A sustained "
+        + "non-zero rate means the chain is outrunning heartbeatSchedulerIntervalMs; read "
+        + HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC + " to see by how much.",
+      registers: [registry],
+    });
+    // Zero-initialize so a healthy worker exports an explicit 0 rather than an
+    // absent series -- "no overlap" and "gate never reached" must not look alike.
+    heartbeatRecoveryChainSkipped.inc(0);
+    heartbeatRecoveryChainDuration = new Gauge({
+      name: HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC,
+      help:
+        "Wall-clock duration of the last COMPLETED periodic recovery chain, in seconds "
+        + "(PEN-3314). Describes the last pass to finish, so it cannot see a pass that is "
+        + "overrunning now; alert on " + HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC + " instead.",
+      registers: [registry],
+    });
+    // Same reasoning as the skip counter above, and it matters more here: without
+    // this, a worker whose very first chain runs long or wedges exports no series
+    // at all, so an alert of the form "> heartbeatSchedulerIntervalMs" never
+    // evaluates -- silent during precisely the incident it was written for.
+    heartbeatRecoveryChainDuration.set(0);
+    heartbeatRecoveryChainInflight = new Gauge({
+      name: HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC,
+      help:
+        "How long the currently outstanding periodic recovery chain has been running, in "
+        + "seconds; 0 when none is outstanding (PEN-3314). Refreshed by a dedicated timer that "
+        + "touches no database, so it stays live when pool saturation stops the heartbeat tick "
+        + "from reporting. "
+        + "This is the overlap alert: it crosses heartbeatSchedulerIntervalMs while the "
+        + "offending pass is still running, hours before the heap ceiling is reached.",
+      registers: [registry],
+    });
+    heartbeatRecoveryChainInflight.set(0);
+    heartbeatRecoveryChainStalled = new Counter({
+      name: HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC,
+      help:
+        "Recovery-chain passes still outstanding past the stall threshold, counted once per "
+        + "stalled pass (PEN-3314/PEN-3365). Non-zero means a pass stopped settling entirely "
+        + "rather than merely running slow, so EVERY recovery pass on this worker is halted. "
+        + "The gate does not self-clear, so this does not resolve itself. Page on this.",
+      registers: [registry],
+    });
+    heartbeatRecoveryChainStalled.inc(0);
     // Pre-seed every backstop series so "healthy" reads as a literal 0 rather than an
     // absent series. The gauge already did this; the counters did not, which reproduced
     // the exact silence defect BLO-29763 was opened to remove, one metric over: on a
@@ -3538,6 +3967,84 @@ function ensureRegistry(): {
         backstopCandidatesSkipped.inc({ source, reason }, 0);
       }
     }
+    isolationReaperScanned = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_SCANNED_METRIC,
+      help:
+        "Directories the isolation-workspace reaper examined, summed over sweeps "
+        + "(BLO-36814). The denominator for every other reaper series. Absent "
+        + "means the reaper has not completed a sweep in this process — NOT that "
+        + "it swept and found nothing; these series are deliberately not "
+        + "pre-seeded so those two states stay distinguishable.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
+    isolationReaperDeleted = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_DELETED_METRIC,
+      help:
+        "Workspace directories irreversibly removed by the isolation-workspace "
+        + "reaper (BLO-36814). Counts real unlinks only, so it is always 0 under "
+        + "dry_run=\"true\" and can never overstate reclaimed space. The "
+        + "would-have-removed count of a dry run is "
+        + ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC + "{outcome=\"eligible\"} — read "
+        + "its dry_run label before treating that as a deletion.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
+    isolationReaperSkippedLayout = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC,
+      help:
+        "Directories skipped UNEXAMINED because their top level did not match the "
+        + "{home, session} allowlist (BLO-36814). Its own series, not an outcome "
+        + "label: a rise above baseline means the tree is more heterogeneous than "
+        + "the allowlist was validated against. BLO-36735 measured that baseline "
+        + "as 1 at maxAgeDays=30 (a stray wt-blo-19094 git worktree).",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
+    isolationReaperRetainedResurrected = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_RETAINED_RESURRECTED_METRIC,
+      help:
+        "Workspaces idle at the sweep's opening snapshot but used again before "
+        + "this pass reached its unlink — i.e. that came within one query of "
+        + "being deleted underneath a live run (BLO-36814). Its own series, not "
+        + "an outcome label: any non-zero value is a finding, and this counter's "
+        + "frequency is the only evidence that can confirm or retire the exposure "
+        + "window the pre-unlink re-read exists to close.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
+    isolationReaperEntries = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC,
+      help:
+        "Routine per-entry isolation-workspace reaper outcomes, labeled by bounded "
+        + "outcome (eligible, retained_in_use, retained_fresh, vanished, failed). "
+        + "The two findings outcomes — skipped_layout and retained_resurrected — "
+        + "are deliberately NOT in this counter; they have their own series so no "
+        + "sum-by aggregates them away.",
+      labelNames: ["dry_run", "outcome"],
+      registers: [registry],
+    });
+    isolationReaperSweeps = new Counter({
+      name: ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC,
+      help:
+        "Completed isolation-workspace reaper sweeps, labeled by how the pass "
+        + "ended (BLO-36814). capped = maxDeletesPerTick stopped it with work "
+        + "remaining; lookup_faulted = the pre-unlink re-read faulted, so the "
+        + "remaining directories were never assessed at all.",
+      labelNames: ["dry_run", "stop_reason"],
+      registers: [registry],
+    });
+    isolationReaperLastSweep = new Gauge({
+      name: ISOLATION_WORKSPACE_REAPER_LAST_SWEEP_METRIC,
+      help:
+        "Unix timestamp of the last completed isolation-workspace reaper sweep "
+        + "(BLO-36814). This is the liveness signal: `time() - max(...)` exceeding "
+        + "2x the configured interval means a daily irreversible-delete sweep has "
+        + "silently stopped ticking, which no counter can express on its own "
+        + "because a healthy idle sweep and a dead one both add zero.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
     pluginWebhookDeliveryRejected = new Counter({
       name: PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC,
       help:
@@ -3624,6 +4131,7 @@ function ensureRegistry(): {
     externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
       externalRuntimeReservationStrandMetricsRefreshSuccess,
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
+    agentStartLockPhaseSecondsGauge: agentStartLockPhaseSeconds,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -3645,6 +4153,7 @@ function ensureRegistry(): {
     scheduledRetryParkHorizonRefreshSuccessGauge: scheduledRetryParkHorizonRefreshSuccess,
     dbPoolConnectionsGauge: dbPoolConnections,
     dbPoolWaitingQueriesGauge: dbPoolWaitingQueries,
+    dbInheritedTimeoutGauge: dbInheritedTimeout,
     pluginErrorGauge: pluginError,
     crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
     pluginMetricCounter: pluginMetric,
@@ -3662,9 +4171,20 @@ function ensureRegistry(): {
     backstopDeferredCandidatesGauge: backstopDeferredCandidates,
     backstopSweepCompletedCounter: backstopSweepCompleted,
     backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
+    heartbeatRecoveryChainSkippedCounter: heartbeatRecoveryChainSkipped,
+    heartbeatRecoveryChainDurationGauge: heartbeatRecoveryChainDuration,
+    heartbeatRecoveryChainInflightGauge: heartbeatRecoveryChainInflight,
+    heartbeatRecoveryChainStalledCounter: heartbeatRecoveryChainStalled,
     pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
     recoveryHorizonExpiredCounter: recoveryHorizonExpired,
     workerTierProxyFailuresCounter: workerTierProxyFailures,
+    isolationReaperScannedCounter: isolationReaperScanned,
+    isolationReaperDeletedCounter: isolationReaperDeleted,
+    isolationReaperSkippedLayoutCounter: isolationReaperSkippedLayout,
+    isolationReaperRetainedResurrectedCounter: isolationReaperRetainedResurrected,
+    isolationReaperEntriesCounter: isolationReaperEntries,
+    isolationReaperSweepsCounter: isolationReaperSweeps,
+    isolationReaperLastSweepGauge: isolationReaperLastSweep,
   };
 }
 
@@ -3767,8 +4287,15 @@ export function recordHeartbeatRunFailed(
   // mode never added a cardinality bound; the error code already was the bound.
   const isolationMode = normalizeIsolationMode(input.isolationMode);
   const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed";
+  // BLO-33441: `agent_id` only — NOT `issue_id`. "Which lane is losing runs to
+  // proxy startup" is the question this code exists to answer, and the agent
+  // roster is bounded (tens), so the series count is bounded with it. `issue_id`
+  // is unbounded and stays collapsed, which is the distinction the comment above
+  // is really about.
+  const retainAgentId = retainSourceIds
+    || input.errorCode === CAVEMAN_PROXY_NOT_READY_ERROR_CODE;
   const labels = {
-    agent_id: retainSourceIds && typeof input.agentId === "string" && input.agentId.length > 0
+    agent_id: retainAgentId && typeof input.agentId === "string" && input.agentId.length > 0
       ? input.agentId
       : UNKNOWN_AGENT_ID,
     issue_id: retainSourceIds && typeof input.issueId === "string" && input.issueId.length > 0
@@ -3836,9 +4363,7 @@ export function recordRetryScheduleOutcome(
     outcome: (KNOWN_RETRY_SCHEDULE_OUTCOMES as readonly string[]).includes(input.outcome ?? "")
       ? (input.outcome as RetryScheduleOutcomeLabel)
       : ("other" as const),
-    retry_reason: (KNOWN_RETRY_SCHEDULE_REASONS as readonly string[]).includes(input.retryReason ?? "")
-      ? (input.retryReason as RetryScheduleReasonLabel)
-      : ("other" as const),
+    retry_reason: coerceRetryScheduleReason(input.retryReason),
   };
   ensureRegistry().retryScheduleOutcomeCounter.inc(labels);
   return labels;
@@ -4122,23 +4647,48 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
-/** Publish the maximum booked park horizon for each live scheduled retry. */
+/**
+ * Publish the maximum booked park horizon for each live scheduled retry, keyed
+ * by agent AND park reason (BLO-31174). Aggregating across reasons was the
+ * second defect on this gauge: `max by (agent_id)` over classes whose ceilings
+ * span at least 289x (300s to a floored `transient_failure` park's 86,700s; a
+ * `provider_quota` floor has no ceiling) can only be thresholded at a value
+ * that is simultaneously below one class's designed backoff and above
+ * another's clamp.
+ */
 export function setScheduledRetryParkHorizonMetrics(
-  entries: ReadonlyArray<{ agentId: string | null | undefined; horizonSeconds: number }>,
+  entries: ReadonlyArray<{
+    agentId: string | null | undefined;
+    reason: string | null | undefined;
+    horizonSeconds: number;
+  }>,
   knownAgentIds: ReadonlySet<string>,
 ): void {
   const gauge = ensureRegistry().scheduledRetryParkHorizonGauge;
   gauge.reset();
-  const maxByAgentId = new Map<string, number>();
+  // Every known agent carries a zero placeholder, so a drained agent reads 0
+  // rather than vanishing. Emitted unconditionally: `none` is always 0, so it
+  // can never win a `max by (agent_id)` over a real park, which is what keeps
+  // the pre-BLO-31174 fleet-wide rule reading exactly as it did before.
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId, reason: NO_SCHEDULED_RETRY_PARK_REASON }, 0);
+  }
+  const maxByLabels = new Map<string, { agentId: string; reason: string; horizonSeconds: number }>();
   for (const entry of entries) {
     const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const reason = coerceRetryScheduleReason(entry.reason);
     const horizonSeconds = Number.isFinite(entry.horizonSeconds) ? Math.max(0, entry.horizonSeconds) : 0;
-    const current = maxByAgentId.get(agentId);
-    if (current === undefined || horizonSeconds > current) maxByAgentId.set(agentId, horizonSeconds);
+    // Distinct reasons can fold to the same `other` label, so re-max here
+    // rather than trusting the query's GROUP BY to have produced unique keys.
+    const key = `${agentId} ${reason}`;
+    const current = maxByLabels.get(key);
+    if (current === undefined || horizonSeconds > current.horizonSeconds) {
+      maxByLabels.set(key, { agentId, reason, horizonSeconds });
+    }
   }
-  for (const agentId of knownAgentIds) gauge.set({ agent_id: agentId }, maxByAgentId.get(agentId) ?? 0);
-  const unknownHorizon = maxByAgentId.get(UNKNOWN_AGENT_ID);
-  if (unknownHorizon !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownHorizon);
+  for (const { agentId, reason, horizonSeconds } of maxByLabels.values()) {
+    gauge.set({ agent_id: agentId, reason }, horizonSeconds);
+  }
 }
 
 export function setScheduledRetryParkHorizonRefreshSuccess(success: boolean): void {
@@ -4172,6 +4722,43 @@ export function setDbPoolStats(stats: DbPoolStats): void {
 }
 
 /**
+ * One inherited timeout setting, as {@link readInheritedTimeoutSettings}
+ * reports it. Declared structurally here, like {@link DbPoolStats}, so the
+ * metrics module keeps no dependency on `@paperclip/db`.
+ *
+ * `valueMs === null` is the probe's encoding for "disabled".
+ */
+export interface DbInheritedTimeoutSetting {
+  readonly name: string;
+  readonly valueMs: number | null;
+  readonly source: string;
+}
+
+/**
+ * Publish the inherited timeout environment (PEN-3365).
+ *
+ * Called once at startup, from the same probe that logs
+ * `Database timeout environment: …`, because that log line is unreadable in
+ * practice — see {@link DB_INHERITED_TIMEOUT_METRIC} for the measurement.
+ *
+ * `reset()` first so a re-probe cannot leave a stale `source` series alongside
+ * the current one: `source` is a label, so a value moving from `default` to
+ * `user` would otherwise publish both, and a reader taking the max or the
+ * first would silently get the retired reading.
+ *
+ * `null` is published as `0`, which is Postgres' own encoding for a disabled
+ * timeout and what `pg_settings` returns. That keeps `== 0` meaning "unbounded"
+ * for a reader who knows Postgres, rather than inventing a sentinel.
+ */
+export function setDbInheritedTimeouts(settings: readonly DbInheritedTimeoutSetting[]): void {
+  const { dbInheritedTimeoutGauge } = ensureRegistry();
+  dbInheritedTimeoutGauge.reset();
+  for (const { name, valueMs, source } of settings) {
+    dbInheritedTimeoutGauge.set({ setting: name, source }, valueMs === null ? 0 : valueMs / 1000);
+  }
+}
+
+/**
  * Publish the currently-held agent start locks and their hold ages (PEN-3305).
  *
  * Reset-then-set, but unlike the per-agent reservation gauges this does NOT
@@ -4188,13 +4775,21 @@ export function setDbPoolStats(stats: DbPoolStats): void {
  * DB-backed background collector would be stuck and publish nothing.
  */
 export function setAgentStartLockHeldMetrics(
-  held: ReadonlyArray<{ agentId: string; heldMs: number }>,
+  held: ReadonlyArray<{ agentId: string; heldMs: number; phase?: string; phaseMs?: number }>,
 ): void {
-  const gauge = ensureRegistry().agentStartLockHeldSecondsGauge;
+  const registry = ensureRegistry();
+  const gauge = registry.agentStartLockHeldSecondsGauge;
+  const phaseGauge = registry.agentStartLockPhaseSecondsGauge;
   gauge.reset();
+  phaseGauge.reset();
   for (const entry of held) {
     const heldMs = Number.isFinite(entry.heldMs) ? Math.max(0, entry.heldMs) : 0;
     gauge.set({ agent_id: entry.agentId }, heldMs / 1000);
+    const phase = entry.phase;
+    if (!phase) continue;
+    const rawPhaseMs = entry.phaseMs ?? 0;
+    const phaseMs = Number.isFinite(rawPhaseMs) ? Math.max(0, rawPhaseMs) : 0;
+    phaseGauge.set({ agent_id: entry.agentId, phase }, phaseMs / 1000);
   }
 }
 
@@ -5073,8 +5668,107 @@ export function recordBackstopSweepCompleted(source: BackstopSource): void {
   ensureRegistry().backstopSweepCompletedCounter.inc({ source });
 }
 
+/** PEN-3314: one tick's recovery chain was skipped because the previous one was still running. */
+export function recordHeartbeatRecoveryChainSkipped(): void {
+  ensureRegistry().heartbeatRecoveryChainSkippedCounter.inc();
+}
+
+/**
+ * PEN-3314: a recovery chain settled (success or failure) after `durationMs`.
+ *
+ * Clamped here as well as at the call site, matching
+ * `recordHeartbeatRecoveryChainInflight`. Both gauges mean "a duration", and
+ * both are equally undefined on a backwards clock, so the guarantee belongs to
+ * the metric rather than to its one caller.
+ */
+export function recordHeartbeatRecoveryChainDuration(durationMs: number): void {
+  ensureRegistry().heartbeatRecoveryChainDurationGauge.set(Math.max(0, durationMs) / 1000);
+}
+
+/**
+ * PEN-3314: how long the outstanding recovery chain has been running, or `0`
+ * once none is.
+ *
+ * Call this on settle and on stall as well as on skip. The gauge means "the pass
+ * running right now", so leaving a stale non-zero value behind after the pass
+ * ends would fire the overlap alert against a worker that has recovered.
+ */
+export function recordHeartbeatRecoveryChainInflight(elapsedMs: number): void {
+  ensureRegistry().heartbeatRecoveryChainInflightGauge.set(Math.max(0, elapsedMs) / 1000);
+}
+
+/** PEN-3314: a recovery-chain pass passed the stall threshold without settling. */
+export function recordHeartbeatRecoveryChainStalled(): void {
+  ensureRegistry().heartbeatRecoveryChainStalledCounter.inc();
+}
+
 export function recordBackstopCandidateSkipped(source: BackstopSource, reason: BackstopSkipReason): void {
   ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
+}
+
+/**
+ * Record one completed isolation-workspace reaper sweep (BLO-36814).
+ *
+ * Every child is materialized on every sweep, **including the zero-valued
+ * ones**. That is the point rather than an inefficiency: a tick that deletes
+ * nothing must still produce a readable `deleted_total{dry_run="false"} 0`, so
+ * "swept and found nothing" is distinguishable from "never swept" — the latter
+ * being the absence of the series entirely. A helper that only incremented
+ * non-zero fields would make the healthy-idle case look exactly like the dead
+ * case, which is the failure this whole module exists to remove.
+ *
+ * Called on the completion path of a sweep that has already done its
+ * irreversible work, so it must not throw: a metrics fault has no business
+ * turning a successful delete pass into an error the scheduler logs as a
+ * failed sweep.
+ */
+export function recordIsolationWorkspaceReapSweep(
+  result: IsolationWorkspaceReapResult,
+  options: {
+    dryRun: boolean;
+    now: () => number;
+    /**
+     * Overrides the stop reason derived from `result`. Only the root-absent
+     * path needs this: it returns a zero-valued result that is structurally
+     * indistinguishable from a clean `complete` sweep.
+     */
+    stopReason?: (typeof ISOLATION_WORKSPACE_REAPER_STOP_REASONS)[number];
+  },
+): void {
+  try {
+    const m = ensureRegistry();
+    const dry_run = options.dryRun ? "true" : "false";
+    m.isolationReaperScannedCounter.inc({ dry_run }, result.scanned);
+    m.isolationReaperDeletedCounter.inc({ dry_run }, result.deleted);
+    m.isolationReaperSkippedLayoutCounter.inc({ dry_run }, result.skippedLayout);
+    m.isolationReaperRetainedResurrectedCounter.inc({ dry_run }, result.retainedResurrected);
+
+    const byOutcome: Record<(typeof ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES)[number], number> = {
+      eligible: result.eligible,
+      retained_in_use: result.retainedInUse,
+      retained_fresh: result.retainedFresh,
+      vanished: result.vanished,
+      failed: result.failed,
+    };
+    for (const outcome of ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES) {
+      m.isolationReaperEntriesCounter.inc({ dry_run, outcome }, byOutcome[outcome]);
+    }
+
+    // `lookupFaulted` wins when both are set: it is the stronger statement —
+    // capped means a budget stopped an assessed pass, faulted means the
+    // remainder was never assessed. Every stop_reason child is materialized so
+    // a dashboard can read 0 capped sweeps rather than no data.
+    const stopReason =
+      options.stopReason ??
+      (result.lookupFaulted ? "lookup_faulted" : result.capped ? "capped" : "complete");
+    for (const reason of ISOLATION_WORKSPACE_REAPER_STOP_REASONS) {
+      m.isolationReaperSweepsCounter.inc({ dry_run, stop_reason: reason }, reason === stopReason ? 1 : 0);
+    }
+
+    m.isolationReaperLastSweepGauge.set({ dry_run }, Math.floor(options.now() / 1000));
+  } catch (error) {
+    logger.error({ err: error }, "failed to record isolation-workspace reaper sweep metrics");
+  }
 }
 
 /**
@@ -5208,6 +5902,7 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationStrandedOldestAge = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
   agentStartLockHeldSeconds = null;
+  agentStartLockPhaseSeconds = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
@@ -5243,6 +5938,10 @@ export function __resetMetricsForTest(): void {
   backstopDeferredCandidates = null;
   backstopSweepCompleted = null;
   backstopCandidatesSkipped = null;
+  heartbeatRecoveryChainSkipped = null;
+  heartbeatRecoveryChainDuration = null;
+  heartbeatRecoveryChainInflight = null;
+  heartbeatRecoveryChainStalled = null;
   recoveryHorizonExpired = null;
   gbrainRecallTotal = null;
   pluginWebhookDeliveryRejected = null;

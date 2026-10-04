@@ -16,9 +16,11 @@ import {
   accessService,
   approvalService,
   issueApprovalService,
+  issueService,
   logActivity,
   secretService,
 } from "../services/index.js";
+import { evaluateAgentIssueApprovalLinkAuthorization } from "./issue-approval-link-authorization.js";
 import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { redactApprovalPayloadForDisplay, withholdAgentConfigFromApprovalPayload } from "../redaction.js";
 import {
@@ -31,7 +33,12 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
 import { applyApprovalEnforcement } from "../services/approval-enforcement-executor.js";
 import { heartbeatService } from "../services/heartbeat.js";
-import { STATUS_ONLY_RECOVERY_RESUME_GUIDANCE } from "../services/recovery/model-profile-hint.js";
+import {
+  isPlanningOnlyRecoveryContextSnapshot,
+  isStatusOnlyRecoveryContextSnapshot,
+  statusOnlyEscalationSourceIssueId,
+  STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
+} from "../services/recovery/model-profile-hint.js";
 import {
   buildIssueGraphLivenessBoardEscalationKey,
   parseIssueGraphLivenessIncidentKey,
@@ -167,30 +174,13 @@ function budgetAssertionRefusal(type: string, payload: unknown) {
   };
 }
 
-function statusOnlyEscalationSourceIssueId(contextSnapshot: unknown): string | null {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
-  const sourceIssueId = (contextSnapshot as Record<string, unknown>).sourceIssueId;
-  return typeof sourceIssueId === "string" && sourceIssueId.trim() ? sourceIssueId : null;
-}
-
-function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-  const context = contextSnapshot as Record<string, unknown>;
-  return context.modelProfile === "cheap" &&
-    context.recoveryIntent === "status_only" &&
-    context.allowDeliverableWork === false &&
-    context.allowDocumentUpdates === false &&
-    context.resumeRequiresNormalModel === true;
-}
-
-function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-  const context = contextSnapshot as Record<string, unknown>;
-  return context.recoveryIntent === "planning_only" &&
-    context.allowDeliverableWork === false &&
-    context.allowDocumentUpdates === true &&
-    context.resumeRequiresNormalModel === false;
-}
+// PEN-3275: both predicates are now derived from the canonical tuples in `model-profile-hint.ts`
+// rather than hand-repeated here. This file carried the last two hand-written copies — the exact
+// shape BLO-32774 removed from the status-only guard in `issues.ts`, and dangerous in the same
+// direction: a key added to either tuple would leave these guards testing the old shape and
+// failing OPEN on a write-containment control.
+const isStatusOnlyCheapRecoveryContext = isStatusOnlyRecoveryContextSnapshot;
+const isPlanningOnlyRecoveryContext = isPlanningOnlyRecoveryContextSnapshot;
 
 type ApprovalRunContextDecision =
   | { allowed: false }
@@ -206,6 +196,7 @@ export function approvalRoutes(
   const svc = approvalService(db);
   const access = accessService(db);
   const issueApprovalsSvc = issueApprovalService(db);
+  const issuesSvc = issueService(db);
   const secretsSvc = secretService(db);
   // Built once, like `costRoutes` does for the sibling budget-writing route
   // (`costs.ts`), rather than rebuilding the whole heartbeat closure graph on
@@ -258,6 +249,16 @@ export function approvalRoutes(
     return { includeAgentConfig: await actorCanReadAgentConfig(req, access, companyId) };
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in the wake prompt — the full approval refusal list, the `request_board_approval`
+  // carve-out, and the "no source issue ⇒ no approval write at all" branch all claim what this
+  // function does. Change what is admitted here and update those sentences in the same edit.
+  //
+  // ADDING A CALL SITE counts as changing it, and that is the case this comment was written for:
+  // the notice enumerates one entry per call site in `REFUSED_APPROVAL_OPERATIONS`, and round 6 of
+  // that PR found `apply` refused here but absent from the enumeration — a list that presents
+  // itself as exhaustive while omitting an operation licenses the agent to plan around it. Add the
+  // guard to a new route, add the operation to that constant.
   async function assertApprovalMutationAllowedByRunContext(
     req: Request,
     res: any,
@@ -441,6 +442,85 @@ export function approvalRoutes(
     });
   }
 
+  /**
+   * BLO-23763: the issue-scoped boundary for `issueIds` on approval create.
+   *
+   * `linkManyForApproval` validates only that each id exists and belongs to the
+   * approval's company. That left this route able to reach the same end state as
+   * `POST /issues/:id/approvals` — a row in `issue_approvals` — without the
+   * issue-side check that route runs, so the boundary was bypassable by choosing
+   * the other entry point. Both doors now decide through
+   * `evaluateAgentIssueApprovalLinkAuthorization`.
+   *
+   * Every id is evaluated before responding, rather than short-circuiting on the
+   * first refusal, so the refusal can name the whole refused set. An agent that
+   * learned about its refusals one id per request would file one approval per
+   * round trip just to enumerate them.
+   *
+   * Ids that do not resolve, or that resolve into another company, are
+   * deliberately passed through untouched: `linkManyForApproval` already rejects
+   * them (404 / 422), and duplicating that here would change this route's error
+   * semantics for a case that is not an authorization question.
+   *
+   * ## Why the response status is not always 403
+   *
+   * The evaluator distinguishes a *retryable* refusal — the issue is `in_progress`
+   * under another agent's checkout — and reports it as 409, matching the conflict
+   * contract `assertAgentIssueMutationAllowed` establishes on the dedicated link
+   * route. Collapsing that to 403 would tell a caller its request can never
+   * succeed when in fact it succeeds once the other agent's checkout ends, so the
+   * verdict's status is preserved here.
+   *
+   * A set can mix the two. The response then takes the *stricter* reading, 403:
+   * "retry this" is only true if every refusal clears on its own, and a set
+   * containing one permanent boundary refusal never does. Each entry still carries
+   * its own `status`, so a caller splitting a mixed batch can see which ids were
+   * merely conflicting.
+   */
+  async function assertIssueLinksAllowed(
+    req: Request,
+    res: any,
+    companyId: string,
+    issueIds: string[],
+  ) {
+    if (req.actor.type !== "agent" || issueIds.length === 0) return true;
+
+    const refusals: Array<{ issueId: string; status: 403 | 409 } & Record<string, unknown>> = [];
+    for (const issueId of issueIds) {
+      const issue = await issuesSvc.getById(issueId);
+      if (!issue || issue.companyId !== companyId) continue;
+      const verdict = await evaluateAgentIssueApprovalLinkAuthorization({ access, db }, req, issue);
+      if (verdict.allowed) continue;
+      refusals.push({
+        issueId,
+        status: verdict.status,
+        reason: verdict.reason,
+        boundary: verdict.boundary,
+        error: verdict.error,
+      });
+    }
+
+    if (refusals.length === 0) return true;
+
+    const everyRefusalIsCheckoutConflict = refusals.every((refusal) => refusal.status === 409);
+    const refusedIssueIds = refusals.map((refusal) => refusal.issueId);
+
+    res.status(everyRefusalIsCheckoutConflict ? 409 : 403).json({
+      error: everyRefusalIsCheckoutConflict
+        ? "Approval cannot be linked to issues checked out by another agent: " +
+          refusedIssueIds.join(", ")
+        : "Approval cannot be linked to issues this actor is not authorized on: " +
+          refusedIssueIds.join(", "),
+      details: {
+        companyId,
+        refusedIssueIds,
+        refusals,
+        securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+      },
+    });
+    return false;
+  }
+
   router.get("/companies/:companyId/approvals", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -496,11 +576,17 @@ export function approvalRoutes(
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
+    // Two independent gates, narrowest first. The run-context gate refuses a cheap
+    // status-only recovery run outright unless it is filing a board escalation bound to
+    // its own trusted source issue (BLO-23036); it reports that refusal in its own terms,
+    // so it must decide before the general check can answer with a less specific message.
+    // The link gate then authorizes every requested id for every agent actor (BLO-23763).
     const runContextDecision = await assertApprovalMutationAllowedByRunContext(req, res, companyId, {
       requestedType: req.body.type,
       requestedIssueIds: uniqueIssueIds,
     });
     if (!runContextDecision.allowed) return;
+    if (!(await assertIssueLinksAllowed(req, res, companyId, uniqueIssueIds))) return;
     // The coalescing key below is company-scoped, which means it deliberately ignores who filed the
     // card. That is only safe while the namespace is unforgeable: a caller that could plant a row
     // under `harness_liveness_board:<company>:<state>:<agent>` would have the next genuine

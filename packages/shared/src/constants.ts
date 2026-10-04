@@ -313,6 +313,63 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
 ] as const;
 export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[number];
 
+/**
+ * BLO-37677: does this kind's action exist to RESTORE a wake path to the source issue?
+ *
+ * `classifySourceRecoveryRevalidation` cancels an active action once the source issue is
+ * observed to have a wake path of its own. The full set of branches the carve-out covers is
+ * six, not five: unresolved first-class blockers on a `blocked` issue (which drain via
+ * `issue_blockers_resolved_sweep`), human owner, agent owner on a dispatchable status, typed
+ * review participant, pending interaction/approval, and scheduled monitor. That theory holds
+ * only for the kinds below marked `true`, whose whole job is to put a wake path back — once
+ * the issue has one, the action genuinely is redundant.
+ *
+ * It is wrong for `pr_review_non_convergence`, which escalates a *quality* condition to a
+ * *different* owner and deliberately leaves the source issue assigned to the looping author
+ * (`escalateStalledSelfReviewPr`). That kind is therefore born matching the agent-owner
+ * cancellation predicate and has no reachable state in which it stops matching: measured
+ * 0 escalations and 0 owner-completions across 118 actions in 8 weeks.
+ *
+ * This is a `Record`, not a lookup with a default, so adding a kind above is a compile error
+ * here rather than a silent inheritance of either behaviour.
+ *
+ * Marking a kind `false` removes ONLY the wake-path-existence branches. Three kind-blind paths
+ * sit above the guard and still retire it, and they are three different reasons, not one:
+ * `done`/`cancelled` (genuinely terminal), the manual blocked→todo recovery (an OUT-OF-BAND
+ * signal that the recovery this action exists to perform already happened), and `backlog` (a
+ * NON-DELIVERABILITY fold). `backlog` is NOT a terminal status — see `routes/issues.ts`, where
+ * the guard's POSITION below all three is the load-bearing detail. Moving it back above them is
+ * not behaviour-preserving for a `false`-marked kind; it is the whole deviation from AC1, and
+ * the backlog negative control is what turns red.
+ *
+ * For the agent-owned shape the bound is covered besides: the action is bounded at creation
+ * (`maxAttempts` + `timeoutAt`) and `escalateExpiredWakeHorizons` retires it. The
+ * board-escalation shape (`ownerAgentId === null`) is deliberately unbounded — both fields null,
+ * which that sweep requires — so those three paths are all it has. There is no PR-close
+ * discharge in this tree: `github_pr_closed` is a wake reason (`recovery/service.ts`), not a
+ * resolver, and the webhook's only recovery call is `escalateStalledSelfReviewPr` — the minting
+ * path. #1967 (PEN-3397) proposes one and is unmerged, so do not count on it. That is the
+ * intended semantics for a board escalation, but it is a real new state: a kind marked `false`
+ * AND minted board-shaped retires on nothing beyond those three.
+ *
+ * `active_run_watchdog` and `issue_graph_liveness` have NO producer in non-test source today —
+ * the only `kind:` literal in the repo is `pr_review_non_convergence`
+ * (`recovery/service.ts`); every other kind is written through `strandedRecoveryActionKind`,
+ * which cannot emit either of them. Their `true` here is the status-quo value and is therefore
+ * inert, not a verified classification. Whoever adds the first producer owns that decision:
+ * ask whether the action RESTORES a wake path (`true`) or escalates a condition to a different
+ * owner while leaving the source issue driveable (`false`), and do not inherit this default.
+ */
+export const ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION: Record<IssueRecoveryActionKind, boolean> = {
+  missing_disposition: true,
+  stranded_assigned_issue: true,
+  workspace_validation: true,
+  configuration_validation: true,
+  active_run_watchdog: true,
+  issue_graph_liveness: true,
+  pr_review_non_convergence: false,
+};
+
 export const ISSUE_RECOVERY_ACTION_STATUSES = [
   "active",
   "escalated",
@@ -688,6 +745,15 @@ export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
  */
 export const APPROVAL_UNDECIDED_STATUSES = ["pending", "revision_requested"] as const;
 export type ApprovalUndecidedStatus = (typeof APPROVAL_UNDECIDED_STATUSES)[number];
+
+/**
+ * Most issues one approval may link at creation (`issueIds` on approval create,
+ * `sourceIssueIds` on agent hire). Each id is authorized on its own, sequentially,
+ * before anything is written, so an uncapped array let one request queue one issue
+ * read plus an authorization decision per element, bounded only by the JSON body
+ * limit (PR #1271). Matches the issue-id arrays on task-bridge key scopes.
+ */
+export const APPROVAL_LINKED_ISSUE_IDS_MAX = 50;
 
 export const SECRET_PROVIDERS = [
   "local_encrypted",

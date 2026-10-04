@@ -19,6 +19,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scoped-test-state.js";
 import { companySkillService } from "../services/company-skills.ts";
 import { folderService } from "../services/folders.js";
 
@@ -61,13 +62,14 @@ describeEmbeddedPostgres("companySkillService.list", () => {
   });
 
   afterEach(async () => {
-    await db.delete(agents);
-    await db.delete(companySkills);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(folders);
-    await db.delete(companies);
-    await db.delete(authUsers);
+    // A timed-out test is failed but not cancelled, so its in-flight writes keep
+    // landing while cleanup runs. An ordered delete list cannot survive that: a
+    // straggler `company_skills` insert between `delete(companySkills)` and
+    // `delete(companies)` makes the parent delete fail on
+    // `company_skills_company_id_companies_id_fk`, which then masks the timeout
+    // that actually failed the test (BLO-35765). TRUNCATE locks the whole
+    // cascade at once, so cleanup itself cannot fail.
+    await truncateCompanyScopedTestState(db, { extraTruncateTables: ["user"] });
     await Promise.all(Array.from(cleanupDirs, (dir) => fs.rm(dir, { recursive: true, force: true })));
     cleanupDirs.clear();
   });

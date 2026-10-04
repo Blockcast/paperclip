@@ -40,6 +40,7 @@ import {
   __test_isClaudeCodeReviewServiceNotice,
   __test_isReviewerSelfEchoReview,
   __test_isSelfReviewedPr,
+  __test_bodyReRaisesPriorFinding,
   __test_hasPrReviewerRequestMention,
   __test_hasPrReviewerAgentRequestMarker,
   __test_hasAllyConsolidatedReviewHeading,
@@ -1001,7 +1002,8 @@ describe("github-webhook pure helpers", () => {
     }
   });
 
-  it("resolves a wake reason for pull_request opened", () => {    const ctx = __test_resolveEventContext("pull_request", {
+  it("resolves a wake reason for pull_request opened", () => {
+    const ctx = __test_resolveEventContext("pull_request", {
       action: "opened",
       pull_request: {
         number: 200,
@@ -1170,6 +1172,90 @@ describe("github-webhook pure helpers", () => {
     expect(__test_buildPrReviewerWakeIdempotencyKey(ctx, "delivery-reopened")).toBe(
       "pr_review:Blockcast/magma:980:github_pr_reopened",
     );
+  });
+
+  it("treats a merge-queue-eviction bot comment as an author wake, distinct from reviewer-request/feedback (BLO-23395)", () => {
+    const ctx = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 1092,
+        title: "BLO-17980 fix agent-job Pod credential injection",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/1092",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1092" },
+      },
+      comment: {
+        id: 999001,
+        body:
+          "<!-- paperclip:merge-queue-eviction -->\nPR #1092 was removed from the `master` merge queue and is " +
+          "**not merged**.\n\nCause: **conflict / un-stageable rebase** -- the queue never created a " +
+          "`merge_group` run for this PR's head (0 runs found).",
+        html_url: "https://github.com/Blockcast/paperclip/pull/1092#issuecomment-999001",
+        user: { login: "github-actions[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+
+    expect(ctx).toMatchObject({
+      identifiers: ["BLO-17980"],
+      wakeReason: "github_pr_merge_queue_evicted",
+      prNumber: 1092,
+      repoFullName: "Blockcast/paperclip",
+      commentAuthorLogin: "github-actions[bot]",
+    });
+    // Not a reviewer-facing wake: it must not be eligible for the reviewer
+    // dispatch path at all, only the generic PR-author wake below (isPrWake
+    // gates on the "github_pr_" prefix, which this reason satisfies).
+    expect(__test_shouldFirePrReviewerWake(ctx)).toBe(false);
+    expect(ctx?.wakeReason.startsWith("github_pr_")).toBe(true);
+  });
+
+  it("ignores a merge-queue-eviction marker from anyone other than github-actions[bot] (BLO-23395)", () => {
+    // The marker alone must not be trusted -- only the exact bot login that
+    // .github/workflows/merge-queue-eviction-detector.yml posts as can raise
+    // this wake, or any PR comment could spoof an eviction notice.
+    const ctx = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 1092,
+        title: "BLO-17980 fix agent-job Pod credential injection",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1092" },
+      },
+      comment: {
+        id: 999002,
+        body: "<!-- paperclip:merge-queue-eviction -->\nspoofed notice",
+        user: { login: "some-random-user" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    expect(ctx).toBeNull();
+  });
+
+  it("ignores a merge-queue-eviction marker that is not at literal byte 0 (BLO-23395)", () => {
+    // Leading whitespace in Markdown is an indented code block -- the canonical
+    // way to render "here is the marker" while DISCUSSING it, which is exactly
+    // what this repo's own review threads do. The marker is anchored for the
+    // same reason REVIEW_GATE_ESCALATION_MARKER_PATTERN is; a `trimStart()`
+    // spelling read such a quote as a real eviction, and the github-actions[bot]
+    // author guard does not help because that identity posts many unrelated
+    // comments here.
+    for (const body of [
+      "    <!-- paperclip:merge-queue-eviction -->\nquoted in a code block",
+      "\n<!-- paperclip:merge-queue-eviction -->\nleading newline",
+      "see this marker: <!-- paperclip:merge-queue-eviction -->",
+    ]) {
+      const ctx = __test_resolveEventContext("issue_comment", {
+        action: "created",
+        issue: {
+          number: 1092,
+          title: "BLO-17980 fix agent-job Pod credential injection",
+          pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1092" },
+        },
+        comment: { id: 999003, body, user: { login: "github-actions[bot]" } },
+        repository: { full_name: "Blockcast/paperclip" },
+      });
+      expect(ctx).toBeNull();
+    }
   });
 
   it("treats @ally in a PR comment as an explicit reviewer wake request", () => {
@@ -5423,7 +5509,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
       // While deferred: the branch was pushed (head is now `liveHead`) and Ally
       // reviewed THAT head. Nothing attests `frozenHead`.
-      const resolved: Array<{ repoFullName: string; prNumber: number }> = [];
+      const resolved: Array<{ repoFullName: string; prNumber: number; signal?: AbortSignal }> = [];
       const reconciled = await reconcileContendedPrReviewerWakes(
         db,
         {
@@ -5449,7 +5535,12 @@ describeEmbeddedPostgres("github-webhook route", () => {
         new Date(Date.now() + 60_000),
       );
 
-      expect(resolved).toEqual([{ repoFullName: REPO, prNumber }]);
+      expect(resolved).toMatchObject([{ repoFullName: REPO, prNumber }]);
+      // BLO-38257: this read runs on the heartbeat tick at the end of the
+      // latched recovery chain, not inline in a webhook handler. It carries its
+      // own deadline because every second it takes holds that latch, and every
+      // tick skips recovery until it lets go.
+      expect(resolved[0]?.signal).toBeInstanceOf(AbortSignal);
       // Against the frozen head this would read `not_attested` and replay,
       // producing the duplicate; against the live head it is superseded.
       expect(reconciled).toMatchObject({ recovered: 0, superseded: 1, exhausted: 0 });
@@ -5826,9 +5917,17 @@ describeEmbeddedPostgres("github-webhook route", () => {
       for (const poolMax of [1, 2, 3]) {
         expect(derivePrReviewerWakeMaxConcurrency(poolMax)).toBe(1);
       }
-      // The shipped pool keeps the previously-hardcoded value, so this is a
-      // refactor of *how* the bound is obtained, not a behaviour change.
-      expect(derivePrReviewerWakeMaxConcurrency(POSTGRES_POOL_MAX)).toBe(4);
+      // The shipped pool. BLO-37330 raised POSTGRES_POOL_MAX 10 -> 18 against
+      // the written server-side budget (doc/DATABASE-CONNECTION-BUDGET.md),
+      // which carries the bound 4 -> 8. Pinned so a future pool change has to
+      // come back through this invariant rather than silently widening the
+      // number of concurrent double-checkouts.
+      //
+      // Note what the invariant does NOT buy: each wake holds 2 connections, so
+      // this reserves 2 * (floor(n/2) - 1) = n - 2 and leaves a constant 2 for
+      // everything else at every even pool size. Scaling the pool does not
+      // widen that; see the note on POSTGRES_POOL_MAX in packages/db.
+      expect(derivePrReviewerWakeMaxConcurrency(POSTGRES_POOL_MAX)).toBe(8);
     });
 
     // Ally's review of this PR: `no_reviewer` re-armed on the *contention*
@@ -7378,7 +7477,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     const fetchedHeadSha = "0123456789abcdef0123456789abcdef01234567";
     const quotedHeadSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const lookups: Array<{ repoFullName: string; prNumber: number }> = [];
+    const lookups: Array<{ repoFullName: string; prNumber: number; signal?: AbortSignal }> = [];
     const app = buildApp({
       prReviewerAgentId: reviewerAgentId,
       resolvePrReviewHeadSha: async (input) => {
@@ -7414,7 +7513,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .send(body);
 
     expect(res.status).toBe(200);
-    expect(lookups).toEqual([{ repoFullName: "Blockcast/paperclip", prNumber: 1435 }]);
+    expect(lookups).toMatchObject([{ repoFullName: "Blockcast/paperclip", prNumber: 1435 }]);
+    // BLO-38257: inline read on the request-blocking webhook path — it must
+    // carry a deadline rather than inherit undici's ~300s default.
+    expect(lookups[0]?.signal).toBeInstanceOf(AbortSignal);
 
     const runs = await db
       .select({ agentId: heartbeatRuns.agentId, contextSnapshot: heartbeatRuns.contextSnapshot })
@@ -8065,6 +8167,87 @@ describeEmbeddedPostgres("github-webhook route", () => {
       ]),
     );
     expect(await authorHeartbeatRuns()).toHaveLength(1);
+  });
+
+  it("wakes the author for a SECOND merge-queue eviction while the first eviction's wake is still running (BLO-23395)", async () => {
+    // The remediation loop: evicted at head A -> author wakes, rebases,
+    // re-enqueues -> the queue evicts again while that run is still `running`.
+    // A repo+pr+reason `stable` key would dedup the second notice against the
+    // running first wake as `duplicate_pr_author_wake`, which is the silent
+    // eviction this PR exists to close. Each eviction is a NEW detector
+    // comment, so the key is comment-scoped; a redelivery of one comment must
+    // still dedup.
+    const { agentId } = await seedIssueWithIdentifier("BLO-9003");
+    const app = buildApp();
+    const evictionPayload = (commentId: number) => ({
+      action: "created",
+      issue: {
+        number: 1092,
+        title: "fix(merge-queue): re-enqueue after eviction (BLO-9003)",
+        body: null,
+        html_url: "https://github.com/Blockcast/paperclip/pull/1092",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/paperclip/pulls/1092" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: commentId,
+        body:
+          "<!-- paperclip:merge-queue-eviction -->\nPR #1092 was removed from the `master` merge queue and is " +
+          "**not merged**.",
+        html_url: `https://github.com/Blockcast/paperclip/pull/1092#issuecomment-${commentId}`,
+        user: { login: "github-actions[bot]" },
+      },
+      repository: { full_name: "Blockcast/paperclip" },
+    });
+    const deliver = async (commentId: number, deliveryId: string) => {
+      const signed = signedRequest(evictionPayload(commentId));
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "issue_comment")
+        .set("x-hub-signature-256", signed.signature)
+        .set("x-github-delivery", deliveryId)
+        .set("content-type", "application/json")
+        .send(signed.body);
+    };
+    const authorWakes = async () =>
+      db
+        .select({ status: agentWakeupRequests.status, idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+    const keyForComment = (commentId: number) =>
+      expect.stringContaining(`:Blockcast/paperclip:1092:github_pr_merge_queue_evicted:comment:${commentId}`);
+
+    const first = await deliver(4900000031, "delivery-eviction-1");
+    expect(first.status).toBe(200);
+    expect(first.body.wakes).toEqual([{ issueIdentifier: "BLO-9003", agentId }]);
+    expect(await authorWakes()).toEqual([{ status: "queued", idempotencyKey: keyForComment(4900000031) }]);
+
+    // The author's run picked the first eviction up and is still working it.
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "running" })
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    // A redelivery of the SAME eviction comment is a duplicate.
+    const redelivery = await deliver(4900000031, "delivery-eviction-1-retry");
+    expect(redelivery.status).toBe(200);
+    expect(redelivery.body.wakes).toEqual([]);
+    expect(redelivery.body.skipped).toContainEqual({
+      issueIdentifier: "BLO-9003",
+      reason: "duplicate_pr_author_wake",
+    });
+
+    // A NEW eviction comment is a new event and must reach the author.
+    const second = await deliver(4900000032, "delivery-eviction-2");
+    expect(second.status).toBe(200);
+    expect(second.body.wakes).toEqual([{ issueIdentifier: "BLO-9003", agentId }]);
+    expect(second.body.skipped ?? []).not.toContainEqual({
+      issueIdentifier: "BLO-9003",
+      reason: "duplicate_pr_author_wake",
+    });
+    expect((await authorWakes()).map((w) => w.idempotencyKey)).toEqual(
+      expect.arrayContaining([keyForComment(4900000031), keyForComment(4900000032)]),
+    );
   });
 
   it("drives the reviewer wake AND preserves the author wake for a marker-prefixed agent review request (BLO-18865)", async () => {
@@ -8815,6 +8998,36 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
   });
 
+  // BLO-35909: a genuine non-convergence needs BOTH clauses of the escalation's
+  // own claim to hold — the owning lane IS the reviewer lane (a real
+  // self-review, not login equality on the fleet-shared App identity), and
+  // Ally's ledger asserts a prior finding is `still-present` (a loop, not three
+  // rounds of disjoint progress). These helpers build those two halves so each
+  // test below varies exactly one of them.
+  const stillPresentReviewBody = [
+    "## Ally — Consolidated PR Review",
+    "",
+    "### Important Issues (1)",
+    "",
+    "Fix before merge.",
+    "",
+    "### Prior Findings Dispositioned",
+    "",
+    "- **prior:de0d81ab important 1** — still-present — unchanged since the last head",
+  ].join("\n");
+
+  const convergingReviewBody = [
+    "## Ally — Consolidated PR Review",
+    "",
+    "### Important Issues (1)",
+    "",
+    "Fix before merge.",
+    "",
+    "### Prior Findings Dispositioned",
+    "",
+    "- **prior:de0d81ab important 1** — fixed — verified at this head",
+  ].join("\n");
+
   it("counts legacy PR feedback cycles without repo metadata for the same issue and PR", async () => {
     const { companyId, agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
     await db.insert(issueComments).values({
@@ -8830,6 +9043,8 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
     const app = buildApp({
       prReviewerBotLogin: "allyblockcast[bot]",
+      // The owning lane IS the reviewer lane: a real self-review.
+      prReviewerAgentIds: [agentId],
       selfReviewEscalationThreshold: 2,
     });
     const payload = {
@@ -8844,7 +9059,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       },
       comment: {
         id: 4784546380,
-        body: "## Ally — Consolidated PR Review\n\n### Important Issues (1)\n\nFix before merge.",
+        body: stillPresentReviewBody,
         html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-4784546380",
         user: { login: "allyblockcast[bot]" },
       },
@@ -8877,6 +9092,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
     const app = buildApp({
       prReviewerBotLogin: "allyblockcast[bot]",
+      prReviewerAgentIds: [agentId],
       selfReviewEscalationThreshold: 1,
     });
     const payload = {
@@ -8891,7 +9107,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       },
       comment: {
         id: 4784546379,
-        body: "## Ally — Consolidated PR Review\n\n### Important Issues (1)\n\nFix before merge.",
+        body: stillPresentReviewBody,
         html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-4784546379",
         user: { login: "allyblockcast[bot]" },
       },
@@ -8914,16 +9130,136 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(res.body.wakes).toEqual([]);
 
     const actions = await db
-      .select({ ownerType: issueRecoveryActions.ownerType, ownerAgentId: issueRecoveryActions.ownerAgentId })
+      .select({
+        ownerType: issueRecoveryActions.ownerType,
+        ownerAgentId: issueRecoveryActions.ownerAgentId,
+        nextAction: issueRecoveryActions.nextAction,
+      })
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-    expect(actions).toEqual([{ ownerType: "board", ownerAgentId: null }]);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]!.ownerType).toBe("board");
+    expect(actions[0]!.ownerAgentId).toBeNull();
+    // BLO-35909: the escalation's evidence is the re-raised finding the ledger
+    // names, NOT the round count. cycleCount counts converging rounds too, so
+    // resting the "without converging" claim on it overstated by however many
+    // rounds did converge. Named here so the prose cannot drift back.
+    expect(actions[0]!.nextAction).toContain("important #1 from de0d81ab");
+    expect(actions[0]!.nextAction).not.toContain("without converging");
 
     const authorWakes = await db
       .select({ id: agentWakeupRequests.id })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(authorWakes).toEqual([]);
+  });
+
+  // BLO-35909, the whole defect end-to-end. Identical to the test above in
+  // every respect EXCEPT that the owning lane is not the reviewer lane — which
+  // is the onprem-k8s#3647 shape and, on this fleet, the shape of every
+  // ordinary agent PR. The author login is still `allyblockcast[bot]`, because
+  // it always is. Escalating here suppressed the author's wake on every agent
+  // PR from the third actionable review round onward, and the recovery action
+  // then woke nobody at all once it hit its horizon.
+  it("does not escalate at threshold when the owning lane is not the reviewer lane (peer review)", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const app = buildApp({
+      prReviewerBotLogin: "allyblockcast[bot]",
+      // The reviewer pool is some OTHER lane; this issue belongs to agentId.
+      prReviewerAgentIds: [randomUUID()],
+      selfReviewEscalationThreshold: 1,
+    });
+    const payload = {
+      action: "created",
+      issue: {
+        number: 3647,
+        title: "arc-dind nested-cluster bootstrap",
+        body: "Closes PEN-1126",
+        html_url: "https://github.com/Blockcast/onprem-k8s/pull/3647",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/onprem-k8s/pulls/3647" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: 4784546381,
+        // Even a still-present ledger must not escalate: this is a peer
+        // review, so no clause of "the author looping on its own self-review"
+        // is true about it.
+        body: stillPresentReviewBody,
+        html_url: "https://github.com/Blockcast/onprem-k8s/pull/3647#issuecomment-4784546381",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/onprem-k8s" },
+    };
+
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-ally-feedback-peer-review-no-escalate")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.escalated).toBeUndefined();
+    // AC3: the author is still woken. This is the assertion the defect broke.
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const actions = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toEqual([]);
+  });
+
+  // BLO-35909 second clause: a real self-review, at threshold, whose rounds
+  // are CONVERGING. Round count alone cannot tell this apart from a loop —
+  // three rounds of disjoint, shrinking findings is progress, and Ally's own
+  // ledger says so by dispositioning the prior finding `fixed`.
+  it("does not escalate a self-reviewed PR whose rounds raise disjoint findings", async () => {
+    const { agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+    const app = buildApp({
+      prReviewerBotLogin: "allyblockcast[bot]",
+      prReviewerAgentIds: [agentId],
+      selfReviewEscalationThreshold: 1,
+    });
+    const payload = {
+      action: "created",
+      issue: {
+        number: 269,
+        title: "Fix hosted vault onboarding",
+        body: "Closes PEN-1126",
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/penstock-llm-proxy-core/pulls/269" },
+        user: { login: "allyblockcast[bot]" },
+      },
+      comment: {
+        id: 4784546382,
+        body: convergingReviewBody,
+        html_url: "https://github.com/Blockcast/penstock-llm-proxy-core/pull/269#issuecomment-4784546382",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/penstock-llm-proxy-core" },
+    };
+
+    const { body, signature } = signedRequest(payload);
+    const res = await request(app)
+      .post("/api/webhooks/github")
+      .set("x-github-event", "issue_comment")
+      .set("x-hub-signature-256", signature)
+      .set("x-github-delivery", "delivery-ally-feedback-converging-no-escalate")
+      .set("content-type", "application/json")
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body.escalated).toBeUndefined();
+    expect(res.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
+
+    const actions = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toEqual([]);
   });
 
   // BLO-19497: second and later Ally reviews on the same PR must still
@@ -11206,23 +11542,112 @@ describe("PR→issue back-link (BLO-13353)", () => {
   });
 });
 
-describe("self-review non-convergence detection (BLO-13353)", () => {
+describe("self-review non-convergence detection (BLO-13353, BLO-35909)", () => {
   const ctx = (prAuthorLogin: string | null) =>
     ({ prAuthorLogin }) as unknown as Parameters<typeof __test_isSelfReviewedPr>[0];
 
-  it("flags a PR authored by the reviewer bot as a self-review (case-insensitive)", () => {
-    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "allyblockcast[bot]")).toBe(true);
-    expect(__test_isSelfReviewedPr(ctx("AllyBlockcast[bot]"), "allyblockcast[bot]")).toBe(true);
+  // Two distinct lanes, both of which push through the SAME shared
+  // `allyblockcast[bot]` App identity. That sharing is the whole defect: the
+  // author login is byte-identical on a self-review and on a peer review, so
+  // every fixture below holds it fixed and varies only the lane.
+  const REVIEWER_LANE = "e0a5011d-5c94-4801-be52-64c14f98ac26";
+  const AUTHOR_LANE = "d6f327a4-f2f2-4a83-bc5a-173d993cf9b6";
+  const lanes = (assigneeAgentId: string | null, reviewerAgentIds: string[] = [REVIEWER_LANE]) => ({
+    assigneeAgentId,
+    reviewerAgentIds,
+  });
+
+  // BLO-35909 regression guard. This is the onprem-k8s#3647 / BLO-34284 shape:
+  // author login is the reviewer bot (it is for every agent PR on this fleet),
+  // but the lane that owns the work is PlatformSREEngineer, not Ally. Asserts
+  // false, and FAILS against the pre-fix login-equality predicate — which is
+  // what makes it a guard rather than a restatement.
+  it("does not flag a peer review as a self-review when the author lane differs from the reviewer lane", () => {
+    expect(
+      __test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "allyblockcast[bot]", lanes(AUTHOR_LANE)),
+    ).toBe(false);
+  });
+
+  it("flags a PR whose owning lane IS the reviewer lane as a self-review (case-insensitive)", () => {
+    expect(
+      __test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "allyblockcast[bot]", lanes(REVIEWER_LANE)),
+    ).toBe(true);
+    expect(
+      __test_isSelfReviewedPr(ctx("AllyBlockcast[bot]"), "allyblockcast[bot]", lanes(REVIEWER_LANE)),
+    ).toBe(true);
   });
 
   it("does not flag a PR authored by someone other than the reviewer bot", () => {
-    expect(__test_isSelfReviewedPr(ctx("some-human"), "allyblockcast[bot]")).toBe(false);
+    // Login equality is kept as a precondition precisely for this: a human
+    // pushing to a reviewer lane's own issue is not the bot reviewing itself.
+    expect(
+      __test_isSelfReviewedPr(ctx("some-human"), "allyblockcast[bot]", lanes(REVIEWER_LANE)),
+    ).toBe(false);
   });
 
   it("returns false when the author or reviewer-bot login is missing", () => {
-    expect(__test_isSelfReviewedPr(ctx(null), "allyblockcast[bot]")).toBe(false);
-    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), null)).toBe(false);
-    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "")).toBe(false);
+    expect(__test_isSelfReviewedPr(ctx(null), "allyblockcast[bot]", lanes(REVIEWER_LANE))).toBe(false);
+    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), null, lanes(REVIEWER_LANE))).toBe(false);
+    expect(__test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "", lanes(REVIEWER_LANE))).toBe(false);
+  });
+
+  it("fails closed when the lane cannot be determined", () => {
+    // Unknown lane must leave the author woken, never suppressed: an
+    // unassigned issue, and a deployment with no reviewer pool configured.
+    expect(
+      __test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "allyblockcast[bot]", lanes(null)),
+    ).toBe(false);
+    expect(
+      __test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "allyblockcast[bot]", lanes(REVIEWER_LANE, [])),
+    ).toBe(false);
+  });
+
+  // BLO-35909 Gap-2 guard. The reviewer pool is plural by design
+  // (configuredPrReviewerAgentIds unions the plural and singular config keys,
+  // and selectPrReviewerAgentId load-balances across it), so a membership test
+  // calls an ordinary peer review BETWEEN two pool lanes a self-review — the
+  // same suppression bug, narrowed from "every agent PR" to "PRs owned by a
+  // reviewer-pool lane". Fails against `reviewerAgentIds.includes(...)`, which
+  // is what makes it a guard rather than a restatement of the new code.
+  it("fails closed when the reviewer pool has more than one lane", () => {
+    expect(
+      __test_isSelfReviewedPr(ctx("allyblockcast[bot]"), "allyblockcast[bot]", {
+        assigneeAgentId: AUTHOR_LANE,
+        reviewerAgentIds: [REVIEWER_LANE, AUTHOR_LANE],
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("PR review convergence signal (BLO-35909)", () => {
+  const ledger = (verb: string) =>
+    [
+      "## Ally — Consolidated PR Review",
+      "",
+      "### Prior Findings Dispositioned",
+      "",
+      `- **prior:de0d81ab important 1** — ${verb} — head has moved on`,
+    ].join("\n");
+
+  it("treats a still-present prior finding as a re-raise", () => {
+    expect(__test_bodyReRaisesPriorFinding(ledger("still-present"))).toBe(true);
+  });
+
+  it("does not treat a retired prior finding as a re-raise", () => {
+    // The onprem-k8s#3647 shape: each round dispositioned the last round's
+    // findings as fixed and raised disjoint new ones. That is convergence.
+    expect(__test_bodyReRaisesPriorFinding(ledger("fixed"))).toBe(false);
+    expect(__test_bodyReRaisesPriorFinding(ledger("no-longer-applicable"))).toBe(false);
+  });
+
+  it("returns false when there is no ledger to read", () => {
+    // No positive evidence of a loop, so no escalation — the author keeps
+    // being woken. Fail-closed in the direction that is recoverable.
+    expect(
+      __test_bodyReRaisesPriorFinding("## Ally — Consolidated PR Review\n\n### Important Issues (1)"),
+    ).toBe(false);
+    expect(__test_bodyReRaisesPriorFinding(null)).toBe(false);
+    expect(__test_bodyReRaisesPriorFinding(undefined)).toBe(false);
   });
 });
 

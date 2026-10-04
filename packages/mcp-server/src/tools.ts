@@ -398,7 +398,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListParkedAgents",
-      "Answer \"which agents cannot run right now, and until when?\". Lists agents whose heartbeat run is parked on a scheduled retry, soonest-due first, with the retry reason, attempt number, and — for provider-capacity parks — what the provider advertised beside what was actually booked. Use this instead of invoking a heartbeat on each agent to discover it is frozen. Filter with reason (e.g. ccrotate_capacity).",
+      "Answer \"which agents cannot run right now, and until when?\". Lists agents whose heartbeat run is parked on a scheduled retry, soonest-due first, with the retry reason, attempt number, and — for provider-capacity parks — what the provider advertised beside what was actually booked. Use this instead of invoking a heartbeat on each agent to discover it is frozen. Filter with reason (e.g. ccrotate_capacity).\n\nTwo populations, told apart by `runStatus` (PEN-3607). `scheduled_retry` = still parked, waiting out its own horizon; `overdueMs` is 0 and `retryInMs` says how much longer. `queued` = the park already FIRED and promotion succeeded, but dispatch has not claimed the run. These have unrelated remedies: the first is provider capacity, the second is the dispatcher, so do not report a `queued` row as a capacity wait. Note `promoteScheduledRetryRun` never clears `scheduledRetryAt` / `scheduledRetryReason` / `scheduledRetryAttempt` on promotion, so a `queued` row's `reason` describes the park it CAME FROM, and `attempt: 0` there means \"promoted on its first due-time hit, never re-deferred\" — NOT \"never retried\".\n\n⚠️ `overdueMs` is time past the park's OWN due time, and on a `queued` row that spans park-due → promotion → now — the SUM of promotion lag and dispatch wait, not the dispatch wait. Read `queuedForMs` (from `queuedAt`, stamped at promotion) for how long dispatch has actually failed to claim it, and the difference between the two for how slow the promotion sweep was. Reporting `overdueMs` as dispatch wait blames the dispatcher for a wedged sweep — a 28 h sweep stall that promotes a due park 10 min ago shows `overdueMs ≈ 29 h` against a real dispatch wait of 10 min. `queuedForMs` is null on rows promoted before that column existed, meaning unmeasurable, NOT zero.\n\n⚠️ Counts come in two units and they are different numbers. `parkedRunCount` / `overdueRunCount` count RUNS and `agents[]` is one entry per run, so a seat holding several parks appears several times — that is the normal case, and it is exactly what the seat behind PEN-3607 looked like. `parkedAgentCount` / `overdueAgentCount` are the SEAT counts; use those to answer \"how many agents are down\". (Older `parkedCount` / `overdueCount` are gone rather than redefined, so a stale reader breaks instead of silently over-counting seats.) When `truncated` is true, `limit` bounded rows, so both agent counts are lower bounds.\n\n⛔ `overdueAgentCount: 0` is not by itself a clean bill of health for the fleet: it counts only rows this endpoint selected. An agent that is dark for some reason other than a park (a dispatch gate, a wedged start lock) still does not appear here at all. Check the seat's own run rows before concluding it is fine.",
       z.object({ companyId: companyIdOptional, reason: z.string().min(1).max(64).optional(), limit: z.number().int().min(1).max(1000).optional() }),
       async ({ companyId, reason, limit }) => {
         const resolved = await client.resolveCompany({ override: companyId });
@@ -705,7 +705,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipAskUserQuestions",
-      "Create an ask_user_questions interaction on an issue",
+      "Create an ask_user_questions interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response.",
       createAskUserQuestionsToolSchema,
       async ({ issueId, ...body }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/interactions`, {
@@ -717,7 +717,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipRequestConfirmation",
-      "Create a request_confirmation interaction on an issue",
+      "Create a request_confirmation interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response.",
       createRequestConfirmationToolSchema,
       async ({ issueId, ...body }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/interactions`, {
@@ -729,7 +729,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipRequestCheckboxConfirmation",
-      "Create a request_checkbox_confirmation interaction on an issue",
+      "Create a request_checkbox_confirmation interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response.",
       createRequestCheckboxConfirmationToolSchema,
       async ({ issueId, ...body }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/interactions`, {

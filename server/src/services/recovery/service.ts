@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
+import type { SQL } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -8,6 +9,7 @@ import {
   getAgentWorkEligibility,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueRecoveryActionKind,
   type IssueStatus,
 } from "@paperclipai/shared";
 import {
@@ -128,6 +130,7 @@ import {
   withStrandedRecoveryWakeWorkClass,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { createPassTimer, type PassTimer } from "./pass-timing.js";
 import {
   resolveStrandedEscalationStatus,
   shouldReuseStrandedRecoveryAction,
@@ -2962,8 +2965,73 @@ export function recoveryService(
    * postgres.js cannot serialize a Date interpolated into a raw `sql` fragment and throws
    * ERR_INVALID_ARG_TYPE at bind time. Same hazard as `hasPositiveRunEvidence` and the
    * work-product upsert, both of which were bitten by it.
+   *
+   * `issueIdentifierSql` is the OWNER-NARROWING clause and is not optional (BLO-38061).
+   * It is a parameter rather than a filter applied by one caller precisely so that adding
+   * a third consumer cannot silently reintroduce the assignee-agnostic read: the type
+   * checker makes supplying it unavoidable. Callers pass a bound value where the issue is
+   * already in hand, or the `issues.identifier` column where the pass classifies many rows
+   * at once.
+   *
+   * Why it must exist at all. Until BLO-38061 this predicate treated ANY open PR row on
+   * an issue as proof a wake would arrive, on the premise recorded (and now falsified) in
+   * `hasPendingBoardApprovalWakePath`'s docblock below:
+   *
+   *     "`hasOpenPullRequestWakePath` can be assignee-agnostic: whoever holds the row is
+   *      by construction the actor the webhook will wake."
+   *
+   * A PR work product is written for EVERY issue the PR references, deliberately — the row
+   * is evidence about the PR, not a wake. The wake is owner-narrowed:
+   * `routes/github-webhook.ts` resolves `owning = context.owningIdentifiers ?? []`, drops
+   * the author wake entirely with `suppressionReason: "no_owning_reference"` when that set
+   * is empty, and otherwise keeps only `matched.filter((m) => owning.includes(m.identifier))`.
+   * So a row whose PR merely MENTIONS it was exempted from seizure while no webhook would
+   * ever wake it — a silent strand, the same failure direction BLO-32679 produced from the
+   * opposite side.
+   *
+   * Measured on company `aaced805` 2026-09-29, one agent's lane, work products read per
+   * issue from `GET /api/issues/{id}/work-products` with the predicate applied exactly as
+   * written here. As filed (494 inbox rows): 116 satisfied every other clause, 82 (71%)
+   * genuinely owned, 34 (29%) not. Re-measured the same day over all 637 rows in the
+   * sweep's candidate statuses plus `blocked`, 637/637 read with no fetch failures: 125
+   * eligible, 81 still exempt, **44 lose the exemption**. Of those 44, 13 are `blocked` —
+   * not in `STRANDED_ASSIGNED_ISSUE_STATUSES`, so they are not sweep candidates and cannot
+   * be seized — and 3 of the rest carry a live run, future monitor, or scheduled retry.
+   * The seizure delta on that lane is therefore **28** (26 `todo`, 2 `in_review`), and it
+   * is an UPPER BOUND: the sweep's remaining gates (run status, recent visible progress,
+   * blockers) are evaluated afterwards and only ever subtract.
+   *
+   * ⚠️ Read that 28 honestly rather than as 28 rescued strands. 26 of them are `todo`,
+   * and a `todo` row with an assignee is still returned by `paperclipInboxLite`, so it is
+   * reachable by its owner's next heartbeat — it was never dark in the way an
+   * `in_progress` row with no run is. The defect this fixes is that the predicate asserted
+   * something false, and the honest benefit is concentrated in the `in_progress` and
+   * `in_review` rows, not in the `todo` bulk.
+   *
+   * THE NULL ARM IS LOAD-BEARING AND DEFAULTS TO EXEMPT. `owningIdentifiers` is absent on
+   * rows written before the field existed, and absence is evidence of nothing; seizing on
+   * it is the same reasoning-from-absence error BLO-32679 was filed about. An empty ARRAY
+   * is the opposite — authoritative, the PR named no owner in its branch, title, or
+   * labeled body — and does not exempt. `jsonb_typeof` is what keeps those two apart;
+   * `coalesce(..., 'null')` is required because the operator yields SQL NULL for an absent
+   * key, which would otherwise make the whole disjunct NULL rather than true.
+   *
+   * A NULL `issues.identifier` also exempts, for the same reason: with no identifier there
+   * is nothing to test membership against, so non-ownership is unproven. Note this is the
+   * OPPOSITE default to `pullRequestOwnsIssue` in productivity-review.ts, which returns
+   * false for a null identifier — deliberately, because there withholding the answer
+   * withholds a progress signal, and here withholding it takes an issue from its owner.
+   *
+   * ⚠️ `::text` on the null test is REQUIRED, not stylistic. A bare `$n is null` gives the
+   * planner no type context and postgres rejects the whole statement with
+   * `could not determine data type of parameter $n` — the same family as the
+   * `freshSinceIso` cast above. It fails in the worst possible way here: the sweep catches
+   * per-candidate errors into `reconcileErrors`, so a throwing predicate yields
+   * `escalated: 0`, which is indistinguishable from a deliberate exemption. Measured while
+   * writing this: every candidate threw and two exemption tests passed regardless. The
+   * fixture asserts `reconcileErrors === 0` for that reason.
    */
-  function openPullRequestWakePathConditions(freshSinceIso: string) {
+  function openPullRequestWakePathConditions(freshSinceIso: string, issueIdentifierSql: SQL) {
     return [
       eq(issueWorkProducts.provider, "github"),
       eq(issueWorkProducts.type, "pull_request"),
@@ -2972,6 +3040,11 @@ export function recoveryService(
       sql`${issueWorkProducts.sourceTrust}->>'promotedByActorType' = 'system'`,
       sql`${issueWorkProducts.sourceTrust}->>'promotedByActorId' = ${PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID}`,
       sql`${issueWorkProducts.updatedAt} > ${freshSinceIso}::timestamptz`,
+      sql`(
+        ${issueIdentifierSql}::text is null
+        or coalesce(jsonb_typeof(${issueWorkProducts.metadata}->'owningIdentifiers'), 'null') <> 'array'
+        or ${issueWorkProducts.metadata}->'owningIdentifiers' @> to_jsonb(${issueIdentifierSql}::text)
+      )`,
     ];
   }
 
@@ -2987,7 +3060,7 @@ export function recoveryService(
         and(
           eq(issueWorkProducts.companyId, issue.companyId),
           eq(issueWorkProducts.issueId, issue.id),
-          ...openPullRequestWakePathConditions(freshSinceIso),
+          ...openPullRequestWakePathConditions(freshSinceIso, sql`${issue.identifier}`),
         ),
       )
       .limit(1)
@@ -3013,9 +3086,14 @@ export function recoveryService(
    * ⚠️ The clause that makes this NOT a copy of the PR predicate, and the reason it must
    * not be written as one. The two wakes have different targets:
    *
-   *   - `github-webhook.ts` wakes `effectiveAssigneeAgentId` — the ISSUE'S ASSIGNEE. So
-   *     `hasOpenPullRequestWakePath` can be assignee-agnostic: whoever holds the row is
-   *     by construction the actor the webhook will wake.
+   *   - `github-webhook.ts` wakes `effectiveAssigneeAgentId` — the ISSUE'S ASSIGNEE, but
+   *     only for the issues the PR OWNS. ⚠️ This bullet used to read "so
+   *     `hasOpenPullRequestWakePath` can be assignee-agnostic: whoever holds the row is by
+   *     construction the actor the webhook will wake." That premise was false and
+   *     BLO-38061 falsified it: the PR row exists on every issue the PR references, while
+   *     the author wake is filtered to `owning`. The distinction below still stands — the
+   *     two wakes do have different targets — but the PR side is now narrowed too, by
+   *     recorded owner rather than by assignee. See `openPullRequestWakePathConditions`.
    *   - `approval-resolution.ts` wakes `approval.requestedByAgentId` — the REQUESTER, who
    *     need not hold the row and frequently does not.
    *
@@ -5820,14 +5898,36 @@ export function recoveryService(
     throw lastError ?? new Error("ensureStrandedIssueRecoveryIssue: exhausted retries with no winner");
   }
 
+  // BLO-37677 AC3.2: a `Record` over the full cause union, not a ternary chain ending in a
+  // bare `stranded_assigned_issue` fallthrough. Four causes — `process_lost`,
+  // `provider_quota`, `codex_output_inactivity_monitor`,
+  // `execution_review_participant_recovery` — reach that literal today, and did so by
+  // omission rather than by decision, so a guard that enumerates `IssueRecoveryActionKind`
+  // could never fire on any of them: adding a *cause* changed no *kind*. Adding a cause is
+  // now a compile error here instead. Their mapping is deliberately unchanged — this makes
+  // the collapse explicit, it does not re-kind anything.
+  // `Exclude<…, "pr_review_non_convergence">` rather than the bare kind union: the old `as const`
+  // ternary returned a 4-literal type, and widening it to all seven would have let the stranded
+  // path start minting the one kind this file makes semantically special. It provably never does —
+  // the only `kind: "pr_review_non_convergence"` literal in the repo is `escalateStalledSelfReviewPr`
+  // — so the invariant is encoded here instead of asserted. (This does NOT address the BLO-37934
+  // clobber, which overwrites *to* `stranded_assigned_issue` on an existing row.)
+  const STRANDED_RECOVERY_ACTION_KIND_BY_CAUSE: Record<
+    StrandedRecoveryCause,
+    Exclude<IssueRecoveryActionKind, "pr_review_non_convergence">
+  > = {
+    [SUCCESSFUL_RUN_MISSING_STATE_REASON]: "missing_disposition",
+    workspace_validation_failed: "workspace_validation",
+    configuration_incomplete: "configuration_validation",
+    stranded_assigned_issue: "stranded_assigned_issue",
+    process_lost: "stranded_assigned_issue",
+    provider_quota: "stranded_assigned_issue",
+    codex_output_inactivity_monitor: "stranded_assigned_issue",
+    execution_review_participant_recovery: "stranded_assigned_issue",
+  };
+
   function strandedRecoveryActionKind(cause: StrandedRecoveryCause) {
-    return cause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-      ? "missing_disposition" as const
-      : cause === "workspace_validation_failed"
-        ? "workspace_validation" as const
-      : cause === "configuration_incomplete"
-        ? "configuration_validation" as const
-      : "stranded_assigned_issue" as const;
+    return STRANDED_RECOVERY_ACTION_KIND_BY_CAUSE[cause];
   }
 
   function strandedRecoveryActionFingerprint(input: {
@@ -7404,25 +7504,85 @@ export function recoveryService(
   }
 
   // BLO-27463: incremented by the dependency-wait gate inside
-  // `escalateStrandedAssignedIssue`, which has 20 call sites and no `result` in scope.
-  // `reconcileStrandedAssignedIssues` snapshots and diffs it rather than threading an
-  // out-param through every caller. Diagnostic only: two overlapping sweeps would split
+  // `escalateStrandedAssignedIssue`, which has 22 direct call sites and no `result` in
+  // scope. `reconcileStrandedAssignedIssues` snapshots and diffs it rather than threading
+  // an out-param through every caller. Diagnostic only: two overlapping sweeps would split
   // the delta between them, which does not affect any control-flow decision.
   //
-  // Invariant the snapshot/diff accounting depends on: every
+  // ⚠ This accounting was documented as resting on an invariant — "every
   // `escalateStrandedAssignedIssue` call site is lexically inside
-  // `reconcileStrandedAssignedIssues`. If a caller is ever added outside that sweep, its
-  // increments land in whichever sweep happens to be open and the delta silently
-  // misattributes — thread an explicit counter at that point instead of widening this one.
+  // `reconcileStrandedAssignedIssues`" — that does NOT hold, and has not held since before
+  // PEN-3636. The direct-call grep covers only internal calls; the function is also
+  // re-exported on the object `recoveryService()` returns, and
+  //   grep -rn '\.escalateStrandedAssignedIssue(' server/src --include='*.ts' \
+  //     | grep -v 'recovery/service.ts' | grep -v '__tests__'
+  // returns TWO production callers in `services/heartbeat.ts` (:13274, :34750). Their
+  // increments land in whichever sweep happens to be open, so this delta is indicative
+  // rather than exact — the same exposure, entering at the same two sites, that the
+  // PEN-3636 comment below documents for `activePassTimer`. If these counters ever need
+  // to be exact, thread an explicit counter through those callers rather than widening
+  // this one.
   let dependencyWaitEscalationSuppressedTotal = 0;
   // BLO-32668: the two sub-tallies that replace the removed per-issue INFO line. Same
-  // snapshot/diff accounting and the same invariant as the total above.
+  // snapshot/diff accounting, and the same indicative-not-exact caveat, as the total above.
   // `DependencyReady` is the defect shape BLO-27463 cares about (reported
   // `issue_dependencies_blocked` with its blockers already resolved); `Unclassified`
   // is a suppression whose caller had no pre-lock readiness in hand, kept separate so
   // an absent classification can never be read as a resolved-blocker defect.
   let dependencyWaitEscalationSuppressedDependencyReadyTotal = 0;
   let dependencyWaitEscalationSuppressedUnclassifiedTotal = 0;
+  // PEN-3636: phase accounting for the open sweep, or `null` when no sweep is running.
+  //
+  // Threaded the same way, and for the same reason, as the three counters above:
+  // `escalateStrandedAssignedIssue` has no `result` in scope and many call sites.
+  //
+  // ⚠ It is NOT true that every call site is inside the sweep, and an earlier revision
+  // of this comment claimed it was. The direct-call grep
+  //   grep -n 'await escalateStrandedAssignedIssue({' server/src/services/recovery/service.ts
+  // only covers internal calls; this function is also re-exported on the object
+  // `recoveryService()` returns, so an external consumer calls it as a member and matches
+  // no direct-call grep at all. That half:
+  //   grep -rn '\.escalateStrandedAssignedIssue(' server/src --include='*.ts' | grep -v 'recovery/service.ts'
+  // returns 63 calls in `__tests__/issue-recovery-actions.test.ts` and, crucially, TWO
+  // production calls in `services/heartbeat.ts` (plan-approval resume failure; blocked
+  // PR-review-gate promotion). Both are event-driven and run in this same process, so
+  // they CAN interleave with a sweep.
+  //
+  // What that costs, stated rather than hidden. Control flow: nothing. Every read below
+  // is guarded on `activePassTimer` being non-null, so a caller outside a sweep takes the
+  // untimed arm rather than crashing — and the 63 test calls are that arm's regression
+  // coverage. Accuracy: an interleaved heartbeat escalation adds its own lock waits to the
+  // pass's `escalate.*` totals. That is a diagnostic inaccuracy only, and a small one —
+  // both call sites are event-driven (one per failed plan-approval resume, one per blocked
+  // PR-review-gate promotion), against a sweep that runs the escalate path ~1000 times per
+  // pass.
+  //
+  // ⚠ That last sentence is a DILUTION argument, so it covers `totalMs` (and the mean)
+  // and does NOT cover `maxMs` or `calls`. `record()` in `pass-timing.ts` keeps any
+  // larger sample (`if (ms > prev.maxMs)`) and increments `calls` unconditionally, so
+  // the 1000:1 ratio damps neither: ONE interleaved escalation that waits long on
+  // `paperclip:issue-parent:<companyId>` writes its full wait straight into
+  // `escalate.lockCompanyIssueGraph.maxMs`. That is the field `PhaseStat` documents as
+  // "a phase whose max approaches its total is one slow call, not a slow phase" — i.e.
+  // the discriminator for whether to go hunting a pathological lock holder — so the
+  // failure mode is a phantom outlier in the exact signal this instrumentation exists
+  // to produce, and `calls` is skewed the same way rather than being available to
+  // sanity-check it. An operator reading a suspicious `escalate.*` max should rule out
+  // a concurrent heartbeat escalation before believing it.
+  //
+  // Exposure is exactly the three phases below that read this module-scoped timer
+  // (`escalate.lockIssueOwnership`, `escalate.lockCompanyIssueGraph`,
+  // `escalate.selectIssueForUpdate`). The `prologue.*`, `candidateQuery` and
+  // `orphanBlockerSweep` phases take `passTimer` as a parameter and cannot be reached
+  // this way at all.
+  //
+  // If the `escalate.*` numbers ever need to be exact rather than indicative, those two
+  // heartbeat sites are where the contamination enters; the structural fix is to thread
+  // the timer through this function's existing `input` object so the CALLER selects the
+  // timed arm, which costs 22 call-site edits (the in-sweep direct calls, counted with
+  // the first grep above) and is not worth it for a diagnostic-accuracy gain until the
+  // totals stop being merely indicative.
+  let activePassTimer: PassTimer | null = null;
 
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
@@ -7480,7 +7640,21 @@ export function recoveryService(
     // commit/return, waiting peers wake up and record their next attempt
     // against the same active source-scoped action.
     const escalation = await db.transaction(async (tx) => {
-      await lockIssueOwnership(tx, input.issue.companyId, input.issue.id);
+      // PEN-3636: the three awaits below are timed separately, not as one
+      // "transaction" bucket. Separating them is the entire diagnostic value —
+      // the leading hypothesis was contention on the PER-ISSUE lock, but this
+      // path also takes a COMPANY-WIDE one (`paperclip:issue-parent:<companyId>`,
+      // contended by every issue-graph writer in the company) and then a row
+      // lock. Those three wait on different things, so a combined total cannot
+      // say which. `pgAdvisoryXactLock` measures wait, not work: both helpers
+      // issue one `pg_advisory_xact_lock(...)` and return, so their latency is
+      // queue time plus one round trip.
+      await (activePassTimer
+        ? activePassTimer.time(
+          "escalate.lockIssueOwnership",
+          () => lockIssueOwnership(tx, input.issue.companyId, input.issue.id),
+        )
+        : lockIssueOwnership(tx, input.issue.companyId, input.issue.id));
 
       // Re-read source issue under the lock so the recovery action records
       // the latest owner/status evidence and repeated sweeps reuse the same
@@ -7496,13 +7670,20 @@ export function recoveryService(
       // company graph lock, then the issue row. Taking the row first here and
       // the graph lock inside `update` would invert against a concurrent
       // blocker/parent mutation (which takes the graph lock before its row).
-      await lockIssueParentMutationCompany(input.issue.companyId, tx);
+      await (activePassTimer
+        ? activePassTimer.time(
+          "escalate.lockCompanyIssueGraph",
+          () => lockIssueParentMutationCompany(input.issue.companyId, tx),
+        )
+        : lockIssueParentMutationCompany(input.issue.companyId, tx));
       const freshQuery = tx
         .select()
         .from(issues)
         .where(eq(issues.id, input.issue.id))
         .limit(1);
-      const [fresh] = await freshQuery.for("update");
+      const [fresh] = await (activePassTimer
+        ? activePassTimer.time("escalate.selectIssueForUpdate", () => freshQuery.for("update"))
+        : freshQuery.for("update"));
       if (!fresh) return null;
       // BLO-18643: mirror the park paths' own re-check (parkReviewWaitingContinuationIssue /
       // parkNoDependencyReviewWaitingIssue both bail if `fresh.status` has moved past the
@@ -7565,7 +7746,7 @@ export function recoveryService(
       // stamp, and escalates then — the cost of losing the race is one status-only wake
       // out of the attempt budget, not a permanent status-only trap.
       // On the caller tx: this runs while `lockIssueOwnership` is held, so a pooled
-      // read would take a second connection out of POSTGRES_POOL_MAX=10 while holding
+      // read would take a second connection out of POSTGRES_POOL_MAX while holding
       // the lock (BLO-34207). Freshness is unchanged — these transactions run at
       // READ COMMITTED, where each statement takes its own snapshot at statement
       // start, so the tx read observes exactly the committed rows a pooled read would.
@@ -8539,12 +8720,109 @@ export function recoveryService(
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    // PEN-3636: published on the pass's own log line below, then cleared in the
+    // `finally` so nothing outside a sweep is ever timed into it. Assigned rather
+    // than pushed/popped because this sweep is single-flight — `index.ts` will not
+    // start a chain while one is in flight — so there is never a second pass to
+    // nest. If that gate is ever removed, the CLEAR below is the sharper problem
+    // rather than the assignment: whichever pass finishes FIRST sets
+    // `activePassTimer = null`, so a still-running pass silently loses all its
+    // `escalate.*` timing from that moment on, while the pass that already emitted
+    // carries the other's spans. Both are diagnostic inaccuracy only, but read this
+    // before concluding the gate is safe to remove.
+    //
+    // Split into an inner function purely so the `finally` cannot be skipped: the
+    // sweep body has many early paths, and a bare try/finally wrapped around all of
+    // it would have to be re-indented wholesale.
+    const passTimer = createPassTimer();
+    activePassTimer = passTimer;
+    // Filled by the inner function once the candidate query resolves. `null` means
+    // the pass died before it had a population — which is itself the reading, and
+    // is why this is not defaulted to 0: a pass that threw in `candidateQuery` and
+    // a pass that genuinely found no candidates are different failures.
+    const scanned: { candidates: number | null } = { candidates: null };
+    let completed = false;
+    try {
+      const swept = await runStrandedAssignedIssueSweep(opts, passTimer, scanned);
+      completed = true;
+      return swept;
+    } finally {
+      activePassTimer = null;
+      // PEN-3636: one line per pass, unconditional, emitted HERE in the `finally`
+      // rather than at the tail of the inner function.
+      //
+      // In the `finally` because a pass that THROWS is the one most worth
+      // diagnosing, and emitting from the tail would discard its entire
+      // accumulated timing. The sweep's per-issue error boundary does not cover
+      // this: `candidateQuery`, the `orphanBlockerSweep` and the whole post-loop
+      // tail sit outside it, and the sweep body has no top-level try/catch. So a
+      // pool timeout or a dropped connection part-way through a pass already
+      // measured at up to 86 minutes unwinds straight through here. This is
+      // `pass-timing.ts`'s own argument for recording a throwing PHASE in a
+      // `finally`, applied one level up to the pass.
+      //
+      // Unconditional on purpose, unlike the funnel line in the sweep. That one is
+      // gated on a non-empty suppressed population so a quiet sweep stays quiet;
+      // this one is the record of where a pass's wall clock went, and a FAST pass
+      // is exactly the observation the slow ones have to be compared against.
+      // Gating it would leave only slow passes in the log and make the comparison
+      // impossible.
+      //
+      // Reading it: `phases` is ordered most-expensive-first, and they are NESTED
+      // spans rather than a partition — see `PassTimingSummary.phases`.
+      // `candidates.p99Ms` next to `candidates.p50Ms` is the first thing to check:
+      // production pass duration varied 15.7x on a workload that varied 9%, so the
+      // open question is whether every candidate is uniformly slower or a thin tail
+      // dominates, and those two numbers separate those cases. `slowest` then names
+      // the tail's issue ids. Check `completed` before comparing across passes.
+      //
+      // `completed` is the boolean; `candidatesScanned - candidates.count` is the
+      // sharper form of the same signal. Every candidate enters a `candidate()`
+      // span unconditionally and that span pushes its duration from a `finally`,
+      // so a candidate that THROWS is still counted — on a pass that ran the loop
+      // to the end the two are necessarily EQUAL. A non-zero difference is
+      // therefore an exact count of candidates the pass never reached, not an
+      // accounting discrepancy to go chasing. Note the one case where they differ
+      // without truncation: `candidatesScanned` is `null` when the pass died in
+      // `candidateQuery`, before it had a population at all.
+      //
+      // Wrapped in its own try/catch because a `finally` that throws during unwind
+      // REPLACES the pass's real error. Diagnostics must never mask the fault they
+      // exist to explain. The catch is deliberately BARE: the summary is plain numbers
+      // and strings, so the realistic failure here is a transport/write error, which
+      // would affect a `logger.warn` in this catch identically — and that second throw
+      // would unwind out of the `finally` and mask the pass's error, which is the exact
+      // thing this guard exists to prevent. Swallowing is the only branch that actually
+      // delivers the stated guarantee.
+      try {
+        logger.info(
+          {
+            ...passTimer.summary(),
+            candidatesScanned: scanned.candidates,
+            // Distinguishes a complete pass from a truncated one. Without it a
+            // partial total reads exactly like a whole one, and every phase total
+            // beside it would be silently understated.
+            completed,
+          },
+          "stranded assigned issue sweep phase timing",
+        );
+      } catch {
+        // Intentionally empty — see above.
+      }
+    }
+  }
+
+  async function runStrandedAssignedIssueSweep(
+    opts: { issueCreatedAtGte?: Date | null } | undefined,
+    passTimer: PassTimer,
+    scanned: { candidates: number | null },
+  ) {
     const dependencyWaitEscalationSuppressedAtSweepStart = dependencyWaitEscalationSuppressedTotal;
     const dependencyWaitEscalationSuppressedDependencyReadyAtSweepStart =
       dependencyWaitEscalationSuppressedDependencyReadyTotal;
     const dependencyWaitEscalationSuppressedUnclassifiedAtSweepStart =
       dependencyWaitEscalationSuppressedUnclassifiedTotal;
-    const candidates = await db
+    const candidates = await passTimer.time("candidateQuery", () => db
       .select()
       .from(issues)
       .where(
@@ -8564,7 +8842,11 @@ export function recoveryService(
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       )
-      .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id));
+      .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id)));
+    // PEN-3636: published to the wrapper immediately, so a pass that throws later
+    // still reports the population it was working against. Read only by the
+    // wrapper's `finally`; nothing branches on it.
+    scanned.candidates = candidates.length;
 
     const result = {
       assignmentDispatched: 0,
@@ -8662,26 +8944,35 @@ export function recoveryService(
         return;
       }
 
-      if (await hasActiveExecutionPath(
+      if (await passTimer.time("prologue.hasActiveExecutionPath", () => hasActiveExecutionPath(
         issue.companyId,
         issue.id,
         issue.status === "in_review" ? agentId : null,
+      ))) {
+        result.skipped += 1;
+        return;
+      }
+
+      if (await passTimer.time(
+        "prologue.hasPendingWakeInteraction",
+        () => hasPendingWakeInteraction(issue.companyId, issue.id),
       )) {
         result.skipped += 1;
         return;
       }
 
-      if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+      if (await passTimer.time(
+        "prologue.pauseHoldGuard",
+        () => isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc),
+      )) {
         result.skipped += 1;
         return;
       }
 
-      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
-        result.skipped += 1;
-        return;
-      }
-
-      const newestIssueRun = await getLatestIssueRun(issue.companyId, issue.id);
+      const newestIssueRun = await passTimer.time(
+        "prologue.getLatestIssueRun",
+        () => getLatestIssueRun(issue.companyId, issue.id),
+      );
       // Memoised per candidate: the dependency-blocked arm below and the
       // review-participant block can both need readiness for the same issue on
       // the fall-through path this sweep now has (BLO-29604).
@@ -8745,14 +9036,23 @@ export function recoveryService(
       // Non-null only on the handover path; every recovery mutation below CASes
       // against it so a lost race takes no side effect.
       const adoptionHandoverLockGuard = adoptionHandover?.lockOwnerState ?? null;
-      const agent = await getAgent(agentId);
+      const agent = await passTimer.time("prologue.getAgent", () => getAgent(agentId));
+      // Timed apart from `getAgent` on purpose: this one is not a primary-key read.
+      // `evaluateAgentInvokabilityFromDb` selects EVERY agent row in the company to
+      // evaluate the org chain, and its result depends only on `agent.companyId` —
+      // which is constant across a company's whole candidate block, since candidates
+      // are ordered by `companyId`. If this phase is a large share of the pass, the
+      // fix is a per-pass memo, not an index.
       const agentInvokable = agent && agent.companyId === issue.companyId
-        ? await isAgentInvokable(agent)
+        ? await passTimer.time("prologue.isAgentInvokable", () => isAgentInvokable(agent))
         : false;
       const dependencyBlockedStrand = latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE &&
         (issue.status === "in_review" || !agentInvokable);
       if (dependencyBlockedStrand) {
-        dependencyReadiness ??= await issuesSvc.getDependencyReadiness(issue.id);
+        dependencyReadiness ??= await passTimer.time(
+          "prologue.getDependencyReadiness",
+          () => issuesSvc.getDependencyReadiness(issue.id),
+        );
       }
       // BLO-29604: this arm's contract is "keep the owner and let the dependency
       // machinery do the routing", and BOTH of its outputs need a blocker row to
@@ -10121,7 +10421,7 @@ export function recoveryService(
 
     for (const issue of candidates) {
       try {
-        await reconcileStrandedCandidate(issue);
+        await passTimer.candidate(issue.id, () => reconcileStrandedCandidate(issue));
       } catch (err) {
         // BLO-28931: per-issue error boundary. Without it, any throw from the body
         // propagated out of the whole sweep -- and because candidates are ordered
@@ -10150,7 +10450,16 @@ export function recoveryService(
       }
     }
 
-    const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
+    // PEN-3636: timed as its own phase because it is a SECOND sequential
+    // per-candidate loop inside this same function, and its population is not
+    // reported anywhere — `candidatesScanned` on the funnel line below counts only
+    // the main loop, while `result.skipped` is shared between the two. So until this
+    // phase had a number, an unknown share of pass 1 was unattributable by
+    // construction.
+    const orphanBlockerRecovery = await passTimer.time(
+      "orphanBlockerSweep",
+      () => reconcileUnassignedBlockingIssues(),
+    );
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
@@ -10190,6 +10499,10 @@ export function recoveryService(
         "skipped stranded escalation for dependency-wait terminal runs",
       );
     }
+
+    // PEN-3636: the phase-timing line is NOT emitted here. It is emitted from the
+    // `finally` in `reconcileStrandedAssignedIssues`, which also covers the passes
+    // that throw before reaching this point — see the note at that emit site.
 
     return result;
   }
@@ -10393,6 +10706,12 @@ export function recoveryService(
       // the same pre-indexed `{companyId, issueId, status}` shape as every other waiting
       // path. Bounded by the grace window, so this is not a scan of every PR ever
       // recorded.
+      //
+      // BLO-38061 added the join. The owner-narrowing clause tests the PR's recorded
+      // owners against `issues.identifier`, which this pass does not otherwise carry, and
+      // the alternative — narrowing only the stranded-assigned sweep — is exactly the
+      // divergence PEN-3198 extracted this function to make unrepresentable. The join is
+      // on a primary key with an FK behind it, so it neither fans rows out nor drops any.
       db
         .select({
           companyId: issueWorkProducts.companyId,
@@ -10400,7 +10719,13 @@ export function recoveryService(
           status: issueWorkProducts.status,
         })
         .from(issueWorkProducts)
-        .where(and(...openPullRequestWakePathConditions(openPullRequestFreshSinceIso))),
+        .innerJoin(issues, eq(issues.id, issueWorkProducts.issueId))
+        .where(and(
+          ...openPullRequestWakePathConditions(
+            openPullRequestFreshSinceIso,
+            sql`${issues.identifier}`,
+          ),
+        )),
     ]);
 
     // Waiting paths contributed by OPEN liveness escalations, kept separate from every
@@ -12494,6 +12819,24 @@ export function recoveryService(
    * the source issue's status, and — like the wake backstop beside it — stays enabled when
    * automatic liveness escalation is off, because it re-routes an already-committed action
    * rather than creating recovery work.
+   *
+   * BLO-19124: the retirement is unconditional and stays that way. What was wrong is what the
+   * `attemptCount === 0` notice ASSERTS while doing it — "the stranding was never worked, and
+   * that is a scheduler-side fault". `attemptCount` counts wakes this action delivered, so 0
+   * proves only that THIS action never woke anyone; it says nothing about whether the issue
+   * was serviced by some other path (a comment wake, a manual dispatch, an operator). The
+   * worked example is BLO-19124 itself: action opened 16:35Z at `attemptCount: 0`, owner runs
+   * commented at 19:44Z and 22:01Z, horizon 22:35Z, escalated 22:55Z with that sentence
+   * attached to an issue that had demonstrably been worked twice inside the window.
+   *
+   * So the fix is to stop publishing the false half, not to stop retiring the row. An earlier
+   * revision of this change discharged the action instead (`status: "resolved"`); that is
+   * withdrawn, because `resolved` is outside `ACTIVE_RECOVERY_ACTION_STATUSES` and so frees
+   * `issue_recovery_actions_active_source_uq` — `upsertSourceScoped` then INSERTs a fresh row
+   * at `attemptCount: 0` with a fresh horizon instead of reusing this one, which is the
+   * unbounded re-fire loop BLO-18996 closed. Escalating holds the slot, so the budget cannot
+   * reset. Leaving the row `active` is not an option either: that is the BLO-24662 limbo this
+   * pass exists to end.
    */
   async function reconcileExpiredRecoveryWakeHorizons(opts?: {
     runId?: string | null;
@@ -12505,6 +12848,8 @@ export function recoveryService(
       checked: 0,
       escalated: 0,
       neverDelivered: 0,
+      /** Of `neverDelivered`, those whose source issue was serviced anyway (BLO-19124). */
+      neverDeliveredButWorked: 0,
       announced: 0,
       actionIds: [] as string[],
       issueIds: [] as string[],
@@ -12524,56 +12869,88 @@ export function recoveryService(
       result.actionIds.push(action.id);
       result.issueIds.push(action.sourceIssueId);
 
-      // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
-      // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
-      // freezes at the delivered count. It also restarts on owner change (`isNewOwnerSequence`
-      // in `upsertSourceScopedUnlocked`), so 0 means no wake was delivered to the CURRENT
-      // owner since it took over — not necessarily across the row's whole life. Within that
-      // scope it is a wake-channel fault rather than an owner who was woken and did not
-      // converge; those are different incidents with different responders and they render
-      // identically without this split. Not gated on `previousOwnerAgentId`: the stranded
-      // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
-      // call above), so it is non-null on the un-churned rows this label exists to catch.
-      const neverDelivered = action.attemptCount === 0;
-      if (neverDelivered) result.neverDelivered += 1;
-      recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
-
-      logger.warn(
-        {
-          actionId: action.id,
-          companyId: action.companyId,
-          sourceIssueId: action.sourceIssueId,
-          cause: action.cause,
-          ownerAgentId: action.ownerAgentId,
-          attemptCount: action.attemptCount,
-          maxAttempts: action.maxAttempts,
-          neverDelivered,
-          timeoutAt: action.timeoutAt,
-          runId: opts?.runId ?? null,
-        },
-        "recovery action passed its wake horizon and was escalated out of active",
-      );
-
-      // Same marker text and the same exact-match dedup as the notice in
-      // `escalateStrandedAssignedIssue`, so whichever path gets there first wins and the
-      // other stays quiet — the operator sees one horizon notice per action, not two.
-      const horizonAt = action.timeoutAt instanceof Date
-        ? action.timeoutAt.toISOString()
-        : String(action.timeoutAt);
-      const marker = `Recovery wake horizon reached for action \`${action.id}\` (horizon \`${horizonAt}\`)`;
-      const alreadyAnnounced = await db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(and(
-          eq(issueComments.issueId, action.sourceIssueId),
-          eq(issueComments.authorType, "system"),
-          sql`${issueComments.body} LIKE ${`%${escapeLikePattern(marker)}%`} ESCAPE '\\'`,
-        ))
-        .limit(1)
-        .then((rows) => rows.length > 0);
-      if (alreadyAnnounced) continue;
-
+      // BLO-19124: the WHOLE per-row body is inside this try, not just the comment write.
+      // `escalateExpiredWakeHorizons` flipped the entire batch to `escalated` in one UPDATE
+      // above and only ever selects `status = "active"` rows, so a row this loop drops is
+      // never re-selected and its notice is lost for good. Both reads below hit the database
+      // — a connection blip or a statement timeout on either used to abort the sweep and
+      // silently strand every remaining row in the batch (default limit 200), which is the
+      // BLO-24662 shape this pass exists to end. The status transition is the load-bearing
+      // half and is already committed; nothing here may roll it back or abort the rest.
       try {
+        // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
+        // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
+        // freezes at the delivered count. It also restarts on owner change (`isNewOwnerSequence`
+        // in `upsertSourceScopedUnlocked`), so 0 means no wake was delivered to the CURRENT
+        // owner since it took over — not necessarily across the row's whole life. Within that
+        // scope it is a wake-channel fault rather than an owner who was woken and did not
+        // converge; those are different incidents with different responders and they render
+        // identically without this split. Not gated on `previousOwnerAgentId`: the stranded
+        // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
+        // call above), so it is non-null on the un-churned rows this label exists to catch.
+        const neverDelivered = action.attemptCount === 0;
+        if (neverDelivered) result.neverDelivered += 1;
+        recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
+
+        // BLO-19124: only asked on the `neverDelivered` branch, because that is the only notice
+        // arm that claims the stranding went unworked — the delivered arm makes no such claim,
+        // so buying this row would be a query per sweep for nothing.
+        //
+        // "Since the action opened" is deliberately an OVERLAP test, not a containment one:
+        // `hasSuccessfulIssueRunSince` matches `createdAt >= since OR finishedAt >= since`, so a
+        // run that started before this action and finished inside its window counts. That is the
+        // meaning the notice needs — such a run WAS working the issue during the horizon.
+        //
+        // `hasActiveExecutionPath`, the guard the sibling decision points in this subsystem use,
+        // is the wrong instrument here: it asks whether a run is in flight RIGHT NOW and would
+        // have missed all three BLO-19124 runs, every one of which had finished before the sweep
+        // read the row.
+        // `createdAt` is `string | Date` on the read model — the driver hands back a Date, but
+        // the type is widened, so normalise rather than relying on the runtime shape.
+        const neverDeliveredButWorked = neverDelivered
+          && await hasSuccessfulIssueRunSince(
+            action.companyId,
+            action.sourceIssueId,
+            new Date(action.createdAt),
+          );
+        if (neverDeliveredButWorked) result.neverDeliveredButWorked += 1;
+
+        logger.warn(
+          {
+            actionId: action.id,
+            companyId: action.companyId,
+            sourceIssueId: action.sourceIssueId,
+            cause: action.cause,
+            ownerAgentId: action.ownerAgentId,
+            attemptCount: action.attemptCount,
+            maxAttempts: action.maxAttempts,
+            neverDelivered,
+            neverDeliveredButWorked,
+            timeoutAt: action.timeoutAt,
+            runId: opts?.runId ?? null,
+          },
+          "recovery action passed its wake horizon and was escalated out of active",
+        );
+
+        // Same marker text and the same exact-match dedup as the notice in
+        // `escalateStrandedAssignedIssue`, so whichever path gets there first wins and the
+        // other stays quiet — the operator sees one horizon notice per action, not two.
+        const horizonAt = action.timeoutAt instanceof Date
+          ? action.timeoutAt.toISOString()
+          : String(action.timeoutAt);
+        const marker = `Recovery wake horizon reached for action \`${action.id}\` (horizon \`${horizonAt}\`)`;
+        const alreadyAnnounced = await db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(and(
+            eq(issueComments.issueId, action.sourceIssueId),
+            eq(issueComments.authorType, "system"),
+            sql`${issueComments.body} LIKE ${`%${escapeLikePattern(marker)}%`} ESCAPE '\\'`,
+          ))
+          .limit(1)
+          .then((rows) => rows.length > 0);
+        if (alreadyAnnounced) continue;
+
         await issuesSvc.addComment(
           action.sourceIssueId,
           [
@@ -12593,9 +12970,20 @@ export function recoveryService(
                 "every sweep since the current owner took over was refused by the wake channel " +
                 "(provider-capacity deferral, an active tree pause hold, wake disabled, or cooldown). An " +
                 "earlier owner may have been woken; check the action's owner history before concluding the " +
-                "whole window was refused. Within the current owner's tenure the stranding this action was " +
-                "opened to repair was never worked, and that is a scheduler-side fault rather than an owner " +
-                "who was woken and could not resolve it."
+                "whole window was refused. " +
+                (neverDeliveredButWorked
+                  // BLO-19124: the claim below is about THIS ACTION's wakes, never about the issue.
+                  // Saying "never worked" here was false on every row where the issue was serviced by
+                  // another path, and it is the whole reason an operator would open this notice.
+                  ? "The issue itself WAS worked inside this window even so — at least one run on it " +
+                    "succeeded after this action was opened — so this is a bookkeeping failure (the " +
+                    "action was never discharged) rather than an unworked stranding. Check whether the " +
+                    "work that happened actually resolved the stranding before treating this as an " +
+                    "incident."
+                  : "No run on the issue succeeded inside this window either, so within the current " +
+                    "owner's tenure the stranding this action was opened to repair was never worked, and " +
+                    "that is a scheduler-side fault rather than an owner who was woken and could not " +
+                    "resolve it.")
               : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
                 "the action, so a new owner does not get fresh attempts.",
             "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
@@ -12605,8 +12993,6 @@ export function recoveryService(
         );
         result.announced += 1;
       } catch (error) {
-        // The status transition is the load-bearing half and is already committed; a failed
-        // comment must not roll it back or abort the rest of the batch.
         logger.warn(
           { err: error, actionId: action.id, sourceIssueId: action.sourceIssueId },
           "failed to announce recovery wake horizon expiry on source issue",
@@ -13176,6 +13562,7 @@ export function recoveryService(
       exhaustedSkipped: 0,
       cooldownSkipped: 0,
       livePathSkipped: 0,
+      livePathQueuedWakeSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
       claimLost: 0,
@@ -13365,11 +13752,19 @@ export function recoveryService(
         result.cooldownSkipped += 1;
         continue;
       }
-      if (
-        await hasActiveExecutionPath(candidate.companyId, candidate.issueId, ownerAgentId) ||
-        await hasQueuedIssueWake(candidate.companyId, candidate.issueId, ownerAgentId)
-      ) {
+      // Split deliberately, and the order is load-bearing: this reproduces the exact
+      // short-circuit of the single `||` it replaces, so a candidate held by a live run
+      // still never evaluates the queued-wake probe. What changes is only that the two
+      // arms are now countable apart. One counter over a union could not say whether the
+      // queued-wake arm was doing any work at all, so BLO-19124 could not size a fix aimed
+      // at it -- if the active-run arm dominates, an age bound on `hasQueuedIssueWake`
+      // moves nothing and nobody could have told.
+      if (await hasActiveExecutionPath(candidate.companyId, candidate.issueId, ownerAgentId)) {
         result.livePathSkipped += 1;
+        continue;
+      }
+      if (await hasQueuedIssueWake(candidate.companyId, candidate.issueId, ownerAgentId)) {
+        result.livePathQueuedWakeSkipped += 1;
         continue;
       }
       if (await hasPendingWakeInteraction(candidate.companyId, candidate.issueId)) {
@@ -13555,6 +13950,7 @@ export function recoveryService(
           exhaustedSkipped: result.exhaustedSkipped,
           cooldownSkipped: result.cooldownSkipped,
           livePathSkipped: result.livePathSkipped,
+          livePathQueuedWakeSkipped: result.livePathQueuedWakeSkipped,
           interactionSkipped: result.interactionSkipped,
           pauseHoldSkipped: result.pauseHoldSkipped,
           claimLost: result.claimLost,
@@ -13570,7 +13966,9 @@ export function recoveryService(
     for (const [reason, count] of [
       ["no_owner", result.noOwnerSkipped], ["cause", result.causeSkipped],
       ["exhausted", result.exhaustedSkipped], ["cooldown", result.cooldownSkipped],
-      ["live_path", result.livePathSkipped], ["interaction", result.interactionSkipped],
+      ["live_path", result.livePathSkipped],
+      ["live_path_queued_wake", result.livePathQueuedWakeSkipped],
+      ["interaction", result.interactionSkipped],
       ["pause_hold", result.pauseHoldSkipped], ["claim_lost", result.claimLost],
       ["deferred_or_failed", result.deferredOrFailed], ["enqueue_failed", result.enqueueFailed],
     ] as const) {
@@ -13729,6 +14127,7 @@ export function recoveryService(
       strandedRecoveryWakeIssueIds: [] as string[],
       expiredRecoveryHorizonsEscalated: 0,
       expiredRecoveryHorizonsNeverDelivered: 0,
+      expiredRecoveryHorizonsNeverDeliveredButWorked: 0,
       expiredRecoveryHorizonsAnnounced: 0,
       expiredRecoveryHorizonIssueIds: [] as string[],
       issueIds: [] as string[],
@@ -13762,7 +14161,11 @@ export function recoveryService(
     result.strandedRecoveryWakesHealed = strandedRecoveryWakeBackstop.healed;
     result.strandedRecoveryWakeExhaustedSkipped = strandedRecoveryWakeBackstop.exhaustedSkipped;
     result.strandedRecoveryWakeCooldownSkipped = strandedRecoveryWakeBackstop.cooldownSkipped;
-    result.strandedRecoveryWakeLivePathSkipped = strandedRecoveryWakeBackstop.livePathSkipped;
+    // Stays the union total, which is what this field has always meant. The per-arm split
+    // lives on the sweep result and the metric; widening this roll-up would only add an
+    // unread field, while leaving it at the active-run arm alone would silently under-report.
+    result.strandedRecoveryWakeLivePathSkipped = strandedRecoveryWakeBackstop.livePathSkipped
+      + strandedRecoveryWakeBackstop.livePathQueuedWakeSkipped;
     result.strandedRecoveryWakeDeferredOrFailed = strandedRecoveryWakeBackstop.deferredOrFailed;
     result.strandedRecoveryWakeEnqueueFailed = strandedRecoveryWakeBackstop.enqueueFailed;
     result.strandedRecoveryWakeIssueIds = strandedRecoveryWakeBackstop.issueIds;
@@ -13777,6 +14180,11 @@ export function recoveryService(
     });
     result.expiredRecoveryHorizonsEscalated = expiredHorizons.escalated;
     result.expiredRecoveryHorizonsNeverDelivered = expiredHorizons.neverDelivered;
+    // BLO-19124: propagated, not just counted internally. Without it the sweep result cannot
+    // distinguish "the wake channel refused and nothing got done" from "the wake channel
+    // refused but the issue was worked anyway", which is the split that decides whether a
+    // never-delivered spike is a scheduler incident or a discharge-bookkeeping gap.
+    result.expiredRecoveryHorizonsNeverDeliveredButWorked = expiredHorizons.neverDeliveredButWorked;
     result.expiredRecoveryHorizonsAnnounced = expiredHorizons.announced;
     result.expiredRecoveryHorizonIssueIds = expiredHorizons.issueIds;
 
@@ -14990,6 +15398,13 @@ export function recoveryService(
     prNumber: number;
     repoFullName: string | null;
     cycleCount: number;
+    // BLO-35909: the findings the latest review's ledger asserts are still
+    // present, as the ledger names them. The evidence for "not converging" is
+    // this list, NOT cycleCount — cycleCount counts every actionable round,
+    // converging ones included, so a PR with five converging rounds and one
+    // re-raise arrives here as 6 and the old "cycled 6 times without
+    // converging" overstated by five. The count is reported as context only.
+    reRaisedFindings?: readonly string[];
   }): Promise<{ escalated: boolean; ownerAgentId: string | null; ownerType: "agent" | "board" }> {
     const issue = await db
       .select()
@@ -15008,6 +15423,9 @@ export function recoveryService(
       resolvedOwnerAgentId && resolvedOwnerAgentId === issue.assigneeAgentId
         ? null
         : resolvedOwnerAgentId;
+    const reRaised = input.reRaisedFindings?.length
+      ? `re-raised ${input.reRaisedFindings.join(", ")}`
+      : "re-raised a finding an earlier review round already raised";
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: issue.companyId,
       sourceIssueId: issue.id,
@@ -15022,11 +15440,12 @@ export function recoveryService(
         repoFullName: input.repoFullName,
         prNumber: input.prNumber,
         cycleCount: input.cycleCount,
+        reRaisedFindings: input.reRaisedFindings ?? [],
         priorAssigneeAgentId: issue.assigneeAgentId,
       },
       nextAction: ownerAgentId
-        ? `Self-reviewed PR #${input.prNumber} has cycled through review feedback ${input.cycleCount} times without converging. Take over the PR, unblock or reassign the author, or record a disposition — do not leave the author looping on its own self-review.`
-        : `Self-reviewed PR #${input.prNumber} is not converging after ${input.cycleCount} review cycles and no invokable agent can own it. Board intervention needed.`,
+        ? `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds. Take over the PR, unblock or reassign the author, or record a disposition — do not leave the author looping on its own self-review.`
+        : `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds, and no invokable agent can own it. Board intervention needed.`,
       wakePolicy: ownerAgentId
         ? { type: "wake_owner", reason: "self_review_pr_non_convergence", ownerAgentId }
         : { type: "board_escalation", reason: "no_invokable_recovery_owner" },

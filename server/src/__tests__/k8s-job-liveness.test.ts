@@ -368,6 +368,58 @@ describe("classifyAgentJobFailureErrorCode", () => {
       container("claude", 137, "OOMKilled"),
     ))).toBe("oom_killed");
   });
+
+  // BLO-33441. The launcher's line reaches the pod log because `console.error`
+  // writes to stderr and the adapter wrapper redirects only stdout.
+  const cavemanLogTail = [
+    "Cloning into '/workspace/repo'...",
+    "penstock agent runtime: Caveman proxy did not become ready",
+  ].join("\n");
+
+  it("classifies the Caveman readiness timeout out of the job_failed catch-all", () => {
+    expect(classifyAgentJobFailureErrorCode({
+      ...diagnostics(container("claude", 1, "Error")),
+      logTail: cavemanLogTail,
+    })).toBe("caveman_proxy_not_ready");
+  });
+
+  it("matches the launcher's wrapped form, not a bare equality", () => {
+    // The whole defect this closes is a check that reads as working while
+    // classifying every real occurrence as the catch-all. The marker never
+    // arrives alone: the launcher prefixes it and the log carries other lines.
+    expect(classifyAgentJobFailureErrorCode({
+      ...diagnostics(container("claude", 1, "Error")),
+      logTail: "PENSTOCK AGENT RUNTIME: CAVEMAN PROXY DID NOT BECOME READY",
+    })).toBe("caveman_proxy_not_ready");
+  });
+
+  it("reads the marker off the termination message too", () => {
+    expect(classifyAgentJobFailureErrorCode(diagnostics({
+      ...container("claude", 1, "Error"),
+      terminationMessage: "penstock agent runtime: Caveman proxy did not become ready",
+    }))).toBe("caveman_proxy_not_ready");
+  });
+
+  it("keeps an OOM an OOM even when the launcher printed the marker on the way out", () => {
+    expect(classifyAgentJobFailureErrorCode({
+      ...diagnostics(container("claude", 137, "OOMKilled")),
+      logTail: cavemanLogTail,
+    })).toBe("oom_killed");
+  });
+
+  it("does not claim the readiness timeout for the sibling 'exited before readiness' fault", () => {
+    expect(classifyAgentJobFailureErrorCode({
+      ...diagnostics(container("claude", 1, "Error")),
+      logTail: "penstock agent runtime: Caveman proxy exited before readiness",
+    })).toBeNull();
+  });
+
+  it("ignores the marker when no app container actually failed", () => {
+    expect(classifyAgentJobFailureErrorCode({
+      ...diagnostics(container("claude", 0, null)),
+      logTail: cavemanLogTail,
+    })).toBeNull();
+  });
 });
 
 describe("pickDiagnosticPod", () => {

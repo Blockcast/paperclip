@@ -7,6 +7,18 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  CCROTATE_CAPACITY_MAX_PARK_MS,
+  jitterTransientRetryFloor,
+  MAX_TRANSIENT_RETRY_HORIZON_MS,
+  resolveCcrotateCapacityRetry,
+} from "../services/ccrotate-capacity-retry.js";
+import {
+  BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
+  computeBoundedTransientHeartbeatRetrySchedule,
+  DEP_BLOCKED_MAX_DELAY_MS,
+  MAX_TURN_CONTINUATION_MAX_DELAY_MS,
+} from "../services/heartbeat.js";
+import {
   __resetMetricsForTest,
   renderMetrics,
   SCHEDULED_RETRY_PARK_HORIZON_METRIC,
@@ -452,7 +464,7 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
 
     await refreshScheduledRetryParkHorizonMetrics(db);
     const { body } = await renderMetrics();
-    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 1594`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="other"} 1594`);
     expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC} 1`);
   });
 
@@ -476,7 +488,7 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     await refreshScheduledRetryParkHorizonMetrics(db);
     await refreshOverdueScheduledRetryAgeMetrics(db, now);
     const { body } = await renderMetrics();
-    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 518000`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="other"} 518000`);
     expect(body).toContain(`paperclip_overdue_scheduled_retry_oldest_age_seconds{agent_id="${agentId}"} 0`);
   });
 
@@ -513,7 +525,7 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     // Each booking chose one hour, so the gauge must read one hour regardless of
     // how long the row has been re-parking. Against created_at this read 39600
     // and breached the 5400s alert threshold ~7x over on a healthy row.
-    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 3600`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="dependency_blocked"} 3600`);
   });
 
   it("does not report a negative horizon for a re-touched past-due park", async () => {
@@ -537,6 +549,128 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
 
     await refreshScheduledRetryParkHorizonMetrics(db);
     const { body } = await renderMetrics();
-    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}"} 0`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="other"} 0`);
+  });
+
+  // BLO-31174 second defect. The guard is the SEPARATION, not the labelling: on
+  // one agent, a designed transient park and a clamp-breaching capacity park are
+  // indistinguishable to `max by (agent_id)`, which returns the transient value
+  // and hides the capacity one entirely. Without the `reason` groupBy this test
+  // fails on both counts -- the two rows collapse to a single series carrying
+  // 8630, and the 3600 is simply gone.
+  it("separates park classes so a clamp breach is not masked by designed backoff", async () => {
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-09-28T01:16:00.000Z");
+    const base = {
+      companyId,
+      agentId,
+      invocationSource: "assignment" as const,
+      status: "scheduled_retry" as const,
+      contextSnapshot: {},
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await db.insert(heartbeatRuns).values([
+      {
+        ...base,
+        // The observed 2026-09-28 re-fire: 7200s final ladder hop x 1.1987
+        // jitter, inside the designed [7200, 9000] band. Healthy.
+        scheduledRetryAt: new Date(now.getTime() + 8_630_000),
+        scheduledRetryAttempt: 4,
+        scheduledRetryReason: "transient_failure",
+      },
+      {
+        ...base,
+        // 3.3x past the 1,080s ccrotate_capacity ceiling (CCROTATE_CAPACITY_MAX_PARK_MS
+        // plus 20% jitter on the clamped value). This is the writer bug
+        // class BLO-28919 fixed, and it is what the detector exists to catch.
+        scheduledRetryAt: new Date(now.getTime() + 3_600_000),
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "ccrotate_capacity",
+      },
+    ]);
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="transient_failure"} 8630`);
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="ccrotate_capacity"} 3600`);
+    // `none` is a per-agent zero floor, not a "drained" marker: a parked agent
+    // carries it too, so `{reason="none"}` selects the whole fleet.
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="none"} 0`);
+  });
+
+  it("zero-fills an agent with no live park without inventing a park class", async () => {
+    const { agentId } = await insertCompanyAndAgent();
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    const { body } = await renderMetrics();
+    // The BLO-25036 invariant: a drained agent reads 0 rather than vanishing.
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="none"} 0`);
+    // `none` is a placeholder, not a class. Nothing may ever bound it above 0,
+    // so assert it cannot be confused with a real reason carrying a real value.
+    expect(body).not.toMatch(
+      new RegExp(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}\\{agent_id="${agentId}",reason="none"\\} [1-9]`),
+    );
+  });
+});
+
+// Not DB-gated: the help text is the first thing an operator reads out of
+// `# HELP`, so its load-bearing ratio must follow from the ceilings it lists,
+// and each listed ceiling must follow from the writer that books it. Deriving
+// the expected values here from a hardcoded list would pin the help text to
+// the list rather than to the source, which cannot catch a missing ceiling.
+describe("scheduled-retry park horizon help text (BLO-31174)", () => {
+  afterEach(() => __resetMetricsForTest());
+
+  it("lists each class ceiling as its writer books it, and the spread they produce", async () => {
+    const { body } = await renderMetrics();
+    const help = body.split("\n").find((line) => line.startsWith(`# HELP ${SCHEDULED_RETRY_PARK_HORIZON_METRIC} `));
+    expect(help).toBeDefined();
+
+    const now = new Date(0);
+    // Final ladder hop at the top of its jitter band.
+    const ladderCeilingS = computeBoundedTransientHeartbeatRetrySchedule(
+      BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      now,
+      () => 1,
+    )!.delayMs / 1000;
+    // An upstream floor exactly at the clamp is not clamped, so it still takes
+    // the full forward jitter window: the largest floored `transient_failure`
+    // park that `scheduleBoundedRetryForRun` can book.
+    const flooredCeilingS = jitterTransientRetryFloor({
+      dueAt: new Date(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS),
+      now,
+      random: () => 1,
+    }).dueAt.getTime() / 1000;
+    // Jitter is added AFTER the clamp, so the constant alone understates the
+    // ceiling: a reset advertised at the clamp, at the top of the jitter band.
+    const capacityCeilingS = resolveCcrotateCapacityRetry({
+      resumeAt: new Date(now.getTime() + CCROTATE_CAPACITY_MAX_PARK_MS),
+      now,
+      // Required by the input type but never consulted here: `resumeAt` is in
+      // the future, so `baseMs` takes it. The ceiling does not depend on this.
+      defaultRetryDelayMs: CCROTATE_CAPACITY_MAX_PARK_MS,
+      random: () => 1,
+    }).retryAt.getTime() / 1000;
+    const ceilings: Array<[string, number]> = [
+      ["max_turns_continuation", MAX_TURN_CONTINUATION_MAX_DELAY_MS / 1000],
+      ["ccrotate_capacity", capacityCeilingS],
+      ["dependency_blocked", DEP_BLOCKED_MAX_DELAY_MS / 1000],
+      ["transient_failure", ladderCeilingS],
+    ];
+    for (const [reason, seconds] of ceilings) expect(help).toContain(`${reason} ${seconds}s`);
+    expect(help).toContain(`up to ${flooredCeilingS}s when it adopts an upstream retryNotBefore floor`);
+    expect(help).toContain("unbounded for a provider_quota floor");
+
+    const finite = [...ceilings.map(([, seconds]) => seconds), flooredCeilingS];
+    // No stale ceiling may survive alongside the derived ones.
+    expect([...help!.matchAll(/ (\d+)s\b/g)].map((match) => Number(match[1]))).toEqual(finite);
+    expect(help).toContain(`span at least ${Math.max(...finite) / Math.min(...finite)}x`);
+    // The flat bound the alert shipped with (runbooks/queued-run-stranded.md),
+    // over the capacity ceiling: how far past its own ceiling a capacity park
+    // can sit before that single threshold notices.
+    const flatAlertBoundS = 5400;
+    expect(help).toContain(`missing a ${flatAlertBoundS / capacityCeilingS}x clamp breach`);
   });
 });

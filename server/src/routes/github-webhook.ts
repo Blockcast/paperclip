@@ -74,6 +74,7 @@ import {
   githubPostIssueComment,
   type MergeHistoryShape,
 } from "../services/github-app-auth.js";
+import { GITHUB_REQUEST_TIMEOUT_MS } from "../services/github-fetch.js";
 import {
   buildForeignCommitNoticeBody,
   foreignCommitNoticeIdempotencyKey,
@@ -85,6 +86,7 @@ import {
 } from "../services/pr-review-head-attestation.js";
 import {
   extractAllyReviewedHeadSha,
+  extractAllyPriorFindingDispositions,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
 } from "../services/ally-review-detection.js";
@@ -492,6 +494,26 @@ function isReviewGateEscalationProducer(
   const normalized = normalizeGithubLogin(login);
   if (!normalized) return false;
   return normalized === normalizeGithubLogin(REVIEW_GATE_ESCALATION_PRODUCER_LOGIN);
+}
+
+// BLO-23395: posted by .github/workflows/merge-queue-eviction-detector.yml
+// (scripts/merge-queue-eviction-detector.mjs) via the default GITHUB_TOKEN
+// whenever a PR is removed from the merge queue without being merged. Gated
+// on the exact github-actions[bot] login below (not just the marker) so an
+// arbitrary commenter cannot spoof a merge-queue-eviction wake.
+//
+// Anchored at literal byte 0, for the reason stated at length on
+// REVIEW_GATE_ESCALATION_MARKER_PATTERN above: leading whitespace in Markdown
+// is an indented code block, i.e. the canonical way to render "here is the
+// marker" while merely DISCUSSING it. The previous `trimStart()` spelling read
+// such a quote as a real eviction. The author guard bounds the blast radius to
+// github-actions[bot], but that identity posts many unrelated comments in this
+// repo, so the tolerance bought nothing and cost a spoofing shape.
+const MERGE_QUEUE_EVICTION_MARKER = "<!-- paperclip:merge-queue-eviction -->";
+const MERGE_QUEUE_EVICTION_BOT_LOGIN = "github-actions[bot]";
+
+function hasMergeQueueEvictionMarker(body: string | null | undefined): boolean {
+  return typeof body === "string" && body.startsWith(MERGE_QUEUE_EVICTION_MARKER);
 }
 
 // BLO-23059: Claude Code Review posts its "this integration is paused/disabled"
@@ -999,14 +1021,117 @@ function commentsContainBackLinkMarker(bodies: string[]): boolean {
 // Self-review PR non-convergence escalation (BLO-13353 (b)).
 const DEFAULT_SELF_REVIEW_ESCALATION_THRESHOLD = 3;
 
-// Self-review = the PR was authored by the reviewer bot itself, so the bot's
-// "review" is a self-review that can't formally request changes. Detected by
-// comparing the signed-webhook PR author login to the configured reviewer bot.
-function isSelfReviewedPr(context: ResolvedEventContext, reviewerBotLogin: string | null): boolean {
+// Self-review = the PR was authored by the reviewer LANE itself, so the
+// "review" has no independent party in it and cannot break its own loop.
+//
+// BLO-35909: this used to be login equality alone — `prAuthorLogin ===
+// reviewerBotLogin` — and on this fleet that predicate carries no signal at
+// all. Every agent pushes through the same `allyblockcast[bot]` GitHub App, so
+// EVERY agent-authored PR has that author login and every Ally review has that
+// reviewer login. The comparison was therefore true for every agent PR Ally
+// ever reviewed, self-review or ordinary peer review alike, and the escalation
+// below then suppressed the author's wake on all of them (onprem-k8s#3647 /
+// BLO-34284: 8 commits, zero authored by Ally, escalated as a self-review).
+// Same trap as `merged_by: null` and the foreign-commit notice's inverted
+// author-login check: a shared identity is not evidence of authorship.
+//
+// The lane is the discriminating signal. `assigneeAgentId` is the lane that
+// owns the work — the one the reopen above is about to wake — and
+// `reviewerAgentIds` is the configured reviewer pool. A genuine self-review is
+// the two coinciding. Chosen over the git-author-email instrument
+// (selectForeignCommits) because it needs no GitHub call on the webhook path
+// and answers the same question.
+//
+// Login equality is KEPT as a precondition rather than replaced: it is what
+// still excludes a human-authored PR on a reviewer lane's issue, and it is what
+// keeps an unset `reviewerBotLogin` an off-switch for the whole feature.
+//
+// Every unknown fails CLOSED (returns false, i.e. not a self-review). The harm
+// being guarded is suppression of the author's wake, so "cannot tell" must
+// leave the author woken.
+//
+// The lane test is SINGLETON EQUALITY, not pool membership. The reviewer pool
+// is plural by design (configuredPrReviewerAgentIds unions the plural and
+// singular config keys; selectPrReviewerAgentId load-balances across it), so
+// with a pool {Ally, X} a PR owned by lane X and reviewed by Ally is an
+// ordinary peer review that membership would call a self-review — the same
+// suppression bug, narrowed. Requiring a one-member pool makes a multi-member
+// pool never escalate, which is the recoverable direction. Today's deployment
+// is a singleton, so this is exact rather than conservative.
+//
+// Residual, named so the next reader does not re-derive it: `assigneeAgentId`
+// is who gets suppressed, not who wrote the code, so an issue REASSIGNED to
+// the reviewer lane after a peer wrote the PR still reads as a self-review.
+// It is narrow — the caller prefers readReturnAssigneeAgentId (the pre-review
+// owner the work is being handed back to) over issue.assigneeAgentId, so this
+// only leaks when execution state carries no return owner, AND it must also
+// clear cycles >= threshold AND a `still-present` ledger. The git-author
+// instrument (BLO-32943) would close it at the cost of a GitHub round-trip on
+// the webhook path; not worth it for this case.
+function isSelfReviewedPr(
+  context: ResolvedEventContext,
+  reviewerBotLogin: string | null,
+  lanes: { assigneeAgentId: string | null; reviewerAgentIds: readonly string[] },
+): boolean {
   if (!reviewerBotLogin) return false;
   const author = context.prAuthorLogin;
   if (!author) return false;
-  return normalizeGithubLogin(author) === normalizeGithubLogin(reviewerBotLogin);
+  if (normalizeGithubLogin(author) !== normalizeGithubLogin(reviewerBotLogin)) return false;
+  if (!lanes.assigneeAgentId) return false;
+  return lanes.reviewerAgentIds.length === 1 && lanes.reviewerAgentIds[0] === lanes.assigneeAgentId;
+}
+
+// Whether this review's prior-finding ledger asserts that a finding an earlier
+// round already raised is STILL PRESENT — the convergence signal (BLO-35909).
+//
+// The escalation below used to fire on round count alone, and a round count
+// cannot tell a loop from progress: three rounds of disjoint, shrinking
+// findings is convergence, and was escalated as "cycled 3 times without
+// converging". Ally's own ledger already answers the question it was guessing
+// at — `still-present` blocks, `fixed`/`no-longer-applicable` retire — and
+// extractAllyPriorFindingDispositions is the single parse point for it.
+//
+// No ledger entry means no positive evidence of re-raising, so no escalation.
+// That is the same fail-closed direction as isSelfReviewedPr: an unprovable
+// loop keeps waking the author, which is recoverable; a wrongly-suppressed wake
+// is not. Two known shapes land there, both benign for that reason:
+//   - a first-round review, which has no prior findings to disposition;
+//   - a PR force-pushed hard enough to rebase earlier heads away along with
+//     their reviews. The reviewer rebuilds its active prior-finding set from
+//     reviews STILL PRESENT on the PR, so it then emits no ledger and this
+//     escalation becomes unreachable — on exactly the force-push-heavy PRs
+//     most likely to be looping. Stated here rather than discovered later as
+//     "the escalation never fires".
+function bodyReRaisesPriorFinding(body: string | null | undefined): boolean {
+  return extractAllyPriorFindingDispositions(body).some((entry) => entry.kind === "blocks");
+}
+
+// Read from the resolve-time classification, which parsed the RAW body, for the
+// same reason isActionableReviewFeedbackContext does: `reviewBody`/`commentBody`
+// on the context are clamped, and a ledger past the clamp boundary would read
+// as "no finding re-raised" — failing in the suppressing direction. The
+// fallback only serves synthetic contexts that never went through a producer.
+//
+// This guard has no failing mutation today, and that is structural rather than
+// a gap in the tests: the ledger sits in the OPENING section of the reviewer's
+// template, above the counted findings buckets, so any body whose ledger is
+// clamped has already had its findings clamped — and that case is caught first
+// by the older raw read for reviewHasActionableFeedback. Keep the raw read
+// anyway: the ordering it relies on is enforced only by the reviewer's
+// template, not by this module. Do not delete it as provably dead code.
+function reRaisesPriorFinding(context: ResolvedEventContext): boolean {
+  return context.reviewReRaisesPriorFinding ?? bodyReRaisesPriorFinding(prFeedbackBody(context));
+}
+
+// The re-raised findings, named the way the ledger names them ("important #1
+// from de0d81ab"). Prose only — the escalation is gated on
+// reRaisesPriorFinding above, which reads the unclamped classification, so an
+// empty list here never suppresses an escalation, it only costs the message
+// its specifics.
+function reRaisedPriorFindingLabels(context: ResolvedEventContext): string[] {
+  return extractAllyPriorFindingDispositions(prFeedbackBody(context))
+    .filter((entry) => entry.kind === "blocks")
+    .map((entry) => `${entry.severity} #${entry.index} from ${entry.shortSha}`);
 }
 
 // Count prior actionable-feedback reopen cycles on this (issue, PR). Each call to
@@ -1059,6 +1184,11 @@ interface ResolvedEventContext {
   // clamped for heartbeat context size, but a findings heading can occur
   // after the clamp boundary (as in frr#61 review 4968003838).
   reviewHasActionableFeedback?: boolean;
+  // BLO-35909: whether this review's prior-finding ledger asserts a finding
+  // from an earlier head is `still-present`. Classified at resolve time off the
+  // RAW body, for the same clamp reason reviewHasActionableFeedback is.
+  // Undefined on contexts no producer built; see reRaisesPriorFinding.
+  reviewReRaisesPriorFinding?: boolean;
   reviewState?: string | null;
   // pull_request_review.submitted only — the numeric GitHub review id.
   // Preferred over reviewUrl for the feedback-comment dedupe key (BLO-19497):
@@ -1600,12 +1730,23 @@ function resolveEventContextRaw(
           });
         }
       }
+      // BLO-23395: a merge-queue eviction notice is its own actionable
+      // signal, independent of the reviewer-request/feedback detection above
+      // (it is not authored by the reviewer bot at all).
+      const mergeQueueEvictionNotice =
+        commentAuthorLogin === MERGE_QUEUE_EVICTION_BOT_LOGIN && hasMergeQueueEvictionMarker(commentBody);
       // PEN-3383: report the structureless-feedback drop only when it actually
       // changes the outcome — i.e. when nothing else claims this delivery. A
       // body that is also a review REQUEST or an ESCALATION still produces a
       // context on those paths and loses nothing, and reporting it there would
       // make this signal noise instead of the template-drift alarm it exists to
       // be.
+      //
+      // `mergeQueueEvictionNotice` is deliberately NOT a term here: the verdict
+      // can only be `suppressed_unstructured` for the configured reviewer
+      // identity (classifyPrReviewComment), and an eviction notice is authored
+      // by github-actions[bot], so the conjunction is unreachable. Adding it
+      // would assert a coupling that does not exist.
       if (
         reviewFeedbackVerdict === "suppressed_unstructured" &&
         !reviewerRequest &&
@@ -1619,7 +1760,8 @@ function resolveEventContextRaw(
           commentUrl: readStringField(comment, "html_url"),
         });
       }
-      if (!reviewerRequest && !reviewFeedback && !reviewGateEscalation) return null;
+      if (!reviewerRequest && !reviewFeedback && !reviewGateEscalation && !mergeQueueEvictionNotice)
+        return null;
       // BLO-9293: on a PR's issue_comment payload, `issue.user.login` is the PR
       // author (the comment author is `comment.user.login`, captured separately).
       const issueUser = issue.user as Record<string, unknown> | undefined;
@@ -1656,6 +1798,11 @@ function resolveEventContextRaw(
           issue.body as string | undefined,
         ),
         owningIdentifiers: owning.owning,
+        // Escalation and merge-queue eviction are mutually exclusive by
+        // construction — both markers are anchored at byte 0, so a body can
+        // lead with only one — which is why their relative order here is
+        // immaterial. Both must outrank `reviewerRequest`.
+        //
         // Escalation takes precedence over `reviewerRequest` deliberately, and
         // this ternary is the whole enforcement of "an escalation never
         // dispatches a review": shouldFirePrReviewerWake keys on wakeReason
@@ -1665,9 +1812,11 @@ function resolveEventContextRaw(
         // mention suppression instead would be a silent coupling.
         wakeReason: reviewGateEscalation
           ? "github_pr_review_gate_escalation"
-          : reviewerRequest
-            ? "github_pr_review_requested"
-            : "github_pr_review_feedback",
+          : mergeQueueEvictionNotice
+            ? "github_pr_merge_queue_evicted"
+            : reviewerRequest
+              ? "github_pr_review_requested"
+              : "github_pr_review_feedback",
         prNumber,
         repoFullName,
         // An issue_comment payload carries no `pull_request.head.sha` (see the
@@ -1692,6 +1841,8 @@ function resolveEventContextRaw(
         eventUrl: commentUrl ?? prUrl,
         commentId: (comment?.id as number | undefined) ?? null,
         commentBody: clampReviewBody(commentBody),
+        // Classified off the RAW comment body, before clampReviewBody above.
+        reviewReRaisesPriorFinding: bodyReRaisesPriorFinding(commentBody),
         commentAuthorLogin,
         prAuthorLogin: (issueUser?.login as string | undefined) ?? null,
         commentUrl,
@@ -1749,6 +1900,7 @@ function resolveEventContextRaw(
         prAuthorLogin: collected.authorLogin,
         reviewBody,
         reviewHasActionableFeedback: hasActionablePrReviewFeedback(rawReviewBody, reviewState),
+        reviewReRaisesPriorFinding: bodyReRaisesPriorFinding(rawReviewBody),
         reviewState,
         reviewId,
         reviewAuthorLogin,
@@ -2657,7 +2809,16 @@ function wakeIdempotencySuffix(
 ): { suffix: string; scope: WakeIdempotencyScope } {
   const scopeFor = (identity: string | number | null): WakeIdempotencyScope =>
     identity === null || identity === "" ? "stable" : "request";
-  if (context.wakeReason === "github_pr_review_requested") {
+  // BLO-23395: a merge-queue eviction is comment-scoped for the same reason.
+  // The detector posts a NEW comment per eviction, so the comment id is the
+  // per-event identity. The default repo+pr+reason `stable` key would collide
+  // a second eviction with the first one's still-running author wake (the
+  // evict -> rebase -> re-enqueue -> evict loop) and drop it as a duplicate.
+  // Head-scoping would be wrong: an eviction can recur on an unchanged head.
+  if (
+    context.wakeReason === "github_pr_review_requested" ||
+    context.wakeReason === "github_pr_merge_queue_evicted"
+  ) {
     const identity = context.commentId ?? deliveryId ?? null;
     return {
       suffix: `${context.wakeReason}:comment:${identity ?? "unknown"}`,
@@ -2761,7 +2922,8 @@ const REVIEWER_HEAD_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
 ]);
 
 // The PR-author wake keeps repo+pr+reason keys for everything except the
-// comment-scoped @ally request; widening it is a separate behavior change.
+// comment-scoped @ally request and merge-queue eviction; widening it is a
+// separate behavior change.
 const AUTHOR_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set();
 
 function prReviewerWakeIdempotencyScope(
@@ -3145,11 +3307,26 @@ async function withPrReviewerTaskLock<T>(
  * for a few milliseconds each; the critical section is two statements plus the
  * enqueue, so even a large burst drains far inside GitHub's webhook timeout.
  *
- * This is a bound, not the structural fix. Doing the enqueue on the lock's own
- * connection would remove the second checkout entirely, but `enqueueWakeup`
- * opens its own transaction and threading one through it is a much wider
- * change to the wake path — deliberately left for structural review rather
- * than folded in here.
+ * This is a bound, not the structural fix, and BLO-37330 decided it stays that
+ * way. Doing the enqueue on the lock's own connection would remove the second
+ * checkout entirely — that is how every other nesting path was fixed (recovery,
+ * issues, environment leases, both outboxes all thread `tx` through). It does
+ * not transfer here.
+ *
+ * Measured 2026-09-28: `enqueueWakeup` (`services/heartbeat.ts`) is ~2,650
+ * lines and opens **three independent** `db.transaction(...)` blocks, each
+ * committing on its own. Threading this lock's `tx` in would fold all three
+ * into the caller's transaction, so they would commit or roll back as one unit
+ * *and* the advisory lock would be held across the whole wake. That changes the
+ * durability semantics of the wake path — a wake request that today survives a
+ * later failure would begin disappearing with it — which is a behaviour change
+ * to the dispatch path, not a refactor. The sibling conversions were all single
+ * short transactions where no such semantics existed to break.
+ *
+ * So the second checkout is deliberate and the concurrency bound below is what
+ * makes it safe. The pool it is derived from is sized against a written
+ * server-side budget (`doc/DATABASE-CONNECTION-BUDGET.md`), so the bound now
+ * scales with a number that has been re-derived rather than inherited.
  *
  * Exported for test: the invariant that matters is `2 * bound < poolMax`, and
  * pinning it as a property of the derivation covers pool sizes no integration
@@ -3829,6 +4006,17 @@ export async function reconcileContendedPrReviewerWakes(
         liveHeadSha = await (config.resolvePrReviewHeadSha ?? githubFetchPrHeadSha)({
           repoFullName: replay.context.repoFullName,
           prNumber: replay.context.prNumber,
+          // Not request-inline: the only production caller is the heartbeat
+          // tick, at the end of the latched recovery chain
+          // (`heartbeatRecoveryChainInFlight` in index.ts), so no GitHub
+          // delivery is held open here. It is bounded because a slow read holds
+          // that latch, and every tick skips recovery until it lets go
+          // (BLO-38257); a timed-out read degrades to the warn below. The bound is
+          // per row, not per pass: a full 50-row batch can still spend 50 x this
+          // timeout here. A pass-level budget was rejected because, once spent,
+          // it would send every later row to the frozen-head fallback, which is
+          // the duplicate-review shape this block exists to stop.
+          signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
         });
       } catch (err) {
         logger.warn(
@@ -5084,6 +5272,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         const headSha = await resolveHeadSha({
           repoFullName: context.repoFullName,
           prNumber: context.prNumber,
+          signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
         });
         if (headSha) {
           context = { ...context, headSha };
@@ -5906,6 +6095,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           const headBranchState = await githubResolveBranchState({
             repoFullName: stackedRepoFullName,
             branch: mergedBaseRef,
+            signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
           });
           if (headBranchState !== "exists") {
             logger.warn(
@@ -6569,10 +6759,23 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         // actionable reopen cycles on a PR authored by the reviewer bot, hand
         // the issue up the chain of command instead of re-waking the author.
         // Best-effort — a failure here must never break the wake path.
+        //
+        // BLO-35909: BOTH load-bearing clauses of that sentence are tested
+        // here, and neither used to be. "self-reviewed" is now a lane
+        // comparison rather than login equality on a fleet-shared App
+        // identity, and "non-convergence" is now Ally's own `still-present`
+        // ledger assertion rather than a bare round count. Each is
+        // independently sufficient to suppress the escalation, because each
+        // being false makes the escalation's own `nextAction` text a false
+        // statement about the PR.
         if (
           reopen.reopened &&
           context.prNumber !== null &&
-          isSelfReviewedPr(context, config.prReviewerBotLogin ?? null)
+          reRaisesPriorFinding(context) &&
+          isSelfReviewedPr(context, config.prReviewerBotLogin ?? null, {
+            assigneeAgentId: effectiveAssigneeAgentId,
+            reviewerAgentIds: configuredPrReviewerAgentIds(config),
+          })
         ) {
           try {
             const cycles = await countPrReviewFeedbackCycles(
@@ -6589,6 +6792,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
                 prNumber: context.prNumber,
                 repoFullName: context.repoFullName,
                 cycleCount: cycles,
+                reRaisedFindings: reRaisedPriorFindingLabels(context),
               });
               escalated.push({
                 issueIdentifier: issue.identifier,
@@ -6810,6 +7014,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             ...(context.wakeReason === "github_pr_review_requested" && context.commentAuthorLogin
               ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
               : {}),
+            // BLO-23395: inline the eviction-cause comment so the woken agent
+            // doesn't have to fetch githubEventUrl just to learn why.
+            ...(context.wakeReason === "github_pr_merge_queue_evicted" && context.commentBody
+              ? { githubMergeQueueEvictionBody: context.commentBody }
+              : {}),
           },
           // Coalesce rapid bursts on the same PR/event so a single review
           // submission can't fan into N author runs. Parallel to the
@@ -6952,6 +7161,7 @@ export const __test_buildIssueBackLinkBody = buildIssueBackLinkBody;
 export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarker;
 export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;
 export const __test_isSelfReviewedPr = isSelfReviewedPr;
+export const __test_bodyReRaisesPriorFinding = bodyReRaisesPriorFinding;
 export const __test_resolvePrCommentReviewGateWebhookTrigger = resolvePrCommentReviewGateWebhookTrigger;
 export const __test_readReviewGateEscalationHeadSha = readReviewGateEscalationHeadSha;
 export const __test_isActionablePrReviewComment = isActionablePrReviewComment;

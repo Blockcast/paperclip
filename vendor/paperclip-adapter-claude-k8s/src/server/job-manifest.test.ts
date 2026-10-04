@@ -497,10 +497,13 @@ describe("buildJobManifest", () => {
         ponytailDefaultMode: "lite",
         env: { PENSTOCK_PROVIDER: "openai", PONYTAIL_DEFAULT_MODE: "ultra" },
       };
-      const { job } = buildJobManifest({ ctx, selfPod });
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
       const env = job.spec?.template?.spec?.containers?.[0]?.env ?? [];
-      expect(env.find((entry) => entry.name === "PENSTOCK_PROVIDER")?.value).toBe("openai");
-      expect(env.find((entry) => entry.name === "PONYTAIL_DEFAULT_MODE")?.value).toBe("ultra");
+      // Operator-set, so layer-4 default-deny routes both through the Secret
+      // (BLO-22546). The assertion here is precedence, not the rendering.
+      expect(env.find((entry) => entry.name === "PENSTOCK_PROVIDER")?.value).toBeUndefined();
+      expect(envSecret?.data.PENSTOCK_PROVIDER).toBe("openai");
+      expect(envSecret?.data.PONYTAIL_DEFAULT_MODE).toBe("ultra");
     });
 
     it("adds the Ponytail plugin directory to Claude args", () => {
@@ -1269,10 +1272,11 @@ describe("buildJobManifest", () => {
 
     it("preserves explicit adapter cache env overrides", () => {
       ctx.config = { env: { XDG_CACHE_HOME: "/custom-cache", GOCACHE: "/custom-go-cache" } };
-      const { job } = buildJobManifest({ ctx, selfPod });
-      const env = new Map(job.spec?.template?.spec?.containers[0]?.env?.map((e) => [e.name, e.value]));
-      expect(env.get("XDG_CACHE_HOME")).toBe("/custom-cache");
-      expect(env.get("GOCACHE")).toBe("/custom-go-cache");
+      const { envSecret } = buildJobManifest({ ctx, selfPod });
+      // Operator-set, so Secret-backed under layer-4 default-deny (BLO-22546);
+      // the override still wins over the adapter's computed cache paths.
+      expect(envSecret?.data.XDG_CACHE_HOME).toBe("/custom-cache");
+      expect(envSecret?.data.GOCACHE).toBe("/custom-go-cache");
     });
 
     it("inherits env vars from selfPod, routing the credential-shaped one through a Secret", () => {
@@ -1303,9 +1307,13 @@ describe("buildJobManifest", () => {
     it("user env config overrides inherited env", () => {
       selfPod.inheritedEnv = { AWS_REGION: "us-east-1" };
       ctx.config = { env: { AWS_REGION: "us-west-2" } };
-      const { job } = buildJobManifest({ ctx, selfPod });
+      const { job, envSecret } = buildJobManifest({ ctx, selfPod });
       const awsRegion = job.spec?.template?.spec?.containers[0]?.env?.find((e) => e.name === "AWS_REGION");
-      expect(awsRegion?.value).toBe("us-west-2");
+      // Same name inherited and operator-set: operator wins, and operator
+      // provenance moves it to the Secret (BLO-22546).
+      expect(awsRegion?.value).toBeUndefined();
+      expect(awsRegion?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(envSecret?.data.AWS_REGION).toBe("us-west-2");
     });
 
     it("sets PAPERCLIP_RUN_ID", () => {
@@ -1381,6 +1389,47 @@ describe("buildJobManifest", () => {
       );
       expect(h2?.value).toBeUndefined();
       expect(r2.envSecret?.data.ANTHROPIC_CUSTOM_HEADERS).toBe("x-penstock-session: manual-pin");
+    });
+
+    // BLO-22546: layer 4 (`adapterConfig.env`) is default-deny. These three
+    // cases must be read together — 1 and 2 fail a name-pattern/value-equality
+    // implementation, 3 fails an implementation that just Secret-ifies
+    // everything. Drop any one and the remaining pair stops discriminating.
+    it("materializes an operator env key with a deliberately non-credential name (AC3 default-deny)", () => {
+      const withPlainOperatorKey = {
+        ...ctx,
+        config: { ...(ctx.config as Record<string, unknown>), env: { FOO_BAR: "not-credential-shaped" } },
+      };
+      const { job, envSecret } = buildJobManifest({ ctx: withPlainOperatorKey, selfPod });
+      const entry = (job.spec?.template?.spec?.containers[0]?.env ?? []).find((e) => e.name === "FOO_BAR");
+      // isSensitiveEnvName("FOO_BAR") is false; only operator provenance routes it.
+      expect(isSensitiveEnvName("FOO_BAR")).toBe(false);
+      expect(entry?.value).toBeUndefined();
+      expect(entry?.valueFrom?.secretKeyRef?.name).toBe(envSecret?.name);
+      expect(envSecret?.data.FOO_BAR).toBe("not-credential-shaped");
+    });
+
+    it("keeps an operator env key in the Secret after a later layer rewrites its value", () => {
+      // HOME is operator-settable and is unconditionally overwritten after the
+      // layer-4 merge, so merged.HOME !== envConfig.HOME. An implementation
+      // that infers provenance from final-value equality emits it as a literal.
+      const withOverwrittenKey = {
+        ...ctx,
+        config: { ...(ctx.config as Record<string, unknown>), env: { HOME: "/operator-supplied" } },
+      };
+      const { job, envSecret } = buildJobManifest({ ctx: withOverwrittenKey, selfPod });
+      const entry = (job.spec?.template?.spec?.containers[0]?.env ?? []).find((e) => e.name === "HOME");
+      expect(envSecret?.data.HOME).not.toBe("/operator-supplied");
+      expect(entry?.value).toBeUndefined();
+      expect(entry?.valueFrom?.secretKeyRef?.key).toBe("HOME");
+    });
+
+    it("leaves a non-operator, non-sensitive inherited var as a literal", () => {
+      selfPod.inheritedEnv = { MY_PLAIN_VAR: "plain" };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const entry = (job.spec?.template?.spec?.containers[0]?.env ?? []).find((e) => e.name === "MY_PLAIN_VAR");
+      expect(entry?.value).toBe("plain");
+      expect(entry?.valueFrom).toBeUndefined();
     });
 
     it("literal env overrides valueFrom with the same name", () => {
@@ -2892,10 +2941,16 @@ describe("env name classification gate (BLO-29804)", () => {
     // it stood before the classification table existed: regex matches plus the
     // one name BLO-21858 pinned. If introducing the table ever moves a var
     // between literal and secretKeyRef, this reddens.
+    //
+    // OPERATOR_TUNABLE is the one deliberate addition since (BLO-22546): it is
+    // a layer-4 `adapterConfig.env` key, and layer 4 is default-deny on
+    // provenance rather than on name. That arm is independent of the table, so
+    // this gate still catches a table-driven move.
     const EXPECTED_SECRET_BACKED = [
       "ANTHROPIC_CUSTOM_HEADERS",
       "GH_TOKEN",
       "OPERATOR_API_TOKEN",
+      "OPERATOR_TUNABLE",
       "PAPERCLIP_API_KEY",
       "PAPERCLIP_K8S_ISOLATION_KEY",
     ];

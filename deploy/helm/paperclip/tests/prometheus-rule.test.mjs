@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import path from "node:path";
@@ -1232,10 +1232,12 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   // (~390/day). That agent count slides with the 7d window -- re-measured
   // 22 of 23 on 2026-09-26 -- so cite it with its date and never as "all
   // agents". Holds past 300s are routine, not exceptional. Blockcast's live
-  // rule is therefore being retuned to a fleet-count expression, with the
-  // log/alert numbers deliberately UNPINNED (Blockcast/onprem-k8s#3985,
-  // unmerged; until it lands the live rule is still > 300 and the two still
-  // share 300); see deploy/helm/paperclip/values.yaml
+  // rule was therefore retuned in Blockcast/onprem-k8s#4036 (merged
+  // 2026-09-28) into two arms -- a per-agent wedge at > 14400 for 5m and a
+  // fleet stall at count(... > 900) >= 3 for 10m -- so the log constant and
+  // the live alert now deliberately carry DIFFERENT numbers. (#3985 proposed
+  // the single-rule form and was closed unmerged; do not port from it.) See
+  // deploy/helm/paperclip/values.yaml
   // (agentStartLockHeldSeconds) and runbooks/queued-run-stranded.md. This
   // assertion still stands because THIS chart copy was not retuned -- it
   // guards the 300 that is still rendered here, not the deployed policy.
@@ -1288,19 +1290,20 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
 test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)", () => {
   // Nothing renders from these two passages, so only an assertion catches them
   // drifting. values.yaml is read by third parties enabling this chart
-  // elsewhere: calling the fleet-count retune Blockcast's live rule while
-  // Blockcast/onprem-k8s#3985 is unmerged hands them an unproven expression as
-  // proven -- and the mirror error, still calling it pending after #3985 lands,
-  // hands them `> 300` when the live rule is `> 900`.
+  // elsewhere, and it is the file they read AT THE POINT OF ACTION -- its
+  // closing line tells them to port the retune before enabling the rule. Naming
+  // the wrong source PR there sends them to port a superseded expression.
   //
-  // This test CANNOT observe #3985's state (CI has no read of onprem-k8s), so
-  // it deliberately enforces only that the prose stays DEFINITE about that
-  // state, in EITHER direction. Pinning it to "pending" would make the correct
-  // post-merge edit a red build whose failure message argues the now-false
-  // claim back in. The gate on which direction is true is the must-update
-  // checklist on Blockcast/onprem-k8s#3985, which names this file by path --
-  // that is where the merge event actually happens, and this repo has no
-  // signal for it.
+  // The onprem-k8s state is now SETTLED, so this guard is definite rather than
+  // either-direction: Blockcast/onprem-k8s#4036 merged 2026-09-28 shipping the
+  // two-arm split, and #3985 (the single-rule `count(...) >= 3` proposal) was
+  // CLOSED UNMERGED and can never land. An earlier version of this test
+  // permitted only two branches, both anchored on #3985 -- neither could
+  // express that outcome, so it was green on false prose and would have gone
+  // red on the true correction. That failure was structural, not a mistuned
+  // regex: it keyed its escape hatch on a merge event (#3985's must-update
+  // checklist) that never happened, so nothing ever triggered the update.
+  // Re-key on the PR that actually shipped, never on one still in flight.
   const values = readFileSync(
     path.join(repoRoot, "deploy/helm/paperclip/values.yaml"),
     "utf8",
@@ -1315,18 +1318,36 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
   const warning = values.slice(warningIndex, warningEnd === -1 ? undefined : warningEnd);
   assert.match(
     warning,
-    /in Blockcast\/onprem-k8s#3985, (?:not yet merged; until it lands the live rule is still `> 300`|merged; the live rule is now `> 900`)/,
-    "values.yaml must state #3985's status definitely: pending with the live rule still > 300, or merged with it now > 900",
+    /retuned in Blockcast\/onprem-k8s#4036, merged 2026-09-28/,
+    "values.yaml must name #4036 (merged 2026-09-28) as the PR that retuned the live rule",
   );
-  // Only meaningful while the prose claims pending -- after #3985 lands, saying
-  // the retune is deployed is the correct statement, not the forbidden one.
-  if (/not yet merged/.test(warning)) {
-    assert.doesNotMatch(
-      warning,
-      /live rule in Blockcast\/onprem-k8s is now|NO LONGER the deployed policy/,
-      "values.yaml must not describe the unmerged retune as deployed",
-    );
-  }
+  // Both arms, so a reader porting from this comment gets the shipped split and
+  // not the single-rule form #3985 proposed.
+  assert.match(
+    warning,
+    /> 14400` for 5m/,
+    "values.yaml must state the live per-agent wedge arm: > 14400 for 5m",
+  );
+  assert.match(
+    warning,
+    /count\(max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > 900\) >= 3` for 10m/,
+    "values.yaml must state the live fleet-stall arm: count(... > 900) >= 3 for 10m",
+  );
+  // The dangling pointer is the sharp end: #3985 is closed, so anyone sent
+  // there to "port the retune" finds a never-merged branch.
+  assert.match(
+    warning,
+    /#3985 .*CLOSED UNMERGED, superseded by #4036/,
+    "values.yaml must state #3985 was closed unmerged and superseded by #4036",
+  );
+  // The chart copy itself is deliberately NOT retuned (agentStartLockHeldSeconds
+  // is still 300, asserted separately). Claiming otherwise here would tell a
+  // reader the landmine is already cleared.
+  assert.match(
+    warning,
+    /THIS chart copy is still the pre-retune `> 300` for 5m/,
+    "values.yaml must state the chart copy is still the pre-retune > 300 for 5m",
+  );
 
   // The 2h14m 2026-09-24 episode was three agents in lockstep, i.e. the
   // fleet-scope regime, and it self-healed. Calling 09-15/16 the only
@@ -1350,6 +1371,25 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
     /only\*?\s+documented\s+fleet-scope\s+episode\s+that\s+ended\s+with\s+a\s+pod\s+replacement/,
     "runbook must narrow the 09-15/16 claim to the only fleet-scope episode ended by a pod replacement",
   );
+
+  // Step 4 is the step an operator executes, and the split left it describing
+  // the pre-split single alert: its capture-and-wait rationale is FleetStall
+  // evidence (holds up to 2h14m), while Wedged pages at 14400s + 5m = 4h05m,
+  // about 1h55m before the [6h] restart gate can read anything but
+  // inconclusive. The two arms also fire together (09-15/16 tripped both), so
+  // the step must say which governs.
+  const step4Index = section.indexOf("#### Step 4");
+  assert.notStrictEqual(step4Index, -1, "runbook start-lock section must keep its Step 4");
+  const step4End = section.slice(step4Index + 1).search(/\n#{2,4} /);
+  const step4 = section.slice(step4Index, step4End === -1 ? undefined : step4Index + 1 + step4End);
+  for (const [pattern, message] of [
+    [/`PaperclipAgentStartLockFleetStall` alone: capture, then wait/, "Step 4 must scope capture-and-wait to FleetStall"],
+    [/`PaperclipAgentStartLockWedged`: capture, then re-check the restart gate/, "Step 4 must give Wedged its own action"],
+    [/4h05m[\s\S]*1h55m after the page/, "Step 4 must state that the 6h gate floor lands ~1h55m after a Wedged page (4h05m)"],
+    [/Both firing: `Wedged` governs/, "Step 4 must say Wedged governs when both arms fire"],
+  ]) {
+    assert.match(step4, pattern, message);
+  }
 
   // The coverage note describes Blockcast's live onprem-k8s rules, which this
   // chart does not match: PaperclipQueuedRunStrandedFleet exists only there,
@@ -1630,5 +1670,59 @@ test("PaperclipCrashRecoveryCandidateIndex{Missing,Unobservable} distinguish a m
     missingBlock,
     /PAPERCLIP_IN_WORKTREE[^)]*enableWorktreeRunExecution/,
     "PAPERCLIP_IN_WORKTREE must be qualified by enableWorktreeRunExecution, since it does not suppress on its own when that setting is armed",
+  );
+});
+
+test("PaperclipIsolationWorkspaceReaperStopped is gauge-keyed, dry_run-collapsed, and links its runbook (BLO-36814)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  const [, block] = rendered.match(
+    /(alert: PaperclipIsolationWorkspaceReaperStopped[\s\S]*?)(?=\n\s+- alert:|\n\s+- name:|$)/,
+  ) ?? [];
+  assert.ok(block, "the reaper-stopped alert must render a block");
+
+  // The metric name carries the `paperclip_` prefix 64 of 74 registered names
+  // use. This is a one-way door: once this expr, the runbook PromQL and the
+  // onprem-k8s copy select a name, renaming breaks all three at once.
+  assert.match(
+    block,
+    /paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds/,
+    "the alert must read the paperclip_-prefixed gauge",
+  );
+
+  // Gauge, NOT rate(). This is the whole design call: a reaper that stopped
+  // ticking and one that ticks and finds nothing are identical on every
+  // counter, because both add zero. Only the timestamp gauge separates them,
+  // so a future edit "simplifying" this to a rate over the scanned counter
+  // silently reintroduces the blind spot the alert exists to close.
+  const [, expr] = block.match(/\n\s+expr: (.+)\n/) ?? [];
+  assert.ok(expr, "the reaper-stopped alert must render an expr");
+  assert.doesNotMatch(
+    expr,
+    /rate\(|increase\(/,
+    "the expr must key on the last-sweep gauge, not a counter rate -- a sweep "
+      + "that deletes nothing adds zero to every counter and is indistinguishable "
+      + "from a sweep that never ran",
+  );
+  // `max by (dry_run)` collapses the per-pod dimension (BLO-23413 multi-replica
+  // guard) while keeping the two modes apart, so a dry-run tick can never
+  // satisfy the liveness check for the live one.
+  assert.match(
+    expr,
+    /max by \(dry_run\)/,
+    "the expr must aggregate with max by (dry_run): replica-invariant, but not "
+      + "collapsing a dry-run tick into the live series",
+  );
+
+  assert.match(
+    block,
+    /runbook_url: "[^"]*runbooks\/isolation-workspace-reaper\.md"/,
+    "the reaper-stopped alert must link its runbook",
+  );
+  // The link is only worth asserting if it resolves; the per-alert runbook
+  // check elsewhere in this file does not cover a newly added page.
+  assert.ok(
+    existsSync(path.join(repoRoot, "runbooks/isolation-workspace-reaper.md")),
+    "runbooks/isolation-workspace-reaper.md must exist for the runbook_url to resolve",
   );
 });

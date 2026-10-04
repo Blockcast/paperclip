@@ -25,12 +25,62 @@ Owner: Platform / SRE (BLO-21116)
 `paperclip_scheduled_retry_park_horizon_seconds` measures the booked interval
 from `heartbeat_runs.updated_at` to `scheduled_retry_at` for live
 `status='scheduled_retry'` rows — i.e. how far out the most recent park decision
-booked. `PaperclipScheduledRetryParkHorizonImplausible`
-fires when that future-due horizon exceeds 5,400 seconds, based on the
-observed seven-day population (n=5,253, p99=1,594.8s, maximum 3,567.5s).
+booked. `PaperclipScheduledRetryParkHorizonImplausible` fires when that future-due
+horizon exceeds 5,400 seconds. That bound was set from an earlier seven-day
+population (n=5,253, p99=1,594.8s, maximum 3,567.5s) which is now
+**superseded**: in the seven days to 2026-09-28 there were 1,016 breaching
+samples across 12 agents, every one inside [5,590.1s, 8,977.8s], i.e. below the
+`transient_failure` ladder's designed 9,000s ceiling. That ladder's final hop is
+7,200s with +/-25% jitter, i.e. [5,400s, 9,000s], so a `transient_failure` page
+anywhere in that band is designed backoff, not an implausible booking -- check
+the `reason` label before treating a page as a fault.
 `PaperclipScheduledRetryParkHorizonMetricsRefreshFailed` is the companion
 alert for a failed gauge refresh; while it is firing, the horizon alert is
 gated off and its last snapshot is not trustworthy.
+
+> **Read the `reason` label** ([BLO-31174](/BLO/issues/BLO-31174), second
+> defect). The gauge is keyed by `agent_id` **and** `reason` (the row's
+> `scheduled_retry_reason`, coerced to the bounded allow-list, anything else
+> reads `other`). Legitimate ceilings differ by class and span at least 289x
+> (300s to 86,700s, and a `provider_quota` floor has none), so for a class
+> listed below, judge a value against its own ceiling, not the flat 5,400s rule:
+>
+> | `reason` | designed ceiling | source |
+> |---|---:|---|
+> | `max_turns_continuation` | 300s | `MAX_TURN_CONTINUATION_MAX_DELAY_MS` |
+> | `ccrotate_capacity` | 1,080s | `CCROTATE_CAPACITY_MAX_PARK_MS` (15min) x (1 + `CCROTATE_CAPACITY_PARK_JITTER_RATIO` 0.2), jitter added after the clamp |
+> | `dependency_blocked` | 3,600s | `DEP_BLOCKED_MAX_DELAY_MS` |
+> | `transient_failure`, backoff ladder | 9,000s | final 2h hop of `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS` x (1 + 0.25 jitter) |
+> | `transient_failure`, upstream `retryNotBefore` floor | 86,700s | `MAX_TRANSIENT_RETRY_HORIZON_MS` (24h) + `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` (5min forward jitter on a floor just under the clamp) |
+> | `transient_failure`, `provider_quota` floor | none | adopted verbatim, never clamped (`clampTransientHorizon` in `scheduleBoundedRetryForRun`) |
+>
+> `transient_failure` is one label over three mechanisms, and the gauge cannot
+> tell them apart: a value in (9,000s, 86,700s] is a floored park, not a fault,
+> and one above 86,700s is either a `provider_quota` floor or a fault. Before
+> calling it either, read the run's error family (`readHeartbeatRunErrorFamily`:
+> `result_json.errorFamily`, else derived from `error_code`, where
+> `provider_quota` and `provider_quota_exhausted` both map to `provider_quota`);
+> only a non-`provider_quota` family above 86,700s is a writer bug. A per-reason
+> alert on `transient_failure` therefore cannot bound it at 9,000s.
+>
+> The table is the subset of classes whose designed ceiling is known, not the
+> whole allow-list (`KNOWN_RETRY_SCHEDULE_REASONS` in
+> `server/src/services/metrics.ts`). `capacity_blocked` is a separate class from
+> `ccrotate_capacity` and is not covered by its 1,080s row. For a reason that is
+> not in the table, no per-class constant is documented yet, so the flat 5,400s
+> rule is still the only bound in force for it: treat the page as a candidate
+> fault, and read that reason's delay at its writer (grep the reason string under
+> `server/src/services/`) before calling it designed backoff. `other` can never
+> have a row: it is the catch-all that NULL and every unrecognised
+> `scheduled_retry_reason` coerce to, so it mixes classes. On an `other` page,
+> read the raw `heartbeat_runs.scheduled_retry_reason` of the agent's
+> `status='scheduled_retry'` rows first, then judge it as that class.
+>
+> Every known agent also carries a `reason="none"` series pinned at 0. It is a
+> per-agent zero floor emitted for **every** agent, including ones with live
+> parks, so `count(...{reason="none"})` is fleet size, not the number of drained
+> agents. It is not a park class and never carries a bound; `max by (agent_id)`
+> aggregates it away, which is why the flat rule reads exactly as before.
 
 > **Do not measure this from `created_at`** ([BLO-31174](/BLO/issues/BLO-31174)).
 > A park is re-decided in place: each re-check UPDATEs the same row with a new
@@ -415,23 +465,39 @@ Source: `server/src/services/agent-start-lock.ts` (`withAgentStartLock`,
 (`AGENT_START_LOCK_HELD_SECONDS_METRIC`, `setAgentStartLockHeldMetrics`),
 `server/src/services/scrape-metrics-collector.ts`
 (`refreshAgentStartLockMetrics`)
-Trigger: alert `PaperclipAgentStartLockWedged` —
-`count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3`
-for 10m once BLO-36522's retune lands. That retune is in `Blockcast/onprem-k8s#3985`,
-**not yet merged**: until it lands, the live rule is still
-`max by (agent_id) (...) > 300` for 5m, and this alert still fires on
-single-agent routine contention.
-The rule is quoted here for readability only and lives in a different repo —
+Trigger: **two alerts**, since `Blockcast/onprem-k8s#4036` landed the BLO-36522
+retune as a split rather than a single retuned rule (`#3985`, the single-rule
+form this section was originally written against, was closed superseded):
+
+| alert | expression | `for` | regime |
+|---|---|---|---|
+| `PaperclipAgentStartLockWedged` | `max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 14400` | 5m | one agent, **>4h** — no hold past 4h has been observed to settle |
+| `PaperclipAgentStartLockFleetStall` | `count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3` | 10m | **≥3 agents** in lockstep — measured to self-clear |
+
+Both are live: verified loaded at `/api/v1/rules` on 2026-09-30, and the
+`>300`-for-5m rule this section used to describe is gone.
+The rules are quoted here for readability only and live in a different repo —
 the source of record is the lockstep pair `paperclip/paperclip-runtime-alerts-prometheusrule.yaml`
 and `monitoring/prometheus-rules-2-configmap.yaml` in `Blockcast/onprem-k8s`.
 Read the numbers there before acting on either one.
 Owner: Platform / SRE (PEN-3305)
 
-### ⚠️ What this alert claims, and what it no longer claims (BLO-36522)
+### ⚠️ What these alerts claim, and what they no longer claim (BLO-36522)
 
-**The name says "wedged". Measured, that word is wrong, and it is retained only
-because it keys this anchor, the promtool cases and the Slack baseline.** Two
-claims this section used to make were falsified on 2026-09-25:
+**The name says "wedged". For the regime the old 300s rule actually fired on,
+that word was wrong.** The split in `#4036` fixed this by moving the name:
+`Wedged` now keys only the >4h regime, where nothing has ever been observed to
+clear, and the routine/fleet regime pages as `FleetStall` instead.
+
+⚠️ **Everything in this subsection falsifies claims about the ≤2h14m regime —
+i.e. about the `FleetStall` regime and the now-unpaged 15m–4h solo band, not
+about `Wedged`.** Do not carry the "it self-heals" wording onto a
+`PaperclipAgentStartLockWedged` page: no hold past 4h has ever
+been observed to settle, and the one time that regime occurred it ended only
+by pod replacement. They are different regimes and the evidence below does not
+reach the second one.
+
+Two claims this section used to make were falsified on 2026-09-25:
 
 - *"It does not self-heal."* The 7-day maximum hold — 8043s (2h14m), three
   agents in lockstep — released on its own at 2026-09-24T03:15Z while the
@@ -470,33 +536,37 @@ agents rather than raising the duration bound. Backtested at 179 fleet-minutes
 — one episode, the 2026-09-24T01:00Z event — over all the history Prometheus
 retains.
 
-**Severity stays `critical`, on a new basis.** The old justification was the
-non-self-healing claim above, which is dead. It stays critical because, once
-#3985 lands, it fires only on the fleet-scope episode, and because it must keep the
+**Both arms stay `critical`, on a new basis.** The old justification was the
+non-self-healing claim above, which is dead for the routine regime. They stay
+critical because each now fires only on a regime that is genuinely a page —
+one agent past 4h, or the fleet-scope episode — and because they must keep the
 out-of-band Slack path precisely *because* the suspected fault is in
-paperclip's own dispatcher — routing it `warning` would put the page behind
-the component it is reporting on. **The action is diagnostic capture, not a
-restart** (Step 4).
+paperclip's own dispatcher — routing them `warning` would put the page behind
+the component it is reporting on. **On `FleetStall` the action is diagnostic
+capture, not a restart** (Step 4).
 
-⚠️ **The coverage this retune GIVES UP, in Blockcast's live rules: a solo
-indefinite hold now pages on nothing.** Stated here because it is the one cost
-of the change that is not self-evident from the expression. After #3985 lands,
-none of the three alerts that could catch a single agent whose lock is held for
-the life of the process does so in Blockcast's live `onprem-k8s` rules: this
-one needs **≥3** agents, `PaperclipQueuedRunStrandedFleet` needs **≥5**, and
-the per-agent `PaperclipQueuedRunStranded` it superseded is already gone from
-them (BLO-29665). The ≥5 is read from the lockstep pair cited under
-Trigger above, which is also where #3985 puts the ≥3; neither fleet-count form
-exists in this repo. So "the fleet alert already covers user-visible impact"
-is true only in the fleet regime.
+⚠️ **The coverage the retune GIVES UP, in Blockcast's live rules: a solo hold
+between ~15m and 4h now pages on nothing.** Stated here because it is the one
+cost of the change that is not self-evident from the expressions. In that band
+none of the alerts that could catch a single agent does so in Blockcast's live
+`onprem-k8s` rules: `FleetStall` needs **≥3** agents, `Wedged` needs **>4h**,
+`PaperclipQueuedRunStrandedFleet` needs **≥5**, and the per-agent
+`PaperclipQueuedRunStranded` it superseded is already gone from them
+(BLO-29665). The ≥5 is read from the lockstep pair cited under Trigger above,
+which is also where the ≥3 lives; neither fleet-count form exists in this repo.
+So "the fleet alert already covers user-visible impact" is true only in the
+fleet regime.
 
 That is a deliberate trade, not an oversight, and the evidence supports it:
 the solo hold measured **cycled** (175 resets/6h — acquired and released
 about every 2 minutes), and the founding 2026-09-15/16 incident was five
-agents, so the retuned expression would have caught it. The residual is the
-case never yet observed: one agent, monotonic, indefinite. **On Blockcast's
-live `onprem-k8s` rules, if you are triaging a single stuck agent, no page will
-have brought you here**; reach for
+agents, so `FleetStall` would have caught it. A solo hold that really does run
+away is still covered — `Wedged` pages at 4h, above the 2h14m self-clearing
+maximum in the 7d window measured 2026-09-25 (same sliding window as the agent
+count above — it moves; re-measure before citing it). The residual is only the
+15m–4h band. **On Blockcast's live `onprem-k8s` rules, if you are triaging a
+single stuck agent inside that band, no page will have brought you here**;
+reach for
 `max by (agent_id) (paperclip_agent_start_lock_held_seconds)` directly, and
 read the `resets()` caveat in Step 4 before concluding it is stuck.
 
@@ -580,11 +650,11 @@ that is slow. `agent start lock held far past its budget; queued-run dispatch
 for this agent has stopped` (error, first at 5m then every 5m) is driven by
 `LOCK_HELD_ERROR_MS` (300s) in `agent-start-lock.ts`.
 
-⚠️ **Once #3985 lands, the log line and this alert deliberately no longer
-share a number.** Until then the live rule is still pinned to the same 300s.
-Before BLO-36522 they were pinned together at 300s so "the log line and the
-page cannot disagree". That pinning was abandoned on purpose: 300s is the
-right boundary for the *log* — it is where the code stops calling a hold slow
+⚠️ **The log line and these alerts deliberately no longer share a number.**
+Before BLO-36522 the alert was pinned to `LOCK_HELD_ERROR_MS` at 300s so "the
+log line and the page cannot disagree". That pinning was abandoned on purpose:
+300s is the right boundary for the *log* — it is where the code stops calling a
+hold slow
 — but as an alert threshold it fires on 2,730 agent-minutes a week of routine
 contention. So the log answers *"is this hold slow?"* and the alert answers
 *"is the fleet stalled at once?"*. The cost is real and accepted: **an
@@ -604,10 +674,12 @@ Queue depth falling is not one either; runs can be cancelled.
 #### Step 3 — decide whether it is the lock or the pool, and mind the trap
 
 The known-plausible wedge is a second pool connection taken while holding
-`lockIssueOwnership`, against `POSTGRES_POOL_MAX = 10` with no acquire timeout
+`lockIssueOwnership`, against `POSTGRES_POOL_MAX` with no acquire timeout
 (`issue-recovery-actions.test.ts` still allowlists five such call sites under
-BLO-34207). Check the pool gauges for the **worker** pod, which is the only
-tier that dispatches:
+BLO-34207). Read the current pool size off `packages/db/src/client.ts` rather
+than assuming 10 — BLO-37330 re-derived it against the server-side budget in
+`doc/DATABASE-CONNECTION-BUDGET.md`. Check the pool gauges for the **worker**
+pod, which is the only tier that dispatches:
 
 ```
 paperclip_db_pool_connections{pod="paperclip-0"}
@@ -629,7 +701,31 @@ paperclip_db_pool_connections{pod="paperclip-0"}
 The signature that *did* discriminate was a permanently `active` connection
 count with nothing queued — a stuck transaction — alongside zero dispatches.
 
-#### Step 4 — recovery: capture, then wait. Do NOT restart the pod.
+#### Step 4 — recovery: capture, then wait. Restart only on the gate below.
+
+**Which arm paged decides what the wait is for** (BLO-36522 split):
+
+- **`PaperclipAgentStartLockFleetStall` alone: capture, then wait.** This is
+  the regime the self-heal evidence above covers (every measured hold up to
+  2h14m released on its own), and the rationale in the next paragraph is
+  about it and nothing else.
+- **`PaperclipAgentStartLockWedged`: capture, then re-check the restart gate
+  below as the hold ages. The gate is the decision point, not the wait.** No
+  hold past 4h has been observed to settle, so the self-heal rationale does
+  not license waiting this one out. But the gate cannot return its top row
+  until the hold is about 6h old (see the gate), and `Wedged` pages at
+  `14400`s + `for: 5m`, about **4h05m**. So on this arm the gate reads
+  *inconclusive* for roughly the first **1h55m after the page by
+  construction**, not because the lock is healthy. Capture now, put the agent
+  id on the issue, and re-run the gate queries once the hold passes 6h; from
+  then on, a top-row reading plus the other three signals is the restart
+  case below.
+- **Both firing: `Wedged` governs** for every agent past 4h, and `FleetStall`'s
+  capture-and-wait covers only the agents below it. The two arms are not
+  mutually exclusive: the founding 2026-09-15/16 incident (five agents at
+  6-19 h) trips both, because each of those agents is past `14400`s. Do not
+  let the `FleetStall` self-clear evidence overrule it -- that evidence stops
+  at 2h14m.
 
 **This step used to read "the section must settle or the process must be
 replaced" and prescribe `kubectl delete pod`. That prescription is withdrawn
@@ -637,10 +733,12 @@ replaced" and prescribe `kubectl delete pod`. That prescription is withdrawn
 worst episode on record cleared itself with the same process still running,
 and kept running 7.75 h afterwards. Replacing the worker pod is a
 shared-infrastructure mutation affecting **every** agent in the fleet, and the
-evidence says it buys nothing the wait would not have given you.
+evidence says it buys nothing the wait would not have given you -- in the
+regime that evidence covers, i.e. `FleetStall`; see the per-arm list above.
 
-**So the page's action is evidence capture inside a window that closes by
-itself.** While it is still firing:
+**So the page's action is evidence capture, on either arm** -- inside a window
+that, on `FleetStall`, has closed by itself every time it was measured, and
+on `Wedged` feeds the gate below. While it is still firing:
 
 ```
 max by (agent_id) (paperclip_agent_start_lock_held_seconds)      # who, and how long
@@ -693,7 +791,9 @@ That gate cannot be met until the hold is roughly six hours old. The series
 does not exist before acquisition, so a younger hold cannot be present
 throughout a `[6h]` window and lands in the inconclusive third row. This is
 deliberate: in practice the gate means "wait about 6h", and the one long hold
-observed end to end (2h14m) released on its own well inside that.
+observed end to end (2h14m) released on its own well inside that. On a
+`Wedged` page, which fires at about 4h05m, that floor lands roughly 1h55m
+after the page (per-arm list at the top of this step).
 
 The real fix — making the critical section's awaits abortable so `fn` rejects
 and releases the lock through the existing `finally` — is out of scope of the
@@ -732,10 +832,9 @@ does **not** make the page live. The rule must also land in the two lockstep
 must be synced (BLO-19095). Verify at `/api/v1/rules` before relying on it.
 
 ⚠️ **KNOWN DIVERGENCE, accepted and recorded rather than fixed (BLO-36522).**
-The BLO-36522 retune is prepared for the two `Blockcast/onprem-k8s` copies (the
-only ones that fire at Blockcast) in `Blockcast/onprem-k8s#3985`, which is
-**not yet merged**: until it lands, the live rule is still `> 300` for 5m and
-this alert still fires on single-agent routine contention. It is
+The BLO-36522 retune shipped to the two `Blockcast/onprem-k8s` copies (the only
+ones that fire at Blockcast) in `Blockcast/onprem-k8s#4036`, merged
+2026-09-28 and verified loaded at `/api/v1/rules` on 2026-09-30. It is
 **deliberately not** in the chart copy above, which still carries `max by (agent_id) (...) > 300` for 5m wired to
 `prometheusRule.agentStartLockHeldSeconds` / `LOCK_HELD_ERROR_MS`. It renders
 nothing here, so this costs Blockcast nothing today. It is a landmine for

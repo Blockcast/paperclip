@@ -192,6 +192,31 @@ export function resolveCcrotateCapacityRetry(
 }
 
 /**
+ * The provider's own advertised resume instant, persisted unclamped (BLO-34782).
+ *
+ * Exported for the same reason as {@link CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY}
+ * below, but the drift it guards is worse because it crosses a language
+ * boundary. Four sites must agree: the writer below, the `result_json ->> ...`
+ * SQL fragment in `queued-run-age-metrics.ts` that computes the overdue gauge's
+ * effective due time, the `parked-agents` projection in `routes/agents.ts`
+ * (the endpoint the alert's runbook sends on-call to), and the on-call triage
+ * query embedded in `deploy/helm/paperclip/templates/prometheusrule.yaml`.
+ *
+ * A rename that misses any consumer compiles clean and fails silently in
+ * the paging direction: `greatest` ignores the NULL from the now-unmatched key,
+ * the gauge degrades to the bare `scheduled_retry_at` column, and it resumes
+ * paging on exactly the capacity-clamped population BLO-34782 removed — while
+ * the triage query the responder reaches for degrades identically at the same
+ * moment, so the instrument used to check the alert corroborates it.
+ *
+ * Reading through this binding in the SQL fragment and the route makes three
+ * of the four rename-safe. The YAML cannot import a TS constant, so the fourth
+ * is pinned instead by `prometheusrule-result-json-keys.test.ts`, which
+ * asserts every occurrence in that query equals this value.
+ */
+export const CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY = "penstockAdvertisedResumeAt";
+
+/**
  * Every `resultJson` key that describes *which* capacity denial parked a run
  * (BLO-24011). Enumerated so a re-defer can clear the previous decision wholesale
  * before writing the current one: a key that is absent from the new decision must
@@ -232,7 +257,7 @@ const CCROTATE_CAPACITY_DECISION_KEYS = [
   "penstockModel",
   "penstockReason",
   "penstockRetryAfterSeconds",
-  "penstockAdvertisedResumeAt",
+  CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY,
   "penstockCapacityParkClampedFrom",
   /**
    * Which gate probe denied this park: "capacity" or "messages_fallback"
@@ -489,7 +514,7 @@ export function applyCcrotateCapacityDecision(
     next.penstockRetryAfterSeconds = decision.retryAfterSeconds;
   }
   if (decision.advertisedResumeAtIso !== null) {
-    next.penstockAdvertisedResumeAt = decision.advertisedResumeAtIso;
+    next[CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY] = decision.advertisedResumeAtIso;
   }
   if (decision.clampedFromIso !== null) {
     next.penstockCapacityParkClampedFrom = decision.clampedFromIso;

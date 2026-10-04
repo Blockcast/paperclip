@@ -12,10 +12,15 @@ import {
   classifyFromListing,
   classifyPr,
   failingChecks,
+  applyRow,
   isFatalGhError,
   isMainModule,
+  markFailure,
   latestCheckStates,
+  renderReceipt,
+  repoRunner,
   settleMinutesFrom,
+  sweepRepos,
   targetRepos,
   unsatisfiedOwners,
 } from "./land-clean-prs.mjs";
@@ -153,6 +158,21 @@ describe("classifyPr rule order", () => {
       assert.equal(classify({ mergeStateStatus: state }).action, "enqueue");
     }
   });
+
+  it("holds UNSTABLE even when the check rule passes, because gh would merge it outright", () => {
+    // `gh pr merge --auto` merges immediately for CLEAN, HAS_HOOKS and UNSTABLE
+    // (cli/cli isImmediatelyMergeable). A red Ally verdict status is ignored by
+    // the check rule, so the mergestate rule is the only thing holding this PR.
+    const row = classify({
+      mergeStateStatus: "UNSTABLE",
+      statusCheckRollup: [
+        { name: "verify", conclusion: "SUCCESS" },
+        { __typename: "StatusContext", context: "gate/ally-comment-findings", state: "FAILURE" },
+      ],
+    });
+    assert.equal(row.action, "skip");
+    assert.equal(row.reason, "mergestate:UNSTABLE");
+  });
 });
 
 describe("Ally verdict selection (BLO-32240)", () => {
@@ -240,22 +260,56 @@ describe("per-fire cap", () => {
     assert.equal(rows[1].action, "enqueue");
   });
 
+  const clean = () => Array.from({ length: 3 }, (_, i) => pr({ number: 200 + i }));
+
   it("carries spend across repos, so the cap is per FIRE and not per repo", () => {
     // `runRepo` calls `classifyAll` once per swept repo. Without `spent` the
     // counter restarts each call and the real ceiling is `cap x repos` — the
     // blast radius scaling with the multi-repo knob that makes a classifier
     // bug reach further in the first place.
-    const clean = () => Array.from({ length: 3 }, (_, i) => pr({ number: 200 + i }));
-    let spent = 0;
     const perRepo = [];
-    for (const _repo of ["a/one", "a/two", "a/three"]) {
-      const rows = classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent });
-      const armed = rows.filter((r) => r.action === "enqueue").length;
-      spent += armed;
-      perRepo.push(armed);
-    }
+    const spent = sweepRepos(["a/one", "a/two", "a/three"], (_repo, carried) => {
+      const rows = classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent: carried });
+      perRepo.push(rows.filter((r) => r.action === "enqueue").length);
+      return rows;
+    });
     assert.deepEqual(perRepo, [3, 1, 0], "repo 2 gets the remainder, repo 3 gets nothing");
     assert.equal(spent, 4, "total armed never exceeds the cap");
+  });
+
+  it("does not spend budget on an enqueue that failed to apply", () => {
+    // A failed enqueue merged nothing, so it must not starve later repos. The
+    // opposite reading (counting `enqueue-failed` as spent) lets a repo full of
+    // doomed enqueues eat the fire's budget before the sweep reaches the rest.
+    const seen = [];
+    const spent = sweepRepos(["a/one", "a/two", "a/three"], (repo, carried) => {
+      seen.push(carried);
+      const rows = classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent: carried });
+      if (repo === "a/one") markFailure(rows[0], "boom");
+      return rows;
+    });
+    assert.deepEqual(seen, [0, 2, 4], "repo 1 spends 2 of its 3, not 3");
+    assert.equal(spent, 4);
+  });
+
+  it("main's per-repo step hands the carried spend to runRepo", () => {
+    // The two tests above stub the step, so they cannot see `main` drop the
+    // carry. This one composes the real `repoRunner` with a spy in place of
+    // `runRepo`: passing a literal 0 would make the cap per repo again.
+    const rotted = [];
+    const calls = [];
+    const spy = (...args) => {
+      calls.push(args);
+      return classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent: args[3] });
+    };
+    sweepRepos(["a/one", "a/two"], repoRunner(true, 7, rotted, spy));
+    assert.deepEqual(calls, [
+      ["a/one", true, 7, 0, rotted],
+      ["a/two", true, 7, 3, rotted],
+    ]);
+    // deepEqual is structural, so an empty `rotted` above matches any empty
+    // array. Identity is what main's `finally` relies on to report the cohort.
+    for (const call of calls) assert.equal(call[4], rotted);
   });
 });
 
@@ -686,5 +740,66 @@ describe("helpers", () => {
     assert.equal(isMainModule("", "file:///tmp/land-clean-prs.mjs"), false);
     assert.equal(isMainModule("/tmp/other.mjs", "file:///tmp/land-clean-prs.mjs"), false);
     assert.equal(isMainModule("/tmp/land-clean-prs.mjs", "file:///tmp/land-clean-prs.mjs"), true);
+  });
+});
+
+describe("applyRow", () => {
+  /**
+   * Regression for BLO-36804. `gh pr merge --auto` only infers a merge method
+   * when the PR base branch has a merge queue, so a PR targeting a stacked
+   * feature branch failed with "--merge, --rebase, or --squash required" on 9
+   * consecutive fires while still reporting `enqueue`.
+   */
+  it("arms auto-merge with an explicit merge method", () => {
+    const calls = [];
+    const outcome = applyRow("o/r", { number: 7, action: "enqueue" }, (args) => {
+      calls.push(args);
+      return "";
+    });
+    // Not "armed": the same call queues, arms, or merges outright depending on
+    // the base, and this defect was a receipt naming an action it had not taken.
+    assert.equal(outcome, "merge requested");
+    assert.deepEqual(calls, [["pr", "merge", "7", "--repo", "o/r", "--auto", "--rebase"]]);
+  });
+
+  it("disarms a stale enqueue without a merge method", () => {
+    const calls = [];
+    applyRow("o/r", { number: 8, action: "stale-enqueue" }, (args) => {
+      calls.push(args);
+      return args[0] === "api" ? "[]" : "";
+    });
+    assert.deepEqual(calls[0], ["pr", "merge", "8", "--repo", "o/r", "--disable-auto"]);
+    assert.equal(calls.at(-1)[0], "pr");
+    assert.equal(calls.at(-1)[1], "comment");
+  });
+
+  it("leaves unknown actions alone", () => {
+    assert.equal(applyRow("o/r", { number: 9, action: "hold" }, () => {
+      throw new Error("must not shell out");
+    }), null);
+  });
+});
+
+describe("markFailure", () => {
+  /**
+   * The receipt tallies by action, so a failure recorded only in `detail` is
+   * invisible to the summary line. That is how 9 silent fires survived review.
+   */
+  it("moves the failure into the action column and keeps prior detail", () => {
+    const row = markFailure(
+      { number: 7, action: "enqueue", detail: "clean at head" },
+      "  --merge, --rebase, or --squash required\nusage: gh pr merge\n",
+    );
+    assert.equal(row.action, "enqueue-failed");
+    assert.equal(row.detail, "clean at head — failed: --merge, --rebase, or --squash required");
+  });
+
+  it("is visible in the receipt tally", () => {
+    const receipt = renderReceipt([
+      { number: 1, action: "enqueue", reason: "clean", detail: "" },
+      markFailure({ number: 2, action: "enqueue", reason: "clean", detail: "" }, "boom"),
+    ]);
+    assert.match(receipt, /enqueue: 1/);
+    assert.match(receipt, /enqueue-failed: 1/);
   });
 });

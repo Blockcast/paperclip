@@ -320,3 +320,117 @@ test("UNEXECUTED_WITH_TESTS has no stale entries", () => {
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// The sweeps above answer "does this package's suite run at all?". This one
+// answers the next question: does it run with a timeout budget anyone chose?
+//
+// Under Vitest 4 `projects`, a root CLI `--testTimeout` reaches a project's
+// resolved config but `--hookTimeout` does not. Measured on vitest 4.1.8
+// against packages/db, which declares neither (BLO-37184, 2026-09-27):
+//
+//   --testTimeout=30000  -> a 7s test passes
+//   --testTimeout=1000   -> "Test timed out in 1000ms."
+//   (no flag)            -> "Test timed out in 5000ms."
+//   --hookTimeout=60000  -> "Hook timed out in 10000ms."
+//   --hookTimeout=2000   -> "Hook timed out in 10000ms."   <- tightening ignored too
+//   (no flag)            -> "Hook timed out in 10000ms."
+//
+// run-vitest-stable.mjs passed both flags to every general-workspaces-b
+// project for months, so the hook half was inert the whole time and the
+// packages it appeared to cover looked handled while running on the bare 10s
+// default. That is what made BLO-36739's alertmanager flake hard to diagnose,
+// and it is why a flag that READS as protection is worse than no flag.
+//
+// A hook budget only binds from the package's own vitest.config.ts (verified:
+// `hookTimeout: 30_000` there makes a 12s hook pass under `--project`). A
+// package that boots a real or WASM Postgres without one is a merge-queue
+// ejection waiting to happen -- BLO-37114 measured 6 of 12 `merge_group`
+// failures as one package's `beforeEach` missing the 10s deadline, each
+// ejection costing a full re-traverse of a ~64-deep queue.
+//
+// So: boot embedded Postgres in a test file, declare a budget. Both halves are
+// required, not just the hook one, so this stays correct if the root
+// `--testTimeout` is ever dropped as well.
+// ---------------------------------------------------------------------------
+
+const EMBEDDED_POSTGRES = /startEmbeddedPostgresTestDatabase|@electric-sql\/pglite|\bPGlite\b/;
+
+function testFilesUnder(dir) {
+  const packageDirs = new Set();
+  const testFiles = [];
+  collectWorkspace(dir, packageDirs, testFiles);
+  return testFiles;
+}
+
+function bootsEmbeddedPostgres(projectDir) {
+  return testFilesUnder(path.join(repoRoot, projectDir)).some((file) =>
+    EMBEDDED_POSTGRES.test(readFileSync(file, "utf8")),
+  );
+}
+
+function declaredTimeouts(projectDir) {
+  let source;
+  try {
+    source = readFileSync(path.join(repoRoot, projectDir, "vitest.config.ts"), "utf8");
+  } catch {
+    return { testTimeout: false, hookTimeout: false, config: false };
+  }
+  // Strip `//` comments first, as the sibling guard in
+  // run-vitest-stable-shard.test.mjs does. These configs carry long comments
+  // that name both knobs, so a commented-out `// testTimeout: 5_000,` -- or
+  // prose merely discussing one -- would otherwise register as declared. That
+  // is a fail-open inside a test whose whole purpose is catching fail-open
+  // protection.
+  const code = source.replace(/^\s*\/\/.*$/gm, "");
+  return {
+    config: true,
+    testTimeout: /\btestTimeout\s*:/.test(code),
+    hookTimeout: /\bhookTimeout\s*:/.test(code),
+  };
+}
+
+test("every project that boots embedded Postgres sets its own test/hook timeouts", () => {
+  const offenders = readConfiguredProjectDirs()
+    .filter(bootsEmbeddedPostgres)
+    .map((dir) => ({ dir, ...declaredTimeouts(dir) }))
+    .filter(({ testTimeout, hookTimeout }) => !testTimeout || !hookTimeout);
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `These Vitest projects boot embedded Postgres but declare no timeout budget of their own, ` +
+      `so they run on Vitest's 5s test / 10s hook defaults. A root CLI --hookTimeout cannot fix ` +
+      `this -- it is inert under Vitest 4 \`projects\` (BLO-37184). Set both in the package's own ` +
+      `vitest.config.ts, as server/vitest.config.ts does:\n` +
+      offenders
+        .map(
+          ({ dir, config, testTimeout, hookTimeout }) =>
+            `  - ${dir} (${config ? `missing ${[!testTimeout && "testTimeout", !hookTimeout && "hookTimeout"].filter(Boolean).join(" + ")}` : "no vitest.config.ts"})`,
+        )
+        .join("\n"),
+  );
+});
+
+test("the embedded-Postgres detector is not vacuous", () => {
+  // Positive control. Without it, a rename of `startEmbeddedPostgresTestDatabase`
+  // or a move of the PGlite import would make the sweep above pass by matching
+  // nothing at all -- the same fail-open shape the inert CLI flags had.
+  //
+  // Both alternation branches need an anchor, because they are matched by
+  // disjoint sets of packages. `server` and `packages/db` match solely via
+  // `startEmbeddedPostgresTestDatabase`; `paperclip-plugin-alertmanager` has
+  // zero hits on that name and is found only by the PGlite branch. Asserting
+  // the first two alone would leave the PGlite branch uncontrolled, so
+  // alertmanager could silently drop out of the sweep -- and it is the package
+  // responsible for most of the merge-queue ejections this guard exists for.
+  const boots = readConfiguredProjectDirs().filter(bootsEmbeddedPostgres);
+  assert.ok(
+    boots.includes("server") &&
+      boots.includes("packages/db") &&
+      boots.includes("packages/plugins/paperclip-plugin-alertmanager"),
+    `expected the detector to find server, packages/db and ` +
+      `packages/plugins/paperclip-plugin-alertmanager (the latter pins the PGlite ` +
+      `branch), got: ${boots.join(", ") || "(none)"}`,
+  );
+});

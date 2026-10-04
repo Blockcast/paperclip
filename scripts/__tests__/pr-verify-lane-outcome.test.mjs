@@ -428,6 +428,475 @@ test("classifyJobFailure defaults to the safe state when annotations are omitted
   );
 });
 
+// ---------------------------------------------------------------------------
+// PEN-3583: a runner that fails BEFORE the job body starts.
+//
+// Real shape, captured verbatim from the Actions API for run 36303595922
+// attempt 2, job 108655477890 ("General tests (workspaces-b)"). `Set up runner`
+// failed, so every step `pr.yml` declares was skipped: no repository checked
+// out, no dependency installed, not one test run. Note step 10 — GitHub runs
+// `Complete job` even here and marks it `success`, which is why the body test
+// must exclude the postamble rather than assert "everything after checkout is
+// skipped".
+// ---------------------------------------------------------------------------
+const PRE_BODY_KILLED_JOB = {
+  id: 108655477890,
+  name: "General tests (workspaces-b)",
+  conclusion: "failure",
+  steps: [
+    { number: 1, name: "Set up job", conclusion: "success" },
+    { number: 2, name: "Set up runner", conclusion: "failure" },
+    { number: 3, name: "Checkout repository", conclusion: "skipped" },
+    { number: 4, name: "Setup pnpm", conclusion: "skipped" },
+    { number: 5, name: "Restore regenerated PR lockfile (if policy uploaded one)", conclusion: "skipped" },
+    { number: 6, name: "Setup Node.js", conclusion: "skipped" },
+    { number: 7, name: "Install dependencies", conclusion: "skipped" },
+    { number: 8, name: "Run grouped general test suites", conclusion: "skipped" },
+    { number: 9, name: "Run serialized server test shard", conclusion: "skipped" },
+    { number: 10, name: "Complete job", conclusion: "success" },
+  ],
+};
+// The job's only annotation. Exit code 130 is SIGINT (128+2) — an interruption,
+// not a test verdict — but it matches none of RUNNER_LOSS_PATTERNS, which is
+// precisely why signal 1 declines on this shape.
+const PRE_BODY_KILLED_ANNOTATIONS = [
+  { annotation_level: "failure", message: "Process completed with exit code 130." },
+];
+
+test("classifier detects a runner that failed before the job body started", async () => {
+  const { classifyJobFailure, RUNNER_LOSS_PATTERNS } = await import(
+    "../classify-lane-failures.mjs"
+  );
+
+  assert.equal(
+    classifyJobFailure(PRE_BODY_KILLED_JOB, PRE_BODY_KILLED_ANNOTATIONS),
+    "infrastructure",
+    "a lane that never checked out a repository cannot have observed the diff, so it must " +
+      "not be announced as a possible defect in it",
+  );
+
+  // Falsification guards for the two pre-existing signals, so this test cannot
+  // pass because one of THEM happened to fire. Both must be shown to decline on
+  // this fixture, or the new signal is untested.
+  //
+  // Signal 1 is checked against the module's OWN exported patterns rather than a
+  // copy of them: a transcription is stale the moment a pattern is added, and a
+  // guard checking a set the classifier does not use would assert the opposite
+  // of the truth while still passing.
+  assert.ok(
+    Array.isArray(RUNNER_LOSS_PATTERNS) && RUNNER_LOSS_PATTERNS.length > 0,
+    "signal 1's guard is vacuous against an empty pattern set — `!some` on [] answers true",
+  );
+  assert.ok(
+    !PRE_BODY_KILLED_ANNOTATIONS.some((annotation) =>
+      RUNNER_LOSS_PATTERNS.some((pattern) => pattern.test(annotation.message)),
+    ),
+    "signal 1 must not fire on this fixture — otherwise the new signal is not what is under test",
+  );
+  assert.ok(
+    PRE_BODY_KILLED_JOB.steps.some((step) => step.conclusion === "failure"),
+    "signal 2 must not fire on this fixture — the failing-step set has to be non-empty",
+  );
+});
+
+// A `Set up job` failure is a DIFFERENT thing from a `Set up runner` failure,
+// even though both are synthetic steps that precede the body and both leave the
+// declared steps `skipped`. `Set up job` is where GitHub resolves remote action
+// references, and those come from the PR's own `pr.yml` — so this shape can be a
+// defect the diff really did introduce, and excusing it would invert the
+// script's purpose exactly as a mislabelled `timeout-minutes` expiry would.
+test("a Set up job failure is not excused — action refs are diff-controlled", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  const badActionRef = {
+    id: 3,
+    name: "General tests (workspaces-b)",
+    conclusion: "failure",
+    steps: [
+      { number: 1, name: "Set up job", conclusion: "failure" },
+      { number: 2, name: "Checkout repository", conclusion: "skipped" },
+      { number: 3, name: "Install dependencies", conclusion: "skipped" },
+      { number: 4, name: "Run grouped general test suites", conclusion: "skipped" },
+      { number: 5, name: "Complete job", conclusion: "success" },
+    ],
+  };
+  assert.equal(
+    classifyJobFailure(badActionRef, [
+      {
+        annotation_level: "failure",
+        message:
+          "Unable to resolve action `actions/checkout@v99`, repository or version not found",
+      },
+    ]),
+    "reported",
+    "a PR that bumps an action to a ref that does not exist must keep the failure wording",
+  );
+
+  // Falsification: the identical shape with the failure moved to `Set up runner`
+  // MUST flip. Without this the assertion above would pass on a classifier that
+  // had simply stopped detecting the pre-body shape at all.
+  //
+  // Varies the step NAME only — the bad-action-ref annotation above is retained
+  // rather than swapped for PRE_BODY_KILLED_ANNOTATIONS, so the single
+  // difference between the two calls is the thing the message claims is
+  // responsible. Swapping both passed for the same reason, but did not isolate
+  // it.
+  assert.equal(
+    classifyJobFailure(
+      {
+        ...badActionRef,
+        steps: badActionRef.steps.map((step) =>
+          step.name === "Set up job" ? { ...step, name: "Set up runner" } : step,
+        ),
+      },
+      [
+        {
+          annotation_level: "failure",
+          message:
+            "Unable to resolve action `actions/checkout@v99`, repository or version not found",
+        },
+      ],
+    ),
+    "infrastructure",
+    "fixture no longer isolates the step name — it must be the failing step that flips this",
+  );
+});
+
+// The synthetic-step names are matched POSITIONALLY: the preamble is the
+// leading run of steps carrying them, not every step that happens to be named
+// one. A declared step colliding with the name after the body has started must
+// therefore stay in the body, where a `failure` conclusion defeats the
+// all-skipped test on its own.
+//
+// This is the unsafe direction, so it is pinned rather than left to the
+// comment: under the previous whole-list name filter the collision was pulled
+// out of the body AND landed in the excusable set, so the step name alone
+// converted a real diff failure into an excused pool kill.
+test("a declared step colliding with a synthetic name stays in the body", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // `Checkout repository` was skipped by an `if:` condition, so the body has
+  // started before the colliding step runs.
+  const collidingBodyStep = {
+    id: 4,
+    name: "General tests (workspaces-b)",
+    conclusion: "failure",
+    steps: [
+      { number: 1, name: "Set up job", conclusion: "success" },
+      { number: 2, name: "Checkout repository", conclusion: "skipped" },
+      { number: 3, name: "Set up runner", conclusion: "failure" },
+      { number: 4, name: "Run grouped general test suites", conclusion: "skipped" },
+      { number: 5, name: "Complete job", conclusion: "success" },
+    ],
+  };
+  const diffCausedAnnotations = [
+    { annotation_level: "failure", message: "docker: image not found" },
+  ];
+
+  assert.equal(
+    classifyJobFailure(collidingBodyStep, diffCausedAnnotations),
+    "reported",
+    "a step the workflow declared is part of the body however it is named — excusing it " +
+      "would let a step name convert a real diff failure into a pool kill",
+  );
+
+  // The documented residual, asserted so the caveat in the module cannot drift
+  // from the behaviour. A collision in the FIRST declared position is absorbed
+  // into the leading run and IS excused: GitHub's jobs API exposes nothing that
+  // distinguishes it from the synthetic step of the same name. If a future
+  // change closes this, update the comment above PRE_BODY_SETUP_STEP_NAMES —
+  // do not simply delete this assertion.
+  assert.equal(
+    classifyJobFailure(
+      {
+        ...collidingBodyStep,
+        steps: [
+          { number: 1, name: "Set up job", conclusion: "success" },
+          { number: 2, name: "Set up runner", conclusion: "failure" },
+          { number: 3, name: "Checkout repository", conclusion: "skipped" },
+          { number: 4, name: "Run grouped general test suites", conclusion: "skipped" },
+          { number: 5, name: "Complete job", conclusion: "success" },
+        ],
+      },
+      diffCausedAnnotations,
+    ),
+    "infrastructure",
+    "residual collision changed shape — the module comment describes it as first-declared-only",
+  );
+});
+
+test("the body is bounded by step `number`, not by array position", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // The PEN-3583 shape with the array scrambled and `number` left truthful.
+  // Reading the preamble positionally made array order load-bearing for the
+  // first time, so the ordering key is asserted rather than assumed: nothing
+  // in the API contract promises the array arrives sorted, and the failure is
+  // silent if it ever does not.
+  //
+  // Unsorted, the leading run breaks at `Checkout repository` in position 0,
+  // so `Set up job` (`success`) falls inside the body and the all-skipped test
+  // declines — this returns "reported" without the sort.
+  assert.equal(
+    classifyJobFailure(
+      {
+        ...PRE_BODY_KILLED_JOB,
+        steps: [
+          { number: 3, name: "Checkout repository", conclusion: "skipped" },
+          { number: 1, name: "Set up job", conclusion: "success" },
+          { number: 2, name: "Set up runner", conclusion: "failure" },
+          { number: 4, name: "Run grouped general test suites", conclusion: "skipped" },
+          { number: 5, name: "Complete job", conclusion: "success" },
+        ],
+      },
+      PRE_BODY_KILLED_ANNOTATIONS,
+    ),
+    "infrastructure",
+    "classification must follow step `number` — a reordered array is the same job",
+  );
+});
+
+// The guard on that sort, pinned separately. Reverting the sort itself fails
+// the test above, but REMOVING the `Number.isFinite` guard — sorting
+// unconditionally — left the whole suite green, so nothing held it. It is not
+// decorative: a comparator returning `NaN` is specified to compare EQUAL
+// (`SortCompare`), so a partially-numbered list does not throw, it interleaves
+// silently.
+test("a partially-numbered step list keeps declaration order rather than interleaving", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // The hazard shape: the array is NOT in `number` order (the postamble is
+  // rendered before the last declared step) AND one step carries no `number`
+  // at all. Both halves are needed — a partially-numbered list that already
+  // happens to be in order is unaffected, because `Array.prototype.sort` is
+  // stable and every NaN comparison reads as "equal", so it moves nothing.
+  //
+  // With the guard, the key is not present throughout, so declaration order is
+  // kept: `Complete job` is not in the trailing run, lands in the body at
+  // `success`, and the all-skipped test declines — "reported", which is the
+  // pre-sort behaviour this replaced.
+  //
+  // Without it, the partial sort displaces `Complete job` to the end where it
+  // IS stripped as postamble, the remaining body reads all-skipped, and the job
+  // is excused as an infrastructure kill. That is the unsafe direction, and it
+  // is the only direction this guard runs in: over all 120 orderings of this
+  // five-step shape crossed with each choice of missing `number`, the 109
+  // inputs whose verdict the guard changes ALL move guarded-"reported" →
+  // unguarded-"infrastructure". The guard never excuses something the sort
+  // would have reported; it only declines to excuse on evidence it cannot
+  // order.
+  assert.equal(
+    classifyJobFailure(
+      {
+        ...PRE_BODY_KILLED_JOB,
+        steps: [
+          { name: "Set up job", conclusion: "success" },
+          { number: 2, name: "Set up runner", conclusion: "failure" },
+          { number: 3, name: "Checkout repository", conclusion: "skipped" },
+          { number: 5, name: "Complete job", conclusion: "success" },
+          { number: 4, name: "Run grouped general test suites", conclusion: "skipped" },
+        ],
+      },
+      PRE_BODY_KILLED_ANNOTATIONS,
+    ),
+    "reported",
+    "a step list that cannot be ordered must not be excused on a silently interleaved body",
+  );
+});
+
+// A lane declaring `container:` / `services:` gets an `Initialize containers`
+// step, which is in NEITHER name set. Both consequences are asserted here
+// because the module's scope note claims them and an earlier revision of that
+// note claimed the opposite (it had `Set up runner` consuming the block).
+test("a container lane classifies on the container step, with no special-casing", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // Step shape measured on `postgres-tests (heavy 3/4)` in
+  // `Blockcast/penstock-llm-proxy-core` (job 104214352274): the preamble is
+  // three steps, not two, AND the postamble is two, not one — that job renders
+  // `24:Stop containers` before `25:Complete job`. An earlier revision of this
+  // fixture omitted the teardown step while citing this same job as its
+  // measured shape, so it asserted over a step list that does not occur and
+  // passed for a reason it did not test.
+  //
+  // `stopConclusion` is a parameter rather than a constant because it is the
+  // half nobody has measured: a container lane killed BEFORE `Initialize
+  // containers` has not been observed, so whether its teardown step renders
+  // `skipped` or `success` is unknown. On the cancelled container jobs that
+  // HAVE been measured (100900589400 / 100896100309 in that repo) it is
+  // `success` even with the declared steps around it `skipped`. Asserting over
+  // both renderings is what keeps the verdict from depending on that unknown.
+  const containerLaneSteps = (containerConclusion, runnerConclusion, stopConclusion) => [
+    { number: 1, name: "Set up job", conclusion: "success" },
+    { number: 2, name: "Set up runner", conclusion: runnerConclusion },
+    { number: 3, name: "Initialize containers", conclusion: containerConclusion },
+    { number: 4, name: "Checkout repository", conclusion: "skipped" },
+    { number: 5, name: "Run grouped general test suites", conclusion: "skipped" },
+    { number: 98, name: "Stop containers", conclusion: stopConclusion },
+    { number: 99, name: "Complete job", conclusion: "success" },
+  ];
+
+  // A real pre-body kill: the container step is skipped alongside the declared
+  // steps, so it does not defeat the all-skipped test and the signal still
+  // fires — under EITHER teardown rendering. Without `Stop containers` in
+  // RUNNER_POSTAMBLE_STEP_NAMES the `success` case returns "reported", so this
+  // loop is what pins that name into the set; drop it and the `success`
+  // iteration fails.
+  for (const stopConclusion of ["success", "skipped"]) {
+    assert.equal(
+      classifyJobFailure(
+        { ...PRE_BODY_KILLED_JOB, steps: containerLaneSteps("skipped", "failure", stopConclusion) },
+        PRE_BODY_KILLED_ANNOTATIONS,
+      ),
+      "infrastructure",
+      `a container lane killed in the preamble observed no more of the diff than any other lane (Stop containers: ${stopConclusion})`,
+    );
+  }
+
+  // The diff-controlled half: a bad image named by the PR fails at
+  // `Initialize containers`, which is in the body and is not excusable. It
+  // must keep the ordinary failure wording with no name added to either set —
+  // excusing it would announce a defect the PR really did introduce as a pool
+  // kill. Asserted under both teardown renderings for the same reason: naming
+  // `Stop containers` as postamble must not have widened what gets excused.
+  for (const stopConclusion of ["success", "skipped"]) {
+    assert.equal(
+      classifyJobFailure(
+        { ...PRE_BODY_KILLED_JOB, steps: containerLaneSteps("failure", "success", stopConclusion) },
+        [{ annotation_level: "failure", message: "Failed to pull image: manifest unknown" }],
+      ),
+      "reported",
+      `a \`container:\` image the diff chose is the diff's own failure, not infrastructure (Stop containers: ${stopConclusion})`,
+    );
+  }
+
+  // The postamble collision, asserted so the asymmetry in the module comment
+  // cannot drift: a DECLARED trailing step named `Stop containers` is absorbed
+  // into the postamble by name, exactly like the preamble residual — but it is
+  // NOT excused, because the name is absent from
+  // EXCUSABLE_SETUP_FAILURE_STEP_NAMES and its `failure` conclusion is read off
+  // the raw step list, which the postamble exclusion never touches. This is the
+  // one direction in which naming a step is safe.
+  assert.equal(
+    classifyJobFailure(
+      {
+        ...PRE_BODY_KILLED_JOB,
+        steps: [
+          { number: 1, name: "Set up job", conclusion: "success" },
+          { number: 2, name: "Set up runner", conclusion: "success" },
+          { number: 3, name: "Checkout repository", conclusion: "skipped" },
+          { number: 4, name: "Stop containers", conclusion: "failure" },
+          { number: 5, name: "Complete job", conclusion: "success" },
+        ],
+      },
+      [{ annotation_level: "failure", message: "Process completed with exit code 1." }],
+    ),
+    "reported",
+    "a postamble name collision must not become excusable — only the preamble set feeds the excuse",
+  );
+});
+
+test("the timeout override still beats the pre-body signal", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // The adversarial case BLO-28813/BLO-33313 exist to protect: a job carrying a
+  // `timeout-minutes` expiry annotation AND the exact step shape the new signal
+  // fires on. Announcing this as a pool kill would invert the script's purpose,
+  // turning a diff-introduced hang into an invitation to re-run forever.
+  assert.equal(
+    classifyJobFailure(PRE_BODY_KILLED_JOB, [
+      ...TIMED_OUT_ANNOTATIONS,
+      ...PRE_BODY_KILLED_ANNOTATIONS,
+    ]),
+    "reported",
+    "a timeout expiry must keep the ordinary failure wording even when the step shape " +
+      "would otherwise satisfy the pre-body signal",
+  );
+
+  // Falsification: strip only the timeout annotation and the very same job must
+  // flip. Without this the assertion above would pass on a classifier that had
+  // simply stopped detecting the pre-body shape at all.
+  assert.equal(
+    classifyJobFailure(PRE_BODY_KILLED_JOB, PRE_BODY_KILLED_ANNOTATIONS),
+    "infrastructure",
+    "fixture no longer isolates the timeout override — it must be the annotation that flips this",
+  );
+
+  // The real timeout fixture is ALSO disjoint on shape, independently of the
+  // ordering above: a job-level expiry leaves the steps before the in-flight one
+  // `success`, so its body is not all-skipped. Pinned so a future edit to
+  // TIMED_OUT_JOB cannot quietly remove the second line of defence.
+  assert.ok(
+    TIMED_OUT_JOB.steps.some(
+      (step) => step.name === "Checkout repository" && step.conclusion === "success",
+    ),
+    "a job-level timeout must still be distinguishable by shape, not only by annotation order",
+  );
+});
+
+test("a genuine failure after checkout is not excused by the pre-body signal", async () => {
+  const { classifyJobFailure } = await import("../classify-lane-failures.mjs");
+
+  // The load-bearing negative: once the body has started, a skipped tail is the
+  // ORDINARY shape of a real failure — GitHub skips the remaining steps after
+  // any step fails. Excusing that would excuse essentially every red lane.
+  const failedAfterCheckout = {
+    id: 2,
+    name: "General tests (workspaces-b)",
+    conclusion: "failure",
+    steps: [
+      { name: "Set up job", conclusion: "success" },
+      { name: "Set up runner", conclusion: "success" },
+      { name: "Checkout repository", conclusion: "success" },
+      { name: "Install dependencies", conclusion: "success" },
+      { name: "Run grouped general test suites", conclusion: "failure" },
+      { name: "Run serialized server test shard", conclusion: "skipped" },
+      { name: "Complete job", conclusion: "success" },
+    ],
+  };
+  assert.equal(
+    classifyJobFailure(failedAfterCheckout, GENUINELY_FAILED_ANNOTATIONS),
+    "reported",
+    "a test step that actually ran and failed must keep the failure wording",
+  );
+
+  // And a job whose body we cannot see at all must not be excused by the
+  // vacuous reading of `every` over an empty set.
+  assert.equal(
+    classifyJobFailure(
+      {
+        id: 3,
+        name: "General tests (workspaces-b)",
+        conclusion: "failure",
+        steps: [
+          { name: "Set up job", conclusion: "success" },
+          { name: "Set up runner", conclusion: "failure" },
+          { name: "Complete job", conclusion: "success" },
+        ],
+      },
+      PRE_BODY_KILLED_ANNOTATIONS,
+    ),
+    "reported",
+    "a job with no declared body step has not been SHOWN to have skipped its body",
+  );
+});
+
+test("a pre-body killed lane is reported as infrastructure end to end", async () => {
+  const { classifyLaneFailures } = await import("../classify-lane-failures.mjs");
+
+  const { infrastructure, reported } = classifyLaneFailures({
+    lanes: ["general_tests"],
+    laneJobNames: ["General tests"],
+    jobs: [PRE_BODY_KILLED_JOB],
+    annotationsByJobId: { [PRE_BODY_KILLED_JOB.id]: PRE_BODY_KILLED_ANNOTATIONS },
+  });
+  assert.deepEqual(
+    { infrastructure, reported },
+    { infrastructure: ["general_tests"], reported: [] },
+    "the matrix lane name must resolve and the lane must carry the infrastructure wording",
+  );
+});
+
 test("a lane whose job is missing from the annotations map is reported, not excused", async () => {
   const { classifyLaneFailures } = await import("../classify-lane-failures.mjs");
 

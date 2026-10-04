@@ -3181,7 +3181,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     }
   });
 
-  it.each(["job_failed", "oom_killed", "exit_137"])(
+  it.each(["job_failed", "oom_killed", "exit_137", "caveman_proxy_not_ready"])(
     "retries %s only when durable evidence proves adapter invocation never began",
     (errorCode) => {
       expect(
@@ -3222,6 +3222,21 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS).toBe(4);
     },
   );
+
+  // BLO-33441: the relabel out of `job_failed` must not quietly change the
+  // retry CONTRACT, only the census label. Admission is asserted above; this
+  // pins the other half, because a code admitted for retry but missing from the
+  // opts arm is scheduled under the default transient opts — a silent
+  // half-regression with no failing assertion anywhere else.
+  it("schedules caveman_proxy_not_ready under the same retry opts as job_failed", () => {
+    expect(resolveAutomaticRunRetryOpts({
+      errorCode: "caveman_proxy_not_ready",
+      contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+    })).toEqual(resolveAutomaticRunRetryOpts({
+      errorCode: "job_failed",
+      contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+    }));
+  });
 
   it("does not retry job_missing even with synthetic never-invoked evidence", () => {
     expect(
@@ -3330,6 +3345,17 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     afterEach(() => {
       if (priorGateContext === undefined) delete process.env[GATE_CONTEXT_ENV];
       else process.env[GATE_CONTEXT_ENV] = priorGateContext;
+      // The notice tests below queue a one-shot lookup with
+      // `mockResolvedValueOnce` and consume it in the same test. A test that
+      // fails BETWEEN the queue and the consume leaves the value on the queue,
+      // where the next test consumes it instead of its own -- and because both
+      // values are well-formed lookups, the symptom is the next test asserting
+      // against the wrong merge-impact branch rather than an obvious error.
+      // Nothing else resets this: there is no `resetMocks`/`clearMocks` in the
+      // vitest config. `mockReset()` (vitest >=2) drops the queue and restores
+      // the `test_default` implementation given to `vi.fn()` at the top of this
+      // file, so the unqueued default survives.
+      mockGithubGetPrRequiredStatusContext.mockReset();
     });
 
     async function exhaustPrReviewRun(contextSnapshot: Record<string, unknown>) {
@@ -3626,13 +3652,18 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     // reviewer, so before the resolver read these tags a crashed author run was
     // published as the reviewer's verdict on the head. Asserted at the call
     // site, not only over the pure predicate: this is the case that must
-    // enqueue no `github_commit_status` delivery at all. One row per guard
-    // clause so neither can hide behind the other under mutation (BLO-34263) —
-    // `measured` is the shape seen on pim-multicast-gateway#3237.
+    // enqueue no `github_commit_status` delivery at all. `measured` is the
+    // shape seen on pim-multicast-gateway#3237. The third row is what makes the
+    // BLO-34263 mutation claim true here: both author rows carry
+    // `prRole: "author"`, so they are caught by the prRole clause and survive a
+    // solo revert of the `reviewKind` clause. Only an untagged PR-shaped wake
+    // reaches that clause alone — revert it by itself and that row, and only
+    // that row, fails.
     it.each([
       { label: "measured author shape (no reviewKind)", overrides: { reviewKind: undefined, prRole: "author" } },
       { label: "author run that is tagged pr_review", overrides: { prRole: "author" } },
-    ])("writes no gate-status event for the PR author's own run — $label", async ({ overrides }) => {
+      { label: "PR-shaped wake carrying no tag at all", overrides: { reviewKind: undefined, prRole: undefined } },
+    ])("writes no gate-status event for a run that is not the reviewer's — $label", async ({ overrides }) => {
       process.env[GATE_CONTEXT_ENV] = "review/ally-complete";
       const { events } = await exhaustPrReviewRun({ ...prReviewSnapshot, ...overrides });
 
@@ -4282,6 +4313,343 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.executionRunId).toBeNull();
+  });
+
+  // BLO-38064. You @-mention an agent precisely BECAUSE it does not own the
+  // issue, so `assigneeAgentId !== run.agentId` is this wake's steady state, not
+  // a reassignment. The guard read it as one and cancelled the retry
+  // `issue_reassigned`, which made the loss unconditional for this shape: a
+  // mention whose first run hit any transient failure was never re-armed and the
+  // mentioned agent was never told. Measured on BLO-3202.
+  //
+  // Paired with "does not promote a scheduled retry after issue ownership
+  // changes" directly above: same reassignment-shaped inequality, opposite
+  // verdict, and the origin wake reason is the only thing that differs. Revert
+  // the NON_OWNERSHIP_RETRY_WAKE_REASONS arm on its own and this test fails
+  // while that one still passes.
+  it("promotes a mention-wake retry for an agent that was never the issue assignee", async () => {
+    const companyId = randomUUID();
+    const mentionedAgentId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T14:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values([
+      {
+        id: mentionedAgentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+
+    // The measured shape: a provider throttle that burned zero tokens, so the
+    // mentioned agent never even saw the comment it was woken for.
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: mentionedAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      error: "hit provider throttle/deadline before any token usage",
+      errorCode: "provider_throttled_no_progress",
+      finishedAt: now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_comment_mentioned",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    // A mention wake never takes the execution lock (isAutoCheckoutWakeReason
+    // excludes it), so the mentioned agent is not and never was the assignee.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry after a mention wake",
+      status: "todo",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    // Every retry mint overwrites `wakeReason` with its own, so the origin has
+    // to be pinned at mint or the gate has nothing left to branch on.
+    const retrySnapshot = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0]?.contextSnapshot as Record<string, unknown> | undefined);
+    expect(retrySnapshot?.wakeReason).toBe("transient_failure_retry");
+    expect(retrySnapshot?.originWakeReason).toBe("issue_comment_mentioned");
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    expect(promotion).toEqual({ promoted: 1, runIds: [scheduled.run.id] });
+
+    const retry = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retry).toEqual({ status: "queued", errorCode: null });
+  });
+
+  // BLO-38064 AC2. The exemption is an allow-list, so a non-ownership wake that
+  // is NOT on it stays suppressed — but under a code that says what happened.
+  // `execution_review_requested` wakes a stage participant who is routinely not
+  // the assignee, so reporting it as `issue_reassigned` sent operators looking
+  // for a reassignment that had never happened.
+  it("suppresses a non-exempt non-ownership wake retry as issue_not_assigned_to_agent", async () => {
+    const companyId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T14:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values([
+      {
+        id: reviewerAgentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: reviewerAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "execution_review_requested",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry after a review-stage wake",
+      status: "todo",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    expect(promotion).toEqual({ promoted: 0, runIds: [] });
+
+    const retry = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retry).toEqual({
+      status: "cancelled",
+      errorCode: "issue_not_assigned_to_agent",
+    });
+  });
+
+  // BLO-38064 review (Ally, Important 2). Pins the DECISION to keep
+  // `source_scoped_recovery_action` off `NON_OWNERSHIP_RETRY_WAKE_REASONS`, so
+  // that choice survives the next read of the allow-list doc instead of being
+  // re-derived.
+  //
+  // A recovery owner is the failed assignee's chain-of-command parent, so
+  // `assigneeAgentId !== run.agentId` is this wake's steady state too — the
+  // same shape as a mention. It is excluded anyway because the harm differs: a
+  // mention has no other wake path, whereas a recovery action carries its own
+  // `attemptCount`/`maxAttempts` budget and the stranded sweep re-upserts it,
+  // re-arming the owner without this retry. Reuse (BLO-30743) bounds that, but
+  // only for an UNCHANGED action whose `escalated` owner is also unchanged —
+  // routing a new owner escalates normally and is still driven. And a stranded
+  // one still fails visibly: `issue.escalation.needs_human_decision` fires once
+  // at the escalation TRANSITION, and reuse is what stops it repeating on every
+  // later sweep rather than what causes it.
+  //
+  // Note this leaves the GATE stricter than `claimQueuedRun`, which exempts
+  // recovery-owner wakes unconditionally (`isRecoveryOwnerWake`). Safe in that
+  // direction only, and by this mechanism: the retry IS armed — `scheduled`
+  // below is today's expected outcome, not a defect — and PROMOTION cancels it
+  // `issue_not_assigned_to_agent`. A cancelled retry never becomes a queued
+  // run, so the claim screen is never reached and its exemption is unreachable
+  // rather than contradicted.
+  //
+  // TRIPWIRE: watch `promoted: 0`, NOT the `scheduled` outcome. If promotion
+  // ever returns 1, the retry reaches `claimQueuedRun`, `isRecoveryOwnerWake`
+  // lets it through, and the two screens have started disagreeing.
+  it("keeps a source_scoped_recovery_action retry suppressed as issue_not_assigned_to_agent", async () => {
+    const companyId = randomUUID();
+    const recoveryOwnerAgentId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T14:15:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values([
+      {
+        id: recoveryOwnerAgentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: recoveryOwnerAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "source_scoped_recovery_action",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry after a recovery-owner wake",
+      status: "todo",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    expect(promotion).toEqual({ promoted: 0, runIds: [] });
+
+    const retry = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    // The pair below is the asymmetry itself, not just the gate leg: the gate
+    // cancels this wake, while `claimQueuedRun`'s `isRecoveryOwnerWake` term
+    // would have exempted the very same shape. `issue_not_assigned_to_agent`
+    // is what makes that visible — a plain `cancelled` would not distinguish
+    // this from the assignee-reassignment case the gate was written for.
+    expect(retry).toEqual({
+      status: "cancelled",
+      errorCode: "issue_not_assigned_to_agent",
+    });
   });
 
   it("does not promote a scheduled retry after the issue is handed to a human owner", async () => {

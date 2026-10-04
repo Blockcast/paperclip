@@ -90,6 +90,56 @@ export function githubReviewerIdentityMatches(login: string, configuredLogin: st
 }
 
 /**
+ * Match ANY spelling of the reviewer identity, the bare `<slug>` user seat
+ * included.
+ *
+ * The fail direction is the inverse of `githubReviewerIdentityMatches`, so the
+ * two are not interchangeable. CREDITING a review must exclude the user seat:
+ * it is a distinct principal, and counting it would let a human-shaped account
+ * speak as the reviewer. DETECTING a self-attestation must include it: the seat
+ * and the App are one agent wearing two hats, so a PR opened by the seat and
+ * attested by the App is still nothing independent examining that head.
+ */
+export function githubSharesReviewerIdentity(login: string, configuredLogin: string): boolean {
+  const candidate = exactGithubLogin(login);
+  const appSlug = githubReviewerAppSlug(configuredLogin);
+  if (!candidate || !appSlug) return false;
+  return candidate === appSlug || githubReviewerIdentityMatches(login, configuredLogin);
+}
+
+/**
+ * Are these two logins the same actor, whichever hat each is wearing?
+ *
+ * `githubSharesReviewerIdentity` is directional — it derives an App slug from
+ * its SECOND argument — so it returns false whenever that side is a plain user
+ * login. This helper is symmetric: both orders, plus plain login equality.
+ *
+ * WHAT IT ACTUALLY BUYS AT ITS CALLER, stated honestly because the obvious
+ * justification does not hold (Ally review of #1966). Its only caller is
+ * `evidence-truth.ts`, comparing a review login against the PR author. Every
+ * row on that surface has already passed `githubReviewerIdentityMatches`, so
+ * the review side is ALWAYS the configured App — which collapses this call to
+ * `githubSharesReviewerIdentity(prAuthor, botLogin)`, the one-liner the merge
+ * gate already uses. Two spellings of one human, and a human reviewing their
+ * own PR, are both UNREACHABLE through that caller today.
+ *
+ * So this is kept for the FORWARD-COMPAT direction, not for a live gap: it
+ * reads the login the row actually carries instead of a config constant, so it
+ * stays correct if that surface is ever widened to admit unfiltered reviewers.
+ * The constant-based form would then fail OPEN — crediting a human's review of
+ * their own PR — and this one fails closed. On a self-attestation check that
+ * asymmetry is the whole reason to prefer the symmetric helper; if the surface
+ * filter is ever made unconditional and provably permanent, delete this and
+ * call `githubSharesReviewerIdentity` directly.
+ */
+export function githubSameActorLogin(a: string, b: string): boolean {
+  const left = exactGithubLogin(a);
+  const right = exactGithubLogin(b);
+  if (!left || !right) return false;
+  return left === right || githubSharesReviewerIdentity(a, b) || githubSharesReviewerIdentity(b, a);
+}
+
+/**
  * Mint an RS256 GitHub App JWT (valid ~9 min). Returns null when the App id or
  * private key is unconfigured.
  */
@@ -206,8 +256,11 @@ export async function getInstallationTokenResult(
   return { ok: true, token: cachedInstallationToken.token };
 }
 
-export async function getInstallationToken(nowMs: number = Date.now()): Promise<string | null> {
-  const result = await getInstallationTokenResult(nowMs);
+export async function getInstallationToken(
+  nowMs: number = Date.now(),
+  options: { signal?: AbortSignal } = {},
+): Promise<string | null> {
+  const result = await getInstallationTokenResult(nowMs, options);
   return result.ok ? result.token : null;
 }
 
@@ -249,7 +302,7 @@ export async function githubGetPullRequestGate(input: {
   prNumber: number;
   signal?: AbortSignal;
 }): Promise<PullRequestGateResult> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { error: tokenResult.reason };
 
   const apiBase = gitHubApiBase(GITHUB_HOST);
@@ -334,7 +387,7 @@ export async function githubListOpenPullRequestsByBase(input: {
   baseRef: string;
   signal?: AbortSignal;
 }): Promise<OpenPullRequestsOnBaseResult> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { error: tokenResult.reason };
 
   const url =
@@ -377,7 +430,7 @@ export async function githubResolveBranchState(input: {
   branch: string;
   signal?: AbortSignal;
 }): Promise<BranchState> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return "unknown";
   try {
     const res = await ghFetch(
@@ -431,7 +484,7 @@ export async function githubResolveMergeHistoryShape(input: {
   mergeCommitSha: string;
   signal?: AbortSignal;
 }): Promise<MergeHistoryShape> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return "unknown";
   try {
     const res = await ghFetch(
@@ -500,7 +553,22 @@ export type PrRequiredStatusContextLookup =
     /** Which surface required it — a ruleset is the one readers cannot see. */
     source: "branch_protection" | "ruleset";
   }
-  | { outcome: "not_required"; baseRef: string; branchProtected: boolean; requiredContexts: string[] }
+  | {
+    outcome: "not_required";
+    baseRef: string;
+    /**
+     * CLASSIC branch protection only — deliberately not a union of both
+     * surfaces. A ruleset that requires a context is already reported through
+     * `requiredContexts`, so folding it in here would add nothing a reader can
+     * see while making the field mean "protected by something, somewhere",
+     * which is a different and weaker claim than the name suggests. Read it as
+     * "`branches/{b}` reports this branch protected", and only when
+     * `requiredContexts` is empty — that is the sole consumer (the merge-impact
+     * notice in `heartbeat.ts`).
+     */
+    branchProtected: boolean;
+    requiredContexts: string[];
+  }
   // `baseRef` is present whenever the base ref resolved and only a later read
   // failed, so the notice can name the branch it could not read.
   | { outcome: "unknown"; reason: string; baseRef?: string };
@@ -582,6 +650,25 @@ async function readClassicRequiredContexts(
 /**
  * Repository- and organization-level rulesets in effect for this ref, via
  * `rules/branches/{ref}`. Invisible to `branches/{b}` — see the type doc.
+ *
+ * Ruleset `enforcement` is not consulted, for the same reason `enforcement_level`
+ * is not on the classic surface — but here it is not a choice: the payload does
+ * not carry it. Re-measured 2026-09-30 against `Blockcast/hang-mmt-fec`'s `main`,
+ * every rule object has exactly the keys
+ * `["parameters","ruleset_id","ruleset_source","ruleset_source_type","type"]`;
+ * there is no ruleset-level `enforcement`, so a dry-run (`evaluate`) ruleset is
+ * indistinguishable from an active one in what we can read. Whether the endpoint
+ * filters dry-run rulesets out before returning them is UNMEASURED — an open
+ * question, not a known defect — and it is not settleable from this seat:
+ * `GET /orgs/{org}/rulesets`, which would name each ruleset's enforcement mode,
+ * returns `403 Resource not accessible by integration` to the App token.
+ *
+ * Shipping on the unmeasured case is deliberate, and the error direction is the
+ * cautious one: if a dry-run ruleset does leak through, we over-report a context
+ * as required, which tells a reader to go look at a gate that turns out to be
+ * inert. Filtering on a field we cannot see would instead risk printing an
+ * all-clear over a ruleset that genuinely blocks the merge — the
+ * `Blockcast/hang-mmt-fec` failure this whole two-surface read exists to remove.
  */
 async function readRulesetRequiredContexts(
   apiBase: string,
@@ -632,7 +719,7 @@ export async function githubGetPrRequiredStatusContext(input: {
   const context = input.context.trim();
   if (!context) return { outcome: "unknown", reason: "status_context_empty" };
 
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { outcome: "unknown", reason: tokenResult.reason };
   const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` };
   const apiBase = gitHubApiBase(GITHUB_HOST);
@@ -694,7 +781,11 @@ export async function githubGetPrRequiredStatusContext(input: {
   return {
     outcome: "not_required",
     baseRef,
-    branchProtected: classic.branchProtected || ruleset.contexts.length > 0,
+    // Classic only. `|| ruleset.contexts.length > 0` was here and was dead: the
+    // sole consumer reads this field only when `requiredContexts` is empty, and
+    // `requiredContexts` is the union of both surfaces, so a non-empty
+    // `ruleset.contexts` makes that read unreachable. See the type doc.
+    branchProtected: classic.branchProtected,
     requiredContexts,
   };
 }
@@ -848,7 +939,7 @@ export async function githubFetchPrHeadSha(input: {
   prNumber: number;
   signal?: AbortSignal;
 }): Promise<string | null> {
-  const token = await getInstallationToken();
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return null;
   return fetchPrHeadSha(
     gitHubApiBase(GITHUB_HOST),
@@ -875,7 +966,7 @@ export async function githubFetchPrAuthorLogin(input: {
   prNumber: number;
   signal?: AbortSignal;
 }): Promise<string | null> {
-  const token = await getInstallationToken();
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return null;
   try {
     const res = await ghFetch(
@@ -913,6 +1004,49 @@ export async function githubFetchPrAuthorLogin(input: {
  */
 const commentAttestsHead = (body: string, head: string): boolean =>
   hasAllyConsolidatedReviewHeading(body) && extractAllyReviewedHeadSha(body) === head;
+
+/**
+ * Whether one formal review is evidence the reviewer read THIS head.
+ *
+ * `commitId` alone cannot answer that. GitHub re-anchors `reviews[].commit_id`
+ * FORWARD onto the new head when the branch is updated, so the comparison fails
+ * OPEN: it does not reject a stale review, it accepts one that never saw the
+ * head being credited. Measured n=128 (BLO-27234): 8 confirmed re-anchorings,
+ * all 8 APPROVED, 6 not even the latest review. Live instance at the time of
+ * writing — `pim-multicast-gateway#3354` review 5318980026: `APPROVED`,
+ * `commit_id` equal to the head, body attesting `c01651f5`, six commits back.
+ *
+ * So when the body states which head it read, that statement wins in BOTH
+ * directions — it is immutable, where `commit_id` is not. This is a
+ * DISAGREEMENT rule, deliberately not an absence rule:
+ *
+ *   - marker present, names a different head -> reject, whatever `commit_id` says
+ *   - marker present, names this head        -> accept, whatever `commit_id` says
+ *   - no usable marker                       -> unchanged, credit `commit_id`
+ *
+ * The third arm is load-bearing and must stay. Requiring a marker would be the
+ * right answer for MERGE AUTHORIZATION, where an unproven review costs only a
+ * wait, and the wrong one for run-output attestation, which is the only
+ * question this predicate is asked: failing it closed is BLO-28920, ~66 paid
+ * retries in 3h. `extractAllyReviewedHeadSha` already returns null for zero or
+ * several attestations and ignores quoted text, so every ambiguous body lands
+ * on the unchanged arm rather than on a guess.
+ *
+ * No `hasAllyConsolidatedReviewHeading` guard here, unlike `commentAttestsHead`
+ * above. The asymmetry is deliberate: a review object is itself proof a review
+ * happened, so the marker is read only for WHICH head, whereas a comment has no
+ * such proof and needs the heading to be told apart from ordinary PR chatter.
+ * Do not harmonise the two — adding the guard here would send every review whose
+ * body Ally shapes differently back onto bare `commit_id`, i.e. straight back
+ * into the fail-open above.
+ *
+ * Applied per review, never across the set: one lying review must not suppress
+ * a different, honest review at the same head.
+ */
+const reviewAttestsHead = (review: ReviewerReview, head: string): boolean => {
+  const attested = extractAllyReviewedHeadSha(review.body);
+  return attested === null ? review.commitId === head : attested === head;
+};
 
 /**
  * Page cap for BOTH evidence surfaces below. Deliberately far smaller than
@@ -1074,7 +1208,7 @@ export async function githubListReviewerSurfacesAtPr(input: {
   // empty surfaces — a misconfiguration that reads to the caller as "Ally
   // reviewed and found nothing". Fail closed, as the predicate below does.
   if (!githubReviewerAppSlug(botLogin)) return { error: "bot_login_not_app_form" };
-  const token = await getInstallationToken();
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return { error: "no_token" };
   const args = {
     apiBase: gitHubApiBase(GITHUB_HOST),
@@ -1118,9 +1252,14 @@ export async function githubListReviewerSurfacesAtPr(input: {
  * Found when the configured App identity left EITHER surface at the exact head,
  * because Ally posts on either and each surface is individually blind to the
  * other:
- *  - a formal SUBMITTED review with `commit_id === headSha`, in any submitted
+ *  - a formal SUBMITTED review that attests this head, in any submitted
  *    state (`COMMENTED` / `CHANGES_REQUESTED` / `APPROVED` / `DISMISSED` — a
- *    dismissed review still happened, it was only disposed of afterwards); or
+ *    dismissed review still happened, it was only disposed of afterwards).
+ *    "Attests" is `reviewAttestsHead`: the body's own `Reviewed head:` line
+ *    when it has exactly one, else `commit_id`. The body wins because
+ *    `commit_id` re-anchors FORWARD onto a new head and so fails OPEN
+ *    (BLO-35545); the `commit_id` fallback stays for bodyless reviews because
+ *    requiring an attestation here is the BLO-28920 paid-retry loop; or
  *  - an issue comment carrying the canonical consolidated-review heading and a
  *    single `Reviewed head:` attestation equal to that head (comment-mode
  *    reviews file no review object and so carry no `commit_id`).
@@ -1294,10 +1433,11 @@ export async function githubHasReviewerEvidenceForPr(input: {
 
   // 1) Formal reviews — the configured App at this exact head, in any SUBMITTED
   // state. `COMMENTED` counts: see the merge-authorization vs attestation note
-  // above.
+  // above. `reviewAttestsHead` prefers the body's own immutable statement of
+  // which head it read over the forward-re-anchoring `commit_id`.
   const reviews = await listReviewerReviews(args);
   if ("error" in reviews) return { error: reviews.error };
-  if (reviews.some((review) => review.commitId === headSha)) return { found: true, via: "review" };
+  if (reviews.some((review) => reviewAttestsHead(review, headSha))) return { found: true, via: "review" };
 
   // 2) Comment-shaped reviews — the second surface. Ally frequently reviews by
   // posting a consolidated comment and files no review object at all, so a PR it

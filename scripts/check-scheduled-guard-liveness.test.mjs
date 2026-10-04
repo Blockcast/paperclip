@@ -11,9 +11,13 @@ import {
   WATCHED_WORKFLOWS,
   annotationFor,
   classifyGuard,
+  classifyWatched,
+  completedRunsPath,
   crossCheckCompletions,
   describeStopMode,
+  makeGuardReaders,
   resolveStaleHours,
+  resolveWatched,
   selectNewestCompleted,
   summarize,
 } from "./check-scheduled-guard-liveness.mjs";
@@ -108,7 +112,22 @@ describe("classifyGuard — reconstruction of the 2026-09-15 outage (PEN-3281)",
     };
   }
 
-  const outage = Object.fromEntries(WATCHED_WORKFLOWS.map((workflow) => [workflow, observed(workflow)]));
+  // The cohort is PINNED to the seven guards watched on 2026-09-15, not read
+  // from WATCHED_WORKFLOWS. This is a reconstruction of one past event: a guard
+  // added later was not in that outage and cannot be reasoned about from it.
+  // Driving it off the live set made the 7/6 counts below drift the moment
+  // BLO-38228 added an eighth, on a lane that was not even starved that day.
+  const PEN_3281_COHORT = [
+    "review-gate-sweep.yml",
+    "ally-review-consistency.yml",
+    "codeowners-guard.yml",
+    "relay-ssl-multicert-guard.yml",
+    "lockfile-drift-monitor.yml",
+    "adapter-pin-drift-monitor.yml",
+    twiceDaily,
+  ];
+
+  const outage = Object.fromEntries(PEN_3281_COHORT.map((workflow) => [workflow, observed(workflow)]));
 
   it("reds the six hourly guards at detection time", () => {
     const results = classifyAll(outage, now);
@@ -742,6 +761,60 @@ describe("classifyGuard — stop-modes a run-state scan cannot see", () => {
     assert.equal(result.reason, "never-completed");
   });
 
+  // A newly-scheduled workflow has zero completed runs at merge by construction
+  // — schedules fire only from the default branch — so without a grace it reds
+  // the shared hourly job until its first cron. The alarm this guard reports
+  // into is all-or-nothing, so a red-by-design window trains everyone to ignore
+  // a real stall in the other seven guards.
+  it("graces a never-completed guard inside its window, and only that reason", () => {
+    const never = { state: "active", name: "Master Health", newest: null };
+    const graceUntil = new Date(now + HOUR).toISOString();
+
+    const inside = classifyGuard("master-health.yml", never, { now, graceUntil });
+    assert.equal(inside.status, "ok");
+    assert.equal(inside.reason, "awaiting-first-run");
+
+    // Fail-closed: the grace expires into a hard red, never into a silent green.
+    const expired = classifyGuard("master-health.yml", never, {
+      now,
+      graceUntil: new Date(now - HOUR).toISOString(),
+    });
+    assert.equal(expired.status, "stale");
+    assert.equal(expired.reason, "never-completed");
+
+    // The grace covers the bootstrap only. Every reason decided on real
+    // evidence must survive it, or it becomes a blanket mute.
+    const disabled = classifyGuard(
+      "master-health.yml",
+      { state: "disabled_manually", name: "Master Health" },
+      { now, graceUntil },
+    );
+    assert.equal(disabled.status, "stale");
+    assert.equal(disabled.reason, "disabled");
+
+    const stale = classifyGuard(
+      "master-health.yml",
+      { state: "active", name: "Master Health", newest: { updatedAt: new Date(now - 100 * HOUR).toISOString(), conclusion: "success" } },
+      { now, graceUntil, staleHours: 48 },
+    );
+    assert.equal(stale.status, "stale");
+
+    const unreadable = classifyGuard("master-health.yml", { error: "unreadable" }, { now, graceUntil });
+    assert.equal(unreadable.status, "stale");
+    assert.equal(unreadable.reason, "unreadable");
+  });
+
+  // The window must outlive the merge that introduces the schedule, or it buys
+  // nothing; and it must not be open-ended, or the guard never starts enforcing.
+  it("sets the grace window past the first cron after merge, and not far past it", () => {
+    const grace = Date.parse(
+      WATCHED_GUARDS.find((guard) => guard.workflow === "master-health.yml").graceUntil,
+    );
+
+    assert.ok(grace > Date.parse("2026-10-01T00:37:00Z"), "expires before master-health's first cron can fire");
+    assert.ok(grace < Date.parse("2026-10-05T00:00:00Z"), "an open-ended grace is a permanently muted guard");
+  });
+
   // Silently dropping a guard from the watched set is this row's whole defect,
   // so an unreadable workflow must fail loudly rather than skip.
   it("reds an unreadable workflow rather than skipping it", () => {
@@ -797,17 +870,19 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
   // in the PR that introduces it, instead of silently at 03:00.
   const workflowDir = resolve(dirname(fileURLToPath(import.meta.url)), "../.github/workflows");
 
-  /** Every workflow that is BOTH scheduled and on the starvable `default` lane. */
-  function scheduledDefaultWorkflows() {
+  /** Every scheduled workflow in the repo, whatever lane it runs on. */
+  function scheduledWorkflows() {
     return readdirSync(workflowDir)
       .filter((file) => file.endsWith(".yml") || file.endsWith(".yaml"))
-      .filter((file) => {
-        const body = readFileSync(join(workflowDir, file), "utf8");
-        const scheduled = /^\s*schedule:\s*$/m.test(body);
-        const onDefault = /^\s*runs-on:\s*default\s*$/m.test(body);
-        return scheduled && onDefault;
-      })
+      .filter((file) => /^\s*schedule:\s*$/m.test(readFileSync(join(workflowDir, file), "utf8")))
       .sort();
+  }
+
+  /** Every workflow that is BOTH scheduled and on the starvable `default` lane. */
+  function scheduledDefaultWorkflows() {
+    return scheduledWorkflows().filter((file) =>
+      /^\s*runs-on:\s*default\s*$/m.test(readFileSync(join(workflowDir, file), "utf8")),
+    );
   }
 
   it("finds the scheduled default-lane workflows it is supposed to be reasoning about", () => {
@@ -871,16 +946,505 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     );
   });
 
-  it("does not watch a workflow that has stopped being a scheduled default guard", () => {
-    const live = new Set(scheduledDefaultWorkflows());
+  it("does not watch a workflow that has stopped being a scheduled guard", () => {
+    // Scoped to `scheduledWorkflows()`, not the `default`-lane subset. The
+    // COVERAGE invariant above is deliberately lane-scoped — it asks which
+    // guards MUST be watched, and starvation is a `default`-lane property. This
+    // one asks whether a watched entry is still a live scheduled workflow, and
+    // that is lane-independent: BLO-38228 added master-health.yml, which runs on
+    // arc-light/arc-paperclip-general. Keeping the lane filter here would have
+    // red-flagged a perfectly live entry as dangling.
+    const live = new Set(scheduledWorkflows());
     const dangling = WATCHED_WORKFLOWS.filter((file) => !live.has(file));
 
     assert.deepEqual(
       dangling,
       [],
-      "a watched entry no longer resolves to a scheduled `default` workflow. At runtime this reds " +
+      "a watched entry no longer resolves to a scheduled workflow. At runtime this reds " +
         "as 'unreadable', which is correct but late — fix the entry here.",
     );
+  });
+
+  // BLO-38228. A guard reachable by an AUTO-FIRING non-schedule trigger needs
+  // `event: "schedule"`, or its newest-run query is satisfied by those runs
+  // while the cron is dead — reporting ok forever. master-health.yml is the
+  // first such guard: it also runs on every push to master.
+  //
+  // `workflow_dispatch` is deliberately NOT in this list, and that is a stated
+  // exposure rather than an oversight. All seven pre-existing guards carry it,
+  // and a dispatch does bump the newest-run timestamp — so a manual dispatch
+  // can mask a dead cron for one threshold window. It is accepted because a
+  // dispatch is human-initiated and rare, where a push to master is neither;
+  // and because narrowing those seven to `event: "schedule"` would invalidate
+  // the gap distributions their thresholds were measured from, which is a
+  // change to a live security control and not this row's to make.
+  it("declares an event filter for every watched guard with an auto-firing non-schedule trigger", () => {
+    const missing = WATCHED_GUARDS.filter((guard) => {
+      const body = readFileSync(join(workflowDir, guard.workflow), "utf8");
+      const autoTrigger = /^\s*(push|pull_request|pull_request_target|workflow_call|workflow_run|merge_group|issue_comment|repository_dispatch|release):/m.test(
+        body,
+      );
+      return autoTrigger && guard.event !== "schedule";
+    }).map((guard) => guard.workflow);
+
+    assert.deepEqual(
+      missing,
+      [],
+      "a watched guard has a non-schedule trigger but no `event: \"schedule\"`. Its liveness " +
+        "check would be satisfied by those runs while the cron is dead, which is a muted alarm " +
+        "dressed as a green one. Add the filter in WATCHED_GUARDS.",
+    );
+
+    // Positive control: a silently-empty scan makes the assertion vacuous, which
+    // is this file's own recurring failure mode.
+    assert.ok(
+      WATCHED_GUARDS.some((guard) => guard.event === "schedule"),
+      "no watched guard declares an event filter — the scan above proves nothing",
+    );
+  });
+
+  // A YAML block scalar (`if: >-`) carries one logical expression across several
+  // physical lines, so a line-anchored scan sees the `if:` token and the
+  // `pretested` reference as unrelated lines and matches neither — the gate goes
+  // unguarded on a reformat alone. Join the continuations back before scanning.
+  //
+  // Not a YAML parser by choice: `scripts/check-workflows-parse.mjs` records the
+  // standing decision that this validator stays Node-builtins-only, because
+  // adding `js-yaml` would change `pnpm-lock.yaml` and the `Block manual
+  // lockfile edits` gate rejects that.
+  //
+  // ponytail: this joins BLOCK scalars (`>`/`|`) only, and treats a blank line as
+  // closing one where real YAML would not. Two known gaps, both MEASURED at this
+  // SHA rather than reasoned about — and note which arm each actually lands in,
+  // because the obvious guess is wrong for both:
+  //
+  //   blank line inside a folded block   -> `unbypassed`, NOT `unscannable`. The
+  //     blank closes the scalar, so line 1 still joins to `if: >- ${{ … pretested
+  //     != '1'` — it matches `/^\s*if:/` and carries the token, it is just
+  //     truncated before the bypass clause. A located gate, read short.
+  //   plain (unquoted) multi-line scalar -> `unbypassed` too, because nothing
+  //     joins it. If the bypass sits on the continuation line this is a FALSE
+  //     RED, and the message will assert the clause is missing when it is
+  //     present. Recognise that message; do not trust it.
+  //
+  // Both fail loudly and neither can pass clean, which is why this is a named
+  // ceiling and not a fix: closing them needs the real YAML parser the paragraph
+  // above rules out. Upgrade to real scalar tracking only if one of these ever
+  // fires on a real reformat — and when you do, the two ceiling cases in "the
+  // bypass scan itself" will fail, which is how you learn the prose here is now
+  // stale rather than discovering it from a wrong hint during an outage.
+  const joinFoldedIfs = (body) => {
+    const joined = [];
+    let openAt = null;
+    for (const line of body.split("\n")) {
+      const indent = line.search(/\S/);
+      if (openAt !== null && indent > openAt) {
+        joined[joined.length - 1] += ` ${line.trim()}`;
+        continue;
+      }
+      openAt = /^\s*if:\s*[>|][-+]?\s*$/.test(line) ? indent : null;
+      joined.push(line);
+    }
+    return joined;
+  };
+
+  // `unbypassed` — a gate the scheduled run would skip. `unscannable` — a body
+  // that mentions the output but whose gate this scan could not locate, which
+  // would otherwise report as zero violations.
+  const auditPretestedBypass = (guards) => {
+    const scanned = guards.map(({ workflow, body }) => ({
+      workflow,
+      ifs: joinFoldedIfs(body).filter(
+        (line) => /^\s*if:/.test(line) && line.includes("needs.gate.outputs.pretested"),
+      ),
+    }));
+    const missingBypass = ({ ifs }) =>
+      ifs.some((line) => !line.includes("github.event_name == 'schedule'"));
+    return {
+      unscannable: scanned.filter(({ ifs }) => ifs.length === 0).map(({ workflow }) => workflow),
+      unbypassed: scanned.filter(missingBypass).map(({ workflow }) => workflow),
+    };
+  };
+
+  // The bypass this PR calls "the load-bearing half of that fix" had NO guard at
+  // any level, and — unlike every other regression in this file — the runtime
+  // guard cannot catch it either. That asymmetry is the whole reason it needs a
+  // source-text assertion:
+  //
+  //   Delete the `schedule:` cron  -> no scheduled run completes -> this guard
+  //                                   reds after 48h. Defence in depth, working.
+  //   Delete the BYPASS            -> the scheduled run still fires, `gate` still
+  //                                   sets pretested=1, the matrix is SKIPPED, and
+  //                                   a skipped matrix still concludes `success`.
+  //                                   The liveness guard sees a fresh completed
+  //                                   `schedule` run and reports ok forever.
+  //
+  // That second row is run 36648202266 reproduced exactly — the specific false
+  // green cited in master-health.yml's own header. So the half that fails loudly
+  // was guarded and the half that fails SILENTLY was not, which inverts the
+  // priority this file is supposed to apply.
+  //
+  // ON THE INSTRUMENT: this file's general doctrine is "hold the behaviour, not
+  // the source text" (a regex on a destructure is what previously passed across
+  // its own reversion). The doctrine does not apply here, because a YAML `if:`
+  // expression has no behavioural surface a node test can drive — there is no
+  // behaviour to hold. A source-text scan is the only available guard, and the
+  // vacuity control below is what makes it trustworthy rather than decorative.
+  it("keeps the schedule bypass on every pretested gate in a watched guard", () => {
+    const gated = WATCHED_GUARDS.map((guard) => ({
+      workflow: guard.workflow,
+      body: readFileSync(join(workflowDir, guard.workflow), "utf8"),
+    })).filter(({ body }) => /needs\.gate\.outputs\.pretested/.test(body));
+
+    const { unscannable, unbypassed } = auditPretestedBypass(gated);
+
+    // Checked BEFORE the bypass assertion, because a scan that located no gate
+    // reports zero violations — the silent green this whole test exists to
+    // prevent, one level down. The body-level `gated` filter cannot see it: the
+    // body still contains the string, so the file still looks audited.
+    assert.deepEqual(
+      unscannable,
+      [],
+      "a watched guard mentions `needs.gate.outputs.pretested` but this scan found no `if:` " +
+        "carrying it, so the bypass assertion below would pass vacuously. Either the gate moved " +
+        "into a form the scan cannot read, or the output was renamed and only the prose kept the " +
+        "old name. Fix the scan — do not delete this control.",
+    );
+
+    assert.deepEqual(
+      unbypassed,
+      [],
+      "a watched guard gates a job on `needs.gate.outputs.pretested` without " +
+        "`github.event_name == 'schedule'` in the same `if:`. The scheduled run then skips that " +
+        "job, a skipped job still concludes `success`, and THIS liveness check reads that as a " +
+        "healthy guard forever. The cron half of the fix reds in 48h; this half never does.",
+    );
+
+    // Positive control: if no watched guard has a pretested gate at all, the
+    // filter above is empty and the assertion proves nothing. That silent-vacuity
+    // shape is this file's own recurring failure mode.
+    assert.ok(
+      gated.length > 0,
+      "no watched guard carries a pretested gate — the scan above proves nothing",
+    );
+  });
+
+  // The scan above is driven by fixtures here as well as by the real file,
+  // because the real file is in exactly one state at a time — so a guard held
+  // only against it has no failing mutation, and is a comment rather than a test.
+  describe("the bypass scan itself", () => {
+    const folded = [
+      "  general_tests:",
+      "    if: >-",
+      "      ${{ !cancelled() && (needs.gate.outputs.pretested != '1'",
+      "      || github.event_name == 'workflow_dispatch') }}",
+      "    runs-on: arc-paperclip-general",
+    ].join("\n");
+
+    // The same gate, correctly bypassed. Shared, because the two ceiling cases
+    // below are reformats OF A GATE THAT PASSES CLEAN — that is what makes them
+    // false reds rather than correct detections.
+    const bypassed = folded.replace(
+      "'workflow_dispatch')",
+      "'workflow_dispatch' || github.event_name == 'schedule')",
+    );
+
+    it("sees through a folded `if:` block scalar, so a reformat cannot disarm it", () => {
+      // Without the fold normaliser the `if:` token and the `pretested`
+      // reference sit on different physical lines, the scan finds zero
+      // candidates, and a DELETED bypass reports clean. `if: >-` is established
+      // convention in this repo (pr.yml, commitperclip-review.yml,
+      // storybook-visual.yml) and the guarded line is the longest in
+      // master-health.yml — so this is one reformat away, not a hypothetical.
+      assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body: folded }]), {
+        unscannable: [],
+        unbypassed: ["f.yml"],
+      });
+    });
+
+    it("accepts a folded `if:` that keeps the bypass", () => {
+      assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body: bypassed }]), {
+        unscannable: [],
+        unbypassed: [],
+      });
+    });
+
+    it("reports a gate it cannot locate rather than reporting it clean", () => {
+      // The output renamed but the prose left behind: the body still matches, so
+      // the file still looks audited, while no `if:` carries the token.
+      const body = ["  # needs.gate.outputs.pretested is set by `gate`", "    if: ${{ true }}"].join(
+        "\n",
+      );
+      assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body }]), {
+        unscannable: ["f.yml"],
+        unbypassed: [],
+      });
+    });
+
+    // The two cases below PIN THE CEILING documented above `joinFoldedIfs`, and
+    // they exist because that comment was wrong once already: it named
+    // `unscannable` for both, when both actually land in `unbypassed`. Prose that
+    // names the wrong arm sends a reader hunting a missing gate that is present.
+    //
+    // Both are `bypassed` — a gate this scan passes CLEAN — reformatted one way
+    // each. So they assert a FALSE RED, not a detection, and they fail the moment
+    // someone teaches `joinFoldedIfs` real scalar tracking. That is the point:
+    // closing a gap should break the test that documents it, not silently leave
+    // a comment describing behaviour the code no longer has.
+    it("reads a blank line inside a folded `if:` as a short gate, not an unreadable one", () => {
+      // The blank closes the scalar early, so line 1 still joins to
+      // `if: >- ${{ … pretested != '1'`: located, carries the token, truncated
+      // before the bypass clause. A located gate read short — hence `unbypassed`.
+      const blankInside = bypassed.replace("\n      || github", "\n\n      || github");
+      assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body: blankInside }]), {
+        unscannable: [],
+        unbypassed: ["f.yml"],
+      });
+    });
+
+    it("reports a plain multi-line `if:` as unbypassed, which is a false red", () => {
+      // No `>`/`|`, so nothing joins the continuation the bypass sits on. The
+      // failure message will assert the clause is missing when it is present
+      // three lines below. Recognise that message; do not trust it.
+      const plain = bypassed.replace("    if: >-\n      ${{", "    if: ${{");
+      assert.match(plain, /github\.event_name == 'schedule'/);
+      assert.deepEqual(auditPretestedBypass([{ workflow: "f.yml", body: plain }]), {
+        unscannable: [],
+        unbypassed: ["f.yml"],
+      });
+    });
+  });
+
+  it("puts the event filter into the API path, and omits it when unset", () => {
+    assert.equal(
+      completedRunsPath("o/r", "master-health.yml", "schedule"),
+      "repos/o/r/actions/workflows/master-health.yml/runs?status=completed&per_page=1&event=schedule",
+    );
+    assert.equal(
+      completedRunsPath("o/r", "codeowners-guard.yml", undefined),
+      "repos/o/r/actions/workflows/codeowners-guard.yml/runs?status=completed&per_page=1",
+    );
+  });
+
+  // The two assertions above prove the filter is BUILT correctly. Neither proves
+  // main() actually hands it over. This used to assert against the SOURCE TEXT
+  // of main()'s destructure, and that test was worthless in the precise way this
+  // file keeps warning about: the destructure stayed correct while the scoping
+  // branch beside it rebuilt entries from the workflow name alone and dropped
+  // `event` for every guard it scoped to. The regex matched; the fix was
+  // reverted. resolveWatched() exists so this is a behavioural test on the
+  // object main() classifies, not on how it is spelled.
+  it("threads each guard's event filter and grace through the unscoped set", () => {
+    const masterHealth = resolveWatched("").find((guard) => guard.workflow === "master-health.yml");
+
+    assert.equal(masterHealth.event, "schedule");
+    assert.equal(
+      completedRunsPath("o/r", masterHealth.workflow, masterHealth.event),
+      "repos/o/r/actions/workflows/master-health.yml/runs?status=completed&per_page=1&event=schedule",
+    );
+  });
+
+  // The cross-check must narrow on the SAME trigger axis as the filtered read
+  // (BLO-38228). PEN-3379's design is that the two reads differ on exactly one
+  // axis, `status=completed`. Let them differ on the trigger axis too and the
+  // unfiltered side sees push runs the filtered side cannot: it reports a newer
+  // completion on every single poll, and `classifyGuard` disagrees forever.
+  // PEN-3462 changed what that disagreement is CALLED — `ok`/`corroborated`
+  // rather than `cross-check-disagreement` — without changing what it does to
+  // this axis: the guard is then declared alive on every poll off a run its own
+  // schedule never produced. A permanent green on the guard whose only job is to
+  // notice silence is strictly worse than the false positives the cross-check
+  // was added to remove, and worse still now that it reads as an affirmative
+  // measurement rather than a withheld verdict.
+  it("narrows the cross-check on the same trigger axis, so it cannot disagree by construction", () => {
+    const paths = [];
+    const reader = (args) => {
+      paths.push(args[1]);
+      return JSON.stringify({ workflow_runs: [] });
+    };
+
+    crossCheckCompletions("o/r", "master-health.yml", reader, "schedule");
+    crossCheckCompletions("o/r", "codeowners-guard.yml", reader);
+
+    assert.match(
+      paths[0],
+      /^repos\/o\/r\/actions\/workflows\/master-health\.yml\/runs\?per_page=\d+&event=schedule$/,
+      "a filtered guard's cross-check must carry the same event filter",
+    );
+    assert.match(
+      paths[1],
+      /^repos\/o\/r\/actions\/workflows\/codeowners-guard\.yml\/runs\?per_page=\d+$/,
+      "an unfiltered guard's cross-check must stay unfiltered",
+    );
+    // The axis it must still DROP: corroboration depends on not going through
+    // the suspect server-side index.
+    for (const path of paths) assert.ok(!path.includes("status=completed"));
+  });
+
+  // GUARD_LIVENESS_WORKFLOWS is the path a human uses to check this guard works,
+  // so unfiltering there reports "fresh" off a push run to whoever is verifying
+  // — the one reading most likely to be believed.
+  it("keeps a scoped guard's own event filter, threshold and grace", () => {
+    const [scoped] = resolveWatched("master-health.yml");
+
+    assert.equal(scoped.event, "schedule", "scoping dropped the event filter — push runs read as fresh");
+    assert.equal(scoped.staleHours, 48, "scoping silently reset the threshold to the hourly default");
+    assert.ok(scoped.graceUntil, "scoping dropped the grace window");
+  });
+
+  // Both assertions above prove the fields SURVIVE resolveWatched(). Neither
+  // reaches the line that hands them to the two consumers. That line lived
+  // inline in main(), which no test invokes, so dropping `event` or `graceUntil`
+  // from it left the whole suite green (Ally, BLO-38228) — and the first of
+  // those mutations reintroduces the exact false green this guard exists to
+  // withhold: an unfiltered newest-run query is satisfied by a push run while
+  // the cron is dead. classifyWatched() is exported so the join is behavioural.
+  it("hands each guard's event filter and grace window to the observer and the classifier", () => {
+    const now = Date.now();
+    const seen = [];
+    const [result] = classifyWatched(
+      [
+        {
+          workflow: "master-health.yml",
+          staleHours: 48,
+          event: "schedule",
+          // Derived from the clock, not pinned — a fixed literal here would rot
+          // the same way the fixture this PR's issue is about did.
+          graceUntil: new Date(now + 60_000).toISOString(),
+        },
+      ],
+      (workflow, event) => {
+        seen.push({ workflow, event });
+        return { state: "active", name: "Master general tests", newest: null };
+      },
+      () => {
+        assert.fail("a graced guard must not spend a cross-check call");
+      },
+      { now },
+    );
+
+    assert.deepEqual(
+      seen,
+      [{ workflow: "master-health.yml", event: "schedule" }],
+      "the event filter never reached the observer — an unfiltered query reads push runs as fresh",
+    );
+    assert.equal(result.status, "ok", "the grace window never reached the classifier");
+    assert.equal(result.reason, "awaiting-first-run");
+  });
+
+  // The THIRD consumer of `event`, and the one the PEN-3379 rebase very nearly
+  // lost. PEN-3379 added an unfiltered second read that must corroborate a stale
+  // verdict before it may red; it differs from the filtered read on exactly one
+  // axis, `status=completed`. Let it differ on the TRIGGER axis too and it sees
+  // push runs the filtered side cannot: it reports a newer completion on every
+  // poll, so the guard is permanently declared alive. PEN-3462 renamed that
+  // standing verdict from `cross-check-disagreement` to `ok`/`corroborated`;
+  // the rename does not reach this axis, it only makes the resulting green look
+  // like a measurement.
+  //
+  // Both changes are correct alone; the naive merge is a permanent green on the
+  // one guard whose entire job is to notice silence. This leg had no failing
+  // mutation until `classifyWatched` took the cross-check as an argument — a
+  // source-text regex was the only instrument available, and this file's own
+  // history is that such a regex passed straight across its own reversion.
+  it("hands the event filter to the cross-check too, so it cannot disagree by construction", () => {
+    const now = Date.parse("2026-09-30T12:00:00Z");
+    const seen = [];
+    const [result] = classifyWatched(
+      [{ workflow: "master-health.yml", staleHours: 48, event: "schedule" }],
+      () => ({ state: "active", name: "Master general tests", newest: null }),
+      (workflow, event) => {
+        seen.push({ workflow, event });
+        return { newestCompletedAt: null };
+      },
+      { now },
+    );
+
+    assert.deepEqual(
+      seen,
+      [{ workflow: "master-health.yml", event: "schedule" }],
+      "the cross-check ran unfiltered against a filtered read — it will disagree on every poll and mute the alarm",
+    );
+    assert.equal(result.status, "stale", "an ungraced never-completed guard must still red");
+    assert.equal(result.reason, "never-completed");
+  });
+
+  // The LAST link: the line that binds `repo` into those two reads. Everything
+  // above is held behaviourally, and with the closures written inline in main()
+  // this one line still was not — main() is never invoked by a test, so dropping
+  // `event` from the cross-check closure specifically left the suite green while
+  // reintroducing the permanent mute. makeGuardReaders() is exported to close it.
+  it("binds repo into both reads without losing the event filter", () => {
+    const paths = [];
+    const { crossCheck } = makeGuardReaders("o/r", (args) => {
+      paths.push(args[1]);
+      return JSON.stringify({ workflow_runs: [] });
+    });
+    crossCheck("master-health.yml", "schedule");
+    crossCheck("codeowners-guard.yml", undefined);
+
+    assert.match(
+      paths[0],
+      /^repos\/o\/r\/actions\/workflows\/master-health\.yml\/runs\?per_page=\d+&event=schedule$/,
+      "the binding layer dropped the event filter — the cross-check will disagree on every poll and mute the alarm",
+    );
+    assert.match(
+      paths[1],
+      /^repos\/o\/r\/actions\/workflows\/codeowners-guard\.yml\/runs\?per_page=\d+$/,
+      "an unfiltered guard's cross-check must stay unfiltered",
+    );
+    // The axis it must still DROP: corroboration depends on not going through
+    // the suspect server-side index.
+    for (const path of paths) assert.ok(!path.includes("status=completed"));
+  });
+
+  // The OTHER leg of that same binding line, and it stayed unguarded one round
+  // longer than the cross-check did. `observeWorkflow` used to call `gh`
+  // directly, so `event` had no observable effect and dropping it from the
+  // `observe` closure left the suite at 78/0. The docstring claimed the leg was
+  // "held by classifyWatched's injected-observer test instead" — it is not:
+  // that test injects a FAKE observer, so it pins classifyWatched's own call and
+  // never the adapter that forwards into the real read. Threading `read` through
+  // `observeWorkflow` is what makes this assertion possible at all.
+  it("keeps the event filter on the observe leg too, not just the cross-check", () => {
+    const paths = [];
+    const reader = (args) => {
+      paths.push(args[1]);
+      // First call is the workflow-meta read; it must look active or the
+      // function short-circuits before ever building the runs path.
+      return args[1].includes("/runs?")
+        ? JSON.stringify({ workflow_runs: [] })
+        : JSON.stringify({ state: "active", name: "Master health" });
+    };
+
+    const { observe } = makeGuardReaders("o/r", reader);
+    observe("master-health.yml", "schedule");
+    observe("codeowners-guard.yml", undefined);
+
+    const runPaths = paths.filter((path) => path.includes("/runs?"));
+    assert.equal(runPaths.length, 2, "the observe leg did not reach its runs read — this test is vacuous");
+
+    assert.match(
+      runPaths[0],
+      /^repos\/o\/r\/actions\/workflows\/master-health\.yml\/runs\?status=completed&per_page=1&event=schedule$/,
+      "the binding layer dropped the event filter on the OBSERVE leg. A push run then satisfies " +
+        "the liveness read while the cron is dead — the exact false green this guard exists to withhold.",
+    );
+    assert.match(
+      runPaths[1],
+      /^repos\/o\/r\/actions\/workflows\/codeowners-guard\.yml\/runs\?status=completed&per_page=1$/,
+      "an unfiltered guard's observe read must stay unfiltered",
+    );
+  });
+
+  it("still honours the stale-hours override and resolves an undeclared workflow", () => {
+    const [overridden] = resolveWatched("master-health.yml", 1);
+    assert.equal(overridden.staleHours, 1, "an explicit override must beat the declared threshold");
+
+    // The dial may name anything; an unwatched workflow is not an error.
+    const [undeclared] = resolveWatched("not-a-watched-guard.yml");
+    assert.equal(undeclared.staleHours, DEFAULT_STALE_HOURS);
+    assert.equal(undeclared.event, undefined);
   });
 
   it("gives every exemption a stated reason", () => {
@@ -892,7 +1456,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     }
   });
 
-  it("carries the six PEN-3281 guards plus the security control the original list missed", () => {
+  it("carries the six PEN-3281 guards, the security control the original list missed, and the clock-rot guard", () => {
     assert.deepEqual(
       [...WATCHED_WORKFLOWS].sort(),
       [
@@ -900,6 +1464,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         "ally-review-consistency.yml",
         "codeowners-guard.yml",
         "lockfile-drift-monitor.yml",
+        "master-health.yml",
         "production-environment-protection-guard.yml",
         "relay-ssl-multicert-guard.yml",
         "review-gate-sweep.yml",
@@ -916,12 +1481,21 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(twiceDaily > 14.6, "would red on ordinary twice-daily jitter");
     assert.ok(twiceDaily < 17.71, "would sail over the 2026-09-15 outage it must catch");
 
+    // BLO-38228: the daily clock-rot guard is on 48h, deliberately loose because
+    // its schedule is new and has no measured gap distribution yet. Asserted
+    // rather than skipped, so a drift into the hourly bar (which would red it
+    // every single day) fails here.
+    const dailyClockRot = byWorkflow.get("master-health.yml");
+    assert.ok(dailyClockRot > 24, "a daily cron must clear one full cycle plus GitHub's delay");
+    assert.ok(dailyClockRot <= 48, "looser than two missed cycles stops being a backstop at all");
+
     // The hourly six share one bar; a shared GLOBAL threshold across cadences is
     // the bug this replaced. Asserted against DEFAULT_STALE_HOURS rather than a
     // literal so moving the bar stays a one-line change with a reason attached
     // (PEN-3379 moved it 4h -> 2.75h).
+    const notHourly = new Set(["production-environment-protection-guard.yml", "master-health.yml"]);
     for (const workflow of WATCHED_WORKFLOWS) {
-      if (workflow === "production-environment-protection-guard.yml") continue;
+      if (notHourly.has(workflow)) continue;
       assert.equal(
         byWorkflow.get(workflow),
         DEFAULT_STALE_HOURS,
@@ -1036,7 +1610,13 @@ describe("summarize — 'could not read' is a different claim from 'stopped exec
     const summary = summarize(results);
 
     assert.equal(summary.exitCode, 0);
-    assert.match(summary.headline, /All 7 watched scheduled guards have completed/);
+    // Derived, not a literal: the count is incidental to what this asserts
+    // (green + silent), and hardcoding it made adding a guard fail here for no
+    // reason anyone could act on.
+    assert.match(
+      summary.headline,
+      new RegExp(`All ${WATCHED_WORKFLOWS.length} watched scheduled guards have completed`),
+    );
   });
 });
 
