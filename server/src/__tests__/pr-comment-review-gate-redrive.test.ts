@@ -57,6 +57,7 @@ function statusReader(createdAt: string | null, ok = true) {
 
 /** The retired legacy context whose supersede post failed. */
 const RETIRED_CONTEXT = "ci/ally-review";
+const SECOND_RETIRED_CONTEXT = "ci/ally-review-legacy";
 
 function gateRunner(posted = true, reason: "fetch_failed" | "retirement_failed" = "fetch_failed") {
   return vi.fn(async () =>
@@ -74,6 +75,17 @@ function gateRunner(posted = true, reason: "fetch_failed" | "retirement_failed" 
               {
                 sha: "0ad8773c6ee4b2b1a0c4e9f1d2a3b4c5d6e7f809",
                 context: RETIRED_CONTEXT,
+                state: "failure" as const,
+                description: `Superseded by ${CONTEXT}`,
+                targetUrl: null,
+              },
+              // A SECOND delivery, because a PR can carry several retired
+              // contexts and they are independent recoveries. With one, a
+              // first-rejection short-circuit is indistinguishable from
+              // settling them all.
+              {
+                sha: "0ad8773c6ee4b2b1a0c4e9f1d2a3b4c5d6e7f809",
+                context: SECOND_RETIRED_CONTEXT,
                 state: "failure" as const,
                 description: `Superseded by ${CONTEXT}`,
                 targetUrl: null,
@@ -184,6 +196,7 @@ describe("comment-review gate lost-trigger re-drive", () => {
       attempted: 0,
       redriven: 0,
       retirementFailed: 0,
+      retirementRetryFailed: 0,
       failed: 0,
       headless: 0,
       capped: false,
@@ -231,7 +244,7 @@ describe("comment-review gate lost-trigger re-drive", () => {
     const { result, enqueueDelivery } = await run({}, { runGateCheck: gateRunner(false, "retirement_failed") });
 
     expect(result.retirementFailed).toBe(1);
-    expect(enqueueDelivery).toHaveBeenCalledTimes(1);
+    expect(enqueueDelivery).toHaveBeenCalledTimes(2);
 
     const [, delivery] = enqueueDelivery.mock.calls[0] as [unknown, Record<string, unknown>];
     expect(delivery.repoFullName).toBe(REPO);
@@ -268,6 +281,37 @@ describe("comment-review gate lost-trigger re-drive", () => {
     expect(result.redriven).toBe(1);
     expect(result.retirementFailed).toBe(1);
     expect(result.failed).toBe(0);
+  });
+
+  it("counts EVERY unarmed retry, so a first rejection cannot hide the rest", async () => {
+    // `retirementFailed` says the cleanup failed and a retry was armed. It reads
+    // identically whether the enqueue succeeded or threw, so without its own
+    // counter a dropped retry — which returns the PR to the pre-fix strand — is
+    // recoverable only from log text. Two deliveries, both rejecting: `all`
+    // short-circuits on the first and the second is subscribed-but-ignored, so
+    // the count is what distinguishes settling them all from stopping at one.
+    const enqueueDelivery = vi.fn(async () => {
+      throw new Error("outbox unavailable");
+    });
+    const { result } = await run(
+      {},
+      { runGateCheck: gateRunner(false, "retirement_failed"), enqueueDelivery },
+    );
+
+    expect(enqueueDelivery).toHaveBeenCalledTimes(2);
+    expect(result.retirementRetryFailed).toBe(2);
+    // Still exactly one bucket for the candidate itself.
+    expect(result.redriven).toBe(1);
+    expect(result.failed).toBe(0);
+  });
+
+  it("leaves retirementRetryFailed at zero when the retries are armed", async () => {
+    // The negative control: without it, a counter incremented unconditionally
+    // passes the positive test above on its own.
+    const { result } = await run({}, { runGateCheck: gateRunner(false, "retirement_failed") });
+
+    expect(result.retirementFailed).toBe(1);
+    expect(result.retirementRetryFailed).toBe(0);
   });
 
   it("isolates a throwing re-drive and keeps sweeping", async () => {
@@ -377,16 +421,16 @@ describe("gate re-drive result aggregation", () => {
 
     mergeGateRedriveResults(totals, {
       considered: 3, probed: 2, attempted: 2, redriven: 1,
-      retirementFailed: 1, failed: 1, headless: 1, capped: false,
+      retirementFailed: 1, retirementRetryFailed: 0, failed: 1, headless: 1, capped: false,
     });
     mergeGateRedriveResults(totals, {
       considered: 4, probed: 1, attempted: 1, redriven: 1,
-      retirementFailed: 0, failed: 0, headless: 2, capped: true,
+      retirementFailed: 0, retirementRetryFailed: 2, failed: 0, headless: 2, capped: true,
     });
 
     expect(totals).toEqual({
       considered: 7, probed: 3, attempted: 3, redriven: 2,
-      retirementFailed: 1, failed: 1, headless: 3, capped: true,
+      retirementFailed: 1, retirementRetryFailed: 2, failed: 1, headless: 3, capped: true,
     });
   });
 
@@ -396,7 +440,7 @@ describe("gate re-drive result aggregation", () => {
     // and turning every later `+=` into NaN.
     expect(emptyGateRedriveResult()).toEqual({
       considered: 0, probed: 0, attempted: 0, redriven: 0,
-      retirementFailed: 0, failed: 0, headless: 0, capped: false,
+      retirementFailed: 0, retirementRetryFailed: 0, failed: 0, headless: 0, capped: false,
     });
   });
 
