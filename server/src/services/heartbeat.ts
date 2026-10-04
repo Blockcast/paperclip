@@ -447,6 +447,7 @@ import {
   setExternalLifecycleRunningRuns,
   recordExternalLifecycleRunSilenceGap,
   recordPrReviewQueueWait,
+  recordRunDispatchWait,
   setAgentLivenessMetrics,
   setReleasePendingExternalRuntimeReservationMetrics,
   setOrphanedEnvironmentLeaseMetrics,
@@ -23187,6 +23188,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     recordPrReviewQueueWait({
       taskKey: claimed.contextTaskKey,
+      createdAt: claimed.createdAt,
+      startedAt: claimed.startedAt,
+    });
+
+    // BLO-25024: same transition, no task-key gate. The PR-review recorder
+    // above only observes `pr_review:` runs, which is why fleet-wide dispatch
+    // latency was invisible to every dashboard for ~8 weeks.
+    recordRunDispatchWait({
+      invocationSource: claimed.invocationSource,
       createdAt: claimed.createdAt,
       startedAt: claimed.startedAt,
     });

@@ -95,7 +95,14 @@ import {
   PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS,
   computePrReviewQueueWaitSeconds,
   recordPrReviewQueueWait,
+  RUN_DISPATCH_WAIT_METRIC,
+  RUN_DISPATCH_WAIT_BUCKETS_SECONDS,
+  RUN_DISPATCH_WAIT_INVOCATION_SOURCES,
+  computeRunDispatchWaitSeconds,
+  recordRunDispatchWait,
+  normalizeInvocationSource,
 } from "../services/metrics.js";
+import { HEARTBEAT_INVOCATION_SOURCES } from "@paperclipai/shared";
 import {
   incrementRoutineDispatchMetric,
   resetRoutineDispatchMetrics,
@@ -136,6 +143,80 @@ describe("PR-review queue-wait metrics (BLO-30623)", () => {
     expect(body).toContain(`${PR_REVIEW_QUEUE_WAIT_METRIC}_count 1`);
     expect(PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS).toEqual([60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800]);
     expect(body).not.toContain("Blockcast");
+  });
+});
+
+describe("run dispatch-wait metrics (BLO-25024)", () => {
+  it("measures every run, not just pr_review ones", () => {
+    // The whole point of this metric: the PR-review recorder returns null here.
+    expect(computePrReviewQueueWaitSeconds("issue_board:1", "2026-10-04T00:00:00Z", "2026-10-04T05:00:00Z"))
+      .toBeNull();
+    expect(computeRunDispatchWaitSeconds("2026-10-04T00:00:00Z", "2026-10-04T05:00:00Z")).toBe(18000);
+  });
+
+  it("returns null for an unmeasurable interval rather than a zero sample", () => {
+    expect(computeRunDispatchWaitSeconds("2026-10-04T00:00:00Z", null)).toBeNull();
+    expect(computeRunDispatchWaitSeconds(null, "2026-10-04T05:00:00Z")).toBeNull();
+    expect(computeRunDispatchWaitSeconds("not-a-date", "2026-10-04T05:00:00Z")).toBeNull();
+    // A never-started run must not be recorded as an instant dispatch.
+    expect(recordRunDispatchWait({ invocationSource: "timer", createdAt: "2026-10-04T00:00:00Z", startedAt: null }))
+      .toBeNull();
+  });
+
+  it("clamps clock skew to zero so a negative sample cannot corrupt the p95", () => {
+    expect(computeRunDispatchWaitSeconds("2026-10-04T05:00:00Z", "2026-10-04T04:00:00Z")).toBe(0);
+  });
+
+  it("buckets start below a minute so healthy sub-minute dispatch stays distinguishable", async () => {
+    // Guards the recovery target: with the PR-review buckets (first edge 60s)
+    // a 1s dispatch and a 59s dispatch are the same observation, and "p95
+    // under target" would be unverifiable at the healthy end.
+    expect(RUN_DISPATCH_WAIT_BUCKETS_SECONDS[0]).toBeLessThan(60);
+    expect(recordRunDispatchWait({
+      invocationSource: "timer",
+      createdAt: "2026-10-04T00:00:00.000Z",
+      startedAt: "2026-10-04T00:00:36.000Z",
+    })).toBe(36);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${RUN_DISPATCH_WAIT_METRIC}_bucket{le="30",invocation_source="timer"} 0`);
+    expect(body).toContain(`${RUN_DISPATCH_WAIT_METRIC}_bucket{le="60",invocation_source="timer"} 1`);
+    expect(body).toContain(`${RUN_DISPATCH_WAIT_METRIC}_count{invocation_source="timer"} 1`);
+  });
+
+  it("bounds the invocation_source label to the run column's vocabulary", async () => {
+    for (const source of RUN_DISPATCH_WAIT_INVOCATION_SOURCES) {
+      recordRunDispatchWait({
+        invocationSource: source,
+        createdAt: "2026-10-04T00:00:00Z",
+        startedAt: "2026-10-04T00:00:10Z",
+      });
+    }
+    recordRunDispatchWait({
+      invocationSource: "d6f327a4-f2f2-4a83-bc5a-173d993cf9b6",
+      createdAt: "2026-10-04T00:00:00Z",
+      startedAt: "2026-10-04T00:00:10Z",
+    });
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${RUN_DISPATCH_WAIT_METRIC}_count{invocation_source="other"} 1`);
+    expect(body).not.toContain("d6f327a4");
+  });
+
+  it("pins the local allow-list against the shared constant it copies", () => {
+    // The list is restated in metrics.ts to keep that module dependency-free.
+    // Without this assertion a new invocation source would silently land in
+    // "other" and the per-source breakdown would quietly stop being complete.
+    expect([...RUN_DISPATCH_WAIT_INVOCATION_SOURCES]).toEqual([...HEARTBEAT_INVOCATION_SOURCES]);
+  });
+
+  it("stays disjoint from the wake-reason vocabulary it is easily confused with", () => {
+    // normalizeInvocationSource() is for KNOWN_INVOCATION_SOURCES (wake
+    // reasons). Routing this column through it would label every sample
+    // "other" while still rendering a full histogram. If these ever overlap,
+    // the "do not merge them" comment in metrics.ts needs revisiting.
+    const overlap = RUN_DISPATCH_WAIT_INVOCATION_SOURCES
+      .filter((source) => (KNOWN_INVOCATION_SOURCES as readonly string[]).includes(source));
+    expect(overlap).toEqual([]);
+    expect(normalizeInvocationSource("timer")).toBe("other");
   });
 });
 
