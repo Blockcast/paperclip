@@ -575,8 +575,8 @@ spec:
           # exactly as a fresh one appears keep the expression true
           # indefinitely while each individual row is young. This gauge
           # carries the server-computed age of the oldest queued row PER
-          # AGENT (refreshed on every /metrics scrape from a live
-          # MIN(coalesce(queued_at, created_at)) aggregate), so `for:` here is only riding out
+          # AGENT (refreshed every 15s on a timer, not per scrape, from a
+          # live MIN(coalesce(queued_at, created_at)) aggregate), so `for:` here is only riding out
           # scrape flapping, not standing in for the real age.
           # The freshness gate is load-bearing: a failed database refresh
           # leaves the previous gauge value in memory, so stale data must not
@@ -618,9 +618,10 @@ spec:
           # server-computed age, past DUE TIME, of the oldest agent row still
           # sitting at status='scheduled_retry' past its EFFECTIVE due time
           # (paperclip_overdue_scheduled_retry_oldest_age_seconds, reset to 0
-          # per agent on every /metrics scrape). A run still backing off
-          # toward a future due time contributes nothing -- this only fires on
-          # overshoot past when the promotion sweep should have already acted.
+          # per agent on every 15s timer refresh, not per scrape). A run still
+          # backing off toward a future due time contributes nothing -- this
+          # only fires on overshoot past when the promotion sweep should have
+          # already acted.
           #
           # "Effective due time" is greatest(scheduled_retry_at, advertised
           # resume) per BLO-34782, not the bare column: a ccrotate_capacity
