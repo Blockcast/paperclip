@@ -3336,6 +3336,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       reason?: string;
       requestedByActorType?: "user" | "agent" | "system";
       requestedAt?: Date;
+      wakeCommentIds?: string[];
     }) {
       const wakeId = randomUUID();
       await db.insert(agentWakeupRequests).values({
@@ -3344,13 +3345,19 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         agentId: input.agentId,
         source: "automation",
         triggerDetail: "system",
-        reason: input.reason ?? "issue_comment_added",
+        // What the deferral insert actually writes — it hardcodes this constant
+        // and the real wake reason rides in the context snapshot. The fixture
+        // used to put the reason here too, which is a divergence no production
+        // producer has, and it hid the fact that the drain was carrying the
+        // deferral reason forward onto the wake it promoted.
+        reason: "issue_execution_deferred",
         payload: {
           issueId: input.issueId,
           _paperclipWakeContext: {
             issueId: input.issueId,
             wakeReason: input.reason ?? "issue_comment_added",
             wakeCommentId: "comment-under-test",
+            ...(input.wakeCommentIds ? { wakeCommentIds: input.wakeCommentIds } : {}),
           },
         },
         requestedByActorType: input.requestedByActorType ?? "agent",
@@ -3358,6 +3365,27 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         requestedAt: input.requestedAt ?? new Date(Date.now() - 2 * 60 * 60 * 1000),
       });
       return wakeId;
+    }
+
+    // A comment the reopen predicate can actually resolve an author for.
+    // `createdByRunId: null` is a human comment; passing a run id makes it
+    // agent-authored, which is what the self-wake conjunct screens on.
+    async function seedIssueComment(input: {
+      companyId: string;
+      issueId: string;
+      createdByRunId?: string | null;
+    }) {
+      const commentId = randomUUID();
+      await db.insert(issueComments).values({
+        id: commentId,
+        companyId: input.companyId,
+        issueId: input.issueId,
+        body: "Please pick this back up.",
+        authorType: "user",
+        authorUserId: "pen-3739-human",
+        createdByRunId: input.createdByRunId ?? null,
+      });
+      return commentId;
     }
 
     async function seedLocklessIssue(input: {
@@ -3388,9 +3416,20 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
 
     const readWake = (wakeId: string) =>
       db
-        .select({ status: agentWakeupRequests.status, error: agentWakeupRequests.error })
+        .select({
+          status: agentWakeupRequests.status,
+          error: agentWakeupRequests.error,
+          reason: agentWakeupRequests.reason,
+        })
         .from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.id, wakeId))
+        .then((rows) => rows[0] ?? null);
+
+    const readIssue = (issueId: string) =>
+      db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
 
     it("promotes a lockless deferred wake and attributes the promotion to the drain", async () => {
@@ -3471,12 +3510,20 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         reason: "scheduled_retry",
         requestedByActorType: "system",
       });
+      // A human follow-up: a comment with no authoring run. Both the
+      // comment-referenced and the not-self-authored conjuncts need this to be
+      // a real row — a wake naming no resolvable comment is not reopen-eligible.
+      const humanCommentId = await seedIssueComment({
+        companyId,
+        issueId: reopenableIssueId,
+      });
       const reopenWakeId = await seedDeferredWake({
         companyId,
         agentId,
         issueId: reopenableIssueId,
         reason: "issue_reopened_via_comment",
         requestedByActorType: "user",
+        wakeCommentIds: [humanCommentId],
       });
 
       const result = await drainSweep().sweepStaleIssueLocks();
@@ -3487,6 +3534,94 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(result.drainedDeferredWakeCancellationWakeIds).toEqual([systemWakeId]);
       expect((await readWake(systemWakeId))?.error).toContain("cannot reopen it");
       expect(result.drainedDeferredWakePromotionWakeIds).toEqual([reopenWakeId]);
+
+      // The arm's whole purpose. Promoting without this delivers the wake
+      // against an issue still `done` — the agent wakes on closed work with no
+      // reopen in context, and the deferred row is retired anyway, so the wake
+      // is consumed without reviving anything. Asserting only the wake-id
+      // bookkeeping above cannot see that.
+      expect((await readIssue(reopenableIssueId))?.status).toBe("todo");
+      expect((await readIssue(closedIssueId))?.status).toBe("done");
+
+      // The reopen is attributable to the drain, not to a finalizing run —
+      // there is none, which is the condition this drain exists to repair.
+      const reopenActivity = await db
+        .select({ details: activityLog.details, runId: activityLog.runId })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.action, "issue.updated"),
+            eq(activityLog.entityId, reopenableIssueId),
+          ),
+        );
+      expect(reopenActivity).toHaveLength(1);
+      expect(reopenActivity[0]?.runId).toBeNull();
+      expect(reopenActivity[0]?.details).toMatchObject({
+        reopened: true,
+        reopenedFrom: "done",
+        source: "lockless_deferred_wake_drain",
+      });
+
+      // The promoted run carries the reopen in its context, as the steady-state
+      // promoter's `promotedContextSeed.reopenedFrom` does.
+      const promotedRun = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${reopenableIssueId}`);
+      expect(promotedRun).toHaveLength(1);
+      expect(
+        (promotedRun[0]?.contextSnapshot as Record<string, unknown> | null)?.reopenedFrom,
+      ).toBe("done");
+    });
+
+    it("cancels a terminal wake whose only comment is the waking agent's own (BLO-23206 shape)", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId, status: "done" });
+      // Local-CLI agents post under *user* auth, so this arrives indistinguishable
+      // from a human follow-up on every field except the comment's authoring run.
+      const selfCommentId = await seedIssueComment({
+        companyId,
+        issueId,
+        createdByRunId: failedRunId,
+      });
+      const selfWakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        reason: "issue_comment_added",
+        requestedByActorType: "user",
+        wakeCommentIds: [selfCommentId],
+      });
+
+      const result = await drainSweep().sweepStaleIssueLocks();
+
+      // The `user` actor type alone would have made this reopen-eligible, which
+      // is what re-queues an agent onto the issue its own run just closed.
+      expect(result.drainedDeferredWakeCancellationWakeIds).toEqual([selfWakeId]);
+      expect((await readIssue(issueId))?.status).toBe("done");
+    });
+
+    it("records a drained promotion as promoted, not as the deferral it carried", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId });
+      await seedDeferredWake({ companyId, agentId, issueId });
+
+      await drainSweep().sweepStaleIssueLocks();
+
+      // The deferral insert hardcodes `issue_execution_deferred`. Carrying that
+      // forward left a drained wake indistinguishable from a fresh deferral in
+      // the table, against the attributability this drain is built around.
+      const promoted = await db
+        .select({ reason: agentWakeupRequests.reason })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, "queued"),
+          ),
+        );
+      expect(promoted).toHaveLength(1);
+      expect(promoted[0]?.reason).toBe("issue_execution_promoted");
     });
 
     it("leaves a deferred wake alone while the issue still holds an execution lock", async () => {

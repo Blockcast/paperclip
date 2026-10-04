@@ -100,9 +100,15 @@ import {
   findExistingIssueBlockersResolvedWakeForAnyKey,
 } from "../issue-dependency-wakeups.js";
 import {
+  type AgentOrgRow,
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
 } from "../agent-invokability.js";
+import {
+  extractWakeCommentIds,
+  isTerminalIssueStatus,
+  shouldReopenTerminalIssueForDeferredWake,
+} from "../deferred-wake-reopen.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -14267,11 +14273,17 @@ export function recoveryService(
    * be transient (cooldown, provider capacity) or may BE a re-deferral that
    * coalesced into the very row we would be cancelling. The row stays, the next
    * pass retries, and {@link LOCKLESS_DEFERRED_WAKE_DRAIN_BATCH} bounds the cost
-   * of that retry. Only states that provably will not promote — a vanished
-   * issue, an unresolved dependency edge, a closed issue whose wake cannot
-   * reopen it — are cancelled outright, because promoting those re-queues
-   * straight back into suppression and the drain would regenerate its own
-   * trigger forever.
+   * of that retry.
+   *
+   * Two states are cancelled outright, on different grounds, and the difference
+   * matters to anyone changing either arm:
+   *
+   * - **an unresolved dependency edge** — forced. Promoting re-queues the wake
+   *   straight back into suppression, so a one-verb drain would regenerate its
+   *   own trigger and never converge.
+   * - **a closed issue whose wake is not reopen-eligible** — a policy choice,
+   *   not forced. `enqueueWakeup` has no terminal-issue suppression and the
+   *   promotion would succeed. The grounds are recorded at the arm itself.
    *
    * @returns the wake ids actually promoted and cancelled, which is what makes
    *   done-when 2 checkable: a row leaving `deferred_issue_execution` proves
@@ -14348,12 +14360,30 @@ export function recoveryService(
     };
 
     const readinessByIssueId = new Map<string, IssueDependencyReadiness>();
+    // Hoisted out of the per-candidate loop below. This ran once per candidate
+    // and selected every column of every agent in the company — up to 25 full
+    // company reads per pass, on a ~30s cadence, precisely when a stuck cohort
+    // exists. The five columns below are all `evaluateAgentInvokability` reads.
+    const companyAgentsByCompanyId = new Map<string, AgentOrgRow[]>();
     for (const companyId of new Set(candidates.map((row) => row.companyId))) {
       const issueIds = candidates
         .filter((row) => row.companyId === companyId)
         .map((row) => row.issueId);
       const readiness = await issuesSvc.listDependencyReadiness(companyId, issueIds);
       for (const [issueId, value] of readiness) readinessByIssueId.set(issueId, value);
+      companyAgentsByCompanyId.set(
+        companyId,
+        await db
+          .select({
+            id: agents.id,
+            companyId: agents.companyId,
+            name: agents.name,
+            status: agents.status,
+            reportsTo: agents.reportsTo,
+          })
+          .from(agents)
+          .where(eq(agents.companyId, companyId)),
+      );
     }
 
     for (const candidate of candidates) {
@@ -14377,16 +14407,66 @@ export function recoveryService(
         continue;
       }
 
-      if (candidate.issueStatus === "done" || candidate.issueStatus === "cancelled") {
-        // Not a blanket terminal cancel. `releaseIssueExecutionAndPromote`
-        // REOPENS a closed issue for a human or comment-reopen wake, and
-        // cancelling those would destroy the one wake class whose whole purpose
-        // is to revive closed work. Mirror that promotion path's own eligibility
-        // test and cancel only what it would never have reopened — system
-        // follow-ups such as retry or cleanup wakes.
-        const canReopenClosedIssue =
-          candidate.requestedByActorType === "user" ||
-          wakeReason === "issue_reopened_via_comment";
+      // Seeds the context the promoted wake carries. The terminal arm below
+      // stamps `reopenedFrom` into it when it revives a closed issue, exactly
+      // as `releaseIssueExecutionAndPromote` stamps its own promotion seed.
+      const promotedContextSeed: Record<string, unknown> = { ...context };
+
+      if (isTerminalIssueStatus(candidate.issueStatus)) {
+        // Not a blanket terminal cancel, and not the forced consequence an
+        // earlier revision of this comment claimed. `enqueueWakeup` has no
+        // terminal-issue suppression, so promoting here would succeed; the
+        // drain would not regenerate its own trigger. This arm is a policy
+        // choice and is recorded as one.
+        //
+        // What makes it the right one is where an unreopened promotion lands.
+        // `evaluateQueuedRunStaleness` prunes a queued run on a terminal issue
+        // ONLY when the wake carries no comment id; a wake carrying one is
+        // exempt, which is precisely the BLO-23206 leak — the announcement of a
+        // closure dispatching a run against the closed issue. So promoting a
+        // terminal wake we are not willing to reopen for either costs a run
+        // that the prune then discards, or evades the prune and spends an agent
+        // on work that is already finished. Cancelling retires it attributably
+        // for the price of neither.
+        //
+        // The exception is the wake class whose entire purpose is reviving
+        // closed work. `releaseIssueExecutionAndPromote` reopens the issue for
+        // those, and this arm must do the same rather than merely re-queueing:
+        // delivering the wake against a still-`done` issue consumes it without
+        // reviving anything, which is strictly worse than leaving it deferred.
+        const commentIds = extractWakeCommentIds(context);
+        // Only the terminal arm pays for this, and only when the wake names a
+        // comment — the common promote path below never reaches it.
+        let commentWakeIsSelfAuthored = false;
+        if (commentIds.length > 0) {
+          // The promoter tests `createdByRunId === run.id`. There is no
+          // finalizing run here, so resolve each comment's authoring run to its
+          // agent and ask the question that survives without one: is this agent
+          // waking itself about its own comment?
+          const commentAuthorAgentIds = await db
+            .select({ runAgentId: heartbeatRuns.agentId })
+            .from(issueComments)
+            .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, issueComments.createdByRunId))
+            .where(
+              and(
+                eq(issueComments.companyId, candidate.companyId),
+                eq(issueComments.issueId, candidate.issueId),
+                inArray(issueComments.id, commentIds),
+              ),
+            );
+          commentWakeIsSelfAuthored =
+            commentAuthorAgentIds.length > 0 &&
+            commentAuthorAgentIds.every((row) => row.runAgentId === candidate.agentId);
+        }
+
+        const canReopenClosedIssue = shouldReopenTerminalIssueForDeferredWake({
+          issueStatus: candidate.issueStatus,
+          commentIds,
+          commentWakeIsSelfAuthored,
+          requestedByActorType: candidate.requestedByActorType,
+          wakeReason,
+        });
+
         if (!canReopenClosedIssue) {
           if (await cancelWake(
             candidate.wakeId,
@@ -14396,6 +14476,47 @@ export function recoveryService(
           }
           continue;
         }
+
+        // Reopen BEFORE enqueuing, as the promoter does — the dispatch screens
+        // `enqueueWakeup` runs read the issue's status. If the enqueue is then
+        // declined or coalesced, the issue is left `todo` with the wake still
+        // deferred: the next pass sees a non-terminal issue and takes the
+        // ordinary promote path, and in the meantime a `todo` assigned issue is
+        // visible to its agent. Convergent either way, so this ordering cannot
+        // strand the row.
+        const reopenedFromStatus = candidate.issueStatus;
+        const reopenedIssue = await issuesSvc.update(candidate.issueId, {
+          status: "todo",
+          executionState: null,
+        });
+        if (!reopenedIssue) {
+          // The issue vanished between the scan and here. Nothing to promote
+          // onto; leave the row for the next pass rather than guessing.
+          continue;
+        }
+        if (!readNonEmptyString(promotedContextSeed.reopenedFrom)) {
+          promotedContextSeed.reopenedFrom = reopenedFromStatus;
+        }
+        await logActivity(db, {
+          companyId: candidate.companyId,
+          actorType: "system",
+          actorId: "recovery",
+          agentId: candidate.agentId,
+          // No finalizing run exists — that is the condition this drain
+          // repairs — so the activity is attributed to the sweep itself.
+          runId: null,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: candidate.issueId,
+          issueId: candidate.issueId,
+          details: {
+            status: "todo",
+            reopened: true,
+            reopenedFrom: reopenedFromStatus,
+            source: "lockless_deferred_wake_drain",
+            identifier: reopenedIssue.identifier,
+          },
+        });
       }
 
       // Checked before the enqueue rather than catching its 409, because a
@@ -14403,16 +14524,9 @@ export function recoveryService(
       // repeat on every pass AND write a `skipped` row each time. Leaving it
       // untouched costs nothing and keeps the wake for when the seat is
       // invokable again.
-      const agent = await db
-        .select()
-        .from(agents)
-        .where(eq(agents.id, candidate.agentId))
-        .then((rows) => rows[0] ?? null);
-      if (!agent || agent.companyId !== candidate.companyId) continue;
-      const companyAgents = await db
-        .select()
-        .from(agents)
-        .where(eq(agents.companyId, candidate.companyId));
+      const companyAgents = companyAgentsByCompanyId.get(candidate.companyId) ?? [];
+      const agent = companyAgents.find((row) => row.id === candidate.agentId) ?? null;
+      if (!agent) continue;
       if (!evaluateAgentInvokability(agent, companyAgents).invokable) continue;
 
       const promotedPayload = { ...payload };
@@ -14427,16 +14541,22 @@ export function recoveryService(
           triggerDetail:
             (readNonEmptyString(candidate.triggerDetail) as
               RecoveryWakeupOptions["triggerDetail"]) ?? undefined,
-          reason: readNonEmptyString(candidate.reason) ?? "issue_execution_promoted",
+          // Always the promoted reason, never the candidate's own. The deferral
+          // insert hardcodes `reason: "issue_execution_deferred"`, so carrying
+          // it forward made every drained wake indistinguishable from a fresh
+          // deferral in the table — against the attributability this drain
+          // exists to provide. Matches what the steady-state promoter writes.
+          reason: "issue_execution_promoted",
           payload: promotedPayload,
-          // Carried verbatim. If the issue was claimed between the scan and
-          // here, `enqueueWakeup` re-defers and may coalesce this back into the
-          // very row being drained — which under PEN-3743's last-write-wins
-          // merge would overwrite that row's `wakeCommentId` with whatever this
-          // call supplies. Supplying the preserved snapshot is what makes that
-          // merge write the same values back instead of destroying the orders
-          // the wake was carrying.
-          contextSnapshot: context,
+          // Carried verbatim, plus any `reopenedFrom` the terminal arm stamped.
+          // If the issue was claimed between the scan and here, `enqueueWakeup`
+          // re-defers and may coalesce this back into the very row being
+          // drained — which under PEN-3743's last-write-wins merge would
+          // overwrite that row's `wakeCommentId` with whatever this call
+          // supplies. Supplying the preserved snapshot is what makes that merge
+          // write the same values back instead of destroying the orders the
+          // wake was carrying.
+          contextSnapshot: promotedContextSeed,
           requestedByActorType:
             (candidate.requestedByActorType as RecoveryWakeupOptions["requestedByActorType"]) ??
               undefined,
