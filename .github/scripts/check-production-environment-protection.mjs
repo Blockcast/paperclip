@@ -40,8 +40,18 @@
  * correction is worth making: asserting prevent_self_review === true would be
  * GREEN today, not "permanently red". The field is therefore unasserted while
  * sitting in the STRICTER state, so a future flip to false is uncaught BY
- * CONSTRUCTION — and that is precisely the half of the 2026-08-08 drift the next
- * paragraph describes as "route around prevent_self_review".
+ * CONSTRUCTION. That is a DIFFERENT MECHANISM from the 2026-08-08 drift described
+ * in the next paragraph — that one attacked the same control by routing around it
+ * (admin reviewer added + can_admins_bypass flipped), and this guard DOES assert
+ * both of those: membership is compared against RATIFIED_REVIEWERS and
+ * can_admins_bypass is asserted false, with a dedicated test ("flags the
+ * 2026-08-08 WIDENING shape"). A direct flip of the field defeats the same
+ * protection by a route the guard does not watch.
+ *
+ * ⛔ The earlier wording of this paragraph called the uncaught case "precisely the
+ * half of the 2026-08-08 drift" that routes around prevent_self_review. That was
+ * wrong in the one direction a header like this must not be wrong: it named a
+ * CAUGHT mechanism as the uncaught one. Corrected 2026-10-04 (CEO) on review.
  *
  * ⛔ NOT CHANGED HERE, DELIBERATELY. Re-adding the assertion is a behaviour change
  * and is this file owner's call, not a passing reader's. The argument for it is one
