@@ -618,7 +618,8 @@ export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | n
   if (!policy.monitor) return policy;
   // BLO-39945: clearing a monitor must not take the productivity-review opt-out
   // with it. (This function also drops `reviewPreset`/`authorizationPolicy` —
-  // pre-existing, out of scope here, tracked separately.)
+  // pre-existing and out of scope here; tracked as BLO-18816, "monitor-only
+  // write path so re-arming can't clobber executionPolicy".)
   if (policy.stages.length === 0 && !policy.productivityReviewDisabled) return null;
   return {
     mode: policy.mode,

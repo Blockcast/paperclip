@@ -261,7 +261,14 @@ export const issueExecutionMonitorPolicySchema = z.object({
   timeoutAt: z.string().datetime().optional().nullable().default(null),
   maxAttempts: z.number().int().positive().max(100).optional().nullable().default(null),
   recoveryPolicy: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES).optional().nullable().default(null),
-  productivityReviewDisabled: z.boolean().optional().default(false),
+  productivityReviewDisabled: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "⚠ THIS COPY DIES WITH THE MONITOR. It opts the issue out of automated productivity review only for as long as this monitor exists: every monitor clear — a convergence stall, a dispatch lapse, or an ordinary fire — drops it, and the opt-out is then silently gone while the issue still reads as opted out to whoever set it. " +
+        "Prefer the top-level `executionPolicy.productivityReviewDisabled`, which is durable and is also the only reachable home on a row with no monitor (`nextCheckAt` is required here). Set it here only when you genuinely mean 'while this monitor is armed'.",
+    ),
 });
 
 export const issueExecutionPolicySchema = z.object({
@@ -289,7 +296,9 @@ export const issueExecutionPolicySchema = z.object({
     .boolean()
     .optional()
     .describe(
-      "Opt this issue out of automated productivity review. Set it here, at the top of `executionPolicy`, when the issue carries no monitor — a deliberately-permanent `in_progress` row attended by a cron, for example, which would otherwise trip `long_active_duration` forever. The older home, `executionPolicy.monitor.productivityReviewDisabled`, still works and is unchanged; it is just unreachable without arming a monitor, since `monitor.nextCheckAt` is required. Like every `executionPolicy` field this is a whole-policy REPLACE: on an issue that already has a monitor, a short {\"executionPolicy\":{\"productivityReviewDisabled\":true}} body clears that monitor.",
+      "Opt this issue out of automated productivity review. Set it here, at the top of `executionPolicy`, when the issue carries no monitor — a deliberately-permanent `in_progress` row attended by a cron, for example, which would otherwise trip `long_active_duration` forever. " +
+        "⚠ SET IT HERE FOR ANYTHING MEANT TO LAST. The older home, `executionPolicy.monitor.productivityReviewDisabled`, still works and is still honoured — but it is NOT equivalent: it is a property of the monitor and DIES WITH IT. Every monitor clear drops it — a convergence stall, a dispatch lapse, or an ordinary fire — and the opt-out is then silently gone while the issue still reads as opted out to whoever set it. It is also unreachable on a row with no monitor at all, since `monitor.nextCheckAt` is required. Only this top-level home is durable. " +
+        "Like every `executionPolicy` field this is a whole-policy REPLACE: on an issue that already has a monitor, a short {\"executionPolicy\":{\"productivityReviewDisabled\":true}} body clears that monitor.",
     ),
 });
 
