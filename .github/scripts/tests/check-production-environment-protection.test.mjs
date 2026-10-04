@@ -12,8 +12,12 @@ const user = (login) => ({ type: 'User', reviewer: { login } });
 
 // A fixture modelled on the live shape of paperclip-production. Ratified as
 // intended by board approval 60e271b7 (2026-09-14), superseding b75f8156. This
-// fixture IS the acceptance criterion for BLO-34896: the guard must be green on
-// it *without* the environment moving.
+// fixture IS the acceptance criterion for BLO-34896, in the direction the board
+// ruled ("reconcile the guard, not the environment"): the guard must be made
+// green on this shape, rather than the environment being changed to suit the
+// guard. That is a claim about which side moves. It is NOT a claim that this
+// fixture transcribes the environment — see the correction immediately below,
+// which denies exactly that.
 //
 // ⛔ CORRECTED 2026-10-04 (PEN-2918). The superseded claim is kept as a record
 // rather than deleted, because it is evidence about which read was wrong:
@@ -229,6 +233,12 @@ test('evaluateEnvironmentProtection: prevent_self_review is REPORTED but not ass
     ],
   });
   assert.equal(stricter.compliant, true);
+  // ...and is REPORTED as true, which is the half this test is named for. `true`
+  // is the live value as of 2026-10-04, so without this line the header's claim
+  // that the field "is still reported under `observed` so the single-approver
+  // posture stays visible in every alert and run log" is asserted only for the
+  // value production does NOT have.
+  assert.equal(stricter.observed.prevent_self_review, true);
 });
 
 test('evaluateEnvironmentProtection: prevent_self_review=false does NOT mask the membership check', () => {

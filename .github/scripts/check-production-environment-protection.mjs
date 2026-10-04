@@ -209,6 +209,16 @@ export function evaluateEnvironmentProtection(env, options = {}) {
       prevent_self_review: rule?.prevent_self_review ?? null,
       can_admins_bypass: env.can_admins_bypass ?? null,
       protected_branches: env.deployment_branch_policy?.protected_branches ?? null,
+      // Informational only. No violation() above reads this, and this line is
+      // the sole consumer of GitHub environment `updated_at` in the repo, so
+      // nothing is gated on it. ⛔ Do NOT promote it to a change-detector
+      // without first settling PEN-2918's open question: both in-repo
+      // observations of a bumped `updated_at` (:94's 08-08 widening, the
+      // transcription at the test's :13-21) ALSO changed reviewers or
+      // can_admins_bypass, so whether a prevent_self_review-only edit bumps it
+      // is untested. That is harmless while the field is inert — every payload
+      // carrying it also carries the literal values it could otherwise mislead
+      // about — and becomes load-bearing the moment it is compared.
       updated_at: env.updated_at ?? null,
     },
   };
