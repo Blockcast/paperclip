@@ -20,14 +20,14 @@
  * so it can only close gaps wider than a review run. It closes the wide ones:
  * a wake that arrives after a review is already visible. (BOTH the "minutes"
  * in the previous sentence and this coverage claim are narrowed — see
- * CORRECTION below. The real figure is hours.) It does NOT close concurrent
- * dispatch at one head — for
- * #1304's 53 s byte-identical pair the second run must already have been
- * running when the first review landed (a review run does not finish inside
- * 53 s), so its dispatch preceded any attestation and this predicate would
- * have answered `not_attested` truthfully. That window is also missed by the
- * delivery-scoped wake idempotency keys, and closing it needs a lock or a
- * post-time check, not this.
+ * CORRECTION below. The real figure runs to hours — see the five-pair range
+ * there.) It does NOT close concurrent dispatch at one head — for #1304's 53 s
+ * byte-identical pair the second run must already have been running when the
+ * first review landed (a review run does not finish inside 53 s), so its
+ * dispatch preceded any attestation and this predicate would have answered
+ * `not_attested` truthfully. That window is also missed by the delivery-scoped
+ * wake idempotency keys, and closing it needs a lock or a post-time check, not
+ * this.
  *
  * Stated explicitly because the next I1 red on `master` will otherwise read as
  * a regression here rather than as the known residual it is.
@@ -86,9 +86,11 @@
  * comment does not lift them (`e0336557` committed 06:57:05Z → 0.369 h;
  * `a8a417ac` 10:18:24Z → 0.561 h). Those are below the floor and change
  * nothing: the window a wake-time exclusion has to hold across is governed by
- * the MAXIMUM, 6.054 h, which is exact — hours, not minutes — and a lower
- * floor cannot weaken a bound on how long a remedy must survive. It needs no
- * decomposition to say so.
+ * the MAXIMUM, which over these five is 6.054 h exactly. Read it as a LOWER
+ * BOUND — at least 6.054 h — because a wider population can only raise a
+ * maximum, never lower it. Hours, not minutes; and a lower floor cannot weaken
+ * a bound on how long a remedy must survive. It needs no decomposition to say
+ * so.
  *
  * Do NOT read the ~42 min above as an independent measurement of run duration
  * and subtract it: it is one of those five request→review pairs, and the
@@ -115,10 +117,10 @@
  * `pr-review-dispatch-lock.ts`), which observes strictly later than this
  * module does. How much later is exactly the unmeasured split above, so
  * BLO-20074 has to measure start→post for itself rather than inherit the
- * five-pair 0.7–6.1 h figure, which bounds wake→post. A vocabulary warning, because this
- * docblock uses both words: "dispatch time" in the WHAT THIS CLOSES paragraph
- * and "wake time" here are the SAME instant for this module. It is called from
- * the webhook handler at the moment the wake is decided
+ * five-pair 0.7–6.1 h figure, which bounds wake→post. A vocabulary warning,
+ * because this docblock uses both words: "dispatch time" in the WHAT THIS
+ * CLOSES paragraph and "wake time" here are the SAME instant for this module.
+ * It is called from the webhook handler at the moment the wake is decided
  * (`github-webhook.ts:5593`, and on the contended-replay path at `:4036`), so
  * it has exactly one point of observation, not two to check between. What that
  * check decides is whether a run STARTS; the duplicate is created hours later
