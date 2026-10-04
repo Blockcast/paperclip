@@ -107,13 +107,13 @@ export type GateRedriveCandidate = {
  *
  * **Invariant, and it is load-bearing rather than descriptive:** every `number`
  * here is ADDITIVE across repos and every `boolean` is "happened in at least one
- * repo this tick". {@link mergeGateRedriveResults} dispatches on the runtime
+ * repo this tick". {@link mergeSweepCounters} dispatches on the runtime
  * type of each value, so it inherits that invariant rather than checking it — a
  * field added here that breaks it (a configured ceiling echoed back, a ratio, an
  * epoch timestamp, an AND-shaped flag) is summed or OR'd into nonsense with no
- * type error and no test failure. A value that is neither number nor boolean is
- * skipped entirely, which is the same class. Add fields that obey it, or change
- * the merge first.
+ * type error and no test failure. A value that is neither number, boolean, nor a
+ * nested result object is skipped entirely, which is the same class. Add fields
+ * that obey it, or change the merge first.
  */
 export type GateRedriveResult = {
   /** Candidates offered to this pass. */
@@ -129,21 +129,29 @@ export type GateRedriveResult = {
   /** Re-drives that published a status (so the next sweep skips the PR). */
   redriven: number;
   /**
-   * The subset of {@link GateRedriveResult.redriven} whose live status published
-   * but whose retired-context cleanup failed. Counted separately because it is
-   * otherwise recoverable only from log text: the PR has converged, so `failed`
+   * Every re-drive whose live status published but whose retired-context
+   * cleanup failed — a SUPERSET of {@link GateRedriveResult.retirementRetryFailed},
+   * not a complement of it. It is incremented before the retry is attempted, so
+   * it says nothing about whether one was armed.
+   *
+   * Read the pair, never this field alone: `retirementFailed` minus the
+   * candidates carrying a `retirementRetryFailed` is what actually converged.
+   * Alerting on `retirementFailed` by itself reads a stranded PR as recovered,
+   * which is the exact inversion the second counter exists to expose.
+   *
+   * Counted separately from `failed` because the PR has converged, so `failed`
    * would state the opposite, and `redriven` alone cannot distinguish a clean
    * re-drive from one leaving superseded contexts behind on every PR it touches.
    */
   retirementFailed: number;
   /**
-   * Retirement deliveries that could not even be handed to the durable outbox.
+   * Retirement deliveries that could not even be handed to the durable outbox,
+   * counted per delivery rather than per candidate.
    *
-   * Distinct from {@link GateRedriveResult.retirementFailed}, which says the
-   * cleanup failed and a retry was armed. This says the retry itself was not
-   * armed, which returns the PR to the pre-fix state: a stale red standing on a
-   * retired context that no later sweep can reach, because the live-context
-   * probe this module re-drives on has just been satisfied.
+   * Non-zero means the retry was NOT armed, which returns the PR to the pre-fix
+   * state: a stale red standing on a retired context that no later sweep can
+   * reach, because the live-context probe this module re-drives on has just been
+   * satisfied. This is the alertable half of the pair.
    */
   retirementRetryFailed: number;
   /** Re-drives that threw or returned without writing anything. */
@@ -180,24 +188,46 @@ export function emptyGateRedriveResult(): GateRedriveResult {
 }
 
 /**
- * Accumulate `next` into `totals`, in place.
+ * Accumulate `next` into `totals`, in place. Counters sum, flags OR, nested
+ * result objects recurse.
  *
  * Keys-driven, and that is the entire point. A caller summing these
  * field-by-field gets no completeness check from the type system — every field
- * is already initialised to `0`, so a counter added to {@link GateRedriveResult}
- * and forgotten at the accumulation site compiles clean and reports zero fleet
- * wide, which reads as "this never happens" rather than as a bug. Counters sum;
- * flags OR, because they are "did this happen in any repo this tick".
+ * is already initialised to `0`, so a counter added to a result type and
+ * forgotten at the accumulation site compiles clean and reports zero fleet
+ * wide, which reads as "this never happens" rather than as a bug.
+ *
+ * Generic over the result shape rather than over {@link GateRedriveResult}
+ * alone, because the body only ever dispatched on `typeof` and the enclosing
+ * `ReviewStateReconcileResult` has the identical defect class at its own
+ * accumulation site. Specialising it there bought nothing and left half the
+ * class open.
+ *
+ * A number or boolean is accumulated against whatever `totals` holds, with no
+ * guard on it — deliberately. An initialiser that omits a counter leaves
+ * `undefined`, and `undefined + n` is `NaN`, which is loud. Guarding that into a
+ * skip would report a healthy `0` instead, which is the very defect this helper
+ * exists to prevent, wearing the guard as a disguise. The recursion branch is
+ * the one exception and only because it has no loud option: it requires the
+ * counterpart in `totals` to be an object too, since there is nothing to recurse
+ * into otherwise and fabricating one would hide the same omission.
  */
-export function mergeGateRedriveResults(totals: GateRedriveResult, next: GateRedriveResult): GateRedriveResult {
+export function mergeSweepCounters<T extends object>(totals: T, next: T): T {
+  const target = totals as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(next)) {
     if (typeof value === "number") {
-      (totals as unknown as Record<string, number>)[key] += value;
+      target[key] = (target[key] as number) + value;
     } else if (typeof value === "boolean") {
-      (totals as unknown as Record<string, boolean>)[key] ||= value;
+      target[key] = (target[key] as boolean) || value;
+    } else if (isPlainResultObject(value) && isPlainResultObject(target[key])) {
+      mergeSweepCounters(target[key] as object, value);
     }
   }
   return totals;
+}
+
+function isPlainResultObject(value: unknown): value is object {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -405,7 +435,10 @@ export async function redriveStaleCommentReviewGates(input: {
               repoFullName: input.repoFullName,
               prNumber: candidate.prNumber,
               contexts: unarmed.map((entry) => entry.context),
-              err: unarmed[0]?.err,
+              // Every cause, not `unarmed[0]`: N contexts can fail for N
+              // different reasons, and one cause attached to a list of all of
+              // them reads as covering all of them. The array is already built.
+              errs: unarmed.map((entry) => entry.err),
             },
             "comment-review gate retired-context retry enqueue failed; stale red may stand unrecovered",
           );
