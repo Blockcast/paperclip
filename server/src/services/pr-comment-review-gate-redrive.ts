@@ -102,6 +102,19 @@ export type GateRedriveCandidate = {
   reviews: Array<{ authorLogin: string | null; submittedAt: string }>;
 };
 
+/**
+ * One pass's re-drive tallies.
+ *
+ * **Invariant, and it is load-bearing rather than descriptive:** every `number`
+ * here is ADDITIVE across repos and every `boolean` is "happened in at least one
+ * repo this tick". {@link mergeGateRedriveResults} dispatches on the runtime
+ * type of each value, so it inherits that invariant rather than checking it — a
+ * field added here that breaks it (a configured ceiling echoed back, a ratio, an
+ * epoch timestamp, an AND-shaped flag) is summed or OR'd into nonsense with no
+ * type error and no test failure. A value that is neither number nor boolean is
+ * skipped entirely, which is the same class. Add fields that obey it, or change
+ * the merge first.
+ */
 export type GateRedriveResult = {
   /** Candidates offered to this pass. */
   considered: number;
@@ -123,6 +136,16 @@ export type GateRedriveResult = {
    * re-drive from one leaving superseded contexts behind on every PR it touches.
    */
   retirementFailed: number;
+  /**
+   * Retirement deliveries that could not even be handed to the durable outbox.
+   *
+   * Distinct from {@link GateRedriveResult.retirementFailed}, which says the
+   * cleanup failed and a retry was armed. This says the retry itself was not
+   * armed, which returns the PR to the pre-fix state: a stale red standing on a
+   * retired context that no later sweep can reach, because the live-context
+   * probe this module re-drives on has just been satisfied.
+   */
+  retirementRetryFailed: number;
   /** Re-drives that threw or returned without writing anything. */
   failed: number;
   /** Candidates skipped because the list payload carried no head sha. */
@@ -139,6 +162,7 @@ const EMPTY_RESULT: GateRedriveResult = {
   attempted: 0,
   redriven: 0,
   retirementFailed: 0,
+  retirementRetryFailed: 0,
   failed: 0,
   headless: 0,
   capped: false,
@@ -337,8 +361,15 @@ export async function redriveStaleCommentReviewGates(input: {
         // false on every later sweep and the PR is never offered again. The
         // webhook caller enqueues these (`github-webhook.ts`); dropping them
         // here strands exactly the failure class this module exists to clear.
-        await Promise.all(
-          (check.retirementDeliveries ?? []).map((delivery) =>
+        const retirementDeliveries = check.retirementDeliveries ?? [];
+        // `allSettled`, not `all`: these are independent recoveries, and `all`
+        // rejects on the FIRST one, leaving the rest subscribed-but-ignored —
+        // so several stranded contexts reported as one, named as none. It also
+        // never rejects, which is what keeps this candidate out of the outer
+        // handler: that one increments `failed`, and the candidate is already
+        // counted as `redriven`. One candidate must never land in both.
+        const settled = await Promise.allSettled(
+          retirementDeliveries.map((delivery) =>
             enqueueDelivery(input.db, {
               // Provenance-less for the same reason as the webhook path: a
               // retirement belongs to no company and no agent run. `null`
@@ -357,15 +388,28 @@ export async function redriveStaleCommentReviewGates(input: {
               forceWrite: true,
             }),
           ),
-          // Caught here, not by the outer handler: that one increments
-          // `failed`, and this candidate has already been counted as
-          // `redriven`. One candidate must never land in both.
-        ).catch((err) =>
-          log.warn(
-            { err, repoFullName: input.repoFullName, prNumber: candidate.prNumber },
-            "comment-review gate retired-context retry enqueue failed",
-          ),
         );
+        // Counted, not just logged. The enqueue is the recovery for a failure,
+        // so its own failure needs a signal at least as alertable as the thing
+        // it recovers — otherwise a dropped retry is visible only in log text,
+        // which is the gap that earned `retirementFailed` its counter.
+        const unarmed = settled.flatMap((outcome, index) =>
+          outcome.status === "rejected"
+            ? [{ context: retirementDeliveries[index]?.context ?? "(unknown)", err: outcome.reason }]
+            : [],
+        );
+        if (unarmed.length > 0) {
+          result.retirementRetryFailed += unarmed.length;
+          log.warn(
+            {
+              repoFullName: input.repoFullName,
+              prNumber: candidate.prNumber,
+              contexts: unarmed.map((entry) => entry.context),
+              err: unarmed[0]?.err,
+            },
+            "comment-review gate retired-context retry enqueue failed; stale red may stand unrecovered",
+          );
+        }
         log.warn(
           { repoFullName: input.repoFullName, prNumber: candidate.prNumber, reason: check.reason },
           "comment-review gate re-driven, but retiring the superseded contexts failed",
