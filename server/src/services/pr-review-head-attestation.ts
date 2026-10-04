@@ -18,13 +18,14 @@
  * WHAT THIS CLOSES, AND WHAT IT DOES NOT. This is a check-then-act guard at
  * *dispatch* time, but the duplicate is created minutes later at *post* time,
  * so it can only close gaps wider than a review run. It closes the wide ones:
- * a wake that arrives after a review is already visible. It does NOT close
- * concurrent dispatch at one head — for #1304's 53 s byte-identical pair the
- * second run must already have been running when the first review landed (a
- * review run does not finish inside 53 s), so its dispatch preceded any
- * attestation and this predicate would have answered `not_attested` truthfully.
- * That window is also missed by the delivery-scoped wake idempotency keys, and
- * closing it needs a lock or a post-time check, not this.
+ * a wake that arrives after a review is already visible. (Narrowed — see
+ * CORRECTION below.) It does NOT close concurrent dispatch at one head — for
+ * #1304's 53 s byte-identical pair the second run must already have been
+ * running when the first review landed (a review run does not finish inside
+ * 53 s), so its dispatch preceded any attestation and this predicate would
+ * have answered `not_attested` truthfully. That window is also missed by the
+ * delivery-scoped wake idempotency keys, and closing it needs a lock or a
+ * post-time check, not this.
  *
  * Stated explicitly because the next I1 red on `master` will otherwise read as
  * a regression here rather than as the known residual it is.
@@ -60,13 +61,17 @@
  * is sound and this is not a detection failure.
  *
  * QUEUE LATENCY is real here but is NOT what produced these pairs, and the
- * distinction matters because the two point at different fixes. Each re-request
- * above sat 1.0–6.1 h before its review landed, against the ~42 min run
- * duration, so the start→post interval is hours rather than minutes — which
- * widens the window any exclusion must hold across. It does not account for
- * these three, because in each the first review predated the re-request and so
- * predated dispatch. Treat queue latency as a constraint on the remedy, not as
- * the diagnosis.
+ * distinction matters because the two point at different fixes. The quantity
+ * actually measured is request→review, and across every such pair on these
+ * three PRs it spans 0.7–6.1 h. That is the window a wake-time exclusion has to
+ * hold across — hours, not minutes — and it needs no decomposition to say so.
+ * Do NOT read the ~42 min above as an independent measurement of run duration
+ * and subtract it: it is one of those request→review pairs, and the fastest of
+ * them. Nothing visible in the review API separates time spent queued from time
+ * spent running, so that split is unmeasured here. Queue latency still does not
+ * account for these three, because in each the first review predated the
+ * re-request and so predated the wake. Treat it as a constraint on the remedy,
+ * not as the diagnosis.
  *
  * Do NOT conclude from that measurement that a post-time refusal is the
  * remedy. It is not, and the reason generalises: a same-head re-review can be
@@ -81,16 +86,20 @@
  * cannot classify these and why I1 is being re-specified to treat a
  * distinct-body pair as supersession rather than as a violation.
  *
- * Exclusion therefore belongs at BLO-20074, and the interval it has to survive
- * is the start→post one above. A vocabulary warning, because this docblock uses
- * both words: "dispatch time" in the WHAT THIS CLOSES paragraph and "wake time"
- * here are the SAME instant for this module. It is called from the webhook
- * handler at the moment the wake is decided (`github-webhook.ts:5593`, and on
- * the contended-replay path at `:4036`), so it has exactly one point of
- * observation, not two to check between. What that check decides is whether a
- * run STARTS; the duplicate is created hours later when that run POSTS, and
- * nothing re-asks in between. That is the gap — one observation against a
- * multi-hour lifetime — not a wake-versus-dispatch distinction.
+ * Exclusion therefore belongs at the queued→running claim (BLO-20074,
+ * `pr-review-dispatch-lock.ts`), which observes strictly later than this
+ * module does. How much later is exactly the unmeasured split above, so
+ * BLO-20074 has to measure start→post for itself rather than inherit the
+ * 0.7–6.1 h figure, which bounds wake→post. A vocabulary warning, because this
+ * docblock uses both words: "dispatch time" in the WHAT THIS CLOSES paragraph
+ * and "wake time" here are the SAME instant for this module. It is called from
+ * the webhook handler at the moment the wake is decided
+ * (`github-webhook.ts:5593`, and on the contended-replay path at `:4036`), so
+ * it has exactly one point of observation, not two to check between. What that
+ * check decides is whether a run STARTS; the duplicate is created hours later
+ * when that run POSTS, and nothing re-asks in between. That is the gap — one
+ * observation against a multi-hour lifetime — not a wake-versus-dispatch
+ * distinction.
  *
  * Why this must be enforced BEFORE the run rather than cleaned up after: a
  * COMMENTED review cannot be retracted. GitHub's dismiss endpoint rejects it
