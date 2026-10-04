@@ -962,8 +962,24 @@ export function IssueProperties({
       onUpdate({ executionPolicy: null });
       return;
     }
+    // BLO-40082: second field-by-field rebuild, same clobber. Carry everything
+    // that is not rebuilt here straight off the issue, so `reviewPreset` and
+    // `authorizationPolicy` survive a board monitor edit. Read off the issue
+    // rather than `basePolicy` so it holds even if that guard is loosened.
+    //
+    // `productivityReviewDisabled` is excluded because it IS rebuilt below,
+    // true-only, per BLO-39945; carrying it would preserve a literal `false`.
+    const {
+      mode: _rebuiltMode,
+      commentRequired: _rebuiltCommentRequired,
+      stages: _rebuiltStages,
+      monitor: _rebuiltMonitor,
+      productivityReviewDisabled: _rebuiltProductivityReviewDisabled,
+      ...carriedPolicy
+    } = issue.executionPolicy ?? {};
     onUpdate({
       executionPolicy: {
+        ...carriedPolicy,
         mode: basePolicy?.mode ?? issue.executionPolicy?.mode ?? "normal",
         commentRequired: true,
         stages: basePolicy?.stages ?? [],
@@ -981,12 +997,21 @@ export function IssueProperties({
     if (Number.isNaN(nextCheckAt.getTime())) return;
     const serviceName = monitorServiceInput.trim() || null;
     updateMonitor({
+      // BLO-40082: the same clobber one nesting level down. This literal used to
+      // re-emit 6 of the 11 fields on IssueExecutionMonitorPolicy, so a board
+      // user changing the next-check time silently cleared `timeoutAt`,
+      // `maxAttempts`, `recoveryPolicy`, `gateSignals`, `externalRef` and the
+      // nested `productivityReviewDisabled`. `gateSignals` is the sharp one:
+      // losing it drops the convergence guard back onto the free-form `notes`
+      // signature, which is the precise failure BLO-18294 added it to prevent.
+      // Spread first, then override only the fields this dialog actually has a
+      // control for.
+      ...issue.executionPolicy?.monitor,
       nextCheckAt: nextCheckAt.toISOString(),
       notes: monitorNotesInput.trim() || null,
       scheduledBy: "board",
       kind: serviceName ? "external_service" : null,
       serviceName,
-      externalRef: null,
     });
     setMonitorOpen(false);
   };

@@ -9,6 +9,7 @@ import type {
   IssueExecutionState,
   IssueLabel,
   Project,
+  TrustAuthorizationPolicy,
   WorkspaceRuntimeService,
 } from "@paperclipai/shared";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -2102,6 +2103,144 @@ describe("IssueProperties", () => {
 
     act(() => root.unmount());
   });
+
+  // BLO-40082. Both of these go through hand-rolled object literals in
+  // IssueProperties rather than through buildExecutionPolicy, so the lib-level
+  // suite cannot see them.
+  describe("board monitor edits do not clobber unrendered policy fields (BLO-40082)", () => {
+    const REVIEW_PRESET = { id: "low_trust_review", version: 1, rawOutputDisposition: "quarantine" } as const;
+    const AUTHORIZATION_POLICY: TrustAuthorizationPolicy = {
+      trustPreset: "low_trust_review",
+      reviewPreset: REVIEW_PRESET,
+      trustBoundary: {
+        mode: "low_trust_review",
+        allowedAgentIds: ["agent-1"],
+        allowedToolClasses: ["git.read"],
+        allowedSecretBindingIds: ["binding-1"],
+        outputPromotionTarget: { type: "issue", issueId: "issue-9" },
+      },
+    };
+
+    async function openMonitorEditor(
+      container: HTMLDivElement,
+      onUpdate: ComponentProps<typeof IssueProperties>["onUpdate"],
+      policyOverrides: Partial<IssueExecutionPolicy>,
+    ) {
+      const root = renderProperties(container, {
+        issue: createIssue({
+          status: "in_progress",
+          assigneeAgentId: "agent-1",
+          executionPolicy: createExecutionPolicy(policyOverrides),
+        }),
+        childIssues: [],
+        onUpdate,
+        inline: true,
+      });
+      await flush();
+      const monitorTrigger = Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.includes("Next check"));
+      await act(async () => {
+        monitorTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flush();
+      return root;
+    }
+
+    function clickMonitorButton(container: HTMLDivElement, label: string) {
+      const button = Array.from(container.querySelectorAll("button"))
+        .find((candidate) => candidate.textContent?.trim() === label);
+      expect(button, `expected a "${label}" button`).toBeTruthy();
+      act(() => {
+        button!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+    }
+
+    it("carries reviewPreset and authorizationPolicy through arming a monitor", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: "Check deployment", scheduledBy: "board" },
+        reviewPreset: REVIEW_PRESET,
+        authorizationPolicy: AUTHORIZATION_POLICY,
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written.authorizationPolicy).toEqual(AUTHORIZATION_POLICY);
+      expect(written.reviewPreset).toEqual(REVIEW_PRESET);
+      expect(written.authorizationPolicy?.trustBoundary).toEqual(AUTHORIZATION_POLICY.trustBoundary);
+
+      act(() => root.unmount());
+    });
+
+    it("carries reviewPreset and authorizationPolicy through clearing a monitor", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: "Check deployment", scheduledBy: "board" },
+        authorizationPolicy: AUTHORIZATION_POLICY,
+      });
+
+      clickMonitorButton(container, "Clear");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written).not.toBeNull();
+      expect(written.monitor).toBeUndefined();
+      expect(written.authorizationPolicy).toEqual(AUTHORIZATION_POLICY);
+
+      act(() => root.unmount());
+    });
+
+    it("preserves the monitor fields the dialog has no control for", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          notes: "Check deployment",
+          scheduledBy: "assignee",
+          // None of these five are rendered by the monitor dialog, so a board
+          // edit used to delete them. `gateSignals` is the sharp one: losing it
+          // drops the BLO-18294 convergence guard back onto `notes`.
+          gateSignals: ["pr:Blockcast/paperclip#2228:checks"],
+          maxAttempts: 5,
+          timeoutAt: "2026-04-20T00:00:00.000Z",
+          recoveryPolicy: "wake_owner",
+          externalRef: "run-123",
+        },
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written.monitor?.gateSignals).toEqual(["pr:Blockcast/paperclip#2228:checks"]);
+      expect(written.monitor?.maxAttempts).toBe(5);
+      expect(written.monitor?.timeoutAt).toBe("2026-04-20T00:00:00.000Z");
+      expect(written.monitor?.recoveryPolicy).toBe("wake_owner");
+      expect(written.monitor?.externalRef).toBe("run-123");
+      // Still authored by the controls that do exist.
+      expect(written.monitor?.scheduledBy).toBe("board");
+      expect(written.monitor?.notes).toBe("Check deployment");
+
+      act(() => root.unmount());
+    });
+
+    // Negative control: without this, the three tests above also pass on an
+    // implementation that emits these keys unconditionally.
+    it("invents no keys when the existing policy carries none of them", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: "Check deployment", scheduledBy: "board" },
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(Object.keys(written).sort()).toEqual(["commentRequired", "mode", "monitor", "stages"]);
+      expect(Object.keys(written.monitor ?? {}).sort()).toEqual(["kind", "nextCheckAt", "notes", "scheduledBy", "serviceName"]);
+
+      act(() => root.unmount());
+    });
+  });
+
 
   const watchdogAgent = {
     id: "agent-1",
