@@ -128,8 +128,14 @@ describe("comment-review gate lost-trigger re-drive", () => {
   });
 
   it("fails closed on an unreadable reviews probe rather than re-driving blind", async () => {
+    // The reviews list must be NON-EMPTY here. An unreadable probe paired with
+    // `[]` is skipped by the no-reviewer-review branch anyway, so that fixture
+    // cannot tell this guard from its absence — it survived the mutation. The
+    // shape with teeth is a partial read: rows present, readability false.
     const { result, readStatus, runGateCheck } = await run({
-      candidates: [candidate({ reviewsReadable: false, reviews: [] })],
+      candidates: [
+        candidate({ reviewsReadable: false, reviews: [{ authorLogin: REVIEWER, submittedAt: REVIEW_AT }] }),
+      ],
     });
 
     expect(result.probed).toBe(0);
