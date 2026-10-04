@@ -10,15 +10,33 @@ const user = (login) => ({ type: 'User', reviewer: { login } });
 
 // ── evaluateEnvironmentProtection ────────────────────────────────────────────
 
-// The EXACT live shape of paperclip-production, re-read 2026-09-21T07:0xZ:
-//   {"can_admins_bypass":false,"updated_at":"2026-08-30T07:13:06Z",
-//    "rules":[{"type":"branch_policy"},
-//             {"type":"required_reviewers","prevent_self_review":false,
-//              "reviewers":["kkroo"]}]}
-// Ratified as intended by board approval 60e271b7 (2026-09-14), superseding
-// b75f8156. This fixture IS the acceptance criterion for BLO-34896: the guard
-// must be green on it *without* the environment moving. Note prevent_self_review
-// is false here on purpose — see the "reported, not asserted" test below.
+// A fixture modelled on the live shape of paperclip-production. Ratified as
+// intended by board approval 60e271b7 (2026-09-14), superseding b75f8156. This
+// fixture IS the acceptance criterion for BLO-34896: the guard must be green on
+// it *without* the environment moving.
+//
+// ⛔ CORRECTED 2026-10-04 (PEN-2918). The superseded claim is kept as a record
+// rather than deleted, because it is evidence about which read was wrong:
+//     "The EXACT live shape of paperclip-production, re-read 2026-09-21T07:0xZ:
+//        {"can_admins_bypass":false,"updated_at":"2026-08-30T07:13:06Z",
+//         "rules":[{"type":"branch_policy"},
+//                  {"type":"required_reviewers","prevent_self_review":false,
+//                   "reviewers":["kkroo"]}]}"
+// The live read on 2026-10-04 returns prevent_self_review=TRUE, and agrees with
+// the abbreviated transcription above on every other field it records, including
+// `updated_at`. (Not byte-identical — the transcription renders
+// `protection_rules` as `rules` — but field-for-field, with prevent_self_review
+// the sole disagreement.) So this fixture is NOT a transcript of the live
+// environment and must not be cited as one. Which of the two reads is wrong is
+// not determinable from an agent seat: an unmoved `updated_at` across a changed
+// field would be surprising, but GitHub documents no guarantee that editing a
+// protection rule bumps it, and an environment exposes no audit surface either
+// way.
+//
+// `prevent_self_review: false` below STAYS, and is not a transcription claim: it
+// is the input that proves a false value does not fail the run, which is the
+// whole point of BLO-34896. The true case is covered in the "reported, not
+// asserted" test below. See the guard script's header for the full correction.
 const COMPLIANT_ENV = {
   can_admins_bypass: false,
   updated_at: '2026-08-30T07:13:06Z',
@@ -152,8 +170,9 @@ test('evaluateEnvironmentProtection: resolves Team reviewers by slug', () => {
 
 // ── the dangerous state: no effective gate (BLO-34896 AC2) ───────────────────
 // These two are the negative control for the reconciliation. The guard was made
-// green against the live prevent_self_review=false shape; it must NOT have gone
-// green by weakening its detection of "there is no approval gate at all".
+// green against the then-observed prevent_self_review=false shape (see the
+// fixture note above, corrected 2026-10-04); it must NOT have gone green by
+// weakening its detection of "there is no approval gate at all".
 
 test('evaluateEnvironmentProtection: flags empty reviewers as non-compliant even if the rule exists', () => {
   const env = {
@@ -180,10 +199,18 @@ test('evaluateEnvironmentProtection: flags an absent required_reviewers rule', (
 });
 
 test('evaluateEnvironmentProtection: prevent_self_review is REPORTED but not asserted', () => {
-  // Re-ratified as permitted-false by approval 60e271b7 (2026-09-14), so it must
-  // not fail the run — that is the whole point of BLO-34896. It must still show
-  // up in `observed`, which is what carries the single-approver posture into
-  // every alert and run log.
+  // A false value must not fail the run — that is the whole point of BLO-34896.
+  // It must still show up in `observed`, which is what carries the
+  // single-approver posture into every alert and run log.
+  //
+  // ⛔ CORRECTED 2026-10-04 (PEN-2918). This read "Re-ratified as permitted-false
+  // by approval 60e271b7 (2026-09-14)". The live environment reads
+  // prevent_self_review=TRUE, so that premise does not describe it; what the
+  // board ruled (A) is that the narrowed shape is the intended one, which is a
+  // statement about the reviewer set. The tolerance asserted here is still
+  // correct and still deliberate — the guard does not assert this field — but it
+  // is a design choice about the detector, not a board ruling about the value.
+  // See the guard script's header.
   const result = evaluateEnvironmentProtection(COMPLIANT_ENV);
   assert.equal(result.compliant, true);
   assert.equal(result.observed.prevent_self_review, false);
@@ -207,10 +234,15 @@ test('evaluateEnvironmentProtection: prevent_self_review is REPORTED but not ass
 test('evaluateEnvironmentProtection: prevent_self_review=false does NOT mask the membership check', () => {
   // The defect this reconciliation fixed. `prevent_self_review !== true` used to
   // be a disjunct of the required_reviewers_rule clause, and because `||`
-  // short-circuits, the live false value sent every run down that branch and the
-  // membership comparison in the `else` was unreachable. A tolerated drift was
-  // hiding an untolerated one. Mutation guard: re-add that disjunct and this
-  // fails, because the result collapses to required_reviewers_rule.
+  // short-circuits, the then-observed false value sent every run down that branch
+  // and the membership comparison in the `else` was unreachable. A tolerated
+  // drift was hiding an untolerated one. Mutation guard: re-add that disjunct and
+  // this fails, because the result collapses to required_reviewers_rule.
+  //
+  // Past tense as of 2026-10-04: the live value reads TRUE. See the guard
+  // script's header — the history is re-anchored in time, not retracted, and it
+  // remains the reason the disjunct was removed. This assertion is unaffected:
+  // its `false` below is an input, not a claim about the environment.
   const env = {
     ...COMPLIANT_ENV,
     protection_rules: [
