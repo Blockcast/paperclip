@@ -718,7 +718,7 @@ spec:
             severity: warning
           annotations:
             summary: "Paperclip queued-run age metric refresh is failing"
-            description: "The most recent /metrics queued-run-age database refresh failed (BLO-21116), so queued-run ages may be stale and PaperclipQueuedRunStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty queue."
+            description: "The most recent queued-run-age database refresh failed (BLO-21116), so queued-run ages may be stale and PaperclipQueuedRunStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty queue."
             runbook_url: {{ .Values.prometheusRule.queuedRunStrandedRunbookUrl | quote }}
     - name: paperclip-overdue-scheduled-retry
       rules:
