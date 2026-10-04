@@ -2089,8 +2089,12 @@ export const PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC =
  * When you add a code here you must also add a row for it to the Step 2
  * action table in `runbooks/agent-wakeup-terminal-failed.md`. Listing a code
  * here removes it from the table's `other` escape hatch, so an operator paged
- * on it would otherwise see a label with no row and no fallback. Nothing
- * asserts the two match — the drift is silent.
+ * on it would otherwise see a label with no row and no fallback.
+ *
+ * BLO-35668: that drift used to be silent. It is now asserted set-for-set by
+ * `terminal-failed-wake-runbook-parity.test.ts`, so a code added here without a
+ * runbook row (or a row with no code) fails CI instead of surfacing as a paged
+ * label with no instruction.
  */
 export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   "external_lifecycle_stale_killed",
@@ -2102,6 +2106,17 @@ export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
   "job_missing",
   "adapter_failed",
+  // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) is the
+  // RENAME of the `adapter_failed` directly above, at the one claude-k8s emit
+  // site that names a skill-source fault — so like `caveman_proxy_not_ready`
+  // these runs WERE a member before the relabel, and omitting it moved them to
+  // `other` with nothing upstream having changed. That is the gauge's own
+  // triage instruction (`other` means "triage it into this list") firing on a
+  // code that already had a home; it is a label-set correction only, and
+  // nothing was suppressed by its absence because the
+  // `PaperclipPrReviewWakeTerminallyFailed` alert keys on
+  // `…_oldest_age_seconds`, not on `error_code`.
+  "skill_materialization_pending",
   "process_lost",
   "agent_not_found",
 ] as const;
