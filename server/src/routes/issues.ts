@@ -12474,7 +12474,8 @@ export function issueRoutes(
       // rewrite the policy. `isLapsedMonitorRearmPatch` already rejects a
       // request carrying anything but a monitor; merging rather than replacing
       // closes the other half — the write itself must not silently drop stages,
-      // reviewPreset, authorizationPolicy or mode that the assignee set.
+      // reviewPreset, authorizationPolicy, mode or the productivity-review
+      // opt-out that the assignee set.
       updateFields.executionPolicy = managerMonitorRearmAuthorized
         ? mergeIssueExecutionPolicyMonitor(
           normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),

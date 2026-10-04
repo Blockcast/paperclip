@@ -2048,6 +2048,17 @@ describe("agent issue mutation checkout ownership", () => {
         authorizationPolicy: { trustPreset: "low_trust_review" },
       },
     ],
+    [
+      "productivityReviewDisabled",
+      {
+        monitor: {
+          nextCheckAt: "2026-08-07T14:00:00.000Z",
+          notes: "re-arm",
+          scheduledBy: "assignee",
+        },
+        productivityReviewDisabled: true,
+      },
+    ],
   ])(
     "refuses a manager-chain monitor re-arm whose policy also carries %s",
     async (_label, executionPolicy) => {
@@ -2069,11 +2080,14 @@ describe("agent issue mutation checkout ownership", () => {
     },
   );
 
-  it("preserves a report's stages and authorizationPolicy when a manager re-arms the monitor", async () => {
+  it("preserves a report's stages, authorizationPolicy and productivity-review opt-out when a manager re-arms the monitor", async () => {
     // The gate above keeps `stages` out of the *request*; this keeps the write
     // itself non-destructive. `executionPolicy` replaces wholesale, so without
     // a merge a legitimate monitor-only re-arm would still drop the assignee's
-    // stages and authorization policy as a side effect of restoring a timer.
+    // stages, authorization policy and opt-out as a side effect of restoring a
+    // timer. BLO-39945: the opt-out is the one of the three a manager can set
+    // on itself, so a silent drop here would re-arm productivity reviews on a
+    // row that deliberately turned them off.
     mockIssueService.getById.mockResolvedValue(makeIssue({
       status: "in_progress",
       assigneeAgentId: peerAgentId,
@@ -2084,6 +2098,7 @@ describe("agent issue mutation checkout ownership", () => {
           { type: "review", participants: [{ type: "agent", agentId: staleAgentId }] },
         ],
         authorizationPolicy: { trustPreset: "low_trust_review" },
+        productivityReviewDisabled: true,
       },
       executionState: lapsedMonitorState,
       monitorNextCheckAt: null,
@@ -2108,12 +2123,14 @@ describe("agent issue mutation checkout ownership", () => {
         monitor: { notes: string };
         stages: { participants: { agentId: string }[] }[];
         authorizationPolicy?: { trustPreset: string };
+        productivityReviewDisabled?: boolean;
       };
     };
     expect(written.executionPolicy.monitor.notes).toBe("manager restored lapsed monitor");
     expect(written.executionPolicy.stages).toHaveLength(1);
     expect(written.executionPolicy.stages[0].participants[0].agentId).toBe(staleAgentId);
     expect(written.executionPolicy.authorizationPolicy?.trustPreset).toBe("low_trust_review");
+    expect(written.executionPolicy.productivityReviewDisabled).toBe(true);
   });
 
   it("keeps the monitor gate closed to a productivity-review owner outside PATCH /issues/:id", async () => {
