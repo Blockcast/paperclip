@@ -41,17 +41,12 @@
  * GREEN today, not "permanently red". The field is therefore unasserted while
  * sitting in the STRICTER state, so a future flip to false is uncaught BY
  * CONSTRUCTION. That is a DIFFERENT MECHANISM from the 2026-08-08 drift described
- * in the next paragraph — that one attacked the same control by routing around it
+ * at :68-73 below — that one attacked the same control by routing around it
  * (admin reviewer added + can_admins_bypass flipped), and this guard DOES assert
  * both of those: membership is compared against RATIFIED_REVIEWERS and
  * can_admins_bypass is asserted false, with a dedicated test ("flags the
  * 2026-08-08 WIDENING shape"). A direct flip of the field defeats the same
  * protection by a route the guard does not watch.
- *
- * ⛔ The earlier wording of this paragraph called the uncaught case "precisely the
- * half of the 2026-08-08 drift" that routes around prevent_self_review. That was
- * wrong in the one direction a header like this must not be wrong: it named a
- * CAUGHT mechanism as the uncaught one. Corrected 2026-10-04 (CEO) on review.
  *
  * ⛔ NOT CHANGED HERE, DELIBERATELY. Re-adding the assertion is a behaviour change
  * and is this file owner's call, not a passing reader's. The argument for it is one
@@ -209,12 +204,18 @@ export function evaluateEnvironmentProtection(env, options = {}) {
       prevent_self_review: rule?.prevent_self_review ?? null,
       can_admins_bypass: env.can_admins_bypass ?? null,
       protected_branches: env.deployment_branch_policy?.protected_branches ?? null,
-      // Informational only. No violation() above reads this, and this line is
-      // the sole consumer of GitHub environment `updated_at` in the repo, so
-      // nothing is gated on it. ⛔ Do NOT promote it to a change-detector
-      // without first settling PEN-2918's open question: both in-repo
-      // observations of a bumped `updated_at` (:94's 08-08 widening, the
-      // transcription at the test's :13-21) ALSO changed reviewers or
+      // Informational only. No violation() above reads this, and no code in the
+      // repo reads a GitHub environment `updated_at` by name other than this
+      // line, so nothing is gated on it. (It does LEAVE this file:
+      // post-environment-protection-alert.mjs:91 serialises `observed` wholesale
+      // into the alert payload without naming any field. Printing is not gating,
+      // but a promoter should know the value is already in flight. Repo-wide
+      // greps for `updated_at` are dominated by ~500 unrelated Postgres column
+      // references; this is a different field and they are not evidence about
+      // it.) ⛔ Do NOT promote it to a change-detector without first settling
+      // PEN-2918's open question: all three in-repo observations of a distinct
+      // `updated_at` (the test's :93-96 08-08 widening, its :74-75 08-04 lapse,
+      // and the transcription at its :24-30) ALSO changed reviewers or
       // can_admins_bypass, so whether a prevent_self_review-only edit bumps it
       // is untested. That is harmless while the field is inert — every payload
       // carrying it also carries the literal values it could otherwise mislead
