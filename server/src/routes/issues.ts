@@ -6411,6 +6411,7 @@ export function issueRoutes(
     if (!requestedPolicy?.monitor) return false;
     if (requestedPolicy.stages.length > 0) return false;
     if (requestedPolicy.reviewPreset || requestedPolicy.authorizationPolicy) return false;
+    if (requestedPolicy.productivityReviewDisabled) return false;
     return true;
   }
 

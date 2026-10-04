@@ -15712,7 +15712,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         commentRequired: previousPolicy?.commentRequired ?? true,
         stages: previousPolicy?.stages ?? [],
         // BLO-39945: this rebuild is field-by-field, so the opt-out has to be
-        // carried explicitly or a watchdog re-arm silently clears it.
+        // carried explicitly or a watchdog re-arm silently clears it. Only the
+        // top-level home is carryable: the monitor-nested one is already gone
+        // by the time this runs, because clearing the fired monitor ran it
+        // through `stripMonitorFromExecutionPolicy`, which drops `monitor`
+        // wholesale (and collapses a monitor-only policy to null outright).
         productivityReviewDisabled: previousPolicy?.productivityReviewDisabled ?? false,
         monitor: {
           nextCheckAt: nextCheckAt.toISOString(),

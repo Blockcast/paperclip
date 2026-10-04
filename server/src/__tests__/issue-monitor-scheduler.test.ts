@@ -486,55 +486,77 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   });
 
-  // BLO-39945: the watchdog re-arm rebuilds the policy field by field, so a
-  // top-level `productivityReviewDisabled` is dropped unless carried
-  // explicitly — silently re-enabling productivity review on a row that opted
-  // out, which is the same silent-drop class this flag exists to fix.
-  it("preserves a top-level productivityReviewDisabled across a dispatch-lapse re-arm", async () => {
-    const { issueId } = await seedFixture();
-    await db
-      .update(issues)
-      .set({
-        executionPolicy: {
-          mode: "normal",
-          commentRequired: true,
-          stages: [],
-          productivityReviewDisabled: true,
-          monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: "Check deploy", scheduledBy: "assignee" },
-        },
-      })
-      .where(eq(issues.id, issueId));
+  // BLO-39945: the watchdog re-arm rebuilds the policy field by field, so
+  // `productivityReviewDisabled` is dropped unless carried explicitly —
+  // silently re-enabling productivity review on a row that opted out, which is
+  // the same silent-drop class this flag exists to fix.
+  //
+  // Both homes are exercised, and they deliberately expect different things.
+  // The monitor-nested flag CANNOT survive here and carrying it is not the fix:
+  // clearing the fired monitor already ran the policy through
+  // `stripMonitorFromExecutionPolicy`, which drops `monitor` wholesale and
+  // collapses a monitor-only policy to null, so by the time the watchdog reads
+  // `previousPolicy` there is nothing left to read (measured: it is `null`).
+  // That is pre-existing and is precisely why the durable opt-out needed a home
+  // outside `monitor`. This case pins that asymmetry so the docs stay true.
+  it.each<{ home: string; atPolicy: boolean; atMonitor: boolean; survives: boolean }>([
+    { home: "top-level", atPolicy: true, atMonitor: false, survives: true },
+    { home: "monitor-nested", atPolicy: false, atMonitor: true, survives: false },
+  ])(
+    "re-arms after a dispatch lapse and keeps a $home productivityReviewDisabled: $survives",
+    async ({ atPolicy, atMonitor, survives }) => {
+      const { issueId } = await seedFixture();
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            mode: "normal",
+            commentRequired: true,
+            stages: [],
+            ...(atPolicy ? { productivityReviewDisabled: true } : {}),
+            monitor: {
+              nextCheckAt: "2026-04-11T12:30:00.000Z",
+              notes: "Check deploy",
+              scheduledBy: "assignee",
+              ...(atMonitor ? { productivityReviewDisabled: true } : {}),
+            },
+          },
+        })
+        .where(eq(issues.id, issueId));
 
-    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
-    heartbeatServices.add(heartbeat);
-    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+      const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+      heartbeatServices.add(heartbeat);
+      const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
 
-    await heartbeat.tickTimers(triggeredAt);
-    const queuedRun = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.status, "queued"))
-      .then((rows) => rows[0]!);
-    await db
-      .update(heartbeatRuns)
-      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
-      .where(eq(heartbeatRuns.id, queuedRun.id));
-    await db.update(issues).set({ executionRunId: queuedRun.id }).where(eq(issues.id, issueId));
+      await heartbeat.tickTimers(triggeredAt);
+      const queuedRun = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.status, "queued"))
+        .then((rows) => rows[0]!);
+      await db
+        .update(heartbeatRuns)
+        .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+        .where(eq(heartbeatRuns.id, queuedRun.id));
+      await db.update(issues).set({ executionRunId: queuedRun.id }).where(eq(issues.id, issueId));
 
-    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
-    await heartbeat.tickTimers(lapseDetectedAt);
-    await db
-      .update(heartbeatRuns)
-      .set({ status: "cancelled", finishedAt: lapseDetectedAt })
-      .where(eq(heartbeatRuns.id, queuedRun.id));
+      const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+      await heartbeat.tickTimers(lapseDetectedAt);
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "cancelled", finishedAt: lapseDetectedAt })
+        .where(eq(heartbeatRuns.id, queuedRun.id));
 
-    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
-    const policy = normalizeIssueExecutionPolicy(issue.executionPolicy);
-    // Control: the re-arm did happen, so the assertion below is about survival
-    // rather than about a policy nothing touched.
-    expect(policy?.monitor).toMatchObject({ serviceName: "paperclip_monitor_dispatch" });
-    expect(policy?.productivityReviewDisabled).toBe(true);
-  });
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      const policy = normalizeIssueExecutionPolicy(issue.executionPolicy);
+      // Control: the re-arm did happen, so the assertion below is about survival
+      // rather than about a policy nothing touched.
+      expect(policy?.monitor).toMatchObject({ serviceName: "paperclip_monitor_dispatch" });
+      expect(policy?.productivityReviewDisabled ?? false).toBe(survives);
+      // The nested flag is never re-invented in either direction.
+      expect(policy?.monitor?.productivityReviewDisabled ?? false).toBe(false);
+    },
+  );
 
   it("re-dispatches and re-arms when the watchdog fires on a run that is still queued", async () => {
     // Regression for BLO-22860: the watchdog re-armed a monitor but left the
