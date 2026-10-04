@@ -50,6 +50,12 @@
  * evaluations per sweep rather than one per candidate; retiring the PR itself
  * needs the persisted per-PR attempt counter named there.
  *
+ * Keying the cap on attempts also makes starvation deterministic rather than
+ * merely possible: candidates are walked in enumeration order, which is stable
+ * across sweeps, so `maxRedrives` permanently-wedged PRs spend the whole budget
+ * every sweep and the PRs behind them are never reached. `capped: true` is the
+ * signal that this is happening. See the ceiling note on the cap itself.
+ *
  * ## No fail-open
  *
  * This module decides *when* to ask, never *what* the answer is. The verdict
@@ -75,8 +81,13 @@ import { logger as defaultLogger } from "../middleware/logger.js";
  * installation rate-limit exhaustion — is also the condition under which a
  * re-drive is most likely to fail and be retried next sweep. It bounds cost per
  * sweep, not repetition across sweeps: a PR whose re-drive never publishes is
- * re-attempted forever. If re-drives routinely hit this cap, give each PR a
- * persisted attempt counter rather than raising it.
+ * re-attempted forever, and because candidate order is stable, that PR consumes
+ * the same slot every sweep and starves whatever sits past the cap. Reaching
+ * that needs `maxRedrives` concurrently-wedged PRs whose *status* reads still
+ * succeed — a rate-limited repo fails the status read and consumes no attempt —
+ * so it is documented, not designed around. If re-drives routinely hit this cap,
+ * give each PR a persisted attempt counter rather than raising it; add a
+ * rotating start offset only if starvation is actually observed.
  */
 export const DEFAULT_MAX_GATE_REDRIVES_PER_REPO = 20;
 
@@ -103,6 +114,14 @@ export type GateRedriveResult = {
   attempted: number;
   /** Re-drives that published a status (so the next sweep skips the PR). */
   redriven: number;
+  /**
+   * The subset of {@link GateRedriveResult.redriven} whose live status published
+   * but whose retired-context cleanup failed. Counted separately because it is
+   * otherwise recoverable only from log text: the PR has converged, so `failed`
+   * would state the opposite, and `redriven` alone cannot distinguish a clean
+   * re-drive from one leaving superseded contexts behind on every PR it touches.
+   */
+  retirementFailed: number;
   /** Re-drives that threw or returned without writing anything. */
   failed: number;
   /** Candidates skipped because the list payload carried no head sha. */
@@ -118,6 +137,7 @@ const EMPTY_RESULT: GateRedriveResult = {
   probed: 0,
   attempted: 0,
   redriven: 0,
+  retirementFailed: 0,
   failed: 0,
   headless: 0,
   capped: false,
@@ -271,6 +291,7 @@ export async function redriveStaleCommentReviewGates(input: {
         // has converged and this is not the thing `failed` is alerted on —
         // reporting it there would state the opposite of what happened.
         result.redriven += 1;
+        result.retirementFailed += 1;
         log.warn(
           { repoFullName: input.repoFullName, prNumber: candidate.prNumber, reason: check.reason },
           "comment-review gate re-driven, but retiring the superseded contexts failed",

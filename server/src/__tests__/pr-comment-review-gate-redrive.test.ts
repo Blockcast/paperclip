@@ -159,6 +159,7 @@ describe("comment-review gate lost-trigger re-drive", () => {
       probed: 0,
       attempted: 0,
       redriven: 0,
+      retirementFailed: 0,
       failed: 0,
       headless: 0,
       capped: false,
@@ -183,6 +184,18 @@ describe("comment-review gate lost-trigger re-drive", () => {
 
     expect(result.redriven).toBe(1);
     expect(result.failed).toBe(0);
+    // ...and is still distinguishable from a clean re-drive. Without its own
+    // counter this outcome is identical to `redriven: 1, failed: 0` and is
+    // recoverable only from log text, so a persistent cleanup failure cannot
+    // be alerted on.
+    expect(result.retirementFailed).toBe(1);
+  });
+
+  it("leaves retirementFailed at zero for a clean re-drive", async () => {
+    const { result } = await run();
+
+    expect(result.redriven).toBe(1);
+    expect(result.retirementFailed).toBe(0);
   });
 
   it("isolates a throwing re-drive and keeps sweeping", async () => {
