@@ -432,12 +432,18 @@ describe("buildEnvGuardSetupShell", () => {
   // widening GUARD_RE silently breaks pruning (the class excludes ' and the
   // pattern is $-anchored), so a hash rotation APPENDS a second live guard hook
   // — quieter and worse than the unquoted bug. Assert (a) and (b) together so
-  // either mutation alone turns this red.
+  // either mutation alone turns this red. The temp dir carries a literal quote
+  // as well as a space, so dropping the `'\''` escaping is a third mutation
+  // this test catches.
   it("quotes the hook command AND still prunes across a hash rotation", () => {
     const mergeScript = decodedBlobs(buildEnvGuardSetupShell())[2]!;
-    // mkdtemp appends to the prefix, so the resulting path contains a space.
-    const dir = mkdtempSync(path.join(tmpdir(), "pc settings "));
+    // mkdtemp appends to the prefix, so the resulting path contains BOTH a
+    // space and a literal single quote. The quote is what makes the `'\''`
+    // escaping load-bearing: mutate it to a bare `'` and the recorded command
+    // becomes an unterminated quoted string, so /bin/sh below exits non-zero.
+    const dir = mkdtempSync(path.join(tmpdir(), "pc 'settings "));
     expect(dir).toContain(" ");
+    expect(dir).toContain("'");
     try {
       const guardA = path.join(dir, "paperclip-env-guard.aaaaaaaaaaaa.mjs");
       const guardB = path.join(dir, "paperclip-env-guard.bbbbbbbbbbbb.mjs");
@@ -462,11 +468,15 @@ describe("buildEnvGuardSetupShell", () => {
 
       // (a) that recorded command runs, as one argument, through a real shell.
       const ran = spawnSync("/bin/sh", ["-c", hooks[0].command], { encoding: "utf8" });
-      expect(ran.stderr).toBe("");
+      // `node` is resolved off /bin/sh's PATH because that is literally what is
+      // recorded in settings.json. A runner without node on PATH gives rc 127,
+      // which is an environment problem, not a quoting bug — say so here rather
+      // than letting it surface as a bare status mismatch.
+      expect(ran.stderr).not.toContain("not found");
       expect(ran.status).toBe(0);
       expect(ran.stdout.trim()).toBe("2");
 
-      expect(hooks[0].command).toBe(`node '${guardB}'`);
+      expect(hooks[0].command).toBe(`node '${guardB.replace(/'/g, "'\\''")}'`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
