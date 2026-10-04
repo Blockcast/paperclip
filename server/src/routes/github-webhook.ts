@@ -5571,6 +5571,16 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // one commit away. On `github_pr_synchronized` the head is new by
       // definition, so this costs one API call and always falls through.
       //
+      // CONTESTED (PEN-3754), and deliberately left in place pending
+      // BLO-20074. `pr-review-head-attestation.ts` argues the opposite in its
+      // own docblock: that the measured wide pairs were deliberate re-reviews
+      // and are "precisely the traffic this guard must not refuse". The narrow
+      // point where "one commit away" is false: a finding that lives in the PR
+      // DESCRIPTION cannot be carried by any commit, so the head necessarily
+      // stays put and a refusal strands the finding permanently. Read both
+      // before changing either; do not treat this comment as the settled
+      // position.
+      //
       // Fail-open by construction: only an `attested` outcome suppresses. An
       // unreachable GitHub, an unparseable body, or a missing head all yield
       // `unknown` and let the wake proceed, because an unreviewed PR is a worse
