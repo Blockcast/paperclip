@@ -236,16 +236,23 @@ export const EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS = [
  * than a re-implementation of it.
  *
  * `observation` is one of:
- *   {error: "unreadable"}                      workflow metadata unreadable
- *   {error: "runs-unreadable", state}          run history unreadable
- *   {state, name, newest: null}                active, never completed
- *   {state, name, newest: {updatedAt, conclusion, htmlUrl}}
+ *   {error: "unreadable"}                               workflow metadata unreadable
+ *   {error: "runs-unreadable", state}                   run history unreadable
+ *   {state, name, newest: null, completedCount}         active, never completed
+ *   {state, name, newest: {updatedAt, conclusion, htmlUrl}, completedCount}
+ *
+ * `completedCount` is the filtered read's `total_count` (null when the response
+ * carried none). It is load-bearing, not decorative: it is one half of the
+ * index-consistency proof below, which is the FIRST arm this function evaluates
+ * on the red path (BLO-38286).
  *
  * `observation.crossCheck` is optional and only consulted on the path that
- * would otherwise red. It is `{newestCompletedAt}` from the independent
- * unfiltered read, or `{error: true}`. A cross-check that is NEWER than
- * `newest` suppresses the alarm to "unknown" (PEN-3379); an absent or
- * unreadable one leaves the verdict alone.
+ * would otherwise red. It is `{newestCompletedAt, allCount}` from the
+ * independent unfiltered read, or `{error: true}`. A cross-check that is NEWER
+ * than `newest` suppresses the alarm to "unknown" (PEN-3379); an `allCount`
+ * that cannot both be true alongside `completedCount` suppresses it to
+ * "unknown" as well (BLO-38286); an absent or unreadable one leaves the verdict
+ * alone.
  *
  * @returns {{workflow: string, status: "ok"|"stale"|"unknown", reason: string,
  *            name: string, ageMinutes: number|null, detail: string}}
@@ -338,6 +345,15 @@ export function classifyGuard(
   // SAME pinned replica are internally consistent and pass straight through
   // this check. It catches the differently-pinned case on proof; it does not
   // make the index trustworthy, and AC2's flap watch is what measures the rest.
+  //
+  // ORDER against the unparsable-timestamp arm below, deliberate: an unparsable
+  // `newest.updatedAt` makes `crossCheckIsBetter` false, because EVERY
+  // comparison against NaN is false. So a guard carrying both an unreadable
+  // timestamp and impossible counts is answered here as `index-inconsistent`
+  // rather than reaching `unparsable-timestamp`. That is the better of the two
+  // answers, not an oversight: counts that cannot both be true make every field
+  // of both reads suspect, which strictly contains "one timestamp is garbage".
+  // Both are `status: "unknown"` and both exit 0, so nothing downstream moves.
   const completedCount = observation?.completedCount;
   const allCount = observation?.crossCheck?.allCount;
   const crossCheckIsBetter =
@@ -888,8 +904,12 @@ export function selectNewestCompleted(runs) {
  * CROSS_CHECK_PAGE_SIZE runs and takes the newest one that has actually
  * completed, which is the same quantity the filtered read claims to return.
  *
- * Returns `{newestCompletedAt}` (ISO string, or null when the page genuinely
- * holds no completed run), or `{error: true}` when the read could not be made.
+ * Returns `{newestCompletedAt, allCount}`, or `{error: true}` when the read
+ * could not be made. `newestCompletedAt` is an ISO string, or null when the
+ * page genuinely holds no completed run. `allCount` is this unfiltered read's
+ * `total_count` (null when absent) — the SUPERSET cardinality that
+ * `observeWorkflow`'s `completedCount` may never exceed, and the other half of
+ * the index-consistency proof in `classifyGuard` (BLO-38286).
  * An unreadable cross-check is NOT treated as agreement — see `classifyGuard`.
  *
  * `read` is injectable so the failure branch is reachable from a test. It is
@@ -1023,10 +1043,14 @@ function main() {
     }
 
     if (result.status === "unknown") {
-      const unknownTitles = {
+      // Null-prototype: `result.reason` is a closed internal enum today, but a
+      // plain literal would resolve `constructor`/`toString` off the prototype,
+      // `??` would not fall back, and a function would be stringified into the
+      // annotation title. Same reason as `titles` below.
+      const unknownTitles = Object.assign(Object.create(null), {
         "cross-check-disagreement": "Run index disagreed with itself — liveness alarm suppressed",
         "index-inconsistent": "Run index is internally inconsistent — liveness alarm suppressed",
-      };
+      });
       const title = unknownTitles[result.reason] ?? "Unparsable run timestamp";
       console.log(`::warning title=${title}::${result.detail}`);
       continue;
@@ -1044,12 +1068,12 @@ function main() {
       continue;
     }
 
-    const titles = {
+    const titles = Object.assign(Object.create(null), {
       unreadable: "Guard workflow unreadable",
       "runs-unreadable": "Guard run history unreadable",
       disabled: "Guard workflow disabled",
       "never-completed": "Guard has never completed",
-    };
+    });
     console.log(`::error title=${titles[result.reason]}::${result.detail}`);
   }
 
