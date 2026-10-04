@@ -524,35 +524,58 @@ test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead
   // exceeds the strand alert's first possible fire time, a refresh outage
   // beginning at the same instant hides a real strand for the difference,
   // and nothing in the rendered chart says so.
+  // One parse for both windows. Reading the strand `for:` with a bare
+  // `(\d+)m` fails OPEN: on any other unit the lazy match does not stop at
+  // the strand rule, it walks downstream and binds against the next `for:`
+  // it finds -- measured at `queuedRunStrandedFor: 30s`, where it silently
+  // bound against this alert's own window instead.
+  const forMinutesOf = (raw) => {
+    const [, value, unit] = /^(\d+)([mh])$/.exec(String(raw ?? "").trim()) ?? [];
+    return value ? Number(value) * (unit === "h" ? 60 : 1) : null;
+  };
+
   const [, refreshFor] = rendered.match(
     /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?\n\s+for: (.+)\n/,
   ) ?? [];
   assert.ok(refreshFor, "the freshness failure alert must render a for window");
-  const refreshForMinutes = /^\d+m$/.test(refreshFor.trim())
-    ? Number(refreshFor.trim().slice(0, -1))
-    : /^\d+h$/.test(refreshFor.trim())
-      ? Number(refreshFor.trim().slice(0, -1)) * 60
-      : null;
+  const refreshForMinutes = forMinutesOf(refreshFor);
   assert.ok(
     refreshForMinutes !== null && refreshForMinutes > 0,
     `for window ${refreshFor} must be a positive minute/hour window`,
   );
 
-  const [, strandThreshold] = rendered.match(
-    /alert: PaperclipQueuedRunStranded[\s\S]*?paperclip_queued_run_oldest_age_seconds[\s\S]*?> (\d+)\n/,
-  ) ?? [];
-  const [, strandFor] = rendered.match(
-    /alert: PaperclipQueuedRunStranded[\s\S]*?\n\s+for: (\d+)m\n/,
-  ) ?? [];
+  // Slice to the strand rule's OWN block before reading either number.
+  // `PaperclipQueuedRunStranded` is a prefix of `...StrandedFleet`, so an
+  // unanchored match binds to whichever of the two YAML renders first --
+  // and it fails in the loosening direction: bounding against the Fleet
+  // rule's 1800s + 15m admits a 30m window that the per-agent rule's
+  // 1440s + 5m correctly rejects. `\b` does not match between `d` and `F`.
+  const strandBlock = rendered
+    .split(/^[ \t]*- alert: /m)
+    .find((block) => /^PaperclipQueuedRunStranded\b/.test(block));
   assert.ok(
-    strandThreshold && strandFor,
+    strandBlock,
+    "could not locate the PaperclipQueuedRunStranded rule to bound this one against",
+  );
+  const [, strandThreshold] = strandBlock.match(
+    /paperclip_queued_run_oldest_age_seconds[\s\S]*?> (\d+)\n/,
+  ) ?? [];
+  const [, strandFor] = strandBlock.match(/\n\s+for: (.+)\n/) ?? [];
+  const strandForMinutes = forMinutesOf(strandFor);
+  assert.ok(
+    strandThreshold && strandForMinutes !== null,
     "could not read the strand alert's threshold and for window to bound this one against",
   );
-  const strandTotalSeconds = Number(strandThreshold) + Number(strandFor) * 60;
+  // Deliberately relative rather than a literal, so it cannot rot when the
+  // strand numbers are retuned -- and it stays BOUNDED because the
+  // BLO-21116 assertion above pins `ageThreshold + for <= 1800` absolutely,
+  // so strandTotalSeconds can never exceed 30m however those numbers move.
+  // Relaxing that cap would silently remove this ceiling too.
+  const strandTotalSeconds = Number(strandThreshold) + strandForMinutes * 60;
   assert.ok(
     refreshForMinutes * 60 < strandTotalSeconds,
     `refresh-failure for-window ${refreshFor} (${refreshForMinutes * 60}s) must page BEFORE the `
-      + `strand alert's first possible fire time (${strandThreshold}s + ${strandFor}m = `
+      + `strand alert's first possible fire time (${strandThreshold}s + ${strandFor} = `
       + `${strandTotalSeconds}s); otherwise a refresh outage can hide a real strand for the difference`,
   );
 });
