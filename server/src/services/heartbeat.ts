@@ -16173,6 +16173,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         mode: previousPolicy?.mode ?? "normal",
         commentRequired: previousPolicy?.commentRequired ?? true,
         stages: previousPolicy?.stages ?? [],
+        // BLO-39945: this rebuild is field-by-field, so the opt-out has to be
+        // carried explicitly or a watchdog re-arm silently clears it.
+        productivityReviewDisabled: previousPolicy?.productivityReviewDisabled ?? false,
         monitor: {
           nextCheckAt: nextCheckAt.toISOString(),
           notes: previousMonitor.notes ?? "Re-check monitor wake dispatch",

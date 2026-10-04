@@ -664,6 +664,12 @@ export interface IssueExecutionPolicy {
   monitor?: IssueExecutionMonitorPolicy | null;
   reviewPreset?: LowTrustReviewPresetPolicy;
   authorizationPolicy?: TrustAuthorizationPolicy;
+  /**
+   * BLO-39945: opt a deliberately-permanent row out of productivity review
+   * without arming a monitor it does not need. Mirrors
+   * `IssueExecutionMonitorPolicy.productivityReviewDisabled`; either is honoured.
+   */
+  productivityReviewDisabled?: boolean;
 }
 
 export interface IssueExecutionMonitorState {

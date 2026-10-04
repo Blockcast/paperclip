@@ -8513,6 +8513,113 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(closed?.details).toMatchObject({ suppressedBy: "unreviewable_source" });
   });
 
+  // BLO-39945. The opt-out gate was correct but unreachable: it read only
+  // `executionPolicy.monitor.productivityReviewDisabled`, and `monitor`
+  // requires `nextCheckAt`. A deliberately-permanent `in_progress` log row
+  // (BLO-34818) correctly carries no monitor, so it could not opt out and
+  // tripped `long_active_duration` forever — four false positives in five days.
+  describe("top-level productivityReviewDisabled opt-out (BLO-39945)", () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    // 7h > the 6h long-active bar, so this source fires on every run.
+    const longActiveStartedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+
+    it("skips generation for a source carrying the flag with no monitor at all", async () => {
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: longActiveStartedAt,
+        executionPolicy: { mode: "normal", commentRequired: true, stages: [], productivityReviewDisabled: true },
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.optedOut).toBe(1);
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+
+    // Negative control. Without this, the test above passes on code that opts
+    // every source out unconditionally.
+    it("still generates for the same fixture with the flag absent", async () => {
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: longActiveStartedAt,
+        executionPolicy: { mode: "normal", commentRequired: true, stages: [] },
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.optedOut).toBe(0);
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    });
+
+    // The pre-existing monitor-nested form must keep working unchanged.
+    it("still honours the monitor-nested flag", async () => {
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: longActiveStartedAt,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+            notes: null,
+            scheduledBy: "assignee",
+            productivityReviewDisabled: true,
+          },
+        },
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.optedOut).toBe(1);
+      expect(result.created).toBe(0);
+    });
+
+    it("retires an already-created review once the source sets the top-level flag", async () => {
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: longActiveStartedAt,
+        monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+        monitorScheduledBy: "assignee",
+      });
+      const reviewId = await insertProductivityReview({ seeded, createdAt: new Date(now.getTime() - 10 * 60_000) });
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: { mode: "normal", commentRequired: true, stages: [], productivityReviewDisabled: true },
+          updatedAt: now,
+        })
+        .where(eq(issues.id, seeded.issueId));
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+        thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      });
+
+      expect(result.created).toBe(0);
+      const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+      expect(review).toMatchObject({ status: "done" });
+      const [closed] = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
+      expect(closed?.details).toMatchObject({ suppressedBy: "unreviewable_source" });
+    });
+  });
+
   it("retires a stale reserved review after its source disappears", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const reservedAt = new Date(now.getTime() - 10 * 60_000);

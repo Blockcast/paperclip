@@ -277,6 +277,14 @@ export const issueExecutionPolicySchema = z.object({
     ),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
+  // BLO-39945: second home for the productivity-review opt-out. The original
+  // lives under `monitor`, whose `nextCheckAt` is required — so the flag was
+  // unreachable for exactly the rows that need it: deliberately-permanent
+  // `in_progress` logs attended by a cron, which correctly carry no monitor
+  // and would trip `long_active_duration` forever (BLO-34818 took four false
+  // positives). `monitor.nextCheckAt` stays required; the monitor-nested form
+  // keeps working.
+  productivityReviewDisabled: z.boolean().optional().default(false),
 });
 
 export const issueExecutionMonitorStateSchema = z.object({
