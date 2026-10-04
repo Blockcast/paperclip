@@ -3518,8 +3518,10 @@ function ensureRegistry(): {
         + "failures (BLO-7457 / BLO-9147 / BLO-17953). agent_id is retained for EVERY error code "
         + "and bounded to the company agent roster by normalizeAgentId, so agent_id='unknown' means "
         + "the run carried no agent id, an id that is not a real agent, or an id the 30s roster "
-        + "cache had not yet observed (reachable only for an agent's first failing run within 30s "
-        + "of its creation) — not that policy collapsed "
+        + "cache had not yet observed (reachable only for that agent's failing runs within 30s "
+        + "of its creation — the cache is never invalidated on agent creation and a miss does not "
+        + "populate it, so every failing run in that window collapses, not just the first) — "
+        + "not that policy collapsed "
         + "it. issue_id is unbounded and is retained only "
         + "for k8s_pod_schedule_failed, in every isolation mode (run, workspace and shared are all "
         + "execution pods); every other error code collapses it to 'none' (BLO-17953 A1f). Note "
@@ -5006,8 +5008,12 @@ export function recordHeartbeatRunFailed(
   //   membership, not runtime status (`agent-roster.ts`), so a paused or retired
   //   agent still reports under its own id. Two ids collapse: one that is not a
   //   real agent (the case worth collapsing), and — rarely — a real one the 30s
-  //   roster cache has not yet observed, i.e. an agent's first failing run inside
-  //   30s of its creation. The second is an accepted, self-correcting cost that
+  //   roster cache has not yet observed, i.e. an agent's failing runs inside
+  //   30s of its creation. Every failing run in that window collapses, not just
+  //   the first: nothing invalidates the cache on agent creation, and a miss
+  //   does not populate it (`normalizeAgentId` is a pure membership test), so
+  //   fast-failing codes can emit several. The second is an accepted,
+  //   self-correcting cost that
   //   errs toward `unknown`, so it can never breach the bound. "Which
   //   lane is losing runs to X" is a question worth answering for every failure
   //   mode, and answering it per-code meant relitigating the allow-list each
@@ -5022,7 +5028,8 @@ export function recordHeartbeatRunFailed(
   // That bound is a SNAPSHOT of today's error-code population, not an enforced
   // ceiling: `error_code` is a raw pass-through. It is safe today because every
   // source stamps a code-literal (`classifyAgentJobFailureErrorCode` returns a
-  // 3-value union or null; `dailyCapBlock.reason` is one literal). Retaining
+  // 3-value union or null; the setup-failure path stamps constants such as
+  // `setup_failed` and `workspace_validation_failed`). Retaining
   // `agent_id` for every code multiplied this dimension's cost by the roster,
   // so the day anything stamps a TEMPLATED or caller-supplied code, gate it
   // through a KNOWN_ERROR_CODES set here before it ships.
