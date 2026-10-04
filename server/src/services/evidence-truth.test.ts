@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { extractAllyReviewedHeadSha } from "./ally-review-detection.js";
 import {
   buildGithubTruthProbe,
   prRefsFromWorkProducts,
@@ -845,6 +846,94 @@ describe("buildGithubTruthProbe", () => {
     expect(r.detections["review:ally-clean"]).toBeUndefined();
     // The author read succeeded, so the absence is the veto and not a failed
     // probe — without this the row would also pass on an unreadable author.
+    expect(r.probeFailed).toBe(false);
+  });
+
+  // BLO-38032. `commit_id` is mutable and GitHub re-anchors it FORWARD onto the
+  // new head on a branch update (BLO-27234, n=128), so `atHead` admits a review
+  // of a tree that no longer exists. `formalDeferred` read that row's ledger and
+  // vetoed, killing a genuine clean this head's own reviewer published.
+  //
+  // MUTATION: restore the `attested !== normalizedHead` arm's absence —
+  // i.e. key `formalDeferred` on `newest` alone — and this row goes red.
+  it("a tracked deferral attesting a REPLACED head does not veto this head's clean", async () => {
+    const trackedAtOld = `## Ally — Consolidated PR Review
+**Reviewed head:** \`${OLD}\`
+
+### Critical Issues (0)
+None.
+
+### Important Issues (0)
+None.
+
+### Prior Findings Dispositioned (1)
+- **prior:abcdef0 important 1** - tracked - accepted onto BLO-36822.
+
+### Recommended Action
+Land.`;
+    // Built literally rather than by chaining `.replace` off `clean`:
+    // `.replace(String, ...)` substitutes only the FIRST occurrence, so a
+    // fixture assembled that way can silently keep attesting HEAD and pass for
+    // the wrong reason.
+    expect(trackedAtOld).toContain(OLD);
+    expect(trackedAtOld).not.toContain(HEAD);
+
+    const r = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          // `submittedAt` is a real timestamp, so this row is ALSO spread into
+          // the comment surface — the production-reachable shape, not the
+          // `submittedAt: null` divergence. It attests OLD, so it is not that
+          // surface's `forHead` and cannot set `commentDeferred`; the clean
+          // comment below is.
+          reviews: [
+            { login: ALLY, body: trackedAtOld, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" },
+          ],
+          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T01:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeDefined();
+    expect(r.probeFailed).toBe(false);
+  });
+
+  // The other half of that narrowing, and the reason it is a narrowing rather
+  // than a swap to `=== normalizedHead`: an UNATTESTED body still vetoes.
+  //
+  // This is not hypothetical bookkeeping. `countAllyDeferredPriorFindings`
+  // reads the RAW body while `extractAllyReviewedHeadSha` reads the
+  // fence-stripped one, so an unbalanced fence can blank the attestation while
+  // the ledger survives. Requiring a positive match would hand that shape a
+  // `review:ally-clean` on a head with a live accepted residual — the exact
+  // BLO-36903 misstatement the veto exists to prevent, reintroduced by the fix
+  // for BLO-38032.
+  //
+  // MUTATION: drop the `attested !== null` arm (require `=== normalizedHead`)
+  // and this row goes red.
+  it("a tracked deferral that attests NO head still vetoes", async () => {
+    const trackedNoAttestation = `Looks fine to me.
+
+### Prior Findings Dispositioned (1)
+- **prior:abcdef0 important 1** - tracked - accepted onto BLO-36822.`;
+    expect(extractAllyReviewedHeadSha(trackedNoAttestation)).toBeNull();
+
+    const r = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [
+            {
+              login: ALLY,
+              body: trackedNoAttestation,
+              state: "COMMENTED",
+              commitId: HEAD,
+              submittedAt: "2026-09-06T00:00:00Z",
+            },
+          ],
+          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T01:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
     expect(r.probeFailed).toBe(false);
   });
 });
