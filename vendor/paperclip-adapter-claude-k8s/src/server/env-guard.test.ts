@@ -448,6 +448,18 @@ describe("block message resolves to the installed helper (BLO-29526)", () => {
       // The space is deliberate. The suggestion is copy-pasted into a shell, so
       // an unquoted path would emit an un-runnable command; this is what makes
       // the quoting load-bearing rather than decorative.
+      //
+      // SCOPE: this covers the BLOCK MESSAGE only. It is NOT a claim that a
+      // spaced config dir works end to end. SETTINGS_MERGE_SCRIPT still builds
+      // `const cmd = "node " + guard` unquoted, so the hook REGISTRATION it
+      // writes into settings.json would split on the space. Pre-existing, and
+      // unreachable in production (session dirs are UUID-based).
+      //
+      // Do not "fix" that by quoting `cmd` alone: GUARD_RE is
+      // /paperclip-env-guard[^\s"']*\.mjs$/ — it excludes `'` and anchors at
+      // $, so a quoted command stops matching, the stale-guard pruning goes
+      // silent, and every hash rotation leaks another live PreToolUse hook.
+      // No test goes red for that. Both sites have to move together.
       const configDir = path.join(root, "session dir", ".claude");
       mkdirSync(home, { recursive: true });
       // Guard the guard: if these ever collapse to the same directory the test
