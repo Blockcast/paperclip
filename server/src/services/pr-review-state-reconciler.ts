@@ -45,6 +45,8 @@ import { issueWorkProducts, pullRequestReviewState } from "@paperclipai/db";
 import { getInstallationTokenResult } from "./github-app-auth.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
+  emptyGateRedriveResult,
+  mergeGateRedriveResults,
   redriveStaleCommentReviewGates,
   type GateRedriveCandidate,
   type GateRedriveResult,
@@ -549,16 +551,7 @@ export async function prReviewStateReconcilerTick(
     unreadable: 0,
     truncated: false,
     malformed: 0,
-    gateRedrive: {
-      considered: 0,
-      probed: 0,
-      attempted: 0,
-      redriven: 0,
-      retirementFailed: 0,
-      failed: 0,
-      headless: 0,
-      capped: false,
-    },
+    gateRedrive: emptyGateRedriveResult(),
   };
 
   const tokenResult = await getInstallationTokenResult();
@@ -590,14 +583,7 @@ export async function prReviewStateReconcilerTick(
       totals.unreadable += result.unreadable;
       totals.truncated = totals.truncated || result.truncated;
       totals.malformed += result.malformed;
-      totals.gateRedrive.considered += result.gateRedrive.considered;
-      totals.gateRedrive.probed += result.gateRedrive.probed;
-      totals.gateRedrive.attempted += result.gateRedrive.attempted;
-      totals.gateRedrive.redriven += result.gateRedrive.redriven;
-      totals.gateRedrive.retirementFailed += result.gateRedrive.retirementFailed;
-      totals.gateRedrive.failed += result.gateRedrive.failed;
-      totals.gateRedrive.headless += result.gateRedrive.headless;
-      totals.gateRedrive.capped = totals.gateRedrive.capped || result.gateRedrive.capped;
+      mergeGateRedriveResults(totals.gateRedrive, result.gateRedrive);
       ok += 1;
     } catch (err) {
       failed += 1;

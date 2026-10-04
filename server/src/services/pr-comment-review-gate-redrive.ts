@@ -70,6 +70,7 @@
 import type { Db } from "@paperclipai/db";
 import { loadConfig } from "../config.js";
 import { githubGetLatestCommitStatusForContext, githubReviewerIdentityMatches } from "./github-app-auth.js";
+import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
 import { runPrCommentReviewGateCheck } from "./pr-comment-review-gate.js";
 import { logger as defaultLogger } from "../middleware/logger.js";
 
@@ -144,6 +145,38 @@ const EMPTY_RESULT: GateRedriveResult = {
 };
 
 /**
+ * A zeroed result.
+ *
+ * Exported so a caller accumulating these never hand-writes the field list: an
+ * initialiser that omits a counter is not a type error either, it just starts
+ * the field at `undefined` and makes every later `+=` produce `NaN`.
+ */
+export function emptyGateRedriveResult(): GateRedriveResult {
+  return { ...EMPTY_RESULT };
+}
+
+/**
+ * Accumulate `next` into `totals`, in place.
+ *
+ * Keys-driven, and that is the entire point. A caller summing these
+ * field-by-field gets no completeness check from the type system — every field
+ * is already initialised to `0`, so a counter added to {@link GateRedriveResult}
+ * and forgotten at the accumulation site compiles clean and reports zero fleet
+ * wide, which reads as "this never happens" rather than as a bug. Counters sum;
+ * flags OR, because they are "did this happen in any repo this tick".
+ */
+export function mergeGateRedriveResults(totals: GateRedriveResult, next: GateRedriveResult): GateRedriveResult {
+  for (const [key, value] of Object.entries(next)) {
+    if (typeof value === "number") {
+      (totals as unknown as Record<string, number>)[key] += value;
+    } else if (typeof value === "boolean") {
+      (totals as unknown as Record<string, boolean>)[key] ||= value;
+    }
+  }
+  return totals;
+}
+
+/**
  * Timestamp of the reviewer's most recent review, or `null` when they have not
  * reviewed.
  *
@@ -209,6 +242,7 @@ export async function redriveStaleCommentReviewGates(input: {
   deps?: {
     readStatus?: typeof githubGetLatestCommitStatusForContext;
     runGateCheck?: typeof runPrCommentReviewGateCheck;
+    enqueueDelivery?: typeof enqueueGithubCommitStatusDelivery;
   };
 }): Promise<GateRedriveResult> {
   const config = loadConfig();
@@ -223,6 +257,7 @@ export async function redriveStaleCommentReviewGates(input: {
   const log = input.logger ?? defaultLogger;
   const readStatus = input.deps?.readStatus ?? githubGetLatestCommitStatusForContext;
   const runGateCheck = input.deps?.runGateCheck ?? runPrCommentReviewGateCheck;
+  const enqueueDelivery = input.deps?.enqueueDelivery ?? enqueueGithubCommitStatusDelivery;
   const maxRedrives = input.maxRedrives ?? DEFAULT_MAX_GATE_REDRIVES_PER_REPO;
 
   const result: GateRedriveResult = { ...EMPTY_RESULT, considered: input.candidates.length };
@@ -292,6 +327,45 @@ export async function redriveStaleCommentReviewGates(input: {
         // reporting it there would state the opposite of what happened.
         result.redriven += 1;
         result.retirementFailed += 1;
+        // The counter alone is not enough. A retired context keeps its PREVIOUS
+        // value when its post fails, and the retirement row mirrors the live
+        // verdict (`commentReviewGateRetirementStatus`) precisely because a
+        // still-required legacy context must not sit green while the live one
+        // blocks — so a failed retirement can leave a stale red standing. The
+        // sweep cannot re-reach it: `readStatus` above probes the LIVE context
+        // only, which this re-drive just published, so `gateStatusIsStale` is
+        // false on every later sweep and the PR is never offered again. The
+        // webhook caller enqueues these (`github-webhook.ts`); dropping them
+        // here strands exactly the failure class this module exists to clear.
+        await Promise.all(
+          (check.retirementDeliveries ?? []).map((delivery) =>
+            enqueueDelivery(input.db, {
+              // Provenance-less for the same reason as the webhook path: a
+              // retirement belongs to no company and no agent run. `null`
+              // rather than omitted — the NULL semantics of
+              // `preserveExistingDelivery` depend on it.
+              companyId: null,
+              sourceRunId: null,
+              repoFullName: input.repoFullName,
+              sha: delivery.sha,
+              context: delivery.context,
+              state: delivery.state,
+              description: delivery.description,
+              targetUrl: delivery.targetUrl,
+              prNumber: candidate.prNumber,
+              prUrl: candidate.prUrl,
+              forceWrite: true,
+            }),
+          ),
+          // Caught here, not by the outer handler: that one increments
+          // `failed`, and this candidate has already been counted as
+          // `redriven`. One candidate must never land in both.
+        ).catch((err) =>
+          log.warn(
+            { err, repoFullName: input.repoFullName, prNumber: candidate.prNumber },
+            "comment-review gate retired-context retry enqueue failed",
+          ),
+        );
         log.warn(
           { repoFullName: input.repoFullName, prNumber: candidate.prNumber, reason: check.reason },
           "comment-review gate re-driven, but retiring the superseded contexts failed",

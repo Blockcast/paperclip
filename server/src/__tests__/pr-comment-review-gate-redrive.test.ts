@@ -18,8 +18,10 @@ import { describe, expect, it, vi } from "vitest";
 
 const {
   DEFAULT_MAX_GATE_REDRIVES_PER_REPO,
+  emptyGateRedriveResult,
   gateStatusIsStale,
   latestReviewerReviewAt,
+  mergeGateRedriveResults,
   redriveStaleCommentReviewGates,
 } = await import("../services/pr-comment-review-gate-redrive.js");
 
@@ -53,17 +55,39 @@ function statusReader(createdAt: string | null, ok = true) {
   );
 }
 
+/** The retired legacy context whose supersede post failed. */
+const RETIRED_CONTEXT = "ci/ally-review";
+
 function gateRunner(posted = true, reason: "fetch_failed" | "retirement_failed" = "fetch_failed") {
   return vi.fn(async () =>
     posted
       ? ({ posted: true as const, verdict: { state: "success" as const, description: "clean", context: CONTEXT } })
-      : ({ posted: false as const, reason }),
+      : reason === "retirement_failed"
+        ? // The real shape: `runPrCommentReviewGateCheck` returns the failed
+          // retirement posts alongside the reason so a caller can hand them to
+          // the durable outbox. A fixture without them cannot observe whether
+          // this caller retries them or drops them on the floor.
+          ({
+            posted: false as const,
+            reason,
+            retirementDeliveries: [
+              {
+                sha: "0ad8773c6ee4b2b1a0c4e9f1d2a3b4c5d6e7f809",
+                context: RETIRED_CONTEXT,
+                state: "failure" as const,
+                description: `Superseded by ${CONTEXT}`,
+                targetUrl: null,
+              },
+            ],
+          })
+        : ({ posted: false as const, reason }),
   );
 }
 
 async function run(overrides: Record<string, unknown> = {}, deps: Record<string, unknown> = {}) {
   const readStatus = (deps.readStatus as ReturnType<typeof statusReader>) ?? statusReader(STALE_STATUS_AT);
   const runGateCheck = (deps.runGateCheck as ReturnType<typeof gateRunner>) ?? gateRunner();
+  const enqueueDelivery = (deps.enqueueDelivery as ReturnType<typeof vi.fn>) ?? vi.fn(async () => ({}));
   const result = await redriveStaleCommentReviewGates({
     db: {} as never,
     repoFullName: REPO,
@@ -71,10 +95,10 @@ async function run(overrides: Record<string, unknown> = {}, deps: Record<string,
     reviewerBotLogin: REVIEWER,
     statusContext: CONTEXT,
     logger: silentLogger,
-    deps: { readStatus, runGateCheck } as never,
+    deps: { readStatus, runGateCheck, enqueueDelivery } as never,
     ...overrides,
   });
-  return { result, readStatus, runGateCheck };
+  return { result, readStatus, runGateCheck, enqueueDelivery };
 }
 
 describe("comment-review gate lost-trigger re-drive", () => {
@@ -198,6 +222,54 @@ describe("comment-review gate lost-trigger re-drive", () => {
     expect(result.retirementFailed).toBe(0);
   });
 
+  it("hands the failed retirement posts to the durable outbox", async () => {
+    // The counter records that cleanup failed; it does not fix it. A retired
+    // context keeps its PREVIOUS value when its post fails, so a still-required
+    // legacy context can sit red while the live gate is green — and this sweep
+    // cannot re-reach it, because it probes the LIVE context only and just
+    // published that. Dropping these strands the PR permanently.
+    const { result, enqueueDelivery } = await run({}, { runGateCheck: gateRunner(false, "retirement_failed") });
+
+    expect(result.retirementFailed).toBe(1);
+    expect(enqueueDelivery).toHaveBeenCalledTimes(1);
+
+    const [, delivery] = enqueueDelivery.mock.calls[0] as [unknown, Record<string, unknown>];
+    expect(delivery.repoFullName).toBe(REPO);
+    expect(delivery.context).toBe(RETIRED_CONTEXT);
+    expect(delivery.state).toBe("failure");
+    expect(delivery.prNumber).toBe(2022);
+    // `forceWrite` is what makes the row overwrite a terminal delivery for the
+    // same key; without it a previously-delivered retirement is never redone.
+    expect(delivery.forceWrite).toBe(true);
+    // Provenance-less by construction: a retirement belongs to no company and
+    // no agent run, and the outbox's NULL semantics depend on the explicit null.
+    expect(delivery.companyId).toBeNull();
+    expect(delivery.sourceRunId).toBeNull();
+  });
+
+  it("enqueues nothing for a clean re-drive", async () => {
+    const { enqueueDelivery } = await run();
+
+    expect(enqueueDelivery).not.toHaveBeenCalled();
+  });
+
+  it("does not double-count a candidate whose retirement enqueue throws", async () => {
+    // The enqueue sits inside the per-candidate try, so an unhandled rejection
+    // would fall to the outer handler and increment `failed` on a candidate
+    // already counted as `redriven`. One candidate must land in exactly one.
+    const enqueueDelivery = vi.fn(async () => {
+      throw new Error("outbox unavailable");
+    });
+    const { result } = await run(
+      {},
+      { runGateCheck: gateRunner(false, "retirement_failed"), enqueueDelivery },
+    );
+
+    expect(result.redriven).toBe(1);
+    expect(result.retirementFailed).toBe(1);
+    expect(result.failed).toBe(0);
+  });
+
   it("isolates a throwing re-drive and keeps sweeping", async () => {
     const runGateCheck = vi
       .fn()
@@ -291,5 +363,48 @@ describe("staleness predicates", () => {
 
   it("refuses to judge against an unparseable review timestamp", () => {
     expect(gateStatusIsStale(null, "not-a-date")).toBe(false);
+  });
+});
+
+describe("gate re-drive result aggregation", () => {
+  it("sums every counter across repos and ORs the flags", () => {
+    // The tick accumulates one of these per repo. Doing it field-by-field is
+    // not completeness-checked by the type system — every field is already
+    // initialised to 0, so a counter added to GateRedriveResult and forgotten
+    // at the call site compiles clean and reports zero fleet wide. Summing by
+    // key is what removes that class, and this is its mutation point.
+    const totals = emptyGateRedriveResult();
+
+    mergeGateRedriveResults(totals, {
+      considered: 3, probed: 2, attempted: 2, redriven: 1,
+      retirementFailed: 1, failed: 1, headless: 1, capped: false,
+    });
+    mergeGateRedriveResults(totals, {
+      considered: 4, probed: 1, attempted: 1, redriven: 1,
+      retirementFailed: 0, failed: 0, headless: 2, capped: true,
+    });
+
+    expect(totals).toEqual({
+      considered: 7, probed: 3, attempted: 3, redriven: 2,
+      retirementFailed: 1, failed: 1, headless: 3, capped: true,
+    });
+  });
+
+  it("starts from a zeroed result with every field present", () => {
+    // Asserted by whole-object equality, not field-by-field: that is what
+    // forces a new counter to be added here rather than arriving as undefined
+    // and turning every later `+=` into NaN.
+    expect(emptyGateRedriveResult()).toEqual({
+      considered: 0, probed: 0, attempted: 0, redriven: 0,
+      retirementFailed: 0, failed: 0, headless: 0, capped: false,
+    });
+  });
+
+  it("does not let a later clean repo clear a flag an earlier one set", () => {
+    const totals = emptyGateRedriveResult();
+    mergeGateRedriveResults(totals, { ...emptyGateRedriveResult(), capped: true });
+    mergeGateRedriveResults(totals, emptyGateRedriveResult());
+
+    expect(totals.capped).toBe(true);
   });
 });
