@@ -2045,6 +2045,64 @@ describe("IssueProperties", () => {
     act(() => root.unmount());
   });
 
+  // BLO-39945: `updateMonitor` hand-rebuilds the policy field-by-field, so a
+  // board user arming a monitor on an opted-out row used to silently drop the
+  // opt-out. This is the BLO-34818 shape: no stages, no monitor, flag only.
+  it("carries productivityReviewDisabled through arming a monitor", async () => {
+    const onUpdate = vi.fn();
+    const root = renderProperties(container, {
+      issue: createIssue({
+        status: "in_progress",
+        assigneeAgentId: "agent-1",
+        executionPolicy: createExecutionPolicy({ productivityReviewDisabled: true }),
+      }),
+      childIssues: [],
+      onUpdate,
+      inline: true,
+    });
+    await flush();
+
+    // Reviewers, Approvers and Monitor all render a bare "None" trigger, so
+    // pick by the row that carries the label.
+    const monitorTrigger = Array.from(container.querySelectorAll("button"))
+      .find((button) => {
+        for (let node = button.parentElement; node; node = node.parentElement) {
+          const text = node.textContent?.trim();
+          if (text === "MonitorNone") return true;
+          if (text && text !== "None") return false;
+        }
+        return false;
+      });
+    expect(monitorTrigger).not.toBeUndefined();
+
+    await act(async () => {
+      monitorTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+
+    const datetimeInput = container.querySelector<HTMLInputElement>('input[type="datetime-local"]');
+    expect(datetimeInput).toBeTruthy();
+    await act(async () => {
+      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      nativeSetter?.call(datetimeInput!, "2026-12-01T09:00");
+      datetimeInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await flush();
+
+    const scheduleButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Schedule");
+    expect(scheduleButton).toBeTruthy();
+    await act(async () => {
+      scheduleButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy;
+    expect(written?.monitor?.nextCheckAt).toBeTruthy();
+    expect(written?.productivityReviewDisabled).toBe(true);
+
+    act(() => root.unmount());
+  });
+
   const watchdogAgent = {
     id: "agent-1",
     name: "ClaudeCoder",

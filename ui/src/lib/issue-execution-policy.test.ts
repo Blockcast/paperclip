@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { issueExecutionPolicySchema } from "@paperclipai/shared";
+import { issueExecutionPolicySchema, type IssueExecutionPolicy } from "@paperclipai/shared";
 import { buildExecutionPolicy } from "./issue-execution-policy";
 
 const AGENT_ID = "00000000-0000-4000-8000-000000000001";
@@ -35,5 +35,64 @@ describe("buildExecutionPolicy", () => {
       expect(stage.participants).toHaveLength(1);
       expect(stage.participants[0]?.id).toMatch(UUID_PATTERN);
     }
+  });
+
+  // BLO-39945: the board UI sends a whole-policy REPLACE, so anything this
+  // helper fails to re-emit is silently deleted on the next reviewer toggle.
+  describe("productivityReviewDisabled carry-forward", () => {
+    const optedOut: IssueExecutionPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [],
+      productivityReviewDisabled: true,
+    };
+
+    it("survives a reviewer toggle on a stageless, monitorless, opted-out row", () => {
+      const policy = buildExecutionPolicy({
+        existingPolicy: optedOut,
+        reviewerValues: [`agent:${AGENT_ID}`],
+        approverValues: [],
+      });
+
+      expect(policy?.productivityReviewDisabled).toBe(true);
+      expect(policy?.stages).toHaveLength(1);
+      expect(issueExecutionPolicySchema.safeParse(policy).success).toBe(true);
+    });
+
+    it("blocks the collapse to null when the flag is the only thing in the policy", () => {
+      // Guards the `:110` collapse directly: clearing the last reviewer off an
+      // opted-out row must not return null, or the opt-out goes with it.
+      const policy = buildExecutionPolicy({
+        existingPolicy: optedOut,
+        reviewerValues: [],
+        approverValues: [],
+      });
+
+      expect(policy).not.toBeNull();
+      expect(policy?.productivityReviewDisabled).toBe(true);
+    });
+
+    // Negative controls — without these both tests above pass on code that
+    // sets the flag unconditionally and never collapses.
+    it("still collapses to null when the flag is absent", () => {
+      expect(
+        buildExecutionPolicy({
+          existingPolicy: { mode: "normal", commentRequired: true, stages: [] },
+          reviewerValues: [],
+          approverValues: [],
+        }),
+      ).toBeNull();
+    });
+
+    it("does not invent the flag on a policy that never carried it", () => {
+      const policy = buildExecutionPolicy({
+        existingPolicy: null,
+        reviewerValues: [`agent:${AGENT_ID}`],
+        approverValues: [],
+      });
+
+      expect(policy).not.toBeNull();
+      expect(policy).not.toHaveProperty("productivityReviewDisabled");
+    });
   });
 });
