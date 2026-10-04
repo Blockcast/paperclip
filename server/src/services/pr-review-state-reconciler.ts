@@ -549,7 +549,7 @@ export async function prReviewStateReconcilerTick(
     unreadable: 0,
     truncated: false,
     malformed: 0,
-    gateRedrive: { considered: 0, probed: 0, redriven: 0, failed: 0, capped: false },
+    gateRedrive: { considered: 0, probed: 0, attempted: 0, redriven: 0, failed: 0, headless: 0, capped: false },
   };
 
   const tokenResult = await getInstallationTokenResult();
@@ -583,8 +583,10 @@ export async function prReviewStateReconcilerTick(
       totals.malformed += result.malformed;
       totals.gateRedrive.considered += result.gateRedrive.considered;
       totals.gateRedrive.probed += result.gateRedrive.probed;
+      totals.gateRedrive.attempted += result.gateRedrive.attempted;
       totals.gateRedrive.redriven += result.gateRedrive.redriven;
       totals.gateRedrive.failed += result.gateRedrive.failed;
+      totals.gateRedrive.headless += result.gateRedrive.headless;
       totals.gateRedrive.capped = totals.gateRedrive.capped || result.gateRedrive.capped;
       ok += 1;
     } catch (err) {
