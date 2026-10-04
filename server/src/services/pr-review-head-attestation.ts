@@ -32,10 +32,48 @@
  * Stated explicitly because the next I1 red on `master` will otherwise read as
  * a regression here rather than as the known residual it is.
  *
- * CORRECTION (PEN-3754): "it closes the wide ones" OVERSTATES this guard — but
- * not because it let a duplicate through. The wide pairs measured so far are
- * ones it SHOULD let through, so a wide gap is not evidence that this guard was
- * consulted and answered wrongly.
+ * CORRECTION (PEN-3754): "it closes the wide ones" OVERSTATES this guard. Each
+ * of the three wide pairs measured below was preceded by an explicit re-request
+ * at the unchanged head, so a wide gap is not by itself evidence of the failure
+ * the coverage claim describes — a wake arriving after a review is visible with
+ * nothing but run duration in between.
+ *
+ * Do NOT read that as "the guard was never consulted, so it cannot have let
+ * these through". Which of those happened is OPEN, and it is the most
+ * decision-relevant fact here. What is established mechanically:
+ *
+ *   - The suppression was ALREADY LIVE IN THE TREE before every measured pair.
+ *     `master@fce3d292` (2026-09-29T23:53:07Z) calls this module at its
+ *     `:5580`, under the "suppresses unconditionally across wake reasons"
+ *     comment at its `:5551`. The three second reviews landed
+ *     2026-09-30T22:21:15Z, 2026-09-30T22:41:51Z and 2026-10-01T21:50:07Z —
+ *     all after it.
+ *   - The unconfigured-login fail-open below does not account for it:
+ *     `prReviewerBotLogin` defaults to `allyblockcast[bot]` (`config.ts:1277`),
+ *     so the "no reviewer bot login is configured" arm was not the one taken.
+ *   - A missing head does not account for it either. All three triggers were PR
+ *     comments, and BOTH wake reasons an `issue_comment` can produce
+ *     (`github_pr_review_requested` / `github_pr_review_feedback`,
+ *     `github-webhook.ts:1818`) are exactly the two for which the webhook
+ *     resolves the head lazily (`:5262-5266`) BEFORE the
+ *     `if (context.headSha && context.repoFullName)` gate at `:5602`.
+ *
+ * So on the tree, these duplicates reached GitHub past a live guard. The
+ * surviving explanations are: it answered `not_attested`; it answered `unknown`
+ * for some reason other than the two excluded above; the deploy carrying
+ * `fce3d292` had not rolled out when those wakes arrived; or those runs were
+ * not dispatched through this webhook path at all. NOT RESOLVED HERE — deploy
+ * timing and dispatch provenance were not checked, and neither is readable from
+ * the review API this measurement used.
+ *
+ * It is answerable, though, and the evidence is already emitted: both
+ * non-suppressing outcomes log distinctly at the call site, keyed by
+ * `deliveryId` / `prNumber` / `wakeReason` / `headSha` — "...wake skipped: this
+ * head is already attested..." (`github-webhook.ts:5622`) and "...could not
+ * establish whether this head was already reviewed; dispatching the reviewer
+ * wake anyway" (`:5636`). Absence of BOTH for a delivery is itself an answer:
+ * the gate was not reached. Read those before concluding the wake keying is at
+ * fault.
  *
  * The paragraph above holds review-run duration (~42 min, measured on #2157:
  * 11:48:35Z request → 12:30:34Z review) as the only thing between dispatch and
@@ -59,7 +97,28 @@
  *
  * So these are not the failure the coverage claim describes. They are DELIBERATE
  * re-reviews of a head that already carried a verdict — precisely the traffic
- * this guard must not refuse. Note the attributions above are NOT equal
+ * this guard must not refuse.
+ *
+ * THE CALLER DISAGREES, IN WRITING, AND THE DISAGREEMENT IS LIVE. That sentence
+ * is normative, and the live path takes the opposite position: the suppression
+ * at `github-webhook.ts:5602` "suppresses unconditionally across wake reasons"
+ * (`:5564-5572`), deliberately INCLUDING the explicit-request reason, on the
+ * stated asymmetry that "a duplicate COMMENTED review can never be retracted
+ * ... whereas a re-review someone still wants is one commit away". So the
+ * shipped behaviour refuses exactly the re-requests this paragraph says must
+ * not be refused. Neither position is being changed here, and this PR does not
+ * change behaviour at all.
+ *
+ * Where they actually conflict is narrow, and it is the description-only case
+ * at `:162-169` below: when the finding lives in the PR description, no commit
+ * can carry the fix, so "one commit away" is false by construction and the
+ * caller's asymmetry does not hold for that class. For every other class the
+ * caller's reasoning stands. Whoever resolves this should change BOTH comments
+ * together — the point of this correction is to stop the next reader taking
+ * either side's text as the settled one. Tracked with the exclusion work in
+ * BLO-20074.
+ *
+ * Note the attributions above are NOT equal
  * evidence: #2121's and #2157's first triggers are human requests, which are
  * unambiguously deliberate, while #2128's only trigger and #2157's second are
  * the reviewer re-waking itself — nearer the duplicate-generation mechanism
@@ -117,11 +176,11 @@
  * `pr-review-dispatch-lock.ts`), which observes strictly later than this
  * module does. How much later is exactly the unmeasured split above, so
  * BLO-20074 has to measure start→post for itself rather than inherit the
- * five-pair 0.7–6.1 h figure, which bounds wake→post. A vocabulary warning,
+ * five-pair 0.7–6.1 h figure, which measures wake→post. A vocabulary warning,
  * because this docblock uses both words: "dispatch time" in the WHAT THIS
  * CLOSES paragraph and "wake time" here are the SAME instant for this module.
  * It is called from the webhook handler at the moment the wake is decided
- * (`github-webhook.ts:5593`, and on the contended-replay path at `:4036`), so
+ * (`github-webhook.ts:5603`, and on the contended-replay path at `:4036`), so
  * it has exactly one point of observation, not two to check between. What that
  * check decides is whether a run STARTS; the duplicate is created hours later
  * when that run POSTS, and nothing re-asks in between. That is the gap — one
