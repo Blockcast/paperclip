@@ -484,6 +484,11 @@ import {
   isExecutionForcedToKubernetes,
 } from "./execution-allowlist.js";
 import {
+  WAKE_COMMENT_IDS_KEY,
+  extractWakeCommentIds,
+  shouldReopenTerminalIssueForDeferredWake,
+} from "./deferred-wake-reopen.js";
+import {
   RECOVERY_ORIGIN_KINDS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -697,7 +702,6 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_released",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
-const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
@@ -9457,19 +9461,9 @@ function deriveCommentId(
   );
 }
 
-export function extractWakeCommentIds(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-): string[] {
-  const raw = contextSnapshot?.[WAKE_COMMENT_IDS_KEY];
-  if (!Array.isArray(raw)) return [];
-  const out: string[] = [];
-  for (const entry of raw) {
-    const value = readNonEmptyString(entry);
-    if (!value || out.includes(value)) continue;
-    out.push(value);
-  }
-  return out;
-}
+// Re-exported from the shared leaf module so the promoter below and the
+// lockless drain in `recovery/service.ts` read wake comment ids the same way.
+export { extractWakeCommentIds };
 
 function mergeWakeCommentIds(...values: Array<unknown>): string[] {
   const merged: string[] = [];
@@ -36019,16 +36013,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           continue;
         }
 
-        // Only human/comment-reopen interactions should revive completed issues;
-        // system follow-ups such as retry or cleanup wakes must not reopen closed work.
-        const shouldReopenDeferredCommentWake =
-          deferredCommentIds.length > 0 &&
-          !deferredCommentWakeIsSelfAuthored &&
-          (issue.status === "done" || issue.status === "cancelled") &&
-          (
-            deferred.requestedByActorType === "user" ||
-            deferredWakeReason === "issue_reopened_via_comment"
-          );
+        // Shared with the lockless drain in `recovery/service.ts`, which
+        // promotes these same wakes when no run will ever finalize on the
+        // issue. The two sites disagreed on this predicate once (PEN-3739); the
+        // helper is what stops that recurring.
+        const shouldReopenDeferredCommentWake = shouldReopenTerminalIssueForDeferredWake({
+          issueStatus: issue.status,
+          commentIds: deferredCommentIds,
+          commentWakeIsSelfAuthored: deferredCommentWakeIsSelfAuthored,
+          requestedByActorType: deferred.requestedByActorType,
+          wakeReason: deferredWakeReason,
+        });
         let reopenedActivity: LogActivityInput | null = null;
 
         if (shouldReopenDeferredCommentWake) {
