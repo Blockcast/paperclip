@@ -130,6 +130,10 @@ interface IssuePropertiesProps {
 
 const ISSUE_BLOCKER_SEARCH_LIMIT = 50;
 const ISSUE_PROPERTY_RELATION_PREVIEW_COUNT = 5;
+// Browser-vs-server clock skew allowance before this dialog will call a monitor
+// `timeoutAt` spent. Only ever widens the "keep the bound" side — see the
+// asymmetry argument at the drop site in `saveMonitor`.
+const MONITOR_BOUND_SKEW_MARGIN_MS = 60_000;
 
 export function IssueProperties({
   issue,
@@ -1039,7 +1043,20 @@ export function IssueProperties({
         : {}),
       // Override only to DROP a spent bound — never to invent a key the stored
       // monitor did not carry, which is what the negative-control tests pin.
-      ...(timeoutAt && new Date(timeoutAt).getTime() <= Date.now() ? { timeoutAt: null } : {}),
+      //
+      // The lapsed test runs on the BROWSER clock and the server re-evaluates
+      // the same predicate on its own, so the two can disagree. The skew
+      // directions are not symmetric: a client behind sends a bound the server
+      // still reads as spent and gets a loud, retryable 422, but a client ahead
+      // reads a still-live `timeoutAt` as spent and sends `timeoutAt: null`,
+      // permanently deleting a deadline this dialog renders no control to
+      // restore — the exact silent-drop class this fix exists to close. The
+      // margin collapses the window to the safe direction: it still clears
+      // every genuinely wedged monitor, and costs at worst one retryable 422 on
+      // a bound expiring inside the next minute.
+      ...(timeoutAt && new Date(timeoutAt).getTime() <= Date.now() - MONITOR_BOUND_SKEW_MARGIN_MS
+        ? { timeoutAt: null }
+        : {}),
       ...(maxAttempts !== null && maxAttempts <= attemptCount ? { maxAttempts: null } : {}),
     });
     setMonitorOpen(false);

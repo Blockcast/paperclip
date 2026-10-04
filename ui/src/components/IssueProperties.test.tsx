@@ -2113,6 +2113,10 @@ describe("IssueProperties", () => {
     // flip these two fixtures into each other as time passes.
     const FUTURE_TIMEOUT_AT = new Date(Date.now() + 86_400_000).toISOString();
     const PAST_TIMEOUT_AT = new Date(Date.now() - 86_400_000).toISOString();
+    // Inside MONITOR_BOUND_SKEW_MARGIN_MS: lapsed on this clock, but close
+    // enough that a skewed browser clock is a likelier explanation than a
+    // genuinely wedged monitor. Must be KEPT, not dropped.
+    const JUST_LAPSED_TIMEOUT_AT = new Date(Date.now() - 10_000).toISOString();
     const REVIEW_PRESET = { id: "low_trust_review", version: 1, rawOutputDisposition: "quarantine" } as const;
     const AUTHORIZATION_POLICY: TrustAuthorizationPolicy = {
       trustPreset: "low_trust_review",
@@ -2250,6 +2254,32 @@ describe("IssueProperties", () => {
       expect(written.monitor?.timeoutAt).toBeNull();
       // Everything else still carries — this drops a spent bound, not the policy.
       expect(written.monitor?.gateSignals).toEqual(["deploy:paperclip-api"]);
+
+      act(() => root.unmount());
+    });
+
+    // The drop test runs on the browser clock; the server re-runs the same
+    // predicate on its own. A client running AHEAD would otherwise read a
+    // still-live deadline as spent and delete it, with no control here to put
+    // it back — the silent-drop class this whole fix exists to close. Skew
+    // inside the margin must resolve to "keep".
+    it("keeps a timeoutAt that lapsed within the clock-skew margin", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+          notes: null,
+          timeoutAt: JUST_LAPSED_TIMEOUT_AT,
+        },
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written.monitor?.timeoutAt).toBe(JUST_LAPSED_TIMEOUT_AT);
+
+      act(() => root.unmount());
     });
 
     it("drops a maxAttempts the monitor has already reached, and keeps one it has not", async () => {
