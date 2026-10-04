@@ -9,7 +9,9 @@
  * --------------------------
  * scheduled-production-deploy.yml's guard (1) refuses to stack a second
  * dispatch while one is already pending. The guard is correct. But the job it
- * protects is gated on three named human reviewers, so while any deploy sits
+ * protects is gated on the paperclip-production reviewer set — ONE ratified
+ * human (this line read "three named human reviewers" until 2026-10-04; see
+ * scheduled-production-deploy.yml's header) — so while any deploy sits
  * `waiting`, the daily dispatcher is a permanent no-op — and every skipped run
  * reported `conclusion: success`. On 2026-09-01 that took production to 45
  * commits behind with an oldest-missing-commit age of 28.8h, and nothing
@@ -144,7 +146,7 @@ export class UnreadableWaitingRunError extends Error {}
  *
  * Only `waiting` counts. `queued` and `in_progress` also block the dispatcher's
  * anti-stacking guard, but they are runner/build states — no human is being
- * waited on, and paging three named reviewers for a slow build would be the
+ * waited on, and paging the production reviewer for a slow build would be the
  * wrong people and the start of alert fatigue. Their timestamps are never read,
  * so a malformed one on a non-waiting run is ignored rather than fatal.
  *
