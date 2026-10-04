@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { promptTokens, totalTokens } from "./cost.js";
+import { promptTokens, totalTokens, type BilledTokenCounts } from "./cost.js";
 
 // BLO-29842 split Anthropic cache writes out of `inputTokens` into their own
 // column. Every volume total in the app used to read `inputTokens` and get
@@ -20,9 +20,14 @@ describe("promptTokens", () => {
 
   // Cache reads bill at ~0.1x and stay a separate class — folding them in here
   // would overstate billed prompt volume and break the rate-card fit this
-  // column was added to make possible.
+  // column was added to make possible. The read leg is deliberately far larger
+  // than the other two: on this fleet it is ~99% of the prompt, so a helper
+  // that leaked it would be off by orders of magnitude, not by a rounding.
+  // Bound to a variable because `promptTokens` takes a `Pick<>` and an inline
+  // literal would be rejected for the excess property rather than exercising it.
   it("excludes cache reads", () => {
-    expect(promptTokens({ inputTokens: 10, cacheCreationInputTokens: 0 })).toBe(10);
+    const row = { inputTokens: 10, cachedInputTokens: 400_000, cacheCreationInputTokens: 0 };
+    expect(promptTokens(row)).toBe(10);
   });
 
   it("is a no-op for providers that report no cache creation", () => {
@@ -53,5 +58,24 @@ describe("totalTokens", () => {
       cacheCreationInputTokens: 1,
       outputTokens: 0,
     })).toBe(1);
+  });
+});
+
+// The types say every leg is required; the WIRE does not. Both helpers are
+// called straight onto API-deserialized rows in the UI, so during the rolling
+// deploy that ships this column a new bundle can reach an old pod whose
+// response omits it. Bare `+` propagates the absent leg into the whole sum as
+// `NaN` — every tile renders "NaN" rather than the old, merely-stale number.
+// The casts are the point: they reproduce a shape TypeScript cannot see.
+// Reverting the `?? 0` legs in cost.ts reddens these two and nothing else.
+describe("absent legs on the wire (rolling-deploy window)", () => {
+  it("promptTokens drops an absent cache-write leg instead of poisoning the sum", () => {
+    const stale = { inputTokens: 1_000 } as unknown as BilledTokenCounts;
+    expect(promptTokens(stale)).toBe(1_000);
+  });
+
+  it("totalTokens drops absent legs instead of poisoning the sum", () => {
+    const stale = { inputTokens: 1_000, outputTokens: 2_000 } as unknown as BilledTokenCounts;
+    expect(totalTokens(stale)).toBe(3_000);
   });
 });
