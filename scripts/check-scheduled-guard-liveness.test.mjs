@@ -1748,4 +1748,37 @@ describe("the run index is not self-consistent across filters (BLO-38286)", () =
     assert.equal(summary.unknownCount, 1);
     assert.doesNotMatch(summary.headline, /have stopped executing/);
   });
+
+  // THE ARM'S REACHABILITY ENVELOPE, held behaviourally rather than by the
+  // comment that used to state it — and used to state it WRONGLY (Ally review
+  // of 9b3251c0). `classifyGuard` evaluates this arm before the
+  // `unparsable-timestamp` arm, which reads as "an unparsable timestamp plus
+  // impossible counts answers `index-inconsistent`". It does not: the first
+  // pass answers `unparsable-timestamp`, which is not `stale`, so
+  // `classifyWatched` returns before spending the cross-check and no
+  // `allCount` ever reaches the arm. Both halves matter — the verdict, and the
+  // request NOT spent. This file's standing doctrine is that a property worth
+  // relying on is held by behaviour, because a comment is what shipped the
+  // error this test exists to prevent.
+  it("never reaches the index-inconsistent arm when the timestamp is unreadable", () => {
+    let crossChecks = 0;
+    const [result] = classifyWatched(
+      [{ workflow: WORKFLOW, staleHours: 2.75, event: "schedule" }],
+      () => ({
+        state: "active",
+        name: "Relay SSL Multicert Guard",
+        completedCount: COMPLETED_COUNT,
+        newest: { updatedAt: "not-a-date", conclusion: "success", htmlUrl: "https://example.invalid/1" },
+      }),
+      () => {
+        crossChecks += 1;
+        return { newestCompletedAt: null, allCount: ALL_COUNT };
+      },
+      { now: NOW },
+    );
+
+    assert.equal(result.reason, "unparsable-timestamp", "the arm fired on a guard it cannot see in production");
+    assert.equal(result.status, "unknown");
+    assert.equal(crossChecks, 0, "spent a corroborating request on a verdict that was never stale");
+  });
 });
