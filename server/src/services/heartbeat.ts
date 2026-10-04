@@ -10107,10 +10107,11 @@ export async function buildPaperclipWakePayload(input: {
   // only the inlined id would name, as "not shown", the one comment the prompt
   // had just rendered: the count comes out one high and the run is sent to
   // re-read what it was handed. Do the subtraction HERE rather than at the call
-  // site because this is the only place the pre-cap set exists -- the rendered
-  // id sorts last in `requestedCommentIds` order, so it is precisely the entry
-  // `SUPERSEDED_WAKE_COMMENT_ID_LIMIT` elides first, and a downstream filter
-  // could not then tell "already shown" from "capped away".
+  // site because this is the only place the pre-cap set exists, and
+  // `supersededCount` is derived from it: a downstream filter sees only the
+  // capped list, so it could neither recompute an exact count nor restore an id
+  // the cap had already dropped. Subtracting the rendered id there instead would
+  // leave the count one high with no way to correct it.
   const renderedWakeCommentId = deriveCommentId(input.contextSnapshot, null);
   const supersededCommentIds = requestedCommentIds.filter(
     (id) => !commentIds.includes(id) && id !== renderedWakeCommentId,
@@ -10375,6 +10376,12 @@ export async function buildPaperclipWakePayload(input: {
     annotationDeltas,
     planReviewContext,
     commentWindow: {
+      // Deliberately POST-override: `commentIds` has already had the freshness
+      // override applied, so on a coalesce this reads `{requestedCount: 1,
+      // includedCount: 1, missingCount: 0}` even though the wake requested
+      // more. Left as-is rather than widened to the pre-override count because
+      // other readers treat it as "what this payload carries"; the information
+      // it under-reports is now carried exactly by `supersededCount` below.
       requestedCount: commentIds.length,
       includedCount: comments.length,
       missingCount: missingCommentCount,
@@ -10387,7 +10394,12 @@ export async function buildPaperclipWakePayload(input: {
       // point of that field -- a run holding only the newest comment must know
       // to go read the rest.
       supersededCount: supersededCommentIds.length,
-      supersededCommentIds: supersededCommentIds.slice(0, SUPERSEDED_WAKE_COMMENT_ID_LIMIT),
+      // Keep the NEWEST ids, not the oldest: `requestedCommentIds` is
+      // append-ordered (which is why `deriveCommentId` reads `.at(-1)`), so
+      // `slice(0, N)` would list the most ancient orders and elide the ones
+      // adjacent to the comment actually rendered -- the far end of the thread
+      // from where a run reading it backward starts.
+      supersededCommentIds: supersededCommentIds.slice(-SUPERSEDED_WAKE_COMMENT_ID_LIMIT),
     },
     truncated: payloadTruncated,
     fallbackFetchNeeded:
@@ -31627,7 +31639,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // site renders as `wakeComment` below -- so the list is disjoint from the
       // body rendered here. It is computed from one `contextSnapshot` (the same
       // `context` object `wakeCommentId` was derived from above), so the two
-      // surfaces cannot disagree about what was shown.
+      // surfaces cannot disagree about which ID was shown.
+      //
+      // They can still disagree about what was RENDERED, in the under-report
+      // direction only: a soft-deleted wake comment has its body forced to ""
+      // and `buildPaperclipTaskMarkdown` skips the block entirely, so that id
+      // is subtracted as "shown" while nothing was shown. It is then named on
+      // neither surface. Narrow and deliberate -- marking such ids is a
+      // payload-shape change, and excluding them would re-silence a retracted
+      // order, which is the defect this ticket exists to kill.
       supersededWakeCommentIds: paperclipWakePayload?.commentWindow?.supersededCommentIds ?? null,
       supersededWakeCommentCount: paperclipWakePayload?.commentWindow?.supersededCount ?? null,
       interaction: {

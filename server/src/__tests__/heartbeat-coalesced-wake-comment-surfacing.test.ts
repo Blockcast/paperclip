@@ -177,6 +177,40 @@ describeEmbeddedPostgres("coalesced wake comment surfacing", () => {
     expect(payload?.fallbackFetchNeeded).toBe(true);
   });
 
+  it("caps the named ids to the NEWEST absorbed orders, not the oldest", async () => {
+    // A coalesce wider than SUPERSEDED_WAKE_COMMENT_ID_LIMIT (20) has to elide
+    // some ids. Which end it elides is the whole question: `wakeCommentIds` is
+    // append-ordered, so `slice(0, 20)` would list the 20 most ANCIENT orders
+    // and drop the ones adjacent to the comment actually rendered -- handing a
+    // run the far end of the thread from where it would start reading back.
+    // `supersededCount` stays exact either way, so nothing below the payload
+    // can observe this; pin it here.
+    const bodies = Array.from({ length: 25 }, (_, index) => `order ${index}`);
+    const { companyId, issueId, commentIds } = await seedIssueWithComments(bodies);
+    const newestId = commentIds[commentIds.length - 1] as string;
+
+    const payload = await buildPaperclipWakePayload({
+      db,
+      companyId,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_commented",
+        wakeCommentIds: [...commentIds],
+        wakeCommentId: newestId,
+      },
+    });
+
+    // The newest is rendered (inlined AND the prompt's row), so 24 are absorbed
+    // but unshown -- more than the cap, which is the point of the fixture.
+    expect(payload?.commentWindow?.supersededCount).toBe(24);
+    expect(payload?.commentWindow?.supersededCommentIds).toHaveLength(20);
+    // Exactly the newest 20 of those 24: indices 4..23.
+    expect(payload?.commentWindow?.supersededCommentIds).toEqual(commentIds.slice(4, 24));
+    // The oldest four are the ones elided -- not the ones kept.
+    expect(payload?.commentWindow?.supersededCommentIds).not.toContain(commentIds[0]);
+    expect(payload?.fallbackFetchNeeded).toBe(true);
+  });
+
   it("keeps the prompt's superseded list disjoint from the body the prompt renders", async () => {
     // The seam the two unit suites straddle: `buildPaperclipWakePayload` decides
     // what is superseded, `buildPaperclipTaskMarkdown` renders the wake comment,
