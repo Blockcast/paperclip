@@ -13,7 +13,8 @@
  *
  * WHICH RECORD IS AUTHORITATIVE (BLO-34896 / BLO-34527) — do not re-derive this.
  * b75f8156 ratified two reviewers plus prevent_self_review. On 2026-08-30 the
- * environment was narrowed to `[kkroo]` with prevent_self_review=false. Card
+ * environment was narrowed to `[kkroo]` with prevent_self_review=false (⛔ but see
+ * the 2026-10-04 correction below — the live value reads TRUE). Card
  * 60e271b7 asked the board which of the two shapes was intended and was
  * APPROVED on 2026-09-14T19:57:20Z, ruling (A): the narrowed shape IS the
  * intended shape, reconcile the guard and not the environment. The ruling is
@@ -128,12 +129,20 @@ export function evaluateEnvironmentProtection(env, options = {}) {
   // run go green (BLO-34896 AC2).
   //
   // `prevent_self_review` is deliberately NOT a disjunct here. It used to be,
-  // and because `||` short-circuits, the live prevent_self_review=false state
-  // sent every run down this branch and the membership comparison in the `else`
-  // below became UNREACHABLE — so the 2026-08-30 narrowing to [kkroo] was never
-  // actually reported as a membership change, only as a self-review complaint.
-  // A compound clause that skips a sibling check is how a tolerated drift masks
-  // an untolerated one; keep these conditions about "is there a gate at all".
+  // and because `||` short-circuits, the then-observed prevent_self_review=false
+  // state sent every run down this branch and the membership comparison in the
+  // `else` below became UNREACHABLE — so the 2026-08-30 narrowing to [kkroo] was
+  // never actually reported as a membership change, only as a self-review
+  // complaint. A compound clause that skips a sibling check is how a tolerated
+  // drift masks an untolerated one; keep these conditions about "is there a gate
+  // at all".
+  //
+  // See the header, 2026-10-04: the live value now reads TRUE, which is why the
+  // sentence above is past-tense. That re-anchors the history in time; it does
+  // not retract it. Whether the field was ever false — and so whether this
+  // short-circuit ever actually fired — is not readable from an agent seat, but
+  // either way it remains the reason the disjunct was removed, and the reason
+  // this clause must stay about "is there a gate at all".
   //
   // `rule == null` is SUBSUMED by `reviewers.length === 0` (an absent rule makes
   // `reviewers` derive to []), so it survives mutation testing — it is kept for
@@ -264,8 +273,8 @@ async function main() {
         `(required_reviewers ${JSON.stringify(observed.reviewers)}, ` +
         `can_admins_bypass=false, deployment_branch_policy.protected_branches=true). ` +
         `Observed prevent_self_review=${JSON.stringify(observed.prevent_self_review)} ` +
-        '(reported, not asserted — see this script\'s header: the "re-ratified as false" ' +
-          'premise behind dropping the assertion is corrected there, 2026-10-04).',
+        '(reported, not asserted — board record 60e271b7; see this script\'s header ' +
+        'for the 2026-10-04 correction).',
     );
     writeSummary({ status: 'compliant', repo, environment: environmentName, observed });
     process.exitCode = 0;
