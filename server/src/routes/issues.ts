@@ -1436,11 +1436,15 @@ export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set(
   // looking admitted. The first revision of this list carried bare
   // `worktree_execution_cutoff` and left exactly the defect this list exists to fix.
   //
-  // Deliberately NOT admitted: the timer-scheduler skips `provider_capacity_deferred`
-  // and `no_in_flight_work`. Both are agent-scoped rows whose payload carries no
-  // `issueId`, `taskId` or `_paperclipWakeContext`, so `wakeRequestTargetsIssue` can
-  // never return them on this route. Listing them would assert a reachability this
-  // route does not have.
+  // Deliberately NOT admitted: the timer-scheduler skips `provider_capacity_deferred`,
+  // `no_in_flight_work`, and (PEN-3765) `idle_circuit_breaker` /
+  // `adapter_failed_circuit_breaker` from `writeTimerCircuitBreakerSkip`. All are
+  // agent-scoped rows whose payload carries no `issueId`, `taskId` or
+  // `_paperclipWakeContext`, so `wakeRequestTargetsIssue` can never return them on
+  // this route. Listing any of them would assert a reachability this route does not
+  // have. The circuit-breaker pair reaches the column through a typed parameter rather
+  // than a literal, so the writer-derived scan cannot see it -- the negative test in
+  // `issue-wake-diagnostics-routes.test.ts` is what holds this exclusion.
   "issue_execution_deferred",
   "issue_execution_promoted",
   "issue_execution_same_name",

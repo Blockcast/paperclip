@@ -716,10 +716,25 @@ describe("issue wake diagnostic reason allowlist", () => {
   const heartbeatUrl = new URL("../services/heartbeat.ts", import.meta.url);
   const heartbeatSource = readFileSync(fileURLToPath(heartbeatUrl), "utf8");
 
-  // The two timer-scheduler skips this route cannot return. Hoisted so the positive
-  // scan below and the negative test at the bottom carve out the SAME two names: if
-  // one list grows and the other does not, the pair contradicts rather than drifts.
-  const AGENT_SCOPED_UNREACHABLE = ["provider_capacity_deferred", "no_in_flight_work"];
+  // The timer-scheduler skips this route cannot return. Hoisted so the positive scan
+  // below and the negative test at the bottom carve out the SAME names: if one list
+  // grows and the other does not, the pair contradicts rather than drifts.
+  //
+  // PEN-3765: this used to name two families and silently omit a third.
+  // `writeTimerCircuitBreakerSkip` (`heartbeat.ts`) is excluded for the identical
+  // reason as the other two -- it writes `payload: { heartbeatSkip: { reason,
+  // ...evidence } }` onto an agent-scoped row with no `issueId`, `taskId` or
+  // `_paperclipWakeContext`. Its `reason` is a parameter typed as a two-member string
+  // union, so the scan below can never resolve it to a literal and the positive scan
+  // would not have caught its admission either. Naming both members here makes the
+  // negative test cover all three families, so this is one list rather than two plus
+  // an omission.
+  const AGENT_SCOPED_UNREACHABLE = [
+    "provider_capacity_deferred",
+    "no_in_flight_work",
+    "idle_circuit_breaker",
+    "adapter_failed_circuit_breaker",
+  ];
 
   // `reason:` is not always an inline literal. Two writers pass a `SCREAMING_SNAKE`
   // const instead -- one declared in `heartbeat.ts`, one imported -- and the first
@@ -761,12 +776,27 @@ describe("issue wake diagnostic reason allowlist", () => {
   // in the allowlist, so a regex that cannot tell them apart would re-seed this
   // change's own defect into the test meant to catch it. Hence brace-depth tracking:
   // take `reason:` only at depth 1 of the `.values({ ... })` object.
+  //
+  // PEN-3765: every opener lands in exactly ONE of four buckets, and the caller
+  // asserts the partition is TOTAL. Before that, a block the walk could not read
+  // simply produced nothing, which made "this writer passes a runtime variable"
+  // byte-identical to "this writer has no reason column" -- and to "the depth walk
+  // desynced and lost the site". `unaccounted` is what tells those apart.
   function columnReasonLiteralsFromDirectInserts() {
     const sites: { line: number; reasons: string[] }[] = [];
     const unresolvedConsts: string[] = [];
+    // Depth-1 `reason` column present, value not statically resolvable. Named, not
+    // dropped, so a site cannot hide here.
+    const dynamic: { line: number; expr: string }[] = [];
+    // No depth-1 `reason` key found at all. Must stay empty: `reason` is NOT NULL on
+    // `agent_wakeup_requests`, so an opener with no reason column means the scan
+    // failed to read the block, not that the writer omitted the column.
+    const unaccounted: number[] = [];
+    let openerCount = 0;
     const openers = /insert\(agentWakeupRequests\)\s*\n?\s*\.?\s*values\(\{/g;
     let opener: RegExpExecArray | null;
     while ((opener = openers.exec(heartbeatSource))) {
+      openerCount++;
       const open = opener.index + opener[0].length - 1;
       let depth = 1;
       let end = open + 1;
@@ -779,6 +809,7 @@ describe("issue wake diagnostic reason allowlist", () => {
       const block = heartbeatSource.slice(open, end);
 
       let blockDepth = 0;
+      let classified = false;
       for (let i = 0; i < block.length; i++) {
         const ch = block[i];
         if (ch === "{") {
@@ -789,13 +820,39 @@ describe("issue wake diagnostic reason allowlist", () => {
           blockDepth--;
           continue;
         }
-        if (blockDepth !== 1 || !block.startsWith("reason:", i)) continue;
+        if (blockDepth !== 1) continue;
+        if (!block.startsWith("reason", i)) continue;
+        // PEN-3765: `reason` reaches the column in TWO syntactic shapes, and matching
+        // only the first is why four writers -- including the `status: "coalesced"`
+        // one -- were invisible here. `reason:` is the explicit-value form; `reason,`
+        // is ES6 property shorthand forwarding a binding of the same name. The
+        // explicit form is tried first, which is what makes a future
+        // `reason: "some_literal"` at one of those four sites resolve normally.
+        //
+        // Both forms must be in KEY position. Walking back over whitespace to a `{`
+        // or `,` is what stops a *string value* that happens to contain "reason,"
+        // (`triggerDetail: "some reason, here"`) from matching and pre-empting the
+        // real key further down the block -- a false positive would classify a
+        // resolvable site as dynamic, which is the same silence this change removes.
+        let back = i - 1;
+        while (back >= 0 && /\s/.test(block[back]!)) back--;
+        if (back >= 0 && block[back] !== "{" && block[back] !== ",") continue;
+        // The window is wide enough to clear the deepest indentation in this file, so
+        // a shorthand written as the LAST property (no trailing comma, newline, then
+        // `}`) still matches -- a tight window there would silently reopen the gap.
+        const shorthand = /^reason\s*[,}]/.test(block.slice(i, i + 64));
+        if (!block.startsWith("reason:", i) && !shorthand) continue;
+        if (shorthand) {
+          // A binding forwarded by shorthand is a runtime value by construction.
+          dynamic.push({ line: lineOf(opener.index), expr: "reason (ES6 shorthand)" });
+          classified = true;
+          break;
+        }
         const tail = block.slice(i + "reason:".length, i + 400);
         const literal = tail.match(/^\s*"([^"]+)"/);
         const ternary = tail.match(/^[^,]*?\?\s*\n?\s*"([^"]+)"\s*\n?\s*:\s*\n?\s*"([^"]+)"/);
         const constIdentifier = tail.match(/^\s*([A-Z][A-Z0-9_]*)\s*,/);
-        // A lowercase/member-expression `reason:` is skipped: it cannot be resolved
-        // statically. That is a known, narrower gap -- see the floor assertions.
+        classified = true;
         if (literal) sites.push({ line: lineOf(opener.index), reasons: [literal[1]] });
         else if (ternary)
           sites.push({ line: lineOf(opener.index), reasons: [ternary[1], ternary[2]] });
@@ -806,11 +863,20 @@ describe("issue wake diagnostic reason allowlist", () => {
           // dynamic. Silently skipping it is the exact failure this revision fixes.
           if (resolved) sites.push({ line: lineOf(opener.index), reasons: [resolved] });
           else unresolvedConsts.push(`${constIdentifier[1]} (heartbeat.ts:${lineOf(opener.index)})`);
+        } else {
+          // A lowercase/member-expression `reason:` cannot be resolved statically.
+          // Named rather than dropped, so it is distinguishable from a block that
+          // carries no `reason` column at all -- see `unaccounted` below.
+          dynamic.push({
+            line: lineOf(opener.index),
+            expr: (tail.match(/^\s*([^,\n]{0,60})/)?.[1] ?? "").trim(),
+          });
         }
         break;
       }
+      if (!classified) unaccounted.push(lineOf(opener.index));
     }
-    return { sites, unresolvedConsts };
+    return { sites, unresolvedConsts, dynamic, unaccounted, openerCount };
   }
 
   function lineOf(index: number) {
@@ -850,22 +916,34 @@ describe("issue wake diagnostic reason allowlist", () => {
   // `github_state_change_queued_coalesced` / `issue_execution_same_name`, so a rename
   // at any of those would still have reached "other" undetected.
   it("admits every statically resolvable reason a direct `insert(agentWakeupRequests)` writes to the column", () => {
-    const { sites, unresolvedConsts } = columnReasonLiteralsFromDirectInserts();
+    const { sites, unresolvedConsts, dynamic, unaccounted, openerCount } =
+      columnReasonLiteralsFromDirectInserts();
 
     // A `SCREAMING_SNAKE` const the resolver cannot follow is a broken resolver, not a
     // dynamic site. Assert it before the floor: a resolver that silently returns null
     // would otherwise just shrink the site count and read as a drifted floor.
     expect(unresolvedConsts, "const-identifier reasons the resolver could not follow").toEqual([]);
 
-    // Vacuity floors. `toBeGreaterThan(0)` would not catch the failure mode that
-    // matters here -- a depth walk desynced by an unbalanced brace inside a string
-    // still yields *some* sites while silently dropping others. So pin a count floor
-    // and name the specific pair this test was added for.
-    expect(sites.length, "direct-insert reason scan found too few sites").toBeGreaterThanOrEqual(
-      17,
-    );
-    const found = new Set(sites.flatMap((site) => site.reasons));
-    for (const anchor of [
+    // PEN-3765: the partition must be TOTAL -- this is the assertion that replaces a
+    // hardcoded count floor as the anti-vacuity control, and it is strictly stronger.
+    // A depth walk desynced by an unbalanced brace, a writer the opener regex stops
+    // matching, or a reason spelling the classifier cannot read all land here instead
+    // of silently shrinking the resolved set.
+    expect(
+      unaccounted,
+      "direct-insert openers whose depth-1 `reason` column the scan could not find at all (heartbeat.ts lines)",
+    ).toEqual([]);
+    expect(
+      sites.length + dynamic.length,
+      `every opener must classify as resolved or dynamic; resolved=${sites.length} dynamic=${dynamic.length} of ${openerCount}. Dynamic sites: ${
+        dynamic.map((site) => `heartbeat.ts:${site.line} (${site.expr})`).join(", ") || "none"
+      }`,
+    ).toBe(openerCount);
+    // ...and the partition must be non-vacuous: zero openers would satisfy the
+    // identity above trivially.
+    expect(openerCount, "no direct `insert(agentWakeupRequests)` openers found").toBeGreaterThan(0);
+
+    const ANCHORS = [
       "github_state_change_queued_coalesced",
       "issue_execution_same_name",
       "issue_execution_deferred",
@@ -875,7 +953,17 @@ describe("issue wake diagnostic reason allowlist", () => {
       // `workspace_worktree_requires_project` survived the previous revision.
       "workspace_worktree_requires_project",
       "execution_review_participant_recovery",
-    ]) {
+    ];
+    // PEN-3765: keyed off the anchors rather than the live site count, which was `17`
+    // against an actual 18. At one site of slack, deleting any single writer turned a
+    // legitimate refactor into a red test pointing at the SCAN rather than at the
+    // removal. The anchors above plus the total-partition assertion now carry the
+    // vacuity guarantee, so this floor only has to stay below them.
+    expect(sites.length, "direct-insert reason scan found too few sites").toBeGreaterThanOrEqual(
+      ANCHORS.length,
+    );
+    const found = new Set(sites.flatMap((site) => site.reasons));
+    for (const anchor of ANCHORS) {
       expect(found.has(anchor), `direct-insert scan lost its anchor ${anchor}`).toBe(true);
     }
     // The nested `payload.heartbeatSkip.reason` sibling of the anchor above. Its
@@ -896,11 +984,16 @@ describe("issue wake diagnostic reason allowlist", () => {
     }
   });
 
-  // The converse, and the reason these two were dropped rather than corrected: both
-  // are written only by the timer scheduler, onto agent-scoped rows whose payload
+  // The converse, and the reason these were dropped rather than corrected: all are
+  // written only by the timer scheduler, onto agent-scoped rows whose payload
   // carries no `issueId`, `taskId` or `_paperclipWakeContext`. `wakeRequestTargetsIssue`
   // cannot return them, so admitting them would assert a reachability this route does
-  // not have. If either writer ever gains issue scope, re-add it with a route test.
+  // not have. If any writer ever gains issue scope, re-add it with a route test.
+  //
+  // PEN-3765: `idle_circuit_breaker` / `adapter_failed_circuit_breaker` are the third
+  // such family (`writeTimerCircuitBreakerSkip`). They reach the column through a
+  // typed parameter, so the positive scan classifies that writer as dynamic and would
+  // never have caught their admission -- this negative test is the only guard on them.
   it("does not admit timer-scheduler skips this route cannot return", () => {
     for (const reason of AGENT_SCOPED_UNREACHABLE) {
       expect(
