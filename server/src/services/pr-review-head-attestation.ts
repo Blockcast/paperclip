@@ -29,23 +29,44 @@
  * Stated explicitly because the next I1 red on `master` will otherwise read as
  * a regression here rather than as the known residual it is.
  *
- * CORRECTION (PEN-3754): "it closes the wide ones" OVERSTATES this guard, and
- * a wide gap is NOT evidence that it was consulted and answered wrongly.
+ * CORRECTION (PEN-3754): "it closes the wide ones" OVERSTATES this guard — but
+ * not because it let a duplicate through. The wide pairs measured so far are
+ * ones it SHOULD let through, so a wide gap is not evidence that this guard was
+ * consulted and answered wrongly.
  *
- * The paragraph above holds review-run duration (~45 min, measured on #2157:
+ * The paragraph above holds review-run duration (~42 min, measured on #2157:
  * 11:48:35Z request → 12:30:34Z review) as the only thing between dispatch and
  * post, and concludes that a gap of hours implies the first review was already
- * visible at the second dispatch. QUEUE LATENCY breaks that step. A wake can
- * clear this gate while no review exists, sit queued for hours, and post into a
- * head that was attested in the meantime — so a long gap and a short gap can
- * have the same cause, differing only in how long the second run waited.
+ * visible at the second dispatch. Three same-head pairs were examined for
+ * PEN-3754 (#2121 `9190d265` 19.7 h, #2128 `621589ce` 6.6 h, #2157 `f03ade2f`
+ * 9.3 h). In every one the second review was preceded by an EXPLICIT re-request
+ * at the unchanged head, posted after the first review was already visible:
  *
- * Measured on the three same-head pairs in PEN-3754 (#2121 `9190d265` 19.7 h,
- * #2128 `621589ce` 6.6 h, #2157 `f03ade2f` 9.3 h): all 13 Ally reviews across
- * those PRs parse cleanly under this module's own predicate — one well-formed
- * attestation each, App identity — so every first review WOULD have returned
- * `attested` had this been asked at post time. The predicate is sound; the
- * timing assumption in its coverage claim is not.
+ *   #2121  first 03:01:17Z → `paperclip:review-request` (kkroo) 17:52:18Z
+ *                          → second 22:41:51Z
+ *   #2128  first 15:44:37Z → "Response to review at `621589ce`" 16:18:00Z
+ *                          → second 22:21:15Z
+ *   #2157  first 12:30:34Z → "please re-review exact head `f03ade2f`" (kkroo)
+ *                            17:44:25Z → `paperclip:review-request` 20:50:33Z
+ *                          → second 21:50:07Z
+ *
+ * So these are not the failure the coverage claim describes. They are DELIBERATE
+ * re-reviews of a head that already carried a verdict — precisely the traffic
+ * this guard must not refuse. The legitimate-re-review argument below was first
+ * made for #2128 alone; the measurement extends it to all three.
+ *
+ * All 13 Ally reviews across those PRs parse cleanly under this module's own
+ * predicate — one well-formed attestation each, App identity — so the predicate
+ * is sound and this is not a detection failure.
+ *
+ * QUEUE LATENCY is real here but is NOT what produced these pairs, and the
+ * distinction matters because the two point at different fixes. Each re-request
+ * above sat 1.0–6.1 h before its review landed, against the ~42 min run
+ * duration, so the start→post interval is hours rather than minutes — which
+ * widens the window any exclusion must hold across. It does not account for
+ * these three, because in each the first review predated the re-request and so
+ * predated dispatch. Treat queue latency as a constraint on the remedy, not as
+ * the diagnosis.
  *
  * Do NOT conclude from that measurement that a post-time refusal is the
  * remedy. It is not, and the reason generalises: a same-head re-review can be
@@ -60,10 +81,16 @@
  * cannot classify these and why I1 is being re-specified to treat a
  * distinct-body pair as supersession rather than as a violation.
  *
- * Exclusion therefore belongs at dispatch (BLO-20074), where the queueing
- * above is the specific thing it has to survive: a check at wake time is not
- * enough on its own, because the decision it makes can be hours stale by the
- * time the run it authorises actually posts.
+ * Exclusion therefore belongs at BLO-20074, and the interval it has to survive
+ * is the start→post one above. A vocabulary warning, because this docblock uses
+ * both words: "dispatch time" in the WHAT THIS CLOSES paragraph and "wake time"
+ * here are the SAME instant for this module. It is called from the webhook
+ * handler at the moment the wake is decided (`github-webhook.ts:5593`, and on
+ * the contended-replay path at `:4036`), so it has exactly one point of
+ * observation, not two to check between. What that check decides is whether a
+ * run STARTS; the duplicate is created hours later when that run POSTS, and
+ * nothing re-asks in between. That is the gap — one observation against a
+ * multi-hour lifetime — not a wake-versus-dispatch distinction.
  *
  * Why this must be enforced BEFORE the run rather than cleaned up after: a
  * COMMENTED review cannot be retracted. GitHub's dismiss endpoint rejects it
