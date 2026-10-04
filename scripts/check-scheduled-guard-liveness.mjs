@@ -346,14 +346,26 @@ export function classifyGuard(
   // this check. It catches the differently-pinned case on proof; it does not
   // make the index trustworthy, and AC2's flap watch is what measures the rest.
   //
-  // ORDER against the unparsable-timestamp arm below, deliberate: an unparsable
-  // `newest.updatedAt` makes `crossCheckIsBetter` false, because EVERY
-  // comparison against NaN is false. So a guard carrying both an unreadable
-  // timestamp and impossible counts is answered here as `index-inconsistent`
-  // rather than reaching `unparsable-timestamp`. That is the better of the two
-  // answers, not an oversight: counts that cannot both be true make every field
-  // of both reads suspect, which strictly contains "one timestamp is garbage".
-  // Both are `status: "unknown"` and both exit 0, so nothing downstream moves.
+  // REACHABILITY, narrower than it looks (Ally review of 9b3251c0, which
+  // corrected a claim an earlier revision of this block asserted as design).
+  // Within `classifyGuard` this arm does precede the `unparsable-timestamp`
+  // arm below — but that ordering never decides a real guard's verdict,
+  // because the two inputs cannot co-occur in production. `classifyWatched`
+  // attaches `crossCheck` only after a FIRST pass returned `stale` +
+  // `stopped`/`never-completed`; an unparsable `newest.updatedAt` returns
+  // `unknown`/`unparsable-timestamp` on that first pass, so the second pass is
+  // never taken, no `allCount` is ever observed, and this arm's `typeof
+  // allCount === "number"` is false. The verdict for such a guard is
+  // `unparsable-timestamp`. On the second pass `newest` is either absent
+  // (`never-completed`) or already parsed (`stopped` is returned past the
+  // `Number.isNaN(completedEpoch)` gate), so the right-hand `Date.parse` here
+  // is never NaN. The ordering is observable only by calling `classifyGuard`
+  // directly with a hand-built observation, which is how tests reach it.
+  //
+  // The NaN that IS reachable is on the LEFT: a cross-check carrying no
+  // completion parses to NaN, every comparison against NaN is false, so
+  // `crossCheckIsBetter` is false and the arm may fire. That is the intended
+  // reading — absent corroboration is not better evidence.
   const completedCount = observation?.completedCount;
   const allCount = observation?.crossCheck?.allCount;
   const crossCheckIsBetter =
