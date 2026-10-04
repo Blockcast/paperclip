@@ -488,6 +488,56 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   });
 
+  // BLO-39945: the watchdog re-arm rebuilds the policy field by field, so a
+  // top-level `productivityReviewDisabled` is dropped unless carried
+  // explicitly — silently re-enabling productivity review on a row that opted
+  // out, which is the same silent-drop class this flag exists to fix.
+  it("preserves a top-level productivityReviewDisabled across a dispatch-lapse re-arm", async () => {
+    const { issueId } = await seedFixture();
+    await db
+      .update(issues)
+      .set({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          productivityReviewDisabled: true,
+          monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: "Check deploy", scheduledBy: "assignee" },
+        },
+      })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+    await db.update(issues).set({ executionRunId: queuedRun.id }).where(eq(issues.id, issueId));
+
+    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await heartbeat.tickTimers(lapseDetectedAt);
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: lapseDetectedAt })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    const policy = normalizeIssueExecutionPolicy(issue.executionPolicy);
+    // Control: the re-arm did happen, so the assertion below is about survival
+    // rather than about a policy nothing touched.
+    expect(policy?.monitor).toMatchObject({ serviceName: "paperclip_monitor_dispatch" });
+    expect(policy?.productivityReviewDisabled).toBe(true);
+  });
+
   it("re-dispatches and re-arms when the watchdog fires on a run that is still queued", async () => {
     // Regression for BLO-22860: the watchdog re-armed a monitor but left the
     // stale run queued. When it fired, enqueueWakeup coalesced into that same
