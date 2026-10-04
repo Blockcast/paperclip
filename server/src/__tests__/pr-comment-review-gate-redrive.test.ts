@@ -21,7 +21,7 @@ const {
   emptyGateRedriveResult,
   gateStatusIsStale,
   latestReviewerReviewAt,
-  mergeGateRedriveResults,
+  mergeSweepCounters,
   redriveStaleCommentReviewGates,
 } = await import("../services/pr-comment-review-gate-redrive.js");
 
@@ -419,11 +419,11 @@ describe("gate re-drive result aggregation", () => {
     // key is what removes that class, and this is its mutation point.
     const totals = emptyGateRedriveResult();
 
-    mergeGateRedriveResults(totals, {
+    mergeSweepCounters(totals, {
       considered: 3, probed: 2, attempted: 2, redriven: 1,
       retirementFailed: 1, retirementRetryFailed: 0, failed: 1, headless: 1, capped: false,
     });
-    mergeGateRedriveResults(totals, {
+    mergeSweepCounters(totals, {
       considered: 4, probed: 1, attempted: 1, redriven: 1,
       retirementFailed: 0, retirementRetryFailed: 2, failed: 0, headless: 2, capped: true,
     });
@@ -446,8 +446,8 @@ describe("gate re-drive result aggregation", () => {
 
   it("does not let a later clean repo clear a flag an earlier one set", () => {
     const totals = emptyGateRedriveResult();
-    mergeGateRedriveResults(totals, { ...emptyGateRedriveResult(), capped: true });
-    mergeGateRedriveResults(totals, emptyGateRedriveResult());
+    mergeSweepCounters(totals, { ...emptyGateRedriveResult(), capped: true });
+    mergeSweepCounters(totals, emptyGateRedriveResult());
 
     expect(totals.capped).toBe(true);
   });

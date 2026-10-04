@@ -386,12 +386,12 @@ describeEmbeddedPostgres("pr-review-state reconciler", () => {
     await db.delete(issues).where(eq(issues.companyId, companyId));
   });
 
-  // The tick accumulates seven fields from each repo's result by hand. A field
+  // The tick accumulates the whole result through one keys-driven merge. A field
   // that is never accumulated is NOT a type error: `totals` is initialised with
   // every field present and zeroed, so the omission compiles clean and reports a
   // healthy zero fleet-wide. Nothing else in this suite drives the tick, so this
   // is the only place that class is observable at the call site — the helper's
-  // own suite pins `mergeGateRedriveResults`, not the fact that the tick calls it.
+  // own suite pins `mergeSweepCounters`, not the fact that the tick calls it.
   it("sums every field across two repos, so a counter dropped at the call site cannot read as zero", async () => {
     const { issueWorkProducts, issues } = await import("@paperclipai/db");
     const REPO_B = "Blockcast/trafficcontrol";
@@ -429,10 +429,13 @@ describeEmbeddedPostgres("pr-review-state reconciler", () => {
       });
     }
 
-    // Deliberately asymmetric: repo A contributes 2/2/0 and repo B 2/2/1, so a
-    // dropped `+=` that keeps only the last repo's value is distinguishable from
-    // a correct sum. Reviews stay empty, which makes every candidate skip before
-    // the status read — `considered` is counted up front, so the aggregation is
+    // Deliberately asymmetric where it discriminates, and symmetric where the
+    // previous shape did not. BOTH repos contribute one headless candidate, so
+    // `headless` is 2 summed and 1 overwritten *whichever repo comes last* —
+    // `selectReviewStateTargets` returns no guaranteed order, and with only B
+    // headless an overwrite-by-last-repo bug still yields 1 and the assertion
+    // passes. Reviews stay empty, which makes every candidate skip before the
+    // status read — `considered` is counted up front, so the aggregation is
     // observable without driving a gate evaluation or a single extra fetch.
     ghFetchMock.mockImplementation(async (url: string) => {
       const repo = url.includes(REPO_B) ? REPO_B : REPO;
@@ -443,7 +446,7 @@ describeEmbeddedPostgres("pr-review-state reconciler", () => {
       if (page > 1) return jsonResponse([]);
       return jsonResponse(
         repo === REPO
-          ? [openPr(11, { head: { sha: "aaa1" } }), openPr(12, { head: { sha: "aaa2" } })]
+          ? [openPr(11, { head: { sha: "aaa1" } }), openPr(12, { head: null })]
           : [openPr(21, { head: { sha: "bbb1" } }), openPr(22, { head: null })],
       );
     });
@@ -456,11 +459,12 @@ describeEmbeddedPostgres("pr-review-state reconciler", () => {
       expect(sweep.failed).toBe(0);
       expect(sweep.totals.enumerated).toBe(4);
       expect(sweep.totals.written).toBe(4);
-      // The field this PR routes through `mergeGateRedriveResults`. `considered`
-      // proves the nested result is summed at all; `headless` proves it is summed
-      // field-wise rather than overwritten by the last repo, since only B has one.
+      // `considered` proves the nested result is summed at all (4 summed, 2
+      // overwritten). `headless` proves it is summed FIELD-WISE rather than
+      // overwritten by the last repo — 2 summed against 1 under an overwrite,
+      // under either target ordering, which is why both repos carry one.
       expect(sweep.totals.gateRedrive.considered).toBe(4);
-      expect(sweep.totals.gateRedrive.headless).toBe(1);
+      expect(sweep.totals.gateRedrive.headless).toBe(2);
     } finally {
       if (priorContext === undefined) delete process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT;
       else process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT = priorContext;

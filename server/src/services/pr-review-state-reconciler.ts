@@ -46,7 +46,7 @@ import { getInstallationTokenResult } from "./github-app-auth.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   emptyGateRedriveResult,
-  mergeGateRedriveResults,
+  mergeSweepCounters,
   redriveStaleCommentReviewGates,
   type GateRedriveCandidate,
   type GateRedriveResult,
@@ -577,13 +577,13 @@ export async function prReviewStateReconcilerTick(
         maxPullRequests: input.maxPullRequests,
         logger: log,
       });
-      totals.enumerated += result.enumerated;
-      totals.written += result.written;
-      totals.pruned += result.pruned;
-      totals.unreadable += result.unreadable;
-      totals.truncated = totals.truncated || result.truncated;
-      totals.malformed += result.malformed;
-      mergeGateRedriveResults(totals.gateRedrive, result.gateRedrive);
+      // Keys-driven for the WHOLE result, nested `gateRedrive` included. The
+      // six fields this used to accumulate by hand carried the same defect as
+      // the nested one: `totals` is initialised with every field zeroed above,
+      // so a seventh added to `ReviewStateReconcileResult` and forgotten here
+      // compiles clean and reports zero fleet-wide. Specialising the helper to
+      // the nested type closed half the class and left this half open.
+      mergeSweepCounters(totals, result);
       ok += 1;
     } catch (err) {
       failed += 1;
