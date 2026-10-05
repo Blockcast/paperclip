@@ -1550,6 +1550,50 @@ describe("issue execution policy routes", () => {
         expect(patch.monitorNotes).toBeNull();
       });
 
+      // BLO-18816 review: an arm through `PATCH /issues/:id` revalidates the active recovery
+      // action, and on an `in_progress` agent-owned row resolves it `cancelled`. The monitor-only
+      // arm has to agree, or the path the docs tell callers to prefer leaves that wake-path
+      // signal `active` where the legacy path retires it.
+      const seedActiveRecoveryAction = () => {
+        mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+          id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+          sourceIssueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          kind: "stranded_assigned_issue",
+          status: "active",
+        });
+      };
+
+      it("revalidates the active recovery action on an arm, as PATCH /issues/:id does", async () => {
+        seedStagedIssue();
+        seedActiveRecoveryAction();
+
+        const res = await request(await asAssignee())
+          .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/monitor")
+          .send({ nextCheckAt: "2099-12-01T13:00:00.000Z", notes: "signature=unchanged" });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(mockIssueRecoveryActionService.resolveActiveForIssue).toHaveBeenCalledWith(
+          expect.objectContaining({
+            sourceIssueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            actionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            status: "cancelled",
+          }),
+        );
+      });
+
+      // The paired half. Same row, same action: a clear removes a wake path rather than adding
+      // one, so it must not retire the action that may be the row's remaining wake path.
+      it("leaves the active recovery action alone on a clear", async () => {
+        seedStagedIssue();
+        seedActiveRecoveryAction();
+
+        const res = await request(await asAssignee())
+          .delete("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/monitor");
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
+      });
+
       it("rejects an actor who is neither the assignee nor the execution run", async () => {
         seedStagedIssue();
         mockAccessService.decide.mockResolvedValue({ allowed: true, explanation: "ok" });
