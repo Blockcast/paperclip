@@ -134,4 +134,34 @@ test("incomplete or out-of-order review-gate enablement fails the Helm render", 
     ]),
     /requires at least one githubApp.reviewGateRepositories entry/,
   );
+  assert.throws(
+    () => render("templates/statefulset.yaml", [
+      "--set",
+      "githubApp.reviewGateCaptureEnabled=true",
+      "--set",
+      "githubApp.reviewGateExpectedAppId=not-a-number",
+    ]),
+    /requires a numeric githubApp.reviewGateExpectedAppId/,
+  );
+  assert.throws(
+    () => render("templates/statefulset.yaml", [
+      "--set",
+      "githubApp.reviewGateCaptureEnabled=true",
+      "--set",
+      "githubApp.reviewGateExpectedInstallationId=not-a-number",
+    ]),
+    /requires a numeric githubApp.reviewGateExpectedInstallationId/,
+  );
+  // config.ts throws on a missing GITHUB_WEBHOOK_SECRET when capture is on, and
+  // the chart binds it from env.extra rather than from the githubApp block — so
+  // the guard has to read the place the value actually comes from.
+  assert.throws(
+    () => render("templates/statefulset.yaml", [
+      "--set",
+      "githubApp.reviewGateCaptureEnabled=true",
+      "--set-json",
+      "env.extra=[]",
+    ]),
+    /requires a GITHUB_WEBHOOK_SECRET entry in env\.extra/,
+  );
 });

@@ -173,6 +173,15 @@ rendered:
 {{- if empty ((.Values.githubApp).prReviewGateStatusContext) -}}
 {{- fail "githubApp.reviewGateCaptureEnabled requires githubApp.prReviewGateStatusContext" -}}
 {{- end -}}
+{{- $hasWebhookSecret := false -}}
+{{- range $entry := (.Values.env).extra -}}
+{{- if eq (toString ($entry.name | default "")) "GITHUB_WEBHOOK_SECRET" -}}
+{{- $hasWebhookSecret = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $hasWebhookSecret -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires a GITHUB_WEBHOOK_SECRET entry in env.extra" -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 
