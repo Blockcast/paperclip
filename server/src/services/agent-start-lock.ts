@@ -735,7 +735,7 @@ export function describeAgentStartLockDispatchHealth(
   return {
     status: stillWedged ? "stalled" : "aborted",
     heldMs: stillWedged && heldSince !== undefined
-      ? Math.max(0, nowMs - heldSince)
+      ? Math.max(0, nowMs - heldSince.startedAtMs)
       : record.heldMs,
     abortedAt: new Date(record.abortedAtMs).toISOString(),
     reason: stillWedged
