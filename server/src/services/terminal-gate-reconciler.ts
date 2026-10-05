@@ -464,7 +464,7 @@ async function listExistingResolutionKeys(
       isNull(issueComments.authorUserId),
       isNull(issueComments.deletedAt),
     ));
-  return new Set(rows.map((row) => `${row.issueId} ${row.idempotencyKey ?? ""}`));
+  return new Set(rows.map((row) => `${row.issueId}\u0000${row.idempotencyKey ?? ""}`));
 }
 
 /**
@@ -532,12 +532,12 @@ export async function listResolvedTerminalGates(
       isNull(issueComments.deletedAt),
     ));
   const existing = new Map(rows.map((row) => [
-    `${row.issueId} ${row.idempotencyKey ?? ""}`,
+    `${row.issueId}\u0000${row.idempotencyKey ?? ""}`,
     row.createdAt,
   ]));
   const resolved = new Map<string, { signals: string[]; idempotencyKey: string; createdAt: Date }>();
   for (const entry of ownedKeyed) {
-    const createdAt = existing.get(`${entry.id} ${entry.key}`);
+    const createdAt = existing.get(`${entry.id}\u0000${entry.key}`);
     if (!createdAt) continue;
     resolved.set(entry.id, { signals: entry.signals, idempotencyKey: entry.key, createdAt });
   }
@@ -580,7 +580,7 @@ export async function reconcileTerminalGates(
     withSignals.map((entry) => ({ id: entry.candidate.id, key: entry.key })),
   );
   const pending = withSignals.filter(
-    (entry) => !alreadyResolved.has(`${entry.candidate.id} ${entry.key}`),
+    (entry) => !alreadyResolved.has(`${entry.candidate.id}\u0000${entry.key}`),
   );
   if (pending.length === 0) {
     return { scanned: candidates.length, resolved: 0, pullRequestReads: 0 };

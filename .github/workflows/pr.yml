@@ -434,6 +434,15 @@ jobs:
         run: node --test ./scripts/check-no-git-push.test.mjs
         timeout-minutes: 1
 
+      - name: Reject raw NUL bytes in tracked source (BLO-39632)
+        if: ${{ !cancelled() }}
+        run: node ./scripts/check-no-raw-nul.mjs
+
+      - name: Test no-raw-nul check
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-no-raw-nul.test.mjs
+        timeout-minutes: 1
+
       - name: Reject App-attributed commits on the PR (BLO-21416)
         if: ${{ !cancelled() }}
         # Non-merge commits stamped with the shared allyblockcast[bot] App
@@ -865,6 +874,13 @@ jobs:
       - name: Test vitest flake-report wiring (BLO-28886)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/vitest-flake-report.test.mjs
+        timeout-minutes: 1
+
+      # The aggregator the step above feeds. Unregistered it would be a comment:
+      # the guards pass locally and nothing enforces them on the next edit.
+      - name: Test vitest flake ledger (BLO-28886)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/vitest-flake-ledger.test.mjs
         timeout-minutes: 1
 
       - name: Validate dependency resolution when manifests change
