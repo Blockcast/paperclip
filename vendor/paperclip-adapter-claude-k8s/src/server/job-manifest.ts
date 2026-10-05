@@ -93,6 +93,22 @@ export type ScopedWritableMount = { subPath: string; mountPath: string };
  * writing `/paperclip/work/foo` verbatim and lands in its own company's subdir:
  * cross-company write closes without any convention changing, which is what
  * makes this safe for writers this builder cannot enumerate.
+ *
+ * That argument covers WRITES only. Reads of data already there do NOT survive:
+ * the live trees are flat and un-scoped (2657 `work` / 161 `wt` entries at the
+ * time of writing, none company-prefixed), so a scoped pod sees an empty dir on
+ * first run and every pre-existing entry becomes unreachable AT THIS PATH. The
+ * bytes are not lost — they stay at `<volume>/work/<name>` and the server, which
+ * mounts the volume whole, still reaches them. Accepted deliberately rather than
+ * migrated: the entries carry no company attribution, so there is nothing to
+ * sort them by. See `PROVENANCE-CHANGES.d/pr-1820.md` §4.
+ *
+ * The scoping is also INERT for any subtree that is itself a derived candidate:
+ * the kubelet orders mounts by path depth, so a deeper derived mount (a runtime
+ * descriptor placing a workspace under `/paperclip/wt/...`, say) wins and
+ * re-exposes that subtree unscoped. That is correct — the data genuinely lives
+ * there and the descriptor is the authority — but it means these two names are
+ * scoped by default, not unconditionally.
  */
 const SCRATCH_DIR_NAMES = ["work", "wt"] as const;
 
@@ -2585,6 +2601,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Joining onto `dataMountPath` would, under a custom mount path, mkdir on the
   // server's own root filesystem and leave the Job's volume untouched.
   const scopedWritableDirs = scopedWritableMounts.map((m) => path.posix.join(SELF_POD_DATA_MOUNT_PATH, m.subPath));
+  // Deliberately NOT checked against `claimedMountPaths` here. A scoped mount
+  // landing exactly on an already-claimed path (an inherited secret mount under
+  // the data mount) is a real hazard, but it is already caught by the
+  // per-container duplicate-mountPath assertion at the end of this function,
+  // which names both volumes and the container. That assertion exists
+  // specifically so append sites do NOT each re-implement the condition — see
+  // its comment. Adding a check here would be the second copy it argues against.
   for (const mount of scopedWritableMounts) {
     volumeMounts.push({ name: "data", mountPath: mount.mountPath, subPath: mount.subPath });
   }
