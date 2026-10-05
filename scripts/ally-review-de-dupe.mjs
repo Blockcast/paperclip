@@ -61,7 +61,7 @@ function reviewState(review) {
  * The guard's blocking-verdict test (I1/I2). Taken whole rather than
  * recomposed from `hasBlockingFindings || hasStillPresentDisposition`: those
  * two are prose readers, so a review that states its findings only in the
- * ```ally-verdict block — or states them in a block nothing can read — came
+ * `<!-- ally-verdict:1 -->` block — or states them in a block nothing can read — came
  * back non-blocking and therefore dismissable (BLO-32695).
  */
 function isBlocking(review) {

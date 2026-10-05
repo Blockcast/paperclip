@@ -728,6 +728,9 @@ export function allyClaimedReviewHead(body: string | null | undefined): string |
  * block closed, but reads an unterminated fence as emitted text: blanked, it
  * hides every bucket below it, and this cross-check is the only thing standing
  * between those buckets and a block that states fewer.
+ *
+ * Partial: it reads only the emitted bucket form. The forms it does not read,
+ * and why it is not widened, are listed at EMITTED_COUNTED_FINDINGS_BUCKET_PATTERN.
  */
 function proseCountContradicting(text: string, counts: Map<string, number>): string | null {
   for (const [, severity, count] of text.matchAll(EMITTED_COUNTED_FINDINGS_BUCKET_PATTERN)) {
@@ -1016,10 +1019,28 @@ const COUNTED_FINDINGS_BUCKET_PATTERN = new RegExp(
 // (N)` — heading, line-anchored, bucket ending the line — and every match that
 // was not one of those was prose, a fenced example, a blockquote, or inline
 // code. Emphasis is allowed around the heading because Ally has chosen it
-// elsewhere. If the emitted form ever grows decoration this does not cover,
-// the rule stops firing and the block is trusted as it was before this
-// cross-check existed; that degrades to the prior behaviour rather than
-// opening something new, whereas a loose pattern reds clean reviews.
+// elsewhere.
+//
+// The backstop is therefore partial, and the cost is more than "the rule stops
+// firing". A readable block stating zero is trusted over every form this does
+// not read, and each form below blocks the same body *without* a block. So the
+// block makes such a body less blocking than no block at all (Ally, #1721 at
+// 2dfdfafe, supplementary Important):
+//   - a list-item bucket: `- Critical Issues (2)`, `1. Critical Issues (2)`
+//   - a bucket with trailing text: `### Critical Issues (2) — see inline comments`
+//   - an uncounted heading: `### Critical Issues`, `**Critical Issues**`
+//   - a blockquoted bucket: `> ### Critical Issues (2)`
+// The first two are in COUNTED_FINDINGS_BUCKET_PATTERN's language and the third
+// is in UNCOUNTED_FINDINGS_HEADING_REGEX's. Each needs the producer to
+// contradict itself, so this is defence in depth behind the block, not the
+// primary control. It is not widened here, for two reasons. The false-red rate
+// of these forms on emitted clean reviews has not been measured the way the
+// 64-bucket sample above was, and the blockquote form is a measured false red.
+// Also, this is not one pattern: the sweep's EMITTED_BUCKET_PATTERN and the
+// auditor's EMITTED_BUCKET_RE mirror it, and a gate that reds a body the sweep
+// reads as attested suppresses the re-request that would clear it. Widen all
+// three together or none. "states its uncovered bucket form" in
+// server/src/__tests__/ally-review-verdict-block.test.ts pins this list.
 //
 // `(?:^|\n)` ... `(?=\n|$)` with no `m` flag, for the reason given at
 // PRIOR_FINDING_DISPOSITION_PATTERN: under `m` a bucket terminated by U+2028
