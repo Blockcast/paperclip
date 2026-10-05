@@ -33085,12 +33085,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // boundaries are arbitrary on every adapter path, not just the sandbox tailer.
       const runSecretBoundaryCarry = createRunSecretBoundaryCarry(runSecretRedaction.needles);
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+        // BLO-39715: run progress is a property of what the adapter SENT, so it is classified
+        // here, on the arriving chunk, before the carry re-slices the stream. The carry's
+        // output is the wrong input on both counts. It is cut at an arbitrary offset, so a
+        // keepalive split mid-line fails the anchored `isSyntheticNonProgressRunLogChunk`
+        // match and would stamp a silent run as active, which disarms the external-lifecycle
+        // silence reaper. And it is empty while the window fills, so stamping on it would
+        // record nothing for real early output and let a live run accrue silence from
+        // `startedAt`. An empty arrival is the settle flush below, not output, so it stamps
+        // nothing.
+        const countsAsRunProgress = chunk.length > 0 && !isSyntheticNonProgressRunLogChunk(chunk);
         // Hold-back is released once the adapter has settled: everything logged after that
         // point is a complete in-process `[paperclip] …` string rather than a stream slice,
         // and leaving the carry armed there would withhold the tail of a message with no
         // later chunk to flush it.
         const carried = runSecretBoundaryCarry.take(stream, chunk, { flush: adapterExecutionSettled });
-        if (!carried) return;
         // The carry has already redacted run-secret values, so the needles below are a
         // second, idempotent pass. That is deliberate and not an oversight: keeping them
         // means deleting or bypassing the carry degrades to the pre-BLO-39715 behaviour
@@ -33102,26 +33111,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           currentUserRedactionOptions,
           runSecretRedaction.needles,
         );
-        const countsAsRunProgress = !isSyntheticNonProgressRunLogChunk(sanitizedChunk);
-        if (countsAsRunProgress && stream === "stdout") {
+        // The excerpt is a copy of persisted bytes, so it classifies the bytes it copies, not
+        // the arrival: gating it on `countsAsRunProgress` would drop real output whenever its
+        // held-back tail is released by a keepalive arrival. The cost runs the other way: a
+        // keepalive cut by the carry can reach the excerpt, and so `classifyRunLiveness`'s
+        // useful-output check, but no real output byte is lost.
+        const belongsInExcerpt = !isSyntheticNonProgressRunLogChunk(sanitizedChunk);
+        if (belongsInExcerpt && stream === "stdout") {
           stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
         }
-        if (countsAsRunProgress && stream === "stderr") {
+        if (belongsInExcerpt && stream === "stderr") {
           stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
         }
         const ts = new Date().toISOString();
 
-        outputSeq += 1;
-        const chunkSeq = outputSeq;
+        // Persistence and the live view are gated on `carried`; the activity stamps below are
+        // not, for the reason given at the top of this function. A chunk the carry withheld
+        // persists nothing, so its progress stamp points at the newest persisted seq.
+        let chunkSeq = outputSeq;
         let appendedBytes = 0;
-        if (handle) {
-          appendedBytes = await runLogStore.append(handle, {
-            stream,
-            chunk: sanitizedChunk,
-            ts,
-            seq: chunkSeq,
-          });
-          persistedLogBytes += appendedBytes;
+        if (carried) {
+          outputSeq += 1;
+          chunkSeq = outputSeq;
+          if (handle) {
+            appendedBytes = await runLogStore.append(handle, {
+              stream,
+              chunk: sanitizedChunk,
+              ts,
+              seq: chunkSeq,
+            });
+            persistedLogBytes += appendedBytes;
+          }
         }
         if (countsAsRunProgress) {
           outputProgressState.pending = {
@@ -33140,6 +33160,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // event stream on every 250ms tail chunk.
         const logActivityAt = new Date(ts);
         if (
+          chunk.length > 0 &&
           isHeartbeatRunRuntimeStatusActive(run.status) &&
           logActivityAt.getTime() - lastLogRuntimeStatusTouchMs >=
             ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS
@@ -33155,6 +33176,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (touchedStatus) publishHeartbeatRunRuntimeProgress(touchedStatus);
         }
 
+        if (!carried) return;
         const payloadChunk =
           sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
             ? sanitizedChunk.slice(sanitizedChunk.length - MAX_LIVE_LOG_CHUNK_BYTES)

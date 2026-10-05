@@ -229,7 +229,13 @@ export function redactRunSecretValues(text: string, needles: readonly string[]):
  *    longest needle, so a large secret (a PEM key) holds back correspondingly more. It is
  *    NOT capped: a cap below the longest needle would reintroduce exactly the silent split
  *    this closes, for precisely the largest secrets. The lag is bounded in time by the
- *    flush at adapter settle, not just in size.
+ *    flush at adapter settle, not just in size. The lag is in bytes only, and liveness must
+ *    not inherit it: `take`'s return value is empty while the window fills and is cut at an
+ *    arbitrary offset otherwise, so it is neither arrival-aligned nor line-shaped. A caller
+ *    MUST derive activity stamps and progress classification from the chunk it was handed,
+ *    never from what `take` returns; the heartbeat `onLog` does, because those stamps feed
+ *    the external-lifecycle silence reaper. Only its excerpt filter classifies the returned
+ *    bytes, because the excerpt is a copy of them; the call site states that trade-off.
  * 2. The flush is required. Without it the final `holdbackChars` of a run's output would be
  *    dropped, so the caller MUST call `take(stream, "", { flush: true })` once output has
  *    settled — trading a leak for silent log truncation would be a bad bargain, and callers
