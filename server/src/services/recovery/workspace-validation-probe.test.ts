@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { isInconclusiveWorkspaceGitProbe } from "./workspace-validation-probe.js";
+import {
+  isInconclusiveWorkspaceGitProbe,
+  WORKSPACE_VALIDATION_RECOVERY_CAUSE,
+  workspaceValidationRecoveryCause,
+} from "./workspace-validation-probe.js";
 
 // BLO-19924. The decision under test is which workspace-validation parks keep the
 // no-wake `manual_repair_required` shape. Getting this wrong in the permissive
@@ -48,5 +52,17 @@ describe("isInconclusiveWorkspaceGitProbe", () => {
     expect(isInconclusiveWorkspaceGitProbe({ gitProbeState: "not_a_checkout" })).toBe(false);
     expect(isInconclusiveWorkspaceGitProbe({ gitProbeState: "INDETERMINATE" })).toBe(false);
     expect(isInconclusiveWorkspaceGitProbe({ gitProbeState: true })).toBe(false);
+  });
+});
+
+describe("workspaceValidationRecoveryCause", () => {
+  it("drops the no-wake cause for an unanswered probe and keeps it otherwise", () => {
+    // `undefined` is not "no opinion" — it is the instruction to fall through to the
+    // ordinary stranded cause, which is the only one carrying a wake and an attempt
+    // budget. Both heartbeat.ts park sites route through here.
+    expect(workspaceValidationRecoveryCause({ gitProbeState: "indeterminate" })).toBeUndefined();
+    expect(workspaceValidationRecoveryCause({ gitProbeState: "checkout" }))
+      .toBe(WORKSPACE_VALIDATION_RECOVERY_CAUSE);
+    expect(workspaceValidationRecoveryCause(null)).toBe(WORKSPACE_VALIDATION_RECOVERY_CAUSE);
   });
 });

@@ -51,3 +51,24 @@ export function isInconclusiveWorkspaceGitProbe(
 ): boolean {
   return workspaceValidationPayload?.gitProbeState === "indeterminate";
 }
+
+/** The no-wake recovery cause a confirmed workspace hazard keeps. */
+export const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
+
+/**
+ * The recovery cause a workspace-validation park should take, or `undefined` to
+ * fall through to the ordinary stranded cause (`wake_owner`: bounded attempts,
+ * then a visible escalation).
+ *
+ * Both heartbeat.ts park sites call this rather than repeating the decision:
+ * service.ts:6069 already records that writing this kind of rule as parallel
+ * expressions is what made the downstream wake-suppression sites drift apart
+ * once, and the two sites here are ~600 lines apart.
+ */
+export function workspaceValidationRecoveryCause(
+  workspaceValidationPayload: Record<string, unknown> | null | undefined,
+): typeof WORKSPACE_VALIDATION_RECOVERY_CAUSE | undefined {
+  return isInconclusiveWorkspaceGitProbe(workspaceValidationPayload)
+    ? undefined
+    : WORKSPACE_VALIDATION_RECOVERY_CAUSE;
+}
