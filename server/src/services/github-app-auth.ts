@@ -868,7 +868,7 @@ export async function githubResolveMergedPullRequestForHeadRef(input: {
   headRef: string;
   signal?: AbortSignal;
 }): Promise<MergedPullRequestForHeadRef> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { outcome: "error", reason: tokenResult.reason };
 
   // `?head=` wants `owner:ref`. The owner is this repository's, not a fork's:
