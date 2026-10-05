@@ -1261,6 +1261,27 @@ const POD_FAILURE_LABELS: Record<PodFailureKind, string> = {
 };
 
 /**
+ * Container `waiting.reason` values that never resolve on their own, so riding
+ * the (now 1800s) start deadline only delays the real error by half an hour and
+ * replaces it with a generic "Timed out waiting for pod containers to start".
+ *
+ * BLO-35486: `CreateContainerConfigError` is this ticket's own symptom — it is
+ * the state a pod enters on `secret "ac-…-env" not found`.  Such a pod stays
+ * `phase: Pending` (so the `phase === "Failed"` throw never fires) and is not
+ * `Unschedulable`, so nothing else in this loop would ever see it.
+ *
+ * Throwing on first observation is safe here for the same reason it is safe for
+ * `ErrImagePull`: all three run Secrets are created and awaited *before*
+ * `createNamespacedJob`, so there is no legitimate transient window in which a
+ * pod of ours sits in a config error and then recovers.
+ */
+const UNRECOVERABLE_WAITING_REASONS = new Set([
+  "CreateContainerConfigError",
+  "CreateContainerError",
+  "InvalidImageName",
+]);
+
+/**
  * Wait for the Job's pod to reach a terminal or running state.
  * Returns the pod name once logs can be streamed, or throws on failure.
  *
@@ -1385,6 +1406,9 @@ async function waitForPod(
       if (waiting?.reason === "CrashLoopBackOff") {
         throw new PodWaitError("init_container", `Init container "${init.name}" crash loop: ${waiting.message ?? waiting.reason}`);
       }
+      if (waiting?.reason && UNRECOVERABLE_WAITING_REASONS.has(waiting.reason)) {
+        throw new PodWaitError("init_container", `Init container "${init.name}" cannot start (${waiting.reason}): ${waiting.message ?? "no detail"}`);
+      }
     }
 
     // phase=Failed means the pod crashed before we could stream logs.
@@ -1426,6 +1450,9 @@ async function waitForPod(
       }
       if (waiting?.reason === "CrashLoopBackOff") {
         throw new PodWaitError("crash_loop", `Container "${cs.name}" crash loop: ${waiting.message ?? waiting.reason}`);
+      }
+      if (waiting?.reason && UNRECOVERABLE_WAITING_REASONS.has(waiting.reason)) {
+        throw new PodWaitError("startup", `Container "${cs.name}" cannot start (${waiting.reason}): ${waiting.message ?? "no detail"}`);
       }
     }
 
@@ -1815,7 +1842,7 @@ async function cleanupJob(
       `[paperclip] Warning: ${podTeardownFailureClause(outcome, `job ${jobName}`)}; ` +
         `leaving Job and run Secrets for K8s GC ` +
         `rather than deleting a Secret a live pod mounts${retainCost}\n`,
-    );
+    ).catch(() => undefined);
     return false;
   }
   await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath, podLogPath);
@@ -1842,7 +1869,7 @@ async function deleteJobOnly(
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    await onLog("stderr", `[paperclip] Warning: failed to cleanup job ${jobName}: ${msg}\n`);
+    await onLog("stderr", `[paperclip] Warning: failed to cleanup job ${jobName}: ${msg}\n`).catch(() => undefined);
   }
 }
 
@@ -2680,10 +2707,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // contention — 8 concurrent pods on one node measured 11m12s–12m36s from
     // schedule to container start, of which the transfer itself was 2–33s and
     // the rest was queueing behind one uncached 3.3 GB layer set.  Every real
-    // failure mode (ErrImagePull/ImagePullBackOff/CrashLoopBackOff/
-    // Unschedulable/init-container exit) is detected and thrown above without
-    // waiting for this deadline, so this is only the backstop for a pod that is
-    // still legitimately working — and it must outlast a cold-image wave.
+    // failure mode (ErrImagePull/ImagePullBackOff/InvalidImageName/
+    // CrashLoopBackOff/CreateContainerConfigError/CreateContainerError/
+    // Unschedulable/phase=Failed/init-container exit) is detected and thrown
+    // above without waiting for this deadline, so this is only the backstop for
+    // a pod that is still legitimately working — and it must outlast a cold-
+    // image wave.  See UNRECOVERABLE_WAITING_REASONS: the enumeration is what
+    // makes the longer deadline safe, so a reason added to the kubelet's
+    // vocabulary belongs there, not here.
     const startTimeoutMs = Math.max(0, asNumber(config.podStartTimeoutSec, 1800)) * 1000;
     try {
       podName = await waitForPod(namespace, jobName, jobUid, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);

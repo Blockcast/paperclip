@@ -2021,6 +2021,72 @@ describe("execute: waitForPod edge cases", () => {
     expect(result.errorMessage).toContain("crash loop");
   });
 
+  // ── BLO-35486: CreateContainerConfigError must not ride the start deadline ──
+  //
+  // `secret "ac-…-env" not found` puts the pod in CreateContainerConfigError:
+  // phase stays Pending, PodScheduled stays True, so neither the phase=Failed
+  // throw nor the Unschedulable throw fires. Before this, the only exit was the
+  // start deadline — which this PR raised 600s → 1800s, so a residual instance
+  // of this very bug would take 30 minutes to surface, as "Timed out waiting
+  // for pod containers to start" rather than as the missing Secret.
+  it("throws immediately when the main container is in CreateContainerConfigError", async () => {
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
+        status: {
+          phase: "Pending",
+          conditions: [{ type: "PodScheduled", status: "True" }],
+          initContainerStatuses: [],
+          containerStatuses: [{
+            name: "claude",
+            state: {
+              waiting: {
+                reason: "CreateContainerConfigError",
+                message: 'secret "ac-e0a5011d-run-env" not found',
+              },
+            },
+          }],
+        },
+      }],
+    });
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("CreateContainerConfigError");
+    expect(result.errorMessage).toContain('secret "ac-e0a5011d-run-env" not found');
+    // The point of the test: the real cause, not the 1800s backstop.
+    expect(result.errorMessage).not.toContain("pod containers to start");
+  });
+
+  it("throws immediately when an init container is in CreateContainerConfigError", async () => {
+    mockCoreListPods.mockResolvedValue({
+      items: [{
+        metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
+        status: {
+          phase: "Pending",
+          conditions: [{ type: "PodScheduled", status: "True" }],
+          initContainerStatuses: [{
+            name: "write-prompt",
+            state: {
+              waiting: {
+                reason: "CreateContainerConfigError",
+                message: 'secret "ac-e0a5011d-run-prompt" not found',
+              },
+            },
+          }],
+          containerStatuses: [],
+        },
+      }],
+    });
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("CreateContainerConfigError");
+    expect(result.errorMessage).not.toContain("pod containers to start");
+  });
+
   // ── BLO-34577: a same-name pod from an EARLIER attempt is not this attempt ──
   //
   // The Job name is deterministic per (agentId, runId) and the server's in-run
@@ -2329,6 +2395,42 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
       // The Job is left behind too — deleting it would let ownerReference GC
       // reap the Secrets, which is the same hazard by another route.
       expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Ally Suggestion on #2099 at 09154619: the retention warning was the last
+  // `await onLog` on the normal teardown path without a `.catch`. Its
+  // `cleanupJob` call sites are all supervised, but one of them is the
+  // `finally` block — and a rejecting onLog there replaces the run's actual
+  // result with a teardown-logging rejection, losing the diagnosis entirely.
+  it("still returns the run result when onLog rejects while logging the retention warning", async () => {
+    vi.useFakeTimers();
+    try {
+      // Same shape as the retention test above: the pod outlives teardown, so
+      // the warning fires.
+      mockCoreDeleteCollectionPods.mockResolvedValue({});
+
+      let retentionLogged = false;
+      const promise = execute(
+        makeCtx({
+          config: { podStartTimeoutSec: 0, env: { MY_API_KEY: "s3cret" } },
+          onLog: vi.fn(async (_stream: string, message: string) => {
+            if (message.includes("leaving Job and run Secrets")) {
+              retentionLogged = true;
+              throw new Error("log transport closed");
+            }
+          }),
+        } as Partial<AdapterExecutionContext>),
+      );
+      await vi.advanceTimersByTimeAsync(90_000);
+      const result = await promise;
+
+      // Guard against a vacuous pass: the rejecting log must have been reached.
+      expect(retentionLogged).toBe(true);
+      expect(result.errorMessage).toContain("Pod startup failed");
+      expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -2713,6 +2815,33 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
 
       // Guard against a vacuous pass: the rejecting log must have been reached.
       expect(onLog).toHaveBeenCalled();
+      expect(mockBatchDeleteJob).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Ally Suggestion on #2099 at 09154619: `deleteJobOnly`'s own failure warning
+  // was the last unguarded `await onLog` reachable from the unsupervised cancel
+  // path (teardownCancelledJob → deleteJobOnly). It only fires when the Job
+  // delete already failed, so the Job is retained either way — the guard turns
+  // an unhandled rejection into a silent return.
+  it("still returns when onLog rejects while logging a Job-delete failure", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
+      mockBatchDeleteJob.mockRejectedValue(
+        Object.assign(new Error("jobs is forbidden"), { code: 403 }),
+      );
+      const onLog = vi.fn().mockRejectedValue(new Error("log transport closed"));
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await expect(promise).resolves.toBeUndefined();
+
+      // Guard against a vacuous pass: the Job delete must have been attempted
+      // and refused, or the warning is never reached.
       expect(mockBatchDeleteJob).toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
