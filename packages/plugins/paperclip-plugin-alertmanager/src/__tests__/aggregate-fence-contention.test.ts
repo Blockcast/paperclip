@@ -749,8 +749,8 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
 
     const releasedAt = Date.now();
     holdFirst.resolve();
-    await expect(a).resolves.toBeUndefined();
-    await expect(b).resolves.toBeUndefined();
+    await expect(a).resolves.toEqual({ accepted: 1 });
+    await expect(b).resolves.toEqual({ accepted: 1 });
     const handoffMs = Date.now() - releasedAt;
 
     // The discriminating assertion. B's own timer could not have fired for
@@ -940,8 +940,8 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
 
     const releasedAt = Date.now();
     holdC.resolve();
-    await expect(c).resolves.toBeUndefined();
-    await expect(b).resolves.toBeUndefined();
+    await expect(c).resolves.toEqual({ accepted: 1 });
+    await expect(b).resolves.toEqual({ accepted: 1 });
 
     // B's own timer could not fire for another ~5s, so finishing this quickly
     // proves C's release reached B through the queue it was put back on.

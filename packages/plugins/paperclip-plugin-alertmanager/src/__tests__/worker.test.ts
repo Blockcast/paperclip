@@ -834,7 +834,7 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
     // become the one metric that can fail a delivery and force a retry.
     await expect(
       handleWebhook(ctx, baseConfig(), true, baseInput()),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ accepted: 1 });
 
     expect(
       mocks.logger.error.mock.calls
