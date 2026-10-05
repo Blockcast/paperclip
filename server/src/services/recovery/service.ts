@@ -12984,6 +12984,12 @@ export function recoveryService(
             // operator legibility only; the marker would still dedup correctly without it,
             // because it embeds the unique `action.id` (an earlier version of this comment
             // claimed a null horizon would collide across rows — it would not).
+            //
+            // `createdAt` is deliberately NOT null-guarded, though the read model widens it to
+            // `Date | string | null`: the derived arm selects on `lte(createdAt, …)`, which
+            // never matches SQL NULL, and the persisted arm does not reach this branch. If you
+            // widen that predicate, guard this first — `new Date(null)` is the epoch, so a null
+            // would render a 1970 horizon into an operator notice instead of failing.
             : new Date(
               new Date(action.createdAt).getTime() + recoveryActionBoundsConfig().timeoutMs,
             ).toISOString();
