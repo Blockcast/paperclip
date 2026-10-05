@@ -6215,9 +6215,11 @@ export function recoveryService(
         : recoveryCause === "codex_output_inactivity_monitor"
           ? "Retry the same agent from durable progress after the output-inactivity termination."
         : recoveryCause === "workspace_validation_failed"
-          ? readWorkspaceValidationPayload(input.latestRun)?.reason === "git_worktree_branch_incoherence"
-            ? "Repair the source issue git worktree branch incoherence, or choose a new execution workspace, before resuming adapter execution."
-            : "Repair the source issue workspace link, project workspace cwd, or git checkout before resuming adapter execution."
+          // BLO-19924: no `git_worktree_branch_incoherence` arm here. This cause now
+          // requires `gitProbeState: "checkout"`, and the sole producer of that field
+          // (heartbeat.ts:4132-4145) always writes reason
+          // `k8s_agent_home_git_bootstrap_unsupported`, so that arm was unreachable.
+          ? "Repair the source issue workspace link, project workspace cwd, or git checkout before resuming adapter execution."
         : recoveryCause === "configuration_incomplete"
           ? "Bind the missing secret(s) named in the run failure to the agent/project/routine env before resuming adapter execution."
         : recoveryCause === "execution_review_participant_recovery"
