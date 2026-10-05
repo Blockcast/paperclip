@@ -7558,14 +7558,14 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             // `heartbeat_runs` has no way to tell "the reviewer found nothing"
             // from "the findings were lost".
             //
-            // Persisted only: nothing projects this key INTO the run. The
-            // directive `buildPaperclipTaskMarkdown` renders is unchanged, so
-            // the run itself still infers the no-op from absence. Making it
-            // run-visible means a `derivePaperclipPrReview` passthrough plus a
-            // rendered line -- a behavior change this issue's AC does not ask
-            // for ("persisted OR returned"), and one the sibling
-            // `githubReviewFeedbackActionable` needs equally. Tracked in
-            // BLO-38816, deliberately not widened into this diff.
+            // Run-visible, not only persisted: BLO-38816's reader landed on
+            // master ahead of this writer. `derivePaperclipPrReview` projects
+            // both keys and `buildPaperclipTaskMarkdown` renders a decline line
+            // keyed on the reason and withholds the push-a-follow-up directive,
+            // so writing them here changes what the woken run is told, not just
+            // the `heartbeat_runs` row. That exceeds this issue's AC
+            // ("persisted OR returned"); the rendering is pinned by the
+            // BLO-38816 tests in `heartbeat-context-summary.test.ts`.
             ...(reviewFeedbackSuppression
               ? {
                   githubReviewFeedbackSuppressionReason: reviewFeedbackSuppression.reason,
