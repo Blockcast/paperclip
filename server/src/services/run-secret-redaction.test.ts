@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
+import { MAX_PERSISTED_LOG_CHUNK_CHARS, sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
 import {
+  RUN_SECRET_CARRY_MAX_HOLD_CHARS,
   RUN_SECRET_MASK,
   buildRunSecretRedactionPlan,
   createRunSecretBoundaryCarry,
@@ -378,6 +379,25 @@ describe("BLO-39715: chunk-boundary splits", () => {
     const next = "n".repeat(carry.holdbackChars);
     expect(carry.take("stdout", ` done\n${next}`)).toBe(`${longLine} done\n`);
     expect(carry.take("stdout", "", { flush: true })).toBe(next);
+  });
+
+  it("bounds the hold when a stream never emits a newline", () => {
+    // Ally (paperclip#2213, Important): `\r` progress output has no newline and stderr has no
+    // keepalive, so an unbounded line hold kept the whole stream in memory and persisted nothing.
+    const carry = createRunSecretBoundaryCarry(PLAN.needles);
+    const chunk = `${"x".repeat(200)}\r`;
+    const count = Math.ceil((RUN_SECRET_CARRY_MAX_HOLD_CHARS * 3) / chunk.length);
+    let emitted = "";
+    for (let i = 0; i < count; i += 1) emitted += carry.take("stderr", chunk);
+    const held = carry.take("stderr", "", { flush: true });
+
+    expect(emitted.length).toBeGreaterThan(0);
+    expect(held.length).toBeLessThanOrEqual(RUN_SECRET_CARRY_MAX_HOLD_CHARS + carry.holdbackChars);
+    expect(emitted + held).toBe(chunk.repeat(count));
+  });
+
+  it("caps the hold at one persisted chunk", () => {
+    expect(RUN_SECRET_CARRY_MAX_HOLD_CHARS).toBe(MAX_PERSISTED_LOG_CHUNK_CHARS);
   });
 
   it("is an identity function when there is nothing to redact", () => {
