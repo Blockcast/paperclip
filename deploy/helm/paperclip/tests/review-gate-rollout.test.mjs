@@ -28,7 +28,6 @@ function render(template, extraArgs = []) {
   );
 }
 
-
 // PEN-2073 step 3 taken 2026-10-04 (BLO-38934): capture is ON in
 // values.blockcast.yaml, the authority is still OFF. Capture-only performs a
 // database insert and makes no GitHub call, so this asserts the live rollout
@@ -57,6 +56,28 @@ test("Blockcast rollout captures deliveries with the authority still disabled", 
       rendered,
       /- name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID\n\s+value: "138085375"/,
     );
+  }
+});
+
+// The false arm of both gates: statefulset.yaml gates the four capture vars on
+// reviewGateCaptureEnabled and PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED separately.
+// render() loads values.blockcast.yaml, where capture is on since step 3, so
+// this has to force it off to exercise the chart default every non-Blockcast
+// consumer gets during the staged rollout.
+test("capture disabled renders no review-gate configuration", () => {
+  const rendered = render("templates/statefulset.yaml", [
+    "--set",
+    "githubApp.reviewGateCaptureEnabled=false",
+  ]);
+
+  for (const name of [
+    "PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED",
+    "PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED",
+    "PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES",
+    "PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID",
+    "PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID",
+  ]) {
+    assert.doesNotMatch(rendered, new RegExp(`- name: ${name}`));
   }
 });
 
@@ -162,6 +183,16 @@ test("incomplete or out-of-order review-gate enablement fails the Helm render", 
       "--set-json",
       "env.extra=[]",
     ]),
-    /requires a GITHUB_WEBHOOK_SECRET entry in env\.extra/,
+    /requires a non-empty GITHUB_WEBHOOK_SECRET entry in env\.extra/,
+  );
+  // A literal empty value renders, then throws in config.ts at boot instead.
+  assert.throws(
+    () => render("templates/statefulset.yaml", [
+      "--set",
+      "githubApp.reviewGateCaptureEnabled=true",
+      "--set-json",
+      'env.extra=[{"name":"GITHUB_WEBHOOK_SECRET","value":""}]',
+    ]),
+    /requires a non-empty GITHUB_WEBHOOK_SECRET entry in env\.extra/,
   );
 });

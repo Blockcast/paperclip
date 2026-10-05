@@ -174,13 +174,18 @@ rendered:
 {{- fail "githubApp.reviewGateCaptureEnabled requires githubApp.prReviewGateStatusContext" -}}
 {{- end -}}
 {{- $hasWebhookSecret := false -}}
+{{/* A literal empty value renders fine and then throws in config.ts at boot, so
+it does not count as bound. A valueFrom entry carries no literal here and is not
+checkable from a template, so secretKeyRef bindings keep passing. */}}
 {{- range $entry := (.Values.env).extra -}}
 {{- if eq (toString ($entry.name | default "")) "GITHUB_WEBHOOK_SECRET" -}}
+{{- if not (and (hasKey $entry "value") (empty (toString ($entry.value | default "")))) -}}
 {{- $hasWebhookSecret = true -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
 {{- if not $hasWebhookSecret -}}
-{{- fail "githubApp.reviewGateCaptureEnabled requires a GITHUB_WEBHOOK_SECRET entry in env.extra" -}}
+{{- fail "githubApp.reviewGateCaptureEnabled requires a non-empty GITHUB_WEBHOOK_SECRET entry in env.extra" -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
