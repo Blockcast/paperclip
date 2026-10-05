@@ -788,9 +788,21 @@ describe("issue wake diagnostic reason allowlist", () => {
     // Depth-1 `reason` column present, value not statically resolvable. Named, not
     // dropped, so a site cannot hide here.
     const dynamic: { line: number; expr: string }[] = [];
-    // No depth-1 `reason` key found at all. Must stay empty: `reason` is NOT NULL on
-    // `agent_wakeup_requests`, so an opener with no reason column means the scan
-    // failed to read the block, not that the writer omitted the column.
+    // No depth-1 `reason` key found at all. Must stay empty — but NOT because the
+    // column is NOT NULL. It is nullable: `reason: text("reason")` carries no
+    // `.notNull()` (`packages/db/src/schema/agent_wakeup_requests.ts`, where `source`
+    // and `status` on the same table do), and `heartbeat.ts` writes
+    // `reason: opts.reason ?? null`, which a NOT NULL column would reject. An earlier
+    // revision of this comment asserted the constraint and built the invariant on it;
+    // that was false, and it was false in a test whose whole job is telling "the scan
+    // went blind" apart from "nothing was there".
+    //
+    // The invariant that actually holds is weaker and empirical: every writer that
+    // exists TODAY sets the column at depth 1. So an entry here has two possible
+    // causes and the assertion cannot tell them apart — either the scan failed to read
+    // the block (desynced depth walk, opener regex drift), or a new writer genuinely
+    // omits the key and must be classified here deliberately. The failure message
+    // names both, so the next engineer checks the writer as well as the scanner.
     const unaccounted: number[] = [];
     let openerCount = 0;
     const openers = /insert\(agentWakeupRequests\)\s*\n?\s*\.?\s*values\(\{/g;
@@ -830,10 +842,19 @@ describe("issue wake diagnostic reason allowlist", () => {
         // `reason: "some_literal"` at one of those four sites resolve normally.
         //
         // Both forms must be in KEY position. Walking back over whitespace to a `{`
-        // or `,` is what stops a *string value* that happens to contain "reason,"
-        // (`triggerDetail: "some reason, here"`) from matching and pre-empting the
-        // real key further down the block -- a false positive would classify a
-        // resolvable site as dynamic, which is the same silence this change removes.
+        // or `,` rejects the common shape of a *string value* that happens to contain
+        // "reason," (`triggerDetail: "some reason, here"` -- the back-walk lands on a
+        // letter) before it can pre-empt the real key further down the block. A false
+        // positive there would classify a resolvable site as dynamic, which is the
+        // same silence this change removes.
+        //
+        // ⚠️ It is a heuristic, not a guarantee, and an earlier revision of this
+        // comment claimed the stronger thing. A string containing `", reason,"` puts a
+        // real comma immediately before the match, so the back-walk accepts it and the
+        // shorthand branch fires on a string body. No such literal exists in
+        // `heartbeat.ts` today -- that is a measurement, not a property, and the
+        // honest fix if one ever lands is to skip string spans rather than to widen
+        // this walk.
         let back = i - 1;
         while (back >= 0 && /\s/.test(block[back]!)) back--;
         if (back >= 0 && block[back] !== "{" && block[back] !== ",") continue;
@@ -929,9 +950,18 @@ describe("issue wake diagnostic reason allowlist", () => {
     // A depth walk desynced by an unbalanced brace, a writer the opener regex stops
     // matching, or a reason spelling the classifier cannot read all land here instead
     // of silently shrinking the resolved set.
+    //
+    // `reason` is nullable (see the `unaccounted` declaration), so a hit here does NOT
+    // prove the scan broke — a new writer may legitimately omit the key. Both causes
+    // are named in the message because they have opposite remedies: fix the scanner,
+    // or classify the new writer here on purpose.
     expect(
       unaccounted,
-      "direct-insert openers whose depth-1 `reason` column the scan could not find at all (heartbeat.ts lines)",
+      "direct-insert openers with no depth-1 `reason` key the scan could read (heartbeat.ts lines). " +
+        "Two causes, opposite fixes: (a) the scan went blind — depth walk desynced by an unbalanced " +
+        "brace in a string property, or the opener regex stopped matching the writer; or (b) a new " +
+        "writer genuinely omits the column, which is schema-valid because `reason` is nullable — " +
+        "classify it here deliberately. Check the named writer before assuming the scanner",
     ).toEqual([]);
     expect(
       sites.length + dynamic.length,
