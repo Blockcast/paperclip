@@ -3610,6 +3610,33 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect((await readIssue(issueId))?.status).toBe("done");
     });
 
+    it("does not let a self-authored comment vouch for an unresolved sibling id in the same wake", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId, status: "done" });
+      const selfCommentId = await seedIssueComment({
+        companyId,
+        issueId,
+        createdByRunId: failedRunId,
+      });
+      // A deleted comment: the id resolves to no row. Alone it reads as
+      // reopen-eligible; batched beside a self-authored id it must too.
+      const vanishedCommentId = randomUUID();
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        reason: "issue_comment_added",
+        requestedByActorType: "user",
+        wakeCommentIds: [selfCommentId, vanishedCommentId],
+      });
+
+      const result = await drainSweep().sweepStaleIssueLocks();
+
+      expect(result.drainedDeferredWakeCancellationWakeIds).toEqual([]);
+      expect(result.drainedDeferredWakePromotionWakeIds).toEqual([wakeId]);
+      expect((await readIssue(issueId))?.status).toBe("todo");
+    });
+
     it("records a drained promotion as promoted, not as the deferral it carried", async () => {
       const { companyId, agentId } = await seed();
       const issueId = await seedLocklessIssue({ companyId, agentId });
