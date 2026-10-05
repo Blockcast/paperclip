@@ -92,6 +92,18 @@ spec:
         paperclip.dev/purpose: migration-preflight
     spec:
       restartPolicy: Never
+      # Every node in this cluster carries a NoSchedule taint, so an untolerated
+      # pod has nowhere to land at all. Run 37342387937 sat FailedScheduling on
+      # 0/21 nodes for its entire startup budget and reported INCONCLUSIVE,
+      # which fails the deploy closed -- a scheduling gap read as a migration
+      # verdict. Match the landing zone every other paperclip workload uses.
+      nodeSelector:
+        workload: paperclip
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: paperclip
+          effect: NoSchedule
       containers:
         - name: preflight
           image: ${IMAGE_REPO}@${DIGEST}

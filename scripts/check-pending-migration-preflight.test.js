@@ -112,3 +112,17 @@ test("pre-flight always surfaces the remediation output", () => {
   assert.notEqual(logsAt, -1, "the script must print the job logs");
   assert.ok(logsAt < passAt, "logs must be printed before the pass/fail branch, so both paths show them");
 });
+
+test("pre-flight job can actually be scheduled", () => {
+  // Every node carries a NoSchedule taint, so a Job with no nodeSelector and no
+  // toleration is unschedulable everywhere: it burns the startup budget on
+  // FailedScheduling and returns INCONCLUSIVE, which fails the deploy closed.
+  // Measured on run 37342387937: "0/21 nodes are available: 21 node(s) had
+  // untolerated taint(s)".
+  assert.match(script, /^\s+nodeSelector:\n\s+workload: paperclip$/m, "the pre-flight job must target the paperclip node pool");
+  assert.match(
+    script,
+    /^\s+tolerations:\n(?:.*\n)*?\s+-\s+key:\s+dedicated$/m,
+    "the pre-flight job must tolerate the dedicated=paperclip taint those nodes carry",
+  );
+});
