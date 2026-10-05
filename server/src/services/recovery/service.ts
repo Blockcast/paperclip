@@ -14502,7 +14502,7 @@ export function recoveryService(
           // agent and ask the question that survives without one: is this agent
           // waking itself about its own comment?
           const commentAuthorAgentIds = await db
-            .select({ runAgentId: heartbeatRuns.agentId })
+            .select({ commentId: issueComments.id, runAgentId: heartbeatRuns.agentId })
             .from(issueComments)
             .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, issueComments.createdByRunId))
             .where(
@@ -14512,9 +14512,15 @@ export function recoveryService(
                 inArray(issueComments.id, commentIds),
               ),
             );
-          commentWakeIsSelfAuthored =
-            commentAuthorAgentIds.length > 0 &&
-            commentAuthorAgentIds.every((row) => row.runAgentId === candidate.agentId);
+          // Reduced over the INPUT ids, not the returned rows: reducing over the
+          // rows let one resolvable self-authored id vouch for an unresolved
+          // sibling, failing closed (cancel) exactly where the rule below says open.
+          const authorByCommentId = new Map(
+            commentAuthorAgentIds.map((row) => [row.commentId, row.runAgentId]),
+          );
+          commentWakeIsSelfAuthored = commentIds.every(
+            (id) => authorByCommentId.get(id) === candidate.agentId,
+          );
           // Fails OPEN, deliberately and in the same direction as the promoter:
           // a comment id that resolves to no row — deleted, or scoped to a
           // different issue, since the query filters on `issueId` — leaves this
