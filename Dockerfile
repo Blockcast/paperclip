@@ -645,7 +645,10 @@ COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-serve
 # /usr/local/libexec rather than /usr/local/bin: these are chain-loaded by
 # PATH/config indirection, not meant to be picked up by a human typing a name,
 # and keeping them out of the ordinary bin dirs makes the shadowing deliberate.
-COPY --chmod=0755 --exclude=README.md docker/github-wrappers/ /usr/local/libexec/paperclip/bin/
+#
+# The exclude is a glob rather than README.md: everything in this directory is
+# installed executable at 0755, so a doc file added later would ship as one.
+COPY --chmod=0755 --exclude=*.md docker/github-wrappers/ /usr/local/libexec/paperclip/bin/
 COPY --from=penstock-agent-runtime /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
 COPY --from=caveman-proxy /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
 COPY --from=ponytail-marketplace /opt/penstock/ponytail /opt/penstock/ponytail

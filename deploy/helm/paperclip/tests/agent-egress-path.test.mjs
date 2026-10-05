@@ -423,9 +423,24 @@ test("an env.path override that drops the root-owned image wrapper directory is 
   assert.match(stderr, /\/usr\/local\/libexec\/paperclip\/bin/);
 });
 
-// A positive control for the three rejections above: the validation has to
+// PEN-3713, the same silent reinstatement reached by reordering rather than
+// omission. Every directory is present and every one precedes /usr/bin, so each
+// per-directory check passes — but `gh` resolves to the first match, and that is
+// the PVC copy uid 1000 can rewrite. This rendered green until the order check
+// landed; the assertion at the top of this file stating that relative order is
+// "the thing that decides which file runs" was only ever exercised against
+// correctly-ordered inputs.
+test("an env.path override that puts the PVC wrapper directories ahead of the root-owned one is rejected", () => {
+  const stderr = renderExpectingFailure([
+    `env.path=/paperclip/.local/bin:/paperclip/bin:${IMAGE_WRAPPER_BIN}:/usr/bin:/bin`,
+  ]);
+  assert.match(stderr, /must keep the Paperclip GitHub egress wrapper/);
+  assert.match(stderr, /\/usr\/local\/libexec\/paperclip\/bin/);
+});
+
+// A positive control for the four rejections above: the validation has to
 // discriminate, not refuse everything. Without this, a helper that failed
-// unconditionally would pass all three.
+// unconditionally would pass all four.
 test("an env.path override that keeps the wrappers first is accepted", () => {
   const rendered = render("templates/statefulset.yaml", {
     set: [
@@ -536,7 +551,7 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
   assert.match(
     dockerfile,
     new RegExp(
-      `COPY --chmod=0755 --exclude=README\\.md docker/github-wrappers/ ${IMAGE_WRAPPER_BIN}/`,
+      `COPY --chmod=0755 --exclude=\\*\\.md docker/github-wrappers/ ${IMAGE_WRAPPER_BIN}/`,
     ),
     "Dockerfile must install the wrappers into the directory the chart puts on PATH",
   );
@@ -595,6 +610,14 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
 // copies of one rule and can drift. They are compared after rewriting the PVC
 // directory to the image directory, which is the only difference either copy is
 // allowed to have.
+//
+// Scope this test does NOT cover, so the next person to debug it does not have
+// to infer it: both sides are compared line-by-line AFTER trimming each line, so
+// indentation drift is invisible here. That is deliberate — the seed copy is a
+// heredoc nested inside YAML and carries the block's indentation, which the repo
+// copy cannot have — but it means a wrapper reindented on one side only will
+// pass. Shell is whitespace-insensitive at this granularity, so the behaviour
+// under test is unaffected; the limit is on what a green result proves.
 test("the repo wrapper files and the seed heredocs are the same scripts", () => {
   const rendered = render("templates/statefulset.yaml");
   for (const name of [
