@@ -591,10 +591,17 @@ jobs:
       #
       # PEN-3315 adds two more. The supersede suite pins that guard (1)'s new
       # bounded exit approves nothing and refuses a run whose target is still
-      # current; the record suite pins that superseding a run cannot reset the
-      # escalation's stall clock. Both properties are unobservable in production
-      # until a deploy is already stuck for hours, which is the wrong moment to
-      # discover either of them regressed.
+      # current; the record suite pins how the record-derived clock sources
+      # resolve. Its follow-up adds the chain suite, which is what pins that
+      # superseding a run cannot reset the escalation's stall clock here.
+      # (Until 2026-10-05 this credited the record suite with that property.
+      # On THIS repository the record is permanently null: `has_issues` is
+      # false, so `POST /issues` is a hard 410 — see deploy-stall-chain.mjs.
+      # deploy-stall-chain.test.mjs pins it: "THE REGRESSION: the 2026-09-18
+      # incident ages at ~46h, not 3h" and "never moves the clock later".)
+      # These properties are unobservable in production until a deploy is
+      # already stuck for hours, which is the wrong moment to discover any of
+      # them regressed.
       #
       # PEN-3744 adds the delivery-gap suite. Its subject is a property of the
       # DELIVERED text, not of the code: the Slack relay forwards `summary`

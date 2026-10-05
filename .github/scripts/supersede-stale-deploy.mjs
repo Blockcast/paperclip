@@ -254,8 +254,10 @@ function declined(reason, detail) {
  * cleared the stall — and would close the durable record as *resolved* while
  * nothing has shipped, where such a record exists. On THIS repository it does
  * not (`has_issues: false`, so `POST /issues` is a hard 410; see
- * deploy-stall-chain.mjs): STALL_ISSUE_NUMBER is always empty here (workflow
- * :336), so this function takes its early return below and only the step
+ * deploy-stall-chain.mjs): STALL_ISSUE_NUMBER is always empty here, because
+ * the workflow binds it from the `escalate` step's `stall_issue_number` output,
+ * which post-pending-deploy-alert.mjs only sets when it holds a record
+ * number. So this function takes its early return below and only the step
  * outputs carry the signal.
  * Until 2026-10-04 this paragraph presented the record as live here.
  *
