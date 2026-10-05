@@ -1876,6 +1876,20 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         `config.workspaceMountPath must not collide with inherited secret mount "${sv.volumeName}" at ${normalized}`,
       );
     }
+    // NOTE the asymmetry with `SelfPodSecretVolume.optional` (PEN-3705), which
+    // is decided the other way on purpose. There, an ABSENT credential Secret
+    // now wedges the Job rather than starting the agent blind, because
+    // `PAPERCLIP_GITHUB_TOKEN_FILE` points inside the mount and the path falls
+    // through to the agent-writable shared PVC underneath. Here, a COLLIDING
+    // path still silently drops the inherited volume — so an operator who
+    // mounts something at exactly that path gets the same substitution shape
+    // the `optional` change closed.
+    //
+    // That is a deliberate trade, not an oversight: a collision needs an
+    // operator to have configured one, whereas a missing Secret is ordinary
+    // platform drift that must not wedge every run in the fleet. Tracked as
+    // PEN-3808. If this is ever revisited, note it is a behaviour change with
+    // its own blast radius, not a comment fix.
     if (claimedMountPaths.has(normalized)) continue;
     claimedMountPaths.set(normalized, sv.volumeName);
     volumes.push({
