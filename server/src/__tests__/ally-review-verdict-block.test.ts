@@ -1693,6 +1693,29 @@ describe("BLO-32695 — the block and the prose must not name different counts",
       ).toBe("unreadable");
     }
   });
+
+  /**
+   * Ally, #1721 at 2dfdfafe, supplementary Important. The cross-check is a
+   * partial backstop. Each of these forms blocks a body with no block, but a
+   * readable block stating zero is trusted over it. The list is stated at
+   * EMITTED_COUNTED_FINDINGS_BUCKET_PATTERN; this pins it, so a form the
+   * cross-check starts reading fails here and the comment is updated with it.
+   * It records the gap and does not endorse it.
+   */
+  it.each([
+    "- Critical Issues (2)",
+    "1. Critical Issues (2)",
+    "### Critical Issues (2) \u2014 see inline comments",
+    "### Critical Issues",
+    "**Critical Issues**",
+    "> ### Critical Issues (2)",
+  ])("states its uncovered bucket form %j", (form) => {
+    const prose = ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${PR1675_HEAD}`, form, "- Token is logged in plaintext."].join("\n");
+    const zeroed = [verdictBlock({ head: PR1675_HEAD, findings: { critical: 0, important: 0 } }), "", prose].join("\n");
+    expect(hasActionablePrReviewFeedback(prose)).toBe(true);
+    expect(parseAllyVerdictBlock(zeroed).kind).toBe("ok");
+    expect(hasActionablePrReviewFeedback(zeroed)).toBe(false);
+  });
 });
 
 /**
