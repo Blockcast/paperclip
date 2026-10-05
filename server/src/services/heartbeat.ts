@@ -32040,10 +32040,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
         // BLO-39715: run progress is a property of what the adapter SENT, so it is classified
         // here, on the arriving chunk, before the carry re-slices the stream. The carry's
-        // output is the wrong input on both counts. It is cut at an arbitrary offset, so a
-        // keepalive split mid-line fails the anchored `isSyntheticNonProgressRunLogChunk`
-        // match and would stamp a silent run as active, which disarms the external-lifecycle
-        // silence reaper. And it is empty while the window fills, so stamping on it would
+        // output is the wrong input on both counts. It is not arrival-aligned: held lines are
+        // released together with a later arrival, so classifying it would credit output to
+        // the wrong moment. And it is empty while the window fills, so stamping on it would
         // record nothing for real early output and let a live run accrue silence from
         // `startedAt`. An empty arrival is the settle flush below, not output, so it stamps
         // nothing.
@@ -32066,9 +32065,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
         // The excerpt is a copy of persisted bytes, so it classifies the bytes it copies, not
         // the arrival: gating it on `countsAsRunProgress` would drop real output whenever its
-        // held-back tail is released by a keepalive arrival. The cost runs the other way: a
-        // keepalive cut by the carry can reach the excerpt, and so `classifyRunLiveness`'s
-        // useful-output check, but no real output byte is lost.
+        // held-back tail is released by a keepalive arrival. The carry emits whole lines only,
+        // so a keepalive reaches this anchored match intact and stays out of the excerpt (and
+        // so out of `classifyRunLiveness`'s useful-output check). One released in the same
+        // emission as real output does reach the excerpt, next to output that is genuinely
+        // useful.
         const belongsInExcerpt = !isSyntheticNonProgressRunLogChunk(sanitizedChunk);
         if (belongsInExcerpt && stream === "stdout") {
           stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);

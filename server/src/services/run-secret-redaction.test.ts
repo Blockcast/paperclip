@@ -349,6 +349,37 @@ describe("BLO-39715: chunk-boundary splits", () => {
     expect(carry.take("stdout", "", { flush: true })).toBe("OUT-ONLY");
   });
 
+  it("emits whole lines only, so per-line classifiers still match what arrived", () => {
+    // Ally (paperclip#2213, Critical): the heartbeat excerpt filter and run-liveness anchor
+    // per line. Splitting at `len - holdbackChars` emitted every keepalive with its head or
+    // tail missing, so none matched and each one reached the useful-output check.
+    const lines = [15, 30, 45, 60, 75].map(
+      (s) => `[paperclip] keepalive: claude_k8s job ac-x still running (${s}s since last output)\n`,
+    );
+    const carry = createRunSecretBoundaryCarry(PLAN.needles);
+    const emitted = lines.map((line) => carry.take("stdout", line));
+    emitted.push(carry.take("stdout", "", { flush: true }));
+
+    expect(carry.holdbackChars).toBeGreaterThan(0);
+    expect(emitted.join("")).toBe(lines.join(""));
+    const nonEmpty = emitted.filter(Boolean);
+    expect(nonEmpty.length).toBeGreaterThan(1);
+    for (const out of nonEmpty) {
+      for (const line of out.split(/(?<=\n)/)) expect(lines).toContain(line);
+    }
+  });
+
+  it("holds an unterminated line until its newline is past the window, or the flush", () => {
+    const carry = createRunSecretBoundaryCarry(PLAN.needles);
+    const longLine = "x".repeat(carry.holdbackChars * 3);
+    // No newline yet, so nothing is released even though the window is long full.
+    expect(carry.take("stdout", longLine)).toBe("");
+    // The newline is released once at least `holdbackChars` follow it.
+    const next = "n".repeat(carry.holdbackChars);
+    expect(carry.take("stdout", ` done\n${next}`)).toBe(`${longLine} done\n`);
+    expect(carry.take("stdout", "", { flush: true })).toBe(next);
+  });
+
   it("is an identity function when there is nothing to redact", () => {
     // A run with no secrets must be byte-for-byte unchanged and pay no streaming latency.
     const carry = createRunSecretBoundaryCarry([]);
