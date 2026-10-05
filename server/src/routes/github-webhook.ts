@@ -6243,7 +6243,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             repoFullName: retargetRepoFullName,
             headRef: retargetedFromRef,
             // Inline on the webhook path: bound to the request deadline, not
-            // ghFetch's 30s default, so GitHub gets its answer (BLO-38257).
+            // the 30s default fetch deadline, so GitHub gets its answer (BLO-38257).
             signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
           });
         if (mergedBase?.outcome === "error") {
