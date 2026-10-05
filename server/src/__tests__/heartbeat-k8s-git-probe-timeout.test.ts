@@ -4,11 +4,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   companies,
   createDb,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -202,6 +204,31 @@ describeEmbeddedPostgres("claude_k8s agent-home git probe timeout", () => {
         }),
       });
       expect(adapterExecute).not.toHaveBeenCalled();
+
+      // BLO-19924: the wiring, not the predicate. Restoring either park site to an
+      // unconditional WORKSPACE_VALIDATION_RECOVERY_CAUSE must fail here — an
+      // inconclusive probe has to land on the ordinary stranded cause, which is the
+      // only one carrying a wake and an attempt budget. `manual_repair_required`
+      // carries neither, so a regression here is silent and permanent.
+      //
+      // Polled: the run row is marked failed before releaseIssueExecutionAndPromote
+      // writes the action, so waitForRunToFinish returning is not proof it exists yet.
+      const deadline = Date.now() + 15_000;
+      let recoveryAction: typeof issueRecoveryActions.$inferSelect | undefined;
+      while (Date.now() < deadline) {
+        [recoveryAction] = await db
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+        if (recoveryAction) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(recoveryAction, "no recovery action was written for the parked issue").toBeDefined();
+      expect(recoveryAction).toMatchObject({
+        cause: "stranded_assigned_issue",
+        wakePolicy: expect.objectContaining({ type: "wake_owner" }),
+      });
+      expect(recoveryAction?.maxAttempts).not.toBeNull();
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
