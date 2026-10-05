@@ -51,6 +51,7 @@
     "test:browserslist-security-override": "node --test scripts/browserslist-security-override.test.js",
     "test:multer-security-override": "node --test scripts/multer-security-override.test.js",
     "test:js-yaml-security-override": "node --test scripts/js-yaml-security-override.test.js",
+    "test:http-cache-semantics-security-override": "node --test scripts/http-cache-semantics-security-override.test.js",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
@@ -143,6 +144,14 @@
           "GHSA-g7r4-m6w7-qqqr"
         ]
       }
+    },
+    "BLO-39519": {
+      "http-cache-semantics": {
+        "patchedRange": ">=4.3.0 <5",
+        "advisories": [
+          "GHSA-ch52-4w7c-c8xp"
+        ]
+      }
     }
   },
   "pnpm": {
@@ -180,6 +189,7 @@
       "jsdom>undici": ">=7.29.1 <8",
       "multer": ">=2.3.0 <3",
       "browserslist": ">=4.28.7 <5",
+      "http-cache-semantics": ">=4.3.0 <5",
       "react": "^19.2.7",
       "react-dom": "^19.2.7",
       "lexical": "0.46.0",
