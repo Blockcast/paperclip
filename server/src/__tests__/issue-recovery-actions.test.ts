@@ -333,6 +333,16 @@ describe("issueRecoveryActionService", () => {
       id: "derived-retired-action",
       status: "escalated",
       retiringBound: "timeout_horizon",
+      // Pinned, not inherited from the helper default: the whole point of this fixture is
+      // the UNCHANGED-owner path. If this ever drifts from the `ownerAgentId` in the upsert
+      // below, `isNewOwnerSequence` goes true, resets `attemptCount` for a different reason,
+      // and the test passes via the branch it is not trying to cover.
+      ownerAgentId: "agent-1",
+      // Above the input `maxAttempts` of 5. A legacy row climbs its counter un-refunded
+      // while `maxAttempts` is null, so the real cohort arrives here well over any budget
+      // it is about to be given. With the counter left at the helper default of 1 this
+      // fixture cannot observe the lift returning an exhausted row to `active`.
+      attemptCount: 9,
       maxAttempts: null,
       timeoutAt: null,
       evidence: { latestRunId: "run-1" },
@@ -381,6 +391,15 @@ describe("issueRecoveryActionService", () => {
       maxAttempts: 5,
     });
     expect(new Date(rebound.timeoutAt as unknown as string).getTime()).toBe(freshHorizon.getTime());
+    // The load-bearing half: un-retiring a row that is still over budget is WORSE than
+    // leaving it retired. `resolveStrandedEscalationStatus` derives
+    // `isWakeExhaustedEscalation` from `status === "escalated"`, so an `active` row counts as
+    // a live owner and holds the source issue `blocked` — while this predicate says no wake
+    // can fire. Lifting must therefore also refund the count spent under no budget.
+    expect(rebound.attemptCount).toBe(1);
+    expect(
+      strandedRecoveryWakeAttemptsExhausted(rebound, new Date("2026-05-31T00:00:00.000Z")),
+    ).toBe(false);
   });
 
   // Negative control for the lift above: BLO-24662's "owner churn must not restore a burned

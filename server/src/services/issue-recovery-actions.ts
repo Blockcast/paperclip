@@ -510,11 +510,18 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       // persisted arm re-retires it when the fresh horizon burns.
       //
       // This does NOT weaken BLO-24662's "owner churn must not restore a burned horizon".
-      // That rule protects a row that HAS a persisted horizon, and such a row always has a
-      // non-null `carriedWakeHorizonAt` (evidence key, or `timeoutAt` with a non-null
-      // `maxAttempts`), so `isNewlyBoundedSequence` is false and nothing is lifted. The gate
-      // fires only where the horizon is being created for the first time. `discharged` and
-      // `cancelled` are explicit disposals and are excluded by the bound check.
+      // That rule protects a row that HAS a persisted horizon, and such a row has a non-null
+      // `carriedWakeHorizonAt` (evidence key, or `timeoutAt` with a non-null `maxAttempts`),
+      // so `isNewlyBoundedSequence` is false and nothing is lifted. The one exception is the
+      // single-shot backfill cohort the ROLLOUT NOTE above describes — a pre-evidence-key row
+      // already mid-ownerless-phase at deploy has `maxAttempts: null` AND no evidence key, so
+      // `carriedWakeHorizonAt` is null and a `timeout_horizon` retirement written by the
+      // PERSISTED arm is lifted too. That is still correct: the same sweep re-arms a fresh
+      // horizon for that row either way, so `active` is the honest status, and the persisted
+      // arm re-retires it when the new horizon burns. Do not read the rule as absolute when
+      // deciding whether the gate is safe to widen. The gate otherwise fires only where the
+      // horizon is being created for the first time. `discharged` and `cancelled` are
+      // explicit disposals and are excluded by the bound check.
       const liftsDerivedHorizonRetirement = isNewlyBoundedSequence &&
         existing.retiringBound === "timeout_horizon";
       const liftsRetirement = liftsAttemptBudgetRetirement || liftsDerivedHorizonRetirement;
@@ -617,7 +624,25 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: isNewOwnerSequence ? 1 : existing.attemptCount + 1,
+          // BLO-40297 (review): a lifted row must be WAKEABLE, not merely un-retired.
+          // `liftsAttemptBudgetRetirement` gets that for free because it requires
+          // `isNewOwnerSequence`, which resets the counter on this same line.
+          // `liftsDerivedHorizonRetirement` has no such requirement and fires on an UNCHANGED
+          // owner, so without this it can return a row to `active` already over its new
+          // budget: a legacy owned row with a waking cause keeps climbing `attemptCount`
+          // un-refunded while `maxAttempts` is null (`strandedRecoveryWakeAttemptsExhausted`
+          // short-circuits false on a null budget), so the derived arm retires it at N >> 5.
+          // The lift would then write `active` + `maxAttempts: 5` + `attemptCount: N + 1` —
+          // exhausted on arrival. That is strictly worse than leaving it retired:
+          // `resolveStrandedEscalationStatus` reads `isWakeExhaustedEscalation` from
+          // `status === "escalated"`, so `active` makes `hasLiveRecoveryOwner` TRUE and holds
+          // the source issue `blocked` while no wake can ever fire — the "held, with nobody
+          // coming" state this ticket exists to end. The count being reset is the honest
+          // reading: it was spent under no budget at all, and the lift starts a genuinely new
+          // bounded sequence.
+          attemptCount: isNewOwnerSequence || liftsDerivedHorizonRetirement
+            ? 1
+            : existing.attemptCount + 1,
           maxAttempts: inputMaxAttempts,
           // BLO-18996: PRESERVE the existing horizon, once the row is actually bounded.
           // `timeoutAt` is the one bound on this row that owner churn cannot reset, and it
