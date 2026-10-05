@@ -346,8 +346,14 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
     expect(settled).toBe(false);
 
     // Reported rather than rescued — the residue is visible, which is what
-    // separates this from the silent wedge PEN-3305 measured.
-    expect(describeAgentStartLockDispatchHealth(agentId)).toMatchObject({ status: "stalled" });
+    // separates this from the silent wedge PEN-3305 measured. The age is
+    // asserted alongside the status because a `stalled` report derives
+    // `heldMs` from the live lock entry, not the abort record, and a status-only
+    // assertion stays green on a `NaN` age (PEN-3328 review).
+    const health = describeAgentStartLockDispatchHealth(agentId);
+    expect(health).toMatchObject({ status: "stalled" });
+    expect(Number.isFinite(health?.heldMs)).toBe(true);
+    expect(health?.heldMs).toBeGreaterThanOrEqual(LOCK_ABORT_MS);
 
     // And the property that must survive the gap: an unrescued section still
     // holds its lock, so a follow-up folds into it rather than running

@@ -233,7 +233,17 @@ describe("agent start lock cancellation (PEN-3328)", () => {
       expect(describeHeldAgentStartLocks()).toHaveLength(1);
 
       // And the agent still reports the fault rather than presenting as idle.
-      expect(describeAgentStartLockDispatchHealth(agentId)).toMatchObject({ status: "stalled" });
+      const wedged = describeAgentStartLockDispatchHealth(agentId);
+      expect(wedged).toMatchObject({ status: "stalled" });
+      // `status` alone cannot see a broken age. A `stalled` report takes its
+      // `heldMs` from the *live* lock entry rather than from the frozen abort
+      // record, so it is computed by different code from the `aborted` branch
+      // below and needs its own assertion — asserting only `status` stayed
+      // green while the subtraction was against the whole map entry and every
+      // wedge reported `NaN` (PEN-3328 review). A wedge age an operator cannot
+      // read is the silence this surface exists to end.
+      expect(Number.isFinite(wedged?.heldMs)).toBe(true);
+      expect(wedged?.heldMs).toBeGreaterThanOrEqual(4 * LOCK_ABORT_MS);
 
       // Still reporting well past the abort-record retention window (1 h).
       // Retention is for *released* records, which are post-mortems; this
@@ -244,7 +254,15 @@ describe("agent start lock cancellation (PEN-3328)", () => {
       // still inside the range of a real one.
       await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
       expect(describeHeldAgentStartLocks()).toHaveLength(1);
-      expect(describeAgentStartLockDispatchHealth(agentId)).toMatchObject({ status: "stalled" });
+      const stillWedged = describeAgentStartLockDispatchHealth(agentId);
+      expect(stillWedged).toMatchObject({ status: "stalled" });
+      // The age must *track the live hold*, not freeze at the moment of the
+      // abort. This is the assertion that discriminates the live entry from
+      // the abort record: `record.heldMs` is fixed at cancellation time and
+      // would not move across these two hours, so an implementation that
+      // silently fell back to it goes red here rather than reporting a wedge
+      // as permanently four budgets old.
+      expect(stillWedged!.heldMs - wedged!.heldMs).toBeGreaterThanOrEqual(2 * 60 * 60_000);
     },
   );
 
