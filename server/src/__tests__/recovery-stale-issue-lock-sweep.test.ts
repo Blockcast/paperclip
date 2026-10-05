@@ -3552,6 +3552,12 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
           and(
             eq(activityLog.action, "issue.updated"),
             eq(activityLog.entityId, reopenableIssueId),
+            // Scoped to the drain's own row rather than to every `issue.updated`
+            // on this issue. `issuesSvc.update` logging one of its own would
+            // make the length assertion below fail for a reason that has nothing
+            // to do with the drain — an invariant of a service this test does
+            // not own.
+            sql`${activityLog.details} ->> 'source' = 'lockless_deferred_wake_drain'`,
           ),
         );
       expect(reopenActivity).toHaveLength(1);
@@ -3671,6 +3677,62 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
 
       expect((await heartbeat.sweepStaleIssueLocks()).drainedDeferredWakePromotionWakeIds)
         .toEqual([wakeId]);
+    });
+
+    it("does not reopen a closed issue when the assignee cannot be invoked", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId, status: "done" });
+      const humanCommentId = await seedIssueComment({ companyId, issueId });
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        // Reopen-eligible on every conjunct, so the ONLY thing standing between
+        // this row and a `done` -> `todo` write is the invokability gate.
+        reason: "issue_reopened_via_comment",
+        requestedByActorType: "user",
+        wakeCommentIds: [humanCommentId],
+      });
+      await db
+        .update(agents)
+        .set({ status: "paused" })
+        .where(eq(agents.id, agentId));
+
+      const heartbeat = drainSweep();
+      const first = await heartbeat.sweepStaleIssueLocks();
+
+      // The reopen used to run ABOVE this gate, so pass 1 wrote the issue to
+      // `todo` and then skipped — and pass 2 saw a non-terminal issue, took the
+      // ordinary promote path, and skipped again. Net: closed work silently
+      // reopened, the wake that justified reopening never delivered, and the row
+      // still stranded. Both halves have to hold, so assert both.
+      expect(first.drainedDeferredWakePromotions).toBe(0);
+      expect(first.drainedDeferredWakeCancellations).toBe(0);
+      expect((await readIssue(issueId))?.status).toBe("done");
+      expect((await readWake(wakeId))?.status).toBe("deferred_issue_execution");
+
+      // Skipping is a real verb, but it holds a batch slot, so it is reported
+      // rather than silent: zero promotions and zero cancellations otherwise
+      // read identically to "nothing to drain".
+      expect(first.drainedDeferredWakeSkips).toBe(1);
+      expect(first.drainedDeferredWakeSkippedWakeIds).toEqual([wakeId]);
+
+      // Stable across passes — not reopened on the second one either.
+      const second = await heartbeat.sweepStaleIssueLocks();
+      expect(second.drainedDeferredWakeSkippedWakeIds).toEqual([wakeId]);
+      expect((await readIssue(issueId))?.status).toBe("done");
+
+      // And it drains for real once the seat comes back, so the gate defers the
+      // reopen rather than permanently refusing it.
+      await db
+        .update(agents)
+        .set({ status: "active" })
+        .where(eq(agents.id, agentId));
+
+      const third = await heartbeat.sweepStaleIssueLocks();
+      expect(third.drainedDeferredWakePromotionWakeIds).toEqual([wakeId]);
+      expect(third.drainedDeferredWakeSkips).toBe(0);
+      expect((await readIssue(issueId))?.status).toBe("todo");
     });
 
     it("is idempotent — a second pass finds nothing left to drain", async () => {

@@ -406,6 +406,16 @@ export const LOCKLESS_DEFERRED_WAKE_MIN_AGE_MS = 10 * 60 * 1000;
 // the next pass (see the drain's "leave" arm for why declining is never treated
 // as permission to cancel). A cap bounds what that retry can cost while a
 // genuinely stuck cohort exists, and the expected steady-state count is zero.
+//
+// That last clause is an expectation, not an invariant, and the scan is
+// oldest-first — so a cohort that can never drain (an indefinitely paused
+// assignee is the realistic one) sits at the head of the queue and holds its
+// slots against every newer stranded wake. The drain reports `skippedWakeIds`
+// precisely so that case is legible: saturation and "nothing to drain" both
+// read zero promotions and zero cancellations, and only the skip count
+// separates them. Excluding non-invokable assignees in the candidate SQL would
+// cost less per pass but would re-derive `evaluateAgentInvokability` — which
+// also walks `reportsTo` — in a second place, so it is deliberately not done.
 export const LOCKLESS_DEFERRED_WAKE_DRAIN_BATCH = 25;
 
 // The activity columns are independent stamps, not a priority chain: a run can
@@ -14660,9 +14670,17 @@ export function recoveryService(
   async function drainLocklessDeferredIssueWakes(): Promise<{
     promotedWakeIds: string[];
     cancelledWakeIds: string[];
+    skippedWakeIds: string[];
   }> {
     const promotedWakeIds: string[] = [];
     const cancelledWakeIds: string[] = [];
+    // Candidates this pass could neither promote nor retire. They are selected
+    // again next pass, and because the scan is oldest-first they are selected
+    // FIRST — so an indefinitely non-invokable assignee holds its batch slot
+    // permanently and can starve every newer stranded wake behind it. Reported
+    // so that saturation is distinguishable from "nothing to drain": both read
+    // `promotions: 0, cancellations: 0` otherwise.
+    const skippedWakeIds: string[] = [];
 
     // The issue a wake names is written to any of four payload paths depending
     // on which producer enqueued it; `sweepStaleIssueLocks`' own deferred scan
@@ -14705,7 +14723,7 @@ export function recoveryService(
       .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
       .limit(LOCKLESS_DEFERRED_WAKE_DRAIN_BATCH);
 
-    if (candidates.length === 0) return { promotedWakeIds, cancelledWakeIds };
+    if (candidates.length === 0) return { promotedWakeIds, cancelledWakeIds, skippedWakeIds };
 
     // Cancel a wake this drain has decided cannot promote. Guarded on the status
     // it was selected under, so a finalizer that promoted the row between the
@@ -14760,11 +14778,31 @@ export function recoveryService(
         readNonEmptyString(context.wakeReason) ?? readNonEmptyString(candidate.reason);
 
       if (!readinessByIssueId.get(candidate.issueId)?.isDependencyReady) {
-        // Promoting here re-queues the wake straight back into suppression — an
-        // unresolved blocker edge suppresses it on arrival — so a one-verb drain
-        // would regenerate its own trigger and never converge. The
-        // blockers-resolved sweep is what wakes this assignee when the edge
-        // clears; it is a different wake and it is not this drain's to hold.
+        // A policy choice, stated as one — and NOT the mechanism an earlier
+        // revision of this comment claimed. Promoting here does not "re-queue
+        // the wake into suppression". `enqueueWakeup` takes its
+        // `!activeExecutionRun && !isDependencyReady` branch and writes a
+        // durable dep-blocked PARK: a fresh `agent_wakeup_requests` row at
+        // `scheduled` plus a `heartbeat_runs` row at `scheduled_retry`, carrying
+        // `depBlockedSnapshot` — the whole enriched context, `wakeCommentId`
+        // included — and a `depBlockedFirstParkedAt` age ceiling. That park
+        // fires on its own backoff. It is a delivery, not a suppression.
+        //
+        // The real convergence hazard is narrower and is about this drain's own
+        // bookkeeping row, not about the wake: `enqueueWakeup` returns `null`
+        // for a park exactly as it does for a decline, so the `if (!queued)
+        // continue` below would leave this row deferred and re-select it every
+        // pass — minting a new park each time. Distinguishing the two needs the
+        // `WakeSuppressionOutcome.dependencyBlockedRetryAt` sink threaded
+        // through `RecoveryWakeup`, which this drain does not take.
+        //
+        // So we cancel, and the cost is real and worth naming: the park would
+        // have carried `wakeCommentId` forward, and cancelling drops it.
+        // `issue_blockers_resolved_sweep` still wakes this assignee when the
+        // edge clears, but generically — the agent is pointed at the issue, not
+        // at the comment that asked for the work. Preferring the park is a
+        // defensible change; it is a change to the verb PEN-3739 prescribes for
+        // this arm, so it belongs in a row of its own rather than here.
         if (await cancelWake(
           candidate.wakeId,
           "Deferred wake cancelled by the lockless drain: the issue has an unresolved dependency blocker (PEN-3739)",
@@ -14774,10 +14812,15 @@ export function recoveryService(
         continue;
       }
 
-      // Seeds the context the promoted wake carries. The terminal arm below
-      // stamps `reopenedFrom` into it when it revives a closed issue, exactly
-      // as `releaseIssueExecutionAndPromote` stamps its own promotion seed.
+      // Seeds the context the promoted wake carries. The reopen below stamps
+      // `reopenedFrom` into it when it revives a closed issue, exactly as
+      // `releaseIssueExecutionAndPromote` stamps its own promotion seed.
       const promotedContextSeed: Record<string, unknown> = { ...context };
+
+      // Set by the terminal arm when this wake has earned a reopen; the reopen
+      // is performed further down, below the invokability gate. Deciding and
+      // writing are split on purpose — see that gate for why.
+      let reopenFromStatus: typeof candidate.issueStatus | null = null;
 
       if (isTerminalIssueStatus(candidate.issueStatus)) {
         // Not a blanket terminal cancel, and not the forced consequence an
@@ -14824,6 +14867,15 @@ export function recoveryService(
           commentWakeIsSelfAuthored =
             commentAuthorAgentIds.length > 0 &&
             commentAuthorAgentIds.every((row) => row.runAgentId === candidate.agentId);
+          // Fails OPEN, deliberately and in the same direction as the promoter:
+          // a comment id that resolves to no row — deleted, or scoped to a
+          // different issue, since the query filters on `issueId` — leaves this
+          // `false` and so reads as reopen-ELIGIBLE. The surrounding conjuncts
+          // state which way each of them fails, so this one says so too. Open
+          // is right here because the only wake classes that reach
+          // `shouldReopenTerminalIssueForDeferredWake` with a comment id are
+          // human follow-ups, and stranding one on the strength of a vanished
+          // row is worse than reviving an issue a human just commented on.
         }
 
         const canReopenClosedIssue = shouldReopenTerminalIssueForDeferredWake({
@@ -14844,14 +14896,45 @@ export function recoveryService(
           continue;
         }
 
+        reopenFromStatus = candidate.issueStatus;
+      }
+
+      // Gated BEFORE the reopen below, not merely before the enqueue, and that
+      // ordering is the whole point: the reopen is an irreversible `done` →
+      // `todo` write, and a skip here is a `continue`, so performing it above
+      // this gate left a non-invokable assignee's issue permanently reopened
+      // with nothing promoted and nothing retired. The next pass then saw a
+      // NON-terminal issue, skipped the terminal arm entirely, and skipped here
+      // again — forever. `releaseIssueExecutionAndPromote` has it this way
+      // round too (`heartbeat.ts` fails the wake on invokability long before it
+      // reopens), so the drain now matches the promoter it mirrors.
+      //
+      // Checked here rather than by catching the enqueue's 409 because a paused
+      // or mis-chained agent is the one decline that would otherwise repeat on
+      // every pass AND write a `skipped` row each time. Both cancel arms above
+      // stay in front of it deliberately: an unresolved blocker and an
+      // unreopenable terminal issue are facts about the row, true whatever the
+      // assignee's state, so those retire normally rather than piling up behind
+      // a paused seat.
+      const companyAgents = companyAgentsByCompanyId.get(candidate.companyId) ?? [];
+      const agent = companyAgents.find((row) => row.id === candidate.agentId) ?? null;
+      if (!agent || !evaluateAgentInvokability(agent, companyAgents).invokable) {
+        // Leaving it untouched costs nothing and keeps the wake for when the
+        // seat is invokable again — but it does hold a batch slot, which is
+        // what `skippedWakeIds` exists to make visible.
+        skippedWakeIds.push(candidate.wakeId);
+        continue;
+      }
+
+      if (reopenFromStatus !== null) {
         // Reopen BEFORE enqueuing, as the promoter does — the dispatch screens
         // `enqueueWakeup` runs read the issue's status. If the enqueue is then
         // declined or coalesced, the issue is left `todo` with the wake still
         // deferred: the next pass sees a non-terminal issue and takes the
         // ordinary promote path, and in the meantime a `todo` assigned issue is
-        // visible to its agent. Convergent either way, so this ordering cannot
-        // strand the row.
-        const reopenedFromStatus = candidate.issueStatus;
+        // visible to its agent. Convergent either way — which is true of the
+        // paths that remain below this line, and was NOT true while the
+        // invokability skip sat between the reopen and the enqueue.
         const reopenedIssue = await issuesSvc.update(candidate.issueId, {
           status: "todo",
           executionState: null,
@@ -14859,10 +14942,11 @@ export function recoveryService(
         if (!reopenedIssue) {
           // The issue vanished between the scan and here. Nothing to promote
           // onto; leave the row for the next pass rather than guessing.
+          skippedWakeIds.push(candidate.wakeId);
           continue;
         }
         if (!readNonEmptyString(promotedContextSeed.reopenedFrom)) {
-          promotedContextSeed.reopenedFrom = reopenedFromStatus;
+          promotedContextSeed.reopenedFrom = reopenFromStatus;
         }
         await logActivity(db, {
           companyId: candidate.companyId,
@@ -14879,22 +14963,12 @@ export function recoveryService(
           details: {
             status: "todo",
             reopened: true,
-            reopenedFrom: reopenedFromStatus,
+            reopenedFrom: reopenFromStatus,
             source: "lockless_deferred_wake_drain",
             identifier: reopenedIssue.identifier,
           },
         });
       }
-
-      // Checked before the enqueue rather than catching its 409, because a
-      // paused or mis-chained agent is the one decline that would otherwise
-      // repeat on every pass AND write a `skipped` row each time. Leaving it
-      // untouched costs nothing and keeps the wake for when the seat is
-      // invokable again.
-      const companyAgents = companyAgentsByCompanyId.get(candidate.companyId) ?? [];
-      const agent = companyAgents.find((row) => row.id === candidate.agentId) ?? null;
-      if (!agent) continue;
-      if (!evaluateAgentInvokability(agent, companyAgents).invokable) continue;
 
       const promotedPayload = { ...payload };
       delete promotedPayload[DEFERRED_WAKE_CONTEXT_KEY];
@@ -14937,10 +15011,14 @@ export function recoveryService(
           { err, wakeId: candidate.wakeId, issueId: candidate.issueId },
           "lockless deferred-wake drain could not re-queue a wake",
         );
+        skippedWakeIds.push(candidate.wakeId);
         continue;
       }
 
-      if (!queued) continue;
+      if (!queued) {
+        skippedWakeIds.push(candidate.wakeId);
+        continue;
+      }
 
       if (await cancelWake(
         candidate.wakeId,
@@ -14950,7 +15028,7 @@ export function recoveryService(
       }
     }
 
-    return { promotedWakeIds, cancelledWakeIds };
+    return { promotedWakeIds, cancelledWakeIds, skippedWakeIds };
   }
 
   // Backstop sweeper: clears stale lock columns on issues whose checkoutRunId
@@ -14988,6 +15066,13 @@ export function recoveryService(
       drainedDeferredWakePromotionWakeIds: [] as string[],
       drainedDeferredWakeCancellations: 0,
       drainedDeferredWakeCancellationWakeIds: [] as string[],
+      // Selected but neither promoted nor retired. Not an error — "leave" is a
+      // real verb here — but the batch is oldest-first and capped, so a cohort
+      // that never drains starves everything behind it while the two counts
+      // above stay at zero, which is also what "nothing to drain" looks like.
+      // This is what tells those two apart.
+      drainedDeferredWakeSkips: 0,
+      drainedDeferredWakeSkippedWakeIds: [] as string[],
     };
 
     const candidates = await db
@@ -15971,9 +16056,14 @@ export function recoveryService(
       result.drainedDeferredWakePromotions = drained.promotedWakeIds.length;
       result.drainedDeferredWakeCancellationWakeIds = drained.cancelledWakeIds;
       result.drainedDeferredWakeCancellations = drained.cancelledWakeIds.length;
+      result.drainedDeferredWakeSkippedWakeIds = drained.skippedWakeIds;
+      result.drainedDeferredWakeSkips = drained.skippedWakeIds.length;
       if (
         result.drainedDeferredWakePromotions > 0 ||
-        result.drainedDeferredWakeCancellations > 0
+        result.drainedDeferredWakeCancellations > 0 ||
+        // Logged on skips alone too. A pass that only skips is the saturation
+        // case, and it is the one pass that would otherwise be silent.
+        result.drainedDeferredWakeSkips > 0
       ) {
         logger.warn(
           {
@@ -15981,6 +16071,12 @@ export function recoveryService(
             promotedWakeIds: result.drainedDeferredWakePromotionWakeIds,
             cancelled: result.drainedDeferredWakeCancellations,
             cancelledWakeIds: result.drainedDeferredWakeCancellationWakeIds,
+            skipped: result.drainedDeferredWakeSkips,
+            skippedWakeIds: result.drainedDeferredWakeSkippedWakeIds,
+            // Skips at the cap mean the batch is full of rows this pass could
+            // not act on, so a newer stranded wake may never be reached.
+            batchSaturatedBySkips:
+              result.drainedDeferredWakeSkips >= LOCKLESS_DEFERRED_WAKE_DRAIN_BATCH,
           },
           "drained deferred issue wakes stranded with no execution lock",
         );
