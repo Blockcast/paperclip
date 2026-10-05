@@ -688,7 +688,7 @@ echo "docker.yml run: $drun"
 gh api "repos/Blockcast/paperclip/actions/runs/$drun/pending_deployments" \
   --jq '.[] | {env: .environment.name, wait_timer: .wait_timer, can_approve: .current_user_can_approve, reviewers: [.reviewers[].reviewer.login]}'
 ```
-Run: the commands above  Expected: `env: "paperclip-production"` and `can_approve: true|false` with the three reviewer logins listed. The run may still be in `build-and-push`; re-run this step until `pending_deployments` is non-empty.
+Run: the commands above  Expected: `env: "paperclip-production"` and `can_approve: true|false` with the reviewer logins listed — exactly the `RATIFIED_REVIEWERS` set in `.github/scripts/check-production-environment-protection.mjs` (one login, `kkroo`, since the environment was narrowed on 2026-08-30). Until 2026-10-04 this expected "the three reviewer logins", which fails a correct environment. The run may still be in `build-and-push`; re-run this step until `pending_deployments` is non-empty.
 
 - [ ] **Step 4: Approve (if permitted) or hand the run to a named reviewer**
 ```bash
