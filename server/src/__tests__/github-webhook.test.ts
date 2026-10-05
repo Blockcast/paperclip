@@ -8,12 +8,13 @@ import { randomUUID } from "node:crypto";
 import crypto from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
   agentWakeupRequests,
   companies,
   createDb,
+  githubCommitStatusDeliveries,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -41,6 +42,7 @@ import {
   __test_isReviewerSelfEchoReview,
   __test_isSelfReviewedPr,
   __test_bodyReRaisesPriorFinding,
+  __test_reRaisedPriorFindingLabels,
   __test_hasPrReviewerRequestMention,
   __test_hasPrReviewerAgentRequestMarker,
   __test_hasAllyConsolidatedReviewHeading,
@@ -3451,6 +3453,183 @@ describeEmbeddedPostgres("github-webhook route", () => {
     expect(calls[0]!.db).toBeDefined();
   });
 
+  // BLO-36819. The live evaluation above is void-detached and fired after the
+  // ack, and it is the sole writer of its status context — so a fetch failure
+  // past its bounded retries, a refused POST, or a pod restart mid-flight
+  // leaves the previous verdict standing forever. frr#105 sat `failure` for
+  // hours after a clean at-head review for exactly that reason. These pin the
+  // durable backstop that is queued BEFORE the ack.
+  describe("comment-review gate durable backstop", () => {
+    const previousContext = process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT;
+
+    beforeEach(() => {
+      process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT = "gate/ally-comment-findings";
+    });
+
+    // afterEach, not afterAll: the backstop enqueue is keyed off this env var,
+    // so leaving it set would silently add outbox rows to every later test in
+    // the file.
+    afterEach(() => {
+      if (previousContext === undefined) delete process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT;
+      else process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT = previousContext;
+    });
+
+    async function readBackstops(sha: string) {
+      return db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.sha, sha));
+    }
+
+    function postReview(app: express.Express, payload: Record<string, unknown>) {
+      const { body, signature } = signedRequest(payload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "pull_request_review")
+        .set("x-hub-signature-256", signature)
+        .set("content-type", "application/json")
+        .send(body);
+    }
+
+    it("queues a delayed re-evaluation row for an Ally review", async () => {
+      const sha = "a".repeat(40);
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+      const before = Date.now();
+
+      const response = await postReview(app, {
+        action: "submitted",
+        repository: { full_name: "Blockcast/frr" },
+        pull_request: { number: 105, head: { sha }, html_url: "https://github.com/Blockcast/frr/pull/105" },
+        review: { user: { login: "allyblockcast[bot]" }, body: "## Ally — Consolidated PR Review" },
+      });
+
+      expect(response.status).toBe(200);
+      const rows = await readBackstops(sha);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        repoFullName: "Blockcast/frr",
+        context: "gate/ally-comment-findings",
+        prNumber: 105,
+        reevaluate: true,
+        status: "queued",
+      });
+      // Delayed, not immediate: firing before the live evaluation has had time
+      // to land would buy a second evaluation on EVERY webhook instead of only
+      // on the ones that lose theirs.
+      expect(rows[0]!.nextAttemptAt.getTime()).toBeGreaterThan(before + 10 * 60_000);
+    });
+
+    // The backstop's config read must be inside its own try. loadConfig()
+    // re-derives the config file on every call and can throw; outside the try
+    // that throw skipped the live evaluation below and failed the ack, so a
+    // bad edit to the config file stopped the gate entirely.
+    it("still acks and fires the live evaluation when the backstop's config read throws", async () => {
+      const sha = "d".repeat(40);
+      const previousCapture = process.env.PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED;
+      // Capture enabled with none of its settings makes loadConfig() throw.
+      process.env.PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED = "true";
+      try {
+        const calls: unknown[] = [];
+        const app = buildApp({
+          prReviewerBotLogin: "allyblockcast[bot]",
+          runPrCommentReviewGateCheck: async (input) => {
+            calls.push(input);
+            return { posted: false as const, reason: "not_configured" as const };
+          },
+        });
+
+        const response = await postReview(app, {
+          action: "submitted",
+          repository: { full_name: "Blockcast/frr" },
+          pull_request: { number: 107, head: { sha }, html_url: "https://github.com/Blockcast/frr/pull/107" },
+          review: { user: { login: "allyblockcast[bot]" }, body: "## Ally \u2014 Consolidated PR Review" },
+        });
+
+        expect(response.status).toBe(200);
+        expect(calls).toHaveLength(1);
+        expect(await readBackstops(sha)).toHaveLength(0);
+      } finally {
+        if (previousCapture === undefined) delete process.env.PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED;
+        else process.env.PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED = previousCapture;
+      }
+    });
+
+    // Known hole, deliberately not closed: a second trigger arriving while a
+    // backstop row is already `processing` is absorbed by
+    // `preserveExistingDelivery`, which keeps the original `createdAt`, so the
+    // newer review gets no backstop of its own. It also needs that newer
+    // review's live evaluation to be lost, which makes it rare enough to leave.
+    it("collapses repeated triggers at one head onto a single backstop row", async () => {
+      const sha = "b".repeat(40);
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+      const payload = {
+        action: "submitted",
+        repository: { full_name: "Blockcast/frr" },
+        pull_request: { number: 106, head: { sha }, html_url: "https://github.com/Blockcast/frr/pull/106" },
+        review: { user: { login: "allyblockcast[bot]" }, body: "## Ally — Consolidated PR Review" },
+      };
+
+      await postReview(app, payload);
+      await postReview(app, payload);
+
+      expect(await readBackstops(sha)).toHaveLength(1);
+    });
+
+    // Pins the known gap rather than leaving it to look covered. An
+    // `issue_comment` payload carries no PR head at all, and reading one would
+    // mean a GitHub call before the ack. Ally used the reviews surface for 33
+    // of 33 measured consolidated reviews, so this is the rare path.
+    it("does not queue a backstop for a comment-shaped review, which carries no head sha", async () => {
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+      const { body, signature } = signedRequest({
+        action: "created",
+        repository: { full_name: "Blockcast/frr" },
+        issue: {
+          number: 107,
+          pull_request: { url: "https://api.github.com/repos/Blockcast/frr/pulls/107" },
+        },
+        comment: {
+          user: { login: "allyblockcast[bot]" },
+          body: "## Ally — Consolidated PR Review\n### Important Issues (0)",
+        },
+      });
+
+      await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "issue_comment")
+        .set("x-hub-signature-256", signature)
+        .set("content-type", "application/json")
+        .send(body);
+
+      expect(
+        await db
+          .select()
+          .from(githubCommitStatusDeliveries)
+          .where(eq(githubCommitStatusDeliveries.prNumber, 107)),
+      ).toHaveLength(0);
+    });
+
+    // Mutation-killer for the OTHER half of the same guard. Deleting the
+    // `commentReviewGateContext &&` test enqueues `context: ""` rows on every
+    // trigger in a deployment that never opted into the gate; without this,
+    // only the `commentReviewGateBackstopSha` half is pinned.
+    it("queues nothing when the gate status context is unconfigured", async () => {
+      delete process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT;
+      const sha = "c".repeat(40);
+      const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+      const response = await postReview(app, {
+        action: "submitted",
+        repository: { full_name: "Blockcast/frr" },
+        pull_request: { number: 108, head: { sha }, html_url: "https://github.com/Blockcast/frr/pull/108" },
+        review: { user: { login: "allyblockcast[bot]" }, body: "## Ally — Consolidated PR Review" },
+      });
+
+      expect(response.status).toBe(200);
+      expect(await readBackstops(sha)).toHaveLength(0);
+    });
+  });
+
   it("leaves reviewer wakes queued when the webhook runs on the API tier", async () => {
     const { agentId } = await seedCompanyAndAgent({ agentName: "Ally" });
     const app = buildApp({
@@ -4606,6 +4785,84 @@ describeEmbeddedPostgres("github-webhook route", () => {
         sourceEventTimestamp: "2026-04-30T10:20:00.000Z",
       });
       expect(rows[0]?.updatedAt.getTime()).toBe(afterNewerSync?.updatedAt.getTime());
+    });
+
+    it("discharges a pr_review_non_convergence action on a close whose issue link is previously-linked only (PEN-3397)", async () => {
+      // Regression pin for the reachability defect caught in review on PR#1967.
+      // The discharge used to sit BELOW the `matched.length === 0` gate, so this
+      // delivery -- identifier removed from the payload, issue reachable only
+      // through the persisted work-product link -- returned at that gate and
+      // never ran it. Every other test for this feature calls the service
+      // directly, which is exactly why a dead call site passed a green suite.
+      // This one goes through the route.
+      const { companyId, agentId, issueId } = await seedIssueWithIdentifier("BLO-40011");
+      const app = buildApp();
+      const prNumber = 4252;
+
+      // Link the PR while the identifier is still present.
+      await postPr(
+        app,
+        prPayload({ action: "opened", identifier: "BLO-40011", number: prNumber }),
+        "wp-nonconv-1",
+      );
+
+      // `escalated`, not `active`: that is the state the stuck production
+      // population was actually in, and it is non-terminal by design.
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "pr_review_non_convergence",
+        status: "escalated",
+        ownerType: "agent",
+        ownerAgentId: agentId,
+        cause: "self_review_pr_non_convergence",
+        fingerprint: `pr_review_non_convergence:${issueId}:Blockcast/paperclip:${prNumber}`,
+        evidence: { repoFullName: "Blockcast/paperclip", prNumber, cycleCount: 3 },
+        nextAction: "Take over the PR, unblock or reassign the author.",
+      });
+
+      const closeWithoutIdentifier = await postPr(
+        app,
+        prPayload({
+          action: "closed",
+          identifier: "no-ticket",
+          number: prNumber,
+          title: "Retitled without paperclip id",
+          merged: true,
+          headSha: "merge-nonconv",
+        }),
+        "wp-nonconv-2",
+      );
+
+      // Still the `no_matching_issue` exit -- the hoist did not change which
+      // exit this delivery takes, only what runs before it.
+      expect(closeWithoutIdentifier.status).toBe(200);
+      expect(closeWithoutIdentifier.body).toMatchObject({
+        ignored: "no_matching_issue",
+        prNonConvergenceDischarged: 1,
+      });
+
+      const actions = await db
+        .select({
+          status: issueRecoveryActions.status,
+          outcome: issueRecoveryActions.outcome,
+          resolutionNote: issueRecoveryActions.resolutionNote,
+        })
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(actions).toHaveLength(1);
+      // Merged -> `resolved`/`restored`: the flagged condition genuinely cleared.
+      expect(actions[0]?.status).toBe("resolved");
+      expect(actions[0]?.outcome).toBe("restored");
+      expect(actions[0]?.resolutionNote).toContain(`PR #${prNumber} merged`);
+
+      // The source issue's status is never written by the discharge.
+      const issueRow = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(issueRow?.status).toBe("in_progress");
     });
 
     it("does not refresh updatedAt for an exact webhook redelivery", async () => {
@@ -11648,6 +11905,147 @@ describe("PR review convergence signal (BLO-35909)", () => {
     ).toBe(false);
     expect(__test_bodyReRaisesPriorFinding(null)).toBe(false);
     expect(__test_bodyReRaisesPriorFinding(undefined)).toBe(false);
+  });
+
+  // BLO-38809: a resolve site must CLASSIFY, not just forward the body.
+  // reRaisesPriorFinding falls back to `bodyReRaisesPriorFinding(prFeedbackBody(context))`
+  // when the field is absent, so dropping a resolve-time line still yields a
+  // boolean and nothing goes red — it just re-derives the verdict off the
+  // CLAMPED body, which is the pre-BLO-35909 behaviour. Only a ledger past the
+  // clamp boundary can tell the two paths apart, so this fixture puts one there
+  // (frr#61's buckets sat at bytes 4248/4273 against the 4096-byte clamp).
+  //
+  // Shared by both producers' guards below. The Important bucket is what makes
+  // the body actionable feedback, which the `issue_comment` resolve branch
+  // requires before it will return a context at all.
+  const stillPresent = "- **prior:de0d81ab important 1** — still-present — head has moved on";
+  const ledgerPastTheClamp = [
+    "## Ally — Consolidated PR Review",
+    "",
+    "### Important Issues (1)",
+    "",
+    "- **[tests]** a finding, so this body reads as actionable feedback.",
+    "",
+    "### Suggestions (60)",
+    "",
+    ...Array.from(
+      { length: 60 },
+      (_, i) => `- nit ${i}: prose padding so the ledger below lands past the 4096-byte clamp boundary.`,
+    ),
+    "",
+    "### Prior Findings Dispositioned",
+    "",
+    stillPresent,
+  ].join("\n");
+
+  it("classifies the ledger off the RAW review body, past the clamp boundary (BLO-38809)", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 61,
+        title: "fix(frr): BLO-35909 convergence signal",
+        head: { ref: "fix/BLO-35909", sha: "251d5caa8726897b25d603d9e6b1b4118ea36ac0" },
+      },
+      review: { body: ledgerPastTheClamp, state: "commented", user: { login: "allyblockcast[bot]" } },
+      repository: { full_name: "Blockcast/frr" },
+    });
+    expect(ctx).not.toBeNull();
+
+    // Control: without this the fixture proves nothing. A body shorter than the
+    // clamp reads the same on both paths, so the assertion below would pass on
+    // the fallback too. This pins that the ledger really is unreachable from the
+    // clamped body the fallback would read (prFeedbackBody === reviewBody here,
+    // commentBody being undefined on a review context).
+    expect(ctx!.reviewBody).not.toContain("still-present");
+    expect(__test_bodyReRaisesPriorFinding(ctx!.reviewBody)).toBe(false);
+
+    // The guard: the field must be PRESENT on the resolved context. `toBe(true)`
+    // rather than a truthiness check so the absent-field case (undefined) fails.
+    expect(ctx!.reviewReRaisesPriorFinding).toBe(true);
+
+    // The deliberate half of the split, pinned so it is not "fixed" into a
+    // defect. reRaisedPriorFindingLabels reads prFeedbackBody — the CLAMPED
+    // body — so on exactly this shape the escalation fires with no specifics.
+    // That asymmetry is intended and documented at reRaisedPriorFindingLabels
+    // ("it only costs the message its specifics"): the gating read is the raw
+    // one above, so an empty list here never suppresses an escalation.
+    //
+    // The reachable regression is plumbing, not a one-word swap: every body on
+    // ResolvedEventContext is already clamped, so there is nothing here to
+    // repoint this call AT. It bites when someone reads the empty list as the
+    // bug and carries a raw body through to this call — which would make the
+    // two reads disagree about which body is authoritative. That mutation is
+    // caught only here: the controls above assert on the clamped context
+    // bodies, which such a change leaves untouched.
+    expect(__test_reRaisedPriorFindingLabels(ctx!)).toEqual([]);
+  });
+
+  // The positive half of the pair above. That assertion pins a DIRECTION (empty
+  // on a past-the-clamp body) and is satisfied by a function that returns []
+  // unconditionally — dropping the .map, or returning [] outright, leaves it
+  // green. Without this test that mutation is invisible, and the escalation at
+  // reRaisedFindings would silently lose its specifics forever: the same
+  // "guard that passes on broken code" shape this describe block exists to
+  // close. Short body on purpose — the ledger sits INSIDE the clamp, so
+  // prFeedbackBody still carries it and the function has something to find.
+  it("names the re-raised findings when the ledger is inside the clamp (BLO-38809)", () => {
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 61,
+        title: "fix(frr): BLO-35909 convergence signal",
+        head: { ref: "fix/BLO-35909", sha: "251d5caa8726897b25d603d9e6b1b4118ea36ac0" },
+      },
+      review: {
+        body: ledger("still-present"),
+        state: "commented",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/frr" },
+    });
+    expect(ctx).not.toBeNull();
+
+    // Control: this body is reachable from the clamped read, which is what
+    // makes a non-empty result possible at all here and distinguishes this
+    // fixture from the past-the-clamp one above.
+    expect(ctx!.reviewBody).toContain("still-present");
+
+    expect(__test_reRaisedPriorFindingLabels(ctx!)).toEqual(["important #1 from de0d81ab"]);
+  });
+
+  // The SECOND producer of the same field, and the one that bites in practice:
+  // Ally frequently answers as a plain PR comment and files no review object at
+  // all, so this is a live surface rather than a symmetry exercise. Identical
+  // hazard and identical direction — `commentBody` is clamped on the context, so
+  // without the resolve-time classification the `??` fallback re-derives `false`
+  // ("no finding re-raised") and the escalation is suppressed.
+  it("classifies the ledger off the RAW comment body, past the clamp boundary (BLO-38809)", () => {
+    const ctx = __test_resolveEventContext("issue_comment", {
+      action: "created",
+      issue: {
+        number: 61,
+        title: "fix(frr): BLO-35909 convergence signal",
+        body: null,
+        html_url: "https://github.com/Blockcast/frr/pull/61",
+        pull_request: { url: "https://api.github.com/repos/Blockcast/frr/pulls/61" },
+      },
+      comment: {
+        id: 987654,
+        body: ledgerPastTheClamp,
+        html_url: "https://github.com/Blockcast/frr/pull/61#issuecomment-987654",
+        user: { login: "allyblockcast[bot]" },
+      },
+      repository: { full_name: "Blockcast/frr" },
+    });
+    expect(ctx).not.toBeNull();
+
+    // Same control, same reason: prFeedbackBody is `reviewBody ?? commentBody`
+    // and `reviewBody` is undefined on an issue_comment context, so this is
+    // exactly what the fallback would read.
+    expect(ctx!.commentBody).not.toContain("still-present");
+    expect(__test_bodyReRaisesPriorFinding(ctx!.commentBody)).toBe(false);
+
+    expect(ctx!.reviewReRaisesPriorFinding).toBe(true);
   });
 });
 

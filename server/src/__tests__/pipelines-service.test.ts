@@ -29,6 +29,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { REDACTED_SENTINEL } from "../services/secret-sentinel.js";
 import {
   PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,
   pipelineService,
@@ -3089,6 +3090,54 @@ describeEmbeddedPostgres("pipelineService", () => {
           warning,
         ],
       ]));
+    });
+
+    it("masks stage env on the way out and restores a masked binding on the way back in (PEN-3707)", async () => {
+      // The pipeline stage secrets panel is the second round-tripping editor over the SAME
+      // `routines.env` column, and it reaches it through a different write path than
+      // `routineService.update` — so it needs its own merge and its own proof. `StageSecretsPanel`
+      // re-emits the whole map on save, exactly as the project and routine editors do.
+      const { company, pipeline, stageId, routineId } = await seedAutomatedStage();
+      const storedPlain = "stored-stage-env-value-that-must-survive-the-round-trip";
+
+      const first = await svc.updateStageAutomationEnv({
+        companyId: company.id,
+        pipelineId: pipeline.id,
+        stageId,
+        env: {
+          UNTOUCHED: { type: "plain", value: storedPlain },
+          EDITED: { type: "plain", value: "original-value" },
+        },
+        actor: userActor,
+      });
+
+      // Read side: the payload this route answers with carries the placeholder, not the value.
+      expect(first.env?.UNTOUCHED).toEqual({ type: "plain", value: REDACTED_SENTINEL });
+      expect(JSON.stringify(first)).not.toContain(storedPlain);
+
+      // ...while storage holds the real value. Masking a response must not reach the column.
+      const [stored] = await db.select().from(routines).where(eq(routines.id, routineId));
+      expect((stored?.env as Record<string, unknown>).UNTOUCHED).toEqual({
+        type: "plain",
+        value: storedPlain,
+      });
+
+      // Write side: the panel hands back exactly what it was rendered with.
+      await svc.updateStageAutomationEnv({
+        companyId: company.id,
+        pipelineId: pipeline.id,
+        stageId,
+        env: {
+          UNTOUCHED: { type: "plain", value: REDACTED_SENTINEL },
+          EDITED: { type: "plain", value: "edited-value" },
+        },
+        actor: userActor,
+      });
+
+      const [after] = await db.select().from(routines).where(eq(routines.id, routineId));
+      const afterEnv = after?.env as Record<string, unknown>;
+      expect(afterEnv.UNTOUCHED).toEqual({ type: "plain", value: storedPlain });
+      expect(afterEnv.EDITED).toEqual({ type: "plain", value: "edited-value" });
     });
   });
 });

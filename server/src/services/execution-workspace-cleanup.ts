@@ -4,6 +4,11 @@ import { companies, executionWorkspaces, projectWorkspaces } from "@paperclipai/
 import { and, asc, eq, isNull, lte, ne, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import {
+  recordExecutionWorkspaceCollectorPass,
+  type ExecutionWorkspaceCleanupReason,
+  type ExecutionWorkspaceCollectorStopReason,
+} from "./metrics.js";
+import {
   cleanupExecutionWorkspaceArtifacts,
   inspectWorktreeReclaimSafety,
   isReclaimFsWedgedDir,
@@ -60,6 +65,14 @@ export const EXECUTION_WORKSPACE_LEGACY_IDLE_MS = readDurationEnv(
 const EXECUTION_WORKSPACE_MIN_IDLE_MS = 10 * 60 * 1000;
 
 /**
+ * The one retain reason that is not a `WorktreeReclaimSafety` verdict: the
+ * removal itself did not report success, so there is no proof to classify.
+ * Named here so the suffix-collision test can enumerate the full input domain
+ * of `encodeRetainedReason` without hardcoding it.
+ */
+export const UNCLEANED_RETAIN_REASON = "uncleaned";
+
+/**
  * Why a proven-removal check needs two inputs, not one.
  *
  * `cleanupExecutionWorkspaceArtifacts` reports `cleaned`, but computes it as
@@ -81,10 +94,93 @@ const EXECUTION_WORKSPACE_MIN_IDLE_MS = 10 * 60 * 1000;
 export function classifyRemovalProof(
   cleaned: boolean,
   proofReason: WorktreeReclaimSafety["reason"] | null,
-): string | null {
-  if (!cleaned) return "uncleaned";
+): WorktreeReclaimSafety["reason"] | typeof UNCLEANED_RETAIN_REASON | null {
+  if (!cleaned) return UNCLEANED_RETAIN_REASON;
   if (proofReason && proofReason !== "missing") return proofReason;
   return null;
+}
+
+/**
+ * How run-attribution survives a deferral (PEN-3692, found by Ally on this PR).
+ *
+ * `cleanup_reason` carries WHY a row became eligible, and deferring overwrites
+ * it with the retain reason. Those are two different facts, and the naive write
+ * destroys the first: a `run_ended` row deferred once reads back `retained_dirty`
+ * forever, because `stampIdleLegacyWorkspaces` only rewrites rows whose
+ * `cleanupEligibleAt` is null and a deferred row's is set. It would then be
+ * labelled `idle_backfill` on every subsequent pass — and `dirty`/`unpushed` is
+ * exactly the state a FAILED run leaves its tree in, so the loss lands squarely
+ * on the population this row exists to measure, and only ever in the direction
+ * that understates it. A tree deferred for ten windows and then collected would
+ * contribute one pass of `run_ended` and ten of `idle_backfill`.
+ *
+ * So the origin is preserved as a SUFFIX. Ally suggested a `run_ended_retained_`
+ * prefix; that would silently break the `cleanup_reason like 'retained_%'` census
+ * documented at the defer site, which is the other consumer of this column, since
+ * a run-origin retain would no longer match it. A suffix keeps every retained row
+ * under the `retained_` prefix and keeps idle-origin values byte-identical to
+ * what they were before this change.
+ *
+ * `decodeRunAttribution` takes the STORED string and `encodeRetainedReason` takes
+ * the DECODED origin, so re-deferring an already-suffixed row re-derives the same
+ * value rather than stacking suffixes. No safety reason (`dirty`, `unpushed`,
+ * `unverifiable`, `uncleaned`, …) ends in either suffix, so the split is unambiguous.
+ *
+ * A null `cleanup_reason` on an ELIGIBLE row is a third origin, not a synonym for
+ * `idle_backfill` (Ally, review of 50628a4). The backfill stamps its own reason and
+ * run teardown stamps `run_ended`, so a stamped row with no reason means some writer
+ * made it collectable without recording why — today only the operator PATCH, since
+ * the heartbeat writer that did it is fixed in this commit. It gets its own suffix
+ * for the same reason `run_ended` does: without one, the first deferral would silently
+ * relabel it `idle_backfill`, which is the collapse this whole mechanism exists to
+ * prevent, one origin over. Only `idle_backfill` stays unsuffixed, so the dominant
+ * population's stored values remain byte-identical to what they were before.
+ */
+const RUN_ATTRIBUTED_RETAIN_SUFFIX = "_run_ended";
+const UNATTRIBUTED_RETAIN_SUFFIX = "_unknown";
+
+/**
+ * Both origin suffixes, exported so the collision test iterates the real values
+ * rather than a mirror of them. The split is only unambiguous while no retain
+ * reason ENDS in one of these; that held by inspection when the suffixes were
+ * chosen, and `execution-workspace-retain-suffix-collision.test.ts` is what
+ * keeps it holding when someone adds a reason.
+ */
+export const RETAIN_ORIGIN_SUFFIXES = [
+  RUN_ATTRIBUTED_RETAIN_SUFFIX,
+  UNATTRIBUTED_RETAIN_SUFFIX,
+] as const;
+
+/**
+ * The origins that can actually round-trip through the suffix encoding.
+ *
+ * `not_applicable` is excluded deliberately (Ally, review of d55f513): it is
+ * the metric's "this series is not a collection" filler, never a stored
+ * `cleanup_reason`, and it is the ONE input that would break the round trip —
+ * `encodeRetainedReason` emits it bare and `decodeRunAttribution` reads a bare
+ * value back as `idle_backfill`. No caller passes it today, since the only
+ * producer of an origin is `decodeRunAttribution`, which cannot return it.
+ * Narrowing here keeps that true by construction rather than by inspection.
+ */
+export type RunAttributionOrigin = Exclude<ExecutionWorkspaceCleanupReason, "not_applicable">;
+
+export function encodeRetainedReason(
+  reason: string,
+  origin: RunAttributionOrigin,
+): string {
+  if (origin === "run_ended") return `retained_${reason}${RUN_ATTRIBUTED_RETAIN_SUFFIX}`;
+  if (origin === "unknown") return `retained_${reason}${UNATTRIBUTED_RETAIN_SUFFIX}`;
+  return `retained_${reason}`;
+}
+
+export function decodeRunAttribution(
+  storedCleanupReason: string | null,
+): RunAttributionOrigin {
+  if (storedCleanupReason === null) return "unknown";
+  if (storedCleanupReason === "run_ended") return "run_ended";
+  if (storedCleanupReason.endsWith(RUN_ATTRIBUTED_RETAIN_SUFFIX)) return "run_ended";
+  if (storedCleanupReason.endsWith(UNATTRIBUTED_RETAIN_SUFFIX)) return "unknown";
+  return "idle_backfill";
 }
 
 function readDurationEnv(name: string, fallback: number): number {
@@ -148,6 +244,12 @@ export function executionWorkspaceCleanupService(db: Db) {
         sourceIssueId: executionWorkspaces.sourceIssueId,
         metadata: executionWorkspaces.metadata,
         cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt,
+        // PEN-3692: the run-attribution split. Ally's review of d729b09 called
+        // this "a column selectEligible already reads" — it was not; only
+        // `cleanupEligibleAt` was. Added here so the collector can label its
+        // teardowns by WHY the row became eligible, which is the only place
+        // run-attributable removal is distinguishable from idle reclamation.
+        cleanupReason: executionWorkspaces.cleanupReason,
         projectWorkspaceCwd: projectWorkspaces.cwd,
       })
       .from(executionWorkspaces)
@@ -211,7 +313,12 @@ export function executionWorkspaceCleanupService(db: Db) {
         { outstanding: outstandingAtEntry, limit: RECLAIM_FS_OUTSTANDING_LIMIT },
         "reconcileExecutionWorkspaceCleanup: abandoned filesystem calls still hold threadpool threads; skipping this pass",
       );
-      return { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 };
+      const skippedResult = { stamped: 0, scanned: 0, collected: 0, skipped: 0, failed: 0 };
+      // PEN-3692: a skipped pass is still recorded — this is the wedged-mount
+      // regime the census exists to explain, and an absent record here reads
+      // exactly like a dead worker.
+      recordExecutionWorkspaceCollectorPass(skippedResult, { stopReason: "skipped_saturated" });
+      return skippedResult;
     }
 
     let stamped = 0;
@@ -246,7 +353,10 @@ export function executionWorkspaceCleanupService(db: Db) {
      *
      * Retained rows stay visible — each logs every window, and
      * `cleanup_reason like 'retained_%'` is a one-query census of the subset
-     * the collector is choosing not to reclaim.
+     * the collector is choosing not to reclaim. That census is why the
+     * run-attribution origin is encoded as a suffix rather than a prefix; see
+     * `encodeRetainedReason`. Split the census by origin with
+     * `cleanup_reason like 'retained\_%\_run\_ended'` if you need it.
      *
      * `ne(status, 'archived')` is the same evidence rule the other two writers
      * carry (`:124`, `:171`), applied to the third. This writer deliberately
@@ -262,12 +372,16 @@ export function executionWorkspaceCleanupService(db: Db) {
      * cannot be corrupted by any future writer that reaches this path from
      * somewhere the latch does not cover.
      */
-    const deferCandidate = async (id: string, reason: string) => {
+    const deferCandidate = async (
+      id: string,
+      reason: string,
+      origin: RunAttributionOrigin,
+    ) => {
       await db
         .update(executionWorkspaces)
         .set({
           cleanupEligibleAt: new Date(now.getTime() + EXECUTION_WORKSPACE_IDLE_GRACE_MS),
-          cleanupReason: `retained_${reason}`,
+          cleanupReason: encodeRetainedReason(reason, origin),
           updatedAt: now,
         })
         .where(and(
@@ -277,6 +391,7 @@ export function executionWorkspaceCleanupService(db: Db) {
     };
 
     let scanned = 0;
+    let stopReason: ExecutionWorkspaceCollectorStopReason = "complete";
     for (const candidate of candidates) {
       // The gate above bounds where a pass *starts*; this bounds where it ends.
       // Sampling it only at entry let one pass outrun the threadpool: the
@@ -301,23 +416,32 @@ export function executionWorkspaceCleanupService(db: Db) {
           { outstanding, limit: RECLAIM_FS_OUTSTANDING_LIMIT, scanned },
           "reconcileExecutionWorkspaceCleanup: abandoned filesystem calls hold the threadpool; ending this pass",
         );
+        stopReason = "ended_saturated";
         break;
       }
       scanned += 1;
       const worktreePath = candidate.providerRef ?? candidate.cwd;
+      // PEN-3692 run attribution. Only `run_ended` is run-attributable; a named
+      // non-run reason (today `idle_backfill`, and anything added later) is
+      // reclamation of the pre-existing population, and NO reason at all is
+      // `unknown` rather than either — see `decodeRunAttribution`. Mapped to the
+      // bounded enum rather than passed through, so a new DB value cannot widen
+      // cardinality. Reads through a prior deferral's retain reason, which is
+      // not the same as reading the column directly.
+      const candidateCleanupReason = decodeRunAttribution(candidate.cleanupReason);
       // A sibling of a tree whose stat was abandoned is on the same wedged
       // mount, so probing it would hold a second thread to learn the same
       // thing. The hold clears when that syscall answers.
       if (worktreePath && isReclaimFsWedgedDir(path.dirname(path.resolve(worktreePath)))) {
-        await deferCandidate(candidate.id, "unverifiable");
+        await deferCandidate(candidate.id, "unverifiable", candidateCleanupReason);
         skipped += 1;
         continue;
       }
       try {
         if (candidate.providerType === "git_worktree" && worktreePath) {
-          const safety = await inspectWorktreeReclaimSafety(worktreePath);
+          const safety = await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector", cleanupReason: candidateCleanupReason });
           if (!safety.safe) {
-            await deferCandidate(candidate.id, safety.reason);
+            await deferCandidate(candidate.id, safety.reason, candidateCleanupReason);
             skipped += 1;
             logger.info(
               {
@@ -343,12 +467,17 @@ export function executionWorkspaceCleanupService(db: Db) {
             // `cleanupExecutionWorkspaceArtifacts`, so a count would let an
             // unrelated concurrent teardown end this pass and be logged as the
             // collector's own wedge.
-            if (isReclaimFsWedgedDir(path.dirname(path.resolve(worktreePath)))) break;
+            if (isReclaimFsWedgedDir(path.dirname(path.resolve(worktreePath)))) {
+              stopReason = "ended_wedged";
+              break;
+            }
             continue;
           }
         }
 
         const cleanup = await cleanupExecutionWorkspaceArtifacts({
+          trigger: "collector",
+          cleanupReason: candidateCleanupReason,
           workspace: {
             id: candidate.id,
             cwd: candidate.cwd,
@@ -380,11 +509,11 @@ export function executionWorkspaceCleanupService(db: Db) {
         // persist-rollback and operator-PATCH callers of
         // `cleanupExecutionWorkspaceArtifacts` keep their existing contract.
         const removalProof = cleanup.cleaned && worktreePath
-          ? await inspectWorktreeReclaimSafety(worktreePath)
+          ? await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector", cleanupReason: candidateCleanupReason })
           : null;
         const retainReason = classifyRemovalProof(cleanup.cleaned, removalProof?.reason ?? null);
         if (retainReason) {
-          await deferCandidate(candidate.id, retainReason);
+          await deferCandidate(candidate.id, retainReason, candidateCleanupReason);
           skipped += 1;
           logger.warn(
             {
@@ -427,7 +556,12 @@ export function executionWorkspaceCleanupService(db: Db) {
       }
     }
 
-    return { stamped, scanned, collected, skipped, failed };
+    const result = { stamped, scanned, collected, skipped, failed };
+    // PEN-3692: recorded here rather than at the `index.ts` call site so the
+    // census cannot be lost by a future caller that forgets, and so it sits
+    // next to the `return` any new field would also have to pass through.
+    recordExecutionWorkspaceCollectorPass(result, { stopReason });
+    return result;
   }
 
   return { reconcileExecutionWorkspaceCleanup, stampIdleLegacyWorkspaces };

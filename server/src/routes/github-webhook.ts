@@ -54,6 +54,7 @@ import {
   recordDependabotWebhookDiagnostic,
   resolveDependabotIssueAssigneeId,
 } from "../services/dependabot-alert-issues.js";
+import { loadConfig } from "../config.js";
 import { logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -996,6 +997,18 @@ function resolvePrCommentReviewGateWebhookTrigger(
 // PR→issue back-link (BLO-13353, #973 symptom-1). A hidden marker makes the
 // one-time post idempotent across redeliveries/reopens: if any existing PR
 // comment carries it, we never post again.
+/**
+ * How long the durable comment-review gate backstop waits before it fires.
+ *
+ * It must outlast the live evaluation it backs up, or every webhook would pay
+ * for a second evaluation instead of only the ones that lose theirs. The live
+ * path's own bounded retries settle in seconds; the longest lag ever measured
+ * between a review and its gate status was ~6 minutes (onprem-k8s#4017), so 15
+ * gives that case room and still bounds a genuinely lost verdict to a quarter
+ * of an hour rather than forever.
+ */
+const COMMENT_REVIEW_GATE_REEVALUATION_DELAY_MS = 15 * 60_000;
+
 const PR_ISSUE_BACKLINK_MARKER = "<!-- paperclip-issue-backlink -->";
 
 function backLinkAbsoluteUrl(publicBaseUrl: string, issuePrefix: string, identifier: string): string {
@@ -1112,13 +1125,17 @@ function bodyReRaisesPriorFinding(body: string | null | undefined): boolean {
 // as "no finding re-raised" — failing in the suppressing direction. The
 // fallback only serves synthetic contexts that never went through a producer.
 //
-// This guard has no failing mutation today, and that is structural rather than
-// a gap in the tests: the ledger sits in the OPENING section of the reviewer's
-// template, above the counted findings buckets, so any body whose ledger is
-// clamped has already had its findings clamped — and that case is caught first
-// by the older raw read for reviewHasActionableFeedback. Keep the raw read
-// anyway: the ordering it relies on is enforced only by the reviewer's
-// template, not by this module. Do not delete it as provably dead code.
+// BOTH producers of this field have a failing mutation as of BLO-38809:
+// deleting the `pull_request_review` resolve-site line fails "classifies the
+// ledger off the RAW review body", and deleting the `issue_comment` one fails
+// the RAW comment body sibling. Neither did before, and the reason they did not
+// is worth keeping: in the reviewer's own template the ledger sits in the
+// OPENING section, above the counted findings buckets, so any body whose ledger
+// is clamped has already had its findings clamped — and that case is caught
+// first by the older raw read for reviewHasActionableFeedback. That ordering is
+// enforced only by the reviewer's template, not by this module, which is why the
+// raw read stays and why both guards are now pinned by a synthetic body rather
+// than by that accident.
 function reRaisesPriorFinding(context: ResolvedEventContext): boolean {
   return context.reviewReRaisesPriorFinding ?? bodyReRaisesPriorFinding(prFeedbackBody(context));
 }
@@ -5379,6 +5396,69 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       config.prReviewerBotLogin,
     );
     if (commentReviewGateTrigger) {
+      // The head this delivery is about, read from the signed payload only.
+      // `headSha` is absent on the review and comment triggers by design — the
+      // live evaluation resolves the head itself so a status is never written
+      // to a commit the branch has moved past — so take it from the payload's
+      // own `pull_request.head.sha` here. `issue_comment` carries no head at
+      // all and gets no backstop rather than an API read before the ack; Ally
+      // has used the reviews surface for 33 of 33 measured consolidated
+      // reviews, so that is the rare path, not the common one.
+      const commentReviewGateBackstopSha =
+        commentReviewGateTrigger.headSha
+        ?? readStringField(
+          (payload.pull_request as Record<string, unknown> | undefined)?.head as
+            | Record<string, unknown>
+            | undefined,
+          "sha",
+        );
+      // Durable backstop, queued BEFORE the detached evaluation below and
+      // before this request acks (BLO-36819). That evaluation is the sole
+      // writer of this status context and has no retry that outlives the
+      // process: a fetch failure past its bounded retries, a refused status
+      // POST, or an API pod restart mid-flight all leave the previous verdict
+      // standing forever. frr#105 sat red for hours after a clean at-head
+      // review for exactly that reason.
+      //
+      // Cheap because it is self-cancelling: the outbox skips the row when a
+      // status for this context was written at or after the row was queued, so
+      // on every webhook whose live evaluation lands — which is ~98% of them —
+      // this costs one upsert and one status read, and no GitHub write.
+      // `loadConfig()`, not the injected route config: the gate's status
+      // context is deployment configuration (the same value
+      // runPrCommentReviewGateCheck reads), not a route seam.
+      // The config read sits INSIDE the try (BLO-36819 review): loadConfig()
+      // re-derives the config file on every call and can throw, and a throw
+      // here would skip the live evaluation below and fail the ack. Losing the
+      // backstop is the tolerable outcome; losing the gate is not.
+      try {
+        const commentReviewGateContext = loadConfig().prCommentReviewGateStatusContext.trim();
+        if (commentReviewGateContext && commentReviewGateBackstopSha) {
+          await enqueueGithubCommitStatusDelivery(db, {
+            companyId: null,
+            sourceRunId: null,
+            repoFullName: commentReviewGateTrigger.repoFullName,
+            sha: commentReviewGateBackstopSha,
+            context: commentReviewGateContext,
+            // Placeholder: a reevaluate row computes its own verdict and never
+            // publishes this state. `pending` is the safe value if a future
+            // change ever did replay it.
+            state: "pending",
+            description: "Comment-review gate re-evaluation queued.",
+            reevaluate: true,
+            delayMs: COMMENT_REVIEW_GATE_REEVALUATION_DELAY_MS,
+            prNumber: commentReviewGateTrigger.prNumber,
+            prUrl: commentReviewGateTrigger.prUrl,
+          });
+        }
+      } catch (err) {
+        // Never fail the ack for the backstop. Losing it costs the behavior
+        // we had before this existed, not a redelivery storm.
+        logger.warn(
+          { err, deliveryId, event: eventName, ...commentReviewGateTrigger },
+          "github webhook comment-review gate re-evaluation enqueue failed (non-fatal)",
+        );
+      }
       // Build the input once and hand the SAME object to both branches, so the
       // injection seam observes the real argument — including `db`. When the
       // seam was called with the bare trigger, no webhook-level test could
@@ -6497,11 +6577,94 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // Both lazy: this pair is declared here so the PEN-3397 discharge below can
+    // sit ABOVE the `matched.length === 0` gate (see its comment). The
+    // heartbeat used to be constructed eagerly below that gate, which is what
+    // pinned the discharge underneath it. Laziness keeps that move free --
+    // a delivery that exits at the gate without discharging anything still
+    // constructs neither service, exactly as before.
+    let heartbeatInstance: ReturnType<typeof heartbeatService> | null = null;
+    const getHeartbeat = () =>
+      (heartbeatInstance ??= heartbeatService(db, {
+        pluginWorkerManager: config.pluginWorkerManager,
+        ...config.heartbeatOptions,
+      }));
+    let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
+    const getRecovery = () =>
+      // Thunked rather than `getHeartbeat().wakeup`: the discharge path never
+      // enqueues a wake, so binding the method here would construct a heartbeat
+      // for every discharge that does not need one.
+      (recoveryInstance ??= recoveryService(db, {
+        enqueueWakeup: (...args) => getHeartbeat().wakeup(...args),
+      }));
+
+    // PEN-3397: a closed PR discharges any `pr_review_non_convergence` action
+    // raised against it. Gated on the `closed` action rather than on
+    // `prMerged === true` like the merged-PR forward-capture above, because a PR
+    // closed WITHOUT merging ends the self-review loop just as conclusively as a
+    // merge — abandoned or superseded, there is still no author left to unstick.
+    //
+    // MUST stay ABOVE the `matched.length === 0` gate below. `matched` is
+    // identifier-matched issues only, so a `closed` delivery whose issue link
+    // exists solely through `pullRequestWorkProductExternalId` exits there --
+    // and that previously-linked half is precisely the half this block's wide
+    // candidate set exists to serve. Placing it after the gate made the call
+    // unreachable for it (caught in review on PR#1967, PEN-3397). The sibling
+    // work-product block consuming the identical set sits above the gate for
+    // the same reason.
+    //
+    // Candidate set is deliberately wide (`pullRequestWorkProductTargets`, i.e.
+    // matched ∪ previously-linked): the service matches on a fingerprint built
+    // from `(issue.id, repoFullName, prNumber)`, so an issue that merely mentions
+    // this PR cannot match, while an issue whose body no longer names the PR is
+    // still reached through the previously-linked half.
+    //
+    // Best-effort, mirroring the forward-capture and work-product blocks: this
+    // must never break the wake path.
+    let prNonConvergenceDischarged = 0;
+    if (
+      eventName === "pull_request" &&
+      context.prAction === "closed" &&
+      context.prNumber !== null &&
+      // Symmetry with the sibling merged-PR block above. Not a live defect
+      // today -- creation and discharge both normalize a null through
+      // `?? "unknown"`, so the fingerprints still match -- but the two
+      // normalizations are independent, and a null repo here can only ever
+      // produce a silent no-op. Refusing it makes that explicit.
+      context.repoFullName &&
+      pullRequestWorkProductTargets.length > 0
+    ) {
+      try {
+        const discharged = await getRecovery().closePrReviewNonConvergenceForClosedPr({
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+          merged: context.prMerged === true,
+          candidateIssues: pullRequestWorkProductTargets.map((issue) => ({
+            id: issue.id,
+            companyId: issue.companyId,
+            identifier: issue.identifier,
+          })),
+        });
+        prNonConvergenceDischarged = discharged.closed;
+      } catch (err) {
+        logger.error(
+          { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
+          "pr_review_non_convergence auto-discharge on PR close failed",
+        );
+      }
+    }
+
     if (matched.length === 0) {
       respond(200, {
         ok: true,
         ignored: "no_matching_issue",
         identifiers: context.identifiers,
+        // PEN-3397: same reasoning as `reviewerWakeFired` below -- the
+        // discharge now runs above this gate, so this exit is a path on which
+        // it can have fired. Reporting it only on the main response would make
+        // exactly the previously-linked-only delivery this block was hoisted to
+        // serve the one delivery whose outcome is invisible.
+        ...(prNonConvergenceDischarged > 0 ? { prNonConvergenceDischarged } : {}),
         // BLO-23893: `reviewerWakeFired` is computed for EVERY delivery but
         // used to be reported only on the two `no_paperclip_identifier`
         // exits. That was invisible until the BLO-20886 owning-union fix
@@ -6515,10 +6678,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       });
       return;
     }
-    const heartbeat = heartbeatService(db, {
-      pluginWorkerManager: config.pluginWorkerManager,
-      ...config.heartbeatOptions,
-    });
+    const heartbeat = getHeartbeat();
     const wakes: Array<{ issueIdentifier: string | null; agentId: string }> = [];
     const skipped: Array<{ issueIdentifier: string | null; reason: string }> = [];
     const reopened: Array<{ issueIdentifier: string | null; commentId: string | null }> = [];
@@ -6623,9 +6783,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
-    let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
-    const getRecovery = () =>
-      (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
     const actionableReviewFeedback = isActionableReviewFeedbackContext(context);
     // BLO-32381: reconstructed from wakeReason rather than threaded through as
     // its own context field. resolveEventContext already made the decision (and
@@ -7105,6 +7262,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       reviewerWakeFired,
       reviewerRunsCancelled,
       ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
+      ...(prNonConvergenceDischarged > 0 ? { prNonConvergenceDischarged } : {}),
       ...(backLinked.length ? { backLinked } : {}),
       ...(foreignCommitNotices > 0 ? { foreignCommitNotices } : {}),
       ...(foreignCommitListingTruncated ? { foreignCommitListingTruncated } : {}),
@@ -7162,6 +7320,7 @@ export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarke
 export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;
 export const __test_isSelfReviewedPr = isSelfReviewedPr;
 export const __test_bodyReRaisesPriorFinding = bodyReRaisesPriorFinding;
+export const __test_reRaisedPriorFindingLabels = reRaisedPriorFindingLabels;
 export const __test_resolvePrCommentReviewGateWebhookTrigger = resolvePrCommentReviewGateWebhookTrigger;
 export const __test_readReviewGateEscalationHeadSha = readReviewGateEscalationHeadSha;
 export const __test_isActionablePrReviewComment = isActionablePrReviewComment;

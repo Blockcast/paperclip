@@ -713,6 +713,203 @@ DB backups are not full instance filesystem backups. For full local disaster
 recovery, also back up local storage files and the local encrypted secrets key if
 those providers are enabled.
 
+## Heap Snapshots
+
+For diagnosing a heap leak whose cause no metric names (PEN-3314), the worker tier
+can write V8 heap snapshots to the Paperclip instance directory. **Off by default.**
+
+```sh
+PAPERCLIP_HEAP_SNAPSHOT_ENABLED=true
+```
+
+Snapshots land in `<instance-root>/data/diagnostics/heap/`. On a deployment where
+that directory sits on a shared volume, any pod mounting it can read the result —
+which is the point: retrieving a snapshot needs no `pods/exec` and no new HTTP
+route on the worker.
+
+Request one by dropping a sentinel file into the snapshot directory from anywhere
+that can write it:
+
+```sh
+touch <instance-root>/data/diagnostics/heap/snapshot.request
+```
+
+The worker consumes the sentinel on its next poll and writes a snapshot. Contents
+are ignored; only the file's existence is read.
+
+**The sentinel is a trigger for a stop-the-world pause on the singleton worker,
+and every pod mounting the shared claim can write it.** Requests are therefore
+rate-limited (`SENTINEL_MIN_INTERVAL_MINUTES`, default 5): a sentinel arriving
+inside that window is deleted but declines to snapshot, so a script touching the
+file in a loop cannot pause the process that drives every heartbeat, dispatch and
+recovery pass once per poll. The sentinel is consumed either way, so a burst of
+touches does not queue up.
+
+**So the file disappearing does not mean a snapshot was taken.** Deletion is how
+the request is claimed, not how it is honoured, and a declined request deletes it
+just the same. Read the worker log rather than the directory to tell them apart:
+
+| worker log | what happened | what to do |
+| --- | --- | --- |
+| `Heap snapshot written` (warn) | honoured | retrieve it; it holds secrets in plaintext |
+| `Heap snapshot request declined` (info) | claimed, rate-limited | wait out `SENTINEL_MIN_INTERVAL_MINUTES`, touch again |
+| `Heap snapshot request seen but not claimed` (warn) | delete failed, **file still there** | if it repeats, the worker cannot delete the file — remove it by hand. Only the request path is affected; threshold capture keeps running |
+| `Heap snapshot skipped` (error) | honoured, then refused | read `skipped` (e.g. `insufficient-free-space`) |
+
+Environment overrides:
+
+Every numeric override below is resolved through `resolveNumericSetting()` against
+the bounds declared in `NUMERIC_SETTING_BOUNDS` (BLO-27641), so each carries a
+ceiling as well as a floor. A value outside the range is clamped into it and a
+value that is not a finite positive number — `Infinity`, `1e999`, `abc`, a
+negative — is rejected and falls back to the documented default. Both are
+reported on stderr at startup, because the banner prints only the resolved
+number and so cannot otherwise distinguish "the operator asked for this" from
+"the operator asked for something impossible".
+
+- `PAPERCLIP_HEAP_SNAPSHOT_ENABLED=true|false` (default `false`)
+- `PAPERCLIP_HEAP_SNAPSHOT_DIR=/absolute/or/~/path`
+- `PAPERCLIP_HEAP_SNAPSHOT_KEEP=<count>` (default `2`, range `1`–`20`)
+- `PAPERCLIP_HEAP_SNAPSHOT_MIN_FREE_GB=<gb>` (default `10`, range `1`–`1024`)
+- `PAPERCLIP_HEAP_SNAPSHOT_THRESHOLD_MB=<mb>` — take one unprompted at or above
+  this live-heap size. Default `0`, which leaves the sentinel as the only trigger;
+  range `0`–`65536`. This is the one setting whose floor is `0`, because `0` is
+  the off switch — an explicit `0`, and anything else the resolver rejects, lands
+  on the default and so stays off. The failure direction that matters is the
+  other one: a typo must never be able to *enable* an unprompted
+  stop-the-world pause.
+- `PAPERCLIP_HEAP_SNAPSHOT_MIN_INTERVAL_MINUTES=<minutes>` (default `120`, range
+  `1`–`10080`) — minimum gap between *automatic* snapshots.
+- `PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES=<minutes>` (default `5`,
+  range `1`–`10080`) — minimum gap between *sentinel* snapshots. The floor of 1
+  minute is a floor on a path anything with write access to the volume can reach,
+  so there is deliberately no way to switch it off — and unlike the `Math.max(1, …)`
+  this replaced, the floor also holds against `Infinity`, which used to pass
+  straight through it.
+- `PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES=<minutes>` (default `1440`, i.e. 24h;
+  range `1`–`43200`, i.e. 30 days) — how long a snapshot may remain on disk,
+  measured from the capture stamp in its filename. See the security section
+  below: this is an exposure window, not a disk cap, so it is bounded at *both*
+  ends and overrides `KEEP`. The 30-day ceiling is why: the file holds every
+  string on the heap, so an unbounded value turns a diagnostic into indefinite
+  retention of the process's secrets on a shared volume. Keep it comfortably
+  above `MIN_INTERVAL_MINUTES` or the older half of a diff pair can expire
+  before the newer half exists; the worker warns at startup if it is not.
+  It bounds the exposure only while capture is *on*: setting `ENABLED=false`
+  deletes the snapshots outright rather than waiting for this to elapse.
+- `PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS=<seconds>` (default `60`, range `5`–`3600`)
+
+### ⛔ A snapshot is a credential, not a diagnostic
+
+`v8.writeHeapSnapshot()` serialises **every reachable string**, and `loadConfig()`
+reads this process's secrets out of the environment into exactly such strings
+(`githubAppPrivateKey` is a required field). So a snapshot contains, in plaintext:
+the GitHub App private key, the agent JWT signing secret, `DATABASE_URL`, the
+webhook secret, and any provider API tokens on the heap.
+
+This is measured, not inferred. A value read from the environment onto a live
+object appears verbatim in the resulting file; a value left in the environment
+and never dereferenced does not.
+
+**File permissions do not mitigate this on the deployed cluster.** The worker and
+every agent pod run as the *same uid* against the same ReadWriteMany claim, so a
+`0600` file owned by `1000` is fully readable by uid `1000` in another pod. There
+is no mode that separates them. The retrieval property this feature is built on —
+readable from any agent seat with no privilege change — is the identical
+mechanism, so it cannot be kept while dropping the exposure.
+
+What follows from that:
+
+- **The file's lifetime is the only control.** Hence `MAX_AGE_MINUTES`, which
+  overrides `KEEP`: "there are only two of them" is not a security property.
+- **⚠️ Disabling the flag DELETES the snapshots. Retrieve them first.** Retention
+  runs on the worker tier whether or not capture is enabled, and with
+  `ENABLED=false` it retains **nothing** — the sweep runs at startup and on every
+  poll with an effective `KEEP` of `0`. Disabling capture is how an operator
+  declares the window closed, so the files go at that point rather than ageing
+  out over the next `MAX_AGE_MINUTES`.
+
+  **The ordering is therefore load-bearing, not a nicety:**
+
+  1. Copy the snapshot pair **off** the volume (`cp` to somewhere the claim is
+     not shared, or pull it down and delete the copy on the volume).
+  2. Read the diff.
+  3. *Then* set `PAPERCLIP_HEAP_SNAPSHOT_ENABLED=false`.
+
+  Flip the flag first and the pair is gone on the next worker start — including a
+  snapshot you had not retrieved. This is the deliberate trade: the prune used to
+  live *inside* the feature flag, so switching capture off stopped the sweep with
+  it and whatever was on the volume stayed there forever. The moment an operator
+  believed the exposure had ended was the moment it became permanent. Losing an
+  un-retrieved snapshot is recoverable — take another. A credential-bearing file
+  left on a shared volume indefinitely is not.
+- **Age is read from the filename stamp, not mtime.** Retrieval means copying
+  these off the volume and copy tooling rewrites mtimes; keying on mtime would
+  let any reader extend the window just by touching the file. This holds for
+  unfinished `.partial` files as well as completed ones — see below.
+- **⚠️ An unfinished `.partial` is just as dangerous, and `ls *.heapsnapshot`
+  will not show it.** `writeHeapSnapshot` serialises incrementally, so a
+  `<stamp>.heapsnapshot.partial` holds the same plaintext secrets as a completed
+  snapshot. One is left behind whenever a capture does not return — and an OOM
+  *during* the write is this feature's own most likely failure mode, since it
+  runs on a worker whose failure mode is heap exhaustion.
+
+  So when checking that the snapshot directory is clear, **match both suffixes**:
+
+  ```sh
+  ls -la <instance-root>/data/diagnostics/heap/*.heapsnapshot*
+  ```
+
+  Spell the directory out rather than reaching for `$PAPERCLIP_HEAP_SNAPSHOT_DIR`.
+  That variable is an *optional override* (`config.ts` falls back to the path
+  above) and it is set nowhere in `deploy/helm/paperclip/`, so on both the worker
+  and the agent pod you would shell into it is unset — and
+  `ls -la "$PAPERCLIP_HEAP_SNAPSHOT_DIR"/*.heapsnapshot*` expands to
+  `ls -la /*.heapsnapshot*`, which reports `No such file or directory` no matter
+  what is sitting in the real directory. That is this paragraph's own failure
+  mode with the suffix fixed and the path wrong: a false all-clear over a
+  multi-gigabyte credential-bearing partial. If you do set the override, quote it
+  with the fallback inline — `"${PAPERCLIP_HEAP_SNAPSHOT_DIR:-<instance-root>/data/diagnostics/heap}"`.
+
+  A glob ending at `.heapsnapshot` reports an empty directory while a
+  multi-gigabyte credential-bearing partial sits in it. The startup warning
+  counts both and lists them separately; the periodic sweep deletes a partial
+  once it is past its abandonment window (10 minutes from its filename stamp),
+  which is also why a freshly stranded one keeps the poll armed rather than
+  arming nothing.
+- **Treat each capture as a credential-exposure event.** Decide on rotation of
+  the App private key and the agent JWT secret the same way you would for any
+  other disclosure, rather than filing it as a diagnostic. Delete the snapshot as
+  soon as it has been analysed rather than waiting for it to age out, and prefer
+  analysing it somewhere the volume is not shared.
+- Where the trade is acceptable, a `kubectl debug` ephemeral container against
+  `--heapsnapshot-signal` writes to `/proc/<pid>/cwd` (container-local, **not**
+  the shared claim) and is the safer option on this axis. It needs
+  `pods/ephemeralcontainers` and is a one-off manoeuvre rather than something
+  repeatable, which is why it is not the default here — but it is a real trade.
+
+Two more things to know before enabling it:
+
+- A snapshot is **stop-the-world**. Expect a pause of seconds on a multi-gigabyte
+  heap, during which the process answers nothing, health checks included.
+- A snapshot file is roughly 1.5-2x the live heap. The retention cap and the
+  free-space floor are what keep that from filling a shared volume, so do not
+  raise `KEEP` without checking what else lives there.
+
+If the volume is too full, the worker logs `Heap snapshot skipped` and writes
+nothing — **and retains the snapshots it would otherwise have pruned.** The
+free-space test already credits the bytes that prune would release
+(`reclaimableBytes` in the log line), so a refusal means deleting them would not
+have been enough. Snapshots of a past heap state cannot be retaken, so they are
+kept rather than spent on a write that cannot happen.
+
+One snapshot names what is on the heap. It takes **two, hours apart**, to name what
+is *accumulating* — load the pair into Chrome DevTools (Memory → Load) and use the
+"Objects allocated between snapshot 1 and 2" comparison view. Copy the pair off
+the volume before you disable the flag — see the security section above, where
+that ordering and the reason for it are spelled out — and delete both once the
+diff has been read.
+
 ## Secrets in Dev
 
 Agent env vars now support secret references. By default, secret values are stored with local encryption and only secret refs are persisted in agent config.

@@ -305,6 +305,146 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
   });
 
+  // BLO-36903. Before `tracked`, a finding the reviewer accepted onto a
+  // follow-up had no truthful ledger verb: `fixed` and `no-longer-applicable`
+  // are both false of a live defect, and `still-present` — the only honest
+  // option left — blocks. So Ally's own recommended landing path was
+  // unreachable through the ledger and the residual had to be demoted to prose.
+  it("reports a tracked residual at this head as deferred, not clean", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(CURRENT_HEAD, OLD_HEAD, "tracked"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    // Non-blocking is the point of the verb...
+    expect(verdict.state).toBe("success");
+    // ...and saying so out loud is the other half: a human approver must be
+    // able to see that a residual was accepted rather than fixed.
+    expect(verdict.outcome).toBe("deferred_finding");
+    expect(verdict.reason).toMatch(/tracked on a follow-up/i);
+    expect(verdict.reason).not.toMatch(/no unresolved findings/i);
+  });
+
+  it("still reports a review with no deferral as clean", () => {
+    // Control for the case above: the deferred branch must be reached by the
+    // ledger verb, not by merely having any ledger or any prior head.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "fixed"), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  it("does not let an unbalanced fence above the ledger downgrade a deferral to clean", () => {
+    // Ally's template attests the head in its opening lines and puts the ledger
+    // after the buckets, so a fence left open between them blanks the ledger on
+    // the emitted-only reading while the attestation and the 0/0 survive. Read
+    // that way the head went `clean` / `success`: a false claim that an accepted
+    // residual was fixed. Moving the fence below the ledger holds the body
+    // otherwise fixed, so fence position alone cannot be what decides it.
+    const buckets = ["### Critical Issues (0)", "### Important Issues (0)"];
+    const ledger = [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** - tracked - accepted onto the follow-up.`,
+    ];
+    const unterminatedFence = ["```ts", "const unterminated = true;"];
+
+    for (const lines of [
+      [...buckets, ...unterminatedFence, ...ledger],
+      [...buckets, ...ledger, ...unterminatedFence],
+    ]) {
+      const verdict = evaluateCommentReviewGate({
+        headSha: CURRENT_HEAD,
+        prAuthorLogin: DISTINCT_PR_AUTHOR,
+        comments: [
+          allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+          allyComment(reviewBody(CURRENT_HEAD, lines), "2026-08-04T21:09:19Z"),
+        ],
+      });
+
+      expect(verdict).toMatchObject({ state: "success", outcome: "deferred_finding" });
+      expect(verdict.reason).toMatch(/accepts 1 prior finding as tracked/);
+    }
+  });
+
+  it("does not let a tracked entry clear a head that still carries a finding", () => {
+    // Precedence: a `tracked` ledger entry is a statement about one prior
+    // finding, not about the review carrying it. A current head that raises its
+    // own finding still blocks.
+    const body = reviewBody(CURRENT_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — tracked — accepted onto the follow-up.`,
+      "### Critical Issues (0)",
+      "### Important Issues (1)",
+      "- A separate defect this head introduced.",
+      "### Recommended Action",
+      "Fix Critical issues before merge.",
+    ]);
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [allyComment(body, "2026-08-04T21:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+  });
+
+  it("stops carrying an earlier head's finding once it is tracked", () => {
+    // The carry-forward half. `tracked` disposes the finding for the purpose of
+    // holding the PR red, exactly as `fixed` does — the difference between them
+    // is reported, not enforced.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "tracked"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    expect(verdict.state).toBe("success");
+    expect(verdict.outcome).not.toBe("carried_finding");
+  });
+
+  it("keeps carrying a head whose findings are only partly tracked", () => {
+    // One entry must not clear a review that reported several findings — the
+    // `isFullyDispositioned` invariant, re-pinned for the new verb because
+    // widening the disposing set is exactly the change that could break it.
+    const twoFindings = reviewBody(OLD_HEAD, [
+      "### Critical Issues (0)",
+      "### Important Issues (2)",
+      "- The first defect.",
+      "- The second defect.",
+      "### Recommended Action",
+      "Fix Critical issues before merge.",
+    ]);
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      comments: [
+        allyComment(twoFindings, "2026-08-04T20:09:19Z"),
+        allyComment(
+          dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "tracked"),
+          "2026-08-04T21:09:19Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
   it("does not let a ledger entry disposition a finding raised after it", () => {
     // Ally re-raising a finding on a head it previously cleared is the newer
     // fact. A ledger entry can only speak to findings that existed when it was
@@ -1039,6 +1179,131 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
   });
 });
 
+/**
+ * Hazard fixtures for the disposition ledger's missing author exclusion
+ * (BLO-34389). The defect is real and still open: an author-written `## Ally`
+ * comment can retire its own carried finding, turning this gate's `failure`
+ * into a pass.
+ *
+ * Both fixtures use a SINGLE shared login, because that is the only shape that
+ * occurs in production: on an agent PR the author and the reviewer are both
+ * `allyblockcast[bot]`. A fixture that varies the login instead tests a case
+ * this fleet never produces, and passes while the shipped gate is broken —
+ * which is exactly how a login-equality exclusion gets mistaken for a working
+ * fix. The lane, not the login, is the discriminator this needs, and no such
+ * discriminator exists yet.
+ *
+ * `prAuthorLogin` is INERT on the path both fixtures exercise, and that is
+ * deliberate rather than an oversight: `evaluateCommentReviewGate` reads it
+ * only inside the `if (forHead)` branch (`pr-comment-review-gate.ts:399`,
+ * `:412`), and neither fixture attests CURRENT_HEAD, so control reaches
+ * `headsWithUndispositionedFinding(comments, reviewerBotLogin)` — which takes
+ * no author argument at all. Setting it here encodes the assumption these
+ * fixtures exist to fence: it becomes load-bearing only once a fix threads an
+ * identity into one of those two functions.
+ *
+ * WHAT IS NOT FENCED HERE, and must be when the lane field lands: the
+ * anti-deadlock AC — "a retirement written by a DIFFERENT LANE still retires".
+ * It is not expressible today, because expressing it requires a lane field
+ * that does not exist yet (BLO-32695 / #1721's `reviewer: <agent-uuid>`). An
+ * attempt at it on login-only inputs is not merely weak, it is contradictory:
+ * it would assert `outcome !== "carried_finding"` on the exact input the
+ * open-defect witness below asserts IS eventually carried, so no single
+ * implementation could satisfy both and the likelier repair would be deleting
+ * the anti-fail-open guard — the direction this block exists to prevent.
+ * Placement (2) is meanwhile PARTLY fenced without it, and the qualifier is
+ * load-bearing: the pre-existing retirement test above feeds the same two
+ * comments and asserts the stronger `{ state: "success", outcome:
+ * "not_evaluated" }`, so it catches an unconditional ledger exclusion — but
+ * it passes no `prAuthorLogin`, so it does NOT catch the author-threaded form
+ * a fix actually reaches for. Only the witness below does; see the per-mutant
+ * counts next.
+ *
+ * WHAT EACH FIXTURE ACTUALLY DETECTS, because "runtime-identical to an
+ * existing test" and "detects nothing new" are NOT the same claim and the
+ * difference decides whether this block may be deleted. Unmutated, both are
+ * indeed identical to tests that already existed, since `prAuthorLogin` is
+ * inert — the anti-fail-open one to "carries an undispositioned finding
+ * forward across a replacement head" (which is strictly stronger, asserting
+ * `carriedFromHeadSha` too), the witness to "lets a later review's ledger
+ * disposition a finding from a head it replaced", down to the same two
+ * comments and timestamps. But a mutant that READS the author is exactly
+ * where they stop being identical, because those pre-existing twins pass no
+ * `prAuthorLogin` at all, so an author-reading exclusion never fires on them.
+ * Measured at this head (113 tests), one mutation per run:
+ *
+ *   placement (1), always-exclude   24 fail — incl. this block's first; the
+ *                                   pre-existing twin catches it too
+ *   placement (2), always-exclude    5 fail — incl. the witness; 4 pre-existing
+ *                                   ledger tests catch it too
+ *   placement (1), author-threaded   3 fail — incl. this block's first; 2
+ *                                   pre-existing author-identity tests catch it
+ *   placement (2), author-threaded   1 fail — THE WITNESS ALONE
+ *
+ * ⚠ Re-taking placement (1) requires care, and getting it wrong reads as a
+ * REASSURING result rather than an error. The mutated line —
+ * `if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;`
+ * — appears TWICE in pr-comment-review-gate.ts, byte-identical: once in
+ * `latestAttestingAllyComment` and once in `headsWithUndispositionedFinding`.
+ * Only the second is placement (1). A naive first-occurrence substitution
+ * mutates the attestation path instead, which leaves the carry path intact, so
+ * this block's first fixture PASSES and the run looks like evidence that the
+ * fixture is worthless — the opposite of what placement (1) actually does to
+ * it. Anchor on the occurrence inside `headsWithUndispositionedFinding`, and
+ * treat "the anti-fail-open fixture stayed green under placement (1)" as proof
+ * the mutant missed, never as a measurement.
+ *
+ * So the first fixture is redundant for detection and earns its place as a
+ * NAMED ANCHOR: it records at the site which hazard those general-looking
+ * tests guard, so neither can be deleted as redundant without stepping over
+ * the reason. The witness is NOT redundant — it is the only test in the file
+ * that goes red on the deadlocking shape this row exists to prevent, and
+ * deleting it would leave placement (2) unfenced against the author-threaded
+ * form a fix reaches for first.
+ *
+ * Read the witness's red carefully rather than as a verdict: a correct lane
+ * fix turns it red in the SAME direction as the deadlock does. It says an
+ * author-reading ledger exclusion landed, not that the right one did.
+ */
+describe("evaluateCommentReviewGate — ledger author exclusion hazards", () => {
+  // Placement (1): excluding the author inside `isAllyConsolidatedReviewComment`
+  // — the smallest diff, and the worse one. That filter feeds the carried-head
+  // map as well as the ledger, so on an agent PR no head is ever carried and
+  // the red path disappears entirely.
+  it("still carries an unretired finding when author and reviewer share one login", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  // The open defect, asserted POSITIVELY as the behavior it actually produces
+  // today rather than via `it.fails`. Both forms retire themselves the moment a
+  // real lane discriminator lands — this one goes red because the outcome stops
+  // matching — but `it.fails` is satisfied by ANY throw, so a later rename or
+  // signature change would turn it green-by-crash and it would silently stop
+  // watching the defect. A guard that cannot tell its own subject from an
+  // unrelated crash is a comment (BLO-34263).
+  it("accepts an author-lane retirement today — the open BLO-34389 defect", () => {
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    // When the lane exclusion lands this becomes
+    // `{ state: "failure", outcome: "carried_finding" }`, and this assertion is
+    // the prompt to say so here.
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+});
+
 describe("evaluateCommentReviewGate — quoted review bodies", () => {
   const fenced = (body: string, info = ""): string =>
     ["Quoting the review I am replying to:", "", `\`\`\`${info}`, body, "```", "", "Nothing addressed yet."].join("\n");
@@ -1541,6 +1806,18 @@ describe("commentReviewGateCheckConclusion", () => {
     headSha: CURRENT_HEAD,
     comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
   });
+  const deferred = evaluateCommentReviewGate({
+    headSha: CURRENT_HEAD,
+    // Independent author, for the same reason `clean` above needs one: a
+    // deferral is a POSITIVE claim about what a review decided, so it sits
+    // behind the BLO-34316 independence gate. Without this the fixture reads
+    // `not_evaluated` and every assertion below passes for the wrong reason.
+    prAuthorLogin: DISTINCT_PR_AUTHOR,
+    comments: [
+      allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
+      allyComment(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "tracked"), "2026-08-04T21:09:19Z"),
+    ],
+  });
 
   it("renders not-evaluated differently from reviewed-and-clean without reading the description", () => {
     // The defect this exists to close: on the commit-status surface both of
@@ -1595,8 +1872,25 @@ describe("commentReviewGateCheckConclusion", () => {
     }
   });
 
+  it("renders a deferred residual as neither a pass nor a block", () => {
+    // BLO-36903. `success` would assert the head is clean, which is the one
+    // thing a tracked residual is not; `failure` would block the landing path
+    // the reviewer explicitly recommended. `neutral` is exactly "did not pass,
+    // does not block", and the title is what separates it from not-evaluated.
+    expect(deferred.state).toBe("success");
+    expect(commentReviewGateCheckConclusion(deferred)).toBe("neutral");
+    expect(commentReviewGateCheckConclusion(deferred)).not.toBe(
+      commentReviewGateCheckConclusion(clean),
+    );
+    expect(commentReviewGateCheckTitle(deferred)).not.toBe(
+      commentReviewGateCheckTitle(notEvaluated),
+    );
+  });
+
   it("gives each outcome its own title so the conclusion is legible unopened", () => {
-    const titles = [notEvaluated, clean, blocking, carried].map(commentReviewGateCheckTitle);
+    const titles = [notEvaluated, clean, blocking, carried, deferred].map(
+      commentReviewGateCheckTitle,
+    );
 
     expect(new Set(titles).size).toBe(titles.length);
     expect(commentReviewGateCheckTitle(notEvaluated)).toMatch(/not evaluated/i);

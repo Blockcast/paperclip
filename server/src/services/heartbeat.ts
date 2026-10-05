@@ -431,6 +431,7 @@ import {
   recordHeartbeatTimerTick,
   recordRetryScheduleOutcome,
   recordConcurrentRunBlocked,
+  recordAgentDispatchDeclined,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
   recordProcessLost,
@@ -454,6 +455,7 @@ import {
   setCrashRecoveryCandidateIndexPresent,
   CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
 } from "./metrics.js";
+import type { DispatchDeclineReason } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
 import { mapAdapterToCcrotateTarget, mapPenstockProviderToCcrotateTarget } from "./ccrotate-target.js";
@@ -899,6 +901,39 @@ export const ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS = 4 * 60 * 60 * 1000;
  */
 export const ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS = 6 * ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS;
 const ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS = 5 * 60 * 1000;
+
+/**
+ * PEN-3326: backoff for a monitor fire that `enqueueWakeup` *suppressed* — it
+ * wrote a durable `skipped` wakeup row and queued nothing, so no run exists and
+ * nothing will retry.
+ *
+ * Why a ladder rather than the flat `ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS`
+ * above: the suppressions that reach a monitor fire are agent/company state
+ * (`budget.blocked`, `agent.not_invokable`, `heartbeat.scheduling_suppressed`,
+ * `heartbeat.worktree_execution_cutoff`, `heartbeat.wakeOnDemand.disabled`,
+ * `issue_tree_hold_active`, …) and clear on a human action, not on a timer. A
+ * flat 5 minutes would spend the whole `DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS`
+ * budget (24) inside two hours and churn the activity log 24 times to do it.
+ * Doubling to a one-hour ceiling spans the same budget over ~21h
+ * (5 + 10 + 20 + 40 + 20 x 60 = 1275 min) at a quarter of the writes.
+ *
+ * The bound is deliberate and is NOT a silent drop: exhausting it routes the
+ * monitor through `clearIssueMonitorAndRecover`, which logs
+ * `issue.monitor_exhausted` and fires the configured `recoveryPolicy`. The
+ * behaviour this replaces deleted the timer on the FIRST suppression with no
+ * recovery at all.
+ */
+const ISSUE_MONITOR_SUPPRESSED_REARM_BASE_DELAY_MS = 5 * 60 * 1000;
+const ISSUE_MONITOR_SUPPRESSED_REARM_MAX_DELAY_MS = 60 * 60 * 1000;
+
+function suppressedDispatchRearmDelayMs(attemptCount: number): number {
+  const exponent = Math.max(0, attemptCount - 1);
+  return Math.min(
+    ISSUE_MONITOR_SUPPRESSED_REARM_BASE_DELAY_MS * Math.pow(2, exponent),
+    ISSUE_MONITOR_SUPPRESSED_REARM_MAX_DELAY_MS,
+  );
+}
+
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE = "paperclip_monitor_dispatch";
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX = "heartbeat_run:";
 
@@ -1724,7 +1759,42 @@ export function shouldScheduleAutomaticRunRetry(
     return isIssueRun && recovery.adapterInvocationStarted === false;
   }
   if (run.errorCode === "session_unavailable") return true;
-  if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") return false;
+  // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) rides this arm
+  // because it REPLACED `adapter_failed` at the claude-k8s emit site. Its author
+  // reasoned that retryability was "preserved exactly" on the strength of the new
+  // code being a member of recovery/service.ts's
+  // TRANSIENT_INFRA_CONTINUATION_ERROR_CODES — true, but that is the issue
+  // CONTINUATION sweep, a different engine from this one, and it is issue-scoped.
+  // A pr_review run is not an issue run, so this gate is its only retry path, and
+  // here `adapter_failed` is admitted by nothing but the literal below. Renaming
+  // the code therefore silently dropped it: measured 2026-10-01 over an 18h
+  // window on Ally, 13 failures / 0 retries, while every sibling transient code
+  // in the same window retried normally (24 `transient_failure_retry` runs).
+  // Classification is not enrolment, and nothing failed loudly when the two
+  // diverged — see the parity test in heartbeat-recoverable-error-family.test.ts.
+  //
+  // The rename had THREE enrolment sites, not two (Ally, #2159). All are now
+  // aligned: TRANSIENT_INFRA_CONTINUATION_ERROR_CODES (#1669 got this one), the
+  // literal below, and ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES in
+  // recovery/zero-token-startup-failure.ts — the last decides owner-vs-manager
+  // routing, so missing it sent an assignee's stranded issue up the manager
+  // ladder. Both of the sites that test can reach are asserted there by
+  // comparison against `adapter_failed`, so a rename applied UNEVENLY ACROSS
+  // THOSE TWO fails CI rather than being measured 18 hours later. A rename at
+  // the adapter emit site alone does not: it leaves both gates holding the old
+  // literal, mutually consistent and green, while production emits a code no
+  // gate admits — #1669's exact shape, and the reason the directive comment
+  // lives at the emit site rather than here. A fourth enrolment SITE is
+  // likewise unasserted: those assertions are keyed on the two literals and
+  // cannot see a set they do not name, so enumerate consumers by hand. Site 1
+  // is not exported from recovery/service.ts and is unasserted either way.
+  if (
+    run.errorCode !== "adapter_failed" &&
+    run.errorCode !== "process_lost" &&
+    run.errorCode !== "skill_materialization_pending"
+  ) {
+    return false;
+  }
 
   // BLO-9147 AC1: gate on wakeReason/reviewKind/taskKey from the persisted
   // contextSnapshot, NOT on githubPrNumber presence. derivePaperclipPrReview
@@ -10533,6 +10603,46 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     // self-review, so the gate must confirm the PR was genuinely bot-authored
     // before accepting a "skipped as self-review" summary.
     prAuthorLogin: readNonEmptyString(contextSnapshot.githubPrAuthorLogin),
+    // BLO-38816: project the review-feedback classification so the woken run can
+    // tell "the reviewer found nothing" from "the findings were lost" from
+    // INSIDE the run, rather than inferring the no-op from absence. Both halves
+    // are needed and neither is redundant:
+    //
+    //  - `reviewFeedbackActionable` is written (BLO-30420) only as literal
+    //    `true` at a single site, under a conditional spread, so `=== true` is
+    //    the whole reader and the projection is `true | null` rather than
+    //    `boolean`: a `false` arm is unreachable by construction, and typing
+    //    one would invite a consumer to branch on "classified non-actionable"
+    //    in code that can never run. Its absence is ambiguous — it means "not
+    //    actionable" OR "this wake predates the writer" — which is exactly why
+    //    it must NOT be the thing the directive keys off.
+    //  - `reviewFeedbackSuppressionReason` is the positive signal: it is only
+    //    ever written when the classifier actually declined the review, so
+    //    keying the directive on its presence cannot mis-fire on a wake that
+    //    simply never ran through the classifier.
+    //
+    // The two signals are mutually exclusive for a single delivery: the webhook
+    // writes the suppression pair only when the classifier declined, and
+    // `githubReviewFeedbackActionable` only when it did not. Should they ever
+    // disagree, the closing directive is safe structurally — its ternary keys
+    // on the decline reason and never consults `reviewFeedbackActionable` — but
+    // the informational block above it is ordered decline-first so the two
+    // cannot contradict each other in the rendered text. That ordering is
+    // pinned by "prefers the decline line when both classifications are
+    // present"; swapping the arms previously passed every test.
+    //
+    // Reader-before-writer is intentional and inert: the suppression keys are
+    // written by BLO-30420 / #1681, which has not merged. Until it does these
+    // two read null on every wake and nothing downstream changes;
+    // `reviewFeedbackActionable` is live today.
+    reviewFeedbackActionable:
+      contextSnapshot.githubReviewFeedbackActionable === true ? (true as const) : null,
+    reviewFeedbackSuppressionReason: readNonEmptyString(
+      contextSnapshot.githubReviewFeedbackSuppressionReason,
+    ),
+    reviewFeedbackSuppressionPredicate: readNonEmptyString(
+      contextSnapshot.githubReviewFeedbackSuppressionPredicate,
+    ),
   };
 }
 
@@ -12115,6 +12225,19 @@ export function buildPaperclipTaskMarkdown(input: {
     // the "YOUR pull request" possessive and the push instruction — see
     // resolveThirdPartyPrAuthor.
     prAuthorLogin?: string | null;
+    // BLO-38816: see derivePaperclipPrReview. `reviewFeedbackSuppressionReason`
+    // is the positive "classifier declined this review" signal and is what the
+    // closing directive keys off; `reviewFeedbackActionable` is informational
+    // because its absence cannot distinguish non-actionable from unclassified.
+    // Typed `true | null`, never `boolean`: the producer writes the key only as
+    // literal `true`, so a `false` arm would be unreachable and a consumer
+    // branching on it would be writing dead code that reads like a real
+    // "classified non-actionable" check. `null` is the honest "not classified
+    // actionable", and `=== false` is a compile error rather than a silent
+    // mis-read.
+    reviewFeedbackActionable?: true | null;
+    reviewFeedbackSuppressionReason?: string | null;
+    reviewFeedbackSuppressionPredicate?: string | null;
   } | null;
   acceptedPlanContinuation?: boolean;
   // PEN-3275: the run's write-containment notice, derived by the caller from the run
@@ -12311,6 +12434,30 @@ export function buildPaperclipTaskMarkdown(input: {
       if (prReview.reviewBody) {
         lines.push("", "Latest review body:", fenceTaskText(prReview.reviewBody));
       }
+      // BLO-38816: the classifier already decided this review carries no
+      // actionable findings and recorded WHY. Say so, so the run does not have
+      // to re-derive the verdict from an empty body — the diagnosability gap
+      // BLO-30420 exists to close, which until now stopped at the
+      // `heartbeat_runs` row and never reached the run itself.
+      const declinedReason = prReview.reviewFeedbackSuppressionReason ?? null;
+      if (declinedReason) {
+        const predicateSuffix = prReview.reviewFeedbackSuppressionPredicate
+          ? `, predicate: ${quoteTaskScalar(prReview.reviewFeedbackSuppressionPredicate)}`
+          : "";
+        lines.push(
+          "",
+          `This review was classified as carrying NO actionable findings (reason: ${quoteTaskScalar(declinedReason)}${predicateSuffix}). That verdict is recorded, not inferred from an empty body.`,
+        );
+      } else if (prReview.reviewFeedbackActionable) {
+        // The positive half of the same signal. Without it the run can only
+        // distinguish "classified actionable" from "never classified" by the
+        // absence of the decline line above, which is the inference-from-
+        // absence this issue exists to remove.
+        lines.push(
+          "",
+          "This review was classified as carrying actionable findings, so there is something concrete to address.",
+        );
+      }
       // BLO-19067: the closing instruction must agree with the review state.
       // It used to unconditionally say "push a follow-up commit addressing
       // them", so an APPROVED review told the author to make an implementation
@@ -12325,7 +12472,15 @@ export function buildPaperclipTaskMarkdown(input: {
           ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here) so you know where it leaves your issue. You are not this PR's author: do NOT commit to its branch. Raise anything that needs changing as a PR comment, or act in your own branch. ${commonClosing}`
           : normalizedReviewState === "approved"
             ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It APPROVED your PR, so no implementation pass is required: do NOT push a no-op or invented follow-up commit, because any new push invalidates this approval and restarts CI. Act on a note only if it identifies a real defect; otherwise proceed to merge once required checks pass. ${commonClosing}`
-            : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
+            // BLO-38816: same damage shape as the APPROVED arm above — a run
+            // told to "push a follow-up commit addressing them" when there is
+            // nothing to address pushes a no-op, which restarts CI and (on a
+            // queued PR) ejects the entry. Declining to render the directive is
+            // the load-bearing half; the named reason alone would still ship
+            // the contradiction.
+            : declinedReason
+              ? `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). It records NO actionable findings, so no implementation pass is required: do NOT push a follow-up or invented commit on the strength of it. If you believe that classification is wrong, reply on the PR with rationale instead of pushing. ${commonClosing}`
+              : `Read the latest review on the PR above (use \`gh pr view\` / \`gh api\` if the body is missing here). If the findings are correct, push a follow-up commit addressing them. If they are wrong or out of scope, reply on the PR with rationale. ${commonClosing}`,
       );
     } else {
       lines.push(
@@ -14941,6 +15096,84 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       source: input.activitySource,
     });
 
+    // Leave the recovery comment on the source issue and log the suppression. The
+    // comment is the artifact an observer of the SOURCE issue can actually see: the
+    // recovery row is a separate issue, and the activity log is not on the thread.
+    //
+    // `recoveryCommentAlreadyPosted` is set by the `wake_owner` caller, which
+    // writes the recovery body unconditionally before the wake (BLO-29856). There
+    // the fallback must add only the note naming why the wake did not land —
+    // re-posting the body would put two copies of it on the thread. The insert is
+    // best-effort for the same reason master's is: a comment that cannot land must
+    // not throw out of the tick, and the activity row is the durable record.
+    async function recordRecoveryWakeSuppression(
+      suppressedCommentLead: string,
+      suppressionMessage: string,
+      options: { recoveryCommentAlreadyPosted?: boolean } = {},
+    ): Promise<void> {
+      const suppressionNote = `${suppressedCommentLead}: ${suppressionMessage}`;
+      try {
+        await db.insert(issueComments).values({
+          companyId: input.claimed.companyId,
+          issueId: input.claimed.id,
+          ...(options.recoveryCommentAlreadyPosted
+            ? {
+              idempotencyKey:
+                `issue-monitor-recovery-wake-suppressed:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+            }
+            : {}),
+          body: options.recoveryCommentAlreadyPosted
+            ? suppressionNote
+            : [
+              monitorRecoveryComment({
+                issue: input.claimed,
+                clearReason: input.clearReason,
+                recoveryPolicy: input.recoveryPolicy,
+                nextAttemptCount: input.nextAttemptCount,
+              }),
+              "",
+              suppressionNote,
+            ].join("\n"),
+        });
+      } catch (commentErr) {
+        logger.warn(
+          { err: commentErr, issueId: input.claimed.id, clearReason: input.clearReason },
+          "issue monitor recovery wake-suppression comment insert failed (non-fatal, suppression still logged)",
+        );
+      }
+      await logActivity(db, {
+        companyId: input.claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_recovery_wake_suppressed",
+        entityType: "issue",
+        entityId: input.claimed.id,
+        details: { ...details, suppressionMessage },
+      });
+    }
+
+    // Queue a recovery wake, or when the gate declines it with a 4xx, fall back to
+    // the suppression record above. The wake target is the same seat whose
+    // suppression this recovery follows, so a declined wake is the expected case,
+    // not an error to escape the tick with.
+    async function enqueueRecoveryWakeOrComment(
+      agentId: string,
+      wakeInput: Parameters<typeof enqueueWakeup>[1],
+      suppressedCommentLead: string,
+      options: { recoveryCommentAlreadyPosted?: boolean } = {},
+    ): Promise<"queued" | "suppressed"> {
+      try {
+        await enqueueWakeup(agentId, wakeInput);
+        return "queued";
+      } catch (err) {
+        if (!(err instanceof HttpError) || err.status < 400 || err.status >= 500) throw err;
+        await recordRecoveryWakeSuppression(suppressedCommentLead, err.message, options);
+        return "suppressed";
+      }
+    }
+
     if (input.recoveryPolicy === "create_recovery_issue") {
       let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(input.claimed);
       if (!recoveryIssue) {
@@ -14966,39 +15199,102 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      if (recoveryIssue.assigneeAgentId) {
-        await enqueueWakeup(recoveryIssue.assigneeAgentId, {
-          source: "automation",
-          triggerDetail: "system",
-          reason: "issue_monitor_recovery_issue",
-          idempotencyKey: `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
-          payload: withRecoveryModelProfileHint({ issueId: recoveryIssue.id, sourceIssueId: input.claimed.id }, "status_only"),
-          requestedByActorType: input.actorType,
-          requestedByActorId: input.actorId,
-          contextSnapshot: withRecoveryModelProfileHint({
-            issueId: recoveryIssue.id,
-            sourceIssueId: input.claimed.id,
-            source: "issue.monitor.recovery_issue",
-            wakeReason: "issue_monitor_recovery_issue",
-          }, "status_only"),
+      // PEN-3326: the recovery issue defaults to the source issue's own assignee,
+      // which on the paused-seat exhaustion that now reaches here is the agent
+      // that could not be woken. The row is the unsuppressible artifact; a
+      // declined wake must not throw past the `issue.monitor_recovery_issue_created`
+      // log below, so route it through the same comment fallback as `wake_owner`.
+      //
+      // The fallback swallows 4xx only and rethrows 5xx, which is right — a server
+      // fault is not this tick's to absorb. But the recovery-issue row has already
+      // committed by then, so letting that rethrow skip the log below would leave
+      // the row discoverable by `originId` and by nothing else. Hence `finally`:
+      // the creation is logged on every exit, and the wake's own outcome is
+      // labelled rather than defaulting to "delivered" — `suppressed` for the 4xx
+      // fallback, `failed` for the 5xx that is about to propagate.
+      //
+      // `unassigned` is the fourth state and the one the union used to omit: the
+      // wake is skipped outright when the recovery row has no assignee, which
+      // `findOpenIssueMonitorRecoveryIssue` can return when a pre-existing
+      // recovery issue has since had its assignee cleared. Without a member for
+      // it the details spread emitted neither `recoveryWakeSuppressed` nor
+      // `recoveryWakeFailed` — byte-identical to a delivered wake, i.e. exactly
+      // the "default to the delivered reading" this labelling exists to prevent,
+      // in the one state where nobody was woken at all.
+      //
+      // The label alone made it auditable but not actionable, so this state
+      // records the SAME suppression artifact the 4xx fallback does: a comment on
+      // the source issue and an `issue.monitor_recovery_wake_suppressed` row. It
+      // is the only exit with nobody to wake, so the source thread is the only
+      // place a reader will look — and it is reached on the exhaustion path, with
+      // the monitor already being cleared, so there is no later tick to report it.
+      // The created-row label stays `recoveryWakeUnassigned` rather than borrowing
+      // `recoveryWakeSuppressed`: the artifact is shared, the cause is not.
+      let recoveryWakeOutcome: "queued" | "suppressed" | "failed" | "unassigned" =
+        recoveryIssue.assigneeAgentId ? "queued" : "unassigned";
+      try {
+        if (recoveryIssue.assigneeAgentId) {
+          recoveryWakeOutcome = await enqueueRecoveryWakeOrComment(recoveryIssue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_monitor_recovery_issue",
+            idempotencyKey: `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+            payload: withRecoveryModelProfileHint({ issueId: recoveryIssue.id, sourceIssueId: input.claimed.id }, "status_only"),
+            requestedByActorType: input.actorType,
+            requestedByActorId: input.actorId,
+            contextSnapshot: withRecoveryModelProfileHint({
+              issueId: recoveryIssue.id,
+              sourceIssueId: input.claimed.id,
+              source: "issue.monitor.recovery_issue",
+              wakeReason: "issue_monitor_recovery_issue",
+            }, "status_only"),
+          }, "The recovery-issue wake could not be delivered");
+        } else {
+          await recordRecoveryWakeSuppression(
+            "The recovery-issue wake was skipped",
+            `recovery issue ${recoveryIssue.identifier ?? recoveryIssue.id} has no assignee, so there was no seat to wake`,
+          );
+        }
+      } catch (err) {
+        recoveryWakeOutcome = "failed";
+        throw err;
+      } finally {
+        // The `.catch()` below is what makes this safe to `await`: it settles the
+        // rejection before the `await` can see it, so a throwing `logActivity`
+        // cannot complete the `finally` abruptly and REPLACE the exception the
+        // `catch` is still rethrowing. Without it the tick would log "issue
+        // monitor tick failed" against the activity-insert error instead of the
+        // 5xx root cause — and the two are correlated, since a 5xx originating in
+        // the DB layer is precisely when this insert also fails, so the
+        // best-effort annotation would outrank the error it exists to annotate
+        // exactly when that error matters most. The `await` must stay: it keeps
+        // the log ordered before the function returns. Swallowing the log error
+        // keeps the row discoverable by `originId`, which is the same fallback the
+        // `finally` was chosen for.
+        await logActivity(db, {
+          companyId: input.claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_recovery_issue_created",
+          entityType: "issue",
+          entityId: input.claimed.id,
+          details: {
+            ...details,
+            recoveryIssueId: recoveryIssue.id,
+            recoveryIdentifier: recoveryIssue.identifier,
+            ...(recoveryWakeOutcome === "suppressed" ? { recoveryWakeSuppressed: true } : {}),
+            ...(recoveryWakeOutcome === "failed" ? { recoveryWakeFailed: true } : {}),
+            ...(recoveryWakeOutcome === "unassigned" ? { recoveryWakeUnassigned: true } : {}),
+          },
+        }).catch((logErr) => {
+          logger.error(
+            { logErr, issueId: input.claimed.id, recoveryIssueId: recoveryIssue.id },
+            "issue monitor recovery-issue activity log failed",
+          );
         });
       }
-
-      await logActivity(db, {
-        companyId: input.claimed.companyId,
-        actorType: input.actorType,
-        actorId: input.actorId,
-        agentId: input.agentId,
-        runId: input.runId,
-        action: "issue.monitor_recovery_issue_created",
-        entityType: "issue",
-        entityId: input.claimed.id,
-        details: {
-          ...details,
-          recoveryIssueId: recoveryIssue.id,
-          recoveryIdentifier: recoveryIssue.identifier,
-        },
-      });
       return;
     }
 
@@ -15059,7 +15355,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     }
 
-    await enqueueWakeup(input.claimed.assigneeAgentId!, {
+    // PEN-3326: the comment above is the visibility half; this is the suppression
+    // half, and the two are independent. `wake_owner` is the DEFAULT recovery
+    // policy and its owner is the issue's own assignee — which on the failure this
+    // recovery most often follows (a suppressed dispatch that exhausted its
+    // deferral budget) is precisely the agent that cannot be woken. A bare
+    // `enqueueWakeup` here lets that 4xx escape the tick, so the escalation meant
+    // to make the loss loud is itself silently suppressed. Swallow it and record
+    // the suppression instead. The recovery body is already on the thread, so the
+    // fallback adds only the note naming why the wake did not land.
+    const wake = await enqueueRecoveryWakeOrComment(input.claimed.assigneeAgentId!, {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_monitor_recovery",
@@ -15086,7 +15391,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutAt: input.monitor?.timeoutAt ?? null,
         maxAttempts: input.monitor?.maxAttempts ?? null,
       }, "status_only"),
-    });
+    }, "The owner-recovery wake could not be delivered", { recoveryCommentAlreadyPosted: true });
+    if (wake === "suppressed") return;
 
     await logActivity(db, {
       companyId: input.claimed.companyId,
@@ -15262,7 +15568,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ...buildIssueMonitorClearedPatch({
               issue: claimed,
               policy,
-              clearReason: "dispatch_skipped",
+              clearReason: "dispatch_watchdog_recovered",
               clearedAt: input.now,
             }),
             updatedAt: input.now,
@@ -15375,17 +15681,141 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
+    // PEN-3326: `enqueueWakeup` can decline a monitor fire outright — it writes a
+    // durable `skipped` wakeup row and queues nothing. Two shapes reach here: the
+    // skip-then-throw gates (`budget.blocked`, `agent.not_invokable`) arrive as a
+    // 409 in the catch below, and the skip-then-return-null gates
+    // (`heartbeat.scheduling_suppressed`, `heartbeat.worktree_execution_cutoff`,
+    // `heartbeat.wakeOnDemand.disabled`, `issue_tree_hold_active`, …) arrive as a
+    // plain `null` on the success path. Both mean the same thing — NO run exists
+    // and nothing will retry — so consuming the timer loses the work outright.
+    // Re-arm instead, bounded, exactly as the sibling `dependency_blocked`
+    // deferral below already does.
+    //
+    // The sink, not the HTTP status, is the discriminator. A null return also
+    // covers `alreadyDelivered` (a wake IS pending) and `providerCapacityDeferred`
+    // (a scheduled_retry run IS committed); neither loses work and neither sets
+    // `durableSkipReason`. Reading the status instead would be wrong in both
+    // directions: it cannot see the return-null gates at all, and it cannot tell
+    // `budget.blocked`'s 409 from a 409 raised by anything else.
+    //
+    // One more return-null writer exists, and it is the only `durableSkipReason`
+    // set outside the funnel at `enqueueWakeup`'s single skip helper:
+    // `pipeline_stage_exit_cancellation_pending`. It fires only on
+    // `issue.status === "cancelled"`, which the tick's own claim filter excludes
+    // (`in_progress`/`in_review`), so reaching it needs a cancellation to commit
+    // in the window between the claim and the gate. It is deliberately NOT
+    // special-cased here: the deferral is still the least-wrong answer, since the
+    // alternative on this path is the triggered patch that asserts a wake nobody
+    // queued. Known consequence, tracked separately — the re-arm leaves a future
+    // `monitorNextCheckAt` on a cancelled row, no later tick can claim it back
+    // (same status filter), and nothing else nulls that column on cancellation,
+    // so `hasActiveMonitorPath` reads a wake path that will never dispatch.
+    //
+    // `company.inactive` is the last gate that reaches here, and it is bounded
+    // the same way — by a filter upstream of this function, not by anything in
+    // it. Both of the tick's own selects innerJoin `companies` on
+    // `status = 'active'`, so a paused, archived or missing company's monitors
+    // are never enumerated in the first place and no attempt budget is ever
+    // spent against them. Two narrow paths remain: a status flip landing between
+    // that select and the gate's own company read (one deferral, then the row is
+    // simply never selected again), and an agent-actor `POST
+    // /issues/:id/monitor/check-now`, which is one manual dispatch — a user
+    // actor gets the `throw conflict` arm instead. Deferring is the right answer
+    // on both: `paused → active` and `archived → active` are BOTH supported
+    // transitions that restore agents, so the monitor a reactivation needs is
+    // the one this keeps. Only a missing company row is genuinely terminal, and
+    // the FK makes that unreachable from an issue that exists.
+    const monitorSuppression: WakeSuppressionOutcome = {
+      durableSkipReason: null,
+      providerCapacityDeferred: false,
+      dependencyBlockedRetryAt: null,
+      alreadyDelivered: false,
+    };
+    const deferSuppressedDispatch = async (
+      skipReason: string,
+      errorMessage: string | null,
+    ): Promise<
+      | {
+        kind: "rearmed";
+        result: { outcome: "dispatch_suppressed_deferred"; nextCheckAt: string; suppressionReason: string };
+      }
+      | { kind: "unpersistable" }
+    > => {
+      // No exhaustion check here. The top-level `clearReason` above already ran
+      // `exhaustedMonitorClearReason` against `priorAttemptCount` and the same
+      // `input.now`, so reaching this point means the budget is not spent. This
+      // re-arm persists `nextAttemptCount`, and the next pass's top-level check
+      // routes a spent budget to `clearIssueMonitorAndRecover` (the loud path:
+      // `issue.monitor_exhausted` plus the configured recoveryPolicy), exactly as
+      // the `dependency_blocked` deferral below terminates. Re-checking the
+      // INCREMENTED count here moved the ceiling by one: at `maxAttempts: 1` a
+      // suppressed dispatch got no deferral at all.
+      const retryAt = new Date(input.now.getTime() + suppressedDispatchRearmDelayMs(nextAttemptCount));
+      const retryPolicy = monitor
+        ? normalizeIssueExecutionPolicy({
+            ...policy,
+            monitor: { ...monitor, nextCheckAt: retryAt.toISOString() },
+          })
+        : null;
+      // Same guard, and for the same reason, as the dependency-blocked branch: if
+      // the monitor policy has drifted away while `monitorNextCheckAt` is still
+      // set there is nothing to rebuild, and reporting "deferred" without a write
+      // would leave the column in the past AND the attempt unincremented — a row
+      // that re-claims every staleClaimThreshold forever against a frozen attempt
+      // count, i.e. the unbounded loop this bound exists to prevent.
+      if (!retryPolicy?.monitor) return { kind: "unpersistable" };
+
+      await db
+        .update(issues)
+        .set({
+          ...buildIssueMonitorDispatchRearmPatch({
+            issue: claimed,
+            policy: retryPolicy,
+            attemptCount: nextAttemptCount,
+          }),
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, claimed.id));
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_dispatch_suppressed_deferred",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: retryAt.toISOString(),
+          previousCheckAt: scheduledAtIso,
+          monitorAttemptCount: nextAttemptCount,
+          // Both were already in hand at the old clear site and neither survived
+          // it: `suppressionReason` is the durable label written onto the skipped
+          // wakeup row, `reason` the gate's own sentence where it threw one.
+          suppressionReason: skipReason,
+          reason: errorMessage,
+          notes: claimed.monitorNotes ?? null,
+          ...monitorMetadata,
+          source: input.activitySource,
+        },
+      });
+      return {
+        kind: "rearmed",
+        result: {
+          outcome: "dispatch_suppressed_deferred" as const,
+          nextCheckAt: retryAt.toISOString(),
+          suppressionReason: skipReason,
+        },
+      };
+    };
+
     try {
       // BLO-22048: an unresolved blocker makes enqueueWakeup park the wake as a
       // `dependency_blocked` scheduled_retry and return null *without throwing*,
       // so the triggered patch below would otherwise fire for a wake that never
       // ran. The sink is how that deferral is distinguished from a real dispatch.
-      const monitorSuppression: WakeSuppressionOutcome = {
-        durableSkipReason: null,
-        providerCapacityDeferred: false,
-        dependencyBlockedRetryAt: null,
-        alreadyDelivered: false,
-      };
       await enqueueWakeup(targetAgentId, {
         source: input.source,
         triggerDetail: input.triggerDetail,
@@ -15510,6 +15940,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { outcome: "dependency_blocked_deferred" as const, nextCheckAt: retryAt.toISOString() };
       }
 
+      // PEN-3326: a declined wake reaching here as a plain `null` was the worse
+      // half of this defect. It fell through to the triggered patch below, which
+      // consumes the timer AND logs `issue.monitor_triggered` — an activity row
+      // asserting a wake that was never queued. The clear path at least said
+      // "skipped".
+      if (monitorSuppression.durableSkipReason) {
+        const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, null);
+        if (deferral.kind === "rearmed") return deferral.result;
+        // `unpersistable` — fall through to the triggered patch, which at least
+        // terminates the row rather than leaving it re-claiming forever. This is
+        // the pre-existing behaviour for policy drift, unchanged.
+      }
+
       await db
         .update(issues)
         .set({
@@ -15545,6 +15988,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { outcome: "triggered" as const };
     } catch (err) {
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
+        // PEN-3326: the skip-then-throw gates (`budget.blocked`,
+        // `agent.not_invokable`) land here. They are suppressions, not verdicts
+        // on this issue: the agent is paused or not invokable *right now*, on a
+        // condition a human clears. Deleting the timer made that recoverable
+        // pause permanently destructive — resuming the seat does not bring the
+        // schedule back, and the row then reads healthy on every field an
+        // observer checks. THIS throw-branch deferral is automation-only: the
+        // manual/on-demand caller passes `clearOnClientError: false`, already
+        // leaves the monitor intact, and must keep seeing the 409. The
+        // return-null deferral above is deliberately NOT gated the same way: a
+        // null return carries no error to surface, so falling through on the
+        // manual path would replay the "triggered for a wake never queued"
+        // defect. It re-arms instead, and the route reports the deferred
+        // outcome rather than a bare ok.
+        if (input.clearOnClientError && monitorSuppression.durableSkipReason) {
+          const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, err.message);
+          if (deferral.kind === "rearmed") return deferral.result;
+          // `unpersistable` — fall through to the clear below, unchanged.
+        }
         if (input.clearOnClientError) {
           await db
             .update(issues)
@@ -15788,6 +16250,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Leaving it uncounted made `checked` exceed `triggered + skipped` with no
     // explanation — the same "the deferral is invisible" shape BLO-22048 is about.
     let dependencyBlockedDeferred = 0;
+    // Counted separately again, and for the same reason: a suppressed dispatch
+    // declined nothing either — it re-armed. Folding it into `skipped` would hide
+    // the very distinction PEN-3326 is about.
+    let dispatchSuppressedDeferred = 0;
 
     for (const due of dueMonitors) {
       const claimed = await db.transaction(async (tx) => {
@@ -15834,6 +16300,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (result.outcome === "triggered") triggered += 1;
         if (result.outcome === "skipped") skipped += 1;
         if (result.outcome === "dependency_blocked_deferred") dependencyBlockedDeferred += 1;
+        if (result.outcome === "dispatch_suppressed_deferred") dispatchSuppressedDeferred += 1;
       } catch (err) {
         logger.error({ err, issueId: claimed.id }, "issue monitor tick failed");
       }
@@ -15844,6 +16311,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       triggered,
       skipped,
       dependencyBlockedDeferred,
+      dispatchSuppressedDeferred,
     };
   }
 
@@ -20269,6 +20737,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function promoteScheduledRetryRun(
     dueRun: typeof heartbeatRuns.$inferSelect,
     now: Date,
+    // BLO-25944: set only by `retryScheduledRetryNow`. An operator press may
+    // shorten a capacity park; it must never spend its retry budget or end it.
+    promotionOpts: { operatorRequested?: boolean } = {},
   ): Promise<
     | { outcome: "promoted"; run: typeof heartbeatRuns.$inferSelect }
     | {
@@ -20472,7 +20943,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
       if (capacity) {
-        const nextAttempt = (dueRun.scheduledRetryAttempt ?? 0) + 1;
+        // An operator press re-probes without counting as a hop, so pressing
+        // retry-now during an outage cannot advance the chain.
+        const nextAttempt = promotionOpts.operatorRequested
+          ? (dueRun.scheduledRetryAttempt ?? 0)
+          : (dueRun.scheduledRetryAttempt ?? 0) + 1;
         // BLO-28919: the give-up condition is how long the pool has ACTUALLY
         // been down, not how many times we looked. Reading the chain origin off
         // the row rather than counting hops is what decouples outage tolerance
@@ -20483,7 +20958,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ],
           now,
         });
-        if (capacityEscalation.exhausted) {
+        // Only the automatic sweep may give up on a chain. An operator press past
+        // the horizon falls through to a re-defer, and the next sweep that finds
+        // the pool still down terminates it as before; retry-now reporting a
+        // cancelled run as a success is the failure this guard exists to stop.
+        if (capacityEscalation.exhausted && !promotionOpts.operatorRequested) {
           // The pool never recovered inside the escalation horizon. Terminate
           // the scheduled retry so it surfaces for operator attention instead
           // of looping forever.
@@ -22170,7 +22649,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(heartbeatRuns.companyId, companyId),
           inArray(heartbeatRuns.status, statuses),
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-          sql`${heartbeatRuns.retryOfRunId} is not null`,
+          // A row is a legitimate retry-lookup target either because it
+          // literally retries a prior run (retryOfRunId set by
+          // scheduleBoundedRetryForRun) or because it's a ccrotate_capacity
+          // capacity-gate park: persistProviderCapacityRetry defers a wake
+          // before any run object exists, so there is no prior run.id to carry
+          // (BLO-25944). Without the second arm, retry-now is structurally
+          // blind to capacity parks — its only remedy.
+          //
+          // Dep-blocked parks (DEP_BLOCKED_RETRY_REASON) have the same null
+          // retryOfRunId and are deliberately NOT matched: their promotion
+          // re-checks dependency readiness and re-parks while blocked, so
+          // retry-now could not release one, only spend its attempt budget.
+          // Resolving the blocker is what releases it.
+          or(
+            sql`${heartbeatRuns.retryOfRunId} is not null`,
+            eq(heartbeatRuns.scheduledRetryReason, CCROTATE_CAPACITY_RETRY_REASON),
+          ),
         ),
       )
       .orderBy(desc(heartbeatRuns.updatedAt), desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
@@ -22325,7 +22820,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
-    const promotion = await promoteScheduledRetryRun(updated, now);
+    const promotion = await promoteScheduledRetryRun(updated, now, { operatorRequested: true });
     const promotedRow = await getIssueRetryRun(issue.companyId, issue.id, ["queued", "running", "cancelled"]);
     const scheduledRetry = promotedRow
       ? summarizeIssueScheduledRetryRun(promotedRow)
@@ -22343,6 +22838,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome: "gate_suppressed" as const,
         message: promotion.reason,
         scheduledRetry,
+      };
+    }
+    // Still parked after the press: the promotion-time re-check (provider
+    // capacity or dependency readiness) re-deferred it. Report the new horizon
+    // rather than letting it read as a promotion.
+    if (promotion.run?.status === "scheduled_retry") {
+      const retryAt = promotion.run.scheduledRetryAt
+        ? new Date(promotion.run.scheduledRetryAt).toISOString()
+        : null;
+      return {
+        outcome: "re_deferred" as const,
+        message: retryAt
+          ? `Scheduled retry could not run yet and was re-deferred to ${retryAt}`
+          : "Scheduled retry could not run yet and was re-deferred",
+        scheduledRetry: summarizeIssueScheduledRetryRun({ run: promotion.run, agentName: scheduled.agentName }),
       };
     }
     return {
@@ -28734,6 +29244,100 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     dispatchAdmissionRetryTimersByAgent.set(agentId, timer);
   }
 
+  /**
+   * Rate-limit the per-decline log lines to at most one per (agent, reason)
+   * per {@link DISPATCH_DECLINE_LOG_INTERVAL_MS}.
+   *
+   * `resumeQueuedRuns` drives a dispatch pass for every agent holding a queued
+   * run, on every scheduler tick — 30 s in `index.ts`. So a decline that
+   * PERSISTS logs on every tick for as long as the condition holds: ~2 880
+   * lines per agent per day, and the motivating incident held one shape for
+   * 73.6 h (~8 800 lines). The scenario this instrumentation exists to
+   * illuminate is precisely the scenario that would drown the log it writes to.
+   *
+   * The counter carries the sustained rate, which is what it is for. The log's
+   * job is the unbounded detail that cannot be a metric label
+   * (`invokabilityReason`, `queuedRunCount`) — and that detail does not need
+   * re-emitting every 30 s to be useful. `suppressedSincePreviousLog` keeps the
+   * emitted line honest about how much it stands for, so a throttled line is
+   * never mistaken for an isolated event.
+   *
+   * Bounded by construction: one entry per (agent, reason), agents come from
+   * our own `agents` table and reasons from the closed
+   * `KNOWN_DISPATCH_DECLINE_REASONS`. No caller-influenced key can enter it, so
+   * unlike `webhookRejectionLogState` in `metrics.ts` — whose plugin keys are
+   * externally supplied and therefore capped — this needs no overflow bucket.
+   * Entries for deleted agents linger for the process lifetime; that is a few
+   * bytes each against a set that is already bounded by the roster.
+   */
+  const DISPATCH_DECLINE_LOG_INTERVAL_MS = 10 * 60_000;
+  const dispatchDeclineLogState = new Map<
+    string,
+    { lastLoggedAt: number; suppressed: number }
+  >();
+
+  function takeDispatchDeclineLogSlot(
+    agentId: string,
+    reason: DispatchDeclineReason,
+  ): { log: false } | { log: true; suppressedSincePreviousLog: number } {
+    const key = `${agentId}:${reason}`;
+    const now = Date.now();
+    const previous = dispatchDeclineLogState.get(key);
+    if (previous && now - previous.lastLoggedAt < DISPATCH_DECLINE_LOG_INTERVAL_MS) {
+      previous.suppressed += 1;
+      return { log: false };
+    }
+    dispatchDeclineLogState.set(key, { lastLoggedAt: now, suppressed: 0 });
+    return { log: true, suppressedSincePreviousLog: previous?.suppressed ?? 0 };
+  }
+
+  /**
+   * PEN-3607: a dispatch pass that declines to start a run must say so.
+   *
+   * `startNextQueuedRunForAgent` declines through its `return []` sites. Before
+   * this, exactly one of them recorded anything an operator could read — the
+   * `availableSlots <= 0` refusal, via `recordConcurrentRunBlocked`. The others
+   * wrote no metric, no log above `debug`, and nothing to the run row,
+   * so a seat that was being considered and refused on every scheduler tick was
+   * indistinguishable from a seat nothing was looking at. Measured cost of that
+   * gap: agent `bcba1cc7` held four `queued` runs for 73.6 h with no `startedAt`
+   * while `resumeQueuedRuns` reached it every tick, and two separate code-trace
+   * localizations of the bail were both wrong because the only signal available
+   * was a *different* counter that had stopped incrementing.
+   *
+   * That is why this records on every decline rather than only on the ones that
+   * look pathological. A silent path cannot be ruled out by measurement, so
+   * narrowing by elimination is the only tool left, and it is a bad one.
+   *
+   * `knownAgentIds` is resolved lazily and only when a decline actually happens:
+   * the roster read is cached (`getActiveAgentIds`), but the pass should not pay
+   * for it on the hot success path. For the process-wide guards that fire before
+   * the agent row is loaded there is no company to scope, so the label collapses
+   * to the bounded `unknown` — those refusals are facts about the process, and
+   * labelling them per-agent would invite exactly the wrong query.
+   */
+  async function noteDispatchDeclined(
+    agentId: string,
+    reason: DispatchDeclineReason,
+    companyId: string | null,
+  ): Promise<void> {
+    try {
+      const knownAgentIds = companyId
+        ? await getActiveAgentIds(db, companyId)
+        : new Set<string>();
+      recordAgentDispatchDeclined({ agentId, reason, knownAgentIds });
+    } catch (error) {
+      // Instrumentation must never be able to fail dispatch. A rejected roster
+      // read here would otherwise convert an ordinary decline into a thrown
+      // pass, which `resumeQueuedRuns` collects and rethrows — turning a
+      // reporting improvement into a fleet-wide dispatch fault.
+      logger.debug(
+        { agentId, reason, error },
+        "startNextQueuedRunForAgent: failed to record dispatch decline",
+      );
+    }
+  }
+
   async function startNextQueuedRunForAgent(
     agentId: string,
     dispatchPassOptions: {
@@ -28744,7 +29348,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reason?: string;
     } = {},
   ) {
-    if (options.skipQueuedRunDispatch || dispatchStopped) return [];
+    if (options.skipQueuedRunDispatch || dispatchStopped) {
+      await noteDispatchDeclined(agentId, "dispatch_stopped", null);
+      return [];
+    }
     if (
       dispatchPassOptions.reason !== "resume_critical_lane"
       && !dispatchPassOptions.suppressCriticalLaneHeadRescanDemand
@@ -28778,13 +29385,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         { agentId, role: paperclipNodeRole },
         "startNextQueuedRunForAgent: dispatch fenced off on the API tier (workers tier owns run execution)",
       );
+      await noteDispatchDeclined(agentId, "api_tier_fence", null);
       return [];
     }
-    if ((await getSchedulingSuppression()).suppressed) return [];
+    if ((await getSchedulingSuppression()).suppressed) {
+      await noteDispatchDeclined(agentId, "scheduling_suppressed", null);
+      return [];
+    }
     const cutoff = await getWorktreeExecutionCutoff();
 
     return withAgentStartLock(agentId, async () => {
-      if (dispatchStopped) return [];
+      if (dispatchStopped) {
+        await noteDispatchDeclined(agentId, "dispatch_stopped", null);
+        return [];
+      }
       await options.beforeQueuedDispatchPassForTest?.({
         agentId,
         reason: dispatchPassOptions.reason ?? "direct",
@@ -28793,12 +29407,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       markAgentStartLockPhase(agentId, "agent_load");
       let agent = await getAgent(agentId);
-      if (!agent) return [];
+      if (!agent) {
+        await noteDispatchDeclined(agentId, "agent_missing", null);
+        return [];
+      }
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         if (shouldCancelRunsForNonInvokableAgent(invokability)) {
           await cancelActiveForAgentInternal(agentId, `Cancelled because the agent is not invokable: ${invokability.reason}`);
         }
+        // `reason` here is the invokability verdict (paused / terminated /
+        // manager_terminated / …), which is what an operator needs and which
+        // nothing else on this path emits. It is deliberately NOT a metric
+        // label: the verdict set is open-ended enough that folding it in would
+        // widen the series, and the bounded decline reason plus this line
+        // together answer the question.
+        //
+        // Level is split by verdict rather than fixed at `warn`. Paused and
+        // terminated are INTENDED operator actions, not anomalies, and `warn`
+        // is the level that feeds dashboards and alert routes — a deliberately
+        // paused agent should not page anyone every 30 s. An invalid reporting
+        // chain is a genuine fault nobody asked for, so it keeps `warn`.
+        // Either way the line is throttled and the counter carries the rate.
+        const invokableLogSlot = takeDispatchDeclineLogSlot(agentId, "agent_not_invokable");
+        if (invokableLogSlot.log) {
+          const invokableLogDetails = {
+            agentId,
+            invokabilityReason: invokability.reason,
+            invalidOrgChain: invokability.invalidOrgChain,
+            suppressedSincePreviousLog: invokableLogSlot.suppressedSincePreviousLog,
+          };
+          const invokableLogMessage =
+            "startNextQueuedRunForAgent: declined because the agent is not invokable";
+          if (invokability.invalidOrgChain) {
+            logger.warn(invokableLogDetails, invokableLogMessage);
+          } else {
+            logger.debug(invokableLogDetails, invokableLogMessage);
+          }
+        }
+        await noteDispatchDeclined(agentId, "agent_not_invokable", agent.companyId);
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
@@ -28900,6 +29547,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { agentId, adapterType: agent.adapterType },
           "startNextQueuedRunForAgent: untracked Kubernetes Job or Pod still holds the agent",
         );
+        await noteDispatchDeclined(agentId, "untracked_external_job", agent.companyId);
         return [];
       }
       const availableSlots = Math.max(0, effectiveMaxConcurrentRuns - runningCount);
@@ -28916,6 +29564,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             knownAgentIds: await getActiveAgentIds(db, agent.companyId),
           });
         }
+        // Recorded here as well as on the adapter-scoped counter above. That
+        // one is external-lifecycle-only and carries an isolation dimension;
+        // this one covers every adapter and sits in the same series as the
+        // other decline reasons, so "why is this seat not dispatching"
+        // is one query rather than a join across two metrics with different
+        // population rules.
+        await noteDispatchDeclined(agentId, "no_available_slots", agent.companyId);
         return [];
       }
       if (externalLifecycle) {
@@ -28946,7 +29601,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Image changes are agent-wide. Drain all active slots before applying
         // the bump so a concurrent dispatch cannot launch an older image after
         // the operator requested convergence.
-        if (runningCount > 0 || hasActiveExternalJob) return [];
+        if (runningCount > 0 || hasActiveExternalJob) {
+          await noteDispatchDeclined(agentId, "pending_image_bump", agent.companyId);
+          return [];
+        }
         await processPendingImageBumpForAgent(db, agentId);
         agent = (await getAgent(agentId)) ?? agent;
       }
@@ -29217,6 +29875,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_critical_lane",
         });
+        await noteDispatchDeclined(agentId, "critical_lane_continuation", agent.companyId);
         return [];
       }
       dispatchCriticalLaneCursorByAgent.delete(agentId);
@@ -29226,7 +29885,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_critical_lane",
         });
-        if (!foundReadyCritical) return [];
+        if (!foundReadyCritical) {
+          await noteDispatchDeclined(agentId, "critical_lane_continuation", agent.companyId);
+          return [];
+        }
       }
 
       // Lane B — recovery-action wakes. Recovery-ness is a property of the RUN,
@@ -29332,6 +29994,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_recovery_lane",
         });
+        await noteDispatchDeclined(agentId, "recovery_lane_continuation", agent.companyId);
         return [];
       }
       dispatchRecoveryLaneCursorByAgent.delete(agentId);
@@ -29341,7 +30004,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId,
           reason: "resume_recovery_lane",
         });
-        if (!foundReadyRecovery) return [];
+        if (!foundReadyRecovery) {
+          await noteDispatchDeclined(agentId, "recovery_lane_continuation", agent.companyId);
+          return [];
+        }
       }
 
       // Lane C — absolute starvation floor. BLO-21792 (second and third review
@@ -29657,6 +30323,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
           scheduleDelayedAdmissionRetry(agentId);
         }
+        await noteDispatchDeclined(agentId, "no_queued_candidates", agent.companyId);
         return [];
       }
 
@@ -29965,13 +30632,65 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (scheduledEmergencyContinuationAfterRefusal) {
         if (claimedRuns.length > 0) {
           launchClaimedRuns();
+          return claimedRuns;
         }
-        return claimedRuns;
+        // PEN-3607 (review follow-up): this branch used to `return claimedRuns`
+        // for BOTH cases, above the `claimedRuns.length === 0` block below that
+        // carries `no_claimable_run`. So the empty case returned an empty array
+        // having recorded nothing — and the source scanner could not see it,
+        // because the line read `return claimedRuns;` rather than `return [];`.
+        // It was the worst path to have dark: a candidate refused AND the pass
+        // escalated, which is the strongest signal the pass itself can give
+        // that this seat is in trouble, and it is the exact refusal shape
+        // PEN-3607 was filed about.
+        //
+        // Returning `[]` here rather than the (empty) accumulator is load
+        // bearing, not cosmetic: it puts the exit back in the idiom the scanner
+        // enforces, so the next decline added beside it cannot go silent the
+        // same way.
+        const emergencyLogSlot = takeDispatchDeclineLogSlot(
+          agentId,
+          "emergency_continuation_scheduled",
+        );
+        if (emergencyLogSlot.log) {
+          logger.warn(
+            {
+              agentId,
+              queuedRunCount: queuedRuns.length,
+              availableSlots,
+              suppressedSincePreviousLog: emergencyLogSlot.suppressedSincePreviousLog,
+            },
+            "startNextQueuedRunForAgent: declined — a candidate refused and an emergency continuation was scheduled",
+          );
+        }
+        await noteDispatchDeclined(agentId, "emergency_continuation_scheduled", agent.companyId);
+        return [];
       }
       if (claimedRuns.length === 0) {
         if (!finishPassWithoutClaims() && dispatchDeferredRunIdsByAgent.has(agentId)) {
           scheduleDelayedAdmissionRetry(agentId);
         }
+        // The pass had slots, scanned the queue, ranked candidates, and every
+        // one of them refused to claim. This is the shape a wedged seat takes:
+        // reached every tick, refused every tick, previously recording nothing
+        // anywhere. `queuedRunCount` is on the log line rather than the metric
+        // because it is unbounded; the series carries only the bounded reason.
+        // Throttled for the reason given on takeDispatchDeclineLogSlot: a
+        // wedged seat holds this shape for as long as it stays wedged, so an
+        // unthrottled line here scales with the incident it is reporting.
+        const noClaimLogSlot = takeDispatchDeclineLogSlot(agentId, "no_claimable_run");
+        if (noClaimLogSlot.log) {
+          logger.warn(
+            {
+              agentId,
+              queuedRunCount: queuedRuns.length,
+              availableSlots,
+              suppressedSincePreviousLog: noClaimLogSlot.suppressedSincePreviousLog,
+            },
+            "startNextQueuedRunForAgent: declined — candidates were ranked but none could be claimed",
+          );
+        }
+        await noteDispatchDeclined(agentId, "no_claimable_run", agent.companyId);
         return [];
       }
       // Settle continuation bookkeeping for a pass that DID claim. A pass that
@@ -31504,6 +32223,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (executionWorkspace.created) {
         try {
           await cleanupExecutionWorkspaceArtifacts({
+            trigger: "persist_rollback",
             workspace: {
               id:
                 reusableExistingExecutionWorkspace?.id
@@ -31606,9 +32326,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reusableExistingExecutionWorkspace.id !== persistedExecutionWorkspace.id &&
       reusableExistingExecutionWorkspace.status === "active"
     ) {
+      // PEN-3692 (found by Ally on PR #2175): this used to null `cleanupReason`
+      // too. Unlike the realization write above it does NOT null
+      // `cleanupEligibleAt`, so a row stamped `run_ended` by run teardown was
+      // left collector-eligible with its origin erased, and every series the
+      // collector then emitted for it read `idle_backfill` — the same
+      // relabelling `deferCandidate` was just fixed for, in a second writer,
+      // biased the same way. Demoting a workspace to `idle` is not a statement
+      // about WHY it became eligible, so the stamp it carries is left alone. If
+      // a future change wants the reason cleared here, clear
+      // `cleanupEligibleAt` with it (the way the realization write does) so the
+      // row is un-stamped coherently rather than left eligible-but-unattributed.
       await executionWorkspacesSvc.update(reusableExistingExecutionWorkspace.id, {
         status: "idle",
-        cleanupReason: null,
       });
     }
     if (issueId && persistedExecutionWorkspace) {
@@ -41350,7 +42080,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Blocker-deferred monitors delivered no wake, so they belong on the
         // not-enqueued side of the ledger rather than silently widening the gap
         // between `checked` and the two counters that explain it (BLO-22048).
+        // A suppressed-dispatch deferral (PEN-3326) is the same shape: no wake
+        // was delivered, and the timer survived.
         skipped: skipped + issueMonitors.skipped + issueMonitors.dependencyBlockedDeferred +
+          issueMonitors.dispatchSuppressedDeferred +
           expiredIssueMonitors.recovered,
         idleSkipped,
       };

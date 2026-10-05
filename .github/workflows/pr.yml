@@ -196,6 +196,24 @@ jobs:
         run: node --test ./scripts/check-db-transaction-alias.test.mjs
         timeout-minutes: 1
 
+      - name: Guard migration-number collision with base (BLO-39490)
+        # The one migration check that cannot be made from a single tree.
+        # packages/db/src/check-migration-numbering.ts (BLO-27927) covers
+        # everything visible in one tree; it cannot see a collision that does
+        # not exist yet. Three open PRs each appended `idx: 248` and all three
+        # were green, because each tree is individually consistent -- the
+        # collision only arrives when the second branch meets the first, as a
+        # merge-queue conflict that ejects the PR (BLO-26675) rather than a
+        # red the author can act on. Needs PR_BASE_SHA; also runs on
+        # merge_group, which is where the second claimant is rejected.
+        if: ${{ !cancelled() }}
+        run: node ./scripts/check-migration-journal-base.mjs "$PR_BASE_SHA"
+
+      - name: Test migration-number base guard (BLO-39490)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-migration-journal-base.test.mjs
+        timeout-minutes: 1
+
       - name: Validate Dockerfile deps stage
         if: ${{ !cancelled() }}
         run: |
@@ -432,6 +450,15 @@ jobs:
       - name: Test no-git-push check
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-no-git-push.test.mjs
+        timeout-minutes: 1
+
+      - name: Reject raw NUL bytes in tracked source (BLO-39632)
+        if: ${{ !cancelled() }}
+        run: node ./scripts/check-no-raw-nul.mjs
+
+      - name: Test no-raw-nul check
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-no-raw-nul.test.mjs
         timeout-minutes: 1
 
       - name: Reject App-attributed commits on the PR (BLO-21416)
@@ -874,6 +901,13 @@ jobs:
       - name: Test vitest flake-report wiring (BLO-28886)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/vitest-flake-report.test.mjs
+        timeout-minutes: 1
+
+      # The aggregator the step above feeds. Unregistered it would be a comment:
+      # the guards pass locally and nothing enforces them on the next edit.
+      - name: Test vitest flake ledger (BLO-28886)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/vitest-flake-ledger.test.mjs
         timeout-minutes: 1
 
       - name: Validate dependency resolution when manifests change
@@ -1586,6 +1620,32 @@ jobs:
       # source does not change without a provenance row -- is now asserted off
       # the diff by the `Require vendored-adapter source changes to be logged`
       # step in the `policy` job, which stores nothing and so cannot conflict.
+
+      # PEN-3223: the vendored version is recorded in two hand-maintained
+      # places — package.json `version` and PROVENANCE.md's Origin table
+      # `Current version` — and nothing else compares them. That pair drifted on
+      # PR#1862 and survived three heads. Since BLO-35109 withdrew the stored
+      # integrity hash, this step is the ONLY machine-checked link between
+      # PROVENANCE.md and the tree beside it; the `policy` job's provenance-log
+      # check asserts that vendored source carries a log row, not that the
+      # recorded version is true. The failure is quiet and lands later: the next
+      # vendored change reads the stale table field and bumps from there.
+      - name: Verify vendored version is recorded consistently
+        run: |
+          set -euo pipefail
+          pkg=$(node -p 'require("./package.json").version')
+          recorded=$(sed -n 's/^| Current version | `\([^`]*\)`.*/\1/p' PROVENANCE.md | head -1)
+          echo "package.json:   $pkg"
+          echo "PROVENANCE.md:  $recorded"
+          if [ -z "$recorded" ]; then
+            echo "::error::No 'Current version' row found in PROVENANCE.md's Origin table."
+            exit 1
+          fi
+          if [ "$pkg" != "$recorded" ]; then
+            echo "::error::PROVENANCE.md records version '$recorded' but package.json is '$pkg'."
+            echo "Update the 'Current version' row in vendor/paperclip-adapter-claude-k8s/PROVENANCE.md to: $pkg"
+            exit 1
+          fi
 
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.

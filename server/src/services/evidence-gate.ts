@@ -285,18 +285,32 @@ const LIST_MARKER_SOURCE = "^(?:[-*]|\\d+[.)])\\s+";
  *   - `String.prototype.match` sets `lastIndex` to 0 on entry when the regex
  *     is global (`RegExp.prototype[Symbol.match]`), so it cannot resume from a
  *     previous call's offset.
- *   - `String.prototype.matchAll` iterates a CLONE, leaving the original's
- *     `lastIndex` untouched.
+ *   - `String.prototype.matchAll` iterates a CLONE, so it never writes back to
+ *     the original's `lastIndex` — but it SEEDS that clone from it, so it can
+ *     still SUFFER an offset some other caller left behind. Measured: with
+ *     `lastIndex = 6`, a two-match input yields one match, and the original
+ *     stays at 6.
  *
  * `.test()` / `.exec()` have neither property: they advance `lastIndex` and
  * resume from it, so adding one against either constant would silently skip
- * matches on alternate invocations — an every-other-call bug, which is the
- * kind that survives a green test suite. If you need one, match against a
- * fresh `new RegExp(LIST_MARKER_SOURCE, ...)` instead of reusing these.
+ * matches. The cycle length is set by the match count, not fixed — an N-match
+ * input returns N trues and then one false, repeating. Measured on `.test()`:
+ * a one-match input gives `true, false, true, false`; a two-match input gives
+ * `true, true, false, true, true`. So spot-checking a multi-match string shows
+ * consecutive trues and reads as fine — the skipped call is the one after the
+ * last match. That is the kind of bug that survives a green test suite.
  *
- * Dropping `g` is not the alternative: `matchAll` throws a TypeError without
- * it, and `.match()` needs it to return ALL matches rather than the first —
- * `detectChecklistDoneWhen` counts that array's length.
+ * If you need `.test()`/`.exec()`, reach for a NON-GLOBAL regex. That is the
+ * fix — not a fresh global one per call, which is wasteful and re-acquires
+ * this hazard the moment anyone hoists it to module scope. `FENCE_LINE_RE`
+ * below is the in-file pattern to copy: module-scoped, no `g`, consumed by
+ * `.exec()`. For these markers that means `new RegExp(LIST_MARKER_SOURCE,
+ * "m")` — note the flags: `m`, not `gm`.
+ *
+ * Dropping `g` from THESE TWO constants specifically is not available:
+ * `matchAll` throws a TypeError without it, and `.match()` needs it to return
+ * ALL matches rather than the first — `detectChecklistDoneWhen` counts that
+ * array's length.
  */
 
 /**

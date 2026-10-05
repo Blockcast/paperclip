@@ -14,9 +14,17 @@ Triggers:
   chart renders. Blockcast's live `onprem-k8s` rules replaced it with the
   fleet-scoped `PaperclipQueuedRunStrandedFleet` (≥5 agents past 1800s, for
   15m; BLO-29665), which also links here.
-- `PaperclipQueuedRunAgeMetricsRefreshFailed` — the most recent `/metrics`
+- `PaperclipQueuedRunAgeMetricsRefreshFailed` — the most recent
   database refresh failed, so queued-run ages are stale and intentionally do
   not qualify the stranded-run alert.
+
+Both freshness properties below describe the live `onprem-k8s` rules as well
+as this chart's. They did not, between 2026-08-24 and 2026-10-03: the
+BLO-29665 rewrite that introduced `PaperclipQueuedRunStrandedFleet` dropped
+the `and on(instance) (… == 1)` gate and shipped no refresh-failure alert, so
+the live fleet rule ran ungated on a gauge that freezes on a failed refresh.
+Restored by BLO-26656. If you are reading this against an older rule set,
+check for the gate in the expression before trusting the paragraphs below.
 
 Owner: Platform / SRE (BLO-21116)
 

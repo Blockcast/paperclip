@@ -69,6 +69,7 @@ import {
   issueCommentPresentationSchema,
   isAgentStatusInvokable,
   isUuidLike,
+  NON_HUMAN_USER_SENTINEL_IDS,
   ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
@@ -260,7 +261,7 @@ function checkoutStartedAtForCurrentRow(now: Date) {
 // agent-attribution derivation even though `local-board` is also materialized
 // as a row in the `user` table (it is the implicit board admin). Genuine human
 // users — real signups with their own ids — are never reattributed.
-const NON_HUMAN_SENTINEL_AUTHOR_USER_IDS = new Set<string>(["local-board"]);
+const NON_HUMAN_SENTINEL_AUTHOR_USER_IDS = NON_HUMAN_USER_SENTINEL_IDS;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;

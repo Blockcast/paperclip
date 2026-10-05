@@ -103,6 +103,73 @@ test("PaperclipAgentPodUnschedulable keys on kube_pod_status_scheduled, not the 
   );
 });
 
+test("PaperclipGithubWorkflowRunMassCancellation is a scale-free ratio with a volume floor, not a count (BLO-21078)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipGithubWorkflowRunMassCancellation/);
+
+  const expr = rendered.match(
+    /alert: PaperclipGithubWorkflowRunMassCancellation[\s\S]*?\n\s+expr: \|\n([\s\S]*?)\n\s+for:/,
+  )?.[1];
+  assert.ok(expr, "mass-cancellation alert must render an expr");
+
+  // The supersession selector carries ~92.8% of the noise reduction
+  // (measured 5,657 non-superseded vs 73,322 superseded on the live
+  // counters, 2026-09-29). Dropping it makes every force-push a page.
+  assert.match(
+    expr,
+    /conclusion="cancelled",supersession="none"/,
+    "mass-cancellation alert must exclude concurrency cancel-in-progress supersedes",
+  );
+
+  // A bare count cannot work here and this is the regression that matters.
+  // The `>= 3` count expression this replaced was true for 67.9% of a 7d
+  // window, because non-superseded cancellations scale with agent push
+  // rate. A ratio is scale-free; reverting to a count re-breaks the alert
+  // in the always-firing direction, which is indistinguishable from the
+  // alert being deleted.
+  //
+  // The denominator carries supersession="none" too. Superseded
+  // cancellations outnumber the rest ~13:1 and move with force-push rate, so
+  // counting them in the denominator masks a real kill: 8 non-superseded
+  // cancellations beside 20 superseded and 2 successes reads 8/30 = 0.27
+  // (quiet) instead of 8/10 = 0.8. Measured live on 2026-09-24T17:46-17:59Z
+  // (BLO-36178 ARC outage): 0.04-0.09 unfiltered vs 0.36-0.42 filtered.
+  assert.match(
+    expr,
+    /\/\s*\n?\s*clamp_min\(sum\(increase\(paperclip_github_workflow_run_conclusion_total\{supersession="none"\}\[15m\]\)\), 1\)/,
+    "mass-cancellation alert must divide by non-superseded completions (scale-free ratio that superseded force-push churn cannot dilute), clamped against divide-by-zero at idle",
+  );
+  assert.match(expr, />=\s*0\.35/, "ratio threshold must be 0.35 (2x the observed 7d p99 of 17.7% on the non-superseded basis)");
+
+  // Without the floor, 1 cancelled of 2 completions reads as 50% and pages
+  // on an idle repo, exactly when the ratio carries least information. The
+  // floor must count the same non-superseded completions as the
+  // denominator: counted over all completions, 1 cancelled + 1 success
+  // beside a 20-run force-push burst clears it and reads as 50%.
+  assert.match(
+    expr,
+    /and\s*\n?\s*sum\(increase\(paperclip_github_workflow_run_conclusion_total\{supersession="none"\}\[15m\]\)\) >= 8/,
+    "mass-cancellation alert must carry a minimum-volume floor, over the same non-superseded completions as the denominator, so a near-idle repo cannot trip the ratio",
+  );
+});
+
 test("PaperclipGithubReviewRequestDeadLettered fires on any dead-lettered delivery and is silent at zero (BLO-18859)", () => {
   const rendered = execFileSync(
     "helm",
@@ -506,6 +573,77 @@ test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead
     rendered,
     /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md"/,
     "the freshness failure alert must route responders to the queued-run runbook",
+  );
+
+  // BLO-26656. This alert carries no threshold -- `== 0` is the whole
+  // predicate -- so its `for:` IS its entire page delay, and it is the only
+  // thing standing between a dead refresh and a strand nobody can see. The
+  // gate on PaperclipQueuedRunStranded disqualifies a stale snapshot, which
+  // is right for the stale-HIGH direction and does nothing for stale-ZERO:
+  // a frozen 0 is byte-identical to a healthy idle fleet, so the strand
+  // alert's silence is not evidence either way and only this alert
+  // distinguishes them.
+  //
+  // Asserted against the strand alert's OWN total delay rather than a
+  // literal, for the same reason that one stacks threshold and `for:`
+  // instead of checking them independently: either number can be retuned
+  // alone and look compliant while the pair regresses. If this window ever
+  // exceeds the strand alert's first possible fire time, a refresh outage
+  // beginning at the same instant hides a real strand for the difference,
+  // and nothing in the rendered chart says so.
+  // One parse for both windows. Reading the strand `for:` with a bare
+  // `(\d+)m` fails OPEN: on any other unit the lazy match does not stop at
+  // the strand rule, it walks downstream and binds against the next `for:`
+  // it finds -- measured at `queuedRunStrandedFor: 30s`, where it silently
+  // bound against this alert's own window instead.
+  const forMinutesOf = (raw) => {
+    const [, value, unit] = /^(\d+)([mh])$/.exec(String(raw ?? "").trim()) ?? [];
+    return value ? Number(value) * (unit === "h" ? 60 : 1) : null;
+  };
+
+  const [, refreshFor] = rendered.match(
+    /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  assert.ok(refreshFor, "the freshness failure alert must render a for window");
+  const refreshForMinutes = forMinutesOf(refreshFor);
+  assert.ok(
+    refreshForMinutes !== null && refreshForMinutes > 0,
+    `for window ${refreshFor} must be a positive minute/hour window`,
+  );
+
+  // Slice to the strand rule's OWN block before reading either number.
+  // `PaperclipQueuedRunStranded` is a prefix of `...StrandedFleet`, so an
+  // unanchored match binds to whichever of the two YAML renders first --
+  // and it fails in the loosening direction: bounding against the Fleet
+  // rule's 1800s + 15m admits a 30m window that the per-agent rule's
+  // 1440s + 5m correctly rejects. `\b` does not match between `d` and `F`.
+  const strandBlock = rendered
+    .split(/^[ \t]*- alert: /m)
+    .find((block) => /^PaperclipQueuedRunStranded\b/.test(block));
+  assert.ok(
+    strandBlock,
+    "could not locate the PaperclipQueuedRunStranded rule to bound this one against",
+  );
+  const [, strandThreshold] = strandBlock.match(
+    /paperclip_queued_run_oldest_age_seconds[\s\S]*?> (\d+)\n/,
+  ) ?? [];
+  const [, strandFor] = strandBlock.match(/\n\s+for: (.+)\n/) ?? [];
+  const strandForMinutes = forMinutesOf(strandFor);
+  assert.ok(
+    strandThreshold && strandForMinutes !== null,
+    "could not read the strand alert's threshold and for window to bound this one against",
+  );
+  // Deliberately relative rather than a literal, so it cannot rot when the
+  // strand numbers are retuned -- and it stays BOUNDED because the
+  // BLO-21116 assertion above pins `ageThreshold + for <= 1800` absolutely,
+  // so strandTotalSeconds can never exceed 30m however those numbers move.
+  // Relaxing that cap would silently remove this ceiling too.
+  const strandTotalSeconds = Number(strandThreshold) + strandForMinutes * 60;
+  assert.ok(
+    refreshForMinutes * 60 < strandTotalSeconds,
+    `refresh-failure for-window ${refreshFor} (${refreshForMinutes * 60}s) must page BEFORE the `
+      + `strand alert's first possible fire time (${strandThreshold}s + ${strandFor} = `
+      + `${strandTotalSeconds}s); otherwise a refresh outage can hide a real strand for the difference`,
   );
 });
 

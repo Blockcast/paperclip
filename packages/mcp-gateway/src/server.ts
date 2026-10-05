@@ -12,9 +12,16 @@
  * with a last-known-good cache fallback, or legacy local JSON env/file.
  *
  * Health check: GET / → 200 with the current upstream table.
+ *
+ * Optionally also binds a second, probe-only listener on
+ * `$PAPERCLIP_MCP_HEALTH_PORT` serving nothing but `GET /healthz`
+ * (`createHealthServer`). Unset by default. It exists so a network policy can
+ * deny the proxy port from the host network without denying the kubelet's
+ * probes along with it — see PEN-3052.
  */
 
 import http from "node:http";
+import net from "node:net";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -63,8 +70,12 @@ export const DEFAULT_UPSTREAM_TIMEOUT_MS = 60_000;
 export const DEFAULT_BREAKER_FAILURE_THRESHOLD = 5;
 export const DEFAULT_BREAKER_OPEN_COOLDOWN_MS = 30_000;
 export const DEFAULT_BREAKER_HALF_OPEN_MAX_PROBES = 1;
+export const DEFAULT_PORT = 8080;
 
 export interface GatewayConfig {
+  port: number;
+  /** Probe-only listener; null (the default) binds no second socket. */
+  healthPort: number | null;
   upstreamTimeoutMs: number;
   breaker: CircuitBreakerConfig;
   sessionPersistenceFile: string | null;
@@ -82,13 +93,56 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+/**
+ * Strict parse for a listener port. Deliberately not `parsePositiveInt`:
+ * falling back on junk is right for a tuning knob and wrong for a port. The
+ * Deployment points both kubelet probes at whatever these values say, so a typo
+ * that silently resolved to some other port would leave the probes hitting a
+ * closed socket — and liveness failure restarts the container. Refusing at
+ * startup names the cause; falling back hides it behind a CrashLoop.
+ *
+ * The regex is load-bearing. `Number.parseInt` accepts "8081abc" (→ 8081),
+ * "0x1f9" (→ 0) and " +8081"; a bare `Number()` accepts "Infinity". Rejecting
+ * anything that is not pure digits is what makes the 1-65535 bound below mean
+ * what it says.
+ *
+ * Applied to `PORT` as well as the health port (PEN-3052 review). `PORT="8O81"`
+ * with a letter O parsed to 8 under the old lenient read, and the
+ * `must differ from PORT` guard below would then have compared the health port
+ * against that wrong value — the guard is only as good as the number it checks.
+ */
+function parsePort(raw: string | undefined, varName: string): number | null {
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const port = /^[0-9]+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`${varName} must be an integer in 1-65535, got ${JSON.stringify(raw)}`);
+  }
+  return port;
+}
+
 export function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
   const publicUrl = env.PAPERCLIP_MCP_PUBLIC_URL?.trim().replace(/\/+$/, "");
   const authorizationServer = env.PAPERCLIP_MCP_AUTHORIZATION_SERVER?.trim().replace(/\/+$/, "");
   if ((publicUrl && !authorizationServer) || (!publicUrl && authorizationServer)) {
     throw new Error("PAPERCLIP_MCP_PUBLIC_URL and PAPERCLIP_MCP_AUTHORIZATION_SERVER must be configured together");
   }
+  const port = parsePort(env.PORT, "PORT") ?? DEFAULT_PORT;
+  const healthPort = parsePort(env.PAPERCLIP_MCP_HEALTH_PORT, "PAPERCLIP_MCP_HEALTH_PORT");
+  // Same port would mean one socket again, which defeats the whole point: the
+  // network policy denies the proxy port by number, so the probe has to live
+  // somewhere that deny does not reach. EADDRINUSE would catch it eventually,
+  // but only after the proxy listener is already up and serving.
+  if (healthPort !== null && healthPort === port) {
+    throw new Error(
+      `PAPERCLIP_MCP_HEALTH_PORT (${healthPort}) must differ from PORT (${port}); ` +
+        "the health listener exists to be reachable when the proxy port is denied",
+    );
+  }
   return {
+    port,
+    healthPort,
     upstreamTimeoutMs: parsePositiveInt(env.PAPERCLIP_MCP_UPSTREAM_TIMEOUT_MS, DEFAULT_UPSTREAM_TIMEOUT_MS),
     breaker: {
       failureThreshold: parsePositiveInt(
@@ -1243,6 +1297,285 @@ export function createGatewayServer(state: GatewayState): http.Server {
   });
 }
 
+function writeHealthResponse(res: http.ServerResponse, status: number, payload: unknown): void {
+  // Through the same chokepoint as every other body in this process. Nothing
+  // here is upstream-derived, so the scrubber is a no-op on it — but PEN-2370's
+  // guard is "exactly one exit", not "one exit plus the ones we vouched for",
+  // and a second `res.end(body)` is how that invariant stops being checkable.
+  writeResponse(res, gatewayResult(status, JSON.stringify(payload)), null, null);
+}
+
+/**
+ * Probe-only listener, bound on `PAPERCLIP_MCP_HEALTH_PORT` (PEN-3052).
+ *
+ * Why a second socket exists at all: the kubelet probes a pod from the *node's*
+ * host network, so a CiliumNetworkPolicy that denies the proxy port from
+ * `fromEntities: [host, remote-node]` denies the probe along with the bypass it
+ * is closing. On this Deployment both probes target the proxy port and liveness
+ * failure restarts the container, so adding that deny without first moving the
+ * probes off that port CrashLoops the gateway.
+ *
+ * ⛔ This server must never route to an upstream. The deny it exists to permit
+ * names ONE port; anything reachable here is reachable around that deny, so a
+ * proxying health listener would be a wider hole than the one being closed. The
+ * `does not proxy` cases in server.test.ts pin that.
+ *
+ * The body is deliberately barer than `/healthz` on the proxy port, which
+ * reports upstream names, breaker state and per-prefix session counts. No deny
+ * covers this port, so treat everything it emits as readable by anything that
+ * can route to the pod.
+ *
+ * `isServing` keeps the signal honest. A static 200 would report healthy with
+ * the proxy listener closed — strictly weaker than the probe it replaces, which
+ * at least had to reach the proxy socket to answer. It may return a promise;
+ * see `createProxyAcceptProbe` for why the production one does.
+ */
+export function createHealthServer(isServing: () => boolean | Promise<boolean>): http.Server {
+  // Bounded in the constructor rather than as properties at the `listen` call
+  // site, for two reasons: a second caller cannot then bind this server
+  // unbounded, and `connectionsCheckingInterval` is settable ONLY here
+  // (PEN-3052 review).
+  //
+  // Why this listener needs tighter bounds than Node's defaults (60s headers,
+  // 300s request): it sits OUTSIDE the deny by construction — that is the
+  // entire reason it exists — so it is reachable by exactly the `host` /
+  // `remote-node` entities the deny excludes from the proxy port, with nothing
+  // in front of it authenticating.
+  //
+  // `connectionsCheckingInterval` is the load-bearing line and is the easy one
+  // to omit. Node arms no per-socket timer for `headersTimeout` /
+  // `requestTimeout`; it sweeps for expired connections from `checkConnections`
+  // on an interval that defaults to 30_000ms, so a byte-silent socket survives
+  // until the first sweep *after* the timeout elapses. Measured on this shape:
+  // 30040ms to enforce a 2s `headersTimeout` at the default interval, against
+  // ~2–3s at 1_000ms (measured 2007ms). Because the reap lands on a sweep and
+  // not on a per-socket timer, that is a range whose floor is the timeout and
+  // whose ceiling is one interval past it; 2007ms is a sample at the floor, not
+  // the enforcement figure to compute from. Without this line the bound stated
+  // below and in README.md is ~15x looser than written — which is exactly the
+  // arithmetic the cost of holding a socket here is computed from.
+  //
+  // `keepAliveTimeout` reclaims an idle keep-alive socket in 2s rather than
+  // Node's 5s. Read that narrowly: it bounds the idle and the malformed socket,
+  // not a determined client. `requestTimeout` restarts per request, so anything
+  // willing to send one cheap request per keep-alive window — roughly 40 bytes
+  // every 2s — holds its socket indefinitely. What these timeouts bound is the
+  // cost *per socket*, as a floor under the holder's effort. They do not bound
+  // how many sockets are held, and neither does anything else here; see the
+  // `maxConnections` block below for why that is accepted rather than capped.
+  const health = http.createServer(
+    {
+      connectionsCheckingInterval: 1_000,
+      headersTimeout: 2_000,
+      requestTimeout: 5_000,
+      keepAliveTimeout: 2_000,
+    },
+    (req, res) => {
+      const pathName = (req.url ?? "/").split("?", 1)[0] ?? "/";
+      if (pathName !== "/" && pathName !== "/healthz") {
+        writeHealthResponse(res, 404, { error: "not found" });
+        return;
+      }
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        writeHealthResponse(res, 405, { error: "method not allowed" });
+        return;
+      }
+      void (async () => {
+        let serving: boolean;
+        try {
+          serving = await isServing();
+        } catch {
+          // A liveness signal that throws must read as unhealthy, never as a
+          // thrown request. Failing closed here is the whole point of the check.
+          serving = false;
+        }
+        try {
+          if (!serving) {
+            writeHealthResponse(res, 503, { ok: false, error: "proxy listener is not accepting connections" });
+            return;
+          }
+          writeHealthResponse(res, 200, { ok: true });
+        } catch {
+          // The probe hung up while the check was in flight. Nothing to report
+          // to and nobody to report it — but this handler is now async, so an
+          // escaping rejection would be an unhandled rejection, which Node 22
+          // turns into a process exit. On the liveness listener that is the one
+          // outcome worth more than a dropped response.
+          res.destroy();
+        }
+      })();
+    },
+  );
+
+  // Deliberately NO `maxConnections` (PEN-3052 review). An earlier revision set
+  // it to 64, reasoning that `createProxyAcceptProbe` needs an fd, so unbounded
+  // socket-holding here could push the process toward fd pressure, fail the
+  // probe, and turn a 503 into a liveness restart of the authenticated proxy.
+  // At 64 the cap does not prevent that outcome. It makes it enormously cheaper
+  // to cause — 64 sockets instead of the process fd limit.
+  //
+  // Node drops the *incoming* socket once `_connections >= maxConnections`
+  // (`net.js` `onconnection` closes the new handle with no response), so the
+  // sockets already held win and the kubelet's next probe connection is the one
+  // refused. Measured against a cap: ECONNRESET with no HTTP status, in 9ms.
+  // Three of those is a liveness failure and a restart of the authenticated
+  // proxy — the exact outcome these bounds exist to put further out of reach.
+  //
+  // The review that produced this block offered a second branch — keep a cap
+  // but set it well clear of anything a probe contends with — and that branch
+  // is ACCEPTED AGAINST rather than refuted. It is a real proposal: a cap
+  // bounds something the timeouts above do not, namely how many descriptors
+  // this unauthenticated listener can take from the process. The cost of
+  // exhausting them is not confined to this port, which is the part worth
+  // stating plainly — an fd-exhausted process cannot accept on the proxy port
+  // and cannot open outbound sockets to upstreams, so the authenticated proxy
+  // is already degraded for the window before liveness notices and restarts.
+  //
+  // It is still not taken, for three reasons, recorded so the next reader does
+  // not have to re-derive them:
+  //   1. Both designs end in a restart. Anything able to hold sockets here
+  //      causes one either way; a high cap changes only whether the proxy keeps
+  //      serving during the window before it.
+  //   2. It buys that window by LOWERING the effort needed to trigger the
+  //      restart — from the process fd limit down to the cap. That is the same
+  //      trade the 64 cap was rejected for, moved along the axis, not off it.
+  //   3. A constant cannot be shown to bind. The fd limit is set by the
+  //      container runtime, not here, so any fixed cap is either inert (limit
+  //      far above it) or load-bearing (limit near it) depending on where this
+  //      is deployed. A stated bound that silently does not bind is worse than
+  //      a recorded acceptance, which is what this block is.
+  //
+  // So: unbounded descriptor consumption on this port is ACCEPTED. What stands
+  // against it is the timeouts above, which put a floor under the per-socket
+  // cost of holding this port, and the deny-scoping of who can route to it at
+  // all — not a cap. If that scoping is ever widened, this is the paragraph to
+  // revisit, and a cap derived from the live fd limit rather than a constant is
+  // the form to revisit it in.
+  //
+  // Unchanged deliberate non-change: an EMFILE that happens anyway still reads
+  // as 503, not 200. A process out of descriptors is accurately described as
+  // "not serving", and a restart is the correct recovery; masking it would be
+  // the bug. That is a separate question from the one above — it is about the
+  // honesty of the signal once descriptors are gone, not about bounding them.
+  return health;
+}
+
+/**
+ * Accept-path liveness for the proxy listener (PEN-3052 review).
+ *
+ * `server.listening` is a bare `!!this._handle` check, so it stays true for a
+ * socket that is *bound* but no longer *accepting*. That distinction did not
+ * matter while the kubelet probed the proxy port directly — a wedged accept
+ * queue timed the probe out and liveness restarted the pod. The moment both
+ * probes move to the health port, the same state would answer `200 {ok:true}`
+ * and the pod would never self-heal. Recovering a wedged listener is precisely
+ * what liveness is for, so the check has to actually open a connection.
+ *
+ * A pod-local loopback connect is outside the deny this listener exists to
+ * permit: `fromEntities: [host, remote-node]` does not match traffic the pod
+ * originates to itself. `server.listen(port, cb)` is called with no host, so
+ * Node binds `::`/`0.0.0.0` and a `127.0.0.1` connect lands either way — this
+ * is not the `localhost` → `::1` hazard.
+ *
+ * That address is fixed rather than an option (PEN-3052 review). Loopback is
+ * the only value for which the paragraph above holds; an override would be an
+ * invitation to probe an address the deny does cover, which would report the
+ * deny's verdict rather than this process's. The one caller that passed it was
+ * the connect-timeout test, which now mocks `net.connect` outright.
+ *
+ * What this does and does not catch, stated precisely so the next reader does
+ * not over-trust it:
+ *   - **Saturated accept queue** → caught. Linux drops the SYN once the queue
+ *     is full (`tcp_abort_on_overflow=0`), the connect never completes, the
+ *     timeout fires, 503.
+ *   - **Blocked event loop** → caught, but by the health handler sharing that
+ *     loop, not by this probe. The kernel completes the handshake without the
+ *     process, so the connect itself is unaffected by the stall — but the
+ *     *verdict* was, until the `setImmediate` at the timeout below. Node
+ *     services the timers phase before the poll phase, so a loop that was
+ *     blocked past `timeoutMs` delivers the expired timer first and the
+ *     already-completed connect second; `finish(false)` won that race and the
+ *     probe reported a healthy listener wedged. Measured on a healthy
+ *     `http.Server` under a 400ms synchronous stall: 20 of 40 trials `false`
+ *     before the deferral, 0 of 40 after (PEN-3052 review).
+ *
+ *     That verdict mattered more than a dropped sample, which is why it is
+ *     fixed rather than noted: this probe's 250ms timeout is 4x stricter than
+ *     the kubelet's 1s default `timeoutSeconds`, and the result is cached for
+ *     `ttlMs`, so one stall could outlive the request that caused it. The
+ *     handler going quiet under the kubelet's own timeout is the intended
+ *     detection for a blocked loop; this probe must not quietly tighten it
+ *     into a restart on transient loop latency.
+ *
+ * The result is cached for `ttlMs` because nothing in front of this port
+ * authenticates. Without it, each unauthenticated health request would open a
+ * fresh connection to the proxy listener — a small amplification into the very
+ * accept queue being measured. One connect per TTL bounds that regardless of
+ * request rate, and is still far finer-grained than the 5s/15s probe periods.
+ *
+ * Two properties of that cache are load-bearing rather than incidental
+ * (PEN-3052 review):
+ *   - The window is measured on `performance.now()`, not `Date.now()`. A
+ *     backwards wall-clock step (NTP correction, VM snapshot restore, resume
+ *     from suspend) makes `now - at` negative, which compares as *inside* the
+ *     TTL — pinning the cached answer for the whole duration of the jump. A
+ *     pinned `true` is exactly the stale positive this probe exists to avoid.
+ *   - An in-flight connect is shared regardless of age. `ttlMs` and
+ *     `timeoutMs` are independent options, so a caller passing
+ *     `timeoutMs > ttlMs` would otherwise get the inverse of the documented
+ *     behaviour: unbounded concurrent connects, worst exactly when the accept
+ *     queue is wedged and every connect is running to its full timeout. This
+ *     cannot pin a stale result, because `connectOnce` always settles within
+ *     `timeoutMs` plus one loop turn — the socket timeout is armed before any
+ *     await point, and the `setImmediate` below adds that single turn.
+ */
+export function createProxyAcceptProbe(
+  port: number,
+  { timeoutMs = 250, ttlMs = 1000 }: { timeoutMs?: number; ttlMs?: number } = {},
+): () => Promise<boolean> {
+  let cached: { at: number; result: Promise<boolean>; pending: boolean } | null = null;
+
+  const connectOnce = (): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      const socket = net.connect({ port, host: "127.0.0.1" });
+      let settled = false;
+      const finish = (ok: boolean): void => {
+        if (settled) return;
+        settled = true;
+        // Torn down immediately rather than lingering: the probe wants its fd
+        // back, and a connection that sent no bytes is a no-op for the http
+        // server on the other end — it registers no `clientError`, which is
+        // raised for parse failures, not for a peer that never spoke.
+        socket.destroy();
+        resolve(ok);
+      };
+      // `setImmediate` rather than deciding in the timer callback (PEN-3052
+      // review). A fired timer means `timeoutMs` elapsed; it does NOT mean the
+      // accept queue is wedged, because the loop being blocked expires the
+      // timer just as readily. Node runs timers before poll, so on resume the
+      // expired timer is serviced before a connect the kernel already
+      // completed. Deferring to the check phase puts the decision after poll,
+      // so that connect lands first; `finish` is idempotent via `settled`, so
+      // this becomes a no-op rather than a second verdict. Costs one loop turn
+      // on a genuine timeout, against 250ms.
+      socket.setTimeout(timeoutMs, () => setImmediate(() => finish(false)));
+      socket.once("connect", () => finish(true));
+      socket.once("error", () => finish(false));
+    });
+
+  return () => {
+    const now = performance.now();
+    if (cached && (cached.pending || now - cached.at < ttlMs)) return cached.result;
+    const result = connectOnce();
+    const entry = { at: now, result, pending: true };
+    cached = entry;
+    void result.then(() => {
+      entry.pending = false;
+    });
+    return result;
+  };
+}
+
 function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResponse): void {
   const cause = (e as { cause?: unknown }).cause;
   const causeCode = (cause as { code?: string } | undefined)?.code;
@@ -1275,7 +1608,7 @@ function safeOnError(e: unknown, req: http.IncomingMessage, res: http.ServerResp
 async function main(): Promise<void> {
   const upstreams = await loadUpstreams();
   const config = loadGatewayConfig();
-  const port = Number.parseInt(process.env.PORT ?? "8080", 10);
+  const port = config.port;
   const state: GatewayState = {
     upstreams,
     sessions: new Map(),
@@ -1291,6 +1624,7 @@ async function main(): Promise<void> {
   state.sessionPersistenceLoaded = true;
 
   const server = createGatewayServer(state);
+  let healthServer: http.Server | null = null;
 
   server.listen(port, () => {
     // eslint-disable-next-line no-console
@@ -1299,12 +1633,67 @@ async function main(): Promise<void> {
         `timeout=${config.upstreamTimeoutMs}ms breaker(threshold=${config.breaker.failureThreshold},cooldown=${config.breaker.openCooldownMs}ms) ` +
         `sessionStore=${config.sessionPersistenceFile ?? "memory"}`,
     );
+
+    // Started from inside the proxy listener's callback so the health port can
+    // never be up while the proxy socket is unbound — the one window in which
+    // a 200 here would be a lie that `isServing` cannot catch.
+    if (config.healthPort === null) return;
+    const acceptProbe = createProxyAcceptProbe(port);
+    // Both conditions, cheapest first: `listening` settles the unbound case
+    // without opening a socket, the probe settles the bound-but-wedged one.
+    const health = createHealthServer(async () => server.listening && (await acceptProbe()));
+
+    // Bind failure only. The Deployment points both probes at this port, so a
+    // port that never comes up kills the container regardless; exiting here
+    // makes the cause legible instead of surfacing as an unexplained
+    // CrashLoopBackOff with a healthy-looking proxy log above it.
+    //
+    // Scoped to the bind window on purpose (PEN-3052 review). Left registered
+    // for the server's lifetime, this would turn any later socket error on the
+    // *non-essential* listener — EMFILE on accept under fd pressure being the
+    // realistic one in a proxy — into an immediate kill that drops in-flight
+    // MCP requests and skips the SIGTERM drain below. Post-bind, log and let
+    // liveness drive a graceful restart; that path is strictly better.
+    const onBindError = (e: Error): void => {
+      // eslint-disable-next-line no-console
+      console.error(`[mcp-gateway] health listener on :${config.healthPort} failed to bind: ${e.message}`);
+      process.exit(1);
+    };
+    health.once("error", onBindError);
+    healthServer = health;
+    health.listen(config.healthPort, () => {
+      // Bind succeeded: swap the kill for a log. From here on a socket error is
+      // the probe's problem to report, not a reason to drop live traffic.
+      health.off("error", onBindError);
+      health.on("error", (e: Error) => {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[mcp-gateway] health listener on :${config.healthPort} error after bind: ${e.message} ` +
+            "(left running; liveness will restart the pod if probes stop succeeding)",
+        );
+      });
+      // eslint-disable-next-line no-console
+      console.log(`[mcp-gateway] health listening on :${config.healthPort} (GET /healthz)`);
+    });
   });
 
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
     process.on(sig, () => {
       // eslint-disable-next-line no-console
       console.log(`[mcp-gateway] ${sig} received, shutting down`);
+      // Health first so the probe port stops answering immediately. That is all
+      // the ordering buys, and it is worth being precise about what it does not:
+      // the pod leaves its Service endpoints because the EndpointSlice
+      // controller acts on its `deletionTimestamp`, which it gets concurrently
+      // with this signal — not because readiness flipped. Readiness could not
+      // flip in time anyway. It needs `failureThreshold` consecutive failures,
+      // i.e. `periodSeconds × (failureThreshold − 1)` ≈ 10s at the documented
+      // `periodSeconds: 5` / `failureThreshold: 3` (see README), which outlasts
+      // the 5s cap below; the process is gone before the kubelet records a
+      // single failure. Making readiness the mechanism is a Deployment-side
+      // change — a longer `terminationGracePeriodSeconds` and a drain to match
+      // — not something this ordering can deliver.
+      healthServer?.close();
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 5000).unref();
     });

@@ -44,6 +44,8 @@
     "check:token-gates": "node scripts/check-token-gates.mjs",
     "check:no-git-push": "node scripts/check-no-git-push.mjs",
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
+    "check:no-raw-nul": "node scripts/check-no-raw-nul.mjs",
+    "test:check-no-raw-nul": "node --test scripts/check-no-raw-nul.test.mjs",
     "test:fast-uri-advisory": "node --test scripts/fast-uri-advisory.test.js",
     "test:agent-health-preflight": "node --test scripts/agent-health-preflight.test.mjs",
     "test:security-audit-overrides": "node scripts/security-audit-overrides.test.js",
@@ -95,8 +97,9 @@
   "securityAuditRemediations": {
     "PEN-1198": {
       "@connectrpc/connect-node>undici": {
-        "patchedRange": ">=6.27.0 <7",
+        "patchedRange": ">=6.28.1 <7",
         "advisories": [
+          "GHSA-rfgv-xxqx-mfg5",
           "GHSA-vrm6-8vpv-qv8q",
           "GHSA-v9p9-hfj2-hcw8",
           "GHSA-p88m-4jfj-68fv",
@@ -111,7 +114,10 @@
           "GHSA-vmh5-mc38-953g",
           "GHSA-hm92-r4w5-c3mj",
           "GHSA-p88m-4jfj-68fv",
-          "GHSA-vxpw-j846-p89q"
+          "GHSA-vxpw-j846-p89q",
+          "GHSA-rfgv-xxqx-mfg5",
+          "GHSA-vrm6-8vpv-qv8q",
+          "GHSA-v9p9-hfj2-hcw8"
         ]
       },
       "multer": {
@@ -176,7 +182,7 @@
       "@babel/core": ">=7.29.7 <8",
       "js-yaml": ">=4.3.2 <5",
       "esbuild": ">=0.28.1 <0.29",
-      "@connectrpc/connect-node>undici": ">=6.27.0 <7",
+      "@connectrpc/connect-node>undici": ">=6.28.1 <7",
       "jsdom>undici": ">=7.29.1 <8",
       "multer": ">=2.3.0 <3",
       "browserslist": ">=4.28.7 <5",

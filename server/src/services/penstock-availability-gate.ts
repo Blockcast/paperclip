@@ -68,8 +68,11 @@ export type PenstockProbePath = PenstockProbePathLabel;
  *
  * `inconclusive` is the load-bearing one: it is the capacity branch that
  * returns no verdict and therefore *causes* the fallback, so its rate is the
- * fallback's cause rather than merely its correlate. Aliased from the metrics
- * label union for the same anti-drift reason as {@link PenstockProbePath}.
+ * fallback's cause rather than merely its correlate — on anthropic, the only
+ * provider with a fallback to cause. Read it per-provider: summed across
+ * providers it over-counts, because codex mints it with nothing downstream.
+ * Aliased from the metrics label union for the same anti-drift reason as
+ * {@link PenstockProbePath}.
  */
 type PenstockProbeOutcome = PenstockProbeOutcomeLabel;
 
@@ -288,9 +291,9 @@ export function createPenstockAvailabilityGate(
       });
       const messagesUrl = resolved.messagesUrl;
       const result =
-        readback ??
-        (messagesUrl
-          ? await observePenstockProbe({
+        readback.result ??
+        (messagesUrl && capacityOutcomeJustifiesFallback(readback.outcome)
+          ? (await observePenstockProbe({
               path: "messages_fallback",
               provider,
               model: resolved.model,
@@ -306,9 +309,13 @@ export function createPenstockAvailabilityGate(
                   now: nowFn,
                   log: opts.log,
                 }),
-            })
-          : // No secondary probe for this provider: fail open, which is the
-            // pre-existing behaviour for any adapter this gate did not cover.
+            })).result
+          : // No fallback ran. Either this provider has no secondary probe —
+            // the pre-existing behaviour for any adapter the gate did not
+            // cover — or the capacity probe failed in transport and a second
+            // call over that same transport could not have answered
+            // (see {@link capacityOutcomeJustifiesFallback}).
+            //
             // Deliberately *not* counted as a probe — nothing was sent, so
             // counting it would inflate the denominator that fallback share is
             // measured against.
@@ -327,7 +334,12 @@ export function createPenstockAvailabilityGate(
 }
 
 /**
- * Time one probe, count it, and hand back only its verdict.
+ * Time one probe, count it, and hand back its verdict *and* how it was counted.
+ *
+ * The outcome is returned rather than swallowed because the caller has to
+ * branch on it: a capacity readback yields `result: null` both when the service
+ * declined to answer and when the request never reached it, and those two take
+ * different paths (see {@link capacityOutcomeJustifiesFallback}).
  *
  * Timing uses `performance.now()` rather than the injectable `opts.now` clock:
  * the injected clock is a *logical* clock that tests deliberately pin to a
@@ -345,13 +357,13 @@ async function observePenstockProbe<T>(input: {
   provider: PenstockProvider;
   model: string;
   run: () => Promise<PenstockProbeObservation<T>>;
-}): Promise<T> {
+}): Promise<PenstockProbeObservation<T>> {
   const startedAt = performance.now();
   let outcome: PenstockProbeOutcome = "error";
   try {
     const observation = await input.run();
     outcome = observation.outcome;
-    return observation.result;
+    return observation;
   } finally {
     try {
       recordPenstockAvailabilityGateProbe({
@@ -365,6 +377,46 @@ async function observePenstockProbe<T>(input: {
       // Instrumenting the gate must never gate dispatch.
     }
   }
+}
+
+/**
+ * Does a verdict-less capacity readback justify spending a real
+ * `POST /v1/messages` against the provider? (BLO-29900 item 3.)
+ *
+ * The fallback exists to answer "is this model available?" when the capacity
+ * *service* declined to say. `outcome: "error"` is not that: it means the
+ * request never got an answer out of the transport at all — timeout, abort,
+ * connection failure. That is information about the capacity endpoint, not
+ * about the model, and the fallback would go out over the same transport that
+ * just failed.
+ *
+ * Measured in production 2026-09-20 over 2.66 pod-hours of a live anthropic
+ * exhaustion cycle (see `ac2-fallback-measured-production` on BLO-29900):
+ * **39/39** capacity nulls were this branch — the 3s `AbortController`, none of
+ * them a 404/unparseable — and **36/36** of the resulting POSTs timed out too
+ * and returned `{allow: true}`. The 3-event gap between 39 and 36 is a limit of
+ * the log instrument, not a third behaviour: that measurement counted fallback
+ * POSTs by the `penstock availability probe failed open` string, which only the
+ * *fail-open* branch emits, so a POST that produced a verdict — or whose +3s
+ * line fell outside the window — is invisible to it. Those 3 are the worst case
+ * for this change (≤8% of events, where a verdict may now be discarded); there
+ * the gate fails open instead of denying, and the dispatch's own capacity
+ * refusal parks the run as `rate_limit_exhausted` on the terminal-result path
+ * instead — later, but not lost.
+ * So on the measured path the fallback bought *zero* decisions while costing up
+ * to 6s of added dispatch latency and one inference call per event, against the
+ * provider least able to absorb it. This is the "every retry is a load
+ * multiplier" shape, inside the mechanism the 15m capacity-park clamp assumes
+ * is free.
+ *
+ * `inconclusive` and `auth_fault` deliberately still fall through: there the
+ * endpoint *did* respond, so the fallback is the only thing that can produce a
+ * verdict, and PEN-2513 reasoned about the `auth_fault` path specifically.
+ * Narrowing only the branch that was measured keeps this a change to the case
+ * with evidence behind it rather than to admission control in general.
+ */
+function capacityOutcomeJustifiesFallback(outcome: PenstockProbeOutcome): boolean {
+  return outcome !== "error";
 }
 
 /**
@@ -651,7 +703,8 @@ function logProbeAuthFault(
 
 /**
  * The capacity endpoint declined to answer, so the caller falls through to the
- * messages fallback.
+ * messages fallback — on a provider that has one. `resolvePenstockCheck` sets
+ * `messagesUrl` for anthropic alone, so on codex this is a terminal fail-open.
  *
  * Distinct from the `error` outcome even though both yield `null`: this branch
  * is a *successful* HTTP exchange that carried no verdict (404, non-ok status,

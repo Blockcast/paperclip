@@ -75,6 +75,7 @@ import {
   WITHHELD_WORKSPACE_RUNTIME_VIEWER,
   type WorkspaceRuntimeViewer,
 } from "./workspace-response.js";
+import { maskEnvBindings } from "../env-binding-mask.js";
 import { documentAnnotationService } from "../services/document-annotations.js";
 import { logActivity } from "../services/activity-log.js";
 import {
@@ -300,7 +301,12 @@ function withDerivedStageAutomation(
         titleTemplate: routine.title,
         instructionsBody: routine.description ?? "",
         ...stageAutomationContext(config),
-        env: routine.env ?? null,
+        // PEN-3707: the stage automation block re-surfaces the backing routine's `env`, so the same
+        // plain values reachable on the routine surface were also reachable here. Masked BEFORE
+        // `publicPipelineStageConfig` deliberately: that projection opens with
+        // `if (viewer.revealRuntimeConfig) return config`, and an env mask must not be
+        // entitlement-gated — see the header of `routine-env-response.ts`.
+        env: maskEnvBindings(routine.env ?? null),
         latestRoutineRevisionId: routine.latestRevisionId,
         latestRoutineRevisionNumber: routine.latestRevisionNumber,
       },
