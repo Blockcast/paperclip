@@ -29,7 +29,8 @@ import {
  * where `created_at` already IS the queue-entry time, but gets stamped with
  * `now()` by the specific transitions that put an *existing* row back into
  * `queued` after it was something else (`promoteScheduledRetryRun`,
- * `deferRunForK8sIsolationConflict`). Without the coalesce target, a run
+ * `deferRunForK8sIsolationConflict`, `deferRunForBranchClaimConflict`).
+ * Without the coalesce target, a run
  * promoted after hours in `scheduled_retry` backoff would instantly report
  * that entire backoff as queued-dispatch wait -- the false-stranded-run alert
  * this gauge exists to prevent.

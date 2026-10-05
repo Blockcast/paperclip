@@ -5008,7 +5008,8 @@ export function computeRunDispatchWaitSeconds(
  * expression `refreshQueuedRunAgeMetrics` ages off (BLO-21116). `queuedAt` is
  * null for a fresh insert, where `createdAt` already is the queue-entry time,
  * and is stamped by the transitions that put an existing row back into
- * `queued` (`promoteScheduledRetryRun`, `deferRunForK8sIsolationConflict`).
+ * `queued` (`promoteScheduledRetryRun`, `deferRunForK8sIsolationConflict`,
+ * `deferRunForBranchClaimConflict`).
  * Measuring from bare `createdAt` would report a promoted retry's whole
  * `scheduled_retry` backoff, or a re-queued run's whole prior execution, as
  * dispatch wait.
