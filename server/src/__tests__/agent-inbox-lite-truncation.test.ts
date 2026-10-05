@@ -395,4 +395,24 @@ describe("REST — GET /api/agents/me/inbox-lite (BLO-39015)", () => {
       expect(mockIssueService.list).not.toHaveBeenCalled();
     },
   );
+
+  // The offset cases above pin a bad offset VALUE. This pins the param NAME —
+  // the other half of BLO-24495. `parseOffsetParam(undefined)` is 0, so without
+  // the guard `?page=2` is a 200 serving window 0, and on a truncated lane the
+  // envelope's `truncated: true` tells the caller there is more while the page
+  // it asked for was silently dropped.
+  it.each(["page", "perPage"])(
+    "rejects %s with 400 rather than silently serving window 0",
+    async (param) => {
+      serveRestPopulation(CAP + 1);
+
+      const res = await request(await buildApp())
+        .get("/api/agents/me/inbox-lite")
+        .query({ [param]: "2" });
+
+      expect(res.status).toBe(400);
+      expect(res.body.unsupportedParams).toEqual([param]);
+      expect(mockIssueService.list).not.toHaveBeenCalled();
+    },
+  );
 });

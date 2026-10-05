@@ -116,6 +116,7 @@ import {
   ISSUE_LIST_APPLIED_LIMIT_HEADER,
   ISSUE_LIST_TRUNCATED_HEADER,
   parseOffsetParam,
+  parseUnsupportedPaginationParams,
 } from "../lib/issue-list-query.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { logger } from "../middleware/logger.js";
@@ -2729,6 +2730,19 @@ export function agentRoutes(
     // remainder; the headers say when there IS a remainder. Same contract as
     // `GET /companies/:id/issues` (BLO-33741) — bare-array body, signal on
     // headers — so one envelope helper covers both on the MCP side.
+    // BLO-24495, one param over: this surface only implements offset paging, so
+    // `page`/`perPage` would be dropped unread and every page number would serve
+    // window 0 — a 200 the caller reads as "I advanced". Worse here than on the
+    // sibling, because on a truncated lane the envelope says `truncated: true`
+    // and so CONFIRMS there is more while the offset asked for was discarded.
+    const unsupportedPaginationParams = parseUnsupportedPaginationParams(req.query);
+    if (unsupportedPaginationParams.length > 0) {
+      res.status(400).json({
+        error: "page/perPage pagination is not supported on this endpoint; use offset instead",
+        unsupportedParams: unsupportedPaginationParams,
+      });
+      return;
+    }
     const parsedOffset = parseOffsetParam(req.query.offset);
     if (parsedOffset === null) {
       res.status(400).json({ error: "offset must be a non-negative integer" });
