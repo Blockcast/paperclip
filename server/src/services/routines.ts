@@ -63,6 +63,7 @@ import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { ACTIVE_RECOVERY_ACTION_STATUSES } from "./issue-recovery-actions.js";
+import { postRoutineDispatchFailureHeartbeat } from "./recovery/routine-scheduler-heartbeat.js";
 import { issueService } from "./issues.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -1874,6 +1875,34 @@ export function routineService(
     return null;
   }
 
+  /**
+   * BLO-40337: a dispatch that fails before `issue_created` leaves a `failed`
+   * run row with no linked issue, and the issue-keyed scheduler heartbeat takes
+   * an execution issue -- so it cannot see this class at all and the routine's
+   * window goes dark with nothing on its alert surface saying so. The run row
+   * already carries everything the receipt needs.
+   *
+   * No try/catch here on purpose. `postRoutineDispatchFailureHeartbeat` swallows
+   * and logs its own errors so a failed receipt can never make a dispatch
+   * failure worse; wrapping it again only makes that guard untestable, because a
+   * mutation that removes it is masked by this one.
+   */
+  async function postDispatchFailureHeartbeat(run: {
+    companyId: string;
+    routineId: string;
+    id: string;
+    triggeredAt: Date;
+    status: string;
+    linkedIssueId: string | null;
+    failureReason: string | null;
+  }) {
+    if (run.status !== "failed" || run.linkedIssueId) return;
+    await postRoutineDispatchFailureHeartbeat(
+      { db, addComment: issueSvc.addComment, logger },
+      { companyId: run.companyId, routineId: run.routineId, run },
+    );
+  }
+
   // BLO-28952: `issueSvc.create` runs on its own connection, so the execution
   // issue commits independently of the dispatch transaction that owns the
   // `routine_runs` row pointing at it. The dispatch transaction's own catch
@@ -1931,6 +1960,15 @@ export function routineService(
         status: reinsert.status ?? "failed",
         issueId: reachedTerminal ? input.run.linkedIssueId : undefined,
         nextRunAt: input.nextRunAt,
+      });
+      await postDispatchFailureHeartbeat({
+        companyId: input.run.companyId,
+        routineId: input.run.routineId,
+        id: input.run.id,
+        triggeredAt: input.run.triggeredAt,
+        status: reinsert.status ?? "failed",
+        linkedIssueId: reinsert.linkedIssueId ?? null,
+        failureReason: reinsert.failureReason ?? null,
       });
     } catch (err) {
       // Best effort by construction — this must never mask the original abort.
@@ -2752,6 +2790,19 @@ export function routineService(
         supersededByRunId: run.id,
       });
     }
+
+    // BLO-40337: the in-transaction catch above commits a `failed` row with no
+    // linked issue. Same receipt as the rollback path, same key -- after commit,
+    // for the same reason the supersede receipts above are.
+    await postDispatchFailureHeartbeat({
+      companyId: input.routine.companyId,
+      routineId: input.routine.id,
+      id: run.id,
+      triggeredAt: run.triggeredAt,
+      status: run.status,
+      linkedIssueId: run.linkedIssueId ?? null,
+      failureReason: run.failureReason ?? null,
+    });
 
     if (input.source === "schedule" || input.source === "webhook") {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";
