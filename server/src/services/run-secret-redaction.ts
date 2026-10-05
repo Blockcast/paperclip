@@ -229,13 +229,17 @@ export function redactRunSecretValues(text: string, needles: readonly string[]):
  *    longest needle, so a large secret (a PEM key) holds back correspondingly more. It is
  *    NOT capped: a cap below the longest needle would reintroduce exactly the silent split
  *    this closes, for precisely the largest secrets. The lag is bounded in time by the
- *    flush at adapter settle, not just in size. The lag is in bytes only, and liveness must
- *    not inherit it: `take`'s return value is empty while the window fills and is cut at an
- *    arbitrary offset otherwise, so it is neither arrival-aligned nor line-shaped. A caller
- *    MUST derive activity stamps and progress classification from the chunk it was handed,
- *    never from what `take` returns; the heartbeat `onLog` does, because those stamps feed
- *    the external-lifecycle silence reaper. Only its excerpt filter classifies the returned
- *    bytes, because the excerpt is a copy of them; the call site states that trade-off.
+ *    flush at adapter settle, not just in size. `take` also backs each split up to the end
+ *    of the last complete line, so it returns whole lines only: the excerpt filter and
+ *    run-liveness both anchor per line, and a mid-line cut made every keepalive
+ *    unclassifiable for as long as any needle existed. That extends the lag to the end of
+ *    the current line, so a long unterminated line is held until its newline or the flush.
+ *    Liveness must still not inherit the lag: the return value is empty while the window
+ *    fills and releases held lines with a later arrival, so it is not arrival-aligned. A
+ *    caller MUST derive activity stamps and progress classification from the chunk it was
+ *    handed, never from what `take` returns; the heartbeat `onLog` does, because those
+ *    stamps feed the external-lifecycle silence reaper. Only its excerpt filter classifies
+ *    the returned bytes, because the excerpt is a copy of them.
  * 2. The flush is required. Without it the final `holdbackChars` of a run's output would be
  *    dropped, so the caller MUST call `take(stream, "", { flush: true })` once output has
  *    settled — trading a leak for silent log truncation would be a bad bargain, and callers
@@ -275,19 +279,25 @@ export function createRunSecretBoundaryCarry(needles: readonly string[]): RunSec
       }
       // Redact the WHOLE window before splitting it, not the emitted slice afterwards.
       // This ordering is the correctness argument, and getting it backwards is a silent
-      // leak that still passes a two-chunk test: with a needle of length L <= K, any
-      // occurrence starting before the split point `len - (K - 1)` necessarily ENDS at or
-      // before `len` (p + L < len - K + 1 + K = len + 1), so it is complete inside
+      // leak that still passes a two-chunk test. With K = holdbackChars every needle has
+      // length L <= K + 1, and the split below is at most `len - K`. An occurrence starting
+      // at p <= len - K - 1 therefore ends at p + L <= len, so it is complete inside
       // `pending` and merely straddles the split. Masking the emitted slice alone would
-      // therefore persist that occurrence's prefix in plaintext. Masking `pending` first
-      // means the split can only ever fall inside a mask.
+      // persist that occurrence's prefix in plaintext. Masking `pending` first means the
+      // split can only ever fall inside a mask.
       const masked = redactRunSecretValues(pending, needles);
-      const hold = Math.min(holdbackChars, masked.length);
+      const latestSplit = masked.length - Math.min(holdbackChars, masked.length);
+      // Withhold at least K, then back up to the end of the last complete line so the
+      // caller only ever sees whole lines (see the interface doc). Moving the split earlier
+      // keeps the bound above. With no newline before `latestSplit` everything is held;
+      // the `latestSplit === 0` guard matters because lastIndexOf clamps a negative
+      // fromIndex to 0 and would otherwise emit a leading "\n".
+      const split = latestSplit === 0 ? 0 : masked.lastIndexOf("\n", latestSplit - 1) + 1;
       // The retained tail may hold the prefix of a needle whose remainder has not arrived.
       // It is left as-is and re-matched next round; a prefix cannot match, so nothing is
       // lost by deferring it, and re-masking already-masked text is idempotent.
-      carried.set(stream, masked.slice(masked.length - hold));
-      return masked.slice(0, masked.length - hold);
+      carried.set(stream, masked.slice(split));
+      return masked.slice(0, split);
     },
   };
 }
