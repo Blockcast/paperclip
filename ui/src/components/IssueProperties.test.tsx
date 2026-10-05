@@ -2113,10 +2113,12 @@ describe("IssueProperties", () => {
     // flip these two fixtures into each other as time passes.
     const FUTURE_TIMEOUT_AT = new Date(Date.now() + 86_400_000).toISOString();
     const PAST_TIMEOUT_AT = new Date(Date.now() - 86_400_000).toISOString();
-    // Inside MONITOR_BOUND_SKEW_MARGIN_MS: lapsed on this clock, but close
-    // enough that a skewed browser clock is a likelier explanation than a
-    // genuinely wedged monitor. Must be KEPT, not dropped.
-    const JUST_LAPSED_TIMEOUT_AT = new Date(Date.now() - 10_000).toISOString();
+    // The two ±1d fixtures above are safe at collection scope. The skew-margin
+    // pair below is NOT, and is built inside its own `it`: those offsets are
+    // tens of seconds, so evaluating them here would hand the assertion a
+    // wall-clock budget equal to the margin minus the offset, spent by every
+    // test that runs in between. Same failure the comment above warns about,
+    // 1728× tighter.
     const REVIEW_PRESET = { id: "low_trust_review", version: 1, rawOutputDisposition: "quarantine" } as const;
     const AUTHORIZATION_POLICY: TrustAuthorizationPolicy = {
       trustPreset: "low_trust_review",
@@ -2264,20 +2266,56 @@ describe("IssueProperties", () => {
     // it back — the silent-drop class this whole fix exists to close. Skew
     // inside the margin must resolve to "keep".
     it("keeps a timeoutAt that lapsed within the clock-skew margin", async () => {
+      // Built here, not in the describe body: 10s of a 60s margin, so at
+      // collection scope the assertion would carry a 50s wall-clock budget
+      // spanning every intervening test. Here the gap is microseconds.
+      const justLapsed = new Date(Date.now() - 10_000).toISOString();
       const onUpdate = vi.fn();
       const root = await openMonitorEditor(container, onUpdate, {
         monitor: {
           nextCheckAt: "2026-04-11T12:30:00.000Z",
           scheduledBy: "assignee",
           notes: null,
-          timeoutAt: JUST_LAPSED_TIMEOUT_AT,
+          timeoutAt: justLapsed,
         },
       });
 
       clickMonitorButton(container, "Schedule");
 
       const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
-      expect(written.monitor?.timeoutAt).toBe(JUST_LAPSED_TIMEOUT_AT);
+      expect(written.monitor?.timeoutAt).toBe(justLapsed);
+
+      act(() => root.unmount());
+    });
+
+    // Pins the MAGNITUDE of the margin, not just its direction. The 10s keep
+    // above and the 1d drop earlier hold for any margin between ~10s and ~24h,
+    // so widening the constant to e.g. 12h — which would hold a genuinely
+    // wedged monitor unresettable for half a day, re-opening the 422 dead end
+    // that the lapsed-bound drop closed — passes both of them untouched.
+    //
+    // The offset is a LITERAL on purpose. Deriving it from the constant
+    // (`-(MONITOR_BOUND_SKEW_MARGIN_MS + 5_000)`) moves the fixture with any
+    // mutation of the constant, so the test stays green for every value and
+    // pins nothing — the exact mutation-blindness this test exists to remove.
+    // With 65s asserted dropped and 10s asserted kept, the margin is bracketed
+    // to (10s, 65s): widen or narrow past either edge and one of them reddens.
+    it("drops a timeoutAt that lapsed just outside the clock-skew margin", async () => {
+      const justOutsideMargin = new Date(Date.now() - 65_000).toISOString();
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+          notes: null,
+          timeoutAt: justOutsideMargin,
+        },
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written.monitor?.timeoutAt).toBeNull();
 
       act(() => root.unmount());
     });
