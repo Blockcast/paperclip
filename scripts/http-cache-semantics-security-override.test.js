@@ -10,10 +10,22 @@ import test from "node:test";
 // This advisory was unfixable when it landed, and that is why the floor here is
 // worth stating explicitly. 4.2.0 was npm's `latest` and the exact top of the
 // vulnerable range, GitHub's advisory carried (and still carries) a null
-// first_patched_version, and every make-fetch-happen release through 16.0.1
-// pins `http-cache-semantics: ^4.1.1` — so there was no floor to raise and no
-// parent to bump. 4.3.0 published 2026-10-04 and is the first release outside
-// the range, which turns this back into an ordinary override.
+// first_patched_version, and no make-fetch-happen release declared a range that
+// excluded it (9.1.0 and 10.2.1 pin `^4.1.0`; 13.x through 16.0.1 pin `^4.1.1`)
+// — so there was no floor to raise and no parent to bump. 4.3.0 published
+// 2026-10-04 and is the first release outside the range, which turns this back
+// into an ordinary override.
+//
+// GHSA-ch52-4w7c-c8xp is the advisory that makes Dependabot alert, but it is
+// NOT the advisory 4.3.0 fixes, and it may not survive: the maintainer closed
+// the upstream report `not_planned` as bogus and a withdrawal request is open
+// at github/advisory-database#10139. The whole 4.2.0 → 4.3.0 delta is
+// `_varyMatches()`, which is GHSA-f27v-pv5m-c5g6 (CVE-2026-93750, high):
+// cross-user disclosure via `Vary` wildcard matching. That advisory is
+// `type: unreviewed` with an EMPTY `vulnerabilities` array, so no version range
+// is mapped and Dependabot structurally cannot alert on it. If ch52 is
+// withdrawn, f27v is the sole remaining justification for this floor — do not
+// read a closed alert as a reason to drop the override.
 //
 // Nothing in this repo depends on http-cache-semantics directly. It arrives on
 // one thread of optional build-time tooling:
@@ -23,11 +35,11 @@ import test from "node:test";
 //          -> make-fetch-happen
 //               -> http-cache-semantics
 //
-// `make-fetch-happen`'s own `^4.1.1` range already admits 4.3.0, so the pnpm
-// override is what pins the floor rather than what makes it reachable: it stops
-// a future resolution drifting back down to 4.2.0 while that version is still
-// the one most of the ecosystem's integrity hashes point at. The only thing
-// that proves the override took is what the lockfile actually resolved.
+// `make-fetch-happen@9.1.0`'s own `^4.1.0` range already admits 4.3.0, so the
+// pnpm override is what pins the floor rather than what makes it reachable: it
+// stops a future resolution drifting back down to 4.2.0 while that version is
+// still the one most of the ecosystem's integrity hashes point at. The only
+// thing that proves the override took is what the lockfile actually resolved.
 
 const PATCHED_FLOOR = ">=4.3.0 <5";
 

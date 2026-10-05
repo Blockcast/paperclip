@@ -149,7 +149,8 @@
       "http-cache-semantics": {
         "patchedRange": ">=4.3.0 <5",
         "advisories": [
-          "GHSA-ch52-4w7c-c8xp"
+          "GHSA-ch52-4w7c-c8xp",
+          "GHSA-f27v-pv5m-c5g6"
         ]
       }
     }
