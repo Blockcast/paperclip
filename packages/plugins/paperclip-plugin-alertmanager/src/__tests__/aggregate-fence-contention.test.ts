@@ -724,7 +724,11 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
             `saw ${localFenceWaiterCount(COMPANY_ID, AGG_KEY)}`,
         );
       }
-      await new Promise((r) => setTimeout(r, 1));
+      // 10ms for the same reason as `waitUntil` above: this shares an event
+      // loop with the deliveries it observes. Safe to coarsen because every
+      // caller waits for a waiter that stays queued until a release later in
+      // the same test, so there is no transient state a 10ms poll can miss.
+      await new Promise((r) => setTimeout(r, 10));
     }
   }
 
@@ -739,7 +743,11 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
       if (Date.now() > deadline) {
         throw new Error(`${what}: the fence was never held, so nothing contended`);
       }
-      await new Promise((r) => setTimeout(r, 1));
+      // 10ms, and this one matters most: the loop body is a real PGlite query,
+      // so polling at 1ms issued ~1000 WASM Postgres round-trips a second
+      // against the very delivery it is waiting for. The fence stays `firing`
+      // until a deferred resolved later in the test, so nothing is missed.
+      await new Promise((r) => setTimeout(r, 10));
     }
   }
 
