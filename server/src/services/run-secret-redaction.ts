@@ -233,7 +233,9 @@ export function redactRunSecretValues(text: string, needles: readonly string[]):
  *    of the last complete line, so it returns whole lines only: the excerpt filter and
  *    run-liveness both anchor per line, and a mid-line cut made every keepalive
  *    unclassifiable for as long as any needle existed. That extends the lag to the end of
- *    the current line, so a long unterminated line is held until its newline or the flush.
+ *    the current line, but by at most {@link RUN_SECRET_CARRY_MAX_HOLD_CHARS} past the
+ *    window: a stream that runs further than that without a newline falls back to the
+ *    character split for that emission.
  *    Liveness must still not inherit the lag: the return value is empty while the window
  *    fills and releases held lines with a later arrival, so it is not arrival-aligned. A
  *    caller MUST derive activity stamps and progress classification from the chunk it was
@@ -249,6 +251,13 @@ export function redactRunSecretValues(text: string, needles: readonly string[]):
  * identity function, so a run with nothing to redact is byte-for-byte unchanged and pays
  * no latency.
  */
+/**
+ * The most a line-aligned split may hold beyond `holdbackChars`: one persisted chunk, the same
+ * value as `MAX_PERSISTED_LOG_CHUNK_CHARS` in `log-chunk-sanitizer.ts`. Restated here because
+ * that module imports this one; a test pins the two together.
+ */
+export const RUN_SECRET_CARRY_MAX_HOLD_CHARS = 64 * 1024;
+
 export interface RunSecretBoundaryCarry {
   /** Trailing characters withheld per stream. `0` disables the carry entirely. */
   readonly holdbackChars: number;
@@ -292,7 +301,13 @@ export function createRunSecretBoundaryCarry(needles: readonly string[]): RunSec
       // keeps the bound above. With no newline before `latestSplit` everything is held;
       // the `latestSplit === 0` guard matters because lastIndexOf clamps a negative
       // fromIndex to 0 and would otherwise emit a leading "\n".
-      const split = latestSplit === 0 ? 0 : masked.lastIndexOf("\n", latestSplit - 1) + 1;
+      const lineSplit = latestSplit === 0 ? 0 : masked.lastIndexOf("\n", latestSplit - 1) + 1;
+      // Bound that hold. A stream with no newline (`\r` progress output, usually on stderr,
+      // which has no keepalive) would otherwise be retained whole, persist nothing, and be
+      // re-masked on every chunk. Past the cap, split at `latestSplit` as before line alignment:
+      // the bound above still holds, and a stream that ran this far without a newline is not a
+      // keepalive stream, so alignment buys nothing there.
+      const split = latestSplit - lineSplit > RUN_SECRET_CARRY_MAX_HOLD_CHARS ? latestSplit : lineSplit;
       // The retained tail may hold the prefix of a needle whose remainder has not arrived.
       // It is left as-is and re-matched next round; a prefix cannot match, so nothing is
       // lost by deferring it, and re-masking already-masked text is idempotent.
