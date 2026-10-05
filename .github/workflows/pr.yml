@@ -836,6 +836,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:js-yaml-security-override
 
+      - name: Test http-cache-semantics security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:http-cache-semantics-security-override
+
       - name: Test agent-health preflight fixtures
         if: ${{ !cancelled() }}
         run: pnpm run test:agent-health-preflight
