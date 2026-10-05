@@ -631,10 +631,39 @@ COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-serve
 COPY --from=penstock-agent-runtime /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
 COPY --from=caveman-proxy /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
 COPY --from=ponytail-marketplace /opt/penstock/ponytail /opt/penstock/ponytail
+# The tree is installed root-owned and not group/other-writable so the agent
+# (uid 1000) cannot rewrite the GitHub egress scrub runtimes the wrappers exec
+# out of it (PEN-3715). The trailing `find` proves the tree we actually
+# produced rather than only pinning the two commands that were supposed to
+# produce it.
+#
+# Symlinks are exempt from the MODE arm only, and that exemption is load-
+# bearing rather than a loosening: a symlink's own mode is always 0777 on
+# Linux and is never consulted for access control — the target's mode governs
+# — so `chmod -R go-w` deliberately skips them and no `chmod` can ever clear
+# those bits. Without `! -type l` this check could not pass over any npm tree:
+# `npm install` populates node_modules/.bin with exactly these links. They stay
+# subject to the OWNERSHIP arm, which is the axis that can actually be wrong.
+#
+# `offender=` before `test`, not `test -z "$(find ...)"`: a POSIX assignment
+# whose value is a command substitution adopts that command's exit status, so a
+# `find` that errors aborts the build instead of yielding an empty string that
+# `test -z` reads as success. See Dockerfile.runtime for the full argument.
+#
+# The offending path is echoed before failing because `-print` writes into the
+# command substitution, so without this the build log carries only a non-zero
+# exit for the whole RUN and the inode that tripped it is never named. This
+# guard aborts the image build when it fires, and the first time it did the
+# cause (`-perm /022` matching node_modules/.bin symlinks) took a round trip to
+# identify. `|| { ...; false; }` rather than `if`: the failing branch must keep
+# the RUN non-zero, and `echo` on its own would succeed and pass the build.
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   npm install --prefix /opt/paperclip-bundled-adapters --omit=dev --no-save --legacy-peer-deps --cache /root/.npm /tmp/paperclip-bundled-adapters/*.tgz \
   && rm -rf /tmp/paperclip-bundled-adapters \
-  && chown -R node:node /opt/paperclip-bundled-adapters
+  && chown -R root:root /opt/paperclip-bundled-adapters \
+  && chmod -R go-w /opt/paperclip-bundled-adapters \
+  && offender="$(find /opt/paperclip-bundled-adapters \( ! -user root -o \( ! -type l -a -perm /022 \) \) -print -quit)" \
+  && { test -z "$offender" || { echo "PEN-3715: agent-writable inode in bundled adapter tree: $offender" >&2; false; }; }
 
 # Keep dependency trees in their own stable layer. Ordinary source edits only
 # replace the much smaller source/compiled payload and do not re-upload pnpm's

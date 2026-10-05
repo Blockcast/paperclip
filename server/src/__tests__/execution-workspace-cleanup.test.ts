@@ -11,7 +11,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { classifyRemovalProof, executionWorkspaceCleanupService } from "../services/execution-workspace-cleanup.ts";
+import { classifyRemovalProof, decodeRunAttribution, encodeRetainedReason, executionWorkspaceCleanupService } from "../services/execution-workspace-cleanup.ts";
 import {
   inspectWorktreeReclaimSafety,
   RECLAIM_FS_OUTSTANDING_LIMIT,
@@ -19,6 +19,13 @@ import {
   resolvePathForWorktreeComparison,
 } from "../services/workspace-runtime.ts";
 import { findGitWorktreeRegistration, lockGitWorktreeForOwner } from "../services/git-worktree-ownership.ts";
+import {
+  EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC,
+  EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC,
+  EXECUTION_WORKSPACE_TEARDOWN_METRIC,
+  __resetMetricsForTest,
+  renderMetrics,
+} from "../services/metrics.ts";
 
 /**
  * BLO-22984. A collector fails silently exactly like a detector: one that never
@@ -87,7 +94,7 @@ describe("inspectWorktreeReclaimSafety", () => {
     const worktreePath = path.join(path.dirname(repo), "wt-clean");
     await addOwnedWorktree({ repo, worktreePath, branchName: "wt-clean", executionWorkspaceId: randomUUID() });
 
-    expect(await inspectWorktreeReclaimSafety(worktreePath)).toMatchObject({ safe: true, reason: "clean" });
+    expect(await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector" })).toMatchObject({ safe: true, reason: "clean" });
   });
 
   it("refuses a worktree holding uncommitted work", async () => {
@@ -96,7 +103,7 @@ describe("inspectWorktreeReclaimSafety", () => {
     await addOwnedWorktree({ repo, worktreePath, branchName: "wt-dirty", executionWorkspaceId: randomUUID() });
     fs.writeFileSync(path.join(worktreePath, "README.md"), "edited but never committed\n", "utf8");
 
-    const verdict = await inspectWorktreeReclaimSafety(worktreePath);
+    const verdict = await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector" });
     expect(verdict.safe).toBe(false);
     expect(verdict.reason).toBe("dirty");
   });
@@ -107,7 +114,7 @@ describe("inspectWorktreeReclaimSafety", () => {
     await addOwnedWorktree({ repo, worktreePath, branchName: "wt-untracked", executionWorkspaceId: randomUUID() });
     fs.writeFileSync(path.join(worktreePath, "scratch.txt"), "not added\n", "utf8");
 
-    expect(await inspectWorktreeReclaimSafety(worktreePath)).toMatchObject({ safe: false, reason: "dirty" });
+    expect(await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector" })).toMatchObject({ safe: false, reason: "dirty" });
   });
 
   it("refuses a worktree whose commits reached no remote", async () => {
@@ -118,7 +125,7 @@ describe("inspectWorktreeReclaimSafety", () => {
     git(["add", "."], worktreePath);
     git(["commit", "-qm", "local work"], worktreePath);
 
-    const verdict = await inspectWorktreeReclaimSafety(worktreePath);
+    const verdict = await inspectWorktreeReclaimSafety(worktreePath, { trigger: "collector" });
     expect(verdict.safe).toBe(false);
     expect(verdict.reason).toBe("unpushed");
   });
@@ -127,11 +134,11 @@ describe("inspectWorktreeReclaimSafety", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-ws-collector-nongit-"));
     tempRoots.add(root);
     // A directory that exists but is not a git worktree: every git probe fails.
-    expect(await inspectWorktreeReclaimSafety(root)).toMatchObject({ safe: false, reason: "unverifiable" });
+    expect(await inspectWorktreeReclaimSafety(root, { trigger: "collector" })).toMatchObject({ safe: false, reason: "unverifiable" });
   });
 
   it("treats an unmaterialized path as registry-only", async () => {
-    const verdict = await inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-absent-${randomUUID()}`));
+    const verdict = await inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-absent-${randomUUID()}`), { trigger: "collector" });
     expect(verdict).toMatchObject({ safe: true, reason: "missing" });
   });
 
@@ -143,7 +150,7 @@ describe("inspectWorktreeReclaimSafety", () => {
     const filePath = path.join(root, "not-a-directory");
     fs.writeFileSync(filePath, "\n", "utf8");
 
-    expect(await inspectWorktreeReclaimSafety(filePath)).toMatchObject({ safe: false, reason: "unverifiable" });
+    expect(await inspectWorktreeReclaimSafety(filePath, { trigger: "collector" })).toMatchObject({ safe: false, reason: "unverifiable" });
   });
 
   it("gives up on a stat that never returns instead of hanging the collector", async () => {
@@ -159,7 +166,7 @@ describe("inspectWorktreeReclaimSafety", () => {
       () => new Promise((resolve) => { unwedge = () => resolve(undefined as never); }),
     );
     try {
-      const pending = inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-wedged-${randomUUID()}`));
+      const pending = inspectWorktreeReclaimSafety(path.join(os.tmpdir(), `paperclip-wedged-${randomUUID()}`), { trigger: "collector" });
       await vi.runOnlyPendingTimersAsync();
       expect(await pending).toMatchObject({ safe: false, reason: "unverifiable", detail: "stat failed: ETIMEDOUT" });
     } finally {
@@ -185,8 +192,8 @@ describe("inspectWorktreeReclaimSafety", () => {
       () => new Promise((resolve) => { unwedge.push(() => resolve(undefined as never)); }),
     );
     try {
-      const first = inspectWorktreeReclaimSafety(path.join(dir, "wt-a"));
-      const second = inspectWorktreeReclaimSafety(path.join(dir, "wt-b"));
+      const first = inspectWorktreeReclaimSafety(path.join(dir, "wt-a"), { trigger: "collector" });
+      const second = inspectWorktreeReclaimSafety(path.join(dir, "wt-b"), { trigger: "collector" });
       await vi.runOnlyPendingTimersAsync();
       await Promise.all([first, second]);
       expect(reclaimFsOutstandingCount()).toBe(2);
@@ -315,6 +322,51 @@ describe("classifyRemovalProof", () => {
   });
 });
 
+describe("run-attribution encoding", () => {
+  it("carries a run origin through a deferral and back, without stacking suffixes", () => {
+    expect(decodeRunAttribution("run_ended")).toBe("run_ended");
+    const once = encodeRetainedReason("dirty", decodeRunAttribution("run_ended"));
+    expect(once).toBe("retained_dirty_run_ended");
+    // Re-deferring an already-suffixed row re-derives rather than appending.
+    expect(encodeRetainedReason("unpushed", decodeRunAttribution(once))).toBe(
+      "retained_unpushed_run_ended",
+    );
+  });
+
+  it("leaves idle-origin values byte-identical to the pre-PEN-3692 encoding", () => {
+    // The `cleanup_reason like 'retained_%'` census documented at the defer
+    // site reads these, and this is the dominant population.
+    expect(encodeRetainedReason("dirty", "idle_backfill")).toBe("retained_dirty");
+    expect(decodeRunAttribution("idle_backfill")).toBe("idle_backfill");
+    expect(decodeRunAttribution("retained_dirty")).toBe("idle_backfill");
+  });
+
+  it("keeps a row made eligible with no recorded reason distinct from idle reclamation", () => {
+    // Ally, review of 50628a4: a null `cleanup_reason` on a STAMPED row is not
+    // the backfill's silence, it is a writer that made the row collectable
+    // without saying why. Reporting it as `idle_backfill` asserts idle
+    // reclamation about work whose origin nobody recorded — and after the
+    // heartbeat fix in this commit, a non-zero `unknown` in production means
+    // another such writer exists.
+    expect(decodeRunAttribution(null)).toBe("unknown");
+    const deferred = encodeRetainedReason("dirty", decodeRunAttribution(null));
+    // Suffixed for the same reason `run_ended` is: otherwise the first deferral
+    // relabels it `idle_backfill` and the distinction lasts exactly one window.
+    expect(deferred).toBe("retained_dirty_unknown");
+    expect(deferred.startsWith("retained_")).toBe(true);
+    expect(decodeRunAttribution(deferred)).toBe("unknown");
+  });
+
+  it("never reads a safety reason as an origin suffix", () => {
+    // The safety union, plus `uncleaned` from classifyRemovalProof. If one of
+    // these ever ends in `_run_ended` or `_unknown` the split stops being
+    // unambiguous, so this is the guard on adding a new one.
+    for (const reason of ["missing", "clean", "dirty", "unpushed", "unverifiable", "uncleaned"]) {
+      expect(decodeRunAttribution(`retained_${reason}`)).toBe("idle_backfill");
+    }
+  });
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -350,6 +402,13 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     branchName: string;
     cleanupEligibleAt: Date | null;
     lastUsedAt: Date;
+    /**
+     * Defaults to the production shape: a STAMPED row carries the reason
+     * `stampIdleLegacyWorkspaces` writes, an unstamped one carries none. Pass
+     * `null` against a stamp to exercise a row made eligible with NO recorded
+     * reason — a distinct origin (`unknown`), not idle reclamation.
+     */
+    cleanupReason?: string | null;
   }) {
     const id = randomUUID();
     await db.insert(executionWorkspaces).values({
@@ -365,6 +424,9 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
       providerRef: input.worktreePath,
       branchName: input.branchName,
       cleanupEligibleAt: input.cleanupEligibleAt,
+      cleanupReason: input.cleanupReason === undefined
+        ? (input.cleanupEligibleAt ? "idle_backfill" : null)
+        : input.cleanupReason,
       lastUsedAt: input.lastUsedAt,
     });
     return id;
@@ -427,6 +489,8 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
       providerType: "git_worktree",
       providerRef: worktreePath,
       branchName: "wt-keep",
+      // The dominant stamped shape: made eligible by the idle backfill.
+      cleanupReason: "idle_backfill",
       cleanupEligibleAt: hourAgo(),
       lastUsedAt: hourAgo(),
     });
@@ -443,6 +507,125 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     expect(row?.cleanupReason).toBe("retained_dirty");
     // Deferred, not abandoned: re-checked next window so it collects once pushed.
     expect(row?.cleanupEligibleAt?.getTime() ?? 0).toBeGreaterThan(Date.now());
+    // Idle-origin rows are byte-identical to what they were before the
+    // run-attribution suffix landed, and still match the documented census.
+    expect(row?.cleanupReason?.startsWith("retained_")).toBe(true);
+  });
+
+  it("keeps run attribution across a deferral, so a failed run's tree is not relabelled idle when it finally collects", async () => {
+    // PEN-3692 asks how much teardown work FAILED runs cause, and a failed run
+    // leaves its tree dirty or unpushed — i.e. the population most likely to be
+    // DEFERRED. Overwriting `cleanup_reason` with the retain reason destroyed
+    // the `run_ended` origin permanently: nothing restores it, because
+    // `stampIdleLegacyWorkspaces` only writes rows whose `cleanupEligibleAt` is
+    // null and a deferred row's is set. Every later pass then charged the work
+    // to `idle_backfill` — including each window's `inspect_safety` walks, so a
+    // tree deferred ten times contributed one pass of `run_ended` and ten of
+    // `idle_backfill`. The bias ran one way only: downward, on exactly the
+    // population the row exists to measure. Found by Ally on PR #2175.
+    const { repo } = createRepoWithRemote();
+    const worktreePath = path.join(path.dirname(repo), "wt-run-ended");
+    const id = randomUUID();
+    await addOwnedWorktree({ repo, worktreePath, branchName: "wt-run-ended", executionWorkspaceId: id });
+    // Uncommitted work: what a failed run leaves behind.
+    fs.writeFileSync(path.join(worktreePath, "scratch.txt"), "failed run\n", "utf8");
+    await db.insert(executionWorkspaces).values({
+      id,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "wt-run-ended",
+      status: "active",
+      cwd: worktreePath,
+      providerType: "git_worktree",
+      providerRef: worktreePath,
+      branchName: "wt-run-ended",
+      // What run end stamps; the collector does the removal.
+      cleanupReason: "run_ended",
+      cleanupEligibleAt: hourAgo(),
+      lastUsedAt: hourAgo(),
+    });
+
+    // Pass 1: dirty, so it defers rather than collecting.
+    const first = await cleanup.reconcileExecutionWorkspaceCleanup();
+    expect(first.skipped).toBe(1);
+    expect(first.collected).toBe(0);
+
+    const [deferred] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
+    // Both facts survive: the retain reason AND the run origin. The origin is a
+    // SUFFIX so the `cleanup_reason like 'retained_%'` census documented at the
+    // defer site still matches this row — a `run_ended_retained_` prefix would
+    // have dropped run-origin retains out of that census silently.
+    expect(deferred?.cleanupReason).toBe("retained_dirty_run_ended");
+    expect(deferred?.cleanupReason?.startsWith("retained_")).toBe(true);
+
+    // The work is finished and pushed, so next window the tree is reclaimable.
+    git(["add", "."], worktreePath);
+    git(["commit", "-qm", "finished"], worktreePath);
+    git(["push", "-q", "origin", "HEAD"], worktreePath);
+    // Undo only the grace window the defer added; the row is otherwise untouched.
+    await db.update(executionWorkspaces)
+      .set({ cleanupEligibleAt: hourAgo() })
+      .where(eq(executionWorkspaces.id, id));
+
+    __resetMetricsForTest();
+    const second = await cleanup.reconcileExecutionWorkspaceCleanup();
+    expect(second.collected).toBe(1);
+    expect(fs.existsSync(worktreePath)).toBe(false);
+
+    // The removal is charged to the run that caused it, one deferral later.
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${EXECUTION_WORKSPACE_TEARDOWN_METRIC}{trigger="collector",method="worktree_remove",cleanup_reason="run_ended",outcome="succeeded"} 1`,
+    );
+    // And so are the safety walks, which the previous round established may be
+    // the largest term in the integral this row reads.
+    expect(body).toMatch(
+      new RegExp(`${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_count\\{trigger="collector",method="inspect_safety",cleanup_reason="run_ended"\\} [1-9]`),
+    );
+    // The negative control, and the assertion that fails without the fix: this
+    // pass touched exactly one workspace, and that workspace's work is NOT
+    // idle reclamation. Before the fix every series here read `idle_backfill`.
+    expect(body).not.toContain('cleanup_reason="idle_backfill"');
+  });
+
+  it("reports a row made eligible with no recorded reason as unknown, not as idle reclamation", async () => {
+    // Ally, review of 50628a4. The heartbeat writer that demoted a reusable
+    // workspace to `idle` nulled `cleanup_reason` WITHOUT nulling
+    // `cleanup_eligible_at`, so a `run_ended` row could be stripped of its
+    // origin and stay collectable — the same relabelling `deferCandidate` was
+    // fixed for, in a second writer, biased the same way. That writer is fixed;
+    // this pins the collector's side of it, which is what makes the fix
+    // observable: a stamped row with no reason is reported as `unknown`, so a
+    // non-zero `unknown` in production means another such writer exists.
+    // Reporting it as `idle_backfill` would hide exactly that.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-unattributed-"));
+    tempRoots.add(root);
+    // Absent on disk: provably registry-only, so it collects without a repo.
+    const id = await insertWorkspace({
+      worktreePath: path.join(root, "wt-unattributed"),
+      branchName: "wt-unattributed",
+      cleanupEligibleAt: hourAgo(),
+      lastUsedAt: hourAgo(),
+      cleanupReason: null,
+    });
+
+    __resetMetricsForTest();
+    const result = await cleanup.reconcileExecutionWorkspaceCleanup();
+    expect(result.collected).toBe(1);
+
+    const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, id));
+    expect(row?.status).toBe("archived");
+
+    const { body } = await renderMetrics();
+    expect(body).toMatch(
+      new RegExp(`${EXECUTION_WORKSPACE_TEARDOWN_DURATION_METRIC}_count\\{trigger="collector",method="inspect_safety",cleanup_reason="unknown"\\} [1-9]`),
+    );
+    // The negative control: this pass touched exactly one workspace, and its
+    // origin is not recorded anywhere. Before the decode fix every series here
+    // read `idle_backfill`, asserting idle reclamation nobody observed.
+    expect(body).not.toContain('cleanup_reason="idle_backfill"');
   });
 
   it("never archives a workspace whose worktree removal was declined", async () => {
@@ -467,6 +650,8 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
       providerType: "git_worktree",
       providerRef: worktreePath,
       branchName: "wt-foreign",
+      // The dominant stamped shape: made eligible by the idle backfill.
+      cleanupReason: "idle_backfill",
       cleanupEligibleAt: hourAgo(),
       lastUsedAt: hourAgo(),
     });
@@ -524,6 +709,7 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
       return (realStat as (...args: unknown[]) => Promise<fs.Stats>)(target, ...rest);
     }) as typeof fsp.stat);
     try {
+      __resetMetricsForTest();
       const pending = cleanup.reconcileExecutionWorkspaceCleanup();
       await wedgedStatCalled;
       await vi.advanceTimersByTimeAsync(30_000);
@@ -544,8 +730,17 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     // Never examined: still eligible, untouched, picked up next window.
     const [next] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, nextId));
     expect(next?.status).toBe("active");
-    expect(next?.cleanupReason).toBeNull();
+    expect(next?.cleanupReason).toBe("idle_backfill");
     expect(next?.cleanupEligibleAt?.getTime() ?? Infinity).toBeLessThanOrEqual(Date.now());
+
+    // The pass ENDED here rather than completing, and that has to be legible
+    // from the census: a truncated pass reporting `complete` is indistinguishable
+    // from one that genuinely had nothing left, which is how a wedged mount
+    // would read as a quiet collector. Deleting the `stopReason` assignment at
+    // the break leaves every other assertion in this test green.
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC}{stop_reason="ended_wedged"} 1`);
+    expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC}{stop_reason="complete"} 0`);
   });
 
   it("holds only the wedged directory, so a colocated sibling is skipped and another root still collects", async () => {
@@ -679,6 +874,7 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
       return (realStat as (...args: unknown[]) => Promise<fs.Stats>)(target, ...rest);
     }) as typeof fsp.stat);
     try {
+      __resetMetricsForTest();
       const pending = cleanup.reconcileExecutionWorkspaceCleanup();
       for (const called of statCalled) {
         await called;
@@ -710,8 +906,16 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, trailingId));
     expect(trailing?.status).toBe("active");
-    expect(trailing?.cleanupReason).toBeNull();
+    expect(trailing?.cleanupReason).toBe("idle_backfill");
     expect(trailing?.cleanupEligibleAt?.getTime() ?? Infinity).toBeLessThanOrEqual(Date.now());
+
+    // Same contract as the wedged case: a pass the threadpool ceiling cut short
+    // must not be censused as a completed one. These two in-loop reasons are
+    // the only members of the stop-reason enum with no other coverage — the
+    // entry-gate skip and the clean pass are pinned in the metrics suite.
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC}{stop_reason="ended_saturated"} 1`);
+    expect(body).toContain(`${EXECUTION_WORKSPACE_COLLECTOR_PASSES_METRIC}{stop_reason="complete"} 0`);
     // Each candidate costs a real-fs inspect, git spawns against a directory
     // that is not a repo, and DB round trips, all before its cleanup-side stat
     // can expire — so this is slower than the inspector-expiry tests above and

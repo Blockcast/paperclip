@@ -32223,6 +32223,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (executionWorkspace.created) {
         try {
           await cleanupExecutionWorkspaceArtifacts({
+            trigger: "persist_rollback",
             workspace: {
               id:
                 reusableExistingExecutionWorkspace?.id
@@ -32325,9 +32326,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reusableExistingExecutionWorkspace.id !== persistedExecutionWorkspace.id &&
       reusableExistingExecutionWorkspace.status === "active"
     ) {
+      // PEN-3692 (found by Ally on PR #2175): this used to null `cleanupReason`
+      // too. Unlike the realization write above it does NOT null
+      // `cleanupEligibleAt`, so a row stamped `run_ended` by run teardown was
+      // left collector-eligible with its origin erased, and every series the
+      // collector then emitted for it read `idle_backfill` — the same
+      // relabelling `deferCandidate` was just fixed for, in a second writer,
+      // biased the same way. Demoting a workspace to `idle` is not a statement
+      // about WHY it became eligible, so the stamp it carries is left alone. If
+      // a future change wants the reason cleared here, clear
+      // `cleanupEligibleAt` with it (the way the realization write does) so the
+      // row is un-stamped coherently rather than left eligible-but-unattributed.
       await executionWorkspacesSvc.update(reusableExistingExecutionWorkspace.id, {
         status: "idle",
-        cleanupReason: null,
       });
     }
     if (issueId && persistedExecutionWorkspace) {

@@ -28,6 +28,33 @@ export interface SelfPodSecretVolume {
    * project the whole Secret and legitimately have no selector.
    */
   items?: k8s.V1KeyToPath[];
+  /**
+   * The source volume's `optional:` setting, when it has one.
+   *
+   * Carried for the same reason as `items`: the control plane's declaration of
+   * how load-bearing a Secret is must survive propagation. `undefined` means
+   * the source said nothing, which upstream reads as `optional: false` — i.e.
+   * required — and that is the reading propagation must preserve.
+   *
+   * PEN-3705: this used to be dropped and replaced with an unconditional
+   * `optional: true` on the agent Job. For a credential mount that is not a
+   * graceful degradation. `PAPERCLIP_GITHUB_TOKEN_FILE` points *inside* the
+   * mount, so an absent mount does not leave the agent with "no token" — it
+   * leaves the path resolving to the bare shared-PVC directory underneath,
+   * which is mode 2775 and writable by uid 1000, the uid every agent runs as.
+   * Failing open on a credential mount whose path is PVC-backed hands that path
+   * to the agent.
+   *
+   * The PVC-backed qualifier is load-bearing, not hedging: the allowlist
+   * currently covers one mount of each kind. `paperclip-github-mcp-token`
+   * mounts under `/paperclip`, so its fallback is fleet-shared and writable —
+   * that is the case this field exists for. `authbot-mcp-consumer-service-keys`
+   * mounts at `/run/authbot`, outside the PVC, so its fallback is the
+   * container's own ephemeral filesystem and reaches no other agent. Both are
+   * chart-declared required and both should stay that way, but only the first
+   * degrades into a credential-substitution path.
+   */
+  optional?: boolean;
 }
 
 export interface SelfPodInfo {
@@ -203,6 +230,7 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
         mountPath: vm.mountPath,
         defaultMode: vol.secret.defaultMode,
         items: vol.secret.items ? [...vol.secret.items] : undefined,
+        optional: vol.secret.optional,
       });
     }
   }

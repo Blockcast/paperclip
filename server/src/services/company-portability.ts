@@ -46,6 +46,8 @@ import {
   ROUTINE_TRIGGER_SIGNING_MODES,
   deriveProjectUrlKey,
   envConfigSchema,
+  isPlausiblySensitiveEnvValue,
+  isSensitiveEnvKey,
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
@@ -443,32 +445,81 @@ function buildSkillExportDirMap(skills: CompanySkill[], companyIssuePrefix: stri
   return keyToDir;
 }
 
-function isSensitiveEnvKey(key: string) {
-  const normalized = key.trim().toLowerCase();
-  return (
-    normalized === "token" ||
-    normalized.endsWith("_token") ||
-    normalized.endsWith("-token") ||
-    normalized.includes("apikey") ||
-    normalized.includes("api_key") ||
-    normalized.includes("api-key") ||
-    normalized.includes("access_token") ||
-    normalized.includes("access-token") ||
-    normalized.includes("auth") ||
-    normalized.includes("auth_token") ||
-    normalized.includes("auth-token") ||
-    normalized.includes("authorization") ||
-    normalized.includes("bearer") ||
-    normalized.includes("secret") ||
-    normalized.includes("passwd") ||
-    normalized.includes("password") ||
-    normalized.includes("credential") ||
-    normalized.includes("jwt") ||
-    normalized.includes("privatekey") ||
-    normalized.includes("private_key") ||
-    normalized.includes("private-key") ||
-    normalized.includes("cookie") ||
-    normalized.includes("connectionstring")
+/**
+ * Should this env input's `default` be withheld from the exported bundle?
+ *
+ * PEN-3701. This surface used to carry its own hand-rolled substring denylist over the key name —
+ * a second, weaker spelling of `@paperclipai/shared`'s `isSensitiveEnvKey`, sitting in the same
+ * file whose `redactPortableAgentRecord` docblock argues that "a per-surface denylist can never
+ * promise" coverage. It was that denylist. Measured divergence against the shared regex, on a
+ * 43-key corpus: the local copy classified 7 keys as plain that the shared one classifies as
+ * secret — `MYTOKEN`, `TOKEN_FILE`, `TOKEN_PATH`, `ACCESSTOKEN`, `GITHUB_TOKEN_B64`,
+ * `REFRESH_TOKEN_V2`, `SLACK_TOKEN_RAW` — because it matched `token` only as a whole key or a
+ * `_token`/`-token` suffix, where the shared rule matches the stem followed by a separator or
+ * end-of-key. It was never stricter on any key, so this is a one-directional loss.
+ *
+ * The second axis is the one no key list can cover: the local copy had no VALUE test at all, so a
+ * credential stored under an innocuous name (`BOOTSTRAP`, `CFG`, `SETTINGS`) exported its literal
+ * value into `inputs.env.<KEY>.default`. `isPlausiblySensitiveEnvValue` closes that by shape —
+ * `sk-…`, `ghp_…`, `AKIA…`, a JWT, or a long mixed-class opaque token.
+ *
+ * Why this is not simply `isSensitiveEnv(key, value)`, which is the OR of the same two helpers:
+ * that function returns `false` for an empty value, which would reclassify a sensitive-NAMED key
+ * with no stored default from `kind: "secret"` to `kind: "plain"` and change what the import
+ * prompts the operator for. The key test has to stand on its own.
+ *
+ * Why this surface keeps a predicate at all, where the sibling `redactPortableAgentRecord` path
+ * masks every env value unconditionally: these two emissions have different jobs. That one exports
+ * an agent's live `adapterConfig`, where a plain binding IS credential material by construction.
+ * This one exports re-import DEFAULTS, whose whole purpose is to carry portable non-secret config
+ * (`LOG_LEVEL`, `REGION`) across the bundle so an import does not have to re-supply everything.
+ * Masking unconditionally here would not be a stricter version of the same control — it would
+ * delete the feature. The fix is to stop this surface owning its own vocabulary, not to remove its
+ * predicate.
+ */
+function withholdsEnvInputDefault(
+  key: string,
+  defaultValue: string,
+  portability: CompanyPortabilityEnvInput["portability"],
+): boolean {
+  if (isSensitiveEnvKey(key)) return true;
+  // An absolute command path (`/Users/dotta/.local/bin/claude`) is usually all `[A-Za-z0-9/._-]`,
+  // so it clears the value heuristic's charset gate and reads as an opaque token. It is already
+  // marked `system_dependent`, which is the right reason; withholding it as a credential too would
+  // drop a default the export keeps and emit two contradictory warnings for one key.
+  // Known ceiling: a benign-named base64 secret that happens to start with "/" also skips the
+  // value arm here (the key arm above still applies); add a path-shape test if that ever matters.
+  if (portability === "system_dependent") return false;
+  return isPlausiblySensitiveEnvValue(defaultValue);
+}
+
+/**
+ * Why only the value-shape branch warns.
+ *
+ * Not because the two branches export differently — they do not. Either arm of
+ * `withholdsEnvInputDefault` yields `kind: "secret"` with an empty `defaultValue`, so the
+ * classification is identical and the warning marks no difference in what is emitted.
+ *
+ * What differs is how LEGIBLE the omission is to whoever reads the bundle. A sensitive-NAMED key
+ * explains itself: `API_KEY` arriving with no default is self-describing, and the name alone tells
+ * an operator both why it is empty and that they must supply it. A benign-named key does not —
+ * `BOOTSTRAP` with an empty default is indistinguishable from `BOOTSTRAP` that was simply never
+ * set, and `kind: "secret"` does not disambiguate the two because it is equally present on the
+ * self-describing case. Naming the reason is the only signal that separates withheld from absent.
+ *
+ * Lives here rather than inline because the `plain` and bare-string branches below would otherwise
+ * each carry their own copy of this literal and its guard — the exact duplicate-spelling shape
+ * this change exists to remove from the key denylist.
+ */
+function pushWithheldEnvDefaultWarning(
+  warnings: string[],
+  warningPrefix: string,
+  key: string,
+  isSensitive: boolean,
+): void {
+  if (!isSensitive || isSensitiveEnvKey(key)) return;
+  warnings.push(
+    `${warningPrefix} env ${key} default was withheld because its value has the shape of a credential; re-supply it after import.`,
   );
 }
 
@@ -517,13 +568,15 @@ function extractPortableScopedEnvInputs(
 
     if (isPlainRecord(binding) && binding.type === "plain") {
       const defaultValue = asString(binding.value);
-      const isSensitive = isSensitiveEnvKey(key);
       const portability = defaultValue && isAbsoluteCommand(defaultValue)
         ? "system_dependent"
         : "portable";
-      if (portability === "system_dependent") {
+      const isSensitive = withholdsEnvInputDefault(key, defaultValue ?? "", portability);
+      if (portability === "system_dependent" && !isSensitive) {
         warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
       }
+      // Warn only on the value-shape branch; see `pushWithheldEnvDefaultWarning`.
+      pushWithheldEnvDefaultWarning(warnings, scope.warningPrefix, key, isSensitive);
       inputs.push({
         key,
         description: `Optional default for ${key} on ${scope.label}`,
@@ -539,17 +592,19 @@ function extractPortableScopedEnvInputs(
 
     if (typeof binding === "string") {
       const portability = isAbsoluteCommand(binding) ? "system_dependent" : "portable";
-      if (portability === "system_dependent") {
+      const isSensitive = withholdsEnvInputDefault(key, binding, portability);
+      if (portability === "system_dependent" && !isSensitive) {
         warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
       }
+      pushWithheldEnvDefaultWarning(warnings, scope.warningPrefix, key, isSensitive);
       inputs.push({
         key,
         description: `Optional default for ${key} on ${scope.label}`,
         agentSlug: scope.agentSlug,
         projectSlug: scope.projectSlug,
-        kind: isSensitiveEnvKey(key) ? "secret" : "plain",
+        kind: isSensitive ? "secret" : "plain",
         requirement: "optional",
-        defaultValue: isSensitiveEnvKey(key) ? "" : binding,
+        defaultValue: isSensitive ? "" : binding,
         portability,
       });
     }

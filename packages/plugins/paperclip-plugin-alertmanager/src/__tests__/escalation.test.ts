@@ -305,6 +305,32 @@ describe("alert escalation", () => {
     expect(store.members.get(`${coverRow.cover_issue_id}:issue-1`)?.resolved_at).toBeNull();
   });
 
+  it("skips the `local-board` non-human sentinel when picking the cover's board owner (BLO-19560)", async () => {
+    // `local-board` is a real `user` row carrying an owner membership, so it
+    // satisfies every principalType/role test and sorts first here. Without
+    // the sentinel guard the cover — "Board direction is required" — is
+    // addressed to a principal no person reads: 19 of 19 live covers were
+    // undelivered this way. Reverting the guard must fail this test.
+    const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
+    const { ctx, mocks } = sweepContext(state, null);
+    mocks.access.members.list = vi.fn(async () => [
+      { principalType: "user", principalId: "local-board", status: "active", membershipRole: "owner" },
+      { principalType: "user", principalId: "human-1", status: "active", membershipRole: "admin" },
+    ]);
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    expect(mocks.issues.create).toHaveBeenCalledWith(expect.objectContaining({ assigneeUserId: "human-1" }));
+  });
+
+  it("leaves the cover unassigned rather than sentinel-assigned when the sentinel is the only owner (BLO-19560)", async () => {
+    const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
+    const { ctx, mocks } = sweepContext(state, null);
+    mocks.access.members.list = vi.fn(async () => [
+      { principalType: "user", principalId: "local-board", status: "active", membershipRole: "owner" },
+    ]);
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    expect(mocks.issues.create).toHaveBeenCalledWith(expect.objectContaining({ assigneeUserId: null }));
+  });
+
   it("creates a fresh cover once the prior cover for this alert is cancelled", async () => {
     const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1 };
     const store = buildFakeAlertmanagerStore();

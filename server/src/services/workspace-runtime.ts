@@ -47,6 +47,12 @@ import {
 } from "./git-checkout-identity.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+import {
+  recordExecutionWorkspaceTeardown,
+  recordExecutionWorkspaceReclaimInspection,
+  type ExecutionWorkspaceCleanupReason,
+  type ExecutionWorkspaceTeardownTrigger,
+} from "./metrics.js";
 
 export function resolveShell(): string {
   const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
@@ -4981,10 +4987,26 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   };
 }
 
+/**
+ * The reasons `inspectWorktreeReclaimSafety` can give. A runtime array rather
+ * than a bare string-literal union because the collector encodes a retained
+ * row's origin as a SUFFIX on these values (`encodeRetainedReason` in
+ * `execution-workspace-cleanup.ts`), so the suffixes must stay collision-free
+ * against every member. A hand-maintained mirror in the test would pass while
+ * going stale; iterating this does not.
+ */
+export const WORKTREE_RECLAIM_SAFETY_REASONS = [
+  "missing",
+  "clean",
+  "dirty",
+  "unpushed",
+  "unverifiable",
+] as const;
+
 export type WorktreeReclaimSafety = {
   /** True only when reclaiming the disk provably discards no work. */
   safe: boolean;
-  reason: "missing" | "clean" | "dirty" | "unpushed" | "unverifiable";
+  reason: (typeof WORKTREE_RECLAIM_SAFETY_REASONS)[number];
   detail: string | null;
 };
 
@@ -5082,8 +5104,49 @@ async function withReclaimFsDeadline<T>(operation: Promise<T>, target: string): 
  * anything it cannot *prove* clean alone. Every failure mode returns
  * `unverifiable`, never `clean`: an unreadable tree is a reason to skip, not a
  * reason to proceed.
+ *
+ * PEN-3692: the `git status --porcelain` below is a full tree walk charged to
+ * the worker's own cgroup, and the collector makes it up to twice per candidate
+ * — so it is observed into the teardown duration histogram under
+ * `method: "inspect_safety"`. `trigger` is required rather than defaulted
+ * precisely so a new PRODUCTION call site has to declare itself instead of
+ * silently landing in an `unknown` bucket nobody reads. ⚠️ That guarantee stops
+ * at `src/`: `server/tsconfig.json` excludes `src/__tests__`, so a test calling
+ * this with one argument is NOT a compile error (BLO-24983). The runtime miss
+ * is loud rather than silent, though: `options` is then `undefined`, so the
+ * `finally` throws a `TypeError` dereferencing `options.trigger` *while
+ * building* the observation — the walk runs, nothing is recorded under a bogus
+ * label, and the call fails at that test. Pass a trigger in tests too.
  */
-export async function inspectWorktreeReclaimSafety(worktreePath: string): Promise<WorktreeReclaimSafety> {
+export async function inspectWorktreeReclaimSafety(
+  worktreePath: string,
+  options: {
+    trigger: ExecutionWorkspaceTeardownTrigger;
+    cleanupReason?: ExecutionWorkspaceCleanupReason;
+  },
+): Promise<WorktreeReclaimSafety> {
+  // PEN-3692: `performance.now()` rather than `Date.now()` at all three sites
+  // that feed this histogram. Its `_sum` IS the work integral §3(b) regresses
+  // slab residual against, so a wall-clock step (NTP, suspend) would land
+  // directly in the headline quantity as phantom or negative walking time.
+  const inspectionStartedAt = performance.now();
+  try {
+    return await inspectWorktreeReclaimSafetyInner(worktreePath);
+  } finally {
+    // In `finally` so an inspection that threw still contributes the walking it
+    // did before throwing — excluding it would bias the integral downward
+    // exactly when the mount is misbehaving, which is the regime this measures.
+    recordExecutionWorkspaceReclaimInspection({
+      trigger: options.trigger,
+      cleanupReason: options.cleanupReason,
+      durationMs: performance.now() - inspectionStartedAt,
+    });
+  }
+}
+
+async function inspectWorktreeReclaimSafetyInner(
+  worktreePath: string,
+): Promise<WorktreeReclaimSafety> {
   // Deliberately not `directoryExists`, which is `stat().catch(() => false)`:
   // that collapses EACCES/EIO/ESTALE into "missing" and so returns `safe` for a
   // tree it never read. Only an errno that *proves* nothing is there counts as
@@ -5164,7 +5227,39 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   cleanupCommand?: string | null;
   teardownCommand?: string | null;
   recorder?: WorkspaceOperationRecorder | null;
+  /**
+   * Which caller asked for this teardown, for the PEN-3692 metrics split.
+   *
+   * Optional with an `unknown` default so adding it could not change any
+   * caller's behaviour, but every production call site sets it explicitly —
+   * the whole point of the label is to separate the periodic collector from
+   * the per-failure run teardown, which PEN-3692 could not do because both
+   * reach this function identically. A rising `unknown` share means a new call
+   * site was added without being classified.
+   *
+   * ⚠️ Asymmetry worth knowing, since both paths land in the same histogram:
+   * `inspectWorktreeReclaimSafety` makes `trigger` REQUIRED, so its drift
+   * detector is opt-out (a new caller is a compile error), while this one's is
+   * opt-in (a new caller silently lands in `unknown`). Defaulting here was
+   * deliberate — making it required would have been a breaking change to an
+   * existing entry point — but it means an `unknown` on the removal methods is
+   * a missed classification, whereas `unknown` cannot arise on `inspect_safety`
+   * from `src/` at all.
+   */
+  trigger?: ExecutionWorkspaceTeardownTrigger;
+  /**
+   * Why this workspace became eligible, for the `cleanup_reason` label. Only
+   * the collector can supply one; the persist-rollback and operator callers
+   * have no eligibility reason and default to `not_applicable`.
+   *
+   * ⛔ This, not `trigger`, is the run-attribution split: run end stamps
+   * `cleanupReason: "run_ended"` and defers the removal to the collector, so
+   * run-attributable work arrives here as `trigger="collector"`.
+   */
+  cleanupReason?: ExecutionWorkspaceCleanupReason;
 }) {
+  const trigger = input.trigger ?? "unknown";
+  const cleanupReason = input.cleanupReason ?? "not_applicable";
   const warnings: string[] = [];
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
   const repoRoot = input.workspace.providerType === "git_worktree" && workspacePath
@@ -5239,6 +5334,9 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         });
         warnings.push(...authorization.warnings);
         if (authorization.authorized) {
+          // Monotonic, for the reason given at `inspectWorktreeReclaimSafety`.
+          const startedAt = performance.now();
+          let removalSucceeded = false;
           try {
             const removeForceArgs = authorization.removeForce === "double"
               ? ["--force", "--force"]
@@ -5258,8 +5356,22 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
               successMessage: `Removed git worktree ${workspacePath}\n`,
               failureLabel: `git worktree remove ${workspacePath}`,
             });
+            removalSucceeded = true;
           } catch (err) {
             warnings.push(err instanceof Error ? err.message : String(err));
+          } finally {
+            // PEN-3692: the tree walk this removal just performed is charged to
+            // the worker's own cgroup — `recordGitOperation` shells out, and an
+            // execFile child shares its parent's cgroup. Recorded in `finally`
+            // so a removal that threw still contributes the work it did before
+            // throwing.
+            recordExecutionWorkspaceTeardown({
+              trigger,
+              cleanupReason,
+              method: "worktree_remove",
+              succeeded: removalSucceeded,
+              durationMs: performance.now() - startedAt,
+            });
           }
         }
       }
@@ -5301,7 +5413,27 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     if (containsProjectWorkspace) {
       warnings.push(`Refusing to remove path "${workspacePath}" because it contains the project workspace.`);
     } else {
-      await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
+      // Monotonic, for the reason given at `inspectWorktreeReclaimSafety`.
+      const startedAt = performance.now();
+      let removalSucceeded = false;
+      try {
+        await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
+        removalSucceeded = true;
+      } finally {
+        // PEN-3692: try/finally, not try/catch — this call deliberately does
+        // not swallow its error (the caller treats a failed local_fs removal as
+        // fatal), so the throw still propagates and only the measurement is
+        // added. A recursive delete must readdir+lstat+unlink every entry, and
+        // unlike the worktree path it does so in-process, holding a libuv
+        // threadpool thread throughout.
+        recordExecutionWorkspaceTeardown({
+          trigger,
+          cleanupReason,
+          method: "remove_local_fs",
+          succeeded: removalSucceeded,
+          durationMs: performance.now() - startedAt,
+        });
+      }
       if (input.recorder) {
         await input.recorder.recordOperation({
           phase: "workspace_teardown",
