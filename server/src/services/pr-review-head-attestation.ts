@@ -51,8 +51,9 @@
  *   - The unconfigured-login fail-open below does not account for it:
  *     `prReviewerBotLogin` defaults to `allyblockcast[bot]` (`config.ts:1277`),
  *     so the "no reviewer bot login is configured" arm was not the one taken.
- *   - A missing head does not account for it, for the triggers that reach this
- *     gate at all. An `issue_comment` can produce FOUR wake reasons, not two —
+ *   - A missing head is NOT excluded — but the trigger surface is narrower than
+ *     it looks, and unlike the other open explanations this one is readable in
+ *     the logs. An `issue_comment` can produce FOUR wake reasons, not two —
  *     the ternary at `github-webhook.ts:1813-1819` yields
  *     `github_pr_review_gate_escalation`, `github_pr_merge_queue_evicted`,
  *     `github_pr_review_requested` or `github_pr_review_feedback` — and only
@@ -62,9 +63,21 @@
  *     return false at `:5534` and execution never arrives at `:5602`. So the
  *     only comment-driven reason that reaches this gate is
  *     `github_pr_review_requested`, and for it the webhook resolves the head
- *     lazily (`:5262-5266`) BEFORE the
- *     `if (context.headSha && context.repoFullName)` gate at `:5602`. A head is
- *     therefore present whenever this gate is consulted from a comment.
+ *     lazily (`:5262-5303`) BEFORE the
+ *     `if (context.headSha && context.repoFullName)` gate at `:5602`.
+ *
+ *     That lookup is BEST-EFFORT, not guaranteed, so it does not establish that
+ *     a head is present. Both failure arms continue without one: a falsy result
+ *     warns "could not resolve current PR head for review comment; continuing
+ *     without head context" (`:5288`), and a thrown lookup warns "PR-head lookup
+ *     failed for review comment; continuing without head context" (`:5301`).
+ *     Either leaves `context.headSha` undefined, so the `:5602` gate is skipped
+ *     entirely and the wake dispatches UN-GATED — and for a comment-driven wake
+ *     there is no other source of a head, as `:5255-5260` says in as many words.
+ *     "A head is present whenever this gate is CONSULTED" would be true but
+ *     vacuous: the gate's own condition requires a head, so it cannot be
+ *     consulted without one. What would be needed to exclude this explanation,
+ *     and is not available, is that the gate is always REACHED.
  *
  *     That narrowing moves #2128 out of this bullet entirely. Its only trigger
  *     is `allyblockcast[bot]`-authored and carries no `paperclip:review-request`
@@ -79,10 +92,14 @@
  * So on the tree, #2121's and #2157's duplicates reached GitHub past a live
  * guard. The surviving explanations are: it answered `not_attested`; it answered
  * `unknown` for some reason other than the two excluded above; the deploy
- * carrying `fce3d292` had not rolled out when those wakes arrived; or those runs
- * were not dispatched through this webhook path at all. NOT RESOLVED HERE —
- * deploy timing and dispatch provenance were not checked, and neither is
- * readable from the review API this measurement used.
+ * carrying `fce3d292` had not rolled out when those wakes arrived; those runs
+ * were not dispatched through this webhook path at all; or the comment-driven
+ * head lookup failed, leaving no `context.headSha`, so `:5602` never ran. NOT
+ * RESOLVED HERE — deploy timing and dispatch provenance were not checked, and
+ * neither is readable from the review API this measurement used. The fifth is
+ * not in that class: it IS readable, from the `could not resolve current PR
+ * head` / `PR-head lookup failed` warnings at `:5288`/`:5301`, which are keyed
+ * on `deliveryId` and `prNumber`.
  *
  * It is PARTLY answerable from evidence already emitted, but current logging
  * cannot settle the question `:41-43` calls the decision-relevant one. This
@@ -99,12 +116,16 @@
  * these logs establish. Absence of both does NOT mean the gate was not reached:
  * it is precisely the signature of the ordinary `not_attested` path, where the
  * gate was reached and answered. Absence leaves `not_attested` (the first
- * surviving explanation above) and never-reached (the fourth) indistinguishable
+ * surviving explanation above), never-reached (the fourth) and the failed head
+ * lookup (the fifth) indistinguishable from one another in THIS module's logs
  * — and `not_attested` is the ORDINARY path by construction: every wake on a
  * head no operative review attests yet answers it, which is the whole steady
  * state of a healthy gate. So reading absence as "not reached" resolves the
- * common case to the wrong answer. Separating them
- * needs a debug log on the `not_attested` arm; it does not exist today. Read
+ * common case to the wrong answer. Separating the first from the fourth needs a
+ * debug log on the `not_attested` arm; it does not exist today. The fifth,
+ * though, is already separable without one, and from the caller rather than
+ * here: the `:5288`/`:5301` warnings fire on exactly that arm, so a delivery
+ * carrying one of them took it and a delivery carrying neither did not. Read
  * these logs for what they can prove before concluding the wake keying is at
  * fault.
  *
@@ -143,7 +164,7 @@
  * change behaviour at all.
  *
  * Where they actually conflict is narrow, and it is the description-only case
- * at `:196-203` below: when the finding lives in the PR description, no commit
+ * at `:217-224` below: when the finding lives in the PR description, no commit
  * can carry the fix, so "one commit away" is false by construction and the
  * caller's asymmetry does not hold for that class. For every other class the
  * caller's reasoning stands. Whoever resolves this should change BOTH comments
