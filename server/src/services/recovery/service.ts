@@ -3772,10 +3772,6 @@ export function recoveryService(
     return `stale_active_run:${companyId}:${runId}`;
   }
 
-  function isTerminalIssueStatus(status: string | null | undefined) {
-    return status === "done" || status === "cancelled";
-  }
-
   function isRecoveryOriginIssue(issue: typeof issues.$inferSelect) {
     return Object.values(RECOVERY_ORIGIN_KINDS).includes(
       issue.originKind as typeof RECOVERY_ORIGIN_KINDS[keyof typeof RECOVERY_ORIGIN_KINDS],
@@ -14655,9 +14651,15 @@ export function recoveryService(
    * Two states are cancelled outright, on different grounds, and the difference
    * matters to anyone changing either arm:
    *
-   * - **an unresolved dependency edge** — forced. Promoting re-queues the wake
-   *   straight back into suppression, so a one-verb drain would regenerate its
-   *   own trigger and never converge.
+   * - **an unresolved dependency edge** — a policy choice, not forced.
+   *   Promoting does NOT re-queue the wake into suppression: `enqueueWakeup`
+   *   writes a durable dep-blocked park that carries the whole context forward
+   *   and fires on its own backoff, which is a delivery. What would not
+   *   converge is this drain's own bookkeeping — `enqueueWakeup` returns `null`
+   *   for that park exactly as for a decline, so `if (!queued) continue` would
+   *   re-select this row and mint a fresh park every pass. Telling the two
+   *   apart needs a sink this drain does not take. Recorded at the arm itself,
+   *   along with what cancelling costs.
    * - **a closed issue whose wake is not reopen-eligible** — a policy choice,
    *   not forced. `enqueueWakeup` has no terminal-issue suppression and the
    *   promotion would succeed. The grounds are recorded at the arm itself.
@@ -14709,7 +14711,20 @@ export function recoveryService(
         executionRunId: issues.executionRunId,
       })
       .from(agentWakeupRequests)
-      .innerJoin(issues, sql`${issues.id}::text = ${wakeIssueId}`)
+      // Scoped by company as well as id, matching the comment lookup further
+      // down. No producer is known to mint a wake whose issue lives in another
+      // company, so this is consistency rather than a fix — but it is the only
+      // place that could catch one, and the failure it forecloses is not a
+      // mis-read: the reopen writes `candidate.issueId` and the activity row is
+      // stamped `candidate.companyId`, so a mismatch would be a cross-company
+      // write. Dropping the row from the scan is the fail-closed direction.
+      .innerJoin(
+        issues,
+        and(
+          sql`${issues.id}::text = ${wakeIssueId}`,
+          eq(issues.companyId, agentWakeupRequests.companyId),
+        ),
+      )
       .where(
         and(
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
