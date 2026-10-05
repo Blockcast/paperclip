@@ -12129,12 +12129,17 @@ export function issueRoutes(
 
     const patch: Record<string, unknown> = { ...transition.patch };
     if (transition.patch.executionPolicy === undefined) {
-      // `applyMonitorTransition` only writes `executionPolicy` on the branches
-      // that refuse the arm (invalid / bounds-exhausted / convergence-stalled),
-      // where it has already stripped the monitor for its own reasons — leave
-      // those alone. Every other outcome needs the merged policy carried through
-      // explicitly, or the stored `executionPolicy.monitor` keeps the previous
-      // `nextCheckAt` while the columns move.
+      // On this route the one branch that writes `executionPolicy` is the
+      // convergence-stalled refusal, where `applyMonitorTransition` has already
+      // stripped the monitor for its own reasons — leave that alone. The other
+      // two refusals cannot reach here: `monitorExplicitlyUpdated` is always
+      // true above, and under it the invalid and bounds-exhausted branches
+      // throw `unprocessable` (`issue-execution-policy.ts`) rather than writing
+      // a patch, so the route 422s before `svc.update`. The `=== undefined`
+      // check stays because it is correct either way. Every other outcome needs
+      // the merged policy carried through explicitly, or the stored
+      // `executionPolicy.monitor` keeps the previous `nextCheckAt` while the
+      // columns move.
       patch.executionPolicy = monitor
         ? nextExecutionPolicy
         : stripMonitorFromExecutionPolicy(previousExecutionPolicy);
