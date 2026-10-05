@@ -159,8 +159,30 @@ describe("run dispatch-wait metrics (BLO-25024)", () => {
     expect(computeRunDispatchWaitSeconds(null, "2026-10-04T05:00:00Z")).toBeNull();
     expect(computeRunDispatchWaitSeconds("not-a-date", "2026-10-04T05:00:00Z")).toBeNull();
     // A never-started run must not be recorded as an instant dispatch.
-    expect(recordRunDispatchWait({ invocationSource: "timer", createdAt: "2026-10-04T00:00:00Z", startedAt: null }))
-      .toBeNull();
+    expect(recordRunDispatchWait({
+      invocationSource: "timer",
+      queuedAt: null,
+      createdAt: "2026-10-04T00:00:00Z",
+      startedAt: null,
+    })).toBeNull();
+  });
+
+  it("starts the clock at queuedAt when a run re-entered the queue (BLO-21116)", () => {
+    // A promoted scheduled_retry or a k8s-isolation re-queue stamps queuedAt;
+    // the hours before it are backoff or a prior execution, not dispatch wait.
+    expect(recordRunDispatchWait({
+      invocationSource: "assignment",
+      queuedAt: "2026-10-04T04:59:00Z",
+      createdAt: "2026-10-04T00:00:00Z",
+      startedAt: "2026-10-04T05:00:00Z",
+    })).toBe(60);
+    // A fresh insert leaves queuedAt null: createdAt is the queue-entry time.
+    expect(recordRunDispatchWait({
+      invocationSource: "assignment",
+      queuedAt: null,
+      createdAt: "2026-10-04T00:00:00Z",
+      startedAt: "2026-10-04T05:00:00Z",
+    })).toBe(18000);
   });
 
   it("clamps clock skew to zero so a negative sample cannot corrupt the p95", () => {
@@ -174,6 +196,7 @@ describe("run dispatch-wait metrics (BLO-25024)", () => {
     expect(RUN_DISPATCH_WAIT_BUCKETS_SECONDS[0]).toBeLessThan(60);
     expect(recordRunDispatchWait({
       invocationSource: "timer",
+      queuedAt: null,
       createdAt: "2026-10-04T00:00:00.000Z",
       startedAt: "2026-10-04T00:00:36.000Z",
     })).toBe(36);
@@ -183,16 +206,24 @@ describe("run dispatch-wait metrics (BLO-25024)", () => {
     expect(body).toContain(`${RUN_DISPATCH_WAIT_METRIC}_count{invocation_source="timer"} 1`);
   });
 
+  it("keeps the worst wait measured on BLO-25024 in a finite bucket", () => {
+    // 28h 19m (run e4de0932). Past the top finite edge it lands in +Inf and
+    // histogram_quantile() reads +Inf for the p95 during the incident regime.
+    expect(RUN_DISPATCH_WAIT_BUCKETS_SECONDS.at(-1)).toBeGreaterThan(28 * 3600 + 19 * 60);
+  });
+
   it("bounds the invocation_source label to the run column's vocabulary", async () => {
     for (const source of RUN_DISPATCH_WAIT_INVOCATION_SOURCES) {
       recordRunDispatchWait({
         invocationSource: source,
+        queuedAt: null,
         createdAt: "2026-10-04T00:00:00Z",
         startedAt: "2026-10-04T00:00:10Z",
       });
     }
     recordRunDispatchWait({
       invocationSource: "d6f327a4-f2f2-4a83-bc5a-173d993cf9b6",
+      queuedAt: null,
       createdAt: "2026-10-04T00:00:00Z",
       startedAt: "2026-10-04T00:00:10Z",
     });

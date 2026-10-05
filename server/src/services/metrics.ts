@@ -986,6 +986,12 @@ export const RUN_DISPATCH_WAIT_INVOCATION_SOURCES = [
   "on_demand",
   "automation",
 ] as const;
+/**
+ * Day-granular edges past 86400 because the regime this metric was filed for
+ * is multi-day: the worst wait measured on BLO-25024 was 28h 19m. With 86400
+ * as the top finite edge that sample lands in +Inf, and histogram_quantile()
+ * then returns +Inf for the p95 exactly while the incident is happening.
+ */
 export const RUN_DISPATCH_WAIT_BUCKETS_SECONDS = [
   10,
   30,
@@ -1000,6 +1006,8 @@ export const RUN_DISPATCH_WAIT_BUCKETS_SECONDS = [
   14400,
   28800,
   86400,
+  172800,
+  259200,
 ];
 /**
  * BLO-21460 (2026-08-03 incident follow-up). Unlike the two metrics above
@@ -3807,7 +3815,7 @@ function ensureRegistry(): {
     runDispatchWait = new Histogram({
       name: RUN_DISPATCH_WAIT_METRIC,
       help:
-        "Seconds from creation until start for every heartbeat run (BLO-25024). "
+        "Seconds from queue entry (queued_at, else created_at) until start for every heartbeat run (BLO-25024). "
         + "Observed once at the guarded queued-to-running transition, labeled only by bounded invocation_source.",
       labelNames: ["invocation_source"],
       buckets: RUN_DISPATCH_WAIT_BUCKETS_SECONDS,
@@ -4985,22 +4993,33 @@ export function recordPrReviewQueueWait(input: {
  * which would corrupt the histogram sum and therefore any p95 derived from it.
  */
 export function computeRunDispatchWaitSeconds(
-  createdAt: Date | string | null | undefined,
+  queueEnteredAt: Date | string | null | undefined,
   startedAt: Date | string | null | undefined,
 ): number | null {
-  if (!createdAt || !startedAt) return null;
-  const createdMs = new Date(createdAt).getTime();
+  if (!queueEnteredAt || !startedAt) return null;
+  const queueEnteredMs = new Date(queueEnteredAt).getTime();
   const startedMs = new Date(startedAt).getTime();
-  if (!Number.isFinite(createdMs) || !Number.isFinite(startedMs)) return null;
-  return Math.max(0, (startedMs - createdMs) / 1000);
+  if (!Number.isFinite(queueEnteredMs) || !Number.isFinite(startedMs)) return null;
+  return Math.max(0, (startedMs - queueEnteredMs) / 1000);
 }
 
+/**
+ * The dispatch-wait clock starts at `coalesce(queuedAt, createdAt)`, the same
+ * expression `refreshQueuedRunAgeMetrics` ages off (BLO-21116). `queuedAt` is
+ * null for a fresh insert, where `createdAt` already is the queue-entry time,
+ * and is stamped by the transitions that put an existing row back into
+ * `queued` (`promoteScheduledRetryRun`, `deferRunForK8sIsolationConflict`).
+ * Measuring from bare `createdAt` would report a promoted retry's whole
+ * `scheduled_retry` backoff, or a re-queued run's whole prior execution, as
+ * dispatch wait.
+ */
 export function recordRunDispatchWait(input: {
   invocationSource: string | null | undefined;
+  queuedAt: Date | string | null | undefined;
   createdAt: Date | string | null | undefined;
   startedAt: Date | string | null | undefined;
 }): number | null {
-  const waitSeconds = computeRunDispatchWaitSeconds(input.createdAt, input.startedAt);
+  const waitSeconds = computeRunDispatchWaitSeconds(input.queuedAt ?? input.createdAt, input.startedAt);
   if (waitSeconds === null) return null;
   const invocation_source = RUN_DISPATCH_WAIT_INVOCATION_SOURCES.includes(
     input.invocationSource as (typeof RUN_DISPATCH_WAIT_INVOCATION_SOURCES)[number],
