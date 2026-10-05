@@ -274,11 +274,17 @@ function deferred<T = void>() {
  * reports zero headroom where there is 15s.
  *
  * Two invariants bound this default, and both are violated at 30s, not 25s:
- *   - 2 x timeoutMs < testTimeout, or backstop #2 is pre-empted and silent.
+ *   - timeoutMs + B's budgetMs < testTimeout, or vitest kills the case before
+ *     either backstop can name itself. This is exactly the 45s-against-60s span
+ *     derived above; writing it as `2 x timeoutMs` would re-assert the
+ *     double-count that paragraph disclaims, and bounds the wrong pair of spans.
  *   - timeoutMs < B's budgetMs, or B can exhaust its budget and reject while A
  *     is still deliberately held, which is the very failure this case asserts
  *     against.
- * 15s satisfies both with 2x margin. Do not raise it without re-deriving these.
+ * The two reduce to the same ceiling only because budgetMs happens to be half
+ * of testTimeout today; move either constant and they diverge, with the first
+ * becoming the tighter. 15s satisfies both with 2x margin. Do not raise it
+ * without re-deriving these.
  */
 async function waitUntil(
   condition: () => boolean,
@@ -743,7 +749,8 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
       if (Date.now() > deadline) {
         throw new Error(`${what}: the fence was never held, so nothing contended`);
       }
-      // 10ms, and this one matters most: the loop body is a real PGlite query,
+      // 10ms for the same reason as `waitUntil` above, and this is the site
+      // where that reason bites hardest: the loop body is a real PGlite query,
       // so polling at 1ms issued ~1000 WASM Postgres round-trips a second
       // against the very delivery it is waiting for. The fence stays `firing`
       // until a deferred resolved later in the test, so nothing is missed.
