@@ -3481,8 +3481,11 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
 
       const result = await drainSweep().sweepStaleIssueLocks();
 
-      // Promoting here would re-queue straight back into suppression and the
-      // drain would regenerate its own trigger on every pass.
+      // A policy choice, not a forced one — promoting would write a durable
+      // dep-blocked park rather than re-queueing into suppression. What the
+      // cancel avoids is this drain re-selecting the row and minting a fresh
+      // park every pass, because `enqueueWakeup` returns `null` for a park and
+      // a decline alike. Grounds in full at the arm.
       expect(result.drainedDeferredWakeCancellations).toBe(1);
       expect(result.drainedDeferredWakeCancellationWakeIds).toEqual([wakeId]);
       expect(result.drainedDeferredWakePromotions).toBe(0);
@@ -3733,6 +3736,64 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       expect(third.drainedDeferredWakePromotionWakeIds).toEqual([wakeId]);
       expect(third.drainedDeferredWakeSkips).toBe(0);
       expect((await readIssue(issueId))?.status).toBe("todo");
+    });
+
+    it("still retires both cancel arms behind a paused assignee, rather than skipping them", async () => {
+      const { companyId, agentId } = await seed();
+
+      // Arm 1: an unresolved dependency edge.
+      const blockedIssueId = await seedLocklessIssue({ companyId, agentId });
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Blocker",
+        status: "todo",
+        priority: "high",
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      });
+      const blockedWakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId: blockedIssueId,
+      });
+
+      // Arm 2: a closed issue whose wake cannot reopen it.
+      const closedIssueId = await seedLocklessIssue({ companyId, agentId, status: "done" });
+      const closedWakeId = await seedDeferredWake({ companyId, agentId, issueId: closedIssueId });
+
+      await db
+        .update(agents)
+        .set({ status: "paused" })
+        .where(eq(agents.id, agentId));
+
+      const result = await drainSweep().sweepStaleIssueLocks();
+
+      // The invokability gate sits BELOW both cancel arms on purpose, and
+      // nothing else pins that. Hoisting it above them — which is the ordering
+      // a reader following "match the promoter" would reach for — leaves every
+      // other case in this describe green while turning both of these into
+      // skips, re-creating in the two arms that drain cleanly the exact batch
+      // starvation the gate exists to bound. Each arm decides on a fact about
+      // the row that is true whatever the assignee's state, so a paused seat
+      // must not hold either one.
+      expect(result.drainedDeferredWakeCancellations).toBe(2);
+      expect([...result.drainedDeferredWakeCancellationWakeIds].sort()).toEqual(
+        [blockedWakeId, closedWakeId].sort(),
+      );
+      expect(result.drainedDeferredWakeSkips).toBe(0);
+      expect(result.drainedDeferredWakeSkippedWakeIds).toEqual([]);
+      expect((await readWake(blockedWakeId))?.status).toBe("cancelled");
+      expect((await readWake(closedWakeId))?.status).toBe("cancelled");
+
+      // Retired, not reopened — the gate is below the cancel arms but still
+      // above the only irreversible write.
+      expect((await readIssue(closedIssueId))?.status).toBe("done");
     });
 
     it("is idempotent — a second pass finds nothing left to drain", async () => {
