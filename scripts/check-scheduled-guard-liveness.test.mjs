@@ -1420,7 +1420,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     }
   });
 
-  it("carries the six PEN-3281 guards, the security control the original list missed, and the clock-rot guard", () => {
+  it("carries the six PEN-3281 guards, the security control the original list missed, the clock-rot guard, and the consumer merge-control guard", () => {
     assert.deepEqual(
       [...WATCHED_WORKFLOWS].sort(),
       [
@@ -1431,6 +1431,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         "master-health.yml",
         "production-environment-protection-guard.yml",
         "relay-ssl-multicert-guard.yml",
+        "review-gate-consumer-protection-guard.yml",
         "review-gate-sweep.yml",
       ],
     );
@@ -1453,11 +1454,26 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(dailyClockRot > 24, "a daily cron must clear one full cycle plus GitHub's delay");
     assert.ok(dailyClockRot <= 48, "looser than two missed cycles stops being a backstop at all");
 
+    // BLO-26736: the consumer merge-control guard shares the twice-daily
+    // cadence and INHERITS the same bar. Asserted equal to the measured one
+    // rather than to a second literal, so that if the 14.60h/17.71h band is
+    // ever re-derived both move together — the alternative is a copy that rots
+    // out of the band silently.
+    assert.equal(
+      byWorkflow.get("review-gate-consumer-protection-guard.yml"),
+      twiceDaily,
+      "the twice-daily guards must share one bar until this one has gaps of its own",
+    );
+
     // The hourly six share one bar; a shared GLOBAL threshold across cadences is
     // the bug this replaced. Asserted against DEFAULT_STALE_HOURS rather than a
     // literal so moving the bar stays a one-line change with a reason attached
     // (PEN-3379 moved it 4h -> 2.75h).
-    const notHourly = new Set(["production-environment-protection-guard.yml", "master-health.yml"]);
+    const notHourly = new Set([
+      "production-environment-protection-guard.yml",
+      "review-gate-consumer-protection-guard.yml",
+      "master-health.yml",
+    ]);
     for (const workflow of WATCHED_WORKFLOWS) {
       if (notHourly.has(workflow)) continue;
       assert.equal(

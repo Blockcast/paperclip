@@ -1,0 +1,75 @@
+name: Review Gate Consumer Protection Guard
+
+# Asserts that the four `review-gate` consumer repositories still require an
+# approving REVIEW on their default branch (BLO-26736 / BLO-27563).
+#
+# WHY IT LIVES IN THIS REPO AND NOT IN THE FOUR IT WATCHES. The finding is that
+# a commit status is not a merge security boundary: `pull_request_review`
+# sources its workflow from `refs/pull/N/merge`, so a pull request can mint a
+# `statuses: write` token and write `review/ally-complete=success` for its own
+# head. Proven at run level on pim-multicast-gateway. The same property makes an
+# in-repo regression check worthless — that job also runs from the PR head and
+# can be disabled in the same pull request. The assertion has to be external.
+#
+# A red run is NOT the alerting path; drift is pushed to Alertmanager with
+# severity=critical, which routes to the slack-relay receiver and reaches a
+# human. The run also fails, as a backstop.
+
+on:
+  schedule:
+    # Twice daily, off the hour. These are settings objects edited by hand a few
+    # times a year, so a tighter cadence buys nothing and costs runner time.
+    - cron: "29 7,19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: default
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # The default Actions GITHUB_TOKEN is scoped to this repository and cannot
+      # read the other four at all; the allyblockcast App installation spans
+      # them (verified 2026-10-05 against rules/branches on all four).
+      - name: Generate app token
+        id: token
+        run: |
+          TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          echo "::add-mask::$TOKEN"
+          echo "value=$TOKEN" >> "$GITHUB_OUTPUT"
+        env:
+          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          COMMITPERCLIP_APP_ID: ${{ vars.COMMITPERCLIP_APP_ID }}
+
+      - name: Check consumer merge controls
+        id: check
+        continue-on-error: true
+        run: |
+          set +e
+          node .github/scripts/check-review-gate-consumer-protection.mjs
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.value }}
+          CHECK_JSON_OUT: ${{ runner.temp }}/consumer-check.json
+
+      # Exit code 2 (could not evaluate) must never be reported as compliant, so
+      # it alerts under its own alertname rather than being folded into drift.
+      - name: Push drift alert to Alertmanager
+        if: steps.check.outputs.exit_code != '0'
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+          SUMMARY_PATH: ${{ runner.temp }}/consumer-check.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node .github/scripts/post-review-gate-consumer-protection-alert.mjs
+
+      - name: Fail the run when a consumer is drifted or unevaluable
+        if: steps.check.outputs.exit_code != '0'
+        run: |
+          echo "::error::review-gate consumer protection check exited ${{ steps.check.outputs.exit_code }} (1=drift, 2=could not evaluate). See the step log and the Alertmanager alert."
+          exit 1
