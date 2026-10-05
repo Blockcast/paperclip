@@ -194,6 +194,11 @@ describe("agent inbox-lite wake-path projection", () => {
     "parkedAt",
   ] as const;
 
+  // Every `loadInbox()` in this block pins `nowMs` to NOW. The fixtures encode
+  // relative-to-now facts (an overdue monitor, a LIVE park), so an unpinned call
+  // re-reads them against the wall clock and they rot into their own opposites —
+  // the park fixture is already expired against today's real date, which is how the
+  // anti-suppression test below survived its first mutation.
   const NOW = new Date("2026-09-17T11:14:00.000Z");
 
   function baseRow(id: string, overrides: Record<string, unknown>) {
@@ -265,7 +270,7 @@ describe("agent inbox-lite wake-path projection", () => {
   });
 
   it("emits every wake-path key on every row, present-and-null rather than absent", async () => {
-    const items = await loadInbox();
+    const items = await loadInbox({ nowMs: NOW.getTime() });
 
     expect(items).toHaveLength(sourceRows.length);
     for (const item of items) {
@@ -321,10 +326,14 @@ describe("agent inbox-lite wake-path projection", () => {
 
     expect(items).toHaveLength(sourceRows.length);
     expect(items.map((item) => item.id)).toContain("live-park");
+    // ...and offered INTACT. A filter is one way to lose a parked row; a projection
+    // that nulls the columns while the park is live is another, and would leave this
+    // test green on the id check alone.
+    expect(items.find((item) => item.id === "live-park")!.parkedUntil).not.toBeNull();
   });
 
   it("agrees with the source rows on the attendance count", async () => {
-    const items = await loadInbox();
+    const items = await loadInbox({ nowMs: NOW.getTime() });
 
     // live-monitor + parked-retry. Before the fix this read 0.
     expect(attendedCount(sourceRows)).toBe(2);
@@ -334,7 +343,7 @@ describe("agent inbox-lite wake-path projection", () => {
   });
 
   it("carries the retry reason and attempt, not just the timestamp", async () => {
-    const items = await loadInbox();
+    const items = await loadInbox({ nowMs: NOW.getTime() });
     const parked = items.find((item) => item.id === "parked-retry")!;
 
     expect(parked.scheduledRetryReason).toBe("ccrotate_capacity");
