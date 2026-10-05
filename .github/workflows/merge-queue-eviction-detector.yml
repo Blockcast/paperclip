@@ -3,15 +3,48 @@ name: Merge Queue Eviction Detector
 # BLO-23395: a PR evicted from the merge queue by an un-stageable rebase
 # (CONFLICTING/DIRTY) emits zero merge_group runs, no check-run, and no PR
 # comment -- the only trace is a removed_from_merge_queue timeline event.
-# GitHub's own `pull_request` webhook fires action=dequeued for every queue
-# removal (including a successful merge), so this classifies the cause and
+# GitHub's own webhook fires action=dequeued for every queue removal
+# (including a successful merge), so this classifies the cause and
 # notifies the PR author only when the removal was NOT a merge. See
 # scripts/merge-queue-eviction-detector.mjs and
 # runbooks/merge-queue-stalled-head.md ("Silent eviction: un-stageable
 # rebase").
+#
+# BLO-40351: THE TRIGGER IS `pull_request_target`, NOT `pull_request`, AND
+# THAT IS LOAD-BEARING -- DO NOT "SIMPLIFY" IT BACK.
+#
+# Under `pull_request`, this workflow ran on exactly and only the dequeues it
+# exists to DISCARD, and was blocked on 100% of the ones it exists to CATCH.
+# Measured over its full 108-run history on 2026-10-05:
+#
+#   conclusion         n     actor                      PR outcome
+#   action_required    9/9   github-merge-queue[bot]    open, never merged -> EVICTED
+#   success           63     kkroo                      merged
+#   success           35     allyblockcast[bot]         merged
+#
+# No actor appears on both sides. `action_required` runs have ZERO jobs --
+# GitHub created the run and never executed it, pending manual approval.
+#
+# The mechanism is that the gate is keyed on the TRIGGERING ACTOR, and the
+# actor is itself a function of merge-vs-evict: a successful dequeue is
+# attributed to whoever enqueued/merged the PR (a human, or the App), while an
+# eviction has no human action behind it, so GitHub records its own
+# `github-merge-queue[bot]` as the actor. That bot is an external actor for
+# approval purposes, so every eviction -- and only an eviction -- was
+# quarantined. This is the same repo-wide `action_required` class as
+# BLO-24150/BLO-25515 (see refresh-lockfile.yml and refresh-shard-manifest.yml,
+# which carry their own guards against it).
+#
+# `pull_request_target` carries no such approval gate, supports the `dequeued`
+# activity type, and delivers an identical `github.event.pull_request` payload.
+# It is also STRICTLY SAFER here, not a trade: under `pull_request` the
+# workflow definition itself is read from the PR's own branch, so a PR could
+# edit this file; under `pull_request_target` it is always read from the
+# default branch. The job already never checks out PR-controlled content (see
+# the checkout step below), which is the discipline this trigger requires.
 
 on:
-  pull_request:
+  pull_request_target:
     types:
       - dequeued
   workflow_dispatch:
@@ -44,9 +77,9 @@ jobs:
     timeout-minutes: 5
     steps:
       # Checkout the base branch explicitly, never the PR's own ref: this
-      # job runs with `pull-requests: write` on a `pull_request` trigger, so
-      # executing PR-controlled script content here would let a PR author
-      # script their own eviction notification.
+      # job runs with `pull-requests: write` on a `pull_request_target`
+      # trigger, so executing PR-controlled script content here would let a PR
+      # author script their own eviction notification.
       - name: Checkout repository (base branch, not PR head)
         uses: actions/checkout@v6
         with:
@@ -57,11 +90,11 @@ jobs:
       # when a runner became free to execute this job -- unlike `Date.now()`
       # inside the script, it isn't skewed by ARC capacity delays (this fleet
       # has had real ones: BLO-25481/BLO-24992/BLO-25596). Only meaningful on
-      # the real `pull_request` trigger; `workflow_dispatch` manual replay
-      # has no run to look up and isn't racing a live queue anyway.
+      # the real `pull_request_target` trigger; `workflow_dispatch` manual
+      # replay has no run to look up and isn't racing a live queue anyway.
       - name: Resolve trigger timestamp
         id: trigger_time
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target'
         # Ally review #1220 (5th pass): this step is an OPTIMISATION, not a
         # prerequisite -- the script documents and implements a `Date.now()`
         # fallback when `--triggered-at` is missing or unparseable. Without
@@ -87,4 +120,4 @@ jobs:
             --repo "${{ github.event.pull_request.base.repo.full_name || inputs.repo }}" \
             --pr "${{ github.event.pull_request.number || inputs.pr_number }}" \
             --triggered-at "${{ steps.trigger_time.outputs.created_at }}" \
-            --comment "${{ github.event_name == 'pull_request' && 'true' || inputs.comment }}"
+            --comment "${{ github.event_name == 'pull_request_target' && 'true' || inputs.comment }}"
