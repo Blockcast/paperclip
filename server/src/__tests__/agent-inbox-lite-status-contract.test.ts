@@ -188,6 +188,10 @@ describe("agent inbox-lite wake-path projection", () => {
     "scheduledRetryAt",
     "scheduledRetryReason",
     "scheduledRetryAttempt",
+    "parkedUntil",
+    "parkedReason",
+    "parkedByAgentId",
+    "parkedAt",
   ] as const;
 
   const NOW = new Date("2026-09-17T11:14:00.000Z");
@@ -209,6 +213,10 @@ describe("agent inbox-lite wake-path projection", () => {
       scheduledRetryAt: null,
       scheduledRetryReason: null,
       scheduledRetryAttempt: null,
+      parkedUntil: null,
+      parkedReason: null,
+      parkedByAgentId: null,
+      parkedAt: null,
       scheduledRetryParkedRuns: [],
       ...overrides,
     };
@@ -237,6 +245,16 @@ describe("agent inbox-lite wake-path projection", () => {
     // definition a wake that did not happen.
     baseRow("overdue-monitor", { monitorNextCheckAt: new Date("2026-09-17T10:00:00.000Z") }),
     baseRow("genuinely-idle", {}),
+    // BLO-39015: a live deliberate park. Offered like any other row — a park is a
+    // strandedness-sweep satisfier, not a dispatch gate — but its columns must be
+    // READABLE here so the caller can tell it apart from `genuinely-idle`.
+    baseRow("live-park", {
+      status: "todo",
+      parkedUntil: new Date("2026-09-18T09:00:00.000Z"),
+      parkedReason: "awaiting TC-04 G0 rerun",
+      parkedByAgentId: "agent-uuid",
+      parkedAt: new Date("2026-09-17T09:00:00.000Z"),
+    }),
   ];
 
   beforeEach(() => {
@@ -263,6 +281,46 @@ describe("agent inbox-lite wake-path projection", () => {
     expect(idle.scheduledRetryAt).toBeNull();
     expect(idle.scheduledRetryReason).toBeNull();
     expect(idle.scheduledRetryAttempt).toBeNull();
+    expect(idle.parkedUntil).toBeNull();
+    expect(idle.parkedReason).toBeNull();
+  });
+
+  // BLO-39015: measured on two lanes — `inbox-lite` neither honoured nor exposed the
+  // park, and the second half is the defect. `issues.ts` selects all four columns so a
+  // park can be shown "by whom, why, and until when"; this projection dropped them, so
+  // a parked row and an idle row were byte-identical to the one surface agents reach
+  // for first. Key presence, not truthiness — every value here is null on most rows.
+  it("carries the deliberate-park columns, so a parked row is distinguishable from an idle one", async () => {
+    // `nowMs` pinned to NOW: the fixture's park is only LIVE relative to a fixed clock,
+    // and `loadInbox()` otherwise defaults to `Date.now()`. Without this the row is an
+    // EXPIRED park and both park assertions below pass vacuously — caught by mutation
+    // test, where adding a suppression filter left all 15 tests green.
+    const items = await loadInbox({ nowMs: NOW.getTime() });
+    const parked = items.find((item) => item.id === "live-park")!;
+    const idle = items.find((item) => item.id === "genuinely-idle")!;
+
+    expect(parked.parkedUntil).toEqual(new Date("2026-09-18T09:00:00.000Z"));
+    expect(parked.parkedReason).toBe("awaiting TC-04 G0 rerun");
+    expect(parked.parkedByAgentId).toBe("agent-uuid");
+    expect(parked.parkedAt).toEqual(new Date("2026-09-17T09:00:00.000Z"));
+
+    // The whole point: these two rows used to be indistinguishable here.
+    expect(parked.parkedUntil).not.toEqual(idle.parkedUntil);
+  });
+
+  // The OTHER direction, pinned on purpose. Exposing the park must not become
+  // filtering on it: `parkedUntil` is compared to now in exactly one place in the
+  // codebase — the strandedness sweep's `hasActiveParkedDisposition` — and selection
+  // has never keyed on it. Withholding a parked row here would remove it from the only
+  // surface BLO-27553 disposition 2 leaves it reachable on, turning a deliberate park
+  // into a strand. If a future author wants suppression, that is an owner-level change
+  // to selection semantics and this assertion is the thing they must argue with.
+  it("still OFFERS a live-parked row — exposure, never suppression", async () => {
+    // Clock pinned so the fixture park is genuinely in force; see the note above.
+    const items = await loadInbox({ nowMs: NOW.getTime() });
+
+    expect(items).toHaveLength(sourceRows.length);
+    expect(items.map((item) => item.id)).toContain("live-park");
   });
 
   it("agrees with the source rows on the attendance count", async () => {

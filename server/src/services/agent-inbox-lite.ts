@@ -145,6 +145,23 @@ export async function loadAgentInboxLite({
         scheduledRetryAt: issue.scheduledRetryAt ?? null,
         scheduledRetryReason: issue.scheduledRetryReason ?? null,
         scheduledRetryAttempt: issue.scheduledRetryAttempt ?? null,
+        // BLO-27912/BLO-39015: the deliberate park, same present-and-null contract and for
+        // the same reason as the four above. `issues.ts`'s column selection already carries
+        // all four ("a park has to stay VISIBLE ... by whom, why, and until when") and the
+        // rows arrive here holding them; only this projection dropped them, so an agent
+        // reading its own inbox could not tell a parked row from an idle one.
+        //
+        // This is EXPOSURE, not suppression, and the asymmetry is deliberate. A live park is
+        // the sweep's seventh waiting path (`hasActiveParkedDisposition`), which answers "is
+        // anyone accountable for this row?" — not "should it be offered as work?". Nothing in
+        // selection has ever keyed on `parkedUntil` and this change does not start: filtering
+        // here would silently remove a row from the only surface BLO-27553 disposition 2
+        // leaves it reachable on, which is a strand by another name. Surface it and let the
+        // caller decide, exactly as the overdue-monitor case is left to the caller above.
+        parkedUntil: issue.parkedUntil ?? null,
+        parkedReason: issue.parkedReason ?? null,
+        parkedByAgentId: issue.parkedByAgentId ?? null,
+        parkedAt: issue.parkedAt ?? null,
         activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
         dependencyReady: dependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
         unresolvedBlockerCount: dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
