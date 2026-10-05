@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME } from "./pod-log-redactor.js";
+import { POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME } from "./pod-log-redactor.js";
 import {
   buildJobManifest,
   buildPodLogPath,
@@ -2011,27 +2011,39 @@ describe("buildJobManifest", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const command = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
 
-      const filter = command.indexOf(`| $${POD_LOG_FILTER_VAR} |`);
+      const filter = command.indexOf(
+        `| "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} |`,
+      );
       const tee = command.indexOf("| tee ");
       const claude = command.indexOf("| claude ");
       expect(filter).toBeGreaterThan(-1);
+      // `launcherCommand` is `agentCommand === "claude" ? "claude" : quoteShellArg(...)`,
+      // so `| claude ` stops matching the moment the fixture's agentCommand
+      // changes — and `-1 < filter` would then pass vacuously.
+      expect(claude).toBeGreaterThan(-1);
       expect(claude).toBeLessThan(filter);
       expect(filter).toBeLessThan(tee);
 
-      // The install has to precede the pipeline that reads the variable, and has
-      // to follow the env-guard setup that creates $GUARD_DIR and establishes
-      // that node exists in this container.
+      // The install has to precede the pipeline that reads the variables, and
+      // has to follow the env-guard setup that creates $GUARD_DIR.
       expect(command.indexOf("paperclip-env-guard.mjs")).toBeLessThan(
         command.indexOf(POD_LOG_REDACTOR_FILENAME),
       );
       expect(command.indexOf(POD_LOG_REDACTOR_FILENAME)).toBeLessThan(filter);
 
-      // Fails open: an install that lost a race degrades to `cat` rather than
-      // failing every run in the fleet through `set -o pipefail`.
+      // Fails open: an install that lost a race, or a container without node,
+      // degrades to `cat` rather than failing every run in the fleet through
+      // `set -o pipefail`.
       expect(command).toContain(`${POD_LOG_FILTER_VAR}=cat`);
+
+      // $GUARD_DIR derives from the operator-configurable CLAUDE_CONFIG_DIR, so
+      // the script path can contain a space. An unquoted single `$VAR` holding
+      // `node <path>` would word-split and fail every run on such a config.
+      expect(command).not.toContain(`| $${POD_LOG_FILTER_VAR} |`);
     });
 
-    it("includes fail-fast awk for `out_of_credits` overage rejection (RCA 2026-05-06)", () => {      const { job } = buildJobManifest({ ctx, selfPod });
+    it("includes fail-fast awk for `out_of_credits` overage rejection (RCA 2026-05-06)", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
       const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
       // Both substring matches must be present in the awk pattern so
       // we exit only on the specific terminal combination, not on

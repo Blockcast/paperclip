@@ -230,20 +230,35 @@ export const POD_LOG_REDACTOR_FILENAME = `paperclip-pod-log-redactor.${createHas
   .digest("hex")
   .slice(0, 12)}.mjs`;
 
-/** Shell variable the pipeline reads. Exported so job-manifest and its tests
- *  cannot drift on the spelling. */
+/** Shell variables the pipeline reads. Exported so job-manifest and its tests
+ *  cannot drift on the spelling.
+ *
+ *  Deliberately TWO variables, command and argument, rather than one holding
+ *  `node <path>`: the path is `$GUARD_DIR/<hex>.mjs` and `$GUARD_DIR` is
+ *  `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` (`env-guard.ts`), where
+ *  `CLAUDE_CONFIG_DIR` is operator-configurable via adapter config
+ *  (`resolveClaudeConfigDir()` in job-manifest.ts). A configured value
+ *  containing whitespace word-splits a single unquoted `$VAR` into
+ *  `node /a` + `b/...mjs`, which exits non-zero and takes every run on that
+ *  config down through `set -o pipefail`. The `[ -f ]` fail-open does NOT
+ *  catch that — its own test is quoted and passes, so the broken command is
+ *  what gets installed. Splitting the two lets the pipeline quote both. */
 export const POD_LOG_FILTER_VAR = "PAPERCLIP_POD_LOG_FILTER";
+export const POD_LOG_FILTER_ARG_VAR = "PAPERCLIP_POD_LOG_FILTER_ARG";
 
 /**
- * `;`-joinable fragment that installs the redactor and sets `$PAPERCLIP_POD_LOG_FILTER`
- * to the command that goes in front of `tee`.
+ * `;`-joinable fragment that installs the redactor and sets
+ * `$PAPERCLIP_POD_LOG_FILTER` (+ `_ARG`) to the command that goes in front of
+ * `tee`.
  *
- * Runs AFTER `buildEnvGuardSetupShell()`, which already created `$GUARD_DIR` and
- * established that `node` exists in the main container.
+ * Runs AFTER `buildEnvGuardSetupShell()`, which already created `$GUARD_DIR`.
+ * It does NOT establish that `node` is runnable — its one node use is
+ * `... | node - 2>/dev/null || echo ... >&2`, explicitly fail-soft — so this
+ * fragment probes `command -v node` itself rather than assuming.
  *
- * The `[ -f ]` fallback to `cat` is the fail-open: if the install lost a race or
- * the volume is unwritable, the pipeline degrades to today's behaviour instead of
- * `set -o pipefail` failing every run in the fleet on a missing file.
+ * The fallback to `cat` is the fail-open: if the install lost a race, the
+ * volume is unwritable, or node is missing, the pipeline degrades to today's
+ * behaviour instead of `set -o pipefail` failing every run in the fleet.
  */
 export function buildPodLogRedactorSetupShell(): string {
   const b64 = Buffer.from(POD_LOG_REDACTOR_SCRIPT, "utf8").toString("base64");
@@ -252,7 +267,8 @@ export function buildPodLogRedactorSetupShell(): string {
   return [
     `[ -f "${target}" ] || { printf %s '${b64}' | base64 -d > "${tmp}" && mv -f "${tmp}" "${target}"; }`,
     `${POD_LOG_FILTER_VAR}=cat`,
-    `[ -f "${target}" ] && ${POD_LOG_FILTER_VAR}="node ${target}"`,
-    `export ${POD_LOG_FILTER_VAR}`,
+    `${POD_LOG_FILTER_ARG_VAR}=`,
+    `command -v node >/dev/null 2>&1 && [ -f "${target}" ] && { ${POD_LOG_FILTER_VAR}=node; ${POD_LOG_FILTER_ARG_VAR}="${target}"; }`,
+    `export ${POD_LOG_FILTER_VAR} ${POD_LOG_FILTER_ARG_VAR}`,
   ].join("; ");
 }

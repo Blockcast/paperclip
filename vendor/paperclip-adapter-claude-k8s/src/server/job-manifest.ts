@@ -14,7 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
-import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
+import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 
 /**
@@ -2235,10 +2235,15 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // the same "a batch scrubber must read every credential it redacts" objection
   // that ruled out retroactive scrubbing on this ticket.
   //
-  // `$PAPERCLIP_POD_LOG_FILTER` is deliberately UNQUOTED: it holds either `cat`
-  // or `node <path>`, and the path is content-addressed hex under $GUARD_DIR, so
-  // it carries no whitespace or shell-active character to re-split on.
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${buildPodLogRedactorSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | $${POD_LOG_FILTER_VAR} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  // `$PAPERCLIP_POD_LOG_FILTER` is the command word and `_ARG` its optional
+  // single argument, both quoted. They are split precisely so that quoting is
+  // possible: `$GUARD_DIR` derives from the operator-configurable
+  // `CLAUDE_CONFIG_DIR`, so the script path can legitimately contain a space,
+  // and one unquoted `$VAR` holding `node <path>` would word-split it and fail
+  // every run on that config through `set -o pipefail`. `${_ARG:+"$_ARG"}` is
+  // the empty-safe form: it expands to nothing at all for the `cat` fallback
+  // rather than passing `cat` an empty argument.
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${buildPodLogRedactorSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
