@@ -1221,9 +1221,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     //   2. `quotaExhausted` (:1431) — newly reachable. `isClaudeQuotaExhausted`
     //      reads `parsed` ONLY (no `stdout` parameter), so it cannot be
     //      transcript-poisoned either way.
-    //   3. `providerQuota` (:1435) — NOT widened. `isClaudeProviderQuotaError`
-    //      keeps its own wide-transcript login veto internally, deliberately, so
-    //      the outer narrowing cannot reach it.
+    //   3. `providerQuota` (:1435) — narrowed the same way, as is (1)'s input: its
+    //      internal login veto on the transcript let a quota result that mentioned
+    //      auth fall through to (1), and (1)'s quota check must agree with this one.
     //   4/5. `claudeReportedSuccess` / `failed` (:1423-1426) and
     //      `resolvedErrorCode` (:1467). `failed` ORs in `requiresLogin`, so under
     //      the wide read a run whose terminal event reported clean SUCCESS was
@@ -1439,7 +1439,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !poisonedPreviousMessageId &&
       isClaudeProviderQuotaError({
         parsed,
-        stdout: proc.stdout,
+        stdout: isClaudeTerminalResultEvent(parsed) ? "" : proc.stdout,
         stderr: proc.stderr,
         errorMessage,
       });
@@ -1452,7 +1452,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !providerQuota &&
       isClaudeTransientUpstreamError({
         parsed,
-        stdout: proc.stdout,
+        stdout: isClaudeTerminalResultEvent(parsed) ? "" : proc.stdout,
         stderr: proc.stderr,
         errorMessage,
       });

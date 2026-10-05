@@ -727,10 +727,10 @@ export function isClaudeTransientUpstreamError(input: {
   // CLI is asking for a login — which is emitted before any result event, exactly
   // where the transcript is the only surface that carries it.
   //
-  // The quota veto below deliberately keeps the wide haystack: narrowing a second
-  // veto in the same change would grant a second retry family off one measurement,
-  // and `isClaudeProviderQuotaError` routes to a different outcome than this rule.
-  // Same latent shape, tracked separately rather than swept in.
+  // The quota suppression below reads `input` as given, so it agrees with the
+  // caller's own quota verdict only if both get the same stdout: `execute.ts`
+  // narrows both on a result event, `test.ts` passes the probe transcript to both.
+  // Handed different inputs, a tool-output quota token vetoes a genuine 429 here.
   const loginMeta = detectClaudeLoginRequired({
     parsed,
     stdout: isClaudeTerminalResultEvent(parsed) ? "" : (input.stdout ?? ""),
