@@ -1955,9 +1955,15 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     // now wedges the Job rather than starting the agent blind, because
     // `PAPERCLIP_GITHUB_TOKEN_FILE` points inside the mount and the path falls
     // through to the agent-writable shared PVC underneath. Here, a COLLIDING
-    // path still silently drops the inherited volume — so an operator who
-    // mounts something at exactly that path gets the same substitution shape
-    // the `optional` change closed.
+    // path still silently drops the inherited volume — but a colliding path is
+    // by definition already claimed, so it keeps resolving to whatever claimed
+    // it, never to the PVC. The workspace mount is the one collision that
+    // would land on the PVC, and it throws above. What reaches this `continue`
+    // is a collision with `/tmp/prompt` or `/runtime-cache` (per-pod
+    // `emptyDir`) or with an earlier inherited volume at the same path (that
+    // earlier Secret projection). The failure is therefore a missing
+    // credential, or for the two `emptyDir` paths a per-pod writable path —
+    // not the fleet-shared substitution the `optional` change closed.
     //
     // That is a deliberate trade, not an oversight: a collision needs an
     // operator to have configured one, whereas a missing Secret is ordinary
