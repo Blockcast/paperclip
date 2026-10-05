@@ -30989,6 +30989,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processGroupId: null,
         processStartedAt: null,
         contextSnapshot: context,
+        // BLO-25024: same as deferRunForK8sIsolationConflict above. This run was
+        // already running, so reset its dispatch-wait clock to this re-queue.
+        queuedAt: now,
         updatedAt: now,
       })
       .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
