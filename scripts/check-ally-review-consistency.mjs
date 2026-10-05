@@ -86,11 +86,11 @@ import { fileURLToPath } from "node:url";
 const ALLY_APP_LOGIN_RE = /^(?:allyblockcast\[bot\]|app\/allyblockcast)$/;
 const ALLY_APP_REVIEW_LOGIN_RE = /^allyblockcast\[bot\]$/;
 const ALLY_SEAT_LOGIN_RE = /^allyblockcast$/;
-const CANONICAL_REVIEW_HEADING_RE = /^## Ally — Consolidated PR Review[ \t]*$/gim;
+const CANONICAL_REVIEW_HEADING_RE = /(?:^|\n)## Ally — Consolidated PR Review[ \t]*(?=\n|$)/gi;
 
 /** A heading like `### Important Issues (2)` — but not `(0)`. */
 const BLOCKING_SECTION_RE =
-  /^#+[ \t]*(critical|important)[^\n]*\((?!0\))\d+\)/im;
+  /(?:^|\n)#+[ \t]*(critical|important)[^\n]*\((?!0\))\d+\)/i;
 
 /**
  * Leading whitespace that CommonMark would render as an indented code block,
@@ -102,32 +102,48 @@ const BLOCKING_SECTION_RE =
  * parsers disagreeing on this exact line, so the auditor and the merge gate
  * must not disagree about which indentation counts.
  *
- * The two constants are deliberately not byte-identical, so compare the
- * *composed* forms rather than these lines. The module's is the bare pair of
- * lookaheads and each of its three use sites appends its own ` {0,3}`; this
- * one folds that quantifier in, because both of its use sites want it. What
- * must match is the composition — `(?! *\t)(?! {4}) {0,3}` on either side. A
- * future edit that reads this as a literal-identity claim and "restores" it
- * by deleting the ` {0,3}` here would silently stop allowing the up-to-three
- * spaces CommonMark still treats as a paragraph, which is the divergence this
- * comment exists to prevent.
+ * Byte-identical to the module's, and each use site appends its own ` {0,3}`
+ * exactly as the module's do. It used to fold that quantifier in, which left
+ * the two block patterns below carrying two ` {0,3}` runs where the gate has
+ * one — harmless, because the leading `(?! {4})` caps the run at three either
+ * way, but a same-named mirror constant holding different content is the drift
+ * vector this file exists to close (Ally review of #1721 at bbe6d640).
  *
- * Residual, stated rather than implied: the gate additionally blanks fenced
- * spans before matching, and this script does not, so a *fenced* paste is
- * still read here as an attestation while the gate ignores it. The extra
- * attestation is not quietly absorbed — canonicalReviewHead requires exactly
- * one, so it returns null and the review is reported as an I3 "not canonical"
- * violation. (I3, not I1: I1 caps operative reviews per lane, not attestations
- * within a body.) The direction is still the safe one for an auditor, because
- * the consequence is a false red against an otherwise-valid review rather than
- * a missed one, but it is a real remaining divergence, not parity.
+ * The attestation is matched over fence-stripped text, as the gate matches it
+ * (attestedHeadFrom), so a *fenced* paste is not an attestation here either.
  */
-const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4}) {0,3}`;
+// Line anchors here are spelled `(?:^|\n)` and `(?=\n|$)`, no pattern in this
+// file carries the `m` flag, and no pattern uses a wildcard `.`. U+2028/U+2029
+// reach a pattern through either: JS's `m` stops at `\r`, U+2028 and U+2029,
+// and JS's `.` excludes the same three, while Python's re.MULTILINE and `.` --
+// and CommonMark -- recognise only `\n`. `\r` is normalised away at entry by
+// `reviewText`. Either one is therefore a silent divergence from the sweep, and
+// the loop it opens is the one this row exists to close: the gate counts a
+// bucket the sweep cannot see and reds the head, while the sweep reads the head
+// as attested and suppresses the re-request that would clear the red (Ally,
+// #1721 at 1bc85198 and 068806d6, Important 1 both times -- the second arrived
+// through the character class after the flag axis was closed).
+//
+// Pinned for patterns added later by "no reader pattern may treat U+2028/U+2029
+// as a line break" in scripts/check-ally-review-consistency.test.mjs, which
+// scans both axes and states its own reach.
+const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
 
-/** A prior-finding disposition that says the blocker is still present. */
-const STILL_PRESENT_DISPOSITION_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*prior:[^\n]*\*\*[ \t]*(?:—|-)[ \t]*still-present[ \t]*(?:—|-)`,
-  "im",
+/**
+ * A prior-finding ledger entry. Composed character-for-character with
+ * PRIOR_FINDING_DISPOSITION_PATTERN in server/src/services/ally-review-detection.ts
+ * (mirrored verbatim in .github/scripts/sweep-stalled-ally-reviews.py), so the
+ * three readers accept exactly the same entries. Group 4 is the disposition
+ * verb; whether it blocks is decided against BLOCKING_PRIOR_DISPOSITIONS rather
+ * than embedded in the pattern. The cross-reader corpus in the test file drives
+ * the same ledger strings through all three sources.
+ */
+// `(?:^|\n)` with no `m` flag, matching the gate: JS's multiline `^` also
+// starts a line after U+2028/U+2029, which the sweep's re.MULTILINE does not
+// (Ally, #1721 at 1bc85198, Important 1).
+const PRIOR_FINDING_DISPOSITION_RE = new RegExp(
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
+  "gi",
 );
 
 /**
@@ -139,18 +155,334 @@ const STILL_PRESENT_DISPOSITION_RE = new RegExp(
  * own grammar (PRIOR_FINDING_DISPOSITION_PATTERN, ally-review-detection.ts), and
  * the verb must end at `tracked`: the gate captures `[a-z][a-z-]*` whole and
  * exact-matches it, so `tracked-elsewhere` is not a deferral there.
+ *
+ * `(?:^|\n)` with no `m` flag, matching PRIOR_FINDING_DISPOSITION_RE above and
+ * the gate's PRIOR_FINDING_DISPOSITION_PATTERN -- which is what
+ * countAllyDeferredPriorFindings actually reads deferrals through. Under `m`,
+ * JS's `^` also starts a line after U+2028/U+2029 and the sweep's re.MULTILINE
+ * does not, so a ledger entry opening after U+2028 exempted here while the gate
+ * read it as still-blocking. That is the divergence this file exists to catch,
+ * in the direction that silently clears a red.
  */
 const TRACKED_DISPOSITION_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+\d+[ \t]*\*\*[ \t]*(?:\u2014|\u2013|-)[ \t]*tracked(?![a-z-])[ \t]*(?:\u2014|\u2013|-)`,
-  "im",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+\d+[ \t]*\*\*[ \t]*(?:\u2014|\u2013|-)[ \t]*tracked(?![a-z-])[ \t]*(?:\u2014|\u2013|-)`,
+  "i",
 );
 
-/** The single standalone attestation line Ally is required to emit. */
+/**
+ * The single standalone attestation line Ally is required to emit.
+ *
+ * The emphasis runs mirror MARKDOWN_EMPHASIS_RUN / ATTESTATION_WRAPPER_RUN in
+ * ally-review-detection.ts:166-167 and sweep-stalled-ally-reviews.py:92-104,
+ * character for character. This reader was left on the narrow
+ * `(?:[_*]+)?` / `` \`? `` form while the other two were widened, and the shape
+ * it dropped is the one this repo's own comment names at
+ * ally-review-detection.ts:138-143 — ``**Reviewed head:** `<sha>` `` — where the
+ * single permitted run is consumed by `**` and cannot then cross the space to
+ * reach the backtick. Measured on the same bodies before this change: gate 1,
+ * python 1, mjs 0, for both that form and `_Reviewed head:_ <sha>`.
+ *
+ * Block-carrying bodies masked it, because attestedHeadFrom falls through to
+ * block.head. The harm landed on the entire pre-block population, where
+ * canonicalReviewHead returned null and operativeAllyReviews dropped a review
+ * the gate reads fine — in a file whose stated purpose is reader parity.
+ *
+ * The inter-run bound is `[ \t]{0,3}` rather than `[ \t]*` deliberately: the
+ * widening has a converse, and `*` here would accept a line the gate rejects,
+ * which is the same divergence one delimiter out.
+ */
+const MARKDOWN_EMPHASIS_RUN = String.raw`[*_\`]{0,3}`;
+const ATTESTATION_WRAPPER_RUN = String.raw`[*_\`\t ]{0,6}`;
+// The gate's exact anchors, `(?:^|\n)` ... `(?=\n|$)` with no `m` flag, not
+// `^`/`$` under `m`: JS's multiline `$` also stops before `\r`, `\u2028` and
+// `\u2029`, so on a CRLF body this credited an attestation the gate cannot read
+// -- the missed-red direction, inverting this auditor's safe one (Ally, #1721
+// at 5f4d5302, Important 4).
 const ATTESTED_HEAD_RE = new RegExp(
-  String.raw`^${NOT_INDENTED_CODE}(?:[_*]+)?[ \t]*reviewed head:[ \t]*\`?([0-9a-f]{40})\`?[ \t]*(?:[_*]+)?[ \t]*$`,
-  "im",
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}${MARKDOWN_EMPHASIS_RUN}[ \t]{0,3}reviewed head:[ \t]*` +
+    String.raw`${ATTESTATION_WRAPPER_RUN}([0-9a-f]{40})${ATTESTATION_WRAPPER_RUN}[ \t]*(?=\n|$)`,
+  "gi",
 );
-const ATTESTED_HEAD_GLOBAL_RE = new RegExp(ATTESTED_HEAD_RE.source, "gim");
+
+// Ally's structured verdict block — the primary source, mirroring
+// server/src/services/ally-review-detection.ts so this reader and the gate
+// cannot disagree about which tree was reviewed. The prose line above is the
+// fallback for a body carrying no block.
+const VERDICT_BLOCK_RE = new RegExp(
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:[ \t]*(\d+)([\s\S]*?)-->`,
+  "g",
+);
+const VERDICT_OPENER_RE = new RegExp(
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict\b`,
+  "g",
+);
+const SUPPORTED_VERDICT_VERSION = 1;
+
+// Mirrors the same-named constants in ally-review-detection.ts. The block is
+// the authoritative statement of what a review found, so this auditor must read
+// the same fields the gate reads: a body whose prose buckets carry no `(N)`
+// counts is not evidence of a clean review once the block says otherwise.
+const MAX_VERDICT_FINDING_COUNT = 1000;
+const BLOCKING_SEVERITIES = ["critical", "important"];
+const VERDICT_SEVERITIES = new Set([...BLOCKING_SEVERITIES, "suggestions"]);
+const BLOCKING_PRIOR_DISPOSITIONS = new Set(["still-present"]);
+
+/**
+ * The pre-structured still-present line, for the *verdict* question only.
+ *
+ * Two different questions were being asked of one function. "Is this a ledger
+ * entry?" must answer exactly what the gate and the sweep answer, or the
+ * three readers disagree about a body and the gate-red/sweep-satisfied
+ * deadlock opens — that is hasStillPresentDisposition, and it stays strict.
+ * "Does this review carry a blocking verdict?" is a fail-closed safety test
+ * with a different consumer (scripts/ally-review-de-dupe.mjs dismisses a
+ * review it reads as non-blocking), and there an entry whose label Ally wrote
+ * as prose rather than as the `prior:<sha> <severity> <index>` triple must
+ * still block. Narrowing the verdict question to the ledger pattern made that
+ * read clean (Ally, #1721 at 53ca8a92, Critical 1 — reproduced by
+ * scripts/ally-review-de-dupe.test.mjs:129 and :220).
+ *
+ * This is the shape master shipped, widened only in directions that add
+ * matches — leading indent up to 3, space after the `**`, en dash alongside em
+ * dash and hyphen — so every body the old reader blocked on still blocks.
+ * `(?:^|\n)` without `m`, per the U+2028/U+2029 rule the rest of this file and
+ * its test scan enforce.
+ */
+const LOOSE_STILL_PRESENT_RE = new RegExp(
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:[^\n]*\*\*[ \t]*(?:—|–|-)[ \t]*still-present[ \t]*(?:—|–|-)`,
+  "i",
+);
+
+/**
+ * The block's per-severity counts, or `null` when the payload cannot be
+ * trusted. Per-severity rather than a bare "does it block": the count rule
+ * below needs to know which severity states zero, and a boolean cannot say.
+ *
+ * Absent counts are not zero counts, and an unknown severity key is not a key
+ * to drop: both are fail-open routes by which a block claiming a finding reads
+ * byte-identically to a clean one. See asSeverityCounts for the long form.
+ */
+function severityCountsIn(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const counts = new Map();
+  for (const [severity, value] of Object.entries(raw)) {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) return null;
+    if (value > MAX_VERDICT_FINDING_COUNT) return null;
+    const key = severity.trim().toLowerCase();
+    if (!VERDICT_SEVERITIES.has(key)) return null;
+    // Two keys normalizing to one severity: last-wins would let
+    // `{"critical":1,"Critical":0}` read clean. Mirrors the guard in
+    // ally-review-detection.ts and sweep-stalled-ally-reviews.py — all three
+    // readers shared the bug identically, so none of them caught it.
+    if (counts.has(key)) return null;
+    counts.set(key, value);
+  }
+  if (!BLOCKING_SEVERITIES.every((severity) => counts.has(severity))) return null;
+  return counts;
+}
+
+/**
+ * A counted bucket the review *emits* that names a positive number of a
+ * severity the block states zero of — mirroring proseCountContradicting in
+ * ally-review-detection.ts.
+ *
+ * Here because the gate treats this as unreadable and this reader did not, so
+ * the same body attested a head here while reading as a broken verdict there —
+ * the cross-reader divergence BLO-31730 is about, on the field that decides
+ * whether a merge is blocked.
+ *
+ * Anchored to the emitted heading form for the reason the module's copy is: an
+ * unanchored bucket matches a sentence *referencing* an earlier pass's counts,
+ * and over-matching fails a clean review closed.
+ */
+// The gate's anchors, as at PRIOR_FINDING_DISPOSITION_RE and ATTESTED_HEAD_RE.
+const EMITTED_BUCKET_RE = new RegExp(
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}(?:#{1,6}[ \t]*)?[*_]{0,3}` +
+    String.raw`(Critical|Important)[ \t]+Issues[ \t]*[*_]{0,3}[ \t]*\((\d+)\)[*_]{0,3}[ \t]*(?=\n|$)`,
+  "gi",
+);
+
+/**
+ * Fenced spans blanked, so a quoted bucket cannot fail a block closed.
+ *
+ * Mirrors withoutFencedCodeBlocks in the gate exactly — tilde fences, fence
+ * length matching and the backtick info-string rule. A simpler toggle here is
+ * not a scoping choice but a divergence: the two readers then disagree about
+ * how many blocks a body contains, which is the BLO-31730 cross-reader failure
+ * one layer down, and it fires first on a review that quotes the marker
+ * template. Applied to this cross-check, to the block and opener counts in
+ * structuredVerdict, and to the prose attestation in attestedHeadFrom.
+ */
+/**
+ * The body with every line ending normalized to `\n` -- the single entry point
+ * for every reader below, mirroring reviewBody in ally-review-detection.ts and
+ * review_text in sweep-stalled-ally-reviews.py. JS `.` excludes `\r` and
+ * Python's matches it, so on a CRLF body fence-stripping was a no-op here and
+ * the three readers returned three verdicts (Ally, #1721 at 5f4d5302,
+ * Critical 3).
+ */
+function reviewText(body) {
+  return String(body ?? "").replace(/\r\n?/g, "\n");
+}
+
+// The info string is `[^\n]*`, never `.` -- see FENCE_DELIMITER_PATTERN in
+// ally-review-detection.ts. JS's `.` excludes `\r`, U+2028 and U+2029 as well as
+// `\n`; Python's FENCE_OPEN_PATTERN and CommonMark exclude only `\n`. A bare `.`
+// here opens no fence on an info string carrying U+2028 while the sweep opens
+// one, which is the gate-red/sweep-satisfied deadlock through the character
+// class instead of the `m` flag.
+const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})([^\n]*)$/;
+const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+
+// `keepUnterminated` mirrors the gate's: a fence that never closes is left as
+// emitted text, for the fail-closed count and ledger cross-checks only.
+function withoutFencedSpans(text, keepUnterminated = false) {
+  if (!text.includes("```") && !text.includes("~~~")) return text;
+  let open = null;
+  let openedAt = -1;
+  const lines = text
+    .split("\n")
+    .map((line, i) => {
+      if (open) {
+        const close = FENCE_CLOSE_RE.exec(line);
+        if (close && close[1][0] === open.char && close[1].length >= open.length) open = null;
+        return "";
+      }
+      const fence = FENCE_OPEN_RE.exec(line);
+      // Per CommonMark a backtick fence's info string may not itself contain a
+      // backtick, so an inline span cannot open a phantom fence that would
+      // blank the rest of a genuine review.
+      if (fence && !(fence[1][0] === "`" && fence[2].includes("`"))) {
+        open = { char: fence[1][0], length: fence[1].length };
+        openedAt = i;
+        return "";
+      }
+      return line;
+    });
+  if (open && keepUnterminated) {
+    return [...lines.slice(0, openedAt), ...text.split("\n").slice(openedAt)].join("\n");
+  }
+  return lines.join("\n");
+}
+
+// Any emitted count above the block's, not only against a stated zero --
+// mirroring the gate (Ally, #1721 at 5f4d5302, Important 2). The caller passes
+// the cross-check reading (an unterminated fence kept, Important 1).
+function proseCountContradicts(text, counts) {
+  for (const [, severity, count] of text.matchAll(EMITTED_BUCKET_RE)) {
+    const key = severity.toLowerCase();
+    if (!BLOCKING_SEVERITIES.includes(key)) continue;
+    if (Number(count) > counts.get(key)) return true;
+  }
+  return false;
+}
+
+/** `true`/`false` per the ledger, `null` when an entry is malformed. */
+function stillPresentIn(raw) {
+  if (raw === undefined) return false;
+  if (!Array.isArray(raw)) return null;
+  let stillPresent = false;
+  for (const item of raw) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) return null;
+    const { head, severity, index, verb } = item;
+    if (typeof head !== "string" || !/^[0-9a-f]{7,40}$/i.test(head.trim())) return null;
+    if (typeof severity !== "string" || !severity.trim()) return null;
+    if (typeof verb !== "string" || !verb.trim()) return null;
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 1) return null;
+    if (BLOCKING_PRIOR_DISPOSITIONS.has(verb.trim().toLowerCase())) stillPresent = true;
+  }
+  return stillPresent;
+}
+
+/**
+ * `{ kind: "absent" }` when no block is present (fall back to prose),
+ * `{ kind: "unreadable" }` when one is present but cannot be trusted (fail
+ * closed — never fall back), or
+ * `{ kind: "ok", head, blockingFindings, stillPresent }`.
+ *
+ * Counted over fence-stripped text, because the gate counts over fence-stripped
+ * text: `parseAllyVerdictBlock` reads `emittedReviewText(body)`. Reading the raw
+ * body here made a fenced ```` ```markdown ```` example of the marker a *second*
+ * block — gate `blocks=1, openers=1` → ok, this reader `blocks=2, openers=2` →
+ * unreadable, on one body. The divergence matters in the direction the sweep
+ * runs: `ally_has_reviewed_head` goes false, so it re-requests a review of a
+ * head Ally already reviewed, and each duplicate is a `COMMENTED` review that
+ * cannot be dismissed — the BLO-22892/BLO-28203 loop, reintroduced through the
+ * new path. It fires first on a review quoting the template, which is the
+ * likeliest shape for a review *of this feature* (found in peer review of
+ * #1721 at 97b4ddd1).
+ *
+ * The count and ledger cross-checks keep an unterminated fence as emitted
+ * text, as the gate's do: blanked, it would hide the bucket that contradicts
+ * the block.
+ */
+function structuredVerdict(rawText) {
+  const text = withoutFencedSpans(rawText);
+  const blocks = Array.from(text.matchAll(VERDICT_BLOCK_RE));
+  const openers = Array.from(text.matchAll(VERDICT_OPENER_RE));
+  // A truncated payload is a broken block, not an older review, so it must not
+  // fall through to the prose parser the block exists to replace.
+  if (openers.length > blocks.length) return { kind: "unreadable" };
+  if (blocks.length === 0) return { kind: "absent" };
+  if (blocks.length > 1) return { kind: "unreadable" };
+  if (Number(blocks[0][1]) !== SUPPORTED_VERDICT_VERSION) return { kind: "unreadable" };
+  let parsed;
+  try {
+    parsed = JSON.parse(blocks[0][2].trim());
+  } catch {
+    return { kind: "unreadable" };
+  }
+  const head = parsed?.head;
+  if (typeof head !== "string" || !/^[0-9a-f]{40}$/i.test(head.trim())) {
+    return { kind: "unreadable" };
+  }
+  const counts = severityCountsIn(parsed?.findings);
+  const stillPresent = stillPresentIn(parsed?.dispositions);
+  if (counts === null || stillPresent === null) return { kind: "unreadable" };
+  const crossCheckText = withoutFencedSpans(rawText, true);
+  if (proseCountContradicts(crossCheckText, counts)) return { kind: "unreadable" };
+  // The same rule on the other field, mirroring proseDispositionContradicting
+  // in ally-review-detection.ts. `structuredBlocking(body, "stillPresent") ??
+  // hasStillPresentDisposition(body)` in reportsStillPresent gives the block
+  // precedence, so a block stating no standing prior finding suppressed the
+  // prose ledger entirely — this reader carried the identical fail-open the
+  // gate did.
+  //
+  // Asymmetric like the count rule: only a *blocking* prose entry against a
+  // block that retires everything is fatal, so `stillPresent` true short-
+  // circuits and a `fixed` prose entry the block omits still reads clean.
+  if (!stillPresent && hasStillPresentDisposition(crossCheckText)) return { kind: "unreadable" };
+  return {
+    kind: "ok",
+    head: head.trim().toLowerCase(),
+    blockingFindings: BLOCKING_SEVERITIES.some((severity) => counts.get(severity) > 0),
+    stillPresent,
+  };
+}
+
+/**
+ * The head this body attests, from the structured block when it carries one and
+ * the prose line otherwise. Null on any ambiguity, which every caller reads as
+ * "not a signal for this head".
+ *
+ * Asymmetric on purpose, matching `extractAllyReviewedHeadSha`: only a prose
+ * line *disagreeing* with the block is fatal. An absent or unparseable prose
+ * line is not — that is the #1675 body (an attested SHA trailed by a
+ * parenthetical), and requiring the prose to parse would put the retired regex
+ * back on the critical path.
+ */
+function attestedHeadFrom(text) {
+  const block = structuredVerdict(text);
+  if (block.kind === "unreadable") return null;
+  // Over the fence-stripped text, as the gate reads it. The raw body let one
+  // fenced copy of the attestation make the prose ambiguous here while the
+  // gate read the emitted line and failed the block on disagreement, so the
+  // two returned opposite verdicts (Ally, #1721 at 5f4d5302, Important 3).
+  const attestations = Array.from(withoutFencedSpans(text).matchAll(ATTESTED_HEAD_RE));
+  const proseHead = attestations.length === 1 ? attestations[0][1].toLowerCase() : null;
+  if (block.kind === "absent") return proseHead;
+  return proseHead !== null && proseHead !== block.head ? null : block.head;
+}
 
 const ALLY_REVIEW_LANES = ["app", "seat"];
 
@@ -179,8 +511,72 @@ function isApproved(review) {
   return reviewState(review) === "APPROVED";
 }
 
-function hasBlockingVerdict(body) {
-  return hasBlockingFindings(body) || hasStillPresentDisposition(body);
+/**
+ * One fact from the structured block: `true`/`false` when the block states it,
+ * `null` when there is no block and the prose fallback should answer instead.
+ *
+ * The block is authoritative when present. Its `findings` counts are the
+ * producer's own tally, and a review may head its buckets `### 🚨 Critical`
+ * with no `(N)` -- the form the template prescribed until #1721 corrected it to
+ * the counted one -- so the prose readers see a blocking review as clean. That
+ * gap is the whole reason this reader exists, and historical bodies keep it
+ * live whatever the template now says.
+ *
+ * An unreadable block answers `false` to every *field* query and is reported
+ * once by I2e instead. It previously answered `true` to all of them, so a
+ * single unreadable verdict surfaced under both I2a and I2c with two mutually
+ * exclusive and factually false causes -- the body cannot both report an open
+ * finding and mark a prior one still-present when nothing in it was read at
+ * all (Ally, #1721 at 5f4d5302, Suggestion 1). Nothing is masked: `I2e` states
+ * the true cause, and `hasBlockingVerdict` keeps counting unreadable as
+ * blocking, so every fail-closed consumer is unchanged.
+ *
+ * `false`, not `null`: `null` would hand the question to the prose fallback,
+ * and a block Ally tried and failed to state is not the same fact as a review
+ * that predates the block. The gate refuses that same fallback for that same
+ * reason (`parseAllyVerdictBlock`, ally-review-detection.ts).
+ */
+function structuredBlocking(body, field) {
+  const block = structuredVerdict(reviewText(body));
+  if (block.kind === "unreadable") return false;
+  if (block.kind === "absent") return null;
+  return block[field];
+}
+
+/** I2e's fact: the body carries a block, and none of it could be read. */
+function structuredUnreadable(body) {
+  return structuredVerdict(reviewText(body)).kind === "unreadable";
+}
+
+/**
+ * I2a's fact: the body reports an open Critical/Important finding.
+ *
+ * Kept separate from reportsStillPresent because I2a and I2c name different
+ * defects, and a review must not be reported for the other one's cause.
+ */
+function reportsBlockingFindings(body) {
+  return structuredBlocking(body, "blockingFindings") ?? hasBlockingFindings(body);
+}
+
+/** I2c's fact: the body marks a prior finding as still standing. */
+function reportsStillPresent(body) {
+  return structuredBlocking(body, "stillPresent") ?? proseStillPresent(body);
+}
+
+/**
+ * The fail-closed roll-up. `structuredUnreadable` is a term in its own right
+ * because the field queries above deliberately stopped answering for it: drop
+ * it and an unreadable block would read as a clean verdict here, which is the
+ * one direction that masks a finding.
+ *
+ * Exported for scripts/ally-review-de-dupe.mjs, which asks exactly this
+ * question before dismissing a review. It used to compose its own from
+ * `hasBlockingFindings || hasStillPresentDisposition`, which reaches neither
+ * the verdict block nor an unreadable one — so a review whose only statement
+ * of a finding was the block read as dismissable.
+ */
+export function hasBlockingVerdict(body) {
+  return structuredUnreadable(body) || reportsBlockingFindings(body) || reportsStillPresent(body);
 }
 
 function reviewDetails(reviews) {
@@ -188,11 +584,10 @@ function reviewDetails(reviews) {
 }
 
 export function canonicalReviewHead(body) {
-  const text = String(body ?? "");
+  const text = reviewText(body);
   const headings = Array.from(text.matchAll(CANONICAL_REVIEW_HEADING_RE));
-  const attestations = Array.from(text.matchAll(ATTESTED_HEAD_GLOBAL_RE));
-  if (headings.length !== 1 || attestations.length !== 1) return null;
-  return attestations[0][1].toLowerCase();
+  if (headings.length !== 1) return null;
+  return attestedHeadFrom(text);
 }
 
 // The two GitHub principals the guard must recognise. Recognising both is not
@@ -254,11 +649,24 @@ export function allyReviewLane(user) {
 }
 
 export function hasBlockingFindings(body) {
-  return BLOCKING_SECTION_RE.test(String(body ?? ""));
+  return BLOCKING_SECTION_RE.test(reviewText(body));
 }
 
 export function hasStillPresentDisposition(body) {
-  return STILL_PRESENT_DISPOSITION_RE.test(String(body ?? ""));
+  for (const match of reviewText(body).matchAll(PRIOR_FINDING_DISPOSITION_RE)) {
+    if (BLOCKING_PRIOR_DISPOSITIONS.has(match[4].toLowerCase())) return true;
+  }
+  return false;
+}
+
+/**
+ * The prose arm of the verdict question: a ledger entry, or the older
+ * free-label line the ledger pattern cannot express. Union, never a
+ * replacement — see LOOSE_STILL_PRESENT_RE for why this is not
+ * hasStillPresentDisposition.
+ */
+function proseStillPresent(body) {
+  return hasStillPresentDisposition(body) || LOOSE_STILL_PRESENT_RE.test(reviewText(body));
 }
 
 export function hasDeferredDisposition(body) {
@@ -266,8 +674,7 @@ export function hasDeferredDisposition(body) {
 }
 
 export function attestedHead(body) {
-  const match = ATTESTED_HEAD_RE.exec(String(body ?? ""));
-  return match ? match[1].toLowerCase() : null;
+  return attestedHeadFrom(reviewText(body));
 }
 
 export function operativeAllyReviews(reviews, headSha, lane = null) {
@@ -478,12 +885,17 @@ export function findPrViolations(pr) {
         );
       }
 
-      if (isApproved(review) && hasBlockingFindings(review.body)) {
+      if (isApproved(review) && structuredUnreadable(review.body)) {
+        violations.push(
+          `I2e PR #${pr.number} @${short}: ${label} review ${review.id} is APPROVED but its ally-verdict block is unreadable — the approval rests on a verdict nothing could read`,
+        );
+      }
+      if (isApproved(review) && reportsBlockingFindings(review.body)) {
         violations.push(
           `I2a PR #${pr.number} @${short}: ${label} review ${review.id} is APPROVED but its body reports a Critical/Important finding`,
         );
       }
-      if (isApproved(review) && hasStillPresentDisposition(review.body)) {
+      if (isApproved(review) && reportsStillPresent(review.body)) {
         violations.push(
           `I2c PR #${pr.number} @${short}: ${label} review ${review.id} is APPROVED but its body marks a prior finding still-present`,
         );
