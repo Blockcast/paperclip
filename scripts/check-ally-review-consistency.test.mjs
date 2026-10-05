@@ -291,6 +291,63 @@ describe("hasStillPresentDisposition", () => {
   });
 });
 
+// Ally, #1721 at 2dfdfafe, Important 1. The sweep decides "Ally already reviewed
+// this head" from CONSOLIDATED_HEADING_PATTERN and the gate credits a review
+// from ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN. A heading one credits and the
+// other does not is the re-request loop (BLO-22892/BLO-28203), so the sweep's
+// copy is held to the gate's source, taken from the committed files.
+describe("the sweep's consolidated heading is the gate's", () => {
+  const tsSource = readFileSync(
+    new URL("../server/src/services/ally-review-detection.ts", import.meta.url),
+    "utf8",
+  );
+  const notIndented = tsSource.match(/NOT_INDENTED_CODE = String\.raw`([^`]+)`/);
+  const tsRaw = tsSource.match(
+    /ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"([a-z]*)",/,
+  );
+  const pyRaw = readFileSync(
+    new URL("../.github/scripts/sweep-stalled-ally-reviews.py", import.meta.url),
+    "utf8",
+  ).match(/CONSOLIDATED_HEADING_PATTERN = re\.compile\(\n\s*r"([^"]+)",\n\s*([^\n]+),\n\)/);
+
+  it("is spelled from the same pieces", () => {
+    assert.ok(notIndented, "ally-review-detection.ts still defines NOT_INDENTED_CODE");
+    assert.ok(tsRaw, "ally-review-detection.ts still defines ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN");
+    assert.ok(pyRaw, "sweep-stalled-ally-reviews.py still defines CONSOLIDATED_HEADING_PATTERN");
+    // The gate anchors with `(?:^|\n)` and no `m`; the sweep with `^` under
+    // re.MULTILINE. Over the `\n`-normalised text both read, the two agree.
+    assert.equal(
+      pyRaw[1],
+      tsRaw[1].replace("(?:^|\\n)${NOT_INDENTED_CODE}", () => `^${notIndented[1]}`),
+    );
+    assert.equal(tsRaw[2], "i");
+    assert.match(pyRaw[2], /re\.IGNORECASE/);
+    assert.match(pyRaw[2], /re\.MULTILINE/);
+  });
+
+  it("credits exactly the headings the gate credits", () => {
+    const gate = new RegExp(tsRaw[1].replace("${NOT_INDENTED_CODE}", () => notIndented[1]), tsRaw[2]);
+    const sweep = new RegExp(pyRaw[1], "im");
+    const corpus = [
+      ["## Ally \u2014 Consolidated PR Review", true],
+      ["### Ally \u2014 Consolidated PR Review", true],
+      ["# Ally \u2014 Consolidated PR Review", true],
+      ["**Ally \u2014 Consolidated PR Review**", true],
+      ["Ally \u2014 Consolidated PR Review", true],
+      ["## Ally \u2014 Consolidated  PR  Review", true],
+      ["## Ally: Consolidated PR Review", true],
+      ["##Ally \u2014 Consolidated PR Review", false],
+      ["## Ally -- Consolidated PR Review", false],
+      ["    ## Ally \u2014 Consolidated PR Review", false],
+      ["\t## Ally \u2014 Consolidated PR Review", false],
+    ];
+    for (const [heading, expected] of corpus) {
+      assert.equal(gate.test(heading), expected, `gate reader: ${JSON.stringify(heading)}`);
+      assert.equal(sweep.test(heading), expected, `sweep reader: ${JSON.stringify(heading)}`);
+    }
+  });
+});
+
 describe("hasDeferredDisposition", () => {
   it("fires on a prior finding marked tracked", () => {
     assert.equal(
