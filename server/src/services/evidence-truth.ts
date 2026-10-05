@@ -460,14 +460,34 @@ async function probeOne(
       newest !== undefined &&
       countAllyDeferredPriorFindings(newest.body) > 0 &&
       !(formalDeferredAttestedHead !== null && formalDeferredAttestedHead !== normalizedHead);
-    // `!commentBlocking` because `formalClean` reaches `out.clean` only through
-    // a conjunction that `commentBlocking` has already falsified — so once
-    // Surface 1 is red this read cannot change a verdict, and can only LOSE
-    // one: an unreadable `GET /pulls/{n}` would set `failed`, which
-    // `evidence-gate.ts` reads as "could not ask" and uses to suppress the
+    // `!commentBlocking` for two reasons. COST came first; CORRECTNESS is a
+    // CONSEQUENCE of this clause rather than a motive for it, and only exists
+    // because the clause does.
+    //
+    // COST: `formalClean` reaches `out.clean` only through a conjunction that
+    // `commentBlocking` has already falsified — so once Surface 1 is red this
+    // read cannot change a verdict, and can only LOSE one: an unreadable
+    // `GET /pulls/{n}` would set `failed`, which `evidence-gate.ts` reads as
+    // "could not ask" and uses to suppress the
     // `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` promotion — demoting a fully
     // justified block to a warn and blaming an unreadable probe for a red this
     // probe was holding in its hand (Ally review of #1966).
+    //
+    // CORRECTNESS (Ally review of #2143): this clause SUBSUMES the
+    // `!commentBlocking` conjunct in `out.clean` below, which consequently has
+    // no failing mutation and cannot be given one. `commentBlocking` implies
+    // `formalClean` is false (its only assignment is inside this guard) AND
+    // `commentClean` is false (that needs `state === "success"` on the same
+    // `commentVerdict`, both read after its last assignment), so
+    // `(commentClean || formalClean)` is already false and the conjunct below
+    // cannot change the result for ANY input. Unlike `formalDeferred` above —
+    // whose keying asymmetry leaves its veto reachable on bodies this guard
+    // never sees — no input distinguishes it, so no replacement test is
+    // possible. The veto below is therefore documentation and THIS is the
+    // enforcement. Do NOT relax this guard to compute `formalClean` anyway
+    // (the tempting form is "cheap enough, keep it for telemetry"): that is a
+    // false `review:ally-clean` on a blocking head with nothing left to catch
+    // it.
     //
     // The route this is REACHABLE on is `blocking_finding`, which stays
     // author-blind on purpose ("a finding is a finding whoever wrote it",
@@ -548,6 +568,11 @@ async function probeOne(
     // `review:ally-clean` for a head with a live accepted residual (BLO-36903).
     const commentDeferred = commentVerdict.outcome === "deferred_finding";
     out.clean =
+      // DEAD since the `!commentBlocking` guard above subsumed it, and it
+      // cannot be given a failing mutation — see the CORRECTNESS paragraph
+      // there. Kept as the honest statement of the invariant; the guard above
+      // is what enforces it. Do not read its deletability as license to drop
+      // either one.
       !commentBlocking &&
       !formalBlocking &&
       !commentDeferred &&
