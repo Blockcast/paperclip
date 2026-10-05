@@ -570,6 +570,11 @@ jobs:
             ./.github/scripts/tests/post-environment-protection-alert.test.mjs
         timeout-minutes: 1
 
+      - name: Test review-gate consumer protection guard (BLO-26736)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/check-review-gate-consumer-protection.test.mjs
+        timeout-minutes: 1
+
       # The stuck-approval escalation only ever runs inside the scheduled
       # dispatcher, and only on the branch where a deploy is already pending —
       # so without this it could regress for weeks unnoticed, and the first

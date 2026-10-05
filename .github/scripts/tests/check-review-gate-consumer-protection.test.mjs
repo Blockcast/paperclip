@@ -147,6 +147,33 @@ test('an already-approved pull request is not evidence either way, so it is excl
   assert.match(r.reason, /no open zero-approval pull request/);
 });
 
+test('a CHANGES_REQUESTED pull request is not evidence either way, so it is excluded from the probe', () => {
+  // The live shape of penstock-llm-proxy-core#1888: zero approvals and
+  // reviewDecision=CHANGES_REQUESTED. That is more blocking than
+  // REVIEW_REQUIRED, so reading it as "no review is required" paged drift on a
+  // repo whose control is in force.
+  const r = evaluateConsumer(
+    core({ openPullRequests: [{ number: 1888, approvals: 0, reviewDecision: 'CHANGES_REQUESTED' }] }),
+  );
+  assert.equal(r.status, 'unreadable');
+  assert.match(r.reason, /no open zero-approval pull request/);
+});
+
+test('a CHANGES_REQUESTED pull request is left out of the sample, not counted as a pass', () => {
+  // probed=1 rather than 2: the CHANGES_REQUESTED PR settled nothing, the
+  // REVIEW_REQUIRED one beside it did.
+  const r = evaluateConsumer(
+    core({
+      openPullRequests: [
+        { number: 1888, approvals: 0, reviewDecision: 'CHANGES_REQUESTED' },
+        { number: 2237, approvals: 0, reviewDecision: 'REVIEW_REQUIRED' },
+      ],
+    }),
+  );
+  assert.equal(r.status, 'compliant');
+  assert.equal(r.observed.probed, 1);
+});
+
 test('no open pull requests at all is VOID, not a pass', () => {
   const r = evaluateConsumer(core({ openPullRequests: [] }));
   assert.equal(r.status, 'unreadable');

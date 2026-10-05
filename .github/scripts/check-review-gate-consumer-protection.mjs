@@ -41,7 +41,8 @@
  *      the control exists or not, and signal 1 alone would silently leave a
  *      quarter of the surface uncovered. The fallback asks the question that
  *      actually matters — is a review REQUIRED IN FORCE — via `reviewDecision`
- *      on open pull requests that carry no approving review.
+ *      on open pull requests that carry no approving review and are not
+ *      already CHANGES_REQUESTED.
  *
  * The fallback is deliberately the weaker of the two and is only consulted when
  * the primary finds no rule, because it can go VOID: it needs at least one open
@@ -148,14 +149,23 @@ export function evaluateConsumer({ repo, branch, rules, openPullRequests }) {
     return { ...base, status: 'unreadable', reason: 'no pull_request rule, and open pull requests could not be read', violationKinds: [] };
   }
 
-  const eligible = openPullRequests.filter((pr) => (pr.approvals ?? 0) === 0);
+  // CHANGES_REQUESTED is excluded for the same reason an approval is: it is
+  // more blocking than REVIEW_REQUIRED, not less, so testing it against
+  // REVIEW_REQUIRED would page drift on a repo whose control is in force
+  // (penstock-llm-proxy-core#1888 carries exactly that shape: zero approvals,
+  // reviewDecision=CHANGES_REQUESTED). It cannot refute the control either
+  // way, so it is left out of the sample rather than counted.
+  const eligible = openPullRequests.filter(
+    (pr) => (pr.approvals ?? 0) === 0 && pr.reviewDecision !== 'CHANGES_REQUESTED',
+  );
   if (eligible.length === 0) {
     // VOID, not a pass. With no zero-approval pull request there is nothing
     // that would read REVIEW_REQUIRED even if the control were deleted.
     return {
       ...base,
       status: 'unreadable',
-      reason: `no pull_request rule, and no open zero-approval pull request on ${branch} to probe ` +
+      reason: `no pull_request rule, and no open zero-approval pull request on ${branch} without ` +
+        `CHANGES_REQUESTED to probe ` +
         `(${openPullRequests.length} open) — the control is unmeasurable from here, which is not a pass`,
       violationKinds: [],
     };
@@ -270,7 +280,9 @@ async function main() {
   try {
     results = await checkConsumers({ owner, token });
   } catch (err) {
-    exitFatal(err, 'review-gate-consumer-protection');
+    // exitFatal defaults to exit 1, which this script's contract reserves for
+    // drift. A throw here evaluated nothing, so it must exit 2.
+    exitFatal(err, 'review-gate-consumer-protection', () => process.exit(2));
     return;
   }
 
