@@ -315,7 +315,7 @@ async function probeOne(
     // GitHub rewrites `commit_id` when the branch is updated, so a review of a
     // tree that no longer exists can start reporting the current head. This
     // repo already made that ruling for the other head-keyed read
-    // (`pr-review-head-attestation.ts:39-44`), and it bites hardest here: a
+    // (`pr-review-head-attestation.ts:252-257`), and it bites hardest here: a
     // false CLEAN is not a missed block, it flips the verdict to `pass` at the
     // shipped default, which is the fabrication the header at :20-24 makes this
     // module's premise. `Reviewed head:` is immutable and is emitted for
