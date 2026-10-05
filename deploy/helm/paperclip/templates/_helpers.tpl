@@ -176,12 +176,13 @@ rendered:
 {{- $hasWebhookSecret := false -}}
 {{/* A literal empty value renders fine and then throws in config.ts at boot, so
 it does not count as bound. A valueFrom entry carries no literal here and is not
-checkable from a template, so secretKeyRef bindings keep passing. */}}
+checkable from a template, so secretKeyRef bindings keep passing. Assign on every
+match rather than latching true: env is a list, the kubelet takes the last entry
+for a duplicated name, so an empty override after a valid entry is what actually
+reaches the container. */}}
 {{- range $entry := (.Values.env).extra -}}
 {{- if eq (toString ($entry.name | default "")) "GITHUB_WEBHOOK_SECRET" -}}
-{{- if not (and (hasKey $entry "value") (empty (toString ($entry.value | default "")))) -}}
-{{- $hasWebhookSecret = true -}}
-{{- end -}}
+{{- $hasWebhookSecret = not (and (hasKey $entry "value") (empty (toString ($entry.value | default "")))) -}}
 {{- end -}}
 {{- end -}}
 {{- if not $hasWebhookSecret -}}

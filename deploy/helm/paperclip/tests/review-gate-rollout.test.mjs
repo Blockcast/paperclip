@@ -195,4 +195,26 @@ test("incomplete or out-of-order review-gate enablement fails the Helm render", 
     ]),
     /requires a non-empty GITHUB_WEBHOOK_SECRET entry in env\.extra/,
   );
+  // env is a list, not a map: the kubelet takes the LAST entry for a duplicated
+  // name, so a valid entry followed by an empty override is what reaches the
+  // container. The guard has to agree with that precedence.
+  assert.throws(
+    () => render("templates/statefulset.yaml", [
+      "--set",
+      "githubApp.reviewGateCaptureEnabled=true",
+      "--set-json",
+      'env.extra=[{"name":"GITHUB_WEBHOOK_SECRET","value":"bound"},{"name":"GITHUB_WEBHOOK_SECRET","value":""}]',
+    ]),
+    /requires a non-empty GITHUB_WEBHOOK_SECRET entry in env\.extra/,
+  );
+  // The other order must still render. Without this case, a guard that simply
+  // failed on ANY empty entry would pass the case above for the wrong reason.
+  assert.doesNotThrow(
+    () => render("templates/statefulset.yaml", [
+      "--set",
+      "githubApp.reviewGateCaptureEnabled=true",
+      "--set-json",
+      'env.extra=[{"name":"GITHUB_WEBHOOK_SECRET","value":""},{"name":"GITHUB_WEBHOOK_SECRET","value":"bound"}]',
+    ]),
+  );
 });
