@@ -316,10 +316,15 @@ jobs:
       # `python3`: an unproven `command not found` on the escalation path would
       # be worse than the gap it closes.
       #
-      # Unconditional since PEN-3315: the non-pending outcomes now close the
-      # durable stall record, so every outcome needs node. That costs a few
-      # seconds on the common path and buys a record lifecycle that ends, rather
-      # than one open issue inheriting the next stall's clock.
+      # Unconditional since PEN-3315: the non-pending outcomes run the
+      # record-closing step below, so every outcome needs node. That costs a few
+      # seconds on the common path.
+      #
+      # On THIS repository there is no record for that step to close
+      # (`has_issues: false`; see the escalation step below), so the lifecycle it
+      # exists for never starts here. Until 2026-10-04 these lines claimed the
+      # cost "buys a record lifecycle that ends, rather than one open issue
+      # inheriting the next stall's clock".
       - name: Set up Node
         if: ${{ !cancelled() }}
         uses: actions/setup-node@v6
@@ -386,8 +391,11 @@ jobs:
       # the deploy lane. This step is independently correct — it re-reads the run's
       # live status before touching anything.
       #
-      # AFTER the escalation, so the durable record exists to be annotated and so
-      # the alert reports the pre-supersede run.
+      # AFTER the escalation, so the alert reports the pre-supersede run, and so a
+      # durable record, where one exists, can be annotated. On THIS repository
+      # none does (`has_issues: false`; see the escalation step above), so
+      # STALL_ISSUE_NUMBER is always empty here. Until 2026-10-04 these lines
+      # claimed "the durable record exists to be annotated".
       - name: Supersede a stale pending deploy so the approvable head is current
         id: supersede
         if: ${{ !cancelled() && steps.dispatch.outputs.outcome == 'skipped-pending' }}
@@ -416,6 +424,13 @@ jobs:
       # the record, and --resolve refuses to close a labelled record on an outcome
       # that did not refill the lane. The condition stays here so a labelled record
       # still closes on `dispatched` / `up-to-date`.
+      #
+      # On THIS repository none of the above has a record to act on
+      # (`has_issues: false`; see the escalation step above): the supersede's
+      # failure paths have nothing to label and this step has nothing to close.
+      # The step name is kept because the schedule tests match on it. Until
+      # 2026-10-04 these lines, and that name, described the record lifecycle as
+      # operating here.
       - name: Close the durable deploy-stall record once nothing is pending
         if: ${{ !cancelled() && steps.dispatch.outputs.outcome != '' && steps.dispatch.outputs.outcome != 'skipped-pending' }}
         env:
