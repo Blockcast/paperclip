@@ -684,6 +684,14 @@ describe("runChildProcess", () => {
       expect(lifecycle.map((event) => event.stage)).toContain("timeout_signal");
 
       // Wait past the grace window so a surviving timer would have fired.
+      //
+      // This fixed sleep is deliberately NOT converted to waitForLifecycleStage
+      // (PEN-3654), and it is not an oversight left over from that pass. The
+      // assertion below is NEGATIVE: there is no state to wait for, because the
+      // only way to show an event never arrived is to outlast the window that
+      // would have produced it. It also fails in the safe direction — a loaded
+      // runner makes this miss a regression, never eject a merge group, which
+      // is the opposite of the sleeps that pass did remove.
       await new Promise((resolve) => setTimeout(resolve, graceSec * 1000 + 750));
 
       expect(lifecycle.map((event) => event.stage)).not.toContain("kill_signal");
