@@ -205,12 +205,30 @@ test('the open-pull-request probe is only paid for where no pull_request rule wa
   });
 });
 
-test('a GraphQL errors array is unreadable, not zero open pull requests', () => {
-  // GraphQL answers 200 with `errors`, so an unchecked read turns a permission
-  // failure into "no open PRs" — which then reads as VOID-but-benign rather
-  // than as a credential problem. Either way it must not be a pass.
+test('a GraphQL errors array is unreadable, even when partial data came back with it', () => {
+  // GraphQL answers 200 with `errors` AND, for a partial failure, a `data`
+  // block holding only the fields it could resolve. That partial block is the
+  // dangerous shape: without the explicit errors check it parses cleanly, so a
+  // truncated pull-request list reads as the whole list and the probe returns
+  // COMPLIANT off a sample it never actually saw.
+  //
+  // The fixture is deliberately partial-with-one-node, not errors-only: an
+  // errors-only body makes `body.data.repository` throw into the same catch,
+  // which returns `unreadable` anyway and leaves the guard untestable. Measured
+  // — the errors-only version of this test survived removing the guard.
   const fetchImpl = async (path) =>
-    path === '/graphql' ? { errors: [{ message: 'Resource not accessible by integration' }] } : [];
+    path === '/graphql'
+      ? {
+          errors: [{ message: 'Something went wrong while executing your query' }],
+          data: {
+            repository: {
+              pullRequests: {
+                nodes: [{ number: 1, reviewDecision: 'REVIEW_REQUIRED', latestOpinionatedReviews: { nodes: [] } }],
+              },
+            },
+          },
+        }
+      : [];
   return checkConsumers({
     owner: 'Blockcast',
     token: 't',
