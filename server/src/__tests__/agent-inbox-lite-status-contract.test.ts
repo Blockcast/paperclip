@@ -182,8 +182,14 @@ describe("agent inbox-lite status contract", () => {
 // which is the input to a demotion pass. These assertions are on KEY PRESENCE, not
 // truthiness: a value-only test passes on the broken payload, because every value it
 // would read is legitimately null on most rows.
-describe("agent inbox-lite wake-path projection", () => {
-  const WAKE_PATH_KEYS = [
+// BLO-39015 widened this block past wake paths: four `parked*` columns are asserted
+// here too, and a park is deliberately NOT a wake path (see `agent-inbox-lite.ts` —
+// nothing fires when a `parkedUntil` lapses). So the block and its key list are named
+// for the CONTRACT they assert — every column present, null rather than absent — not
+// for any one mechanism. Do not re-read this list as "the attendance predicate's
+// inputs"; `attendedCount` below is that, and it is deliberately narrower.
+describe("agent inbox-lite liveness-column projection", () => {
+  const PRESENT_AND_NULL_KEYS = [
     "monitorNextCheckAt",
     "scheduledRetryAt",
     "scheduledRetryReason",
@@ -227,7 +233,12 @@ describe("agent inbox-lite wake-path projection", () => {
     };
   }
 
-  // The doctrine's own predicate, applied to whatever shape it is handed.
+  // The doctrine's own predicate — and it models WAKE-PATH attendance specifically:
+  // run, scheduled retry, future monitor. A live deliberate park is deliberately
+  // OUTSIDE it, because nothing fires when a `parkedUntil` lapses; a park satisfies
+  // the strandedness sweep ("is anyone accountable?"), not dispatch ("will this wake?").
+  // So `live-park` scoring unattended here is the intended answer, not a gap to close:
+  // adding a `parkedUntil` arm would be a doctrine change, not a fixture fix.
   function attendedCount(rows: Array<Record<string, unknown>>) {
     return rows.filter((row) => {
       const monitorAt = row.monitorNextCheckAt as Date | string | null | undefined;
@@ -274,7 +285,7 @@ describe("agent inbox-lite wake-path projection", () => {
 
     expect(items).toHaveLength(sourceRows.length);
     for (const item of items) {
-      for (const key of WAKE_PATH_KEYS) {
+      for (const key of PRESENT_AND_NULL_KEYS) {
         // `in`, not a value check: absent and always-null are both failures here,
         // and only `in` can tell them apart.
         expect(Object.keys(item)).toContain(key);
@@ -340,6 +351,18 @@ describe("agent inbox-lite wake-path projection", () => {
     expect(attendedCount(items as unknown as Array<Record<string, unknown>>)).toBe(
       attendedCount(sourceRows),
     );
+
+    // The boundary, made executable rather than nominal: a LIVE park is exposed by
+    // this endpoint and is still not attendance. Without this, a future author who
+    // adds a `parkedUntil` arm sees only `2` -> `3` and reads it as fixture drift to
+    // update. With it, they have to argue with the claim instead.
+    expect(
+      attendedCount(
+        (items as unknown as Array<Record<string, unknown>>).filter(
+          (row) => row.id === "live-park",
+        ),
+      ),
+    ).toBe(0);
   });
 
   it("carries the retry reason and attempt, not just the timestamp", async () => {
