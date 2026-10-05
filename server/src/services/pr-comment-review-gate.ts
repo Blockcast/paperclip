@@ -498,8 +498,11 @@ function headsWithUndispositionedFinding(
   // fail-open this branch exists to close, arriving through the fix for it
   // (peer review of #1721 at bbe6d640, TrafficOpsEngineer). Caught by the
   // pre-existing case at "leaves a finding carried from the head it names".
-  // Among two unreadable reviews neither is evidence, so there is nothing to
-  // lose between them.
+  // The same holds between two unreadable reviews. Neither attests, but either
+  // may still carry a finding, because hasActionablePrReviewFeedback falls
+  // through to prose for an unreadable body. So with no attested candidate,
+  // every candidate at the head is eligible, not only the newest (Ally, #1721
+  // at 2dfdfafe, Important 2).
   //
   // The remaining tie — same head, same attestation class, same second — is
   // resolved here on the *final* verdict rather than on a mid-loop proxy, which
@@ -530,7 +533,7 @@ function headsWithUndispositionedFinding(
     const tied = topTiedBy(candidates, (candidate) => [candidate.attested ? 1 : 0, candidate.timeMs]);
     const eligible = tied[0]!.attested
       ? [...tied, ...candidates.filter((c) => !c.attested && c.timeMs >= tied[0]!.timeMs)]
-      : tied;
+      : candidates;
     const blocking = eligible.find(
       (entry) =>
         hasActionablePrReviewFeedback(entry.attesting.comment.body, undefined, {

@@ -1347,6 +1347,38 @@ describe("BLO-32695 — an unreadable block may carry a finding, never retire on
     });
   });
 
+  /**
+   * Ally, #1721 at 2dfdfafe, Important 2. "May add, may not displace" holds
+   * between two unreadable reviews too. An unreadable body attests nothing but
+   * still carries a finding through its prose, so a newer unreadable review
+   * that merely states none must not discard an older one's Critical.
+   */
+  describe("a newer unreadable review of the same head", () => {
+    const newerQuiet = [
+      `<!-- ally-verdict:1 {"head": "${HEAD_A}", "findings": {"critical":`,
+      "## Ally \u2014 Consolidated PR Review",
+      `Reviewed head: ${HEAD_A}`,
+      "Follow-up note on the review above.",
+    ].join("\n");
+
+    it("positive control: it is unreadable and carries nothing of its own", () => {
+      expect(parseAllyVerdictBlock(newerQuiet).kind).toBe("unreadable");
+      expect(hasActionablePrReviewFeedback(newerQuiet)).toBe(false);
+      expect(gateAt(HEAD_B, [allyComment(newerQuiet, "2026-09-07T10:00:30Z")])).not.toMatchObject({
+        outcome: "carried_finding",
+      });
+    });
+
+    it("does not hide an older unreadable review's finding", () => {
+      for (const order of [
+        [allyComment(malformedBlock, "2026-09-07T10:00:00Z"), allyComment(newerQuiet, "2026-09-07T10:00:30Z")],
+        [allyComment(newerQuiet, "2026-09-07T10:00:30Z"), allyComment(malformedBlock, "2026-09-07T10:00:00Z")],
+      ]) {
+        expect(gateAt(HEAD_B, order)).toMatchObject({ state: "failure", outcome: "carried_finding" });
+      }
+    });
+  });
+
   it("carries it as identities a ledger entry can name, not as an unretirable head", () => {
     // The two readers have to move together. Blocking while enumerating `null`
     // would carry a head that no disposition could ever retire — the
