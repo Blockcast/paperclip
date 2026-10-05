@@ -188,6 +188,19 @@ reaches the container. */}}
 {{- if not $hasWebhookSecret -}}
 {{- fail "githubApp.reviewGateCaptureEnabled requires a non-empty GITHUB_WEBHOOK_SECRET entry in env.extra" -}}
 {{- end -}}
+{{/* The worker tier renders worker.extraEnv AFTER env.extra (statefulset.yaml),
+so an empty literal there unbinds the secret on that tier by the same last-entry
+rule. The check stays separate rather than scanning the concatenation: the API
+tier renders env.extra alone and is the webhook receiver (app.ts), so
+worker.extraEnv can unbind the secret but can never supply it. */}}
+{{- range $entry := (.Values.worker).extraEnv -}}
+{{- if eq (toString ($entry.name | default "")) "GITHUB_WEBHOOK_SECRET" -}}
+{{- $hasWebhookSecret = not (and (hasKey $entry "value") (empty (toString ($entry.value | default "")))) -}}
+{{- end -}}
+{{- end -}}
+{{- if not $hasWebhookSecret -}}
+{{- fail "githubApp.reviewGateCaptureEnabled: worker.extraEnv must not override GITHUB_WEBHOOK_SECRET with an empty value" -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 

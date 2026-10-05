@@ -217,4 +217,43 @@ test("incomplete or out-of-order review-gate enablement fails the Helm render", 
       'env.extra=[{"name":"GITHUB_WEBHOOK_SECRET","value":""},{"name":"GITHUB_WEBHOOK_SECRET","value":"bound"}]',
     ]),
   );
+  // The worker tier renders worker.extraEnv after env.extra, so an empty
+  // override there is the same defect one list further on.
+  assert.throws(
+    () => render("templates/statefulset.yaml", [
+      "--set",
+      "githubApp.reviewGateCaptureEnabled=true",
+      "--set-json",
+      'env.extra=[{"name":"GITHUB_WEBHOOK_SECRET","value":"bound"}]',
+      "--set-json",
+      'worker.extraEnv=[{"name":"GITHUB_WEBHOOK_SECRET","value":""}]',
+    ]),
+    /worker\.extraEnv must not override GITHUB_WEBHOOK_SECRET/,
+  );
+  // Last-wins applies inside worker.extraEnv too: an empty entry that is itself
+  // overridden must still render, or the guard above passes for the wrong reason.
+  assert.doesNotThrow(
+    () => render("templates/statefulset.yaml", [
+      "--set",
+      "githubApp.reviewGateCaptureEnabled=true",
+      "--set-json",
+      'env.extra=[{"name":"GITHUB_WEBHOOK_SECRET","value":"bound"}]',
+      "--set-json",
+      'worker.extraEnv=[{"name":"GITHUB_WEBHOOK_SECRET","value":""},{"name":"GITHUB_WEBHOOK_SECRET","value":"later"}]',
+    ]),
+  );
+  // A worker-only binding is NOT legitimate and must keep failing: the API tier
+  // renders env.extra alone (deployment-api.yaml) and is where webhooks land
+  // (app.ts), so it would boot-crash in config.ts with the chart rendering clean.
+  assert.throws(
+    () => render("templates/statefulset.yaml", [
+      "--set",
+      "githubApp.reviewGateCaptureEnabled=true",
+      "--set-json",
+      "env.extra=[]",
+      "--set-json",
+      'worker.extraEnv=[{"name":"GITHUB_WEBHOOK_SECRET","value":"bound"}]',
+    ]),
+    /requires a non-empty GITHUB_WEBHOOK_SECRET entry in env\.extra/,
+  );
 });
