@@ -9357,6 +9357,100 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect((await getReservation(runId))?.state).toBe("released");
     });
 
+    // ---------------------------------------------------------------------
+    // BLO-32052: the orphaned-lease sweep gated on `activeRunExecutions`,
+    // which is an in-memory Set that `executeRun` never clears when its await
+    // does not resolve. That turned a one-pass deferral into a permanent
+    // quarantine: measured in production, two single-slot agents were locked
+    // out of external-runtime work for 77h and 49h against a worker up 6.6
+    // days. The reaper's main loop already carried the external-lifecycle
+    // bypass; this loop did not. (The sibling reservation sweep has the same
+    // defect and is fixed separately by PEN-3640 / #2137.) Attribution: the
+    // 77h/49h figures evidence the shared `activeRunExecutions` defect class,
+    // not this sweep alone. External-runtime slot capacity is gated by the
+    // reservation row (`ACTIVE_RUNTIME_SLOT_CONSTRAINT`), so the slot lockout
+    // they measure clears with #2137; this PR clears the environment-lease
+    // half. The measured symptom needs both.
+    // ---------------------------------------------------------------------
+    it("releases an orphaned external-lifecycle lease whose executor is wedged in activeRunExecutions (BLO-32052)", async () => {
+      const { runId, leaseId, reservation } = await seedTerminalExternalRunWithLease();
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+      mockListManagedAgentPods.mockResolvedValue([]);
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(1);
+
+      expect((await getLease(leaseId))?.status).toBe("failed");
+    });
+
+    it("still defers to an in-process executor for a LOCAL adapter lease (BLO-32052 negative control)", async () => {
+      // The guard was narrowed, not deleted, and this is the half that proves
+      // it. A local run has no Job to re-verify against, so in-process
+      // ownership really is the only liveness signal and must still win. If
+      // this passes with the external-lifecycle test above also passing, the
+      // predicate genuinely discriminates rather than voting one way for
+      // everything.
+      const { companyId, runId, issueId } = await seedRunFixture({
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      mockListManagedAgentPods.mockResolvedValue([]);
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(0);
+
+      expect((await getLease(leaseId))?.status).toBe("active");
+    });
+
+    it("falls back to the pod arm alone once the reservation is released, and is fail-closed there (BLO-32052)", async () => {
+      // The production-reachable shape on the `reapOrphanedRuns` path, and the
+      // one the two tests above do NOT cover: they seed a launched reservation,
+      // so `confirmStaleKilledJobQuiesced` finds a live `jobName` and the Job
+      // arm does the work. The probe sources its name from
+      // `getActiveExternalRuntimeReservation` (filtered `released_at IS NULL`),
+      // and the sibling reservation sweep runs first in the real pass. Until
+      // PEN-3640 / #2137 lands, that sweep still skips a wedged run, so its
+      // reservation is not released first and the Job arm is still live for
+      // it. Once #2137 removes that guard, the sweep has usually just released
+      // the row, `jobName` is null, and `listManagedAgentPods` is the ONLY
+      // thing deciding. That is the state this path must rest on, so the
+      // fail-closed `pods !== null` arm is pinned here rather than assumed.
+      //
+      // No reservation is seeded at all, which is the same observable state as
+      // one already released.
+      const { companyId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      // Arm 1 — kube unreadable. Quiescence is unproven, so the lease is KEPT.
+      mockListManagedAgentPods.mockResolvedValue(null);
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(0);
+      expect((await getLease(leaseId))?.status).toBe("active");
+      // Pins "only the pod arm evaluates": with no active reservation there is
+      // no job name to probe, so the Job arm must not have run.
+      expect(mockReadAgentJobRunStatusByName).not.toHaveBeenCalled();
+
+      // Arm 2 — same fixture, pods now observable and empty. Proven quiesced,
+      // so the lease is released. Without this half, arm 1 would also pass on a
+      // sweep that never releases anything.
+      mockListManagedAgentPods.mockResolvedValue([]);
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(1);
+      expect((await getLease(leaseId))?.status).toBe("failed");
+    });
+
     it("lease sweep isolates a per-row probe failure and still releases the other row", async () => {
       const failing = await seedTerminalExternalRunWithLease();
       const healthy = await seedTerminalExternalRunWithLease();

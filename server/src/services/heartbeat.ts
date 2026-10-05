@@ -26390,7 +26390,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // A run finalizing right now in this process releases its own leases
         // in its `finally` block; racing it here risks acting on a status
         // snapshot from just before that block runs. Let it win.
-        if (activeRunExecutions.has(run.runId)) continue;
+        //
+        // BLO-32052: but only for adapters whose lifecycle this process
+        // actually owns. For external-lifecycle runs the kube Job is the
+        // source of truth, and a hung `executeRun` await leaves the runId in
+        // `activeRunExecutions` forever (the Set is in-memory and only a
+        // process restart clears it), which quarantined orphaned leases
+        // permanently instead of deferring them by a pass. Same defect and
+        // same Set as the `externalLifecycleRun` bypass in reapOrphanedRuns,
+        // and as PEN-3640 (#2137) fixes in the reservation sweep above.
+        // External-lifecycle runs are not left unguarded:
+        // `confirmStaleKilledJobQuiesced` below is a fail-closed quiescence
+        // probe that keeps the lease whenever the runtime is still active or
+        // merely unobservable.
+        //
+        // One caveat on that probe in *this* caller: it sources its Job name
+        // from `getActiveExternalRuntimeReservation`, which filters
+        // `released_at IS NULL`, and in `reapOrphanedRuns` the reservation
+        // sweep above runs first in the same pass. For a run NOT in
+        // `activeRunExecutions` that sweep has usually just released the row,
+        // so `jobName` is null and only the pod arm (`listManagedAgentPods`,
+        // fail-closed on a null read) evaluates; that is pre-existing.
+        //
+        // Ordering dependency on PEN-3640 (#2137) for the wedged runs this
+        // change unblocks: until #2137 lands, the reservation sweep's first
+        // statement still skips any run in `activeRunExecutions`, so a wedged
+        // run's reservation is NOT released first, `jobName` is non-null, and
+        // the Job arm is live here alongside the pod arm. Once #2137 removes
+        // that sibling guard, wedged runs join the case above and the pod arm
+        // is what this path must rest on. That is still safe, because the
+        // sibling sweep verified the Job moments earlier and coverage holds
+        // across the pair, but do not rely on the Job arm being live here.
+        if (!hasExternalLifecycle(run.adapterType) && activeRunExecutions.has(run.runId)) continue;
         if (hasExternalLifecycle(run.adapterType)) {
           // Background Job deletion does not prove that the Job or its
           // run-labelled pods have stopped. Reuse the same fail-closed probe as
