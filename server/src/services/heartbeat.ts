@@ -23381,9 +23381,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     // BLO-25024: same transition, no task-key gate. The PR-review recorder
     // above only observes `pr_review:` runs, which is why fleet-wide dispatch
-    // latency was invisible to every dashboard for ~8 weeks.
+    // latency was invisible to every dashboard for ~8 weeks. queuedAt is
+    // passed so a promoted retry or a k8s-isolation re-queue is measured from
+    // its re-queue instant, not from an old createdAt (BLO-21116).
     recordRunDispatchWait({
       invocationSource: claimed.invocationSource,
+      queuedAt: claimed.queuedAt,
       createdAt: claimed.createdAt,
       startedAt: claimed.startedAt,
     });
