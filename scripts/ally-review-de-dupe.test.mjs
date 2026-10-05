@@ -158,10 +158,13 @@ describe("selectDuplicateDismissals", () => {
 
   it("never dismisses a canonical review in favour of a newer non-canonical one", () => {
     const genuine = review({ id: 555, submitted_at: "2026-09-08T20:10:12Z" });
+    // Two *emitted* attestations. Keep them unfenced: I3 reads the attestation
+    // over the fence-stripped body, as the gate does, so a fenced copy is a
+    // quoted template rather than a second attestation (BLO-32695).
     const doubleAttested = review({
       id: 444,
       submitted_at: "2026-09-08T20:10:36Z",
-      body: `${body()}\n\n\`\`\`\nReviewed head: ${HEAD}\n\`\`\``,
+      body: `${body()}\n\nReviewed head: ${HEAD}`,
     });
     const decision = selectDuplicateDismissals([genuine, doubleAttested], HEAD);
 
@@ -311,9 +314,11 @@ describe("exactHeadAppReviews", () => {
   });
 
   it("excludes a body that I3 would report as not canonical", () => {
+    // Unfenced, per the note on the doubleAttested fixture above: I3 counts
+    // attestations over the fence-stripped body (BLO-32695).
     const twoAttestations = review({
       id: 2,
-      body: `${body()}\n\n\`\`\`\nReviewed head: ${HEAD}\n\`\`\``,
+      body: `${body()}\n\nReviewed head: ${HEAD}`,
     });
     const noHeading = review({ id: 3, body: `Reviewed head: ${HEAD}\n\n### Critical Issues (0)` });
 

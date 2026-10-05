@@ -47,8 +47,7 @@
 import {
   allyReviewLane,
   canonicalReviewHead,
-  hasBlockingFindings,
-  hasStillPresentDisposition,
+  hasBlockingVerdict,
   isMainModule,
 } from "./check-ally-review-consistency.mjs";
 
@@ -58,9 +57,15 @@ function reviewState(review) {
   return String(review?.state ?? "UNKNOWN").toUpperCase();
 }
 
-/** The guard's blocking-verdict test (I1/I2), composed from its exported parts. */
+/**
+ * The guard's blocking-verdict test (I1/I2). Taken whole rather than
+ * recomposed from `hasBlockingFindings || hasStillPresentDisposition`: those
+ * two are prose readers, so a review that states its findings only in the
+ * ```ally-verdict block — or states them in a block nothing can read — came
+ * back non-blocking and therefore dismissable (BLO-32695).
+ */
 function isBlocking(review) {
-  return hasBlockingFindings(review?.body) || hasStillPresentDisposition(review?.body);
+  return hasBlockingVerdict(review?.body);
 }
 
 function submittedAt(review) {
