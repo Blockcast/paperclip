@@ -278,22 +278,32 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
  * posting one (SKILL.md), so the marker namespace this reads was spoken for
  * before it was parsed.
  *
- * ⚠ THE BLOCK MUST BE ADDITIVE, NOT A REPLACEMENT. Four independent readers
- * parse the `Reviewed head:` attestation and only this one understands the
- * block:
+ * ⚠ THE BLOCK MUST BE ADDITIVE, NOT A REPLACEMENT — and the reason is the
+ * out-of-repo consumer, not the in-repo ones. All four in-repo readers parse
+ * the block, including on a body carrying no prose `Reviewed head:` line:
  *
  *   1. this module
- *   2. `commentAttestsHead` in server/src/services/github-app-auth.ts
- *   3. `ATTESTED_HEAD_RE` in scripts/check-ally-review-consistency.mjs
- *   4. `REVIEWED_HEAD_PATTERN` in .github/scripts/sweep-stalled-ally-reviews.py
+ *   2. `commentAttestsHead` in server/src/services/github-app-auth.ts —
+ *      delegates to `extractAllyReviewedHeadSha` outright
+ *   3. `VERDICT_BLOCK_RE` in scripts/check-ally-review-consistency.mjs
+ *   4. `VERDICT_BLOCK_PATTERN` in .github/scripts/sweep-stalled-ally-reviews.py
  *
- * A review carrying a block *and* the prose line reads identically to all
- * four, so adding the block breaks nothing. A review carrying only a block
- * would attest nothing to readers 2-4 — reader 2 would raise
- * `pr_review_output_missing` and post a false "reviewer never finished". So
- * whoever changes Ally's emitting side must keep the prose attestation until
- * all four read the block; BLO-31730 was already one instance of two of these
- * parsers disagreeing, and this is the same hazard with more copies.
+ * The prose line is retained for the reader that is not in this repo. Ally's
+ * one-review-per-head guard ships in a managed bundle, matches the consolidated
+ * heading at the first byte, and reads the prose attestation. Drop the prose on
+ * the strength of readers 1-4 and that guard stops recognising its own prior
+ * review, so it posts a second one at the same head — and a `COMMENTED` review
+ * cannot be dismissed, so each duplicate is permanent until the head moves.
+ * `.planning/ally-agent/AGENTS.md` records that exact failure (4 of 17 reviews
+ * across 2 heads). BLO-31730 was an earlier instance of two of these parsers
+ * disagreeing; the copies are now aligned in-repo and the seam is the bundle.
+ *
+ * Spelled out because the premise an earlier revision gave here — that only
+ * this module understood the block — was checkable, false, and load-bearing: a
+ * maintainer who checked it, as that text invited, would find the stated
+ * precondition met and conclude the prose line was retirable. A correct
+ * instruction resting on a falsified reason is one verification away from being
+ * discarded. The `unreadable` rule below records the same alignment.
  *
  * Line-anchored and guarded like every prose pattern in this file, and for a
  * sharper reason than they have. Fencing is not the only way to quote: an
@@ -313,6 +323,16 @@ export function extractAllyReviewedHeadSha(body: string | null | undefined): str
  * embedded terminator truncates the JSON and the block reads `unreadable`. No
  * current field can carry one; a future free-text field (a `reason`, a `file`
  * holding a diff hunk or a regex) could, and would have to encode it.
+ *
+ * Known ceiling, recorded so it is not rediscovered: `([\s\S]*?)-->` is
+ * quadratic in the number of *unterminated* openers, because each line-anchored
+ * start position rescans to end-of-body looking for a terminator. Measured on a
+ * body that is nothing but unterminated openers: 8 KB 2.0 ms · 16 KB 2.5 ms ·
+ * 33 KB 6.9 ms · 65 KB 28.8 ms · 131 KB 128.4 ms — a clean 4x per doubling.
+ * Left as-is deliberately: the review-body size limit bounds the reachable
+ * worst case at the 65 KB row, where the full three-function pass measured
+ * 79 ms, roughly an order of magnitude under the 757 ms ReDoS this file already
+ * fixed below. Revisit only if that bound moves or an input escapes it.
  */
 const ALLY_VERDICT_BLOCK_PATTERN = new RegExp(
   String.raw`(?:^|\n)${NOT_INDENTED_CODE}(?![ \t]*>) {0,3}<!--[ \t]*ally-verdict:[ \t]*(\d+)([\s\S]*?)-->`,
