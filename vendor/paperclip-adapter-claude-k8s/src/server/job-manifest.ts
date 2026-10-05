@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
+import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 
 /**
@@ -2287,7 +2288,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       ].join(" ")
     : "";
   const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(podLogPath))} || exit $?`;
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  // BLO-29553 AC1(b): the redactor goes BEFORE `tee`, so the credential never
+  // reaches the file on the shared PVC rather than being cleaned up afterwards.
+  // Anything after `tee` would be scrubbing a copy that already landed, which is
+  // the same "a batch scrubber must read every credential it redacts" objection
+  // that ruled out retroactive scrubbing on this ticket.
+  //
+  // `$PAPERCLIP_POD_LOG_FILTER` is deliberately UNQUOTED: it holds either `cat`
+  // or `node <path>`, and the path is content-addressed hex under $GUARD_DIR, so
+  // it carries no whitespace or shell-active character to re-split on.
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${buildPodLogRedactorSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | $${POD_LOG_FILTER_VAR} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
