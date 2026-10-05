@@ -51,6 +51,7 @@ import {
   strandedRecoveryWakeAttemptsExhausted,
   summarizeStrandedRecoveryHandBackPass,
 } from "../services/recovery/service.js";
+import { postRoutineDispatchFailureHeartbeat } from "../services/recovery/routine-scheduler-heartbeat.js";
 
 // BLO-19160: seam for the adoption-interleaving regression test. The stranded
 // sweep reads its candidates as one bulk snapshot and only reaches the
@@ -9278,6 +9279,66 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(afterCancel[0]!.idempotencyKey).toBe(`scheduler-heartbeat:${routineId}:${windowKey}`);
       // The surviving row is the original strand-time one, not a rewrite.
       expect(afterCancel[0]!.body).toContain("external_lifecycle_stale_killed");
+    });
+
+    // BLO-40337 AC3: the dispatch-failure receipt shares that same key, so a
+    // window whose dispatch failed and whose *later* catch-up fire then
+    // stranded still carries at most one scheduler receipt in total.
+    it("collapses a dispatch-failure and a later strand-time receipt onto one row", async () => {
+      const { companyId, managerId, coderId, prefix } = await seedCompany();
+      const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+        companyId,
+        prefix,
+        assigneeAgentId: managerId,
+      });
+      const triggeredAt = new Date("2026-09-21T00:07:11.010Z");
+      const { issue, routineRunId } = await seedRoutineExecutionIssue({
+        companyId,
+        prefix,
+        assigneeAgentId: coderId,
+        routineId,
+        triggeredAt,
+        siblingTriggeredAt: [
+          new Date("2026-09-20T18:07:11.010Z"),
+          new Date("2026-09-20T12:07:11.010Z"),
+        ],
+        issueNumber: 520,
+      });
+
+      await postRoutineDispatchFailureHeartbeat(
+        { db, addComment: issueService(db).addComment, logger },
+        {
+          companyId,
+          routineId,
+          run: {
+            id: routineRunId,
+            triggeredAt,
+            // The live shape from the six measured windows.
+            failureReason: "Failed query: select pg_advisory_xact_lock(hashtextextended($1, 0))",
+          },
+        },
+      );
+
+      const windowKey = triggeredAt.toISOString();
+      const afterDispatchFailure = await db
+        .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(afterDispatchFailure).toHaveLength(1);
+      expect(afterDispatchFailure[0]!.idempotencyKey).toBe(
+        `scheduler-heartbeat:${routineId}:${windowKey}`,
+      );
+      expect(afterDispatchFailure[0]!.body).toContain("pg_advisory_xact_lock");
+
+      await issueService(db).update(issue.id, { status: "cancelled" });
+
+      const afterCancel = await db
+        .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(afterCancel).toHaveLength(1);
+      // The surviving row is the dispatch-failure one, not a rewrite.
+      expect(afterCancel[0]!.body).toContain("pg_advisory_xact_lock");
     });
 
     /**
