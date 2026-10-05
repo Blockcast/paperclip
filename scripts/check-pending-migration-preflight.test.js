@@ -99,6 +99,16 @@ test("startup and run budgets are separate, and startup clears a cold pull", () 
   );
 });
 
+test("pre-flight tolerates the paperclip pool so it can schedule", () => {
+  // No node is untainted once the data pool is tainted; without this the job
+  // sits Pending until the startup budget expires and every deploy fails.
+  assert.match(
+    script,
+    /tolerations:\n\s+- key: dedicated\n\s+operator: Equal\n\s+value: paperclip\n\s+effect: NoSchedule/,
+    "the job must tolerate dedicated=paperclip:NoSchedule like the API pods",
+  );
+});
+
 test("pre-flight cleans up its job", () => {
   assert.match(script, /trap cleanup EXIT/, "the script must remove its job on exit");
   assert.match(script, /ttlSecondsAfterFinished/, "the job must also self-expire");
