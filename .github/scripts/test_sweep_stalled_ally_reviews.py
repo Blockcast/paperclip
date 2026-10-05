@@ -341,8 +341,11 @@ def issue_comment(login=ALLY_LOGIN, body="", user_type="Bot"):
 
 
 def consolidated_body(head_sha=HEAD_SHA):
+    # The em dash Ally emits. `--` was an ASCII stand-in the gate never
+    # credited; it read as a review here only while CONSOLIDATED_HEADING_PATTERN
+    # was looser than the gate's.
     return (
-        "## Ally -- Consolidated PR Review\n\n"
+        "## Ally \u2014 Consolidated PR Review\n\n"
         "Reviewed head: %s\n\n"
         "### Critical Issues (0)\n### Important Issues (0)\n"
     ) % head_sha
@@ -4010,6 +4013,31 @@ class TestIsConsolidatedAllyCommentForHead(unittest.TestCase):
                 "## Ally — Consolidated PR Review\n", self.HEAD
             )
         )
+
+    def test_heading_forms_agree_with_the_gate(self):
+        """Ally, #1721 at 2dfdfafe, Important 1: the expected column is what
+        hasAllyConsolidatedReviewHeading returns for each heading. The pattern
+        source itself is pinned against the gate's in
+        scripts/check-ally-review-consistency.test.mjs; this drives the whole
+        predicate, fence stripping included."""
+        cases = [
+            ("## Ally \u2014 Consolidated PR Review", True),
+            ("### Ally \u2014 Consolidated PR Review", True),
+            ("# Ally \u2014 Consolidated PR Review", True),
+            ("**Ally \u2014 Consolidated PR Review**", True),
+            ("Ally \u2014 Consolidated PR Review", True),
+            ("## Ally \u2014 Consolidated  PR  Review", True),
+            ("## Ally: Consolidated PR Review", True),
+            ("##Ally \u2014 Consolidated PR Review", False),
+            ("## Ally -- Consolidated PR Review", False),
+            ("    ## Ally \u2014 Consolidated PR Review", False),
+            ("\t## Ally \u2014 Consolidated PR Review", False),
+            ("```\n## Ally \u2014 Consolidated PR Review\n```", False),
+        ]
+        for heading, expected in cases:
+            with self.subTest(heading=heading):
+                body = "%s\nReviewed head: %s\n" % (heading, self.HEAD)
+                self.assertIs(sweep.is_consolidated_ally_comment_for_head(body, self.HEAD), expected)
 
 
 class TestVerdictBlockMirrorsJsCharacterSemantics(unittest.TestCase):

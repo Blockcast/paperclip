@@ -419,11 +419,20 @@ def prose_disposition_contradicts(text, payload):
             return True
     return False
 
-# Same latitude the previous `startswith("## Ally") and "Consolidated PR Review"
-# in body` pair allowed, minus the first-byte anchor.
+# Mirrors ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN in ally-review-detection.ts
+# piece for piece -- `#{1,6}` or `**`, the em/en/hyphen/colon separator,
+# `[ \t]+` between words, the NOT_INDENTED_CODE bound -- and is searched over
+# fence-stripped text as the gate's emittedReviewText is. The looser
+# `##[ \t]*Ally\b.*Consolidated PR Review` it replaces split from the gate in
+# both directions: it missed the `###`, `#`, bold and bare forms the gate
+# credits, so the sweep re-requested a review of a head Ally had already
+# reviewed (the BLO-22892/BLO-28203 loop), and it accepted `##Ally`, `--` and
+# indented-code forms the gate does not (Ally, #1721 at 2dfdfafe, Important 1).
+# Pinned by "the sweep's consolidated heading is the gate's" in
+# scripts/check-ally-review-consistency.test.mjs.
 CONSOLIDATED_HEADING_PATTERN = re.compile(
-    r"^[ \t]*##[ \t]*Ally\b.*Consolidated PR Review",
-    re.MULTILINE | re.IGNORECASE | ASCII_RE,
+    r"^(?! *\t)(?! {4}) {0,3}(?:#{1,6}[ \t]+|\*\*[ \t]*)?Ally[ \t]*(?:—|–|-|:)[ \t]*Consolidated[ \t]+PR[ \t]+Review\b",
+    re.IGNORECASE | re.MULTILINE | ASCII_RE,
 )
 
 
@@ -542,7 +551,7 @@ def is_consolidated_ally_comment_for_head(body, head_sha):
     # anchoring on "## Ally" being the first byte misses Ally's own emitted
     # bodies. Require the heading on its own line instead.
     return (
-        CONSOLIDATED_HEADING_PATTERN.search(review_text(body)) is not None
+        CONSOLIDATED_HEADING_PATTERN.search(without_fenced_spans(review_text(body))) is not None
         and attests_head(body, head_sha)
     )
 
