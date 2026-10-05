@@ -57,9 +57,12 @@
  * from — has `head_sha == master` while master has not moved, and is therefore
  * NOT superseded. Once master does move it becomes superseded like anything
  * else; that is a real, accepted limitation, it is announced in the step
- * summary, on the durable record and in the Alertmanager alert, and the remedy
- * is to re-dispatch. A rollback is approved in minutes during an incident, so
- * the >=SUPERSEDE_AFTER_HOURS (48h) precondition makes the collision unlikely
+ * summary and in the Alertmanager alert, and the remedy is to re-dispatch.
+ * (Until 2026-10-04 this also listed "the durable record". On THIS repository
+ * there is none: `has_issues` is false, so `POST /issues` is a hard 410 — see
+ * deploy-stall-chain.mjs. Two channels announce it here, not three.) A
+ * rollback is approved in minutes during an incident, so the
+ * >=SUPERSEDE_AFTER_HOURS (48h) precondition makes the collision unlikely
  * rather than merely survivable.
  *
  * THE RACE, AND WHY THE LIVE RE-CHECK IS NOT DECORATION
@@ -119,10 +122,15 @@ export const DEPLOY_REF = 'master';
  * selectStuckApproval: the run that arms the escalation is the run that gets
  * superseded, so the two can never disagree about which deploy is stuck.
  *
- * `ageHours` is the age of the RUN, not of the stall. The stall clock lives in
- * the durable record because a supersede resets the run's age by construction;
- * here the run's own age is the right input, since what is being judged is
- * whether THIS run has been sitting long enough to be worth replacing.
+ * `ageHours` is the age of the RUN, not of the stall. A supersede resets the
+ * run's age by construction, so the stall clock cannot be the run's age. Until
+ * 2026-10-04 this said the clock "lives in the durable record"; on THIS
+ * repository that record does not exist (`has_issues: false`, so
+ * `POST /issues` is a hard 410), and trusting it is what reset the clock on
+ * 2026-09-18. The stall clock is DERIVED from the cancelled-predecessor chain in
+ * Actions run history instead — see deploy-stall-chain.mjs. Here the run's own
+ * age is still the right input, since what is being judged is whether THIS run
+ * has been sitting long enough to be worth replacing.
  *
  * The threshold is `SUPERSEDE_AFTER_HOURS`, NOT `ALERT_AFTER_HOURS` (BLO-25050).
  * They were deliberately the same value until 2026-10-04 — "the condition that
@@ -244,8 +252,12 @@ function declined(reason, detail) {
  * at the stale commit. On the next sampling slot the dispatcher then reports
  * `checked-no-pending`, which is otherwise indistinguishable from a human having
  * cleared the stall — and would close the durable record as *resolved* while
- * nothing has shipped. That is the one record whose entire purpose is to make
- * this incident auditable after the fact.
+ * nothing has shipped, where such a record exists. On THIS repository it does
+ * not (`has_issues: false`, so `POST /issues` is a hard 410; see
+ * deploy-stall-chain.mjs): STALL_ISSUE_NUMBER is always empty here (workflow
+ * :336), so this function takes its early return below and only the step
+ * outputs carry the signal.
+ * Until 2026-10-04 this paragraph presented the record as live here.
  *
  * The signal is a LABEL, not a comment: `--resolve` already reads the issue
  * object (labels included) to find the record, so this costs it no extra call
