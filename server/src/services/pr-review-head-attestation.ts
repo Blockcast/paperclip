@@ -51,31 +51,64 @@
  *   - The unconfigured-login fail-open below does not account for it:
  *     `prReviewerBotLogin` defaults to `allyblockcast[bot]` (`config.ts:1277`),
  *     so the "no reviewer bot login is configured" arm was not the one taken.
- *   - A missing head does not account for it either. All three triggers were PR
- *     comments, and BOTH wake reasons an `issue_comment` can produce
- *     (`github_pr_review_requested` / `github_pr_review_feedback`,
- *     `github-webhook.ts:1818`) are exactly the two for which the webhook
- *     resolves the head lazily (`:5262-5266`) BEFORE the
- *     `if (context.headSha && context.repoFullName)` gate at `:5602`.
+ *   - A missing head does not account for it, for the triggers that reach this
+ *     gate at all. An `issue_comment` can produce FOUR wake reasons, not two —
+ *     the ternary at `github-webhook.ts:1813-1819` yields
+ *     `github_pr_review_gate_escalation`, `github_pr_merge_queue_evicted`,
+ *     `github_pr_review_requested` or `github_pr_review_feedback` — and only
+ *     ONE of them survives `shouldFirePrReviewerWake`, whose whitelist at
+ *     `:2767-2774` is {`opened`, `reopened`, `ready_for_review`,
+ *     `synchronized`, `review_requested`, `review_submitted`}. The other three
+ *     return false at `:5534` and execution never arrives at `:5602`. So the
+ *     only comment-driven reason that reaches this gate is
+ *     `github_pr_review_requested`, and for it the webhook resolves the head
+ *     lazily (`:5262-5266`) BEFORE the
+ *     `if (context.headSha && context.repoFullName)` gate at `:5602`. A head is
+ *     therefore present whenever this gate is consulted from a comment.
  *
- * So on the tree, these duplicates reached GitHub past a live guard. The
- * surviving explanations are: it answered `not_attested`; it answered `unknown`
- * for some reason other than the two excluded above; the deploy carrying
- * `fce3d292` had not rolled out when those wakes arrived; or those runs were
- * not dispatched through this webhook path at all. NOT RESOLVED HERE — deploy
- * timing and dispatch provenance were not checked, and neither is readable from
- * the review API this measurement used.
+ *     That narrowing moves #2128 out of this bullet entirely. Its only trigger
+ *     is `allyblockcast[bot]`-authored and carries no `paperclip:review-request`
+ *     marker (live comment, 2026-09-30T16:18:00Z, body opens "## Response to
+ *     review at `621589ce`"), so `reviewerRequest` at `:1560-1562` is false and
+ *     it classifies as `github_pr_review_feedback` — which never reaches `:5602`.
+ *     For that pair the gate was not bypassed for lack of a head; it was not
+ *     reached. That is the fourth surviving explanation below, and for #2128 the
+ *     tree answers it rather than leaving it open. #2121 and #2157 are
+ *     unaffected: both carry explicit `paperclip:review-request` triggers.
  *
- * It is answerable, though, and the evidence is already emitted: both
- * non-suppressing outcomes log distinctly at the call site, keyed by
- * `deliveryId` / `prNumber` / `wakeReason` / `headSha` — "...wake skipped: this
- * head is already attested..." (`github-webhook.ts:5622`) and "...could not
- * establish whether this head was already reviewed; dispatching the reviewer
- * wake anyway" (`:5636`). Absence of BOTH for a delivery is itself an answer:
- * the gate was not reached. Read those before concluding the wake keying is at
+ * So on the tree, #2121's and #2157's duplicates reached GitHub past a live
+ * guard. The surviving explanations are: it answered `not_attested`; it answered
+ * `unknown` for some reason other than the two excluded above; the deploy
+ * carrying `fce3d292` had not rolled out when those wakes arrived; or those runs
+ * were not dispatched through this webhook path at all. NOT RESOLVED HERE —
+ * deploy timing and dispatch provenance were not checked, and neither is
+ * readable from the review API this measurement used.
+ *
+ * It is PARTLY answerable from evidence already emitted, but current logging
+ * cannot settle the question `:41-43` calls the decision-relevant one. This
+ * module returns THREE outcomes (`PrReviewHeadAttestation` below) and the call
+ * site logs only two:
+ * `attested` logs at `github-webhook.ts:5622` ("...wake skipped: this head is
+ * already attested...") and then `return false`s at `:5624` — that is the
+ * SUPPRESSING outcome, not a non-suppressing one — while `unknown` warns at
+ * `:5636` ("...could not establish whether this head was already reviewed;
+ * dispatching the reviewer wake anyway") and falls through. `not_attested`
+ * emits NOTHING and falls through to the dispatch at `:5640`.
+ *
+ * So a hit at `:5622` or `:5636` proves the gate WAS reached, and that is all
+ * these logs establish. Absence of both does NOT mean the gate was not reached:
+ * it is precisely the signature of the ordinary `not_attested` path, where the
+ * gate was reached and answered. Absence leaves `not_attested` (the first
+ * surviving explanation above) and never-reached (the fourth) indistinguishable
+ * — and `not_attested` is the ORDINARY path by construction: every wake on a
+ * head no operative review attests yet answers it, which is the whole steady
+ * state of a healthy gate. So reading absence as "not reached" resolves the
+ * common case to the wrong answer. Separating them
+ * needs a debug log on the `not_attested` arm; it does not exist today. Read
+ * these logs for what they can prove before concluding the wake keying is at
  * fault.
  *
- * The paragraph above holds review-run duration (~42 min, measured on #2157:
+ * The CORRECTION above holds review-run duration (~42 min, measured on #2157:
  * 11:48:35Z request → 12:30:34Z review) as the only thing between dispatch and
  * post, and concludes that a gap of hours implies the first review was already
  * visible at the second dispatch. Three same-head pairs were examined for
@@ -110,7 +143,7 @@
  * change behaviour at all.
  *
  * Where they actually conflict is narrow, and it is the description-only case
- * at `:162-169` below: when the finding lives in the PR description, no commit
+ * at `:196-203` below: when the finding lives in the PR description, no commit
  * can carry the fix, so "one commit away" is false by construction and the
  * caller's asymmetry does not hold for that class. For every other class the
  * caller's reasoning stands. Whoever resolves this should change BOTH comments
