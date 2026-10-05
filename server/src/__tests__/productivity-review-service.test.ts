@@ -2109,12 +2109,13 @@ describeEmbeddedPostgres("productivity review service", () => {
   // so these runs stayed in the `no_comment_streak` numerator as conduct.
   //
   // The gap was invisible from the zero-token side, which is the whole reason
-  // it survived the BLO-36535 sweep. Re-measured 2026-10-01 over the 400 most
-  // recent runs of agent `29033747`: 2 `claude_transient_upstream` runs, BOTH
-  // billed (61,230 output tokens at the worst, $12.92 across the pair), against
-  // 109 `provider_throttled_no_progress` runs with zero billed. The throttled
-  // code was already caught by `isInfraFailureRun`'s zero-token test whether or
-  // not it was enumerated; this one never was.
+  // it survived the BLO-36535 sweep: the sibling `provider_throttled_no_progress`
+  // was already caught by `isInfraFailureRun`'s zero-token test whether or not
+  // it was enumerated, and this code never was. For the run counts, token and
+  // dollar figures behind that — see the measurement recorded at the set in
+  // `zero-token-startup-failure.ts`, which is the single copy of it. Restating
+  // it here is what the PEN-3698 suggestion closed; the negative control below
+  // points at the same place for the same reason.
   //
   // Non-zero `outputTokens` is load-bearing, exactly as in the BLO-32472 replay
   // above: a zero-token fixture is excluded by `isInfraFailureRun` regardless of

@@ -236,16 +236,30 @@ export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   // NOT added, and the exclusion rests on measurement, not on BLO-18285's
   // "normally parked in `scheduled_retry`": it IS reachable on a billed run
   // (heartbeat's finalization assigns it to an `outcome === "failed"` run with
-  // no zero-token gate). Over the same 400-run window above it had ZERO
-  // occurrences, billed or not — and agent `29033747` runs `claude_k8s`, the
-  // k8s adapter this server-side classification exists for, so that zero is
-  // not the codex-style "never runs the emitting adapter" artifact. Also zero
-  // across that agent's 1000 most recent runs (2026-09-25T02:19Z →
-  // 2026-10-01T20:09Z) and the Penstock company's 1000 most recent
-  // (2026-09-28T20:32Z → 2026-10-01T20:24Z). Membership here is per code, not
-  // per family: the first billed `provider_transient_upstream` run observed
-  // puts it in this set, and the PEN-3442 negative control then needs a
-  // different subject.
+  // no zero-token gate).
+  //
+  // The number that carries the exclusion is the COMPANY-wide one: ZERO
+  // occurrences, billed or not, across the Penstock company's 1000 most recent
+  // runs (2026-09-28T20:32Z → 2026-10-01T20:24Z). That window spans many
+  // adapters, which is the property this exclusion actually needs and the one
+  // a single-agent window structurally cannot supply.
+  //
+  // Agent `29033747` is also zero — over the 400-run window above and over its
+  // own 1000 most recent (2026-09-25T02:19Z → 2026-10-01T20:09Z) — but read
+  // those as corroboration, not as the load-bearing evidence they were first
+  // written as. This code is assigned ONLY when the adapter set no `errorCode`
+  // of its own: heartbeat's arm is guarded on `transientUpstreamOverride &&
+  // !adapterResult.errorCode && !silentFailureMessage`, and
+  // `claude_transient_upstream` IS such a code, emitted by the `claude_k8s`
+  // adapter that agent runs. So on that agent the adapter pre-empts the branch
+  // whenever it classifies the fault itself, and part of its zero is
+  // structural rather than observed. Ally's non-blocking suggestion on #2171,
+  // carried by PEN-3698; the conclusion is unchanged, because the company
+  // window never depended on it.
+  //
+  // Membership here is per code, not per family: the first billed
+  // `provider_transient_upstream` run observed puts it in this set, and the
+  // PEN-3442 negative control then needs a different subject.
   "claude_transient_upstream",
   "codex_transient_upstream",
 ]);
