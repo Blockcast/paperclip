@@ -205,11 +205,21 @@ describeEmbeddedPostgres("claude_k8s agent-home git probe timeout", () => {
       });
       expect(adapterExecute).not.toHaveBeenCalled();
 
-      // BLO-19924: the wiring, not the predicate. Restoring either park site to an
-      // unconditional WORKSPACE_VALIDATION_RECOVERY_CAUSE must fail here — an
-      // inconclusive probe has to land on the ordinary stranded cause, which is the
-      // only one carrying a wake and an attempt budget. `manual_repair_required`
-      // carries neither, so a regression here is silent and permanent.
+      // BLO-19924: the wiring, not the predicate. An inconclusive probe has to land on
+      // the ordinary stranded cause, which is the only one carrying a wake and an
+      // attempt budget; `manual_repair_required` carries neither, so a regression is
+      // silent and permanent.
+      //
+      // Coverage, stated narrowly: this fixture reaches exactly ONE of the two park
+      // sites in releaseIssueExecutionAndPromote — the pre-dispatch validation branch,
+      // whose guard (workspace_validation_failed + todo/in_progress + no assigneeUserId
+      // + self-assigned) this issue matches, and which returns before the
+      // shouldBlockImmediately branch is reachable. Reverting THAT site to an
+      // unconditional WORKSPACE_VALIDATION_RECOVERY_CAUSE fails here. Reverting the
+      // shouldBlockImmediately site alone does NOT — no fixture reaches it. What stands
+      // behind that site is that both call the single workspaceValidationRecoveryCause
+      // helper, which has its own failing mutation in
+      // services/recovery/workspace-validation-probe.test.ts.
       //
       // Polled: the run row is marked failed before releaseIssueExecutionAndPromote
       // writes the action, so waitForRunToFinish returning is not proof it exists yet.
