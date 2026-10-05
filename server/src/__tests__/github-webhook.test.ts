@@ -9808,8 +9808,9 @@ describeEmbeddedPostgres("github-webhook route", () => {
       // Wake behavior is unchanged: a review event still reaches the author,
       // now carrying the reason on the run's context so a later reader of
       // `heartbeat_runs` can tell "reviewer found nothing" from "the findings
-      // were lost". The directive the run itself renders is unchanged --
-      // projecting the reason into it is BLO-38816.
+      // were lost". Writing it also activates BLO-38816's reader, so the
+      // directive the run renders now names the reason; that half is pinned in
+      // `heartbeat-context-summary.test.ts`.
       expect(response.body.wakes).toEqual([{ issueIdentifier: "PEN-1126", agentId }]);
       const wakes = await db
         .select({ id: agentWakeupRequests.id })

@@ -10754,10 +10754,9 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     // pinned by "prefers the decline line when both classifications are
     // present"; swapping the arms previously passed every test.
     //
-    // Reader-before-writer is intentional and inert: the suppression keys are
-    // written by BLO-30420 / #1681, which has not merged. Until it does these
-    // two read null on every wake and nothing downstream changes;
-    // `reviewFeedbackActionable` is live today.
+    // The suppression keys are written by the GitHub webhook (BLO-30420 /
+    // #1681); this reader landed first and was inert until that writer
+    // merged. Both keys are now live alongside `reviewFeedbackActionable`.
     reviewFeedbackActionable:
       contextSnapshot.githubReviewFeedbackActionable === true ? (true as const) : null,
     reviewFeedbackSuppressionReason: readNonEmptyString(
