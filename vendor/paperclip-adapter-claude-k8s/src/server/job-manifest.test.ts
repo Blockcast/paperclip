@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME } from "./pod-log-redactor.js";
 import {
   buildJobManifest,
   buildPodLogPath,
@@ -2002,8 +2003,35 @@ describe("buildJobManifest", () => {
       expect(command).not.toContain("rtk-filter");
     });
 
-    it("includes fail-fast awk for `out_of_credits` overage rejection (RCA 2026-05-06)", () => {
+    // BLO-29553 AC1(b). The credential must not reach the file at all, so the
+    // only correct position for the redactor is UPSTREAM of `tee`. Anything
+    // downstream scrubs a copy that already landed on the shared PVC — the same
+    // objection that ruled out retroactive scrubbing on that ticket.
+    it("pipes claude through the pod-log redactor BEFORE tee (BLO-29553)", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+
+      const filter = command.indexOf(`| $${POD_LOG_FILTER_VAR} |`);
+      const tee = command.indexOf("| tee ");
+      const claude = command.indexOf("| claude ");
+      expect(filter).toBeGreaterThan(-1);
+      expect(claude).toBeLessThan(filter);
+      expect(filter).toBeLessThan(tee);
+
+      // The install has to precede the pipeline that reads the variable, and has
+      // to follow the env-guard setup that creates $GUARD_DIR and establishes
+      // that node exists in this container.
+      expect(command.indexOf("paperclip-env-guard.mjs")).toBeLessThan(
+        command.indexOf(POD_LOG_REDACTOR_FILENAME),
+      );
+      expect(command.indexOf(POD_LOG_REDACTOR_FILENAME)).toBeLessThan(filter);
+
+      // Fails open: an install that lost a race degrades to `cat` rather than
+      // failing every run in the fleet through `set -o pipefail`.
+      expect(command).toContain(`${POD_LOG_FILTER_VAR}=cat`);
+    });
+
+    it("includes fail-fast awk for `out_of_credits` overage rejection (RCA 2026-05-06)", () => {      const { job } = buildJobManifest({ ctx, selfPod });
       const cmd = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
       // Both substring matches must be present in the awk pattern so
       // we exit only on the specific terminal combination, not on
