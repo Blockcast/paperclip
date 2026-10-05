@@ -60,9 +60,9 @@
  *    positive-controlled query. See deploy-stall-record.mjs.
  * 2. A stall clock that survives a supersede. supersede-stale-deploy.mjs cancels
  *    a stale pending run and dispatches a fresh one, which resets that run's
- *    `createdAt` to now. Ageing the escalation off the run alone would turn one
- *    41h stall into a train of 6.0h ones, flapping firing/resolved on the
- *    threshold instead of firing continuously with a climbing age. The stall
+ *    `createdAt` to now. Ageing the escalation off the run alone would cap the
+ *    reported age at SUPERSEDE_AFTER_HOURS (48h since 2026-10-04, BLO-25050) and
+ *    restart it there, instead of one continuously-climbing age. The stall
  *    start comes from the durable record, and the age basis is the EARLIER of
  *    that and the oldest waiting run.
  *
@@ -274,8 +274,10 @@ export function buildAlert({
             'Nothing has been approved — that age is how long a human has been needed.\n\n'
           : '') +
         `Approve or reject the pending deploy to clear it: ${pendingQueueUrl}\n` +
-        'That link lists whatever is on the gate right now. A stale run is cancelled and ' +
-        'replaced whenever master moves past it, so approve whichever run is waiting there. ' +
+        'That link lists whatever is on the gate right now. A stale run is eventually cancelled ' +
+        'and replaced, but not promptly — the supersede threshold is measured in tens of hours ' +
+        '(48h since 2026-10-04, BLO-25050), so do not wait for a replacement to appear: approve ' +
+        'whichever run is waiting there. ' +
         // The automatic bound is the DAILY slot, not the next hourly one: guard (1b)
         // exits `checked-no-pending` for every cron but `23 7 * * *`, so an empty gate
         // cannot be refilled by an hourly slot. The 2026-10-02 window was 1h26m only

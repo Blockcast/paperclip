@@ -49,8 +49,10 @@
 # RUN, which is pinned to the sha it was dispatched with; the dispatcher itself
 # has always computed each dispatch against origin/master at dispatch time.
 #
-# So on the `skipped-pending` path, past the SAME threshold that arms the
-# escalation, a `waiting` dispatch whose head is a strict ancestor of
+# So on the `skipped-pending` path, past PENDING_DEPLOY_SUPERSEDE_HOURS — its
+# OWN threshold, deliberately NOT the one that arms the escalation; see the
+# `supersede-stale-deploy.mjs` step comment below for the BLO-25050 reasoning —
+# a `waiting` dispatch whose head is a strict ancestor of
 # origin/master is cancelled and re-dispatched at master. It APPROVES NOTHING —
 # the 2026-08-28 rejection of auto-approval is untouched. A human still presses
 # the button; they press it on a current head, so the click that eventually lands
@@ -340,10 +342,16 @@ jobs:
         run: node .github/scripts/post-pending-deploy-alert.mjs
 
       # PEN-3315. Guard (1)'s bounded exit: cancel a dispatch that has been on the
-      # reviewer gate past the SAME threshold and whose head is a strict ancestor
-      # of master, then dispatch fresh at master. Deliberately reuses
-      # PENDING_DEPLOY_ALERT_HOURS rather than adding a tunable, so the condition
-      # that supersedes is the condition that already escalates.
+      # reviewer gate past PENDING_DEPLOY_SUPERSEDE_HOURS and whose head is a
+      # strict ancestor of master, then dispatch fresh at master.
+      #
+      # BLO-25050: this reused PENDING_DEPLOY_ALERT_HOURS until 2026-10-04, "so
+      # the condition that supersedes is the condition that already escalates".
+      # That was right when the gate had one consumer. It now has two — a
+      # Paperclip board card pins to the waiting run id and is retired when that
+      # run dies — and a 6h supersede destroyed the card's handle roughly six
+      # times per decision cycle, measured. The ESCALATION threshold is unchanged
+      # at 6h; only the supersede moved. See supersede-stale-deploy.mjs.
       #
       # `!cancelled()` rather than `success()`: the escalation above is fatal on a
       # failed Alertmanager push, and an Alertmanager outage must not also freeze
@@ -357,7 +365,7 @@ jobs:
         if: ${{ !cancelled() && steps.dispatch.outputs.outcome == 'skipped-pending' }}
         env:
           PENDING_JSON_PATH: ${{ runner.temp }}/pending-dispatches.json
-          ALERT_AFTER_HOURS: ${{ vars.PENDING_DEPLOY_ALERT_HOURS || '6' }}
+          SUPERSEDE_AFTER_HOURS: ${{ vars.PENDING_DEPLOY_SUPERSEDE_HOURS || '48' }}
           MASTER_SHA: ${{ steps.dispatch.outputs.master_sha }}
           STALL_ISSUE_NUMBER: ${{ steps.escalate.outputs.stall_issue_number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
