@@ -1,5 +1,5 @@
 #!/bin/sh
-exec /usr/local/libexec/paperclip/bin/paperclip-github-token-env /usr/bin/git \
+exec /usr/local/libexec/paperclip/bin/paperclip-github-token-env /usr/local/bin/node /opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-git-egress-runtime.js /usr/bin/git \
   -c credential.https://github.com.helper= \
   -c credential.https://github.com.helper=/usr/local/libexec/paperclip/bin/github-token-credential-helper \
   "$@"
