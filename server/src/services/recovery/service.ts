@@ -12897,6 +12897,9 @@ export function recoveryService(
       now,
       companyId: opts?.companyId ?? null,
       limit: opts?.limit,
+      // BLO-40297: the same horizon a bounded action gets, applied from `createdAt` to the
+      // rows that never persisted one. One knob, not two.
+      unboundedHorizonMs: recoveryActionBoundsConfig().timeoutMs,
     });
     result.checked = expired.length;
     if (expired.length === 0) return result;
@@ -12974,7 +12977,15 @@ export function recoveryService(
         // other stays quiet — the operator sees one horizon notice per action, not two.
         const horizonAt = action.timeoutAt instanceof Date
           ? action.timeoutAt.toISOString()
-          : String(action.timeoutAt);
+          : action.timeoutAt != null
+            ? String(action.timeoutAt)
+            // BLO-40297 derived arm: the row never persisted a horizon, so report the one it
+            // was actually retired on — `createdAt` plus the configured horizon. Without this
+            // the marker reads "horizon `null`", which is both useless to an operator and a
+            // dedup key that collides across every unbounded row on the issue.
+            : new Date(
+              new Date(action.createdAt).getTime() + recoveryActionBoundsConfig().timeoutMs,
+            ).toISOString();
         const marker = `Recovery wake horizon reached for action \`${action.id}\` (horizon \`${horizonAt}\`)`;
         const alreadyAnnounced = await db
           .select({ id: issueComments.id })
@@ -12997,8 +13008,8 @@ export function recoveryService(
               "stopped waking anyone for it and has moved it out of `active` to `escalated`. It now needs a human " +
               "or a board operator to resolve it.",
             "",
-            `- Attempts: ${action.attemptCount} (budget ${action.maxAttempts})`,
-            `- Auto-recovery horizon: ${horizonAt}`,
+            `- Attempts: ${action.attemptCount} (budget ${action.maxAttempts ?? "none — this action was created before wake bounds existed, or by a cause that carries none"})`,
+            `- Auto-recovery horizon: ${horizonAt}${action.timeoutAt == null ? " (derived from `createdAt`; none was persisted)" : ""}`,
             `- Cause: \`${action.cause}\``,
             action.attemptCount === 0
               ? "- Note: no wake reached the queue for this action's current owner. `Attempts` counts wakes " +
