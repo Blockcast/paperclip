@@ -16,6 +16,8 @@ import { describe, expect, it, beforeAll } from "vitest";
 import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable, type Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
 import { redactCommandText } from "@paperclipai/adapter-utils/command-redaction";
@@ -23,6 +25,7 @@ import { redactCommandText } from "@paperclipai/adapter-utils/command-redaction"
 import {
   POD_LOG_REDACTOR_SCRIPT,
   POD_LOG_REDACTOR_FILENAME,
+  POD_LOG_FILTER_ARG_VAR,
   POD_LOG_FILTER_VAR,
   buildPodLogRedactorSetupShell,
 } from "./pod-log-redactor.js";
@@ -40,6 +43,7 @@ function normaliseBacktick(source: string): string {
 type PodRedactor = {
   redactText(text: string): string;
   redactLine(line: string): string;
+  createRedactTransform(): Transform;
 };
 
 let pod: PodRedactor;
@@ -229,6 +233,55 @@ describe("pod-log-redactor: no composite token segment reaches the pod log", () 
   });
 });
 
+// `createRedactTransform()` is the ONLY entry point that executes in the pod —
+// the tests above all call `redactLine`/`redactText` directly, so the line
+// framing around them (residue accumulation across chunk boundaries, the `\n`
+// split, the flush of an unterminated final line) was unpinned. Dropping the
+// `safeRedactLine` call ships a no-op redactor; dropping `flush` silently
+// discards claude's last line when the stream does not end in a newline.
+// Neither mutation is visible to any other test in this file.
+describe("pod-log-redactor: stream transform", () => {
+  async function drive(chunks: string[]): Promise<string> {
+    let out = "";
+    await pipeline(Readable.from(chunks), pod.createRedactTransform(), async function (source) {
+      for await (const c of source) out += c;
+    });
+    return out;
+  }
+
+  it("redacts a credential split across chunk boundaries and flushes the tail", async () => {
+    const token = composite(3);
+    // Chunk boundary deliberately falls INSIDE the token, so a transform that
+    // redacted per-chunk instead of per-line would leak both halves.
+    const mid = Math.floor(token.length / 2);
+    const out = await drive([
+      `leading ${token.slice(0, mid)}`,
+      `${token.slice(mid)} trailing\n`,
+      `tail ${token} unterminated`,
+    ]);
+
+    for (const seg of tokenSegments(token)) {
+      expect(out).not.toContain(seg);
+    }
+    // The flush path: the last line has no `\n` and must still be emitted.
+    expect(out).toContain("unterminated");
+    expect(out).toContain("leading ");
+    expect(out).toContain("trailing");
+    // Exactly one newline, in the same place the input had one — the transport
+    // is NDJSON and the server parses it line by line.
+    expect(out.split("\n")).toHaveLength(2);
+  });
+
+  it("emits nothing extra when the stream is empty", async () => {
+    expect(await drive([])).toBe("");
+  });
+
+  it("passes benign lines through byte-identically", async () => {
+    const benign = '{"type":"assistant","text":"service.platform.retries.maxAttempts"}\n';
+    expect(await drive([benign])).toBe(benign);
+  });
+});
+
 describe("pod-log-redactor: shell wiring", () => {
   it("installs write-once and never truncates the shared inode", () => {
     const shell = buildPodLogRedactorSetupShell();
@@ -241,8 +294,37 @@ describe("pod-log-redactor: shell wiring", () => {
   it("falls open to cat when the script is not on disk", () => {
     const shell = buildPodLogRedactorSetupShell();
     expect(shell).toContain(`${POD_LOG_FILTER_VAR}=cat`);
-    const guarded = shell.indexOf(`[ -f "$GUARD_DIR/${POD_LOG_REDACTOR_FILENAME}" ] && ${POD_LOG_FILTER_VAR}=`);
+    const guarded = shell.indexOf(`[ -f "$GUARD_DIR/${POD_LOG_REDACTOR_FILENAME}" ] && {`);
     expect(guarded).toBeGreaterThan(shell.indexOf(`${POD_LOG_FILTER_VAR}=cat`));
+  });
+
+  // `buildEnvGuardSetupShell()` uses node exactly once, fail-soft
+  // (`... | node - 2>/dev/null || echo ... >&2`), so it establishes nothing
+  // about node being runnable. `[ -f ]` covers "script missing", not
+  // "node missing" — probe for it rather than assuming.
+  it("falls open to cat when node is not runnable", () => {
+    const shell = buildPodLogRedactorSetupShell();
+    expect(shell).toContain("command -v node >/dev/null 2>&1 &&");
+    expect(shell.indexOf("command -v node")).toBeLessThan(
+      shell.indexOf(`${POD_LOG_FILTER_VAR}=node`),
+    );
+  });
+
+  // $GUARD_DIR is `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and CLAUDE_CONFIG_DIR is
+  // operator-configurable (`resolveClaudeConfigDir()`), so the script path can
+  // contain a space. Command and argument therefore have to be separate
+  // variables — a single `$VAR` holding `node <path>` cannot be quoted at the
+  // use site without also quoting `cat` into a one-word command that happens to
+  // work, and cannot be left unquoted without word-splitting the path.
+  it("keeps the command word and the script path in separate variables", () => {
+    const shell = buildPodLogRedactorSetupShell();
+    expect(shell).toContain(`${POD_LOG_FILTER_VAR}=node;`);
+    expect(shell).toContain(
+      `${POD_LOG_FILTER_ARG_VAR}="$GUARD_DIR/${POD_LOG_REDACTOR_FILENAME}"`,
+    );
+    // The old single-variable form is the regression this pins.
+    expect(shell).not.toContain(`${POD_LOG_FILTER_VAR}="node `);
+    expect(shell).toContain(`export ${POD_LOG_FILTER_VAR} ${POD_LOG_FILTER_ARG_VAR}`);
   });
 
   it("content-addresses the filename so a rule change lands as a new file", () => {
