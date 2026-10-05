@@ -274,17 +274,18 @@ function deferred<T = void>() {
  * reports zero headroom where there is 15s.
  *
  * Two invariants bound this default, and both are violated at 30s, not 25s:
- *   - timeoutMs + B's budgetMs < testTimeout, or vitest kills the case before
- *     either backstop can name itself. This is exactly the 45s-against-60s span
- *     derived above; writing it as `2 x timeoutMs` would re-assert the
- *     double-count that paragraph disclaims, and bounds the wrong pair of spans.
+ *   - timeoutMs + B's budgetMs < testTimeout, or vitest kills the case inside
+ *     B's budget and backstop #2 is pre-empted and silent. This is exactly the
+ *     45s-against-60s span derived above; writing it as `2 x timeoutMs` would
+ *     re-assert the double-count that paragraph disclaims, and bounds the wrong
+ *     pair of spans.
  *   - timeoutMs < B's budgetMs, or B can exhaust its budget and reject while A
  *     is still deliberately held, which is the very failure this case asserts
  *     against.
  * The two reduce to the same ceiling only because budgetMs happens to be half
- * of testTimeout today; move either constant and they diverge, with the first
- * becoming the tighter. 15s satisfies both with 2x margin. Do not raise it
- * without re-deriving these.
+ * of testTimeout today; move either constant and they diverge: the first binds
+ * when budgetMs exceeds half of testTimeout, the second when it falls below.
+ * 15s satisfies both with 2x margin. Do not raise it without re-deriving these.
  */
 async function waitUntil(
   condition: () => boolean,
