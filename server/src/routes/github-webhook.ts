@@ -6242,6 +6242,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           : await githubResolveMergedPullRequestForHeadRef({
             repoFullName: retargetRepoFullName,
             headRef: retargetedFromRef,
+            // Inline on the webhook path: bound to the request deadline, not
+            // ghFetch's 30s default, so GitHub gets its answer (BLO-38257).
+            signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
           });
         if (mergedBase?.outcome === "error") {
           // NOT "nothing merged this branch" — we could not find out. Same
@@ -6261,6 +6264,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             ? await githubResolveMergeHistoryShape({
               repoFullName: retargetRepoFullName,
               mergeCommitSha: mergedBase.mergeCommitSha,
+              signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
             })
             : "unknown";
           await wakeStackedChildIssues({
