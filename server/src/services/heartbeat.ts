@@ -509,6 +509,7 @@ import {
   readContinuationAttempt,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
+import { isInconclusiveWorkspaceGitProbe } from "./recovery/workspace-validation-probe.js";
 import {
   runUsageHasNoModelTokens,
   SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
@@ -36637,7 +36638,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : buildWorkspaceValidationRecoveryComment({ latestRun: run }),
             recoveryCause: configurationIncomplete
               ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-              : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
+              // BLO-19924: an unanswered git probe is not a confirmed hazard, so it
+              // must not take the no-wake `manual_repair_required` shape. Falling
+              // through to the default stranded cause buys bounded wake attempts and
+              // a visible escalation; the dispatch refusal above is unchanged.
+              : isInconclusiveWorkspaceGitProbe(readWorkspaceValidationPayloadFromRun(run))
+                ? undefined
+                : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
             recoveryOwnerAgentId: undefined,
             expectedReviewStage: undefined,
           },
@@ -37236,7 +37243,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             previousStatus: issue.status,
             comment,
             recoveryCause: workspaceValidationFailure
-              ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
+              // BLO-19924: see the sibling site above — an inconclusive probe keeps
+              // the workspace-validation comment (the diagnostics stay) but gives up
+              // the no-wake recovery shape, so something re-probes it.
+              ? isInconclusiveWorkspaceGitProbe(readWorkspaceValidationPayloadFromRun(run))
+                ? undefined
+                : WORKSPACE_VALIDATION_RECOVERY_CAUSE
               : configurationIncompleteFailure
                 ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
                 : undefined,
