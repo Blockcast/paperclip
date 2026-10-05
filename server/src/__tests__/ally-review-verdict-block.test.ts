@@ -281,12 +281,13 @@ describe("BLO-32695 — the structured verdict block as the primary source", () 
 /**
  * Cross-reader agreement about which tree was examined.
  *
- * Four readers parse `Reviewed head:` and only this module understands the
- * block — commentAttestsHead (github-app-auth.ts), ATTESTED_HEAD_RE
- * (check-ally-review-consistency.mjs) and HEAD_ATTESTATION_RE
- * (sweep-stalled-ally-reviews.py) are the other three. So a body whose block
- * and prose name different heads would set the merge gate against one tree
- * while the retry sweep reasoned about another.
+ * Every in-repo reader prefers the block, and the prose `Reviewed head:` line
+ * is retained for the one reader that is not in this repo — Ally's
+ * one-review-per-head guard, which ships in a managed bundle and reads the
+ * prose attestation. So a body whose block and prose name different heads would
+ * set the merge gate against one tree while that guard reasoned about another.
+ * The reader list and the reasoning live once, in the header of
+ * server/src/services/ally-review-detection.ts.
  *
  * The asymmetry is the whole design and is easy to get backwards. Requiring a
  * *matching* prose attestation before the block may be trusted would have been

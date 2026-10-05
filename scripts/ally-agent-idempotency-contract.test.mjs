@@ -357,17 +357,17 @@ test("the template's severity counts are all severities the gate can act on", ()
 test("the verdict block is additive, never a replacement for the prose line", () => {
   const { template } = step4Template();
 
-  // Four readers parse `Reviewed head:` and only one understands the block
-  // (this module; plus commentAttestsHead in github-app-auth.ts,
-  // ATTESTED_HEAD_RE in check-ally-review-consistency.mjs, and
-  // HEAD_ATTESTATION_RE in sweep-stalled-ally-reviews.py). A block-only review
-  // attests nothing to the other three, and reader 2 then raises
-  // pr_review_output_missing — a false "reviewer never finished" on a review
-  // that was in fact completed.
+  // Why the prose line survives alongside the block is recorded once, in the
+  // header of server/src/services/ally-review-detection.ts: every in-repo
+  // reader parses the block, and the prose attestation is kept for the
+  // out-of-repo one-review-per-head guard. That reader list used to be
+  // duplicated here, unguarded by the registry check below, and it went stale —
+  // it named a HEAD_ATTESTATION_RE that has never existed in any reader. Do not
+  // re-add a copy; point at the module.
   assert.match(template, /<!--[ \t]*ally-verdict:1/, "positive control: the block is present");
   assert.match(template, /(^|\n)Reviewed head: /,
     "the prose attestation must survive alongside the block; dropping it breaks"
-    + " the three readers that do not parse the block");
+    + " the out-of-repo one-review-per-head guard");
 });
 
 test("the skip path posts a comment, not a review", () => {
