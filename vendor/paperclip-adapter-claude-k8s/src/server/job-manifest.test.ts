@@ -3612,6 +3612,25 @@ describe("scoped writable mounts (BLO-32734)", () => {
     expect(main.filter((m) => m.subPath?.startsWith("instances/default/data/k8s-isolation/pnpm/"))).toEqual([]);
   });
 
+  // The scoped mounts are minted after the reserved-mount guard has run, so an
+  // inherited secret mount sitting exactly on one of them is caught by the
+  // per-container duplicate assertion at the end of buildJobManifest rather
+  // than at the append site. Pinned here because nothing else covers that
+  // interaction, and because the append site deliberately carries no check of
+  // its own — if someone adds one, this test says where the coverage was.
+  it("rejects a scoped writable mount colliding with an inherited secret mount", () => {
+    expect(() =>
+      buildJobManifest({
+        ctx: isolatedCtx(),
+        selfPod: makeSelfPod({
+          secretVolumes: [
+            { volumeName: "gh-token", secretName: "gh", mountPath: "/paperclip/work", defaultMode: 0o400 },
+          ],
+        }),
+      }),
+    ).toThrow(/duplicate volumeMounts at \/paperclip\/work \(volumes "gh-token" and "data"\)/);
+  });
+
   it("gives the init container the same scoped mounts as the main container", () => {
     const { main, init } = mountsFor(isolatedCtx());
     const scopedOf = (mounts: typeof main) =>
