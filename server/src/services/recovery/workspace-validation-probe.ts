@@ -18,9 +18,10 @@
  * The rule this bucket is supposed to follow is already stated for the git
  * transport classifier in service.ts: route to the no-wake cause only when "the
  * same agent against the same source cannot produce a different result". That
- * holds for a confirmed checkout and fails for a probe that never completed, so
- * the inconclusive case is handed back to the ordinary stranded cause — bounded
- * wake attempts, then a visible escalation.
+ * holds for a confirmed checkout and fails for every other park reason here, so
+ * a confirmed checkout is the only one that keeps the no-wake shape and the
+ * rest are handed back to the ordinary stranded cause — bounded wake attempts,
+ * then a visible escalation.
  *
  * This is deliberately the fix that is correct under BOTH readings of the
  * underlying probe fault, which was measured but NOT explained:
@@ -37,19 +38,37 @@
  */
 
 /**
- * True only when the strict git probe positively failed to reach a verdict.
+ * True only when a probe positively confirmed the hazard.
  *
- * Deliberately narrow. "checkout" is a confirmed hazard and keeps the
- * manual-repair shape, because removing that checkout really is a repair only a
- * human/agent can perform. The managed-worktree reasons
- * (`git_worktree_base_not_git_checkout`, `git_worktree_branch_incoherence`)
- * carry no `gitProbeState` at all and likewise keep it: those are genuine
- * configuration faults, not unanswered probes.
+ * `probeGitCheckoutStateStrict` is the only producer of `gitProbeState`
+ * (heartbeat.ts:4132), and "checkout" is its only affirmative verdict: a real
+ * repository under the fallback cwd, whose removal is a repair only a
+ * human/agent can perform. That is the one park that has earned the no-wake
+ * shape.
+ *
+ * Everything else fails open and must NOT, including the two managed-worktree
+ * reasons, which an earlier revision of this file wrongly asserted were
+ * "genuine configuration faults, not unanswered probes":
+ *   - `git_worktree_base_not_git_checkout` comes from `isGitCheckout`
+ *     (heartbeat.ts:3832), which is `.catch(() => false)` with no timeout — any
+ *     probe error reads as a confirmed "not a checkout". This very file already
+ *     refuses to use that helper for the dispatch guard for exactly that reason
+ *     (heartbeat.ts:4127-4131).
+ *   - `git_worktree_branch_incoherence` comes from
+ *     `inspectManagedGitWorktreeBranch` (workspace-runtime.ts:3766), whose four
+ *     `.catch(() => null)` arms each turn a git exec failure into a
+ *     confirmed-sounding verdict; its own throw message concedes it, reporting
+ *     that "the checked-out branch could not be verified".
+ *
+ * So the predicate is an allowlist, not a denylist. A reason code added later
+ * is unlatched by default, and the worst case for a genuine configuration fault
+ * is a bounded set of wake attempts followed by a visible escalation — against
+ * a worst case of a permanent silent strand on the other side.
  */
-export function isInconclusiveWorkspaceGitProbe(
+export function isConfirmedWorkspaceGitHazard(
   workspaceValidationPayload: Record<string, unknown> | null | undefined,
 ): boolean {
-  return workspaceValidationPayload?.gitProbeState === "indeterminate";
+  return workspaceValidationPayload?.gitProbeState === "checkout";
 }
 
 /** The no-wake recovery cause a confirmed workspace hazard keeps. */
@@ -68,7 +87,7 @@ export const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed"
 export function workspaceValidationRecoveryCause(
   workspaceValidationPayload: Record<string, unknown> | null | undefined,
 ): typeof WORKSPACE_VALIDATION_RECOVERY_CAUSE | undefined {
-  return isInconclusiveWorkspaceGitProbe(workspaceValidationPayload)
-    ? undefined
-    : WORKSPACE_VALIDATION_RECOVERY_CAUSE;
+  return isConfirmedWorkspaceGitHazard(workspaceValidationPayload)
+    ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
+    : undefined;
 }
