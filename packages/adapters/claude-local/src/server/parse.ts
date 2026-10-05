@@ -440,9 +440,34 @@ export function isClaudeTerminalResultEvent(parsed: Record<string, unknown> | nu
  *
  * The transcript-reading callers below (`isClaudeImmutableThinkingBlockError`,
  * `isClaudeProviderQuotaError`, `extractClaudeRetryNotBefore`) keep the wide
- * builder on purpose: the first two can only ever SUPPRESS a transient label, and
- * the third extracts a timestamp once a family is already decided. None of them
- * grants a retry family off transcript text.
+ * builder — but NOT because they are harmless with it. The bounding happens in
+ * the CALLER, not here. This spot used to read "the first two can only ever
+ * SUPPRESS a transient label … none of them grants a retry family off transcript
+ * text"; that was false for `isClaudeProviderQuotaError` and is corrected here,
+ * because a maintainer who believed it would widen the caller back:
+ *
+ *   - `isClaudeProviderQuotaError` suppresses only in its ONE internal role,
+ *     inside `isClaudeTransientUpstreamError` (:789). At its DIRECT call sites it
+ *     GRANTS, off whatever `stdout` it is handed: `execute.ts:1293` →
+ *     `errorCode`/`errorFamily` `provider_quota` (:1327/:1331), and `:1457` →
+ *     `:1511`/`:1517`. "Can only ever suppress" described one caller and silently
+ *     generalised to the rest.
+ *   - `isClaudeImmutableThinkingBlockError` grants a session-error KIND
+ *     (`execute.ts:1592`/`:1600` → `"immutable"`), not a retry family — so the
+ *     retry-family clause was narrowly true of it, and still not a reason the
+ *     wide builder is safe.
+ *   - `extractClaudeRetryNotBefore` reads the transcript only after a family is
+ *     already decided, and prefers structured `parsed` fields (:676-681) before
+ *     falling back to this haystack.
+ *
+ * What actually bounds the granting path is that `execute.ts` narrows the
+ * `stdout` it HANDS these rules on a terminal result event
+ * (`isClaudeTerminalResultEvent(parsed) ? "" : proc.stdout`, at `:1459` and
+ * `:1472`). Those two must stay narrowed TOGETHER: the transient rule suppresses
+ * on the quota rule's verdict (:789), so handing them different stdout makes them
+ * disagree and drops a genuine 429 to no family at all. Do not widen either back
+ * on the strength of this builder being wide. Both lines are pinned by
+ * `execute.login-veto-routing.test.ts` — reverting either one alone reds a case.
  */
 function buildClaudeTerminalResultHaystack(input: {
   parsed?: Record<string, unknown> | null;
@@ -765,6 +790,21 @@ export function isClaudeTransientUpstreamError(input: {
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }
 
+// This rule GRANTS a family at its direct call sites — it is not only the
+// suppressor it looks like from `isClaudeTransientUpstreamError` (:789). On the
+// `!parsed` path `execute.ts:1293` turns a true verdict here into `errorCode`
+// AND `errorFamily` `provider_quota` (:1327/:1331); on the result-event path
+// `:1457` does the same at `:1511`/`:1517`. So the `stdout` a caller hands it is
+// a classification input, not a hint.
+//
+// Its internal login veto reads `input.stdout` as given. On a terminal result
+// event `execute.ts` therefore narrows that input to `""` (`:1459`), and MUST
+// narrow `isClaudeTransientUpstreamError`'s to match (`:1472`) — the suppression
+// at `:789` passes `input` through unchanged, so if the two disagree a quota
+// token present only in the tool output vetoes a genuine 429's transient verdict
+// while the narrowed gate says "not quota", and the run ends with no family.
+// `test.ts` passes its probe transcript to both, which agrees by construction.
+// Pinned by `execute.login-veto-routing.test.ts`.
 export function isClaudeProviderQuotaError(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;
