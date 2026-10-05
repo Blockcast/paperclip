@@ -1232,6 +1232,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     //      registry output. Those false positives are what this drops. The
     //      override itself is preserved: the case the comment at :1412 describes
     //      lives on `parsed.result`, which the narrowed read still consults.
+    //
+    // Scoped OUT, deliberately, and recorded here because it sits on the path
+    // this change narrows: the CLASSIFICATION is narrowed, the SCHEDULE derived
+    // from it is not. `extractClaudeRetryNotBefore` (:1477) is still handed the
+    // full `proc.stdout`, so a run whose family was decided from bounded surfaces
+    // can still take its `retryNotBefore` from a transcript `…resets at <t>`
+    // string that had no part in deciding that family. Before this change the two
+    // agreed by construction, because a transcript-labelled family drew its
+    // timestamp from the same text that labelled it; narrowing one side breaks
+    // that coupling. Left wide on purpose, for two reasons: the extractor prefers
+    // the structured `parsed` fields and only falls back to the haystack
+    // (`parse.ts:676-681`), and narrowing it is a behaviour change to the retry
+    // SCHEDULE that no corpus run here measures — the 114k-log run predates it and
+    // scored verdicts, not timestamps. Unmeasured, so disclosed rather than
+    // bundled in. A transcript carrying a reset-shaped string is believed rare but
+    // is NOT a measured zero; treat that as the open question if a run ever
+    // retries on a timestamp its family never saw.
     const requiresLogin = detectClaudeLoginRequired({
       parsed,
       stdout: isClaudeTerminalResultEvent(parsed) ? "" : proc.stdout,
@@ -1464,6 +1481,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
+    // KNOWN GAP, tracked in PEN-3829 — not fixed here, so do not read the
+    // narrowing above as covering this ladder. `isClaudeModelNotFoundError` below
+    // still reads the full `proc.stdout` and ranks ABOVE both families this change
+    // bounded (`providerQuota` :1511, `transientUpstream` :1513), so a genuine 429
+    // whose TRANSCRIPT merely mentions `model not found` still codes
+    // `model_not_found`. `errorFamily` (:1517) is computed independently and does
+    // not consult it, so that run emerges with `errorCode: "model_not_found"`
+    // beside `errorFamily: "transient_upstream"`. Left alone deliberately:
+    // `model_not_found` is a PERMANENT label, so narrowing it widens what gets a
+    // retry family, and that direction needs its own corpus measurement rather
+    // than inheriting this change's.
     const resolvedErrorCode = requiresLogin
       ? "claude_auth_required"
       : quotaExhausted
