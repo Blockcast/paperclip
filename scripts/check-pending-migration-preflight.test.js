@@ -120,9 +120,11 @@ test("pre-flight job can actually be scheduled", () => {
   // Measured on run 37342387937: "0/21 nodes are available: 21 node(s) had
   // untolerated taint(s)".
   assert.match(script, /^\s+nodeSelector:\n\s+workload: paperclip$/m, "the pre-flight job must target the paperclip node pool");
+  // Pin value and effect, not just the key: a `dedicated=other:NoExecute`
+  // toleration would satisfy a key-only match and still not schedule.
   assert.match(
     script,
-    /^\s+tolerations:\n(?:.*\n)*?\s+-\s+key:\s+dedicated$/m,
+    /^\s+- key: dedicated\n\s+operator: Equal\n\s+value: paperclip\n\s+effect: NoSchedule$/m,
     "the pre-flight job must tolerate the dedicated=paperclip taint those nodes carry",
   );
 });
