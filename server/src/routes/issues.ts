@@ -12159,6 +12159,32 @@ export function issueRoutes(
         actor,
       });
     }
+    // An arm through `PATCH /issues/:id` reaches recovery revalidation via
+    // `monitorChanged`; without this an arm here leaves `active` the same
+    // recovery action that path retires, and the two paths disagree about a
+    // wake-path signal the fleet's attendance predicates read.
+    //
+    // A clear is skipped on purpose. It changes neither status nor assignee, so
+    // the status-keyed branches above the kind guard in
+    // `classifySourceRecoveryRevalidation` have nothing new to fold, and every
+    // branch below it cancels because the issue NOW has its own wake path while
+    // a clear only removes one: revalidating here could only cancel an action
+    // the row may still need. The legacy
+    // `{"executionPolicy": {}}` clear still revalidates; doc/execution-semantics.md
+    // records the asymmetry.
+    if (monitor) {
+      await revalidateActiveSourceRecoveryAfterCommittedWrite({
+        issue,
+        trigger: "issue_update",
+        actor,
+        // The convergence-stalled refusal moves the issue to `blocked`.
+        statusChanged: existing.status !== issue.status,
+        assigneeChanged:
+          existing.assigneeAgentId !== issue.assigneeAgentId ||
+          existing.assigneeUserId !== issue.assigneeUserId,
+        monitorChanged: true,
+      });
+    }
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
