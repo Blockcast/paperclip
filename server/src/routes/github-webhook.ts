@@ -54,6 +54,7 @@ import {
   recordDependabotWebhookDiagnostic,
   resolveDependabotIssueAssigneeId,
 } from "../services/dependabot-alert-issues.js";
+import { loadConfig } from "../config.js";
 import { logger } from "../middleware/logger.js";
 import { HttpError } from "../errors.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -74,6 +75,7 @@ import {
   githubPostIssueComment,
   type MergeHistoryShape,
 } from "../services/github-app-auth.js";
+import { GITHUB_REQUEST_TIMEOUT_MS } from "../services/github-fetch.js";
 import {
   buildForeignCommitNoticeBody,
   foreignCommitNoticeIdempotencyKey,
@@ -493,6 +495,26 @@ function isReviewGateEscalationProducer(
   const normalized = normalizeGithubLogin(login);
   if (!normalized) return false;
   return normalized === normalizeGithubLogin(REVIEW_GATE_ESCALATION_PRODUCER_LOGIN);
+}
+
+// BLO-23395: posted by .github/workflows/merge-queue-eviction-detector.yml
+// (scripts/merge-queue-eviction-detector.mjs) via the default GITHUB_TOKEN
+// whenever a PR is removed from the merge queue without being merged. Gated
+// on the exact github-actions[bot] login below (not just the marker) so an
+// arbitrary commenter cannot spoof a merge-queue-eviction wake.
+//
+// Anchored at literal byte 0, for the reason stated at length on
+// REVIEW_GATE_ESCALATION_MARKER_PATTERN above: leading whitespace in Markdown
+// is an indented code block, i.e. the canonical way to render "here is the
+// marker" while merely DISCUSSING it. The previous `trimStart()` spelling read
+// such a quote as a real eviction. The author guard bounds the blast radius to
+// github-actions[bot], but that identity posts many unrelated comments in this
+// repo, so the tolerance bought nothing and cost a spoofing shape.
+const MERGE_QUEUE_EVICTION_MARKER = "<!-- paperclip:merge-queue-eviction -->";
+const MERGE_QUEUE_EVICTION_BOT_LOGIN = "github-actions[bot]";
+
+function hasMergeQueueEvictionMarker(body: string | null | undefined): boolean {
+  return typeof body === "string" && body.startsWith(MERGE_QUEUE_EVICTION_MARKER);
 }
 
 // BLO-23059: Claude Code Review posts its "this integration is paused/disabled"
@@ -975,6 +997,18 @@ function resolvePrCommentReviewGateWebhookTrigger(
 // PR→issue back-link (BLO-13353, #973 symptom-1). A hidden marker makes the
 // one-time post idempotent across redeliveries/reopens: if any existing PR
 // comment carries it, we never post again.
+/**
+ * How long the durable comment-review gate backstop waits before it fires.
+ *
+ * It must outlast the live evaluation it backs up, or every webhook would pay
+ * for a second evaluation instead of only the ones that lose theirs. The live
+ * path's own bounded retries settle in seconds; the longest lag ever measured
+ * between a review and its gate status was ~6 minutes (onprem-k8s#4017), so 15
+ * gives that case room and still bounds a genuinely lost verdict to a quarter
+ * of an hour rather than forever.
+ */
+const COMMENT_REVIEW_GATE_REEVALUATION_DELAY_MS = 15 * 60_000;
+
 const PR_ISSUE_BACKLINK_MARKER = "<!-- paperclip-issue-backlink -->";
 
 function backLinkAbsoluteUrl(publicBaseUrl: string, issuePrefix: string, identifier: string): string {
@@ -1091,13 +1125,17 @@ function bodyReRaisesPriorFinding(body: string | null | undefined): boolean {
 // as "no finding re-raised" — failing in the suppressing direction. The
 // fallback only serves synthetic contexts that never went through a producer.
 //
-// This guard has no failing mutation today, and that is structural rather than
-// a gap in the tests: the ledger sits in the OPENING section of the reviewer's
-// template, above the counted findings buckets, so any body whose ledger is
-// clamped has already had its findings clamped — and that case is caught first
-// by the older raw read for reviewHasActionableFeedback. Keep the raw read
-// anyway: the ordering it relies on is enforced only by the reviewer's
-// template, not by this module. Do not delete it as provably dead code.
+// BOTH producers of this field have a failing mutation as of BLO-38809:
+// deleting the `pull_request_review` resolve-site line fails "classifies the
+// ledger off the RAW review body", and deleting the `issue_comment` one fails
+// the RAW comment body sibling. Neither did before, and the reason they did not
+// is worth keeping: in the reviewer's own template the ledger sits in the
+// OPENING section, above the counted findings buckets, so any body whose ledger
+// is clamped has already had its findings clamped — and that case is caught
+// first by the older raw read for reviewHasActionableFeedback. That ordering is
+// enforced only by the reviewer's template, not by this module, which is why the
+// raw read stays and why both guards are now pinned by a synthetic body rather
+// than by that accident.
 function reRaisesPriorFinding(context: ResolvedEventContext): boolean {
   return context.reviewReRaisesPriorFinding ?? bodyReRaisesPriorFinding(prFeedbackBody(context));
 }
@@ -1709,12 +1747,23 @@ function resolveEventContextRaw(
           });
         }
       }
+      // BLO-23395: a merge-queue eviction notice is its own actionable
+      // signal, independent of the reviewer-request/feedback detection above
+      // (it is not authored by the reviewer bot at all).
+      const mergeQueueEvictionNotice =
+        commentAuthorLogin === MERGE_QUEUE_EVICTION_BOT_LOGIN && hasMergeQueueEvictionMarker(commentBody);
       // PEN-3383: report the structureless-feedback drop only when it actually
       // changes the outcome — i.e. when nothing else claims this delivery. A
       // body that is also a review REQUEST or an ESCALATION still produces a
       // context on those paths and loses nothing, and reporting it there would
       // make this signal noise instead of the template-drift alarm it exists to
       // be.
+      //
+      // `mergeQueueEvictionNotice` is deliberately NOT a term here: the verdict
+      // can only be `suppressed_unstructured` for the configured reviewer
+      // identity (classifyPrReviewComment), and an eviction notice is authored
+      // by github-actions[bot], so the conjunction is unreachable. Adding it
+      // would assert a coupling that does not exist.
       if (
         reviewFeedbackVerdict === "suppressed_unstructured" &&
         !reviewerRequest &&
@@ -1728,7 +1777,8 @@ function resolveEventContextRaw(
           commentUrl: readStringField(comment, "html_url"),
         });
       }
-      if (!reviewerRequest && !reviewFeedback && !reviewGateEscalation) return null;
+      if (!reviewerRequest && !reviewFeedback && !reviewGateEscalation && !mergeQueueEvictionNotice)
+        return null;
       // BLO-9293: on a PR's issue_comment payload, `issue.user.login` is the PR
       // author (the comment author is `comment.user.login`, captured separately).
       const issueUser = issue.user as Record<string, unknown> | undefined;
@@ -1765,6 +1815,11 @@ function resolveEventContextRaw(
           issue.body as string | undefined,
         ),
         owningIdentifiers: owning.owning,
+        // Escalation and merge-queue eviction are mutually exclusive by
+        // construction — both markers are anchored at byte 0, so a body can
+        // lead with only one — which is why their relative order here is
+        // immaterial. Both must outrank `reviewerRequest`.
+        //
         // Escalation takes precedence over `reviewerRequest` deliberately, and
         // this ternary is the whole enforcement of "an escalation never
         // dispatches a review": shouldFirePrReviewerWake keys on wakeReason
@@ -1774,9 +1829,11 @@ function resolveEventContextRaw(
         // mention suppression instead would be a silent coupling.
         wakeReason: reviewGateEscalation
           ? "github_pr_review_gate_escalation"
-          : reviewerRequest
-            ? "github_pr_review_requested"
-            : "github_pr_review_feedback",
+          : mergeQueueEvictionNotice
+            ? "github_pr_merge_queue_evicted"
+            : reviewerRequest
+              ? "github_pr_review_requested"
+              : "github_pr_review_feedback",
         prNumber,
         repoFullName,
         // An issue_comment payload carries no `pull_request.head.sha` (see the
@@ -2769,7 +2826,16 @@ function wakeIdempotencySuffix(
 ): { suffix: string; scope: WakeIdempotencyScope } {
   const scopeFor = (identity: string | number | null): WakeIdempotencyScope =>
     identity === null || identity === "" ? "stable" : "request";
-  if (context.wakeReason === "github_pr_review_requested") {
+  // BLO-23395: a merge-queue eviction is comment-scoped for the same reason.
+  // The detector posts a NEW comment per eviction, so the comment id is the
+  // per-event identity. The default repo+pr+reason `stable` key would collide
+  // a second eviction with the first one's still-running author wake (the
+  // evict -> rebase -> re-enqueue -> evict loop) and drop it as a duplicate.
+  // Head-scoping would be wrong: an eviction can recur on an unchanged head.
+  if (
+    context.wakeReason === "github_pr_review_requested" ||
+    context.wakeReason === "github_pr_merge_queue_evicted"
+  ) {
     const identity = context.commentId ?? deliveryId ?? null;
     return {
       suffix: `${context.wakeReason}:comment:${identity ?? "unknown"}`,
@@ -2873,7 +2939,8 @@ const REVIEWER_HEAD_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
 ]);
 
 // The PR-author wake keeps repo+pr+reason keys for everything except the
-// comment-scoped @ally request; widening it is a separate behavior change.
+// comment-scoped @ally request and merge-queue eviction; widening it is a
+// separate behavior change.
 const AUTHOR_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set();
 
 function prReviewerWakeIdempotencyScope(
@@ -3257,11 +3324,26 @@ async function withPrReviewerTaskLock<T>(
  * for a few milliseconds each; the critical section is two statements plus the
  * enqueue, so even a large burst drains far inside GitHub's webhook timeout.
  *
- * This is a bound, not the structural fix. Doing the enqueue on the lock's own
- * connection would remove the second checkout entirely, but `enqueueWakeup`
- * opens its own transaction and threading one through it is a much wider
- * change to the wake path — deliberately left for structural review rather
- * than folded in here.
+ * This is a bound, not the structural fix, and BLO-37330 decided it stays that
+ * way. Doing the enqueue on the lock's own connection would remove the second
+ * checkout entirely — that is how every other nesting path was fixed (recovery,
+ * issues, environment leases, both outboxes all thread `tx` through). It does
+ * not transfer here.
+ *
+ * Measured 2026-09-28: `enqueueWakeup` (`services/heartbeat.ts`) is ~2,650
+ * lines and opens **three independent** `db.transaction(...)` blocks, each
+ * committing on its own. Threading this lock's `tx` in would fold all three
+ * into the caller's transaction, so they would commit or roll back as one unit
+ * *and* the advisory lock would be held across the whole wake. That changes the
+ * durability semantics of the wake path — a wake request that today survives a
+ * later failure would begin disappearing with it — which is a behaviour change
+ * to the dispatch path, not a refactor. The sibling conversions were all single
+ * short transactions where no such semantics existed to break.
+ *
+ * So the second checkout is deliberate and the concurrency bound below is what
+ * makes it safe. The pool it is derived from is sized against a written
+ * server-side budget (`doc/DATABASE-CONNECTION-BUDGET.md`), so the bound now
+ * scales with a number that has been re-derived rather than inherited.
  *
  * Exported for test: the invariant that matters is `2 * bound < poolMax`, and
  * pinning it as a property of the derivation covers pool sizes no integration
@@ -3941,6 +4023,17 @@ export async function reconcileContendedPrReviewerWakes(
         liveHeadSha = await (config.resolvePrReviewHeadSha ?? githubFetchPrHeadSha)({
           repoFullName: replay.context.repoFullName,
           prNumber: replay.context.prNumber,
+          // Not request-inline: the only production caller is the heartbeat
+          // tick, at the end of the latched recovery chain
+          // (`heartbeatRecoveryChainInFlight` in index.ts), so no GitHub
+          // delivery is held open here. It is bounded because a slow read holds
+          // that latch, and every tick skips recovery until it lets go
+          // (BLO-38257); a timed-out read degrades to the warn below. The bound is
+          // per row, not per pass: a full 50-row batch can still spend 50 x this
+          // timeout here. A pass-level budget was rejected because, once spent,
+          // it would send every later row to the frozen-head fallback, which is
+          // the duplicate-review shape this block exists to stop.
+          signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
         });
       } catch (err) {
         logger.warn(
@@ -5196,6 +5289,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         const headSha = await resolveHeadSha({
           repoFullName: context.repoFullName,
           prNumber: context.prNumber,
+          signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
         });
         if (headSha) {
           context = { ...context, headSha };
@@ -5302,6 +5396,69 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       config.prReviewerBotLogin,
     );
     if (commentReviewGateTrigger) {
+      // The head this delivery is about, read from the signed payload only.
+      // `headSha` is absent on the review and comment triggers by design — the
+      // live evaluation resolves the head itself so a status is never written
+      // to a commit the branch has moved past — so take it from the payload's
+      // own `pull_request.head.sha` here. `issue_comment` carries no head at
+      // all and gets no backstop rather than an API read before the ack; Ally
+      // has used the reviews surface for 33 of 33 measured consolidated
+      // reviews, so that is the rare path, not the common one.
+      const commentReviewGateBackstopSha =
+        commentReviewGateTrigger.headSha
+        ?? readStringField(
+          (payload.pull_request as Record<string, unknown> | undefined)?.head as
+            | Record<string, unknown>
+            | undefined,
+          "sha",
+        );
+      // Durable backstop, queued BEFORE the detached evaluation below and
+      // before this request acks (BLO-36819). That evaluation is the sole
+      // writer of this status context and has no retry that outlives the
+      // process: a fetch failure past its bounded retries, a refused status
+      // POST, or an API pod restart mid-flight all leave the previous verdict
+      // standing forever. frr#105 sat red for hours after a clean at-head
+      // review for exactly that reason.
+      //
+      // Cheap because it is self-cancelling: the outbox skips the row when a
+      // status for this context was written at or after the row was queued, so
+      // on every webhook whose live evaluation lands — which is ~98% of them —
+      // this costs one upsert and one status read, and no GitHub write.
+      // `loadConfig()`, not the injected route config: the gate's status
+      // context is deployment configuration (the same value
+      // runPrCommentReviewGateCheck reads), not a route seam.
+      // The config read sits INSIDE the try (BLO-36819 review): loadConfig()
+      // re-derives the config file on every call and can throw, and a throw
+      // here would skip the live evaluation below and fail the ack. Losing the
+      // backstop is the tolerable outcome; losing the gate is not.
+      try {
+        const commentReviewGateContext = loadConfig().prCommentReviewGateStatusContext.trim();
+        if (commentReviewGateContext && commentReviewGateBackstopSha) {
+          await enqueueGithubCommitStatusDelivery(db, {
+            companyId: null,
+            sourceRunId: null,
+            repoFullName: commentReviewGateTrigger.repoFullName,
+            sha: commentReviewGateBackstopSha,
+            context: commentReviewGateContext,
+            // Placeholder: a reevaluate row computes its own verdict and never
+            // publishes this state. `pending` is the safe value if a future
+            // change ever did replay it.
+            state: "pending",
+            description: "Comment-review gate re-evaluation queued.",
+            reevaluate: true,
+            delayMs: COMMENT_REVIEW_GATE_REEVALUATION_DELAY_MS,
+            prNumber: commentReviewGateTrigger.prNumber,
+            prUrl: commentReviewGateTrigger.prUrl,
+          });
+        }
+      } catch (err) {
+        // Never fail the ack for the backstop. Losing it costs the behavior
+        // we had before this existed, not a redelivery storm.
+        logger.warn(
+          { err, deliveryId, event: eventName, ...commentReviewGateTrigger },
+          "github webhook comment-review gate re-evaluation enqueue failed (non-fatal)",
+        );
+      }
       // Build the input once and hand the SAME object to both branches, so the
       // injection seam observes the real argument — including `db`. When the
       // seam was called with the bare trigger, no webhook-level test could
@@ -6018,6 +6175,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           const headBranchState = await githubResolveBranchState({
             repoFullName: stackedRepoFullName,
             branch: mergedBaseRef,
+            signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
           });
           if (headBranchState !== "exists") {
             logger.warn(
@@ -6419,11 +6577,94 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // Both lazy: this pair is declared here so the PEN-3397 discharge below can
+    // sit ABOVE the `matched.length === 0` gate (see its comment). The
+    // heartbeat used to be constructed eagerly below that gate, which is what
+    // pinned the discharge underneath it. Laziness keeps that move free --
+    // a delivery that exits at the gate without discharging anything still
+    // constructs neither service, exactly as before.
+    let heartbeatInstance: ReturnType<typeof heartbeatService> | null = null;
+    const getHeartbeat = () =>
+      (heartbeatInstance ??= heartbeatService(db, {
+        pluginWorkerManager: config.pluginWorkerManager,
+        ...config.heartbeatOptions,
+      }));
+    let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
+    const getRecovery = () =>
+      // Thunked rather than `getHeartbeat().wakeup`: the discharge path never
+      // enqueues a wake, so binding the method here would construct a heartbeat
+      // for every discharge that does not need one.
+      (recoveryInstance ??= recoveryService(db, {
+        enqueueWakeup: (...args) => getHeartbeat().wakeup(...args),
+      }));
+
+    // PEN-3397: a closed PR discharges any `pr_review_non_convergence` action
+    // raised against it. Gated on the `closed` action rather than on
+    // `prMerged === true` like the merged-PR forward-capture above, because a PR
+    // closed WITHOUT merging ends the self-review loop just as conclusively as a
+    // merge — abandoned or superseded, there is still no author left to unstick.
+    //
+    // MUST stay ABOVE the `matched.length === 0` gate below. `matched` is
+    // identifier-matched issues only, so a `closed` delivery whose issue link
+    // exists solely through `pullRequestWorkProductExternalId` exits there --
+    // and that previously-linked half is precisely the half this block's wide
+    // candidate set exists to serve. Placing it after the gate made the call
+    // unreachable for it (caught in review on PR#1967, PEN-3397). The sibling
+    // work-product block consuming the identical set sits above the gate for
+    // the same reason.
+    //
+    // Candidate set is deliberately wide (`pullRequestWorkProductTargets`, i.e.
+    // matched ∪ previously-linked): the service matches on a fingerprint built
+    // from `(issue.id, repoFullName, prNumber)`, so an issue that merely mentions
+    // this PR cannot match, while an issue whose body no longer names the PR is
+    // still reached through the previously-linked half.
+    //
+    // Best-effort, mirroring the forward-capture and work-product blocks: this
+    // must never break the wake path.
+    let prNonConvergenceDischarged = 0;
+    if (
+      eventName === "pull_request" &&
+      context.prAction === "closed" &&
+      context.prNumber !== null &&
+      // Symmetry with the sibling merged-PR block above. Not a live defect
+      // today -- creation and discharge both normalize a null through
+      // `?? "unknown"`, so the fingerprints still match -- but the two
+      // normalizations are independent, and a null repo here can only ever
+      // produce a silent no-op. Refusing it makes that explicit.
+      context.repoFullName &&
+      pullRequestWorkProductTargets.length > 0
+    ) {
+      try {
+        const discharged = await getRecovery().closePrReviewNonConvergenceForClosedPr({
+          repoFullName: context.repoFullName,
+          prNumber: context.prNumber,
+          merged: context.prMerged === true,
+          candidateIssues: pullRequestWorkProductTargets.map((issue) => ({
+            id: issue.id,
+            companyId: issue.companyId,
+            identifier: issue.identifier,
+          })),
+        });
+        prNonConvergenceDischarged = discharged.closed;
+      } catch (err) {
+        logger.error(
+          { err, prNumber: context.prNumber, repoFullName: context.repoFullName },
+          "pr_review_non_convergence auto-discharge on PR close failed",
+        );
+      }
+    }
+
     if (matched.length === 0) {
       respond(200, {
         ok: true,
         ignored: "no_matching_issue",
         identifiers: context.identifiers,
+        // PEN-3397: same reasoning as `reviewerWakeFired` below -- the
+        // discharge now runs above this gate, so this exit is a path on which
+        // it can have fired. Reporting it only on the main response would make
+        // exactly the previously-linked-only delivery this block was hoisted to
+        // serve the one delivery whose outcome is invisible.
+        ...(prNonConvergenceDischarged > 0 ? { prNonConvergenceDischarged } : {}),
         // BLO-23893: `reviewerWakeFired` is computed for EVERY delivery but
         // used to be reported only on the two `no_paperclip_identifier`
         // exits. That was invisible until the BLO-20886 owning-union fix
@@ -6437,10 +6678,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       });
       return;
     }
-    const heartbeat = heartbeatService(db, {
-      pluginWorkerManager: config.pluginWorkerManager,
-      ...config.heartbeatOptions,
-    });
+    const heartbeat = getHeartbeat();
     const wakes: Array<{ issueIdentifier: string | null; agentId: string }> = [];
     const skipped: Array<{ issueIdentifier: string | null; reason: string }> = [];
     const reopened: Array<{ issueIdentifier: string | null; commentId: string | null }> = [];
@@ -6545,9 +6783,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
-    let recoveryInstance: ReturnType<typeof recoveryService> | null = null;
-    const getRecovery = () =>
-      (recoveryInstance ??= recoveryService(db, { enqueueWakeup: heartbeat.wakeup }));
     const actionableReviewFeedback = isActionableReviewFeedbackContext(context);
     // BLO-32381: reconstructed from wakeReason rather than threaded through as
     // its own context field. resolveEventContext already made the decision (and
@@ -6936,6 +7171,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             ...(context.wakeReason === "github_pr_review_requested" && context.commentAuthorLogin
               ? { githubPrReviewRequestAuthorLogin: context.commentAuthorLogin }
               : {}),
+            // BLO-23395: inline the eviction-cause comment so the woken agent
+            // doesn't have to fetch githubEventUrl just to learn why.
+            ...(context.wakeReason === "github_pr_merge_queue_evicted" && context.commentBody
+              ? { githubMergeQueueEvictionBody: context.commentBody }
+              : {}),
           },
           // Coalesce rapid bursts on the same PR/event so a single review
           // submission can't fan into N author runs. Parallel to the
@@ -7022,6 +7262,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       reviewerWakeFired,
       reviewerRunsCancelled,
       ...(workProductsUpserted > 0 ? { workProductsUpserted } : {}),
+      ...(prNonConvergenceDischarged > 0 ? { prNonConvergenceDischarged } : {}),
       ...(backLinked.length ? { backLinked } : {}),
       ...(foreignCommitNotices > 0 ? { foreignCommitNotices } : {}),
       ...(foreignCommitListingTruncated ? { foreignCommitListingTruncated } : {}),
@@ -7079,6 +7320,7 @@ export const __test_commentsContainBackLinkMarker = commentsContainBackLinkMarke
 export const __test_backLinkAbsoluteUrl = backLinkAbsoluteUrl;
 export const __test_isSelfReviewedPr = isSelfReviewedPr;
 export const __test_bodyReRaisesPriorFinding = bodyReRaisesPriorFinding;
+export const __test_reRaisedPriorFindingLabels = reRaisedPriorFindingLabels;
 export const __test_resolvePrCommentReviewGateWebhookTrigger = resolvePrCommentReviewGateWebhookTrigger;
 export const __test_readReviewGateEscalationHeadSha = readReviewGateEscalationHeadSha;
 export const __test_isActionablePrReviewComment = isActionablePrReviewComment;

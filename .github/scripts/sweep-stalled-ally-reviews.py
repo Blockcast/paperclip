@@ -300,6 +300,22 @@ STALL_THRESHOLD_SECONDS = int(os.environ.get("STALL_THRESHOLD_SECONDS") or 18 * 
 # manually inside the cooldown; this only throttles the AUTOMATED re-ask.
 REFIRE_COOLDOWN_SECONDS = int(os.environ.get("REFIRE_COOLDOWN_SECONDS") or 2 * 60 * 60)
 
+# How often the sweep runs, mirroring `cron: '9 * * * *'` in
+# review-gate-sweep.yml. Used ONLY to state the rotation coverage bound in the
+# run summary (MAX_REFIRES_PER_RUN x cooldown/interval; see PEN-3589) -- no
+# decision reads it, so drift against the workflow misstates one sentence
+# rather than changing any behaviour. Kept here rather than parsed from the
+# workflow because a YAML cron parser is far more machinery than one
+# operator-facing figure is worth.
+#
+# Clamped to at least 1s for the same reason MAX_REFIRE_ATTEMPTS_PER_RUN is
+# clamped: it is operator-settable, it is a DIVISOR at the coverage-bound
+# print, and that print happens AFTER the run's writes have landed. An
+# unclamped 0 raises ZeroDivisionError there, which the top-level handler does
+# not catch (it takes RateLimitExhausted/HTTPError/URLError), so a stray env
+# value would turn a fully-successful sweep into a bare traceback.
+SWEEP_RUN_INTERVAL_SECONDS = max(1, int(os.environ.get("SWEEP_RUN_INTERVAL_SECONDS") or 60 * 60))
+
 # Ceiling on re-fires per run. The trafficcontrol original needed no such cap:
 # its status pre-filter naturally bounded the candidate set to heads a gate
 # had recently touched. `status-free` mode has no such bound -- on a repo with
@@ -308,6 +324,62 @@ REFIRE_COOLDOWN_SECONDS = int(os.environ.get("REFIRE_COOLDOWN_SECONDS") or 2 * 6
 # cooldown exists to avoid. Over-limit PRs are not dropped silently: they are
 # reported as deferred, still counted in `considered`, and still alarm.
 MAX_REFIRES_PER_RUN = int(os.environ.get("MAX_REFIRES_PER_RUN") or 5)
+
+# Ceiling on re-fire ATTEMPTS per run. MAX_REFIRES_PER_RUN counts re-fires
+# that were actually DELIVERED, so a PR whose write fails does not consume a
+# slot -- otherwise a permanently-failing PR would hold rank 0 forever (no
+# marker is posted on failure, so its cooldown never engages and its wait
+# keeps growing), and MAX_REFIRES_PER_RUN such PRs would starve the budget
+# every run. That fall-through has to stop somewhere or a run where every
+# write fails would attempt the entire eligible set, so this bounds the
+# extra calls.
+#
+# 2x the delivery cap. Each re-fire costs up to 4 requests -- request_review
+# does GET + conditional DELETE + POST (it withdraws an existing request
+# before re-issuing it, see its docstring), then the marker comment POST -- so
+# the worst case is 40 requests, 30 of them writes, against github.token's
+# 1,000/hour/repository budget. The 4-request branch is the steady state
+# rather than the corner: a COMMENTED review does not clear a review request,
+# so the PRs this sweep re-fires are exactly the ones that keep one
+# outstanding, and the conditional DELETE fires. Negligible beside the ~359
+# reads a run already makes (see review-gate-sweep.yml's rate-limit
+# arithmetic, which is unchanged by this -- that note's ~270 is the same
+# 3-reads-per-PR method over a hypothetical 90 open PRs, not a competing
+# figure). It tolerates up to MAX_REFIRES_PER_RUN persistently-failing PRs
+# while still delivering a full budget to healthy ones.
+#
+# Clamped to at least the delivery cap. An operator-set value below it would
+# make MAX_REFIRES_PER_RUN unreachable, and the deferral message would then
+# name the attempt ceiling while implying the delivery budget had been spent.
+# The clamp makes that state unrepresentable rather than merely unlikely.
+MAX_REFIRE_ATTEMPTS_PER_RUN = max(
+    MAX_REFIRES_PER_RUN,
+    int(os.environ.get("MAX_REFIRE_ATTEMPTS_PER_RUN") or 2 * MAX_REFIRES_PER_RUN),
+)
+
+# Absolute floor at which the WRITE pass alone marks a run degraded.
+#
+# "WRITE pass" names the PASS, not the write call: the expression at its use
+# site counts BOTH refire_write_failures and refire_recheck_failures, because
+# both arise in pass 2 and both spend the same ceiling (the re-check is
+# counted against MAX_REFIRE_ATTEMPTS_PER_RUN at its own guard, `attempted +
+# recheck_failures >= ...`). Sharing the ceiling is the entire argument for an
+# absolute floor, so a bucket that shares the ceiling shares the floor. The
+# name is kept over REFIRE_PASS_DEGRADED_FLOOR because the boundary that
+# matters here is pass 1 vs pass 2 -- read population vs bounded population --
+# and "write pass" is how the rest of this file draws it.
+#
+# The read pass is judged proportionally (sweep_is_degraded), which is right
+# for a population whose size is the open-PR count. The write pass is NOT that
+# population: it is hard-capped at MAX_REFIRE_ATTEMPTS_PER_RUN just above, so
+# past ~100 open PRs a proportional threshold rises above that ceiling and
+# becomes unreachable -- every write can fail and the run still exits 0. A
+# bounded population needs a bounded trigger.
+#
+# 3 matches sweep_is_degraded's own floor, and is a majority of the
+# MAX_REFIRES_PER_RUN=5 a healthy run delivers, so it reads as "the write side
+# is systematically failing" rather than one transient rejection.
+WRITE_PASS_DEGRADED_FLOOR = 3
 
 # BLO-22892 AC4: the stranded condition must be visible without a human
 # noticing by hand. A re-fired request can itself go unserviced (that's the
@@ -387,6 +459,117 @@ REVIEWED_SKIP_REASON_PREFIX = "skip: Ally reviewed this head between scan and wr
 # instead of reporting N indistinguishable per-PR errors.
 RATE_LIMIT_TOKEN = "RateLimitExhausted"
 
+# Distinguishing token for a failure in the WRITE pass rather than the read
+# pass. Both are recorded under SWEEP_ERROR_REASON_PREFIX (both are genuine
+# failures and must count toward sweep_is_degraded), but only a write failure
+# means "this PR won a slot and the re-fire did not land" -- which is what
+# lets main()'s deferred summary stay honest about where the budget went.
+REFIRE_WRITE_FAILURE_TOKEN = "re-fire write failed"
+
+# Distinguishing token for a failure of the PRE-WRITE RE-CHECK
+# (refire_still_permitted), which is a third failure surface: it issues a live
+# read of its own, after the budget is committed but before any write. Kept
+# separate from REFIRE_WRITE_FAILURE_TOKEN because the operator question the
+# two answer is different -- a write failure means the re-fire was attempted
+# and did not land, while this means it was never attempted at all.
+#
+# Split the two halves of what that costs, because they go opposite ways and
+# reading one for the other is how the deferral header fell behind its own
+# ceiling. It leaves the DELIVERY cap (MAX_REFIRES_PER_RUN) free, since
+# nothing was delivered -- but it SPENDS the ATTEMPT ceiling
+# (MAX_REFIRE_ATTEMPTS_PER_RUN), because it made live reads and produced no
+# write, which is exactly the shape that ceiling exists to bound. Contrast
+# the WITHHELD branch, which spends neither. See the comment on the
+# `recheck_failures += 1` site for the full argument.
+#
+# MUST NOT contain REFIRE_WRITE_FAILURE_TOKEN as a substring: main() classifies
+# results by substring-matching these display strings (see the rate-limit
+# exclusion below, and PEN-3417), so an overlapping token would silently
+# re-classify every re-check failure as a failed write and inflate the
+# "(N re-fire write(s) failed)" figure operators read.
+REFIRE_RECHECK_FAILURE_TOKEN = "re-fire pre-write re-check failed"
+
+# The write-pass failure tokens, as ONE set. Every member means "this PR WAS
+# fully evaluated in the read pass -- its `pending_since` and therefore its
+# alarm verdict are exact -- and only the write pass failed". Read-pass
+# failures are what is left once these are excluded.
+#
+# Named as a set rather than spelled out at each use site because this same
+# correction has now been made three times, each time by editing one call
+# site and missing the others: `rate_limited` reported a fully-evaluated PR
+# as one the run never reached (PEN-3417), then the DEGRADED paragraph
+# reported it as one that "could not be read", then the section heading and
+# the console line kept doing so after the paragraph was fixed. Each was the
+# same defect at a different doorway. Deriving every bucket from this tuple
+# means a token added here leaves all of them at once, so the next bucket
+# cannot re-open the gap in whichever surface was not updated.
+WRITE_PASS_FAILURE_TOKENS = (REFIRE_WRITE_FAILURE_TOKEN, REFIRE_RECHECK_FAILURE_TOKEN)
+
+
+def is_write_pass_failure(reason):
+    """True when `reason` names a failure the PR was fully evaluated before.
+
+    Substring matching, like every other classifier here -- the tokens are
+    display strings embedded in a human-readable reason. WRITE_PASS_FAILURE_TOKENS
+    are required to be mutually non-overlapping (see REFIRE_RECHECK_FAILURE_TOKEN)
+    so membership here cannot double-count.
+    """
+    text = str(reason)
+    return any(token in text for token in WRITE_PASS_FAILURE_TOKENS)
+
+
+def failure_breakdown(read_count, write_count, recheck_count):
+    """Name every non-empty failure bucket, for the surfaces that report a total.
+
+    Two surfaces report `len(failed)` as a single number -- the section
+    heading and the console line -- and that number spans three kinds whose
+    meaning to an operator is opposite: a read failure means a PR was never
+    evaluated and the `alarming` count is an undercount, while the other two
+    mean the PR was evaluated exactly and only the re-fire did not land.
+    Reporting the total under one verb is what made the heading contradict
+    the paragraph directly beneath it.
+
+    The three buckets partition `failed` exactly -- `read_failures` is its
+    complement with respect to WRITE_PASS_FAILURE_TOKENS, whose members are
+    required to be mutually non-overlapping -- so the parts always sum to the
+    total the caller prints beside them.
+    """
+    parts = []
+    if read_count:
+        parts.append("%d could not be read" % read_count)
+    if write_count:
+        parts.append("%d failed the re-fire write" % write_count)
+    if recheck_count:
+        parts.append("%d failed the pre-write re-check" % recheck_count)
+    return ", ".join(parts)
+
+
+def unserved_breakdown(write_count, recheck_count):
+    """Name every non-empty bucket that won a slot and posted no marker.
+
+    The deferred section's rotation guarantee is earned by
+    REFIRE_COOLDOWN_SECONDS, which starts only when a marker is actually
+    posted. Two buckets win a slot and post none: a re-fire whose WRITE
+    failed, and one whose PRE-WRITE RE-CHECK failed (that branch `continue`s
+    before `_refire_pr` is ever entered). For the rotation claim the two are
+    indistinguishable -- both leave a longer-waiting PR unserved and
+    uncooled, so both re-take the front of the next run ahead of everything
+    deferred behind them.
+
+    Kept separate from failure_breakdown because the question is different:
+    that one partitions `failed` for an operator asking "what broke", this
+    one names only the buckets that falsify the rotation guarantee. Read
+    failures are deliberately absent -- a PR that could not be read never
+    reached the budget, so it neither won a slot nor lost one.
+    """
+    parts = []
+    if write_count:
+        parts.append("%d re-fire write(s) failed" % write_count)
+    if recheck_count:
+        parts.append("%d pre-write re-check(s) failed" % recheck_count)
+    return " and ".join(parts)
+
+
 # Every API call is bounded. urlopen's default timeout is None -- block
 # forever -- and this script never calls socket.setdefaulttimeout(), so a
 # single stalled TCP connection would otherwise hang the job to the Actions
@@ -401,10 +584,17 @@ REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS") or 30)
 # Exit codes. Both are non-zero (both turn the scheduled job red), but they
 # are distinct so a red run can be read without opening the log: a stranded
 # PR needs a human to go review it, whereas a degraded sweep means the
-# reconciler itself did not run and the PR list is unknown. Conflating them
-# would mean "red because it worked and found something" and "red because it
-# could not look" are the same signal -- which is the failure class this
+# reconciler could not complete its own work. Conflating them would mean
+# "red because it worked and found something" and "red because it could not
+# do its job" are the same signal -- which is the failure class this
 # reconciler exists to remove.
+#
+# "Could not complete its work" covers two shapes, and main()'s summary names
+# which one occurred rather than leaving the reader to assume the first:
+# a READ failure, where the PR list is unknown and the alarm count is
+# therefore unreliable; and a re-fire WRITE failure, where every PR was read
+# (so the alarm count is exact) but re-fires the sweep decided on did not
+# land. Both are genuine failures of the run; only the first blinds it.
 EXIT_ALARM = 1
 EXIT_SWEEP_DEGRADED = 2
 
@@ -740,7 +930,8 @@ def ally_has_reviewed_head(reviews, comments, head_sha, ally_logins):
     return False
 
 
-def build_comment_body(pr_number, head_sha, age_seconds, requested_login=None, mode=None):
+def build_comment_body(pr_number, head_sha, age_seconds, requested_login=None, mode=None,
+                       request_pending=False):
     """The durable audit trail for a re-fire, and the cooldown input.
 
     The opening sentence is mode-aware on purpose. In `status-free` mode there
@@ -748,17 +939,36 @@ def build_comment_body(pr_number, head_sha, age_seconds, requested_login=None, m
     wording ("this PR's `review/ally-complete` check has been `pending`")
     would assert a signal that does not exist -- misleading anyone who then
     goes looking for it on the Checks tab.
+
+    `request_pending` renders the line for the case where the review request
+    has NOT been issued yet, which is the live ordering in _refire_pr: the
+    marker is posted first so it exists even if a later call fails (PEN-3394
+    review). The two outcome-asserting variants are kept for callers that
+    already know the result. Do not collapse the three -- a body that claims
+    an outcome it was written before is exactly the false audit trail this
+    comment is supposed to be evidence against.
     """
     hours = age_seconds / 3600.0
     mode = mode or PREDICATE_MODE
-    request_line = (
-        "Requested a review from @%s directly (native GitHub review request, "
-        "not just this comment) against current head `%s`.\n" % (requested_login, head_sha[:7])
-        if requested_login
-        else "Attempted to request a review from @%s directly; that call failed, so this "
-        "comment is the only re-fire for now -- see the sweep job's Actions log.\n"
-        % ALLY_REQUEST_REVIEWER_LOGIN
-    )
+    if request_pending:
+        request_line = (
+            "Requesting a review from @%s directly (native GitHub review request, not "
+            "just this comment) against current head `%s`. This comment is posted FIRST, "
+            "before that request, so the re-fire cooldown is recorded even if the request "
+            "call fails -- see the sweep job's Actions log for its outcome.\n"
+            % (ALLY_REQUEST_REVIEWER_LOGIN, head_sha[:7])
+        )
+    elif requested_login:
+        request_line = (
+            "Requested a review from @%s directly (native GitHub review request, "
+            "not just this comment) against current head `%s`.\n" % (requested_login, head_sha[:7])
+        )
+    else:
+        request_line = (
+            "Attempted to request a review from @%s directly; that call failed, so this "
+            "comment is the only re-fire for now -- see the sweep job's Actions log.\n"
+            % ALLY_REQUEST_REVIEWER_LOGIN
+        )
     if mode == "status":
         condition = "this PR's `%s` check has been `pending` for %.1fh" % (STATUS_CONTEXT, hours)
     else:
@@ -1087,27 +1297,29 @@ def too_young_to_be_stranded(pr_payload, now):
     return (now - created) < STALL_THRESHOLD_SECONDS
 
 
-def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry_run=False):
-    """Evaluate one open PR and, if it is stranded, re-fire the request and
-    post the marker comment. Returns the result tuple for the accounting.
-    Network failures propagate to sweep(), which isolates them per-PR.
+def _consider_pr(owner, repo, pr, token, api_base_url, now):
+    """Evaluate one open PR and report whether it is stranded and eligible
+    for a re-ask. Returns the result tuple for the accounting. Network
+    failures propagate to sweep(), which isolates them per-PR.
 
-    `may_refire` False means the run's MAX_REFIRES_PER_RUN budget is spent.
-    The PR is still fully evaluated -- so it still counts toward `considered`
-    and can still ALARM -- but the two write calls are withheld and the
-    reason is marked deferred. Skipping evaluation instead would hide a
-    stranded PR behind a rate limit, which is the silent cap this must not be.
+    Issues NO writes, deliberately. Which of the eligible PRs actually get
+    the run's MAX_REFIRES_PER_RUN budget cannot be decided while walking the
+    list, because it depends on how every OTHER PR came out -- see the
+    ranking note in sweep(). Writing here is what made the budget
+    first-come-first-served over an order nobody chose.
 
-    `dry_run` reports the decision without issuing either write. The returned
-    re-fire flag stays True so the caller's accounting and budget match a live
-    run exactly; only the side effects are withheld.
+    Every PR is still fully evaluated whether or not it will win a slot, so
+    a PR that loses one still counts toward `considered` and can still ALARM.
+    Skipping evaluation instead would hide a stranded PR behind the cap,
+    which is the silent cap this must not be.
 
-    A re-fire decision is re-checked against freshly-read state immediately
-    before the write (refire_still_permitted) -- the scan's reads are minutes
-    stale by then. Both of the scan's preconditions are re-applied: a
-    concurrent sweep may have re-asked (BLO-31908) and Ally may have answered
-    (BLO-32044). Neither `may_refire=False` nor `dry_run` pays for that extra
-    read, since neither is going to write.
+    A re-fire decision made here is PROVISIONAL. The scan's reads are minutes
+    stale by the time a write is issued, so BOTH of this pass's preconditions
+    are re-applied immediately before that write by refire_still_permitted():
+    a concurrent sweep may have re-asked (BLO-31908) and Ally may have
+    answered (BLO-32044). That re-check lives in sweep()'s pass 2 rather than
+    here, because this pass issues no writes -- which is also what keeps a
+    budget-deferred PR and a dry run from paying for its extra read.
     """
     number = pr["number"]
     is_draft = bool(pr.get("draft"))
@@ -1173,65 +1385,53 @@ def _consider_pr(owner, repo, pr, token, api_base_url, now, may_refire=True, dry
         "existing_marker_epochs": marker_epochs,
     }
     refire, reason = should_refire(decision_input, now)
-    if refire and not may_refire:
-        return (
-            pr,
-            head_sha,
-            pending_since,
-            False,
-            "%s -- %s, over MAX_REFIRES_PER_RUN=%d this run" % (DEFERRED_REASON_PREFIX, reason, MAX_REFIRES_PER_RUN),
-        )
-    if refire and dry_run:
-        return (pr, head_sha, pending_since, True, "DRY-RUN would re-fire -- %s" % reason)
-    if refire:
-        # Re-read the surfaces and re-apply BOTH scan-time preconditions
-        # immediately before the write (BLO-31908 cooldown, BLO-32044
-        # already-reviewed). The scan's reads are minutes stale by now: a sweep
-        # running concurrently -- or an operator re-asking by hand -- may have
-        # posted a marker in between, and Ally may simply have answered. Firing
-        # on top of either is the stacked-request pathology this repo has hit
-        # before.
-        permitted, withheld, prefix = refire_still_permitted(
-            owner, repo, number, head_sha, token, api_base_url, now
-        )
-        if not permitted:
-            # BOTH writes are withheld, not just the reviewer re-request.
-            # Posting the marker comment alone would still double the re-ask
-            # trail and push the cooldown out for the next run, so gating only
-            # request_review would leave half the defect in place.
-            if prefix == REVIEWED_SKIP_REASON_PREFIX:
-                # Same fact the scan normalizes above (ally_has_reviewed_head
-                # -> pending_since = None), just discovered minutes later:
-                # Ally answered THIS head, so the PR is not stranded. Without
-                # this, is_alarming counts the guard's healthiest outcome and
-                # main() fails the run red on it. The contended branch keeps
-                # pending_since on purpose -- that PR genuinely is still
-                # waiting, and must still be able to alarm.
-                #
-                # Both surfaces reach HERE rather than the contended branch:
-                # the guard runs the comment AND reviews answered-checks ahead
-                # of the cooldown (see refire_still_permitted's ORDERING), so
-                # an answered-AND-contended PR is reported as answered however
-                # Ally replied. That matters because the reviews surface is
-                # the one Ally actually uses -- across the 45 most recent PRs
-                # in this repo, ZERO reports landed on the comment surface.
-                # The zero is the claim; the numerator drifts (see the
-                # ORDERING docstring in refire_still_permitted).
-                pending_since = None
-            return (pr, head_sha, pending_since, False, "%s -- %s" % (prefix, withheld))
-        requested = request_review(owner, repo, number, token, api_base_url)
-        body = build_comment_body(
-            number, head_sha, now - pending_since,
-            requested_login=ALLY_REQUEST_REVIEWER_LOGIN if requested else None,
-            mode=PREDICATE_MODE,
-        )
-        _request(
-            "%s/repos/%s/%s/issues/%d/comments" % (api_base_url.rstrip("/"), owner, repo, number),
-            token,
-            method="POST",
-            payload={"body": body},
-        )
     return (pr, head_sha, pending_since, refire, reason)
+
+
+def _refire_pr(owner, repo, pr, head_sha, pending_since, token, api_base_url, now):
+    """Issue the writes for one stranded PR: the marker comment and the native
+    reviewer re-request, in that order. Two write STEPS, but up to three write
+    REQUESTS -- request_review withdraws an existing request before re-issuing
+    it, so it is itself a GET plus a conditional DELETE plus a POST (see its
+    docstring, and the budget note at MAX_REFIRE_ATTEMPTS_PER_RUN).
+
+    Split out of _consider_pr so the decision pass can rank every eligible PR
+    before any of them is written (see sweep()). Exceptions propagate to the
+    caller, which isolates them per-PR exactly as the decision pass does.
+
+    ORDER IS LOAD-BEARING: the marker comment is posted BEFORE the review
+    request, and must stay that way (PEN-3394 review). The marker is the
+    cooldown's ONLY token, and request_review swallows its own failures
+    (returning a bool) while the comment POST raises. Under the old order --
+    request first, comment second -- a comment that raised left a wake already
+    delivered and no token to throttle the next one: `succeeded` is not
+    incremented, `cooldown_blocks_refire` stays False, `pending_since` has not
+    moved, and under longest-wait ranking the PR is still rank 0, so the next
+    hourly run serves it first and wakes Ally again. Forever, while
+    `unserved_breakdown` reports it to the operator as NOT served. GitHub's
+    secondary content-creation limit is the realistic trigger, and this loop
+    invites it by POSTing up to MAX_REFIRES_PER_RUN comments back-to-back.
+
+    Posting the token first makes a failed comment cost a SKIPPED re-fire
+    rather than an unthrottled one -- the safe direction, and the one
+    request_review's "the marker still leaves a durable trail" contract
+    already assumes. The body is built with request_pending=True because at
+    that point the request outcome genuinely is not known yet; do not "restore"
+    an outcome-asserting body here without moving the write back, which would
+    reintroduce the storm.
+    """
+    body = build_comment_body(
+        pr["number"], head_sha, now - pending_since,
+        mode=PREDICATE_MODE,
+        request_pending=True,
+    )
+    _request(
+        "%s/repos/%s/%s/issues/%d/comments" % (api_base_url.rstrip("/"), owner, repo, pr["number"]),
+        token,
+        method="POST",
+        payload={"body": body},
+    )
+    request_review(owner, repo, pr["number"], token, api_base_url)
 
 
 def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
@@ -1239,11 +1439,46 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
     for every non-draft open PR considered, in list order, so the caller can
     print a full accounting -- not just the ones actioned (no silent caps).
 
-    Each PR is evaluated in isolation. A failure against one PR must never
-    strand the others: this sweep *is* the reconciler for stranded PRs, so
-    letting a single transient error abort the loop would reinstate exactly
-    the defect it exists to clear (BLO-22892) -- and silently, since the
-    remaining PRs would simply never be considered.
+    Two passes, and the split is load-bearing rather than tidiness (PEN-3394):
+
+      1. DECIDE every PR. No writes.
+      2. Spend MAX_REFIRES_PER_RUN on the LONGEST-WAITING eligible PRs.
+         The cap counts DELIVERED re-fires; see MAX_REFIRE_ATTEMPTS_PER_RUN.
+
+    This used to be one pass that wrote as it walked, which handed the budget
+    to whatever order the API returned -- and `GET /pulls?state=open` returns
+    NEWEST FIRST. (That ordering is already noted in main()'s degraded-run
+    summary below; it was reasoned about for the dropped-reads path and not
+    for this one.) With more eligible PRs per run than slots, the budget was
+    therefore always spent on the newest and the oldest never got a slot at
+    all. Measured on this repo 2026-09-20 over five consecutive runs: in every
+    one, every re-fired PR number was strictly greater than every deferred
+    number -- a deterministic rank cut, not a distribution. #1862 went 50h
+    with no re-fire while newer PRs were re-fired hourly, and the deferred
+    summary below was telling operators they "will be picked up on the next
+    scheduled run" when structurally they would not be.
+
+    Ranking by `pending_since` ascending -- longest wait first -- is what
+    makes the cap fair rather than positional. Note the cap alone does NOT
+    starve anyone: REFIRE_COOLDOWN_SECONDS takes a PR out of eligibility for
+    2h as soon as it is served, so a stable candidate set rotates through the
+    budget on its own. Newest-first defeated that only because new PRs keep
+    arriving and keep refilling the front of the list. Ordering by wait also
+    avoids the mirror-image bug that plain oldest-PR-first would introduce: a
+    brand-new PR whose `pull_request.opened` wake was LOST -- precisely what
+    this reconciler exists to backstop -- would sit behind the entire old
+    cohort. Wait-time ordering serves it on the same terms as everyone else.
+
+    Pass 1 costs no extra API calls: every PR was already fully evaluated
+    before this change (that is why over-budget PRs could still ALARM), so
+    only the *timing* of the two writes moves.
+
+    Each PR is evaluated in isolation, and so is each write. A failure
+    against one PR must never strand the others: this sweep *is* the
+    reconciler for stranded PRs, so letting a single transient error abort
+    the loop would reinstate exactly the defect it exists to clear
+    (BLO-22892) -- and silently, since the remaining PRs would simply never
+    be considered.
 
     `dry_run` evaluates every PR and reports what it WOULD do without issuing
     either write (the reviewer re-request or the marker comment). It exists so
@@ -1253,7 +1488,6 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
     now = now if now is not None else time.time()
     prs = _fetch_paginated(api_base_url, "/repos/%s/%s/pulls?state=open" % (owner, repo), token)
     results = []
-    refires_left = MAX_REFIRES_PER_RUN
     for index, pr in enumerate(prs):
         head_sha = pr.get("head", {}).get("sha", "")
         if pr.get("locked"):
@@ -1266,25 +1500,15 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
             results.append((pr, head_sha, None, False, "skip: conversation locked"))
             continue
         try:
-            outcome = _consider_pr(
-                owner, repo, pr, token, api_base_url, now,
-                may_refire=(refires_left > 0),
-                dry_run=dry_run,
-            )
-            if outcome[3]:
-                # True in a dry run means "would have re-fired". Decrementing
-                # on that too is what makes the dry run's plan match what a
-                # live run would really do, cap included.
-                refires_left -= 1
-            results.append(outcome)
+            results.append(_consider_pr(owner, repo, pr, token, api_base_url, now))
         except RateLimitExhausted as error:
             # Not isolated per-PR like the errors below: the budget is spent,
             # so every remaining PR would raise the identical error. Grinding
             # through them would deepen the exhaustion, hide the real cause
             # behind N indistinguishable per-PR failures, and delay the run's
-            # end for no information. Abort, but keep the partial results and
-            # record the unevaluated remainder as failures -- they feed
-            # sweep_is_degraded, so this run exits non-zero rather than
+            # end for no information. Abort the READS, but keep the partial
+            # results and record the unevaluated remainder as failures -- they
+            # feed sweep_is_degraded, so this run exits non-zero rather than
             # reporting `alarming=0` off a list it never finished reading.
             print("rate limit exhausted at PR #%d: %s" % (pr.get("number", -1), error), file=sys.stderr)
             for unevaluated in prs[index:]:
@@ -1295,7 +1519,27 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
                     False,
                     "%s -- %s" % (SWEEP_ERROR_REASON_PREFIX, RATE_LIMIT_TOKEN),
                 ))
-            return results
+            # Fall through to the re-fire pass rather than returning. Two
+            # reasons, and the second is the one that makes `break` load-
+            # bearing rather than merely preferable:
+            #
+            #   1. Under the old single pass, PRs walked before exhaustion
+            #      had ALREADY been written; returning here would make an
+            #      exhausted run issue zero re-fires, which is a regression --
+            #      the re-asks are the point of the job and the reads only
+            #      serve them.
+            #   2. Since the writes no longer happen inside _consider_pr, a
+            #      `return` would leave the already-decided PRs at
+            #      refire=True with no write ever attempted -- and main()
+            #      derives `refired = [r for r in results if r[3]]`, so the
+            #      run would REPORT re-fires that never happened. That is a
+            #      correctness defect in the accounting, not just lost work.
+            #
+            # Do not "simplify" this back to a return. Pinned by
+            # test_rate_limit_in_the_read_pass_still_spends_the_refire_budget.
+            # The writes are attempted and may themselves hit the limit,
+            # which lands in the per-write isolation below.
+            break
         except Exception as error:  # noqa: BLE001 -- deliberate per-PR isolation
             print(
                 "PR #%d: sweep failed (%s: %s) -- continuing with the remaining PRs"
@@ -1303,6 +1547,175 @@ def sweep(owner, repo, token, api_base_url, now=None, dry_run=False):
                 file=sys.stderr,
             )
             results.append((pr, head_sha, None, False, "%s -- %s" % (SWEEP_ERROR_REASON_PREFIX, type(error).__name__)))
+
+    # --- Pass 2: spend the budget, longest wait first. ---------------------
+    #
+    # `refire` True implies `pending_since` is not None (should_refire returns
+    # False for None before it can reach the eligible branch), so the sort key
+    # is always a real epoch. Ties keep list order, which is stable and
+    # arbitrary -- two PRs stalled in the same second have no fairness claim
+    # against each other.
+    eligible = sorted(
+        (i for i, outcome in enumerate(results) if outcome[3]),
+        key=lambda i: results[i][2],
+    )
+    #
+    # The cap counts DELIVERED re-fires, not attempts, and that distinction is
+    # load-bearing (PEN-3394 review). A failed write posts no marker, so
+    # should_refire's cooldown never engages -- the PR keeps the longest wait
+    # and sorts back to rank 0 on the next run, forever. If a failure spent a
+    # slot, then >= MAX_REFIRES_PER_RUN permanently-failing PRs (a comment POST
+    # 403ing as "resource not accessible by integration" is the realistic case)
+    # would consume the whole budget every run and nobody would be served --
+    # the same starvation this change exists to fix, reintroduced through a
+    # different door. Counting successes lets a failed write fall through to
+    # the next-ranked PR instead.
+    #
+    # MAX_REFIRE_ATTEMPTS_PER_RUN is what keeps that from being unbounded: it
+    # caps the API calls a run of failures can make, so the fall-through cannot
+    # walk the entire eligible set.
+    #
+    # That ceiling has to cover the pre-write re-check too, and it did not
+    # (PEN-3394 review). The re-check issues live reads of its own and its
+    # failure branch below `continue`s without ever reaching `attempted`, so
+    # a SYSTEMIC re-check failure walked every eligible PR making doomed
+    # reads -- falsifying the bound this very paragraph asserts. Not
+    # hypothetical: after pass 1's rate-limit `break` every later read
+    # raises, so every re-check in pass 2 fails. Measured at 90 eligible PRs
+    # before this counted: 90 re-check calls, 0 deferred. Pass 1 `break`s for
+    # exactly this reason -- grinding out N indistinguishable per-PR failures
+    # deepens the exhaustion it is reacting to.
+    #
+    # Counted SEPARATELY from `attempted` rather than folded into it, because
+    # `attempted - succeeded` is the count of failed WRITES in the deferral
+    # message below and a withheld write is not a failed one. Two counters,
+    # one ceiling. The withheld branch further down still spends NEITHER: a
+    # guard that answers is not a guard that failed, and it cost one read
+    # that the ceiling is not there to police.
+    succeeded = 0
+    attempted = 0
+    recheck_failures = 0
+    for i in eligible:
+        pr, head_sha, pending_since, _refire, reason = results[i]
+        if (
+            succeeded >= MAX_REFIRES_PER_RUN
+            or attempted + recheck_failures >= MAX_REFIRE_ATTEMPTS_PER_RUN
+        ):
+            # Withheld for rate-limiting, not because nothing is wrong. The
+            # PR keeps its `pending_since`, so it still counts toward
+            # `considered` and can still ALARM -- rate-limiting a write must
+            # never suppress the alarm.
+            exhausted = (
+                "over MAX_REFIRES_PER_RUN=%d this run" % MAX_REFIRES_PER_RUN
+                if succeeded >= MAX_REFIRES_PER_RUN
+                else "over MAX_REFIRE_ATTEMPTS_PER_RUN=%d this run "
+                     "(%d re-fire write(s) failed, %d pre-write re-check(s) failed)"
+                     % (
+                         MAX_REFIRE_ATTEMPTS_PER_RUN,
+                         attempted - succeeded,
+                         recheck_failures,
+                     )
+            )
+            results[i] = (
+                pr, head_sha, pending_since, False,
+                "%s -- %s, %s" % (DEFERRED_REASON_PREFIX, reason, exhausted),
+            )
+            continue
+        if dry_run:
+            # The flag stays True so the dry run's accounting and budget match
+            # a live run exactly; only the side effects are withheld.
+            attempted += 1
+            succeeded += 1
+            results[i] = (pr, head_sha, pending_since, True, "DRY-RUN would re-fire -- %s" % reason)
+            continue
+        # Re-read the surfaces and re-apply BOTH scan-time preconditions as
+        # late as possible before the write (BLO-31908 cooldown, BLO-32044
+        # already-reviewed). Pass 1's reads are minutes stale by now: a sweep
+        # running concurrently -- or an operator re-asking by hand -- may have
+        # posted a marker in between, and Ally may simply have answered.
+        #
+        # This sits AFTER the budget and dry-run branches on purpose, matching
+        # the ordering this guard was written with: neither a deferred PR nor
+        # a dry run is going to write, so neither should pay for its read.
+        # Moving it above them would spend a request per eligible PR rather
+        # than per candidate write.
+        permitted, withheld, prefix = (True, None, None)
+        try:
+            permitted, withheld, prefix = refire_still_permitted(
+                owner, repo, pr["number"], head_sha, token, api_base_url, now
+            )
+        except Exception as error:  # noqa: BLE001 -- isolation, as for the write below
+            # The guard issues a live read, so it can fail on its own. It must
+            # be isolated exactly like the write it protects: letting it
+            # propagate would abort pass 2 and strand every LOWER-RANKED PR --
+            # i.e. the longest-waiting ones this change exists to serve --
+            # which is the whole-loop abort the decision pass already refuses.
+            # Recorded as a sweep error rather than silently re-firing: the
+            # guard failing open would reinstate the double-fire (BLO-31908)
+            # and the re-ask-after-answer (BLO-32044) it was added to prevent.
+            #
+            # It spends the attempt ceiling (never the delivery cap): this
+            # branch made live reads and produced no write, which is exactly
+            # the shape the ceiling exists to bound. Isolation is preserved --
+            # the loop still `continue`s to the next-ranked PR rather than
+            # aborting, so a TRANSIENT failure here costs one slot instead of
+            # stranding every longer-waiting PR below it, while a SYSTEMIC one
+            # now stops after MAX_REFIRE_ATTEMPTS_PER_RUN instead of walking
+            # the whole set. `break`ing on RateLimitExhausted alone was the
+            # other candidate and is strictly narrower -- it would leave a
+            # systemic 5xx or a network partition walking the set unbounded.
+            recheck_failures += 1
+            print(
+                "PR #%d: pre-write re-check failed (%s: %s) -- withholding this re-fire"
+                % (pr.get("number", -1), type(error).__name__, error),
+                file=sys.stderr,
+            )
+            results[i] = (
+                pr, head_sha, pending_since, False,
+                "%s -- %s (%s)"
+                % (SWEEP_ERROR_REASON_PREFIX, REFIRE_RECHECK_FAILURE_TOKEN, type(error).__name__),
+            )
+            continue
+        if not permitted:
+            # A withheld write is NOT a failed write, so it spends neither
+            # `succeeded` nor `attempted`: the slot stays free for the next
+            # ranked PR. That is the guard's own documented contract, and it
+            # is also why `attempted - succeeded` stays a true count of failed
+            # writes in the deferral message above -- folding withheld PRs in
+            # there would report them to operators as write failures.
+            if prefix == REVIEWED_SKIP_REASON_PREFIX:
+                # Ally answered THIS head, so the PR is not stranded -- the
+                # same normalization pass 1 does when ally_has_reviewed_head
+                # is true, just discovered minutes later. Without dropping
+                # pending_since, is_alarming counts the guard's HEALTHIEST
+                # outcome and main() fails the run red on it. The contended
+                # branch deliberately keeps pending_since: that PR genuinely
+                # is still waiting and must still be able to alarm.
+                pending_since = None
+            results[i] = (pr, head_sha, pending_since, False, "%s -- %s" % (prefix, withheld))
+            continue
+        attempted += 1
+        try:
+            _refire_pr(owner, repo, pr, head_sha, pending_since, token, api_base_url, now)
+        except Exception as error:  # noqa: BLE001 -- isolation, as in the decision pass
+            # A failed write must not strand the remaining re-fires, and must
+            # not read as a clean skip. RateLimitExhausted is not special-cased
+            # here: unlike the read pass there is no per-PR read left to grind
+            # through, the remaining writes are bounded by
+            # MAX_REFIRE_ATTEMPTS_PER_RUN, and each is the job's actual
+            # product -- so attempt them and let each record its own failure.
+            print(
+                "PR #%d: re-fire failed (%s: %s) -- continuing with the remaining re-fires"
+                % (pr.get("number", -1), type(error).__name__, error),
+                file=sys.stderr,
+            )
+            results[i] = (
+                pr, head_sha, pending_since, False,
+                "%s -- %s (%s)"
+                % (SWEEP_ERROR_REASON_PREFIX, REFIRE_WRITE_FAILURE_TOKEN, type(error).__name__),
+            )
+            continue
+        succeeded += 1
     return results
 
 
@@ -1349,7 +1762,48 @@ def main(argv=None):
         if is_alarming({"is_draft": bool(r[0].get("draft")), "pending_since": r[2]}, now)
     ]
     failed = [r for r in results if str(r[4]).startswith(SWEEP_ERROR_REASON_PREFIX)]
-    rate_limited = [r for r in failed if RATE_LIMIT_TOKEN in str(r[4])]
+    refire_write_failures = [r for r in failed if REFIRE_WRITE_FAILURE_TOKEN in str(r[4])]
+    # The third bucket. A pre-write re-check failure is neither a read-pass
+    # failure nor a failed write: the PR was fully evaluated in pass 1 (so its
+    # `pending_since` and its alarm verdict are exact) and the write was
+    # WITHHELD rather than rejected. It needs naming here because the DEGRADED
+    # paragraph below partitions `failed`, and a bucket with no name falls
+    # into whichever one is computed by subtraction.
+    refire_recheck_failures = [r for r in failed if REFIRE_RECHECK_FAILURE_TOKEN in str(r[4])]
+    # A write-pass failure records the EXCEPTION TYPE in its reason, so a
+    # rate-limited write reads "re-fire write failed (RateLimitExhausted)" --
+    # which contains RATE_LIMIT_TOKEN as a substring. Matching on that alone
+    # put it in this bucket and printed "never attempted ... the run aborted"
+    # over a PR that was fully evaluated and whose write was attempted and
+    # rejected. Excluding write failures keeps the two apart because their
+    # remedies differ: read-pass exhaustion argues for fewer reads, a
+    # write-side rejection (secondary limit, or a token that cannot post)
+    # does not.
+    #
+    # The pre-write re-check is excluded for the SAME reason: it too records
+    # the exception type, so a rate-limited re-check reads
+    # "re-fire pre-write re-check failed (RateLimitExhausted)" and would
+    # likewise be reported as a PR the run never reached. It is a write-pass
+    # read, not a read-pass one -- the PR was fully evaluated.
+    rate_limited = [
+        r for r in failed
+        if RATE_LIMIT_TOKEN in str(r[4])
+        and not is_write_pass_failure(r[4])
+    ]
+    # The read-pass bucket, derived ONCE here rather than inside the
+    # `if degraded:` arm that used to own it. Three surfaces report on
+    # `failed` -- this section's heading, the DEGRADED paragraph, and the
+    # console line at the end of main() -- and only the paragraph could see
+    # a derivation scoped to the paragraph. That is precisely how the heading
+    # and the console line went on saying "could not be evaluated" about PRs
+    # the paragraph directly beneath them described as "read in full"
+    # (PEN-3394 review). Deriving it beside the buckets it partitions with
+    # keeps the three surfaces answering off one number.
+    #
+    # Derived by EXCLUSION from WRITE_PASS_FAILURE_TOKENS, not by subtracting
+    # remembered buckets: subtraction silently absorbs any bucket the
+    # subtractor forgot, which is the defect this has already produced twice.
+    read_failures = [r for r in failed if not is_write_pass_failure(r[4])]
     deferred = [r for r in results if str(r[4]).startswith(DEFERRED_REASON_PREFIX)]
     # The two pre-write guard outcomes. `failed`, `deferred` and `alarming`
     # each already get a summary section; these reached an operator only
@@ -1359,7 +1813,31 @@ def main(argv=None):
     # Reported separately because they mean opposite things: see below.
     contended = [r for r in results if str(r[4]).startswith(REREAD_SKIP_REASON_PREFIX)]
     answered = [r for r in results if str(r[4]).startswith(REVIEWED_SKIP_REASON_PREFIX)]
-    degraded = sweep_is_degraded(len(failed), len(results))
+    # Two populations, two denominators -- and the write bucket needs an
+    # ABSOLUTE floor rather than a proportional one (PEN-3394 review).
+    #
+    # sweep_is_degraded scales its threshold with every open PR, but write-pass
+    # failures cannot exceed MAX_REFIRE_ATTEMPTS_PER_RUN. Past ~100 open PRs
+    # the ceiling sits BELOW the threshold, so the write population can never
+    # trip the alarm on its own: measured against this script's own constants,
+    # a run in which every re-fire write failed gives degraded=True at open=100
+    # but False at open=111 and open=147 -- both of them this repo's own
+    # recorded snapshots (review-gate-sweep.yml:45, :67). A sweep that
+    # delivered ZERO re-fires would report itself healthy, which is exactly the
+    # "broken and healthy produce the identical green tick" defect that
+    # sweep_is_degraded's docstring says it exists to remove.
+    #
+    # Written as a strictly-ADDITIVE `or` rather than by re-basing the first
+    # term on read_failures. The review prescribed
+    # `sweep_is_degraded(len(read_failures), ...) or ... >= 3`, but that SILENCES
+    # a run that alarms today: 8 read + 2 write failures over 100 considered is
+    # True now and False under that form, because the 2 write failures stop
+    # contributing to the proportional test without reaching the absolute one.
+    # This form can only ever add a way to become degraded, never remove one.
+    degraded = (
+        sweep_is_degraded(len(failed), len(results))
+        or len(refire_write_failures) + len(refire_recheck_failures) >= WRITE_PASS_DEGRADED_FLOOR
+    )
     for pr, head_sha, pending_since, refire, reason in results:
         marker = "RE-FIRED" if refire else "skip"
         print("PR #%d (%s): %s -- %s" % (pr["number"], head_sha[:7], marker, reason))
@@ -1377,9 +1855,24 @@ def main(argv=None):
             if failed:
                 # A PR we could not even evaluate is not "clean" -- surfacing
                 # it here keeps per-PR isolation from becoming a silent cap.
+                #
+                # "failed", not "could not be evaluated": this section spans
+                # all three buckets, and two of them WERE evaluated in full.
+                # The heading used to assert the read-failure meaning over the
+                # whole total, directly above a paragraph that said the
+                # opposite about the same PRs (PEN-3394 review). The breakdown
+                # is shared with the console line so the two cannot drift.
                 handle.write(
-                    "\n### :warning: %d PR(s) could not be evaluated this run "
-                    "(isolated so the rest still swept)\n\n" % len(failed)
+                    "\n### :warning: %d PR(s) failed this run: %s "
+                    "(isolated so the rest still swept)\n\n"
+                    % (
+                        len(failed),
+                        failure_breakdown(
+                            len(read_failures),
+                            len(refire_write_failures),
+                            len(refire_recheck_failures),
+                        ),
+                    )
                 )
                 if rate_limited:
                     handle.write(
@@ -1387,14 +1880,115 @@ def main(argv=None):
                         "mid-sweep and the run aborted rather than grinding out one identical "
                         "failure per remaining PR.\n\n" % len(rate_limited)
                     )
-                if degraded:
+                if refire_write_failures:
+                    # Sits here, beside its read-pass counterpart, rather than
+                    # under `if deferred:` -- write failures and deferrals are
+                    # independent, and a run with failed writes but nothing
+                    # deferred used to print no explanation of them at all.
+                    # Phrased to hold in both cases, so hoisting it needs no
+                    # extra condition.
                     handle.write(
-                        "**This run is DEGRADED** (%d of %d failed). Its `alarming=%d` "
-                        "count is not trustworthy -- a PR that could not be read cannot be "
-                        "shown to be un-stranded, and GitHub lists open PRs newest-first, so "
-                        "the ones dropped are the oldest.\n\n"
-                        % (len(failed), len(results), len(alarming))
+                        "%d of them DID win a slot and were attempted -- the re-fire write "
+                        "was rejected. A failed write posts no marker and so starts no "
+                        "cooldown, so it does NOT consume the MAX_REFIRES_PER_RUN=%d budget "
+                        "-- but it does count against MAX_REFIRE_ATTEMPTS_PER_RUN=%d, which "
+                        "is what can defer an otherwise-eligible PR with fewer than %d "
+                        "re-fired.\n\n"
+                        % (
+                            len(refire_write_failures),
+                            MAX_REFIRES_PER_RUN,
+                            MAX_REFIRE_ATTEMPTS_PER_RUN,
+                            MAX_REFIRES_PER_RUN,
+                        )
                     )
+                if degraded:
+                    # The run is degraded on EITHER kind of failure -- that is
+                    # deliberate (see REFIRE_WRITE_FAILURE_TOKEN) and the
+                    # non-zero exit stays. What differs is what each kind
+                    # costs. Only a READ failure makes `alarming` unreliable:
+                    # a PR whose read succeeded and whose WRITE was rejected
+                    # was fully evaluated, so its pending_since is known and
+                    # its alarm verdict is exact. Attributing the whole
+                    # `failed` count to "could not be read" told the operator
+                    # to discount the one number that was still trustworthy,
+                    # on precisely the run where it is the only signal left.
+                    # The COUNT is only trustworthy when no read failed, so the
+                    # write clause claims it only when `read_failures` is empty.
+                    #
+                    # `read_failures` is derived once, up beside the buckets it
+                    # partitions with, rather than here. It used to be local to
+                    # this arm, which is exactly why the section heading above
+                    # and the console line at the end of main() could not see
+                    # it and went on contradicting this paragraph.
+                    handle.write(
+                        "**This run is DEGRADED** (%d of %d failed)."
+                        % (len(failed), len(results))
+                    )
+                    if read_failures:
+                        handle.write(
+                            " %d could not be read, so its `alarming=%d` count is not "
+                            "trustworthy -- a PR that could not be read cannot be shown "
+                            "to be un-stranded, and GitHub lists open PRs newest-first, "
+                            "so the ones dropped are the oldest."
+                            % (len(read_failures), len(alarming))
+                        )
+                    if refire_write_failures:
+                        handle.write(
+                            " %d PR(s) were read in full and failed on the re-fire WRITE, "
+                            "so their alarm verdict is exact %s is on the write side, "
+                            "not in the read budget."
+                            % (
+                                len(refire_write_failures),
+                                (
+                                    "and `alarming=%d` is trustworthy; the remedy"
+                                    if not read_failures
+                                    else "-- they are not what makes `alarming=%d` "
+                                    "unreliable; the remedy for them"
+                                )
+                                % len(alarming),
+                            )
+                        )
+                    if refire_recheck_failures:
+                        # Without a clause of its own this bucket rendered as
+                        # a bare "**This run is DEGRADED** (3 of 3 failed)."
+                        # with no account of what failed -- the exclusion
+                        # above removes it from `read_failures` but cannot
+                        # explain it. These PRs were read in full, so their
+                        # verdict is exact; what they did NOT get is a write,
+                        # which is the part an operator has to act on.
+                        #
+                        # Do NOT call this bucket "withheld". That word is
+                        # already taken by the CLEAN guard outcome below
+                        # (`### %d re-fire(s) withheld by the pre-write
+                        # guard`), which spends NEITHER counter and leaves the
+                        # slot free. This bucket spends the attempt ceiling.
+                        # Same word, opposite budget semantics, and this
+                        # summary renders both sections -- so the split has to
+                        # be in the wording, not just in the code.
+                        #
+                        # State the budget fact; do NOT cite the deferral
+                        # header's `attempted` figure for it. This clause
+                        # renders on `refire_recheck_failures`, that header on
+                        # `deferred` -- two independent gates, so a forward
+                        # reference dangles on every run where the first is
+                        # true and the second is false. That is the COMMON
+                        # shape, not the corner: a deferral needs the delivery
+                        # or attempt ceiling to be exceeded, while DEGRADED
+                        # needs only 3 failures at >=10%, so the ordinary
+                        # degraded run has a handful of re-check failures and
+                        # no deferrals at all. Keep the assertion
+                        # self-contained and it is true in both documents.
+                        handle.write(
+                            " %d PR(s) were read in full and then failed the pre-write "
+                            "re-check, so no write was attempted -- though the live reads "
+                            "they made do spend `MAX_REFIRE_ATTEMPTS_PER_RUN`, so they count "
+                            "against this run's attempt budget. Their `pending_since` "
+                            "is exact and they do not make `alarming=%d` unreliable, but "
+                            "they were not served either and sort back to the front of the "
+                            "next run."
+                            % (len(refire_recheck_failures), len(alarming))
+                        )
+                    handle.write("\n\n")
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
                 for pr, head_sha, _pending_since, _refire, reason in failed:
                     handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))
@@ -1402,11 +1996,115 @@ def main(argv=None):
                 # Over-budget PRs are real stranded work withheld only for
                 # rate-limiting. Naming them keeps MAX_REFIRES_PER_RUN from
                 # reading as "nothing else was wrong".
+                #
+                # "next scheduled run" is a claim, so it has to be earned:
+                # it holds because the budget now goes to the longest wait
+                # (see sweep()) and REFIRE_COOLDOWN_SECONDS drops each PR
+                # just served out of eligibility for 2h, so the set rotates.
+                # Before PEN-3394 this line was simply false -- spending was
+                # positional over a newest-first list, so a deferred PR could
+                # be deferred indefinitely, and one was for 50h.
+                #
+                # `len(refired)` is the count that went on COOLDOWN, which is
+                # exactly what makes "those rank first next run" true -- and
+                # it is only the same as "the count that won a slot" because
+                # a failed write no longer consumes one.
+                #
+                # So it is the DELIVERED figure here too. Interpolating the
+                # constant instead reported "MAX_REFIRES_PER_RUN=5 delivered"
+                # on a run that delivered nothing, two lines under
+                # "re-fired 0" -- a fully-spent budget over a genuine
+                # starvation, which is the one reading that stops an operator
+                # looking. The rotation clause has the same dependency and is
+                # split out below rather than asserted unconditionally.
                 handle.write(
-                    "\n### %d PR(s) eligible but deferred past MAX_REFIRES_PER_RUN=%d "
-                    "(they will be picked up on the next scheduled run)\n\n"
-                    % (len(deferred), MAX_REFIRES_PER_RUN)
+                    "\n### %d PR(s) eligible but deferred past this run's re-fire budget "
+                    "(%d of MAX_REFIRES_PER_RUN=%d delivered, "
+                    "%d of MAX_REFIRE_ATTEMPTS_PER_RUN=%d attempted)\n\n"
+                    % (
+                        len(deferred),
+                        len(refired),
+                        MAX_REFIRES_PER_RUN,
+                        # Measured, like the delivered figure -- and measured
+                        # against the SAME ceiling it names. That ceiling is
+                        # `attempted + recheck_failures` (see sweep()), so
+                        # every bucket it counts has to appear here. A re-fire
+                        # that reached the write either lands in `refired` or
+                        # is recorded as a write failure; a pre-write re-check
+                        # that FAILED made live reads and produced no write,
+                        # which spends the attempt ceiling too -- that is the
+                        # whole reason the ceiling counts it.
+                        #
+                        # Omitting that third bucket rendered "0 of
+                        # MAX_REFIRE_ATTEMPTS_PER_RUN=10 attempted" beside PRs
+                        # whose own per-PR reason said they were deferred for
+                        # hitting exactly that 10 -- unspent budget over a
+                        # genuine exhaustion, which is the same
+                        # stop-looking reading the bare cap produced.
+                        len(refired)
+                        + len(refire_write_failures)
+                        + len(refire_recheck_failures),
+                        MAX_REFIRE_ATTEMPTS_PER_RUN,
+                    )
                 )
+                if refire_write_failures or refire_recheck_failures:
+                    # The guarantee is earned by the cooldown, and a re-fire
+                    # that did not land posts no marker, so it starts none.
+                    # Those PRs keep the longer waits that won them a slot and
+                    # re-take the front of the queue ahead of everything
+                    # deferred here -- the set is stationary, not rotating.
+                    # Claiming otherwise reads a starvation as fairness
+                    # working.
+                    #
+                    # BOTH buckets, because the cooldown argument does not
+                    # distinguish them: a failed write and a failed pre-write
+                    # re-check alike leave the PR unserved with no marker
+                    # posted (the re-check branch `continue`s before
+                    # `_refire_pr` is entered at all). Gating this on write
+                    # failures alone told the operator the set advances on a
+                    # run deferred ENTIRELY by re-check failures -- directly
+                    # contradicting the failed-run paragraph 60 lines above,
+                    # which says those PRs "sort back to the front of the next
+                    # run", and self-refuting besides, since the `else` names
+                    # `len(refired)` and that is 0 on such a run.
+                    handle.write(
+                        "These do **not** rank first next run: %s, and a re-fire that "
+                        "did not land posts no marker so starts no cooldown. Those "
+                        "PRs keep their longer waits and rank ahead of these again "
+                        "until that failure is fixed.\n\n"
+                        % unserved_breakdown(
+                            len(refire_write_failures), len(refire_recheck_failures)
+                        )
+                    )
+                else:
+                    # A RANKING statement, deliberately not a coverage promise
+                    # (PEN-3394 review). `pending_since` is static for a given
+                    # head, so being served does not move it: a re-fired PR
+                    # returns to rank 0 as soon as its cooldown expires, ahead
+                    # of PRs never served at all. Coverage is therefore about
+                    # MAX_REFIRES_PER_RUN x (cooldown / run interval) distinct
+                    # PRs, and this section used to tell the operator "these
+                    # rank first next run" -- false for everything below that
+                    # bound, on a repo whose own snapshots record 100+ open
+                    # PRs. Say what the sort guarantees and name the bound;
+                    # PEN-3589 carries the round-robin fix that would make the
+                    # stronger sentence true.
+                    handle.write(
+                        "They waited less than the %d re-fired this run, which go on "
+                        "cooldown, so these rank ahead of THOSE next run.\n\n"
+                        "This is a ranking statement, not a coverage guarantee: the sort "
+                        "key is how long a head has been pending, and being served does "
+                        "not move it, so a re-fired PR returns to the front once its "
+                        "%.0fh cooldown expires. A run reaches roughly "
+                        "MAX_REFIRES_PER_RUN x (cooldown / run interval) = %d distinct "
+                        "PRs before the first comes round again; anything ranked below "
+                        "that is not reached. Tracked in PEN-3589.\n\n"
+                        % (
+                            len(refired),
+                            REFIRE_COOLDOWN_SECONDS / 3600.0,
+                            MAX_REFIRES_PER_RUN * max(1, REFIRE_COOLDOWN_SECONDS // SWEEP_RUN_INTERVAL_SECONDS),
+                        )
+                    )
                 handle.write("| PR | head | reason |\n|---|---|---|\n")
                 for pr, head_sha, _pending_since, _refire, reason in deferred:
                     handle.write("| #%d | `%s` | %s |\n" % (pr["number"], head_sha[:7], reason))
@@ -1468,23 +2166,53 @@ def main(argv=None):
         sys.exit(EXIT_ALARM)
     if degraded:
         # Distinct from the alarm above, and checked second so a genuine
-        # stranded PR still reports as a stranded PR. `alarming=0` off a run
-        # that could not evaluate most of its PRs is not a clean bill of
-        # health -- it is an unread list. Exiting green here would make a
-        # systematically broken sweep indistinguishable from a working one,
-        # which is the exact defect class this reconciler exists to remove.
-        print(
-            "SWEEP DEGRADED: %d of %d PR(s) could not be evaluated%s -- "
-            "review-gate-sweep failing because the sweep itself did not run, NOT because a PR "
-            "is stranded. `alarming=%d` is not a clean bill of health on this run."
-            % (
-                len(failed),
-                len(results),
-                " (API rate limit exhausted mid-sweep)" if rate_limited else "",
-                len(alarming),
-            ),
-            file=sys.stderr,
+        # stranded PR still reports as a stranded PR. Exiting green here would
+        # make a systematically broken sweep indistinguishable from a working
+        # one, which is the exact defect class this reconciler exists to
+        # remove -- so the non-zero exit is unconditional.
+        #
+        # WHAT it reports is not, and that is the PEN-3394 review fix. This
+        # line used to assert, over the whole `failed` total, that "the sweep
+        # itself did not run" and that `alarming` was untrustworthy. Both are
+        # read-failure statements. On a run whose failures are all write-pass,
+        # every PR WAS read in full and `alarming` is exact -- so the console
+        # was contradicting the step summary about the same PRs, on the same
+        # number, in the same run. The branch below says only what the bucket
+        # in hand supports.
+        breakdown = failure_breakdown(
+            len(read_failures),
+            len(refire_write_failures),
+            len(refire_recheck_failures),
         )
+        if read_failures:
+            # `rate_limited` is a subset of `read_failures` (it excludes the
+            # write-pass tokens), so its note can only ever belong on this
+            # branch -- carrying it to the other one would be dead code that
+            # reads like a live case.
+            print(
+                "SWEEP DEGRADED: %d of %d PR(s) failed (%s)%s -- review-gate-sweep failing "
+                "because %d of them could not be read, NOT because a PR is stranded. "
+                "`alarming=%d` is not a clean bill of health on this run: a PR that could "
+                "not be read cannot be shown to be un-stranded."
+                % (
+                    len(failed),
+                    len(results),
+                    breakdown,
+                    " (API rate limit exhausted mid-sweep)" if rate_limited else "",
+                    len(read_failures),
+                    len(alarming),
+                ),
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "SWEEP DEGRADED: %d of %d PR(s) failed (%s) -- review-gate-sweep failing "
+                "because the re-fire did not land, NOT because the sweep could not run. "
+                "Every one of these PRs was read in full, so `alarming=%d` IS exact; they "
+                "were not served either, and sort back to the front of the next run."
+                % (len(failed), len(results), breakdown, len(alarming)),
+                file=sys.stderr,
+            )
         sys.exit(EXIT_SWEEP_DEGRADED)
 
 

@@ -10,7 +10,7 @@ import {
   evaluateManifestFreshness,
   formatMissingSuitesDiagnostic,
 } from "./check-shard-manifest-freshness.mjs";
-import { collectGeneralServerSuiteFiles } from "./run-vitest-stable-suites.mjs";
+import { collectAllServerSuiteFiles } from "./run-vitest-stable-suites.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const durationsManifest = path.join(repoRoot, "scripts", "general-server-shard-durations.json");
@@ -56,8 +56,12 @@ test("formatMissingSuitesDiagnostic names every missing suite and the one-line f
 // .github/workflows/pr.yml with continue-on-error, so a future regression
 // here shows as a visible red X on its own step instead of failing the
 // `policy` job and skipping build/typecheck/e2e for the whole PR.
-test("no general-server suite present on disk is absent from the manifest", () => {
-  const files = collectGeneralServerSuiteFiles(repoRoot);
+// BLO-28956 widened this from the general-server half to every server suite:
+// the serialized route/authz lane draws its partition from the same manifest
+// now, so a missing entry there has the same effect it has here -- the suite
+// silently takes the median weight.
+test("no server suite present on disk is absent from the manifest", () => {
+  const files = collectAllServerSuiteFiles(repoRoot);
   const durations = loadShardDurations(durationsManifest);
 
   const result = evaluateManifestFreshness({ files, durations });

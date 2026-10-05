@@ -4,6 +4,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { accessRoutes } from "../routes/access.js";
 import { errorHandler } from "../middleware/index.js";
 
+/**
+ * PEN-3658: `isInviteExpired` (routes/access.ts) is `expiresAt <= Date.now()`, so a
+ * fixed future date here is an *expiring* fixture — these cases stop granting access
+ * on the calendar day it passes, with nothing in the diff that changed. Derive it
+ * from the clock. Same defect class as the BLO-27912 park deadline, which lapsed at
+ * 2026-09-30T00:00:00Z and ejected six consecutive merge groups.
+ */
+const ACTIVE_INVITE_EXPIRES_AT = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
 const accessServiceMock = vi.hoisted(() => ({
   isInstanceAdmin: vi.fn(),
   canUser: vi.fn(),
@@ -64,7 +73,7 @@ function createDbStub() {
     allowedJoinTypes: "human",
     tokenHash: "hash",
     defaultsPayload: { humanRole: "viewer" },
-    expiresAt: new Date("2027-03-10T00:00:00.000Z"),
+    expiresAt: ACTIVE_INVITE_EXPIRES_AT,
     invitedByUserId: "user-1",
     revokedAt: null,
     acceptedAt: null,
@@ -151,7 +160,7 @@ function createDirectHumanInviteDbStub() {
     allowedJoinTypes: "human",
     tokenHash: "hash",
     defaultsPayload: { human: { role: "owner" } },
-    expiresAt: new Date("2027-03-10T00:00:00.000Z"),
+    expiresAt: ACTIVE_INVITE_EXPIRES_AT,
     invitedByUserId: "inviter-user",
     revokedAt: null,
     acceptedAt: null,
@@ -228,7 +237,7 @@ function createAcceptedHumanInviteReplayDbStub() {
     allowedJoinTypes: "human",
     tokenHash: "hash",
     defaultsPayload: { human: { role: "operator" } },
-    expiresAt: new Date("2027-03-10T00:00:00.000Z"),
+    expiresAt: ACTIVE_INVITE_EXPIRES_AT,
     invitedByUserId: "inviter-user",
     revokedAt: null,
     acceptedAt: new Date("2026-03-07T00:05:00.000Z"),

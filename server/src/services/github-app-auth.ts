@@ -256,8 +256,11 @@ export async function getInstallationTokenResult(
   return { ok: true, token: cachedInstallationToken.token };
 }
 
-export async function getInstallationToken(nowMs: number = Date.now()): Promise<string | null> {
-  const result = await getInstallationTokenResult(nowMs);
+export async function getInstallationToken(
+  nowMs: number = Date.now(),
+  options: { signal?: AbortSignal } = {},
+): Promise<string | null> {
+  const result = await getInstallationTokenResult(nowMs, options);
   return result.ok ? result.token : null;
 }
 
@@ -299,7 +302,7 @@ export async function githubGetPullRequestGate(input: {
   prNumber: number;
   signal?: AbortSignal;
 }): Promise<PullRequestGateResult> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { error: tokenResult.reason };
 
   const apiBase = gitHubApiBase(GITHUB_HOST);
@@ -384,7 +387,7 @@ export async function githubListOpenPullRequestsByBase(input: {
   baseRef: string;
   signal?: AbortSignal;
 }): Promise<OpenPullRequestsOnBaseResult> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { error: tokenResult.reason };
 
   const url =
@@ -427,7 +430,7 @@ export async function githubResolveBranchState(input: {
   branch: string;
   signal?: AbortSignal;
 }): Promise<BranchState> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return "unknown";
   try {
     const res = await ghFetch(
@@ -481,7 +484,7 @@ export async function githubResolveMergeHistoryShape(input: {
   mergeCommitSha: string;
   signal?: AbortSignal;
 }): Promise<MergeHistoryShape> {
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return "unknown";
   try {
     const res = await ghFetch(
@@ -550,7 +553,22 @@ export type PrRequiredStatusContextLookup =
     /** Which surface required it — a ruleset is the one readers cannot see. */
     source: "branch_protection" | "ruleset";
   }
-  | { outcome: "not_required"; baseRef: string; branchProtected: boolean; requiredContexts: string[] }
+  | {
+    outcome: "not_required";
+    baseRef: string;
+    /**
+     * CLASSIC branch protection only — deliberately not a union of both
+     * surfaces. A ruleset that requires a context is already reported through
+     * `requiredContexts`, so folding it in here would add nothing a reader can
+     * see while making the field mean "protected by something, somewhere",
+     * which is a different and weaker claim than the name suggests. Read it as
+     * "`branches/{b}` reports this branch protected", and only when
+     * `requiredContexts` is empty — that is the sole consumer (the merge-impact
+     * notice in `heartbeat.ts`).
+     */
+    branchProtected: boolean;
+    requiredContexts: string[];
+  }
   // `baseRef` is present whenever the base ref resolved and only a later read
   // failed, so the notice can name the branch it could not read.
   | { outcome: "unknown"; reason: string; baseRef?: string };
@@ -632,6 +650,25 @@ async function readClassicRequiredContexts(
 /**
  * Repository- and organization-level rulesets in effect for this ref, via
  * `rules/branches/{ref}`. Invisible to `branches/{b}` — see the type doc.
+ *
+ * Ruleset `enforcement` is not consulted, for the same reason `enforcement_level`
+ * is not on the classic surface — but here it is not a choice: the payload does
+ * not carry it. Re-measured 2026-09-30 against `Blockcast/hang-mmt-fec`'s `main`,
+ * every rule object has exactly the keys
+ * `["parameters","ruleset_id","ruleset_source","ruleset_source_type","type"]`;
+ * there is no ruleset-level `enforcement`, so a dry-run (`evaluate`) ruleset is
+ * indistinguishable from an active one in what we can read. Whether the endpoint
+ * filters dry-run rulesets out before returning them is UNMEASURED — an open
+ * question, not a known defect — and it is not settleable from this seat:
+ * `GET /orgs/{org}/rulesets`, which would name each ruleset's enforcement mode,
+ * returns `403 Resource not accessible by integration` to the App token.
+ *
+ * Shipping on the unmeasured case is deliberate, and the error direction is the
+ * cautious one: if a dry-run ruleset does leak through, we over-report a context
+ * as required, which tells a reader to go look at a gate that turns out to be
+ * inert. Filtering on a field we cannot see would instead risk printing an
+ * all-clear over a ruleset that genuinely blocks the merge — the
+ * `Blockcast/hang-mmt-fec` failure this whole two-surface read exists to remove.
  */
 async function readRulesetRequiredContexts(
   apiBase: string,
@@ -682,7 +719,7 @@ export async function githubGetPrRequiredStatusContext(input: {
   const context = input.context.trim();
   if (!context) return { outcome: "unknown", reason: "status_context_empty" };
 
-  const tokenResult = await getInstallationTokenResult();
+  const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { outcome: "unknown", reason: tokenResult.reason };
   const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` };
   const apiBase = gitHubApiBase(GITHUB_HOST);
@@ -744,7 +781,11 @@ export async function githubGetPrRequiredStatusContext(input: {
   return {
     outcome: "not_required",
     baseRef,
-    branchProtected: classic.branchProtected || ruleset.contexts.length > 0,
+    // Classic only. `|| ruleset.contexts.length > 0` was here and was dead: the
+    // sole consumer reads this field only when `requiredContexts` is empty, and
+    // `requiredContexts` is the union of both surfaces, so a non-empty
+    // `ruleset.contexts` makes that read unreachable. See the type doc.
+    branchProtected: classic.branchProtected,
     requiredContexts,
   };
 }
@@ -898,7 +939,7 @@ export async function githubFetchPrHeadSha(input: {
   prNumber: number;
   signal?: AbortSignal;
 }): Promise<string | null> {
-  const token = await getInstallationToken();
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return null;
   return fetchPrHeadSha(
     gitHubApiBase(GITHUB_HOST),
@@ -925,7 +966,7 @@ export async function githubFetchPrAuthorLogin(input: {
   prNumber: number;
   signal?: AbortSignal;
 }): Promise<string | null> {
-  const token = await getInstallationToken();
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return null;
   try {
     const res = await ghFetch(
@@ -1167,7 +1208,7 @@ export async function githubListReviewerSurfacesAtPr(input: {
   // empty surfaces — a misconfiguration that reads to the caller as "Ally
   // reviewed and found nothing". Fail closed, as the predicate below does.
   if (!githubReviewerAppSlug(botLogin)) return { error: "bot_login_not_app_form" };
-  const token = await getInstallationToken();
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return { error: "no_token" };
   const args = {
     apiBase: gitHubApiBase(GITHUB_HOST),

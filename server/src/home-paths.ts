@@ -5,6 +5,7 @@ import {
   expandHomePrefix,
   resolveDefaultBackupDir as resolveSharedDefaultBackupDir,
   resolveDefaultEmbeddedPostgresDir as resolveSharedDefaultEmbeddedPostgresDir,
+  resolveDefaultHeapSnapshotDir as resolveSharedDefaultHeapSnapshotDir,
   resolveDefaultLogsDir as resolveSharedDefaultLogsDir,
   resolveDefaultSecretsKeyFilePath as resolveSharedDefaultSecretsKeyFilePath,
   resolveDefaultStorageDir as resolveSharedDefaultStorageDir,
@@ -45,6 +46,10 @@ export function resolveDefaultStorageDir(): string {
 
 export function resolveDefaultBackupDir(): string {
   return resolveSharedDefaultBackupDir();
+}
+
+export function resolveDefaultHeapSnapshotDir(): string {
+  return resolveSharedDefaultHeapSnapshotDir();
 }
 
 export function resolveDefaultAgentWorkspaceDir(agentId: string): string {

@@ -134,7 +134,76 @@ export const WATCHED_GUARDS = [
   // this guard — disabled, renamed, never completed — are decided on their own
   // branches and are threshold-independent.
   { workflow: "production-environment-protection-guard.yml", staleHours: 16 },
+
+  // BLO-38228. Daily at 00:37, and the ONLY thing in this repo that observes
+  // time passing — a test fixture can expire on the clock with no commit, which
+  // is how master stayed red 63h with every push-triggered signal green.
+  //
+  // `event: "schedule"` is load-bearing, not tidiness. master-health also runs
+  // on every push to master, so an unfiltered newest-run query is satisfied by
+  // push runs while the cron is dead. Watching it without the filter would
+  // report ok forever and manufacture exactly the confidence this guard exists
+  // to withhold.
+  //
+  // 48h is DELIBERATELY LOOSE and is the one threshold in this file not derived
+  // from a measured gap distribution — there is none, because BLO-38228 is what
+  // introduces the schedule. Rather than invent a number, it is set where it
+  // cannot false-red on GitHub's scheduled-run delay under load: a daily cron
+  // must miss two full cycles to trip it. That is honest about what it buys.
+  // The value here is mostly the threshold-INDEPENDENT branches — renamed or
+  // deleted (unreadable), disabled (state), never completed — with a coarse
+  // descheduled backstop on top. Tighten to ~26h once 30+ real gaps exist,
+  // by this file's normal method.
+  //
+  // `graceUntil` exists because a schedule only fires from the DEFAULT branch,
+  // so at merge this workflow has zero completed `schedule` runs by
+  // construction and classifies `never-completed` — a threshold-INDEPENDENT
+  // branch the 48h above cannot cover. Without the grace it reds the hourly
+  // liveness job for up to ~24h, and an alarm that is red by design is one
+  // everybody learns to ignore, which is the exact failure this guard exists
+  // to prevent.
+  //
+  // This is a fixed literal in the PR that exists BECAUSE a fixed literal
+  // rotted, so state the difference: rotting here is FAIL-CLOSED. When it
+  // lapses the guard gets STRICTER, and the only thing that can go wrong is a
+  // loud red — never a silent green. The date is the first cron after merge
+  // (2026-10-01T00:37Z) plus two full cycles of slack for GitHub's scheduled-
+  // run delay under load. If the merge slips past it, the grace is already
+  // expired and the guard simply reds on day one: honest, not silent.
+  {
+    workflow: "master-health.yml",
+    staleHours: 48,
+    event: "schedule",
+    graceUntil: "2026-10-03T00:00:00.000Z",
+  },
 ];
+
+/**
+ * Resolves the guard entries `main()` will classify.
+ *
+ * Extracted and exported ONLY so the scoping branch is testable. It was
+ * previously inline and rebuilt entries from the workflow name alone, which
+ * silently dropped `event` and `graceUntil` — i.e. scoping to a guard reverted
+ * its own fix and reported ok off a push run. The source-text test could not
+ * see that, because the destructure it asserts on stayed correct.
+ *
+ * `GUARD_LIVENESS_WORKFLOWS` is a debugging dial that may name a workflow not
+ * in WATCHED_GUARDS at all, so an undeclared name still resolves — to the
+ * default threshold and no filter.
+ */
+export function resolveWatched(workflowsEnv, overrideHours = null) {
+  const scoped = (workflowsEnv || "").trim();
+  if (!scoped) return WATCHED_GUARDS;
+
+  return scoped.split(/\s+/).map((workflow) => {
+    const declared = WATCHED_GUARDS.find((guard) => guard.workflow === workflow);
+    return {
+      ...declared,
+      workflow,
+      staleHours: overrideHours ?? declared?.staleHours ?? DEFAULT_STALE_HOURS,
+    };
+  });
+}
 
 /** Back-compat / convenience view: just the workflow filenames. */
 export const WATCHED_WORKFLOWS = WATCHED_GUARDS.map((guard) => guard.workflow);
@@ -181,7 +250,11 @@ export const EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS = [
  * @returns {{workflow: string, status: "ok"|"stale"|"unknown", reason: string,
  *            name: string, ageMinutes: number|null, detail: string}}
  */
-export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT_STALE_HOURS } = {}) {
+export function classifyGuard(
+  workflow,
+  observation,
+  { now, staleHours = DEFAULT_STALE_HOURS, graceUntil = null } = {},
+) {
   const name = observation?.name || workflow;
   const base = { workflow, name, ageMinutes: null };
 
@@ -224,6 +297,30 @@ export function classifyGuard(workflow, observation, { now, staleHours = DEFAULT
   }
 
   if (!observation?.newest) {
+    // Grace is checked BEFORE the cross-check, deliberately. A guard inside its
+    // grace window has no completed run for a known, benign reason, so there is
+    // nothing for a second read to corroborate — and returning `ok` here means
+    // main()'s `first.status !== "stale"` early-out fires and the cross-check
+    // call is never spent. Correct and one request cheaper.
+    //
+    // A guard whose schedule is newer than its own history has no completed run
+    // yet and cannot have one: schedules fire only from the default branch, so
+    // the count is zero at merge by construction. Red-by-design until the first
+    // cron is noise sitting on top of a shared alarm — see graceUntil's comment
+    // in WATCHED_GUARDS. Only this branch is graced; every other stale reason is
+    // decided on real evidence and is not suppressed.
+    if (graceUntil && now < Date.parse(graceUntil)) {
+      return {
+        ...base,
+        status: "ok",
+        reason: "awaiting-first-run",
+        detail:
+          `${name} (${workflow}) has no completed run yet and is inside its grace window until ` +
+          `${graceUntil}. A newly-scheduled workflow cannot have fired before it reached the ` +
+          `default branch. After that instant this reverts to a hard red.`,
+      };
+    }
+
     // This reds on the SAME filtered index the rest of this function now
     // distrusts, and on its strongest possible claim — "never enforced
     // anything". An index that served a 140-run-old entry as [0] is not
@@ -537,10 +634,33 @@ function gh(args, { attempts = 3, backoffMs = 1000 } = {}) {
   throw lastError;
 }
 
-function observeWorkflow(repo, workflow) {
+/**
+ * API path for a guard's newest completed run.
+ *
+ * `event` narrows to one trigger, for a guard that is ALSO reachable by a
+ * non-scheduled trigger. Without it the newest run is whatever fired last, so a
+ * workflow with a push trigger reads fresh while its cron is dead.
+ *
+ * Exported only so the colocated test can mutation-check that filter — the same
+ * reason `classifyGuard` is exported: a guard with no failing mutation is a
+ * comment.
+ */
+export function completedRunsPath(repo, workflow, event) {
+  const base = `repos/${repo}/actions/workflows/${workflow}/runs?status=completed&per_page=1`;
+  return event ? `${base}&event=${encodeURIComponent(event)}` : base;
+}
+
+/**
+ * `read` is injectable for exactly one reason: without it this function reaches
+ * `gh` directly, so the `event` argument had no observable effect and dropping
+ * it from the adapter in `makeGuardReaders` was a mutation no test could see.
+ * `crossCheckCompletions` already took `read` and its `event` leg was guarded;
+ * this leg was not, which is the asymmetry rather than a style difference.
+ */
+export function observeWorkflow(repo, workflow, read = gh, event = undefined) {
   let meta;
   try {
-    meta = JSON.parse(gh(["api", `repos/${repo}/actions/workflows/${workflow}`]));
+    meta = JSON.parse(read(["api", `repos/${repo}/actions/workflows/${workflow}`]));
   } catch {
     return { error: "unreadable" };
   }
@@ -579,10 +699,15 @@ function observeWorkflow(repo, workflow) {
     // instead of firing it. The false-early/false-quiet trade above still
     // decides the sort key; what changed is that "false-early" is no longer
     // assumed to be small.
-    const raw = gh([
-      "api",
-      `repos/${repo}/actions/workflows/${workflow}/runs?status=completed&per_page=1`,
-    ]);
+    //
+    // ON THE `event` NARROWING (BLO-38228): orthogonal to the axis above, and it
+    // is threaded into `crossCheckCompletions` as well. The cross-check's whole
+    // point is to differ on ONE axis — `status=completed` — so if it differed on
+    // the trigger axis too it would read a push run the filtered side cannot
+    // see, disagree with itself on every poll, and suppress the alarm forever.
+    // An always-muted guard is the failure mode both of these mechanisms exist
+    // to prevent.
+    const raw = read(["api", completedRunsPath(repo, workflow, event)]);
     const run = JSON.parse(raw).workflow_runs?.[0];
     if (!run) return { state: meta.state, name: meta.name, newest: null };
 
@@ -675,43 +800,62 @@ export function selectNewestCompleted(runs) {
  * the branch that matters most: it decides whether a broken second read
  * degrades to "no corroboration, red stands" or to a silent mute, and a
  * veto whose failure mode is untested is a veto nobody can trust.
+ *
+ * `event` MIRRORS `observeWorkflow`'s narrowing and is deliberately NOT dropped
+ * along with `status=completed` (BLO-38228). "Differs on ONE axis" is the whole
+ * design: for a guard that is also reachable by a non-scheduled trigger, an
+ * unfiltered cross-check would see push runs the filtered side cannot, report a
+ * newer completion on every poll, and land permanently in
+ * `cross-check-disagreement` — i.e. suppress the alarm forever. It comes after
+ * `read` so the existing positional call sites keep working; nothing about the
+ * PEN-3379 corroboration property depends on the trigger axis.
  */
-export function crossCheckCompletions(repo, workflow, read = gh) {
+export function crossCheckCompletions(repo, workflow, read = gh, event = undefined) {
   try {
-    const raw = read([
-      "api",
-      `repos/${repo}/actions/workflows/${workflow}/runs?per_page=${CROSS_CHECK_PAGE_SIZE}`,
-    ]);
+    const base = `repos/${repo}/actions/workflows/${workflow}/runs?per_page=${CROSS_CHECK_PAGE_SIZE}`;
+    const raw = read(["api", event ? `${base}&event=${encodeURIComponent(event)}` : base]);
     return { newestCompletedAt: selectNewestCompleted(JSON.parse(raw).workflow_runs ?? []) };
   } catch {
     return { error: true };
   }
 }
 
-function main() {
-  const repo = process.env.GUARD_LIVENESS_REPO || process.env.GITHUB_REPOSITORY || "Blockcast/paperclip";
-
-  // An explicit override is a manual debugging dial (workflow_dispatch, or the
-  // live checks in the PR). It deliberately applies to EVERY guard, flattening
-  // the per-guard thresholds, so a dispatch at 1h reds the whole set on purpose.
-  const override = process.env.GUARD_LIVENESS_STALE_HOURS;
-  const overrideHours = override && String(override).trim() !== "" ? resolveStaleHours(override) : null;
-
-  const watched = (process.env.GUARD_LIVENESS_WORKFLOWS || "").trim()
-    ? process.env.GUARD_LIVENESS_WORKFLOWS.trim()
-        .split(/\s+/)
-        .map((workflow) => ({ workflow, staleHours: overrideHours ?? DEFAULT_STALE_HOURS }))
-    : WATCHED_GUARDS;
-
-  const now = Date.now();
-  const results = watched.map(({ workflow, staleHours }) => {
+/**
+ * Classifies every resolved guard entry, including the PEN-3379 cross-check
+ * escalation.
+ *
+ * Extracted and exported ONLY so this line has a failing mutation. It is the
+ * JOIN between producer and consumers — `resolveWatched()`'s `event` and
+ * `graceUntil` handed to `observeWorkflow()`, `classifyGuard()` and the
+ * cross-check — and while it lived inline in `main()` it was the last unguarded
+ * link in the chain: dropping any of those fields left the whole suite green,
+ * because `main()` is never invoked by a test and `observeWorkflow` was not
+ * exported (BLO-38228). `observeWorkflow` now takes an injectable `read` and is
+ * exported, so its own `event` leg is held directly too.
+ *
+ * `observe` and `crossCheck` are injected for exactly that reason: the join is
+ * then testable without a network call, so every field is held by a behavioural
+ * guard rather than a source-text regex. A regex would also have caught the
+ * `observe` leg, but a regex on a destructure is what previously passed across
+ * its own reversion — hold the behaviour instead.
+ *
+ * `crossCheck` MUST receive `event`. That leg came back from the PEN-3379 rebase
+ * as the only one a test could not see, and its failure mode is the worst of the
+ * three: an unfiltered cross-check against a filtered read disagrees on every
+ * poll, so the guard lands permanently in `cross-check-disagreement` and the
+ * alarm is muted forever rather than going red. Pulling it in here is what makes
+ * that arm mutation-visible.
+ */
+export function classifyWatched(watched, observe, crossCheck, { now, overrideHours = null } = {}) {
+  return watched.map(({ workflow, staleHours, event, graceUntil }) => {
     const effectiveStaleHours = overrideHours ?? staleHours;
-    const observation = observeWorkflow(repo, workflow);
-    const first = classifyGuard(workflow, observation, { now, staleHours: effectiveStaleHours });
+    const options = { now, staleHours: effectiveStaleHours, graceUntil };
+    const observation = observe(workflow, event);
+    const first = classifyGuard(workflow, observation, options);
 
     // The cross-check is only worth a call once the cheap read has already
     // decided this guard looks stopped — the same "spend it only when it
-    // matters" shape as countQueued below. Re-classifying is a pure call on the
+    // matters" shape as countQueued. Re-classifying is a pure call on the
     // observation we already hold, so corroborating costs exactly one request
     // and only on the path that was about to red (PEN-3379).
     //
@@ -724,12 +868,50 @@ function main() {
       return first;
     }
 
-    return classifyGuard(
-      workflow,
-      { ...observation, crossCheck: crossCheckCompletions(repo, workflow) },
-      { now, staleHours: effectiveStaleHours },
-    );
+    return classifyGuard(workflow, { ...observation, crossCheck: crossCheck(workflow, event) }, options);
   });
+}
+
+/**
+ * Binds `repo` to the two reads `classifyWatched` consumes.
+ *
+ * Exported for the same single reason `classifyWatched` is: to leave no
+ * unguarded link. With the closures written inline in `main()`, dropping
+ * `event` from the cross-check closure was the last mutation the suite could
+ * not see — `main()` is never invoked by a test, so the whole chain was held
+ * behaviourally right up to the line that assembles it. Here it is one exported
+ * call away from a test.
+ *
+ * `read` is threaded to BOTH legs so each one's real URL is observable without
+ * a network call. It used to reach only `crossCheckCompletions`; `observeWorkflow`
+ * called `gh` directly, so dropping `event` from the observe closure below was a
+ * mutation the suite could not see. The docstring here previously claimed that
+ * leg was "held by `classifyWatched`'s injected-observer test instead" — that was
+ * wrong and measured wrong: that test injects a FAKE observer, so it pins
+ * `classifyWatched`'s call, never the adapter that forwards into the real
+ * `observeWorkflow`. Both legs now have a failing mutation.
+ */
+export function makeGuardReaders(repo, read = gh) {
+  return {
+    observe: (workflow, event) => observeWorkflow(repo, workflow, read, event),
+    crossCheck: (workflow, event) => crossCheckCompletions(repo, workflow, read, event),
+  };
+}
+
+function main() {
+  const repo = process.env.GUARD_LIVENESS_REPO || process.env.GITHUB_REPOSITORY || "Blockcast/paperclip";
+
+  // An explicit override is a manual debugging dial (workflow_dispatch, or the
+  // live checks in the PR). It deliberately applies to EVERY guard, flattening
+  // the per-guard thresholds, so a dispatch at 1h reds the whole set on purpose.
+  const override = process.env.GUARD_LIVENESS_STALE_HOURS;
+  const overrideHours = override && String(override).trim() !== "" ? resolveStaleHours(override) : null;
+
+  const watched = resolveWatched(process.env.GUARD_LIVENESS_WORKFLOWS, overrideHours);
+
+  const now = Date.now();
+  const { observe, crossCheck } = makeGuardReaders(repo);
+  const results = classifyWatched(watched, observe, crossCheck, { now, overrideHours });
 
   for (const result of results) {
     if (result.status === "ok") {

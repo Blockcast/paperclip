@@ -986,7 +986,7 @@ describe("paperclip MCP tools", () => {
 
   it("queries parked agents with an optional reason filter", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
-      mockJsonResponse({ parkedCount: 1, agents: [{ agentName: "PlatformSREEngineer" }] }),
+      mockJsonResponse({ parkedRunCount: 1, parkedAgentCount: 1, agents: [{ agentName: "PlatformSREEngineer" }] }),
     );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -1000,11 +1000,11 @@ describe("paperclip MCP tools", () => {
     expect(String(url)).toContain("reason=ccrotate_capacity");
     expect(String(url)).toContain("limit=50");
     expect(response.isError).toBeUndefined();
-    expect(JSON.parse(response.content[0]!.text)).toMatchObject({ parkedCount: 1 });
+    expect(JSON.parse(response.content[0]!.text)).toMatchObject({ parkedRunCount: 1, parkedAgentCount: 1 });
   });
 
   it("omits the parked-agents query string when no filters are given", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ parkedCount: 0, agents: [] }));
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ parkedRunCount: 0, parkedAgentCount: 0, agents: [] }));
     vi.stubGlobal("fetch", fetchMock);
 
     await getTool("paperclipListParkedAgents").execute({});

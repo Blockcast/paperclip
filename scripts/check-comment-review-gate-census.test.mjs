@@ -9,6 +9,7 @@ import {
   isMainModule,
   isReviewNamespacedContext,
   statusesAsOfMerge,
+  violatingPrCount,
 } from "./check-comment-review-gate-census.mjs";
 
 const HEAD = "a".repeat(40);
@@ -160,6 +161,47 @@ describe("findPrViolations", () => {
   it("treats a PR with no statuses at all as clean for this invariant", () => {
     assert.deepEqual(findPrViolations(pr([])), []);
   });
+
+  // BLO-34742. The gate also writes a retirement pointer over the old
+  // `review/ally-comment` context, mirroring the live state. For a
+  // not-evaluated verdict that mirror is a green `review/`-namespaced row on a
+  // head nothing reviewed — a violation by this census's own definition — and
+  // it was worded past the pattern, so the row was admitted at the state check
+  // and then silently skipped at the description check. BLO-34316 made that
+  // blind spot matter: `not_evaluated` went from "PRs Ally has not reviewed
+  // yet" to every agent PR carrying only a self-attestation.
+  //
+  // These fixtures carry the gate's wording verbatim. The binding cross-check
+  // that the gate still emits it lives in the server suite
+  // (`pr-comment-review-gate.test.ts`), which asserts against this module's own
+  // `admitsNothingEvaluated` rather than against a copy of these strings.
+  it("flags the retired mirror of a not-evaluated verdict", () => {
+    const violations = findPrViolations(
+      pr([
+        status({
+          description:
+            'Retired. No independent Ally consolidated-review comment attests this head; "gate/ally-comment-findings" carries the verdict.',
+        }),
+      ]),
+    );
+
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].context, "review/ally-comment");
+  });
+
+  it("does not flag the retired mirror of a clean verdict", () => {
+    assert.deepEqual(
+      findPrViolations(
+        pr([
+          status({
+            description:
+              'Retired. Comment-shaped review findings now publish to "gate/ally-comment-findings".',
+          }),
+        ]),
+      ),
+      [],
+    );
+  });
 });
 
 describe("findViolations", () => {
@@ -167,6 +209,27 @@ describe("findViolations", () => {
     assert.equal(findViolations([pr([status()]), pr([status()], { number: 1390 })]).length, 2);
     assert.deepEqual(findViolations([]), []);
     assert.deepEqual(findViolations(undefined), []);
+  });
+});
+
+describe("violatingPrCount", () => {
+  // The headline reads "N of M merged PRs", so N counts PRs and the per-row
+  // detail lines count rows. Counting rows there was harmless while at most one
+  // `review/` row per PR could match; making the retired mirror countable makes
+  // several rows per PR routine, and a row count can then exceed M.
+  it("counts distinct PRs, not rows", () => {
+    const rows = findViolations([
+      pr([status(), status({ context: "review/ally-complete" })]),
+      pr([status()], { number: 1390 }),
+    ]);
+
+    assert.equal(rows.length, 3);
+    assert.equal(violatingPrCount(rows), 2);
+  });
+
+  it("is zero for an empty or missing list", () => {
+    assert.equal(violatingPrCount([]), 0);
+    assert.equal(violatingPrCount(undefined), 0);
   });
 });
 

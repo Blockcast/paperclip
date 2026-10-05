@@ -312,17 +312,36 @@ re-derive it or re-file it as a fresh misattribution report:
 - **Merge and squash-merge commits are legitimately App-attributed** — GitHub
   itself creates those via the merge API on your behalf. This is out of
   scope; don't flag them.
-- **The gate matches only the numeric-prefixed App email
-  (`290875700+allyblockcast[bot]@users.noreply.github.com`), deliberately not
-  the bare `allyblockcast[bot]@users.noreply.github.com`.** That bare form is
-  the `graphify-reindex` bot's own legitimate `git push` identity, verified
-  against real PRs (#789, #944) — widening the match would flag its
-  commits. If a *commit* shows the bare form, that is the `graphify-reindex`
-  bot's own identity, not a misconfigured checkout — diagnose it with
-  `git log -1 --pretty='%an <%ae>'`, not with `git config user.email`, which
-  no longer decides authorship (see above) and so cannot tell you anything
-  about what the gate saw. Do not ask the gate to catch it; it cannot
-  distinguish the two cases by email alone.
+- **The gate matches every spelling of the App noreply address, not one
+  literal** (BLO-26647): the id-prefixed
+  `290875700+allyblockcast[bot]@users.noreply.github.com`, the bare
+  `allyblockcast[bot]@users.noreply.github.com`, any other numeric prefix, an
+  optional `+tag` subaddress, any casing. All of those resolve to the same
+  shared installation — the prefix is caller-supplied at commit time, not a
+  verified property of the write — so the old single-literal match was
+  measuring spelling rather than identity and let 15 of 207 commits through.
+  It still does **not** match `allyblockcast@users.noreply.github.com` (no
+  `[bot]`), which is a different real account (id 296676656). Diagnose a
+  flagged commit with `git log -1 --pretty='%an <%ae>'`, never with
+  `git config user.email`, which no longer decides authorship (see above).
+- **The one exemption is the `graphify-reindex` bot, and it is scoped by
+  author name AND by path.** That scheduled knowledge-graph refresh shares
+  the bare address, so email cannot distinguish it — but a git author *name*
+  is caller-controlled too, so exempting on the name alone would be a
+  one-line bypass of the whole gate. `NON_AGENT_PROCESS_EXEMPTIONS` therefore
+  also pins the paths it may touch (`graphify-out/`); a commit wearing that
+  name which changes anything else is still an offense. Add a new non-agent
+  process the same way — name it, pin its output paths, cite the real
+  commit — never by widening the email pattern.
+- **Before asking for a grandfather entry, look your author up.** If a
+  flagged commit predates `ATTRIBUTION_GATE_CUTOFF`, query the Paperclip run
+  record for the run whose comments describe that commit's work within
+  minutes of its author date — runs routinely name the SHA they created. If
+  the author is recoverable, re-attribute the commit (`git commit --amend
+  --author=…`, preserving the author date, proving the content is unchanged
+  with `git patch-id --stable`). That shrinks the allowlist instead of
+  growing it and touches no security control. The grandfather clause is for
+  commits whose author is genuinely lost, not for commits nobody looked up.
 - CI enforces this going forward on every `paperclip` PR
   (`scripts/check-commit-author-attribution.mjs`, wired into `pr.yml`); an
   on-demand cross-repo audit mode (`--audit-merged`) covers

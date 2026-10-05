@@ -12,7 +12,7 @@ import type {
 } from "@paperclipai/shared";
 import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
-import { ghFetch, resolveRawGitHubUrl } from "./github-fetch.js";
+import { ghFetch, ghReadBody, resolveRawGitHubUrl } from "./github-fetch.js";
 import { normalizePortablePath } from "./portable-path.js";
 
 interface CatalogManifestFile {
@@ -224,7 +224,7 @@ async function fetchCatalogSourceFile(
   if (!response.ok) {
     throw unprocessable(`Failed to fetch pinned catalog file ${sourcePath} from ${source.owner}/${source.repo}@${source.commit}: HTTP ${response.status}`);
   }
-  return Buffer.from(await response.arrayBuffer());
+  return Buffer.from(await ghReadBody(url, () => response.arrayBuffer()));
 }
 
 async function readCatalogFileBytes(

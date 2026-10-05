@@ -698,6 +698,142 @@ const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
 type AggregateFenceWedgedMemo = Set<string>;
 
 /**
+ * Process-local fair handoff for the aggregate fence (PEN-3013).
+ *
+ * Every refusal this fence produces in production is a delivery in THIS process
+ * losing to a sibling delivery in THIS process — that is a property of the
+ * claim predicate, not an observation that could drift. `beginAggregateFiring`
+ * admits a holder in the same slot with a *different* `owner_instance_id`
+ * (BLO-31036) and a holder past the abandonment backstop, so the only holder it
+ * can still refuse for is one sharing `WORKER_INSTANCE_ID` — i.e. a concurrent
+ * delivery interleaved into the same worker child, which is exactly what the
+ * RPC layer produces. Measured 2026-09-30 over 24h on `paperclip-0`: 902
+ * refusals, all of them phase `firing`, none `cancelling`, single pod.
+ *
+ * So the fence is being used as a mutex between coroutines of one process, and
+ * the waiter had no way to learn that the holder had finished. It polled with
+ * exponential full jitter, which is the right shape against an *unknown* remote
+ * holder but is unfair against a local one: a delivery that has already waited
+ * competes on equal terms with a fresh arrival every round. Measured over the
+ * same window, 36% of refusals reported a holder age *below* the 3s budget the
+ * waiter had already spent — lost races against a briskly rotating fence, not a
+ * stuck one. Raising the budget lengthens that starvation window; it does not
+ * end it.
+ *
+ * This registry closes the loop: a release performed by this process wakes one
+ * waiter directly, so the handoff is FIFO by arrival and the woken waiter
+ * reclaims before any jitter timer fires.
+ *
+ * Two properties keep the worst case at exactly today's behaviour:
+ *   - Waiters keep their jitter timer. The signal only ever *shortens* a wait,
+ *     so a fence held by another process, another slot, or a dead owner behaves
+ *     precisely as before — including the budget arithmetic and the wedged memo.
+ *   - A wake is never required for progress. If the woken waiter exhausts its
+ *     budget before retrying, the wake is dropped rather than forwarded; the
+ *     remaining waiters still retry on their own timers within
+ *     `maxDelayMs`. That bounds a lost wake at one extra poll interval, which
+ *     is why forwarding it is not worth the state it would cost.
+ *
+ * Waking exactly one is deliberate. Waking all would rebuild the thundering
+ * herd this file's jitter exists to break up, and only one of them can win.
+ */
+type LocalFenceWaiter = {
+  /** Re-armed after each wake, because one waiter waits across many attempts. */
+  awaken: () => Promise<void>;
+  wake: () => void;
+};
+
+const aggregateFenceLocalWaiters = new Map<string, LocalFenceWaiter[]>();
+
+/** Fences are company-scoped, so the local queue must be too. */
+function localFenceQueueKey(companyId: string, aggregateKey: string): string {
+  // `\0` rather than a literal NUL byte: byte-identical at runtime, but a raw
+  // NUL makes this whole file binary to content search. Measured here, `grep`
+  // did not even print "binary file matches" — it exited 1 with no output,
+  // i.e. a silent false negative, while `rg` suppressed the matches (PEN-3013
+  // review). NUL stays the separator: it is the one byte that cannot appear in
+  // either component, so the key cannot be forged by a crafted aggregate key.
+  return `${companyId}\0${aggregateKey}`;
+}
+
+function createLocalFenceWaiter(): LocalFenceWaiter {
+  let resolve: (() => void) | null = null;
+  let pending: Promise<void> | null = null;
+  return {
+    awaken() {
+      if (!pending) {
+        pending = new Promise<void>((res) => {
+          resolve = res;
+        });
+      }
+      return pending;
+    },
+    wake() {
+      const res = resolve;
+      pending = null;
+      resolve = null;
+      res?.();
+    },
+  };
+}
+
+/**
+ * Hand the fence to the longest-waiting local delivery, if there is one.
+ *
+ * Called only after a release this process actually performed, so it cannot
+ * announce availability that does not exist. A spurious wake would still be
+ * harmless — the woken waiter simply re-attempts the real claim, which is the
+ * only thing that decides ownership — but keeping it truthful is what lets the
+ * wake be read as "the fence was just freed" in a log or a test.
+ */
+function signalLocalFenceRelease(companyId: string, aggregateKey: string): void {
+  const queueKey = localFenceQueueKey(companyId, aggregateKey);
+  const queue = aggregateFenceLocalWaiters.get(queueKey);
+  if (!queue || queue.length === 0) return;
+  const next = queue.shift();
+  if (queue.length === 0) aggregateFenceLocalWaiters.delete(queueKey);
+  next?.wake();
+}
+
+/**
+ * Put a woken waiter back at the head of the queue after a claim it could not
+ * convert.
+ *
+ * A wake is not a grant. `signalLocalFenceRelease` removes the waiter from the
+ * queue, but ownership is still decided by `beginAggregateFiring`, and the
+ * window between the two is a full database round trip — wide enough for a
+ * freshly arrived delivery, which attempts a claim once before it registers, to
+ * take the fence first. Without this the loser would have both consumed the
+ * wake (no other queued delivery received it) and dropped out of the queue, so
+ * it could never be woken again and would fall back to pure jittered polling
+ * for the rest of its budget — strictly worse treatment than a waiter that was
+ * never woken, and inflicted specifically on the longest-waiting delivery.
+ *
+ * Front rather than back, because the waiter's arrival time has not changed:
+ * it still predates everything now queued, so `unshift` is what keeps the
+ * handoff FIFO by arrival. Re-entry is conditional on the waiter actually being
+ * absent, so a waiter whose timer fired (still queued, never woken) is not
+ * duplicated.
+ */
+function requeueLocalFenceWaiter(queueKey: string, waiter: LocalFenceWaiter): void {
+  const queue = aggregateFenceLocalWaiters.get(queueKey) ?? [];
+  if (queue.includes(waiter)) return;
+  queue.unshift(waiter);
+  aggregateFenceLocalWaiters.set(queueKey, queue);
+}
+
+/** Test seam: how many deliveries are queued on a local fence right now. */
+export function localFenceWaiterCount(
+  companyId: string,
+  aggregateKey: string,
+): number {
+  return (
+    aggregateFenceLocalWaiters.get(localFenceQueueKey(companyId, aggregateKey))
+      ?.length ?? 0
+  );
+}
+
+/**
  * `beginAggregateFiring`, but waits out a fence held by a live holder instead of
  * failing the delivery on first refusal (PEN-3013).
  *
@@ -737,25 +873,54 @@ async function claimAggregateFiringWaiting(
   const startedAt = policy.now();
   let attempt = 0;
   let claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  if (claim.ok) return claim;
 
-  while (!claim.ok) {
-    const elapsedMs = policy.now() - startedAt;
-    const remainingMs = policy.budgetMs - elapsedMs;
-    if (remainingMs <= 0) {
-      wedgedKeys?.add(aggregateKey);
-      return claim;
+  // Registered only once the first attempt has actually been refused, and for
+  // the whole remaining wait rather than per iteration. Both halves matter: the
+  // uncontended path allocates nothing, and a waiter that kept re-registering
+  // would drop to the back of the queue on every poll, which is the starvation
+  // this is here to remove.
+  const queueKey = localFenceQueueKey(companyId, aggregateKey);
+  const waiter = createLocalFenceWaiter();
+  const queue = aggregateFenceLocalWaiters.get(queueKey) ?? [];
+  queue.push(waiter);
+  aggregateFenceLocalWaiters.set(queueKey, queue);
+
+  try {
+    while (!claim.ok) {
+      const elapsedMs = policy.now() - startedAt;
+      const remainingMs = policy.budgetMs - elapsedMs;
+      if (remainingMs <= 0) {
+        wedgedKeys?.add(aggregateKey);
+        return claim;
+      }
+
+      // Exponential with full jitter, clamped to whatever budget is left so the
+      // total wait cannot overrun even on the final attempt.
+      const ceiling = Math.min(
+        policy.maxDelayMs,
+        policy.initialDelayMs * 2 ** attempt,
+      );
+      const delayMs = Math.min(remainingMs, Math.ceil(policy.random() * ceiling));
+      // Whichever comes first: a local release hands the fence over directly,
+      // the timer is the backstop for every holder this process cannot observe.
+      // `awaken()` is read before the sleep starts so a release that lands
+      // mid-sleep is not missed.
+      await Promise.race([waiter.awaken(), policy.sleep(delayMs)]);
+      attempt += 1;
+      claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+      // A wake that lost the reclaim race must not cost the waiter its place in
+      // the queue; see {@link requeueLocalFenceWaiter}. No-op when the timer,
+      // not a wake, is what ended the sleep.
+      if (!claim.ok) requeueLocalFenceWaiter(queueKey, waiter);
     }
-
-    // Exponential with full jitter, clamped to whatever budget is left so the
-    // total wait cannot overrun even on the final attempt.
-    const ceiling = Math.min(
-      policy.maxDelayMs,
-      policy.initialDelayMs * 2 ** attempt,
-    );
-    const delayMs = Math.min(remainingMs, Math.ceil(policy.random() * ceiling));
-    await policy.sleep(delayMs);
-    attempt += 1;
-    claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  } finally {
+    const live = aggregateFenceLocalWaiters.get(queueKey);
+    if (live) {
+      const index = live.indexOf(waiter);
+      if (index >= 0) live.splice(index, 1);
+      if (live.length === 0) aggregateFenceLocalWaiters.delete(queueKey);
+    }
   }
 
   if (attempt > 0) {
@@ -878,6 +1043,9 @@ async function finishAggregateFiring(
       `Alertmanager aggregate firing fence was lost for ${aggregateKey}; retrying delivery`,
     );
   }
+  // The fence is now 'active' and claimable. Hand it to the longest-waiting
+  // local delivery instead of leaving it to find out on its next poll.
+  signalLocalFenceRelease(companyId, aggregateKey);
 }
 
 /**
@@ -917,7 +1085,12 @@ export async function recoverAggregateFiring(
        AND firing_token = $3`,
     [companyId, aggregateKey, token],
   );
-  if (result.rowCount > 0) return true;
+  if (result.rowCount > 0) {
+    // An operator draining a wedged fence should not also have to wait out the
+    // poll interval of whatever is queued behind it.
+    signalLocalFenceRelease(companyId, aggregateKey);
+    return true;
+  }
   // Same compare-and-set discipline on the resolution token: a stale or wrong
   // token releases nothing, so this cannot reopen a fence owned by a newer
   // resolver.
@@ -934,7 +1107,9 @@ export async function recoverAggregateFiring(
        AND resolution_token = $3`,
     [companyId, aggregateKey, token],
   );
-  return cancelling.rowCount > 0;
+  if (cancelling.rowCount === 0) return false;
+  signalLocalFenceRelease(companyId, aggregateKey);
+  return true;
 }
 
 async function tryClaimAggregateFinalization(
@@ -1018,7 +1193,7 @@ async function releaseAggregateFinalization(
   token: string,
 ): Promise<void> {
   const ns = ctx.db.namespace;
-  await ctx.db.execute(
+  const result = await ctx.db.execute(
     `UPDATE ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
      SET phase = 'active',
          resolution_token = NULL,
@@ -1031,6 +1206,13 @@ async function releaseAggregateFinalization(
        AND resolution_token = $3`,
     [companyId, aggregateKey, token],
   );
+  // 'cancelling' refuses a firing claim just as 'firing' does, so a delivery
+  // can be queued locally behind this release too. Production has not observed
+  // that phase blocking (0 of 902 refusals over 24h on 2026-09-30), but the
+  // handoff belongs wherever this process makes the fence claimable again —
+  // leaving it out would make the fast path depend on which phase happened to
+  // hold it.
+  if (result.rowCount > 0) signalLocalFenceRelease(companyId, aggregateKey);
 }
 
 async function resolveAggregateMember(
@@ -2802,6 +2984,41 @@ function buildRecoveredStateRecord(
 }
 
 /**
+ * The API tier's worker-proxy deadline, mirrored here for reporting only.
+ *
+ * Deliberately a mirrored literal and not an import: it lives in
+ * `PROXY_REQUEST_TIMEOUT_MS` (server/src/routes/worker-tier-proxy.ts), which is
+ * host-side code this plugin worker cannot import. Nothing here enforces it —
+ * it is used to label a delivery that has already blown past it, so a drift
+ * between the two values costs a mislabelled metric, never a behaviour change.
+ */
+const WORKER_PROXY_DEADLINE_MS = 120_000;
+
+/**
+ * Elapsed wall-clock at which a single delivery logs which alert it is on.
+ *
+ * Half the proxy deadline, deliberately. This handler has no deadline of its
+ * own — it always runs the whole batch to completion — so the 504 Alertmanager
+ * sees is emitted by the *API tier* while this loop is still running, and the
+ * worker has never recorded what it was doing at the time. That is why
+ * BLO-37485 read as "invisible from the worker side": the evidence was not
+ * missing, it was never written. Warning at the halfway mark is what makes a
+ * give-up attributable to a specific alert instead of inferred from the client.
+ */
+const SLOW_DELIVERY_WARN_MS = WORKER_PROXY_DEADLINE_MS / 2;
+
+/**
+ * The elapsed marks a delivery reports on, ascending. Each is reported once, by
+ * the alert whose work carried the delivery across it, so a 29-alert batch
+ * still logs at most one line per mark.
+ *
+ * The halfway mark alone is not enough: a later wedge would be masked by the
+ * earlier crossing. The deadline mark names the alert that was in flight when
+ * the API tier gave up, which is the one AC1 has to attribute.
+ */
+const SLOW_DELIVERY_MARKS_MS = [SLOW_DELIVERY_WARN_MS, WORKER_PROXY_DEADLINE_MS];
+
+/**
  * Top-level webhook handler. Pure-ish: takes ctx + config + an authentication
  * verdict + input, returns the delivery's disposition. Throws
  * `WebhookUnauthorizedError` when that verdict is `false` — the worker's
@@ -2896,7 +3113,53 @@ export async function handleWebhook(
   // so a wedged fence stays O(1) in batch size on the failure path.
   const fenceWedgedMemo: AggregateFenceWedgedMemo = new Set();
 
-  for (const alert of body.alerts) {
+  // `performance.now()`, not `Date.now()`: every value derived from these
+  // timestamps is a duration, and a wall-clock *step* mid-delivery corrupts
+  // exactly the two numbers this instrumentation exists to produce. A backward
+  // step writes a negative `duration_ms`, which `increase()` reads as a counter
+  // reset rather than as a small value; a forward step fabricates a
+  // `deadline_exceeded`, the counter AC3 is judged on. Slew over a 120s window
+  // is immaterial either way, but a step is not, and NTP steps correlate with
+  // the host pressure that makes deliveries slow in the first place. Clamping
+  // at 0 would only cover the backward half.
+  const deliveryStartedAt = performance.now();
+  let slowMarksReported = 0;
+  let inFlight:
+    | { alertIndex: number; alert: AlertmanagerAlert; startedAt: number }
+    | undefined;
+
+  // Evaluated after each alert's work, naming the alert just finished: the
+  // first alert whose completion crosses a mark is the one in flight when the
+  // mark passed. Sampling before an alert instead names whichever alert starts
+  // next, and never sees the last alert's work at all.
+  const reportIfSlow = (finished: NonNullable<typeof inFlight>): void => {
+    const finishedAt = performance.now();
+    // Rounded once here: `performance.now()` is fractional, and both values
+    // below are printed for an operator.
+    const elapsedMs = Math.round(finishedAt - deliveryStartedAt);
+    const crossed = SLOW_DELIVERY_MARKS_MS.filter((mark) => elapsedMs > mark).length;
+    if (crossed <= slowMarksReported) return;
+    slowMarksReported = crossed;
+    const { alertIndex, alert, startedAt } = finished;
+    const deadline =
+      elapsedMs > WORKER_PROXY_DEADLINE_MS
+        ? `The API tier abandoned this request at ${WORKER_PROXY_DEADLINE_MS}ms while this alert was in flight, so Alertmanager discards the whole batch.`
+        : `The API tier abandons this request at ${WORKER_PROXY_DEADLINE_MS}ms, after which Alertmanager discards the whole batch.`;
+    ctx.logger.warn(
+      `paperclip-plugin-alertmanager: slow delivery: ${elapsedMs}ms elapsed after ${alertIndex + 1} of ${body.alerts.length} alerts; ${
+        alert.labels.alertname ?? "unknown"
+      } (${alert.fingerprint}) took ${Math.round(finishedAt - startedAt)}ms. ${deadline}`,
+    );
+  };
+
+  for (const [alertIndex, alert] of body.alerts.entries()) {
+    // The previous alert's work ends here. Checked before the label filter so
+    // the warning fires on elapsed time rather than on reaching a billable
+    // alert: a batch can be slow and then spend its last seconds on filtered
+    // alerts, and that is still the delivery that gets abandoned.
+    if (inFlight) reportIfSlow(inFlight);
+    inFlight = { alertIndex, alert, startedAt: performance.now() };
+
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
       await ctx.metrics.write("alertmanager.webhook.filtered", 1, {
         alertname: alert.labels.alertname ?? "unknown",
@@ -3058,6 +3321,66 @@ export async function handleWebhook(
           `paperclip-plugin-alertmanager: failed to record alert error metric for ${alert.fingerprint}: ${String(metricErr)}`,
         );
       }
+    }
+  }
+
+  // The last alert's work ends here; without this a one-alert delivery that
+  // wedges past the deadline would never be attributed.
+  if (inFlight) reportIfSlow(inFlight);
+
+  // Per-delivery timing (BLO-37485).
+  //
+  // This runs even when the API tier gave up on the request long ago: nothing
+  // aborts the handler when the proxy's fetch is abandoned, so a delivery that
+  // blew the deadline still reaches this line and still reports. That is the
+  // only case worth measuring here, and it is precisely the case the host-side
+  // `plugin_webhook_deliveries.duration_ms` column records but does not expose
+  // — that column is readable only through the board-gated plugin dashboard
+  // route and is capped at the last 10 rows.
+  //
+  // Counters, not a histogram, because `ctx.metrics.write` is the only channel
+  // a plugin has. Mean delivery cost is
+  // `increase(duration_ms) / increase(completed)`; mean per-alert cost is
+  // `increase(duration_ms) / increase(alerts_received)`, which is the number
+  // that decides whether the deadline is mis-set for real batch cost.
+  //
+  // Untagged on purpose: promoted tag keys share a 50-slot per-name label
+  // budget (see manifest `metricLabels`), and an `alertname` tag here would
+  // spend it for an aggregate that is only ever read summed. The per-delivery
+  // attribution lives in the log line above, where cardinality is free.
+  const deliveryMs = Math.round(performance.now() - deliveryStartedAt);
+  const timingMetrics: Array<[name: string, value: number]> = [
+    ["alertmanager.webhook.duration_ms", deliveryMs],
+    ["alertmanager.webhook.completed", 1],
+    ["alertmanager.webhook.alerts_received", body.alerts.length],
+  ];
+  if (deliveryMs > WORKER_PROXY_DEADLINE_MS) {
+    // A worker-side LOWER BOUND on destroyed batches, not a count of them.
+    // `deliveryStartedAt` is handler entry, but the 120s deadline runs from
+    // request arrival at the API tier: transport, worker-tier dispatch and
+    // queueing, and host-side body parsing all happen first and are outside
+    // this measurement. `PluginWebhookInput` carries no arrival time, so the
+    // worker cannot see them. A batch destroyed after 25s of queueing plus 100s
+    // of handler work records `duration_ms: 100000` and no breach, and queueing
+    // shares its causes with slow deliveries, so the undercount is worst under
+    // load. Read 0 as "no delivery spent the whole deadline inside the
+    // handler", never as "no batch was destroyed". The Alertmanager-side grep
+    // this issue shipped with errs the other way, counting retry attempts as
+    // terminal give-ups.
+    timingMetrics.push(["alertmanager.webhook.deadline_exceeded", 1]);
+  }
+  // One `catch` per write, not one around all of them: a shared `try` lets the
+  // first failure skip every later write, dropping a denominator (`completed`)
+  // or the breach counter itself, and telemetry trouble and slow deliveries
+  // share causes. Best-effort, matching every other metric write in this
+  // handler: a telemetry outage must not change a delivery's outcome.
+  for (const [name, value] of timingMetrics) {
+    try {
+      await ctx.metrics.write(name, value);
+    } catch (metricErr) {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record delivery timing metric ${name}: ${String(metricErr)}`,
+      );
     }
   }
 

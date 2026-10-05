@@ -61,6 +61,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
+import { setDbInheritedTimeouts } from "./services/metrics.js";
 import { auditConfiguredHookCommandsOnBoot } from "./services/lifecycle-hook-command-audit.js";
 import {
   parseAdapterRegistryEnv,
@@ -70,7 +71,27 @@ import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-sh
 import { summarizeStrandedRecoveryHandBackPass } from "./services/recovery/service.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import {
+  recordHeartbeatRecoveryChainDuration,
+  recordHeartbeatRecoveryChainInflight,
+  recordHeartbeatRecoveryChainSkipped,
+  recordHeartbeatRecoveryChainStalled,
+} from "./services/metrics.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
+import {
+  HEAP_SNAPSHOT_SENTINEL_BASENAME,
+  decideHeapSnapshot,
+  describeSentinelOutcome,
+  ensureHeapSnapshotDir,
+  findConcurrentSnapshotWriters,
+  heapSnapshotSweepKeep,
+  listHeapSnapshots,
+  listResidualHeapSnapshots,
+  planHeapSnapshotStartup,
+  pruneHeapSnapshots,
+  seedLastAutoSnapshotAtMs,
+  takeHeapSnapshot,
+} from "./services/heap-snapshot.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -728,6 +749,13 @@ export async function startServer(): Promise<StartedServer> {
   // means one blocked query can hang a recovery pass indefinitely (PEN-3365);
   // that is the reading the explicit-timeout decision is gated on. Probing is
   // strictly diagnostic, so it must never prevent the server from starting.
+  //
+  // The reading is published as a gauge as well as logged. The log line alone
+  // proved unreadable: it is emitted once at startup, and by 2026-09-26 no pod
+  // had restarted in over two days, leaving it ~390k lines behind a tail-only
+  // log reader with `kubectl logs` 403 from an agent seat. The gauge makes the
+  // gating reading answerable by query at any time instead of only in the
+  // minutes after a restart nobody controls.
   try {
     const inheritedTimeouts = await readInheritedTimeoutSettings(activeDatabaseConnectionString);
     const unbounded = inheritedTimeouts.statementTimeout.valueMs === null;
@@ -737,9 +765,18 @@ export async function startServer(): Promise<StartedServer> {
           ? " — statement_timeout is disabled, so a blocked query is bounded by nothing server-side (PEN-3365)"
           : ""),
     );
+    setDbInheritedTimeouts([
+      inheritedTimeouts.statementTimeout,
+      inheritedTimeouts.idleInTransactionSessionTimeout,
+      inheritedTimeouts.lockTimeout,
+    ]);
   } catch (error) {
+    // "read or publish": the gauge write is inside this guard too, so a throw
+    // from the registry path lands here as well. Naming only the read would
+    // point an operator at the database when the read had in fact succeeded
+    // and printed its line immediately above.
     logger.warn(
-      `Could not read the database timeout environment: ${error instanceof Error ? error.message : String(error)}`,
+      `Could not read or publish the database timeout environment: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   
@@ -1096,6 +1133,33 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  // PEN-3314. Separate timer from `heartbeatSchedulerInterval` on purpose — see
+  // the watchdog registration below for why the recovery-chain detector must
+  // not ride the heartbeat tick.
+  let heartbeatRecoveryChainWatchdogInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * PEN-3631. The heap-snapshot poll, declared out here so `shutdown()` can
+   * clear it the way it clears `heartbeatSchedulerInterval`.
+   *
+   * Leaking the timer would be harmless on its own — shutdown ends in
+   * `process.exit`. What is not harmless is what the callback *does* during the
+   * drain that precedes it. It is deliberately synchronous and
+   * `writeHeapSnapshot` is stop-the-world, so a trigger observed after SIGTERM
+   * blocks the event loop for the length of a multi-gigabyte write while
+   * `shutdown()` is still awaiting `drainInFlightRunSetup`, per-company secret
+   * queries and `embeddedPostgres.stop()`. Outlast the remaining
+   * `terminationGracePeriodSeconds` and the pod is SIGKILLed mid-drain with
+   * in-flight runs never terminalized — precisely the outcome the drain exists
+   * to prevent. With a threshold set the heap sits above it by definition (that
+   * is the PEN-3314 posture) and `lastAutoSnapshotAtMs` is null after a restart,
+   * so the first post-SIGTERM poll fires unconditionally; any pod on the shared
+   * claim touching the sentinel reaches the same place on demand.
+   *
+   * `unref()` would not do: it stops the timer holding the loop open, not an
+   * already-fired callback from blocking the drain.
+   */
+  let heapSnapshotPollInterval: ReturnType<typeof setInterval> | null = null;
+  let heapSnapshotPollStopped = false;
   /**
    * BLO-19123. Last time the hand-back drain actually ran, so its cadence is decoupled from
    * the scheduler's.
@@ -1139,6 +1203,23 @@ export async function startServer(): Promise<StartedServer> {
   // overlap the latch exists to remove, so this reports and does not act.
   let heartbeatRecoveryChainInFlight = false;
   let heartbeatRecoveryChainStartedAt = 0;
+  // PEN-3314: latches the stall COUNTER to once per stalled pass. A counter
+  // that ticked with the log would conflate "how many passes stalled" with "how
+  // long one of them has been stalled", and the first is the alertable
+  // quantity. Reset when a new pass starts, not when one ends, so a pass that
+  // never settles cannot re-arm it.
+  let heartbeatRecoveryChainStallCounted = false;
+  // PEN-3314, from Ally's review of 0cbb0915: the stall report re-logs while the
+  // halt is unresolved — an unresolved halt should keep saying so — but at
+  // `error` and one line per watchdog sample that is unbounded, and the watchdog
+  // now samples faster than the scheduler interval (see
+  // HEARTBEAT_RECOVERY_CHAIN_WATCHDOG_INTERVAL_MS), which would have tripled it.
+  // Re-log on its own coarse clock instead: the first crossing logs
+  // immediately, then at most one line per HEARTBEAT_RECOVERY_CHAIN_RELOG_MS.
+  // `0` means "not currently logged as stalled"; reset with the counter latch on
+  // pass start so a later stall reports immediately rather than inheriting the
+  // previous pass's clock.
+  let heartbeatRecoveryChainStallLoggedAt = 0;
   // BLO-22984: the same latch, for the execution-workspace collector. It is
   // its own tracked pass (below), and `setInterval` fires the next callback on
   // schedule whether or not the previous one settled, so without this a slow
@@ -1155,10 +1236,32 @@ export async function startServer(): Promise<StartedServer> {
   // the chain's stamp it reports and does not act.
   let executionWorkspaceCollectorInFlight = false;
   let executionWorkspaceCollectorStartedAt = 0;
-  // 10 ticks. Above the normal case (a sweep routinely outlives one interval —
-  // that is what the latch is for) and far below the hours a wedged chain would
-  // otherwise sit silent.
-  const HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS = 10 * config.heartbeatSchedulerIntervalMs;
+  // 10 scheduler intervals. Above the normal case (a sweep routinely outlives
+  // one interval — that is what the latch is for) and far below the hours a
+  // wedged chain would otherwise sit silent. Deliberately scaled to the
+  // SCHEDULER interval, not the watchdog's sampling period below: it describes
+  // how long a pass may legitimately run, which is a property of the work, not
+  // of how often we look at it. Naming it `…_STALL_MS` rather than
+  // `…_STALL_WARN_MS` keeps it honest now that its two readers log at different
+  // levels — `error` for the recovery chain, `warn` for the execution-workspace
+  // collector.
+  const HEARTBEAT_RECOVERY_CHAIN_STALL_MS = 10 * config.heartbeatSchedulerIntervalMs;
+  // PEN-3314: how often a still-stalled pass re-logs. One line per stall
+  // threshold keeps the "keeps saying so" property bounded at ~288 lines/day per
+  // wedged worker instead of one per watchdog sample.
+  const HEARTBEAT_RECOVERY_CHAIN_RELOG_MS = HEARTBEAT_RECOVERY_CHAIN_STALL_MS;
+  // PEN-3314, from Ally's review of 0cbb0915: sample at a FRACTION of the
+  // scheduler interval, not at the interval itself. The documented alert is
+  // `inflight > heartbeatSchedulerIntervalMs`, so sampling at that same period
+  // lets the gauge lag the actual overlap crossing by up to a full interval —
+  // the one quantity the alert thresholds on. This callback reads two in-memory
+  // variables, awaits nothing and touches no database, so a faster period costs
+  // nothing. Floored so a pathologically small configured interval cannot spin
+  // the timer.
+  const HEARTBEAT_RECOVERY_CHAIN_WATCHDOG_INTERVAL_MS = Math.max(
+    1_000,
+    Math.floor(config.heartbeatSchedulerIntervalMs / 3),
+  );
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1437,6 +1540,83 @@ export async function startServer(): Promise<StartedServer> {
     if (toolHealthSweep.failed > 0) {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
+
+    // PEN-3314. Deliberately its OWN timer, not part of the heartbeat tick
+    // below. The tick reaches the recovery-chain latch only after two
+    // `resolveSchedulingSuppression()` round-trips and a suppression branch, so
+    // it is downstream of the very resource whose exhaustion this detector
+    // exists to report: when the pool saturates — `active` pinned at
+    // POSTGRES_POOL_MAX with a long `waiting` queue, the BLO-34207 state — every
+    // tick parks on those awaits and none arrives here. Reporting from there
+    // would therefore go SILENT exactly when the chain is wedged, and worse than
+    // silent: the in-flight gauge would hold the `0` written by the last settle,
+    // so the worker would export a confident "no pass outstanding" throughout
+    // the incident. That is the same fabricated-health failure the tick body's
+    // own comment above says this code exists to remove.
+    //
+    // This callback reads two in-memory variables and writes two metrics. It
+    // touches no database, takes no lock, and awaits nothing, so nothing the
+    // chain can do to the pool can starve it.
+    heartbeatRecoveryChainWatchdogInterval = setInterval(() => {
+      try {
+        if (heartbeatSchedulerStopped) return;
+        if (!heartbeatRecoveryChainInFlight) {
+          // No pass outstanding. Written every tick rather than only on settle
+          // so the series stays live even if a settle path is ever missed.
+          recordHeartbeatRecoveryChainInflight(0);
+          return;
+        }
+        const inFlightMs = Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt);
+        recordHeartbeatRecoveryChainInflight(inFlightMs);
+        if (inFlightMs > HEARTBEAT_RECOVERY_CHAIN_STALL_MS) {
+          if (!heartbeatRecoveryChainStallCounted) {
+            // Latch before the record, matching the log's own ordering: a
+            // throwing recorder must not re-arm a once-per-pass signal.
+            heartbeatRecoveryChainStallCounted = true;
+            recordHeartbeatRecoveryChainStalled();
+          }
+          // A chain in flight across many ticks is not normal. Reported, not
+          // acted on — see the latch declaration for why clearing it would
+          // re-admit the overlap the latch exists to remove.
+          //
+          // `error`, not `warn`, to match what the matching series already
+          // documents ({@link HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC}: "Page
+          // on this. It is rare by design and it does not resolve itself").
+          // Every recovery pass on this worker is halted by the time this
+          // fires, and it lets a log-based alert reach the same conclusion as a
+          // metric-based one.
+          //
+          // Re-logged on its own coarse clock rather than once per sample. The
+          // halt does not resolve itself, so it must keep saying so; but at
+          // `error`, and at a watchdog period deliberately shorter than the
+          // scheduler interval, one line per sample is an unbounded page storm
+          // against a worker that is already down. Nothing is lost by the
+          // suppressed lines: `inFlightMs` is monotonic for the life of the
+          // pass, so each line that does survive already says how far into the
+          // same unresolved stall it is.
+          const now = Date.now();
+          if (
+            heartbeatRecoveryChainStallLoggedAt === 0 ||
+            now - heartbeatRecoveryChainStallLoggedAt >= HEARTBEAT_RECOVERY_CHAIN_RELOG_MS
+          ) {
+            heartbeatRecoveryChainStallLoggedAt = now;
+            logger.error(
+              {
+                inFlightMs,
+                stallAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_MS,
+                relogAfterMs: HEARTBEAT_RECOVERY_CHAIN_RELOG_MS,
+              },
+              "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
+            );
+          }
+        }
+      } catch (err) {
+        // An uncaught throw from a bare timer callback takes the process down,
+        // and this watchdog runs precisely when the worker is already degraded.
+        // Losing a metric sample is survivable; losing the worker is the outage.
+        logger.warn({ err }, "heartbeat recovery chain watchdog tick failed");
+      }
+    }, HEARTBEAT_RECOVERY_CHAIN_WATCHDOG_INTERVAL_MS);
 
     heartbeatSchedulerInterval = setInterval(() => {
       // Async so the suppression checks below can honor the override-aware
@@ -1777,14 +1957,14 @@ export async function startServer(): Promise<StartedServer> {
               }));
           } else if (
             Date.now() - executionWorkspaceCollectorStartedAt >
-            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
+            HEARTBEAT_RECOVERY_CHAIN_STALL_MS
           ) {
             // Skipping is normal and silent; a pass in flight for many ticks is
             // not. Reported, not acted on: see the latch declaration.
             logger.warn(
               {
                 inFlightMs: Date.now() - executionWorkspaceCollectorStartedAt,
-                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
+                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_MS,
               },
               "periodic execution-workspace collector still in flight across many ticks; workspaces are not being collected",
             );
@@ -1885,6 +2065,11 @@ export async function startServer(): Promise<StartedServer> {
           if (!heartbeatRecoveryChainInFlight) {
             heartbeatRecoveryChainInFlight = true;
             heartbeatRecoveryChainStartedAt = Date.now();
+            heartbeatRecoveryChainStallCounted = false;
+            // Same reset scope as the counter latch: a new pass must be able to
+            // report its own stall immediately rather than waiting out the
+            // previous pass's re-log clock.
+            heartbeatRecoveryChainStallLoggedAt = 0;
             trackHeartbeatSchedulerWork(heartbeat
               .reconcileStrandedAssignedIssues()
               .then(async (reconciled) => {
@@ -1974,22 +2159,75 @@ export async function startServer(): Promise<StartedServer> {
                 logger.error({ err }, "periodic heartbeat recovery failed");
               })
               .finally(() => {
+                // Read the duration BEFORE clearing the start stamp. A backwards
+                // clock must not produce a negative value on a gauge that only
+                // ever means "how long did this take". Captured into a local
+                // rather than recorded here, because the latch must be cleared
+                // first — see below.
+                const elapsedMs = Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt);
+                // Clear the latch BEFORE any fallible call. Both recorders route
+                // through `ensureRegistry()` and prom-client validates on `.set()`,
+                // so either can throw; a throw between here and the clear would
+                // leave the latch set and every later tick would take the skip
+                // branch for the life of the process — orphan reaping, retry
+                // promotion, stranded-issue reconciliation and the watchdogs all
+                // halted until restart. The rejection is swallowed by
+                // `trackHeartbeatSchedulerWork`, so that wedge would be silent.
+                // Same reasoning as the watchdog's own `try`/`catch` above:
+                // losing a metric sample is survivable, losing the chain is the
+                // outage.
                 heartbeatRecoveryChainInFlight = false;
                 heartbeatRecoveryChainStartedAt = 0;
+                try {
+                  recordHeartbeatRecoveryChainDuration(elapsedMs);
+                  // No pass is outstanding now. Leaving the previous value behind
+                  // would keep the overlap alert firing against a worker that has
+                  // already recovered.
+                  recordHeartbeatRecoveryChainInflight(0);
+                } catch (err) {
+                  logger.error(
+                    { err },
+                    "failed to record heartbeat recovery chain settle metrics; chain latch already cleared",
+                  );
+                }
               }));
-          } else if (
-            Date.now() - heartbeatRecoveryChainStartedAt >
-            HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS
-          ) {
-            // Skipping is normal and silent; a chain that has been in flight for
-            // many ticks is not. Reported, not acted on — see the latch decl.
-            logger.warn(
-              {
-                inFlightMs: Date.now() - heartbeatRecoveryChainStartedAt,
-                warnAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_WARN_MS,
-              },
-              "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
-            );
+          } else {
+            // Every skipped tick, not just the stalled ones: a sustained skip
+            // rate is how "the chain is outrunning the interval" becomes
+            // visible, and that is observable hours before the heap ceiling.
+            //
+            // PEN-3314: this is the ONLY recovery-chain signal that belongs on
+            // the tick, because it is the only one whose subject *is* the tick —
+            // "a tick reached the latch and had to skip". The in-flight gauge and
+            // the stall report deliberately live on the watchdog timer instead;
+            // both describe the pass rather than the tick, and both must keep
+            // reporting when no tick gets this far. That split is also what makes
+            // a flat skip counter readable: paired with a climbing in-flight
+            // gauge it now means "ticks are not arriving", which is a distinct
+            // and worse condition than "the chain is keeping up".
+            try {
+              recordHeartbeatRecoveryChainSkipped();
+            } catch (err) {
+              // Same hazard the settle path above guards, at the one call site
+              // that fix did not reach: this recorder routes through the same
+              // `ensureRegistry()` and can throw for the same reasons.
+              //
+              // It matters more here than the line count suggests. This branch
+              // runs ONLY while a pass is already in flight — the degraded
+              // state these metrics exist to make visible — so an unguarded
+              // throw would take the worker down in precisely the window the
+              // instrumentation was added to report on.
+              //
+              // "Takes the worker down" is literal, and it is not Node's
+              // default `ERR_UNHANDLED_REJECTION`. This IIFE is `void`-ed with
+              // no `.catch()`, so the rejection reaches the
+              // `unhandledRejection` handler that `installWorkerCrashGuard()`
+              // arms at the entrypoint — which terminalizes every in-flight run
+              // on this worker and exits 1. Losing a metric sample is
+              // survivable; losing the worker and every run on it is the
+              // outage.
+              logger.error({ err }, "failed to record heartbeat recovery chain skip");
+            }
           }
         }
       })();
@@ -2243,6 +2481,362 @@ export async function startServer(): Promise<StartedServer> {
     }
   }
 
+  // Heap-snapshot diagnostics (PEN-3631). Worker tier only, for the same reason
+  // backups are: this writes one large file per trigger, and replicas racing
+  // would multiply both the stop-the-world pause and the disk cost.
+  //
+  // The trigger is a sentinel file rather than an HTTP route because the volume
+  // this writes to is already shared read-write with every agent pod, so it
+  // works as the control channel too — no new listener, no new auth surface.
+  //
+  // NOTE the gate: the tier check is the outer condition and
+  // `heapSnapshotEnabled` only guards *capture*. Retention runs either way.
+  // A snapshot serialises every reachable string, including the secrets
+  // loadConfig() reads out of the environment, and the worker shares both the
+  // volume and its uid with every agent pod — so no file mode separates the
+  // readers and the file's lifetime is the only control left. When the prune
+  // lived inside the feature flag (as this first shipped), switching capture
+  // off stopped the sweep with it: the moment an operator believes the exposure
+  // ended was the moment it became permanent. (CTO review, PEN-3631.)
+  if (config.paperclipNodeRole !== "api") {
+    // Config carries each of these in the unit its env var is written in, so
+    // the bounds key can match the field name (see NUMERIC_SETTING_BOUNDS).
+    // The conversion to the ms/bytes the service works in happens here.
+    const heapSnapshotConfig = {
+      dir: config.heapSnapshotDir,
+      keep: config.heapSnapshotKeep,
+      minFreeBytes: config.heapSnapshotMinFreeGb * 1024 * 1024 * 1024,
+      autoThresholdBytes: config.heapSnapshotThresholdMb * 1024 * 1024,
+      autoMinIntervalMs: config.heapSnapshotAutoMinIntervalMinutes * 60 * 1000,
+      sentinelMinIntervalMs: config.heapSnapshotSentinelMinIntervalMinutes * 60 * 1000,
+      maxAgeMs: config.heapSnapshotMaxAgeMinutes * 60 * 1000,
+    };
+    const heapSnapshotPollIntervalMs = config.heapSnapshotPollIntervalSeconds * 1000;
+    // Resolved before the state literal so the failure has somewhere to be
+    // reported from. `seedLastAutoSnapshotAtMs` never throws, which is the whole
+    // reason it exists: this read is the only one on this path that runs ABOVE
+    // the `config.heapSnapshotEnabled` branch below, so it is reached on every
+    // worker boot including every deployment that never enabled the feature.
+    // Read bare, an unreadable snapshot directory rejected startServer() — which
+    // is invoked as `void startServer().catch(() => process.exit(1))` — and so
+    // crash-looped the worker tier over a switched-off diagnostic.
+    //
+    // The seed is directory-wide, not this-replica's-history: it reads the
+    // newest stamp any writer left, so a peer replica's capture — or this
+    // replica's own sentinel-driven one — also spaces THIS replica's automatic
+    // trigger. The claim is ReadWriteMany, so that is reachable, and it is the
+    // behaviour we want: `keep` is a directory-wide cap for the same reason, and
+    // the thing being rate-limited is captures landing on one volume, not
+    // captures originating in one process. "Cross-restart spacing" below names
+    // the route this was written for, not the only one it covers. Inert in the
+    // shipped config, where the threshold is unset and the automatic arm never
+    // reaches the spacing check at all. (Ally review suggestion, PEN-3631.)
+    const autoSnapshotSeed = seedLastAutoSnapshotAtMs(heapSnapshotConfig.dir);
+    if (autoSnapshotSeed.readError !== null) {
+      logger.error(
+        { err: autoSnapshotSeed.readError, snapshotDir: heapSnapshotConfig.dir },
+        "Heap snapshot directory could not be read at startup — the automatic trigger's cross-restart spacing is " +
+          "unseeded for this boot, so the first automatic capture after a restart is unthrottled and may land close " +
+          "enough to its predecessor that the retained pair is not hours apart",
+      );
+    }
+
+    const heapSnapshotState: {
+      lastAutoSnapshotAtMs: number | null;
+      lastSentinelSnapshotAtMs: number | null;
+    } = {
+      // Seeded from the volume, not from null. This limiter is the only thing
+      // holding the retained pair hours apart, and it lives in process memory —
+      // so a worker that OOM-restarts and re-grows past the threshold inside
+      // `autoMinIntervalMs` would otherwise capture again immediately and, at
+      // `keep: 2`, prune the hours-older half it was accumulating. The crash
+      // cycle would set the spacing instead of the interval, silently: only
+      // `prunedCount` moves, and `findConcurrentSnapshotWriters` cannot see it
+      // because a restart's predecessor wrote before our start and the
+      // successor shares no pid with it. (Ally review, PEN-3631.)
+      //
+      // The seed reads the whole directory, so on the ReadWriteMany claim a peer
+      // replica's capture throttles this one's first automatic capture too. That
+      // is intended rather than incidental: `keep` is a directory-wide cap, so
+      // peer captures are what this replica's would be pruned against, and
+      // spacing only against our own would let two replicas restart into a pair
+      // minutes apart — the exact outcome the seed exists to prevent.
+      lastAutoSnapshotAtMs: autoSnapshotSeed.stampMs,
+      // Left null deliberately: a human request after a restart should be
+      // honoured promptly. See `newestHeapSnapshotStampMs`.
+      lastSentinelSnapshotAtMs: null,
+    };
+
+    const sweepHeapSnapshots = (): void => {
+      // Capture off ⇒ retain nothing. Ageing out via maxAgeMs bounds the window
+      // while it is open; disabling the flag is the operator closing it, and the
+      // snapshots go then. DEVELOPING.md carries the ordering this imposes:
+      // retrieve the pair BEFORE flipping the flag off.
+      const keep = heapSnapshotSweepKeep(config.heapSnapshotEnabled, heapSnapshotConfig.keep);
+      try {
+        const removed = pruneHeapSnapshots(
+          heapSnapshotConfig.dir,
+          keep,
+          heapSnapshotConfig.maxAgeMs,
+        );
+        if (removed.length > 0) {
+          logger.warn(
+            {
+              snapshotDir: heapSnapshotConfig.dir,
+              removed,
+              keep,
+              maxAgeMs: heapSnapshotConfig.maxAgeMs,
+              captureEnabled: config.heapSnapshotEnabled,
+            },
+            "Pruned heap snapshots",
+          );
+        }
+      } catch (err) {
+        logger.error({ err, snapshotDir: heapSnapshotConfig.dir }, "Heap snapshot prune failed");
+      }
+    };
+
+    if (config.heapSnapshotEnabled) {
+      // Create the directory now so the sentinel has somewhere to land; otherwise
+      // there would be no way to request the first snapshot. Only when capture is
+      // on — a disabled feature should not materialise a directory, and the sweep
+      // below treats a missing one as nothing to do.
+      //
+      // Guarded for the same reason the sweep is: this runs inside startServer(),
+      // which is invoked as `void startServer().catch(() => process.exit(1))`, so
+      // an unhandled EACCES/EIO/ESTALE here is not a failed diagnostic — it is a
+      // boot crash-loop. The shared CephFS claim every agent pod also mounts rw
+      // makes a transient one entirely ordinary. Capture will fail later and say
+      // so; nothing in this block may reject startup.
+      try {
+        ensureHeapSnapshotDir(heapSnapshotConfig.dir);
+      } catch (err) {
+        logger.error(
+          { err, snapshotDir: heapSnapshotConfig.dir },
+          "Heap snapshot directory could not be created — capture is enabled but the sentinel has nowhere to land, " +
+            "so requests will not be honoured until this is resolved",
+        );
+      }
+
+      logger.warn(
+        {
+          snapshotDir: heapSnapshotConfig.dir,
+          sentinel: path.join(heapSnapshotConfig.dir, HEAP_SNAPSHOT_SENTINEL_BASENAME),
+          keep: heapSnapshotConfig.keep,
+          maxAgeMs: heapSnapshotConfig.maxAgeMs,
+          autoThresholdBytes: heapSnapshotConfig.autoThresholdBytes,
+          sentinelMinIntervalMs: heapSnapshotConfig.sentinelMinIntervalMs,
+          pollIntervalMs: heapSnapshotPollIntervalMs,
+        },
+        "Heap snapshot diagnostics ENABLED — each trigger pauses this process for seconds and writes a multi-gigabyte file " +
+          "containing EVERY STRING ON THIS PROCESS'S HEAP IN PLAINTEXT, including the secrets read from the environment " +
+          "(GitHub App private key, agent JWT signing secret, database URL, webhook and provider tokens). Anyone who can read " +
+          "the snapshot directory can recover them, and where that directory is a shared volume no file mode prevents it. " +
+          "Treat every capture as a credential-exposure event with a rotation decision attached.",
+      );
+
+      if (heapSnapshotConfig.maxAgeMs <= heapSnapshotConfig.autoMinIntervalMs) {
+        logger.warn(
+          {
+            maxAgeMs: heapSnapshotConfig.maxAgeMs,
+            autoMinIntervalMs: heapSnapshotConfig.autoMinIntervalMs,
+          },
+          "PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES is not greater than the automatic snapshot interval — the older half of a " +
+            "diff pair can expire before the newer half is taken, leaving nothing to diff",
+        );
+      }
+    }
+
+    // Sweep once at startup, whether or not capture is enabled, then on every
+    // poll. This is what makes "flag off" end the exposure rather than freeze it.
+    sweepHeapSnapshots();
+
+    // Measured after the sweep, so the count reported and the decision to keep
+    // polling both reflect what actually survived it.
+    //
+    // Counts `.partial` leftovers as well as completed files. A partial holds
+    // the same plaintext secrets (writeHeapSnapshot serialises incrementally),
+    // and an OOM *during* the write is this feature's own documented failure
+    // mode — so the case most likely to strand one was the case this check used
+    // to be blind to. (Ally review Important 1, PEN-3631.)
+    //
+    // Guarded like the sweep above it. This is on the *default* path — the
+    // branch runs only when capture is disabled — and is reached on every boot
+    // once the directory exists, i.e. after the documented enable → capture →
+    // retrieve → disable cycle. Read bare, a directory this process cannot read
+    // turned a switched-off diagnostic into a rejected startServer() and so into
+    // a crash-loop. On failure the residual state is *unknown*, which is
+    // deliberately resolved towards keeping the poll armed: the poll's own sweep
+    // is itself guarded, so retrying costs nothing, while assuming the volume is
+    // clear would silently abandon credential-bearing files. (Ally review,
+    // PEN-3631.)
+    let residualSnapshots: { completed: string[]; partial: string[] } = {
+      completed: [],
+      partial: [],
+    };
+    let residualSnapshotsUnreadable = false;
+    if (!config.heapSnapshotEnabled) {
+      try {
+        residualSnapshots = listResidualHeapSnapshots(heapSnapshotConfig.dir);
+      } catch (err) {
+        residualSnapshotsUnreadable = true;
+        logger.error(
+          { err, snapshotDir: heapSnapshotConfig.dir },
+          "Heap snapshot directory could not be read at startup — residual snapshot state is unknown. Assuming files " +
+            "may remain and keeping the sweep poll armed; these would contain this process's secrets in plaintext",
+        );
+      }
+    }
+    const residualSnapshotCount =
+      residualSnapshots.completed.length + residualSnapshots.partial.length;
+    const heapSnapshotPlan = planHeapSnapshotStartup({
+      captureEnabled: config.heapSnapshotEnabled,
+      // Unknown is treated as "something may be there", so the poll stays armed
+      // and keeps retrying the sweep rather than concluding the volume is clear.
+      residualSnapshotCount: residualSnapshotsUnreadable ? 1 : residualSnapshotCount,
+    });
+
+    if (heapSnapshotPlan.warnResidualSnapshots && !residualSnapshotsUnreadable) {
+      logger.warn(
+        {
+          snapshotDir: heapSnapshotConfig.dir,
+          count: residualSnapshotCount,
+          completed: residualSnapshots.completed,
+          partial: residualSnapshots.partial,
+          // Each list is newest-first, so its last entry is its oldest. Reported
+          // per category rather than as one "oldest" across both, which could
+          // only be right by accident — the two are retired by different bounds.
+          oldestCompleted: residualSnapshots.completed[residualSnapshots.completed.length - 1],
+          oldestPartial: residualSnapshots.partial[residualSnapshots.partial.length - 1],
+        },
+        "Heap snapshot capture is DISABLED and snapshot files remain on disk — these contain this process's secrets in " +
+          "plaintext, and an unfinished '.partial' contains them just as a completed one does. With capture off the sweep " +
+          "retains no completed snapshot, so any listed under 'completed' survived an unlink; a '.partial' may instead have " +
+          "been spared because it is still inside its abandonment window, and the poll below will collect it once it ages " +
+          "out. The poll keeps retrying either way, but remove them by hand if this warning persists.",
+      );
+    }
+
+    if (heapSnapshotPlan.poll) {
+      heapSnapshotPollInterval = setInterval(() => {
+        // Checked before anything else, including the sweep. Clearing the handle
+        // in shutdown() covers the common case; this covers a callback that had
+        // already entered the queue when the signal arrived, and keeps the
+        // guarantee local rather than resting on there being no `await` between
+        // the signal handler and the clear. See heapSnapshotPollInterval.
+        if (heapSnapshotPollStopped) return;
+        // Deliberately synchronous. writeHeapSnapshot is stop-the-world anyway, so
+        // there is nothing to yield to, and keeping it on one tick means a poll can
+        // never overlap its own predecessor.
+        //
+        // Retention first and unconditionally: when capture is off this poll is
+        // running *only* to retry a deletion the startup sweep could not make.
+        sweepHeapSnapshots();
+        if (!heapSnapshotPlan.capture) return;
+        try {
+          const decision = decideHeapSnapshot(heapSnapshotConfig, heapSnapshotState);
+
+          // Emit before the early return below. A sentinel that was claimed and
+          // then declined has already *deleted* the request file, and that file
+          // is the only feedback this interface has — so without this the
+          // operator sees their request vanish with no snapshot and no log, and
+          // cannot tell it apart from one that was honoured.
+          const sentinelLog = describeSentinelOutcome(
+            decision,
+            heapSnapshotConfig,
+            heapSnapshotState,
+          );
+          if (sentinelLog !== null) {
+            logger[sentinelLog.level](sentinelLog.data, sentinelLog.message);
+          }
+
+          if (decision.trigger === null) return;
+
+          // Stamp the trigger before attempting, not after, for the same reason
+          // the sentinel is consumed before attempting: a snapshot that fails for
+          // a persistent reason (a full volume, a dying heap) would otherwise be
+          // retried on every single poll.
+          if (decision.trigger === "threshold") {
+            heapSnapshotState.lastAutoSnapshotAtMs = Date.now();
+          } else {
+            heapSnapshotState.lastSentinelSnapshotAtMs = Date.now();
+          }
+
+          const result = takeHeapSnapshot(heapSnapshotConfig, decision.trigger);
+
+          // `keep` is a cap over the directory, not over this process, and the
+          // directory is on a volume every pod mounts. A second live writer
+          // means each round fills every slot and the prune above has just
+          // taken the previous round out — so the pair stops spanning hours and
+          // becomes one instant across processes, which is not a diff. It fails
+          // silently otherwise: only `prunedCount` moves. Checked here rather
+          // than at startup because this is the moment the eviction actually
+          // happens. (Ally review, PEN-3631.)
+          //
+          // Above the skipped-guard below, not after it, because multiple
+          // writers against the shared claim are exactly what fills the volume:
+          // once that happens every capture returns `insufficient-free-space`,
+          // and a detector on the success path alone would go quiet at the one
+          // moment it has something to say. The operator would see repeated
+          // "Heap snapshot skipped" with no hint a peer is responsible. Its
+          // input is `listHeapSnapshots`, equally readable after a refusal.
+          //
+          // `performance.timeOrigin` is this process's start as epoch ms. A
+          // dead predecessor cannot have written after it, which is what keeps
+          // a restart-spanning diff pair — the deliverable — out of the
+          // warning without assuming anything about how far apart its halves
+          // land. It sees only *foreign* pids: the single-process routes to the
+          // same collapsed pair are bounded in `decideHeapSnapshot` and by the
+          // startup seed of `lastAutoSnapshotAtMs` instead.
+          try {
+            const concurrent = findConcurrentSnapshotWriters(listHeapSnapshots(heapSnapshotConfig.dir), {
+              pid: process.pid,
+              startedAtMs: performance.timeOrigin,
+            });
+            if (concurrent !== null) {
+              logger.warn(
+                {
+                  snapshotDir: heapSnapshotConfig.dir,
+                  pids: concurrent.pids,
+                  newestStampAt: new Date(concurrent.newestStampMs).toISOString(),
+                  selfPid: process.pid,
+                  keep: heapSnapshotConfig.keep,
+                },
+                "Another process wrote heap snapshots into this directory while this one was running — 'keep' is a " +
+                  "directory-wide cap, so each round evicts the previous one and the retained snapshots are different processes " +
+                  "at one instant rather than one process hours apart, which cannot be diffed. Raise " +
+                  "PAPERCLIP_HEAP_SNAPSHOT_KEEP to at least writers x desired-pairs, or give each writer its own directory",
+              );
+            }
+          } catch (err) {
+            // Advisory only — never let the detector fail the capture it is
+            // reporting on, nor the poll that has retention work still to do.
+            logger.debug({ err }, "Concurrent heap snapshot writer check failed");
+          }
+
+          if ("skipped" in result) {
+            logger.error({ ...result, trigger: decision.trigger }, "Heap snapshot skipped");
+            return;
+          }
+          logger.warn(
+            {
+              snapshotFile: result.filePath,
+              sizeBytes: result.sizeBytes,
+              heapUsedBytes: result.heapUsedBytes,
+              durationMs: result.durationMs,
+              prunedCount: result.prunedCount,
+              trigger: result.trigger,
+              expiresAtMs: Date.now() + heapSnapshotConfig.maxAgeMs,
+            },
+            "Heap snapshot written — contains this process's secrets in plaintext; retrieve, then treat as a credential exposure",
+          );
+        } catch (err) {
+          logger.error({ err, snapshotDir: heapSnapshotConfig.dir }, "Heap snapshot failed");
+        }
+      }, heapSnapshotPollIntervalMs);
+    }
+  }
+  
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
@@ -2411,6 +3005,21 @@ export async function startServer(): Promise<StartedServer> {
       if (heartbeatSchedulerInterval) {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
+      }
+      if (heartbeatRecoveryChainWatchdogInterval) {
+        clearInterval(heartbeatRecoveryChainWatchdogInterval);
+        heartbeatRecoveryChainWatchdogInterval = null;
+      }
+
+      // Disarmed alongside the scheduler, and before the drain below, because a
+      // heap snapshot is a synchronous multi-gigabyte stop-the-world write: one
+      // fired during the drain can push the pod past its termination grace and
+      // get it SIGKILLed with runs still in flight. The flag is set as well as
+      // the handle cleared — see heapSnapshotPollInterval. (PEN-3631.)
+      heapSnapshotPollStopped = true;
+      if (heapSnapshotPollInterval) {
+        clearInterval(heapSnapshotPollInterval);
+        heapSnapshotPollInterval = null;
       }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({

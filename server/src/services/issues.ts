@@ -69,6 +69,7 @@ import {
   issueCommentPresentationSchema,
   isAgentStatusInvokable,
   isUuidLike,
+  ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
@@ -830,8 +831,16 @@ export interface IssueFilters {
   q?: string;
   limit?: number;
   offset?: number;
-  sortField?: "updated";
+  /**
+   * "updated" sorts by canonical last activity, which mutates constantly. Paginating
+   * over it re-orders rows mid-sweep, so an exhaustive walk both duplicates and skips
+   * rows. "id" sorts by the immutable primary key instead: rows never move, so a walk
+   * is safe to paginate. Pair it with `afterId` for a keyset cursor.
+   */
+  sortField?: "updated" | "id";
   sortDir?: "asc" | "desc";
+  /** Keyset cursor: return only rows with `id > afterId`. Requires sortField "id". */
+  afterId?: string;
 }
 
 /**
@@ -2238,6 +2247,12 @@ function issueListOrderBy(
   },
 ) {
   const canonicalLastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
+  if (sortField === "id") {
+    // Total order on an immutable unique column, so concurrent activity cannot move a
+    // row between pages. Relevance ranking is deliberately dropped: a stable walk that
+    // visits every row exactly once is the whole point of this mode.
+    return [sortDir === "desc" ? desc(issues.id) : asc(issues.id)];
+  }
   if (sortField === "updated") {
     const activityOrder = sortDir === "asc"
       ? asc(canonicalLastActivityAt)
@@ -2734,13 +2749,6 @@ const PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS = [
   "issue.productivity_review_source_mutation",
   "issue.productivity_review_updated",
 ];
-const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = [
-  "no_comment_streak",
-  "long_active_duration",
-  "high_churn",
-  "runtime_failure_streak",
-  "runaway_execution",
-];
 
 function lowTrustBoundaryIssueCondition(
   companyId: string,
@@ -3182,7 +3190,7 @@ async function terminalExplicitBlockersByRoot(
 
 function readProductivityReviewTrigger(value: unknown): IssueProductivityReviewTrigger | null {
   if (typeof value !== "string") return null;
-  return PRODUCTIVITY_REVIEW_TRIGGERS.includes(value as IssueProductivityReviewTrigger)
+  return ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS.includes(value as IssueProductivityReviewTrigger)
     ? (value as IssueProductivityReviewTrigger)
     : null;
 }
@@ -5839,7 +5847,7 @@ export function issueService(db: Db) {
   // that already holds `lockIssueParentMutationCompany` (recovery's
   // `escalateStrandedAssignedIssue`). Reading instance settings off the pooled
   // handle there takes a SECOND pool connection while the lock is held, and
-  // with `POSTGRES_POOL_MAX=10` against 8-9 waiters on that same key the read
+  // with `POSTGRES_POOL_MAX` against 8-9 waiters on that same key the read
   // only gets a connection when a waiter hits its `lock_timeout` — the convoy.
   // So bind the settings reads to the caller's handle when there is one.
   //
@@ -8048,6 +8056,11 @@ export function issueService(db: Db) {
         shouldExcludeRoutineExecutionIssues(filters)
       ) {
         conditions.push(nonRoutineExecutionIssueCondition());
+      }
+      if (filters?.afterId) {
+        conditions.push(
+          filters.sortDir === "desc" ? lt(issues.id, filters.afterId) : gt(issues.id, filters.afterId),
+        );
       }
       const priorityOrder = sql`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
       const searchOrder = sql<number>`

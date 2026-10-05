@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -40,28 +40,156 @@ test("findAttributionOffenses ignores a per-agent author email", () => {
   assert.deepEqual(offenses, []);
 });
 
-test("findAttributionOffenses ignores the graphify-reindex bot's git-push identity", () => {
-  // The graphify-reindex bot commits via `git push` under
-  // `graphify-reindex (allyblockcast) <allyblockcast[bot]@users.noreply.github.com>`,
-  // which is NOT the REST write-path stamp this gate matches (that one carries
-  // the numeric App-user prefix, `290875700+...`). Verified against the real
-  // PRs Blockcast/paperclip#789 and #944: both pass this gate unmodified.
-  //
-  // This is why pr.yml carries no `bot/graphify-reindex` branch exemption — an
-  // exemption there would have been a fork bypass (`github.head_ref` says
-  // nothing about which repository the branch lives in) and a merge-queue
-  // false-reject (`head_ref` is empty on `merge_group`), guarding against a
-  // rejection that does not occur. If this test starts failing, the bot has
-  // moved onto the REST write path: fix the bot, do not re-add an exemption.
+// The graphify-reindex bot is a scheduled knowledge-graph refresh on
+// origin/bot/graphify-reindex. It pushes under
+// `graphify-reindex (allyblockcast) <allyblockcast[bot]@users.noreply.github.com>`
+// — the BARE App spelling, which since BLO-26647 this gate DOES match. It is
+// exempt as a non-agent process, but only name-plus-path: both halves of a git
+// author are caller-controlled, so a name-only exemption would be a one-line
+// bypass of the whole gate.
+//
+// Before BLO-26647 this test asserted the same `[]` for the wrong reason — the
+// narrow `!==` matcher simply never reached the bare email, so the exemption
+// was accidental and 15 real offenses shared the ride. If these start failing,
+// the bot's author name or output paths changed: update
+// NON_AGENT_PROCESS_EXEMPTIONS to match, do NOT re-add a `head_ref` branch
+// exemption (a fork bypass — `head_ref` carries no repository identity — and
+// empty on `merge_group`, so it would false-reject the whole queue).
+const GRAPHIFY_COMMIT = {
+  sha: "206d6edaf",
+  authorEmail: "allyblockcast[bot]@users.noreply.github.com",
+  authorName: "graphify-reindex (allyblockcast)",
+  parentCount: 1,
+  message: "chore(graphify): refresh knowledge graphs",
+  paths: ["server/src/graphify-out/graph.json", "server/src/graphify-out/GRAPH_REPORT.md"],
+};
+
+test("findAttributionOffenses exempts the graphify-reindex bot inside its own output paths", () => {
+  assert.deepEqual(findAttributionOffenses([GRAPHIFY_COMMIT]), []);
+});
+
+test("findAttributionOffenses still flags a commit wearing the graphify name outside graphify-out (forged-name bypass)", () => {
+  // The bypass Ally flagged on PR #1350: set user.name to the bot's name,
+  // keep the bare email, and the gate waves any commit through. The path pin
+  // is what makes the forgery worthless — it can only ever smuggle generated
+  // graph data, never work.
+  const forged = { ...GRAPHIFY_COMMIT, sha: "forged1", paths: ["server/src/services/issues.ts"] };
+  assert.equal(findAttributionOffenses([forged]).length, 1);
+
+  // A single out-of-scope path among otherwise-legitimate ones is enough.
+  const mixed = {
+    ...GRAPHIFY_COMMIT,
+    sha: "forged2",
+    paths: ["server/src/graphify-out/graph.json", ".github/workflows/pr.yml"],
+  };
+  assert.equal(findAttributionOffenses([mixed]).length, 1);
+
+  // A forger can create a NEW `graphify-out/` directory anywhere, so the scope
+  // must be anchored to the real output dir, not match the name at any depth.
+  for (const forgedPath of ["server/src/services/graphify-out/pwn.ts", "docs/x/graphify-out/deploy.sh", "graphify-out/x.json"]) {
+    const nested = { ...GRAPHIFY_COMMIT, sha: "forged3", paths: [forgedPath] };
+    assert.equal(findAttributionOffenses([nested]).length, 1, forgedPath);
+  }
+});
+
+test("findAttributionOffenses fails closed on the graphify name when no paths are known", () => {
+  // `--audit-merged` has no cheap path source, so it supplies none. Exempting
+  // on the strength of a forgeable name alone is exactly the hole; reporting
+  // the commit instead is the safe direction for an advisory mode.
+  const { paths: _paths, ...noPaths } = GRAPHIFY_COMMIT;
+  assert.equal(findAttributionOffenses([noPaths]).length, 1);
+  assert.equal(findAttributionOffenses([{ ...GRAPHIFY_COMMIT, paths: [] }]).length, 1);
+});
+
+test("findAttributionOffenses flags every observed spelling of the App noreply address (BLO-26647)", () => {
+  // Measured on origin/master, non-merge commits since 2026-07-01: 192 carried
+  // the id-prefixed form and were caught; 15 carried a variant and were not.
+  // Each of these resolves via GET /repos/{owner}/{repo}/commits/{sha} to the
+  // same installation (id 290875700) as the id-prefixed form — or, for
+  // `220200645+`, to no account at all, which erases the author even harder.
+  const spellings = [
+    APP_NOREPLY_EMAIL,
+    "allyblockcast[bot]@users.noreply.github.com", // 6c0e9c336 — author.id 290875700
+    "220200645+allyblockcast[bot]@users.noreply.github.com", // d41030016 — resolves to nothing
+    "ALLYBLOCKCAST[BOT]@Users.NoReply.GitHub.com", // casing is not a write path this gate may miss
+    "290875700+allyblockcast[bot]+agent@users.noreply.github.com", // subaddressed
+  ];
+  for (const authorEmail of spellings) {
+    const offenses = findAttributionOffenses([
+      { sha: "a", authorEmail, authorName: "CTO", parentCount: 1, message: "api write" },
+    ]);
+    assert.equal(offenses.length, 1, `${authorEmail} should be an offense`);
+  }
+});
+
+test("findAttributionOffenses does NOT flag the no-[bot] allyblockcast account (id 296676656)", () => {
+  // A different, real GitHub account — not installation 290875700, which is
+  // the only identity this gate is chartered to catch. Matching it would
+  // misattribute it to the wrong installation. See the module docblock.
   const offenses = findAttributionOffenses([
     {
-      sha: "35340799",
-      authorEmail: "allyblockcast[bot]@users.noreply.github.com",
+      sha: "7fb261047",
+      authorEmail: "allyblockcast@users.noreply.github.com",
+      authorName: "PlatformSREEngineer (Ally)",
       parentCount: 1,
-      message: "chore(graphify): refresh knowledge graphs",
+      message: "git push",
     },
   ]);
   assert.deepEqual(offenses, []);
+});
+
+test("findAttributionOffenses matches the grandfather allowlist case-insensitively on email", () => {
+  // The matcher accepts mixed case, so the allowlist key must normalize it too
+  // — otherwise widening the matcher would silently eject an allowlisted
+  // commit that happened to be stamped in a different case.
+  const patchId = "102821942f40ec00b8ad6caef30fdcf06d3d10a2";
+  const key = `${patchId}|allyblockcast[bot]@users.noreply.github.com`;
+  const commit = {
+    sha: "cace65cf3",
+    authorEmail: "AllyBlockcast[Bot]@users.noreply.github.com",
+    authorName: "allyblockcast[bot]",
+    parentCount: 1,
+    patchId,
+    message: "fix(issues): stable enumeration",
+  };
+  assert.deepEqual(findAttributionOffenses([commit], { allowlist: new Set([key]) }), []);
+});
+
+test("GRANDFATHERED_OFFENSE_SHAS registers the pre-cutoff bare-spelling cohort BLO-26647 exposes", () => {
+  // Widening the matcher newly reaches these. All are pre-ATTRIBUTION_GATE_CUTOFF
+  // and sat on open PRs on 2026-09-29, so without registration this change
+  // would retro-break them — the exact failure BLO-23894 exists to prevent.
+  const bare = "allyblockcast[bot]@users.noreply.github.com";
+  for (const patchId of [
+    "3203ee89e7bbeef3cc7d34bc3fa0a84e26788387", // #1076 6e7440da2 — this issue's named AC
+    "102821942f40ec00b8ad6caef30fdcf06d3d10a2", // #1140
+    "6f68b4dc6658bff45a895cf4b917e64af4f76e9e", // #1183
+    "4e5c4ab103c22ab8aa27ab6563219bb80061e00b", // #891
+    "c9ceb199c4c43b8ed690e53f16c699fb5fd8a343", // #891
+    "6300049f135f0bda6f93cf2966563efe708328ed", // #929
+  ]) {
+    assert.ok(
+      GRANDFATHERED_OFFENSE_SHAS.has(`${patchId}|${bare}`),
+      `${patchId} must stay registered or its PR retro-breaks`,
+    );
+  }
+
+  // The POST-cutoff one found in the same scan is deliberately absent: it is a
+  // live violation, and grandfathering it would reopen the gate it trips.
+  assert.ok(
+    !GRANDFATHERED_OFFENSE_SHAS.has(`0f54e7c58624243b66149833ec3d5f7cd9947879|${bare}`),
+    "#1278 7d8070c83 is post-cutoff and must NOT be grandfathered",
+  );
+
+  // Two dead entries removed in BLO-26647 — their PRs landed by re-attribution,
+  // so the patches they keyed exist on no ref. Verified against all 13
+  // App-attributed commits across all 142 open PRs before removal.
+  for (const deadKey of [
+    `b22bed3ac5812f8ba9b335b597accc2dbd59b9c8|${APP_NOREPLY_EMAIL}`,
+    `437abe8653d01a0dbbae17e8a2ed88477df9d46e|${APP_NOREPLY_EMAIL}`,
+  ]) {
+    assert.ok(!GRANDFATHERED_OFFENSE_SHAS.has(deadKey), `${deadKey} is dead and should stay removed`);
+  }
 });
 
 test("findAttributionOffenses excludes merge commits even when App-attributed (scope boundary)", () => {
@@ -398,6 +526,61 @@ test("findLocalRangeOffenses carries a registered grandfather through a rebase (
       findLocalRangeOffenses({ repoRoot, base, head: rebasedHead, allowlist: new Set([patchKey(repoRoot, rebasedHead)]) }),
       [],
     );
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("findLocalRangeOffenses reads real paths, so the graphify exemption holds in-scope and fails out-of-scope (BLO-26647)", () => {
+  // The end-to-end proof that `paths` is actually plumbed from git. Every pure
+  // `findAttributionOffenses` case above can pass on a hand-built record while
+  // `findLocalRangeOffenses` never populates `paths` at all — in which case the
+  // exemption fails closed and every real graphify PR breaks. This test is what
+  // notices.
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-graphify-"));
+  try {
+    const git = (args, overrides) =>
+      execFileSync("git", args, {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: { ...process.env, ...asAuthor("base@example.com"), ...overrides },
+      });
+    const commitFile = (relPath, body, overrides) => {
+      mkdirSync(path.join(repoRoot, path.dirname(relPath)), { recursive: true });
+      writeFileSync(path.join(repoRoot, relPath), body);
+      git(["add", relPath]);
+      git(["-c", "commit.gpgsign=false", "commit", "-m", `touch ${relPath}`, "-q"], overrides);
+      return git(["rev-parse", "HEAD"]).trim();
+    };
+
+    git(["init", "-q", "-b", "main"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"], asAuthor("base@example.com"));
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    const bot = asAuthor("allyblockcast[bot]@users.noreply.github.com", "graphify-reindex (allyblockcast)");
+
+    // In scope: the bot's own generated output.
+    const inScope = commitFile("server/src/graphify-out/graph.json", '{"nodes":[]}\n', bot);
+    assert.deepEqual(findLocalRangeOffenses({ repoRoot, base, head: inScope }), []);
+
+    // In scope with a non-ASCII name: git quotes these by default
+    // ("server/src/graphify-out/\303\251.json"), which the anchored scope
+    // would reject. Proves `pathsForCommit` reads them unquoted.
+    const nonAscii = commitFile("server/src/graphify-out/\u00e9.json", "{}\n", bot);
+    assert.deepEqual(findLocalRangeOffenses({ repoRoot, base: inScope, head: nonAscii }), []);
+
+    // Out of scope: same name, same email, real source file. Still an offense.
+    const outOfScope = commitFile("server/src/services/issues.ts", "export const x = 1;\n", bot);
+    const offenses = findLocalRangeOffenses({ repoRoot, base: nonAscii, head: outOfScope });
+    assert.equal(offenses.length, 1);
+    assert.equal(offenses[0].sha, outOfScope);
+    assert.deepEqual(offenses[0].paths, ["server/src/services/issues.ts"]);
+
+    // Out of scope: a forger-created `graphify-out/` below a source dir.
+    const nested = commitFile("server/src/services/graphify-out/pwn.ts", "export const y = 1;\n", bot);
+    const nestedOffenses = findLocalRangeOffenses({ repoRoot, base: outOfScope, head: nested });
+    assert.equal(nestedOffenses.length, 1);
+    assert.deepEqual(nestedOffenses[0].paths, ["server/src/services/graphify-out/pwn.ts"]);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

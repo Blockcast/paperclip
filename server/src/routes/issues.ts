@@ -51,6 +51,7 @@ import {
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
@@ -87,6 +88,7 @@ import {
   type IssueWakeDiagnosticWakeRequest,
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
+  type IssueRecoveryActionKind,
   type IssueWatchdogDiscoveryKind,
   type ProjectWorkspace,
   type SourceTrustMetadata,
@@ -244,7 +246,9 @@ import {
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import {
+  isPlanningOnlyRecoveryContextSnapshot,
   isStatusOnlyRecoveryContextSnapshot,
+  statusOnlyEscalationSourceIssueId,
   STATUS_ONLY_RECOVERY_RESUME_GUIDANCE,
   statusOnlyMonitorArmResumeGuidance,
 } from "../services/recovery/model-profile-hint.js";
@@ -523,6 +527,20 @@ function scheduleDuplicateCandidateShownActivity(input: {
 }
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+/**
+ * Query params that change which issues list() returns but that the general COUNT(*)
+ * path in issueService.count() does not express. Accepting one would return a count of
+ * a wider set than the caller asked for, with nothing in the response to reveal it.
+ */
+const COUNT_UNSUPPORTED_FILTERS = [
+  "q",
+  "descendantOf",
+  "labelId",
+  "participantAgentId",
+  "touchedByUserId",
+  "inboxArchivedByUserId",
+  "unreadForUserId",
+] as const;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -3028,6 +3046,79 @@ function logIssueListRequest(input: {
   });
 }
 
+/**
+ * Page-count ceiling for walkIssueListPages.
+ *
+ * Deliberately its own constant rather than a reuse of ISSUE_LIST_MAX_LIMIT, which is a
+ * rows-per-PAGE request limit: the two are unrelated dimensions that merely happen to share
+ * a value today. Tying them together would make the walk's row ceiling — their product —
+ * shrink quadratically if that request-facing limit were ever tuned down.
+ */
+export const WALK_MAX_PAGES = 1000;
+
+/**
+ * Pages through `fetchPage` until it returns a short page, handing each page to `visit`.
+ *
+ * attention=blocked is served by listBlockedInboxIssues, which pages by offset only and
+ * ignores sortField/afterId, so that path advances `offset`; a keyset cursor there would
+ * re-read page one forever. Every other path walks the immutable id order with a keyset
+ * cursor, because offset paging over the mutable activity order re-ranks rows touched
+ * mid-walk, which both double-counts and skips them.
+ *
+ * Termination depends on `opts.blocked` mirroring list()'s internal routing, and that
+ * mirror spans two files: list() picks the blocked branch at an early return that lands
+ * BEFORE the afterId predicate, so a new early return added above it would silently make
+ * afterId a no-op here — no conflict, no type error, an unbounded loop. Each branch below
+ * therefore asserts its own cursor actually moved, so that mistake surfaces on page two as
+ * an error rather than as a request that never returns. A page cap backstops both, since
+ * the blocked assertion compares consecutive pages and churn can differ them indefinitely.
+ */
+export async function walkIssueListPages<Row extends { id: string }>(
+  fetchPage: (page: { offset?: number; afterId?: string }) => Promise<Row[]>,
+  opts: { blocked: boolean; pageSize: number },
+  visit: (rows: Row[]) => Promise<void>,
+): Promise<void> {
+  let offset = 0;
+  let afterId: string | undefined;
+  let previousPageIds: string | undefined;
+  // Backstop for both branches. The per-branch assertions below catch the mirror breaking
+  // on page two, but the blocked one compares only the immediately previous page: a dropped
+  // `offset` combined with churn at the head of the mutable activity order can serve
+  // differing pages forever and slip past it. This cap cannot, and cannot false-positive
+  // either — the walk's own caller caps a page at ISSUE_LIST_MAX_LIMIT, so at that page size
+  // the ceiling is WALK_MAX_PAGES * ISSUE_LIST_MAX_LIMIT rows before firing.
+  for (let page = 0; ; page += 1) {
+    if (page >= WALK_MAX_PAGES) {
+      throw new Error(
+        `walkIssueListPages: exceeded ${WALK_MAX_PAGES} pages, so the walk is not terminating`,
+      );
+    }
+    const rows = await fetchPage(opts.blocked ? { offset } : { afterId });
+    await visit(rows);
+    if (rows.length < opts.pageSize) return;
+    if (opts.blocked) {
+      // The blocked listing pages by offset, so non-advance here means the caller dropped
+      // `offset` on its way to list() and every fetch re-serves page one. Compare the whole
+      // page, not its last id: this order is the mutable activity order, and a re-rank can
+      // legitimately repeat one row across pages — it cannot reproduce the entire page.
+      const pageIds = rows.map((row) => row.id).join(",");
+      if (pageIds === previousPageIds) {
+        throw new Error("walkIssueListPages: blocked page repeated, so offset is not reaching list()");
+      }
+      previousPageIds = pageIds;
+      offset += rows.length;
+    } else {
+      // list() honoring afterId returns only rows with id > afterId, so the last id of a
+      // full page is always past the cursor we sent. Equal means the predicate never ran.
+      const next = rows[rows.length - 1]!.id;
+      if (next === afterId) {
+        throw new Error("walkIssueListPages: keyset cursor did not advance, so afterId is not reaching list()");
+      }
+      afterId = next;
+    }
+  }
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -3067,6 +3158,14 @@ export function issueRoutes(
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
     createIssueBeforeResponseHook?: () => Promise<void>;
+    /**
+     * Test seam for the restricted-actor count walk. `pageSize` shrinks the page so a
+     * multi-page walk costs a handful of rows instead of ISSUE_LIST_MAX_LIMIT + 1, and
+     * `onPage` runs after each page is counted so a test can mutate an already-returned
+     * row mid-walk and prove the enumeration is stable under re-ranking rather than only
+     * that the cursor advances.
+     */
+    issueCountWalk?: { pageSize?: number; onPage?: () => Promise<void> };
     registerCommentEffectProcessor?: (processor: (commentId: string) => Promise<unknown>) => void;
   } = {},
 ) {
@@ -3607,6 +3706,7 @@ export function issueRoutes(
 
   async function classifySourceRecoveryRevalidation(input: {
     issue: IssueRouteSnapshot;
+    kind: IssueRecoveryActionKind;
     trigger: RecoveryRevalidationTrigger;
     statusChanged?: boolean;
     assigneeChanged?: boolean;
@@ -3649,6 +3749,40 @@ export function issueRoutes(
       input.reopened === true;
     if (!durableSourceChange) return null;
 
+    // Parking an issue in `backlog` retires its recovery action (BLO-25907). `backlog` is
+    // deliberately not dispatchable, so an action left active there names an owner wake that
+    // no sweep will ever deliver — `reconcileStrandedAssignedIssues` covers only
+    // todo/in_progress/in_review. Folding here retires it at the moment of the park; the
+    // backstop sweep folds rows that were parked before this branch existed, or parked by a
+    // path that never reaches this classifier.
+    //
+    // This sits ABOVE the kind guard on purpose: it is a NON-DELIVERABILITY fold, the exact
+    // inverse of the wake-path-existence family below, so the kind carve-out must not reach
+    // it. `reconcileStrandedRecoveryWakeBackstop` folds `backlog` kind-blindly
+    // (`STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES`, ahead of its owner/cause/cooldown
+    // gates), so putting it below would only have deferred the same fold to the sweep and
+    // broken the write-time/sweep division of labour for one kind.
+    if (issue.status === "backlog") {
+      return "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.";
+    }
+
+    // BLO-37677: everything below this line is a wake-path-EXISTENCE test — "the source
+    // issue now has its own way of being re-driven, so this action is redundant". That is
+    // only true for kinds whose action IS a wake-path restoration. `pr_review_non_convergence`
+    // escalates a quality condition to a *different* owner and deliberately leaves the source
+    // issue `in_progress` with its agent owner, so it is born matching the agent-owner branch
+    // below and can never stop matching it. The branches ABOVE stay kind-blind on purpose,
+    // and they are three different reasons, not one: `done`/`cancelled` is genuinely terminal;
+    // the manual blocked→todo recovery is an OUT-OF-BAND signal that the recovery this action
+    // exists to perform has already happened; `backlog` is a NON-DELIVERABILITY fold. A new
+    // branch belongs above this line if it cancels because the issue is finished, because it
+    // CANNOT be driven, or because the action's work was already done by someone else — and
+    // below it only if it cancels because the issue now has its own wake path.
+    //
+    // `=== false` rather than a truthiness read: an off-enum `kind` from the DB keeps today's
+    // cancelling behaviour instead of silently becoming a new zombie-row class (BLO-16074).
+    if (ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION[input.kind] === false) return null;
+
     if (issue.status === "blocked") {
       const readiness = await svc.getDependencyReadiness(issue.id);
       if (readiness.unresolvedBlockerCount > 0) {
@@ -3659,16 +3793,6 @@ export function issueRoutes(
 
     if (issue.assigneeUserId && issue.status !== "done" && issue.status !== "cancelled") {
       return "Recovery action became stale because the source issue now has a human owner.";
-    }
-
-    // Parking an issue in `backlog` retires its recovery action (BLO-25907). `backlog` is
-    // deliberately not dispatchable, so an action left active there names an owner wake that
-    // no sweep will ever deliver — `reconcileStrandedAssignedIssues` covers only
-    // todo/in_progress/in_review. Folding here retires it at the moment of the park; the
-    // backstop sweep folds rows that were parked before this branch existed, or parked by a
-    // path that never reaches this classifier.
-    if (issue.status === "backlog") {
-      return "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.";
     }
 
     if ((issue.status === "todo" || issue.status === "in_progress") && issue.assigneeAgentId) {
@@ -3726,7 +3850,10 @@ export function issueRoutes(
         : input.activeRecoveryAction;
     if (!activeRecoveryAction) return null;
 
-    const resolutionNote = await classifySourceRecoveryRevalidation(input);
+    const resolutionNote = await classifySourceRecoveryRevalidation({
+      ...input,
+      kind: activeRecoveryAction.kind,
+    });
     if (!resolutionNote) return activeRecoveryAction;
 
     const resolved = await recoveryActionsSvc.resolveActiveForIssue({
@@ -4006,7 +4133,7 @@ export function issueRoutes(
 
   async function logExpiredRequestConfirmations(input: {
     issue: { id: string; companyId: string; identifier?: string | null };
-    interactions: Array<{ id: string; kind: string; status: string; result?: unknown }>;
+    interactions: Array<{ id: string; kind: string; status: string; title?: string | null; result?: unknown }>;
     actor: ReturnType<typeof getActorInfo>;
     source: string;
   }) {
@@ -4030,6 +4157,95 @@ export function issueRoutes(
           result: interaction.result ?? null,
         },
       });
+    }
+
+    await postSupersededByCommentNotice(input);
+  }
+
+  /**
+   * BLO-35308: an activity_log row is not a signal anybody reads. A pending ask
+   * expiring on an unrelated user comment was invisible on every triage surface
+   * — the row still read `in_review`, the thread looked healthy, and the absence
+   * of a live card is exactly what made the next reader conclude nothing had
+   * ever been asked for. Three consecutive asks for one verdict died that way on
+   * BLO-26446 and cost 26 days.
+   *
+   * Keyed on the RESULT payload rather than on `input.source`, so it self-selects
+   * at every present call site (four comment paths) and at any future one, and so
+   * the document-driven `stale_target` expiries — a different reason with its own
+   * ledger — do not get swept in.
+   */
+  async function postSupersededByCommentNotice(input: {
+    issue: { id: string; companyId: string; identifier?: string | null };
+    interactions: Array<{ id: string; kind: string; status: string; title?: string | null; result?: unknown }>;
+    actor: ReturnType<typeof getActorInfo>;
+  }) {
+    const superseded = input.interactions.flatMap((interaction) => {
+      const result = interaction.result as Record<string, unknown> | null | undefined;
+      if (!result || typeof result !== "object") return [];
+      // ask_user_questions records the reason as `expirationReason`; every other
+      // supersedable kind uses `outcome`. Both carry the killing `commentId`.
+      const reason = result.outcome ?? result.expirationReason;
+      if (reason !== "superseded_by_comment") return [];
+      const commentId = typeof result.commentId === "string" ? result.commentId : null;
+      return [{ ...interaction, commentId }];
+    });
+
+    if (superseded.length === 0) return;
+
+    // One notice per killing comment, not per interaction and not per sweep.
+    // Several asks dying on one comment is a single event, but a catchup batch
+    // can span several comments (each ask dies on the earliest human comment
+    // after its own createdAt), and each notice names the comment it cites.
+    const byKillingComment = new Map<string | null, typeof superseded>();
+    for (const item of superseded) {
+      const group = byKillingComment.get(item.commentId);
+      if (group) group.push(item);
+      else byKillingComment.set(item.commentId, [item]);
+    }
+
+    for (const [killedBy, group] of byKillingComment) {
+      const lines = group.map((item) => {
+        const title = item.title?.trim();
+        return `- \`${item.kind}\` \`${item.id}\`${title ? ` — ${title}` : ""}`;
+      });
+
+      const body = [
+        "**Pending ask expired — superseded by a comment.**",
+        "",
+        group.length === 1
+          ? "This interaction was waiting for a human answer and has been expired unanswered:"
+          : `These ${group.length} interactions were waiting for a human answer and have been expired unanswered:`,
+        ...lines,
+        "",
+        killedBy
+          ? `Expired by comment \`${killedBy}\`, because the ask carried \`supersedeOnUserComment: true\` — which is the default when the field is omitted.`
+          : "Expired by a user comment, because the ask carried `supersedeOnUserComment: true` — which is the default when the field is omitted.",
+        "",
+        "**No answer was recorded.** If this gate still needs one, create a fresh interaction with `supersedeOnUserComment: false` so unrelated thread traffic cannot expire it again.",
+      ].join("\n");
+
+      try {
+        await svc.addComment(
+          input.issue.id,
+          body,
+          // `authorType: "system"` is rejected for any actor carrying an
+          // agentId or userId, so pass the run alone (as the monitor
+          // convergence notice does). Who triggered the sweep is already on
+          // the expiry (`resolvedBy*`) and on its activity_log row.
+          { runId: input.actor.runId },
+          {
+            authorType: "system",
+            // The supersession sweep is guarded on `authorUserId`, which a system
+            // comment does not have, so this notice cannot itself supersede
+            // anything. The key keeps a retried effect from double-posting.
+            idempotencyKey: killedBy ? `interaction-superseded:${killedBy}` : null,
+          },
+        );
+      } catch (error) {
+        // A missing notice must not roll back the expiry that already committed.
+        logger.error({ err: error, issueId: input.issue.id }, "failed to post interaction supersession notice");
+      }
     }
   }
 
@@ -7052,16 +7268,11 @@ export function issueRoutes(
   // BLO-32774: the five keys used to be repeated here. They are now derived from
   // `STATUS_ONLY_RECOVERY_GUARD_CONTEXT`, so editing the tuple can no longer
   // leave this guard testing a stale shape and quietly failing open.
+  //
+  // PEN-3275: the planning-only predicate below was still hand-written, carrying
+  // the same hazard for `PLANNING_ONLY_RECOVERY_GUARD_CONTEXT`. Both are now derived.
   const isStatusOnlyCheapRecoveryContext = isStatusOnlyRecoveryContextSnapshot;
-
-  function isPlanningOnlyRecoveryContext(contextSnapshot: unknown) {
-    if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
-    const context = contextSnapshot as Record<string, unknown>;
-    return context.recoveryIntent === "planning_only" &&
-      context.allowDeliverableWork === false &&
-      context.allowDocumentUpdates === true &&
-      context.resumeRequiresNormalModel === false;
-  }
+  const isPlanningOnlyRecoveryContext = isPlanningOnlyRecoveryContextSnapshot;
 
   function requestsCheapIssueAssigneeModelProfile(input: { assigneeAdapterOverrides?: unknown }) {
     const overrides = input.assigneeAdapterOverrides;
@@ -7089,6 +7300,10 @@ export function issueRoutes(
     return run;
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in prose, in the wake prompt, before the agent plans. Change the condition here
+  // and that sentence silently becomes a lie — which is how round 6 shipped a notice claiming a
+  // flat refusal for a guard BLO-34683 had already made conditional. Update both together.
   async function assertCheapRecoveryIssueAssigneeProfileAllowed(
     req: Request,
     res: Response,
@@ -7170,6 +7385,13 @@ export function issueRoutes(
    * and restores arming, and that write is a status-only run's one allowed
    * deliverable (BLO-25868). The row is only unreachable if this run declines to
    * dispose of it, which is the case the handoff detector already escalates.
+   *
+   * PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+   * this verdict in the wake prompt. This is the guard that proved the hazard — the BLO-34683
+   * change above made the refusal conditional, the notice kept saying "arming issue monitors"
+   * flatly, and the run dispatched to repair a cleared monitor read the notice and declined the
+   * arm this guard would have permitted. The notice now names the CONDITION; if that condition
+   * changes again, change the sentence in the same edit.
    */
   async function assertMonitorArmingAllowedByRunContext(
     req: Request,
@@ -7399,6 +7621,14 @@ export function issueRoutes(
     // `standard` in exactly the deadlocking case and queues another status-only
     // wake into the identical 403.
     //
+    // PEN-3275: the wake prompt now ANNOUNCES this refusal before the agent
+    // plans, which means a compliant agent would never reach this stamp — the
+    // announcement would silently disable the escalation. So
+    // `recoveryRunWriteClassNotice` tells the reader to attempt the write
+    // anyway, naming it as the escalation channel. That sentence and this stamp
+    // are one mechanism: removing either leaves the other inert, and nothing
+    // fails when it happens.
+    //
     // Documents only: the escalation target is `planning_only`, which permits
     // document updates but still bars deliverables and annotations, so a refused
     // deliverable write would be escalated onto a lane that still cannot perform
@@ -7482,6 +7712,9 @@ export function issueRoutes(
     return false;
   }
 
+  // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES
+  // this verdict in the wake prompt, including the `request_board_approval` carve-out and its
+  // link-set exclusivity. Change what is admitted here and update that sentence in the same edit.
   async function assertApprovalMutationAllowedByRunContext(
     req: Request,
     res: Response,
@@ -7497,8 +7730,16 @@ export function issueRoutes(
       error:
         planningOnly
           ? "Planning-only recovery runs cannot link or unlink approvals"
-          : "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
-            "create a `request_board_approval` with the run context's source issue in `issueIds` instead",
+          // PEN-3275: the redirect is only offered when the guard would actually admit it.
+          // `approvals.ts` refuses the create when the run context carries no source issue, so on
+          // an issueless status-only run the old unconditional phrasing sent a refused caller
+          // straight into a second refusal.
+          : statusOnlyEscalationSourceIssueId(run.contextSnapshot)
+            ? "Cheap status-only recovery runs cannot link or unlink approvals; to escalate from this run, " +
+              "create a `request_board_approval` with the run context's source issue in `issueIds` instead"
+            : "Cheap status-only recovery runs cannot link or unlink approvals, and this run context " +
+              "carries no source issue, so it cannot file a `request_board_approval` either; record a " +
+              "status disposition instead",
       details: {
         issueId: issue.id,
         runId: run.id,
@@ -8364,6 +8605,7 @@ export function issueRoutes(
     const attention = req.query.attention as string | undefined;
     const sortField = req.query.sortField as string | undefined;
     const sortDir = req.query.sortDir as string | undefined;
+    const afterId = req.query.afterId as string | undefined;
     const view = req.query.view as string | undefined;
     const compactView = view === "compact";
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
@@ -8403,13 +8645,38 @@ export function issueRoutes(
       res.status(400).json({ error: "offset must be a non-negative integer" });
       return;
     }
-    if (sortField !== undefined && sortField !== "updated") {
-      res.status(400).json({ error: "sortField must be 'updated' when provided" });
+    if (sortField !== undefined && sortField !== "updated" && sortField !== "id") {
+      res.status(400).json({ error: "sortField must be 'updated' or 'id' when provided" });
       return;
     }
     if (sortDir !== undefined && sortDir !== "asc" && sortDir !== "desc") {
       res.status(400).json({ error: "sortDir must be 'asc' or 'desc' when provided" });
       return;
+    }
+    if (afterId !== undefined) {
+      if (typeof afterId !== "string" || !isUuidLike(afterId.trim())) {
+        res.status(400).json({ error: "afterId must be an issue UUID" });
+        return;
+      }
+      // Keyset paging is only meaningful against the immutable id order; allowing it
+      // on the mutable activity order would hand back a cursor that silently skips rows.
+      if (sortField !== "id") {
+        res.status(400).json({ error: "afterId requires sortField=id" });
+        return;
+      }
+      // offset applies on top of the keyset predicate, so combining them would
+      // silently skip `offset` rows per page.
+      if (parsedOffset !== null && parsedOffset > 0) {
+        res.status(400).json({ error: "afterId cannot be combined with offset" });
+        return;
+      }
+      // attention=blocked is served by the blocked-inbox listing, which pages by
+      // offset only and ignores afterId, so a cursor there would return page one on
+      // every request and never advance.
+      if (attention === "blocked") {
+        res.status(400).json({ error: "afterId cannot be combined with attention=blocked" });
+        return;
+      }
     }
     if (hasPlanDocument === null) {
       res.status(400).json({ error: "hasPlanDocument must be true or false when provided" });
@@ -8477,8 +8744,9 @@ export function issueRoutes(
       q: req.query.q as string | undefined,
       limit,
       offset,
-      sortField: sortField === "updated" ? "updated" : undefined,
+      sortField: sortField === "updated" ? "updated" : sortField === "id" ? "id" : undefined,
       sortDir: sortDir === "asc" || sortDir === "desc" ? sortDir : undefined,
+      afterId: afterId?.trim() || undefined,
     };
     const requestKey = issueListRequestKey({
       req,
@@ -8664,8 +8932,8 @@ export function issueRoutes(
     }
     const attention = req.query.attention as string | undefined;
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
-    if (attention !== "blocked") {
-      res.status(400).json({ error: "issues/count currently requires attention=blocked" });
+    if (attention !== undefined && attention !== "blocked") {
+      res.status(400).json({ error: "attention must be 'blocked' when provided" });
       return;
     }
     if (req.query.limit !== undefined || req.query.offset !== undefined) {
@@ -8676,13 +8944,37 @@ export function issueRoutes(
       res.status(400).json({ error: "hasPlanDocument must be true or false when provided" });
       return;
     }
+    // The general (non-blocked) count is a single COUNT(*) over a narrower condition set
+    // than list(). Any filter it cannot express must 400 rather than be dropped: silently
+    // counting a wider set is worse than refusing, because the caller cannot tell.
+    if (attention === undefined) {
+      const unsupported = COUNT_UNSUPPORTED_FILTERS.filter((key) => {
+        const value = req.query[key];
+        return value !== undefined && value !== "";
+      });
+      if (unsupported.length > 0) {
+        res.status(400).json({
+          error: `issues/count cannot honor ${unsupported.join(", ")}; omit them or use attention=blocked`,
+        });
+        return;
+      }
+    }
+    const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
+    const assigneeUserId =
+      assigneeUserFilterRaw === "me" && req.actor.type === "board"
+        ? req.actor.userId
+        : assigneeUserFilterRaw;
+    if (assigneeUserFilterRaw === "me" && (!assigneeUserId || req.actor.type !== "board")) {
+      res.status(403).json({ error: "assigneeUserId=me requires board authentication" });
+      return;
+    }
 
-    const blockedCountFilters = {
-      attention: "blocked",
+    const countFilters = {
+      attention: attention === "blocked" ? "blocked" as const : undefined,
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
       participantAgentId: req.query.participantAgentId as string | undefined,
-      assigneeUserId: req.query.assigneeUserId as string | undefined,
+      assigneeUserId,
       projectId: req.query.projectId as string | undefined,
       workspaceId: req.query.workspaceId as string | undefined,
       executionWorkspaceId: req.query.executionWorkspaceId as string | undefined,
@@ -8698,8 +8990,8 @@ export function issueRoutes(
         req.query.excludeRoutineExecutions === "true" || req.query.excludeRoutineExecutions === "1",
       includePluginOperations:
         req.query.includePluginOperations === "true" || req.query.includePluginOperations === "1",
-      includeBlockedBy: true,
-      includeBlockedInboxAttention: true,
+      includeBlockedBy: attention === "blocked",
+      includeBlockedInboxAttention: attention === "blocked",
       hasPlanDocument,
       q: req.query.q as string | undefined,
     } as const;
@@ -8716,30 +9008,35 @@ export function issueRoutes(
       }
       if (trustResolution?.kind === "low_trust_review") {
         const count = await svc.count(companyId, {
-          ...blockedCountFilters,
+          ...countFilters,
           lowTrustBoundary: trustResolution.boundary,
         });
         res.json({ count });
         return;
       }
 
-      let offset = 0;
+      const blocked = countFilters.attention === "blocked";
+      const pageSize = opts.issueCountWalk?.pageSize ?? ISSUE_LIST_MAX_LIMIT;
       let visibleCount = 0;
-      while (true) {
-        const rows = await svc.list(companyId, {
-          ...blockedCountFilters,
-          limit: ISSUE_LIST_MAX_LIMIT,
-          offset,
-        });
-        visibleCount += (await filterIssuesForActor(req, rows)).length;
-        if (rows.length < ISSUE_LIST_MAX_LIMIT) break;
-        offset += rows.length;
-      }
+      await walkIssueListPages(
+        (page) =>
+          svc.list(
+            companyId,
+            blocked
+              ? { ...countFilters, limit: pageSize, offset: page.offset }
+              : { ...countFilters, limit: pageSize, sortField: "id", afterId: page.afterId },
+          ),
+        { blocked, pageSize },
+        async (rows) => {
+          visibleCount += (await filterIssuesForActor(req, rows)).length;
+          await opts.issueCountWalk?.onPage?.();
+        },
+      );
       res.json({ count: visibleCount });
       return;
     }
 
-    const count = await svc.count(companyId, blockedCountFilters);
+    const count = await svc.count(companyId, countFilters);
     res.json({ count });
   });
 
@@ -11636,14 +11933,16 @@ export function issueRoutes(
     await assertCanManageIssueMonitor(access, req, issue.companyId, issue, true);
 
     const actor = getActorInfo(req);
-    await heartbeat.triggerIssueMonitor(issue.id, {
+    // PEN-3326: a check-now under a tree hold or `wakeOnDemand: false` re-arms
+    // the monitor instead of firing; surface that outcome rather than a bare ok.
+    const result = await heartbeat.triggerIssueMonitor(issue.id, {
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId ?? null,
       runId: actor.runId ?? null,
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, ...result });
   });
 
   router.post("/issues/:id/scheduled-retry/retry-now", async (req, res) => {

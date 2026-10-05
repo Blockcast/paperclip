@@ -1822,6 +1822,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       //
       // No catalog row => a genuine, permanent configuration fault, which keeps
       // the existing non-retryable `skill_not_found`.
+      //
+      // BLO-35668: that first sentence is true and INSUFFICIENT, and this is the
+      // comment the next rename starts from. Inheriting `adapter_failed`'s
+      // membership in ONE set does not inherit its behaviour — this code has to be
+      // enrolled at THREE sites in the paperclip server, and shipping only the
+      // first left pr_review runs with no retry path at all (13 failures / 0
+      // retries over 18h) and stranded issue runs routed up the manager ladder:
+      //
+      //   1. TRANSIENT_INFRA_CONTINUATION_ERROR_CODES
+      //      (server/src/services/recovery/service.ts) — issue continuation budget.
+      //      This is the one the sentence above names; it is issue-scoped.
+      //   2. shouldScheduleAutomaticRunRetry (server/src/services/heartbeat.ts) —
+      //      the ONLY retry path for a pr_review run, admitted by literal only.
+      //   3. ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES
+      //      (server/src/services/recovery/zero-token-startup-failure.ts) —
+      //      owner-vs-manager routing, the recovery audit stamp, and productivity
+      //      review classification.
+      //
+      // Renaming this code, or adding a sibling here, means changing all three.
+      // Sites 2 and 3 are pinned against `adapter_failed` in
+      // server/src/__tests__/heartbeat-recoverable-error-family.test.ts; site 1 is
+      // not exported and is still unasserted.
       errorCode: err.catalogBacked ? "skill_materialization_pending" : "skill_not_found",
     };
   }

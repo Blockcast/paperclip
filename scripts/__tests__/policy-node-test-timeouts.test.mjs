@@ -153,6 +153,40 @@ test("the timeout guard fails when a node --test bound reaches the job cap", () 
   assert.throws(() => assertTimeouts(mutated, cap), /must sit below the/);
 });
 
+// The `policy` job cap is a hang detector sized by the BLO-35615 rule in
+// pr.yml, not a performance budget, so this pins only a floor: the smaller of
+// that rule's two branches as last derived, `ceil( 364 / 19.2 ) = 19` (the W95
+// branch; pr.yml's derivation block carries the other). What must fail loudly
+// is a revert toward the old 10m, which BLO-31690 measured as truncating
+// healthy runs (healthy max 600s = the cap). Any value the rule yields today
+// passes. If a later BLO-35615 pass lands both branches below 19, lower this
+// constant in the same change as pr.yml and cite that pass; do not raise the
+// cap to fit.
+const POLICY_JOB_CAP_FLOOR_MINUTES = 19;
+
+function assertCapFloor(region = jobRegion("policy")) {
+  const cap = policyJobCap(region);
+  assert.ok(
+    cap >= POLICY_JOB_CAP_FLOOR_MINUTES,
+    `policy job cap ${cap}m is below ${POLICY_JOB_CAP_FLOOR_MINUTES}m, the smaller branch of the ` +
+      "BLO-35615 hang-detector rule in pr.yml; re-derive the cap by that rule rather than tuning it",
+  );
+}
+
+test("policy job cap stays at or above the BLO-35615 hang-detector floor", () => {
+  assertCapFloor();
+});
+
+test("the cap floor fails when the policy job cap is reverted toward 10m", () => {
+  const region = jobRegion("policy");
+  const mutated = region.replace(
+    new RegExp(`\\n {4}${TIMEOUT_MINUTES}\\n`),
+    "\n    timeout-minutes: 10\n",
+  );
+  assert.notEqual(mutated, region, "mutation must rewrite the job-level timeout-minutes");
+  assert.throws(() => assertCapFloor(mutated), /is below/);
+});
+
 // BLO-32670. Three of `policy`'s bounded steps measured a p100 above
 // 50% of the old 60s budget over 58 sampled runs; the rest were all at or
 // under 25%. These three are the fork-heavy ones — they shell out per case, so

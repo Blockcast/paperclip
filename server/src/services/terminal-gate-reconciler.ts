@@ -57,11 +57,15 @@ import type { Db } from "@paperclipai/db";
 import { issueComments, issueWorkProducts, issues } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { githubGetPullRequestGate, type PullRequestGateResult } from "./github-app-auth.js";
-import { normalizeIssueMonitorGateSignals } from "./issue-execution-policy.js";
+import {
+  exhaustedMonitorClearReason,
+  issueAllowsMonitor,
+  normalizeIssueMonitorGateSignals,
+} from "./issue-execution-policy.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { listIssueDependencyReadinessMap } from "./issues.js";
 
-/** Issues scanned per pass. The population is small by construction (a monitor with declared gates and no next check). */
+/** Issues scanned per pass. The population is small by construction (a monitor with declared gates that is not polling, or has not polled yet — see `listCandidateIssues`). */
 const SCAN_LIMIT = 200;
 
 /**
@@ -153,6 +157,33 @@ export function readIssueMonitorGateSignals(executionState: unknown): string[] {
 }
 
 /**
+ * The monitor's declared bounds, in the shape `exhaustedMonitorClearReason` reads.
+ *
+ * Read off `executionState.monitor` — where `monitorMetadataFromPolicy`
+ * (issue-execution-policy.ts) copies them at arm time — rather than re-parsing
+ * `executionPolicy` with `normalizeIssueExecutionPolicy`. That helper *throws*
+ * on a policy it cannot parse, which on this sweep would abort the whole pass
+ * over one malformed row; this module fails closed per row everywhere else
+ * (see the CASE expression in `listCandidateIssues` for the same reasoning).
+ * Anything unreadable here therefore reads as "no bound declared", which is the
+ * same verdict the bound-less majority already gets.
+ */
+export function readIssueMonitorBounds(
+  executionState: unknown,
+): { timeoutAt: string | null; maxAttempts: number | null } {
+  const monitor =
+    executionState && typeof executionState === "object"
+      ? (executionState as { monitor?: unknown }).monitor
+      : null;
+  if (!monitor || typeof monitor !== "object") return { timeoutAt: null, maxAttempts: null };
+  const { timeoutAt, maxAttempts } = monitor as { timeoutAt?: unknown; maxAttempts?: unknown };
+  return {
+    timeoutAt: typeof timeoutAt === "string" ? timeoutAt : null,
+    maxAttempts: typeof maxAttempts === "number" ? maxAttempts : null,
+  };
+}
+
+/**
  * Re-read every declared gate and decide whether the issue's terminal gate is
  * satisfied. Fail-closed at every branch: any token this module cannot parse,
  * any PR it cannot read, and any PR that is not merged leaves the issue
@@ -217,19 +248,40 @@ export async function resolveTerminalGate(input: {
 export function buildTerminalGateResolvedComment(input: {
   signals: readonly string[];
   mergedPullRequests: readonly string[];
+  /**
+   * The monitor's pending first check, for a row admitted by the never-polled
+   * arm (BLO-36289). Non-null means the monitor is **armed** — it has a live
+   * wake path and simply has not reached its first check — which is the
+   * opposite of the stranded case this module was built for.
+   *
+   * The branch is not cosmetic. This comment is system-authored and read by
+   * agents deciding whether a row is stranded, and the documented repair for a
+   * stranded row *destroys* the wake path it already had. Asserting "nothing is
+   * polling it" over an armed monitor is the same false signal as the
+   * 86%-false-positive strand detector, so the two populations must not share
+   * copy.
+   */
+  armedNextCheckAt?: Date | null;
 }) {
+  const armed = input.armedNextCheckAt != null;
   const prLines = input.mergedPullRequests.map((pr) => `- \`${pr}\` — **merged**`).join("\n");
   const signalLines = input.signals.map((signal) => `\`${signal}\``).join(", ");
   return [
-    "**Terminal gate resolved — this issue's monitor gate is satisfied, but nothing is polling it.**",
+    armed
+      ? "**Terminal gate resolved — this issue's gate was already satisfied when its monitor was armed.**"
+      : "**Terminal gate resolved — this issue's monitor gate is satisfied, but nothing is polling it.**",
     "",
-    "The monitor stopped re-checking (converged to a stall, was cleared, or its run was killed) while its declared gate was still unsatisfied. A board-side re-read now finds it satisfied:",
+    armed
+      ? `The monitor is armed and scheduled; its first check is not due until \`${input.armedNextCheckAt!.toISOString()}\`. A board-side re-read finds the declared gate already satisfied, so that wait buys nothing:`
+      : "The monitor stopped re-checking (converged to a stall, was cleared, or its run was killed) while its declared gate was still unsatisfied. A board-side re-read now finds it satisfied:",
     "",
     prLines,
     "",
     `Declared gate signals: ${signalLines}`,
     "",
-    "No run was dispatched to produce this — re-reading a pull request is one API call, and waking an agent to do it is not. Nothing here closes the issue: a merged gate proves the gate resolved, not that the acceptance criteria are met. Verify the acceptance criteria against the merged artifact and close, or re-arm the monitor on whatever is genuinely still outstanding.",
+    armed
+      ? "No run was dispatched to produce this — re-reading a pull request is one API call, and waking an agent to do it is not. Nothing here closes the issue: a merged gate proves the gate resolved, not that the acceptance criteria are met. Verify the acceptance criteria against the merged artifact and close. **The monitor is still armed, so this issue has a live wake path — do not treat it as stranded and do not repair it as one.**"
+      : "No run was dispatched to produce this — re-reading a pull request is one API call, and waking an agent to do it is not. Nothing here closes the issue: a merged gate proves the gate resolved, not that the acceptance criteria are met. Verify the acceptance criteria against the merged artifact and close, or re-arm the monitor on whatever is genuinely still outstanding.",
     "",
     "_Posted by the terminal-gate reconciler (BLO-27515)._",
   ].join("\n");
@@ -310,16 +362,51 @@ type CandidateRow = {
   companyId: string;
   identifier: string | null;
   executionState: unknown;
+  /** Non-null == admitted by the never-polled arm. Armed only if it can also fire; see the call site. */
+  monitorNextCheckAt: Date | null;
+  /** The scheduler's eligibility tuple (`issueAllowsMonitor`); this query does not filter on it. */
+  status: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
 };
 
 /**
- * Issues whose monitor declared gates and whose polling has stopped.
+ * Issues whose monitor declared gates and is either no longer polling or has
+ * not polled yet.
  *
  * Deliberately NOT restricted to `in_progress`/`in_review`. A monitor can only
  * be *armed* on those statuses, but the population this exists for is precisely
  * the one an outage moved to `blocked` (and a restore sweep then moved to
  * `todo`) with the monitor state left behind in the JSONB. Restricting to the
  * armable statuses would exclude the worked example that motivated this module.
+ *
+ * ## Why the never-polled arm exists (BLO-36289)
+ *
+ * `monitorNextCheckAt IS NULL` alone means "polling stopped", so a monitor
+ * armed on a gate that was *already satisfied at arm time* was invisible here
+ * until its whole window elapsed. Worked example: BLO-28908's monitor was armed
+ * at 02:00 with `notes: "checks=pending, review=none"` while both check runs had
+ * finished at 01:12:50Z — 47 minutes earlier. It waited a full day and cleared
+ * `timeout_exceeded`.
+ *
+ * `attemptCount = 0 AND lastTriggeredAt IS NULL` is "armed and never evaluated",
+ * which is exactly that population and no more. It is self-limiting: a row
+ * leaves the set the first time the monitor fires, and leaves it earlier if the
+ * gate resolves (the announcement anti-join above drops it). Re-arming preserves
+ * `attemptCount`, so a re-armed monitor is not readmitted — deliberate, since
+ * the harm being closed is the *first* window, and readmitting every re-arm is
+ * the unbounded variant BLO-29856 rejected.
+ *
+ * Cost, measured 2026-09-25 against the live fleet rather than estimated: 47
+ * armed monitors, of which 9 never-triggered. All 9 declare gates; 8 declare at
+ * least one token `parseTerminalGateSignal` cannot parse (`mq:`, `heap:`,
+ * `argo:`, `approval:`, `cron:`, `insync:`, `deploy:`, `cto-ruling:`), and
+ * `resolveTerminalGate` runs its parse loop to completion *before* its read
+ * loop, so those cost zero network calls. Added GitHub reads per pass: **1**
+ * (`blockcast/onprem-k8s#3823`, deduped per pass by `gateCache`).
+ *
+ * No network call is added to `PATCH /api/issues/{id}` — the evaluation stays
+ * here, on the sweep, off the monitor-write transaction.
  */
 async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promise<CandidateRow[]> {
   return db
@@ -328,11 +415,16 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
       companyId: issues.companyId,
       identifier: issues.identifier,
       executionState: issues.executionState,
+      monitorNextCheckAt: issues.monitorNextCheckAt,
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
     })
     .from(issues)
     .where(and(
       notInArray(issues.status, ["done", "cancelled"]),
-      isNull(issues.monitorNextCheckAt),
+      sql`(${issues.monitorNextCheckAt} is null
+            or (${issues.monitorAttemptCount} = 0 and ${issues.monitorLastTriggeredAt} is null))`,
       visibleIssueCondition(),
       // One CASE, not two ANDed predicates: PostgreSQL does not promise to
       // evaluate a WHERE conjunct only after its neighbour, so a separate
@@ -539,6 +631,47 @@ export async function reconcileTerminalGates(
         body: buildTerminalGateResolvedComment({
           signals: verdict.signals,
           mergedPullRequests: verdict.mergedPullRequests,
+          // Only a check still in the FUTURE is a live wake path. A non-null
+          // `monitorNextCheckAt` here always means the row came in via the
+          // never-polled arm (the other arm requires it to be null), but an
+          // *overdue* first check is by definition a wake that did not happen —
+          // so claiming "live wake path, do not treat as stranded" over it would
+          // be the mirror of the false signal this branch exists to avoid. The
+          // stranded copy, including its re-arm advice, is the true one there.
+          //
+          // A future check is necessary but not sufficient, on two independent
+          // counts. First, the scheduler only ever selects rows
+          // `issueAllowsMonitor` admits, and this query admits every status but
+          // done/cancelled by design (the blocked -> todo restore population).
+          // Second, selection is not the same question as whether the monitor
+          // has any road left: `exhaustedMonitorClearReason` returns
+          // `timeout_exceeded` off `timeoutAt` alone, and nothing constrains
+          // `nextCheckAt <= timeoutAt` — "check in 6h, give up after 2h" arms
+          // fine, and the scheduler's next evaluation clears it rather than
+          // firing it. Either way a future check is a wake that will never
+          // happen, so it gets the stranded copy too.
+          //
+          // `attemptCount: 0` is the literal truth here rather than a
+          // simplification: a non-null `monitorNextCheckAt` can only have come
+          // in via the never-polled arm, whose predicate *is*
+          // `monitorAttemptCount = 0`. `defaultMaxAttempts` is deliberately
+          // omitted — the scheduler's ceiling is about repeated polling, and
+          // nothing has polled yet.
+          armedNextCheckAt:
+            entry.candidate.monitorNextCheckAt !== null
+              && entry.candidate.monitorNextCheckAt.getTime() > now.getTime()
+              && issueAllowsMonitor(
+                entry.candidate.status,
+                entry.candidate.assigneeAgentId,
+                entry.candidate.assigneeUserId,
+              )
+              && exhaustedMonitorClearReason({
+                monitor: readIssueMonitorBounds(entry.candidate.executionState),
+                attemptCount: 0,
+                now,
+              }) === null
+              ? entry.candidate.monitorNextCheckAt
+              : null,
         }),
       })
       .onConflictDoNothing()

@@ -57,6 +57,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.js";
+import { logger } from "../middleware/logger.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
@@ -688,10 +689,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     slotId?: number;
     jobName?: string;
     jobUid?: string;
+    // PEN-3640: the stuck-skip diagnostic gates on `updatedAt` (time spent
+    // refused), not `reservedAt` (time the run has existed). Overridable so a
+    // test can drive the two clocks apart.
+    reservedAt?: Date;
+    updatedAt?: Date;
   }) {
     const jobName = input.jobName ?? `agent-job-${input.runId.slice(0, 8)}`;
     const jobUid = input.jobUid ?? `uid-${input.runId}`;
     const now = new Date("2026-03-19T00:01:00.000Z");
+    const reservedAt = input.reservedAt ?? now;
     return db
       .insert(externalRuntimeReservations)
       .values({
@@ -706,11 +713,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         isolationMode: "shared",
         isolationKey: `agent-shared:${input.agentId}`,
         isolationBoundAt: now,
-        reservedAt: now,
-        launchingAt: now,
-        launchedAt: now,
-        createdAt: now,
-        updatedAt: now,
+        reservedAt,
+        launchingAt: reservedAt,
+        launchedAt: reservedAt,
+        createdAt: reservedAt,
+        updatedAt: input.updatedAt ?? reservedAt,
       })
       .returning()
       .then((rows) => rows[0]);
@@ -2214,6 +2221,117 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect((await heartbeat.getRun(runId))?.errorCode).toBe("process_lost");
   });
 
+  // BLO-33385: a pre-adapter process_lost destroys a ONE-SHOT issue wake
+  // (issue_comment_mentioned, missing_issue_comment, ...). Nothing redelivers
+  // those, so before this fix the issue was released and stranded. Only
+  // PR-review runs were retried; these two pin the widened gate and the
+  // BLO-7913 boundary it must not cross.
+  it("retries an issue-scoped pre-adapter process_lost exactly once so the one-shot wake survives (BLO-33385)", async () => {
+    const { agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      lastOutputAt: null,
+      // Deliberately NOT a pr_review context: this is the shape that got no
+      // retry before the fix.
+      contextSnapshot: { wakeReason: "issue_comment_mentioned" },
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    expect(result.runIds).toContain(runId);
+
+    const lostRun = await heartbeat.getRun(runId);
+    expect(lostRun?.status).toBe("failed");
+    expect(lostRun?.errorCode).toBe("process_lost");
+    expect(lostRun?.error).toContain("retrying once");
+    // The parent carries the spent budget, so a second loss on the retry
+    // chain fails the `< 1` bound and stays terminal.
+    expect(lostRun?.processLossRetryCount).toBe(1);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const retryRuns = runs.filter((row) => row.retryOfRunId === runId);
+    expect(retryRuns).toHaveLength(1);
+    expect(["queued", "running"]).toContain(retryRuns[0]?.status);
+    expect(retryRuns[0]?.processLossRetryCount).toBe(1);
+    expect(retryRuns[0]?.contextSnapshot).toMatchObject({
+      wakeReason: "process_lost_retry",
+      retryOfRunId: runId,
+      issueId,
+    });
+
+    // The retry is the SINGLE continuation for this issue: promotion is
+    // suppressed, so no second runnable path is created beside it.
+    expect(runs).toHaveLength(2);
+  });
+
+  it("leaves a pre-adapter process_lost with no issue id terminal, with no retry (BLO-7913 non-regression)", async () => {
+    // Timer/maintenance runs self-redeliver, so retrying them only leaks.
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+      contextSnapshot: { wakeReason: "heartbeat_timer" },
+    });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    expect(result.runIds).toContain(runId);
+
+    const lostRun = await heartbeat.getRun(runId);
+    expect(lostRun?.status).toBe("failed");
+    expect(lostRun?.errorCode).toBe("process_lost");
+    expect(lostRun?.error).not.toContain("retrying once");
+    expect(lostRun?.processLossRetryCount ?? 0).toBe(0);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.filter((row) => row.retryOfRunId === runId)).toHaveLength(0);
+    expect(runs).toHaveLength(1);
+  });
+
+  it(
+    "leaves a pre-adapter process_lost monitor dispatch terminal while a future monitor wake remains (BLO-33385 review)",
+    async () => {
+      // The widened pre-adapter gate must not swallow `issue_monitor_due`: that
+      // wake is redelivered by the monitor, so a retry here would race the
+      // scheduled redelivery and produce two continuations for one issue. The
+      // sibling test above covers the same wake reason on a NON-external adapter,
+      // which never reaches this branch -- `opencode_k8s` is what makes it
+      // pre-adapter, and is the shape the review flagged as unguarded.
+      const { companyId, agentId, runId, issueId } = await seedRunFixture({
+        adapterType: "opencode_k8s",
+        agentStatus: "idle",
+        processPid: null,
+        processGroupId: null,
+        lastOutputAt: null,
+        contextSnapshot: { wakeReason: "issue_monitor_due" },
+      });
+      await db
+        .update(issues)
+        .set({ monitorNextCheckAt: new Date("2099-03-19T00:00:00.000Z") })
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
+
+      const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      expect(result.runIds).toContain(runId);
+
+      const lostRun = await heartbeat.getRun(runId);
+      expect(lostRun?.status).toBe("failed");
+      expect(lostRun?.errorCode).toBe("process_lost");
+      expect(lostRun?.error).not.toContain("retrying once");
+      expect(lostRun?.processLossRetryCount ?? 0).toBe(0);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.filter((row) => row.retryOfRunId === runId)).toHaveLength(0);
+      expect(runs).toHaveLength(1);
+
+      // The wake that survives is the monitor's own, untouched by the reap.
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((r) => r[0]);
+      expect(issue?.monitorNextCheckAt?.toISOString()).toBe("2099-03-19T00:00:00.000Z");
+    },
+  );
+
   it("immediately reaps a fresh exact-missing Job and records that adapter invocation started", async () => {
     const jobName = "agent-opencode-restart-missing";
     const { companyId, agentId, runId } = await seedRunFixture({
@@ -2744,6 +2862,236 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       prReviewGateFailureReason: "non_retryable_external_lifecycle",
       reviewerRunId: runId,
     });
+  });
+
+  it("notifies only the issue the PR owns, not every issue its body mentions (BLO-37225)", async () => {
+    // A PR work product row is written for EVERY issue the PR references
+    // anywhere — the row is evidence about the PR, not a wake. The notifier read
+    // that join as the link set, so one failed reviewer run fanned this notice
+    // out to every BLO id in the PR body. Measured on Blockcast/paperclip#2062:
+    // 7 issues across 2 lanes, ~10 notices each over 91 minutes, and the worst
+    // recipient was an issue whose only appearance in the body was a sentence
+    // saying the PR deliberately does not touch it.
+    //
+    // Shape matters: the webhook writes the SAME resolved owning set onto every
+    // fanned-out row, so a mention row is not distinguishable by a missing or
+    // empty field — only by comparing that set against the issue holding it.
+    const jobName = "agent-opencode-ambiguous-review-owner-only";
+    const headSha = "c41b8f6a2d7e5093b1ac4f8e2d6b70915ce3a842";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      includeIssue: false,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/libmmt:448:${headSha}`,
+        githubRepoFullName: "Blockcast/libmmt",
+        githubPrNumber: 448,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+
+    const ownerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "PlayersEngineerOwnerOnly",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    // A owns the PR; B and C are the provenance-citation / "not touched"
+    // recipients. All three are wakeable (assigned, live status) so the
+    // assertion below cannot pass for the incidental reason that B and C had
+    // nowhere for a wake to land.
+    const seeded = [
+      { identifier: "TOWNER-448", issueNumber: 448 },
+      { identifier: "TMENTION-449", issueNumber: 449 },
+      { identifier: "TMENTION-450", issueNumber: 450 },
+    ].map((row) => ({ ...row, id: randomUUID() }));
+    for (const row of seeded) {
+      await db.insert(issues).values({
+        id: row.id,
+        companyId,
+        title: `${row.identifier} review-gate fanout`,
+        status: "in_review",
+        priority: "high",
+        assigneeAgentId: ownerAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: row.issueNumber,
+        identifier: row.identifier,
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId: row.id,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/libmmt#448",
+        title: "TOWNER-448 review-gate fanout",
+        url: "https://github.com/Blockcast/libmmt/pull/448",
+        status: "ready_for_review",
+        // Same owning set on every row — exactly what the webhook writes.
+        metadata: { owningIdentifiers: ["TOWNER-448"] },
+      });
+    }
+
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
+    try {
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    } finally {
+      if (previousGateContext === undefined) {
+        delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      } else {
+        process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      }
+    }
+
+    const [comments, wakeups] = await Promise.all([
+      db.select().from(issueComments).where(
+        inArray(issueComments.issueId, seeded.map((row) => row.id)),
+      ),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, ownerAgentId)),
+    ]);
+    const notices = comments.filter((comment) =>
+      comment.body.includes("Ally review did not land on")
+    );
+    // The owner still gets it, unchanged — narrowing the recipient set must not
+    // cost the notice BLO-33589 added.
+    expect(notices.map((comment) => comment.issueId)).toEqual([seeded[0]!.id]);
+    // Control: the per-(run, issue) idempotency guard is untouched.
+    expect(notices[0]?.idempotencyKey).toBe(`pr_review_gate_failed:${runId}:${seeded[0]!.id}`);
+    const gateWakes = wakeups.filter((wakeup) => wakeup.reason === "github_pr_review_gate_failed");
+    expect(gateWakes).toHaveLength(1);
+    expect(gateWakes[0]?.payload).toMatchObject({ issueId: seeded[0]!.id, prNumber: 448 });
+
+    // Re-finalizing the same run is still a no-op on the owner, so the fix did
+    // not trade a fanout for a duplicate.
+    await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    const after = await db.select().from(issueComments).where(
+      inArray(issueComments.issueId, seeded.map((row) => row.id)),
+    );
+    expect(
+      after.filter((comment) => comment.body.includes("Ally review did not land on")),
+    ).toHaveLength(1);
+  });
+
+  it("notifies nobody when the PR's recorded owning set is empty (BLO-37225)", async () => {
+    // `owningIdentifiers: []` is authoritative -- no tier named an owner, so the
+    // webhook already dropped the author wake (`no_owning_reference`) while still
+    // writing a row per mentioned issue. Every row here is a mention; the
+    // notifier chooses silence rather than falling back to the mention set.
+    const jobName = "agent-opencode-ambiguous-review-empty-owners";
+    const headSha = "5d02e9b7c1a84f36e0b9d2c7a5f18e4b3c6d9a01";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      includeIssue: false,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/libmmt:451:${headSha}`,
+        githubRepoFullName: "Blockcast/libmmt",
+        githubPrNumber: 451,
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+
+    const ownerAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: ownerAgentId,
+      companyId,
+      name: "PlayersEngineerEmptyOwners",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // Assigned and live, so an empty result cannot come from nowhere to land.
+    const seeded = [
+      { identifier: "TEMPTY-452", issueNumber: 452 },
+      { identifier: "TEMPTY-453", issueNumber: 453 },
+    ].map((row) => ({ ...row, id: randomUUID() }));
+    for (const row of seeded) {
+      await db.insert(issues).values({
+        id: row.id,
+        companyId,
+        title: `${row.identifier} review-gate empty owners`,
+        status: "in_review",
+        priority: "high",
+        assigneeAgentId: ownerAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: row.issueNumber,
+        identifier: row.identifier,
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId: row.id,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/libmmt#451",
+        title: "review-gate empty owners",
+        url: "https://github.com/Blockcast/libmmt/pull/451",
+        status: "ready_for_review",
+        metadata: { owningIdentifiers: [] },
+      });
+    }
+
+    mockGithubHasReviewerEvidenceForPr.mockResolvedValueOnce({ found: false });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+      phase: "missing",
+      reason: "NotFound",
+      name: jobName,
+    });
+    const infoSpy = vi.spyOn(logger, "info");
+    let infoCalls: unknown[][] = [];
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
+    try {
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    } finally {
+      infoCalls = infoSpy.mock.calls.slice();
+      infoSpy.mockRestore();
+      if (previousGateContext === undefined) {
+        delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      } else {
+        process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      }
+    }
+
+    // Positive control: the notifier ran and filtered both rows out, rather than
+    // never being reached or throwing (its caller swallows errors).
+    expect(infoCalls).toContainEqual([
+      expect.objectContaining({ runId, prNumber: 451, mentionRowCount: 2 }),
+      "failed PR-review gate has no linked Paperclip issue in the reviewer run's company to notify",
+    ]);
+    const [comments, wakeups] = await Promise.all([
+      db.select().from(issueComments).where(
+        inArray(issueComments.issueId, seeded.map((row) => row.id)),
+      ),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, ownerAgentId)),
+    ]);
+    expect(comments.filter((comment) => comment.body.includes("Ally review did not land on"))).toEqual([]);
+    expect(wakeups.filter((wakeup) => wakeup.reason === "github_pr_review_gate_failed")).toEqual([]);
   });
 
   it("does not enqueue a second wake when another finalizer already claimed the notice (BLO-33589)", async () => {
@@ -6690,6 +7038,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.status).toBe("in_progress");
   });
 
+  it("decides the dependency-wait suppression without opening a transaction (PEN-3636)", async () => {
+    // The counters above prove the gate still *classifies* correctly. This proves
+    // the thing PEN-3636 is actually about: that reaching the verdict costs no
+    // transaction, and therefore no `lockIssueOwnership`, no company-global
+    // `lockIssueParentMutationCompany`, and no `SELECT … FOR UPDATE`.
+    //
+    // Why that is worth a dedicated test rather than trusting the diff: the gate
+    // is decided purely from caller-supplied `input`, so it reads identically
+    // whether it sits before or after `db.transaction`. Nothing in the counter
+    // assertions can tell those two placements apart — this assertion is the only
+    // one that regresses if the gate ever drifts back inside the transaction.
+    //
+    // The production measurement that motivated the hoist is on PEN-3636; as with
+    // the gate comment in `service.ts`, it is not restated here, because it dates
+    // a single pass and will not be re-verified against this test.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_dependencies_blocked",
+      runError:
+        "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve",
+    });
+
+    let transactionCalls = 0;
+    const countingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "transaction") {
+          return (...args: Parameters<typeof target.transaction>) => {
+            transactionCalls += 1;
+            return target.transaction(...args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as typeof db;
+
+    const countingHeartbeat = heartbeatService(countingDb, {
+      penstockAvailabilityGate: allowPenstockGate,
+    });
+    heartbeatServices.add(countingHeartbeat);
+
+    const result = await countingHeartbeat.reconcileStrandedAssignedIssues();
+
+    // Positive control: the candidate really did reach the gate and get suppressed.
+    // Without this a zero transaction count would be satisfied just as well by a
+    // sweep that never saw the issue at all, which is the opposite of the claim.
+    expect(result.dependencyWaitEscalationSuppressed).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    // Deliberately sweep-global: this counts `db.transaction` across the whole
+    // `reconcileStrandedAssignedIssues` pass, not just this candidate's escalation.
+    // If you are adding legitimate transactional work elsewhere in the sweep, this
+    // will go red on your change without the hoisted gate having regressed — widen
+    // the fixture rather than reading it as a PEN-3636 regression.
+    expect(transactionCalls).toBe(0);
+
+    // And the suppression is still inert on the row itself.
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.assigneeAgentId).toBe(agentId);
+    expect(after.status).toBe("in_progress");
+  });
+
   it("keeps a dependency-blocked continuation with nothing blocking it visible without escalating it (BLO-27463)", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
@@ -7112,50 +7529,51 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         });
       }
 
-      // The outer sweep has already classified the issue as dependency-ready
-      // before it calls `escalateStrandedAssignedIssue`. Inject the relation
-      // change just before that method opens its advisory-lock transaction so
-      // the locked re-read, rather than the stale preflight, decides whether
-      // recovery side effects are allowed.
-      const originalTransaction = db.transaction.bind(db);
-      const transactionSpy = vi.spyOn(db, "transaction");
-      let blockerMutationApplied = false;
-      transactionSpy.mockImplementationOnce(async (callback: any) => {
-        if (change === "added") {
-          await db.insert(issues).values({
-            id: blockerIssueId,
-            companyId,
-            title: "Dependency added during escalation",
-            status: "in_progress",
-            priority: "medium",
-            issueNumber: 26,
-            identifier: `${issuePrefix}-26`,
-          });
-          await db.insert(issueRelations).values({
-            companyId,
-            issueId: blockerIssueId,
-            relatedIssueId: issueId,
-            type: "blocks",
-          });
-        } else {
-          await db
-            .update(issues)
-            .set({ status: "in_progress", completedAt: null })
-            .where(eq(issues.id, blockerIssueId));
-        }
-        blockerMutationApplied = true;
-        return originalTransaction(callback);
-      });
-
-      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
-      let result: Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>>;
-      try {
-        result = await heartbeat.reconcileStrandedAssignedIssues();
-      } finally {
-        transactionSpy.mockRestore();
+      // PEN-3636: this blocker change used to be injected from inside a
+      // `db.transaction` spy, on the stated reasoning that "the locked re-read,
+      // rather than the stale preflight, decides whether recovery side effects
+      // are allowed". That reasoning no longer describes the code, and had not
+      // since BLO-32668 — which moved the readiness read out of the transaction,
+      // leaving `input.dependencyWaitReadiness` (the stale preflight value) as
+      // the only readiness this path consults. The injected blocker had no
+      // consumer at all on this fixture: the one place blocker state is read,
+      // `unresolvedBlockerHumanDecisionEscalationState`, sits *below* the
+      // dependency-wait gate, which returns first for a candidate carrying
+      // `issue_dependencies_blocked`. So the under-lock timing was decorative —
+      // the test passed because the error-code gate refuses escalation, exactly
+      // as it would with no blocker injected.
+      //
+      // PEN-3636 hoists that gate above the transaction, so there is no longer a
+      // transaction to hang the injection on. Since the timing provably did not
+      // matter, the mutation is applied before the sweep instead. Every
+      // behavioural assertion below is unchanged — what is dropped is a hook
+      // that could not influence them.
+      if (change === "added") {
+        await db.insert(issues).values({
+          id: blockerIssueId,
+          companyId,
+          title: "Dependency added during escalation",
+          status: "in_progress",
+          priority: "medium",
+          issueNumber: 26,
+          identifier: `${issuePrefix}-26`,
+        });
+        await db.insert(issueRelations).values({
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: issueId,
+          type: "blocks",
+        });
+      } else {
+        await db
+          .update(issues)
+          .set({ status: "in_progress", completedAt: null })
+          .where(eq(issues.id, blockerIssueId));
       }
 
-      expect(blockerMutationApplied).toBe(true);
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
       expect(result.escalated).toBe(0);
       expect(result.issueIds).not.toContain(issueId);
 
@@ -7163,6 +7581,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(source?.status).toBe("in_progress");
       expect(source?.assigneeAgentId).toBe(agentId);
       await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([blockerIssueId]);
+
+      // Witness the injected mutation itself. `sourceBlockerIssueIds` reads only
+      // `issueRelations`, so it proves the "added" arm (which inserts the relation)
+      // but cannot see the "reopened" arm, whose relation already existed and whose
+      // mutation is a status change. Asserting the blocker is open covers both arms:
+      // "added" inserts it `in_progress`, "reopened" updates it back to `in_progress`.
+      const blocker = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, blockerIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(blocker?.status).toBe("in_progress");
+      expect(blocker?.completedAt).toBeNull();
 
       const recoveryActions = await db
         .select()
@@ -8541,6 +8972,159 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const metrics = await renderMetrics();
       expect(metrics.body).toMatch(/paperclip_external_runtime_reservations_release_pending 0\b/);
       expect(metrics.body).toMatch(/paperclip_environment_leases_orphaned_active 0\b/);
+    });
+
+    // PEN-3640: `activeRunExecutions` is an in-memory Set on the worker. An
+    // external-lifecycle run whose adapter hung mid-dispatch stays in it for
+    // the life of the process, and the reclaim sweep used to skip such a
+    // reservation unconditionally -- so `released_at` stayed NULL, the partial
+    // unique index on (agent_id, slot_id) held the slot, and the agent's
+    // effective concurrency was ratcheted down until the worker restarted.
+    // Measured in production: 64.6 h and 36.3 h strands on two seats across a
+    // 144.8 h worker uptime with no backing Job for either.
+    //
+    // `reapOrphanedRuns` already carried the external-lifecycle exemption; this
+    // sweep did not. The pair below pins the CONDITION, not just the exemption:
+    // the second case is the reason the guard still exists at all, and a fix
+    // that simply deleted the skip would pass the first and fail the second.
+    it("releases a reservation for an external-lifecycle run still stuck in activeRunExecutions (PEN-3640)", async () => {
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: false,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      // The Job is gone -- the only thing still claiming this run is alive is
+      // the stale in-memory Set entry.
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+      const persisted = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation.id))
+        .then((rows) => rows[0]);
+      expect(persisted?.releasedAt).not.toBeNull();
+    });
+
+    it("still withholds release for a NON-external run in activeRunExecutions (PEN-3640 control)", async () => {
+      // For an in-process adapter the await is authoritative: `executeRun` is
+      // driving this run in this very pod, so the sweep must not race it even
+      // though the Job lookup reports missing. This is the half of the guard
+      // that must survive the fix above.
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "codex_local",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: false,
+      });
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      // PEN-3640 (Ally suggestion 2): the `refusedBy` labelling is half this
+      // change's value and nothing else asserts on it, so a refactor could drop
+      // it silently. This fixture is already the right one -- its `updatedAt`
+      // sits far past the 30-min gate -- so the assertion costs one spy.
+      const warnSpy = vi.spyOn(logger, "warn");
+
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+      const persisted = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation.id))
+        .then((rows) => rows[0]);
+      expect(persisted?.releasedAt).toBeNull();
+
+      // Scoped to THIS reservation on purpose: `reapOrphanedRuns` sweeps the
+      // whole namespace, so an unreleased row left behind by an earlier test in
+      // this file could otherwise inflate the count.
+      const stuckSkipCalls = () =>
+        warnSpy.mock.calls.filter(
+          (call) =>
+            call[1] === "external-runtime reservation still unreleased after reclaim sweep refused it"
+            && (call[0] as Record<string, unknown>)?.reservationId === reservation.id,
+        );
+      expect(stuckSkipCalls()).toHaveLength(1);
+      expect(stuckSkipCalls()[0]![0] as Record<string, unknown>).toMatchObject({
+        reservationId: reservation.id,
+        runId,
+        refusedBy: "active_run_execution",
+      });
+
+      // PEN-3640 (Ally important 1): the age gate is one-way -- past 30 min it
+      // admits every pass. At the default 30 s scheduler tick that is ~7,700
+      // lines for the single 64.6 h production strand, and under a kube-read
+      // outage every pending row at once. The per-row rate limit must keep the
+      // second sweep silent.
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      expect(stuckSkipCalls()).toHaveLength(1);
+
+      warnSpy.mockRestore();
+    });
+
+    it("does not warn about a reservation refused only moments ago, however old the run (PEN-3640)", async () => {
+      // PEN-3640 (Ally suggestion 1): the gate measures time spent REFUSED, not
+      // the age of the run. A run cancelled after hours sits `release_pending`
+      // while its Job terminates; measured from `reservedAt` it would trip the
+      // warn on its very first pass, which is healthy churn and not a strand.
+      // `isolationSetupGraceActive` already uses `updatedAt` for exactly this.
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "codex_local",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: false,
+      });
+      const reservation = await seedLaunchedReservation({
+        companyId,
+        agentId,
+        runId,
+        // Dispatched long ago...
+        reservedAt: new Date("2026-03-19T00:01:00.000Z"),
+        // ...but it entered this refusing state just now.
+        updatedAt: new Date(),
+      });
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      const warnSpy = vi.spyOn(logger, "warn");
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+      // Still refused -- this test is about the diagnostic, not the guard.
+      const persisted = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation.id))
+        .then((rows) => rows[0]);
+      expect(persisted?.releasedAt).toBeNull();
+
+      expect(
+        warnSpy.mock.calls.filter(
+          (call) =>
+            call[1] === "external-runtime reservation still unreleased after reclaim sweep refused it"
+            && (call[0] as Record<string, unknown>)?.reservationId === reservation.id,
+        ),
+      ).toHaveLength(0);
+      warnSpy.mockRestore();
     });
 
     // BLO-21460 (Ally important 2): the three contracts this PR introduces that

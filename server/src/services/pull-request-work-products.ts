@@ -36,9 +36,14 @@ export interface PullRequestWorkProductInput {
    * re-deriving ownership from fields the row does not carry (the PR body is
    * never persisted).
    *
-   * `undefined`/`null` means "not recorded" — for rows written before this
-   * field existed — and must not be read as "owns nothing". An empty array IS
-   * authoritative: the PR named no owner in its title, branch, or labeled body.
+   * `undefined`/`null` means "not recorded" and must not be read as "owns
+   * nothing". Three populations reach it: rows written before this field
+   * existed, rows whose caller never resolved ownership, and recordings this
+   * reader cannot parse. Only the first ages out. Agent-registered rows are the
+   * common case (the Paperclip skill tells agents to create one) and pass no
+   * ownership, so this arm is load-bearing indefinitely — not a migration
+   * artifact with an end date. An empty array IS authoritative: the PR named no
+   * owner in its title, branch, or labeled body.
    */
   owningIdentifiers?: readonly string[] | null;
 }
@@ -51,7 +56,10 @@ export interface PullRequestWorkProductInput {
  *
  * Deliberately a STATE, not a timestamp. GitHub emits exactly two per-PR
  * merge-queue signals — `added_to_merge_queue` and `removed_from_merge_queue`
- * — and NOTHING while a PR advances through the queue. Measured on
+ * on the issue TIMELINE, delivered to this handler as the `pull_request`
+ * webhook ACTIONS `enqueued` and `dequeued` — and NOTHING while a PR advances
+ * through the queue. The two name pairs are the same two signals on different
+ * surfaces; this file keys on the webhook actions throughout. Measured on
  * `Blockcast/paperclip`: #1948 sat 27.4h between the two with no intervening
  * event, #1654 sat 38.9h. So there is no "last queue activity" clock to read;
  * the only honest question is "is it in the queue right now".
@@ -184,6 +192,36 @@ export function pullRequestWorkProductSourceEventActionOrder(
     default:
       return 10;
   }
+}
+
+/**
+ * Read `metadata.owningIdentifiers` back off a stored row, preserving the
+ * null-vs-empty distinction the writer above encodes.
+ *
+ * Returns `null` for "not recorded" — the row predates the field, its writer
+ * never resolved ownership (the common case; see the field docblock), or it
+ * holds a non-empty value no entry of which is readable as a string. An array is
+ * returned otherwise, and an empty one IS authoritative: the guard below means
+ * `[]` out implies `[]` in. Consumers differ on what to do with `null`, and
+ * deliberately so: productivity-review re-derives
+ * ownership from the row's surviving tiers and withholds a progress signal when
+ * that fails, while the PR-review-gate notifier keeps the row, because its
+ * failure direction is silence. Both treat an empty array the same way: the PR
+ * owns nothing, so it is attributable to (and notifies) no issue. Only the read
+ * is shared.
+ */
+export function recordedPullRequestOwners(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const strings = value.filter((entry): entry is string => typeof entry === "string");
+  // A non-empty recording this reader cannot parse is NOT the authoritative
+  // empty set — it is a recording we failed to read, so it belongs in the
+  // "not recorded" arm where each consumer takes its own safe direction.
+  // `metadata` is `Record<string, unknown>` read back from the DB, so the
+  // writer above is not the only way rows get here. Without this, `[42]`
+  // reaches the notifier as "the PR owns nothing" and it answers with the
+  // silence BLO-33589 exists to remove.
+  if (strings.length === 0 && value.length > 0) return null;
+  return strings;
 }
 
 export function buildPullRequestWorkProductFields(

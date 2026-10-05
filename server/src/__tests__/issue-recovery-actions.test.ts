@@ -37,6 +37,7 @@ import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService, reco
 import { issueService } from "../services/issues.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { BACKSTOP_CANDIDATES_SKIPPED_METRIC, renderMetrics } from "../services/metrics.js";
 import { buildPullRequestWorkProductFields } from "../services/pull-request-work-products.js";
 import { loadConfig } from "../config.js";
 import {
@@ -1016,10 +1017,143 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // a shape that changes with whichever gate happened to fire.
     expect(reported?.[0]).toMatchObject({
       livePathSkipped: expect.any(Number),
+      // Both arms of the live-path gate, present even at zero. This log line is the
+      // zero-safe surface for the split: the Prometheus series only exists once its arm
+      // first fires, so an arm that never fires is absent there and indistinguishable
+      // from an undeployed build (#1946 pre-seeds those counters; until it lands this
+      // line is the only place a genuine zero is legible).
+      livePathQueuedWakeSkipped: expect.any(Number),
       pauseHoldSkipped: expect.any(Number),
       exhaustedSkipped: expect.any(Number),
       candidateLimitSkipped: expect.any(Number),
       enqueueFailed: expect.any(Number),
+    });
+  });
+
+  /**
+   * BLO-19124. The live-path gate is two probes behind one `||` and used to be one counter.
+   * Because `hasActiveExecutionPath` is evaluated first and short-circuits, a candidate held
+   * by a live run never reaches `hasQueuedIssueWake` at all — so `live_path` could not say
+   * whether the queued-wake arm was doing any work. That matters because the proposed fix
+   * (age-bounding `hasQueuedIssueWake`, whose `queued` rows nothing reaps by age) moves
+   * exactly zero candidates if the active-run arm dominates, and the old counter could not
+   * have told anyone.
+   *
+   * Both arms are asserted because the halves must disagree: seeding only the queued wake
+   * still passes a collapsed implementation if you assert the union, and seeding only the
+   * live run cannot catch the two counters being swapped.
+   *
+   * The emitted Prometheus label is asserted alongside the sweep result, not instead of it,
+   * because they can disagree. The result fields are computed at the two gates; the labels
+   * are bound to them by a separate table at the end of the sweep. Swapping that table's two
+   * rows leaves every result field, log line and type correct and inverts only the deployed
+   * series — which is the series BLO-19124 is read from, i.e. the silent inversion this test
+   * exists to prevent, displaced one layer out onto the read surface. Read through
+   * `renderMetrics()` rather than a mock on the recorder: that is the exact text Prometheus
+   * scrapes, so it also pins the label *names*, and it cannot drift from the real registry.
+   * Deltas, not absolutes — the counter is process-wide and other cases in this file sweep too.
+   */
+  it("counts the live-run and queued-wake arms of the live-path gate apart", async () => {
+    // Absent and zero are the same reading for a delta: a series that has never fired does
+    // not exist yet, which is the very absent-vs-zero ambiguity #1946 fixes for the absolute.
+    const skipLabel = async (reason: string): Promise<number> => {
+      const { body } = await renderMetrics();
+      const line = new RegExp(
+        `^${BACKSTOP_CANDIDATES_SKIPPED_METRIC}\\{source="stranded_recovery_wake_backstop",reason="${reason}"\\} (\\d+)$`,
+        "m",
+      );
+      return Number(body.match(line)?.[1] ?? 0);
+    };
+    const armDeltas = async <T>(run: () => Promise<T>): Promise<{ result: T; livePath: number; queuedWake: number }> => {
+      const before = { livePath: await skipLabel("live_path"), queuedWake: await skipLabel("live_path_queued_wake") };
+      const result = await run();
+      return {
+        result,
+        livePath: (await skipLabel("live_path")) - before.livePath,
+        queuedWake: (await skipLabel("live_path_queued_wake")) - before.queuedWake,
+      };
+    };
+    const seedGatedCandidate = async (fingerprintSuffix: string) => {
+      const seeded = await seedCompany();
+      await db
+        .update(issues)
+        .set({ status: "blocked", assigneeAgentId: seeded.managerId })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      await db.insert(issueRecoveryActions).values({
+        companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId,
+        kind: "stranded_assigned_issue",
+        cause: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: seeded.managerId,
+        returnOwnerAgentId: null,
+        fingerprint: `source_scoped_recovery:${seeded.companyId}:${seeded.sourceIssueId}:${fingerprintSuffix}`,
+        evidence: {},
+        nextAction: "Wake the recovery owner.",
+        attemptCount: 0,
+        maxAttempts: defaultRecoveryActionMaxAttempts,
+        timeoutAt: new Date("2026-12-31T00:00:00.000Z"),
+        lastAttemptAt: null,
+      });
+      return seeded;
+    };
+    const sweep = (companyId: string) => {
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      return recoveryService(db, { enqueueWakeup }).reconcileStrandedRecoveryWakeBackstop({
+        companyId,
+        now: new Date("2026-08-26T00:00:00.000Z"),
+        cooldownMs: 30 * 60 * 1000,
+      });
+    };
+
+    // Arm 1: a live run, nothing queued. Pins the ordering — swapping the two counters
+    // fails here, and swapping the two label rows fails on `livePath`/`queuedWake`.
+    const liveRun = await seedGatedCandidate("live-run-arm");
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: liveRun.companyId,
+      agentId: liveRun.managerId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId: liveRun.sourceIssueId, wakeReason: "issue_assigned" },
+    });
+    const liveRunArm = await armDeltas(() => sweep(liveRun.companyId));
+    expect(liveRunArm.result).toMatchObject({
+      checked: 1,
+      healed: 0,
+      livePathSkipped: 1,
+      livePathQueuedWakeSkipped: 0,
+    });
+    expect({ livePath: liveRunArm.livePath, queuedWake: liveRunArm.queuedWake }).toEqual({
+      livePath: 1,
+      queuedWake: 0,
+    });
+
+    // Arm 2: a queued wake, no run. Pins the split — collapsing back to one counter
+    // attributes this to `livePathSkipped` and fails here. Dropping the
+    // `live_path_queued_wake` label row leaves both deltas at 0 and fails here too.
+    const queuedWake = await seedGatedCandidate("queued-wake-arm");
+    await db.insert(agentWakeupRequests).values({
+      companyId: queuedWake.companyId,
+      agentId: queuedWake.managerId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      status: "queued",
+      payload: { issueId: queuedWake.sourceIssueId },
+    });
+    const queuedWakeArm = await armDeltas(() => sweep(queuedWake.companyId));
+    expect(queuedWakeArm.result).toMatchObject({
+      checked: 1,
+      healed: 0,
+      livePathSkipped: 0,
+      livePathQueuedWakeSkipped: 1,
+    });
+    expect({ livePath: queuedWakeArm.livePath, queuedWake: queuedWakeArm.queuedWake }).toEqual({
+      livePath: 0,
+      queuedWake: 1,
     });
   });
 
@@ -2709,48 +2843,73 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     return recovery.reconcileStrandedAssignedIssues();
   }
 
-  describe("PEN-2791 open pull request as an attendance path", () => {
+  // Built through the real producer, not hand-written literals: the predicate filters
+  // on the webhook's metadata source and system source-trust, so if either constant
+  // moves, this seeding moves with it and a stale filter fails loudly instead of
+  // silently matching nothing.
+  //
+  // Shared by the PEN-2791 and BLO-38061 blocks below, for the same reason
+  // `seedSeizableProductiveRow` is shared: both measure exemptions keyed off the SAME
+  // work-product row, and PEN-3198's rule that two gates asking one question must not
+  // answer it differently applies to the fixtures that pin them too.
+  async function insertPullRequestWorkProduct(input: {
+    companyId: string;
+    issueId: string;
+    prNumber: number;
+    merged?: boolean;
+    updatedAt?: Date;
+    /** Simulates a hand-created row: no webhook metadata, no system source-trust. */
+    handCreated?: boolean;
+    /**
+     * BLO-38061. The identifiers the PR OWNS, as the webhook resolved them. Omitting the
+     * key reproduces a row written before the field existed — the shape every PEN-2791
+     * test seeds, and the one that must stay exempt.
+     */
+    owningIdentifiers?: readonly string[] | null;
+    /**
+     * BLO-38061. Deletes `owningIdentifiers` from the built metadata entirely, which is
+     * NOT the same row as passing `null`. The current producer always emits the key with
+     * an explicit JSON `null`, so `metadata->'owningIdentifiers'` yields `'null'::jsonb`
+     * and `jsonb_typeof` returns the STRING `'null'`. A row written before the field
+     * existed has no key at all, `->` yields SQL NULL, and `jsonb_typeof` returns SQL
+     * NULL — which is what the predicate's `coalesce(..., 'null')` exists to normalise.
+     * Seeding only the producer's shape would leave that coalesce untested, and 15 of the
+     * 167 open PR work products measured on 2026-09-29 are exactly this older shape.
+     */
+    stripOwningIdentifiersKey?: boolean;
+  }) {
+    const fields = buildPullRequestWorkProductFields({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: input.prNumber,
+      prTitle: "Scrub secret material from k8s MCP responses",
+      prUrl: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}`,
+      headSha: "0b11256d0a5dccad3d26bb9756d02294c231988f",
+      prBranch: "security/scrub-k8s-mcp-env",
+      prDraft: false,
+      prMerged: input.merged === true,
+      prUpdatedAt: new Date().toISOString(),
+      action: input.merged === true ? "closed" : "synchronize",
+      owningIdentifiers: input.owningIdentifiers,
+    });
+    const metadata = { ...fields.metadata };
+    if (input.stripOwningIdentifiersKey) delete metadata.owningIdentifiers;
+    await db.insert(issueWorkProducts).values({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      provider: "github",
+      type: "pull_request",
+      externalId: fields.externalId,
+      title: fields.title,
+      url: fields.url,
+      status: fields.status,
+      metadata: input.handCreated ? null : metadata,
+      sourceTrust: input.handCreated ? null : fields.sourceTrust,
+      ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
+    });
+    return fields;
+  }
 
-    // Built through the real producer, not hand-written literals: the predicate filters
-    // on the webhook's metadata source and system source-trust, so if either constant
-    // moves, this seeding moves with it and a stale filter fails loudly instead of
-    // silently matching nothing.
-    async function insertPullRequestWorkProduct(input: {
-      companyId: string;
-      issueId: string;
-      prNumber: number;
-      merged?: boolean;
-      updatedAt?: Date;
-      /** Simulates a hand-created row: no webhook metadata, no system source-trust. */
-      handCreated?: boolean;
-    }) {
-      const fields = buildPullRequestWorkProductFields({
-        repoFullName: "Blockcast/paperclip",
-        prNumber: input.prNumber,
-        prTitle: "Scrub secret material from k8s MCP responses",
-        prUrl: `https://github.com/Blockcast/paperclip/pull/${input.prNumber}`,
-        headSha: "0b11256d0a5dccad3d26bb9756d02294c231988f",
-        prBranch: "security/scrub-k8s-mcp-env",
-        prDraft: false,
-        prMerged: input.merged === true,
-        prUpdatedAt: new Date().toISOString(),
-        action: input.merged === true ? "closed" : "synchronize",
-      });
-      await db.insert(issueWorkProducts).values({
-        companyId: input.companyId,
-        issueId: input.issueId,
-        provider: "github",
-        type: "pull_request",
-        externalId: fields.externalId,
-        title: fields.title,
-        url: fields.url,
-        status: fields.status,
-        metadata: input.handCreated ? null : fields.metadata,
-        sourceTrust: input.handCreated ? null : fields.sourceTrust,
-        ...(input.updatedAt ? { updatedAt: input.updatedAt } : {}),
-      });
-      return fields;
-    }
+  describe("PEN-2791 open pull request as an attendance path", () => {
 
     it("escalates the PEN-2370 shape when no pull request is recorded (control)", async () => {
       const { sourceIssueId } = await seedSeizableProductiveRow();
@@ -2920,6 +3079,131 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(result.escalated).toBe(1);
       const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
       expect(updated?.status).toBe("blocked");
+    });
+  });
+
+  // BLO-38061. A third axis, orthogonal to both blocks above: not "which PRs count" and
+  // not "which runs let the question be asked", but "is this PR's wake aimed at THIS
+  // issue at all".
+  //
+  // The predicate used to treat any open PR row as proof of a wake, on the premise that
+  // whoever holds the row is by construction the actor the webhook will wake. That is
+  // false. `routes/github-webhook.ts` writes a PR work product for EVERY issue the PR
+  // references — the row is evidence about the PR, not a wake — but narrows the author
+  // wake to `matched.filter((m) => owning.includes(m.identifier))`, and drops it outright
+  // (`suppressionReason: "no_owning_reference"`) when the owning set is empty. So a row
+  // mentioned by somebody else's PR was exempted from seizure while nothing would ever
+  // wake it: a silent strand, which is the expensive direction and the same one BLO-32679
+  // produced from the opposite side.
+  //
+  // Measured on company `aaced805` 2026-09-29 across 494 inbox rows: 116 satisfied every
+  // other clause of the predicate, of which 82 (71%) were genuinely owned and 34 (29%)
+  // were not — 32 mention-only plus 2 carrying an authoritative empty owner set.
+  describe("BLO-38061 an open pull request must OWN the issue to be an attendance path", () => {
+    // Seeds the PEN-2370-shaped seizable row and hangs one fresh, open, webhook-written PR
+    // off it, varying ONLY the recorded owning set. Every other clause of the predicate is
+    // held at its exempting value, so the owning set is the single variable across the
+    // four tests below and each one measures the new clause rather than a row that was
+    // never at risk (the control for which is the first test in the PEN-2791 block).
+    async function sweepWithOwners(
+      resolveOwners: (seeded: { prefix: string; identifier: string }) =>
+        readonly string[] | null | undefined,
+      options: { stripOwningIdentifiersKey?: boolean } = {},
+    ) {
+      const seeded = await seedSeizableProductiveRow();
+      const identifier = seeded.sourceIssue.identifier!;
+      const owningIdentifiers = resolveOwners({ prefix: seeded.prefix, identifier });
+      const fields = await insertPullRequestWorkProduct({
+        companyId: seeded.companyId,
+        issueId: seeded.sourceIssueId,
+        prNumber: 2087,
+        // Spread rather than passed, so `undefined` reaches the producer as an ABSENT key
+        // — the legacy shape — instead of an explicit undefined that would read the same
+        // here but not in every caller.
+        ...(owningIdentifiers === undefined ? {} : { owningIdentifiers }),
+        ...options,
+      });
+      // Guard the guard, as in the PEN-2791 block: if the producer ever stops emitting an
+      // open status, these pass for the wrong reason — a terminal row, not the owner
+      // clause.
+      expect(fields.status).toBe("ready_for_review");
+      const result = await sweep();
+      // ⚠️ THE LOAD-BEARING ASSERTION, and it is not defensive tidying. The sweep catches
+      // per-candidate errors and counts them in `reconcileErrors` (see the boundary added
+      // after a single thrower silently truncated every later candidate), so a query that
+      // THROWS produces `escalated: 0` — indistinguishable at the call site from a row
+      // that was deliberately exempted. While writing this block a malformed cast made the
+      // predicate throw on every candidate, and the two exemption tests below passed
+      // anyway, measuring nothing. Assert the sweep actually ran before reading its
+      // verdict.
+      expect(result.reconcileErrors).toBe(0);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, seeded.sourceIssueId));
+      return { ...seeded, result, updated };
+    }
+
+    it("exempts a row whose open pull request names it as an owner", async () => {
+      const { result, updated, coderId } = await sweepWithOwners(({ identifier }) => [identifier]);
+
+      expect(result.escalated).toBe(0);
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.assigneeAgentId).toBe(coderId);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    });
+
+    it("seizes a row whose open pull request names ONLY another issue", async () => {
+      // The 32-row bucket, and the defect itself. Every clause the predicate used to check
+      // is satisfied — the PR is open, fresh and webhook-written — but its author wake is
+      // addressed to `-2`, so this row is dark and must not be spared.
+      const { result, updated } = await sweepWithOwners(({ prefix }) => [`${prefix}-2`]);
+
+      expect(result.escalated).toBe(1);
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("seizes a row whose open pull request recorded an authoritative EMPTY owner set", async () => {
+      // The 2-row bucket, and the one the null arm below must never be collapsed into. An
+      // empty ARRAY means the webhook resolved ownership and found none in the branch,
+      // title or labeled body — exactly the `no_owning_reference` case where it drops the
+      // author wake outright. Absence of the field is a different claim entirely.
+      const { result, updated } = await sweepWithOwners(() => []);
+
+      expect(result.escalated).toBe(1);
+      expect(updated?.status).toBe("blocked");
+    });
+
+    it("still exempts a row whose open pull request recorded NO owner set at all", async () => {
+      // The null arm, asserted on its own because it is the one that must NOT change.
+      // `owningIdentifiers` is absent on rows written before the field existed, and
+      // absence is evidence of nothing — seizing on it would be the same
+      // reasoning-from-absence error this whole family of predicates exists to avoid.
+      // Distinguished from the empty array above only by `jsonb_typeof`, which is what
+      // makes that operator load-bearing rather than defensive.
+      //
+      // This is the CURRENT producer's null: the key is present carrying JSON `null`.
+      const { result, updated, coderId } = await sweepWithOwners(() => undefined);
+
+      expect(result.escalated).toBe(0);
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.assigneeAgentId).toBe(coderId);
+    });
+
+    it("still exempts a row written before `owningIdentifiers` existed at all", async () => {
+      // The same claim as above but the OTHER null shape, and the two are not
+      // interchangeable in SQL: a present-but-JSON-null key makes `jsonb_typeof` return
+      // the string 'null', while a missing key makes it return SQL NULL, which would
+      // render the whole disjunct NULL and silently drop the row from the exemption.
+      // `coalesce(..., 'null')` is what collapses them, and without a test on this shape
+      // that coalesce has no failing mutation. 15 of the 167 open PR work products
+      // measured on 2026-09-29 predate the field, so this is a live population, not a
+      // hypothetical one.
+      const { result, updated, coderId } = await sweepWithOwners(
+        () => undefined,
+        { stripOwningIdentifiersKey: true },
+      );
+
+      expect(result.escalated).toBe(0);
+      expect(updated?.status).toBe("in_progress");
+      expect(updated?.assigneeAgentId).toBe(coderId);
     });
   });
 
@@ -5241,7 +5525,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
-    expect(action).toMatchObject({ cause: "provider_quota", ownerAgentId: managerId });
+    // BLO-37677 AC4: `provider_quota` is one of the four causes that reach the
+    // `stranded_assigned_issue` kind. It used to reach it through a bare ternary
+    // fallthrough and now reaches it through an explicit `Record` arm; pinning the kind
+    // here is what makes that refactor a no-op rather than a trusted reading.
+    expect(action).toMatchObject({
+      cause: "provider_quota",
+      kind: "stranded_assigned_issue",
+      ownerAgentId: managerId,
+    });
     expect(action!.wakePolicy).toMatchObject({ type: "wake_owner" });
 
     // The fix, asserted as behaviour first: the owner is woken a bounded number of times
@@ -6192,6 +6484,143 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 
+  describe("a closed PR discharges its non-convergence action (PEN-3397)", () => {
+    // These beacons had no resolution-on-merge and no resolution-on-close, so a
+    // moot one sat on its owner's plate forever. Measured live: `6542ffc8` asked
+    // the CTO to "take over" onprem-k8s#3076 for 3 DAYS after that PR merged —
+    // the PR merged 3h22m after the action was created, and 3h22m after its own
+    // `timeoutAt`. PEN-2756 bounded the shape; a bound stops it re-firing, it does
+    // not notice that the thing it is escalating about is over.
+    async function seedBeacon(overrides?: { prNumber?: number }) {
+      const fixture = await seedCompany();
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup } as any);
+      await recovery.escalateStalledSelfReviewPr({
+        issueId: fixture.sourceIssueId,
+        prNumber: overrides?.prNumber ?? 3076,
+        repoFullName: "Blockcast/onprem-k8s",
+        cycleCount: 4,
+      });
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, fixture.sourceIssueId));
+      return { ...fixture, recovery, action: action! };
+    }
+
+    it("resolves a merged PR's beacon without touching the source issue", async () => {
+      const { companyId, sourceIssueId, coderId, recovery } = await seedBeacon();
+
+      const result = await recovery.closePrReviewNonConvergenceForClosedPr({
+        repoFullName: "Blockcast/onprem-k8s",
+        prNumber: 3076,
+        merged: true,
+        candidateIssues: [{ id: sourceIssueId, companyId }],
+      });
+
+      expect(result.closed).toBe(1);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action!.status).toBe("resolved");
+      expect(action!.outcome).toBe("restored");
+      expect(action!.resolvedAt).not.toBeNull();
+
+      // The action closes; the WORK does not. A merged PR does not mean the
+      // issue's Done-when was evaluated, so moving the row here would silently
+      // complete work nobody checked.
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.status).toBe("in_progress");
+      expect(issue!.assigneeAgentId).toBe(coderId);
+    });
+
+    it("discharges a beacon that has already gone escalated", async () => {
+      // This is the population that was actually stuck. `escalated` is where
+      // `escalateExpiredWakeHorizons` parks a spent beacon, and it is deliberately
+      // NOT terminal — it stays in ACTIVE_RECOVERY_ACTION_STATUSES so the row keeps
+      // holding `issue_recovery_actions_active_source_uq`. Both live instances were
+      // in exactly this state. A discharge that only handled `active` would have
+      // left them precisely as stuck as before.
+      const { companyId, sourceIssueId, recovery, action } = await seedBeacon();
+      await db
+        .update(issueRecoveryActions)
+        .set({ status: "escalated", retiringBound: "timeout_horizon" })
+        .where(eq(issueRecoveryActions.id, action.id));
+
+      const result = await recovery.closePrReviewNonConvergenceForClosedPr({
+        repoFullName: "Blockcast/onprem-k8s",
+        prNumber: 3076,
+        merged: true,
+        candidateIssues: [{ id: sourceIssueId, companyId }],
+      });
+
+      expect(result.closed).toBe(1);
+      const [after] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(after!.status).toBe("resolved");
+    });
+
+    it("cancels rather than resolves when the PR closed unmerged", async () => {
+      const { companyId, sourceIssueId, recovery } = await seedBeacon();
+
+      const result = await recovery.closePrReviewNonConvergenceForClosedPr({
+        repoFullName: "Blockcast/onprem-k8s",
+        prNumber: 3076,
+        merged: false,
+        candidateIssues: [{ id: sourceIssueId, companyId }],
+      });
+
+      expect(result.closed).toBe(1);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      // The loop ended, but it did not converge — recording `restored` here would
+      // assert a success that never happened.
+      expect(action!.status).toBe("cancelled");
+      expect(action!.outcome).toBe("cancelled");
+    });
+
+    it("leaves a beacon for a DIFFERENT PR on the same issue untouched", async () => {
+      // The guard that makes a wide candidate list safe. The webhook passes every
+      // issue the PR mentions OR was ever linked to, so without fingerprint
+      // matching this would close an unrelated PR's live escalation. Seeded on the
+      // same issue and same repo, differing only in PR number.
+      const { companyId, sourceIssueId, recovery } = await seedBeacon({ prNumber: 4242 });
+
+      const result = await recovery.closePrReviewNonConvergenceForClosedPr({
+        repoFullName: "Blockcast/onprem-k8s",
+        prNumber: 3076,
+        merged: true,
+        candidateIssues: [{ id: sourceIssueId, companyId }],
+      });
+
+      expect(result.closed).toBe(0);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action!.status).toBe("active");
+      expect(action!.resolvedAt).toBeNull();
+    });
+
+    it("names the discharge route in nextAction, with the action id in the body", async () => {
+      // The omission this replaces cost two agents an investigation and produced a
+      // filed finding that NO agent-facing discharge route exists. The old text
+      // ended at "or record a disposition" — an outcome with no mechanism. Both
+      // agents inferred a REST shape, put the action id in the path, and got a
+      // uniform 404 that reads as route-absence rather than a wrong URL.
+      const { action } = await seedBeacon();
+      expect(action.nextAction).toContain("/recovery-actions/resolve");
+      expect(action.nextAction).toContain("BODY");
+      // The exact trap: the id must not appear as a path segment.
+      expect(action.nextAction).not.toContain(`/recovery-actions/${action.id}`);
+    });
+  });
+
   it("clears a beacon on an in_progress row without writing a status (PEN-2756)", async () => {
     // The row seeded here is `in_progress` and assigned to the coder — the exact
     // shape 4 of the 6 beacons found in the fleet census sat on. `in_progress` is
@@ -6659,6 +7088,316 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       source: "source_revalidation",
       trigger: "read_projection",
       recoveryActionId: action.id,
+    });
+  });
+
+  // BLO-37677. `classifySourceRecoveryRevalidation`'s lower half is a family of
+  // wake-path-EXISTENCE tests: "the source issue now has its own way of being re-driven, so
+  // this action is redundant". True for the kinds whose action IS a wake-path restoration;
+  // false for `pr_review_non_convergence`, which escalates a quality condition to a
+  // *different* owner and deliberately leaves the source issue `in_progress` with the
+  // looping author still assigned (`escalateStalledSelfReviewPr`). That kind was therefore
+  // born matching the agent-owner predicate with no reachable state in which it stops
+  // matching — measured 0 escalations and 0 owner-completions across 118 actions in 8 weeks.
+  //
+  // The negative controls are the point of this block. Without them the primary case passes
+  // on a "fix" that simply stops cancelling everything, which reinstates BLO-16074.
+  describe("BLO-37677 source revalidation is kind-aware", () => {
+    const MONITOR_ARM = {
+      executionPolicy: {
+        monitor: { nextCheckAt: "2099-12-01T12:30:00.000Z", scheduledBy: "assignee" as const },
+      },
+    };
+
+    async function seedPrNonConvergence(kind: "pr_review_non_convergence" | "stranded_assigned_issue") {
+      const fixture = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId: fixture.companyId,
+        sourceIssueId: fixture.sourceIssueId,
+        kind,
+        ownerType: "agent",
+        // The escalation deliberately goes to the manager, NOT back to the assignee, and
+        // does not reassign the issue — which is why the source issue stays `in_progress`
+        // with an agent owner as a structural property of this kind.
+        ownerAgentId: fixture.managerId,
+        previousOwnerAgentId: fixture.coderId,
+        returnOwnerAgentId: fixture.coderId,
+        cause: kind === "pr_review_non_convergence" ? "self_review_pr_non_convergence" : "stranded_assigned_issue",
+        fingerprint: `${kind}:blo-37677`,
+        evidence: { prNumber: 2065, cycleCount: 10 },
+        nextAction: "Take over the PR or record a disposition.",
+        wakePolicy: { type: "wake_owner", reason: "self_review_pr_non_convergence" },
+      });
+      return { ...fixture, recoveryActionSvc, action };
+    }
+
+    // The exact BLO-37010 shape: a monitor arm carrying no `status` key, on an issue that is
+    // `in_progress` with an agent owner. Before the fix this cancelled the action 2h20m
+    // after it was minted, without the owner ever acting on it.
+    it("keeps a pr_review_non_convergence action active across a monitor-arm PATCH with no status key", async () => {
+      const { companyId, sourceIssueId, recoveryActionSvc, action } =
+        await seedPrNonConvergence("pr_review_non_convergence");
+
+      const app = createApp();
+      const patched = await request(app)
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send(MONITOR_ARM)
+        .expect(200);
+
+      // The monitor really was armed — otherwise this asserts nothing about the trigger.
+      // (The PATCH projection only injects `activeRecoveryAction` when it CANCELS one, so
+      // the surviving action is read back off the detail projection below.)
+      expect(patched.body).toMatchObject({ status: "in_progress", monitorNextCheckAt: expect.any(String) });
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({ status: "active", resolutionNote: null, resolvedAt: null });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+        id: action.id,
+        status: "active",
+      });
+
+      // Still eligible to wake its owner on the detail projection. Note what does NOT protect
+      // this path: `classifySourceRecoveryRevalidation` returns null for `read_projection` at
+      // the trigger gate, before either the backlog fold or the kind guard runs, so this holds
+      // for every kind with or without the carve-out. It pins the trigger gate, not the guard.
+      const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+      expect(detail.body.activeRecoveryAction).toMatchObject({ id: action.id, status: "active" });
+
+      const activityRows = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.entityId, sourceIssueId));
+      expect(activityRows.map((row) => row.action)).not.toContain("issue.recovery_action_resolved");
+    });
+
+    // Negative control. Same issue shape, same PATCH, different kind — still cancels, with
+    // the agent-owner note. A fix that widened into "stop cancelling" fails here.
+    it("still cancels a stranded_assigned_issue action on the same monitor-arm PATCH", async () => {
+      const { companyId, sourceIssueId, recoveryActionSvc, action } =
+        await seedPrNonConvergence("stranded_assigned_issue");
+
+      const patched = await request(createApp())
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send(MONITOR_ARM)
+        .expect(200);
+
+      expect(patched.body).toMatchObject({ status: "in_progress", activeRecoveryAction: null });
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Recovery action became stale because the source issue is in_progress with an agent owner.",
+      });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    });
+
+    // Second negative control. The carve-out sits BELOW the terminal branches, so a source
+    // issue that reaches `done` still retires the action — no kind is exempt from that.
+    it("still cancels a pr_review_non_convergence action once the source issue reaches done", async () => {
+      const { companyId, sourceIssueId, recoveryActionSvc, action } =
+        await seedPrNonConvergence("pr_review_non_convergence");
+
+      await request(createApp())
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ status: "done" })
+        .expect(200);
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Recovery action became stale because the source issue reached done.",
+      });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    });
+
+    // Third negative control, and the one that pins the guard's POSITION rather than its
+    // existence. `backlog` is not a sibling of the wake-path-existence family — it cancels
+    // because the issue CANNOT be driven, the exact inverse test — so it sits above the kind
+    // guard and stays kind-blind. Move the guard above that branch and this goes red while
+    // the primary case still passes.
+    it("still cancels a pr_review_non_convergence action when the source issue is parked in backlog", async () => {
+      const { companyId, sourceIssueId, recoveryActionSvc, action } =
+        await seedPrNonConvergence("pr_review_non_convergence");
+
+      await request(createApp())
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send({ status: "backlog" })
+        .expect(200);
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote:
+          "Recovery action became stale because the source issue was parked in backlog, which is not dispatchable.",
+      });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    });
+
+    // The sixth branch below the kind guard, and the only carve-out member that had no
+    // coverage: an unresolved first-class blocker edge is a genuine wake path (the issue
+    // drains via `issue_blockers_resolved_sweep`), so it belongs with its siblings and the
+    // carve-out must cover it. This is a real behaviour change for this kind — before the
+    // fix a `blocked` source issue with unresolved blockers cancelled the action.
+    //
+    // Seeded by writing the `blocked` status and the blocker edge STRAIGHT TO THE DB, then
+    // triggering revalidation with an execution-policy write (see the note at the PATCH
+    // below for why this case cannot use the primary case's MONITOR_ARM). Deliberately
+    // not a `PATCH {status:"blocked", blockedByIssueIds:[...]}`: that shape also drives the
+    // blocked-transition machinery at `routes/issues.ts:13279`, whose detached
+    // `getDependencyReadiness` continuation outlives the request and rejects unhandled once
+    // the fixture is truncated. That is a real pre-existing hazard in code this PR does not
+    // touch (BLO-38008) — seeding directly keeps this case a test of the
+    // classifier branch and nothing else.
+    async function blockSourceOnFreshIssue(fixture: Awaited<ReturnType<typeof seedPrNonConvergence>>) {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId: fixture.companyId,
+        title: "Upstream blocker",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: `${fixture.prefix}-2`,
+      });
+      await db.insert(issueRelations).values({
+        companyId: fixture.companyId,
+        issueId: blockerId,
+        relatedIssueId: fixture.sourceIssueId,
+        type: "blocks",
+      });
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.sourceIssueId));
+      // An execution-policy write rather than MONITOR_ARM: a monitor cannot be armed on a
+      // `blocked` issue (422), and `executionPolicyChanged` is a durable source change in the
+      // same 9-flag OR, so it reaches the classifier identically.
+      return request(createApp())
+        .patch(`/api/issues/${fixture.sourceIssueId}`)
+        .send({ executionPolicy: { commentRequired: false } })
+        .expect(200);
+    }
+
+    it("keeps a pr_review_non_convergence action active when the source issue gains unresolved blockers", async () => {
+      const fixture = await seedPrNonConvergence("pr_review_non_convergence");
+      const { companyId, sourceIssueId, recoveryActionSvc, action } = fixture;
+
+      await blockSourceOnFreshIssue(fixture);
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({ status: "active", resolutionNote: null, resolvedAt: null });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+        id: action.id,
+        status: "active",
+      });
+    });
+
+    // Instrument check for the case above, and it is not optional. Both cases assert on a
+    // branch that only fires when `getDependencyReadiness` reports a live blocker, so if the
+    // seeded edge were malformed or invisible to that query the branch would never run and
+    // the case above would pass vacuously — green for the wrong reason. This arm proves the
+    // branch is reached, by pinning the note only it can write, and that `kind` is the sole
+    // thing that decides the outcome between the two.
+    it("still cancels a stranded_assigned_issue action when the source issue gains unresolved blockers", async () => {
+      const fixture = await seedPrNonConvergence("stranded_assigned_issue");
+      const { companyId, sourceIssueId, recoveryActionSvc, action } = fixture;
+
+      await blockSourceOnFreshIssue(fixture);
+
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(actionRow).toMatchObject({
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote:
+          "Recovery action became stale because the source issue now has unresolved first-class blockers.",
+      });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    });
+
+    // The carve-out keys on `kind`, which is MUTABLE: `upsertSourceScoped` holds one active
+    // action per (companyId, sourceIssueId) and its existing-row UPDATE sets `kind:
+    // input.kind` unconditionally. `shouldReuseStrandedRecoveryAction` gates reuse on
+    // status/owner/`isUnchangedAction` and not on kind, and `isUnchangedAction` compares a
+    // `self_review_pr_non_convergence` cause + fingerprint against a stranded one, so it is
+    // always false here and a stranded sweep falls through to the upsert.
+    //
+    // This case asserts what actually happens rather than what should: a second recovery
+    // producer REWRITES the beacon's kind in place, after which the carve-out stops applying
+    // and the next durable source update cancels it exactly as it did before this fix.
+    // Nothing in this PR prevents that. Whether a specific escalation beacon should outrank
+    // the generic stranded sweep for the single active-action slot is a design call with its
+    // own blast radius — the obvious guard (refuse the clobber) can deadlock the board-shaped
+    // beacon, which is unbounded by design (`maxAttempts: null`, no `timeoutAt`). Tracked as
+    // BLO-37934; this exists so the hazard is visible and so that changing it is a
+    // deliberate act that turns this assertion red.
+    it("records that a stranded upsert rewrites a live pr_review_non_convergence kind in place", async () => {
+      const { companyId, sourceIssueId, recoveryActionSvc, action, managerId, coderId } =
+        await seedPrNonConvergence("pr_review_non_convergence");
+
+      const clobbered = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        previousOwnerAgentId: coderId,
+        returnOwnerAgentId: coderId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "source_scoped_recovery:blo-37677:stranded",
+        evidence: {},
+        nextAction: "Re-drive the stranded issue.",
+        wakePolicy: { type: "wake_owner", reason: "stranded_assigned_issue" },
+      });
+
+      // Same row, not a second action: the slot is unique per (companyId, sourceIssueId).
+      expect(clobbered.id).toBe(action.id);
+      expect(clobbered.kind).toBe("stranded_assigned_issue");
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+        id: action.id,
+        kind: "stranded_assigned_issue",
+        status: "active",
+      });
+
+      // With the kind rewritten, the carve-out no longer covers the row: the same PATCH the
+      // primary case survives now cancels it. Pre-fix behaviour, reachable with no write to
+      // the classifier.
+      await request(createApp())
+        .patch(`/api/issues/${sourceIssueId}`)
+        .send(MONITOR_ARM)
+        .expect(200);
+
+      // Pin the note, not just the absence of an active row: the claim is specifically that
+      // the AGENT-OWNER branch reclaims the row once the kind is rewritten. Without this a
+      // future unrelated cancellation path would satisfy the case while the demotion it
+      // exists to characterize had stopped happening.
+      const [clobberedRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect(clobberedRow).toMatchObject({
+        status: "cancelled",
+        outcome: "cancelled",
+        resolutionNote: "Recovery action became stale because the source issue is in_progress with an agent owner.",
+      });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
     });
   });
 

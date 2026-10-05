@@ -1,13 +1,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  budgetBoundFetch,
+  qualityRetryBudgetMs,
+  QUALITY_STEP_TIMEOUT_MS,
+  REVIEW_JOB_TIMEOUT_MS,
+  SECURITY_STEP_TIMEOUT_MS,
   buildComment,
+  deliverComment,
   findExistingComment,
   isGraphifyReindexArtifactOnlyPr,
 } from '../run-quality-gates.mjs';
+import { RATE_LIMIT_MIN_WAIT_MS, exitFatal } from '../get-bot-token.mjs';
 
 const workflow = readFileSync(
   path.resolve(
@@ -261,4 +269,178 @@ test('isGraphifyReindexArtifactOnlyPr: rejects empty file lists', () => {
   });
 
   assert.equal(result, false);
+});
+
+// A delivery failure arrives after every gate has already decided. It must
+// leave the verdict standing instead of reaching exitFatal, which would exit 1
+// regardless of the verdict.
+test('deliverComment: a rate-limited read (flagged by ghFetch) does not throw', async () => {
+  const delivered = await deliverComment(async () => {
+    throw Object.assign(new Error('GitHub API rate limit exceeded'), { rateLimited: true });
+  });
+  assert.equal(delivered, false);
+});
+
+// The write shape ghFetch really produces: it never retries a POST/PATCH, so a
+// rate-limited comment write is a plain Error with no `rateLimited` flag.
+test('deliverComment: a rate-limited comment write (plain, unflagged Error) does not throw', async () => {
+  const delivered = await deliverComment(async () => {
+    throw new Error('GitHub API PATCH /repos/o/r/issues/comments/1 → 403: {"message":"API rate limit exceeded"}');
+  });
+  assert.equal(delivered, false);
+});
+
+test('deliverComment: reports success when the post completes', async () => {
+  let posted = false;
+  assert.equal(await deliverComment(async () => { posted = true; }), true);
+  assert.equal(posted, true);
+});
+
+test('main posts the comment through deliverComment, not directly', () => {
+  const source = readFileSync(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../run-quality-gates.mjs'),
+    'utf8',
+  );
+  const main = source.slice(source.indexOf('async function main()'));
+  assert.match(main, /await deliverComment\(async \(\) => \{\s*const existing = await findExistingComment\(/);
+  assert.equal((main.match(/findExistingComment\(/g) ?? []).length, 1);
+});
+
+test('deliverComment: a failed delivery records comment_delivered=false; a delivered one records nothing', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'rqg-'));
+  const failed = path.join(dir, 'failed');
+  const ok = path.join(dir, 'ok');
+  writeFileSync(failed, '');
+  writeFileSync(ok, '');
+  await deliverComment(async () => { throw new Error('GitHub API POST → 403'); }, failed);
+  await deliverComment(async () => {}, ok);
+  assert.equal(readFileSync(failed, 'utf8'), 'comment_delivered=false\n');
+  assert.equal(readFileSync(ok, 'utf8'), '');
+});
+
+test('commitperclip-review: an undelivered comment is not reported as "see commitperclip comment"', () => {
+  assert.match(workflow, /QUALITY_COMMENT_DELIVERED: \$\{\{ steps\.quality\.outputs\.comment_delivered \}\}/);
+  assert.match(workflow, /elif \[ "\$\{QUALITY_COMMENT_DELIVERED\}" = "false" \]; then\s*\n\s*echo "One or more quality gates failed, but the commitperclip comment could not be posted/);
+});
+
+// Each read gets only what is left of ONE budget measured from script start,
+// so paginated reads cannot each draw a fresh per-call budget.
+test('budgetBoundFetch: reads share one shrinking budget and get 0 once it is spent', async () => {
+  const seen = [];
+  let clock = 1_000;
+  const gh = budgetBoundFetch(1_000, 100, async (_p, _t, options) => { seen.push(options.retryBudgetMs); }, () => clock);
+  await gh('/a', 't');
+  clock = 1_060;
+  await gh('/b', 't');
+  clock = 1_500;
+  await gh('/c', 't');
+  assert.deepEqual(seen, [100, 40, 0]);
+});
+
+// timeout-minutes of the block that starts at `marker`, up to the next sibling.
+function timeoutMinutesOf(marker, sibling) {
+  const block = workflow.slice(workflow.indexOf(marker));
+  return Number(block.slice(0, block.indexOf(sibling)).match(/timeout-minutes: (\d+)/)[1]);
+}
+
+test('the budget constants mirror the three timeout-minutes in commitperclip-review.yml', () => {
+  assert.equal(QUALITY_STEP_TIMEOUT_MS, timeoutMinutesOf('- name: Run quality gates', '\n      - name:') * 60_000);
+  assert.equal(SECURITY_STEP_TIMEOUT_MS, timeoutMinutesOf('- name: Run security gates', '\n      - name:') * 60_000);
+  assert.equal(REVIEW_JOB_TIMEOUT_MS, timeoutMinutesOf('\n  review:\n', '\n    steps:') * 60_000);
+});
+
+test('the review job records its start before any other step', () => {
+  // Split the job's step list into items and take the first one, so this
+  // checks position, not just presence: a Record job start step that drifts
+  // behind checkout, Dependency Review or setup-node would make the budget
+  // measure a near-zero elapsed on exactly the cold runner it exists for.
+  const job = workflow.slice(workflow.indexOf('\n  review:\n'));
+  const firstStep = job.slice(job.indexOf('    steps:\n')).split('\n      - ')[1];
+  assert.match(firstStep, /^name: Record job start\n(        #[^\n]*\n)*        run: [^\n]*REVIEW_JOB_STARTED_AT_MS=\$\(\( \$\(date \+%s\) \* 1000 \)\)" >> "\$GITHUB_ENV"/);
+});
+
+// Whatever the steps before this one spent, the funded sleeps, the reserve and
+// the security step's cap must still fit inside the job's cap, so the job is
+// never cancelled mid-sleep (which would surface as a red `review` with no
+// not_evaluated annotation). 23-75s is the measured warm range; 300s is the
+// cold case the job's timeout comment describes.
+test('qualityRetryBudgetMs never lets the job outlive its timeout, warm or cold', () => {
+  for (const elapsed of [0, 23_000, 75_000, 180_000, 300_000, 420_000, 600_000]) {
+    const budget = qualityRetryBudgetMs(1_000, 1_000 + elapsed);
+    assert.ok(budget >= 0, `elapsed ${elapsed}: ${budget}`);
+    assert.ok(budget <= QUALITY_STEP_TIMEOUT_MS - RATE_LIMIT_MIN_WAIT_MS, `elapsed ${elapsed}: ${budget}`);
+    if (budget > 0) {
+      assert.ok(
+        elapsed + budget + RATE_LIMIT_MIN_WAIT_MS + SECURITY_STEP_TIMEOUT_MS <= REVIEW_JOB_TIMEOUT_MS,
+        `elapsed ${elapsed}: budget ${budget} overruns the job`,
+      );
+    }
+  }
+});
+
+test('qualityRetryBudgetMs refuses to guess when the job start was not recorded', () => {
+  for (const missing of [Number(undefined), 0, Number('')]) {
+    assert.throws(() => qualityRetryBudgetMs(missing, 1_000), /REVIEW_JOB_STARTED_AT_MS is not set/);
+  }
+});
+
+// The throw fires before any gate runs, so it must reach the workflow as "did
+// not run" (not_evaluated=true), not as a failure pointing at a comment that was
+// never posted.
+test('a missing job start reaches exitFatal as not-evaluated, with its own reason', () => {
+  let thrown;
+  try { qualityRetryBudgetMs(Number(undefined), 1_000); } catch (e) { thrown = e; }
+  assert.ok(thrown, 'qualityRetryBudgetMs must throw without a recorded start');
+  const dir = mkdtempSync(path.join(tmpdir(), 'budget-not-evaluated-'));
+  const out = path.join(dir, 'github_output');
+  writeFileSync(out, '');
+  const lines = [];
+  const error = console.error;
+  console.error = msg => lines.push(String(msg));
+  let code;
+  try {
+    exitFatal(thrown, 'commitperclip quality gates', c => { code = c; }, out);
+  } finally {
+    console.error = error;
+  }
+  assert.equal(code, 1);
+  assert.equal(readFileSync(out, 'utf8'), 'not_evaluated=true\n');
+  const annotation = lines.find(l => l.includes('DID NOT EVALUATE THE DIFF'));
+  assert.ok(annotation, lines.join('\n'));
+  assert.match(annotation, /REVIEW_JOB_STARTED_AT_MS/);
+  assert.doesNotMatch(annotation, /rate limit/i);
+});
+
+// On a warm runner the shared budget must still fund more than one headerless
+// rate-limit wait. Model ghFetch's pre-sleep check with real request time: each
+// read spends `rtt`, fails if the 60s floor exceeds what is left of its budget,
+// else sleeps it and retries once (another `rtt`). The old per-call 120s funded
+// the first read and failed the second at ~61s.
+test('a warm job funds three headerless rate-limited reads with request time', async () => {
+  const rtt = 1_000;
+  let clock = 0;
+  const funded = [];
+  const fakeGhFetch = async (p, _t, { retryBudgetMs }) => {
+    const deadline = clock + retryBudgetMs;
+    clock += rtt;
+    if (RATE_LIMIT_MIN_WAIT_MS > deadline - clock) throw new Error(`unfunded: ${p}`);
+    clock += RATE_LIMIT_MIN_WAIT_MS + rtt;
+    funded.push(p);
+  };
+  const warmElapsed = 30_000;
+  const gh = budgetBoundFetch(0, qualityRetryBudgetMs(-warmElapsed + 1e12, 1e12), fakeGhFetch, () => clock);
+  for (const p of ['/pull', '/files?page=2', '/comments?page=2']) await gh(p, 't');
+  assert.deepEqual(funded, ['/pull', '/files?page=2', '/comments?page=2']);
+  assert.ok(clock < QUALITY_STEP_TIMEOUT_MS - RATE_LIMIT_MIN_WAIT_MS, `used ${clock}ms`);
+});
+
+test('main routes every read through the shared budget, not bare ghFetch', () => {
+  const source = readFileSync(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../run-quality-gates.mjs'),
+    'utf8',
+  );
+  const main = source.slice(source.indexOf('async function main()'));
+  assert.match(main, /const gh = budgetBoundFetch\(startedAt, qualityRetryBudgetMs\(Number\(process\.env\.REVIEW_JOB_STARTED_AT_MS\), startedAt\)\)/);
+  assert.equal((main.match(/\bghFetch\b/g) ?? []).length, 0);
+  assert.match(main, /checkDependencies\([^)]*, gh\)/);
 });

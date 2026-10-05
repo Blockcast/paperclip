@@ -9,6 +9,8 @@
  * These are used by all other gate scripts.
  */
 import { createSign } from 'node:crypto';
+import { appendFileSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
 // Upstream's commitperclip app by default; forks point this at their own
@@ -33,33 +35,133 @@ export function generateJWT(privateKey) {
 // different bounds.
 export const GH_FETCH_DEFAULT_TIMEOUT_MS = 15_000;
 
+// GitHub's documented guidance for a rate-limited response carrying neither
+// `retry-after` nor `x-ratelimit-reset`: wait at least 60s before retrying.
+export const RATE_LIMIT_MIN_WAIT_MS = 60_000;
+
+// The deadline is checked BEFORE sleeping, so funding n retries of a
+// *headerless* rate-limit response needs a budget strictly greater than
+// n × RATE_LIMIT_MIN_WAIT_MS. 45s — the review-gate-action default that
+// BLO-28906 was filed against — funds ZERO and leaves the machinery inert.
+// 120s funds exactly one. Sized to one and not more because the
+// commitperclip-review job caps at 10 minutes and a cold ARC runner already
+// spends several of them on Dependency Review + setup-node.
+export const RATE_LIMIT_RETRY_BUDGET_MS = 120_000;
+
+// Marker on the thrown error and in its message so a rate-limit exhaustion is
+// never read as a quality or security verdict on the diff.
+export const RATE_LIMIT_NOT_EVALUATED = 'RATE_LIMIT_NOT_EVALUATED';
+
+// A plain 403 is a permission denial and must NOT be retried, so a rate-limit
+// signal is required on top of the status.
+export function isRateLimited(status, headers, body) {
+  if (status !== 403 && status !== 429) return false;
+  return (
+    headers.get('retry-after') !== null ||
+    headers.get('x-ratelimit-remaining') === '0' ||
+    /rate limit/i.test(body)
+  );
+}
+
+export function rateLimitWaitMs(headers, now = Date.now()) {
+  const retryAfter = Number(headers.get('retry-after'));
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return retryAfter * 1000;
+  const reset = Number(headers.get('x-ratelimit-reset'));
+  if (Number.isFinite(reset) && reset > 0) {
+    // A reset already at or behind our clock (skew, or a second limit after an
+    // earlier sleep) must not become a zero wait: that re-requests at full rate
+    // against an API that is refusing us. Fall back to the headerless floor.
+    const wait = reset * 1000 - now;
+    return wait > 0 ? wait : RATE_LIMIT_MIN_WAIT_MS;
+  }
+  return RATE_LIMIT_MIN_WAIT_MS;
+}
+
 export async function ghFetch(path, token, options = {}) {
-  const { timeoutMs = GH_FETCH_DEFAULT_TIMEOUT_MS, signal: externalSignal, ...fetchOptions } = options;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`ghFetch timeout after ${timeoutMs}ms: ${path}`)), timeoutMs);
-  const abortOnExternal = () => controller.abort(externalSignal?.reason);
-  if (externalSignal) {
-    if (externalSignal.aborted) abortOnExternal();
-    else externalSignal.addEventListener('abort', abortOnExternal, { once: true });
+  const {
+    timeoutMs = GH_FETCH_DEFAULT_TIMEOUT_MS,
+    signal: externalSignal,
+    retryBudgetMs = RATE_LIMIT_RETRY_BUDGET_MS,
+    sleep = delay,
+    ...fetchOptions
+  } = options;
+  const method = fetchOptions.method ?? 'GET';
+  const deadline = Date.now() + retryBudgetMs;
+
+  for (;;) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`ghFetch timeout after ${timeoutMs}ms: ${path}`)), timeoutMs);
+    const abortOnExternal = () => controller.abort(externalSignal?.reason);
+    if (externalSignal) {
+      if (externalSignal.aborted) abortOnExternal();
+      else externalSignal.addEventListener('abort', abortOnExternal, { once: true });
+    }
+    let res;
+    let text;
+    try {
+      res = await fetch(`https://api.github.com${path}`, {
+        ...fetchOptions,
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          ...fetchOptions.headers,
+        },
+      });
+      text = await res.text();
+    } finally {
+      clearTimeout(timer);
+      if (externalSignal) externalSignal.removeEventListener('abort', abortOnExternal);
+    }
+    if (res.ok) return JSON.parse(text);
+
+    // READ PATH ONLY. A POST/PATCH here carries no idempotency key — the
+    // comment upsert, the check-run POST and the advisory sync all append or
+    // overwrite — so a response-lost retry can write this run's stale verdict
+    // over a newer run's. BLO-19827 re-baselined on exactly this: retry reads,
+    // never writes.
+    if (method !== 'GET' || !isRateLimited(res.status, res.headers, text)) {
+      throw new Error(`GitHub API ${method} ${path} → ${res.status}: ${text}`);
+    }
+
+    const waitMs = rateLimitWaitMs(res.headers);
+    // Pre-sleep check: a primary installation-limit exhaustion resets up to an
+    // hour out, so fail fast with a distinguishable outcome rather than stall.
+    const remainingMs = deadline - Date.now();
+    if (waitMs > remainingMs) {
+      const err = new Error(
+        `${RATE_LIMIT_NOT_EVALUATED}: GitHub API ${method} ${path} → ${res.status} rate limited. ` +
+        `Next retry needs ${Math.round(waitMs / 1000)}s but only ${Math.max(0, Math.round(remainingMs / 1000))}s of ` +
+        `the ${Math.round(retryBudgetMs / 1000)}s budget remains. The request never completed.`
+      );
+      err.rateLimited = true;
+      throw err;
+    }
+    console.warn(`[ghFetch] ${path} → ${res.status} rate limited; retrying in ${Math.round(waitMs / 1000)}s`);
+    // Pass the caller's signal so an abort (e.g. an expired advisory budget)
+    // ends the wait at once instead of after it, and clears its timer.
+    await sleep(waitMs, undefined, { signal: externalSignal });
   }
-  try {
-    const res = await fetch(`https://api.github.com${path}`, {
-      ...fetchOptions,
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        ...fetchOptions.headers,
-      },
-    });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`GitHub API ${fetchOptions.method ?? 'GET'} ${path} → ${res.status}: ${text}`);
-    return JSON.parse(text);
-  } finally {
-    clearTimeout(timer);
-    if (externalSignal) externalSignal.removeEventListener('abort', abortOnExternal);
+}
+
+// Every gate script funnels its fatal path through here so a failure that
+// evaluated nothing cannot be read as a verdict on the code: a rate-limit
+// exhaustion (ghFetch sets err.rateLimited), or any error a caller marks with
+// err.notEvaluated = '<why no gate ran>'. Without this the failing check is
+// indistinguishable from a genuine finding (BLO-37010).
+export function exitFatal(err, gateLabel, exit = process.exit, outputFile = process.env.GITHUB_OUTPUT) {
+  console.error(err.message);
+  const why = err?.rateLimited
+    ? 'A GitHub rate limit outlived the retry budget, so no gate ran. Re-run the job once the limit clears.'
+    : err?.notEvaluated;
+  if (why) {
+    console.error(`::error::${gateLabel} DID NOT EVALUATE THE DIFF. ${why} This is NOT a quality or security finding.`);
+    // A later workflow step reports this step's failure in its own words; the
+    // output lets it say "did not run" instead of re-asserting "failed".
+    if (outputFile) appendFileSync(outputFile, 'not_evaluated=true\n');
   }
+  exit(1);
 }
 
 export async function resolveInstallationId(fetchInstallation, token, repo, owner) {
@@ -131,5 +233,5 @@ async function main() {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main().catch(e => { console.error(e.message); process.exit(1); });
+  main().catch(e => exitFatal(e, 'commitperclip token generation'));
 }

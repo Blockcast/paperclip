@@ -97,4 +97,29 @@ describeEmbeddedPostgres("PR work-product upsert: same-second merge-queue events
     await deliver(companyId, issueId, "dequeued");
     expect(await storedQueueState(issueId)).toBe("dequeued");
   });
+
+  // The ordering the 45/46 ranks deliberately get WRONG. A dequeue and a
+  // re-enqueue inside one second tie on timestamp, and because rank encodes
+  // "which state is later" rather than arrival order, the lower-ranked
+  // `enqueued` is rejected and the row keeps `dequeued` even though the PR is
+  // really back in the queue. That is the chosen fail-closed ceiling: the PR
+  // keeps its normal freshness window instead of the queue's extended one
+  // (pull-request-work-products.ts, `pullRequestWorkProductSourceEventActionOrder`).
+  //
+  // What this case uniquely pins is NOT the ranks -- the enqueued->dequeued
+  // case directly above already fails loudly on any re-rank, and no mutation
+  // confined to the two ranks can red this one without redding that one too
+  // (they are exact mirrors over the same pair). What it pins is the
+  // STRICTNESS of the tie-break in work-products.ts `tieBreak`: that a
+  // same-second tie is resolved by rank and never by arrival order. Relaxing
+  // that comparison to accept the later arrival (`then true` at the rank
+  // comparison) reds this case and no other in either PR work-product test
+  // file, which is precisely the change to think twice about -- it would turn
+  // the fail-closed ceiling above into a fail-open one.
+  it("keeps the fail-closed dequeued when dequeued and enqueued share a second", async () => {
+    const { companyId, issueId } = await seedIssue();
+    await deliver(companyId, issueId, "dequeued");
+    await deliver(companyId, issueId, "enqueued");
+    expect(await storedQueueState(issueId)).toBe("dequeued");
+  });
 });

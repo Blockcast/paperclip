@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
-import { clampIssueRequestDepth } from "@paperclipai/shared";
+import { clampIssueRequestDepth, ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS } from "@paperclipai/shared";
+import type { IssueProductivityReviewTrigger } from "@paperclipai/shared";
 import {
   activityLog,
   agentWakeupRequests,
@@ -44,6 +45,7 @@ import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import {
   PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+  recordedPullRequestOwners,
 } from "./pull-request-work-products.js";
 import { resolveOwningPaperclipIdentifiers } from "./paperclip-identifiers.js";
 import {
@@ -244,16 +246,13 @@ export const MONITOR_LAPSE_SERVICE_GRACE_MS = DEFAULT_PRODUCTIVITY_REVIEW_MONITO
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
-type ProductivityReviewTrigger =
-  | "no_comment_streak"
-  | "long_active_duration"
-  | "high_churn"
-  | "runtime_failure_streak"
-  // BLO-27698 B3b: one run that has been executing, uninterrupted and still
-  // live, for at least `longActiveMs`. Distinct from `long_active_duration`,
-  // which after B3 measures only time nobody was accounting for — a runaway run
-  // is the opposite shape (the turn was taken and never given back).
-  | "runaway_execution";
+// BLO-34216: derived from the single `ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS` tuple
+// in `@paperclipai/shared`. `runaway_execution` (BLO-27698 B3b) is one run that
+// has been executing, uninterrupted and still live, for at least `longActiveMs`
+// — distinct from `long_active_duration`, which after B3 measures only time
+// nobody was accounting for (a runaway run is the opposite shape: the turn was
+// taken and never given back).
+type ProductivityReviewTrigger = IssueProductivityReviewTrigger;
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
@@ -1458,12 +1457,10 @@ function isProgressPullRequest(pr: PullRequestEvidence | null): boolean {
  */
 function pullRequestOwnsIssue(row: PullRequestEvidenceRow, sourceIdentifier: string | null): boolean {
   if (!sourceIdentifier) return false;
-  const recorded = row.owningIdentifiers;
   // An empty recorded array IS authoritative — the PR named no owner anywhere,
   // so it is attributable to nothing. Only null/absent means "not recorded".
-  if (Array.isArray(recorded)) {
-    return recorded.some((value) => typeof value === "string" && value === sourceIdentifier);
-  }
+  const recorded = recordedPullRequestOwners(row.owningIdentifiers);
+  if (recorded) return recorded.includes(sourceIdentifier);
   return resolveOwningPaperclipIdentifiers({
     title: row.title,
     branch: row.branch,
@@ -1951,6 +1948,32 @@ function isTerminalGateClosableTriggerSet(triggers: unknown) {
     && triggers.every((trigger) => trigger === "long_active_duration");
 }
 
+// BLO-37071: which triggers an *unchanged run sample* excuses. Only
+// `runtime_failure_streak`, and the scoping is the whole point.
+//
+// `runtime_failure_streak` is computed by walking `latestRuns` newest-first and
+// breaking on the first non-infra-failure run. That query carries no time
+// predicate (`collectEvidence`, `MAX_RUNS_FOR_STREAK`), so on a source that has
+// stopped running the sample is frozen: the streak can never acquire a
+// streak-breaker, and the trigger re-fires forever over byte-identical
+// evidence. A review already resolved against that exact sample has answered
+// everything the next one could say.
+//
+// `long_active_duration` is deliberately excluded and must stay excluded: its
+// evidence is elapsed wall-clock from `issues.started_at` to `now`, which grows
+// precisely *because* nothing is running. Suppressing it on a frozen sample
+// would be a new false negative — the case it exists to catch. `high_churn`,
+// `no_comment_streak` and `runaway_execution` are excluded for the same reason
+// in weaker form: none of them is a pure function of `latestRuns`, so an
+// unchanged sample is not evidence that their evidence is unchanged.
+//
+// Set form, and every trigger must match: a review that also fired anything
+// else still files.
+function isUnchangedSampleClosableTriggerSet(triggers: unknown) {
+  return Array.isArray(triggers) && triggers.length > 0
+    && triggers.every((trigger) => trigger === "runtime_failure_streak");
+}
+
 // Close-path form: the persisted `details.firedTriggers` when the review was
 // minted with one, else the single `details.trigger` for rows written before
 // BLO-22436's follow-up. The fallback is deliberately the *old* behaviour and
@@ -1966,11 +1989,14 @@ function isDependencyBlockedClosableRecord(trigger: unknown, firedTriggers: unkn
   return isDependencyBlockedClosableTriggerSet(firedTriggers);
 }
 
-// Exhaustive by type, not by if-ladder (Ally review on BLO-27698 2e95b50b): the
-// previous form fell through to "Long active duration" as its default, so a new
-// trigger would render under an existing trigger's name — a silently wrong
-// evidence pack rather than a compile error. `runaway_execution` in particular
-// would have been labelled as the very trigger it was split out from.
+// Exhaustive by construction, not by if-ladder (Ally review on BLO-27698
+// 2e95b50b): the previous form fell through to "Long active duration" as its
+// default, so a new trigger would render under an existing trigger's name — a
+// silently wrong evidence pack rather than a compile error. `runaway_execution`
+// in particular would have been labelled as the very trigger it was split out
+// from. Since BLO-34216 the key type derives from
+// `ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS`, so a trigger added to the tuple with no
+// entry here is a typecheck failure.
 const TRIGGER_LABELS: Record<ProductivityReviewTrigger, string> = {
   no_comment_streak: "No-comment streak",
   long_active_duration: "Long active duration",
@@ -1983,24 +2009,24 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   return TRIGGER_LABELS[trigger];
 }
 
-const PRODUCTIVITY_REVIEW_TRIGGERS: readonly ProductivityReviewTrigger[] = [
-  "no_comment_streak",
-  "long_active_duration",
-  "high_churn",
-  "runtime_failure_streak",
-  "runaway_execution",
-];
-
 // BLO-22105: `buildReviewMarkdown` bakes the trigger that produced it into the
 // `- Primary trigger:` line. Reading it back out of the persisted description
 // (rather than, say, the last activity-log entry) means the comparison is
 // against exactly what a reader currently sees, so a refresh regenerates
 // precisely when the visible Manager Decision guidance is actually stale.
-function extractReviewTriggerFromDescription(description: string | null): ProductivityReviewTrigger | null {
+export function extractReviewTriggerFromDescription(description: string | null): ProductivityReviewTrigger | null {
   if (!description) return null;
   const match = description.match(/^- Primary trigger: `([a-z_]+)`/m);
   const candidate = match?.[1];
-  return PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
+  return ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS.find((trigger) => trigger === candidate) ?? null;
+}
+
+// BLO-34216: the renderer half of that round-trip, kept adjacent to the parser
+// so the shared `- Primary trigger:` prefix is visible in one place. Drift here
+// fails the same way a drifted trigger name does — the review silently stops
+// refreshing — so the round-trip test drives this rather than a hand-built line.
+export function renderPrimaryTriggerLine(trigger: ProductivityReviewTrigger) {
+  return `- Primary trigger: \`${trigger}\` (${formatTrigger(trigger)})`;
 }
 
 // BLO-22097: manager-facing evidence text must not claim a measured "0
@@ -2500,6 +2526,60 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * BLO-37071: `createdAt` of the newest already-resolved review on this source,
+   * or null when it has none.
+   *
+   * Deliberately `createdAt` and not `updatedAt`, and deliberately unbounded in
+   * time. The question this answers is "what run sample had a review already
+   * been minted against", which is fixed at mint time — `updatedAt` moves when
+   * the review is resolved, which would let a slow triage make a sample look
+   * newer than the evidence it was drawn from. And a frozen sample stays frozen
+   * indefinitely, so any cutoff here would just re-open the loop it closes.
+   *
+   * `cancelled` counts alongside `done`: both mean a human or manager has seen
+   * this evidence and stopped. Matches `findRecentResolvedProductivityReview`.
+   *
+   * `isNotNull(identifier)` enforces exactly that premise, and without it the
+   * premise is false. `retireStaleProductivityReviewReservation` parks a stale
+   * *reservation* at `status: "done"` with `identifier`/`issueNumber` still
+   * NULL and no `hiddenAt`, so it would otherwise satisfy both the status arm
+   * and `visibleIssueCondition()`. A reservation is minted from this same
+   * evidence, so its `createdAt` postdates the frozen sample by construction —
+   * and because this query is unbounded, one such row would silence every
+   * future `runtime_failure_streak` review on that source permanently. It is
+   * reachable on a live source: the `review_owner_changed` and
+   * `unreviewable_source` retirement arms do not require a terminal source. A
+   * retired reservation never rendered a body and was never assigned, so it
+   * answered nothing and must not count as an answer.
+   *
+   * The invariant that makes the `createdAt` anchor sound — that
+   * `newestSampledRunAt <= priorTerminalReviewAt` implies the sample is
+   * *identical* to the one the prior review saw — holds only while
+   * `heartbeat_runs` rows are append-only. Retention pruning would move
+   * `newestSampledRunAt` backwards and make this gate fire over evidence the
+   * prior review never saw, failing open in the silencing direction. Any future
+   * pruning of that table has to revisit this gate.
+   */
+  async function findLatestTerminalProductivityReviewCreatedAt(companyId: string, sourceIssueId: string) {
+    return db
+      .select({ createdAt: issues.createdAt })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          inArray(issues.status, ["done", "cancelled"]),
+          isNotNull(issues.identifier),
+          visibleIssueCondition(),
+        ),
+      )
+      .orderBy(desc(issues.createdAt), desc(issues.id))
+      .limit(1)
+      .then((rows) => rows[0]?.createdAt ?? null);
+  }
+
   async function hasRepeatedTerminalReviewsInBackoff(companyId: string, sourceIssueId: string, now: Date) {
     const cutoff = new Date(now.getTime() - PRODUCTIVITY_REVIEW_REPEAT_BACKOFF_MS);
     const count = await db
@@ -2564,6 +2644,23 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => Number(rows[0]?.count ?? 0));
   }
 
+  /**
+   * BLO-37071: `isNotNull(identifier)` here for the same reason it is on
+   * `findLatestTerminalProductivityReviewCreatedAt`, and this site is the
+   * *unbounded* one of the pair.
+   *
+   * `retireStaleProductivityReviewReservation` parks a stale reservation at
+   * `status: "done"` with NULL identifier/issueNumber and no `hiddenAt`, so it
+   * satisfies every other arm here. This walk is capped by row count
+   * (`maxConsecutiveNoActionReviews`), not by a time window, so — unlike
+   * `findRecentResolvedProductivityReview`, whose identical exposure is bounded
+   * to `resolvedSnoozeMs` and is deliberately left alone — nothing ages the row
+   * out. Worse, the retirement logs its activity row against
+   * `entityId: input.review.id`, the *review* issue rather than the source, so
+   * nothing in that path breaks the streak either. The reservation therefore
+   * occupies a slot as a review nobody ever saw and the cap fires one real
+   * review early, which is the silencing direction.
+   */
   async function countConsecutiveNoActionProductivityReviews(
     companyId: string,
     sourceIssueId: string,
@@ -2580,6 +2677,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
           eq(issues.originId, sourceIssueId),
           eq(issues.status, "done"),
+          isNotNull(issues.identifier),
           visibleIssueCondition(),
         ),
       )
@@ -3209,9 +3307,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     ].join("|");
   }
 
-  async function latestMonitorScheduledSuppressionKey(
+  const suppressionDetailString = (value: unknown) => (typeof value === "string" ? value : null);
+
+  /**
+   * The `details` of the newest suppression row on this issue, but only when it
+   * reports `suppressedBy`. Shared by every deduped recorder (BLO-24022,
+   * BLO-37071) so there is one readback query and one filter constant.
+   *
+   * The `suppressedBy` arm is load-bearing: a different suppression reason
+   * (approval_pending, terminal gate, unchanged sample) is a real state change,
+   * so it must not be mistaken for a repeat of the one about to be recorded.
+   */
+  async function latestSuppressionDetails(
     executor: DbOrTx,
-    input: { companyId: string; issueId: string },
+    input: { companyId: string; issueId: string; suppressedBy: string },
   ) {
     const row = await executor
       .select({ details: activityLog.details })
@@ -3229,14 +3338,23 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const details = activityDetails(row.details);
-    // A different suppression reason (approval_pending, terminal source) is a real state change,
-    // so it must not be mistaken for an already-reported monitor wait.
-    if (details.suppressedBy !== "monitor_scheduled") return null;
-    const str = (value: unknown) => (typeof value === "string" ? value : null);
+    if (details.suppressedBy !== input.suppressedBy) return null;
+    return details;
+  }
+
+  async function latestMonitorScheduledSuppressionKey(
+    executor: DbOrTx,
+    input: { companyId: string; issueId: string },
+  ) {
+    const details = await latestSuppressionDetails(executor, {
+      ...input,
+      suppressedBy: "monitor_scheduled",
+    });
+    if (!details) return null;
     return monitorSuppressionWindowKey({
-      monitorNextCheckAt: str(details.monitorNextCheckAt),
-      monitorScheduledBy: str(details.monitorScheduledBy),
-      monitorLastTriggeredAt: str(details.monitorLastTriggeredAt),
+      monitorNextCheckAt: suppressionDetailString(details.monitorNextCheckAt),
+      monitorScheduledBy: suppressionDetailString(details.monitorScheduledBy),
+      monitorLastTriggeredAt: suppressionDetailString(details.monitorLastTriggeredAt),
     });
   }
 
@@ -3309,7 +3427,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       actorType: "system",
       actorId: "system",
       agentId: sourceIssue.assigneeAgentId,
-      action: "issue.productivity_review_suppressed",
+      action: PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION,
       entityType: "issue",
       entityId: sourceIssue.id,
       details,
@@ -3318,6 +3436,105 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       details,
       "productivity review long_active_duration suppressed by an already-resolved terminal gate (BLO-27515)",
     );
+  }
+
+  /**
+   * BLO-37071: identity of the frozen-sample wait a suppression is reporting.
+   *
+   * The pair is constant for exactly as long as the sample is frozen and moves
+   * the instant either side does, so keying on it writes one row per distinct
+   * suppression state — which is also the honest audit record.
+   *
+   * `runtimeFailureStreak` is deliberately excluded. It is derivable from the
+   * pair (a run that would change it also moves `newestSampledRunCreatedAt`,
+   * `heartbeat_runs` being append-only), and BLO-24022's `elapsedMs` is the
+   * standing lesson that putting a field which can drift into the key makes
+   * every key unique and defeats the dedupe entirely.
+   */
+  function unchangedSampleSuppressionWindowKey(details: {
+    priorTerminalReviewCreatedAt: string | null;
+    newestSampledRunCreatedAt: string | null;
+  }) {
+    return [details.priorTerminalReviewCreatedAt ?? "none", details.newestSampledRunCreatedAt ?? "none"].join("|");
+  }
+
+  /**
+   * BLO-37071: a `runtime_failure_streak` review was already resolved against
+   * this exact run sample and no run has happened since. Recorded on the source
+   * issue so the next reader can tell "the detector stayed quiet because nothing
+   * changed" from "the detector stopped firing".
+   */
+  async function recordUnchangedSampleSuppression(
+    sourceIssue: IssueRow,
+    evidence: ProductivityReviewEvidence,
+    priorReviewCreatedAt: Date,
+    newestRunCreatedAt: Date,
+  ) {
+    const details = {
+      source: "productivity_review.reconcile",
+      sourceIssueId: sourceIssue.id,
+      trigger: evidence.trigger,
+      firedTriggers: evidence.firedTriggers,
+      suppressedBy: "unchanged_run_sample",
+      priorTerminalReviewCreatedAt: priorReviewCreatedAt.toISOString(),
+      newestSampledRunCreatedAt: newestRunCreatedAt.toISOString(),
+      runtimeFailureStreak: evidence.runtimeFailureStreak,
+    };
+    // BLO-24022, and this gate needs it more than any sibling did. The reconcile
+    // re-evaluates every ~30s (`heartbeatSchedulerIntervalMs`) and every other
+    // suppression terminates on its own — the approval gate ends when the
+    // approval is decided, the monitor gate when the monitor fires,
+    // `recordTerminalGateResolvedSuppression` is bounded by `longActiveMs`.
+    // This one is deliberately unbounded in time (see
+    // `findLatestTerminalProductivityReviewCreatedAt`) because a frozen sample
+    // stays frozen until a run happens, so without a dedupe a single such source
+    // emits a row per pass forever — the 46%-of-all-company-activity flood that
+    // broke agent-health triage.
+    //
+    // It is also not merely noise here. `countConsecutiveNoActionProductivityReviews`
+    // breaks its streak on ANY `activityLog` row on the source, and these rows
+    // are written against `entityId: sourceIssue.id` — so an undeduped recorder
+    // resets `maxConsecutiveNoActionReviews` to 0 on exactly the sources this
+    // gate touches. That does not bite while the gate suppresses (the caller
+    // `continue`s past `createOrUpdateReview`), it bites the moment one run
+    // lands and the gate stops applying, which is precisely when that cap is
+    // the remaining bound. The gate would have become a producer of the defect
+    // documented at its own call site.
+    //
+    // Best-effort by design, as in `recordMonitorScheduledSuppression`: a
+    // read-then-write without a lock, so overlapping reconciles can both miss
+    // the row and write. That degrades to a few rows per frozen window rather
+    // than one per pass, which is the whole point.
+    const previous = await latestSuppressionDetails(db, {
+      companyId: sourceIssue.companyId,
+      issueId: sourceIssue.id,
+      suppressedBy: "unchanged_run_sample",
+    });
+    if (
+      previous &&
+      unchangedSampleSuppressionWindowKey({
+        priorTerminalReviewCreatedAt: suppressionDetailString(previous.priorTerminalReviewCreatedAt),
+        newestSampledRunCreatedAt: suppressionDetailString(previous.newestSampledRunCreatedAt),
+      }) === unchangedSampleSuppressionWindowKey(details)
+    ) {
+      logger.debug(details, "productivity review runtime_failure_streak suppression already recorded for this sample");
+      return false;
+    }
+    await logActivity(db, {
+      companyId: sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: sourceIssue.assigneeAgentId,
+      action: PRODUCTIVITY_REVIEW_SUPPRESSED_ACTION,
+      entityType: "issue",
+      entityId: sourceIssue.id,
+      details,
+    });
+    logger.info(
+      details,
+      "productivity review runtime_failure_streak suppressed: run sample unchanged since the last resolved review (BLO-37071)",
+    );
+    return true;
   }
 
   /**
@@ -3873,13 +4090,20 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
    * this row's `latestRuns` and `routineOnlySamplingWindow` cannot suppress
    * them. Counting them there would let a row with no runs of its own raise
    * `high_churn` on receipts alone.
+   *
+   * BLO-36717: `options` and `runScoped` are both REQUIRED rather than
+   * defaulted. The two counts answer different questions and the wrong one is a
+   * silent regression of the bug above — an omitted option would hand a future
+   * caller the widened count with nothing at the call site to show it, and on
+   * the `high_churn` arms that is a live gate. Making it explicit costs five
+   * call sites and turns the mistake into a type error.
    */
   async function countIssueCommentsSince(
     companyId: string,
     issueId: string,
     agentId: string,
-    since?: Date,
-    options?: { runScoped?: boolean },
+    since: Date | undefined,
+    options: { runScoped: boolean },
   ) {
     return db
       .select({ count: sql<number>`count(*)::int` })
@@ -3892,7 +4116,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(issueComments.authorAgentId, agentId),
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
-          options?.runScoped ? issueRunScopeSql(issueId) : undefined,
+          options.runScoped ? issueRunScopeSql(issueId) : undefined,
           since ? sql`${issueComments.createdAt} >= ${since.toISOString()}::timestamptz` : undefined,
         ),
       )
@@ -4315,11 +4539,21 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     ] = await Promise.all([
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, oneHourAgo),
       countIssueRunsSince(sourceIssue.companyId, sourceAgent.id, sourceIssue.id, sixHoursAgo),
-      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id),
-      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo),
-      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo),
-      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo, { runScoped: true }),
-      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo, { runScoped: true }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, undefined, {
+        runScoped: false,
+      }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo, {
+        runScoped: false,
+      }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo, {
+        runScoped: false,
+      }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, oneHourAgo, {
+        runScoped: true,
+      }),
+      countIssueCommentsSince(sourceIssue.companyId, sourceIssue.id, sourceAgent.id, sixHoursAgo, {
+        runScoped: true,
+      }),
       // BLO-35893: same widening as `countIssueCommentsSince` — no
       // `issueRunScopeSql` here. `Latest Assignee Run Comments` is a list of
       // comments *on this issue*, so filtering by the authoring run's context
@@ -5193,7 +5427,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       "",
       `- Source issue: ${issueUiLink(evidence.sourceIssue, prefix)}`,
       `- Assigned agent: ${evidence.sourceAgent.name} (${evidence.sourceAgent.role})`,
-      `- Primary trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
+      renderPrimaryTriggerLine(evidence.trigger),
       `- Trigger reasons: ${evidence.triggerReasons.join("; ")}`,
       `- Generated at: ${evidence.generatedAt.toISOString()}`,
       "",
@@ -5214,13 +5448,22 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // so the two counts do sum, unlike the never-invoked/non-executing pair
       // below.
       `- Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — \`errorCode\` in the shared infra-class set, BLO-36535): ${evidence.infraClassKilledRunCount}`,
-      // BLO-29535 (Ally suggestion on a38c12fe2): "not excluded from the streak
+      // BLO-29535 (Ally suggestion on a38c12fe2): "eligible for the streak
       // walk", NOT "counted toward the streak". This count is taken over every
       // run in `noCommentEligibleRuns`, while `noCommentStreak` is only the
       // prefix of that list before the first commented run — so the two numbers
       // legitimately differ, and the old label invited a manager to read the
       // larger one as the streak length.
-      `- Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, not excluded from the streak walk — BLO-26165): ${evidence.commentExemptExecutedRunCount}`,
+      //
+      // BLO-37560: say "by design" and name the revert. The previous phrasing,
+      // "not excluded from the streak walk — BLO-26165", is equally true but
+      // reads as a confession of a known gap, and a CTO review run acted on it
+      // that way: it filed a `high` defect asking for these runs to be excluded,
+      // which is precisely the change BLO-26165 made and then reverted (see
+      // `isNeverInvokedRun` for why — excluding on this column blinds the
+      // detector to silence on almost every wake reason). An evidence line
+      // describing a deliberate decision must not read like a bug report.
+      `- Comment-policy-exempt runs that DID execute (terminal, \`issueCommentStatus: not_applicable\`, eligible for the streak walk by design — excluding them was BLO-26165's reverted regression, not a gap): ${evidence.commentExemptExecutedRunCount}`,
       ...(evidence.nonExecutingRunCount > 0
         ? [
             // BLO-22436 (Ally suggestion on 37c1bd65): one parenthetical group,
@@ -5372,9 +5615,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // BLO-29535: same wording fix as the description's evidence block — this
       // count is every streak-eligible exempt run, not the streak prefix, and
       // a bare "(counted)" sitting under "No-comment streak" read as "counted
-      // into that streak". The comment must tell the same story as the
-      // description it summarises.
-      `- Comment-policy-exempt runs that DID execute (not excluded from the streak walk): ${evidence.commentExemptExecutedRunCount}`,
+      // into that streak". BLO-37560: and "by design" for the same reason as
+      // there — "not excluded" reads as a known gap and got acted on as one.
+      // The comment must tell the same story as the description it summarises.
+      `- Comment-policy-exempt runs that DID execute (eligible for the streak walk by design, not a gap): ${evidence.commentExemptExecutedRunCount}`,
       // BLO-22436 (Ally suggestion on 37c1bd65): the never-invoked count is
       // ambiguous on its own — it says nothing about *why* those runs could not
       // comment. Carry the non-executing count and its overlap here too, so the
@@ -5629,6 +5873,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       return { kind: "creation_capped" as const, reviewIssueId: null };
     }
 
+    // BLO-37071: this cap asks "has anyone touched the SOURCE ISSUE between
+    // reviews" — `countConsecutiveNoActionProductivityReviews` walks
+    // `activityLog` rows on the source. It is NOT a sample-staleness check, and
+    // the two only coincide while a row is completely untouched.
+    //
+    // Read that limit literally before relying on it: on a
+    // `runtime_failure_streak` source, ANY activityLog row — a comment from
+    // another lane, a label, a priority edit, a dependency sweep — resets this
+    // streak to 0 and re-arms `maxConsecutiveNoActionReviews` more reviews over
+    // a byte-identical frozen run sample. That it bounded the BLO-37071 loop at
+    // 3 was coincidence, not design. The sample-staleness gate in
+    // `reconcileProductivityReviews` supplements this cap; neither replaces the
+    // other.
     const consecutiveNoActionReviews = await countConsecutiveNoActionProductivityReviews(
       evidence.sourceIssue.companyId,
       evidence.sourceIssue.id,
@@ -6172,6 +6429,25 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       approvalGatedSuppressed: 0,
       dependencyBlockedSuppressed: 0,
       terminalGateResolvedSuppressed: 0,
+      // BLO-37071: its own counter, deliberately not folded into `snoozed`.
+      // The field measurement this gate ships with has to distinguish "the
+      // sample-staleness gate fired" from "cadence caps fired"; a shared
+      // counter makes that unreadable.
+      //
+      // It measures the steady state, not the whole population. The gate sits
+      // after `findRecentResolvedProductivityReview` and
+      // `hasRepeatedTerminalReviewsInBackoff`, both of which increment
+      // `snoozed` and `continue`, so while a source is still inside
+      // `resolvedSnoozeMs` or the repeat backoff those win and this stays 0.
+      // That ordering is deliberate — it keeps the extra query off candidates
+      // a cadence cap already stopped — but it means a low reading early in a
+      // loop is under-reporting, not absence.
+      //
+      // It counts suppression *decisions*, one per pass. The audit row is
+      // deduped per frozen window (BLO-24022), so this counter and a count of
+      // `unchanged_run_sample` activityLog rows are deliberately different
+      // numbers — do not reconcile one against the other.
+      unchangedSampleSuppressed: 0,
       closedSuppressedMonitorReviews: 0,
       closedTerminalSourceReviews: 0,
       closedDependencyBlockedReviews: 0,
@@ -6433,6 +6709,48 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       if (await hasRepeatedTerminalReviewsInBackoff(candidate.companyId, candidate.id, now)) {
         result.snoozed += 1;
         continue;
+      }
+      // BLO-37071. Placed after the two cadence snoozes so it costs a query only
+      // on candidates that would otherwise mint, and after `collectEvidence`
+      // because it needs `latestRuns`.
+      //
+      // Both no-ops below are load-bearing (AC3). A source with no resolved
+      // review, or with no sampled runs at all, falls straight through — a gate
+      // that matched those would degrade the detector to "never fires", which is
+      // indistinguishable from "fixed".
+      //
+      // The empty-`latestRuns` arm is unreachable today and is kept as
+      // fail-open defence, not as live coverage: the only trigger this gate
+      // accepts needs `noCommentStreakRuns` sampled runs to fire at all, so an
+      // empty sample cannot reach here. Say that rather than implying a
+      // mutation-tested guard — if the accepted set ever widens, the arm starts
+      // carrying weight and needs a real test then.
+      //
+      // Known residual: this `continue` skips `createOrUpdateReview`, so it
+      // suppresses a *refresh* as well as a creation. Reachable — a review
+      // filed while the source was `in_progress` fired
+      // `{long_active_duration, runtime_failure_streak}`, so this gate did not
+      // apply; once the source goes non-active the set narrows to
+      // `{runtime_failure_streak}` and that already-open review stops being
+      // refreshed, while no arm of `closeOpenSuppressedReviews` retires it
+      // (all are scoped to `long_active_duration` / `runaway_execution` /
+      // terminal source). It sits open with a body naming the older trigger.
+      // Accepted: the review is already filed and assigned, so a human still
+      // has it, and a stale body beats the refresh churn this replaces.
+      // BLO-35725 is the row that widens the retirement arm to this trigger.
+      if (isUnchangedSampleClosableTriggerSet(evidence.firedTriggers)) {
+        const newestSampledRunAt = evidence.latestRuns[0]?.createdAt ?? null;
+        if (newestSampledRunAt) {
+          const priorTerminalReviewAt = await findLatestTerminalProductivityReviewCreatedAt(
+            candidate.companyId,
+            candidate.id,
+          );
+          if (priorTerminalReviewAt && newestSampledRunAt.getTime() <= priorTerminalReviewAt.getTime()) {
+            await recordUnchangedSampleSuppression(candidate, evidence, priorTerminalReviewAt, newestSampledRunAt);
+            result.unchangedSampleSuppressed += 1;
+            continue;
+          }
+        }
       }
       let prefix = prefixCache.get(candidate.companyId);
       if (!prefix) {
