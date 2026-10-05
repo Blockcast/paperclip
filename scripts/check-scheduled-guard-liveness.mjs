@@ -176,6 +176,27 @@ export const WATCHED_GUARDS = [
     event: "schedule",
     graceUntil: "2026-10-03T00:00:00.000Z",
   },
+
+  // BLO-26736. Twice daily (cron "29 7,19"), so it takes the same 16h bar as
+  // the other twice-daily guard above rather than the hourly 2.75h one. The bar
+  // is INHERITED, not re-derived: this workflow has no gap history of its own
+  // yet, and 16h is the number the only comparable cadence on this repo was
+  // measured against. Re-derive it by this file's normal method once ~30 real
+  // gaps exist; if its distribution turns out wider than
+  // production-environment-protection-guard's, this will false-red first and
+  // loudly, which is the right direction to be wrong in.
+  //
+  // `graceUntil` for the same reason as master-health: a schedule only fires
+  // from the default branch, so at merge this guard has zero completed runs by
+  // construction and classifies `never-completed` — a threshold-INDEPENDENT
+  // branch 16h cannot cover. Set to the first cron after the expected merge
+  // plus two full cycles of slack. Rotting here is FAIL-CLOSED: when it lapses
+  // the guard gets stricter, so the only thing that can go wrong is a loud red.
+  {
+    workflow: "review-gate-consumer-protection-guard.yml",
+    staleHours: 16,
+    graceUntil: "2026-10-09T00:00:00.000Z",
+  },
 ];
 
 /**
