@@ -7,11 +7,12 @@
  * `supersede-stale-deploy.mjs` cancels a stale pending deploy and dispatches a
  * fresh one at `master`. That is the fix PEN-3315 shipped, and it works — but it
  * resets the pending run's `createdAt` to now. Ageing the escalation off the run
- * alone therefore turns one continuous 46h stall into a train of 6.0h ones, and
- * the dispatcher goes green for ~5 of every 6 hourly slots while production sits
- * unshipped. Measured live on 2026-09-18: a genuine stall running since
- * 09-17T02:01:24Z reported `3.0h old, under the 6h threshold — not escalating`
- * while `paperclip_api_deploy_commits_behind` read 107.
+ * alone therefore caps the reported age at SUPERSEDE_AFTER_HOURS (48h since
+ * 2026-10-04, BLO-25050) and restarts it there, however long production has
+ * actually been unshipped. Measured live on 2026-09-18, when that threshold was
+ * still 6h and the understatement was correspondingly worse: a genuine stall
+ * running since 09-17T02:01:24Z reported `3.0h old, under the 6h threshold — not
+ * escalating` while `paperclip_api_deploy_commits_behind` read 107.
  *
  * PEN-3315 solved this with a durable GitHub issue carrying the stall clock.
  * That channel is structurally unavailable here: `Blockcast/paperclip` has
@@ -59,10 +60,10 @@
 export const CHAIN_WINDOW_MINUTES = 5;
 
 /**
- * A stall long enough to need 12 supersedes is >72h at the 6h threshold, which
- * is far past the point where the age's exact value changes any decision. The
- * cap exists so a pathological history cannot turn this into an unbounded walk
- * issuing an ancestry call per link.
+ * A stall long enough to need 12 supersedes is >24 days at SUPERSEDE_AFTER_HOURS
+ * (48h), which is far past the point where the age's exact value changes any
+ * decision. The cap exists so a pathological history cannot turn this into an
+ * unbounded walk issuing an ancestry call per link.
  */
 export const MAX_CHAIN_LINKS = 12;
 
