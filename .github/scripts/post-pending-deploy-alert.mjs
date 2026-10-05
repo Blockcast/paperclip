@@ -11,6 +11,7 @@
  * dispatch while one is already pending. The guard is correct. But the job it
  * protects is gated on the paperclip-production reviewer set — ONE ratified
  * human (this line read "three named human reviewers" until 2026-10-04; see
+ * RATIFIED_REVIEWERS in check-production-environment-protection.mjs, and
  * scheduled-production-deploy.yml's header) — so while any deploy sits
  * `waiting`, the daily dispatcher is a permanent no-op — and every skipped run
  * reported `conclusion: success`. On 2026-09-01 that took production to 45
