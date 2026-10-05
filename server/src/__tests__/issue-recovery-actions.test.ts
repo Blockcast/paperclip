@@ -318,6 +318,182 @@ describe("issueRecoveryActionService", () => {
     expect(updates.at(-1)).toMatchObject({ timeoutAt: originalHorizon });
   });
 
+  // BLO-40297 (review). The derived arm retires a legacy `maxAttempts: null` row as
+  // `timeout_horizon` and announces "Paperclip has stopped waking anyone for it". If that row
+  // later takes a waking cause, the upsert gives it `maxAttempts` and a FRESH horizon — at
+  // which point `strandedRecoveryWakeAttemptsExhausted` returns false again and the owner IS
+  // woken, on a row still marked retired. The notice is then false and
+  // `resolveStrandedEscalationStatus` leaves the issue dispatchable mid-wake. The write that
+  // makes the predicate false must therefore also lift the retirement.
+  it("lifts a derived timeout_horizon retirement when the row takes its first real horizon", async () => {
+    const freshHorizon = new Date("2026-06-01T00:00:00.000Z");
+    // The derived-arm shape exactly: retired without ever persisting a horizon, so no
+    // `sourceScopedWakeHorizonAt` evidence key and a null `maxAttempts`.
+    let row = makeRecoveryActionRow({
+      id: "derived-retired-action",
+      status: "escalated",
+      retiringBound: "timeout_horizon",
+      maxAttempts: null,
+      timeoutAt: null,
+      evidence: { latestRunId: "run-1" },
+    });
+    const makeSelectQuery = () => ({
+      from() { return this; },
+      where() { return this; },
+      orderBy() { return this; },
+      limit() { return Promise.resolve(row ? [row] : []); },
+    });
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery()),
+      update: vi.fn(() => ({
+        set: vi.fn((patch: Record<string, unknown>) => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => {
+              row = { ...row, ...patch };
+              return [row];
+            }),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+
+    const rebound = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: "agent-1",
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:rebound",
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+      timeoutAt: freshHorizon,
+    });
+
+    // Honestly bounded-and-active: the row now has a budget and a live horizon, so it must
+    // not also claim to be retired. `escalateExpiredWakeHorizons`'s PERSISTED arm re-retires
+    // it when `freshHorizon` burns, so this is not a way back into the unbounded loop.
+    expect(rebound).toMatchObject({
+      status: "active",
+      retiringBound: null,
+      maxAttempts: 5,
+    });
+    expect(new Date(rebound.timeoutAt as unknown as string).getTime()).toBe(freshHorizon.getTime());
+  });
+
+  // Negative control for the lift above: BLO-24662's "owner churn must not restore a burned
+  // horizon" is unchanged. A row that actually HAS a persisted horizon carries a non-null
+  // `carriedWakeHorizonAt`, so `isNewlyBoundedSequence` is false and nothing is lifted. If
+  // this test ever goes green on `active`, the lift has widened past the derived arm.
+  it("keeps a persisted timeout_horizon retirement sticky across an owner change", async () => {
+    const burnedHorizon = new Date("2026-05-01T00:00:00.000Z");
+    let row = makeRecoveryActionRow({
+      id: "persisted-retired-action",
+      status: "escalated",
+      retiringBound: "timeout_horizon",
+      ownerAgentId: "agent-1",
+      maxAttempts: 5,
+      timeoutAt: burnedHorizon,
+      evidence: { latestRunId: "run-1" },
+    });
+    const makeSelectQuery = () => ({
+      from() { return this; },
+      where() { return this; },
+      orderBy() { return this; },
+      limit() { return Promise.resolve(row ? [row] : []); },
+    });
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery()),
+      update: vi.fn(() => ({
+        set: vi.fn((patch: Record<string, unknown>) => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => {
+              row = { ...row, ...patch };
+              return [row];
+            }),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+
+    const swept = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: "agent-2",
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:sticky",
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+      timeoutAt: new Date("2026-06-01T00:00:00.000Z"),
+    });
+
+    expect(swept).toMatchObject({ status: "escalated", retiringBound: "timeout_horizon" });
+    expect(new Date(swept.timeoutAt as unknown as string).getTime()).toBe(burnedHorizon.getTime());
+  });
+
+  // Second negative control, for the `retiringBound === "timeout_horizon"` clause rather than
+  // for `isNewlyBoundedSequence`. Becoming newly bounded is not on its own a reason to lift
+  // SOME OTHER bound: an `attempt_budget` retirement is lifted by an owner CHANGE and by
+  // nothing else (BLO-19124), because the budget belongs to the owner that spent it. A legacy
+  // row can reach `maxAttempts: null` with no evidence key while retired on the budget (the
+  // bounded -> ownerless -> bounded flap in the ROLLOUT NOTE), which is exactly where a lift
+  // keyed only on `isNewlyBoundedSequence` would hand an unchanged owner a budget it never
+  // earned back.
+  it("does not lift an attempt_budget retirement just because the row becomes newly bounded", async () => {
+    let row = makeRecoveryActionRow({
+      id: "budget-retired-action",
+      status: "escalated",
+      retiringBound: "attempt_budget",
+      ownerAgentId: "agent-1",
+      maxAttempts: null,
+      timeoutAt: null,
+      evidence: { latestRunId: "run-1" },
+    });
+    const makeSelectQuery = () => ({
+      from() { return this; },
+      where() { return this; },
+      orderBy() { return this; },
+      limit() { return Promise.resolve(row ? [row] : []); },
+    });
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery()),
+      update: vi.fn(() => ({
+        set: vi.fn((patch: Record<string, unknown>) => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => {
+              row = { ...row, ...patch };
+              return [row];
+            }),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+
+    const swept = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      // SAME owner, so `liftsAttemptBudgetRetirement` does not fire either.
+      ownerAgentId: "agent-1",
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:budget",
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+      timeoutAt: new Date("2026-06-01T00:00:00.000Z"),
+    });
+
+    expect(swept).toMatchObject({ status: "escalated", retiringBound: "attempt_budget" });
+  });
+
   // BLO-20263. The handoff comment grant's TTL is measured from this anchor, so if
   // ordinary sweep churn refreshed it the grant would never expire — which is the
   // failure mode the ticket exists to close, not a cosmetic detail.

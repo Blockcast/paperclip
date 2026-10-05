@@ -342,9 +342,9 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     expect(action.retiringBound).toBe("timeout_horizon");
     expect(action.outcome).toBeNull();
 
-    // The announcement must not render `horizon \`null\``: with no persisted horizon the
-    // marker is also the dedup key, so a null there collides across every unbounded row on
-    // the issue and the second one is silently swallowed as already-announced.
+    // The announcement must not render `horizon \`null\``: an operator reading the notice has
+    // to be able to see which horizon was burned. (Dedup is unaffected either way — the
+    // marker embeds the unique `action.id`.)
     const [comment] = await db
       .select({ body: issueComments.body })
       .from(issueComments)

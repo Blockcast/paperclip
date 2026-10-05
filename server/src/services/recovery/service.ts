@@ -12980,9 +12980,10 @@ export function recoveryService(
           : action.timeoutAt != null
             ? String(action.timeoutAt)
             // BLO-40297 derived arm: the row never persisted a horizon, so report the one it
-            // was actually retired on — `createdAt` plus the configured horizon. Without this
-            // the marker reads "horizon `null`", which is both useless to an operator and a
-            // dedup key that collides across every unbounded row on the issue.
+            // was actually retired on — `createdAt` plus the configured horizon. This is for
+            // operator legibility only; the marker would still dedup correctly without it,
+            // because it embeds the unique `action.id` (an earlier version of this comment
+            // claimed a null horizon would collide across rows — it would not).
             : new Date(
               new Date(action.createdAt).getTime() + recoveryActionBoundsConfig().timeoutMs,
             ).toISOString();
