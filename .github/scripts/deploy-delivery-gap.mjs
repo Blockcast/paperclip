@@ -135,15 +135,25 @@ export async function findLastSuccessfulDeploy({
   const runs = [];
   // Page until we hold `scanLimit` runs or the API runs out. A short page means
   // the history ended; stopping there keeps a healthy lane at one list call.
+  //
+  // `per_page` is HELD CONSTANT across pages, and that is load-bearing rather
+  // than tidy. GitHub's offset is `(page - 1) * per_page`, so shrinking
+  // `per_page` on a final page moves the offset BACKWARDS and re-fetches runs
+  // already held: measured on this repo's own docker.yml history, page 2 at
+  // `per_page=50` begins at index 50 of the `per_page=100` page 1, not index
+  // 100. Narrowing the last request to "not overshoot scanLimit" therefore
+  // bought duplicates and scanned SHALLOWER than it claimed — for a scanLimit
+  // of 150, runs 101-150 were never read at all. That is precisely the
+  // stops-short-of-the-deploy failure this scan depth exists to prevent, so the
+  // overshoot is trimmed locally below instead, where it costs nothing.
   for (let page = 1; runs.length < scanLimit; page += 1) {
-    const perPage = Math.min(DEPLOY_SCAN_PAGE_SIZE, scanLimit - runs.length);
     const path =
       `/actions/workflows/${encodeURIComponent(workflowFile)}/runs` +
-      `?event=workflow_dispatch&status=success&per_page=${perPage}&page=${page}`;
+      `?event=workflow_dispatch&status=success&per_page=${DEPLOY_SCAN_PAGE_SIZE}&page=${page}`;
     const body = await client.request('GET', path);
     const batch = body?.workflow_runs ?? [];
     runs.push(...batch);
-    if (batch.length < perPage) break;
+    if (batch.length < DEPLOY_SCAN_PAGE_SIZE) break;
   }
 
   // Sort explicitly rather than trusting list order. The API returns newest
@@ -153,6 +163,13 @@ export async function findLastSuccessfulDeploy({
   // AFTER accumulating every page keeps that guarantee global: a per-page sort
   // would still trust the API to have paged in order.
   runs.sort((a, b) => Date.parse(b?.created_at ?? 0) - Date.parse(a?.created_at ?? 0));
+
+  // Trim the over-fetch AFTER the sort, not before it. Paging can overshoot by
+  // at most one page, and discarding the tail in API order would hand back the
+  // guarantee the sort above just bought: if list order ever changes, the run
+  // trimmed off might be the NEWEST one. Cutting the sorted tail keeps this
+  // "the newest `scanLimit` runs" by date whatever order they arrived in.
+  if (runs.length > scanLimit) runs.length = scanLimit;
 
   for (const run of runs) {
     if (!run?.id || !run?.head_sha) continue;

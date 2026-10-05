@@ -12,6 +12,11 @@ import {
 
 const NOW = new Date('2026-10-04T05:17:00.000Z');
 
+// The scan depth this module shipped with before PEN-3744 raised it. Named so
+// the "deep enough to matter" assertions below compare against something real
+// rather than restating a literal that can never disagree with itself.
+const RETIRED_DEPLOY_SCAN_LIMIT = 20;
+
 /**
  * Minimal GitHub client stand-in. `routes` maps a path PREFIX to either a value
  * or a thrower, and every call is recorded so the tests can assert the scan
@@ -96,14 +101,31 @@ test('findLastSuccessfulDeploy: an all-skipped history returns null, not a guess
 });
 
 /**
- * Page-aware runs stub. `pages` is an array of run arrays, served in order as
- * `page=1`, `page=2`, ...; anything past the end is an empty page. This is the
- * shape the real API has and the flat stub above cannot express.
+ * Page-aware runs stub carrying GitHub's REAL offset arithmetic.
+ *
+ * `pages` is still written as an array of page arrays because that is how the
+ * call sites read, but it is flattened into one backing history and served by
+ * `offset = (page - 1) * per_page` — measured against this repo's own
+ * docker.yml history, where page 2 at `per_page=50` begins at index 50 of the
+ * `per_page=100` page 1, not index 100.
+ *
+ * The previous version of this stub keyed on `page` ALONE and returned a fixed
+ * array per index, so a `per_page` that changed between requests was invisible
+ * to it. A scan that silently re-fetched runs it already held was then
+ * indistinguishable from one that paged correctly, and both the defective and
+ * the corrected module passed every test in this file.
  */
 function pagedRunsRoute(pages) {
+  const history = pages.flat();
   return (path) => {
-    const page = Number(new URL(`https://x${path}`).searchParams.get('page') ?? '1');
-    return { workflow_runs: pages[page - 1] ?? [] };
+    const params = new URL(`https://x${path}`).searchParams;
+    const page = Number(params.get('page') ?? '1');
+    // GitHub CLAMPS per_page at 100 rather than rejecting it. Mirroring the
+    // clamp matters: without it the stub would honour an impossible page size
+    // and reward a request the real API would quietly narrow.
+    const perPage = Math.min(Number(params.get('per_page') ?? '30'), 100);
+    const offset = (page - 1) * perPage;
+    return { workflow_runs: history.slice(offset, offset + perPage) };
   };
 }
 
@@ -137,8 +159,16 @@ test('findLastSuccessfulDeploy: a long stall does not consume the scan window (P
 
   assert.equal(last.headSha, 'aaaa');
   assert.equal(last.landedAt, '2026-09-21T16:38:56Z');
-  // And it is genuinely past the depth this used to stop at.
-  assert.ok(60 > 20, 'the stall must exceed the retired 20-run window for this to prove anything');
+  // And it is genuinely past the depth this used to stop at. Tie this to the
+  // values it is asserting ABOUT: as two literals (`60 > 20`) it could never
+  // fail whatever the module did, so it read as a guard and was documentation.
+  // Bound on both sides — deep enough to clear the retired 20-run window, and
+  // still inside the shipped limit, so it tracks the constant if that is retuned.
+  assert.ok(
+    skipped.length > RETIRED_DEPLOY_SCAN_LIMIT && skipped.length < DEFAULT_DEPLOY_SCAN_LIMIT,
+    `the stall (${skipped.length}) must exceed the retired ${RETIRED_DEPLOY_SCAN_LIMIT}-run window ` +
+      `and stay inside the shipped ${DEFAULT_DEPLOY_SCAN_LIMIT} for this to prove anything`,
+  );
 });
 
 test('findLastSuccessfulDeploy: pages at per_page=100 rather than asking for an impossible page', async () => {
@@ -183,24 +213,58 @@ test('findLastSuccessfulDeploy: a short page ends the scan, so a healthy lane pa
   assert.equal(client.calls.filter((c) => c.includes('/runs?')).length, 1);
 });
 
-test('findLastSuccessfulDeploy: never requests more runs than the scan limit', async () => {
-  const page = Array.from({ length: 100 }, (_, i) =>
+test('findLastSuccessfulDeploy: a scanLimit off a page boundary still reaches that depth', async () => {
+  // THE REGRESSION GUARD FOR THE OFFSET DEFECT. This asserts the property that
+  // matters — the depth actually REACHED — rather than the sum of requested
+  // per_page values, which the previous version of this test pinned at exactly
+  // `scanLimit`. That sum is only satisfiable by narrowing the final page, and
+  // narrowing it is the defect: GitHub's offset is `(page - 1) * per_page`, so
+  // a smaller final per_page walks the window BACKWARDS onto runs already held.
+  //
+  // 150 is chosen precisely because it is NOT a multiple of 100, which is the
+  // only case that triggers it. Under the old code: page 1 takes runs 1-100,
+  // page 2 asks per_page=50 and re-reads runs 51-100, `runs.length` hits 150,
+  // the loop exits, and runs 101-150 are never read — so the deploy at index
+  // 120 is missed entirely and the alert degrades to its pre-PEN-3744 wording,
+  // which is the exact failure the scan depth exists to prevent.
+  const history = Array.from({ length: 400 }, (_, i) =>
     run(300 + i, `s${i}`, new Date(Date.parse('2026-12-01T00:00:00Z') - i * 3_600_000).toISOString()),
   );
+  const deployIndex = 120;
   const client = stubClient({
-    '/actions/workflows/docker.yml/runs': pagedRunsRoute([page, page, page, page]),
-    '/actions/runs/': jobs(['deploy', 'skipped']),
+    '/actions/workflows/docker.yml/runs': pagedRunsRoute([history]),
+    '/actions/runs/': (path) =>
+      path.includes(`/actions/runs/${300 + deployIndex}/jobs`)
+        ? jobs(['deploy', 'success'])
+        : jobs(['deploy', 'skipped']),
   });
 
-  assert.equal(await findLastSuccessfulDeploy({ client, scanLimit: 150 }), null);
+  const last = await findLastSuccessfulDeploy({ client, scanLimit: 150 });
 
+  assert.equal(
+    last?.headSha,
+    `s${deployIndex}`,
+    'a deploy inside the scan limit must be reached even when the limit is off a page boundary',
+  );
+
+  // No run may be probed twice: a duplicate job probe is the signature of the
+  // window having moved backwards, and it is what the wasted depth is spent on.
+  const probes = client.calls.filter((c) => c.includes('/jobs'));
+  assert.equal(
+    probes.length,
+    new Set(probes).size,
+    'a run re-fetched by a shifted page offset gets probed twice; the scan must not overlap',
+  );
+
+  // Every list request holds per_page constant, which is what keeps the offset
+  // arithmetic sound across pages.
   const requested = client.calls
     .filter((c) => c.includes('/runs?'))
     .map((c) => Number(new URL(`https://x${c.split(' ')[1]}`).searchParams.get('per_page')));
-  assert.equal(
-    requested.reduce((a, b) => a + b, 0),
-    150,
-    'the final page must be narrowed so the scan cannot overshoot its limit',
+  assert.deepEqual(
+    [...new Set(requested)],
+    [100],
+    'per_page must not change between pages, or the offset moves under the scan',
   );
 });
 
