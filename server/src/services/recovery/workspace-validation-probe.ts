@@ -23,8 +23,20 @@
  * rest are handed back to the ordinary stranded cause — bounded wake attempts,
  * then a visible escalation.
  *
+ * That last clause holds ONLY when an invokable owner resolves. When the owner
+ * ladder returns none (service.ts:5535), `wakesOwner` is false (:6073), so
+ * `maxAttempts`/`timeoutAt` are written null (:6184-6185), `wakePolicy` is the
+ * unbounded `board_escalation`/`no_invokable_recovery_owner` shape (:6174), and
+ * `enqueueSourceScopedStrandedRecoveryWake` returns before enqueueing anything
+ * (:6208). The backstop sweep skips it too, and ORDERING is why this change is
+ * inert there: the `!ownerAgentId` test (:13759-13761) runs BEFORE the cause
+ * test (:13763-13768) this change was aimed at, so an ownerless row only moves
+ * from "skipped by cause" to "skipped by no owner" — same zero wakes, same null
+ * budget. This change does not address that residual; BLO-40525 tracks it.
+ *
  * This is deliberately the fix that is correct under BOTH readings of the
- * underlying probe fault, which was measured but NOT explained:
+ * underlying probe fault, which was measured but NOT explained — again, on the
+ * owner-resolved branch:
  *   - transient  -> the next attempt re-probes, gets a verdict, and drains.
  *   - determinis -> the attempts exhaust and the action escalates where someone
  *                   can see it, instead of latching silently forever.
@@ -35,6 +47,16 @@
  * repository was ever found on any of them. Re-probing six of the implicated
  * fallback dirs returned "not_a_checkout" cleanly in 14-53ms against a 5000ms
  * timeout.
+ *
+ * Two downstream effects of the cause change, neither obvious from here:
+ * the action's `kind` moves "workspace_validation" -> "stranded_assigned_issue"
+ * (service.ts:6115, `strandedRecoveryActionKind`), so anything filtering or
+ * alerting on that kind stops seeing this class entirely — the diagnostics
+ * survive on the issue comment; and the `git_worktree_branch_incoherence` arm
+ * of the `nextAction` text became unreachable and was deleted (service.ts:6148),
+ * because `workspace_validation_failed` now requires `gitProbeState: "checkout"`
+ * and the sole producer of that field (heartbeat.ts:4132-4145) always writes
+ * reason `k8s_agent_home_git_bootstrap_unsupported`.
  */
 
 /**
