@@ -21,13 +21,13 @@
  * a wake that arrives after a review is already visible. (BOTH the "minutes"
  * in the previous sentence and this coverage claim are narrowed — see
  * CORRECTION below. The real figure runs to hours — see the five-pair range
- * there.) It does NOT close concurrent dispatch at one head — for #1304's 53 s
- * byte-identical pair the second run must already have been running when the
- * first review landed (a review run does not finish inside 53 s), so its
- * dispatch preceded any attestation and this predicate would have answered
- * `not_attested` truthfully. That window is also missed by the delivery-scoped
- * wake idempotency keys, and closing it needs a lock or a post-time check, not
- * this.
+ * under QUEUE LATENCY below.) It does NOT close concurrent dispatch at one
+ * head — for #1304's 53 s byte-identical pair the second run must already
+ * have been running when the first review landed (a review run does not
+ * finish inside 53 s), so its dispatch preceded any attestation and this
+ * predicate would have answered `not_attested` truthfully. That window is
+ * also missed by the delivery-scoped wake idempotency keys, and closing it
+ * needs a lock or a post-time check, not this.
  *
  * Stated explicitly because the next I1 red on `master` will otherwise read as
  * a regression here rather than as the known residual it is.
@@ -129,13 +129,14 @@
  * these logs for what they can prove before concluding the wake keying is at
  * fault.
  *
- * The CORRECTION above holds review-run duration (~42 min, measured on #2157:
- * 11:48:35Z request → 12:30:34Z review) as the only thing between dispatch and
- * post, and concludes that a gap of hours implies the first review was already
- * visible at the second dispatch. Three same-head pairs were examined for
- * PEN-3754 (#2121 `9190d265` 19.7 h, #2128 `621589ce` 6.6 h, #2157 `f03ade2f`
- * 9.3 h). In every one the second review was preceded by an EXPLICIT re-request
- * at the unchanged head, posted after the first review was already visible:
+ * The coverage claim in the WHAT THIS CLOSES paragraph holds review-run
+ * duration (~42 min, measured on #2157: 11:48:35Z request → 12:30:34Z review)
+ * as the only thing between dispatch and post, and concludes that a gap of
+ * hours implies the first review was already visible at the second dispatch.
+ * Three same-head pairs were examined for PEN-3754 (#2121 `9190d265` 19.7 h,
+ * #2128 `621589ce` 6.6 h, #2157 `f03ade2f` 9.3 h). In every one the second
+ * review was preceded by an EXPLICIT re-request at the unchanged head, posted
+ * after the first review was already visible:
  *
  *   #2121  first 03:01:17Z → `paperclip:review-request` (kkroo, HUMAN)
  *                            17:52:18Z
@@ -154,8 +155,8 @@
  * this guard must not refuse.
  *
  * THE CALLER DISAGREES, IN WRITING, AND THE DISAGREEMENT IS LIVE. That sentence
- * is normative, and the live path takes the opposite position: the suppression
- * at `github-webhook.ts:5602` "suppresses unconditionally across wake reasons"
+ * is normative, and the live path takes the opposite position: the gate at
+ * `github-webhook.ts:5602` "suppresses unconditionally across wake reasons"
  * (`:5564-5572`), deliberately INCLUDING the explicit-request reason, on the
  * stated asymmetry that "a duplicate COMMENTED review can never be retracted
  * ... whereas a re-review someone still wants is one commit away". So the
@@ -164,7 +165,7 @@
  * change behaviour at all.
  *
  * Where they actually conflict is narrow, and it is the description-only case
- * at `:217-224` below: when the finding lives in the PR description, no commit
+ * at `:218-225` below: when the finding lives in the PR description, no commit
  * can carry the fix, so "one commit away" is false by construction and the
  * caller's asymmetry does not hold for that class. For every other class the
  * caller's reasoning stands. Whoever resolves this should change BOTH comments
