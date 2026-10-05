@@ -3837,7 +3837,7 @@ async function hasGitMetadata(cwd: string | null | undefined) {
 async function isGitCheckout(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized })
+  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized, env: strictGitCheckoutProbeEnv() })
     .then((result) => Boolean(readNonEmptyString(result.stdout)))
     .catch(() => false);
 }
@@ -3851,16 +3851,19 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
   }
 }
 
-// BLO-40317: resolve `git` for the strict probe WITHOUT the Paperclip home bin
-// dirs on PATH. `/paperclip/.local/bin/git` is a credential shim that execs the
-// real git through a token wrapper and exits 1 when its token file is
-// unreadable. That stderr is neither ENOENT nor "not a git repository", so the
-// probe below returned `indeterminate` and dispatch was refused for every
-// workspace-less row in the fleet (134 of 146 blocked rows on 2026-10-05) — on
-// an unrelated credential fault, for a `rev-parse` that reads only the local
-// filesystem and needs no credentials at all. Filtering the home prefix rather
-// than hardcoding /usr/bin keeps the probe working on dev machines and in CI,
-// and excludes any future agent-home shim for free.
+// BLO-40317: resolve `git` for local-only reads (the strict probe below,
+// isGitCheckout() and hasGitPushRemote(), none of which contacts a remote)
+// WITHOUT the Paperclip home bin dirs on PATH. `/paperclip/.local/bin/git` is a
+// credential shim that execs the real git through a token wrapper and exits 1
+// when its token file is unreadable. That stderr is neither ENOENT nor "not a
+// git repository", so the probe below returned `indeterminate` and dispatch was
+// refused for every workspace-less row in the fleet (134 of 146 blocked rows on
+// 2026-10-05) — on an unrelated credential fault, for a `rev-parse` that reads
+// only the local filesystem and needs no credentials at all. The other two
+// readers fail the same way under the shim, as a false
+// git_worktree_base_not_git_checkout and a false missing_git_push_remote. Filtering the home prefix rather than
+// hardcoding /usr/bin keeps these working on dev machines and in CI, and
+// excludes any future agent-home shim for free.
 function strictGitCheckoutProbeEnv(): NodeJS.ProcessEnv {
   const home = path.resolve(resolvePaperclipHomeDir());
   const entries = (process.env.PATH ?? "").split(path.delimiter).filter((entry) => {
@@ -3913,7 +3916,8 @@ function sameResolvedPath(left: string | null | undefined, right: string | null 
 async function hasGitPushRemote(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  const remoteNames = await execFile("git", ["remote"], { cwd: normalized })
+  const env = strictGitCheckoutProbeEnv();
+  const remoteNames = await execFile("git", ["remote"], { cwd: normalized, env })
     .then((result) =>
       result.stdout
         .split(/\r?\n/)
@@ -3923,7 +3927,7 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
     .catch(() => []);
 
   for (const remoteName of remoteNames) {
-    const pushUrl = await execFile("git", ["remote", "get-url", "--push", remoteName], { cwd: normalized })
+    const pushUrl = await execFile("git", ["remote", "get-url", "--push", remoteName], { cwd: normalized, env })
       .then((result) => readNonEmptyString(result.stdout))
       .catch(() => null);
     if (pushUrl) return true;

@@ -11,6 +11,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  assertGitWorktreeBaseWorkspaceReady,
+  assertPushCapabilityCheckoutValid,
   isRetryableInteractionContinuationInfrastructureFailure,
   probeGitCheckoutStateStrict,
 } from "../services/heartbeat.js";
@@ -73,6 +75,38 @@ describe("probeGitCheckoutStateStrict PATH resolution", () => {
     } finally {
       await fs.chmod(unreadable, 0o700);
     }
+  });
+
+  it("accepts a real checkout as a git_worktree base under the same shimmed PATH", async () => {
+    await execFile("/usr/bin/git", ["init", "--quiet", probeCwd]);
+    await expect(assertGitWorktreeBaseWorkspaceReady({
+      requestedExecutionWorkspaceMode: "isolated_workspace",
+      config: { workspaceStrategy: { type: "git_worktree" } },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1",
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+      },
+      base: {
+        baseCwd: probeCwd,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: null,
+      },
+    })).resolves.toBeUndefined();
+  });
+
+  it("finds a configured push remote under the same shimmed PATH", async () => {
+    await execFile("/usr/bin/git", ["init", "--quiet", probeCwd]);
+    await execFile("/usr/bin/git", ["-C", probeCwd, "remote", "add", "origin", "https://example.invalid/repo.git"]);
+    await expect(assertPushCapabilityCheckoutValid({
+      enabled: true,
+      issue: { id: "issue-1", identifier: "PAP-1" },
+      cwd: probeCwd,
+    })).resolves.toBeUndefined();
   });
 });
 
