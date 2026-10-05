@@ -280,7 +280,7 @@ describe("agent inbox-lite liveness-column projection", () => {
     mockRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
   });
 
-  it("emits every wake-path key on every row, present-and-null rather than absent", async () => {
+  it("emits every liveness-column key on every row, present-and-null rather than absent", async () => {
     const items = await loadInbox({ nowMs: NOW.getTime() });
 
     expect(items).toHaveLength(sourceRows.length);
@@ -299,6 +299,8 @@ describe("agent inbox-lite liveness-column projection", () => {
     expect(idle.scheduledRetryAttempt).toBeNull();
     expect(idle.parkedUntil).toBeNull();
     expect(idle.parkedReason).toBeNull();
+    expect(idle.parkedByAgentId).toBeNull();
+    expect(idle.parkedAt).toBeNull();
   });
 
   // BLO-39015: measured on two lanes — `inbox-lite` neither honoured nor exposed the
