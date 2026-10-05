@@ -255,9 +255,14 @@ PEN-3713: the root-owned image directory leads, so the wrappers that execute are
 the ones uid 1000 cannot rewrite.
 
 Override with `env.path`. The override is validated rather than trusted: it must
-keep every wrapper directory ahead of /usr/bin or the render fails, because the
-failure mode being prevented is an agent that looks healthy while publishing
-unscrubbed.
+keep every wrapper directory ahead of /usr/bin, and must keep them in the order
+this chart declares them, or the render fails. Both halves matter, and the
+second is not implied by the first: an override that lists the agent-writable
+PVC directories ahead of the root-owned image directory satisfies every
+per-directory check — each one is present, each one precedes /usr/bin — while
+resolving `gh` to exactly the copy uid 1000 can rewrite. The failure mode being
+prevented is an agent that looks healthy while publishing unscrubbed, so a
+reordering that reinstates it must fail as loudly as an omission.
 */}}
 {{- define "paperclip.runtimePath" -}}
 {{- $wrapperDirs := splitList "," (include "paperclip.wrapperBinDirs" .) -}}
@@ -274,6 +279,15 @@ unscrubbed.
 {{- $systemIdx = $i -}}
 {{- end -}}
 {{- end -}}
+{{- /* `paperclip.wrapperBinDirs` is an ordered list, not a set: it names the
+       root-owned image directory first and the agent-writable PVC directories
+       behind it, and that order IS the PEN-3713 fix. So the override is checked
+       for relative order as well as presence — `$prevIdx` carries the previous
+       declared directory's position and each one must land after it. Without
+       this the two checks below pass per-directory on a PATH that resolves `gh`
+       to the PVC copy. */ -}}
+{{- $prevIdx := -1 -}}
+{{- $prevDir := "" -}}
 {{- range $dir := $wrapperDirs -}}
 {{- $idx := -1 -}}
 {{- range $i, $entry := $entries -}}
@@ -287,6 +301,11 @@ unscrubbed.
 {{- if and (ge $systemIdx 0) (gt $idx $systemIdx) -}}
 {{- fail (printf "env.path must place the Paperclip GitHub egress wrapper directory %q before /usr/bin, or agent `gh` resolves to the unscrubbed image CLI (PEN-2527)" $dir) -}}
 {{- end -}}
+{{- if and (ge $prevIdx 0) (lt $idx $prevIdx) -}}
+{{- fail (printf "env.path must keep the Paperclip GitHub egress wrapper directories in the order this chart declares them: %q must precede %q. Both are ahead of /usr/bin, so every per-directory check passes, but `gh` resolves to the first match — and %q is the agent-writable PVC copy that uid 1000 can rewrite, which is the defect PEN-3713 fixed." $prevDir $dir $dir) -}}
+{{- end -}}
+{{- $prevIdx = $idx -}}
+{{- $prevDir = $dir -}}
 {{- end -}}
 {{- $path -}}
 {{- end }}
