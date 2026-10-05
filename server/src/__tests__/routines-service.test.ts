@@ -3524,6 +3524,77 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       expect(run.failureReason).toContain("queue unavailable");
       expect(await schedulerReceipts(alertIssueId)).toHaveLength(1);
     });
+
+    // Ally review: every test above throws a plain JS error from `wakeup`, which
+    // never aborts the transaction, so they only reach the post-commit call
+    // site. This one aborts the transaction for real -- the same
+    // `pg_terminate_backend` technique as the BLO-28952 test below -- so only
+    // `reconcileRolledBackDispatch` can emit the receipt. The issue INSERT runs
+    // on the service's own pool, so a trigger on it is the only hook between
+    // the run INSERT and `issueSvc.create`; it raises so the abort lands before
+    // an execution issue exists.
+    it("emits the receipt from the rollback path, and none once the execution issue exists", async () => {
+      const terminateDispatchSession = sql`
+        select pg_terminate_backend(pid)
+        from pg_stat_activity
+        where datname = current_database()
+          and pid <> pg_backend_pid()
+          and state = 'idle in transaction'
+      `;
+
+      const beforeIssue = await seedWithAlertSurface();
+      await db.execute(sql.raw(`
+        create function abort_dispatch_before_issue() returns trigger language plpgsql as $$
+        begin
+          perform pg_terminate_backend(pid)
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and state = 'idle in transaction';
+          raise exception 'injected issue insert failure';
+        end
+        $$
+      `));
+      await db.execute(sql.raw(`
+        create trigger abort_dispatch_before_issue
+        before insert on issues
+        for each row
+        when (new.origin_id = '${beforeIssue.routine.id}')
+        execute function abort_dispatch_before_issue()
+      `));
+      try {
+        await expect(beforeIssue.svc.runRoutine(beforeIssue.routine.id, { source: "manual" })).rejects.toThrow();
+      } finally {
+        await db.execute(sql.raw("drop trigger if exists abort_dispatch_before_issue on issues"));
+        await db.execute(sql.raw("drop function if exists abort_dispatch_before_issue()"));
+      }
+
+      // Re-persisted by the rollback path: the in-transaction catch rolled back.
+      const [rolledBackRun] = await db.select().from(routineRuns)
+        .where(eq(routineRuns.routineId, beforeIssue.routine.id));
+      expect(rolledBackRun).toMatchObject({ status: "failed", linkedIssueId: null });
+      const receipts = await schedulerReceipts(beforeIssue.alertIssueId);
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.idempotencyKey).toBe(
+        `scheduler-heartbeat:${beforeIssue.routine.id}:${rolledBackRun!.triggeredAt.toISOString()}`,
+      );
+
+      // An abort that reached `issueSvc.create` leaves a durable orphan issue,
+      // which the issue-keyed heartbeat owns; a dispatch-failure receipt here
+      // would double-report it.
+      const afterIssue = await seedWithAlertSurface({
+        wakeup: async () => {
+          await db.execute(terminateDispatchSession);
+          return null;
+        },
+      });
+      await expect(afterIssue.svc.runRoutine(afterIssue.routine.id, { source: "manual" })).rejects.toThrow();
+      const [orphanedRun] = await db.select().from(routineRuns)
+        .where(eq(routineRuns.routineId, afterIssue.routine.id));
+      expect(orphanedRun?.status).toBe("failed");
+      expect(orphanedRun?.linkedIssueId).toBeTruthy();
+      expect(await schedulerReceipts(afterIssue.alertIssueId)).toHaveLength(0);
+    });
   });
 
   it("accepts standard second-precision webhook timestamps for HMAC triggers", async () => {
