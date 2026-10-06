@@ -27,6 +27,7 @@ import {
   PORTABLE_JSON_BODY_LIMIT,
 } from "./body-limits.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
+import { rejectRawNulInBody } from "./raw-nul-guard.js";
 
 /** Stash the exact request bytes so downstream code can verify provider HMACs. */
 function captureRawBody(
@@ -49,7 +50,13 @@ function shouldCaptureRawBody(req: IncomingMessage): boolean {
  *   2. global JSON
  *   3. global urlencoded (form bodies → req.body, e.g. Slack interactivity)
  *   4. raw catch-all (captures rawBody for any other non-multipart content-type)
+ *   5. raw-NUL guard (400 instead of 500 when a parsed string holds 0x00)
  * Every parser captures req.rawBody via the same verify hook.
+ *
+ * The NUL guard is mounted HERE, not per route, because the set of text columns
+ * an agent write can reach is open-ended -- see http/raw-nul-guard.ts. It runs
+ * last so it sees whatever req.body the parsers above produced, and it is a
+ * no-op for the raw catch-all's Buffer body.
  */
 export function registerBodyParsers(app: express.Express): void {
   app.use(
@@ -71,4 +78,5 @@ export function registerBodyParsers(app: express.Express): void {
       verify: captureRawBody,
     }),
   );
+  app.use(rejectRawNulInBody());
 }
