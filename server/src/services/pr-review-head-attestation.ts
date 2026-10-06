@@ -19,7 +19,7 @@
  * *dispatch* time, but the duplicate is created minutes later at *post* time,
  * so it can only close gaps wider than a review run. It closes the wide ones:
  * a wake that arrives after a review is already visible. (BOTH the "minutes"
- * in the previous sentence and this coverage claim are narrowed — see
+ * earlier in this paragraph and this coverage claim are narrowed — see
  * CORRECTION below. The real figure runs to hours — see the five-pair range
  * under QUEUE LATENCY below.) It does NOT close concurrent dispatch at one
  * head — for #1304's 53 s byte-identical pair the second run must already
@@ -125,9 +125,16 @@
  * debug log on the `not_attested` arm; it does not exist today. The fifth,
  * though, is already separable without one, and from the caller rather than
  * here: the `:5288`/`:5301` warnings fire on exactly that arm, so a delivery
- * carrying one of them took it and a delivery carrying neither did not. Read
- * these logs for what they can prove before concluding the wake keying is at
- * fault.
+ * carrying one of them took it. The converse holds only one way: a delivery
+ * carrying neither did not take that arm PROVIDED the lookup was entered at
+ * all, and its conjuncts at `:5262-5268` also require a numeric
+ * `context.prNumber` — which `:1768` derives as `(issue.number as number |
+ * undefined) ?? null`. A null there skips the block, logs neither warning, and
+ * still reaches `:5602` with no head. GitHub always sends `issue.number` on an
+ * `issue_comment` payload, so that is a theoretical residual rather than a
+ * live one; it is recorded because this docblock's subject is exactly the line
+ * between what is established and what is open. Read these logs for what they
+ * can prove before concluding the wake keying is at fault.
  *
  * The coverage claim in the WHAT THIS CLOSES paragraph holds review-run
  * duration (~42 min, measured on #2157: 11:48:35Z request → 12:30:34Z review)
@@ -165,7 +172,7 @@
  * change behaviour at all.
  *
  * Where they actually conflict is narrow, and it is the description-only case
- * at `:218-225` below: when the finding lives in the PR description, no commit
+ * at `:225-232` below: when the finding lives in the PR description, no commit
  * can carry the fix, so "one commit away" is false by construction and the
  * caller's asymmetry does not hold for that class. For every other class the
  * caller's reasoning stands. Whoever resolves this should change BOTH comments
