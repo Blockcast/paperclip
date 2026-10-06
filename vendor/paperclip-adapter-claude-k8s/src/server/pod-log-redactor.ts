@@ -259,6 +259,12 @@ export const POD_LOG_FILTER_ARG_VAR = "PAPERCLIP_POD_LOG_FILTER_ARG";
  * The fallback to `cat` is the fail-open: if the install lost a race, the
  * volume is unwritable, or node is missing, the pipeline degrades to today's
  * behaviour instead of `set -o pipefail` failing every run in the fleet.
+ *
+ * That degradation is announced on stderr. Silently, "redacted" and "degraded
+ * to `cat`" are indistinguishable after the fact — on the one control whose
+ * whole purpose is that it held — so a pod log could be read as scrubbed when
+ * nothing scrubbed it. The `||` also makes the statement exit 0 rather than
+ * leaving a non-zero status mid-fragment.
  */
 export function buildPodLogRedactorSetupShell(): string {
   const b64 = Buffer.from(POD_LOG_REDACTOR_SCRIPT, "utf8").toString("base64");
@@ -268,7 +274,7 @@ export function buildPodLogRedactorSetupShell(): string {
     `[ -f "${target}" ] || { printf %s '${b64}' | base64 -d > "${tmp}" && mv -f "${tmp}" "${target}"; }`,
     `${POD_LOG_FILTER_VAR}=cat`,
     `${POD_LOG_FILTER_ARG_VAR}=`,
-    `command -v node >/dev/null 2>&1 && [ -f "${target}" ] && { ${POD_LOG_FILTER_VAR}=node; ${POD_LOG_FILTER_ARG_VAR}="${target}"; }`,
+    `command -v node >/dev/null 2>&1 && [ -f "${target}" ] && { ${POD_LOG_FILTER_VAR}=node; ${POD_LOG_FILTER_ARG_VAR}="${target}"; } || echo '[paperclip-pod-log-redactor] not installed; pod log is UNREDACTED' >&2`,
     `export ${POD_LOG_FILTER_VAR} ${POD_LOG_FILTER_ARG_VAR}`,
   ].join("; ");
 }

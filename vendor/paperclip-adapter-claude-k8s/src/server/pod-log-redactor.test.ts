@@ -13,7 +13,8 @@
 // store whose safety was in question.
 
 import { describe, expect, it, beforeAll } from "vitest";
-import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable, type Transform } from "node:stream";
@@ -325,6 +326,78 @@ describe("pod-log-redactor: shell wiring", () => {
     // The old single-variable form is the regression this pins.
     expect(shell).not.toContain(`${POD_LOG_FILTER_VAR}="node `);
     expect(shell).toContain(`export ${POD_LOG_FILTER_VAR} ${POD_LOG_FILTER_ARG_VAR}`);
+  });
+
+  // Every other test in this describe is a STRING match on the fragment, which
+  // cannot settle a precedence question: `A && B && { ... } || C` fires C when
+  // EITHER probe fails, and would also fire it spuriously if the braced group
+  // ever returned non-zero (leaving a "not installed" warning next to a filter
+  // that IS installed). Run the real fragment in a real shell instead.
+  //
+  // The container command is `sh -c` (job-manifest.ts), so /bin/sh is the
+  // binding target; bash is included only to catch a bashism creeping in.
+  describe("the fragment actually behaves, under a real shell", () => {
+    /** Runs the real setup fragment, then reports what it set. `$GUARD_DIR` is
+     *  a tmpdir; pre-creating the target short-circuits the `[ -f ] ||` install
+     *  so the only commands needed are shell builtins — which is what lets the
+     *  node-missing case use an empty PATH without also breaking `base64`. */
+    function runFragment(opts: { node: boolean; script: boolean }) {
+      const root = mkdtempSync(path.join(tmpdir(), "pod-log-redactor-shell-"));
+      const guardDir = path.join(root, "guard");
+      mkdirSync(guardDir);
+      if (opts.script) {
+        writeFileSync(path.join(guardDir, POD_LOG_REDACTOR_FILENAME), "// placeholder\n");
+      }
+      let binPath = "/nonexistent";
+      if (opts.node) {
+        const bin = path.join(root, "bin");
+        mkdirSync(bin);
+        writeFileSync(path.join(bin, "node"), "#!/bin/sh\n");
+        chmodSync(path.join(bin, "node"), 0o755);
+        binPath = bin;
+      }
+      const stderrPath = path.join(root, "stderr");
+      // Redirect inside `-c` rather than via stdio: `$?` after the braced group
+      // is still the fragment's own status, which is the thing under test.
+      const stdout = execFileSync(
+        "/bin/sh",
+        [
+          "-c",
+          `{ ${buildPodLogRedactorSetupShell()}; } 2>"${stderrPath}"; ` +
+            `echo "rc=$? filter=$${POD_LOG_FILTER_VAR} arg=$${POD_LOG_FILTER_ARG_VAR}"`,
+        ],
+        { env: { PATH: binPath, GUARD_DIR: guardDir }, encoding: "utf8" },
+      );
+      return {
+        stdout: stdout.trim(),
+        stderr: readFileSync(stderrPath, "utf8"),
+        guardDir,
+      };
+    }
+
+    it("sets node + the script path when both are available, and warns nothing", () => {
+      const { stdout, stderr, guardDir } = runFragment({ node: true, script: true });
+      expect(stdout).toBe(
+        `rc=0 filter=node arg=${path.join(guardDir, POD_LOG_REDACTOR_FILENAME)}`,
+      );
+      expect(stderr).toBe("");
+    });
+
+    // The whole point of announcing the degradation: silently, "redacted" and
+    // "fell open to cat" are indistinguishable after the fact.
+    it("falls open to cat and SAYS SO when node is missing", () => {
+      const { stdout, stderr } = runFragment({ node: false, script: true });
+      expect(stdout).toContain("filter=cat");
+      expect(stdout).toContain("rc=0"); // must not poison `set -o pipefail`
+      expect(stderr).toContain("pod log is UNREDACTED");
+    });
+
+    it("falls open to cat and SAYS SO when the script is missing", () => {
+      const { stdout, stderr } = runFragment({ node: true, script: false });
+      expect(stdout).toContain("filter=cat");
+      expect(stdout).toContain("rc=0");
+      expect(stderr).toContain("pod log is UNREDACTED");
+    });
   });
 
   it("content-addresses the filename so a rule change lands as a new file", () => {
