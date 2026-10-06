@@ -2765,6 +2765,25 @@ export async function handleResolved(
               ctx.logger.error(
                 `paperclip-plugin-alertmanager: failed to stamp close authorship for ${alert.fingerprint}: ${String(stampErr)}`,
               );
+              // Swallowing is right, but a stamp that fails *systematically*
+              // degrades straight back to the muting this fix removes — and
+              // does it invisibly, on the path that feeds alerting. The log
+              // line above attributes a single failure; only a counter makes
+              // the systematic case detectable. Its own `try` for the reason
+              // every other metric write in this handler has one: a telemetry
+              // outage must not convert a swallowed stamp failure into a
+              // failed delivery, which is the retry loop the swallow exists
+              // to avoid.
+              try {
+                await ctx.metrics.write("alertmanager.resolved.stamp_failed", 1, {
+                  alertname,
+                  severity: existing.severity,
+                });
+              } catch (metricErr) {
+                ctx.logger.error(
+                  `paperclip-plugin-alertmanager: failed to record stamp_failed metric for ${alert.fingerprint}: ${String(metricErr)}`,
+                );
+              }
             }
           } catch (err) {
             if (!isExecutionLockPreconditionFailure(err)) throw err;
