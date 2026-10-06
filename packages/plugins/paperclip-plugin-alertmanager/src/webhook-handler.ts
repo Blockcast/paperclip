@@ -2732,6 +2732,45 @@ export async function handleResolved(
               existing.paperclipCompanyId,
             );
             pluginCancelLanded = true;
+            // BLO-40673: stamp authorship HERE, not only at the commit point
+            // below. Everything between this line and that commit can throw —
+            // `recordSourceResolvedAndCloseCovers` is deliberately placed ahead
+            // of it, so a cover-cascade failure aborts the delivery *after* this
+            // cancel has already landed. Alertmanager then retries, the retry
+            // finds the row already `cancelled`, the guard above skips the
+            // update, `pluginCancelLanded` stays false, and the commit-point
+            // spread leaves `pluginClosedAt` at the `null` the last firing write
+            // planted — while writing `resolvedAt`. Our own close is now
+            // indistinguishable from an operator's, and `closedByPlugin` reads it
+            // as one: the next re-fire is muted for the whole 24h BLO-24234
+            // window instead of re-opening the row.
+            //
+            // Measured 2026-10-06 (BLO-40673): nine fingerprints, two of them
+            // `critical`/`page`, sat active 10h+ with no open row. Worker log:
+            // "Alert <name> (<fp>) still suppressed by operator close of issue
+            // <id>", against closes `issue.updated` attributes to
+            // `actorType: plugin`. The two states are identical in the record by
+            // the time anyone looks, so this must be recorded when it happens
+            // rather than reconstructed later.
+            //
+            // Narrow by construction: it fires only where the plugin's own
+            // `status: "cancelled"` patch returned success, so an operator close
+            // never reaches it and BLO-24234's suppression is unchanged. A
+            // failure here is swallowed — the commit-point write below is still
+            // the authoritative one, and letting a best-effort stamp fail the
+            // delivery would trade a mute for a retry loop.
+            try {
+              await ctx.state.set(stateRef, {
+                ...existing,
+                aggregateKey,
+                paperclipIssueId: aggregateResolution.issueId,
+                pluginClosedAt: resolvedAt,
+              });
+            } catch (stampErr) {
+              ctx.logger.error(
+                `paperclip-plugin-alertmanager: failed to stamp close authorship for ${alert.fingerprint}: ${String(stampErr)}`,
+              );
+            }
           } catch (err) {
             if (!isExecutionLockPreconditionFailure(err)) throw err;
             // The diagnostic read before update is racy. Re-read after the
