@@ -499,16 +499,30 @@ async function probeOne(
     // reader could disprove in thirty seconds.
     //
     // Measured, not reasoned — re-runnable mutation ladder over
-    // `evidence-truth.test.ts` + `evidence-gate.test.ts` (48 cases):
+    // `evidence-truth.test.ts` + `evidence-gate.test.ts` (50 cases):
     //
-    //   drop `&& !commentBlocking` here  -> 2 red, BOTH call-count only
-    //                                       ("suppresses the Surface 2 author
-    //                                       read entirely" / "author-blind
-    //                                       CARRIED finding"). No verdict moves.
-    //   drop `!commentBlocking` below    -> 48/48 GREEN. No failing mutation.
+    //   drop `&& !commentBlocking` here  -> 2 red, both REPORTED as a call
+    //                                       count ("suppresses the Surface 2
+    //                                       author read entirely" /
+    //                                       "author-blind CARRIED finding").
+    //                                       The `probeFailed`/diagnostic
+    //                                       assertions in those same two cases
+    //                                       also flip, but they sit after the
+    //                                       `authorCalls` one and `expect`
+    //                                       throws on first failure, so the
+    //                                       COST regression is MEASURED AND
+    //                                       NOT PRINTED (Ally review of #2143;
+    //                                       confirmed by neutralizing the
+    //                                       `authorCalls` asserts, which turns
+    //                                       both reds into `probeFailed`
+    //                                       true-vs-false). Read "2 red, call
+    //                                       counts" as the runner's output,
+    //                                       NOT as the full cost. No verdict
+    //                                       moves.
+    //   drop `!commentBlocking` below    -> 50/50 GREEN. No failing mutation.
     //   drop BOTH                        -> the same 2, PLUS "a blocking
     //                                       verdict on either surface beats a
-    //                                       clean one on the other" (:761)
+    //                                       clean one on the other"
     //                                       going red on a detected
     //                                       `review:ally-clean`. That third
     //                                       failure is the false clean.
