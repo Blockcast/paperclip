@@ -69,15 +69,36 @@ one of these:
    The empty-window guard is not decoration: without it an empty result set
    divides by zero and prints `cannot divide: null and number (0)`, which
    reads as a broken command rather than as "your window selected nothing".
+   ⚠ **A transient empty has been observed on an otherwise-correct
+   invocation** — three different people hit it, and on the last occasion the
+   next four runs returned `n=114` identically. Re-run before concluding your
+   `$SINCE` is wrong.
    `--limit 200` is a cap, not a window — if `n` comes back at or near it,
-   the window is wider than the page and the median is over a prefix.
+   the window is wider than the page and the median is over a prefix. ⚠ **The
+   same applies to every `$SINCE`-anchored query in this file**: they are
+   anchored to a fixed date and so grow monotonically, and at ~15-20
+   builds/day each reaches its cap within weeks and then silently reports a
+   prefix. **Check `n` against the expectation below before believing a
+   median** — a short page returns a plausible, wrong number rather than an
+   error. While writing this file one invocation of this block returned
+   `n=48` where the correct count was `148`; the number looked entirely
+   reasonable and was only caught by a second read.
 
    `--workflow pr.yml` is load-bearing: two other workflows (`Comment-review
    gate`, `commitperclip PR Review`) also run on `merge_group` and finish in
    ~2 min, so an unfiltered query reports a median less than half the real
-   one. Clock from `startedAt`, not `createdAt` — the gap between them is
-   runner wait, which is tracked separately by the stall counter below and is
-   not build duration. Re-run 2026-10-06, n=96: median 68.5, mean 69.4.
+   one. Clock from `startedAt`, not `createdAt`: the two are *equal* on a
+   first-attempt run, and on a re-run `startedAt` is the latest attempt's
+   start, so it times that attempt instead of the dead time back to the
+   original dispatch. Re-run 2026-10-06 with `$SINCE` at the exact 2-lane
+   change: **n=114, median 69.0, mean 69.8** — 1.6% above the 67.9 quoted
+   above, which does not move any figure derived from it.
+   ⚠ Set `$SINCE` to the *timestamp*, not the date: `>= "2026-10-03"` sweeps
+   in ~20 one-lane builds from earlier that day and returns n=134, mixing the
+   two lane counts the window exists to separate.
+   **Expectation for the `n` check above:** ~15-20 successful builds/day, so
+   `n ≈ 114 + 17 × (days since 2026-10-06)`. An `n` well under that is a short
+   page, not a quiet queue.
 2. **A commit date on `master` is NOT a merge time.** `merge_method: REBASE`
    stamps the commit at *enqueue*, so a commit date lags wall-clock by exactly
    the queue residency. Reading `commits/master` as "last merge" manufactures a
@@ -101,8 +122,8 @@ timestamps at the entry's `headCommit.oid` are what remain. Pass the **full
 40-hex SHA** (`actions/runs?head_sha=` silently returns zero rows for an
 abbreviated SHA, which reads as "no runs ever" for the wrong reason).
 **Which** of the run's timestamps to clock from is not uniform — step 3's
-table decides it per arm, and `run_started_at` is the right one whenever the
-run has started.
+table decides it per arm, and `run_started_at` is the right one whenever a
+run exists at all, `queued` or `in_progress` alike.
 
 **Before escalating, run the control:** if PRs merged by `merged_at` inside
 your claimed stall window, there was no stall. That single query refuted all
@@ -394,7 +415,10 @@ replacement for it:
    and confirm the returned `headSha` matches `headCommit.oid` before acting
    on it. `startedAt` is in that list so step 3's table is decidable from this
    one call — it is `gh`'s camelCase spelling of the REST field
-   `run_started_at`, same value, and it is null on a run that never started.
+   `run_started_at`, same value. ⚠ It is **not** null on a run that has not
+   started: it is the start of the run's *latest attempt*, and until a re-run
+   happens it is a copy of `created_at` — populated, equal, and present even
+   while the run is `queued`. See step 3's table note.
    Record the PR node ID and the run's `databaseId`. If the run is
    `in_progress` and its per-job timestamps are still advancing, keep
    monitoring — this is a slow but live run, not a stall.
@@ -406,26 +430,30 @@ replacement for it:
 3. **150 minutes of elapsed time, clocked per the arm below** — never
    wall-clock time since the last merge, which is not a property of this
    entry at all (a freshly promoted position-1 entry has not been stalled
-   just because its predecessor was). Which field you clock from depends on
-   what step 2 found, because at 2 lanes `createdAt` no longer means one
-   thing (see "Why 150 minutes" below — clocking a *started* run from
-   `createdAt` fails toward dequeuing a **healthy** entry):
+   just because its predecessor was).
 
    | step 2 found | clock from | trigger at |
    |---|---|---|
-   | run `in_progress`, no job progressed since the step-2 check | **`run_started_at`** (`gh`: `startedAt`) | 150 min |
-   | run `queued`, never started (`run_started_at` is null) | `createdAt` | 150 min — ⚠ margin is thin, see below |
+   | a run at that `oid` — **any** `status`, `queued` or `in_progress` | **`run_started_at`** (`gh`: `startedAt`) | 150 min |
    | no run at all at that `oid` (dispatch gap) | the step-2 check time recorded above | 150 min |
 
    ```
-   gh api repos/Blockcast/paperclip/actions/runs/<id> --jq '{created_at,run_started_at,status}'
+   gh api repos/Blockcast/paperclip/actions/runs/<id> --jq '{created_at,run_started_at,run_attempt,status}'
    ```
 
-   ⚠ The `queued` arm is the weak one: the longest *legitimate* runner wait
-   measured is **113.2 min**, so 150 min is only 1.3× it, not a comfortable
-   margin. Prefer raising `arc-merge-queue`'s warm pool over loosening this
-   (see the cold-start burst section); if you do trip it during a known
-   cold-start burst, treat it as runner supply, not a wedged build.
+   **One clock covers both run states, and `run_attempt` is why.**
+   `run_started_at` is the start of the run's *latest attempt*. On a
+   first-attempt run it is a byte-identical copy of `created_at`, so the two
+   candidate clocks agree and the choice does not matter; it diverges only
+   after a re-run, and there it is the one you want, because it excludes the
+   dead time between a cancelled attempt and its replacement. Measured over
+   1000 `merge_group` `pr.yml` runs (2026-08-20 → 2026-10-06), the two fields
+   differ on exactly 7 runs and **all 7 are `run_attempt > 1`**; no
+   first-attempt run differs, and no re-run fails to. So do not special-case
+   `queued`: `status` tells you what the run is doing, `run_attempt` tells you
+   whether the clocks differ, and `run_started_at` is right either way.
+   (If `run_started_at` is ever null, fall back to `createdAt` — on a
+   first attempt they are equal.)
 
    With the elapsed time met on the applicable arm,
    this is a stall. Re-run the step-2 resolution and require the PR node ID
@@ -491,24 +519,32 @@ attached; that is **superseded** and was optimistic by ~1.5×, because it
 timed consecutive *successful* builds and so silently excluded the failures,
 cancellations and idle gaps that net drain has to carry.
 
-☠️ **A flat 150 min / `createdAt` pairing is NOT SAFE at 2 lanes — it fails
-toward dequeuing a HEALTHY entry.** This is the defect step 3's per-arm table
-exists to avoid; it is recorded here because the sizing argument is what
-justifies the table. The threshold was sized as 2.5× a ~35 min end-to-end run
-started on a free runner. Measured 2026-10-05, neither half of that premise
-holds: builds now take a **median 67.9 min** (150 min = 2.2×), and runner
-supply is no longer instant — two runs waited **113.2 min** between
-`createdAt` and `run_started_at` (see the 2-lane cold-start burst below). A
-healthy build can therefore legitimately be `113 + 68 = 181 min` old by
-`createdAt` while nothing whatsoever is wrong, which is **past** the dequeue
-trigger.
+**Sizing.** The threshold was set as 2.5× a ~35 min end-to-end run started on
+a free runner. Half of that premise is gone: builds now take a **median
+69.0 min** (n=114, 2026-10-06, over the 2-lane window), so 150 min is
+**2.2×** a healthy build, not 2.5×. That is still a margin, but a thinner one
+than the number was chosen to give, and it shrinks further if build duration
+keeps climbing — re-derive it from instrument 1 rather than trusting the
+constant.
 
-**This is why step 3 clocks a started run from `run_started_at`, not
-`createdAt`.** `createdAt` measures "waiting for a runner" and "wedged
-mid-build" as the same number, and only the second is a stall. `createdAt`
-survives only on the arms where there is no started run to clock from — the
-`queued` and dispatch-gap rows of step 3's table. Step 3 is the procedure;
-this section is only its justification, so if the two ever disagree again,
+**Why step 3 clocks from `run_started_at` and not `createdAt`: re-runs.** On a
+first-attempt run the two are identical, so this changes nothing on the
+ordinary path. It matters when a build is cancelled and re-run — the merge
+queue re-forms lanes on every invalidation, and a re-run's `created_at` still
+points at the *original* dispatch. Clocking from it charges the new attempt
+with all the dead time since, which on the one measured instance was **113.2
+min** of already-elapsed clock before the attempt had run for a second. That
+fails toward dequeuing a **healthy** entry. `run_started_at` tracks the
+attempt that is actually running, so it cannot.
+
+⚠ **A previous revision of this file justified the same rule with "runner
+supply is no longer instant — two runs waited 113.2 min for a runner", and
+that was wrong.** Those two runs are `run_attempt: 3`; their first attempt
+started with *zero* wait (`run_started_at == created_at == 19:07:44Z`) and the
+113.2 min is the span to a manual re-run at 21:00:53Z. The field never
+measures runner wait (see the stall counter below). The prescription survived
+the correction, the reason did not — which is exactly why this section is only
+a justification. Step 3 is the procedure: if the two ever disagree again,
 **step 3 wins and this section is the stale one**.
 
 ```
@@ -567,60 +603,79 @@ row rather than re-deriving the count.
 single eviction re-forms every lane at once, so an N-lane repo turns one
 supply event into N stalled runs; counting runs would make the same incident
 flip the decision faster purely because the lane count went up, which is not
-what the threshold is about. The 2026-10-05 row below is two runs
-(`pr-2228` + `pr-2224`) and counts as **one**.
+what the threshold is about. (The retracted 2026-10-05 row below was two runs
+and would have counted as **one** — the unit rule was right even though the
+row itself did not qualify.)
 
 **A row qualifies when** the `merge_group` run was dispatched and sat unable
-to start for want of a runner — a `createdAt` → `run_started_at` gap of
-**≥ 10 min** — not merely slow once running. The exact floor is not
-load-bearing, because the measured distribution has nothing in the band it
-cuts: over 107 post-change `pr.yml` builds the gap is **exactly 0.0 on 105 of
-them**, and the only two non-zero values are the 113.2 min pair in the row
-below. Any floor between 1 and 110 min selects the same set. Re-measure
-before trusting that — if intermediate values ever appear, the floor becomes
-a real judgement call and wants re-deriving from the new distribution:
+to start for want of a runner. ☠️ **Do not measure that with
+`createdAt → run_started_at`. That gap is re-run delay, not runner wait, and
+it is structurally incapable of detecting a runner-supply stall.** Over 1000
+`merge_group` `pr.yml` runs (2026-08-20 → 2026-10-06) the gap is non-zero on
+exactly 7, and all 7 are `run_attempt > 1`; it is **0.0 on every one of the
+993 first-attempt runs**, no matter how long the runner took. The reason is
+in step 3's table: `run_started_at` is a copy of `created_at` until a re-run
+happens, so on the only attempt that could show a wait it is pinned to zero
+by construction. An earlier revision of this file used that gap as the
+qualifying test and classified the 2026-10-05 re-run pair as a supply
+incident; both readings were wrong.
+
+Runner wait lives at **job** level — the first job's `started_at` against the
+run's `created_at`:
 
 ```
-gh run list --repo Blockcast/paperclip --workflow pr.yml --event merge_group \
-  --json createdAt,startedAt --limit 300 \
-  --jq '[.[]|select(.createdAt>="'"$SINCE"'")
-         |(((.startedAt|fromdate)-(.createdAt|fromdate))/60)]
-        |sort|{n:length,nonzero:[.[]|select(.>=10)]}'
+gh api repos/Blockcast/paperclip/actions/runs/<id> --jq '.created_at'
+gh api repos/Blockcast/paperclip/actions/runs/<id>/jobs \
+  --jq '[.jobs[]|select(.started_at)|.started_at]|sort|first'
 ```
 
-| date | gap | evidence |
-|---|---:|---|
-| 2026-08-26 | ~3h20m | [BLO-27641](/BLO/issues/BLO-27641) — zero `arc-merge-queue` pods after a listener restart |
-| 2026-10-05 | 113.2 min | `pr-2228` + `pr-2224`, both `createdAt 19:07:44/45Z` → `run_started_at 21:00:53/55Z`; 2-lane cold-start burst, below |
+Measured 2026-10-06 over 40 post-change builds this is **p50 12s, p90 41s,
+max 50s** — seconds, not minutes. So a run still `queued` after **≥ 10 min**
+is far outside anything observed and is the floor for a row here. The margin
+against step 3's 150 min threshold is ~180×, not the 1.3× an earlier revision
+claimed. There is no cheap sweep for this (it is one extra API call per run),
+which is fine: the counter takes a row per *incident*, and the cheaper
+front-line signal is the one the 2026-08-26 case actually turned on — a
+`merge_group` run `queued` with **zero runner pods in its target scale set**.
 
-**As of 2026-10-05 that is one incident inside the trailing month** (the
-2026-08-26 row is ~40 days back), so the decision does **not** flip yet. Note
-the hazard rate is now higher than it was when the decision was taken — see
-the mode below — so treat the next occurrence as flipping it rather than
-re-opening the cost argument.
+| date | evidence | runner wait |
+|---|---|---|
+| 2026-08-26 | [BLO-27641](/BLO/issues/BLO-27641) — zero `arc-merge-queue` pods after a listener restart; merge cadence ~45 min with a 3h20m hole at 14:29Z→17:49Z | genuine supply stall |
+| ~~2026-10-05~~ | ~~`pr-2228` + `pr-2224`~~ — **retracted**: both are `run_attempt: 3`; attempt 1 started at `19:07:44Z` with zero wait and the 113.2 min spans two cancellations and a manual re-run by `kkroo` at `21:00:53Z` | not a supply stall |
 
-### 2-lane cold-start burst (new since BLO-36439 raised `max_entries_to_build` to 2)
+**As of 2026-10-06 that is one incident on record, ~6 weeks back**, so the
+decision does **not** flip. Note this is one *fewer* than the previous
+revision counted, and the retraction moves the trailing-month count to
+**zero** — the hazard rate is lower than that revision asserted, not higher.
+
+### 2-lane invalidation fan-out (new since BLO-36439 raised `max_entries_to_build` to 2)
 
 An eviction invalidates every lane stacked behind it, so **all lanes re-form
-and cold-start at the same instant**. At 1 lane that asked ARC for one build's
-worth of runners; at N lanes it asks for N at once, and `arc-merge-queue`
-scales from a warm pool sized for the steady state, not for an N-wide
-simultaneous cold start.
+at the same instant** and the builds they were running are cancelled. At
+1 lane one eviction cancelled one build; at N lanes it cancels up to N.
 
 Measured 2026-10-05, the `#2214` eviction (`removed_from_merge_queue` by
 `github-merge-queue[bot]` at 19:07:40Z): 3 builds cancelled in one 25-min
-window, then both lanes re-formed at 19:07:44/45Z and **both waited 113.2 min
-for a runner**. Across the window: `createdAt → run_started_at` was **0.0 min
-at every percentile including max over 143 pre-change builds**, versus median
-0.0 / max 113.2 over 88 post-change builds (2 of 88, 2%).
+window (`pr-2214` twice, `pr-2228` once), both lanes re-formed at
+19:07:44/45Z, those attempts were cancelled too, and the pair was finally
+re-run **manually by `kkroo` at 21:00:53Z** and succeeded.
 
-**This is a cost of parallelism, not a regression to back out** — net drain
-still went 17.3/day → 40.0/day (`merged_at` counts over the 7 days before and
-the 2 days after the change) and depth 108 → 27. But two consequences:
+**This is a cost of parallelism, not a regression to back out** — and the
+measured cost is small. Cancelled share of `merge_group` `pr.yml` builds:
+**1.4% (2/140) over the 7 days before the change, 2.0% (3/148) after**, with
+the post window containing the whole 10-05 burst. That is the
+[BLO-22289](/BLO/issues/BLO-22289) cascade signature the issue asked for and
+it has not regressed. Net drain went 17.3/day → 40.0/day (`merged_at` counts
+over the 7 days before and the 2 days after) and depth 108 → 27.
 
-- It is why the `createdAt` clock in step 3 is now unsafe (see "Why 150
-  minutes" above). Both affected runs were healthy.
-- It is the shape most likely to trip the counter above. If it does,
-  the cheaper fix is raising `arc-merge-queue`'s **minimum warm pool** to
-  `max_entries_to_build` × one build's runner demand, so an N-wide re-form
-  never cold-starts — not lowering `max_entries_to_build` back to 1.
+⚠ **An earlier revision of this section reported that both lanes "waited
+113.2 min for a runner" and recommended raising `arc-merge-queue`'s minimum
+warm pool. Both are retracted.** The two runs are `run_attempt: 3`; attempt 1
+started at 19:07:44Z with `run_started_at == created_at`, i.e. **zero** wait,
+and the 113.2 min is the span from that first dispatch to the manual re-run.
+Runner supply was never implicated: measured job-level runner wait is p50 12s
+/ max 50s (see the stall counter above), so the warm pool is not the
+constraint and there is nothing for that change to fix. The real exposure
+from an N-wide re-form is **cancelled build-minutes**, bounded by the share
+above — if it ever does become expensive, the lever is reducing invalidations
+(fewer evictions, `ALLGREEN` grouping already helps), not more warm runners.
