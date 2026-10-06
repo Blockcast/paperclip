@@ -502,6 +502,40 @@ different repo -- the source of record is the lockstep pair
 Read the numbers there before acting on any of them.
 Owner: Platform / SRE (PEN-3305, re-fitted in PEN-3328)
 
+> ⚠️ **This section's Step 4 restart gate is the ONE-AGENT arm.** If several
+> agents are held at once, the fleet arm governs — see
+> [Fleet stall: many agents in lockstep](#fleet-stall-many-agents-in-lockstep-blo-36922)
+> for what that regime is and what to capture. One query tells them apart:
+>
+> ```
+> count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900)
+> ```
+>
+> | result | arm | remedy |
+> |---|---|---|
+> | `>= 3` | [fleet stall](#fleet-stall-many-agents-in-lockstep-blo-36922): many agents together, ~25–120 min observed, **self-clears** | do **not** replace the process |
+> | below 3, or no data | fewer than three agents; unbounded (6–19 h observed) | this section, which ends with the Step 4 restart gate |
+>
+> **The fleet arm takes precedence.** A fleet stall pages
+> `PaperclipAgentStartLockFleetStall` (that count, `>= 3` for 10m), once per
+> episode. `PaperclipAgentStartLockWedged` is not the page for that shape: it
+> needs a 4 h hold (`> 14400`), longer than any measured fleet stall, and past
+> 4 h PEN-3328 aborts each held section anyway — a landed abort deletes the
+> gauge series inside a scrape, so Wedged's `for: 5m` never completes and the
+> per-agent signal is `PaperclipAgentStartLockAborted` (`warning`), once per
+> agent. Wedged pages only on an abort that fails to land. While the
+> count reads `>= 3`, do not apply this section's remedy to any agent,
+> whichever name paged; Step 4's per-arm list governs when both fire. Once the
+> count drops below 3, an agent that is still held is back in this arm.
+>
+> Deleting the worker pod on a fleet stall destroys the only evidence of the
+> cause and buys nothing: the episode was going to end on its own.
+>
+> ⚠️ The step-0 count is the robust check because it does not depend on either
+> name. FleetStall is live in `Blockcast/onprem-k8s` (#4036, BLO-35571) and is
+> **not** in this chart copy — see KNOWN DIVERGENCE below, and verify at
+> `/api/v1/rules` before relying on either name.
+
 ### ⚠️ What these alerts claim, and what they no longer claim (BLO-36522)
 
 **The name says "wedged". For the regime the old 300s rule actually fired on,
@@ -948,6 +982,119 @@ The divergence is not only the number. The *rationale prose* beside it —
 cross-reference pointing here so that neither reads as live Blockcast policy,
 and the chart test's threshold assertion deliberately still stands, because it
 guards the number this chart actually renders.
+
+## Fleet stall: many agents in lockstep (BLO-36922)
+
+Trigger: **the shape, not an alert name.** The step-0 count at the top of the
+[one-agent section](#agent-start-lock-wedged-pen-3305) reads `>= 3`:
+`count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900) >= 3`.
+That shape pages as `PaperclipAgentStartLockFleetStall` (same expr, `for: 10m`),
+one page per episode. It landed in `Blockcast/onprem-k8s` #4036 (BLO-35571) and
+is absent from this chart. The onprem-k8s `PaperclipAgentStartLockWedged`
+(`> 14400`, 4 h) cannot fire on this shape as measured: the 7-day maximum
+hold was 8043s (2h14m). Even past 4 h it would mostly not page — PEN-3328
+aborts each held section at that boundary and a landed abort deletes the gauge
+series within a scrape, so what surfaces per agent is
+`PaperclipAgentStartLockAborted` (`warning`). Verify at `/api/v1/rules` before
+expecting any of them to page.
+
+**Do NOT replace the process.** Every measured episode self-cleared with
+`process_start_time_seconds` on `paperclip-0` constant across it. A restart
+would have been credited with a recovery that was already happening, and would
+have destroyed the evidence. Four episodes in the 7d to 2026-09-27 (8, 5, 13
+and 14 agents); the leading cause is the un-coalesced fleet-wide orphan reap —
+see [below](#leading-cause-and-what-to-check-first-now-blo-36922) — and the row
+is BLO-36922.
+
+The stall is real, not a gauge artifact — during the 2026-09-26 22:10–22:52Z
+episode `sum(rate(paperclip_k8s_isolated_run_started_total[10m]))*600` fell to
+**1.05 run-starts/10min against a ~50 control median**, recovering to 60
+immediately on release.
+
+### What has already been falsified: do not re-run these
+
+Measured over 2026-09-26 22:10–22:52Z against an 18:00–21:00Z control:
+
+| hypothesis | verdict | evidence |
+|---|---|---|
+| Event-loop block / GC pause | **falsified** | `nodejs_eventloop_lag_max_seconds` ≤0.5s throughout; scrapes landed every 60s to ms precision, which a multi-minute stop-the-world pause cannot do. The one 12.85s spike sits 16 min after onset and 26 min before release — neither end of the episode. |
+| DB pool exhaustion | **falsified, and anti-correlated** | During the stall `paperclip-0` ran `active=0–2 / idle=8–10 / waiting=0`. In the healthy control the same pool is repeatedly **pegged at `active=10 / idle=0`**. Saturation is what health looks like here; it rises only *after* release. |
+| Postgres contention | **falsified for ≥11 of 13 sections** | A `pg_advisory_xact_lock` waiter pins a pool connection. Only 0–2 connections were active, so at most 2 sections could have been in a DB wait — it cannot be the state of 13. *Not* fully closed server-side: there is no postgres exporter, so `pg_locks` / `pg_stat_activity` are unavailable post-hoc. |
+| Kubernetes API stall | **falsified** | apiserver p99 for `jobs\|pods` `LIST/POST/DELETE` was at its **lowest** during the stall (LIST 0.099–0.22s vs 0.157–0.558s control; POST 0.23–0.39s vs 1.4–5.6s control). |
+
+The pattern across all four: **every dependency gets quieter during the
+stall.** The sections are not queued behind a busy resource — they are making
+no I/O at all.
+
+### Two corrections to the intuitive reading
+
+- **Lockstep does not imply a shared blocker.** Dispatch passes start in
+  synchronized waves: at 2026-09-27T01:04:12–01:04:29Z **13 agents crossed the
+  30s warn threshold within 17 seconds of each other** during an ordinary hour.
+  A synchronized *start* plus a common slowdown reproduces the lockstep shape
+  with no shared blocker at all, so the shape alone is not evidence of one.
+- **The critical section is chronically far over budget, not binary.** In a
+  quiet hour (01:03–02:10Z) there were 203 overrun lines, median hold **30s**,
+  max **180s**, against a designed expectation of sub-second. The episodes look
+  like that same chronic overrun spiking, not a clean wedge/healthy switch.
+
+### What to capture when paged
+
+The cause is unidentified because **no surface retains enough to name it after
+the fact**: container logs on `paperclip-0` rotate in ~1 h (all four episodes
+had aged out), `paperclip` emits no traces to Tempo, and there is no postgres
+exporter. So capture live, while it is firing:
+
+```
+kubectl logs -n paperclip paperclip-0 | grep "agent start lock held" > /tmp/held.log
+```
+
+`heldMs` in those lines does **not** tell the two arms apart. Each arm is one
+continuous hold per agent, so `heldMs` grows line over line in both, and past
+`LOCK_HELD_ERROR_MS` both log the same `logger.error` line every 5m. A reset to
+~30000 only means one section released and another started. The agent count in
+step 0 is what separates the arms; capture these lines for the timeline.
+
+Note the log line names the agent and the hold age but **not what the section
+is awaiting** — which is precisely why four episodes went uncaused.
+
+### Leading cause, and what to check first now (BLO-36922)
+
+`startNextQueuedRunForAgent` calls `reapOrphanedRuns` from **inside**
+`withAgentStartLock`, and that reap is **fleet-wide, not agent-scoped**: every
+`running` row joined to `agents`, a namespace-wide `listManagedAgentJobs`,
+`cleanupManagedJobsWithoutRun`, then per-run reservation reads and per-Job
+deletes. It was the only unbounded await in the section — `hasActiveJobForAgent`
+is fenced at 2s and the adapter's own guard at 15s. So N agents waking together
+ran N concurrent whole-fleet sweeps through the single in-pod Kubernetes client.
+
+That resolves the "every dependency gets quieter" pattern above: the work was
+queued **client-side** and never reached the apiserver, which is also why 8
+`k8s_concurrency_guard_unreachable` trips came from in-pod calls in the same
+window while `kubectl` from outside answered in 1.6s.
+
+It also corrects the episode shape recorded above. The starts are **staggered,
+the release is simultaneous** — `count(paperclip_agent_start_lock_held_seconds
+> 300)` over 2026-09-26 22:15→22:55Z reads `3 → 3 → 6 → 8 → 7 → 11 → 11 → 14 →
+0`. Ramp-in/cliff-out is contention that each new waking agent adds to, not one
+shared promise everyone is awaiting.
+
+Coalescing (single-flight + a 5s freshness TTL) and a phase breadcrumb merged in
+[paperclip#2064](https://github.com/Blockcast/paperclip/pull/2064) on
+2026-10-02. **Merged is not deployed**: query the phase gauge before trusting
+it, because an absent series here reads exactly like a healthy one.
+
+```
+count(count_over_time(paperclip_agent_start_lock_phase_seconds[12h]))
+```
+
+Empty means the running pod predates #2064 — as it did on 2026-10-06, when the
+same query over `paperclip_agent_start_lock_held_seconds` returned 23 series as
+a positive control. Once it answers, **read the phase before anything else**:
+it names the await directly and does not depend on the log surviving rotation.
+A `phase` of `reap` with `phaseMs` close to `heldMs` confirms this cause. Any
+other phase means it is something else — most likely recall latency on the
+critical path (BLO-35878), which is **not** excluded.
 
 ## Agent start lock aborted (PEN-3328)
 

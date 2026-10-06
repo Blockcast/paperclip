@@ -2018,3 +2018,163 @@ test("PaperclipIsolationWorkspaceReaperStopped is gauge-keyed, dry_run-collapsed
     "runbooks/isolation-workspace-reaper.md must exist for the runbook_url to resolve",
   );
 });
+
+test("the start-lock runbook routes its two arms on agent count, not on an alert name (BLO-36922)", () => {
+  // The two arms have opposite remedies: the one-agent wedge ends in replacing
+  // the process, while a fleet stall self-clears and the restart destroys its
+  // only evidence. Each way this routing has been written wrong fails toward
+  // the restart, and nothing rendered breaks when it rots (the chart does not
+  // read the runbook), so only an assertion catches it.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/queued-run-stranded.md"),
+    "utf8",
+  );
+  // Blockquote markers and line wraps are layout, not content; match on the
+  // prose so a re-wrap cannot make an assertion pass or fail.
+  const flat = (text) => text.replace(/^> ?/gm, "").replace(/\s+/g, " ");
+  const wedgedAt = runbook.indexOf("\n## Agent start lock wedged (PEN-3305)\n");
+  const referencesAt = runbook.indexOf("\n## References\n");
+  const [fleetHeading] = runbook.match(/^#+ Fleet stall: .*$/m) ?? [];
+  assert.ok(
+    wedgedAt !== -1 && referencesAt !== -1 && fleetHeading,
+    "runbook must keep the one-agent, fleet-stall and References headings -- "
+      + "the assertions below scope themselves to them by name",
+  );
+
+  // A sibling `##`, not nested inside the section that opens by saying it is
+  // the one-agent arm only, and after that section's own liveness check,
+  // whose closing paragraph describes the Wedged rule alone.
+  assert.match(
+    fleetHeading,
+    /^## /,
+    "fleet stall must be a sibling ## of the one-agent section, not nested inside it",
+  );
+  const fleetAt = runbook.indexOf(`\n${fleetHeading}\n`);
+  assert.ok(wedgedAt < fleetAt && fleetAt < referencesAt, "fleet stall must follow the one-agent section");
+  // Bound each section at the NEXT `##`, never at the other one's offset. These
+  // two were adjacent when this test was written and are not any more: PEN-3328
+  // added `## Agent start lock aborted` as a third sibling between them.
+  // slice(wedgedAt, fleetAt) would have swallowed it into `wedged`, so a
+  // doesNotMatch guard below would have started policing prose that belongs to
+  // a different alert -- failing or passing for reasons unrelated to routing.
+  const nextH2 = (from) => {
+    const at = runbook.indexOf("\n## ", from + 1);
+    return at === -1 ? runbook.length : at;
+  };
+  const wedged = runbook.slice(wedgedAt, nextH2(wedgedAt));
+  const fleet = runbook.slice(fleetAt, nextH2(fleetAt));
+  for (const [name, text] of [["one-agent", wedged], ["fleet-stall", fleet]]) {
+    assert.ok(
+      !text.slice(1).includes("\n## "),
+      `the ${name} slice must stop at the next ## heading, not run into a sibling section`,
+    );
+  }
+  assert.match(
+    wedged,
+    /\n### Verifying the signal is live\n/,
+    "the one-agent section must close with its own liveness check before the fleet arm opens",
+  );
+
+  const routingEnd = wedged.indexOf("\n### ");
+  const fleetIntroEnd = fleet.indexOf("\n### ");
+  assert.ok(routingEnd !== -1 && fleetIntroEnd !== -1, "both arms must keep their subsections");
+  const routing = flat(wedged.slice(0, routingEnd));
+  const fleetIntro = flat(fleet.slice(0, fleetIntroEnd));
+
+  // Step 0 is the agent count, which keys on shape and so survives the alert
+  // names' semantics moving (they moved three times in two weeks). Since
+  // onprem-k8s #4036 (BLO-35571) the split is live: a fleet stall pages
+  // `PaperclipAgentStartLockFleetStall` (unlabelled count, one page per
+  // episode) and `PaperclipAgentStartLockWedged` only past 4 h, longer than any
+  // measured fleet stall. The runbook still has to say which arm wins.
+  // Scope step 0 to the routing blockquote: `routing` also spans the Trigger,
+  // which quotes FleetStall's count, so asserting on `routing` let the step-0
+  // block be deleted with the test still green.
+  const blockquoteAt = wedged.indexOf("ONE-AGENT arm");
+  assert.ok(
+    blockquoteAt !== -1 && blockquoteAt < routingEnd,
+    "the one-agent section must keep its routing blockquote before its first subsection",
+  );
+  assert.ok(
+    flat(wedged.slice(blockquoteAt, routingEnd)).includes(
+      "count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900)",
+    ),
+    "the one-agent section must open with the agent-count query as step 0",
+  );
+  // The Trigger is the section's entry point, read before the blockquote. It
+  // must give Wedged its own landed rule (the solo 4 h arm), not FleetStall's
+  // count, and no start-lock text may still wait on #3985: it closed unmerged
+  // and #4036 landed the split instead.
+  assert.match(
+    flat(wedged.slice(0, blockquoteAt)),
+    /\| `PaperclipAgentStartLockWedged` \| `max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > 14400` \| 5m \|/,
+    "the Trigger must give PaperclipAgentStartLockWedged its landed solo rule (> 14400 for 5m), not FleetStall's count",
+  );
+  assert.doesNotMatch(
+    flat(wedged + fleet),
+    /#3985(?![^.]*closed (?:unmerged|superseded))/,
+    "every #3985 mention in the start-lock runbook must say it closed without landing; the live split is onprem-k8s #4036",
+  );
+  // Pin every remedy sentence's direction, not just its words. Inverting or
+  // deleting any of the fleet-side ones tells a responder to restart during a
+  // fleet stall; inverting the below-3 row withholds the one-agent remedy.
+  for (const [text, pattern, message] of [
+    [routing, /\*\*The fleet arm takes precedence\.\*\*/, "routing must say the fleet arm wins when both alerts fire"],
+    [routing, /\| `>= 3` \|[^|]*\| do \*\*not\*\* replace the process \|/, "the `>= 3` row's remedy must say do not replace the process"],
+    [routing, /\| below 3, or no data \|[^|]*\| this section, which ends with the Step 4 restart gate \|/, "the below-3 row's remedy must be this section, whose Step 4 gate can authorise a restart"],
+    [routing, /While the count reads `>= 3`, do not apply this section's remedy to any agent/, "routing must say not to apply the one-agent remedy while the count reads >= 3"],
+    [fleetIntro, /\*\*Do NOT replace the process\.\*\*/, "the fleet-stall section must say do NOT replace the process"],
+  ]) {
+    assert.match(text, pattern, message);
+  }
+
+  // PEN-3328 made "Wedged pages once per agent past 4h" false, and false in the
+  // direction that matters: `paperclip_agent_start_lock_held_seconds` is
+  // reset-then-set, so an abort that LANDS deletes the series inside a scrape
+  // and Wedged's `for: 5m` never completes. The normal outcome past 4h is
+  // therefore silence on Wedged and one `PaperclipAgentStartLockAborted`
+  // (`warning`) per agent. Prose that promises a Wedged page licenses the
+  // inverse inference -- "no Wedged page, so nothing is past 4h" -- in exactly
+  // the case where the system worked. templates/prometheusrule.yaml states the
+  // same mechanism beside the `for:` it depends on.
+  for (const [where, text] of [["the routing block", routing], ["the fleet-stall trigger", fleetIntro]]) {
+    assert.match(
+      text,
+      /`PaperclipAgentStartLockAborted`/,
+      `${where} must name PaperclipAgentStartLockAborted as the per-agent signal past the 4h abort boundary`,
+    );
+    assert.doesNotMatch(
+      text,
+      /would page it once per agent|pages? it once per agent/,
+      `${where} must not promise a per-agent Wedged page past 4h; a landed abort deletes the series before for: 5m completes`,
+    );
+  }
+
+  // FleetStall landed in onprem-k8s #4036 and is in the deployed rules, but
+  // not in this chart. Both texts must name it, say where to verify what is
+  // live, and not resurrect the "not deployed" wording whose premise expired
+  // when #4036 merged (2026-09-28).
+  for (const [where, text] of [["the routing block", routing], ["the fleet-stall trigger", fleetIntro]]) {
+    assert.match(
+      text,
+      /`PaperclipAgentStartLockFleetStall`[^.]*(?:once|one page) per episode/,
+      `${where} must say a fleet stall pages PaperclipAgentStartLockFleetStall, once per episode`,
+    );
+    assert.doesNotMatch(
+      text,
+      /not deployed/,
+      `${where} must not call PaperclipAgentStartLockFleetStall not deployed; it landed in onprem-k8s #4036`,
+    );
+    assert.match(text, /\/api\/v1\/rules/, `${where} must say where to verify which rules are live`);
+  }
+
+  // Both arms are one continuous hold per agent, so `heldMs` grows line over
+  // line in either (agent-start-lock.ts: one interval per acquisition,
+  // `heldMs = nowMs - startedAtMs`). It separates a continuous hold from
+  // sequential short ones, not a fleet stall from a wedge.
+  assert.doesNotMatch(
+    flat(wedged + fleet),
+    /`heldMs`[^.]*discriminat/,
+    "runbook must not offer heldMs as the discriminator between the two arms -- it grows in both",
+  );
+});
