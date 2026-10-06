@@ -255,6 +255,12 @@ export function redactRunSecretValues(text: string, needles: readonly string[]):
  * The most a line-aligned split may hold beyond `holdbackChars`: one persisted chunk, the same
  * value as `MAX_PERSISTED_LOG_CHUNK_CHARS` in `log-chunk-sanitizer.ts`. Restated here because
  * that module imports this one; a test pins the two together.
+ *
+ * It is a throughput knob as well as a memory bound, so raising it costs CPU too. Each `take`
+ * re-masks the whole retained buffer, so per-chunk work is proportional to this cap and
+ * inversely proportional to chunk size — measured on ~860 KiB of newline-free input: 6 ms at
+ * 8192-char chunks, 167 ms at 215, 2393 ms at 16. All linear in total output (the uncapped
+ * hold this replaced was quadratic), but a reader tuning this for memory is moving both.
  */
 export const RUN_SECRET_CARRY_MAX_HOLD_CHARS = 64 * 1024;
 

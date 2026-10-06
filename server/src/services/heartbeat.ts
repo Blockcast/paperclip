@@ -32047,10 +32047,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // `startedAt`. An empty arrival is the settle flush below, not output, so it stamps
         // nothing.
         const countsAsRunProgress = chunk.length > 0 && !isSyntheticNonProgressRunLogChunk(chunk);
-        // Hold-back is released once the adapter has settled: everything logged after that
-        // point is a complete in-process `[paperclip] …` string rather than a stream slice,
-        // and leaving the carry armed there would withhold the tail of a message with no
-        // later chunk to flush it.
+        // Hold-back is released once the adapter has settled: the flush in the `finally` below
+        // runs there, and everything this process logs afterwards is a complete in-process
+        // `[paperclip] …` string, so leaving the carry armed would withhold the tail of a
+        // message with no later chunk to flush it.
+        // That is a property of OUR post-settle logging, not a guarantee about the adapter's.
+        // BLO-32553 established that an adapter can fire callbacks from a detached continuation
+        // outliving execute() (the orphan-SIGKILL path) — that is what `onAdapterEvent`'s late
+        // guard below exists for — so a late `onLog` stream slice is possible and arrives with
+        // the carry disarmed. The post-settle path is therefore best-effort: the needles still
+        // run per chunk in `sanitizeRunLogChunkForStorage` below, so a whole-chunk match is
+        // still redacted and only a value straddling two late slices escapes the carry. That is
+        // the same pre-BLO-39715 degradation described five lines down, not an unredacted path.
         const carried = runSecretBoundaryCarry.take(stream, chunk, { flush: adapterExecutionSettled });
         // The carry has already redacted run-secret values, so the needles below are a
         // second, idempotent pass. That is deliberate and not an oversight: keeping them
