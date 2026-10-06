@@ -52,6 +52,30 @@ async function copyLockfileFixture(fixtureRoot: string) {
   }
 }
 
+describe("securityAuditRemediations ledger", () => {
+  // BLO-40334 decision: the per-bucket readers below stay hardcoded rather
+  // than becoming one generic loop. Each bucket's value is the *set of
+  // advisory IDs* its floor rests on, which is semantic and belongs beside
+  // that remediation's own reasoning — a generic shape test can assert that
+  // `advisories` is a non-empty array of strings, which is exactly the part
+  // that never regresses. BLO-39519's bucket is already asserted in full by
+  // `scripts/http-cache-semantics-security-override.test.js`.
+  //
+  // The real gap a generic test would have closed is a *third* bucket landing
+  // with no guard at all. This pins the key set instead: adding one fails
+  // here until someone wires its guard and updates this list.
+  it("has a guard wired for every ticket bucket", () => {
+    expect(
+      Object.keys(rootPackageJson.securityAuditRemediations).sort(),
+    ).toEqual([
+      // scripts/http-cache-semantics-security-override.test.js
+      "BLO-39519",
+      // the PEN-1198 suite below
+      "PEN-1198",
+    ]);
+  });
+});
+
 describe("PEN-1198 audit dependency remediation", () => {
   it("keeps high-risk production dependency paths on patched ranges", () => {
     const overrides = rootPackageJson.pnpm.overrides;
