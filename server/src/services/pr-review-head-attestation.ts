@@ -19,7 +19,7 @@
  * *dispatch* time, but the duplicate is created minutes later at *post* time,
  * so it can only close gaps wider than a review run. It closes the wide ones:
  * a wake that arrives after a review is already visible. (BOTH the "minutes"
- * in the previous sentence and this coverage claim are narrowed — see
+ * earlier in this paragraph and this coverage claim are narrowed — see
  * CORRECTION below. The real figure runs to hours — see the five-pair range
  * under QUEUE LATENCY below.) It does NOT close concurrent dispatch at one
  * head — for #1304's 53 s byte-identical pair the second run must already
@@ -49,31 +49,31 @@
  *     2026-09-30T22:21:15Z, 2026-09-30T22:41:51Z and 2026-10-01T21:50:07Z —
  *     all after it.
  *   - The unconfigured-login fail-open below does not account for it:
- *     `prReviewerBotLogin` defaults to `allyblockcast[bot]` (`config.ts:1277`),
+ *     `prReviewerBotLogin` defaults to `allyblockcast[bot]` (`config.ts:1403`),
  *     so the "no reviewer bot login is configured" arm was not the one taken.
  *   - A missing head is NOT excluded — but the trigger surface is narrower than
  *     it looks, and unlike the other open explanations this one is readable in
  *     the logs. An `issue_comment` can produce FOUR wake reasons, not two —
- *     the ternary at `github-webhook.ts:1813-1819` yields
+ *     the ternary at `github-webhook.ts:1847-1853` yields
  *     `github_pr_review_gate_escalation`, `github_pr_merge_queue_evicted`,
  *     `github_pr_review_requested` or `github_pr_review_feedback` — and only
  *     ONE of them survives `shouldFirePrReviewerWake`, whose whitelist at
- *     `:2767-2774` is {`opened`, `reopened`, `ready_for_review`,
+ *     `:2801-2808` is {`opened`, `reopened`, `ready_for_review`,
  *     `synchronized`, `review_requested`, `review_submitted`}. The other three
- *     return false at `:5534` and execution never arrives at `:5602`. So the
+ *     return false at `:5799` and execution never arrives at `:5867`. So the
  *     only comment-driven reason that reaches this gate is
  *     `github_pr_review_requested`, and for it the webhook resolves the head
- *     lazily (`:5262-5303`) BEFORE the
- *     `if (context.headSha && context.repoFullName)` gate at `:5602`.
+ *     lazily (`:5464-5505`) BEFORE the
+ *     `if (context.headSha && context.repoFullName)` gate at `:5867`.
  *
  *     That lookup is BEST-EFFORT, not guaranteed, so it does not establish that
  *     a head is present. Both failure arms continue without one: a falsy result
  *     warns "could not resolve current PR head for review comment; continuing
- *     without head context" (`:5288`), and a thrown lookup warns "PR-head lookup
- *     failed for review comment; continuing without head context" (`:5301`).
- *     Either leaves `context.headSha` undefined, so the `:5602` gate is skipped
+ *     without head context" (`:5490`), and a thrown lookup warns "PR-head lookup
+ *     failed for review comment; continuing without head context" (`:5503`).
+ *     Either leaves `context.headSha` undefined, so the `:5867` gate is skipped
  *     entirely and the wake dispatches UN-GATED — and for a comment-driven wake
- *     there is no other source of a head, as `:5255-5260` says in as many words.
+ *     there is no other source of a head, as `:5457-5462` says in as many words.
  *     "A head is present whenever this gate is CONSULTED" would be true but
  *     vacuous: the gate's own condition requires a head, so it cannot be
  *     consulted without one. What would be needed to exclude this explanation,
@@ -82,8 +82,8 @@
  *     That narrowing moves #2128 out of this bullet entirely. Its only trigger
  *     is `allyblockcast[bot]`-authored and carries no `paperclip:review-request`
  *     marker (live comment, 2026-09-30T16:18:00Z, body opens "## Response to
- *     review at `621589ce`"), so `reviewerRequest` at `:1560-1562` is false and
- *     it classifies as `github_pr_review_feedback` — which never reaches `:5602`.
+ *     review at `621589ce`"), so `reviewerRequest` at `:1594-1596` is false and
+ *     it classifies as `github_pr_review_feedback` — which never reaches `:5867`.
  *     For that pair the gate was not bypassed for lack of a head; it was not
  *     reached. That is the fourth surviving explanation below, and for #2128 the
  *     tree answers it rather than leaving it open. #2121 and #2157 are
@@ -94,25 +94,25 @@
  * `unknown` for some reason other than the two excluded above; the deploy
  * carrying `fce3d292` had not rolled out when those wakes arrived; those runs
  * were not dispatched through this webhook path at all; or the comment-driven
- * head lookup failed, leaving no `context.headSha`, so `:5602` never ran. NOT
+ * head lookup failed, leaving no `context.headSha`, so `:5867` never ran. NOT
  * RESOLVED HERE — deploy timing and dispatch provenance were not checked, and
  * neither is readable from the review API this measurement used. The fifth is
  * not in that class: it IS readable, from the `could not resolve current PR
- * head` / `PR-head lookup failed` warnings at `:5288`/`:5301`, which are keyed
+ * head` / `PR-head lookup failed` warnings at `:5490`/`:5503`, which are keyed
  * on `deliveryId` and `prNumber`.
  *
  * It is PARTLY answerable from evidence already emitted, but current logging
  * cannot settle the question `:41-43` calls the decision-relevant one. This
  * module returns THREE outcomes (`PrReviewHeadAttestation` below) and the call
  * site logs only two:
- * `attested` logs at `github-webhook.ts:5622` ("...wake skipped: this head is
- * already attested...") and then `return false`s at `:5624` — that is the
+ * `attested` logs at `github-webhook.ts:5887` ("...wake skipped: this head is
+ * already attested...") and then `return false`s at `:5889` — that is the
  * SUPPRESSING outcome, not a non-suppressing one — while `unknown` warns at
- * `:5636` ("...could not establish whether this head was already reviewed;
+ * `:5901` ("...could not establish whether this head was already reviewed;
  * dispatching the reviewer wake anyway") and falls through. `not_attested`
- * emits NOTHING and falls through to the dispatch at `:5640`.
+ * emits NOTHING and falls through to the dispatch at `:5906`.
  *
- * So a hit at `:5622` or `:5636` proves the gate WAS reached, and that is all
+ * So a hit at `:5887` or `:5901` proves the gate WAS reached, and that is all
  * these logs establish. Absence of both does NOT mean the gate was not reached:
  * it is precisely the signature of the ordinary `not_attested` path, where the
  * gate was reached and answered. Absence leaves `not_attested` (the first
@@ -124,10 +124,17 @@
  * common case to the wrong answer. Separating the first from the fourth needs a
  * debug log on the `not_attested` arm; it does not exist today. The fifth,
  * though, is already separable without one, and from the caller rather than
- * here: the `:5288`/`:5301` warnings fire on exactly that arm, so a delivery
- * carrying one of them took it and a delivery carrying neither did not. Read
- * these logs for what they can prove before concluding the wake keying is at
- * fault.
+ * here: the `:5490`/`:5503` warnings fire on exactly that arm, so a delivery
+ * carrying one of them took it. The converse holds only one way: a delivery
+ * carrying neither did not take that arm PROVIDED the lookup was entered at
+ * all, and its conjuncts at `:5464-5470` also require a numeric
+ * `context.prNumber` — which `:1802` derives as `(issue.number as number |
+ * undefined) ?? null`. A null there skips the block, logs neither warning, and
+ * still reaches `:5867` with no head. GitHub always sends `issue.number` on an
+ * `issue_comment` payload, so that is a theoretical residual rather than a
+ * live one; it is recorded because this docblock's subject is exactly the line
+ * between what is established and what is open. Read these logs for what they
+ * can prove before concluding the wake keying is at fault.
  *
  * The coverage claim in the WHAT THIS CLOSES paragraph holds review-run
  * duration (~42 min, measured on #2157: 11:48:35Z request → 12:30:34Z review)
@@ -156,8 +163,8 @@
  *
  * THE CALLER DISAGREES, IN WRITING, AND THE DISAGREEMENT IS LIVE. That sentence
  * is normative, and the live path takes the opposite position: the gate at
- * `github-webhook.ts:5602` "suppresses unconditionally across wake reasons"
- * (`:5564-5572`), deliberately INCLUDING the explicit-request reason, on the
+ * `github-webhook.ts:5867` "suppresses unconditionally across wake reasons"
+ * (`:5829-5837`), deliberately INCLUDING the explicit-request reason, on the
  * stated asymmetry that "a duplicate COMMENTED review can never be retracted
  * ... whereas a re-review someone still wants is one commit away". So the
  * shipped behaviour refuses exactly the re-requests this paragraph says must
@@ -165,7 +172,7 @@
  * change behaviour at all.
  *
  * Where they actually conflict is narrow, and it is the description-only case
- * at `:218-225` below: when the finding lives in the PR description, no commit
+ * at `:225-232` below: when the finding lives in the PR description, no commit
  * can carry the fix, so "one commit away" is false by construction and the
  * caller's asymmetry does not hold for that class. For every other class the
  * caller's reasoning stands. Whoever resolves this should change BOTH comments
@@ -235,7 +242,7 @@
  * because this docblock uses both words: "dispatch time" in the WHAT THIS
  * CLOSES paragraph and "wake time" here are the SAME instant for this module.
  * It is called from the webhook handler at the moment the wake is decided
- * (`github-webhook.ts:5603`, and on the contended-replay path at `:4036`), so
+ * (`github-webhook.ts:5868`, and on the contended-replay path at `:4070`), so
  * it has exactly one point of observation, not two to check between. What that
  * check decides is whether a run STARTS; the duplicate is created hours later
  * when that run POSTS, and nothing re-asks in between. That is the gap — one
@@ -255,6 +262,27 @@
  * this predicate suppress review of a head nobody read. The body's
  * `Reviewed head: <40-hex>` line is immutable and is what the reviewer emits
  * for exactly this purpose.
+ *
+ * THE `github-webhook.ts` LINE NUMBERS ABOVE ARE PERISHABLE, and they have
+ * already perished once. Every `:NNNN` into that file was re-resolved against
+ * `master@2bc0b3a1` (2026-10-07). The set before this one was resolved against
+ * #2217's head and was WRONG THE MOMENT IT LANDED: the merge queue rebases onto
+ * a `master` that had moved 467 commits, and a line citation does not rebase
+ * with its prose. Nothing checks these, so the failure is silent and the reader
+ * lands confidently on an unrelated statement rather than near-missing it.
+ *
+ * So do not trust a number here without re-resolving it; and when you do,
+ * re-resolve ALL of them, because they shift by region (that re-point moved the
+ * `:52xx`/`:54xx` lookup block by +202 and the `:56xx` gate block by +265 — one
+ * offset would have mis-pointed the other half). The durable anchors, which
+ * this docblock deliberately carries alongside most numbers, are what to search
+ * on instead: the quoted log messages ("could not resolve current PR head for
+ * review comment; continuing without head context", "...wake skipped: this head
+ * is already attested...", "...could not establish whether this head was
+ * already reviewed..."), the identifiers (`shouldFirePrReviewerWake`,
+ * `allyReviewAlreadyAttestsHead`, `resolvePrReviewHeadSha`), and the section
+ * headings in this file. Those survive a rebase; the numbers are a convenience
+ * for the reader who has the file open at the same base.
  */
 import {
   githubListPrReviewsWithTimestamps,
