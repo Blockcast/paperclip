@@ -1401,8 +1401,8 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * comments and asserts the stronger `{ state: "success", outcome:
  * "not_evaluated" }`, so it catches an unconditional ledger exclusion — but
  * it passes `prAuthorLogin: null`, which no comment author can equal, so it
- * does NOT catch the author-threaded form a fix actually reaches for. Only the
- * witness below does; see the per-mutant counts next.
+ * does NOT catch an author-threaded form that credits an unknown author as
+ * independent. Only the witness below does; see the per-mutant counts next.
  *
  * WHAT EACH FIXTURE ACTUALLY DETECTS, because "runtime-identical to an
  * existing test" and "detects nothing new" are NOT the same claim and the
@@ -1416,11 +1416,17 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * where they stop being identical, because those pre-existing twins pass
  * `prAuthorLogin: null` while both fixtures here pass `ALLY_BOT_LOGIN`, and an
  * author-reading exclusion can only fire on a login a comment author actually
- * carries — never on `null`. That distinction, not the mere presence of the
- * argument, is what the counts below rest on: the twins carried no argument at
- * all when these counts were taken, and BLO-38582 later gave them the explicit
- * `null`, which is inert at the same sites for the same reason.
- * Measured at this head (113 tests), one mutation per run:
+ * carries, never on `null`, PROVIDED the exclusion credits an unknown author as
+ * independent. That distinction, not the mere presence of the argument, is
+ * what the counts below rest on: the twins carried no argument at all when
+ * these counts were taken, and BLO-38582 later gave them the explicit `null`,
+ * which is inert at the same sites for the same reason. The fail-closed form
+ * the attestation path already uses (`pr-comment-review-gate.ts:457`,
+ * `authorUnknown: true`) treats `null` as self-attested instead, so it would
+ * fire on the twins too and a run taken under it shows the witness red
+ * alongside them. That does not make the witness redundant: the credits-unknown
+ * form still reaches it alone. The counts below are for the credits-unknown
+ * form. Measured at this head (113 tests), one mutation per run:
  *
  *   placement (1), always-exclude   24 fail — incl. this block's first; the
  *                                   pre-existing twin catches it too
