@@ -24,15 +24,35 @@
  * then a visible escalation.
  *
  * That last clause holds ONLY when an invokable owner resolves. When the owner
- * ladder returns none (service.ts:5535), `wakesOwner` is false (:6073), so
- * `maxAttempts`/`timeoutAt` are written null (:6184-6185), `wakePolicy` is the
- * unbounded `board_escalation`/`no_invokable_recovery_owner` shape (:6174), and
- * `enqueueSourceScopedStrandedRecoveryWake` returns before enqueueing anything
- * (:6208). The backstop sweep skips it too, and ORDERING is why this change is
- * inert there: the `!ownerAgentId` test (:13759-13761) runs BEFORE the cause
- * test (:13763-13768) this change was aimed at, so an ownerless row only moves
- * from "skipped by cause" to "skipped by no owner" — same zero wakes, same null
- * budget. This change does not address that residual; BLO-40525 tracks it.
+ * ladder returns none (service.ts:5534), `wakesOwner` is false (:6073), so
+ * `maxAttempts`/`timeoutAt` are written null (:6186-6187), `wakePolicy` is the
+ * unbounded `board_escalation`/`no_invokable_recovery_owner` shape (:6176-6177),
+ * and `enqueueSourceScopedStrandedRecoveryWake` returns before enqueueing
+ * anything (:6210 — note :6208 is the `provider_quota` guard and :6209 the
+ * cause return; three adjacent returns, only :6210 is the ownerless one). The
+ * backstop sweep skips it too, and ORDERING is why this change is inert there:
+ * the `!ownerAgentId` test (:13761-13764) runs BEFORE the cause test
+ * (:13765-13771) this change was aimed at, so an ownerless row only moves from
+ * "skipped by cause" to "skipped by no owner" — same zero wakes, same null
+ * budget.
+ *
+ * BLO-40525 measured that residual and closed it DECLINED (2026-10-06): the
+ * branch has never fired. Over the whole table (12,852 actions, 2026-05-25 ->
+ * 2026-10-06) ownerless `stranded_assigned_issue` actions are 0 of 11,296, and
+ * `board_escalation` of any kind is 1 of 12,852 — a `pr_review_non_convergence`
+ * row on BLO-22145 that lived 13m18s and was cancelled. Control: `ownerAgentId`
+ * IS nullable in that projection (1/12,852), so the zero is a measurement, not
+ * a hydration artifact. The ladder ends assignee's-manager -> creator's-manager
+ * -> creator -> CTO -> CEO -> assignee, so emptying it needs every rung
+ * non-invokable at once. Re-measure before reopening:
+ *   GET /api/companies/{id}/recovery-actions?limit=500&offset=N&order=asc
+ *   jq -s '[.[]|select(.kind=="stranded_assigned_issue" and .ownerAgentId==null)]|length'
+ *
+ * Do NOT "fix" the null budget on this branch. It is deliberate for every shape
+ * that wakes nobody, and is pinned by
+ * `packages/db/src/issue-recovery-action-legacy-wake-bounds-migration.test.ts`:
+ * bounding these makes them retirable by `escalateExpiredWakeHorizons` while
+ * still waking no one, which is BLO-19124's damage in reverse.
  *
  * This is deliberately the fix that is correct under BOTH readings of the
  * underlying probe fault, which was measured but NOT explained — again, on the
