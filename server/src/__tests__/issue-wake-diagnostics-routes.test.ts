@@ -800,7 +800,8 @@ describe("issue wake diagnostic reason allowlist", () => {
     // The invariant that actually holds is weaker and empirical: every writer that
     // exists TODAY sets the column at depth 1. So an entry here has two possible
     // causes and the assertion cannot tell them apart — either the scan failed to read
-    // the block (desynced depth walk, opener regex drift), or a new writer genuinely
+    // the block (desynced depth walk -- opener regex drift never reaches this bucket,
+    // see the `openerCount` check in the caller), or a new writer genuinely
     // omits the key and must be classified here deliberately. The failure message
     // names both, so the next engineer checks the writer as well as the scanner.
     const unaccounted: number[] = [];
@@ -945,11 +946,13 @@ describe("issue wake diagnostic reason allowlist", () => {
     // would otherwise just shrink the site count and read as a drifted floor.
     expect(unresolvedConsts, "const-identifier reasons the resolver could not follow").toEqual([]);
 
-    // PEN-3765: the partition must be TOTAL -- this is the assertion that replaces a
-    // hardcoded count floor as the anti-vacuity control, and it is strictly stronger.
-    // A depth walk desynced by an unbalanced brace, a writer the opener regex stops
-    // matching, or a reason spelling the classifier cannot read all land here instead
-    // of silently shrinking the resolved set.
+    // PEN-3765: the partition must be TOTAL -- this, together with the `openerCount`
+    // check below, is the anti-vacuity control that replaces a hardcoded count floor.
+    // A depth walk desynced by an unbalanced brace, or a reason spelling the classifier
+    // cannot read, lands here instead of silently shrinking the resolved set. The
+    // partition covers unreadable BLOCKS, not unmatched OPENERS: a writer the opener
+    // regex stops matching never enters the scan loop, so it drops out of
+    // `openerCount` and `unaccounted` alike and the identity below still holds.
     //
     // `reason` is nullable (see the `unaccounted` declaration), so a hit here does NOT
     // prove the scan broke — a new writer may legitimately omit the key. Both causes
@@ -959,7 +962,8 @@ describe("issue wake diagnostic reason allowlist", () => {
       unaccounted,
       "direct-insert openers with no depth-1 `reason` key the scan could read (heartbeat.ts lines). " +
         "Two causes, opposite fixes: (a) the scan went blind — depth walk desynced by an unbalanced " +
-        "brace in a string property, or the opener regex stopped matching the writer; or (b) a new " +
+        "brace in a string property (a writer the opener regex stops matching cannot land here; the " +
+        "`openerCount` assertion below catches that); or (b) a new " +
         "writer genuinely omits the column, which is schema-valid because `reason` is nullable — " +
         "classify it here deliberately. Check the named writer before assuming the scanner",
     ).toEqual([]);
@@ -972,6 +976,13 @@ describe("issue wake diagnostic reason allowlist", () => {
     // ...and the partition must be non-vacuous: zero openers would satisfy the
     // identity above trivially.
     expect(openerCount, "no direct `insert(agentWakeupRequests)` openers found").toBeGreaterThan(0);
+    // ...and the denominator must be checked, not trusted. A writer the opener regex
+    // misses shrinks both sides of the identity above and leaves it true, so count
+    // every raw `insert(agentWakeupRequests)` and require the regex to have matched all.
+    expect(
+      openerCount,
+      "opener regex stopped matching a writer — `.values(<identifier>)`, or a reformatted `values({`",
+    ).toBe((heartbeatSource.match(/insert\(agentWakeupRequests\)/g) ?? []).length);
 
     const ANCHORS = [
       "github_state_change_queued_coalesced",
