@@ -840,6 +840,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:http-cache-semantics-security-override
 
+      - name: Test proxy-addr security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:proxy-addr-security-override
+
       - name: Test agent-health preflight fixtures
         if: ${{ !cancelled() }}
         run: pnpm run test:agent-health-preflight
