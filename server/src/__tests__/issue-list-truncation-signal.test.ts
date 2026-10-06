@@ -220,6 +220,31 @@ describe("BLO-33741 issue-list truncation signal", () => {
   });
 
   describe("REST — GET /api/companies/:companyId/issues", () => {
+    /**
+     * BLO-40714 negative control, and it exists to fail rather than to pass.
+     *
+     * The sibling surface `/agents/me/inbox-lite` rejects `limit` with a 400.
+     * The tempting "harmonisation" is to fold that rule into the shared
+     * `parseUnsupportedPaginationParams`, which both routes call — and every
+     * assertion in that sibling's suite would still pass while THIS endpoint,
+     * which genuinely implements `limit` and is paged by it fleet-wide, began
+     * 400ing. A small caller-chosen limit is asserted (not the cap) so the
+     * case also fails if `limit` is read but ignored.
+     */
+    it("still honours a caller-supplied limit — `limit` is supported HERE", async () => {
+      serveFromPopulation(CAP);
+      const app = await buildApp();
+
+      const res = await request(app)
+        .get("/api/companies/company-1/issues")
+        .query({ limit: "10" });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(10);
+      expect(res.headers[ISSUE_LIST_APPLIED_LIMIT_HEADER.toLowerCase()]).toBe("10");
+      expect(res.headers[ISSUE_LIST_TRUNCATED_HEADER.toLowerCase()]).toBe("true");
+    });
+
     it("at cap + 1 available rows: returns exactly cap rows and signals truncation with the applied cap", async () => {
       serveFromPopulation(CAP + 1);
       const app = await buildApp();

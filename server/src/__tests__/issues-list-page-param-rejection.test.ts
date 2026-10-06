@@ -54,6 +54,30 @@ describe("issue list page/perPage rejection", () => {
     expect(res.body.unsupportedParams).toEqual(["page", "perPage"]);
   });
 
+  // BLO-40714: `per_page` is GitHub's spelling and was the one that still fell
+  // through the helper, so a caller reaching for it got the pre-BLO-24495
+  // behaviour back — a 200 over window 0. The mitigation was that such a
+  // caller usually sends `page` too and is caught by that arm; this case is
+  // deliberately `per_page` ALONE, so it fails if the new arm is reverted and
+  // cannot be satisfied by the `page` arm.
+  it("rejects ?per_page=100 on its own with 400 and names the unsupported param", async () => {
+    const res = await request(buildApp()).get("/api/companies/c1/issues?per_page=100");
+    expect(res.status).toBe(400);
+    expect(res.body.unsupportedParams).toEqual(["per_page"]);
+  });
+
+  it("names all three spellings when a caller sends all three", async () => {
+    const res = await request(buildApp()).get(
+      "/api/companies/c1/issues?page=2&perPage=100&per_page=100",
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.unsupportedParams).toEqual(["page", "perPage", "per_page"]);
+  });
+
+  // The positive control for every case above: `limit` is NOT a pagination
+  // param this helper rejects, and must never become one — the endpoint this
+  // helper serves genuinely implements it. The behavioural half of that pin
+  // lives in issue-list-truncation-signal.test.ts, which drives the real route.
   it("does not reject requests using limit/offset", async () => {
     const res = await request(buildApp()).get("/api/companies/c1/issues?limit=100&offset=100");
     expect(res.status).toBe(200);

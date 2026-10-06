@@ -8656,10 +8656,12 @@ export function issueRoutes(
     // were silently dropped (never read from req.query), so every page number
     // replayed the same limit/offset-default window with no error. Reject
     // explicitly instead of returning a confident, wrong result set.
+    // BLO-40714 adds `per_page` — GitHub's spelling, and the one that still fell
+    // through to the silent-window-0 behaviour. `limit` stays SUPPORTED here.
     const unsupportedPaginationParams = parseUnsupportedPaginationParams(req.query);
     if (unsupportedPaginationParams.length > 0) {
       res.status(400).json({
-        error: "page/perPage pagination is not supported on this endpoint; use limit and offset instead",
+        error: "page/perPage/per_page pagination is not supported on this endpoint; use limit and offset instead",
         unsupportedParams: unsupportedPaginationParams,
       });
       return;

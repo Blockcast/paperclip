@@ -1546,7 +1546,13 @@ registry.registerPath({
     "truncated response routinely returns fewer than `X-Applied-Limit` rows. Paging makes the " +
     "tail reachable but does NOT make the paged union a census: offset paging over a mutating " +
     "collection duplicates and drops rows, and the within-band sort key is last-activity. For an " +
-    "exact per-agent open count read `/api/companies/{companyId}/issues/open-assignment-census`.",
+    "exact per-agent open count read `/api/companies/{companyId}/issues/open-assignment-census`. " +
+    "`offset` is the ONLY pagination param this surface accepts: `limit`, `page`, `perPage` and " +
+    "`per_page` are rejected 400 with the offending name in `unsupportedParams` (BLO-40714). " +
+    "`limit` is rejected rather than honoured on purpose — the page size is fixed and already " +
+    "reported on `X-Applied-Limit`, so honouring a caller-supplied one would only ever hand back a " +
+    "silently short page. Note the sibling `GET /api/companies/{companyId}/issues` does implement " +
+    "`limit`; the two surfaces differ here deliberately.",
   request: {
     query: z.object({
       offset: z.string().optional().describe("Rows to skip; offset += X-Applied-Limit to page."),
