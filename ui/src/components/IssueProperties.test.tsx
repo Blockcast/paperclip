@@ -2184,11 +2184,14 @@ describe("IssueProperties", () => {
       act(() => root.unmount());
     });
 
-    it("carries reviewPreset and authorizationPolicy through clearing a monitor", async () => {
+    it("carries reviewPreset, authorizationPolicy and productivityReviewDisabled through clearing a monitor", async () => {
       const onUpdate = vi.fn();
       const root = await openMonitorEditor(container, onUpdate, {
         monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: "Check deployment", scheduledBy: "board" },
         authorizationPolicy: AUTHORIZATION_POLICY,
+        // The clear path rebuilds this flag on its own arm of `updateMonitor`,
+        // so the arm-path test does not cover it here.
+        productivityReviewDisabled: true,
       });
 
       clickMonitorButton(container, "Clear");
@@ -2197,6 +2200,7 @@ describe("IssueProperties", () => {
       expect(written).not.toBeNull();
       expect(written.monitor).toBeUndefined();
       expect(written.authorizationPolicy).toEqual(AUTHORIZATION_POLICY);
+      expect(written.productivityReviewDisabled).toBe(true);
 
       act(() => root.unmount());
     });

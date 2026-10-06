@@ -990,7 +990,9 @@ export function IssueProperties({
         // BLO-39945: a second field-by-field rebuild, so it needs the same
         // carry-forward as `buildExecutionPolicy`. Read off the issue rather
         // than `basePolicy` so it survives even if that guard is loosened.
-        ...(issue.executionPolicy?.productivityReviewDisabled ? { productivityReviewDisabled: true as const } : {}),
+        ...(issue.executionPolicy?.productivityReviewDisabled === true
+          ? { productivityReviewDisabled: true as const }
+          : {}),
         ...(nextMonitor ? { monitor: nextMonitor } : {}),
       },
     });
