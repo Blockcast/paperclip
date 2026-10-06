@@ -272,6 +272,8 @@ describe("agent inbox-lite truncation signal (BLO-39015)", () => {
  * Mutation-checked per the 2026-09-17 rule, each guard reverted ALONE:
  *   - drop `res.setHeader(ISSUE_LIST_TRUNCATED_HEADER)` -> the cap+1 case fails;
  *   - drop `res.setHeader(ISSUE_LIST_APPLIED_LIMIT_HEADER)` -> both cap cases fail;
+ *   - drop the `parseUnsupportedPaginationParams` 400 -> both the `page` and
+ *     `perPage` cases fail (status `200 !== 400`, and `list` is reached);
  *   - drop the `parseOffsetParam === null` 400 -> both rejection cases fail;
  *   - pass a literal `0` instead of `parsedOffset` -> the paging case fails;
  *   - weaken `parseOffsetParam`'s `Number.isSafeInteger` to `Number.isFinite`
