@@ -581,7 +581,8 @@ export type IssueRetryNowOutcome =
   | "promoted"
   | "already_promoted"
   | "no_scheduled_retry"
-  | "gate_suppressed";
+  | "gate_suppressed"
+  | "re_deferred";
 
 export interface IssueRetryNowResponse {
   outcome: IssueRetryNowOutcome;
@@ -663,6 +664,19 @@ export interface IssueExecutionPolicy {
   monitor?: IssueExecutionMonitorPolicy | null;
   reviewPreset?: LowTrustReviewPresetPolicy;
   authorizationPolicy?: TrustAuthorizationPolicy;
+  /**
+   * BLO-39945: opt a deliberately-permanent row out of productivity review
+   * without arming a monitor it does not need.
+   *
+   * `isProductivityReviewOptedOut` honours this OR the older
+   * `IssueExecutionMonitorPolicy.productivityReviewDisabled` — but the two are
+   * not equivalent in lifetime, and only this one is durable. The nested form
+   * is a property of the monitor: clearing that monitor runs the policy through
+   * `stripMonitorFromExecutionPolicy`, which drops `monitor` wholesale (and
+   * collapses a monitor-only policy to null), so the nested opt-out dies with
+   * the monitor it was attached to. Set it here for anything meant to last.
+   */
+  productivityReviewDisabled?: boolean;
 }
 
 export interface IssueExecutionMonitorState {

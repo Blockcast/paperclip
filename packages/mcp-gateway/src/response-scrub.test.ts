@@ -411,7 +411,7 @@ describe("scrubResponseBody — transport framing", () => {
   });
 
   it("passes through a body it cannot parse rather than corrupting it", () => {
-    const body = Buffer.from("env: not-json-not-yaml- binary");
+    const body = Buffer.from("env: not-json-not-yaml-\u0000binary");
 
     expect(scrubResponseBody(body, "application/octet-stream").toString("utf8")).toBe(
       body.toString("utf8"),

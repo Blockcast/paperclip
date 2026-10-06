@@ -16,6 +16,15 @@ vi.mock("../middleware/logger.js", () => ({
 
 const { heartbeatService } = await import("../services/heartbeat.js");
 
+const probeWarns = () =>
+  warn.mock.calls.filter(
+    ([, message]) => typeof message === "string" && message.includes("candidate index"),
+  );
+
+beforeEach(() => {
+  warn.mockClear();
+});
+
 /**
  * BLO-21526 / BLO-35258. `crashRecoveryCandidateIndexPresent` is probed twice
  * per tick from two callers — the gauge publisher (registered above both
@@ -45,15 +54,6 @@ describe("crash-recovery candidate-index probe tags its caller (BLO-35258)", () 
       throw new Error("catalog unreadable");
     }),
   } as unknown as Parameters<typeof heartbeatService>[0];
-
-  const probeWarns = () =>
-    warn.mock.calls.filter(
-      ([, message]) => typeof message === "string" && message.includes("candidate index"),
-    );
-
-  beforeEach(() => {
-    warn.mockClear();
-  });
 
   it("tags the gauge publisher's probe failure and does not claim a skipped reconciliation", async () => {
     const heartbeat = heartbeatService(throwingDb, { skipQueuedRunDispatch: true });
@@ -96,5 +96,67 @@ describe("crash-recovery candidate-index probe tags its caller (BLO-35258)", () 
 
     expect(gaugeMessage).toEqual(expect.any(String));
     expect(gateMessage).not.toBe(gaugeMessage);
+  });
+});
+
+/**
+ * BLO-36862. The `catch`-path cases above all stub `db.execute` to THROW, so
+ * none of them reach the absent-transition warn — which carries its own
+ * `source` and had no coverage at all. A reader of that branch's comment could
+ * conclude the field was vestigial there (the latch is atomic, so it is not a
+ * double-warn tag) and delete it with nothing failing.
+ *
+ * It is not vestigial. Exactly one line is emitted per absent episode, so the
+ * caller that won IS the report: `source` names which caller observed the
+ * index going absent. It does not say whether the replica is suppressed: the
+ * gauge publisher is issued first in every tick, above both scheduler gates, so
+ * `source: "gauge"` is the usual value on a healthy replica too.
+ */
+describe("crash-recovery absent-transition warn tags its caller (BLO-36862)", () => {
+  // Non-throwing, unlike the fixture above: an empty catalog result is
+  // `present = false`, which is what drives the latched absent branch.
+  const absentDb = {
+    execute: vi.fn(async () => []),
+  } as unknown as Parameters<typeof heartbeatService>[0];
+
+  it("names which caller observed the index going absent", async () => {
+    // One fresh service per caller. The latch lives in the `heartbeatService`
+    // closure and fires once per episode, so a single instance can only ever
+    // show one caller — which is exactly why the tag has to say which.
+    await heartbeatService(absentDb, {
+      skipQueuedRunDispatch: true,
+    }).publishCrashRecoveryCandidateIndexGauge();
+
+    const gate = heartbeatService(absentDb, { skipQueuedRunDispatch: true });
+    const result = await gate.reconcileWorkerCrashedRuns({ requireCandidateIndex: true });
+    expect(result.skippedReason).toBe("candidate_index_missing");
+
+    const warns = probeWarns();
+    // Pins the absent branch specifically — the catch path never says this.
+    expect(warns.map(([, message]) => message)).toEqual([
+      expect.stringContaining("periodic crash reconciliation is disabled"),
+      expect.stringContaining("periodic crash reconciliation is disabled"),
+    ]);
+    // Deleting `source` gives [undefined, undefined]; collapsing it to a
+    // constant gives a matched pair. Both turn this red.
+    expect(warns.map(([context]) => (context as { source?: string }).source)).toEqual([
+      "gauge",
+      "gate",
+    ]);
+  });
+
+  // The premise the case above rests on, which nothing else pinned. The
+  // DB-backed suite covers the presence PROBE being re-run rather than cached
+  // (heartbeat-worker-crash-marking.test.ts); the warn LATCH is separate, and
+  // removing it leaves the case above green — two fresh services would still
+  // emit one line each. Without this, "the winning caller is the whole report"
+  // is documented and unguarded.
+  it("emits exactly one absent warn per episode, however many callers probe", async () => {
+    const heartbeat = heartbeatService(absentDb, { skipQueuedRunDispatch: true });
+
+    await heartbeat.publishCrashRecoveryCandidateIndexGauge();
+    await heartbeat.reconcileWorkerCrashedRuns({ requireCandidateIndex: true });
+
+    expect(probeWarns()).toHaveLength(1);
   });
 });

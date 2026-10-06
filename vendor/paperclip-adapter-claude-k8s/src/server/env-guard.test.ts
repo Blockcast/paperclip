@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -417,7 +417,7 @@ describe("buildEnvGuardSetupShell", () => {
         (g: { matcher?: string }) => g.matcher === "Bash",
       );
       expect(guardEntries).toHaveLength(1);
-      expect(guardEntries[0].hooks[0].command).toBe(`node ${guardFile}`);
+      expect(guardEntries[0].hooks[0].command).toBe(`node '${guardFile}'`);
       // The stale fixed-name guard hook is gone, not merely deduplicated.
       const raw = readFileSync(path.join(dir, "settings.json"), "utf8");
       expect(raw).not.toContain(`${path.join(dir, "paperclip-env-guard.mjs")}`);
@@ -425,6 +425,143 @@ describe("buildEnvGuardSetupShell", () => {
       expect(settings.hooks.Stop[0].hooks[0].command).toBe("echo stop");
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Both halves of BLO-39898, in one test on purpose. Quoting `cmd` without
+  // widening GUARD_RE silently breaks pruning (the class excludes ' and the
+  // pattern is $-anchored), so a hash rotation APPENDS a second live guard hook
+  // — quieter and worse than the unquoted bug. Assert (a) and (b) together so
+  // either mutation alone turns this red. The temp dir carries a literal quote
+  // as well as a space, so dropping the `'\''` escaping is a third mutation
+  // this test catches.
+  it("quotes the hook command AND still prunes across a hash rotation", () => {
+    const mergeScript = decodedBlobs(buildEnvGuardSetupShell())[2]!;
+    // mkdtemp appends to the prefix, so the resulting path contains BOTH a
+    // space and a literal single quote. The quote is what makes the `'\''`
+    // escaping load-bearing: mutate it to a bare `'` and the recorded command
+    // becomes an unterminated quoted string, so /bin/sh below exits non-zero.
+    const dir = mkdtempSync(path.join(tmpdir(), "pc 'settings "));
+    expect(dir).toContain(" ");
+    expect(dir).toContain("'");
+    try {
+      const guardA = path.join(dir, "paperclip-env-guard.aaaaaaaaaaaa.mjs");
+      const guardB = path.join(dir, "paperclip-env-guard.bbbbbbbbbbbb.mjs");
+      // A stub standing in for the real guard: argv.length is 2 only when the
+      // shell got the path as a SINGLE argument.
+      writeFileSync(guardB, "console.log(process.argv.length);\n");
+      const merge = (guard: string) =>
+        spawnSync(process.execPath, ["-"], {
+          input: mergeScript,
+          encoding: "utf8",
+          env: { ...process.env, CLAUDE_CONFIG_DIR: dir, PAPERCLIP_GUARD_FILE: guard },
+        });
+      expect(merge(guardA).status).toBe(0);
+      expect(merge(guardB).status).toBe(0); // hash rotation
+
+      const settings = JSON.parse(readFileSync(path.join(dir, "settings.json"), "utf8"));
+      const hooks = settings.hooks.PreToolUse.flatMap(
+        (g: { hooks?: { command?: string }[] }) => g.hooks ?? [],
+      ).filter((h: { command?: string }) => h.command?.includes("paperclip-env-guard"));
+      // (b) exactly one guard hook survives the rotation — not two.
+      expect(hooks).toHaveLength(1);
+
+      // (a) that recorded command runs, as one argument, through a real shell.
+      const ran = spawnSync("/bin/sh", ["-c", hooks[0].command], { encoding: "utf8" });
+      // `node` is resolved off /bin/sh's PATH because that is literally what is
+      // recorded in settings.json. A runner without node on PATH gives rc 127,
+      // which is an environment problem, not a quoting bug — say so here rather
+      // than letting it surface as a bare status mismatch.
+      expect(ran.stderr).not.toContain("not found");
+      expect(ran.status).toBe(0);
+      expect(ran.stdout.trim()).toBe("2");
+
+      expect(hooks[0].command).toBe(`node '${guardB.replace(/'/g, "'\\''")}'`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// BLO-29526. The block message used to build its remediation path from $HOME
+// while the installer writes to ${CLAUDE_CONFIG_DIR:-$HOME/.claude}. The pod
+// sets CLAUDE_CONFIG_DIR to a session dir OUTSIDE $HOME, so the suggested
+// command was always MODULE_NOT_FOUND. That is worse than a broken path:
+// agents pipe the suggestion into a filter (`... 2>/dev/null | grep -i FOO`),
+// so node's error went to the discarded stderr, grep read empty stdin, and the
+// empty output read as "no variable matches FOO" — a confident wrong negative.
+//
+// So this installs for real with the two directories deliberately APART, then
+// RUNS whatever the guard suggests. Asserting on the message string alone
+// would not catch a move of the install target.
+describe("block message resolves to the installed helper (BLO-29526)", () => {
+  it("suggests a command that actually executes", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pc-install-"));
+    try {
+      const home = path.join(root, "home");
+      // The space is deliberate. The suggestion is copy-pasted into a shell, so
+      // an unquoted path would emit an un-runnable command; this is what makes
+      // the quoting load-bearing rather than decorative.
+      //
+      // SCOPE: this covers the BLOCK MESSAGE only. It is NOT a claim that a
+      // spaced config dir works end to end. SETTINGS_MERGE_SCRIPT still builds
+      // `const cmd = "node " + guard` unquoted, so the hook REGISTRATION it
+      // writes into settings.json would split on the space. Pre-existing, and
+      // unreachable in production (session dirs are UUID-based).
+      //
+      // Do not "fix" that by quoting `cmd` alone: GUARD_RE is
+      // /paperclip-env-guard[^\s"']*\.mjs$/ — it excludes `'` and anchors at
+      // $, so a quoted command stops matching, the stale-guard pruning goes
+      // silent, and every hash rotation leaks another live PreToolUse hook.
+      // No test goes red for that. Both sites have to move together.
+      const configDir = path.join(root, "session dir", ".claude");
+      mkdirSync(home, { recursive: true });
+      // Guard the guard: if these ever collapse to the same directory the test
+      // stops exercising the drift condition and silently passes on a revert.
+      expect(configDir).not.toBe(path.join(home, ".claude"));
+
+      const env = { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: configDir };
+      const setup = spawnSync("sh", ["-c", buildEnvGuardSetupShell()], { encoding: "utf8", env });
+      expect(setup.status).toBe(0);
+
+      const guardName = readdirSync(configDir).find((f) => f.startsWith("paperclip-env-guard."));
+      expect(guardName).toBeTruthy();
+
+      const blocked = spawnSync(process.execPath, [path.join(configDir, guardName!)], {
+        input: JSON.stringify({ tool_name: "Bash", tool_input: { command: "env" } }),
+        encoding: "utf8",
+        env,
+      });
+      expect(blocked.status).toBe(2);
+
+      const suggested = /run: node '([^']+)'/.exec(blocked.stderr)?.[1];
+      expect(suggested).toBeTruthy();
+      expect(suggested).toContain(" ");
+
+      const helper = spawnSync(process.execPath, [suggested!], {
+        encoding: "utf8",
+        env: { ...env, PC_TEST_SECRET: "super-secret-value-xyz" },
+      });
+      expect(helper.stderr).not.toContain("MODULE_NOT_FOUND");
+      expect(helper.status).toBe(0);
+      expect(helper.stdout).toContain("PC_TEST_SECRET");
+      expect(helper.stdout).not.toContain("super-secret-value-xyz");
+
+      // The guard must not block its own remediation. SAFE_ENV_INSPECTION_RE
+      // does NOT match the quoted form (the path group excludes spaces and the
+      // trailing quote), so what allows it is containsDump() — `node ...` is
+      // not a dump. Pinned because the allowlist looks like the thing keeping
+      // this working and is not, so a change there would read as safe.
+      for (const cmd of [`node '${suggested}'`, `node '${suggested}' 2>/dev/null | grep -i PC_`]) {
+        const again = spawnSync(process.execPath, [path.join(configDir, guardName!)], {
+          input: JSON.stringify({ tool_name: "Bash", tool_input: { command: cmd } }),
+          encoding: "utf8",
+          env,
+        });
+        expect(again.status, `guard blocked its own suggestion: ${cmd}`).toBe(0);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

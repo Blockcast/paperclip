@@ -236,19 +236,28 @@ export const EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS = [
  * than a re-implementation of it.
  *
  * `observation` is one of:
- *   {error: "unreadable"}                      workflow metadata unreadable
- *   {error: "runs-unreadable", state}          run history unreadable
- *   {state, name, newest: null}                active, never completed
- *   {state, name, newest: {updatedAt, conclusion, htmlUrl}}
+ *   {error: "unreadable"}                               workflow metadata unreadable
+ *   {error: "runs-unreadable", state}                   run history unreadable
+ *   {state, name, newest: null, completedCount}         active, never completed
+ *   {state, name, newest: {updatedAt, conclusion, htmlUrl}, completedCount}
+ *
+ * `completedCount` is the filtered read's `total_count` (null when the response
+ * carried none). It is load-bearing, not decorative: it is one half of the
+ * index-consistency proof below, which is the FIRST arm this function evaluates
+ * on the red path (BLO-38286).
  *
  * `observation.crossCheck` is optional and only consulted on the path that
- * would otherwise red. It is `{newestCompletedAt}` from the independent
- * unfiltered read, or `{error: true}`. A cross-check that is NEWER than
- * `newest` and inside `staleHours` clears the alarm to "ok"/"corroborated"
+ * would otherwise red. It is `{newestCompletedAt, allCount}` from the
+ * independent unfiltered read, or `{error: true}`. A cross-check that is NEWER
+ * than `newest` and inside `staleHours` clears the alarm to "ok"/"corroborated"
  * (PEN-3379 suppressed it to "unknown"; PEN-3462 corrected that to a positive
  * verdict, since the same freshness test the "fresh" branch uses has been
  * satisfied). Newer but PAST the bar reds, citing the better timestamp. An
- * absent or unreadable one leaves the verdict alone.
+ * `allCount` that cannot both be true alongside `completedCount` suppresses the
+ * alarm to "unknown" (BLO-38286) — that arm proves only that the reads
+ * disagree, never that the guard is alive, so it stays a suppression rather
+ * than a confirmation and defers whenever the cross-check is the better
+ * timestamp. An absent or unreadable one leaves the verdict alone.
  *
  * @returns {{workflow: string, status: "ok"|"stale"|"unknown", reason: string,
  *            name: string, ageMinutes: number|null,
@@ -297,6 +306,95 @@ export function classifyGuard(
         `GitHub sets disabled_inactivity automatically on scheduled workflows in dormant ` +
         `repositories; disabled_manually means a human turned it off. Re-enable it, or drop it ` +
         `from WATCHED_WORKFLOWS if it was retired on purpose.`,
+    };
+  }
+
+  // INDEX CONSISTENCY (BLO-38286). Both reads this function weighs are served
+  // by the SAME eventually-consistent run index, and a same-instant second read
+  // of a PINNED replica agrees with the first. The PEN-3379 timestamp
+  // cross-check below suppresses only when the unfiltered read is strictly
+  // NEWER, so it is structurally blind to a window in which both reads are
+  // equally stale — which is the fault actually observed. On run 36692972253
+  // (2026-09-30T08:59Z) the cross-check was read cleanly, agreed, and two
+  // healthy guards went red anyway; `relay-ssl-multicert-guard` was cited at
+  // 436h stale while completing on schedule.
+  //
+  // This arm compares no timestamps. It compares SET SIZES, and it is a proof
+  // rather than a heuristic: completed runs are a subset of all runs over any
+  // one consistent snapshot, so `completedCount` may never exceed `allCount`.
+  // When it does, the two responses came from different index states and
+  // nothing derived from either is worth aging. Measured on codeowners-guard.yml
+  // + event=schedule inside ~4 minutes: 632 unfiltered, then 1058 with
+  // `status=completed` — adding a filter INCREASED the count.
+  //
+  // Free: both numbers ride on responses this file already fetches. It fires
+  // only on the red path, because `classifyWatched` attaches the cross-check
+  // only there, and it only ever WEAKENS a red.
+  //
+  // WHAT BOUNDS IT, AND WHAT DOES NOT. Unlike the PEN-3379 arm below, this one
+  // rests on no evidence that the guard is alive: `completedCount > allCount`
+  // proves the reads are untrustworthy, which is just as true of a guard that
+  // has stopped. So it defers whenever there IS timestamp evidence: when the
+  // unfiltered read carries a strictly better completion (newer than the
+  // filtered one, or any at all against an empty filtered page), the PEN-3379
+  // arm below decides on that timestamp, confirming the guard alive if it is
+  // fresh (`ok`/`corroborated` since PEN-3462; `unknown` when BLO-38286 wrote
+  // this) and redding if it is itself past staleHours, exactly as it would
+  // with consistent counts.
+  // What it still mutes is the shape the production false red actually had:
+  // both reads citing the SAME stale completion. That observation is
+  // field-for-field what a stopped guard with split reads produces, so no pure
+  // function of one poll can separate the two; such a guard warns on every
+  // poll and exits 0 for as long as its counts stay inconsistent. Bounding
+  // that needs state across polls (consecutive `index-inconsistent` verdicts),
+  // which this file does not keep.
+  //
+  // NOT complete coverage, stated rather than implied: two reads served by the
+  // SAME pinned replica are internally consistent and pass straight through
+  // this check. It catches the differently-pinned case on proof; it does not
+  // make the index trustworthy, and AC2's flap watch is what measures the rest.
+  //
+  // REACHABILITY, narrower than it looks (Ally review of 9b3251c0, which
+  // corrected a claim an earlier revision of this block asserted as design).
+  // Within `classifyGuard` this arm does precede the `unparsable-timestamp`
+  // arm below — but that ordering never decides a real guard's verdict,
+  // because the two inputs cannot co-occur in production. `classifyWatched`
+  // attaches `crossCheck` only after a FIRST pass returned `stale` +
+  // `stopped`/`never-completed`; an unparsable `newest.updatedAt` returns
+  // `unknown`/`unparsable-timestamp` on that first pass, so the second pass is
+  // never taken, no `allCount` is ever observed, and this arm's `typeof
+  // allCount === "number"` is false. The verdict for such a guard is
+  // `unparsable-timestamp`. On the second pass `newest` is either absent
+  // (`never-completed`) or already parsed (`stopped` is returned past the
+  // `Number.isNaN(completedEpoch)` gate), so the right-hand `Date.parse` here
+  // is never NaN. The ordering is observable only by calling `classifyGuard`
+  // directly with a hand-built observation, which is how tests reach it.
+  //
+  // The NaN that IS reachable is on the LEFT: a cross-check carrying no
+  // completion parses to NaN, every comparison against NaN is false, so
+  // `crossCheckIsBetter` is false and the arm may fire. That is the intended
+  // reading — absent corroboration is not better evidence.
+  const completedCount = observation?.completedCount;
+  const allCount = observation?.crossCheck?.allCount;
+  const crossCheckIsBetter =
+    Date.parse(observation?.crossCheck?.newestCompletedAt ?? "") >
+    (observation?.newest ? Date.parse(observation.newest.updatedAt) : -Infinity);
+  if (
+    typeof completedCount === "number" &&
+    typeof allCount === "number" &&
+    completedCount > allCount &&
+    !crossCheckIsBetter
+  ) {
+    return {
+      ...base,
+      status: "unknown",
+      reason: "index-inconsistent",
+      detail:
+        `${name} (${workflow}) could not be assessed: the run index reported ${completedCount} ` +
+        `completed run(s) but only ${allCount} run(s) in total for the same workflow. Completed runs ` +
+        `are a subset of all runs, so both answers cannot be true — these reads were served from ` +
+        `different index states, and every timestamp in them is suspect. Suppressing the alarm rather ` +
+        `than firing it (BLO-38286); this guard is NOT being asserted to have stopped.`,
     };
   }
 
@@ -772,6 +870,27 @@ export function observeWorkflow(repo, workflow, read = gh, event = undefined) {
     // above still decides the sort key; what changed is that "false-early" is
     // no longer assumed to be small.
     //
+    // THE ENDPOINT IS EVENTUALLY CONSISTENT (BLO-38286). PEN-3379 recorded the
+    // 2026-09-18 fault without naming the property behind it, so the next
+    // reader — me — re-derived the determinism assumption from scratch and
+    // published a false "3 of 8 guards have stopped". Stated here so nobody
+    // does it a third time: this index serves point-in-time-PINNED answers for
+    // windows of minutes to an hour. Measured 2026-09-30, the same URL from the
+    // same pod ~20 minutes apart returned 2026-09-12T04:27:19Z and then
+    // 2026-09-30T08:40:45Z, with seven workflows on seven different cron minutes
+    // all pinned inside one 27-minute window on 09-12 — a replica frozen at an
+    // instant, not seven independent stalls. Two further properties matter for
+    // anyone writing a check against it:
+    //
+    //   - THE STALENESS IS WINDOWED, NOT PER-CALL. Six identical calls 2s apart
+    //     returned byte-identical answers. Retrying in a tight loop detects
+    //     nothing, and neither does a second read taken at the same instant —
+    //     which is precisely why the timestamp cross-check above, live since
+    //     09-27, still let run 36692972253 red two healthy guards on 09-30.
+    //   - IT IS NOT EVEN SELF-CONSISTENT ACROSS FILTERS, which is the one thing
+    //     here that can be checked by proof rather than by inference. See
+    //     INDEX CONSISTENCY in `classifyGuard`.
+    //
     // ON THE `event` NARROWING (BLO-38228): orthogonal to the axis above, and it
     // is threaded into `crossCheckCompletions` as well. The cross-check's whole
     // point is to differ on ONE axis — `status=completed` — so if it differed on
@@ -784,12 +903,21 @@ export function observeWorkflow(repo, workflow, read = gh, event = undefined) {
     // not less. An always-green guard is the failure mode both of these
     // mechanisms exist to prevent.
     const raw = read(["api", completedRunsPath(repo, workflow, event)]);
-    const run = JSON.parse(raw).workflow_runs?.[0];
-    if (!run) return { state: meta.state, name: meta.name, newest: null };
+    const page = JSON.parse(raw);
+    const run = page.workflow_runs?.[0];
+
+    // Carried for the set-cardinality check in `classifyGuard` (BLO-38286).
+    // Completed runs are a SUBSET of all runs, so this count may never exceed
+    // the cross-check's `allCount`; when it does, the two reads provably came
+    // from different index states. Costs no extra request — the number is
+    // already on this response.
+    const completedCount = typeof page.total_count === "number" ? page.total_count : null;
+    if (!run) return { state: meta.state, name: meta.name, newest: null, completedCount };
 
     return {
       state: meta.state,
       name: meta.name,
+      completedCount,
       newest: { updatedAt: run.updated_at, conclusion: run.conclusion, htmlUrl: run.html_url },
     };
   } catch {
@@ -894,8 +1022,12 @@ export function selectNewestCompleted(runs) {
  * CROSS_CHECK_PAGE_SIZE runs and takes the newest one that has actually
  * completed, which is the same quantity the filtered read claims to return.
  *
- * Returns `{newestCompletedAt}` (ISO string, or null when the page genuinely
- * holds no completed run), or `{error: true}` when the read could not be made.
+ * Returns `{newestCompletedAt, allCount}`, or `{error: true}` when the read
+ * could not be made. `newestCompletedAt` is an ISO string, or null when the
+ * page genuinely holds no completed run. `allCount` is this unfiltered read's
+ * `total_count` (null when absent) — the SUPERSET cardinality that
+ * `observeWorkflow`'s `completedCount` may never exceed, and the other half of
+ * the index-consistency proof in `classifyGuard` (BLO-38286).
  * An unreadable cross-check is NOT treated as agreement — see `classifyGuard`.
  *
  * `read` is injectable so the failure branch is reachable from a test. It is
@@ -919,7 +1051,14 @@ export function crossCheckCompletions(repo, workflow, read = gh, event = undefin
   try {
     const base = `repos/${repo}/actions/workflows/${workflow}/runs?per_page=${CROSS_CHECK_PAGE_SIZE}`;
     const raw = read(["api", event ? `${base}&event=${encodeURIComponent(event)}` : base]);
-    return { newestCompletedAt: selectNewestCompleted(JSON.parse(raw).workflow_runs ?? []) };
+    const page = JSON.parse(raw);
+    return {
+      newestCompletedAt: selectNewestCompleted(page.workflow_runs ?? []),
+      // The cardinality half of the corroboration (BLO-38286). Unfiltered, so
+      // this is the SUPERSET count that `observeWorkflow`'s `completedCount`
+      // must not exceed.
+      allCount: typeof page.total_count === "number" ? page.total_count : null,
+    };
   } catch {
     return { error: true };
   }
@@ -976,7 +1115,17 @@ export function annotationFor(result, stopModeDetail = null) {
     // names the unhandled reason rather than printing `undefined` — a bare
     // map would trade one silent mistitle for another, and this annotation is
     // the only place the reason surfaces.
-    const titles = { "unparsable-timestamp": "Unparsable run timestamp" };
+    //
+    // Null-prototype (BLO-38286, carried through the PEN-3462 extraction):
+    // `result.reason` is a closed internal enum today, but a plain literal
+    // would resolve `constructor`/`toString` off the prototype, `??` would not
+    // fall back, and a function would be stringified into the annotation
+    // title. That is what makes the fallback claim above actually true rather
+    // than merely intended. Same reason as `titles` below.
+    const titles = Object.assign(Object.create(null), {
+      "unparsable-timestamp": "Unparsable run timestamp",
+      "index-inconsistent": "Run index is internally inconsistent — liveness alarm suppressed",
+    });
     const title = titles[result.reason] ?? `Guard could not be assessed (${result.reason})`;
     return `::warning title=${title}::${result.detail}`;
   }
@@ -990,12 +1139,12 @@ export function annotationFor(result, stopModeDetail = null) {
     );
   }
 
-  const titles = {
+  const titles = Object.assign(Object.create(null), {
     unreadable: "Guard workflow unreadable",
     "runs-unreadable": "Guard run history unreadable",
     disabled: "Guard workflow disabled",
     "never-completed": "Guard has never completed",
-  };
+  });
   // Exhaustive over the stale reasons that reach here today ("stopped" is
   // handled above), but carrying the same fallback as the `unknown` branch:
   // an unmapped reason must name itself rather than print `title=undefined`,

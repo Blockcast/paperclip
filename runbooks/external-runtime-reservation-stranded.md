@@ -9,10 +9,17 @@ Source: `server/src/services/external-runtime-reservation-strand-metrics.ts`
 Triggers:
 
 - `PaperclipExternalRuntimeReservationStranded` — an agent holds an unreleased
-  `external_runtime_reservations` row older than
-  `externalRuntimeReservationStrandedAgeSeconds` (900 seconds by default)
-  whose run is terminal or silent, and the age snapshot refreshed
-  successfully.
+  `external_runtime_reservations` row whose run is terminal or silent, the age
+  snapshot refreshed successfully, and the row is older than the rule's
+  threshold. **The live Blockcast rule is the copy in `Blockcast/onprem-k8s`
+  (`paperclip/paperclip-runtime-alerts-prometheusrule.yaml`); read its `expr`
+  for the threshold in force.** onprem-k8s#4498 is the change that raises it
+  from `> 900` to `> 14400` seconds (4h), because most 900s pages cleared
+  without anyone acting. The rule's `for: 5m` stacks on top, so the real fire
+  time is threshold + 300s: 1200s (20m) at 900, 14700s (4h05m) at 14400. This
+  chart's own copy renders `externalRuntimeReservationStrandedAgeSeconds` (900
+  seconds by default) independently of the live rule, so the two numbers can
+  differ.
 - `PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed` — the most
   recent `/metrics` database refresh failed, so strand ages are stale and
   intentionally do not qualify the strand alert.

@@ -142,6 +142,35 @@ export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   "caveman_proxy_not_ready",
   "k8s_pod_schedule_failed",
   "adapter_failed",
+  // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) is not a new
+  // fault — it is the RENAME of the `adapter_failed` directly above, at the one
+  // claude-k8s emit site that names a skill-source fault
+  // (vendor/paperclip-adapter-claude-k8s/src/server/execute.ts, the sole emitter).
+  // It therefore inherits `adapter_failed`'s membership here for the same
+  // BLO-20933 reason: the throw is pre-`buildJobManifest`, so no Job, no Secret
+  // and no CLI spawn ever happened and the assignee had no part in it.
+  //
+  // Missing it was the third and last site of this rename's drift. Consequence,
+  // for issue runs rather than the pr_review ones the rest of BLO-35668 covers:
+  // once the three continuation attempts are exhausted the run strands as
+  // `stranded_assigned_issue`, and the routing union at recovery/service.ts
+  // `resolveStrandedRecoveryRouting` is this set OR `isInfraClassStrandedFailure`
+  // — whose arms are `k8s_job_deleted_externally`, the git-transport predicate,
+  // and `claude_truncated` + pod-removal wording. A `ClaudeSkillSourceUnavailableError`
+  // matches none, so `ownerAgentId` transferred UP the manager ladder for a
+  // materialization race nobody on this side caused, and stamped
+  // `infraClassCauseByErrorCode: false` into the recovery audit row.
+  //
+  // Membership has a THIRD consequence, in this file: `isInfraClassErrorCodeRun`
+  // below is a `.has()` on this set and nothing else, so adding a code also
+  // reclassifies it for the productivity review. Correct here — the throw is
+  // pre-`buildJobManifest`, so a run that left no comment was killed before it
+  // could write one, which is infrastructure rather than agent silence. Check all
+  // three consumers before adding a code, not the two above.
+  //
+  // Raised by Ally as an Important finding on #2159. The pairing is asserted in
+  // heartbeat-recoverable-error-family.test.ts so the next rename fails CI.
+  "skill_materialization_pending",
   "external_lifecycle_stale_killed",
   "k8s_concurrency_guard_unreachable",
   // BLO-27463: provider capacity throttling. Both codes carry errorFamily
@@ -168,6 +197,57 @@ export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   // against those guards, not a side effect of fixing ownership.
   "rate_limit_exhausted",
   "provider_throttled_no_progress",
+  // PEN-3442: the provider's own transient upstream failure (a 503/529 from
+  // Anthropic/OpenAI mid-turn), which is the same "the provider refused to
+  // serve" category as the two codes above and is already paired with
+  // `adapter_failed` — a member of this set since BLO-20933 — in
+  // `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` and in heartbeat's own retry
+  // classifier. The membership rule this set states is met: the run never got
+  // to succeed or fail on its own merits, and the assignee had no part in it.
+  //
+  // These were the one measured infra-class population the BLO-36535 sweep left
+  // behind, and the gap was invisible from the zero-token side. Re-measured
+  // 2026-10-01 over the 400 most recent runs of agent `29033747` (window
+  // 2026-09-27T21:33Z → 2026-10-01T17:24Z): 2 `claude_transient_upstream` runs,
+  // BOTH billed, 61,230 output tokens at the worst and $12.92 across the pair.
+  // A billed run has a real `usageJson`, so `isInfraFailureRun`'s zero-token
+  // test reads false and — absent this membership — `no_comment_streak` reads
+  // the missing run comment as assignee silence. Compare the same window's
+  // `provider_throttled_no_progress` (109 runs, zero billed), which the
+  // zero-token predicate already caught whether or not it was enumerated here:
+  // that asymmetry is exactly why a code can look covered and not be.
+  //
+  // `codex_transient_upstream` is the identical adapter-side classification for
+  // the other provider (`claude-local-execute` / `codex-local-execute` emit them
+  // from the same branch) and is enumerated with it everywhere else in this
+  // codebase. Splitting the pair here would leave a drift seam for no reason —
+  // it had zero occurrences in the measured window purely because that agent
+  // does not run the codex adapter.
+  //
+  // Scope note, same shape as the one above: this changes ROUTING and the
+  // review's exclusion, not the attempt budget. Both codes are ALREADY in
+  // `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES`, so their bounded-retry
+  // behaviour is untouched by this line; what changes is that a run which
+  // exhausts those retries and strands is re-dispatched to the existing
+  // assignee instead of moving `ownerAgentId` up the manager ladder for a
+  // provider outage.
+  //
+  // The family's third member, `provider_transient_upstream`, is deliberately
+  // NOT added, and the exclusion rests on measurement, not on BLO-18285's
+  // "normally parked in `scheduled_retry`": it IS reachable on a billed run
+  // (heartbeat's finalization assigns it to an `outcome === "failed"` run with
+  // no zero-token gate). Over the same 400-run window above it had ZERO
+  // occurrences, billed or not — and agent `29033747` runs `claude_k8s`, the
+  // k8s adapter this server-side classification exists for, so that zero is
+  // not the codex-style "never runs the emitting adapter" artifact. Also zero
+  // across that agent's 1000 most recent runs (2026-09-25T02:19Z →
+  // 2026-10-01T20:09Z) and the Penstock company's 1000 most recent
+  // (2026-09-28T20:32Z → 2026-10-01T20:24Z). Membership here is per code, not
+  // per family: the first billed `provider_transient_upstream` run observed
+  // puts it in this set, and the PEN-3442 negative control then needs a
+  // different subject.
+  "claude_transient_upstream",
+  "codex_transient_upstream",
 ]);
 
 // True when a run died of an infrastructure fault, REGARDLESS of how much work

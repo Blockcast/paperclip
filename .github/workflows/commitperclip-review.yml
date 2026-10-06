@@ -189,9 +189,10 @@ jobs:
           steps.quality.outcome == 'failure'
         env:
           # Set by exitFatal when no gate ran (a rate limit outlived the retry
-          # budget, or the budget could not be sized). The step stays red either
-          # way; only its explanation changes, because no commitperclip comment
-          # exists for a run whose gates never ran.
+          # budget, the budget could not be sized, or a GitHub 5xx meant a read
+          # never completed). The step stays red either way; only its
+          # explanation changes, because no commitperclip comment exists for a
+          # run whose gates never ran.
           QUALITY_NOT_EVALUATED: ${{ steps.quality.outputs.not_evaluated }}
           # Set by deliverComment when the verdict exists but its comment
           # could not be posted, so there is no comment to point at.

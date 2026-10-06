@@ -85,7 +85,13 @@ export interface Invite {
 
 export type InviteState = "active" | "revoked" | "accepted" | "expired";
 
-export interface CompanyInviteRecord extends Invite {
+/**
+ * PEN-3725: `tokenHash` is stripped from every invite response body, so the wire record cannot
+ * carry it. `Invite` above keeps the field because that interface describes the stored ROW; this
+ * one describes what a caller actually receives. The UI's own copy of this type
+ * (`ui/src/api/access.ts`) never declared it, which is what first showed the two had drifted.
+ */
+export interface CompanyInviteRecord extends Omit<Invite, "tokenHash"> {
   companyName: string | null;
   humanRole: HumanCompanyMembershipRole | null;
   inviteMessage: string | null;

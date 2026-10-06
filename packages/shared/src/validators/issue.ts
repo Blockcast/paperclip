@@ -232,13 +232,43 @@ export const issueExecutionMonitorPolicySchema = z.object({
         "SURFACE 2 — issue comments (`issues/{n}/comments`): Ally frequently answers as a plain PR comment and files no formal review object at all, so `pulls/{n}/reviews` reads `reviews=0` forever on those PRs even though Ally has demonstrably reviewed (verified on Blockcast/magma#1655 and Blockcast/paperclip#929/#942/#948/#951/#952). `reviews=0` is therefore NOT evidence of no review: before re-arming on it, also read `issues/{n}/comments`. Credit a comment only when it is authored by the reviewer App identity (the same-slug user seat is not that identity and never counts here either), carries the canonical `## Ally — Consolidated PR Review` heading, and contains EXACTLY ONE standalone full-40-hex `Reviewed head:` attestation; zero or several means unproven, so fail closed rather than crediting it. " +
         "On both surfaces judge staleness by comparing the attested `Reviewed head:` SHA against the PR's current head — never by `commit_id` alone (mutable; see the SURFACE 1 warning), and never by timestamp, which cannot tell \"read this head\" apart from \"raced the push\". PAGINATE BOTH surfaces, and note the trap is not the far end: GitHub's DEFAULT page size is 30, so a hand-rolled single-page fetch silently drops the rest of a longer thread and reproduces the very `reviews=0` false negative this block exists to kill. Pass `per_page=100` AND keep following pages until a short one. Whatever your cap, a TRUNCATED read is UNPROVEN, never absence: the helper stops at 10 pages and returns `reviews_pagination_exhausted`/`comments_pagination_exhausted`, a retryable outcome distinct from `{found:false}` — re-check, do not record a verdict off it. `githubHasReviewerEvidenceForPr` in `server/src/services/github-app-auth.ts` is the authoritative server-side implementation of this check: mirror its identity matching, its SUBMITTED-state handling, its pagination and its exhaustion codes rather than re-deriving weaker logic. But it PREDATES the body-marker rule above and still keys surface 1 on `commit_id` alone, in ANY submitted state. That is sound for the states Ally's reviews take on agent-authored PRs, which is its dominant case — but `APPROVED` IS a state it runs on (a human-authored PR can carry an App `APPROVED` review), so the server carries the same latent fail-open and is NOT cleared by this block. Do NOT carry its `commit_id` keying over to `APPROVED`, where re-anchoring makes it the fail-open recipe this block exists to remove.",
     ),
-  kind: z.enum(ISSUE_EXECUTION_MONITOR_KINDS).optional().nullable().default(null),
+  kind: z
+    .enum(ISSUE_EXECUTION_MONITOR_KINDS)
+    .optional()
+    .nullable()
+    .default(null)
+    // PEN-3415: this field is the trigger for the #1195 external-wait slot yield, and until now it
+    // was the only conjunct of that gate with nothing agent-facing describing it. The result was an
+    // opt-in mechanism nobody opted into: measured 2026-09-21T22:2xZ across every `in_review` row
+    // in the Penstock company (64 rows, untruncated), 7 carried an armed monitor and **7/7 left
+    // `kind` null** — so the yield was deployed and unreachable for all of them. It does fire where
+    // callers set it (#1794's 4-week fleet read counted two `external_wait_yield` runs), which is
+    // what makes this a discoverability defect rather than a dead mechanism.
+    //
+    // Deliberately documents the *whole* predicate, not just the value. Each omitted conjunct is a
+    // silent no-op an agent cannot distinguish from success: the PATCH returns 200 either way, and
+    // `monitorNextCheckAt` is armed either way. `issue-execution-policy-routes.test.ts` pins the
+    // behaviour (including the no-yield case for a `kind`-less monitor); `issue.test.ts` pins the
+    // load-bearing claims here so a size-motivated trim fails loudly.
+    .describe(
+      "PEN-3415: THIS FIELD IS WHAT RELEASES YOUR AGENT EXECUTION SLOT. Set `kind: \"external_service\"` in the SAME PATCH that parks the issue on an external wait and ends your work, and the control plane cancels your run with `errorCode: external_wait_yield` (activity `heartbeat.external_wait_yielded`), freeing the slot for other work while the armed monitor keeps the wake. Recovery treats such a row as attended, not stranded. " +
+        "It defaults to `null` and a null `kind` yields NOTHING — the row still parks and the monitor still arms, so a 200 and an armed `monitorNextCheckAt` are NOT evidence the slot was freed; the only positive evidence is the cancelled run plus that activity row. " +
+        "Every other conjunct is required too: you must be the issue's CURRENT execution run (setting `kind` later, from a different run, does nothing), `nextCheckAt` must be set and unlapsed, the row must end `in_progress` or `in_review`, and this PATCH must carry `executionPolicy` (or be the transition into `in_review`). " +
+        "⚠️ ORDER OF OPERATIONS: your run is terminated at this PATCH. Commit, push, open the PR and post your comment FIRST — anything you had not finished is lost, and a comment you intended to add afterwards never lands. Leave `kind` null for an internal follow-up re-check you intend to keep working through. Use `serviceName`/`externalRef` to name what you are waiting on.",
+    ),
   serviceName: z.string().trim().min(1).max(120).optional().nullable().default(null),
   externalRef: z.string().trim().min(1).max(500).optional().nullable().default(null),
   timeoutAt: z.string().datetime().optional().nullable().default(null),
   maxAttempts: z.number().int().positive().max(100).optional().nullable().default(null),
   recoveryPolicy: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES).optional().nullable().default(null),
-  productivityReviewDisabled: z.boolean().optional().default(false),
+  productivityReviewDisabled: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "⚠ THIS COPY DIES WITH THE MONITOR. It opts the issue out of automated productivity review only for as long as this monitor exists: every monitor clear — a convergence stall, a dispatch lapse, or an ordinary fire — drops it, and the opt-out is then silently gone while the issue still reads as opted out to whoever set it. " +
+        "Prefer the top-level `executionPolicy.productivityReviewDisabled`, which is durable and is also the only reachable home on a row with no monitor (`nextCheckAt` is required here). Set it here only when you genuinely mean 'while this monitor is armed'.",
+    ),
 });
 
 export const issueExecutionPolicySchema = z.object({
@@ -249,11 +279,27 @@ export const issueExecutionPolicySchema = z.object({
     .optional()
     .nullable()
     .describe(
-      "The ONLY accepted way to arm, re-arm, or clear an issue monitor (wake) is this nested field, `executionPolicy.monitor`. There is no top-level `monitor` / `monitorNextCheckAt` / `monitorNotes` input — those keys are rejected, because they used to be silently discarded (BLO-18790). Carry a re-check signature in `monitor.notes`. Every write REPLACES the whole `executionPolicy` rather than merging into it, and that applies to arming and re-arming exactly as much as to clearing: read the issue's current `executionPolicy` first, then re-send it complete with `monitor` set (arm/re-arm) or omitted (clear). The short {\"executionPolicy\":{\"monitor\":{…}}} body is safe ONLY on an issue whose policy has nothing else in it — on any other issue it erases `stages`, `reviewPreset` and `authorizationPolicy`, and a bare {\"executionPolicy\":{}} normalizes to null and erases them along with the monitor. Re-arming supersedes a `triggered` monitor, which is how you reset a wedged one — but `attemptCount` is preserved across re-arm, so re-sending a `maxAttempts` at or below that count (or a `timeoutAt` already in the past) is rejected 422 as exhausted instead of re-arming; omit `maxAttempts` when resetting a wedged monitor. Monitors only hold on an `in_progress`/`in_review` issue assigned to an agent, and an unresolved `blockedBy` edge suppresses the wake even while it reads as `scheduled` — so ALWAYS re-read `monitorNextCheckAt` in the same run and treat `null` as failure rather than reporting success off a 200. BLO-18294: an assignee-scheduled monitor that re-checks the SAME unresolved gate set 3 times running stops re-arming — the 4th arm is refused, the monitor is cleared with reason `convergence_stalled`, and the issue is moved to `blocked` with its blocker set posted as named unblock owners. Moving the issue back to `in_progress` can clear the stale consecutive count, but the same assignee cannot grant itself another monitor budget after a convergence stall; a non-assignee actor must make that re-arm decision. Declare `gateSignals` so that comparison runs against what you are actually waiting on; otherwise it falls back to the `notes` signature, and an unchanged signature converges. Polling never moves a human-only gate (approval, credential grant, another team's sign-off) — escalate those instead of arming a monitor on them.",
+      "The ONLY accepted way to arm, re-arm, or clear an issue monitor (wake) is this nested field, `executionPolicy.monitor`. There is no top-level `monitor` / `monitorNextCheckAt` / `monitorNotes` input — those keys are rejected, because they used to be silently discarded (BLO-18790). Carry a re-check signature in `monitor.notes`. Every write REPLACES the whole `executionPolicy` rather than merging into it, and that applies to arming and re-arming exactly as much as to clearing: read the issue's current `executionPolicy` first, then re-send it complete with `monitor` set (arm/re-arm) or omitted (clear). The short {\"executionPolicy\":{\"monitor\":{…}}} body is safe ONLY on an issue whose policy has nothing else in it — on any other issue it erases `stages`, `reviewPreset`, `authorizationPolicy` and `productivityReviewDisabled`, and a bare {\"executionPolicy\":{}} normalizes to null and erases them along with the monitor. Re-arming supersedes a `triggered` monitor, which is how you reset a wedged one — but `attemptCount` is preserved across re-arm, so re-sending a `maxAttempts` at or below that count (or a `timeoutAt` already in the past) is rejected 422 as exhausted instead of re-arming; omit `maxAttempts` when resetting a wedged monitor. Monitors only hold on an `in_progress`/`in_review` issue assigned to an agent, and an unresolved `blockedBy` edge suppresses the wake even while it reads as `scheduled` — so ALWAYS re-read `monitorNextCheckAt` in the same run and treat `null` as failure rather than reporting success off a 200. BLO-18294: an assignee-scheduled monitor that re-checks the SAME unresolved gate set 3 times running stops re-arming — the 4th arm is refused, the monitor is cleared with reason `convergence_stalled`, and the issue is moved to `blocked` with its blocker set posted as named unblock owners. Moving the issue back to `in_progress` can clear the stale consecutive count, but the same assignee cannot grant itself another monitor budget after a convergence stall; a non-assignee actor must make that re-arm decision. Declare `gateSignals` so that comparison runs against what you are actually waiting on; otherwise it falls back to the `notes` signature, and an unchanged signature converges. Polling never moves a human-only gate (approval, credential grant, another team's sign-off) — escalate those instead of arming a monitor on them. PEN-3415: arming a monitor does NOT release your agent execution slot on its own — only `monitor.kind: \"external_service\"`, set in this same PATCH, does that; read that field's description before parking on an external wait.",
 
     ),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
+  // BLO-39945: second home for the productivity-review opt-out. The original
+  // lives under `monitor`, whose `nextCheckAt` is required — so the flag was
+  // unreachable for exactly the rows that need it: deliberately-permanent
+  // `in_progress` logs attended by a cron, which correctly carry no monitor
+  // and would trip `long_active_duration` forever (BLO-34818 took four false
+  // positives). `monitor.nextCheckAt` stays required; the monitor-nested form
+  // keeps being honoured, but it is not equivalent — it dies with the monitor
+  // it hangs off (see the doc on `IssueExecutionPolicy`). This one is durable.
+  productivityReviewDisabled: z
+    .boolean()
+    .optional()
+    .describe(
+      "Opt this issue out of automated productivity review. Set it here, at the top of `executionPolicy`, when the issue carries no monitor — a deliberately-permanent `in_progress` row attended by a cron, for example, which would otherwise trip `long_active_duration` forever. " +
+        "⚠ SET IT HERE FOR ANYTHING MEANT TO LAST. The older home, `executionPolicy.monitor.productivityReviewDisabled`, still works and is still honoured — but it is NOT equivalent: it is a property of the monitor and DIES WITH IT. Every monitor clear drops it — a convergence stall, a dispatch lapse, or an ordinary fire — and the opt-out is then silently gone while the issue still reads as opted out to whoever set it. It is also unreachable on a row with no monitor at all, since `monitor.nextCheckAt` is required. Only this top-level home is durable. " +
+        "Like every `executionPolicy` field this is a whole-policy REPLACE: on an issue that already has a monitor, a short {\"executionPolicy\":{\"productivityReviewDisabled\":true}} body clears that monitor.",
+    ),
 });
 
 export const issueExecutionMonitorStateSchema = z.object({
@@ -487,7 +533,7 @@ export const MISPLACED_ISSUE_MONITOR_INPUT_KEYS = [
 ] as const;
 
 export function misplacedIssueMonitorInputMessage(key: string) {
-  return `\`${key}\` is not a writable issue field, so it would be silently discarded. Arm, re-arm or clear a monitor with the nested shape \`executionPolicy.monitor\`. Every write REPLACES the whole \`executionPolicy\` — it is never merged — so read the issue's current \`executionPolicy\` first and re-send it complete, with \`monitor\` set to arm/re-arm or omitted to clear: {"executionPolicy":{<the issue's current mode/commentRequired/stages/reviewPreset/authorizationPolicy>,"monitor":{"nextCheckAt":"<ISO-8601>","notes":"<signature>","scheduledBy":"assignee"}}}. Sending only \`monitor\` is safe ONLY on an issue whose policy has nothing else in it; otherwise it erases \`stages\`, \`reviewPreset\` and \`authorizationPolicy\`, and a bare {"executionPolicy":{}} normalizes the whole policy to null. The \`monitor_*\` columns are server-owned: they are derived from that input and cannot be written directly.`;
+  return `\`${key}\` is not a writable issue field, so it would be silently discarded. Arm, re-arm or clear a monitor with the nested shape \`executionPolicy.monitor\`. Every write REPLACES the whole \`executionPolicy\` — it is never merged — so read the issue's current \`executionPolicy\` first and re-send it complete, with \`monitor\` set to arm/re-arm or omitted to clear: {"executionPolicy":{<the issue's current mode/commentRequired/stages/reviewPreset/authorizationPolicy/productivityReviewDisabled>,"monitor":{"nextCheckAt":"<ISO-8601>","notes":"<signature>","scheduledBy":"assignee"}}}. Sending only \`monitor\` is safe ONLY on an issue whose policy has nothing else in it; otherwise it erases \`stages\`, \`reviewPreset\`, \`authorizationPolicy\` and \`productivityReviewDisabled\`, and a bare {"executionPolicy":{}} normalizes the whole policy to null. The \`monitor_*\` columns are server-owned: they are derived from that input and cannot be written directly.`;
 }
 
 function misplacedIssueMonitorInputSchema(key: (typeof MISPLACED_ISSUE_MONITOR_INPUT_KEYS)[number]) {

@@ -136,7 +136,13 @@ export function getConfigSchema(): AdapterConfigSchema {
       type: "text",
       key: "resources.limits.memory",
       label: "Memory Limit",
-      hint: "Memory limit for Job pods (e.g. 128Mi, 512Mi, 1Gi).",
+      hint: "Memory limit for Job pods (e.g. 2Gi, 4Gi, 8Gi). Under about 1.5Gi, half the limit is too small for node, so the tool child memory cap below is raised to its 768 MiB floor.",
+    },
+    {
+      type: "number",
+      key: "resources.limits.toolMemoryKb",
+      label: "Tool Child Memory Cap (KiB)",
+      hint: "RLIMIT_DATA ceiling (ulimit -d, KiB) applied to every bash or zsh the agent spawns — Bash tool commands and their children — and inherited by their descendants, including plain `sh`. Not applied to the claude process itself, nor to a bare `sh -c` launched outside a tool shell (POSIX sh reads neither BASH_ENV nor ZDOTDIR). A runaway child then fails alone with ENOMEM instead of the cgroup OOM-killing the whole run (BLO-34477). Default: half of Memory Limit, raised to at least 786432 (768 MiB) because node cannot start below about 576 MiB; an explicit value is used as given. 0 disables.",
     },
     // Scheduling
     {

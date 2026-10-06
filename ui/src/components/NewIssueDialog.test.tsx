@@ -483,11 +483,16 @@ describe("NewIssueDialog", () => {
       description: "## Acceptance criteria\n\n- Observable result",
     };
     const { root } = renderDialog(container);
-    await flush();
 
-    const submitButton = Array.from(container.querySelectorAll("button"))
+    // Defaults entry path: `disabled` is `!titleHasText`, and `titleHasText` is
+    // only set by the initialization effect after the first commit. The
+    // `await flush()` that used to sit here supplied exactly one tick and no
+    // more — the BLO-32761 shape. See the sub-task test below.
+    const findSubmitButton = () => Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expectSubmitEnabled(submitButton);
+    await waitForAssertion(() => expectSubmitEnabled(findSubmitButton()));
+    const submitButton = findSubmitButton();
+
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
@@ -725,14 +730,17 @@ describe("NewIssueDialog", () => {
     };
 
     const { root } = renderDialog(container);
-    await flush();
 
-    const planningButton = container.querySelector('[data-issue-work-mode="planning"]');
-    expect(planningButton?.className).toContain("bg-accent");
-
-    const submitButton = Array.from(container.querySelectorAll("button"))
+    // Both assertions read state the initialization effect writes after the
+    // first commit, so a single `await flush()` is zero margin under CI load.
+    const findSubmitButton = () => Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expectSubmitEnabled(submitButton);
+    await waitForAssertion(() => {
+      const planningButton = container.querySelector('[data-issue-work-mode="planning"]');
+      expect(planningButton?.className).toContain("bg-accent");
+      expectSubmitEnabled(findSubmitButton());
+    });
+    const submitButton = findSubmitButton();
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -757,14 +765,19 @@ describe("NewIssueDialog", () => {
     };
 
     const { root } = renderDialog(container);
-    await flush();
 
-    const askButton = container.querySelector('[data-issue-work-mode="ask"]');
-    expect(askButton?.className).toContain("bg-accent");
-
-    const submitButton = Array.from(container.querySelectorAll("button"))
+    // Same defaults-entry race as the planning-mode test above. This exact
+    // assertion ejected merge group 36288636688 from the queue (BLO-29023) as
+    // `AssertionError: expected true to be false` — the button was still
+    // disabled one tick in.
+    const findSubmitButton = () => Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
-    expectSubmitEnabled(submitButton);
+    await waitForAssertion(() => {
+      const askButton = container.querySelector('[data-issue-work-mode="ask"]');
+      expect(askButton?.className).toContain("bg-accent");
+      expectSubmitEnabled(findSubmitButton());
+    });
+    const submitButton = findSubmitButton();
 
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));

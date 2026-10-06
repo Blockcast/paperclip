@@ -110,30 +110,61 @@
  * `GET /repos/{owner}/{repo}/commits/{sha}` (`author.login`, `author.id`,
  * `author.type` all resolving to the App, id `290875700`), the same
  * installation also lands commits under a bare `allyblockcast[bot]@…` with no
- * numeric prefix, and once under a WRONG numeric prefix
- * (`220200645+allyblockcast[bot]@…`). The numeric prefix is caller-supplied at
- * commit time — whatever `git config user.email` or the REST payload said — not
- * a verified property of the write, so it varies by write path even though
- * every one of these is the same shared credential.
+ * numeric prefix, and twice under a WRONG numeric prefix
+ * (`220200645+allyblockcast[bot]@…`, `218837398+allyblockcast[bot]@…`). The
+ * numeric prefix is caller-supplied at commit time — whatever
+ * `git config user.email` or the REST payload said — not a verified property
+ * of the write, so it varies by write path even though every one of these is
+ * the same shared credential.
  * `APP_NOREPLY_EMAIL_PATTERN` therefore matches the `allyblockcast[bot]`
  * local-part on the `users.noreply.github.com` domain with an OPTIONAL numeric
  * prefix of ANY digits, an OPTIONAL `+tag` subaddress, and case-insensitively.
  *
- * Measured on `origin/master`, non-merge commits since 2026-07-01: 192 caught
- * by the old literal, 15 missed purely on spelling (13 bare, 1 wrong-prefix,
- * 1 no-`[bot]`), 2 of the missed landing AFTER this gate's own cutoff.
+ * Measured on `origin/master`, non-merge commits since 2026-07-01, at the time
+ * this was written (2026-08-12): 192 caught by the old literal, 15 missed (13
+ * bare and 1 wrong-prefix, both spelling; 1 no-`[bot]`, a different account
+ * that stays unmatched, see below), 2 of the missed landing AFTER this gate's
+ * own cutoff.
  *
- * ### `220200645+allyblockcast[bot]@…` is NOT a second installation — it is a
+ * RE-MEASURED 2026-10-02, the day the widened matcher merged, over 3181
+ * non-merge commits via the GitHub API: 194 caught by the old literal, 288 by
+ * this pattern (+94) — 92 bare, 1 under each wrong prefix. The bare-spelling
+ * write path kept running for two weeks after this was filed and stopped on
+ * 2026-08-26, so the post-cutoff cohort grew from 2 to 77. Re-measure rather
+ * than quoting either figure; both are dated snapshots.
+ *
+ * ### Those 77 post-cutoff commits are on master and are NOT grandfathered
+ *
+ * They are deliberately absent from `GRANDFATHERED_OFFENSE_SHAS`. That list
+ * exists to stop an OPEN PR being retro-broken when the matcher tightens
+ * (BLO-23894); it is not a record of historical violations. These 77 are
+ * already on published master, where no gate run can reach them — CI invokes
+ * this script only as `--base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"`
+ * (`.github/workflows/pr.yml`), and a PR range never contains commits already
+ * on master. They cannot be re-attributed without rewriting published history,
+ * so they are recorded here rather than allowlisted; adding 77 inert entries
+ * would be noise, and would misrepresent the allowlist's purpose.
+ *
+ * One of the 77 did not arrive by this spelling bug at all: `c3020290b`
+ * carries the canonical spelling the old literal already matched, because it
+ * is a SQUASH commit created at merge time, after the gate had already run and
+ * passed on five correctly per-agent-attributed commits. No matcher change can
+ * reach that write path. Tracked separately as BLO-39345.
+ *
+ * ### A WRONG numeric prefix is NOT a second installation — it is a
  * ### malformed stamp, and it IS matched
  *
- * The one commit carrying it (`d41030016`, merged 2026-08-10) has NO `author`
- * object at all in `GET /repos/{owner}/{repo}/commits/{sha}` — only `committer`
- * (a human, `kkroo`). GitHub could not resolve `220200645` to any account, App
- * or user. It reads as a hand-typed or copy-paste-mangled `--author` override
- * that got the prefix wrong, and it erases the true author exactly as badly
- * (worse — it does not even resolve), so the any-digits prefix catches it
- * deliberately. If a genuinely second App installation ever appears, name it
- * here explicitly rather than leaning on this catch-all.
+ * Two commits carry one: `d41030016` (`220200645+…`, merged 2026-08-10) and
+ * `8afd2b4c0` (`218837398+…`, authored 2026-08-25). Both have NO `author`
+ * object at all in `GET /repos/{owner}/{repo}/commits/{sha}` — only
+ * `committer` (`kkroo`, a human, on the first; `allyblockcast[bot]` on the
+ * second). GitHub could resolve neither `220200645` nor `218837398` to any
+ * account, App or user. They read as hand-typed or copy-paste-mangled
+ * `--author` overrides that got the prefix wrong, and they erase the true
+ * author exactly as badly (worse — they do not even resolve), so the
+ * any-digits prefix catches them deliberately. If a genuinely second App
+ * installation ever appears, name it here explicitly rather than leaning on
+ * this catch-all.
  *
  * ### `allyblockcast@users.noreply.github.com` (no `[bot]`) is a DIFFERENT real
  * ### account — deliberately NOT matched

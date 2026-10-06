@@ -7633,6 +7633,141 @@ export function recoveryService(
       });
     }
 
+    // BLO-27463: a terminal `issue_dependencies_blocked` run on the *assignee's own
+    // execution* is a wait state, never a stranded execution path (see
+    // DEPENDENCY_BLOCKED_ERROR_CODE), so it must not open a stranded_assigned_issue
+    // action or move ownership up the org chain — regardless of whether the blockers
+    // have since cleared.
+    //
+    // This previously only refused escalation while the issue was *still* not
+    // dependency-ready. That predicate cannot fire on the population that actually
+    // escalates: heartbeat.ts restores the issue to its pre-checkout status when the
+    // dep-blocked retry budget exhausts, so by the time the sweep sees it the
+    // blockers have resolved or never existed, and the readiness re-check passes.
+    // Measured against the CEO inbox 2026-08-18, of the 24 escalations opened since
+    // the readiness guards landed on 2026-08-09: 24/24 had zero unresolved blockers,
+    // 23/24 were reassigned up the org chain, and 24/24 came to rest in `blocked`
+    // with an empty blocker set — permanently undispatchable per BLO-21523.
+    //
+    // 14 of those 24 were provider rate-limit/quota parks carrying this error code
+    // ("surfaced as `issue_dependencies_blocked`"), which BLO-19889 AC#2 classes as
+    // infra-class and equally non-escalating. Refusing on the error code covers both
+    // populations at the single gate every escalation caller passes through.
+    //
+    // Skipping is safe for that population two ways: a dependency-ready issue is left
+    // in a dispatchable status for the normal scheduler, and a still-blocked one
+    // retains its edge-triggered dependency-resolved wake.
+    //
+    // Review-participant strands are deliberately excluded, because neither of
+    // those safety arguments holds for them. Four of the five review-participant
+    // call sites below reach here with a *terminal participant run*, and because
+    // DEPENDENCY_BLOCKED_ERROR_CODE is a member of
+    // NON_RETRYABLE_CONTINUATION_ERROR_CODES the non-retryable branch catches it
+    // first. An `in_review` issue with a pending stage is not re-dispatched by the
+    // normal scheduler; and when its blockers have already cleared there is no
+    // dependency wake left to retain, because the wait is on the *participant*, not
+    // on a dependency. On the `!agentInvokable` branch the participant provably
+    // cannot be invoked, so suppressing here would leave the stage with no recovery
+    // path at all, silently re-skipped every sweep — strictly worse than the
+    // escalation this gate removes, and reachable in production because
+    // `claimQueuedRun`'s dependency gate cancels *any* queued run for the issue,
+    // participant wakes included. The measurement above covers the
+    // assignee-execution population only; whether an `in_review` dependency wait
+    // should also stop escalating is a separate question that needs its own evidence.
+    //
+    // `recoveryOwnerAgentId == null` is that exclusion stated exactly, rather than
+    // proxied through `previousStatus !== "in_review"`. All five review-participant sites
+    // pass `recoveryOwnerAgentId: participantAgentId`, which the guard at the top of the
+    // `issue.status === "in_review"` block has already narrowed to a non-null string; no
+    // assignee-lane site passes the field at all. The status proxy was broader than its
+    // own justification: three assignee-lane sites forward `previousStatus: issue.status`
+    // and `in_review` is a member of STRANDED_ASSIGNED_ISSUE_STATUSES, so it exempted
+    // them too.
+    //
+    // The two predicates are not currently distinguishable in practice. BLO-19123's F2
+    // (`3830d7bc`) added an earlier arm keyed on `errorCode === DEPENDENCY_BLOCKED &&
+    // (status === "in_review" || !agentInvokable)` that `continue`s before this gate is
+    // reached, so no `in_review` strand of either lane arrives here. This gate therefore
+    // covers the remaining and much larger population: `todo`/`in_progress` issues with
+    // an invokable assignee, which that arm does not match. The exact form is kept
+    // regardless — it states the intent instead of encoding an assumption about an
+    // upstream arm that may later narrow.
+    //
+    // PEN-3636: this gate is decided entirely from `input`, so it is evaluated
+    // *before* the transaction opens rather than inside it.
+    //
+    // It used to sit ~150 lines below, after the transaction had taken two
+    // advisory locks (one of them `lockIssueParentMutationCompany`, a
+    // company-global mutex) and two reads, to evaluate a condition on values it
+    // already held — making it the most expensive no-op in the recovery chain.
+    // The measurements that motivated the hoist are on PEN-3636; they are not
+    // restated here because they date a single production pass and will not be
+    // re-verified against this code.
+    //
+    // Hoisting is return-value-identical for every candidate. The three early
+    // returns the transaction can take before reaching this point (`!fresh`, the
+    // stale review-stage arm, and the moved-status arm) all `return null`, and so
+    // does this gate, so no candidate changes outcome. Nothing is skipped either:
+    // the work removed is two lock acquisitions and two reads, none of which
+    // write, and advisory locks are xact-scoped so dropping the transaction
+    // releases nothing another caller was relying on.
+    //
+    // ⚠ One observable DOES change, deliberately: the counters below now also
+    // count candidates that match this gate *and* would have lost one of those
+    // three races. Those are silent `return null`s today, counted in no bucket,
+    // so the tally was undercounting the suppressed population by exactly the
+    // racing remainder. The value is diagnostic-only (see the increment site's
+    // own note) and the new reading is the more faithful one — this gate asks a
+    // question about `input`, not about who won a race on the row.
+    //
+    // The INVARIANT on the three increments is preserved and in fact
+    // strengthened: they remain one synchronous block, now with no `await`
+    // anywhere near them, so the `...StillBlocked` subtraction still cannot go
+    // negative.
+    // On `latestRunForReceipt` rather than `input.latestRun`: this is the one
+    // thing about the hoist that is not a pure move. `isRoutineExecutionDuplicate\
+    // SuppressedRun` is a type predicate, so in its negative branch TypeScript
+    // narrows `input.latestRun` to `never` — reading `.errorCode` off it here is a
+    // compile error (TS2339). The old site escaped that only because it sat inside
+    // the `db.transaction` callback, where narrowing of a mutable property access
+    // is discarded and the declared type comes back. `latestRunForReceipt` is the
+    // unnarrowed capture taken at the top of this function for precisely this
+    // reason, and it holds the identical runtime value, so this is a type-level
+    // fix and not a behavioural one.
+    if (input.recoveryOwnerAgentId == null && latestRunForReceipt?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
+      // `isDependencyReady` is what separates a still-blocked wait from the
+      // defect-shaped "dependency-blocked with nothing blocking it" arm, and that
+      // distinction is the visibility this gate trades the escalation for. It is
+      // kept, but as a pass-scoped tally rather than a per-issue emission.
+      //
+      // BLO-32668 moved the readiness read out of the transaction for the same
+      // reason this block has now followed it: it serialized a round-trip per
+      // candidate while holding a lock that checkout and adoption both contend
+      // on. The value is diagnostic-only, so a caller-supplied read is as good.
+      //
+      // On the `?? null` below: from the two wired lanes it is unreachable, not a
+      // real fallback. `listIssueDependencyReadinessMap` pre-seeds a default
+      // `IssueDependencyReadiness` for every id it is asked about before it queries
+      // `issueRelations` (`services/issues.ts`), so `.get(issue.id)` never returns
+      // `undefined` for an id in the request. `...Unclassified` is therefore fed
+      // only by call sites that omit `dependencyWaitReadiness` entirely — it is
+      // structurally dead from `todo` and `in_progress`. Kept as defence-in-depth so
+      // that a future lane which forgets to thread readiness degrades into its own
+      // bucket instead of being miscounted as a resolved-blocker defect.
+      //
+      // INVARIANT: these three increments must stay one synchronous block. The
+      // still-blocked arm is not counted here; it is *derived* by subtraction at the
+      // end of the pass, which is only non-negative because no sweep can observe a
+      // suppression that has been totalled but not yet classified. Inserting an
+      // `await` between the total and the classification would make
+      // `...StillBlocked` go negative silently.
+      dependencyWaitEscalationSuppressedTotal += 1;
+      const readiness = input.dependencyWaitReadiness ?? null;
+      if (readiness == null) dependencyWaitEscalationSuppressedUnclassifiedTotal += 1;
+      else if (readiness.isDependencyReady) dependencyWaitEscalationSuppressedDependencyReadyTotal += 1;
+      return null;
+    }
+
     // Serialize escalation per (company, source-issue) so concurrent
     // reconcile sweeps don't fight over the same recovery-action upsert,
     // wakeup, and source-issue UPDATE.
@@ -7754,104 +7889,6 @@ export function recoveryService(
       const documentWriteRefusedRunId = newestIssueRun?.statusOnlyDocumentWriteRefusedAt
         ? newestIssueRun.id
         : null;
-
-      // BLO-27463: a terminal `issue_dependencies_blocked` run on the *assignee's own
-      // execution* is a wait state, never a stranded execution path (see
-      // DEPENDENCY_BLOCKED_ERROR_CODE), so it must not open a stranded_assigned_issue
-      // action or move ownership up the org chain — regardless of whether the blockers
-      // have since cleared.
-      //
-      // This previously only refused escalation while the issue was *still* not
-      // dependency-ready. That predicate cannot fire on the population that actually
-      // escalates: heartbeat.ts restores the issue to its pre-checkout status when the
-      // dep-blocked retry budget exhausts, so by the time the sweep sees it the
-      // blockers have resolved or never existed, and the readiness re-check passes.
-      // Measured against the CEO inbox 2026-08-18, of the 24 escalations opened since
-      // the readiness guards landed on 2026-08-09: 24/24 had zero unresolved blockers,
-      // 23/24 were reassigned up the org chain, and 24/24 came to rest in `blocked`
-      // with an empty blocker set — permanently undispatchable per BLO-21523.
-      //
-      // 14 of those 24 were provider rate-limit/quota parks carrying this error code
-      // ("surfaced as `issue_dependencies_blocked`"), which BLO-19889 AC#2 classes as
-      // infra-class and equally non-escalating. Refusing on the error code covers both
-      // populations at the single gate every escalation caller passes through.
-      //
-      // Skipping is safe for that population two ways: a dependency-ready issue is left
-      // in a dispatchable status for the normal scheduler, and a still-blocked one
-      // retains its edge-triggered dependency-resolved wake.
-      //
-      // Review-participant strands are deliberately excluded, because neither of
-      // those safety arguments holds for them. Four of the five review-participant
-      // call sites below reach here with a *terminal participant run*, and because
-      // DEPENDENCY_BLOCKED_ERROR_CODE is a member of
-      // NON_RETRYABLE_CONTINUATION_ERROR_CODES the non-retryable branch catches it
-      // first. An `in_review` issue with a pending stage is not re-dispatched by the
-      // normal scheduler; and when its blockers have already cleared there is no
-      // dependency wake left to retain, because the wait is on the *participant*, not
-      // on a dependency. On the `!agentInvokable` branch the participant provably
-      // cannot be invoked, so suppressing here would leave the stage with no recovery
-      // path at all, silently re-skipped every sweep — strictly worse than the
-      // escalation this gate removes, and reachable in production because
-      // `claimQueuedRun`'s dependency gate cancels *any* queued run for the issue,
-      // participant wakes included. The measurement above covers the
-      // assignee-execution population only; whether an `in_review` dependency wait
-      // should also stop escalating is a separate question that needs its own evidence.
-      //
-      // `recoveryOwnerAgentId == null` is that exclusion stated exactly, rather than
-      // proxied through `previousStatus !== "in_review"`. All five review-participant sites
-      // pass `recoveryOwnerAgentId: participantAgentId`, which the guard at the top of the
-      // `issue.status === "in_review"` block has already narrowed to a non-null string; no
-      // assignee-lane site passes the field at all. The status proxy was broader than its
-      // own justification: three assignee-lane sites forward `previousStatus: issue.status`
-      // and `in_review` is a member of STRANDED_ASSIGNED_ISSUE_STATUSES, so it exempted
-      // them too.
-      //
-      // The two predicates are not currently distinguishable in practice. BLO-19123's F2
-      // (`3830d7bc`) added an earlier arm keyed on `errorCode === DEPENDENCY_BLOCKED &&
-      // (status === "in_review" || !agentInvokable)` that `continue`s before this gate is
-      // reached, so no `in_review` strand of either lane arrives here. This gate therefore
-      // covers the remaining and much larger population: `todo`/`in_progress` issues with
-      // an invokable assignee, which that arm does not match. The exact form is kept
-      // regardless — it states the intent instead of encoding an assumption about an
-      // upstream arm that may later narrow.
-      if (input.recoveryOwnerAgentId == null && input.latestRun?.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
-        // `isDependencyReady` is what separates a still-blocked wait from the
-        // defect-shaped "dependency-blocked with nothing blocking it" arm, and that
-        // distinction is the visibility this gate trades the escalation for. It is
-        // kept, but as a pass-scoped tally rather than a per-issue emission.
-        //
-        // BLO-32668: this used to read readiness here — inside the transaction, under
-        // the per-issue advisory lock — and log one INFO line per suppressed issue.
-        // Both costs scale with a population that is large and growing (515 distinct
-        // issues per ~43 s pass; 2,758 log lines in 10 min, 300-600/min sustained,
-        // measured 2026-09-07), and neither bought anything the caller could not
-        // supply: the value is diagnostic-only, so a pre-lock read is as good, and the
-        // per-issue line said nothing the aggregate does not. The lock-held read was
-        // the worse of the two — it serialized a round-trip per candidate while
-        // holding a lock that checkout and adoption both contend on.
-        //
-        // On the `?? null` below: from the two wired lanes it is unreachable, not a
-        // real fallback. `listIssueDependencyReadinessMap` pre-seeds a default
-        // `IssueDependencyReadiness` for every id it is asked about before it queries
-        // `issueRelations` (`services/issues.ts`), so `.get(issue.id)` never returns
-        // `undefined` for an id in the request. `...Unclassified` is therefore fed
-        // only by call sites that omit `dependencyWaitReadiness` entirely — it is
-        // structurally dead from `todo` and `in_progress`. Kept as defence-in-depth so
-        // that a future lane which forgets to thread readiness degrades into its own
-        // bucket instead of being miscounted as a resolved-blocker defect.
-        //
-        // INVARIANT: these three increments must stay one synchronous block. The
-        // still-blocked arm is not counted here; it is *derived* by subtraction at the
-        // end of the pass, which is only non-negative because no sweep can observe a
-        // suppression that has been totalled but not yet classified. Inserting an
-        // `await` between the total and the classification would make
-        // `...StillBlocked` go negative silently.
-        dependencyWaitEscalationSuppressedTotal += 1;
-        const readiness = input.dependencyWaitReadiness ?? null;
-        if (readiness == null) dependencyWaitEscalationSuppressedUnclassifiedTotal += 1;
-        else if (readiness.isDependencyReady) dependencyWaitEscalationSuppressedDependencyReadyTotal += 1;
-        return null;
-      }
 
       // BLO-19160: re-check the handover evidence under the same lock before
       // creating recovery state. This remains useful for callers whose candidate
@@ -15444,7 +15481,24 @@ export function recoveryService(
         priorAssigneeAgentId: issue.assigneeAgentId,
       },
       nextAction: ownerAgentId
-        ? `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds. Take over the PR, unblock or reassign the author, or record a disposition — do not leave the author looping on its own self-review.`
+        // PEN-3397: name the discharge route explicitly. This used to end at
+        // "or record a disposition", which names an outcome and no mechanism.
+        // Two agents independently read that as an instruction to find a write
+        // route, probed four shapes that all put the action id in the PATH
+        // (`POST .../recovery-actions/{actionId}/resolve`, `PATCH
+        // .../recovery-actions/{actionId}`, ...), got a uniform
+        // `404 API route not found`, and filed the conclusion that NO
+        // agent-facing discharge route exists and a grant could not fix it.
+        // The route exists and always did — the action id belongs in the BODY,
+        // and is optional there, because the endpoint resolves the issue's one
+        // active action. Spelling the call out is what stops that misreading.
+        //
+        // The `${reRaised}, after N actionable review rounds` lead-in is
+        // BLO-35909's and is kept verbatim: the evidence for non-convergence is
+        // the re-raised findings, not the round count, which counts converging
+        // rounds too. The two changes are not alternatives — this one replaces
+        // only the "or record a disposition" tail.
+        ? `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds. Take over the PR, unblock or reassign the author, or discharge this action yourself: POST /issues/${issue.id}/recovery-actions/resolve with body {"outcome":"restored","resolutionNote":"<why>"} (the action id goes in the BODY as an optional "actionId", never in the path; omit "sourceIssueStatus" to leave the source issue's status untouched). Do not leave the author looping on its own self-review.`
         : `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds, and no invokable agent can own it. Board intervention needed.`,
       wakePolicy: ownerAgentId
         ? { type: "wake_owner", reason: "self_review_pr_non_convergence", ownerAgentId }
@@ -15502,8 +15556,140 @@ export function recoveryService(
     return { escalated: true, ownerAgentId, ownerType: ownerAgentId ? "agent" : "board" };
   }
 
+  /**
+   * PEN-3397: discharge `pr_review_non_convergence` actions whose PR has closed.
+   *
+   * The escalation's entire premise is "an author is looping on its own
+   * self-review and nothing forces a resolution". A closed PR ends that loop by
+   * construction — merged, the loop converged; closed unmerged, it was abandoned
+   * or superseded. Either way there is no author left to unstick.
+   *
+   * Nothing was watching for that. PEN-2756 bounded the shape so it can no longer
+   * re-fire forever, and BLO-24662's `escalateExpiredWakeHorizons` moves a spent
+   * one to `escalated` — but `escalated` is deliberately NOT terminal (it stays
+   * inside `ACTIVE_RECOVERY_ACTION_STATUSES` so the row keeps holding
+   * `issue_recovery_actions_active_source_uq`; see the note on
+   * `escalateExpiredWakeHorizons`). So a moot action still read as active and
+   * still sat on its owner's plate. Measured on two live rows: `6542ffc8` asked
+   * the CTO to "take over" onprem-k8s#3076 for **3 days** after that PR merged —
+   * it merged 3h22m after the action was created, and 3h22m after its own
+   * `timeoutAt`.
+   *
+   * Discharging DOES free that uniqueness slot — the very thing the note above
+   * declines to do — and that is deliberate here, because the difference is the
+   * TRIGGER, not the status. That note's concern is a *sweep* freeing the slot
+   * and then minting a brand-new action with a fresh budget and horizon on its
+   * next pass, which is self-perpetuating precisely because the sweep runs
+   * unconditionally on a timer. This path frees the slot only on an observed
+   * PR-close, and re-minting requires a fresh actionable review cycle on that PR
+   * (`github-webhook.ts` -> `escalateStalledSelfReviewPr`), which a closed PR
+   * does not generate unaided. If the PR is reopened and review cycles genuinely
+   * resume, a new action is the CORRECT outcome rather than a re-fire loop.
+   *
+   * Matched on the FINGERPRINT, which the creation site above builds from
+   * `(issue.id, repoFullName, prNumber)` and is therefore exactly reconstructible
+   * here. That is what makes passing a broad candidate issue list safe: an issue
+   * that merely mentions this PR, or carries a non-convergence action for a
+   * DIFFERENT PR, cannot match. Do not relax this to a `kind`-only predicate — an
+   * issue can legitimately carry an action for another PR.
+   *
+   * Resolving (rather than cancelling) on merge is the honest outcome: the
+   * condition the action flagged genuinely cleared. A PR closed unmerged is
+   * recorded `cancelled`, matching how the wake backstop records an action whose
+   * premise went stale rather than succeeded.
+   */
+  async function closePrReviewNonConvergenceForClosedPr(input: {
+    repoFullName: string | null;
+    prNumber: number;
+    merged: boolean;
+    candidateIssues: ReadonlyArray<{ id: string; companyId: string; identifier?: string | null }>;
+    runId?: string | null;
+  }): Promise<{ closed: number; issueIds: string[] }> {
+    const closedIssueIds: string[] = [];
+    for (const issue of input.candidateIssues) {
+      // Contained per candidate: one issue's failure must not abort the rest,
+      // and this whole path is best-effort decoration on the webhook.
+      try {
+        const fingerprint =
+          `pr_review_non_convergence:${issue.id}:${input.repoFullName ?? "unknown"}:${input.prNumber}`;
+        const resolutionNote = input.merged
+          ? `Recovery action discharged automatically: PR #${input.prNumber} merged, so the self-review loop it flagged has converged and there is no author left to unstick.`
+          : `Recovery action cancelled automatically: PR #${input.prNumber} closed without merging, so the self-review loop it flagged has ended.`;
+        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          kind: "pr_review_non_convergence",
+          fingerprint,
+          // Deliberately no `sourceIssueStatus` equivalent: this closes the
+          // recovery action ONLY. A merged PR does not by itself mean the source
+          // issue is done, and moving it here would silently complete work whose
+          // Done-when nobody evaluated.
+          status: input.merged ? "resolved" : "cancelled",
+          // `cancelled` is restricted to board actors on the REST surface
+          // (`routes/issues.ts` -> `assertBoard`). That gate scopes who may
+          // *assert* an action failed, and this is a system-initiated discharge
+          // acting on an observed GitHub event rather than an agent's judgement,
+          // so it deliberately does not go through it.
+          outcome: input.merged ? "restored" : "cancelled",
+          resolutionNote,
+        });
+        if (!resolved) continue;
+        closedIssueIds.push(issue.id);
+
+        // Contained SEPARATELY from the discharge above, and not merely for
+        // tidiness: by this line the action is already resolved and already
+        // counted in the returned `closed`. Sharing the outer catch would report
+        // "auto-discharge failed" for a discharge that in fact SUCCEEDED, and
+        // send the next reader debugging a write that worked. A failure here
+        // costs an audit row, not the discharge.
+        try {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "pr_review_non_convergence_pr_closed",
+            agentId: resolved.ownerAgentId,
+            runId: input.runId ?? null,
+            action: "issue.recovery_action_resolved",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              source: "recovery.close_pr_review_non_convergence_for_closed_pr",
+              identifier: issue.identifier ?? null,
+              repoFullName: input.repoFullName,
+              prNumber: input.prNumber,
+              prMerged: input.merged,
+              recoveryActionId: resolved.id,
+              recoveryActionStatus: resolved.status,
+              outcome: resolved.outcome,
+              recoveryOwnerAgentId: resolved.ownerAgentId,
+            },
+          });
+        } catch (err) {
+          logger.warn(
+            {
+              err,
+              issueId: issue.id,
+              prNumber: input.prNumber,
+              repoFullName: input.repoFullName,
+              recoveryActionId: resolved.id,
+            },
+            "pr_review_non_convergence auto-discharge succeeded but its audit-log write failed (non-fatal)",
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, prNumber: input.prNumber, repoFullName: input.repoFullName },
+          "pr_review_non_convergence auto-discharge failed for issue (non-fatal)",
+        );
+      }
+    }
+
+    return { closed: closedIssueIds.length, issueIds: closedIssueIds };
+  }
+
   return {
     escalateStalledSelfReviewPr,
+    closePrReviewNonConvergenceForClosedPr,
     buildRunOutputSilence,
     closeRecoveredCcrotateCapacityEscalations,
     escalateCcrotateCapacityExhausted,

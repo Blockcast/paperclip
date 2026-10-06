@@ -120,6 +120,29 @@
 
     - Same manual `monitoring-rules` Argo sync gate as above (BLO-19095)
       applies after merge -- a merged rule is not a deployed one.
+
+  STATUS of the BLO-21078 mass-cancellation alert
+  (PaperclipGithubWorkflowRunMassCancellation), same auditability rule:
+
+    - NOT in onprem-k8s and NOT live. Blockcast/onprem-k8s#1968 (branch
+      platformsre/blo-21078-mass-cancellation-alert) proposed it and was
+      CLOSED UNMERGED on 2026-09-13T07:25:56Z; no other onprem-k8s PR carries
+      it. Re-checked 2026-09-29 at onprem-k8s master b53d049d0af1: absent
+      (both the alert name and paperclip_github_workflow_run_conclusion_total)
+      from all of monitoring/prometheus-rules-{1..5}-configmap.yaml and from
+      paperclip/paperclip-runtime-alerts-prometheusrule.yaml. Verify:
+        for f in monitoring/prometheus-rules-{1..5}-configmap.yaml \
+                 paperclip/paperclip-runtime-alerts-prometheusrule.yaml; do
+          gh api "repos/Blockcast/onprem-k8s/contents/$f" \
+            -H 'Accept: application/vnd.github.raw' \
+            | grep -c PaperclipGithubWorkflowRunMassCancellation
+        done
+
+    - So BLO-21078 has no detector in production. The chart rule below is
+      the only copy anywhere, and it renders nowhere live. Landing it in both
+      onprem-k8s files (then the manual `monitoring-rules` Argo sync,
+      BLO-19095) is the change that closes BLO-21078; until then the chart
+      rule is the reviewed source for that change, not a mirror of one.
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
@@ -403,13 +426,11 @@ spec:
           annotations:
             summary: "Paperclip GitHub review-request wakes suppressed by an outage-like cause (reviews are being dropped)"
             description: "At least one GitHub review-request reviewer wake was terminally suppressed in the last {{ .Values.prometheusRule.githubDeliverySuppressionWindow }} with an outage-like cause ({{ .Values.prometheusRule.githubDeliverySuppressionOutageCauses }}) (BLO-18859). Suppressed means the wake was declined rather than dispatched: no run exists and nothing will re-arm it, so the PR has a posted trigger and no review — the same user-visible outcome as a dead-letter. Check the `cause` label first. `heartbeat.scheduling_suppressed` means the fleet-wide scheduling-suppression flag is on: if that is not a deliberate maintenance window, clear it (this is the mode that silently strands every review). `dispatch_rejected` means the dispatch path threw a business-rule HttpError with no durable skipped row — an unresolvable agent or responsible user; waiting will not fix it. `other` means the server emitted a skip reason missing from KNOWN_GITHUB_SUPPRESSION_CAUSES in services/metrics.ts: find it with `select reason, count(*) from agent_wakeup_requests where status = 'skipped' and created_at > now() - interval '1 hour' group by 1 order by 2 desc`, then either add it to the allow-list as an expected decline or fix the cause. Expected declines (company.inactive, heartbeat.cooldown.active, heartbeat.disabled, heartbeat.wakeOnDemand.disabled, budget.blocked, agent.not_invokable, heartbeat.worktree_execution_cutoff, issue_tree_hold_active) are excluded from this selector by default and are visible on the same counter for context."
-        # BLO-21078: mirrors the authoritative copy in
-        # Blockcast/onprem-k8s monitoring/prometheus-rules-2-configmap.yaml (key
-        # paperclip-runtime-alerts.rules.yml) and its CRD copy
-        # paperclip/paperclip-runtime-alerts-prometheusrule.yaml — see those
-        # files for the full incident writeup and threshold-tuning caveat.
-        # This chart copy renders nowhere live (prometheusRule.enabled is
-        # false on Blockcast, see the file header); kept only for coherence.
+        # BLO-21078. This is NOT a mirror: no onprem-k8s copy of this rule
+        # exists (onprem-k8s#1968 closed unmerged, see the BLO-21078 STATUS
+        # stanza in the file header), and this chart copy renders nowhere
+        # live (prometheusRule.enabled is false on Blockcast). Until it lands
+        # in onprem-k8s, BLO-21078 has no detector in production.
         # The `supersession="none"` selector is load-bearing, not a
         # refinement: pr.yml sets concurrency.cancel-in-progress, so an
         # ordinary force-push yields conclusion="cancelled" too. Measured
@@ -419,15 +440,110 @@ spec:
         # and raising the threshold does not help because benign
         # cancellations scale with agent push rate — the noise floor rises
         # with the signal.
+        #
+        # THIS IS A RATIO, NOT A COUNT, and that is the whole point. The
+        # comment above called it: the noise floor rises with the signal.
+        # That is true of the non-superseded stream too, so the supersession
+        # selector bought a 92.8% reduction and still left a count threshold
+        # unusable. Measured against the live counters 2026-09-29 over 7d,
+        # the ORIGINAL `>= 3` count expression is true for 67.9% of
+        # wall-clock (p50 5.17, p99 71.1, max 132.4 per 15m) — it would have
+        # paged continuously from the moment it deployed. Decisively: the
+        # BLO-21078 incident this rule exists to catch was 4 cancellations
+        # in 18 minutes, which is BELOW today's median. No count threshold
+        # can both catch that incident and stay quiet; the instrument was
+        # wrong, not the number.
+        #
+        # The incident's real signature was BREADTH — 4 consecutive runs on
+        # unrelated branches, i.e. essentially every run in the window dying
+        # — so the discriminating quantity is the cancelled SHARE of
+        # completions, which is scale-free and does not drift with push
+        # rate.
+        #
+        # The supersession selector applies to the DENOMINATOR and the floor
+        # too, for the same reason it applies to the numerator. Superseded
+        # cancellations outnumber the rest ~13:1 (73,322 vs 5,657 over 7d)
+        # and swing with force-push rate independently of the signal, so
+        # left in the denominator they mask a real kill: 8 non-superseded
+        # cancellations beside a routine 20-run force-push burst and 2
+        # successes reads 8/30 = 0.27 and stays quiet, but 8/10 = 0.8 once
+        # they are excluded. Not hypothetical: on 2026-09-24T17:46-17:59Z,
+        # inside the 2h41m BLO-36178 ARC listener outage that paged nobody,
+        # 64-130 non-superseded cancellations per 15m sat beside 564-2,616
+        # superseded ones. The all-completions form read 0.04-0.09 there;
+        # this form reads 0.36-0.42. Every non-cancelled conclusion records
+        # supersession="none" (recordGithubWorkflowRunConclusion in
+        # services/metrics.ts), so {supersession="none"} is exactly "every
+        # completion except a superseded cancellation".
+        #
+        # Measured on THIS basis, live counters, 7d to 2026-09-29T07:40Z at
+        # 1m resolution: p50 1.46%, p99 17.7%, max 42.1%, and the max IS the
+        # BLO-36178 window above. Outside it the 7d max is 31.7%
+        # (2026-09-28T05:11Z, ~20 of 62, not attributed to any incident).
+        # So 0.35 sits 2x above p99 and 1.1x above the highest non-incident
+        # window, and the one incident inside retention read 0.36-0.42: the
+        # margin is thin on both sides, not an order of magnitude. (The
+        # original BLO-21078 incident, outside retention, measured 0.8-1.0 on
+        # the all-completions basis; dropping terms from the denominator can
+        # only raise that.) Retention is 7d, so re-derive this once more
+        # incident windows exist.
+        #
+        # The trade, stated: a supersession-classifier miss (a superseded
+        # run recorded as "none") now scales with force-push volume instead
+        # of being normalised by it. No non-incident window in the 7d
+        # measurement crossed 0.35 (max 0.317, above).
+        #
+        # The `>= 8` volume floor is required, not belt-and-braces: without
+        # it a single cancelled run out of two completions reads as 50% and
+        # pages on an idle repo, which is precisely when the ratio is least
+        # meaningful. It counts the same non-superseded completions as the
+        # denominator: counting all completions would let 1 cancelled + 1
+        # success beside a 20-run force-push burst clear the floor and read
+        # as 50%.
+        #
+        # clamp_min is defence in depth and is NOT load-bearing, so do not
+        # read it as the idle guard: the numerator is a label subset of the
+        # denominator, so x/0 with x>0 is unreachable, and at 0/0 the
+        # comparison yields NaN and filters out. The expression returns
+        # empty with and without it (both forms checked under promtool).
+        # `>= 8` is the operative guard.
+        #
+        # `for: 2m` is close to no debouncing for a single burst against
+        # otherwise steady traffic, noted because it is the obvious knob to
+        # reach for if the margin above proves too thin. An increase() over
+        # [15m] holds the burst for the full width of the window: a single
+        # 1m burst of 25 cancellations on steady 4/min traffic pins the
+        # ratio flat at 0.294 for ~14m, then drops to 0 only when the burst
+        # leaves the window. With a steady denominator, any `for:` shorter
+        # than the window behaves the same.
+        #
+        # That does NOT hold when the denominator moves. The ratio also
+        # un-crosses when completions grow while the burst is still inside
+        # the window, so `for:` does change outcomes there (promtool, this
+        # expr, 25 cancellations at t=21m on 1 success/min): a 60-run
+        # backlog draining at t=26m (0.625 -> 0.240) fires under `for: 2m`
+        # and stays silent under `for: 6m`; a 300-run drain at t=22m clears
+        # the crossing after one evaluation, so even `for: 2m` stays silent.
+        # "Mass cancel, then the pool recovers and the backlog completes" is
+        # plausibly benign, and raising `for:` does suppress that shape, at
+        # the cost of equally suppressing a real kill whose backlog drains
+        # fast. Against a transient spike on steady traffic the defence is
+        # the threshold margin -- the 0.35-vs-0.317 gap disclosed above.
         - alert: PaperclipGithubWorkflowRunMassCancellation
           expr: |
-            sum(increase(paperclip_github_workflow_run_conclusion_total{conclusion="cancelled",supersession="none"}[15m])) >= 3
+            (
+              sum(increase(paperclip_github_workflow_run_conclusion_total{conclusion="cancelled",supersession="none"}[15m]))
+              /
+              clamp_min(sum(increase(paperclip_github_workflow_run_conclusion_total{supersession="none"}[15m])), 1)
+            ) >= 0.35
+            and
+            sum(increase(paperclip_github_workflow_run_conclusion_total{supersession="none"}[15m])) >= 8
           for: 2m
           labels:
             severity: warning
           annotations:
-            summary: "GitHub Actions is mass-cancelling workflow runs (3+ non-superseded cancellations in 15m)"
-            description: "At least 3 workflow_run webhook deliveries concluded `cancelled` without being superseded by a newer run on the same branch in the last 15m (BLO-21078) — i.e. not explained by concurrency cancel-in-progress. See the onprem-k8s authoritative copy of this rule for the full runbook."
+            summary: "GitHub Actions is mass-cancelling workflow runs (35%+ of non-superseded completions cancelled in 15m)"
+            description: "Over the last 15m, at least 35% of completed workflow_run deliveries, excluding cancellations superseded by a newer run on the same branch, concluded `cancelled` (BLO-21078), i.e. not explained by concurrency cancel-in-progress, across at least 8 such completions. Normal operation runs at ~1.5% (p99 17.7%, highest non-incident 15m window 31.7%), so this is a runner-side or GitHub-side kill affecting runs indiscriminately, not one branch's CI failing. Check ARC runner pool health in `arc-runners` first: a scale-set spec change under `--update-strategy=immediate` deletes in-flight ephemeral runners, which GitHub records as `cancelled`. See the runbook_url issue (BLO-21078) for the full incident writeup."
             runbook_url: "/BLO/issues/BLO-21078"
     - name: paperclip-wake-terminal-failed
       rules:
@@ -575,8 +691,8 @@ spec:
           # exactly as a fresh one appears keep the expression true
           # indefinitely while each individual row is young. This gauge
           # carries the server-computed age of the oldest queued row PER
-          # AGENT (refreshed on every /metrics scrape from a live
-          # MIN(coalesce(queued_at, created_at)) aggregate), so `for:` here is only riding out
+          # AGENT (refreshed every 15s on a timer, not per scrape, from a
+          # live MIN(coalesce(queued_at, created_at)) aggregate), so `for:` here is only riding out
           # scrape flapping, not standing in for the real age.
           # The freshness gate is load-bearing: a failed database refresh
           # leaves the previous gauge value in memory, so stale data must not
@@ -602,7 +718,7 @@ spec:
             severity: warning
           annotations:
             summary: "Paperclip queued-run age metric refresh is failing"
-            description: "The most recent /metrics queued-run-age database refresh failed (BLO-21116), so queued-run ages may be stale and PaperclipQueuedRunStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty queue."
+            description: "The most recent queued-run-age database refresh failed (BLO-21116), so queued-run ages may be stale and PaperclipQueuedRunStranded is intentionally gated off. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty queue."
             runbook_url: {{ .Values.prometheusRule.queuedRunStrandedRunbookUrl | quote }}
     - name: paperclip-overdue-scheduled-retry
       rules:
@@ -618,9 +734,10 @@ spec:
           # server-computed age, past DUE TIME, of the oldest agent row still
           # sitting at status='scheduled_retry' past its EFFECTIVE due time
           # (paperclip_overdue_scheduled_retry_oldest_age_seconds, reset to 0
-          # per agent on every /metrics scrape). A run still backing off
-          # toward a future due time contributes nothing -- this only fires on
-          # overshoot past when the promotion sweep should have already acted.
+          # per agent on every 15s timer refresh, not per scrape). A run still
+          # backing off toward a future due time contributes nothing -- this
+          # only fires on overshoot past when the promotion sweep should have
+          # already acted.
           #
           # "Effective due time" is greatest(scheduled_retry_at, advertised
           # resume) per BLO-34782, not the bare column: a ccrotate_capacity
@@ -880,15 +997,21 @@ spec:
       rules:
         - alert: PaperclipAgentStartLockWedged
           # PEN-3305. `withAgentStartLock` serializes queued-run dispatch per
-          # agent and has no timeout, no TTL and no owner-liveness check --
-          # deliberately, because the defect BLO-20396 removed was a timeout
-          # that let a waiter run ALONGSIDE the holder. The cost of that
-          # choice is that a section which never settles holds its agent's
-          # lock for the life of the process, and the agent then dispatches
-          # nothing while presenting as `status: idle` / `errorReason: null` /
-          # `orgChainHealth: healthy`. Measured 2026-09-15/16: five agents
-          # across two companies dark for 6-19 h, ~70 runs stuck in `queued`,
-          # ended only by a pod replacement on an identical image.
+          # agent. It has no TTL and no owner-liveness check, and it never
+          # stops awaiting `fn` -- deliberately, because the defect BLO-20396
+          # removed was a timeout that let a waiter run ALONGSIDE the holder.
+          # Until PEN-3328 it had no bound of any kind, so a section which
+          # never settled held its agent's lock for the life of the process,
+          # and the agent then dispatched nothing while presenting as
+          # `status: idle` / `errorReason: null` / `orgChainHealth: healthy`.
+          # Measured 2026-09-15/16: five agents across two companies dark for
+          # 6-19 h, ~70 runs stuck in `queued`, ended only by a pod replacement
+          # on an identical image.
+          #
+          # PEN-3328 added the bound that was missing: the section is now
+          # cancellable, so at LOCK_ABORT_MS `fn` rejects and the lock is
+          # released. That does not make this rule redundant -- it is what
+          # gives it a meaning worth paging on (see the threshold note below).
           #
           # This is the reported half of that. The gauge alone only closed the
           # "nobody could have looked" gap; the incident's actual failure was
@@ -905,27 +1028,126 @@ spec:
           # That absence is deliberate; do not "fix" it by adding an
           # `and on(instance) (...)` join to a series that does not exist.
           #
-          # Silent in steady state without a zero-fill: the gauge is emitted
-          # only for locks held RIGHT NOW (`reset()` then set), so an agent
-          # with no held lock has no series rather than a 0, and a healthy
-          # section is sub-second.
+          # No zero-fill, deliberately: the gauge is emitted only for locks
+          # held RIGHT NOW (`reset()` then set), so an agent with no held lock
+          # has no series rather than a 0. That is what keeps any positive
+          # threshold quiet for an IDLE agent, and it is the whole of the
+          # argument -- it says nothing about how long a held lock runs.
+          # Holds of minutes to a couple of hours are routine and release on
+          # their own (see the ⚠️ below), so this gauge is NOT near-empty in
+          # normal operation and "anything above a few seconds" is not the
+          # detector. server/src/services/metrics.ts states the same of the
+          # same gauge; the two must not drift apart.
           #
-          # Threshold is LOCK_HELD_ERROR_MS (300s) from agent-start-lock.ts --
-          # the same boundary at which the code itself stops calling the hold
-          # "slow" and logs "queued-run dispatch for this agent has stopped".
-          # Keeping one number of record means the log line an operator finds
-          # and the alert that woke them agree. `for:` stacks on top as
-          # scrape-flap tolerance only, so the first real-clock fire is at
-          # 300 + 300 = 600s of continuous hold -- three orders of magnitude
-          # inside the 19h this alert exists to have caught.
+          # Threshold is LOCK_ABORT_MS (14400s / 4h) from agent-start-lock.ts,
+          # NOT the LOCK_HELD_ERROR_MS (300s) log budget. Pinning it there is
+          # what makes this page mean something a responder can act on: the
+          # abort fires at that boundary and releases the lock, so the gauge is
+          # gone within a scrape if it lands. A series that is STILL present
+          # afterwards therefore means the abort was requested and did not
+          # land, which is the one state in this family that does not
+          # self-heal and the only one worth waking someone for.
+          #
+          # ⚠️ Do NOT move this back onto LOCK_HELD_ERROR_MS to "keep one
+          # number of record". That was the original PEN-3305 design and the
+          # gauge it shipped refutes the premise behind it. Over the 14 days to
+          # 2026-09-25, 21 agents held past 300s (peak 8073s / 2h14m) and this
+          # alert reached `firing` for 20 of them -- twenty critical pages, all
+          # of which resolved on their own with no pod recreation and no
+          # container restart. At 300s this rule paged on the normal case and
+          # sent the responder to Step 4 pod replacement. An attention
+          # threshold (a log line; being early is free) and a page that routes
+          # to a destructive remedy are different questions and no longer share
+          # a number; the `error` log still escalates at 300s.
+          #
+          # `for:` stacks on top, so the first real-clock fire is at
+          # 14400 + 300 = 14700s (4h05m). That window is NOT mere scrape-flap
+          # tolerance any more: since this rule and PaperclipAgentStartLockAborted
+          # below share the same 4h boundary, the window is the abort's LANDING
+          # BUDGET and the only thing separating the two. A landed abort deletes
+          # the series inside a scrape, so this window never completes and only
+          # the UNLANDED abort pages. Shortening it therefore does not merely
+          # reduce flap tolerance -- it pages `critical` on a section that
+          # recovered, the exact false-page class PEN-3328 exists to remove.
+          # prometheus-rule.test.mjs floors it for that reason.
+          #
+          # The consequence of a hold is separately visible the whole time via
+          # PaperclipQueuedRunStranded -- but visible is not paged: that alert
+          # is `severity: warning` at 1440s + `for: 5m` (~29m), and it is gated
+          # on `paperclip_queued_run_age_metrics_refresh_success == 1`, a
+          # dependency this gauge deliberately does not have. Stated honestly,
+          # the net change for a genuinely wedged agent is: before, `critical`
+          # at 600s; after, `warning` at ~29m and `critical` at 4h05m. That
+          # four-hour delay on a true wedge is the accepted cost of not paging
+          # on the settling tail -- twenty measured false pages against one
+          # delayed true positive.
           expr: max by (agent_id) (paperclip_agent_start_lock_held_seconds) > {{ .Values.prometheusRule.agentStartLockHeldSeconds }}
           for: {{ .Values.prometheusRule.agentStartLockHeldFor }}
           labels:
             severity: critical
           annotations:
-            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has held its start lock for longer than {{ .Values.prometheusRule.agentStartLockHeldSeconds }}s and has stopped dispatching"
-            description: "Agent {{`{{ $labels.agent_id }}`}} has held its per-agent start lock for {{`{{ $value | printf \"%.0f\" }}`}}s (PEN-3305). Queued-run dispatch for THIS agent is stopped for as long as the hold lasts. The lock has no timeout by design, so nothing external will break the hold -- but do NOT read that as a wedge: measured holds since 2026-09-16 have settled on their own (BLO-36522; measured 2026-09-25 -- the 2026-09-24 2h14m three-agent hold released with the same process still running 7.75h later). Replacing the process is NOT the default remedy -- see the runbook's Step 4 gate before concluding it is needed. The agent will still read `status: idle` / `errorReason: null` / `orgChainHealth: healthy` and its runs will sit in `queued` -- do NOT clear that as healthy. Correlate with the `agent start lock held far past its budget` error log (same agentId, re-logged every 5m) and with PaperclipQueuedRunStranded for the same agent_id, which fires on the consequence rather than the cause. See the runbook for the pool-exhaustion-versus-lock split; note that a pod restart clearing it does NOT discriminate between the two, because lockIssueOwnership is pg_advisory_xact_lock and dies with the connection."
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} held its start lock past the {{ .Values.prometheusRule.agentStartLockHeldSeconds }}s abort boundary and the abort did not land"
+            description: "Agent {{`{{ $labels.agent_id }}`}} has held its per-agent start lock for {{`{{ $value | printf \"%.0f\" }}`}}s (PEN-3305/PEN-3328). Queued-run dispatch for THIS agent is stopped for as long as the hold lasts. Past this threshold the section's abort signal has ALREADY fired and failed to release the lock -- cancellation only reaches awaits that observe the signal, so a section wedged on something else (a socket with no timeout, a promise that never settles) survives it. That residue does not self-heal: the section must settle or the process must be replaced. The agent will still read `status: idle` / `errorReason: null` / `orgChainHealth: healthy` and its runs will sit in `queued` -- do NOT clear that as healthy. Confirm the abort really did not land before replacing anything: `dispatchHealth` on the agent row reads `stalled` for requested-but-unlanded versus `aborted` for landed, and must be read on the WORKER pod (the api tier never holds a lock and always reports `null`). Correlate with the `agent start lock held past its abort budget` error log for the same agentId, and with PaperclipQueuedRunStranded, which fires on the consequence rather than the cause. A hold under this threshold is NOT this alert and is usually a slow section that settles by itself -- 21 agents held past 300s in the 14 days to 2026-09-25, peak 8073s, all self-resolved. See the runbook for the pool-exhaustion-versus-lock split; note that a pod restart clearing it does NOT discriminate between the two, because lockIssueOwnership is pg_advisory_xact_lock and dies with the connection."
             runbook_url: {{ .Values.prometheusRule.agentStartLockWedgedRunbookUrl | quote }}
+        - alert: PaperclipAgentStartLockAborted
+          # PEN-3328. The companion to PaperclipAgentStartLockWedged above, and
+          # the two are deliberately not redundant -- they fire on opposite
+          # outcomes of the same fault.
+          #
+          # PEN-3328 made the dispatch critical section cancellable, so a
+          # wedged section now rejects at LOCK_ABORT_MS and releases its lock
+          # instead of holding it for the life of the process. That is a
+          # self-heal, which is exactly why it needs its own rule: the wedge
+          # alert above reads a gauge that is emitted ONLY for locks held right
+          # now, so the moment cancellation works the series disappears. Both
+          # rules sit on the same 4h boundary, and the wedge alert's `for: 5m`
+          # is what separates them -- a landed abort deletes the series inside
+          # a scrape, so the wedge alert's window never completes and only the
+          # UNLANDED abort pages. The handled incident would otherwise be
+          # invisible precisely because it was handled.
+          #
+          # A counter is the right shape for that: it survives the release, so
+          # the event stays answerable after the fact. `increase(...[1h]) > 0`
+          # rather than a rate threshold because ONE abort is already the
+          # signal -- reaching the abort boundary means a section outran the
+          # worst hold ever measured settling on its own (8073s) by ~1.8x, so
+          # it is not the slow-but-healthy case the 300s log budget catches.
+          # The cancellation bounded the damage; it did not fix whatever hung,
+          # and that cause is still there.
+          #
+          # `warning`, not `critical`, and the split is the point: by the time
+          # this fires the agent is dispatching again and queued runs were not
+          # lost, so nobody needs waking. Sustained or repeating aborts are the
+          # thing to chase, and `increase` over an hour surfaces that without a
+          # second rule.
+          # ⚠️ This expression depends on a SERVER-SIDE seed and is wrong
+          # without it. `increase()` takes `last - first` over the range, so it
+          # can only read a difference between two samples -- it cannot read a
+          # value. prom-client renders no series at all for a labelled metric
+          # that was never written, so an unseeded
+          # paperclip_agent_start_lock_aborted_total{agent_id} would be BORN AT
+          # 1 on the first abort: one sample at the first evaluation (element
+          # dropped), then `[1, 1, ...]` forever, giving 0. Prometheus's
+          # counter-birth correction in `extrapolatedRate` is gated on
+          # `resultValue > 0`, so it does not apply. `0 > 0` is false, and since
+          # the 4h budget is ~1.8x the worst hold ever measured settling on its
+          # own -- and a deploy resets the series -- every real abort is in
+          # practice a FIRST abort. The alert would be silent for all of them.
+          # `seedAgentStartLockAbortedSeries` in server/src/services/metrics.ts,
+          # called from `runExclusively` when the lock is taken, is what makes
+          # the first abort a 0->1 transition. If that seed is removed this
+          # alert stops firing SILENTLY -- it does not error, it just never
+          # matches. Do not "simplify" it to a bare `> 0` on the counter either:
+          # an absolute counter value latches for the life of the process and
+          # would page forever after one abort.
+          expr: increase(paperclip_agent_start_lock_aborted_total[{{ .Values.prometheusRule.agentStartLockAbortedWindow }}]) > 0
+          for: {{ .Values.prometheusRule.agentStartLockAbortedFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} had a queued-run dispatch section cancelled after overrunning its budget"
+            description: "Agent {{`{{ $labels.agent_id }}`}} held its per-agent start lock past its abort budget and the section was cancelled (PEN-3328), so the lock released and dispatch has RESUMED -- queued runs were not lost and this is not an outage. That budget is LOCK_ABORT_MS in server/src/services/agent-start-lock.ts: compiled in, NOT the chart's agentStartLockHeldSeconds, which this alert does not threshold on -- read the constant rather than a rendered number. Treat it as evidence of the underlying hang, not of the recovery: the section outran the worst hold ever observed settling on its own (8073s) by ~1.8x, so this is not the slow-but-healthy case. Correlate with the `agent start lock held past its abort budget` error log for the same agentId, and check `dispatchHealth` on the agent row (worker tier only) for the post-mortem. If this repeats for one agent_id, the cancellation is masking a persistent condition -- most likely pool exhaustion or a circular advisory-lock wait in lockIssueOwnership -- and that is what to fix. See the runbook."
+            runbook_url: {{ .Values.prometheusRule.agentStartLockAbortedRunbookUrl | quote }}
     - name: paperclip-pr-review-queue
       rules:
         - alert: PaperclipPrReviewQueueWaitSaturated

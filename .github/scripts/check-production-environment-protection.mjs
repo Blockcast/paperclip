@@ -13,21 +13,57 @@
  *
  * WHICH RECORD IS AUTHORITATIVE (BLO-34896 / BLO-34527) — do not re-derive this.
  * b75f8156 ratified two reviewers plus prevent_self_review. On 2026-08-30 the
- * environment was narrowed to `[kkroo]` with prevent_self_review=false. Card
+ * environment was narrowed to `[kkroo]` with prevent_self_review=false (⛔ but see
+ * the 2026-10-04 correction below — the live value reads TRUE). Card
  * 60e271b7 asked the board which of the two shapes was intended and was
  * APPROVED on 2026-09-14T19:57:20Z, ruling (A): the narrowed shape IS the
  * intended shape, reconcile the guard and not the environment. The ruling is
  * recorded on BLO-34527. Three separate agent runs have now re-litigated this
  * question; the answer lives here so a fourth does not have to.
  *
- * WHY prevent_self_review IS NO LONGER ASSERTED. It was re-ratified as false by
- * 60e271b7, so asserting it would make the guard permanently red about a
- * deliberate board decision — which erodes the same slack-relay channel this
- * check depends on. It is still reported under `observed` so the single-approver
- * posture stays visible in every alert and run log. The residual risk (one
- * person can both dispatch and approve a production deploy, and their
- * unavailability is a total deploy outage) is recorded on BLO-22329, not here:
- * a detector should assert the ratified shape, not re-argue it.
+ * WHY prevent_self_review IS NO LONGER ASSERTED.
+ *
+ * ⛔ CORRECTED 2026-10-04 (CEO, PEN-2918): THIS PARAGRAPH'S PREMISE IS FALSE
+ * AGAINST THE LIVE ENVIRONMENT. The superseded sentence is kept here as a record
+ * rather than silently deleted:
+ *     "It was re-ratified as false by 60e271b7, so asserting it would make the
+ *      guard permanently red about a deliberate board decision."
+ * Live read of GET /repos/Blockcast/paperclip/environments/paperclip-production
+ * on 2026-10-04: prevent_self_review = TRUE, alongside reviewers=[kkroo],
+ * can_admins_bypass=false, protected_branches=true, updated_at=2026-08-30T07:13:06Z.
+ * So :15-16's "narrowed to [kkroo] with prevent_self_review=false" does not
+ * describe the environment either. Whether the 08-30 narrowing ever set it false
+ * or this header mis-transcribed it is NOT readable from an agent seat — a GitHub
+ * environment exposes no audit surface — so that half is left open, not guessed.
+ *
+ * The consequence is certain even though the history is not, and it is why this
+ * correction is worth making: asserting prevent_self_review === true would be
+ * GREEN today, not "permanently red". The field is therefore unasserted while
+ * sitting in the STRICTER state, so a future flip to false is uncaught BY
+ * CONSTRUCTION. That is a DIFFERENT MECHANISM from the 2026-08-08 drift described
+ * at :68-73 below — that one attacked the same control by routing around it
+ * (admin reviewer added + can_admins_bypass flipped), and this guard DOES assert
+ * both of those: membership is compared against RATIFIED_REVIEWERS and
+ * can_admins_bypass is asserted false, with a dedicated test ("flags the
+ * 2026-08-08 WIDENING shape"). A direct flip of the field defeats the same
+ * protection by a route the guard does not watch.
+ *
+ * ⛔ NOT CHANGED HERE, DELIBERATELY. Re-adding the assertion is a behaviour change
+ * and is this file owner's call, not a passing reader's. The argument for it is one
+ * line: ruling (A) says the narrowed shape IS the intended shape and the guard should
+ * reconcile to the environment — and the live narrowed shape carries
+ * prevent_self_review=true. This edit only removes the false premise so that decision
+ * is made against the real value instead of a mis-transcribed one.
+ *
+ * ⛔ This is NOT the single-approver question. That is settled (PEN-2863 RESOLVED,
+ * ruling (A) above), its residual risk is homed on BLO-22329, and nothing here
+ * reopens it or proposes a second reviewer. It is a different field.
+ *
+ * The field is still reported under `observed` so the single-approver posture stays
+ * visible in every alert and run log. The residual risk (one person can both dispatch
+ * and approve a production deploy, and their unavailability is a total deploy outage)
+ * is recorded on BLO-22329, not here: a detector should assert the ratified shape,
+ * not re-argue it.
  *
  * Why the reviewer set is compared by membership and not merely for
  * non-emptiness (BLO-22329): the 2026-08-08 drift *added* `kkroo` — a repo
@@ -98,12 +134,20 @@ export function evaluateEnvironmentProtection(env, options = {}) {
   // run go green (BLO-34896 AC2).
   //
   // `prevent_self_review` is deliberately NOT a disjunct here. It used to be,
-  // and because `||` short-circuits, the live prevent_self_review=false state
-  // sent every run down this branch and the membership comparison in the `else`
-  // below became UNREACHABLE — so the 2026-08-30 narrowing to [kkroo] was never
-  // actually reported as a membership change, only as a self-review complaint.
-  // A compound clause that skips a sibling check is how a tolerated drift masks
-  // an untolerated one; keep these conditions about "is there a gate at all".
+  // and because `||` short-circuits, the then-observed prevent_self_review=false
+  // state sent every run down this branch and the membership comparison in the
+  // `else` below became UNREACHABLE — so the 2026-08-30 narrowing to [kkroo] was
+  // never actually reported as a membership change, only as a self-review
+  // complaint. A compound clause that skips a sibling check is how a tolerated
+  // drift masks an untolerated one; keep these conditions about "is there a gate
+  // at all".
+  //
+  // See the header, 2026-10-04: the live value now reads TRUE, which is why the
+  // sentence above is past-tense. That re-anchors the history in time; it does
+  // not retract it. Whether the field was ever false — and so whether this
+  // short-circuit ever actually fired — is not readable from an agent seat, but
+  // either way it remains the reason the disjunct was removed, and the reason
+  // this clause must stay about "is there a gate at all".
   //
   // `rule == null` is SUBSUMED by `reviewers.length === 0` (an absent rule makes
   // `reviewers` derive to []), so it survives mutation testing — it is kept for
@@ -160,6 +204,22 @@ export function evaluateEnvironmentProtection(env, options = {}) {
       prevent_self_review: rule?.prevent_self_review ?? null,
       can_admins_bypass: env.can_admins_bypass ?? null,
       protected_branches: env.deployment_branch_policy?.protected_branches ?? null,
+      // Informational only. No violation() above reads this, and no code in the
+      // repo reads a GitHub environment `updated_at` by name other than this
+      // line, so nothing is gated on it. (It does LEAVE this file:
+      // post-environment-protection-alert.mjs:91 serialises `observed` wholesale
+      // into the alert payload without naming any field. Printing is not gating,
+      // but a promoter should know the value is already in flight. Repo-wide
+      // greps for `updated_at` are dominated by ~500 unrelated Postgres column
+      // references; this is a different field and they are not evidence about
+      // it.) ⛔ Do NOT promote it to a change-detector without first settling
+      // PEN-2918's open question: all three in-repo observations of a distinct
+      // `updated_at` (the test's :93-96 08-08 widening, its :74-75 08-04 lapse,
+      // and the transcription at its :24-30) ALSO changed reviewers or
+      // can_admins_bypass, so whether a prevent_self_review-only edit bumps it
+      // is untested. That is harmless while the field is inert — every payload
+      // carrying it also carries the literal values it could otherwise mislead
+      // about — and becomes load-bearing the moment it is compared.
       updated_at: env.updated_at ?? null,
     },
   };
@@ -234,7 +294,8 @@ async function main() {
         `(required_reviewers ${JSON.stringify(observed.reviewers)}, ` +
         `can_admins_bypass=false, deployment_branch_policy.protected_branches=true). ` +
         `Observed prevent_self_review=${JSON.stringify(observed.prevent_self_review)} ` +
-        '(re-ratified as permitted by approval 60e271b7; reported, not asserted).',
+        '(reported, not asserted — board record 60e271b7; see this script\'s header ' +
+        'for the 2026-10-04 correction).',
     );
     writeSummary({ status: 'compliant', repo, environment: environmentName, observed });
     process.exitCode = 0;

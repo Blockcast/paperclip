@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -10,6 +10,7 @@ import {
   createDb,
   issueComments,
   issueLabels,
+  issueWorkProducts,
   issues,
   labels,
 } from "@paperclipai/db";
@@ -19,6 +20,46 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+
+/**
+ * NETWORK TRIPWIRE (BLO-34808 item 3).
+ *
+ * This suite drives the real PATCH handler, which carries the module-level
+ * `githubTruthProbe` built in `services/issues.ts`. Only FOUR of the five
+ * functions mocked below are that probe's deps (`GithubTruthDeps`); the fifth,
+ * `githubHasCommitEvidence`, is a separate dial-out on the done-gate path that
+ * the probe never touches. It is mocked on purpose and must not be pruned as
+ * unused: a later `status: "done"` fixture would otherwise open a socket this
+ * tripwire cannot see.
+ *
+ * Before this mock the suite was deterministic only by accident: no fixture
+ * attached a `pull_request` work product, so the probe returned at
+ * `all.length === 0` before a socket opened. The first fixture to attach one —
+ * for any unrelated reason — would have turned an embedded-Postgres test into a
+ * live GitHub test with an 8s probe deadline per PATCH, and the failure would
+ * have landed on whoever added that fixture rather than on whoever chose the
+ * wiring.
+ *
+ * Throwers, not stubs: this is a tripwire, not a simulator. `probeOne` catches
+ * and reports `github-truth-probe-failed:exception:<repo>#<n>`, which the
+ * "refuses to reach GitHub" case below asserts — so removing this mock fails
+ * that case instead of opening a socket. Probe BEHAVIOUR is covered by
+ * `services/evidence-truth.test.ts`, which injects its deps directly.
+ */
+vi.mock("../services/github-app-auth.js", async (importActual) => {
+  const actual = await importActual<typeof import("../services/github-app-auth.js")>();
+  const tripwire = (name: string) => () => {
+    throw new Error(`issues-patch-evidence must not reach GitHub: ${name}`);
+  };
+  return {
+    ...actual,
+    githubFetchPrHeadSha: tripwire("githubFetchPrHeadSha"),
+    githubFetchPrAuthorLogin: tripwire("githubFetchPrAuthorLogin"),
+    githubGetPullRequestGate: tripwire("githubGetPullRequestGate"),
+    githubListReviewerSurfacesAtPr: tripwire("githubListReviewerSurfacesAtPr"),
+    githubHasCommitEvidence: tripwire("githubHasCommitEvidence"),
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -465,6 +506,62 @@ describeEmbeddedPostgres("PATCH /issues/:id evidence gate", () => {
       expect(response.status).toBe(422);
       expect(JSON.stringify(response.body)).toContain("labels are invalid");
     });
+  });
+
+  // The failing mutation for the tripwire at the top of this file (BLO-34808
+  // item 3). Every other case in this suite leaves the probe at
+  // `all.length === 0`, so the mock is inert and removing it changes nothing —
+  // a guard with no failing mutation is a comment. This case attaches the
+  // `pull_request` work product that makes the probe dial out, and pins the
+  // diagnostic the tripwire produces. Measured: deleting the `vi.mock` fails
+  // THIS case and no other (12 passed, 1 failed), because the real
+  // `githubGetPullRequestGate` reports its own diagnostic instead. On a host
+  // with no GitHub App credentials that real call stops at
+  // `missing_github_app_credentials` before the socket; on a host that has them
+  // it is the live request this suite must never make. The guard discriminates
+  // either way.
+  it("refuses to reach GitHub when a pull_request work product is attached", async () => {
+    const { companyId, issueId, agentId } = await seedUnlabeledIssue();
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      body: [
+        "https://github.com/Blockcast/paperclip/pull/4242",
+        "",
+        "| Criterion | Status |",
+        "|---|---|",
+        "| desktop works | ✅ |",
+        "| mobile works | ✅ |",
+        "| tests pass | ✅ |",
+      ].join("\n"),
+      authorAgentId: agentId,
+      authorUserId: null,
+      createdAt: new Date(),
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId,
+      type: "pull_request",
+      provider: "github",
+      externalId: "Blockcast/paperclip#4242",
+      title: "tripwire",
+      url: "https://github.com/Blockcast/paperclip/pull/4242",
+      status: "open",
+      // No webhook `sourceTrust`, so `merged` is untrusted and the probe must
+      // ask GitHub — which is exactly the dial-out this case exists to catch.
+      metadata: { repoFullName: "Blockcast/paperclip", prNumber: 4242 },
+    });
+
+    const response = await request(createApp())
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review" });
+
+    // 200, not 500: a thrown dep is "could not ask GitHub", which `probeOne`
+    // catches into `probeFailed` rather than letting it fail the PATCH.
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body.lastEvidenceVerdict.diagnostics).toEqual(
+      expect.arrayContaining(["github-truth-probe-failed:exception:Blockcast/paperclip#4242"]),
+    );
   });
 
 });

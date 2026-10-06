@@ -69,6 +69,7 @@ import {
   issueCommentPresentationSchema,
   isAgentStatusInvokable,
   isUuidLike,
+  NON_HUMAN_USER_SENTINEL_IDS,
   ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   SYSTEM_ISSUE_DOCUMENT_KEYS,
@@ -169,6 +170,7 @@ import {
   type SchedulerHeartbeatAddComment,
 } from "./recovery/routine-scheduler-heartbeat.js";
 import { classifyIssueGraphLiveness, PENDING_INTERACTION_MAX_AGE_MS, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { readRecoveryRunWriteClass, type RecoveryRunWriteClass } from "./recovery/model-profile-hint.js";
 import {
   ACTIVE_RECOVERY_ACTION_STATUSES,
   BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
@@ -260,7 +262,7 @@ function checkoutStartedAtForCurrentRow(now: Date) {
 // agent-attribution derivation even though `local-board` is also materialized
 // as a row in the `user` table (it is the implicit board admin). Genuine human
 // users — real signups with their own ids — are never reattributed.
-const NON_HUMAN_SENTINEL_AUTHOR_USER_IDS = new Set<string>(["local-board"]);
+const NON_HUMAN_SENTINEL_AUTHOR_USER_IDS = NON_HUMAN_USER_SENTINEL_IDS;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
@@ -928,6 +930,23 @@ type IssueActiveRunRow = {
   // holding this issue from one that has been silent long enough to be stale.
   lastOutputAt: Date | null;
   lastUsefulActionAt: Date | null;
+  // PEN-3275: WHETHER the holder can act, not merely whether one exists.
+  //
+  // Every liveness surface we have answers "is a run attending this row?" and
+  // none answers "can that run perform this row's remedy?". A write-contained
+  // run reads as fully attended — `activeRun` populates, the wake is delivered
+  // and serviced — while the writes the row needs are refused by the guards in
+  // `routes/approvals.ts` and `routes/issues.ts`. Measured on PEN-3248 and
+  // PEN-3328: an audit sweeping for unattended rows scores those rows as fine,
+  // and the opposite reading ("nothing is chasing this") is equally available.
+  // Both are wrong, and nothing on the row distinguished them.
+  //
+  // `null` means UNCONSTRAINED, never "unknown" — the same contract
+  // `readRecoveryRunWriteClass` documents. Explicitly null, never absent: an
+  // absent key reads as "no containment" to a consumer doing a truthiness test,
+  // which is the expensive direction and the exact defect BLO-34421 closed on
+  // the inbox-lite attendance scalars.
+  writeContainment: RecoveryRunWriteClass | null;
 };
 type IssueScheduledRetryRow = {
   runId: string;
@@ -2829,6 +2848,59 @@ function activeRunMapKey(companyId: string, runId: string) {
   return `${companyId}:${runId}`;
 }
 
+/**
+ * PEN-3275: the one place a selected `heartbeat_runs` row becomes an `activeRun`.
+ *
+ * Two things this function exists to guarantee, neither of which is visible at a
+ * call site that spreads the row:
+ *
+ *  1. **The response shape is an ALLOWLIST.** Every returned field is named
+ *     below; nothing reaches a response by being present on the row. This is
+ *     deliberately not the `...rest`-after-destructuring form, which is a
+ *     denylist: under that shape any column added to the select later lands in
+ *     the API response automatically, and because `activeRunMapForIssues` takes
+ *     `dbOrTx: any` its `rows` are `any`, so nothing — not the parameter type
+ *     here, not `tsc` — would flag it. The threat model is that the run payload
+ *     must not reach a response, and an allowlist holds it for the NEXT column
+ *     too, not just for `contextSnapshot`.
+ *
+ *     `contextSnapshot` is the live instance of that threat: it is selected only
+ *     so the containment class can be derived from it, and it carries the run's
+ *     wake payload and task data — a far wider surface than the single derived
+ *     enum any caller needs.
+ *  2. **`writeContainment` is always present**, explicitly `null` when the run is
+ *     unconstrained. See the field's comment on `IssueActiveRunRow`.
+ *
+ * The class is READ from `readRecoveryRunWriteClass`, never re-derived here. That
+ * function reads the same guard tuple `routes/approvals.ts` and `routes/issues.ts`
+ * enforce against, which is what makes this field honest: a row reported as
+ * `status_only` is exactly a row those guards will refuse. Deriving it from a
+ * single key — `recoveryIntent`, or a generated mirror column over it — would be a
+ * second, weaker derivation that goes quiet precisely where the guards still bite,
+ * and a second derivation of a dispatch-affecting predicate is what cost the proxy
+ * repo a production incident (PR#1876).
+ */
+export function toIssueActiveRunRow(
+  row: Omit<IssueActiveRunRow, "writeContainment"> & {
+    companyId: string;
+    contextSnapshot: Record<string, unknown> | null;
+  },
+): IssueActiveRunRow {
+  return {
+    id: row.id,
+    status: row.status,
+    agentId: row.agentId,
+    invocationSource: row.invocationSource,
+    triggerDetail: row.triggerDetail,
+    startedAt: row.startedAt,
+    finishedAt: row.finishedAt,
+    createdAt: row.createdAt,
+    lastOutputAt: row.lastOutputAt,
+    lastUsefulActionAt: row.lastUsefulActionAt,
+    writeContainment: readRecoveryRunWriteClass(row.contextSnapshot),
+  };
+}
+
 async function activeRunMapForIssues(
   dbOrTx: any,
   issueRows: Array<Pick<IssueRow, "companyId" | "executionRunId">>,
@@ -2854,6 +2926,16 @@ async function activeRunMapForIssues(
         createdAt: heartbeatRuns.createdAt,
         lastOutputAt: heartbeatRuns.lastOutputAt,
         lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
+        // PEN-3275: selected ONLY to derive `writeContainment`, and dropped by
+        // `toIssueActiveRunRow` before the row is returned — it must not reach a
+        // response. Deliberately NOT read from a generated mirror column: the
+        // class is a 4-key guard tuple, so a single-key mirror would be a second,
+        // weaker derivation (see `toIssueActiveRunRow`). The detoast cost the
+        // mirror columns exist to avoid is bounded here by LIVE-RUN count rather
+        // than list size — the `notInArray(status, TERMINAL)` filter below means
+        // only non-terminal runs are projected, which is bounded by concurrency
+        // (dozens), not by the up-to-1000-row list that names them.
+        contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
       .where(
@@ -2885,8 +2967,7 @@ async function activeRunMapForIssues(
       );
 
     for (const row of rows) {
-      const { companyId, ...activeRun } = row;
-      map.set(activeRunMapKey(companyId, row.id), activeRun);
+      map.set(activeRunMapKey(row.companyId, row.id), toIssueActiveRunRow(row));
     }
   }
   return map;

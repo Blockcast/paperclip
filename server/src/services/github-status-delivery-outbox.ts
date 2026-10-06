@@ -80,6 +80,15 @@ export type EnqueueGithubCommitStatusDeliveryInput = {
   context: string;
   state: GitHubCommitStatusState;
   forceWrite?: boolean;
+  /**
+   * Re-run the comment-review gate for this head instead of replaying `state`.
+   * Pair with `delayMs`: the row is a backstop for the live evaluation, and
+   * firing it before that evaluation has had time to land would duplicate the
+   * work on every webhook rather than only on the ones that lose it.
+   */
+  reevaluate?: boolean;
+  /** Hold the first attempt back by this many milliseconds. */
+  delayMs?: number;
   description: string;
   targetUrl?: string | null;
   prNumber: number;
@@ -377,7 +386,129 @@ async function failPermanentDelivery(
   );
 }
 
+/**
+ * Re-drive a lost comment-review gate evaluation (BLO-36819).
+ *
+ * Unlike every other row in this table, a `reevaluate` row carries no verdict:
+ * the whole point is that the evaluation which would have produced one never
+ * completed. So it re-runs the gate rather than replaying `state`.
+ *
+ * The freshness guard here is deliberately NOT `handleFreshCommitStatusIfPresent`.
+ * That helper also short-circuits on any `success`, regardless of age, which is
+ * right for replaying a stale failure and wrong here: a review can turn a green
+ * head red, and skipping on an older green would make this backstop blind to
+ * exactly the transition that matters most. Only "a status was written at or
+ * after this row was queued" proves the live evaluation landed.
+ */
+async function processGateReevaluation(db: Db, row: DeliveryRow): Promise<void> {
+  const latestStatus = await githubGetLatestCommitStatusForContext({
+    repoFullName: row.repoFullName,
+    sha: row.sha,
+    context: row.context,
+  });
+  if (!latestStatus.ok) {
+    if (latestStatus.retryable) {
+      await retryOrFailDelivery(db, row, latestStatus.reason, { latestStatus });
+    } else {
+      await failPermanentDelivery(db, row, latestStatus.reason, { latestStatus });
+    }
+    return;
+  }
+  const latestCreatedAt = latestStatus.status?.createdAt ? Date.parse(latestStatus.status.createdAt) : NaN;
+  if (statusCreatedAtOrAfterQueueSecond(latestCreatedAt, row.createdAt)) {
+    await markTerminal(
+      db,
+      row,
+      "skipped",
+      "info",
+      `Skipped comment-review gate re-evaluation for ${row.context} on ${row.repoFullName}@${row.sha.slice(0, 7)} because the live evaluation already published`,
+      { reason: "live_evaluation_published", latestStatus: latestStatus.status },
+    );
+    return;
+  }
+
+  const fencedRow = await refreshDeliveryClaimBeforeExternalWrite(db, row);
+  if (!fencedRow) {
+    logger.info(
+      { deliveryId: row.id },
+      "github-status-delivery-outbox: stale delivery claim ignored before gate re-evaluation",
+    );
+    return;
+  }
+
+  // Imported lazily: pr-comment-review-gate imports withGithubStatusDeliveryLock
+  // from this module, and a static edge back would be a module-init cycle.
+  const { runPrCommentReviewGateCheck } = await import("./pr-comment-review-gate.js");
+  // Not inside withGithubStatusDeliveryLock: the check takes that same advisory
+  // lock itself, on a second pool connection, which would self-deadlock.
+  const result = await runPrCommentReviewGateCheck({
+    repoFullName: fencedRow.repoFullName,
+    prNumber: fencedRow.prNumber,
+    // The head this row was queued for, not the PR's current head. A head that
+    // has since moved got its own trigger and its own row; this one exists to
+    // finish the verdict that was lost for THIS sha.
+    headSha: fencedRow.sha,
+    prUrl: fencedRow.prUrl,
+    db,
+  });
+  if (result.posted) {
+    await markTerminal(
+      db,
+      fencedRow,
+      "delivered",
+      "info",
+      `Re-evaluated comment-review gate for ${fencedRow.context} on ${fencedRow.repoFullName}@${fencedRow.sha.slice(0, 7)} after the live evaluation was lost`,
+      { reason: "reevaluated", verdict: result.verdict },
+    );
+    return;
+  }
+  if (result.reason === "not_configured") {
+    await failPermanentDelivery(db, fencedRow, "comment_review_gate_not_configured", { result });
+    return;
+  }
+  if (result.reason === "retirement_failed" && result.retirementDeliveries?.length) {
+    // The live status DID publish; only the retired-context cleanup did not.
+    // Mirror `github-webhook.ts`: give each retirement its own durable row and
+    // close this one as `delivered`, because the verdict it existed to publish
+    // is published.
+    //
+    // Retrying this row instead loses the retirement outright. `retryOrFailDelivery`
+    // does not reset `createdAt`, so the next attempt reads the status THIS run
+    // just wrote, the freshness guard above necessarily sees it as at-or-after
+    // `createdAt`, and the row terminates `skipped: live_evaluation_published` —
+    // a reason that is also false, since the backstop published, not the live path.
+    for (const delivery of result.retirementDeliveries) {
+      await enqueueGithubCommitStatusDelivery(db, {
+        // Provenance-less for the same reason as the webhook path: a retirement
+        // is triggered by a gate evaluation, not an agent run.
+        companyId: null,
+        sourceRunId: null,
+        repoFullName: fencedRow.repoFullName,
+        sha: delivery.sha,
+        context: delivery.context,
+        state: delivery.state,
+        description: delivery.description,
+        targetUrl: delivery.targetUrl,
+        prNumber: fencedRow.prNumber,
+        prUrl: fencedRow.prUrl,
+        forceWrite: true,
+      });
+    }
+    await markTerminal(
+      db,
+      fencedRow,
+      "delivered",
+      "info",
+      `Re-evaluated comment-review gate for ${fencedRow.context} on ${fencedRow.repoFullName}@${fencedRow.sha.slice(0, 7)}; queued ${result.retirementDeliveries.length} retired-context retry(s)`,
+      { reason: "reevaluated_retirement_requeued", retirementDeliveries: result.retirementDeliveries },
+    );
+    return;
+  }
+  await retryOrFailDelivery(db, fencedRow, `comment_review_gate_${result.reason}`, { result });
+}
+
 async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
+  if (row.reevaluate) return processGateReevaluation(db, row);
   if (!row.forceWrite) {
     if (await handleFreshCommitStatusIfPresent(db, row)) return;
 
@@ -480,6 +611,8 @@ export async function enqueueGithubCommitStatusDelivery(
 ): Promise<DeliveryRow> {
   const now = new Date();
   const nowSql = sql`${now.toISOString()}::timestamptz`;
+  const dueAt = new Date(now.getTime() + Math.max(input.delayMs ?? 0, 0));
+  const dueAtSql = sql`${dueAt.toISOString()}::timestamptz`;
   // Normalize the two optional provenance fields ONCE, before anything below
   // reads them. `undefined` and `null` are different inputs to drizzle and only
   // the second is safe here: an `undefined` chunk renders as the empty string
@@ -536,13 +669,14 @@ export async function enqueueGithubCommitStatusDelivery(
     context: input.context,
     state: input.state,
     forceWrite: input.forceWrite ?? false,
+    reevaluate: input.reevaluate ?? false,
     description: scrubbedDescription,
     targetUrl: input.targetUrl ?? null,
     prNumber: input.prNumber,
     prUrl: input.prUrl ?? null,
     status: "queued",
     attempts: 0,
-    nextAttemptAt: now,
+    nextAttemptAt: dueAt,
     lastError: null,
     lastErrorKind: null,
     lastResult: null,
@@ -566,11 +700,12 @@ export async function enqueueGithubCommitStatusDelivery(
         prUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prUrl} else ${input.prUrl ?? null} end`,
         state: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.state} else ${input.state} end`,
         forceWrite: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.forceWrite} else ${input.forceWrite ?? false} end`,
+        reevaluate: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.reevaluate} else ${input.reevaluate ?? false} end`,
         description: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.description} else ${scrubbedDescription} end`,
         targetUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.targetUrl} else ${input.targetUrl ?? null} end`,
         status: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.status} else 'queued' end`,
         attempts: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.attempts} else 0 end`,
-        nextAttemptAt: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.nextAttemptAt} else ${nowSql} end`,
+        nextAttemptAt: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.nextAttemptAt} else ${dueAtSql} end`,
         lastError: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.lastError} else null end`,
         lastErrorKind: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.lastErrorKind} else null end`,
         lastResult: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.lastResult} else null end`,

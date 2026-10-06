@@ -256,6 +256,134 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(authorMarkdown).not.toContain("GitHub PR review request directive:");
   });
 
+  // BLO-38816 (BLO-30420 follow-up): the webhook records WHY it declined to
+  // treat a review as actionable, but nothing projected that into the run, so a
+  // review with no findings still rendered "If the findings are correct, push a
+  // follow-up commit addressing them". Acting on it means a no-op push, which
+  // restarts CI and ejects a queued PR -- the same damage the APPROVED arm was
+  // fixed for in BLO-19067.
+  //
+  // This test deliberately goes through derivePaperclipPrReview rather than
+  // hand-building `prReview`: the projection is the thing under test, and a
+  // literal object would bypass it and pin nothing (BLO-34263 guard-mutation
+  // rule). Deleting either projection line must turn this red.
+  it("names the declined reason and withholds the push-a-follow-up directive for a non-actionable review", () => {
+    const prReview = derivePaperclipPrReview({
+      wakeReason: "github_pr_review_submitted",
+      githubPrNumber: 1681,
+      githubRepoFullName: "Blockcast/paperclip",
+      githubEvent: "pull_request_review",
+      prRole: "author",
+      githubPrReviewState: "commented",
+      githubPrReviewAuthorLogin: "allyblockcast[bot]",
+      githubReviewFeedbackSuppressionReason: "ally_review_findings_all_zero",
+      githubReviewFeedbackSuppressionPredicate: "counted_findings_buckets_all_zero",
+    });
+    expect(prReview?.reviewFeedbackSuppressionReason).toBe("ally_review_findings_all_zero");
+    expect(prReview?.reviewFeedbackSuppressionPredicate).toBe(
+      "counted_findings_buckets_all_zero",
+    );
+    // The declined classification is written as `true`-only, so a declined wake
+    // leaves it null -- the actionable and declined cases stay distinguishable
+    // from inside the run.
+    expect(prReview?.reviewFeedbackActionable).toBeNull();
+
+    const authorMarkdown = buildPaperclipTaskMarkdown({ issue: null, prReview });
+
+    // The reason reaches the run instead of being inferable only from a
+    // heartbeat_runs query.
+    expect(authorMarkdown).toContain("ally_review_findings_all_zero");
+    expect(authorMarkdown).toContain("counted_findings_buckets_all_zero");
+    expect(authorMarkdown).toContain("classified as carrying NO actionable findings");
+    // The load-bearing half: asserting only the added line passes while the
+    // contradictory directive still ships.
+    expect(authorMarkdown).not.toContain("If the findings are correct");
+    expect(authorMarkdown).not.toContain("push a follow-up commit addressing them");
+    expect(authorMarkdown).toContain("no implementation pass is required");
+  });
+
+  // Boundary guard: without the suppression reason the directive is unchanged,
+  // so the fix above cannot silence a genuine review. Absence of
+  // `githubReviewFeedbackActionable` must NOT be read as "declined" -- it is
+  // also what every wake predating the writer looks like.
+  it("still tells the author to push a follow-up when no decline reason was recorded", () => {
+    const prReview = derivePaperclipPrReview({
+      wakeReason: "github_pr_review_submitted",
+      githubPrNumber: 1681,
+      githubRepoFullName: "Blockcast/paperclip",
+      githubEvent: "pull_request_review",
+      prRole: "author",
+      githubPrReviewState: "commented",
+      githubPrReviewAuthorLogin: "allyblockcast[bot]",
+    });
+    expect(prReview?.reviewFeedbackSuppressionReason).toBeNull();
+    expect(prReview?.reviewFeedbackActionable).toBeNull();
+
+    const authorMarkdown = buildPaperclipTaskMarkdown({ issue: null, prReview });
+    expect(authorMarkdown).toContain("If the findings are correct");
+    expect(authorMarkdown).toContain("push a follow-up commit addressing them");
+    expect(authorMarkdown).not.toContain("classified as carrying NO actionable findings");
+  });
+
+  // AC3: actionable and declined must be distinguishable from inside the run.
+  // Three states exist and all three must look different -- "classified
+  // actionable", "classified declined", and the unclassified wake above.
+  it("names the actionable classification when the webhook recorded one", () => {
+    const prReview = derivePaperclipPrReview({
+      wakeReason: "github_pr_review_submitted",
+      githubPrNumber: 1681,
+      githubRepoFullName: "Blockcast/paperclip",
+      githubEvent: "pull_request_review",
+      prRole: "author",
+      githubPrReviewState: "commented",
+      githubReviewFeedbackActionable: true,
+    });
+    expect(prReview?.reviewFeedbackActionable).toBe(true);
+    expect(prReview?.reviewFeedbackSuppressionReason).toBeNull();
+
+    const authorMarkdown = buildPaperclipTaskMarkdown({ issue: null, prReview });
+    expect(authorMarkdown).toContain("classified as carrying actionable findings");
+    expect(authorMarkdown).not.toContain("classified as carrying NO actionable findings");
+    // An actionable review still gets the unchanged push directive.
+    expect(authorMarkdown).toContain("If the findings are correct");
+  });
+
+  // The two classifications are mutually exclusive for a single delivery, so
+  // this state is unreachable from today's webhook. It is pinned anyway because
+  // the decline-first ordering is a safety property the code comments claim,
+  // and until this test existed nothing held it: swapping the informational
+  // block's arms passed all 541 tests in this file (measured 2026-10-01).
+  //
+  // Note what the ordering does and does not protect. The closing directive is
+  // safe structurally -- its ternary keys on the decline reason and never reads
+  // `reviewFeedbackActionable` -- so a swap cannot resurrect the push
+  // instruction. What it breaks is coherence: the run would be told there is
+  // "something concrete to address" directly above a directive saying no
+  // implementation pass is required, which is the self-contradicting wake this
+  // PR exists to remove.
+  it("prefers the decline line when both classifications are present", () => {
+    const prReview = derivePaperclipPrReview({
+      wakeReason: "github_pr_review_submitted",
+      githubPrNumber: 1681,
+      githubRepoFullName: "Blockcast/paperclip",
+      githubEvent: "pull_request_review",
+      prRole: "author",
+      githubPrReviewState: "commented",
+      githubReviewFeedbackActionable: true,
+      githubReviewFeedbackSuppressionReason: "ally_review_findings_all_zero",
+    });
+    expect(prReview?.reviewFeedbackActionable).toBe(true);
+    expect(prReview?.reviewFeedbackSuppressionReason).toBe("ally_review_findings_all_zero");
+
+    const authorMarkdown = buildPaperclipTaskMarkdown({ issue: null, prReview });
+    // Decline wins the informational block ...
+    expect(authorMarkdown).toContain("classified as carrying NO actionable findings");
+    expect(authorMarkdown).not.toContain("classified as carrying actionable findings");
+    // ... and the directive agrees with it rather than asking for a no-op push.
+    expect(authorMarkdown).toContain("no implementation pass is required");
+    expect(authorMarkdown).not.toContain("If the findings are correct");
+  });
+
   it("falls back to a generic author-facing directive when reviewer login / state / body are missing", () => {
     const authorMarkdown = buildPaperclipTaskMarkdown({
       issue: null,
@@ -580,6 +708,11 @@ describe("derivePaperclipPrReview", () => {
       // BLO-23395: only populated on a github_pr_merge_queue_evicted wake.
       mergeQueueEvictionBody: null,
       prAuthorLogin: null,
+      // BLO-38816: review-feedback classification. Absent from this snapshot,
+      // so the run reads "unclassified" -- not "declined".
+      reviewFeedbackActionable: null,
+      reviewFeedbackSuppressionReason: null,
+      reviewFeedbackSuppressionPredicate: null,
     });
   });
 

@@ -19,6 +19,12 @@ import { forbidden, unauthorized } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { maskProjectEnv } from "./project-env-response.js";
+import {
+  maskRoutineEnv,
+  maskRoutineEnvList,
+  maskRoutineEnvelopeEnv,
+  maskRoutineRevisionEnvList,
+} from "./routine-env-response.js";
 
 export function routineRoutes(
   db: Db,
@@ -152,7 +158,9 @@ export function routineRoutes(
     assertCompanyAccess(req, companyId);
     const projectId = typeof req.query.projectId === "string" ? req.query.projectId : undefined;
     const result = await svc.list(companyId, { projectId });
-    res.json(result);
+    // PEN-3707: `list` spreads the full routine row, so `env` — the same `EnvBinding` union
+    // `maskProjectEnv` exists to withhold — shipped in the clear to every same-company agent.
+    res.json(maskRoutineEnvList(result));
   });
 
   router.post("/companies/:companyId/routines", validate(createRoutineSchema), async (req, res) => {
@@ -189,7 +197,7 @@ export function routineRoutes(
       changeSummary: "Created routine",
       triggerCount: 0,
     });
-    res.status(201).json(created);
+    res.status(201).json(maskRoutineEnv(created));
   });
 
   router.get("/routines/:id", async (req, res) => {
@@ -199,7 +207,11 @@ export function routineRoutes(
     // service builds it with a bare `db.select()` full-row read and TypeScript does not strip excess
     // properties at runtime — so `env` was serialized with plain values in the clear. The narrow type
     // is what hid this: it reads as though the material was never fetched.
-    res.json(detail.project ? { ...detail, project: maskProjectEnv(detail.project) } : detail);
+    // PEN-3707: the routine's OWN `env` crossed here too, on the `...row` spread in `getDetail`. The
+    // third carrier on this response, `detail.assignee`, is projected in the service instead — see
+    // the comment there for why a column projection rather than a redactor.
+    const safeDetail = maskRoutineEnv(detail);
+    res.json(safeDetail.project ? { ...safeDetail, project: maskProjectEnv(safeDetail.project) } : safeDetail);
   });
 
   router.get("/routines/:id/revisions", async (req, res) => {
@@ -209,7 +221,10 @@ export function routineRoutes(
       return;
     }
     const revisions = await svc.listRevisions(routine.id);
-    res.json(revisions);
+    // PEN-3707: every stored snapshot carries `snapshot.routine.env`, copied in by
+    // `routineRevisionSnapshotRoutine`. Masking the live row and not the snapshots would leave the
+    // same material one request away.
+    res.json(maskRoutineRevisionEnvList(revisions));
   });
 
   router.get("/routines/:id/description/annotations", async (req, res) => {
@@ -420,7 +435,11 @@ export function routineRoutes(
         triggerCount: null,
       });
     }
-    res.json(updated);
+    // PEN-3707: `update` answers with the full routine row, so this returned every plain `env` value
+    // to an assignee agent that had only edited, say, the title. The write half of the round trip —
+    // an incoming masked value meaning "keep what is stored" — lives in `services/routines.ts`,
+    // because routines normalize env inside the service rather than in the route.
+    res.json(updated ? maskRoutineEnv(updated) : updated);
   });
 
   router.post("/routines/:id/revisions/:revisionId/restore", async (req, res) => {
@@ -455,7 +474,9 @@ export function routineRoutes(
       },
     });
     await remapRoutineDescriptionAnnotations(req, routine.id);
-    res.json(result);
+    // PEN-3707: `restoreRevision` returns BOTH carriers at once — the restored `routine` row and the
+    // new `revision` whose snapshot copies the same env.
+    res.json(maskRoutineEnvelopeEnv(result));
   });
 
   router.get("/routines/:id/runs", async (req, res) => {
@@ -499,7 +520,9 @@ export function routineRoutes(
       changeSummary: created.revision.changeSummary,
       triggerCount: created.revision.snapshot.triggers.length,
     });
-    res.status(201).json(created);
+    // PEN-3707: `created.revision.snapshot.routine.env` carries the routine env, so a trigger
+    // creation handed it back even though the request was about a trigger.
+    res.status(201).json(maskRoutineEnvelopeEnv(created));
   });
 
   router.patch("/routine-triggers/:id", validate(updateRoutineTriggerSchema), async (req, res) => {
@@ -627,7 +650,10 @@ export function routineRoutes(
         changeSummary: rotated.revision.changeSummary,
         triggerCount: rotated.revision.snapshot.triggers.length,
       });
-      res.json(rotated);
+      // PEN-3707: same snapshot carrier as trigger creation. `secretMaterial` is deliberately left
+      // intact — the freshly minted webhook secret is the value the caller asked to be told, and it
+      // exists nowhere else by the time this is written.
+      res.json(maskRoutineEnvelopeEnv(rotated));
     },
   );
 

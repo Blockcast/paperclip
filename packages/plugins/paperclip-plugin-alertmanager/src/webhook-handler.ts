@@ -9,7 +9,7 @@
 
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { hostname as osHostname } from "node:os";
-import type { PluginContext, PluginFencingPrecondition, PluginWebhookInput } from "@paperclipai/plugin-sdk";
+import type { PluginContext, PluginFencingPrecondition, PluginWebhookInput, PluginWebhookResult } from "@paperclipai/plugin-sdk";
 import {
   ACCEPTED_SCHEMA_VERSIONS,
   DEFAULT_OPERATOR_SUPPRESSION_HOURS,
@@ -698,6 +698,142 @@ const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
 type AggregateFenceWedgedMemo = Set<string>;
 
 /**
+ * Process-local fair handoff for the aggregate fence (PEN-3013).
+ *
+ * Every refusal this fence produces in production is a delivery in THIS process
+ * losing to a sibling delivery in THIS process — that is a property of the
+ * claim predicate, not an observation that could drift. `beginAggregateFiring`
+ * admits a holder in the same slot with a *different* `owner_instance_id`
+ * (BLO-31036) and a holder past the abandonment backstop, so the only holder it
+ * can still refuse for is one sharing `WORKER_INSTANCE_ID` — i.e. a concurrent
+ * delivery interleaved into the same worker child, which is exactly what the
+ * RPC layer produces. Measured 2026-09-30 over 24h on `paperclip-0`: 902
+ * refusals, all of them phase `firing`, none `cancelling`, single pod.
+ *
+ * So the fence is being used as a mutex between coroutines of one process, and
+ * the waiter had no way to learn that the holder had finished. It polled with
+ * exponential full jitter, which is the right shape against an *unknown* remote
+ * holder but is unfair against a local one: a delivery that has already waited
+ * competes on equal terms with a fresh arrival every round. Measured over the
+ * same window, 36% of refusals reported a holder age *below* the 3s budget the
+ * waiter had already spent — lost races against a briskly rotating fence, not a
+ * stuck one. Raising the budget lengthens that starvation window; it does not
+ * end it.
+ *
+ * This registry closes the loop: a release performed by this process wakes one
+ * waiter directly, so the handoff is FIFO by arrival and the woken waiter
+ * reclaims before any jitter timer fires.
+ *
+ * Two properties keep the worst case at exactly today's behaviour:
+ *   - Waiters keep their jitter timer. The signal only ever *shortens* a wait,
+ *     so a fence held by another process, another slot, or a dead owner behaves
+ *     precisely as before — including the budget arithmetic and the wedged memo.
+ *   - A wake is never required for progress. If the woken waiter exhausts its
+ *     budget before retrying, the wake is dropped rather than forwarded; the
+ *     remaining waiters still retry on their own timers within
+ *     `maxDelayMs`. That bounds a lost wake at one extra poll interval, which
+ *     is why forwarding it is not worth the state it would cost.
+ *
+ * Waking exactly one is deliberate. Waking all would rebuild the thundering
+ * herd this file's jitter exists to break up, and only one of them can win.
+ */
+type LocalFenceWaiter = {
+  /** Re-armed after each wake, because one waiter waits across many attempts. */
+  awaken: () => Promise<void>;
+  wake: () => void;
+};
+
+const aggregateFenceLocalWaiters = new Map<string, LocalFenceWaiter[]>();
+
+/** Fences are company-scoped, so the local queue must be too. */
+function localFenceQueueKey(companyId: string, aggregateKey: string): string {
+  // `\0` rather than a literal NUL byte: byte-identical at runtime, but a raw
+  // NUL makes this whole file binary to content search. Measured here, `grep`
+  // did not even print "binary file matches" — it exited 1 with no output,
+  // i.e. a silent false negative, while `rg` suppressed the matches (PEN-3013
+  // review). NUL stays the separator: it is the one byte that cannot appear in
+  // either component, so the key cannot be forged by a crafted aggregate key.
+  return `${companyId}\0${aggregateKey}`;
+}
+
+function createLocalFenceWaiter(): LocalFenceWaiter {
+  let resolve: (() => void) | null = null;
+  let pending: Promise<void> | null = null;
+  return {
+    awaken() {
+      if (!pending) {
+        pending = new Promise<void>((res) => {
+          resolve = res;
+        });
+      }
+      return pending;
+    },
+    wake() {
+      const res = resolve;
+      pending = null;
+      resolve = null;
+      res?.();
+    },
+  };
+}
+
+/**
+ * Hand the fence to the longest-waiting local delivery, if there is one.
+ *
+ * Called only after a release this process actually performed, so it cannot
+ * announce availability that does not exist. A spurious wake would still be
+ * harmless — the woken waiter simply re-attempts the real claim, which is the
+ * only thing that decides ownership — but keeping it truthful is what lets the
+ * wake be read as "the fence was just freed" in a log or a test.
+ */
+function signalLocalFenceRelease(companyId: string, aggregateKey: string): void {
+  const queueKey = localFenceQueueKey(companyId, aggregateKey);
+  const queue = aggregateFenceLocalWaiters.get(queueKey);
+  if (!queue || queue.length === 0) return;
+  const next = queue.shift();
+  if (queue.length === 0) aggregateFenceLocalWaiters.delete(queueKey);
+  next?.wake();
+}
+
+/**
+ * Put a woken waiter back at the head of the queue after a claim it could not
+ * convert.
+ *
+ * A wake is not a grant. `signalLocalFenceRelease` removes the waiter from the
+ * queue, but ownership is still decided by `beginAggregateFiring`, and the
+ * window between the two is a full database round trip — wide enough for a
+ * freshly arrived delivery, which attempts a claim once before it registers, to
+ * take the fence first. Without this the loser would have both consumed the
+ * wake (no other queued delivery received it) and dropped out of the queue, so
+ * it could never be woken again and would fall back to pure jittered polling
+ * for the rest of its budget — strictly worse treatment than a waiter that was
+ * never woken, and inflicted specifically on the longest-waiting delivery.
+ *
+ * Front rather than back, because the waiter's arrival time has not changed:
+ * it still predates everything now queued, so `unshift` is what keeps the
+ * handoff FIFO by arrival. Re-entry is conditional on the waiter actually being
+ * absent, so a waiter whose timer fired (still queued, never woken) is not
+ * duplicated.
+ */
+function requeueLocalFenceWaiter(queueKey: string, waiter: LocalFenceWaiter): void {
+  const queue = aggregateFenceLocalWaiters.get(queueKey) ?? [];
+  if (queue.includes(waiter)) return;
+  queue.unshift(waiter);
+  aggregateFenceLocalWaiters.set(queueKey, queue);
+}
+
+/** Test seam: how many deliveries are queued on a local fence right now. */
+export function localFenceWaiterCount(
+  companyId: string,
+  aggregateKey: string,
+): number {
+  return (
+    aggregateFenceLocalWaiters.get(localFenceQueueKey(companyId, aggregateKey))
+      ?.length ?? 0
+  );
+}
+
+/**
  * `beginAggregateFiring`, but waits out a fence held by a live holder instead of
  * failing the delivery on first refusal (PEN-3013).
  *
@@ -737,25 +873,54 @@ async function claimAggregateFiringWaiting(
   const startedAt = policy.now();
   let attempt = 0;
   let claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  if (claim.ok) return claim;
 
-  while (!claim.ok) {
-    const elapsedMs = policy.now() - startedAt;
-    const remainingMs = policy.budgetMs - elapsedMs;
-    if (remainingMs <= 0) {
-      wedgedKeys?.add(aggregateKey);
-      return claim;
+  // Registered only once the first attempt has actually been refused, and for
+  // the whole remaining wait rather than per iteration. Both halves matter: the
+  // uncontended path allocates nothing, and a waiter that kept re-registering
+  // would drop to the back of the queue on every poll, which is the starvation
+  // this is here to remove.
+  const queueKey = localFenceQueueKey(companyId, aggregateKey);
+  const waiter = createLocalFenceWaiter();
+  const queue = aggregateFenceLocalWaiters.get(queueKey) ?? [];
+  queue.push(waiter);
+  aggregateFenceLocalWaiters.set(queueKey, queue);
+
+  try {
+    while (!claim.ok) {
+      const elapsedMs = policy.now() - startedAt;
+      const remainingMs = policy.budgetMs - elapsedMs;
+      if (remainingMs <= 0) {
+        wedgedKeys?.add(aggregateKey);
+        return claim;
+      }
+
+      // Exponential with full jitter, clamped to whatever budget is left so the
+      // total wait cannot overrun even on the final attempt.
+      const ceiling = Math.min(
+        policy.maxDelayMs,
+        policy.initialDelayMs * 2 ** attempt,
+      );
+      const delayMs = Math.min(remainingMs, Math.ceil(policy.random() * ceiling));
+      // Whichever comes first: a local release hands the fence over directly,
+      // the timer is the backstop for every holder this process cannot observe.
+      // `awaken()` is read before the sleep starts so a release that lands
+      // mid-sleep is not missed.
+      await Promise.race([waiter.awaken(), policy.sleep(delayMs)]);
+      attempt += 1;
+      claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+      // A wake that lost the reclaim race must not cost the waiter its place in
+      // the queue; see {@link requeueLocalFenceWaiter}. No-op when the timer,
+      // not a wake, is what ended the sleep.
+      if (!claim.ok) requeueLocalFenceWaiter(queueKey, waiter);
     }
-
-    // Exponential with full jitter, clamped to whatever budget is left so the
-    // total wait cannot overrun even on the final attempt.
-    const ceiling = Math.min(
-      policy.maxDelayMs,
-      policy.initialDelayMs * 2 ** attempt,
-    );
-    const delayMs = Math.min(remainingMs, Math.ceil(policy.random() * ceiling));
-    await policy.sleep(delayMs);
-    attempt += 1;
-    claim = await beginAggregateFiring(ctx, companyId, aggregateKey);
+  } finally {
+    const live = aggregateFenceLocalWaiters.get(queueKey);
+    if (live) {
+      const index = live.indexOf(waiter);
+      if (index >= 0) live.splice(index, 1);
+      if (live.length === 0) aggregateFenceLocalWaiters.delete(queueKey);
+    }
   }
 
   if (attempt > 0) {
@@ -878,6 +1043,9 @@ async function finishAggregateFiring(
       `Alertmanager aggregate firing fence was lost for ${aggregateKey}; retrying delivery`,
     );
   }
+  // The fence is now 'active' and claimable. Hand it to the longest-waiting
+  // local delivery instead of leaving it to find out on its next poll.
+  signalLocalFenceRelease(companyId, aggregateKey);
 }
 
 /**
@@ -917,7 +1085,12 @@ export async function recoverAggregateFiring(
        AND firing_token = $3`,
     [companyId, aggregateKey, token],
   );
-  if (result.rowCount > 0) return true;
+  if (result.rowCount > 0) {
+    // An operator draining a wedged fence should not also have to wait out the
+    // poll interval of whatever is queued behind it.
+    signalLocalFenceRelease(companyId, aggregateKey);
+    return true;
+  }
   // Same compare-and-set discipline on the resolution token: a stale or wrong
   // token releases nothing, so this cannot reopen a fence owned by a newer
   // resolver.
@@ -934,7 +1107,9 @@ export async function recoverAggregateFiring(
        AND resolution_token = $3`,
     [companyId, aggregateKey, token],
   );
-  return cancelling.rowCount > 0;
+  if (cancelling.rowCount === 0) return false;
+  signalLocalFenceRelease(companyId, aggregateKey);
+  return true;
 }
 
 async function tryClaimAggregateFinalization(
@@ -1018,7 +1193,7 @@ async function releaseAggregateFinalization(
   token: string,
 ): Promise<void> {
   const ns = ctx.db.namespace;
-  await ctx.db.execute(
+  const result = await ctx.db.execute(
     `UPDATE ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
      SET phase = 'active',
          resolution_token = NULL,
@@ -1031,6 +1206,13 @@ async function releaseAggregateFinalization(
        AND resolution_token = $3`,
     [companyId, aggregateKey, token],
   );
+  // 'cancelling' refuses a firing claim just as 'firing' does, so a delivery
+  // can be queued locally behind this release too. Production has not observed
+  // that phase blocking (0 of 902 refusals over 24h on 2026-09-30), but the
+  // handoff belongs wherever this process makes the fence claimable again —
+  // leaving it out would make the fast path depend on which phase happened to
+  // hold it.
+  if (result.rowCount > 0) signalLocalFenceRelease(companyId, aggregateKey);
 }
 
 async function resolveAggregateMember(
@@ -2838,8 +3020,9 @@ const SLOW_DELIVERY_MARKS_MS = [SLOW_DELIVERY_WARN_MS, WORKER_PROXY_DEADLINE_MS]
 
 /**
  * Top-level webhook handler. Pure-ish: takes ctx + config + an authentication
- * verdict + input, returns void. Throws `WebhookUnauthorizedError` when that
- * verdict is `false` — the worker's onWebhook re-throws this so the host
+ * verdict + input, returns the delivery's disposition. Throws
+ * `WebhookUnauthorizedError` when that verdict is `false` — the worker's
+ * onWebhook re-throws this so the host
  * can surface a 401 / drop the delivery. Throws `AlertDeliveryIncompleteError`
  * when any alert in the batch failed to process, so the host records the
  * delivery `failed` and Alertmanager retries it.
@@ -2856,6 +3039,13 @@ const SLOW_DELIVERY_MARKS_MS = [SLOW_DELIVERY_WARN_MS, WORKER_PROXY_DEADLINE_MS]
  * and ends Alertmanager's retries. Only do that when the delivery needs no
  * retry — a malformed or unsupported-version payload, or a filtered alert —
  * never when something that could succeed later has failed.
+ *
+ * The returned `PluginWebhookResult` is what makes that acknowledgement
+ * *legible* to the sender. Real Alertmanager ignores it, but a hand-rolled
+ * producer reading only the status code cannot otherwise tell an ingested page
+ * from a destroyed one — which is how a malformed payload from the Prometheus
+ * liveness checker went undetected for 36 days while every page it sent was
+ * dropped here and reported delivered (BLO-38643).
  */
 export async function handleWebhook(
   ctx: PluginContext,
@@ -2863,12 +3053,12 @@ export async function handleWebhook(
   authenticated: boolean,
   input: PluginWebhookInput,
   fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
-): Promise<void> {
+): Promise<PluginWebhookResult> {
   if (input.endpointKey !== WEBHOOK_KEYS.alertmanager) {
     ctx.logger.warn(
       `paperclip-plugin-alertmanager: ignoring webhook for unknown endpoint key "${input.endpointKey}"`,
     );
-    return;
+    return { accepted: 0, rejected: "unknown_endpoint" };
   }
 
   if (!authenticated) {
@@ -2885,7 +3075,7 @@ export async function handleWebhook(
       "paperclip-plugin-alertmanager: dropping webhook with malformed body",
     );
     await ctx.metrics.write("alertmanager.webhook.malformed", 1);
-    return;
+    return { accepted: 0, rejected: "malformed" };
   }
 
   if (!ACCEPTED_SCHEMA_VERSIONS.has(body.version)) {
@@ -2895,10 +3085,25 @@ export async function handleWebhook(
     await ctx.metrics.write("alertmanager.webhook.unsupported_version", 1, {
       version: body.version,
     });
-    return;
+    return { accepted: 0, rejected: "unsupported_version" };
   }
 
   const failedFingerprints: string[] = [];
+  // Alerts the receiver RECOGNISED AND PROCESSED, reported to the sender in the
+  // 200 body: the count that answers "did my page reach your logic intact",
+  // which a status code cannot (BLO-38643).
+  //
+  // One rule, because a signal with exceptions is not a signal. NOT counted =
+  // the receiver refused the alert: excluded by the label filter, a malformed
+  // `paperclip_issue`, an unknown status, or a permanent per-alert error.
+  // Counted = a handler ran, whatever the policy outcome — so the severity
+  // floor, a dedupe re-fire, an opt-out, and a resolve for an unknown
+  // fingerprint all count.
+  //
+  // So `accepted` does NOT promise an issue was created. It promises the
+  // payload was understood and routed. Claiming more than that is the exact
+  // defect being fixed here, so it is stated rather than implied.
+  let accepted = 0;
   // Scoped to this delivery — see FallbackOwnerMemo. A storm is the case that
   // matters: without it, every ownerless alert in the batch repeats the same
   // company-wide agent lookup.
@@ -3013,6 +3218,11 @@ export async function handleWebhook(
               `paperclip-plugin-alertmanager: failed to record issue opt-out metric for ${alert.fingerprint}: ${String(metricErr)}`,
             );
           }
+          // Counted: the receiver understood the alert and the operator's own
+          // policy said do not file. Same class as the severity floor, which
+          // counts by sitting inside handleFiring — this keeps the two
+          // consistent rather than letting placement decide the answer.
+          accepted += 1;
           continue;
         }
         await handleFiring(
@@ -3023,6 +3233,7 @@ export async function handleWebhook(
           fenceWaitPolicy,
           fenceWedgedMemo,
         );
+        accepted += 1;
       } else if (status === "resolved") {
         // Reached with BOTH policy gates above deliberately bypassed — this
         // path is creation-only, exactly like the severity floor in
@@ -3053,6 +3264,7 @@ export async function handleWebhook(
         // row, and handleResolved drops an unknown fingerprint without touching
         // anything.
         await handleResolved(ctx, config, alert);
+        accepted += 1;
       } else {
         ctx.logger.warn(
           `paperclip-plugin-alertmanager: unknown alert status "${status}" for fingerprint ${alert.fingerprint}`,
@@ -3178,4 +3390,11 @@ export async function handleWebhook(
     // succeeded update their existing issue rather than filing a duplicate.
     throw new AlertDeliveryIncompleteError(failedFingerprints);
   }
+
+  // Reached only when nothing in the batch failed transiently, so this count is
+  // final. `accepted: 0` here means every alert was deliberately dropped — by
+  // the label filter, by `paperclip_issue`, by an unknown status, or by a
+  // permanent per-alert error — all of which answer 200 and would otherwise be
+  // indistinguishable from ingestion at the sender.
+  return { accepted };
 }

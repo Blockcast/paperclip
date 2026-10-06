@@ -93,6 +93,7 @@ import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { resolveApprovalWithSideEffects } from "./approval-resolution.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
+import { redactInviteRecord } from "../routes/invite-response.js";
 
 // ---------------------------------------------------------------------------
 // Agent adapter-override (plugin host method `agents.updateAdapterOverrides`)
@@ -1050,13 +1051,15 @@ export function buildHostServices(
   };
 
   const redactInvite = (invite: typeof invites.$inferSelect) => {
-    const { tokenHash: _tokenHash, defaultsPayload, ...safeInvite } = invite;
+    // Shares the one walk in `routes/invite-response.ts` rather than re-deriving it here: this
+    // module had the only copy of the strip-and-sanitize while the six `access.ts` exits had none,
+    // which is exactly how this class of disclosure propagates (PEN-3725). `redactAgentConfigPayload`
+    // is stricter than the `sanitizeRecord` this replaces — it masks every non-benign `headers`
+    // entry rather than only the ones whose names happen to look secret.
+    const safeInvite = redactInviteRecord(invite);
     return {
       ...safeInvite,
       allowedJoinTypes: safeInvite.allowedJoinTypes as InviteJoinType,
-      defaultsPayload: defaultsPayload && typeof defaultsPayload === "object"
-        ? sanitizeRecord(defaultsPayload)
-        : defaultsPayload ?? null,
       state: inviteState(invite),
     };
   };

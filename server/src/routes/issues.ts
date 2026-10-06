@@ -1398,7 +1398,9 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_SOURCES = new Set([
   "automation",
 ]);
 
-const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
+// Exported only so the writer-derived tests can read membership; `ReadonlySet` keeps
+// that a read. Every consumer in and out of this module uses `.has()`.
+export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set([
   "issue_assigned",
   "issue_blockers_resolved",
   "issue_commented",
@@ -1411,6 +1413,59 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "heartbeat.disabled",
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
+  // PEN-3727: every reason below is written by `heartbeat.wakeup` on a path that
+  // deliberately produces NO `heartbeat_runs` row -- the wake is deferred behind the
+  // issue execution lock, merged into a live run, or suppressed outright. Those are
+  // exactly the cases an operator reaches this route to explain ("my comment woke
+  // nobody"), and this route is the only surface that can read `agent_wakeup_requests`
+  // at all. Projecting them to "other" erased the answer: a PEN-3164 comment wake sat
+  // `deferred_issue_execution` for 10h53m behind another agent's queued run, and the
+  // one row that said so reported `reason: "other"`. All are server-authored literals,
+  // so admitting them widens nothing -- the allowlist exists to keep operator- and
+  // adapter-supplied strings out of the response, not these.
+  //
+  // Spelling is load-bearing, which is why the skip family below is asserted against
+  // its writer in `issue-wake-diagnostics-routes.test.ts` rather than restated here.
+  // `writeSkippedHeartbeatRequest` puts the DOTTED `heartbeat.*` form in the `reason`
+  // COLUMN and the bare form only in nested `payload.heartbeatSkip.reason`, which
+  // `projectWakeDiagnosticReason` never reads -- so a bare entry is inert while
+  // looking admitted. The first revision of this list carried bare
+  // `worktree_execution_cutoff` and left exactly the defect this list exists to fix.
+  //
+  // Deliberately NOT admitted: the timer-scheduler skips `provider_capacity_deferred`
+  // and `no_in_flight_work`. Both are agent-scoped rows whose payload carries no
+  // `issueId`, `taskId` or `_paperclipWakeContext`, so `wakeRequestTargetsIssue` can
+  // never return them on this route. Listing them would assert a reachability this
+  // route does not have.
+  "issue_execution_deferred",
+  "issue_execution_promoted",
+  "issue_execution_same_name",
+  "issue_execution_issue_not_found",
+  "issue_external_wait_wake_suppressed",
+  "issue_rewake_throttled",
+  "retry_execution_duplicate",
+  "github_state_change_queued_coalesced",
+  "task_scope_queued_coalesced",
+  "zero_token_session_reset_superseded",
+  "pipeline_stage_exit_cancellation_pending",
+  "heartbeat.scheduling_suppressed",
+  "heartbeat.worktree_execution_cutoff",
+  // Written as a const identifier rather than an inline literal, which is why the
+  // writer-derived scan missed them and `workspace_worktree_requires_project` survived
+  // the revision that added this list. Both resolve to server-authored literals; the
+  // scan now resolves `SCREAMING_SNAKE` consts, so these are protected from drift by
+  // the same control as every entry above rather than by being restated as symbols.
+  //
+  // `workspace_worktree_requires_project` is the same no-run-row family as the block
+  // above -- the worktree pre-flight marks the issue `blocked`, writes this row
+  // `skipped`, and returns without inserting into `heartbeat_runs`. It is also the
+  // most actionable of the set: its payload already carries a `remediation` string
+  // while the one surface that could print it reported `reason: "other"`.
+  // `execution_review_participant_recovery` is the exception that shows this list is
+  // not *only* no-run-row reasons (neither is `issue_commented`) -- it does queue a
+  // run, but it is issue-scoped and reachable here, so naming it beats "other".
+  "workspace_worktree_requires_project",
+  "execution_review_participant_recovery",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
@@ -3047,6 +3102,16 @@ function logIssueListRequest(input: {
 }
 
 /**
+ * Page-count ceiling for walkIssueListPages.
+ *
+ * Deliberately its own constant rather than a reuse of ISSUE_LIST_MAX_LIMIT, which is a
+ * rows-per-PAGE request limit: the two are unrelated dimensions that merely happen to share
+ * a value today. Tying them together would make the walk's row ceiling — their product —
+ * shrink quadratically if that request-facing limit were ever tuned down.
+ */
+export const WALK_MAX_PAGES = 1000;
+
+/**
  * Pages through `fetchPage` until it returns a short page, handing each page to `visit`.
  *
  * attention=blocked is served by listBlockedInboxIssues, which pages by offset only and
@@ -3054,6 +3119,14 @@ function logIssueListRequest(input: {
  * re-read page one forever. Every other path walks the immutable id order with a keyset
  * cursor, because offset paging over the mutable activity order re-ranks rows touched
  * mid-walk, which both double-counts and skips them.
+ *
+ * Termination depends on `opts.blocked` mirroring list()'s internal routing, and that
+ * mirror spans two files: list() picks the blocked branch at an early return that lands
+ * BEFORE the afterId predicate, so a new early return added above it would silently make
+ * afterId a no-op here — no conflict, no type error, an unbounded loop. Each branch below
+ * therefore asserts its own cursor actually moved, so that mistake surfaces on page two as
+ * an error rather than as a request that never returns. A page cap backstops both, since
+ * the blocked assertion compares consecutive pages and churn can differ them indefinitely.
  */
 export async function walkIssueListPages<Row extends { id: string }>(
   fetchPage: (page: { offset?: number; afterId?: string }) => Promise<Row[]>,
@@ -3062,12 +3135,42 @@ export async function walkIssueListPages<Row extends { id: string }>(
 ): Promise<void> {
   let offset = 0;
   let afterId: string | undefined;
-  while (true) {
+  let previousPageIds: string | undefined;
+  // Backstop for both branches. The per-branch assertions below catch the mirror breaking
+  // on page two, but the blocked one compares only the immediately previous page: a dropped
+  // `offset` combined with churn at the head of the mutable activity order can serve
+  // differing pages forever and slip past it. This cap cannot, and cannot false-positive
+  // either — the walk's own caller caps a page at ISSUE_LIST_MAX_LIMIT, so at that page size
+  // the ceiling is WALK_MAX_PAGES * ISSUE_LIST_MAX_LIMIT rows before firing.
+  for (let page = 0; ; page += 1) {
+    if (page >= WALK_MAX_PAGES) {
+      throw new Error(
+        `walkIssueListPages: exceeded ${WALK_MAX_PAGES} pages, so the walk is not terminating`,
+      );
+    }
     const rows = await fetchPage(opts.blocked ? { offset } : { afterId });
     await visit(rows);
     if (rows.length < opts.pageSize) return;
-    if (opts.blocked) offset += rows.length;
-    else afterId = rows[rows.length - 1]!.id;
+    if (opts.blocked) {
+      // The blocked listing pages by offset, so non-advance here means the caller dropped
+      // `offset` on its way to list() and every fetch re-serves page one. Compare the whole
+      // page, not its last id: this order is the mutable activity order, and a re-rank can
+      // legitimately repeat one row across pages — it cannot reproduce the entire page.
+      const pageIds = rows.map((row) => row.id).join(",");
+      if (pageIds === previousPageIds) {
+        throw new Error("walkIssueListPages: blocked page repeated, so offset is not reaching list()");
+      }
+      previousPageIds = pageIds;
+      offset += rows.length;
+    } else {
+      // list() honoring afterId returns only rows with id > afterId, so the last id of a
+      // full page is always past the cursor we sent. Equal means the predicate never ran.
+      const next = rows[rows.length - 1]!.id;
+      if (next === afterId) {
+        throw new Error("walkIssueListPages: keyset cursor did not advance, so afterId is not reaching list()");
+      }
+      afterId = next;
+    }
   }
 }
 
@@ -3110,6 +3213,14 @@ export function issueRoutes(
     createIssueDuplicateCandidateActivityTimeoutMs?: number;
     createIssueDuplicateCandidateCorpusFilter?: CreateIssueDuplicateCandidateCorpusFilter;
     createIssueBeforeResponseHook?: () => Promise<void>;
+    /**
+     * Test seam for the restricted-actor count walk. `pageSize` shrinks the page so a
+     * multi-page walk costs a handful of rows instead of ISSUE_LIST_MAX_LIMIT + 1, and
+     * `onPage` runs after each page is counted so a test can mutate an already-returned
+     * row mid-walk and prove the enumeration is stable under re-ranking rather than only
+     * that the cursor advances.
+     */
+    issueCountWalk?: { pageSize?: number; onPage?: () => Promise<void> };
     registerCommentEffectProcessor?: (processor: (commentId: string) => Promise<unknown>) => void;
   } = {},
 ) {
@@ -6411,6 +6522,7 @@ export function issueRoutes(
     if (!requestedPolicy?.monitor) return false;
     if (requestedPolicy.stages.length > 0) return false;
     if (requestedPolicy.reviewPreset || requestedPolicy.authorizationPolicy) return false;
+    if (requestedPolicy.productivityReviewDisabled) return false;
     return true;
   }
 
@@ -8960,18 +9072,20 @@ export function issueRoutes(
       }
 
       const blocked = countFilters.attention === "blocked";
+      const pageSize = opts.issueCountWalk?.pageSize ?? ISSUE_LIST_MAX_LIMIT;
       let visibleCount = 0;
       await walkIssueListPages(
         (page) =>
           svc.list(
             companyId,
             blocked
-              ? { ...countFilters, limit: ISSUE_LIST_MAX_LIMIT, offset: page.offset }
-              : { ...countFilters, limit: ISSUE_LIST_MAX_LIMIT, sortField: "id", afterId: page.afterId },
+              ? { ...countFilters, limit: pageSize, offset: page.offset }
+              : { ...countFilters, limit: pageSize, sortField: "id", afterId: page.afterId },
           ),
-        { blocked, pageSize: ISSUE_LIST_MAX_LIMIT },
+        { blocked, pageSize },
         async (rows) => {
           visibleCount += (await filterIssuesForActor(req, rows)).length;
+          await opts.issueCountWalk?.onPage?.();
         },
       );
       res.json({ count: visibleCount });
@@ -11875,14 +11989,16 @@ export function issueRoutes(
     await assertCanManageIssueMonitor(access, req, issue.companyId, issue, true);
 
     const actor = getActorInfo(req);
-    await heartbeat.triggerIssueMonitor(issue.id, {
+    // PEN-3326: a check-now under a tree hold or `wakeOnDemand: false` re-arms
+    // the monitor instead of firing; surface that outcome rather than a bare ok.
+    const result = await heartbeat.triggerIssueMonitor(issue.id, {
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId ?? null,
       runId: actor.runId ?? null,
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, ...result });
   });
 
   router.post("/issues/:id/scheduled-retry/retry-now", async (req, res) => {
@@ -12358,7 +12474,8 @@ export function issueRoutes(
       // rewrite the policy. `isLapsedMonitorRearmPatch` already rejects a
       // request carrying anything but a monitor; merging rather than replacing
       // closes the other half — the write itself must not silently drop stages,
-      // reviewPreset, authorizationPolicy or mode that the assignee set.
+      // reviewPreset, authorizationPolicy, mode or the productivity-review
+      // opt-out that the assignee set.
       updateFields.executionPolicy = managerMonitorRearmAuthorized
         ? mergeIssueExecutionPolicyMonitor(
           normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),

@@ -36,7 +36,11 @@
  */
 import type { EvidenceShape } from "./evidence-shapes.js";
 import { evaluateCommentReviewGate } from "./pr-comment-review-gate.js";
-import { extractAllyReviewedHeadSha, hasActionablePrReviewFeedback } from "./ally-review-detection.js";
+import {
+  countAllyDeferredPriorFindings,
+  extractAllyReviewedHeadSha,
+  hasActionablePrReviewFeedback,
+} from "./ally-review-detection.js";
 import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID } from "./pull-request-work-products.js";
 import { githubSameActorLogin, type ReviewerSurfaces } from "./github-app-auth.js";
 
@@ -308,6 +312,23 @@ async function probeOne(
     const atHead = surfaces.reviews
       .filter((r) => (r.state ?? "").trim().toUpperCase() !== "DISMISSED")
       .filter((r) => (r.commitId ?? "").trim().toLowerCase() === normalizedHead)
+      // No tiebreak for a null `submittedAt`, ON PURPOSE (BLO-34808 item 2,
+      // closed as not-a-defect rather than left unexplained). Equal sort keys
+      // would fall back to GitHub's unsorted response order — but the state is
+      // unreachable: `PENDING` is the only unsubmitted review state and
+      // `githubListReviewerSurfacesAtPr` already drops it, so every row here
+      // carries a real timestamp. The ordering rule itself IS covered: the two
+      // multi-review fixtures in `evidence-truth.test.ts` ("only the NEWEST
+      // review at head decides", "a DISMISSED review does not veto a live clean
+      // one") use distinct real `submittedAt` values. Adding a tiebreak would
+      // be dead code with no failing mutation.
+      //
+      // The `typeof r.submittedAt === "string"` filter in the comment-surface
+      // merge above is NOT a second opinion on that reachability, and the two
+      // sites do not disagree: `ReviewerReview.submittedAt` is `string | null`
+      // while the gate row's `createdAt` is `string | Date`, so that filter is
+      // what makes the `as string` beside it honest — on top of mirroring the
+      // production gate's own row filter. Reachability is argued here only.
       .sort((a, b) => (b.submittedAt ?? "").localeCompare(a.submittedAt ?? ""));
     const newest = atHead[0];
     const formalBlocking = newest !== undefined && hasActionablePrReviewFeedback(newest.body, newest.state);
@@ -379,6 +400,66 @@ async function probeOne(
     // `required`, not to fabricate it). A detector that invents the pass is
     // exactly what would make that measurement lie about being safe to flip.
     let formalClean = false;
+    // A `tracked` ledger entry does not block (it is a supported, accepted
+    // residual), so hasActionablePrReviewFeedback lets a 0/0 body carrying one
+    // through. The comment surface refuses it as `deferred_finding`; the formal
+    // surface must refuse it by the same helper, or an App-authored PR, whose
+    // artifact of record is a formal review, reads `review:ally-clean` for a
+    // head with a live accepted residual (BLO-36903).
+    //
+    // NARROWED, not swapped (BLO-38032). `atHead` admits `newest` on
+    // `commit_id`, which GitHub re-anchors FORWARD onto the new head on a
+    // branch update (BLO-27234, n=128) — so a review of a tree that no longer
+    // exists can read its ledger into this veto and kill a genuine clean that
+    // this head's own reviewer published. The veto therefore drops on exactly
+    // one condition: the body POSITIVELY attests a DIFFERENT head.
+    //
+    // An UNATTESTED body keeps vetoing, and that is the whole reason this is
+    // `attested !== null &&` rather than the symmetric `=== normalizedHead`
+    // that `formalClean` uses one line below. As a veto the fail direction is
+    // inverted, so silence must not buy a pass — and the gap is reachable, not
+    // theoretical: `countAllyDeferredPriorFindings` reads the RAW body while
+    // `extractAllyReviewedHeadSha` reads the fence-stripped one, so an
+    // unbalanced fence can blank the attestation while the ledger survives.
+    // Requiring a positive match would publish `review:ally-clean` for a head
+    // with a live accepted residual on exactly that shape — reintroducing
+    // BLO-36903 through its own fix. Both arms are pinned by a failing
+    // mutation in `evidence-truth.test.ts` (BLO-34263).
+    //
+    // Enforced ONLY as the cross-surface veto on `out.clean` below, and NOT as
+    // an extra condition on the `formalAttestingReview` guard. Two reasons, in
+    // order of weight:
+    //
+    //   1. The guard cannot replace the veto, because of the keying above — so
+    //      a copy there would be an ADDITIONAL arm, not a relocation.
+    //   2. Two arms would mask each other under mutation. `formalClean` feeds
+    //      nothing but this veto, so with a copy on the guard, deleting the
+    //      veto's `!formalDeferred` leaves every assertion green and vice
+    //      versa. BLO-34263: a guard with no failing mutation is a comment, and
+    //      an arm whose only sibling already covers every case is how a
+    //      detector ends up with N-1 decorations.
+    //
+    // CORRECTION, and the cost is real rather than zero (Ally review of #2076,
+    // head 0394d75b0): an earlier revision of this comment justified the single
+    // copy with "the comment surface reads the PR author on this same path
+    // regardless". That is FALSE on exactly the population `formalClean` exists
+    // for. Surface 1 reaches `readPrAuthor` only via `authorUnknown`, which is
+    // set only by `withheldPositive`, which needs `isAllyConsolidatedReviewComment`
+    // -> `hasAllyConsolidatedReviewHeading`; `countAllyDeferredPriorFindings`
+    // and `extractAllyReviewedHeadSha` need no heading. So on a body that
+    // attests this head and carries a `tracked` entry but has NO `## Ally`
+    // heading, Surface 1 returns `not_evaluated` with no `authorUnknown` and
+    // never fetches, while this branch does. ACCEPTED COST, stated so it is not
+    // rediscovered as a bug: one call from the scarce budget above, and on a
+    // failed read a `github-truth-probe-failed:pr_author` diagnostic for a
+    // cause that did not decide anything. `out.clean` is false either way, so
+    // the direction is safe, and the population is confined to bodies that fail
+    // Surface 1's grammar. Paying it buys the mutation coverage in (2).
+    const formalDeferredAttestedHead = newest === undefined ? null : extractAllyReviewedHeadSha(newest.body);
+    const formalDeferred =
+      newest !== undefined &&
+      countAllyDeferredPriorFindings(newest.body) > 0 &&
+      !(formalDeferredAttestedHead !== null && formalDeferredAttestedHead !== normalizedHead);
     if (formalAttestingReview !== undefined) {
       const prAuthorLogin = await readPrAuthor();
       // An unread author leaves this false: it cannot establish independence,
@@ -420,7 +501,18 @@ async function probeOne(
     // The VETO keeps its independent justification either way: `formalBlocking`
     // reads `newest.state`, so a bodyless CHANGES_REQUESTED is reachable only
     // through Surface 2.
-    out.clean = !commentBlocking && !formalBlocking && (commentClean || formalClean);
+    //
+    // A deferral gets the same veto, for the same reason: it is the more
+    // conservative reading, and without it a clean comment beside a formal
+    // review that accepts a residual (or the mirror) still reads
+    // `review:ally-clean` for a head with a live accepted residual (BLO-36903).
+    const commentDeferred = commentVerdict.outcome === "deferred_finding";
+    out.clean =
+      !commentBlocking &&
+      !formalBlocking &&
+      !commentDeferred &&
+      !formalDeferred &&
+      (commentClean || formalClean);
   } catch {
     // A throw is an inability to ask, which is exactly `probeFailed` — never
     // let it escape and turn one bad socket into a failed PATCH.

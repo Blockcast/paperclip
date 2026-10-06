@@ -2103,6 +2103,92 @@ describeEmbeddedPostgres("productivity review service", () => {
     );
   });
 
+  // PEN-3442: the one measured infra-class population BLO-36535's set left
+  // behind. A provider 503/529 mid-turn is the same "the provider refused to
+  // serve" category as `rate_limit_exhausted`, but it was absent from the set,
+  // so these runs stayed in the `no_comment_streak` numerator as conduct.
+  //
+  // The gap was invisible from the zero-token side, which is the whole reason
+  // it survived the BLO-36535 sweep. Re-measured 2026-10-01 over the 400 most
+  // recent runs of agent `29033747`: 2 `claude_transient_upstream` runs, BOTH
+  // billed (61,230 output tokens at the worst, $12.92 across the pair), against
+  // 109 `provider_throttled_no_progress` runs with zero billed. The throttled
+  // code was already caught by `isInfraFailureRun`'s zero-token test whether or
+  // not it was enumerated; this one never was.
+  //
+  // Non-zero `outputTokens` is load-bearing, exactly as in the BLO-32472 replay
+  // above: a zero-token fixture is excluded by `isInfraFailureRun` regardless of
+  // set membership and so passes against the PRE-fix code, proving nothing.
+  //
+  // The two codes are asserted separately rather than mixed into one window so
+  // that deleting either set member reds exactly one case. Mixed, a single
+  // surviving member would bridge the whole window and both cases would stay
+  // green against half the change.
+  for (const errorCode of ["claude_transient_upstream", "codex_transient_upstream"]) {
+    it(`generates no productivity review for a window of billed ${errorCode} runs (PEN-3442)`, async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        // 2.5h spacing for the same reason as the BLO-32472 replay: 10 runs
+        // inside an hour trip `high_churn`, and "no review" would then pass for
+        // the wrong reason.
+        spacingMs: 2.5 * 60 * 60 * 1000,
+        status: "failed",
+        livenessState: "failed",
+        usageJson: { inputTokens: 402_118, outputTokens: 61_230 },
+        errorCode,
+      });
+
+      const service = productivityReviewService(db);
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+  }
+
+  // PEN-3442 negative control, pinning the over-exclusion direction shut in the
+  // place it would most plausibly leak: `provider_transient_upstream` is the
+  // THIRD member of the transient-upstream family in
+  // `TRANSIENT_INFRA_CONTINUATION_ERROR_CODES` and is deliberately NOT added to
+  // the infra-class set. The exclusion is measured, not inferred from
+  // BLO-18285's "normally parked in `scheduled_retry`" — see the zero-occurrence
+  // count recorded at the set in `zero-token-startup-failure.ts`. Membership
+  // here is per code, not per family — a reader who adds one sibling "for
+  // consistency" reds this; a billed one observed in production is the reason
+  // to add it and re-subject this control.
+  it("keeps a billed provider_transient_upstream run in the no-comment streak (PEN-3442 negative control)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 402_118, outputTokens: 61_230 },
+      errorCode: "provider_transient_upstream",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 10");
+    expect(reviews[0]?.description).toContain(
+      "Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — `errorCode` in the shared infra-class set, BLO-36535): 0",
+    );
+  });
+
   // BLO-36535 negative control, pinning BLO-26165's false negative shut: an
   // application-class `errorCode` is not in the infra set, so a run that
   // executed and failed on its own merits still counts as silence. The sibling
@@ -6170,6 +6256,73 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // BLO-36717: the two fixtures above pin the *gate* — they prove a cross-scope
+  // receipt cannot raise `high_churn`. Neither reaches the rendered trigger
+  // string, because in both the gate correctly does not fire, so no string is
+  // produced at all. This one pins the *consumer*: `high_churn` fires, and the
+  // two counters hold different non-zero values, so the rendered line says
+  // which one it read. Without that divergence the assertion is vacuous — the
+  // pre-existing fixture behind the `runs/0` assertion seeds zero comments, so
+  // both counters read 0 and the widened counter renders identically.
+  it("renders the run-scoped churn count, not the widened one, in the high_churn trigger string", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Run-scoped: 10 runs woken for this issue, each leaving a comment here.
+    // Enough on its own to trip the hourly arm, so the gate fires on the
+    // run-scoped count and the mutation below cannot change *whether* a review
+    // is created — only what the trigger string says.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
+      now,
+      withRunComments: true,
+    });
+    // Cross-scope: 3 more comments on this issue authored by runs woken
+    // elsewhere. Invisible to the run-scoped counter, counted by the widened
+    // one — the only thing making the two numbers differ.
+    const receiptRuns = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: randomUUID(),
+      count: 3,
+      now: new Date(now.getTime() - 30_000),
+    });
+    await db.insert(issueComments).values(
+      receiptRuns.map((run, index) => {
+        const at = new Date(now.getTime() - (index + 1) * 90_000);
+        return {
+          companyId: seeded.companyId,
+          issueId: seeded.issueId,
+          authorAgentId: seeded.coderId,
+          createdByRunId: run.id!,
+          body: `Cross-scope receipt ${index}.`,
+          createdAt: at,
+          updatedAt: at,
+        };
+      }),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    const description = review?.description ?? "";
+    expect(description).toContain("Primary trigger: `high_churn`");
+    // The divergence, asserted in the same document: the widened evidence line
+    // reads 13 while the trigger string reads 10. If these two ever agree the
+    // fixture has gone vacuous and the mutation check proves nothing.
+    expect(description).toContain("Assignee run-linked comments total/window: 13 total, 13/1h, 13/6h");
+    expect(description).toContain(
+      "10 runs/10 assignee comments from runs woken for this issue in 1h; 10 runs/10 in 6h",
+    );
+    expect(description).not.toContain("10 runs/13 assignee comments from runs woken for this issue in 1h");
+  });
+
   it("recovers a Next line from an assignee comment instead of reporting 'none recorded'", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
@@ -8360,6 +8513,113 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(closed?.details).toMatchObject({ suppressedBy: "unreviewable_source" });
   });
 
+  // BLO-39945. The opt-out gate was correct but unreachable: it read only
+  // `executionPolicy.monitor.productivityReviewDisabled`, and `monitor`
+  // requires `nextCheckAt`. A deliberately-permanent `in_progress` log row
+  // (BLO-34818) correctly carries no monitor, so it could not opt out and
+  // tripped `long_active_duration` forever — four false positives in five days.
+  describe("top-level productivityReviewDisabled opt-out (BLO-39945)", () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    // 7h > the 6h long-active bar, so this source fires on every run.
+    const longActiveStartedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+
+    it("skips generation for a source carrying the flag with no monitor at all", async () => {
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: longActiveStartedAt,
+        executionPolicy: { mode: "normal", commentRequired: true, stages: [], productivityReviewDisabled: true },
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.optedOut).toBe(1);
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+
+    // Negative control. Without this, the test above passes on code that opts
+    // every source out unconditionally.
+    it("still generates for the same fixture with the flag absent", async () => {
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: longActiveStartedAt,
+        executionPolicy: { mode: "normal", commentRequired: true, stages: [] },
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.optedOut).toBe(0);
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    });
+
+    // The pre-existing monitor-nested form must keep working unchanged.
+    it("still honours the monitor-nested flag", async () => {
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: longActiveStartedAt,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+            notes: null,
+            scheduledBy: "assignee",
+            productivityReviewDisabled: true,
+          },
+        },
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.optedOut).toBe(1);
+      expect(result.created).toBe(0);
+    });
+
+    it("retires an already-created review once the source sets the top-level flag", async () => {
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: longActiveStartedAt,
+        monitorNextCheckAt: new Date(now.getTime() - 10 * 60 * 1000),
+        monitorScheduledBy: "assignee",
+      });
+      const reviewId = await insertProductivityReview({ seeded, createdAt: new Date(now.getTime() - 10 * 60_000) });
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: { mode: "normal", commentRequired: true, stages: [], productivityReviewDisabled: true },
+          updatedAt: now,
+        })
+        .where(eq(issues.id, seeded.issueId));
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+        thresholds: { monitorLapseServiceGraceMs: 60_000 },
+      });
+
+      expect(result.created).toBe(0);
+      const [review] = await db.select().from(issues).where(eq(issues.id, reviewId));
+      expect(review).toMatchObject({ status: "done" });
+      const [closed] = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityId, reviewId), eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed")));
+      expect(closed?.details).toMatchObject({ suppressedBy: "unreviewable_source" });
+    });
+  });
+
   it("retires a stale reserved review after its source disappears", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const reservedAt = new Date(now.getTime() - 10 * 60_000);
@@ -9868,6 +10128,186 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
   });
 
+  // BLO-35725: `runtime_failure_streak` was absent from the `done` arm, so it
+  // fell to the "unknown trigger semantics fail closed" default and no such
+  // review could ever auto-retire on source completion. Measured 2026-09-23:
+  // 32 of 32 open productivity reviews fleet-wide carried this trigger (the
+  // self-retiring triggers clear themselves, so it was the entire open
+  // population) and 6 were orphans whose source had reached `done` — each one
+  // otherwise costing a manager run to close by hand, which is exactly the cost
+  // BLO-20549 removed for `long_active_duration`.
+  //
+  // Paired with the `no_comment_streak` sibling below rather than
+  // parameterised, for the same reason as the two arms above: this is a
+  // per-trigger decision, and the accountability triggers must still retire
+  // neither.
+  it("closes an open runtime-failure-streak productivity review once its source issue is done", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "runtime_failure_streak",
+        firedTriggers: ["runtime_failure_streak"],
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // Dropping `runtime_failure_streak` from the `done` arm turns this red.
+    expect(result.closedTerminalSourceReviews).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("done");
+
+    const closeEntries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_suppressed_open_review_closed"));
+    expect(closeEntries).toHaveLength(1);
+    expect(closeEntries[0]?.details).toMatchObject({
+      suppressedBy: "terminal_source",
+      sourceStatus: "done",
+      sourceIssueId: seeded.issueId,
+    });
+  });
+
+  // BLO-35725 (Ally review on eb48670e): the overlap case. `runtime_failure_streak`
+  // is the first member of the `done` arm that *outranks* the accountability
+  // triggers in `choosePrimaryTrigger`, so it is the first one that can present a
+  // closable primary while carrying a non-closable `high_churn` record underneath.
+  // The defaults make that the norm, not a corner: both thresholds are 10 and
+  // infra-failure runs count toward churn in full, so ten fast infra-failing runs
+  // inside an hour trip both predicates at once.
+  //
+  // Retiring this row would destroy the cost record permanently — generation only
+  // scans `["todo", "in_progress"]` sources, so a `done` source never re-fires it.
+  // Keying the arm on the primary trigger alone turns this red.
+  it("does not close a done-source runtime-failure-streak review that also fired high_churn", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        // `firedTriggers[0] === trigger` always holds (see `collectEvidence`).
+        trigger: "runtime_failure_streak",
+        firedTriggers: ["runtime_failure_streak", "high_churn"],
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedTerminalSourceReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
+  });
+
+  // BLO-35725: legacy rows minted before `firedTriggers` was persisted fail
+  // closed for this trigger specifically — we cannot tell whether `high_churn`
+  // co-fired, and there is no stranding risk to trade against because the
+  // trigger is new enough that no legacy row carries it. The two older members
+  // keep the old primary-trigger fallback (their ladder position makes it safe),
+  // which the BLO-20549 tests above pin.
+  it("does not close a done-source runtime-failure-streak review with no recorded firedTriggers", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "done",
+      startedAt: new Date(now.getTime() - 13 * 60 * 60 * 1000),
+    });
+    const reviewId = randomUUID();
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source",
+      status: "todo",
+      priority: "medium",
+      parentId: seeded.issueId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await logActivity(db, {
+      companyId: seeded.companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.productivity_review_created",
+      entityType: "issue",
+      entityId: reviewId,
+      details: {
+        trigger: "runtime_failure_streak",
+        sourceIssueId: seeded.issueId,
+      },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.closedTerminalSourceReviews).toBe(0);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.status).toBe("todo");
+  });
+
   // BLO-33477: retirement-scan starvation, the same defect BLO-30303 fixed on
   // the source scan. `closeOpenSuppressedReviews` is the only path that can
   // retire an open review, and it only writes to a review it *retires* — a
@@ -10047,7 +10487,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.status).toBe("todo");
   });
 
-  it("does not close a done-source review whose trigger was not long_active_duration", async () => {
+  it("does not close a done-source review whose trigger is an accountability record", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({ status: "done" });
     const reviewId = randomUUID();

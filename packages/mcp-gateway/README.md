@@ -186,6 +186,8 @@ disabled unless both variables are present; partial configuration fails startup.
 
 ## Endpoints
 
+On `$PORT` (default 8080):
+
 - `GET /healthz` — health check; returns `{ ok: true, upstreams, upstreamCallCounts, breakers, sessions }`.
 - `GET /` — same as `/healthz`.
 - `GET /.well-known/oauth-protected-resource[/mcp]` — tenant MCP OAuth protected-resource metadata when configured.
@@ -194,6 +196,175 @@ disabled unless both variables are present; partial configuration fails startup.
 - `<METHOD> /mcp` — aggregate MCP endpoint; exposes one stable tool list with `<prefix>__<toolName>` names.
 - `<METHOD> /<prefix>/mcp` — proxied to the upstream URL for `<prefix>`.
 - `<METHOD> /<prefix>/mcp/<rest...>` — preserves the trailing path.
+
+On `$PAPERCLIP_MCP_HEALTH_PORT`, when set — see [Probe-only health port](#probe-only-health-port):
+
+- `GET /healthz`, `GET /` — `{ ok: true }`, or 503 `{ ok: false }` when the proxy listener is not accepting connections.
+- `HEAD` of either path — same status, no body.
+- any other method on those paths — 405. Any other path — 404. No MCP route, no
+  upstream, no discovery document is served here.
+
+## Probe-only health port
+
+`PAPERCLIP_MCP_HEALTH_PORT` binds a second listener that serves `GET /healthz`
+and nothing else. Unset by default; nothing changes unless you set it.
+
+It exists so a `NetworkPolicy` can deny the proxy port without taking the
+kubelet's probes down with it. The kubelet reaches a pod from the **node's host
+network**, so a Cilium `ingressDeny` with `fromEntities: [host, remote-node]` on
+the proxy port denies the probes as well as the bypass it is closing. On a
+Deployment whose liveness probe targets that port, adding the deny is a
+CrashLoop rather than a policy change (PEN-3052).
+
+```yaml
+env:
+  - name: PORT
+    value: "8080"
+  - name: PAPERCLIP_MCP_HEALTH_PORT
+    value: "8081"
+ports:
+  - { name: http,   containerPort: 8080 }
+  - { name: health, containerPort: 8081 }
+readinessProbe:
+  httpGet: { path: /healthz, port: health }
+  periodSeconds: 5
+  timeoutSeconds: 1
+  failureThreshold: 3
+livenessProbe:
+  httpGet: { path: /healthz, port: health }
+  periodSeconds: 15
+  timeoutSeconds: 1
+  failureThreshold: 3
+```
+
+The probe fields are spelled out rather than left to defaults because the
+reasoning elsewhere in this file depends on their values: `timeoutSeconds: 1` is
+what the accept probe's own 250ms connect timeout sits inside, and
+`failureThreshold: 3` is why three consecutive failures restart the
+authenticated proxy rather than drop a sample.
+
+`initialDelaySeconds` is deliberately absent: the startup window is covered by
+the threshold rather than by a delay. The health listener binds inside the proxy
+listener's own `listen` callback, so until the proxy is up *both* ports are
+closed and every probe before that is a connection refusal, not a wrong answer.
+At `periodSeconds: 15` / `failureThreshold: 3` that grants liveness ~30s of
+start-up grace — not 45s. The kubelet probes immediately rather than one period
+in: `doProbe` is the loop *condition* in its probe worker, and with
+`initialDelaySeconds` unset its delay gate is `0 < 0`. So the three failures land
+at t≈0s / 15s / 30s, and the margin is `periodSeconds × (failureThreshold − 1)`,
+not `× failureThreshold`. Tighten `periodSeconds` and that grace shrinks with it
+— at which point add an explicit `initialDelaySeconds` rather than rediscovering
+why the margin was enough.
+
+30s is still ample for this process today: the figure was wrong here, not the
+config. Do not budget the slack above it either. The worker's ticker is phased to
+*its own* start, which precedes the container's, so the first probe really lands
+somewhere in `(0, periodSeconds]` and the observed restart ranges up to ~45s;
+after a kubelet restart `run()` additionally sleeps a random fraction of a period
+first. Both offsets are phase-dependent and neither is guaranteed, so 30s is the
+number a start-up has to fit inside.
+
+Four properties this port is required to keep, all pinned in `server.test.ts`:
+
+- **It never proxies.** The deny it exists to permit names one port, so anything
+  reachable here is reachable around that deny. A health listener that routed to
+  an upstream would be a wider hole than the one being closed.
+- **It discloses less than the proxy port's `/healthz`,** which reports upstream
+  names, breaker state and per-prefix session counts. No deny covers this port;
+  treat its body as readable by anything that can route to the pod.
+- **Its connections are bounded in time, not in number** — 2s headers, 5s
+  request, swept every 1s, idle keep-alive reclaimed at 2s — rather than left on
+  Node's 60s / 300s / 30s-sweep defaults. Those defaults suit an authenticated
+  proxy port; this one is reachable by exactly the `host` and `remote-node`
+  entities the deny excludes, with nothing authenticating in front of it.
+  Read "in time" narrowly: what these reclaim is the **idle and the malformed**
+  socket. `requestTimeout` restarts per request, so a client willing to send one
+  cheap request inside each keep-alive window holds its socket indefinitely —
+  roughly one 40-byte request every 2s. What the timeouts bound is therefore the
+  *per-socket* cost, as a floor under the holder's effort; they do not bound the
+  number of sockets, and no number here does.
+  The sweep interval is the part worth stating explicitly: Node arms no
+  per-socket timer for these timeouts, it reaps expired connections on
+  `connectionsCheckingInterval`, which defaults to 30s and is settable only as a
+  `http.createServer` option. Left at the default, the 2s headers timeout above
+  is enforced in ~30s — measured at 30040ms, against ~2–3s at a 1s interval
+  (measured 2007ms). Reaping happens on the sweep rather than on a per-socket
+  timer, so that is a range and 2007ms is its floor, not the figure to compute
+  from.
+- **There is deliberately no connection cap.** An earlier revision set
+  `maxConnections = 64` to keep socket-holding here from pushing the process
+  toward fd pressure, since `createProxyAcceptProbe` needs a descriptor of its
+  own and a failed probe turns a 503 into a liveness restart of the
+  authenticated proxy. At 64 a cap makes that outcome cheaper, not rarer: Node
+  closes the *incoming* handle once the cap is reached, with no response, so the
+  sockets already held win and the kubelet's next probe connection is the one
+  reset — moving the restart threshold down from the process fd limit to the
+  cap.
+  A cap set well clear of probe contention is a different proposal, and it is
+  **accepted against, not refuted.** It would bound something the timeouts do
+  not: how many descriptors this unauthenticated listener can take from the
+  process. That is worth naming, because the cost of exhausting them is not
+  confined to this port — an fd-exhausted process also cannot accept on the
+  proxy port or open outbound sockets to upstreams, so the authenticated proxy
+  is degraded for the window before liveness restarts the pod. Three reasons it
+  is still not taken, recorded here so the next reader does not re-derive them:
+  - Both designs end in a restart. A holder that can hold sockets here causes
+    one either way; a high cap only changes whether the proxy keeps serving
+    during the window before it.
+  - It buys that window by *lowering* the effort needed to trigger the restart,
+    from the process fd limit to the cap. That is the same trade the 64 cap was
+    rejected for, moved along the axis rather than off it.
+  - A constant cannot be shown to bind. The fd limit is set by the container
+    runtime, not here, so any fixed cap is either inert (limit far above it) or
+    load-bearing (limit near it) depending on deployment — and a stated bound
+    that silently does not bind is worse than a recorded acceptance.
+  So unbounded descriptor consumption on this port is accepted. What stands
+  against it is the timeouts, which put a floor under the per-socket cost, and
+  the deny-scoping of who can route here at all — not a cap.
+  An EMFILE that happens anyway still reads as 503, deliberately: a process out
+  of descriptors genuinely is not accepting, so the honest answer is "not
+  serving" and a restart is the correct recovery.
+
+### What the 200 actually asserts
+
+`{ ok: true }` means the proxy listener is **bound and accepting**, not merely
+bound. `server.listening` is a bare `!!this._handle` check and stays true for a
+socket whose accept queue is saturated, so the check also opens a short-timeout
+loopback connection to `PORT` (`createProxyAcceptProbe`). That matters only once
+the probes move here: while liveness targets the proxy port directly, a wedged
+accept queue times the probe out and the pod restarts on its own; served from
+this port without the connect, the same state would answer 200 forever and the
+pod would never self-heal.
+
+A pod-local loopback connect is outside the deny — `fromEntities: [host,
+remote-node]` does not match traffic the pod originates to itself — so this
+costs no policy surface. The result is cached for 1s so that an unauthenticated
+flood of health requests cannot amplify into the accept queue it measures.
+
+A blocked event loop is caught separately: the health handler runs on that same
+loop, so it simply stops answering, and the kubelet's own `timeoutSeconds`
+decides. The accept probe deliberately does **not** tighten that. Its timeout
+defers one loop turn (`setImmediate`) before reporting failure, because Node
+services timers before poll: without the deferral, a loop that had been blocked
+past the probe's 250ms delivered the expired timer ahead of a connect the kernel
+had already completed, and the probe reported a healthy listener wedged — 20 of
+40 trials against a real `http.Server` under a 400ms stall. That would have put
+a 250ms verdict, cached for 1s, on the liveness path in place of the kubelet's
+1s one, and three of them restart the authenticated proxy. Transient loop
+latency is not what this probe is for.
+
+The value must be a plain integer in 1–65535 and must differ from `PORT`.
+Anything else fails startup rather than falling back — a port that silently
+resolved elsewhere would leave the probes hitting a closed socket, which
+liveness turns into a restart loop with no stated cause. `PORT` is parsed the
+same strict way, for the same reason: `PORT="8O81"` with a letter O used to
+parse to `8`, and the `must differ` guard is only as good as the number it
+compares against.
+
+An exec probe was considered and rejected for this workload: `node -e` costs
+~90 ms CPU per spawn against a 200m limit (20 ms per CFS period), i.e. ~4.5
+periods of the entire quota per probe, on a container already throttled 8–10% of
+periods. On a liveness path that is a throttle-driven CrashLoop.
 
 ## Migrating an agent
 

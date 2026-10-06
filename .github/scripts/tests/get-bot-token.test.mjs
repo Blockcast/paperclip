@@ -7,8 +7,10 @@ import {
   RATE_LIMIT_MIN_WAIT_MS,
   RATE_LIMIT_NOT_EVALUATED,
   RATE_LIMIT_RETRY_BUDGET_MS,
+  TRANSIENT_UPSTREAM_NOT_EVALUATED,
   exitFatal,
   ghFetch,
+  isTransientUpstreamFailure,
   rateLimitWaitMs,
   resolveInstallationId,
 } from '../get-bot-token.mjs';
@@ -214,6 +216,98 @@ test('exitFatal: a rate-limit exhaustion marks the step output not_evaluated; a 
     console.error = error;
   }
   assert.equal(readFileSync(out, 'utf8'), 'not_evaluated=true\n');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// ── transient upstream 5xx (PEN-3760) ────────────────────────────────────────
+//
+// A 504 on the first read of run-quality-gates.mjs threw a bare Error, so
+// exitFatal emitted no marker and the workflow's else-branch announced "One or
+// more quality gates failed. See commitperclip comment on the PR for details"
+// — for a run that computed no verdict and posted no comment. The 5xx must
+// reach exitFatal labelled, exactly as a rate-limit exhaustion does.
+
+test('ghFetch: a GET that 5xxs is labelled not-evaluated, so it cannot read as a finding', async () => {
+  for (const status of [500, 502, 503, 504]) {
+    const h = harness([response(status, { body: '{"message":"We could not respond in time."}' })]);
+    try {
+      const err = await ghFetch('/repos/o/r/pulls/1', 'tok', { sleep: h.sleep }).then(
+        () => { throw new Error(`${status} must not resolve`); },
+        e => e,
+      );
+      assert.ok(
+        err.notEvaluated?.includes(TRANSIENT_UPSTREAM_NOT_EVALUATED),
+        `${status} must carry the not-evaluated marker, got ${JSON.stringify(err.notEvaluated)}`,
+      );
+      assert.match(err.message, new RegExp(`→ ${status}:`), 'the raw status stays in the message');
+      assert.equal(h.calls.length, 1, 'classification only — this must not add a retry');
+    } finally {
+      h.restore();
+    }
+  }
+});
+
+test('ghFetch: a non-GET 5xx is NOT relabelled — a failed write can follow a real verdict', async () => {
+  const h = harness([response(503, { body: '{"message":"unavailable"}' })]);
+  try {
+    const err = await ghFetch('/repos/o/r/issues/1/comments', 'tok', {
+      method: 'POST', body: '{}', sleep: h.sleep,
+    }).then(() => { throw new Error('must not resolve'); }, e => e);
+    assert.equal(err.notEvaluated, undefined, 'the write path must keep its existing meaning');
+    assert.equal(h.calls.length, 1, 'writes are never retried (BLO-19827)');
+  } finally {
+    h.restore();
+  }
+});
+
+test('ghFetch: a 4xx that is not a rate limit stays a hard failure, not "did not evaluate"', async () => {
+  // The boundary that keeps the fix from excusing real errors: a 404 or a
+  // plain 403 permission denial is a definite answer, and must stay one.
+  for (const status of [403, 404, 422]) {
+    const h = harness([response(status, { body: '{"message":"Not Found"}' })]);
+    try {
+      const err = await ghFetch('/repos/o/r/pulls/1', 'tok', { sleep: h.sleep }).then(
+        () => { throw new Error(`${status} must not resolve`); },
+        e => e,
+      );
+      assert.equal(err.notEvaluated, undefined, `${status} is an answer, not an outage`);
+      assert.equal(err.rateLimited, undefined);
+    } finally {
+      h.restore();
+    }
+  }
+});
+
+test('isTransientUpstreamFailure: 5xx only', () => {
+  assert.equal(isTransientUpstreamFailure(500), true);
+  assert.equal(isTransientUpstreamFailure(504), true);
+  assert.equal(isTransientUpstreamFailure(599), true);
+  assert.equal(isTransientUpstreamFailure(499), false);
+  assert.equal(isTransientUpstreamFailure(429), false);
+  assert.equal(isTransientUpstreamFailure(403), false);
+  assert.equal(isTransientUpstreamFailure(200), false);
+});
+
+test('exitFatal: a 5xx-marked error writes not_evaluated=true and annotates', () => {
+  // End to end on the real contract: this output is the ONLY thing standing
+  // between a transient 5xx and the workflow asserting a verdict.
+  const dir = mkdtempSync(join(tmpdir(), 'exitfatal-5xx-'));
+  const out = join(dir, 'github_output');
+  writeFileSync(out, '');
+  const lines = [];
+  const error = console.error;
+  console.error = msg => lines.push(String(msg));
+  let code;
+  const err = new Error('GitHub API GET /repos/o/r/pulls/1 → 504: ...');
+  err.notEvaluated = `${TRANSIENT_UPSTREAM_NOT_EVALUATED}: GitHub returned 504 ...`;
+  try {
+    exitFatal(err, 'quality gates', c => { code = c; }, out);
+  } finally {
+    console.error = error;
+  }
+  assert.equal(code, 1, 'still red — it just is not a verdict on the code');
+  assert.equal(readFileSync(out, 'utf8'), 'not_evaluated=true\n');
+  assert.ok(lines.some(l => l.includes('DID NOT EVALUATE THE DIFF')), lines.join('\n'));
   rmSync(dir, { recursive: true, force: true });
 });
 

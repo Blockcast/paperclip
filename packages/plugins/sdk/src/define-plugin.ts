@@ -141,6 +141,35 @@ export interface PluginWebhookInput {
   requestId: string;
 }
 
+/**
+ * Disposition a webhook handler reports back to the host, echoed into the 200
+ * response body so the *sender* can tell an ingested delivery from a dropped
+ * one.
+ *
+ * A deliberate drop still answers HTTP 200 — that is correct and must stay, so
+ * a producer stops retrying a body that can never parse. But a 200 alone is
+ * then ambiguous, and the host's own `{status: "success"}` is worse than
+ * ambiguous: it reports the *transport* succeeded while the payload was
+ * destroyed. A hand-rolled producer reading only the status code therefore
+ * cannot see its own payload regressions. One did not, for 36 days
+ * (BLO-38643).
+ *
+ * Real Alertmanager ignores response bodies, so reporting this is additive.
+ *
+ * Returning nothing is still valid and means "disposition not reported" — the
+ * host omits both fields rather than inventing an acceptance.
+ */
+export interface PluginWebhookResult {
+  /** How many inbound items the plugin actually ingested. 0 means dropped. */
+  accepted: number;
+  /**
+   * Why nothing was ingested. Set only when `accepted` is 0 and the drop was
+   * deliberate. Must be a short stable token (`malformed`,
+   * `unsupported_version`), not a free-text message: senders branch on it.
+   */
+  rejected?: string;
+}
+
 export interface PluginApiRequestInput {
   routeKey: string;
   method: string;
@@ -251,10 +280,13 @@ export interface PluginDefinition {
    * If not implemented but webhooks are declared in the manifest, the host
    * returns HTTP 501 for webhook deliveries.
    *
+   * Return a {@link PluginWebhookResult} to report the delivery's disposition
+   * in the 200 response body; returning nothing leaves it unreported.
+   *
    * @param input - Webhook delivery metadata and payload
    * @see PLUGIN_SPEC.md §13.7 — `handleWebhook`
    */
-  onWebhook?(input: PluginWebhookInput): Promise<void>;
+  onWebhook?(input: PluginWebhookInput): Promise<PluginWebhookResult | void>;
 
   /**
    * Called for manifest-declared scoped JSON API routes under

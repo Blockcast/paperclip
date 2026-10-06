@@ -103,6 +103,73 @@ test("PaperclipAgentPodUnschedulable keys on kube_pod_status_scheduled, not the 
   );
 });
 
+test("PaperclipGithubWorkflowRunMassCancellation is a scale-free ratio with a volume floor, not a count (BLO-21078)", () => {
+  const rendered = execFileSync(
+    "helm",
+    [
+      "template",
+      "paperclip",
+      "deploy/helm/paperclip",
+      "--namespace",
+      "paperclip",
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
+      "--show-only",
+      "templates/prometheusrule.yaml",
+      "--set",
+      "prometheusRule.enabled=true",
+    ],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  assert.match(rendered, /alert: PaperclipGithubWorkflowRunMassCancellation/);
+
+  const expr = rendered.match(
+    /alert: PaperclipGithubWorkflowRunMassCancellation[\s\S]*?\n\s+expr: \|\n([\s\S]*?)\n\s+for:/,
+  )?.[1];
+  assert.ok(expr, "mass-cancellation alert must render an expr");
+
+  // The supersession selector carries ~92.8% of the noise reduction
+  // (measured 5,657 non-superseded vs 73,322 superseded on the live
+  // counters, 2026-09-29). Dropping it makes every force-push a page.
+  assert.match(
+    expr,
+    /conclusion="cancelled",supersession="none"/,
+    "mass-cancellation alert must exclude concurrency cancel-in-progress supersedes",
+  );
+
+  // A bare count cannot work here and this is the regression that matters.
+  // The `>= 3` count expression this replaced was true for 67.9% of a 7d
+  // window, because non-superseded cancellations scale with agent push
+  // rate. A ratio is scale-free; reverting to a count re-breaks the alert
+  // in the always-firing direction, which is indistinguishable from the
+  // alert being deleted.
+  //
+  // The denominator carries supersession="none" too. Superseded
+  // cancellations outnumber the rest ~13:1 and move with force-push rate, so
+  // counting them in the denominator masks a real kill: 8 non-superseded
+  // cancellations beside 20 superseded and 2 successes reads 8/30 = 0.27
+  // (quiet) instead of 8/10 = 0.8. Measured live on 2026-09-24T17:46-17:59Z
+  // (BLO-36178 ARC outage): 0.04-0.09 unfiltered vs 0.36-0.42 filtered.
+  assert.match(
+    expr,
+    /\/\s*\n?\s*clamp_min\(sum\(increase\(paperclip_github_workflow_run_conclusion_total\{supersession="none"\}\[15m\]\)\), 1\)/,
+    "mass-cancellation alert must divide by non-superseded completions (scale-free ratio that superseded force-push churn cannot dilute), clamped against divide-by-zero at idle",
+  );
+  assert.match(expr, />=\s*0\.35/, "ratio threshold must be 0.35 (2x the observed 7d p99 of 17.7% on the non-superseded basis)");
+
+  // Without the floor, 1 cancelled of 2 completions reads as 50% and pages
+  // on an idle repo, exactly when the ratio carries least information. The
+  // floor must count the same non-superseded completions as the
+  // denominator: counted over all completions, 1 cancelled + 1 success
+  // beside a 20-run force-push burst clears it and reads as 50%.
+  assert.match(
+    expr,
+    /and\s*\n?\s*sum\(increase\(paperclip_github_workflow_run_conclusion_total\{supersession="none"\}\[15m\]\)\) >= 8/,
+    "mass-cancellation alert must carry a minimum-volume floor, over the same non-superseded completions as the denominator, so a near-idle repo cannot trip the ratio",
+  );
+});
+
 test("PaperclipGithubReviewRequestDeadLettered fires on any dead-lettered delivery and is silent at zero (BLO-18859)", () => {
   const rendered = execFileSync(
     "helm",
@@ -506,6 +573,77 @@ test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead
     rendered,
     /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md"/,
     "the freshness failure alert must route responders to the queued-run runbook",
+  );
+
+  // BLO-26656. This alert carries no threshold -- `== 0` is the whole
+  // predicate -- so its `for:` IS its entire page delay, and it is the only
+  // thing standing between a dead refresh and a strand nobody can see. The
+  // gate on PaperclipQueuedRunStranded disqualifies a stale snapshot, which
+  // is right for the stale-HIGH direction and does nothing for stale-ZERO:
+  // a frozen 0 is byte-identical to a healthy idle fleet, so the strand
+  // alert's silence is not evidence either way and only this alert
+  // distinguishes them.
+  //
+  // Asserted against the strand alert's OWN total delay rather than a
+  // literal, for the same reason that one stacks threshold and `for:`
+  // instead of checking them independently: either number can be retuned
+  // alone and look compliant while the pair regresses. If this window ever
+  // exceeds the strand alert's first possible fire time, a refresh outage
+  // beginning at the same instant hides a real strand for the difference,
+  // and nothing in the rendered chart says so.
+  // One parse for both windows. Reading the strand `for:` with a bare
+  // `(\d+)m` fails OPEN: on any other unit the lazy match does not stop at
+  // the strand rule, it walks downstream and binds against the next `for:`
+  // it finds -- measured at `queuedRunStrandedFor: 30s`, where it silently
+  // bound against this alert's own window instead.
+  const forMinutesOf = (raw) => {
+    const [, value, unit] = /^(\d+)([mh])$/.exec(String(raw ?? "").trim()) ?? [];
+    return value ? Number(value) * (unit === "h" ? 60 : 1) : null;
+  };
+
+  const [, refreshFor] = rendered.match(
+    /alert: PaperclipQueuedRunAgeMetricsRefreshFailed[\s\S]*?\n\s+for: (.+)\n/,
+  ) ?? [];
+  assert.ok(refreshFor, "the freshness failure alert must render a for window");
+  const refreshForMinutes = forMinutesOf(refreshFor);
+  assert.ok(
+    refreshForMinutes !== null && refreshForMinutes > 0,
+    `for window ${refreshFor} must be a positive minute/hour window`,
+  );
+
+  // Slice to the strand rule's OWN block before reading either number.
+  // `PaperclipQueuedRunStranded` is a prefix of `...StrandedFleet`, so an
+  // unanchored match binds to whichever of the two YAML renders first --
+  // and it fails in the loosening direction: bounding against the Fleet
+  // rule's 1800s + 15m admits a 30m window that the per-agent rule's
+  // 1440s + 5m correctly rejects. `\b` does not match between `d` and `F`.
+  const strandBlock = rendered
+    .split(/^[ \t]*- alert: /m)
+    .find((block) => /^PaperclipQueuedRunStranded\b/.test(block));
+  assert.ok(
+    strandBlock,
+    "could not locate the PaperclipQueuedRunStranded rule to bound this one against",
+  );
+  const [, strandThreshold] = strandBlock.match(
+    /paperclip_queued_run_oldest_age_seconds[\s\S]*?> (\d+)\n/,
+  ) ?? [];
+  const [, strandFor] = strandBlock.match(/\n\s+for: (.+)\n/) ?? [];
+  const strandForMinutes = forMinutesOf(strandFor);
+  assert.ok(
+    strandThreshold && strandForMinutes !== null,
+    "could not read the strand alert's threshold and for window to bound this one against",
+  );
+  // Deliberately relative rather than a literal, so it cannot rot when the
+  // strand numbers are retuned -- and it stays BOUNDED because the
+  // BLO-21116 assertion above pins `ageThreshold + for <= 1800` absolutely,
+  // so strandTotalSeconds can never exceed 30m however those numbers move.
+  // Relaxing that cap would silently remove this ceiling too.
+  const strandTotalSeconds = Number(strandThreshold) + strandForMinutes * 60;
+  assert.ok(
+    refreshForMinutes * 60 < strandTotalSeconds,
+    `refresh-failure for-window ${refreshFor} (${refreshForMinutes * 60}s) must page BEFORE the `
+      + `strand alert's first possible fire time (${strandThreshold}s + ${strandFor} = `
+      + `${strandTotalSeconds}s); otherwise a refresh outage can hide a real strand for the difference`,
   );
 });
 
@@ -1172,7 +1310,7 @@ test("PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed exposes a st
   );
 });
 
-test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own error boundary (PEN-3305)", () => {
+test("PaperclipAgentStartLockWedged pages on the abort boundary, so firing means the abort did not land (PEN-3305/PEN-3328)", () => {
   const rendered = renderChart([
     "--show-only",
     "templates/prometheusrule.yaml",
@@ -1206,45 +1344,64 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
   // later reader "restoring" a join against a series that does not exist,
   // which would make the alert permanently unevaluable rather than noisy.
   //
-  // BLO-36522: this shape is what THIS chart copy renders, and this copy is
-  // deliberately unretuned. Porting Blockcast's fleet-count retune
-  // (`count(max by (agent_id) (...) > 900) >= 3`, for 10m) is expected to
-  // change this shape AND the two assertions below (`heldThreshold == "300"`
-  // and the 900s stacking cap) -- that is a correct port, not a regression.
+  // BLO-36522 / PEN-3328: this per-agent shape is what THIS chart copy
+  // renders, and it is NOT Blockcast's live rule. Blockcast is retuning to a
+  // fleet-count form (`count(max by (agent_id) (...) > 900) >= 3`, for 10m,
+  // Blockcast/onprem-k8s#3985); this copy instead keeps the per-agent form
+  // and moves the threshold to the abort boundary (PEN-3328). Both abandon
+  // the old log-budget pinning, differently. Porting the fleet-count form
+  // here would change this shape AND the threshold assertion below -- that
+  // is a deliberate policy change, not a regression fix, and it loses this
+  // alert's "the abort did not land" meaning in the process.
   assert.match(
     expr,
     /^max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > (\d+)$/,
     "wedged-start-lock alert must threshold the per-agent max of the hold gauge, with no refresh-freshness join"
-      + " (unretuned chart copy -- porting the BLO-36522 fleet-count form changes this shape and the two assertions below)",
+      + " (this chart copy keeps the per-agent form; Blockcast's fleet-count retune is a different rule, not a port of this one)",
   );
 
   const [, heldThreshold] = expr.match(/> (\d+)$/) ?? [];
   // The gauge is emitted only for locks held at scrape time (reset-then-set,
   // no zero-fill), so any positive threshold is silent in steady state. It is
-  // pinned to 300 on purpose: that is LOCK_HELD_ERROR_MS in
-  // server/src/services/agent-start-lock.ts, the point at which the code
-  // itself escalates to logger.error and says dispatch "has stopped". If the
-  // constant moves and this does not, the page and the log line disagree
-  // about when an agent is considered wedged.
+  // pinned to LOCK_ABORT_MS (14400s / 4h) in
+  // server/src/services/agent-start-lock.ts, NOT to LOCK_HELD_ERROR_MS (300s),
+  // and that distinction is the whole meaning of the page: the abort fires at
+  // this boundary and releases the lock, so a series still present afterwards
+  // means the abort was requested and did NOT land. If the constant moves and
+  // this does not, the page stops describing that state.
   //
-  // BLO-36522: "silent in steady state" is FALSE as written -- measured
-  // 2026-09-25, 21 of 23 agents crossed 300s over 7d for 2,730 agent-minutes
-  // (~390/day). That agent count slides with the 7d window -- re-measured
-  // 22 of 23 on 2026-09-26 -- so cite it with its date and never as "all
-  // agents". Holds past 300s are routine, not exceptional. Blockcast's live
-  // rule was therefore retuned in Blockcast/onprem-k8s#4036 (merged
-  // 2026-09-28) into two arms -- a per-agent wedge at > 14400 for 5m and a
-  // fleet stall at count(... > 900) >= 3 for 10m -- so the log constant and
-  // the live alert now deliberately carry DIFFERENT numbers. (#3985 proposed
-  // the single-rule form and was closed unmerged; do not port from it.) See
-  // deploy/helm/paperclip/values.yaml
-  // (agentStartLockHeldSeconds) and runbooks/queued-run-stranded.md. This
-  // assertion still stands because THIS chart copy was not retuned -- it
-  // guards the 300 that is still rendered here, not the deployed policy.
+  // ⚠️ PEN-3328: this was "300", tracking LOCK_HELD_ERROR_MS. Do not revert it
+  // on the reasoning that the page and the escalated log should share one
+  // number of record. Over the 14 days to 2026-09-25, 21 agents held past 300s
+  // (peak 8073s) and this alert reached `firing` for 20 of them -- twenty
+  // critical pages, all of which resolved on their own, routed by the runbook
+  // to pod replacement. A log line is an attention threshold where being early
+  // is free; this is a page that routes to a destructive remedy. They answer
+  // different questions and no longer share a number.
+  //
+  // BLO-36522 measured the same thing from the other direction and its
+  // numbers stand: over 7d to 2026-09-25, 21 of 23 agents crossed 300s for
+  // 2,730 agent-minutes (~390/day), and that distribution is smooth and
+  // knee-free (2,730 >300s -> 1,565 >900s -> 963 >1800s -> 492 >3600s) --
+  // which is why no single-agent DURATION has a natural cut and the number
+  // has to come from a code constant rather than from a fit. The agent count
+  // slides with the window (22 of 23 on 2026-09-26), so cite it with its
+  // date.
+  //
+  // Blockcast's live rule has since been retuned in Blockcast/onprem-k8s#4036,
+  // MERGED 2026-09-28 and verified loaded at /api/v1/rules on 2026-09-30, into
+  // two arms: a per-agent `PaperclipAgentStartLockWedged` at > 14400 for 5m and
+  // a fleet `PaperclipAgentStartLockFleetStall` at count(... > 900) >= 3 for
+  // 10m. (#3985, which PEN-3328 described here as "unmerged", was closed
+  // superseded by #4036 -- do not port from it.) The 14400 asserted below is
+  // therefore the SAME number as the live per-agent arm, which is what makes
+  // this assertion worth pinning. It does not make the two rules equivalent:
+  // this chart has no fleet-stall arm, and a fleet-count expression and a
+  // per-agent abort boundary answer different questions.
   assert.equal(
     heldThreshold,
-    "300",
-    "hold threshold must track LOCK_HELD_ERROR_MS (300s) in agent-start-lock.ts",
+    "14400",
+    "hold threshold must track LOCK_ABORT_MS (14400s) in agent-start-lock.ts, not the LOCK_HELD_ERROR_MS log budget",
   );
 
   const [, forWindow] = block.match(/\n\s+for: (.+)\n/) ?? [];
@@ -1254,27 +1411,49 @@ test("PaperclipAgentStartLockWedged pages on a held start lock at the code's own
     : /^(\d+)h$/.test(forWindow.trim())
       ? Number(forWindow.trim().slice(0, -1)) * 60
       : null;
-  // Scrape-flap tolerance only; the ageing lives in the threshold. Same
-  // stacking trap as PaperclipQueuedRunStranded -- threshold and `for:` are
-  // not independent, so check the sum, not each half.
+  // NOT scrape-flap tolerance, despite the sibling `*For` values that are.
+  // Same stacking trap as PaperclipQueuedRunStranded -- threshold and `for:`
+  // are not independent, and the sum is what decides whether this page means
+  // "the abort did not land" -- but since PEN-3328 this window carries a
+  // second, load-bearing job: it is the abort's LANDING BUDGET. This alert and
+  // PaperclipAgentStartLockAborted sit on the same 4h boundary, and a landed
+  // abort deletes the held series inside a scrape, so this window is the only
+  // thing that keeps a recovered section from paging `critical`.
+  //
+  // ⚠️ Hence a FLOOR, not just a ceiling. The threshold above is pinned to a
+  // measurement (> 8073); this window has no equivalent measurement available,
+  // because abort-to-release latency cannot be observed until aborts exist in
+  // production -- so the floor is the shipped value and the burden is on any
+  // edit that lowers it. Anything that delays release past the window
+  // (cancellation reaching a fresh connection, a statement tearing down, an
+  // unlucky scrape) reintroduces the false-page class PEN-3328 removed.
+  // Raising it is safe; lowering it needs evidence, not the "free flap
+  // tolerance" reading that values.yaml used to invite.
   assert.ok(
-    forMinutes !== null && forMinutes > 0 && forMinutes <= 10,
-    `for window ${forWindow} must be a short scrape-flap tolerance (<= 10m)`,
+    forMinutes !== null && forMinutes >= 5 && forMinutes <= 10,
+    `for window ${forWindow} must be the abort's landing budget (>= 5m), not a bare scrape-flap tolerance, `
+      + "and must stay <= 10m so the page still lands promptly. A shorter window pages `critical` on a "
+      + "section whose abort landed just after the window opened, which is the false-page class PEN-3328 removed.",
   );
   assert.ok(
-    Number(heldThreshold) + forMinutes * 60 <= 900,
-    `hold threshold ${heldThreshold}s plus for-window ${forWindow} stacks to `
-      + `${Number(heldThreshold) + forMinutes * 60}s; this unretuned copy's 300s threshold `
-      + "must not drift far enough to stop being a prompt page on the condition it still "
-      + "renders (BLO-36522: the retuned fleet-count pair stacks to 900 + 600 = 1500s by "
-      + "design, and porting it is expected to move this cap with it)",
+    Number(heldThreshold) > 8073,
+    `hold threshold ${heldThreshold}s does not clear the observed settling tail (8073s, PEN-3328). `
+      + "A critical page below that fires on holds that resolve themselves and routes the responder "
+      + "to pod replacement; `for:` cannot rescue it, because a for-window is a continuity requirement "
+      + "and not a magnitude one.",
   );
 
-  // Severity, not decoration: the lock has no timeout, so nothing external
-  // will break the hold (BLO-36522 withdrew the stronger "never self-heals /
-  // lasts until the process is replaced" reading -- measured holds do settle).
-  // A warning would reproduce the original failure, which was nobody being
-  // paged.
+  // Severity, not decoration: past the abort boundary the section's own
+  // cancellation has already been requested and failed to release the lock,
+  // so what remains is a per-agent dispatch outage lasting until the process
+  // is replaced. A warning would reproduce the original failure, which was
+  // nobody being paged.
+  //
+  // ⚠️ That is only true BECAUSE the threshold is the abort boundary. Below
+  // it the hold usually settles by itself -- PEN-3328 measured 21 agents past
+  // 300s over 14 days, peak 8073s, all self-resolved -- and a critical page
+  // there produced twenty false pages routed to pod replacement. Severity and
+  // threshold move together or not at all.
   assert.match(
     block,
     /\n\s+severity: critical\n/,
@@ -1340,13 +1519,23 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
     /#3985 .*CLOSED UNMERGED, superseded by #4036/,
     "values.yaml must state #3985 was closed unmerged and superseded by #4036",
   );
-  // The chart copy itself is deliberately NOT retuned (agentStartLockHeldSeconds
-  // is still 300, asserted separately). Claiming otherwise here would tell a
-  // reader the landmine is already cleared.
+  // PEN-3328 retired the clause this guard used to pin. The chart copy IS now
+  // retuned on the per-agent axis: agentStartLockHeldSeconds is 14400
+  // (LOCK_ABORT_MS), asserted separately, so prose claiming it "is still the
+  // pre-retune `> 300`" would now be the false statement. The guard's purpose is
+  // unchanged -- stop the prose telling a reader the landmine is cleared when it
+  // is not -- so it moves to the half that is still missing: this chart renders
+  // the wedge arm and has no fleet-stall arm, which is what a third party
+  // enabling it needs to port.
   assert.match(
     warning,
-    /THIS chart copy is still the pre-retune `> 300` for 5m/,
-    "values.yaml must state the chart copy is still the pre-retune > 300 for 5m",
+    /THIS chart copy is NO LONGER the pre-retune `> 300` for 5m/,
+    "values.yaml must state the chart copy is no longer the pre-retune > 300 for 5m (PEN-3328)",
+  );
+  assert.match(
+    warning,
+    /still LACKS is the fleet-stall arm/,
+    "values.yaml must state the chart still lacks the fleet-stall arm, so a porter knows what is missing",
   );
 
   // The 2h14m 2026-09-24 episode was three agents in lockstep, i.e. the
@@ -1463,22 +1652,125 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
       `${relPath} must keep its start-lock section for the BLO-36522 guard to scan; `
         + "a renamed heading or key would otherwise make this assertion vacuous",
     );
-    // The alternation covers the two withdrawn claims in the wordings they
-    // have actually appeared in. "unbounded" and "21 of 21" are here because
-    // BLO-36522 shipped both INSIDE this scanned region while the guard
-    // certified it clean: an alternation only audits the phrasings it lists,
-    // so a region can look reviewed and still carry the claim in other words.
-    // Add a phrasing here when you retire one in prose, not instead of it.
+    // "unbounded" and "21 of 21" stay BANNED OUTRIGHT. Both are factual
+    // errors at every threshold: the 6-19 h episode of 2026-09-15/16 ended in
+    // a pod replacement before the hold could be observed to settle, so it is
+    // evidence for no ceiling in neither direction; and the agent count was
+    // 21 of 23 on 2026-09-25 and 22 of 23 on 2026-09-26 -- a sliding window,
+    // cite it with its date. No qualifier rescues either one.
     assert.doesNotMatch(
       section,
-      /does not self-heal|never self-heals|process must be replaced|process is replaced|unbounded|21 of 21/,
-      `${relPath} must not restate the "does not self-heal" / "replace the process" `
-        + "claims BLO-36522 withdrew; they are false as measured 2026-09-25. "
-        + 'Nor "unbounded" (the 6-19 h episode ended in a pod replacement before '
-        + 'the hold could settle) nor "21 of 21" (it was 21 of 23 on 2026-09-25 '
-        + "and 22 of 23 on 2026-09-26 -- a sliding window, cite it with its date)",
+      /\bunbounded\b|21 of 21/,
+      `${relPath} must not restate the "unbounded hold" or "21 of 21" claims `
+        + "BLO-36522 withdrew; both are false at every threshold. If you mean a "
+        + 'socket or an await with no timeout, write "with no timeout" -- the word '
+        + "itself is banned in these regions because it is how the withdrawn "
+        + "duration claim was phrased",
     );
+    // NARROWED BY PEN-3328, deliberately. This is the one judgement in this
+    // guard worth re-reading before touching it.
+    //
+    // BLO-36522 banned the "does not self-heal / replace the process" family
+    // outright because the alert then fired at 300s, where the claim was
+    // measurably false -- holds past 300s settle, and the text routed twenty
+    // responders to a pod replacement they did not need. PEN-3328 moved the
+    // page to the abort boundary (LOCK_ABORT_MS, 14400s). Past that boundary
+    // the claim is true by construction: the section's own cancellation has
+    // already been requested and failed to land, so what is left genuinely
+    // does not self-heal. An outright ban would now force the alert's own
+    // description to omit the most action-relevant fact about the state it
+    // fires on.
+    //
+    // So the ban is narrowed, not lifted. The phrases are allowed only in a
+    // region that ALSO (a) talks about the abort and (b) says holds below it
+    // resolve on their own -- so a reader cannot come away with the
+    // generalised claim BLO-36522 killed. Dropping either qualifier re-fails
+    // this assertion, which is the ratchet's actual job.
+    if (/does not self-heal|never self-heals|process must be replaced|process is replaced/.test(section)) {
+      assert.match(
+        section,
+        /\babort(?:s|ed|ing)?\b/,
+        `${relPath} restates the "does not self-heal" / "replace the process" family `
+          + "without mentioning the abort boundary that makes it true. Below "
+          + "LOCK_ABORT_MS it is the claim BLO-36522 withdrew",
+      );
+      assert.match(
+        section,
+        /self-resolved|settles? (?:by itself|on its own)|resolved on (?:its|their) own|resolved with no pod/,
+        `${relPath} restates the "does not self-heal" / "replace the process" family `
+          + "without saying that holds BELOW the abort boundary settle by themselves. "
+          + "That sentence is what stops a responder generalising the claim back to "
+          + "the 300s regime, where BLO-36522 measured it false",
+      );
+    }
   }
+});
+
+test("PaperclipAgentStartLockAborted reports the self-healed wedge the held gauge cannot (PEN-3328)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipAgentStartLockAborted/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "aborted-start-lock alert must render an expr");
+
+  // A counter over a window, NOT the held gauge. This is the whole reason the
+  // rule exists: PEN-3328 cancels a wedged section at the 4h abort boundary,
+  // which is the same boundary PaperclipAgentStartLockWedged thresholds on,
+  // and the held gauge is emitted only for locks held at scrape time -- so a
+  // successful cancellation deletes the series inside the wedge alert's `for:`
+  // window and it never fires. Without a durable counter the incident is
+  // invisible exactly because it was handled.
+  // If a later reader "simplifies" this onto the gauge, that blind spot returns.
+  //
+  // ⚠️ This assertion pins the rendered STRING and cannot see the semantics it
+  // depends on. `increase()` reads `last - first`, so the expression is correct
+  // only because `seedAgentStartLockAbortedSeries`
+  // (server/src/services/metrics.ts, called from `runExclusively`) publishes
+  // the per-agent series at 0 when the lock is taken. Unseeded, the series is
+  // born at 1 on the first abort and `increase` evaluates to 0 forever, so this
+  // alert would never fire while this test stayed green. The test that actually
+  // discriminates lives beside the seed, in
+  // server/src/__tests__/agent-start-lock-abort.test.ts ("publishes the abort
+  // counter at 0 when the lock is taken"). Change either side and check both.
+  assert.match(
+    expr,
+    /increase\(paperclip_agent_start_lock_aborted_total\[1h\]\) > 0/,
+    "aborted alert must read the durable counter over a window, not the transient held gauge",
+  );
+
+  // Warning, not critical, and this is the deliberate split from the wedge
+  // alert beside it. By the time this fires the lock has been released and the
+  // agent is dispatching again, so waking someone is wrong -- but the thing
+  // that blocked the section for four hours has NOT been fixed, so staying
+  // silent is also wrong.
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?\n\s+severity: warning\n/,
+    "a self-healed dispatch wedge must warn rather than page",
+  );
+  // The anchor is load-bearing, not cosmetic. The wedged section runs "do NOT
+  // clear the agent as healthy" and ends in pod replacement; the aborted
+  // section opens "Dispatch has already resumed and no queued runs were lost".
+  // Linking the wedged anchor here would send a responder to replace a pod that
+  // already recovered -- the exact work this alert's description calls
+  // unnecessary. Pinned per-alert so the two cannot silently converge again.
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockAborted[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-aborted-pen-3328"/,
+    "aborted-start-lock alert must link its OWN runbook section, not the wedged one",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipAgentStartLockWedged[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#agent-start-lock-wedged-pen-3305"/,
+    "wedged-start-lock alert must keep linking the wedged runbook section",
+  );
 });
 
 test("PaperclipRecoveryHorizonNoWakeToCurrentOwner{Elevated,Sustained} key on the never_delivered series only and take their thresholds from values (PEN-3000)", () => {

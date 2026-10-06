@@ -84,6 +84,7 @@ export function buildExecutionPolicy(input: {
   const mode = input.existingPolicy?.mode ?? "normal";
   const stages: IssueExecutionPolicy["stages"] = [];
   const monitor = input.existingPolicy?.monitor ?? null;
+  const productivityReviewDisabled = input.existingPolicy?.productivityReviewDisabled === true;
 
   const existingReviewStage = input.existingPolicy?.stages.find((stage) => stage.type === "review");
   const reviewParticipants = mergeParticipants(existingReviewStage?.participants, input.reviewerValues);
@@ -107,12 +108,23 @@ export function buildExecutionPolicy(input: {
     });
   }
 
-  if (stages.length === 0 && !monitor) return null;
+  // BLO-39945: mirrors the collapse guard in the server's
+  // `normalizeIssueExecutionPolicy`. Without the third conjunct a board user
+  // toggling a reviewer on a stageless, monitorless, opted-out row collapses
+  // the whole policy to null and silently drops the opt-out.
+  //
+  // Known gap, pre-existing and deliberately out of scope here: this helper
+  // also drops `reviewPreset` and `authorizationPolicy`, so the same clobber
+  // exists for those — BLO-40082. Do not read this guard as proof that every
+  // policy field survives a UI edit.
+  if (stages.length === 0 && !monitor && !productivityReviewDisabled) return null;
 
   return {
     mode,
     commentRequired: true,
     stages,
     ...(monitor ? { monitor } : {}),
+    // Emitted only when true, so every existing policy rebuilds byte-identically.
+    ...(productivityReviewDisabled ? { productivityReviewDisabled: true as const } : {}),
   };
 }
