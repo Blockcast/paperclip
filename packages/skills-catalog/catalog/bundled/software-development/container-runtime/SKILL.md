@@ -51,8 +51,12 @@ container and `DOCKER_HOST` is preset, so the Docker CLI works out of the box.
 Check whether you have it before assuming:
 
 ```sh
-test -S /var/run/docker.sock && echo "docker available" || echo "no dind sidecar"
-echo "$DOCKER_HOST"   # unix:///var/run/docker.sock when enabled
+# Probe DOCKER_HOST, never a hardcoded socket path. The socket moved to
+# /var/run/dind/docker.sock in BLO-40401 — mounting the shared emptyDir over
+# the whole of /var/run hid every sibling mount beneath it — so `test -S
+# /var/run/docker.sock` now reports "no dind sidecar" on a healthy pod.
+echo "$DOCKER_HOST"                              # unix:///var/run/dind/docker.sock when enabled
+test -S "${DOCKER_HOST#unix://}" && echo "docker available" || echo "no dind sidecar"
 docker info           # talks to the sidecar daemon
 ```
 
@@ -72,6 +76,6 @@ Resource limits & gotchas:
   killed mid-layer, request higher limits rather than retrying blindly.
 - The pod is **privileged** when DinD is on. This is deliberate and scoped to
   build/test engineering agents; don't treat it as a general capability.
-- If you need Docker and `/var/run/docker.sock` is absent, your adapter doesn't
+- If you need Docker and `$DOCKER_HOST` is empty, your adapter doesn't
   have `enableDocker: true`. Ask for it to be enabled — don't try to start a
   daemon yourself (you can't, and it isn't the intended path).
