@@ -514,7 +514,7 @@ Owner: Platform / SRE (PEN-3305, re-fitted in PEN-3328)
 > | result | arm | remedy |
 > |---|---|---|
 > | `>= 3` | [fleet stall](#fleet-stall-many-agents-in-lockstep-blo-36922): many agents together, ~25–120 min observed, **self-clears** | do **not** replace the process |
-> | below 3, or no data | fewer than three agents; unbounded (6–19 h observed) | this section, which ends with the Step 4 restart gate |
+> | below 3, or no data | fewer than three agents; the solo hold measured **cycled** (175 resets/6h), and `Wedged` pages at 4 h only if the abort fails to land | this section, which ends with the Step 4 restart gate |
 >
 > **The fleet arm takes precedence.** A fleet stall pages
 > `PaperclipAgentStartLockFleetStall` (that count, `>= 3` for 10m), once per
