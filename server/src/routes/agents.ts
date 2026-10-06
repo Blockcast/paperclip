@@ -6,11 +6,10 @@ import { isPlainObject, maskWorkspaceRuntimeTextForRead, redactEventPayload } fr
 import {
   containAgentConfig,
   containAgentMetadata,
-  containsRedactedAdapterValue,
   keepSanitizedAgentMetadata,
   redactAgentSecrets,
-  restoreRedactedAdapterValue,
   restoreRedactedAgentMetadata,
+  restoreRedactedAgentRuntimeConfig,
   stripRedactedEnvBindingsFromAdapterConfig,
 } from "../agent-redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
@@ -1382,10 +1381,15 @@ export function agentRoutes(
     existingRuntimeConfig: unknown,
     requestedRuntimeConfig: Record<string, unknown>,
   ): Record<string, unknown> {
-    const existingRecord = asRecord(existingRuntimeConfig) ?? {};
-    const restoredRuntimeConfig = containsRedactedAdapterValue(requestedRuntimeConfig)
-      ? (restoreRedactedAdapterValue(requestedRuntimeConfig, existingRecord) as Record<string, unknown>)
-      : requestedRuntimeConfig;
+    // The generic half is shared with the approval replay
+    // (`activatePendingApproval`), which reaches the same column by a different
+    // route and must not restore it by a different rule (PEN-3847). Only the
+    // `modelProfiles.*.adapterConfig` half below is route-specific: it undoes
+    // the short env sentinel, which `redactEventPayload` never emits.
+    const restoredRuntimeConfig = restoreRedactedAgentRuntimeConfig(
+      requestedRuntimeConfig,
+      asRecord(existingRuntimeConfig) ?? {},
+    ) as Record<string, unknown>;
     return restoreRedactedRuntimeConfigAdapterConfigs(existingRuntimeConfig, restoredRuntimeConfig);
   }
 

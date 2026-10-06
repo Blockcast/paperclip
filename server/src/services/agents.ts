@@ -47,7 +47,7 @@ import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 // Leaf module (imports only `../redaction.js`), so this does not close an
 // import cycle the way reaching into `routes/agents.ts` would — that module
 // imports this one. See PEN-3757 at `activatePendingApproval`.
-import { restoreRedactedAgentMetadata } from "../agent-redaction.js";
+import { restoreRedactedAgentMetadata, restoreRedactedAgentRuntimeConfig } from "../agent-redaction.js";
 import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
 import { secretService } from "./secrets.js";
 import {
@@ -1119,32 +1119,26 @@ export function agentService(db: Db) {
         // credential there is raw plaintext under a caller-chosen key, so the mask
         // is irreversible and the snapshot holds nothing to restore from.
         //
-        // `runtimeConfig` is the third column replayed on this path, and it is
-        // safe by a third mechanism again — not by either of the two above, so do
-        // not read this census as covering it by analogy. `mergeApprovedRuntimeConfig`
-        // starts from the stored row (`{ ...current }`) and `continue`s on any key
-        // whose requested and approved values are `jsonEqual`, so a value the board
-        // did not change keeps its stored form and the mask never lands on it.
-        // The one branch that guard does not cover is below: the merge runs only
-        // when `requestedConfigurationSnapshot.runtimeConfig` is present, and takes
-        // `approvedRuntimeConfig` verbatim otherwise. That branch IS reachable, so
-        // do not read this census as clearing `runtimeConfig` on every path:
-        // - At creation it is reachable but benign. `routes/agents.ts` always sets
-        //   the snapshot, and `POST /companies/:companyId/approvals` refuses a
-        //   `hire_agent` carrying `agentId`, but `built-in-agents.ts` and
-        //   `plugin-managed-agents.ts` file bound hires with no snapshot. Their
-        //   `runtimeConfig` is the unredacted row value, and `update` refuses to
-        //   change it while pending, so the verbatim write puts back what the row
-        //   already holds.
-        // - On `POST /approvals/:id/resubmit` it is a live gap. The route replaces
-        //   the stored payload wholesale with the caller's body and re-binds
-        //   `agentId` from `linkedAgentId`; neither it nor `svc.resubmit()`
-        //   re-derives the snapshot. A resubmitted payload without
-        //   `requestedConfigurationSnapshot` reaches here with
-        //   `requestedSnapshot === null`, and its `runtimeConfig` — e.g. copied from
-        //   the redacted read projection — is written verbatim, sentinels included:
-        //   the same corruption mode as above. Pre-existing, not closed by
-        //   PEN-3759, and needs its own follow-up.
+        // `runtimeConfig`, the third column replayed here, is restored on the same
+        // rule a few lines down — see PEN-3847 there for why its own guard
+        // (`mergeApprovedRuntimeConfig`) is not sufficient on its own, and why the
+        // restore runs ahead of BOTH of that guard's branches rather than patching
+        // the verbatim one alone.
+        //
+        // Running it there is what makes the two snapshot-less producers safe, and
+        // they were never equally safe. At creation the verbatim branch is reachable
+        // but benign: `routes/agents.ts` always sets the snapshot and
+        // `POST /companies/:companyId/approvals` refuses a `hire_agent` carrying
+        // `agentId`, yet `built-in-agents.ts` and `plugin-managed-agents.ts` file
+        // bound hires with no snapshot — their `runtimeConfig` is the unredacted row
+        // value, and `update` refuses to change it while pending, so the write puts
+        // back what the row already holds. `PUT /approvals/:id/resubmit` is the
+        // second producer and was the live gap PEN-3847 closes: it replaces the
+        // stored payload wholesale (`services/approvals.ts`) and re-binds `agentId`
+        // from `linkedAgentId` (`routes/approvals.ts`), restoring the binding the
+        // creation route refuses, so an ordinary read-modify-write through the
+        // redacted read projection supplied both a masked leaf and a missing
+        // snapshot in one step.
         //
         // Restore from the stored row instead, which keeps the tamper control the
         // replay exists for: `restoreRedactedAgentMetadata` rewrites ONLY the
@@ -1171,7 +1165,46 @@ export function agentService(db: Db) {
         const requestedRuntimeConfig = requestedSnapshot && isPlainRecord(requestedSnapshot.runtimeConfig)
           ? requestedSnapshot.runtimeConfig
           : null;
-        const approvedRuntimeConfig = isPlainRecord(patch.runtimeConfig) ? patch.runtimeConfig : null;
+        // PEN-3847. `mergeApprovedRuntimeConfig` below starts from the stored row
+        // and `continue`s on keys whose requested and approved values are
+        // `jsonEqual`, so an unchanged value keeps its stored form and a mask that
+        // round-tripped through BOTH copies never lands. That guard is real but it
+        // is not the whole column, in two ways:
+        //
+        //  - It only runs when `requestedConfigurationSnapshot.runtimeConfig` is
+        //    present. Otherwise `approvedRuntimeConfig` was taken VERBATIM. That
+        //    branch was documented as unreachable because the only producer of the
+        //    stored payload (`POST .../agent-hires`) sets the snapshot
+        //    unconditionally — but `PUT /approvals/:id/resubmit` is a second
+        //    producer. It REPLACES the stored payload rather than merging into it
+        //    (`services/approvals.ts`) and re-binds `agentId` from the card
+        //    (`routes/approvals.ts`), restoring the binding the creation route
+        //    refuses. A requester that GETs its own `revision_requested` card
+        //    through the redacted read path, edits a field and PUTs it back —
+        //    ordinary read-modify-write — supplies both a masked leaf and a missing
+        //    snapshot in one step.
+        //  - Even inside the merge, a key whose requested copy is REAL while its
+        //    approved copy is MASKED is not `jsonEqual`, so it falls through to
+        //    `merged[key] = approvedRuntimeConfig[key]` — the sentinel.
+        //
+        // So restore ONCE here, before either branch, rather than patching the
+        // verbatim arm alone. Restoring first does not blunt the merge: a key the
+        // board left alone now reads approved=restored-real vs requested=masked, is
+        // not equal, and takes `merged[key]` = that same stored value — the outcome
+        // the `continue` arm produced. A key the board genuinely changed carries no
+        // sentinel, so the restore is a no-op on it and the change still applies.
+        // That is the whole reason this is a leaf-wise restore and not a fallback
+        // to `existing.runtimeConfig`, which would silently discard it.
+        //
+        // `requestedRuntimeConfig` is deliberately NOT restored: it is a diff
+        // source, never persisted, and restoring it would blunt the comparison.
+        const rawApprovedRuntimeConfig = isPlainRecord(patch.runtimeConfig) ? patch.runtimeConfig : null;
+        const restoredApprovedRuntimeConfig = rawApprovedRuntimeConfig
+          ? restoreRedactedAgentRuntimeConfig(rawApprovedRuntimeConfig, existing.runtimeConfig)
+          : null;
+        const approvedRuntimeConfig = isPlainRecord(restoredApprovedRuntimeConfig)
+          ? restoredApprovedRuntimeConfig
+          : null;
         const candidateRuntimeConfig = approvedRuntimeConfig
           ? requestedRuntimeConfig
             ? mergeApprovedRuntimeConfig(existing.runtimeConfig, requestedRuntimeConfig, approvedRuntimeConfig)
