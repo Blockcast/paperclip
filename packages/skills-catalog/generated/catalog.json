@@ -376,11 +376,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 2936,
-          "sha256": "5dc7f764701632bd4ca968d1d31ddd647628674517848b0d5557305787279c0f"
+          "sizeBytes": 3261,
+          "sha256": "c4df78119e9cbba62d08d4a1132513fe347f43359cea6bdac1b9963b812edca9"
         }
       ],
-      "contentHash": "sha256:e3741391d2415db28824c4df7b07409e9894e4e93c8049012554b0e4d95ba219"
+      "contentHash": "sha256:139f543d701031b4c436dae1b516c7ec63d4e9a5cd630017ae51862b0c91bb10"
     },
     {
       "id": "paperclipai:bundled:software-development:github-pr-workflow",

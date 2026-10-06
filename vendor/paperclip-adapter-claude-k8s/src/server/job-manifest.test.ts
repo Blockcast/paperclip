@@ -474,11 +474,76 @@ describe("buildJobManifest", () => {
     });
 
     it("rejects workspaceMountPath colliding with the DinD socket mount", () => {
-      // /var/run is appended AFTER the targeted workspace check, so only the
-      // per-container backstop catches this one.
+      // The socket dir is appended AFTER the targeted workspace check, so only
+      // the per-container backstop catches this one.
       ctx.config.enableDocker = true;
-      ctx.config.workspaceMountPath = "/var/run";
-      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/duplicate volumeMounts at \/var\/run/);
+      ctx.config.workspaceMountPath = "/var/run/dind";
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/duplicate volumeMounts at \/var\/run\/dind/);
+    });
+
+    // BLO-40401. The DinD socket used to mount at /var/run — over the whole
+    // directory, after the inherited secret mounts — so any Secret the
+    // Deployment mounts beneath /var/run vanished from the agent container.
+    // `gbrain-authbot-service-key` at /var/run/authbot is the live one:
+    // PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE then pointed into an empty
+    // tmpfs. Kubernetes admits that Pod and `kubectl describe` still lists the
+    // mount, so nothing short of a read inside the container notices.
+    const authbotSecretVolume = {
+      volumeName: "gbrain-authbot-service-key",
+      secretName: "authbot-mcp-consumer-service-keys",
+      mountPath: "/var/run/authbot",
+      defaultMode: 0o400,
+    };
+
+    it("the DinD socket does not shadow an inherited Secret mounted under /var/run (BLO-40401)", () => {
+      selfPod.secretVolumes = [authbotSecretVolume];
+      ctx.config.enableDocker = true;
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const spec = job.spec?.template?.spec;
+      const containers = [...(spec?.initContainers ?? []), ...(spec?.containers ?? [])];
+
+      for (const container of containers) {
+        const paths = (container.volumeMounts ?? []).map((m) => m.mountPath);
+        for (const [i, parent] of paths.entries()) {
+          for (const [j, child] of paths.entries()) {
+            if (i === j) continue;
+            // Only a parent declared AFTER its child hides anything; the
+            // reverse order is legal and is used (/runtime-cache first).
+            const hides = j < i && child.startsWith(`${parent}/`);
+            expect(hides, `${container.name}: ${parent} (#${i}) hides ${child} (#${j})`).toBe(false);
+          }
+        }
+      }
+
+      // Anti-vacuity: the loop above passes trivially if the mounts it is
+      // about are not there at all.
+      const mainMounts = spec?.containers?.[0]?.volumeMounts ?? [];
+      expect(mainMounts.map((m) => m.mountPath)).toEqual(
+        expect.arrayContaining(["/var/run/authbot", "/var/run/dind"]),
+      );
+    });
+
+    it("DOCKER_HOST points at the relocated socket, and the wait preamble polls the same path", () => {
+      ctx.config.enableDocker = true;
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const spec = job.spec?.template?.spec;
+      const main = spec?.containers?.[0];
+      const sidecar = spec?.initContainers?.find((c) => c.name === "dind");
+
+      expect(main?.env?.find((e) => e.name === "DOCKER_HOST")?.value).toBe("unix:///var/run/dind/docker.sock");
+      expect(main?.command?.[2]).toContain("-S /var/run/dind/docker.sock");
+      // The sidecar must publish the socket where the agent is told to look.
+      expect(sidecar?.args).toContain("--host=unix:///var/run/dind/docker.sock");
+      expect(sidecar?.volumeMounts).toContainEqual({ name: "docker-sock", mountPath: "/var/run/dind" });
+    });
+
+    it("rejects a mount that would hide an earlier one, whoever declares it", () => {
+      // Reachable from operator config alone: `data` is appended after
+      // /tmp/prompt, so a workspace mount at /tmp swallows the prompt volume.
+      ctx.config.workspaceMountPath = "/tmp";
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(
+        /would mount "data" at \/tmp, hiding the earlier "prompt" mount at \/tmp\/prompt/,
+      );
     });
 
     it("still allows a NESTED workspace mount path — only exact duplicates are illegal", () => {
