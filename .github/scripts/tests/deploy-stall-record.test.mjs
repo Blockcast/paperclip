@@ -4,7 +4,10 @@
 //    after the last push the escalation leaves no trace anywhere. PEN-3289 tried
 //    to audit the 41.2h stall of 2026-09-14 after it cleared and got 0 hits from
 //    a positive-controlled Alertmanager query. The record is what makes the
-//    escalation reviewable after the fact.
+//    escalation reviewable after the fact — where a record can exist. (Until
+//    2026-10-05 this read as true here. On THIS repository there is none:
+//    `has_issues` is false, so `POST /issues` is a hard 410 — see
+//    deploy-stall-chain.mjs.)
 //
 // 2. THE STALL CLOCK. supersede-stale-deploy cancels a stale pending run and
 //    dispatches a fresh one, whose createdAt is NOW. Ageing the escalation off
@@ -12,7 +15,10 @@
 //    firing/resolved on the threshold. resolveStallStartedAt is what stops the
 //    supersede from resetting the reported age, and it can only ever move the
 //    basis EARLIER — a lost or unreadable record degrades to the previous
-//    behaviour rather than masking a stall.
+//    behaviour rather than masking a stall. On THIS repository both
+//    record-derived sources are permanently null, so the property is pinned by
+//    deploy-stall-chain.test.mjs (the supersede-chain source), not here; this
+//    suite pins how the record-derived sources resolve where Issues are enabled.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -54,9 +60,11 @@ test('an absent, malformed, mis-versioned or unparseable marker reads as null, n
 });
 
 test('resolveStallStartedAt: the recorded start survives a supersede', () => {
-  // The whole point. The pending run is 20 minutes old because we replaced it;
-  // the stall is 18 hours old. Reporting 0.3h here is how a 41h outage would
-  // have read as healthy.
+  // The whole point, where a record exists. The pending run is 20 minutes old
+  // because we replaced it; the stall is 18 hours old. Reporting 0.3h here is
+  // how a 41h outage would have read as healthy. On THIS repository
+  // `source === 'record-marker'` is unreachable (`has_issues` is false); the
+  // same incident is pinned through the chain source in deploy-stall-chain.test.mjs.
   const { stallStartedAt, source } = resolveStallStartedAt({
     marker: { stallStartedAt: '2026-09-15T00:00:00.000Z' },
     issueCreatedAt: '2026-09-15T06:00:00.000Z',
