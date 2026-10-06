@@ -49,7 +49,7 @@ export interface SelfPodSecretVolume {
    * currently covers one mount of each kind. `paperclip-github-mcp-token`
    * mounts under `/paperclip`, so its fallback is fleet-shared and writable —
    * that is the case this field exists for. `authbot-mcp-consumer-service-keys`
-   * mounts at `/run/authbot`, outside the PVC, so its fallback is the
+   * mounts at `/var/run/authbot`, outside the PVC, so its fallback is the
    * container's own ephemeral filesystem and reaches no other agent. Both are
    * chart-declared required and both should stay that way, but only the first
    * degrades into a credential-substitution path.

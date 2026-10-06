@@ -448,6 +448,7 @@ import {
   setExternalLifecycleRunningRuns,
   recordExternalLifecycleRunSilenceGap,
   recordPrReviewQueueWait,
+  recordRunDispatchWait,
   setAgentLivenessMetrics,
   setReleasePendingExternalRuntimeReservationMetrics,
   setOrphanedEnvironmentLeaseMetrics,
@@ -23378,6 +23379,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       startedAt: claimed.startedAt,
     });
 
+    // BLO-25024: same transition, no task-key gate. The PR-review recorder
+    // above only observes `pr_review:` runs, which is why fleet-wide dispatch
+    // latency was invisible to every dashboard for ~8 weeks. queuedAt is
+    // passed so a promoted retry or a k8s-isolation re-queue is measured from
+    // its re-queue instant, not from an old createdAt (BLO-21116).
+    recordRunDispatchWait({
+      invocationSource: claimed.invocationSource,
+      queuedAt: claimed.queuedAt,
+      createdAt: claimed.createdAt,
+      startedAt: claimed.startedAt,
+    });
+
     publishLiveEvent({
       companyId: claimed.companyId,
       type: "heartbeat.run.status",
@@ -30976,6 +30989,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processGroupId: null,
         processStartedAt: null,
         contextSnapshot: context,
+        // BLO-25024: same as deferRunForK8sIsolationConflict above. This run was
+        // already running, so reset its dispatch-wait clock to this re-queue.
+        queuedAt: now,
         updatedAt: now,
       })
       .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
