@@ -107,8 +107,9 @@ describe("createDb idle-in-transaction bound never loosens the server's (PEN-336
     });
 
     // Tighter server bound => we would be overriding it upward.
-    expect(poolIdleInTransactionTimeoutLoosens(at(30_000))).toBe(true);
-    expect(formatInheritedTimeoutSettings(at(30_000))).toContain("LOOSENED");
+    const tighter = POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS - 1;
+    expect(poolIdleInTransactionTimeoutLoosens(at(tighter))).toBe(true);
+    expect(formatInheritedTimeoutSettings(at(tighter))).toContain("LOOSENED");
 
     // Equal is the shipped state, and is not a loosening.
     expect(
@@ -148,8 +149,9 @@ describe("createDb idle-in-transaction bound never loosens the server's (PEN-336
     // was announced at `info`, the same severity as the healthy line. The
     // `LOOSENED:` marker was added because printing the two numbers had not
     // been enough; stating the verdict at `info` left it just as unread.
-    expect(inheritedTimeoutLogLevel(at(30_000, 30_000))).toBe("warn");
-    expect(formatInheritedTimeoutSettings(at(30_000, 30_000))).toContain("LOOSENED");
+    const tighter = POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS - 1;
+    expect(inheritedTimeoutLogLevel(at(tighter, 30_000))).toBe("warn");
+    expect(formatInheritedTimeoutSettings(at(tighter, 30_000))).toContain("LOOSENED");
 
     // The two conditions are orthogonal, so each must raise the level alone.
     expect(inheritedTimeoutLogLevel(at(60_000, null))).toBe("warn");

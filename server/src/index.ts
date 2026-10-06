@@ -30,6 +30,7 @@ import {
   readInheritedTimeoutSettings,
   formatInheritedTimeoutSettings,
   inheritedTimeoutLogLevel,
+  POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
   formatDatabaseBackupResult,
   runDatabaseBackup,
   authUsers,
@@ -777,6 +778,13 @@ export async function startServer(): Promise<StartedServer> {
       inheritedTimeouts.statementTimeout,
       inheritedTimeouts.idleInTransactionSessionTimeout,
       inheritedTimeouts.lockTimeout,
+      // The pool's own value, so the `LOOSENED:` verdict above is also a
+      // one-series PromQL comparison rather than only a startup log line.
+      {
+        name: "idle_in_transaction_session_timeout_pool",
+        valueMs: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+        source: "startup_packet",
+      },
     ]);
   } catch (error) {
     // "read or publish": the gauge write is inside this guard too, so a throw
