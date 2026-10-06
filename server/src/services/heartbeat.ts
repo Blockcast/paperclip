@@ -3861,9 +3861,10 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
 // 2026-10-05) — on an unrelated credential fault, for a `rev-parse` that reads
 // only the local filesystem and needs no credentials at all. The other two
 // readers fail the same way under the shim, as a false
-// git_worktree_base_not_git_checkout and a false missing_git_push_remote. Filtering the home prefix rather than
-// hardcoding /usr/bin keeps these working on dev machines and in CI, and
-// excludes any future agent-home shim for free.
+// git_worktree_base_not_git_checkout and a false missing_git_push_remote.
+// Filtering the home prefix rather than hardcoding /usr/bin keeps these
+// working on dev machines and in CI, and excludes any future agent-home
+// shim for free.
 function strictGitCheckoutProbeEnv(): NodeJS.ProcessEnv {
   const home = path.resolve(resolvePaperclipHomeDir());
   const entries = (process.env.PATH ?? "").split(path.delimiter).filter((entry) => {

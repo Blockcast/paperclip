@@ -19,6 +19,14 @@ import {
 
 const execFile = promisify(execFileCallback);
 
+// Must bypass the shim these tests put first on PATH, so it cannot be bare
+// `git`. Overridable for layouts where the real git is not in /usr/bin.
+const REAL_GIT = process.env.REAL_GIT ?? "/usr/bin/git";
+
+// CAP_DAC_OVERRIDE makes a mode 0o000 directory readable anyway, so the
+// unreadable-directory test below would assert nothing if it ran as root.
+const IS_ROOT = process.getuid?.() === 0;
+
 describe("probeGitCheckoutStateStrict PATH resolution", () => {
   let home = "";
   let probeCwd = "";
@@ -61,11 +69,13 @@ describe("probeGitCheckoutStateStrict PATH resolution", () => {
   });
 
   it("still reports checkout for a real repository under the same shimmed PATH", async () => {
-    await execFile("/usr/bin/git", ["init", "--quiet", probeCwd]);
+    await execFile(REAL_GIT, ["init", "--quiet", probeCwd]);
     expect(await probeGitCheckoutStateStrict(probeCwd)).toBe("checkout");
   });
 
-  it("still fails closed when the directory is unreadable", async () => {
+  // Skipped as root: CAP_DAC_OVERRIDE makes mode 0o000 readable anyway, so the
+  // assertion would pass without the directory ever being unreadable.
+  it.skipIf(IS_ROOT)("still fails closed when the directory is unreadable", async () => {
     const unreadable = path.join(probeCwd, "locked");
     await fs.mkdir(unreadable);
     await fs.chmod(unreadable, 0o000);
@@ -78,7 +88,7 @@ describe("probeGitCheckoutStateStrict PATH resolution", () => {
   });
 
   it("accepts a real checkout as a git_worktree base under the same shimmed PATH", async () => {
-    await execFile("/usr/bin/git", ["init", "--quiet", probeCwd]);
+    await execFile(REAL_GIT, ["init", "--quiet", probeCwd]);
     await expect(assertGitWorktreeBaseWorkspaceReady({
       requestedExecutionWorkspaceMode: "isolated_workspace",
       config: { workspaceStrategy: { type: "git_worktree" } },
@@ -100,8 +110,8 @@ describe("probeGitCheckoutStateStrict PATH resolution", () => {
   });
 
   it("finds a configured push remote under the same shimmed PATH", async () => {
-    await execFile("/usr/bin/git", ["init", "--quiet", probeCwd]);
-    await execFile("/usr/bin/git", ["-C", probeCwd, "remote", "add", "origin", "https://example.invalid/repo.git"]);
+    await execFile(REAL_GIT, ["init", "--quiet", probeCwd]);
+    await execFile(REAL_GIT, ["-C", probeCwd, "remote", "add", "origin", "https://example.invalid/repo.git"]);
     await expect(assertPushCapabilityCheckoutValid({
       enabled: true,
       issue: { id: "issue-1", identifier: "PAP-1" },
