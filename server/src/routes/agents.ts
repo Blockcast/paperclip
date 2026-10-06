@@ -2,7 +2,17 @@ import { Router, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { REDACTED_EVENT_VALUE, isPlainObject, maskWorkspaceRuntimeTextForRead, redactAgentConfigPayload, redactEventPayload } from "../redaction.js";
+import { isPlainObject, maskWorkspaceRuntimeTextForRead, redactEventPayload } from "../redaction.js";
+import {
+  containAgentConfig,
+  containAgentMetadata,
+  containsRedactedAdapterValue,
+  keepSanitizedAgentMetadata,
+  redactAgentSecrets,
+  restoreRedactedAdapterValue,
+  restoreRedactedAgentMetadata,
+  stripRedactedEnvBindingsFromAdapterConfig,
+} from "../agent-redaction.js";
 import { diffAgentAdapterSecretBindings } from "../services/agent-secret-bindings.js";
 import { agentRuntimeState, agents as agentsTable, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, asc, desc, eq, gte, inArray, isNotNull, lte, not, or, sql } from "drizzle-orm";
@@ -134,111 +144,16 @@ const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
 const EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
 
-// Sentinel substituted into adapter_config.env values by redactAgentSecrets()
-// on the GET response. A naive UI/operator round-trip (read agent, edit, save)
-// posts the sentinel back as the literal env value; without a guard it lands
-// in the DB and breaks runs (BLO-5xxx: PATH=*** in opencode_k8s pods made
-// runc fail to find sh and every Staff Engineer run died as StartError).
-// Keep this in lockstep with the redactor.
-export const REDACTED_ENV_SENTINEL = "***";
-
-export function isRedactedEnvBinding(binding: unknown): boolean {
-  if (typeof binding === "string") return binding === REDACTED_ENV_SENTINEL;
-  if (binding && typeof binding === "object") {
-    const b = binding as { type?: unknown; value?: unknown };
-    return b.type === "plain" && b.value === REDACTED_ENV_SENTINEL;
-  }
-  return false;
-}
-
-const OMIT_REDACTED_ADAPTER_VALUE = Symbol("omit-redacted-adapter-value");
-
-function containsRedactedAdapterValue(value: unknown): boolean {
-  if (typeof value === "string") return value.includes(REDACTED_EVENT_VALUE);
-  if (Array.isArray(value)) return value.some(containsRedactedAdapterValue);
-  if (!value || typeof value !== "object") return false;
-  return Object.values(value as Record<string, unknown>).some(containsRedactedAdapterValue);
-}
-
-function restoreRedactedAdapterValue(incoming: unknown, existing: unknown): unknown {
-  // PEN-2747: the URI-credential rule masks only the credential *component* of
-  // a URL, so the round-tripped value is `https://user:***REDACTED***@host/mcp`
-  // — a string that merely CONTAINS the sentinel rather than equalling it. An
-  // equality test misses it and persists a broken upstream URL, which is the
-  // BLO-5xxx failure mode described above (a sentinel written back into live
-  // config killed every run) with a different shape. Substring-test instead:
-  // no legitimate configured value contains this sentinel.
-  if (typeof incoming === "string" && incoming.includes(REDACTED_EVENT_VALUE)) {
-    return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
-  }
-  if (
-    incoming
-    && typeof incoming === "object"
-    && !Array.isArray(incoming)
-    && (incoming as { type?: unknown; value?: unknown }).type === "plain"
-    && (incoming as { type?: unknown; value?: unknown }).value === REDACTED_EVENT_VALUE
-  ) {
-    return existing === undefined ? OMIT_REDACTED_ADAPTER_VALUE : existing;
-  }
-  if (Array.isArray(incoming)) {
-    const existingArray = Array.isArray(existing) ? existing : [];
-    return incoming.flatMap((value, index) => {
-      const restored = restoreRedactedAdapterValue(value, existingArray[index]);
-      return restored === OMIT_REDACTED_ADAPTER_VALUE ? [] : [restored];
-    });
-  }
-  if (!incoming || typeof incoming !== "object") return incoming;
-
-  const existingRecord =
-    existing && typeof existing === "object" && !Array.isArray(existing)
-      ? (existing as Record<string, unknown>)
-      : {};
-  const restored: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(incoming as Record<string, unknown>)) {
-    const restoredValue = restoreRedactedAdapterValue(value, existingRecord[key]);
-    if (restoredValue !== OMIT_REDACTED_ADAPTER_VALUE) restored[key] = restoredValue;
-  }
-  return restored;
-}
-
-// The legacy name is retained for call-site compatibility; this now restores
-// both env sentinels and recursively redacted adapter values on API round-trips.
-export function stripRedactedEnvBindingsFromAdapterConfig(
-  incomingAdapterConfig: Record<string, unknown>,
-  existingAdapterConfig: Record<string, unknown> | null,
-): Record<string, unknown> {
-  const restoredAdapterConfig = containsRedactedAdapterValue(incomingAdapterConfig)
-    ? (restoreRedactedAdapterValue(
-        incomingAdapterConfig,
-        existingAdapterConfig ?? {},
-      ) as Record<string, unknown>)
-    : incomingAdapterConfig;
-  const incomingEnv = restoredAdapterConfig.env;
-  if (!incomingEnv || typeof incomingEnv !== "object" || Array.isArray(incomingEnv)) {
-    return restoredAdapterConfig;
-  }
-  const existingEnv =
-    existingAdapterConfig
-    && typeof existingAdapterConfig.env === "object"
-    && existingAdapterConfig.env !== null
-    && !Array.isArray(existingAdapterConfig.env)
-      ? (existingAdapterConfig.env as Record<string, unknown>)
-      : {};
-  const cleaned: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(incomingEnv as Record<string, unknown>)) {
-    if (isRedactedEnvBinding(value)) {
-      // UI round-trip: the GET response masks env values to the sentinel,
-      // and a naive save sends them back. Preserve the prior binding if we
-      // have one; drop the key entirely otherwise.
-      if (Object.prototype.hasOwnProperty.call(existingEnv, key)) {
-        cleaned[key] = existingEnv[key];
-      }
-    } else {
-      cleaned[key] = value;
-    }
-  }
-  return { ...restoredAdapterConfig, env: cleaned };
-}
+// Defined in `../agent-redaction.js` alongside the redactors they must stay in
+// lockstep with; re-exported here because this module is their established
+// import path. The write-side restore pair moved there in PEN-3757 so
+// `services/agents.ts` can reach it without a services -> routes import.
+export {
+  REDACTED_ENV_SENTINEL,
+  isRedactedEnvBinding,
+  restoreRedactedAgentMetadata,
+  stripRedactedEnvBindingsFromAdapterConfig,
+} from "../agent-redaction.js";
 
 function readRunLogLimitBytes(value: unknown) {
   const parsed = Number(value ?? RUN_LOG_DEFAULT_LIMIT_BYTES);
@@ -2244,90 +2159,20 @@ export function agentRoutes(
       ...agent,
       adapterConfig: {},
       runtimeConfig: {},
+      // This is the LOWER-privilege projection — it withholds both config
+      // columns outright — yet it spread `metadata` exactly as stored, so a
+      // caller denied every config byte still received the open bag beside it
+      // (PEN-3726).
+      //
+      // Assigned unconditionally, unlike the `"metadata" in agent` guard on
+      // `redactAgentSecrets`: that helper is generic over any `T` that MIGHT
+      // carry the column and must not add one, whereas this takes a concrete
+      // agent row where the column always exists. The visible difference is
+      // only for an absent/`undefined` metadata, which becomes `null` here —
+      // unreachable from `svc.getById`, and the fail-closed direction anyway.
+      metadata: containAgentMetadata(agent.metadata),
     };
   }
-
-  /**
-   * The one admission gate for anything agent-config-shaped on its way out.
-   *
-   * `redactAgentConfigPayload` — and `sanitizeValue` beneath it — sanitize only
-   * `isPlainObject` values and return anything else *by reference*. A caller
-   * that admits on a weaker "is it an object" test, or hands the value straight
-   * in with no gate, therefore has a fail-open the redactor cannot see: it gets
-   * the raw value back and serializes it.
-   *
-   * The obvious repair — swap the caller's predicate to `isPlainObject` — does
-   * not work where the assignment sits inside the gate, as in
-   * `redactAgentSecrets`: a failing gate just leaves the raw value on the
-   * `{ ...agent }` spread, so the same bytes reach the wire by a different
-   * route. Containment has to be *written back*, which is why this returns a
-   * value rather than answering a question.
-   *
-   *   `undefined` — not object-like (`null`, `undefined`, a primitive). No
-   *                 config to contain; each caller keeps its own absence
-   *                 contract for these.
-   *   `{}`        — an object this file cannot sanitize (array or foreign
-   *                 prototype). Withheld rather than emitted uncontained.
-   *   otherwise   — the redacted record.
-   */
-  function containAgentConfig(value: unknown): Record<string, unknown> | undefined {
-    if (typeof value !== "object" || value === null) return undefined;
-    if (!isPlainObject(value)) return {};
-    return redactAgentConfigPayload(value) ?? {};
-  }
-
-  /**
-   * Strip credential material out of an agent row before it goes on the wire.
-   *
-   * `adapterConfig` holds live secrets — `{type:"plain",value}` env bindings and
-   * literal `Bearer …` values in `mcpServers.*.headers`. This used to be applied
-   * only on the read paths, so a budget-only `PATCH /api/agents/:id` handed the
-   * caller the agent's entire credential set, and it landed verbatim in agent
-   * transcripts and run logs, which are read far more widely than the secret
-   * store (BLO-18969).
-   *
-   * `secret_ref` / `user_secret_ref` bindings are pointers, not plaintext, so
-   * they survive — minus any resolved `value`, which the schema has no field
-   * for and which only ever means a secret leaked in.
-   *
-   * Redaction is structural, not key-name based: `redactAgentConfigPayload`
-   * masks every plain binding and every `env` value at any depth, so a nested
-   * `runtimeConfig.modelProfiles.*.adapterConfig.env` entry is covered too.
-   *
-   * Every response that serializes an agent MUST go through here,
-   * `redactForRestrictedAgentView`, or `redactAgentConfiguration`. Adding an
-   * agent-serializing route without one of them reopens this hole.
-   */
-  function redactAgentSecrets<T extends { adapterConfig?: unknown; runtimeConfig?: unknown }>(agent: T): T {
-    let result = { ...agent };
-    // `containAgentConfig`, not the local `asRecord`: `asRecord` admits any
-    // non-array object, and for a foreign-prototype config the redactor handed
-    // the argument straight back, so `result.adapterConfig` was assigned the
-    // raw record. See the helper for why swapping the predicate alone would
-    // have moved the leak rather than closed it.
-    const rawConfig = agent.adapterConfig;
-    const containedConfig = containAgentConfig(rawConfig);
-    if (containedConfig) {
-      const env = isPlainObject(rawConfig) ? asRecord(rawConfig.env) : null;
-      if (env) {
-        // The top-level env keeps the shorter `***` sentinel the UI and
-        // `stripRedactedEnvBindingsFromAdapterConfig` have always round-tripped.
-        const redactedEnv: Record<string, string> = {};
-        for (const key of Object.keys(env)) {
-          redactedEnv[key] = REDACTED_ENV_SENTINEL;
-        }
-        result.adapterConfig = { ...containedConfig, env: redactedEnv } as T["adapterConfig"];
-      } else {
-        result.adapterConfig = containedConfig as T["adapterConfig"];
-      }
-    }
-    const containedRuntime = containAgentConfig(agent.runtimeConfig);
-    if (containedRuntime) {
-      result.runtimeConfig = containedRuntime as T["runtimeConfig"];
-    }
-    return result;
-  }
-
 
   function redactAgentConfiguration(agent: Awaited<ReturnType<typeof svc.getById>>) {
     if (!agent) return null;
@@ -2403,22 +2248,11 @@ export function agentRoutes(
       ...contained,
       adapterConfig: isPlainObject(contained.adapterConfig) ? contained.adapterConfig : {},
       runtimeConfig: isPlainObject(contained.runtimeConfig) ? contained.runtimeConfig : {},
-      // `metadata` is NOT coerced to a record: an array-valued `metadata` must
-      // survive as the element-wise-sanitized array `sanitizeValue` produced,
-      // not be flattened to `null`. But it must still fail closed the same way
-      // the two lines above do. `metadata` matches no tier and no special case
-      // in `sanitizeRecord`, so it reaches `sanitizeValue`, which returns a
-      // non-plain non-array object BY REFERENCE — a foreign-prototype
-      // `metadata` arrived in `contained` unsanitized and `?? null` emitted it
-      // verbatim. Arrays and plain objects have been sanitized and pass; a
-      // primitive carries no binding for `sanitizeValue` to have missed and any
-      // string has already been through `redactUriCredentialsInValue`;
-      // everything else is withheld.
-      metadata:
-        meta === null || meta === undefined ? null
-        : typeof meta !== "object" ? meta
-        : isPlainObject(meta) || Array.isArray(meta) ? meta
-        : null,
+      // `metadata` gets the shared fail-closed rule rather than its own copy:
+      // `keepSanitizedAgentMetadata` is the single definition of what an
+      // already-sanitized `metadata` may become, so this path and the two
+      // spread-based redactors cannot drift apart on the same column.
+      metadata: keepSanitizedAgentMetadata(meta),
     };
   }
 
@@ -3150,6 +2984,15 @@ export function agentRoutes(
       (hireInput.adapterConfig ?? {}) as Record<string, unknown>,
       null,
     );
+    // Same `null` prior as the `adapterConfig` call above, and for the same
+    // reason: on a create there is nothing to restore, so the helper *scrubs* —
+    // a masked key is dropped rather than persisted as the placeholder. Runs
+    // here, before `normalizedHireInput` spreads `hireInput`, so the one pass
+    // covers both `svc.create` and the approval payload built from it below
+    // (that snapshot is replayed verbatim over the agent row on approval).
+    if (hasOwn(hireInput, "metadata")) {
+      hireInput.metadata = restoreRedactedAgentMetadata(hireInput.metadata, null);
+    }
     assertNoNewAgentLegacyPromptTemplate(
       hireInput.adapterType,
       rawHireAdapterConfig,
@@ -3377,6 +3220,12 @@ export function agentRoutes(
       (createInput.adapterConfig ?? {}) as Record<string, unknown>,
       null,
     );
+    // See the matching call on the hire path: `null` prior means scrub, not
+    // restore, so a payload copied from a masked `GET` (the clone-an-agent
+    // flow) drops the masked key instead of storing the placeholder.
+    if (hasOwn(createInput, "metadata")) {
+      createInput.metadata = restoreRedactedAgentMetadata(createInput.metadata, null);
+    }
     assertNoNewAgentLegacyPromptTemplate(
       createInput.adapterType,
       rawCreateAdapterConfig,
@@ -4001,6 +3850,13 @@ export function agentRoutes(
       if (mixesNonProfileKeys) await assertCanUpdateAgent(req, existing);
     } else {
       await assertCanUpdateAgent(req, existing);
+    }
+
+    // Deliberately after the authorization checks above and before `svc.update`:
+    // an unauthorized PATCH must still fail on its own terms, and no masked
+    // value may reach the column. See `restoreRedactedAgentMetadata`.
+    if (hasOwn(patchData, "metadata")) {
+      patchData.metadata = restoreRedactedAgentMetadata(patchData.metadata, existing.metadata);
     }
 
     const actor = getActorInfo(req);

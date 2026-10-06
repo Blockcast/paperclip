@@ -297,18 +297,104 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     expect((await readAction(actionId)).status).toBe("active");
   });
 
-  it("leaves an unbounded action alone even with a past timeoutAt", async () => {
+  it("leaves a RECENT unbounded action alone even with a past timeoutAt", async () => {
     // `maxAttempts: null` is the monitor-only / manual-repair shape. A `timeoutAt` there
     // belongs to the provider-quota scheduler's `retryAt`, not to a wake horizon, and is
     // routinely already in the past — retiring on it would manufacture a false exhaustion.
+    //
+    // BLO-40297 added a second arm that DOES retire unbounded rows, anchored on `createdAt`.
+    // This case is what keeps the two apart, so the fixture's `createdAt` is now load-bearing
+    // and stated rather than defaulted: fresh, so only the `timeoutAt` arm could fire. If the
+    // derived arm ever starts reading `timeoutAt`, this goes red — which is the whole job.
     const seeded = await seed();
-    const actionId = await insertAction(seeded, { maxAttempts: null });
+    const actionId = await insertAction(seeded, { maxAttempts: null, createdAt: now });
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
 
     const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
 
     expect(result).toMatchObject({ escalated: 0 });
     expect((await readAction(actionId)).status).toBe("active");
+  });
+
+  it("retires an unbounded action once it is older than the derived horizon (BLO-40297)", async () => {
+    // The shape this ticket is about: BOTH `maxAttempts` and `timeoutAt` null, so the row
+    // matched neither sweep predicate and was structurally un-retireable — permanently
+    // `active` while holding `issue_recovery_actions_active_source_uq`, which blocks the
+    // source issue from ever opening a fresh recovery action. 21 such rows company-wide on
+    // 2026-10-05, oldest 122 days.
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, {
+      maxAttempts: null,
+      timeoutAt: null,
+      lastAttemptAt: null,
+      createdAt: new Date(now.getTime() - 90 * 24 * 60 * 60_000),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 1, announced: 1 });
+    const action = await readAction(actionId);
+    expect(action.status).toBe("escalated");
+    // AC2: retired through the existing terminal path, carrying a bound. `outcome` MUST stay
+    // null — writing one frees the active-source unique index and re-opens the unbounded
+    // re-fire loop BLO-18996 closed.
+    expect(action.retiringBound).toBe("timeout_horizon");
+    expect(action.outcome).toBeNull();
+
+    // The announcement must not render `horizon \`null\``: an operator reading the notice has
+    // to be able to see which horizon was burned. (Dedup is unaffected either way — the
+    // marker embeds the unique `action.id`.)
+    const [comment] = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, seeded.sourceIssueId));
+    expect(comment!.body).not.toContain("horizon `null`");
+    expect(comment!.body).toContain("derived from `createdAt`");
+  });
+
+  it("leaves an OWNERLESS unbounded action alone however old it is (BLO-40297)", async () => {
+    // The documented carve-out, and the negative control for the arm above. `wakesOwner` is
+    // `Boolean(ownerAgentId) && …`, so an ownerless action wakes nobody by construction and
+    // has no wake horizon to burn — the provider-quota monitor wait is expected to sit open
+    // across many sweeps. Without this, the derived arm would retire it on age alone.
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, {
+      maxAttempts: null,
+      timeoutAt: null,
+      lastAttemptAt: null,
+      ownerType: "system",
+      ownerAgentId: null,
+      createdAt: new Date(now.getTime() - 90 * 24 * 60 * 60_000),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 0 });
+    expect((await readAction(actionId)).status).toBe("active");
+  });
+
+  it("retires an unbounded action of ANY kind, not just stranded_assigned_issue (BLO-40297)", async () => {
+    // AC4: the hole is kind-agnostic. `workspace_validation` and `pr_review_non_convergence`
+    // are both in the measured cohort because `wakesOwner` excludes their causes outright, so
+    // they are created unbounded TODAY — a `stranded_assigned_issue`-only fix would leave the
+    // hole open for the next cause added to that list.
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, {
+      kind: "workspace_validation",
+      cause: "workspace_validation_failed",
+      maxAttempts: null,
+      timeoutAt: null,
+      lastAttemptAt: null,
+      createdAt: new Date(now.getTime() - 26 * 24 * 60 * 60_000),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 1 });
+    expect((await readAction(actionId)).status).toBe("escalated");
   });
 
   it("is idempotent — a second sweep neither re-escalates nor re-announces", async () => {

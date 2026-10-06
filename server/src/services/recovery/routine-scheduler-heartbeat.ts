@@ -39,14 +39,19 @@ export type RoutineSchedulerHeartbeatIssue = Pick<
 >;
 
 /**
- * How this window stopped being live. Both dispositions produce the same
- * idempotency key, so a window that stranded and was *then* cancelled keeps
- * exactly one row -- the second write dedupes against the first rather than
- * doubling the alarm.
+ * How this window stopped being live. Every disposition produces the same
+ * idempotency key, so a window that failed dispatch, or stranded and was *then*
+ * cancelled, keeps exactly one row -- the later write dedupes against the first
+ * rather than doubling the alarm.
+ *
+ * BLO-40337: `dispatch_failed` is the only one with no execution issue to name.
+ * Dispatch died before `issue_created`, so there is nothing to ride along with
+ * and the clause describes the run row instead.
  */
 export type RoutineSchedulerHeartbeatDisposition =
   | { kind: "stranded"; failureClass: string }
-  | { kind: "cancelled"; previousStatus: string };
+  | { kind: "cancelled"; previousStatus: string }
+  | { kind: "dispatch_failed"; failureReason: string | null };
 
 function issueUiLink(issue: { identifier: string | null; id: string }, prefix: string) {
   const label = issue.identifier ?? issue.id;
@@ -55,8 +60,12 @@ function issueUiLink(issue: { identifier: string | null; id: string }, prefix: s
 
 function dispositionClause(
   disposition: RoutineSchedulerHeartbeatDisposition,
-  issueLink: string,
+  issueLink: string | null,
 ) {
+  if (disposition.kind === "dispatch_failed") {
+    return "dispatch failed before the execution issue was created, with " +
+      `\`${disposition.failureReason ?? "no recorded reason"}\`.`;
+  }
   return disposition.kind === "stranded"
     ? `execution issue ${issueLink} stranded with class \`${disposition.failureClass}\`.`
     : `execution issue ${issueLink} was retired to \`cancelled\` from \`${disposition.previousStatus}\` ` +
@@ -223,9 +232,79 @@ export async function postRoutineSchedulerFailureHeartbeat(deps: {
   disposition: RoutineSchedulerHeartbeatDisposition;
   prefix: string;
 }) {
-  const { db, addComment, logger } = deps;
   const { issue, disposition, prefix } = input;
   if (issue.originKind !== ROUTINE_EXECUTION_ORIGIN_KIND || !issue.originId) return;
+
+  await postSchedulerHeartbeat(deps, {
+    companyId: issue.companyId,
+    routineId: issue.originId,
+    runId: issue.originRunId,
+    // The run row is the window's identity; `issue.createdAt` is the fallback
+    // for an execution issue whose run row is gone (BLO-28952).
+    resolveWindowAt: async (db) =>
+      (issue.originRunId
+        ? await db
+          .select({ triggeredAt: routineRuns.triggeredAt })
+          .from(routineRuns)
+          .where(eq(routineRuns.id, issue.originRunId))
+          .then((rows) => rows[0]?.triggeredAt ?? null)
+        : null) ?? issue.createdAt,
+    issueLink: issueUiLink(issue, prefix),
+    disposition,
+    logContext: { issueId: issue.id },
+  });
+}
+
+/**
+ * BLO-40337: the same receipt, for a dispatch that died *before* it created an
+ * execution issue (`routine_runs.status = 'failed'` with `linkedIssueId IS
+ * NULL`). There is no issue to ride along with, so the entry point above cannot
+ * reach this class at all -- six windows of the live agent-health routine went
+ * dark in September with a `failed` run row sitting right there and nothing on
+ * the alert surface saying so.
+ *
+ * Everything else is deliberately shared with the issue-keyed path: the same
+ * `scheduler-heartbeat:<routineId>:<windowKey>` key namespace, so a window that
+ * fails dispatch and is *later* also stranded or cancelled still carries at most
+ * one scheduler receipt; the same receipt-absence suppression; the same
+ * swallow-everything contract, because a dispatch failure must never be made
+ * worse by a failed attempt to report it.
+ */
+export async function postRoutineDispatchFailureHeartbeat(deps: {
+  db: Db;
+  addComment: SchedulerHeartbeatAddComment;
+  logger: { warn: (obj: unknown, msg: string) => void };
+}, input: {
+  companyId: string;
+  routineId: string;
+  run: { id: string; triggeredAt: Date; failureReason: string | null };
+}) {
+  await postSchedulerHeartbeat(deps, {
+    companyId: input.companyId,
+    routineId: input.routineId,
+    runId: input.run.id,
+    resolveWindowAt: async () => input.run.triggeredAt,
+    issueLink: null,
+    disposition: { kind: "dispatch_failed", failureReason: input.run.failureReason },
+    logContext: { runId: input.run.id },
+  });
+}
+
+async function postSchedulerHeartbeat(deps: {
+  db: Db;
+  addComment: SchedulerHeartbeatAddComment;
+  logger: { warn: (obj: unknown, msg: string) => void };
+}, input: {
+  companyId: string;
+  routineId: string;
+  runId: string | null;
+  resolveWindowAt: (db: Db) => Promise<Date>;
+  issueLink: string | null;
+  disposition: RoutineSchedulerHeartbeatDisposition;
+  logContext: Record<string, unknown>;
+}) {
+  const { db, addComment, logger } = deps;
+  const { companyId, routineId, disposition } = input;
 
   try {
     const routine = await db
@@ -236,23 +315,16 @@ export async function postRoutineSchedulerFailureHeartbeat(deps: {
         createdAt: routines.createdAt,
       })
       .from(routines)
-      .where(and(eq(routines.companyId, issue.companyId), eq(routines.id, issue.originId)))
+      .where(and(eq(routines.companyId, companyId), eq(routines.id, routineId)))
       .then((rows) => rows[0] ?? null);
     // No configured alert surface -- nothing to cross-post to. Not an error:
     // most routines don't parent their executions under a tracking issue.
     if (!routine || !routine.parentIssueId) return;
 
-    const run = issue.originRunId
-      ? await db
-        .select({ triggeredAt: routineRuns.triggeredAt })
-        .from(routineRuns)
-        .where(eq(routineRuns.id, issue.originRunId))
-        .then((rows) => rows[0] ?? null)
-      : null;
-    const windowAt = run?.triggeredAt ?? issue.createdAt;
+    const windowAt = await input.resolveWindowAt(db);
     const windowKey = windowAt.toISOString();
     const windowStartExclusive = await resolveWindowStartExclusive(db, {
-      companyId: issue.companyId,
+      companyId,
       routineId: routine.id,
       windowAt,
       routineCreatedAt: routine.createdAt,
@@ -284,9 +356,9 @@ export async function postRoutineSchedulerFailureHeartbeat(deps: {
         `**Scheduler-side failure heartbeat.** As of \`${observedAt}\`, window \`${windowKey}\` of routine ` +
           `\`${routine.title}\` (\`${routine.id}\`) carried no \`agent-health:*\` receipt keyed ` +
           `${describeSearchedWindow(windowKey, windowStartExclusive)} on this issue; ` +
-          `${dispositionClause(disposition, issueUiLink(issue, prefix))}`,
+          `${dispositionClause(disposition, input.issueLink)}`,
         "",
-        `- Routine run: \`${issue.originRunId ?? "unknown"}\``,
+        `- Routine run: \`${input.runId ?? "unknown"}\``,
         `- Idempotency key: \`${idempotencyKey}\``,
       ].join("\n"),
       {},
@@ -294,9 +366,10 @@ export async function postRoutineSchedulerFailureHeartbeat(deps: {
     );
   } catch (err) {
     // Never let a missing/renamed alert surface or a transient DB error break
-    // the escalation or the cancellation this heartbeat rides along with.
+    // the escalation, cancellation or dispatch failure this heartbeat rides
+    // along with.
     logger.warn(
-      { err, issueId: issue.id, routineId: issue.originId },
+      { err, ...input.logContext, routineId },
       "failed to post scheduler-side failure heartbeat",
     );
   }

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME } from "./pod-log-redactor.js";
 import {
   buildJobManifest,
   buildPodLogPath,
@@ -1483,6 +1484,66 @@ describe("buildJobManifest", () => {
       expect(entry?.valueFrom?.secretKeyRef?.key).toBe("HOME");
     });
 
+    // PEN-3713/PEN-2527. The chart's render guard keeps the GitHub egress
+    // wrappers ahead of /usr/bin on the StatefulSet and the api Deployment —
+    // and only there. An agent Job's PATH is whatever layer 3 inherited or
+    // layer 4 overwrote, with no shape check on any key, so the invariant was
+    // enforced everywhere except the containers that run agents. Measured on a
+    // live pod: PATH led with an agent-writable PVC directory and did not
+    // contain the wrapper directory at all.
+    //
+    // Read these four together. Drop the operator case and an implementation
+    // that only fixes the inherited path passes; drop the idempotence case and
+    // one that prepends unconditionally passes, growing PATH on every build;
+    // drop the no-PATH case and one that emits a lone directory passes, which
+    // clobbers the image's own ENV PATH and leaves nothing else resolvable.
+    const WRAPPER_BIN = "/usr/local/libexec/paperclip/bin";
+
+    function pathOf(result: ReturnType<typeof buildJobManifest>): string {
+      const entry = (result.job.spec?.template?.spec?.containers[0]?.env ?? []).find(
+        (e) => e.name === "PATH",
+      );
+      // Operator-set PATH is routed to the env Secret, so read both shapes.
+      return entry?.value ?? result.envSecret?.data.PATH ?? "";
+    }
+
+    it("prepends the root-owned wrapper directory to an inherited PATH", () => {
+      selfPod.inheritedEnv = { PATH: "/usr/local/bin:/usr/bin:/bin" };
+      const value = pathOf(buildJobManifest({ ctx, selfPod }));
+      expect(value).toBe(`${WRAPPER_BIN}:/usr/local/bin:/usr/bin:/bin`);
+    });
+
+    it("prepends it to an operator-set PATH too, which the merge does not validate", () => {
+      // The live shape: an adapterConfig.env PATH leading with an
+      // agent-writable PVC directory and omitting the wrappers entirely.
+      const withOperatorPath = {
+        ...ctx,
+        config: {
+          ...(ctx.config as Record<string, unknown>),
+          env: { PATH: "/paperclip/opencode-api-key-bin:/paperclip/bin:/usr/bin:/bin" },
+        },
+      };
+      const value = pathOf(buildJobManifest({ ctx: withOperatorPath, selfPod }));
+      expect(value.split(":")[0]).toBe(WRAPPER_BIN);
+      // The operator's own entries survive; this pins ordering, not content.
+      expect(value).toContain("/paperclip/opencode-api-key-bin");
+      expect(value).toContain("/usr/bin");
+    });
+
+    it("is idempotent when the wrapper directory already leads", () => {
+      const already = `${WRAPPER_BIN}:/usr/bin:/bin`;
+      selfPod.inheritedEnv = { PATH: already };
+      expect(pathOf(buildJobManifest({ ctx, selfPod }))).toBe(already);
+    });
+
+    it("falls back to the system PATH rather than emitting a lone directory", () => {
+      selfPod.inheritedEnv = {};
+      const value = pathOf(buildJobManifest({ ctx, selfPod }));
+      expect(value.split(":")[0]).toBe(WRAPPER_BIN);
+      expect(value.split(":").length).toBeGreaterThan(1);
+      expect(value).toContain("/usr/bin");
+    });
+
     it("leaves a non-operator, non-sensitive inherited var as a literal", () => {
       selfPod.inheritedEnv = { MY_PLAIN_VAR: "plain" };
       const { job } = buildJobManifest({ ctx, selfPod });
@@ -1977,6 +2038,57 @@ describe("buildJobManifest", () => {
       const init = job.spec?.template?.spec?.initContainers?.[0];
       expect(init?.env?.[0]?.name).toBe("PROMPT_CONTENT");
     });
+
+    // BLO-35720. Linux caps one execve env string at MAX_ARG_STRLEN = 32 *
+    // PAGE_SIZE = 131072 bytes including `NAME=` and the trailing NUL. Past
+    // that the init container's `sh -c` cannot exec (E2BIG) and the pod dies
+    // with a bare non-zero init exit naming neither the prompt nor its size.
+    // The threshold used to be 256 KiB — guarding the ~1 MiB PodSpec limit,
+    // which is not the binding one — so every prompt in the 128..256 KiB dead
+    // zone took the env path and failed 100% of the time.
+    const MAX_ARG_STRLEN = 32 * 4096;
+
+    it.each([
+      ["just under the exec limit", 120 * 1024],
+      ["the real BLO-35720 prompt size", 130_660],
+      ["just over the exec limit", 140 * 1024],
+      ["mid dead zone", 200 * 1024],
+      ["the old 256 KiB threshold", 256 * 1024],
+    ])("never emits an unexecable PROMPT_CONTENT env: %s (%i B)", (_label, size) => {
+      ctx.config = { promptTemplate: "x".repeat(size) };
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const promptEnv = init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT");
+      if (!promptEnv) return; // took the Secret path — safe by construction
+      const envStringBytes = Buffer.byteLength(`PROMPT_CONTENT=${promptEnv.value ?? ""}`, "utf-8") + 1;
+      expect(envStringBytes).toBeLessThanOrEqual(MAX_ARG_STRLEN);
+    });
+
+    it("routes a dead-zone prompt to the Secret path, not the env var", () => {
+      // The failing agent-health fires carry a 130,660 B issue description,
+      // which is itself under the limit — it is the ~420-450 B of mandatory
+      // task-context preamble concatenated on top that crosses it. Model that
+      // sum: the first byte past MAX_ARG_STRLEN minus the `PROMPT_CONTENT=`
+      // prefix and NUL must already be on the Secret path.
+      const firstUnexecableSize = MAX_ARG_STRLEN - "PROMPT_CONTENT=".length - 1 + 1;
+      ctx.config = { promptTemplate: "x".repeat(firstUnexecableSize) };
+      const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
+      expect(promptSecret).not.toBeNull();
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      expect(init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT")).toBeUndefined();
+    });
+
+    it("keeps the largest still-execable prompt on the cheaper env var path", () => {
+      // Guards the other direction: the fix must not push everything to
+      // Secrets. Exactly at the limit the env path is still correct.
+      const largestExecable = MAX_ARG_STRLEN - "PROMPT_CONTENT=".length - 1;
+      ctx.config = { promptTemplate: "x".repeat(largestExecable) };
+      const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
+      expect(promptSecret).toBeNull();
+      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const promptEnv = init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT");
+      expect(Buffer.byteLength(`PROMPT_CONTENT=${promptEnv?.value ?? ""}`, "utf-8") + 1).toBe(MAX_ARG_STRLEN);
+    });
   });
 
   describe("pod log file tailing", () => {
@@ -2000,6 +2112,45 @@ describe("buildJobManifest", () => {
       expect(command.indexOf("mkdir -p '/paperclip/instances/default/data/run-logs")).toBeLessThan(command.indexOf("cat /tmp/prompt/prompt.txt"));
       expect(command).not.toContain("ccrotate snap");
       expect(command).not.toContain("rtk-filter");
+    });
+
+    // BLO-29553 AC1(b). The credential must not reach the file at all, so the
+    // only correct position for the redactor is UPSTREAM of `tee`. Anything
+    // downstream scrubs a copy that already landed on the shared PVC — the same
+    // objection that ruled out retroactive scrubbing on that ticket.
+    it("pipes claude through the pod-log redactor BEFORE tee (BLO-29553)", () => {
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+
+      const filter = command.indexOf(
+        `| "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} |`,
+      );
+      const tee = command.indexOf("| tee ");
+      const claude = command.indexOf("| claude ");
+      expect(filter).toBeGreaterThan(-1);
+      // `launcherCommand` is `agentCommand === "claude" ? "claude" : quoteShellArg(...)`,
+      // so `| claude ` stops matching the moment the fixture's agentCommand
+      // changes — and `-1 < filter` would then pass vacuously.
+      expect(claude).toBeGreaterThan(-1);
+      expect(claude).toBeLessThan(filter);
+      expect(filter).toBeLessThan(tee);
+
+      // The install has to precede the pipeline that reads the variables, and
+      // has to follow the env-guard setup that creates $GUARD_DIR.
+      expect(command.indexOf("paperclip-env-guard.mjs")).toBeLessThan(
+        command.indexOf(POD_LOG_REDACTOR_FILENAME),
+      );
+      expect(command.indexOf(POD_LOG_REDACTOR_FILENAME)).toBeLessThan(filter);
+
+      // Fails open: an install that lost a race, or a container without node,
+      // degrades to `cat` rather than failing every run in the fleet through
+      // `set -o pipefail`.
+      expect(command).toContain(`${POD_LOG_FILTER_VAR}=cat`);
+
+      // $GUARD_DIR derives from the operator-configurable CLAUDE_CONFIG_DIR, so
+      // the script path can contain a space. An unquoted single `$VAR` holding
+      // `node <path>` would word-split and fail every run on such a config.
+      expect(command).not.toContain(`| $${POD_LOG_FILTER_VAR} |`);
     });
 
     it("includes fail-fast awk for `out_of_credits` overage rejection (RCA 2026-05-06)", () => {

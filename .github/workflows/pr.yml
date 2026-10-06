@@ -42,19 +42,34 @@ jobs:
     #            container_cpu_usage_seconds_total{container="runner"} over the
     #            job's own start..end, n=33 successful runs, 2026-09-19..09-24.
     #            CPU-seconds measures WORK and is invariant to supply.
-    #   F      = 0.32 cores -- measured arc-light supply floor (2026-09-23;
-    #            re-measured 2026-09-24 = 0.3175). arc-light requests 250m with
-    #            NO cpu limit, so achieved supply spans 0.32..12.4 cores (39x).
-    #            Taken from arc-light, not arc-merge-queue, because one scalar
-    #            must cover the worse of the two pools this job runs on.
+    #   F      = 0.21 cores -- arc-light worst-case supply floor, republished by
+    #            BLO-35615 rev 3 (2026-09-28) after CTO review. arc-light requests
+    #            250m with NO cpu limit; measured single-pod ceiling 11.0 cores,
+    #            so the spread is 52x. Taken from arc-light, not arc-merge-queue,
+    #            because one scalar must cover the worse of the two pools this job
+    #            runs on.
+    #
+    #            RETRACTED: F = 0.32 / 0.3175. That was p05 of a series filtered
+    #            to `rate > 0.25`, so it was >= 0.25 BY CONSTRUCTION -- a readout
+    #            of the filter, not a supply floor. arc-light is one ephemeral pod
+    #            per job, so the filter dropped low-CPU JOBS, not idle runners. F
+    #            is in the denominator, so an overstated F UNDERSTATES every cap,
+    #            which is the defect this rule exists to end.
+    #            Independent re-measurement 2026-10-01 (BLO-35886) as pure supply,
+    #            0.25/node_requests * allocatable across all 9 uncordoned runner
+    #            nodes: worst case 0.265, median 0.285 -- below 0.32, above 0.21.
+    #            The lower published value governs per the issue's own tie-break:
+    #            a stale-LOW F only makes the detector weaker, a stale-HIGH F
+    #            kills healthy jobs.
     #   T_best = 217s, fastest observed healthy run.
     #
-    #   ceil( 364 / 19.2 ) = 19   and   ceil( 6 * 217 / 60 ) = 22   => 22
+    #   ceil( 364 / 12.6 ) = 29   and   ceil( 6 * 217 / 60 ) = 22   => 29
     #
     # Both forms are LOWER bounds on a hang detector, so where they disagree the
-    # larger wins -- here the interim form is larger because only 33 of 67 runs
-    # still had pod metrics inside Prometheus' ~5d retention, so W95 is the
-    # under-sampled one. Rule: BLO-35615. This pass: BLO-35886.
+    # larger wins -- under the corrected F the primary form now binds. Measured
+    # headroom at the old 22: longest HEALTHY policy job 20.8m = 94.3% of cap,
+    # i.e. 1.06x -- the cap was about to truncate healthy work again.
+    # Rule: BLO-35615. This pass: BLO-35886.
     #
     # Why 10 was not survivable: healthy successful runs measured p50 371s /
     # p95 555s / max 600s -- the max IS the old cap, i.e. the cap was already
@@ -65,7 +80,7 @@ jobs:
     # PRESERVED -- previous basis: "10, not 5 ... `./.github/actions/setup-pnpm`
     # may spend a second attempt on a stalled npm registry (BLO-28813). Worst
     # case here is roughly 2 x (bootstrap + 120s fetch) + backoff ~= 5m."
-    timeout-minutes: 22
+    timeout-minutes: 29
     # BLO-32682: the step-kill classifier at the end of this job reads the run's
     # own step conclusions and annotations back off the Actions API, and
     # `pr.yml` declares no workflow-level `permissions:`. Under a restricted
@@ -112,13 +127,13 @@ jobs:
         # cap (10.22m step-time) regardless, and every checkout above 6.52m in
         # the window sits in a job that cap then killed. So no COMPLETED run
         # was at stake -- the bound governs the step, and 9m04s is what the
-        # step took. The reason to size above it is that now the cap is 22m and
+        # step took. The reason to size above it is that now the cap is 29m and
         # no longer truncates this distribution, the same draw lands in a run
         # that would otherwise finish.
         #
         # So do not read 12m as a safety factor over p100. `fetch-depth: 0`
         # cost grows with history, this term was censored by the old cap, and
-        # the 22m cap is what will let its real tail appear for the first time.
+        # the 29m cap is what will let its real tail appear for the first time.
         # Re-measure once it has; if a ratio is wanted against something that
         # does not move on one observation, p99 is 8.07m.
         uses: actions/checkout@v6
@@ -553,6 +568,11 @@ jobs:
           node --test \
             ./.github/scripts/tests/check-production-environment-protection.test.mjs \
             ./.github/scripts/tests/post-environment-protection-alert.test.mjs
+        timeout-minutes: 1
+
+      - name: Test review-gate consumer protection guard (BLO-26736)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/check-review-gate-consumer-protection.test.mjs
         timeout-minutes: 1
 
       # The stuck-approval escalation only ever runs inside the scheduled
@@ -997,18 +1017,20 @@ jobs:
     # HANG DETECTOR, NOT A PERFORMANCE BUDGET. BLO-35615 rule; do NOT re-tune
     # from observed durations. W95 = 277 CPU-seconds (p95 counter delta of
     # container_cpu_usage_seconds_total{container="runner"} over the job,
-    # n=39 successful runs, 2026-09-19..09-24); F = 0.32 cores, the measured
-    # arc-light floor (2026-09-23, re-measured 09-24 = 0.3175). F is taken from
-    # arc-light, not arc-merge-queue, because one scalar must cover the worse of
-    # the two pools this job runs on.
-    #   primary: ceil( 277 / (0.32 * 60) ) = ceil( 14.4 ) = 15   <- binds
+    # n=39 successful runs, 2026-09-19..09-24); F = 0.21 cores, the arc-light
+    # worst-case supply floor republished by BLO-35615 rev 3 (2026-09-28). F is
+    # taken from arc-light, not arc-merge-queue, because one scalar must cover
+    # the worse of the two pools this job runs on.
+    # RETRACTED: F = 0.32 / 0.3175 -- p05 of a series filtered to `rate > 0.25`,
+    # so >= 0.25 by construction. See the `policy` block above for the full note.
+    #   primary: ceil( 277 / (0.21 * 60) ) = ceil( 21.98 ) = 22   <- binds
     #   floor:   ceil( 6 * T_best / 60 )   = ceil( 6 * 35 / 60 ) = 4
     # Both forms are lower bounds; where they disagree the larger wins (see
-    # `policy` above, where the floor is the binding one).
+    # `policy` above).
     # Not previously filed as a cap row -- swept in with BLO-35886 because it is
     # the same defect on the same runner class in the same file, and leaving it
     # at 10 guarantees a sixth row later.
-    timeout-minutes: 15
+    timeout-minutes: 22
 
     steps:
       - name: Checkout repository
@@ -1571,15 +1593,17 @@ jobs:
     # HANG DETECTOR, NOT A PERFORMANCE BUDGET. BLO-35615 rule; do NOT re-tune
     # from observed durations. W95 = 210 CPU-seconds (p95 counter delta of
     # container_cpu_usage_seconds_total{container="runner"} over the job,
-    # n=50 successful runs, 2026-09-19..09-24); F = 0.32 cores, the measured
-    # arc-light floor (2026-09-23, re-measured 09-24 = 0.3175).
-    #   primary: ceil( 210 / (0.32 * 60) ) = ceil( 10.9 ) = 11   <- binds
+    # n=50 successful runs, 2026-09-19..09-24); F = 0.21 cores, the arc-light
+    # worst-case supply floor republished by BLO-35615 rev 3 (2026-09-28).
+    # RETRACTED: F = 0.32 / 0.3175 -- p05 of a series filtered to `rate > 0.25`,
+    # so >= 0.25 by construction. See the `policy` block above for the full note.
+    #   primary: ceil( 210 / (0.21 * 60) ) = ceil( 16.67 ) = 17   <- binds
     #   floor:   ceil( 6 * T_best / 60 )   = ceil( 6 * 62 / 60 ) = 7
     # Both forms are lower bounds; where they disagree the larger wins (see
-    # `policy` above, where the floor is the binding one).
+    # `policy` above).
     # Not previously filed as a cap row -- swept in with BLO-35886 for the same
     # reason as helm_chart above. 10 sat 0.9m under the floor requirement.
-    timeout-minutes: 11
+    timeout-minutes: 17
     defaults:
       run:
         working-directory: vendor/paperclip-adapter-claude-k8s
@@ -1668,10 +1692,12 @@ jobs:
     # cover the setup around it. This 10 is NOT derived by the BLO-35615 rule
     # that sizes `policy` above: W95 = 27 CPU-seconds, but over only n=3 runs
     # (2026-09-19..09-24), which is too few to be a usable p95. It is far below
-    # the 600 x 0.32 = 192 CPU-seconds this cap supplies at that rule's F = 0.32
-    # floor -- ~7x headroom -- so 10 cannot fire on a healthy run. Re-measure
-    # W95 and apply the rule before lowering it; do not tune it from observed
-    # durations.
+    # the 600 x 0.21 = 126 CPU-seconds this cap supplies at that rule's F = 0.21
+    # floor -- ~4.7x headroom -- so 10 cannot fire on a healthy run.
+    # RETRACTED: F = 0.32 / 0.3175 -- p05 of a series filtered to `rate > 0.25`,
+    # so >= 0.25 by construction. See the `policy` block above for the full note.
+    # Re-measure W95 and apply the rule before lowering it; do not tune it from
+    # observed durations.
     timeout-minutes: 10
     # BLO-28999: the classify step below is this workflow's first GITHUB_TOKEN
     # consumer, and `pr.yml` declares no workflow-level `permissions:`. Under a

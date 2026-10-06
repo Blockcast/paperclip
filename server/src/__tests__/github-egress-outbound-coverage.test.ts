@@ -376,7 +376,16 @@ describe("outbound GitHub egress coverage", () => {
       // The whole control rests on this indirection. A seed that pointed
       // `github` straight at /usr/local/bin/github-mcp-server would bypass the
       // scrub while leaving every wrapper assertion above green.
-      expect(readSeededGitHubMcpCommand()).toBe("/paperclip/.local/bin/github-mcp-server");
+      //
+      // PEN-3713 moved the other four wrappers into the image but deliberately
+      // left this one dialling the PVC copy. The command is ABSOLUTE, so PATH
+      // ordering cannot absorb a skew, and the seed that writes it runs in the
+      // server pod while the file is read by agent Job pods on an
+      // independently pinned image — so the server carrying a root-owned
+      // wrapper is no evidence the agent does. It reaches LOCAL_BIN rather than
+      // a hardcoded /paperclip so it tracks persistence.mountPath, exactly as
+      // the seed's own wrapper install does.
+      expect(readSeededGitHubMcpCommand()).toBe("${LOCAL_BIN}/github-mcp-server");
     });
 
     it("is a wrapper the seed actually writes", () => {

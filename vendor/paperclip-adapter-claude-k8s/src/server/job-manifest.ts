@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
+import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 
 /**
@@ -86,12 +87,35 @@ export function buildPodLogPath(companyId: string, agentId: string, runId: strin
   return `${dir}/${runId}.pod.ndjson`;
 }
 
-/** Prompts above this size (bytes) are staged via a Secret instead of an
- *  init container env var, protecting against the ~1 MiB PodSpec limit. */
-const LARGE_PROMPT_THRESHOLD_BYTES = 256 * 1024;
+/** Env var carrying the prompt on the small-prompt path. Shared with
+ *  LARGE_PROMPT_THRESHOLD_BYTES below, which depends on its length. */
+const PROMPT_ENV_NAME = "PROMPT_CONTENT";
+
+/** Linux caps a SINGLE execve argument/environment string at MAX_ARG_STRLEN =
+ *  32 * PAGE_SIZE = 131072 bytes (4 KiB pages; larger page sizes only raise
+ *  it), counting the `NAME=` prefix and the trailing NUL. Exceed it and the
+ *  init container's `sh -c` cannot exec at all — E2BIG — which the kubelet
+ *  surfaces as a bare non-zero init-container exit that names neither the
+ *  prompt nor its size.
+ *
+ *  This threshold used to be 256 KiB, chosen against the ~1 MiB PodSpec limit.
+ *  That is the wrong constraint: the kernel's exec limit binds first, at half
+ *  that. Every prompt in the resulting 128 KiB..256 KiB dead zone took the env
+ *  var path and failed 100% of the time (BLO-35720). */
+const MAX_ARG_STRLEN_BYTES = 32 * 4096;
+const LARGE_PROMPT_THRESHOLD_BYTES = MAX_ARG_STRLEN_BYTES - PROMPT_ENV_NAME.length - "=".length - 1;
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
+// PEN-3713. Where the image installs the root-owned GitHub egress wrappers
+// (Dockerfile `COPY docker/github-wrappers/`). Must match
+// `paperclip.imageWrapperBinDir` in the chart; the pair is pinned by
+// deploy/helm/paperclip/tests/agent-egress-path.test.mjs so the two cannot
+// drift into a PATH entry no image carries.
+const GITHUB_WRAPPER_BIN_DIR = "/usr/local/libexec/paperclip/bin";
+// Only used when the merged env carries no PATH at all; see the prepend below.
+const GITHUB_WRAPPER_FALLBACK_PATH =
+  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const RUNTIME_CACHE_ENV: Record<string, string> = {
   XDG_CACHE_HOME: `${RUNTIME_CACHE_MOUNT_PATH}/xdg`,
   GOCACHE: `${RUNTIME_CACHE_MOUNT_PATH}/go-build`,
@@ -610,6 +634,12 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
   },
 
   // --- SAFE_LITERAL: identity and run context ---------------------------
+  {
+    name: "PATH",
+    classification: "SAFE_LITERAL",
+    reason:
+      "Binary lookup order. Code-originated since PEN-3713, which prepends the root-owned GitHub egress wrapper directory to whatever PATH layers 3/4 produced. A list of directory names carries no credential, and burying it in a Secret would stop `GET Pod` answering 'which gh does this agent resolve?' — the exact question PEN-3713 was diagnosed by. That holds for an inherited (layer-3) PATH only: layer 4 is default-deny by NAME (BLO-22546), so an operator-set `adapterConfig.env.PATH` is in `userEnvKeys` and becomes a secretKeyRef regardless of this row — which is the configuration the PEN-3713 measurement actually found. This table is a record of classification, not a behaviour switch.",
+  },
   {
     name: "PAPERCLIP_AGENT_ID",
     classification: "SAFE_LITERAL",
@@ -1210,6 +1240,50 @@ function buildEnvVars(
     : RUNTIME_CACHE_ENV;
   for (const [key, value] of Object.entries(cacheEnv)) {
     if (!userEnvKeys.has(key)) merged[key] = value;
+  }
+
+  // PEN-3713/PEN-2527: keep the root-owned GitHub egress wrappers ahead of the
+  // image CLIs on the agent's PATH, whatever PATH it ended up with.
+  //
+  // The chart validates this invariant at render time ("paperclip.runtimePath"
+  // fails the render if a wrapper directory is missing or lands after
+  // /usr/bin), but that guard only reaches the long-lived server and api
+  // containers. An agent Job's PATH is whatever layer 3 inherited or layer 4
+  // (`adapterConfig.env.PATH`, an operator-set database value) overwrote — see
+  // the merge above, which applies no shape check to any key. Measured
+  // 2026-10-02 on a live agent pod: PATH began with an agent-writable PVC
+  // directory and did not contain the wrapper directory at all, so `git`
+  // resolved straight to /usr/bin/git and PEN-3156's wrapper was off the
+  // traffic path entirely while the chart's render guard reported healthy.
+  //
+  // Prepending rather than rejecting: a bad PATH here is an operator
+  // misconfiguration that would otherwise fail a Job that has nothing to do
+  // with GitHub, and the thing worth guaranteeing is the ordering, not the
+  // rest of the value. Idempotent, so a PATH that already leads with the
+  // directory is left exactly as it is.
+  const existingPath = merged.PATH;
+  // With no PATH to prepend to, emitting a bare wrapper directory would
+  // CLOBBER the image's own `ENV PATH` — an explicit container env entry wins
+  // outright — and leave the agent unable to resolve any other binary. Fall
+  // back to the system default in that case rather than to one directory.
+  //
+  // The third option is to leave `merged.PATH` unset and let the image's own
+  // `ENV PATH` stand, which preserves whatever toolchain directories the agent
+  // image adds that this hand-written constant does not know about. It is
+  // rejected because it silently declines to enforce the ordering in exactly
+  // the case where nothing else does: no env entry means no chart guard and no
+  // inherited value either, so the wrapper directory would be absent rather
+  // than merely late. A missing toolchain entry breaks a build step loudly; a
+  // missing wrapper directory routes GitHub traffic around the egress scrub
+  // and reports healthy. This branch is in practice unreachable — layer 3
+  // `inheritedEnv` carries the server pod's PATH — so the cost is theoretical
+  // and the exposure is not.
+  const pathEntries = (existingPath || GITHUB_WRAPPER_FALLBACK_PATH).split(":");
+  if (pathEntries[0] !== GITHUB_WRAPPER_BIN_DIR) {
+    merged.PATH = [
+      GITHUB_WRAPPER_BIN_DIR,
+      ...pathEntries.filter((entry) => entry !== GITHUB_WRAPPER_BIN_DIR),
+    ].join(":");
   }
 
   // Convert literal env to V1EnvVar array. Names matching the sensitive
@@ -2228,7 +2302,21 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       ].join(" ")
     : "";
   const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(podLogPath))} || exit $?`;
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  // BLO-29553 AC1(b): the redactor goes BEFORE `tee`, so the credential never
+  // reaches the file on the shared PVC rather than being cleaned up afterwards.
+  // Anything after `tee` would be scrubbing a copy that already landed, which is
+  // the same "a batch scrubber must read every credential it redacts" objection
+  // that ruled out retroactive scrubbing on this ticket.
+  //
+  // `$PAPERCLIP_POD_LOG_FILTER` is the command word and `_ARG` its optional
+  // single argument, both quoted. They are split precisely so that quoting is
+  // possible: `$GUARD_DIR` derives from the operator-configurable
+  // `CLAUDE_CONFIG_DIR`, so the script path can legitimately contain a space,
+  // and one unquoted `$VAR` holding `node <path>` would word-split it and fail
+  // every run on that config through `set -o pipefail`. `${_ARG:+"$_ARG"}` is
+  // the empty-safe form: it expands to nothing at all for the `cat` fallback
+  // rather than passing `cat` an empty argument.
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${buildPodLogRedactorSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
@@ -2278,10 +2366,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // init-container env var, regardless of size (BLO-17980/BLO-17973).
   const initCommandParts = useLargePromptPath
     ? ["cp /tmp/prompt-secret/prompt.txt /tmp/prompt/prompt.txt"]
-    : [`printf '%s' "$PROMPT_CONTENT" > /tmp/prompt/prompt.txt`];
+    : [`printf '%s' "$${PROMPT_ENV_NAME}" > /tmp/prompt/prompt.txt`];
   const initEnv: k8s.V1EnvVar[] = useLargePromptPath
     ? []
-    : [{ name: "PROMPT_CONTENT", value: prompt }];
+    : [{ name: PROMPT_ENV_NAME, value: prompt }];
   let mcpConfigSecret: McpConfigSecret | null = null;
   if (mergedMcpJson) {
     const mcpConfigSecretName = `${jobName}-mcp`;
