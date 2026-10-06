@@ -483,11 +483,43 @@ async function probeOne(
     // cannot change the result for ANY input. Unlike `formalDeferred` above —
     // whose keying asymmetry leaves its veto reachable on bodies this guard
     // never sees — no input distinguishes it, so no replacement test is
-    // possible. The veto below is therefore documentation and THIS is the
-    // enforcement. Do NOT relax this guard to compute `formalClean` anyway
-    // (the tempting form is "cheap enough, keep it for telemetry"): that is a
-    // false `review:ally-clean` on a blocking head with nothing left to catch
-    // it.
+    // possible.
+    //
+    // It is NOT thereby inert, and the relation is 2-of-2 rather than one arm
+    // winning (Ally review of #2143 again, correcting an earlier revision of
+    // this paragraph): relax THIS clause alone and the veto still falsifies
+    // `out.clean`; delete the veto alone and this clause still keeps
+    // `formalClean` false. Either one alone holds the invariant; losing BOTH
+    // is a false `review:ally-clean` on a blocking head. So neither may be
+    // removed on the ground that the other covers it — and relaxing this
+    // clause to compute `formalClean` anyway (the tempting form is "cheap
+    // enough, keep it for telemetry") still reintroduces the COST regression
+    // above, veto or no veto. That is the consequence to weigh; a false clean
+    // is NOT, and claiming it was made this prohibition rest on a premise a
+    // reader could disprove in thirty seconds.
+    //
+    // Measured, not reasoned — re-runnable mutation ladder over
+    // `evidence-truth.test.ts` + `evidence-gate.test.ts` (48 cases):
+    //
+    //   drop `&& !commentBlocking` here  -> 2 red, BOTH call-count only
+    //                                       ("suppresses the Surface 2 author
+    //                                       read entirely" / "author-blind
+    //                                       CARRIED finding"). No verdict moves.
+    //   drop `!commentBlocking` below    -> 48/48 GREEN. No failing mutation.
+    //   drop BOTH                        -> the same 2, PLUS "a blocking
+    //                                       verdict on either surface beats a
+    //                                       clean one on the other" (:761)
+    //                                       going red on a detected
+    //                                       `review:ally-clean`. That third
+    //                                       failure is the false clean.
+    //
+    // That reach asymmetry is also why reason (2) above refuses a guard copy
+    // of `!formalDeferred` while this clause IS a guard copy of the veto
+    // below: the same two-arms question, answered oppositely because the arms
+    // differ in reach. A `formalDeferred` copy would be a strictly narrower
+    // arm that could only mask the wider one; these two are coextensive, so
+    // each is a real backstop for the other's mutation — and this one
+    // additionally buys the COST saving above, which is its actual motive.
     //
     // The route this is REACHABLE on is `blocking_finding`, which stays
     // author-blind on purpose ("a finding is a finding whoever wrote it",
@@ -568,11 +600,13 @@ async function probeOne(
     // `review:ally-clean` for a head with a live accepted residual (BLO-36903).
     const commentDeferred = commentVerdict.outcome === "deferred_finding";
     out.clean =
-      // DEAD since the `!commentBlocking` guard above subsumed it, and it
-      // cannot be given a failing mutation — see the CORRECTNESS paragraph
-      // there. Kept as the honest statement of the invariant; the guard above
-      // is what enforces it. Do not read its deletability as license to drop
-      // either one.
+      // The `!commentBlocking` conjunct below is DEAD since the
+      // `!commentBlocking` guard above subsumed it, and it cannot be given a
+      // failing mutation — see the CORRECTNESS paragraph there. It is dormant
+      // ENFORCEMENT, not scaffolding: it is what makes relaxing that guard
+      // survivable, exactly as that guard is what makes this conjunct's
+      // deletability survivable. Do not read its deletability as license to
+      // drop either one.
       !commentBlocking &&
       !formalBlocking &&
       !commentDeferred &&
