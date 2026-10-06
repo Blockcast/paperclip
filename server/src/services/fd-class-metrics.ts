@@ -50,9 +50,20 @@ export const PROC_SELF_FD = "/proc/self/fd";
  * bounded by a constant rather than by however many descriptors the process has
  * managed to leak — the one scenario in which this code runs is the one in
  * which that number is growing without limit. 4096 is ~17x the observed steady
- * state and still a sub-millisecond procfs walk; beyond it the remainder is
- * reported as a single `unclassified-truncated` series rather than silently
- * dropped, so the class counts always sum to the true total.
+ * state; beyond it the remainder is reported as a single
+ * `unclassified-truncated` series rather than silently dropped, so the class
+ * counts always sum to the true total.
+ *
+ * What the cap costs at full engagement, measured on a Linux container rather
+ * than estimated: 33 fds → 0.33 ms, 4033 fds → 43.7 ms (median of 7), i.e.
+ * ~10.8 µs per descriptor. These are synchronous syscalls on the event loop, so
+ * that 43 ms blocks every other request for its duration — "no I/O wait" is not
+ * the same as "does not block", and an earlier version of this comment claimed
+ * a sub-millisecond walk, which was wrong by ~40x. It is admissible anyway
+ * because the cost is a bounded constant amortised over the scrape interval:
+ * once per 15 s is a ~0.3% duty cycle, far inside BLO-33243's 10 s budget. The
+ * bound is what makes that true, which is why it is a constant and not a
+ * fraction of the table.
  */
 export const FD_CLASS_MAX_ENTRIES = 4096;
 
@@ -116,8 +127,35 @@ export const FD_CLASS_MAX_SEGMENT_CHARS = 32;
 export const FD_CLASS_VANISHED = "vanished";
 /** Class carrying the count of descriptors skipped by {@link FD_CLASS_MAX_ENTRIES}. */
 export const FD_CLASS_TRUNCATED = "unclassified-truncated";
-/** Class assigned when `readlink` fails for any reason other than `ENOENT`. */
+/**
+ * Class assigned to a descriptor that could not be classified. Three distinct
+ * causes land here, and the label names none of them, so a non-zero count is a
+ * prompt to look rather than a diagnosis:
+ *   - `readlink` failed for any reason other than `ENOENT` (the race, which is
+ *     {@link FD_CLASS_VANISHED});
+ *   - the target read back empty;
+ *   - the target is a non-path form whose prefix fails the subtype alphabet,
+ *     i.e. a kernel prefix this code does not recognise.
+ * Widened from naming only the first: an investigator told to look for a
+ * failing `readlink` will not find one when the cause was an unrecognised
+ * prefix.
+ */
 export const FD_CLASS_UNREADABLE = "unreadable";
+/**
+ * Sentinel published when the descriptor *table itself* could not be
+ * enumerated on a host that has procfs — `EACCES` under a restricted `/proc`,
+ * `ENOMEM`, or anything else the kernel raises that is not "no such directory".
+ *
+ * Deliberately not {@link FD_CLASS_UNREADABLE}: that one counts descriptors
+ * this code looked at and could not classify, and folding a whole-table failure
+ * into it would conflate "240 descriptors, 3 unclassifiable" with "no idea, the
+ * walk never ran". The value is always 0 — nothing was inspected, so the
+ * partition still sums to a total of 0 — and it is the series' *presence* that
+ * carries the signal: the instrument is deployed and failing. Absence of the
+ * whole metric then keeps meaning exactly one thing, that this host has no
+ * procfs to read.
+ */
+export const FD_CLASS_TABLE_UNREADABLE = "table-unreadable";
 /** Fold bucket for classes past {@link FD_CLASS_MAX_SERIES}. */
 export const FD_CLASS_OTHER = "other";
 
@@ -211,15 +249,28 @@ function boundedSegment(segment: string): string {
   const parts = body.split(SEGMENT_TOKEN_SEPARATORS);
   let prefix = "";
   let redacted = false;
+  // Budget every character that can reach the emitted label, not just the
+  // tokens: the leading dot, the separator appended alongside each token, and
+  // the redaction marker. Charging only `prefix + token` let the result settle
+  // two over — measured, `wwwww-xxxxx-yyyyy-zzzzz-ssssssss-ZZ` reduced to a
+  // 34-character segment against a stated ceiling of 32, so the constant did
+  // not mean its name and a future reader sizing anything against it would be
+  // wrong. Reserving the marker up front can redact an all-stable compound of
+  // 31-32 characters that previously survived verbatim; that is the cost of
+  // making the bound true by construction, and it is paid in label precision
+  // for a shape this repo does not generate.
+  const prefixBudget =
+    FD_CLASS_MAX_SEGMENT_CHARS - (dotted ? 1 : 0) - FD_CLASS_VOLATILE_SEGMENT.length;
   // Even indices are tokens, odd indices the separator that followed them; the
   // separator is kept so the stable prefix rebuilds verbatim.
   for (let i = 0; i < parts.length; i += 2) {
     const token = parts[i] ?? "";
-    if (!isStableSegmentToken(token) || prefix.length + token.length > FD_CLASS_MAX_SEGMENT_CHARS) {
+    const separator = parts[i + 1] ?? "";
+    if (!isStableSegmentToken(token) || prefix.length + token.length + separator.length > prefixBudget) {
       redacted = true;
       break;
     }
-    prefix += token + (parts[i + 1] ?? "");
+    prefix += token + separator;
   }
   // Every token stable — a compound name like `x86_64-linux-gnu` that only
   // failed the whole-segment test because of its separators. Keep it verbatim
@@ -342,10 +393,19 @@ function foldToSeriesCap(raw: Map<string, number>, maxSeries: number): Map<strin
 /**
  * Read and classify the descriptor table.
  *
- * Returns `null` where procfs is unavailable — macOS dev machines and any
- * non-Linux CI runner. A null return means "not measurable here", which is why
- * the caller publishes nothing rather than zeroes: a zeroed gauge on a platform
- * that cannot see descriptors would read identically to a process that has none.
+ * Returns `null` only where there is no procfs to read — macOS dev machines and
+ * any non-Linux CI runner, which surface as `ENOENT`/`ENOTDIR` on the directory
+ * itself. A null return means "not measurable here", which is why the caller
+ * publishes nothing rather than zeroes: a zeroed gauge on a platform that
+ * cannot see descriptors would read identically to a process that has none.
+ *
+ * Every *other* errno is a Linux host whose table we failed to enumerate, and
+ * that is reported as {@link FD_CLASS_TABLE_UNREADABLE} rather than folded into
+ * the same `null`. Collapsing the two would tell an investigator on a Linux pod
+ * that the instrument is not deployed at the moment it is deployed and broken —
+ * the same "unmeasurable is distinct from zero" conflation this module exists
+ * to avoid, one level up. This mirrors the `ENOENT`-vs-everything-else branch
+ * the per-descriptor `readlink` path below already makes.
  */
 export function collectFdClassSnapshot(options: CollectFdClassOptions = {}): FdClassSnapshot | null {
   const dir = options.dir ?? PROC_SELF_FD;
@@ -357,8 +417,10 @@ export function collectFdClassSnapshot(options: CollectFdClassOptions = {}): FdC
   let entries: string[];
   try {
     entries = readdir(dir);
-  } catch {
-    return null;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    return { classes: new Map([[FD_CLASS_TABLE_UNREADABLE, 0]]), total: 0 };
   }
 
   const raw = new Map<string, number>();

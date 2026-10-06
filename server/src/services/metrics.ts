@@ -3746,14 +3746,21 @@ function ensureRegistry(): {
         + "but NOT authenticated: a live file whose name merely ends in ' (deleted)' readlinks "
         + "identically, so this class can be inflated by a filename), "
         + "vanished (readlink lost a race with close; ~1 per scrape is the readdir handle itself), "
+        + "unreadable (descriptor seen but not classifiable -- readlink failed for some reason "
+        + "other than the race, or the target read back empty, or its kernel prefix is one this "
+        + "build does not recognise), "
         + "other (fold of everything past the series cap), unclassified-truncated (descriptors "
         + "beyond the per-scrape inspection cap). Counts sum to the true descriptor total. "
         + "Directory labels are depth-bounded AND per-segment alphabet-bounded (an "
         + "identifier-shaped segment becomes '*', e.g. /tmp/paperclip-run-*), so this names a "
         + "code site class, not a file, and does not mint a series per run. "
         + "NOT an alert source: max_fds is 524288 against ~240 open, and the heap aborts long "
-        + "before descriptors matter. Absent series means procfs was unreadable (non-Linux), "
-        + "which is deliberately distinct from a zero.",
+        + "before descriptors matter. Absent series means there is no procfs to read at all "
+        + "(non-Linux), which is deliberately distinct from a zero. A LONE table-unreadable "
+        + "series means the opposite: procfs exists and enumerating /proc/self/fd failed "
+        + "(EACCES under a restricted /proc, ENOMEM, ...), so the instrument is deployed and "
+        + "broken rather than absent -- its value is always 0 and carries nothing; its presence "
+        + "is the signal.",
       labelNames: ["fd_class"],
       registers: [registry],
     });

@@ -17,13 +17,20 @@
  *
  * 3. **"Unmeasurable" is distinct from "zero".** A non-Linux runner must
  *    publish no series at all. A zeroed gauge there would be a confident
- *    assertion that nothing is open.
+ *    assertion that nothing is open. The same distinction applies one level
+ *    up and is tested separately: "unmeasurable because this host has no
+ *    procfs" (absent) must not collapse into "unmeasurable because reading it
+ *    failed" (a lone `table-unreadable` series), or an investigator on a Linux
+ *    pod is told the instrument is not deployed while it is deployed and
+ *    broken.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  FD_CLASS_MAX_SEGMENT_CHARS,
   FD_CLASS_OTHER,
+  FD_CLASS_TABLE_UNREADABLE,
   FD_CLASS_TRUNCATED,
   FD_CLASS_UNREADABLE,
   FD_CLASS_VANISHED,
@@ -180,19 +187,70 @@ describe("classifyFdTarget", () => {
     expect(classifyFdTarget("bpf_map:[7]")).toBe("bpf_map");
     expect(classifyFdTarget("")).toBe(FD_CLASS_UNREADABLE);
   });
+
+  it("holds every emitted segment inside the stated character cap", () => {
+    // The cap is a constant a future reader will size something against, so it
+    // has to mean its name. It previously charged only `prefix + token`, while
+    // the separator and the `*` marker landed in the label too — this exact
+    // input measured 34 characters against a ceiling of 32.
+    const measured = "/wwwww-xxxxx-yyyyy-zzzzz-ssssssss-ZZ/f";
+    expect(classifyFdTarget(measured)).toBe("file:/wwwww-xxxxx-yyyyy-zzzzz-*");
+
+    // Property, not just the one regression: no segment of any emitted label
+    // exceeds the cap, including the dotted and fully-volatile forms.
+    const inputs = [
+      measured,
+      "/.cache-aaaaa-bbbbb-ccccc-ddddd-eeeee-ZZ/f",
+      "/tmp/paperclip-run-BLO-38624-abc123def456-XyZ9aB/scratch.json",
+      "/aaaaa-bbbbb-ccccc-ddddd-eeeee-fffff-GG/f",
+      "/usr/lib/x86_64-linux-gnu/libc.so",
+    ];
+    for (const input of inputs) {
+      for (const segment of classifyFdTarget(input).replace(/^file:/, "").split("/")) {
+        expect(segment.length).toBeLessThanOrEqual(FD_CLASS_MAX_SEGMENT_CHARS);
+      }
+    }
+  });
 });
 
 describe("collectFdClassSnapshot", () => {
-  it("returns null when procfs is unreadable, so nothing is published", () => {
-    const snapshot = collectFdClassSnapshot({
-      dir: "/nope",
-      readdir: () => {
-        throw enoent();
-      },
-    });
-    // Distinct from `{ classes: empty }`: a zeroed gauge on macOS would assert
-    // "no descriptors open", which is never true of a running process.
-    expect(snapshot).toBeNull();
+  it("returns null when there is no procfs at all, so nothing is published", () => {
+    for (const code of ["ENOENT", "ENOTDIR"]) {
+      const snapshot = collectFdClassSnapshot({
+        dir: "/nope",
+        readdir: () => {
+          const err = new Error(code) as NodeJS.ErrnoException;
+          err.code = code;
+          throw err;
+        },
+      });
+      // Distinct from `{ classes: empty }`: a zeroed gauge on macOS would assert
+      // "no descriptors open", which is never true of a running process.
+      expect(snapshot).toBeNull();
+    }
+  });
+
+  it("books a failed table enumeration separately from an absent procfs", () => {
+    // The whole point of the distinction: on a Linux pod these errnos mean the
+    // instrument is deployed and FAILING, and collapsing them into the same
+    // `null` as the non-Linux case tells an investigator it is not deployed.
+    // Mutating the branch back to a bare `return null` fails here.
+    for (const code of ["EACCES", "ENOMEM", "EMFILE"]) {
+      const snapshot = collectFdClassSnapshot({
+        dir: "/proc/self/fd",
+        readdir: () => {
+          const err = new Error(code) as NodeJS.ErrnoException;
+          err.code = code;
+          throw err;
+        },
+      });
+      expect(snapshot).not.toBeNull();
+      // Value is 0 and the partition still holds; presence is what carries the
+      // signal. Deliberately NOT FD_CLASS_UNREADABLE, which counts descriptors
+      // that were inspected and could not be classified.
+      expect(Object.fromEntries(snapshot!.classes)).toEqual({ [FD_CLASS_TABLE_UNREADABLE]: 0 });
+      expect(snapshot!.total).toBe(0);
+    }
   });
 
   it("counts a realistic table and keeps the classes summing to the total", () => {

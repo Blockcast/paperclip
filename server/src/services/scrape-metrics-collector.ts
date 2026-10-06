@@ -174,11 +174,16 @@ export function refreshAgentStartLockMetrics(): void {
 
 /**
  * Publish the descriptor-class histogram (PEN-3314). Synchronous and DB-free
- * like its two neighbours, and cheap for a reason worth stating: `/proc` is
- * backed by kernel memory, not by a filesystem, so the walk is a bounded run of
- * `readdir`/`readlink` syscalls with no I/O wait — the property that makes it
- * admissible on a request path whose whole design constraint (BLO-33243) is
- * that nothing on it may block.
+ * like its two neighbours. Its cost is a bounded constant rather than a cheap
+ * one, and the distinction matters: `/proc` is kernel memory, so the walk is
+ * `readdir`/`readlink` syscalls with no I/O wait — but they are synchronous
+ * syscalls on the event loop, and no I/O wait is not the same as not blocking.
+ * Measured on a Linux container, 33 fds → 0.33 ms and 4033 fds → 43.7 ms, so at
+ * the inspection cap it holds the loop for ~43 ms. What makes it admissible on
+ * a request path whose whole design constraint (BLO-33243) is that nothing on
+ * it may block is the amortisation, not the speed: once per 15 s scrape is a
+ * ~0.3% duty cycle against a 10 s timeout, and the cap keeps that figure from
+ * growing with the leak.
  *
  * On the scrape path rather than in {@link REFRESHES} for the same reason as
  * {@link refreshAgentStartLockMetrics}, and it is the load-bearing one: the
