@@ -53,6 +53,15 @@
  * reach the window. Point readiness back at `/healthz` and that guarantee is
  * gone — `deploy/helm/paperclip/tests/probes.test.mjs` pins it.
  *
+ * It also makes readiness `timeoutSeconds` (20s), not `stallMs`, this
+ * detector's real saturation margin: about 1.5x the 13.19s worst non-wedge
+ * sample. kubelet abandons a probe at its timeout, so an `/api/health` slower
+ * than that counts as an arrival without a completion. Three of those (~60s)
+ * remove the only Service endpoint, the probe is then the only `/api` traffic
+ * left, and a saturation episode that keeps `/api/health` above 20s for the
+ * window reads as a wedge and restarts the worker. The same test file pins
+ * the 20s floor.
+ *
  * ## Why an idle instance stays green
  *
  * The arrival timestamp only advances past the completion timestamp while a
@@ -74,7 +83,8 @@
 /**
  * No completed `/api` response for this long, while requests are outstanding,
  * is a wedge. Deliberately far above the 13.19s pool-saturation tail measured
- * on 2026-09-10, so saturation cannot reach it, and far below the ~29 minutes
+ * on 2026-09-10, so saturation cannot reach it while `/api/health` answers
+ * inside the readiness timeout (see above), and far below the ~29 minutes
  * the 2026-10-05 wedge ran unattended. With the worker liveness probe at
  * `periodSeconds: 30, failureThreshold: 6`, a restart lands ~3-6 minutes into
  * a wedge.

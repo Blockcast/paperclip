@@ -228,4 +228,23 @@ test("worker liveness can detect an API wedge without acquiring the database", (
       `${liveness.failureThreshold} x ${liveness.periodSeconds}s) so a single late ` +
       `/livez cannot restart the singleton worker. See BLO-40591.`,
   );
+
+  // Readiness timeoutSeconds is the /livez wedge detector's saturation margin.
+  // The detector counts only completed `/api` responses, kubelet abandons a
+  // probe at its timeout, and once readiness drops the only endpoint the probe
+  // is the only `/api` traffic left. So an `/api/health` slower than this
+  // timeout for the 180s window reads as a wedge and restarts the worker.
+  // 20s is ~1.5x the 13.19s worst non-wedge sample; tightening it toward that
+  // tail turns pool saturation into a restart. Not scoped to replicas === 1:
+  // the detector is per-pod.
+  const LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS = 20;
+  const readiness = probeSettings(rendered, "readinessProbe");
+  assert.ok(
+    readiness.timeoutSeconds >= LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS,
+    `readiness timeoutSeconds (${readiness.timeoutSeconds}s) must be at least ` +
+      `${LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS}s: it is the /livez wedge detector's ` +
+      `saturation margin. A /api/health probe abandoned at its timeout counts as an ` +
+      `arrival without a completion, so pool saturation above it restarts the singleton ` +
+      `worker. See BLO-40591.`,
+  );
 });
