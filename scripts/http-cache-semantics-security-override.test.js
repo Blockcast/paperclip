@@ -47,7 +47,9 @@ const PATCHED_FLOOR = ">=4.3.0 <5";
 // `arrayContaining`: ch52 is the one Dependabot alerts on and f27v is the one
 // 4.3.0 actually fixes, and the comment above explains why dropping either
 // misrepresents the override. An unpinned array lets that justification revert
-// silently.
+// silently. `deepEqual` under `node:assert/strict` is `deepStrictEqual`, so
+// order is pinned too — deliberate for a hand-maintained two-element list, and
+// the failure message says so rather than claiming an ID went missing.
 const ADVISORIES = ["GHSA-ch52-4w7c-c8xp", "GHSA-f27v-pv5m-c5g6"];
 
 // Derive the numeric comparison from PATCHED_FLOOR rather than restating it.
@@ -83,7 +85,7 @@ function assertPatched(versions, where) {
   for (const version of versions) {
     assert.ok(
       satisfiesFloor(version),
-      `${where} resolved http-cache-semantics ${version.join(".")} outside ${PATCHED_FLOOR} (GHSA-ch52-4w7c-c8xp affects <= 4.2.0)`,
+      `${where} resolved http-cache-semantics ${version.join(".")} outside ${PATCHED_FLOOR} (floor rests on ${ADVISORIES.join(", ")})`,
     );
   }
 }
@@ -108,7 +110,7 @@ test("http-cache-semantics resolves above the GHSA-ch52-4w7c-c8xp floor", async 
       "http-cache-semantics"
     ].advisories,
     ADVISORIES,
-    "securityAuditRemediations ledger no longer cites both advisories this floor rests on",
+    "securityAuditRemediations ledger advisories differ from the pinned set (exact contents and order)",
   );
 
   // Positive control. Every assertion below is satisfied by a lockfile that
