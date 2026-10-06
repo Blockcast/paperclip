@@ -8448,7 +8448,30 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
       const unpark = svc.update(dependentId, { ...unparkPatch });
       const unparkSettled = unpark.catch(() => undefined);
-      await new Promise((resolve) => setTimeout(resolve, 75));
+
+      // Wait until the unpark is parked on the row rather than sleeping blind.
+      // A row `FOR UPDATE` wait means it already holds both advisories, so the
+      // add below must queue behind it. If the add won the company advisory
+      // instead, it would commit the live edge first and the unpark's
+      // precondition would correctly 409, failing this case for timing alone.
+      const rowWaitDeadline = Date.now() + 10_000;
+      let unparkParkedOnRow = false;
+      while (Date.now() < rowWaitDeadline && !unparkParkedOnRow) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ~* 'for update'
+          ) as waiting
+        `);
+        unparkParkedOnRow = Boolean(Array.from(waitingRows)[0]?.waiting);
+        if (!unparkParkedOnRow) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(unparkParkedOnRow).toBe(true);
+
       // The production blocker add: svc.update -> runUpdate -> syncBlockedByIssueIds.
       const blockerAdd = svc.update(dependentId, { blockedByIssueIds: [liveBlockerId] });
       const blockerAddSettled = blockerAdd.catch(() => undefined);
