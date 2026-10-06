@@ -54,6 +54,7 @@
     "test:multer-security-override": "node --test scripts/multer-security-override.test.js",
     "test:js-yaml-security-override": "node --test scripts/js-yaml-security-override.test.js",
     "test:http-cache-semantics-security-override": "node --test scripts/http-cache-semantics-security-override.test.js",
+    "test:proxy-addr-security-override": "node --test scripts/proxy-addr-security-override.test.js",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
@@ -157,6 +158,14 @@
         "advisories": [
           "GHSA-ch52-4w7c-c8xp",
           "GHSA-f27v-pv5m-c5g6"
+        ]
+      }
+    },
+    "BLO-40607": {
+      "proxy-addr": {
+        "patchedRange": ">=2.0.8 <3",
+        "advisories": [
+          "GHSA-jqcg-44mw-7w3h"
         ]
       }
     }
