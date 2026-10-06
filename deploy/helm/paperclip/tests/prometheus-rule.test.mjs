@@ -2147,6 +2147,18 @@ test("the start-lock runbook routes its two arms on agent count, not on an alert
   const [, fleetArm = ""] = routing.match(/\| `>= 3` \| ([^|]*) \|/) ?? [];
   const [, soloArm = ""] = routing.match(/\| below 3, or no data \| ([^|]*) \|/) ?? [];
   assert.match(fleetArm, /\*\*self-clears\*\*/, "the `>= 3` row's arm must say the fleet stall self-clears");
+  // Pin the fleet arm's observed CEILING too, not just its self-clear verdict.
+  // The four BLO-36922 episodes top out at 120 min, but the 2026-09-24 episode
+  // at :664 was "also three agents in lockstep" -- fleet-scope, 2h14m, above
+  // that ceiling. A range built from the four alone reads as a bound the
+  // record already exceeds, and understating it is the direction that matters:
+  // a responder watching a 130-minute stall against a "120 min" ceiling
+  // concludes this episode is not the measured shape and reaches for Step 4.
+  assert.match(
+    fleetArm,
+    /2h14m/,
+    "the `>= 3` row's arm must carry the 2h14m ceiling (the 2026-09-24 three-agent episode, :664), not the 120 min top of the four BLO-36922 episodes",
+  );
   assert.match(
     soloArm,
     /\*\*cycled\*\*[^|]*`Wedged` pages at 4 h only if the abort fails to land/,
@@ -2157,6 +2169,37 @@ test("the start-lock runbook routes its two arms on agent count, not on an alert
     /6.19 ?h|2026-09-15/,
     "the below-3 row's arm must not cite the 2026-09-15/16 episode: it was five agents, so it is `>= 3` evidence, and evidence in neither direction",
   );
+
+  // 8043s and 8073s are TWO MEASUREMENTS OVER TWO WINDOWS, not one figure
+  // spelled two ways: 8043s is the 7-day maximum hold (the 2026-09-24
+  // three-agent episode, which is where the `>= 3` row's 2h14m ceiling comes
+  // from) and 8073s is the 14-day peak across the 21 agents that held past
+  // 300s. 8043 <= 8073 is the expected relationship between a window and the
+  // one containing it, so agreement is not something to restore. Both round
+  // to "2h14m", which is the whole trap -- a reader comparing the rendered
+  // durations sees a typo and reconciles them, and the file then states a
+  // 14-day peak as a 7-day measurement while the 2h14m ceiling above silently
+  // disagrees with its own source. Reviewed and declined once already (Ally,
+  // 2026-10-06, PR #2059); pin the window labels so the next reader does not
+  // re-derive it, and so "reconciling" them turns the suite red instead.
+  for (const [figure, window, label] of [
+    [/\b8043s\b/g, /7-day/, "7-day maximum hold (2026-09-24, three agents)"],
+    [/\b8073s\b/g, /14 days/, "14-day peak across the 21 agents past 300s"],
+  ]) {
+    const hits = [...runbook.matchAll(figure)];
+    assert.ok(
+      hits.length > 0,
+      `the runbook must keep its ${label} figure; losing it makes this guard vacuous`,
+    );
+    for (const hit of hits) {
+      assert.match(
+        flat(runbook.slice(Math.max(0, hit.index - 240), hit.index)),
+        window,
+        `every ${hit[0]} in the runbook must be labelled with its measurement window -- it is the ${label}, `
+          + "and the other figure is a different window, not a typo to reconcile",
+      );
+    }
+  }
 
   // PEN-3328 made "Wedged pages once per agent past 4h" false, and false in the
   // direction that matters: `paperclip_agent_start_lock_held_seconds` is

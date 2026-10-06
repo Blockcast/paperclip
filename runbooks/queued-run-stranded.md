@@ -513,7 +513,7 @@ Owner: Platform / SRE (PEN-3305, re-fitted in PEN-3328)
 >
 > | result | arm | remedy |
 > |---|---|---|
-> | `>= 3` | [fleet stall](#fleet-stall-many-agents-in-lockstep-blo-36922): many agents together, ~25–120 min observed, **self-clears** | do **not** replace the process |
+> | `>= 3` | [fleet stall](#fleet-stall-many-agents-in-lockstep-blo-36922): many agents together, ~25 min–2h14m observed, **self-clears** | do **not** replace the process |
 > | below 3, or no data | fewer than three agents; the solo hold measured **cycled** (175 resets/6h), and `Wedged` pages at 4 h only if the abort fails to land | this section, which ends with the Step 4 restart gate |
 >
 > **The fleet arm takes precedence.** A fleet stall pages
@@ -1123,7 +1123,8 @@ release and keeps the event answerable afterwards.
 
 **Do not close this on the strength of the recovery.** The cancellation bounded
 the damage; it did not fix whatever blocked the section. Holds of minutes to a
-couple of hours do settle on their own — the worst measured was 8073s (2h14m)
+couple of hours do settle on their own — the worst measured over the 14 days
+to 2026-09-25 was 8073s (2h14m)
 — so a section that reached 4h outran that tail by ~1.8× and is not the
 slow-but-healthy case.
 
