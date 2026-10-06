@@ -54,9 +54,11 @@
  * alerting on that kind stops seeing this class entirely — the diagnostics
  * survive on the issue comment; and the `git_worktree_branch_incoherence` arm
  * of the `nextAction` text became unreachable and was deleted (service.ts:6148),
- * because `workspace_validation_failed` now requires `gitProbeState: "checkout"`
- * and the sole producer of that field (heartbeat.ts:4132-4145) always writes
- * reason `k8s_agent_home_git_bootstrap_unsupported`.
+ * because the heartbeat park sites now grant `workspace_validation_failed` only
+ * on `gitProbeState: "checkout"`, whose sole producer (heartbeat.ts:4132-4145)
+ * always writes reason `k8s_agent_home_git_bootstrap_unsupported`; the cause's
+ * other writer, the BLO-31351 git-transport producer (service.ts:9322), sets it
+ * on an `adapter_failed` run that carries no `workspaceValidation` payload.
  */
 
 /**
@@ -82,7 +84,10 @@
  *     confirmed-sounding verdict; its own throw message concedes it, reporting
  *     that "the checked-out branch could not be verified".
  *
- * So the predicate is an allowlist, not a denylist. A reason code added later
+ * So the predicate is an allowlist, not a denylist. It governs only the two
+ * heartbeat.ts park sites that call `workspaceValidationRecoveryCause` below,
+ * not the BLO-31351 git-transport producer (service.ts:9322), which writes the
+ * cause directly. At those two park sites, a reason code added later
  * is unlatched by default, and the worst case for a genuine configuration fault
  * is a bounded set of wake attempts followed by a visible escalation — against
  * a worst case of a permanent silent strand on the other side.
