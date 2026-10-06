@@ -134,7 +134,15 @@ export async function findLastSuccessfulDeploy({
 }) {
   const runs = [];
   // Page until we hold `scanLimit` runs or the API runs out. A short page means
-  // the history ended; stopping there keeps a healthy lane at one list call.
+  // the history ended; stopping there keeps the scan at one list call while the
+  // dispatch history still FITS one page. That is a property of history length,
+  // not of lane health: measured 2026-10-06, docker.yml has 81 successful
+  // `workflow_dispatch` runs, so page 1 is short and this costs one call no
+  // matter how stalled the lane is. Once that history crosses
+  // `DEPLOY_SCAN_PAGE_SIZE` — at ~1 dispatch/day, a few weeks out — the loop
+  // fills to `scanLimit` before probing anything and pays three list calls on
+  // every invocation, healthy or not. The cost that tracks the stall is the
+  // job-probe count at `:113`; this one tracks the calendar.
   //
   // `per_page` is HELD CONSTANT across pages, and that is load-bearing rather
   // than tidy. GitHub's offset is `(page - 1) * per_page`, so shrinking

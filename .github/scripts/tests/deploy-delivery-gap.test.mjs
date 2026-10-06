@@ -268,6 +268,59 @@ test('findLastSuccessfulDeploy: a scanLimit off a page boundary still reaches th
   );
 });
 
+test('findLastSuccessfulDeploy: scanLimit bounds the ANSWER, not just the paging', async () => {
+  // THE SIBLING OF THE TEST ABOVE, and it pins the trim that one cannot reach.
+  // Paging overshoots by up to a page, so with `scanLimit=150` the loop exits
+  // holding 200 runs. The test above places its deploy at index 120 — INSIDE
+  // the limit — so it is reached either way and says nothing about the trim.
+  //
+  // Here the only shipped deploy sits at index 175: past `scanLimit`, but
+  // inside the over-fetched tail. Without the trim the scan answers from a run
+  // it was never asked to look at, so `scanLimit` silently stops bounding both
+  // the answer and the probe cost. The failure direction is the safe one — it
+  // scans DEEPER than claimed, not shallower — which is exactly why nothing
+  // else in this file notices it.
+  const history = Array.from({ length: 400 }, (_, i) =>
+    run(300 + i, `s${i}`, new Date(Date.parse('2026-12-01T00:00:00Z') - i * 3_600_000).toISOString()),
+  );
+  const scanLimit = 150;
+  const deployIndex = 175;
+  // Bind the fixture to the constant it is exercising rather than asserting
+  // against two literals that can never disagree: the deploy must land in the
+  // overshoot window — past the limit, but inside the page the scan over-reads.
+  assert.ok(
+    deployIndex >= scanLimit && deployIndex < scanLimit + DEPLOY_SCAN_PAGE_SIZE,
+    `the deploy (${deployIndex}) must sit past scanLimit (${scanLimit}) but inside the ` +
+      `${DEPLOY_SCAN_PAGE_SIZE}-run overshoot for this to pin the trim`,
+  );
+
+  const client = stubClient({
+    '/actions/workflows/docker.yml/runs': pagedRunsRoute([history]),
+    '/actions/runs/': (path) =>
+      path.includes(`/actions/runs/${300 + deployIndex}/jobs`)
+        ? jobs(['deploy', 'success'])
+        : jobs(['deploy', 'skipped']),
+  });
+
+  const last = await findLastSuccessfulDeploy({ client, scanLimit });
+
+  assert.equal(
+    last,
+    null,
+    'a deploy beyond scanLimit must not be reported just because paging over-fetched it',
+  );
+
+  // And the cost is bounded by the same number. This is the other half of the
+  // claim at `:113` — "finding a deploy D positions back costs D+1 job probes"
+  // is only a bound if the scan cannot walk past the depth it was given.
+  const probes = client.calls.filter((c) => c.includes('/jobs'));
+  assert.equal(
+    probes.length,
+    scanLimit,
+    'the scan must probe at most scanLimit runs; the over-fetched tail is not its to read',
+  );
+});
+
 test('findLastSuccessfulDeploy: the newest-first sort spans pages, not just within one', async () => {
   // A per-page sort would still trust the API to have PAGED in order. Here the
   // newest shipped run is on page 2, behind an older shipped run on page 1.
