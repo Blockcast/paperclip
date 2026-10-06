@@ -6537,6 +6537,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         const stacked = await githubListOpenPullRequestsByBase({
           repoFullName: stackedRepoFullName,
           baseRef: mergedBaseRef,
+          // Inline on the webhook path, ahead of the first respond(200): bound
+          // to the request deadline, not the 30s default fetch deadline, so
+          // GitHub gets its answer inside the ~10s delivery timeout (BLO-38257).
+          signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
         });
         if ("error" in stacked) {
           // NOT "no stacked children" — we could not find out. Logged loudly
@@ -6602,6 +6606,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             ? await githubResolveMergeHistoryShape({
               repoFullName: stackedRepoFullName,
               mergeCommitSha: context.prMergeCommitSha,
+              // Second sequential hop on this same blocking path: unbounded it
+              // would stack onto the enumeration above for 60s against a ~10s
+              // delivery timeout (BLO-38257).
+              signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
             })
             : "unknown";
           const directive = stackedChildDirective(mergeShape);
