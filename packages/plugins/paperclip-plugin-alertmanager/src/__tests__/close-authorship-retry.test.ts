@@ -149,6 +149,27 @@ describe("BLO-40673 close authorship survives a post-cancel delivery failure", (
     ).toEqual({ kind: "reopen", reason: "plugin_resolved" });
   });
 
+  it("the stamp does not mark a legacy record aggregate-tracked", async () => {
+    // The stamp records authorship and nothing else. Persisting the computed
+    // aggregate key here would make the next delivery treat this legacy
+    // per-fingerprint record as aggregate-tracked with no member row, and the
+    // fail-closed path would refuse to cancel it — e.g. after an operator
+    // re-opens the row before Alertmanager retries the failed delivery.
+    const s = store(afterFiring());
+    await expect(
+      handleResolved(ctxFor(s, "todo", true), config(), resolvedAlert()),
+    ).rejects.toThrow();
+    expect(s.read().aggregateKey).toBeUndefined();
+
+    const retry = ctxFor(s, "todo");
+    await handleResolved(retry, config(), resolvedAlert());
+    expect(retry.issues.update).toHaveBeenCalledWith(
+      "issue-1",
+      expect.objectContaining({ status: "cancelled" }),
+      "company-1",
+    );
+  });
+
   it("CONTROL: an operator close is still suppressed — the stamp never fires", async () => {
     // The tuple this fix turns on is identical to a hand-cancel whose alert
     // later cleared, so BLO-24234's suppression has to be re-asserted here or

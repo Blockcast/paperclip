@@ -2760,12 +2760,7 @@ export async function handleResolved(
             // the authoritative one, and letting a best-effort stamp fail the
             // delivery would trade a mute for a retry loop.
             try {
-              await ctx.state.set(stateRef, {
-                ...existing,
-                aggregateKey,
-                paperclipIssueId: aggregateResolution.issueId,
-                pluginClosedAt: resolvedAt,
-              });
+              await ctx.state.set(stateRef, { ...existing, pluginClosedAt: resolvedAt });
             } catch (stampErr) {
               ctx.logger.error(
                 `paperclip-plugin-alertmanager: failed to stamp close authorship for ${alert.fingerprint}: ${String(stampErr)}`,
