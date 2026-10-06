@@ -30,7 +30,6 @@ import {
   readInheritedTimeoutSettings,
   formatInheritedTimeoutSettings,
   inheritedTimeoutLogLevel,
-  POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
   formatDatabaseBackupResult,
   runDatabaseBackup,
   authUsers,
@@ -42,6 +41,7 @@ import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { withAgentStartLockAbortableDb } from "./services/agent-start-lock-db.js";
 import { loadConfig } from "./config.js";
+import { dbInheritedTimeoutSeries } from "./db-inherited-timeouts.js";
 import { startEventLoopStallLogging } from "./event-loop-stall-log.js";
 import { logger } from "./middleware/logger.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
@@ -774,18 +774,9 @@ export async function startServer(): Promise<StartedServer> {
           ? " — statement_timeout is disabled, so a blocked query is bounded by nothing server-side (PEN-3365)"
           : ""),
     );
-    setDbInheritedTimeouts([
-      inheritedTimeouts.statementTimeout,
-      inheritedTimeouts.idleInTransactionSessionTimeout,
-      inheritedTimeouts.lockTimeout,
-      // The pool's own value, so the `LOOSENED:` verdict above is also a
-      // one-series PromQL comparison rather than only a startup log line.
-      {
-        name: "idle_in_transaction_session_timeout_pool",
-        valueMs: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
-        source: "startup_packet",
-      },
-    ]);
+    // Includes the pool's own value, so the `LOOSENED:` verdict above is also a
+    // one-series PromQL comparison rather than only a startup log line.
+    setDbInheritedTimeouts(dbInheritedTimeoutSeries(inheritedTimeouts));
   } catch (error) {
     // "read or publish": the gauge write is inside this guard too, so a throw
     // from the registry path lands here as well. Naming only the read would

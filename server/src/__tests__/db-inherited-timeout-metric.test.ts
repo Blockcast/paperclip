@@ -29,8 +29,11 @@ import {
   DB_INHERITED_TIMEOUT_METRIC,
   __resetMetricsForTest,
   renderMetrics,
+  POOL_IDLE_IN_TRANSACTION_SERIES,
   setDbInheritedTimeouts,
 } from "../services/metrics.js";
+import { POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS } from "@paperclipai/db";
+import { dbInheritedTimeoutSeries } from "../db-inherited-timeouts.js";
 
 afterEach(() => {
   __resetMetricsForTest();
@@ -93,7 +96,7 @@ describe("inherited DB timeout exposition (PEN-3365)", () => {
     setDbInheritedTimeouts([
       { name: "idle_in_transaction_session_timeout", valueMs: 30_000, source: "user" },
       {
-        name: "idle_in_transaction_session_timeout_pool",
+        name: POOL_IDLE_IN_TRANSACTION_SERIES,
         valueMs: 60_000,
         source: "startup_packet",
       },
@@ -101,8 +104,42 @@ describe("inherited DB timeout exposition (PEN-3365)", () => {
 
     const seen = await readings();
     expect(seen.get("idle_in_transaction_session_timeout")).toEqual({ value: 30, source: "user" });
-    expect(seen.get("idle_in_transaction_session_timeout_pool")).toEqual({
+    expect(seen.get(POOL_IDLE_IN_TRANSACTION_SERIES)).toEqual({
       value: 60,
+      source: "startup_packet",
+    });
+  });
+
+  it("startup publishes the pool series at the shipped constant, not just the inherited three", async () => {
+    // The wiring is what makes the loosening queryable, so it needs its own
+    // failing test: dropping the pool entry from `dbInheritedTimeoutSeries`
+    // leaves every other assertion here green and silently reverts the gauge
+    // to the inherited-only reading.
+    const inherited = {
+      statementTimeout: { name: "statement_timeout", valueMs: 30_000, source: "user" },
+      idleInTransactionSessionTimeout: {
+        name: "idle_in_transaction_session_timeout",
+        valueMs: null,
+        source: "default",
+      },
+      lockTimeout: { name: "lock_timeout", valueMs: null, source: "default" },
+    };
+    const series = dbInheritedTimeoutSeries(inherited);
+    expect(series.map((s) => s.name)).toEqual([
+      "statement_timeout",
+      "idle_in_transaction_session_timeout",
+      "lock_timeout",
+      POOL_IDLE_IN_TRANSACTION_SERIES,
+    ]);
+    expect(series[3]).toEqual({
+      name: POOL_IDLE_IN_TRANSACTION_SERIES,
+      valueMs: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+      source: "startup_packet",
+    });
+
+    setDbInheritedTimeouts(series);
+    expect((await readings()).get(POOL_IDLE_IN_TRANSACTION_SERIES)).toEqual({
+      value: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS / 1000,
       source: "startup_packet",
     });
   });

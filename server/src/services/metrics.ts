@@ -1273,6 +1273,15 @@ export const DB_INHERITED_TIMEOUT_METRIC = "paperclip_db_inherited_timeout_secon
  * measurement that motivated it and for the cardinality bounds.
  */
 export const PROCESS_OPEN_FDS_BY_CLASS_METRIC = "paperclip_process_open_fds_by_class";
+
+/**
+ * `setting` label of the series carrying the pool's OWN idle-in-transaction
+ * bound (PEN-3365), published beside the inherited reading so a loosening is a
+ * one-series comparison. Named once here so the help text, the startup wiring
+ * ({@link dbInheritedTimeoutSeries} in `db-inherited-timeouts.ts`) and the tests
+ * cannot drift apart.
+ */
+export const POOL_IDLE_IN_TRANSACTION_SERIES = "idle_in_transaction_session_timeout_pool";
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
@@ -3939,7 +3948,7 @@ function ensureRegistry(): {
         + "means nothing sets it; database/user means a real inherited bound. NOT the effective "
         + "value for idle_in_transaction_session_timeout: the pool overrides that in its own "
         + "startup packet, which this probe deliberately does not observe. The pool's own value "
-        + "is the setting=idle_in_transaction_session_timeout_pool,source=startup_packet series; "
+        + `is the setting=${POOL_IDLE_IN_TRANSACTION_SERIES},source=startup_packet series; `
         + "it above a non-zero inherited value means the pool LOOSENS the server's bound "
         + "(PEN-3365). statement_timeout and lock_timeout are not set pool-side, so for "
         + "those inherited is effective. Do not read "
