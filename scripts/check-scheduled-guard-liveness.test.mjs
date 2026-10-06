@@ -1997,6 +1997,64 @@ describe("summarize — the unknown clause names the cause it actually measured"
   });
 });
 
+// Ally's review of 112107cd. Three sites in the source build their lookup with
+// `Object.assign(Object.create(null), {…})`, and the file's own comments call
+// the null prototype the thing that makes the fallback real rather than merely
+// intended (`:697`, `:1176`). Nothing held it: rewriting all three to
+// `Object.assign({}, {…})` left the suite at 119/119.
+//
+// The reasons below are the only inputs that can tell the two apart, and that
+// is exactly why the tests that looked like coverage could not fail — the
+// existing `brand-new-reason` probes collide with nothing on the prototype and
+// pass identically with and without the guard.
+//
+// The `summarize` half is not a mistitle but the vanishing failure this job
+// says it exists to prevent. `unknownCauses` skips a reason it considers
+// already phrased, via `reason in UNKNOWN_REASON_CAUSES` (`:718`); against a
+// prototype-bearing map `"constructor" in map` is true, so the `continue`
+// fires, the reason drops out of the clause, and the headline reads an empty
+// `()` while the guard is still counted. That is the map acting as the filter
+// the comment at `:693` rejects by name.
+describe("a reason colliding with Object.prototype still names itself", () => {
+  // Not an exhaustive list of prototype members — two is enough to show the
+  // behaviour is the prototype and not one special-cased string, and they
+  // differ in kind: `constructor` stringifies to `function Object()`,
+  // `toString` to `function toString()`, so a fix that only skipped one would
+  // still fail here.
+  const COLLIDING = ["constructor", "toString"];
+
+  for (const reason of COLLIDING) {
+    it(`summarize names \`${reason}\` in the unknown clause instead of emptying it`, () => {
+      const summary = summarize([{ status: "unknown", reason }]);
+      const causes = summary.headline.match(/could not be assessed \(([^)]*)\)/)?.[1];
+
+      assert.equal(causes, reason, "the reason must reach the clause, not be skipped as already-phrased");
+      assert.notEqual(causes, "", "an empty parenthetical is the vanishing failure, not a cosmetic one");
+      // The count is the half that stays correct under the fault, so asserting
+      // it alone would pass either way. Pinned here only to show the clause and
+      // the accounting agree — the clause is what an operator reads.
+      assert.equal(summary.unknownCount, 1);
+    });
+
+    it(`annotationFor titles an unknown \`${reason}\` with the reason, not the inherited value`, () => {
+      const line = annotationFor({ status: "unknown", reason, detail: "d" });
+
+      assert.match(line, new RegExp(`title=Guard could not be assessed \\(${reason}\\)::`));
+      assert.doesNotMatch(line, /\[native code\]/, "`??` does not fall back when the prototype supplies a value");
+    });
+
+    // The third site. `annotationFor`'s stale branch at `:1198` carries the
+    // same construction and the same fallback, and it reds rather than warns —
+    // so the corrupted title lands on the louder annotation of the two.
+    it(`annotationFor titles a stale \`${reason}\` with the reason, not the inherited value`, () => {
+      const line = annotationFor({ status: "stale", reason, detail: "d" });
+
+      assert.match(line, new RegExp(`title=Scheduled guard is stale \\(${reason}\\)::`));
+      assert.doesNotMatch(line, /\[native code\]/);
+    });
+  }
+});
+
 describe("the run index is not self-consistent across filters (BLO-38286)", () => {
   // Reconstructed from the production false red: run 36692972253,
   // 2026-09-30T08:59Z. `relay-ssl-multicert-guard` was cited at 436h stale and
