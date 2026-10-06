@@ -1686,9 +1686,13 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
   // each found by re-grepping the phrase rather than by re-reading the diff --
   // so assert the class is gone instead of waiting for a sixth site. These
   // three files carry start-lock guidance as live operator/operator-adjacent
-  // instruction, never as quotation. queued-run-stranded.md and this file are
-  // excluded on purpose: both quote the claim in order to withdraw it, which
-  // is the one place it still belongs.
+  // instruction, never as quotation. This file is excluded on purpose: it
+  // quotes the claim in order to withdraw it, which is the one place it still
+  // belongs. queued-run-stranded.md does both, so only its live-instruction
+  // regions are scanned: the step-0 routing blockquote and the fleet-stall
+  // trigger, which a responder reads first. Its BLO-36522 sections stay out
+  // because they quote the claim to withdraw it, and a whole-file scan would
+  // also trip the legitimate socket/await sense further down.
   //
   // Each file is sliced to its start-lock region rather than scanned whole.
   // The phrases are ordinary English, and prometheusrule.yaml is a 909-line
@@ -1709,6 +1713,14 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
     [
       "deploy/helm/paperclip/values.yaml",
       /\n\s+# -- How long a single per-agent start lock may be held[\s\S]*?agentStartLockWedgedRunbookUrl: .*/,
+    ],
+    [
+      "runbooks/queued-run-stranded.md",
+      /\n> [^\n]*\*\*This section's Step 4 restart gate is the ONE-AGENT arm\.\*\*[\s\S]*?(?=\n(?!>)|$)/,
+    ],
+    [
+      "runbooks/queued-run-stranded.md",
+      /\n## Fleet stall: many agents in lockstep \(BLO-36922\)\n[\s\S]*?(?=\n#{2,3} |$)/,
     ],
   ]) {
     const [section] =
@@ -2193,6 +2205,24 @@ test("the start-lock runbook routes its two arms on agent count, not on an alert
   ]) {
     assert.match(text, pattern, message);
   }
+  // Pin each row's arm cell too: the remedy patterns above accept any arm
+  // text. The 2026-09-15/16 episode (6-19 h) was five agents, so it is `>= 3`
+  // evidence, and evidence in neither direction; cited on the below-3 row it
+  // reads as a solo hold that would not end and routes to the Step 4 restart.
+  // The solo hold measured cycled.
+  const [, fleetArm = ""] = routing.match(/\| `>= 3` \| ([^|]*) \|/) ?? [];
+  const [, soloArm = ""] = routing.match(/\| below 3, or no data \| ([^|]*) \|/) ?? [];
+  assert.match(fleetArm, /\*\*self-clears\*\*/, "the `>= 3` row's arm must say the fleet stall self-clears");
+  assert.match(
+    soloArm,
+    /\*\*cycled\*\*[^|]*`Wedged` pages at 4 h only if the abort fails to land/,
+    "the below-3 row's arm must give what was measured for a solo hold: it cycled, and Wedged pages at 4 h only on an unlanded abort",
+  );
+  assert.doesNotMatch(
+    soloArm,
+    /6.19 ?h|2026-09-15/,
+    "the below-3 row's arm must not cite the 2026-09-15/16 episode: it was five agents, so it is `>= 3` evidence, and evidence in neither direction",
+  );
 
   // PEN-3328 made "Wedged pages once per agent past 4h" false, and false in the
   // direction that matters: `paperclip_agent_start_lock_held_seconds` is
