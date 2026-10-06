@@ -1685,6 +1685,143 @@ function resolveFallbackAgentIdMemoized(
 }
 
 /**
+ * Firing passes that completed end to end, keyed
+ * `companyId|fingerprint|startsAt` and valued with the completion time
+ * (BLO-33168).
+ *
+ * In memory, deliberately, and that is the whole design. The obvious
+ * alternative — a field on the stored alert state — cannot be written safely:
+ * a pass is only known complete once `finishAggregateFiring` has returned, and
+ * by then the fence is released, so persisting it there would write state
+ * outside the generation that BLO-31036 requires every state write to carry.
+ * Writing it earlier, under the fence, marks passes complete that later threw.
+ *
+ * Nothing durable is owed here. The cache only ever suppresses *redundant*
+ * work, so losing it on a worker restart costs one repeated pass — i.e. the
+ * pre-BLO-33168 behaviour — and never loses an alert. A restart re-verifying
+ * from scratch is the safe direction.
+ *
+ * Retries land on whichever worker Alertmanager's connection reaches, so this
+ * only collapses the retries that return to the same process. That is the
+ * common case and it is a pure optimization either way.
+ *
+ * ponytail: unbounded-in-principle Map, pruned lazily on write. Entries are
+ * bounded by (distinct firing fingerprints × the TTL), which is small; if that
+ * ever stops being true, swap in an LRU.
+ *
+ * Hung off the context rather than kept as a module global. The worker holds
+ * one `pluginCtx` for its whole lifetime (`worker.ts` `onWebhook`), so in
+ * production the two are the same object — but a module global is shared
+ * across every test case in a file, so one case's committed fingerprint
+ * silently suppresses the next case's first delivery. Per-context isolation
+ * makes that impossible by construction instead of by a `beforeEach` nobody
+ * remembers to add.
+ */
+const firingReplayCommitsByCtx = new WeakMap<object, Map<string, number>>();
+
+function firingReplayCommits(ctx: PluginContext): Map<string, number> {
+  let cache = firingReplayCommitsByCtx.get(ctx);
+  if (!cache) {
+    cache = new Map<string, number>();
+    firingReplayCommitsByCtx.set(ctx, cache);
+  }
+  return cache;
+}
+
+const replayKey = (companyId: string, alert: AlertmanagerAlert): string =>
+  `${companyId}|${alert.fingerprint}|${alert.startsAt}`;
+
+/**
+ * How recently a firing pass must have completed for a replay of the same
+ * firing episode to skip it (BLO-33168).
+ *
+ * The webhook has no partial-ack, so one unprocessable alert fails the whole
+ * delivery and Alertmanager re-sends the entire batch — ~16 times. Without
+ * this, every healthy sibling that already committed on the first pass re-runs
+ * its full issue RPCs and re-claims its aggregate fence on every one of those
+ * retries.
+ *
+ * A retry and a `repeat_interval` re-send are byte-identical — Alertmanager
+ * carries no delivery or attempt id — so elapsed time is the only available
+ * discriminator, and this window is therefore a heuristic rather than an exact
+ * test. It is sized to sit above Alertmanager's retry train (the measured
+ * 2026-09-10 episode ran ~15 retries over 5m22s) and far below any realistic
+ * `repeat_interval` (default 4h; a value under 5m would be pathological).
+ *
+ * Both error directions are bounded, and they are deliberately asymmetric:
+ *   - too short — a late retry redoes idempotent work. That is exactly the
+ *     status quo, so the worst case is no improvement.
+ *   - too long — a genuine re-fire inside the window is skipped. It loses a
+ *     `lastFiredAt` bump (write-only; nothing reads it) and one firing event.
+ *     It cannot stall escalation, which runs off the `check-alert-escalations`
+ *     sweep over issues rather than off the delivery, and it cannot mute an
+ *     alert, because the next re-fire outside the window is processed normally.
+ *
+ * ponytail: wall-clock window, not an exact replay test. If Alertmanager ever
+ * exposes a delivery/attempt id, key on that instead and delete this.
+ */
+const ALERT_REPLAY_SKIP_WINDOW_MS = 5 * 60_000;
+
+/**
+ * Record that a firing pass for this alert completed end to end. Called only
+ * once `finishAggregateFiring` has returned, so a pass that threw anywhere —
+ * including in the fence release — leaves no entry and is retried in full.
+ */
+function markFiringCommitted(
+  ctx: PluginContext,
+  companyId: string,
+  alert: AlertmanagerAlert,
+  nowMs: number,
+): void {
+  const cache = firingReplayCommits(ctx);
+  for (const [key, committedAtMs] of cache) {
+    if (nowMs - committedAtMs >= ALERT_REPLAY_SKIP_WINDOW_MS) {
+      cache.delete(key);
+    }
+  }
+  cache.set(replayKey(companyId, alert), nowMs);
+}
+
+/** Forget a fingerprint's completion, so the next firing delivery is processed. */
+function forgetFiringCommit(
+  ctx: PluginContext,
+  companyId: string,
+  alert: AlertmanagerAlert,
+): void {
+  firingReplayCommits(ctx).delete(replayKey(companyId, alert));
+}
+
+/**
+ * True when a firing pass for this alert's *exact* firing episode completed
+ * inside {@link ALERT_REPLAY_SKIP_WINDOW_MS} — i.e. this delivery is a replay
+ * of work already done.
+ *
+ * Fails closed on anything unexpected: no entry (different episode, different
+ * worker, restarted process, or a resolve that invalidated it) processes
+ * normally, and so does a future-dated entry, which a clock moving backwards
+ * could otherwise make "recent" indefinitely.
+ */
+function firingAlreadyCommitted(
+  ctx: PluginContext,
+  companyId: string,
+  alert: AlertmanagerAlert,
+  nowMs: number,
+): boolean {
+  if (!alert.startsAt) return false;
+  const committedAtMs = firingReplayCommits(ctx).get(replayKey(companyId, alert));
+  if (committedAtMs === undefined) return false;
+  const sinceMs = nowMs - committedAtMs;
+  return sinceMs >= 0 && sinceMs < ALERT_REPLAY_SKIP_WINDOW_MS;
+}
+
+/** Test seam: lets a case age an entry without faking the clock. */
+export function __firingReplayCacheForTests(
+  ctx: PluginContext,
+): Map<string, number> {
+  return firingReplayCommits(ctx);
+}
+
+/**
  * §8.1 — first time we see a fingerprint, create an issue. On re-fire, just
  * bump `lastFiredAt` and re-emit the firing event. On re-fire after a manual
  * close, re-open the existing issue (§8.3 option A).
@@ -1756,6 +1893,36 @@ export async function handleFiring(
     } catch (metricErr) {
       ctx.logger.error(
         `paperclip-plugin-alertmanager: failed to record issue floor metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+    return;
+  }
+
+  // BLO-33168: a replayed delivery must not re-walk fingerprints that already
+  // committed. Deliberately placed AFTER the state read and BEFORE the fence
+  // claim: this is the last point at which the decision is still free, and
+  // returning here skips the claim, the contention wait, the member upsert and
+  // the issue RPCs in one step.
+  //
+  // This does not weaken the retry contract. The batch still fails as a whole
+  // while any alert genuinely cannot be processed — a skip records no failed
+  // fingerprint, so it cannot turn a failing delivery into an HTTP 200 and
+  // cannot reach the BLO-20467 silent-loss class.
+  if (firingAlreadyCommitted(ctx, companyId, alert, Date.parse(nowIso))) {
+    ctx.logger.info(
+      `Alertmanager: ${alertname} (${alert.fingerprint}) already committed for this ` +
+        `firing episode at ${existing?.lastFiredAt}; skipping replayed delivery.`,
+    );
+    try {
+      await ctx.metrics.write("alertmanager.alert.replay_skipped", 1, {
+        alertname,
+        severity,
+      });
+    } catch (metricErr) {
+      // Best-effort, as everywhere else in this file: a metrics outage must not
+      // turn a skip into redundant work, let alone into a failed delivery.
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record replay-skip metric for ${alert.fingerprint}: ${String(metricErr)}`,
       );
     }
     return;
@@ -1878,6 +2045,11 @@ export async function handleFiring(
     );
   }
   const firingToken = firingClaim.token;
+  // BLO-33168: set only where this pass genuinely applied its decision, and
+  // read in the `finally` AFTER the fence release — so a throw from the body or
+  // from the release itself leaves no replay marker and the retry does the work
+  // in full.
+  let firingApplied = false;
 
   try {
     if (existing && existing.paperclipIssueId) {
@@ -2201,6 +2373,14 @@ export async function handleFiring(
       await ctx.state.set(stateRef, updated, {
         fencing: firingFence(companyId, aggregateKey, firingToken),
       });
+      // BLO-33168: eligible for the replay marker only if this pass actually
+      // applied its decision against a readable issue. The predicate is the one
+      // already used for `suppressionAnchor` and `pluginClosureUpdate` directly
+      // above, and for the same reason: a failed `issues.get` or a vanished
+      // issue learned nothing, so the issue-side work is still owed and a later
+      // delivery must do it. Marking those complete would skip the delivery
+      // that re-opens the row (BLO-31736).
+      firingApplied = !(!decisionApplied || decision.kind === "issue_missing");
 
       // Same generation, re-read immediately before dispatch — but an
       // ownership *check*, not a fence, and named accordingly. It stops a
@@ -2509,6 +2689,8 @@ export async function handleFiring(
   await ctx.state.set(stateRef, record, {
     fencing: firingFence(companyId, aggregateKey, firingToken),
   });
+  // BLO-33168: a freshly created issue applied its decision by construction.
+  firingApplied = true;
 
   await ctx.events.emit(
     "alertmanager.alert.firing",
@@ -2558,6 +2740,15 @@ export async function handleFiring(
   });
   } finally {
     await finishAggregateFiring(ctx, companyId, aggregateKey, firingToken);
+    // BLO-33168: reached only when the body AND the fence release both
+    // succeeded — a throw from either skips it, so the retry does the work in
+    // full. Placed after the release precisely because that is the first point
+    // at which the pass is known complete; it writes no persisted state, so
+    // unlike a stored marker it raises no generation-fencing question
+    // (BLO-31036).
+    if (firingApplied) {
+      markFiringCommitted(ctx, companyId, alert, Date.now());
+    }
   }
 }
 
@@ -2644,6 +2835,17 @@ export async function handleResolved(
     );
     return;
   }
+  // BLO-33168: a resolve invalidates any firing-replay marker for this
+  // fingerprint. Deliberately before the state read and the unknown-fingerprint
+  // drop, so it runs even on the paths that return early: the cheap wrong
+  // reading here is to leave a stale marker, which would let a firing delivery
+  // arriving moments later skip the re-open and strand the alert on a closed
+  // issue. Dropping a marker that was not there costs nothing.
+  //
+  // Keyed on `startsAt`, which a resolve carries unchanged from the firing
+  // episode it ends, so this clears the entry that episode created.
+  forgetFiringCommit(ctx, companyId, alert);
+
   const { ref: stateRef, record: stateRecord } = await readAlertState(
     ctx,
     companyId,
