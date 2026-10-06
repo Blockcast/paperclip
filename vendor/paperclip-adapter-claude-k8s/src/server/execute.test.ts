@@ -2545,6 +2545,61 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
     }
   });
 
+  // Ally I1 on #2099 at 2123e158: both early aborts `return` from inside the
+  // create-phase try, whose `finally` only releases the mutex, so the teardown
+  // `finally` that names unowned Secrets never ran on them. Each can carry one:
+  // a created Job with no UID leaves every Secret unpatched, and a throwing
+  // launch ack can follow a refused ownerReference patch.
+  it.each([
+    [
+      "the created Job returns no UID",
+      () => {
+        mockBatchCreateJob.mockResolvedValue({ metadata: {} });
+        return {};
+      },
+    ],
+    [
+      "the launch ack throws after a refused ownerReference patch",
+      () => {
+        mockCorePatchSecret.mockRejectedValue(
+          Object.assign(new Error("secrets is forbidden"), { code: 403 }),
+        );
+        return { onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation ack failed")) };
+      },
+    ],
+  ])("names the unowned Secrets when %s and a pod outlives the abort teardown", async (_path, arrange) => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeletePod.mockResolvedValue({});
+      const onLog = vi.fn().mockResolvedValue(undefined);
+
+      const promise = execute(
+        makeCtx({
+          ...arrange(),
+          onLog,
+          config: { env: { MY_API_KEY: "s3cret" } },
+        } as Partial<AdapterExecutionContext>),
+      );
+      await vi.advanceTimersByTimeAsync(90_000);
+      const result = await promise;
+
+      // Guard against a vacuous pass: this must be an early abort, not the
+      // main teardown whose `finally` already names them.
+      expect(result.errorCode).toBe("k8s_job_identity_unacknowledged");
+      const log = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
+      expect(log).toContain("with no ownerReference, so no GC will ever collect them");
+      const created = mockCoreCreateSecret.mock.calls
+        .map(([arg]: [{ body?: { metadata?: { name?: string } } }]) => arg?.body?.metadata?.name)
+        .filter(Boolean) as string[];
+      expect(created.length).toBeGreaterThan(0);
+      for (const name of created) expect(log).toContain(name);
+      // Still fails closed: naming them is not licence to reap them.
+      expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // Ally Suggestion on #2099 at 09154619: the retention warning was the last
   // `await onLog` on the normal teardown path without a `.catch`. Its
   // `cleanupJob` call sites are all supervised, but one of them is the

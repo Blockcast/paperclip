@@ -2091,8 +2091,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // eslint-disable-next-line prefer-const
   let podLogPath!: string;
   // Run Secrets whose ownerReference patch did not land, so the Job GC that
-  // collects the rest can never reach them.  Named on the retain path below.
+  // collects the rest can never reach them.  Named on every retain path below.
   const unownedSecrets: { name: string; namespace: string }[] = [];
+  // Shared by every path that retains the run Secrets: the teardown `finally`
+  // and both early aborts, which `return` before that `finally` is entered.
+  const warnUnownedSecrets = async (): Promise<void> => {
+    if (unownedSecrets.length === 0) return;
+    await onLog(
+      "stderr",
+      `[paperclip] Warning: retaining ${unownedSecrets.length} Secret(s) for job ${jobName} ` +
+        `with no ownerReference, so no GC will ever collect them; delete by hand once the ` +
+        `pod is gone: ${unownedSecrets.map((s) => s.name).join(", ")}\n`,
+    ).catch(() => undefined);
+  };
   let promptSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let envSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let mcpConfigSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
@@ -2559,7 +2570,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // patch content-type in this file.
     //
     // A Secret whose patch did not land therefore has no collector at all, so
-    // the failures are tracked here and named on the retain path rather than
+    // the failures are tracked here and named on every retain path rather than
     // logged once and forgotten.
     for (const [label, secret] of [
       ["prompt", promptSecret],
@@ -2607,6 +2618,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (!adoptedExistingJob) {
         if (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)) {
           await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+        } else {
+          await warnUnownedSecrets();
         }
       }
       return {
@@ -2632,6 +2645,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (!adoptedExistingJob) {
         if (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)) {
           await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+        } else {
+          await warnUnownedSecrets();
         }
       }
       return {
@@ -2936,18 +2951,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Job GC collects them, and a retained Job's pod must keep its mounts.
     if (podsGone) {
       await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
-    } else if (unownedSecrets.length > 0) {
+    } else {
       // These carry no ownerReference, so the Job GC that eventually collects
       // the rest will never reach them and the adapter has no Secret reaper:
       // they leak until someone deletes them by hand.  Deleting them here is
       // the exact hazard this change exists to stop — a pod that outlived
       // teardown still mounts them — so name them instead of reaping them.
-      await onLog(
-        "stderr",
-        `[paperclip] Warning: retaining ${unownedSecrets.length} Secret(s) for job ${jobName} ` +
-          `with no ownerReference, so no GC will ever collect them; delete by hand once the ` +
-          `pod is gone: ${unownedSecrets.map((s) => s.name).join(", ")}\n`,
-      ).catch(() => undefined);
+      await warnUnownedSecrets();
     }
   }
 
