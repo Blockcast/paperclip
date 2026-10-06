@@ -5606,9 +5606,13 @@ export function setAgentStartLockHeldMetrics(
  * count forever and read as a leak that had plateaued.
  *
  * A `null` snapshot publishes nothing at all, deliberately — see
- * {@link collectFdClassSnapshot}, which returns `null` only where procfs is
- * unreadable. "Cannot measure descriptors here" and "has no descriptors" must
- * not render identically.
+ * {@link collectFdClassSnapshot}, which returns `null` only where there is no
+ * procfs to read (`ENOENT`/`ENOTDIR`). "Cannot measure descriptors here" and
+ * "has no descriptors" must not render identically. An *unreadable* procfs is
+ * not `null`: it arrives as a lone `table-unreadable`
+ * (`FD_CLASS_TABLE_UNREADABLE`) class with value 0, and is published like any
+ * other class — the series' presence is the signal, so this loop must not skip
+ * zero counts.
  */
 export function setFdClassMetrics(snapshot: FdClassSnapshot | null): void {
   const gauge = ensureRegistry().processOpenFdsByClassGauge;

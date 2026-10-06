@@ -448,6 +448,15 @@ describe("setFdClassMetrics (the publish path)", () => {
     expect(await publishedClasses()).toEqual({});
   });
 
+  it("publishes the zero-valued table-unreadable sentinel", async () => {
+    // The sentinel's whole mechanism is that the series is *present* at 0, and
+    // every other test here uses non-zero counts, so a "skip empty classes"
+    // tidy-up in the publish loop would render it as `{}` — identical to the
+    // null snapshot above — with the whole suite still green.
+    setFdClassMetrics({ classes: new Map([[FD_CLASS_TABLE_UNREADABLE, 0]]), total: 0 });
+    expect(await publishedClasses()).toEqual({ [FD_CLASS_TABLE_UNREADABLE]: 0 });
+  });
+
   it("drops the previous scrape's series when procfs becomes unreadable", async () => {
     // The two behaviours interact: `null` must clear as well as publish
     // nothing, or a procfs that stops being readable freezes the last good

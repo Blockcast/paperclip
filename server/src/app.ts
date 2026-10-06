@@ -328,7 +328,10 @@ export async function createApp(
   // (PEN-3305): it reports dispatch sections wedged on the database, so it must
   // not itself need the database to be reachable. `refreshFdClassMetrics`
   // (PEN-3314) joins them on the same terms: procfs is kernel memory, so the
-  // descriptor walk is syscalls without I/O wait.
+  // descriptor walk is syscalls without I/O wait. That alone does not make it
+  // non-blocking (~43 ms at the inspection cap); it is admissible because the
+  // cost is a bounded constant amortised over the scrape interval -- see
+  // fd-class-metrics.ts and scrape-metrics-collector.ts.
   app.get("/metrics", async (_req, res, next) => {
     try {
       expireStaleRefreshFreshness();
