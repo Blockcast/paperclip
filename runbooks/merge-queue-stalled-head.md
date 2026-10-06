@@ -43,10 +43,41 @@ one of these:
    not evidence the constants still hold. At 2 lanes residency ≈
    `position × 34 min`, and at depth 27 that is ~15h.
 
+   Lanes:
+
    ```
    gh api repos/Blockcast/paperclip/rules/branches/master \
      --jq '.[]|select(.type=="merge_queue")|.parameters.max_entries_to_build'
    ```
+
+   Build duration — this is the input that actually moved (`35 → 67.9 min`,
+   +94%, against `1 → 2` lanes), so re-derive it rather than the lane count if
+   you only do one. This is the query the 2026-10-05 figure came from; set
+   `$SINCE` to the last `max_entries_to_build` change (`2026-10-03T22:15:49Z`
+   for the 2-lane change) so the window covers one lane count only:
+
+   ```
+   gh run list --repo Blockcast/paperclip --workflow pr.yml --event merge_group \
+     --status success --json createdAt,startedAt,updatedAt --limit 200 \
+     --jq '[.[]|select(.createdAt>="'"$SINCE"'")
+            |(((.updatedAt|fromdate)-(.startedAt|fromdate))/60)]
+           |sort
+           |if length==0 then "NO BUILDS IN WINDOW — check $SINCE and --limit"
+            else {n:length,median:.[length/2|floor],mean:(add/length)} end'
+   ```
+
+   The empty-window guard is not decoration: without it an empty result set
+   divides by zero and prints `cannot divide: null and number (0)`, which
+   reads as a broken command rather than as "your window selected nothing".
+   `--limit 200` is a cap, not a window — if `n` comes back at or near it,
+   the window is wider than the page and the median is over a prefix.
+
+   `--workflow pr.yml` is load-bearing: two other workflows (`Comment-review
+   gate`, `commitperclip PR Review`) also run on `merge_group` and finish in
+   ~2 min, so an unfiltered query reports a median less than half the real
+   one. Clock from `startedAt`, not `createdAt` — the gap between them is
+   runner wait, which is tracked separately by the stall counter below and is
+   not build duration. Re-run 2026-10-06, n=96: median 68.5, mean 69.4.
 2. **A commit date on `master` is NOT a merge time.** `merge_method: REBASE`
    stamps the commit at *enqueue*, so a commit date lags wall-clock by exactly
    the queue residency. Reading `commits/master` as "last merge" manufactures a
@@ -359,9 +390,12 @@ replacement for it:
      } } }'
    ```
    then filter Actions runs by that exact commit, not by recency:
-   `gh run list --repo Blockcast/paperclip --event merge_group --commit <headCommit.oid> --json databaseId,status,createdAt,headSha`,
+   `gh run list --repo Blockcast/paperclip --event merge_group --commit <headCommit.oid> --json databaseId,status,createdAt,startedAt,headSha`,
    and confirm the returned `headSha` matches `headCommit.oid` before acting
-   on it. Record the PR node ID and the run's `databaseId`. If the run is
+   on it. `startedAt` is in that list so step 3's table is decidable from this
+   one call — it is `gh`'s camelCase spelling of the REST field
+   `run_started_at`, same value, and it is null on a run that never started.
+   Record the PR node ID and the run's `databaseId`. If the run is
    `in_progress` and its per-job timestamps are still advancing, keep
    monitoring — this is a slow but live run, not a stall.
    If no run is returned for that full 40-hex `oid`, that is the dispatch-gap
@@ -379,7 +413,7 @@ replacement for it:
 
    | step 2 found | clock from | trigger at |
    |---|---|---|
-   | run `in_progress`, no job progressed since the step-2 check | **`run_started_at`** | 150 min |
+   | run `in_progress`, no job progressed since the step-2 check | **`run_started_at`** (`gh`: `startedAt`) | 150 min |
    | run `queued`, never started (`run_started_at` is null) | `createdAt` | 150 min — ⚠ margin is thin, see below |
    | no run at all at that `oid` (dispatch gap) | the step-2 check time recorded above | 150 min |
 
@@ -439,9 +473,16 @@ watching. It is not a target. At this repo's observed drain rate (**~1
 merge/36 min**, = 40.0/day, measured over the 80 PRs merged in the 2 days
 after the 2-lane change; the 1-lane baseline was **~1 merge/83 min**, =
 17.3/day, over the 121 PRs merged in the 7 days before it), a single stuck
-head left for the full 6h can cost 6-8 merges' worth of fleet-wide
-throughput. 150 minutes bounds that loss to roughly 2-3 missed merges before
-an SRE intervenes.
+head left for the full 6h costs **`360 ÷ 36 ≈ 10` merges'** worth of
+fleet-wide throughput. 150 minutes bounds that loss to **`150 ÷ 36 ≈ 4`**
+missed merges before an SRE intervenes.
+
+Both loss figures are written as the division that produces them so that the
+next time the drain rate moves, the staleness is visible rather than silent.
+They were previously quoted as "6-8" and "2-3", which were `360 ÷ 45-60` and
+`150 ÷ 45-60` against the superseded rate below and survived the revision
+that replaced it. At the 1.4× higher cost the current rate implies, this
+argues *for* the 150 min threshold over 6h, not against it.
 
 Both rates above are `merged_at` counts over a stated window, which is the
 only methodology this runbook uses for drain — see instrument 2. An earlier
@@ -520,16 +561,39 @@ it was the instruments. That is fixed at the top of this file.
 ### Runner-supply stall counter (the revisit condition above)
 
 The decision flips at **two genuine runner-supply stalls in one month**. Add a
-row rather than re-deriving the count; a stall is only genuine if the
-`merge_group` run was dispatched and sat unable to start for want of a runner
-(`createdAt` → `run_started_at` gap), not merely slow once running.
+row rather than re-deriving the count.
+
+**The counting unit is one row per supply *incident*, not per stalled run.** A
+single eviction re-forms every lane at once, so an N-lane repo turns one
+supply event into N stalled runs; counting runs would make the same incident
+flip the decision faster purely because the lane count went up, which is not
+what the threshold is about. The 2026-10-05 row below is two runs
+(`pr-2228` + `pr-2224`) and counts as **one**.
+
+**A row qualifies when** the `merge_group` run was dispatched and sat unable
+to start for want of a runner — a `createdAt` → `run_started_at` gap of
+**≥ 10 min** — not merely slow once running. The exact floor is not
+load-bearing, because the measured distribution has nothing in the band it
+cuts: over 107 post-change `pr.yml` builds the gap is **exactly 0.0 on 105 of
+them**, and the only two non-zero values are the 113.2 min pair in the row
+below. Any floor between 1 and 110 min selects the same set. Re-measure
+before trusting that — if intermediate values ever appear, the floor becomes
+a real judgement call and wants re-deriving from the new distribution:
+
+```
+gh run list --repo Blockcast/paperclip --workflow pr.yml --event merge_group \
+  --json createdAt,startedAt --limit 300 \
+  --jq '[.[]|select(.createdAt>="'"$SINCE"'")
+         |(((.startedAt|fromdate)-(.createdAt|fromdate))/60)]
+        |sort|{n:length,nonzero:[.[]|select(.>=10)]}'
+```
 
 | date | gap | evidence |
 |---|---:|---|
 | 2026-08-26 | ~3h20m | [BLO-27641](/BLO/issues/BLO-27641) — zero `arc-merge-queue` pods after a listener restart |
 | 2026-10-05 | 113.2 min | `pr-2228` + `pr-2224`, both `createdAt 19:07:44/45Z` → `run_started_at 21:00:53/55Z`; 2-lane cold-start burst, below |
 
-**As of 2026-10-05 that is one occurrence inside the trailing month** (the
+**As of 2026-10-05 that is one incident inside the trailing month** (the
 2026-08-26 row is ~40 days back), so the decision does **not** flip yet. Note
 the hazard rate is now higher than it was when the decision was taken — see
 the mode below — so treat the next occurrence as flipping it rather than
