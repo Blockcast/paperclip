@@ -100,6 +100,32 @@ test('findLastSuccessfulDeploy: an all-skipped history returns null, not a guess
   assert.equal(await findLastSuccessfulDeploy({ client }), null);
 });
 
+test('findLastSuccessfulDeploy: a malformed run is SKIPPED, not allowed to cost the measurement', async () => {
+  // `if (!run?.id || !run?.head_sha) continue` reads as defensive boilerplate,
+  // but it changes the ANSWER rather than merely tidying it. Without it the
+  // scan requests `/actions/runs/undefined/jobs`, and that rejection propagates
+  // straight out of findLastSuccessfulDeploy — so resolveDeliveryGap fails open
+  // and the alert degrades to its pre-PEN-3744 wording. One malformed row would
+  // cost the whole gap figure, which is the exact failure this module exists to
+  // prevent. Skipping the row costs only that row.
+  const client = stubClient({
+    '/actions/workflows/docker.yml/runs': {
+      workflow_runs: [
+        { ...run(7, 'bbbb', '2026-10-01T00:00:00Z'), id: undefined },
+        run(1, 'good', '2026-09-21T16:10:46Z', '2026-09-21T16:38:56Z'),
+      ],
+    },
+    '/actions/runs/1/jobs': jobs(['deploy', 'success']),
+  });
+
+  const last = await findLastSuccessfulDeploy({ client });
+
+  assert.equal(last.headSha, 'good');
+  // The malformed row is never probed — the guard skips it ahead of the fetch,
+  // so there is no `undefined` path for the stub (or the real API) to reject.
+  assert.ok(!client.calls.some((c) => c.includes('/actions/runs/undefined/jobs')));
+});
+
 /**
  * Page-aware runs stub carrying GitHub's REAL offset arithmetic.
  *
