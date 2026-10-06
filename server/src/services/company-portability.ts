@@ -445,8 +445,16 @@ function buildSkillExportDirMap(skills: CompanySkill[], companyIssuePrefix: stri
   return keyToDir;
 }
 
+type WithheldEnvDefaultReason = "sensitive_key" | "credential_shape" | null;
+
 /**
- * Should this env input's `default` be withheld from the exported bundle?
+ * Should this env input's `default` be withheld from the exported bundle, and by which arm?
+ *
+ * Returns the arm that fired rather than a bare boolean. `pushEnvDefaultWarning` has to tell a
+ * sensitive-NAMED key from a credential-SHAPED value to choose its warning, and recovering that
+ * distinction by re-testing the key there would give `isSensitiveEnvKey` a second live call site
+ * that has to be kept in agreement with the one below by hand — tightening the key arm here
+ * without touching the copy there would silently start warning about the wrong keys.
  *
  * PEN-3701. This surface used to carry its own hand-rolled substring denylist over the key name —
  * a second, weaker spelling of `@paperclipai/shared`'s `isSensitiveEnvKey`, sitting in the same
@@ -477,27 +485,36 @@ function buildSkillExportDirMap(skills: CompanySkill[], companyIssuePrefix: stri
  * delete the feature. The fix is to stop this surface owning its own vocabulary, not to remove its
  * predicate.
  */
-function withholdsEnvInputDefault(
+function withheldEnvInputDefaultReason(
   key: string,
   defaultValue: string,
   portability: CompanyPortabilityEnvInput["portability"],
-): boolean {
-  if (isSensitiveEnvKey(key)) return true;
+): WithheldEnvDefaultReason {
+  if (isSensitiveEnvKey(key)) return "sensitive_key";
   // An absolute command path (`/Users/dotta/.local/bin/claude`) is usually all `[A-Za-z0-9/._-]`,
   // so it clears the value heuristic's charset gate and reads as an opaque token. It is already
   // marked `system_dependent`, which is the right reason; withholding it as a credential too would
   // drop a default the export keeps and emit two contradictory warnings for one key.
   // Known ceiling: a benign-named base64 secret that happens to start with "/" also skips the
   // value arm here (the key arm above still applies); add a path-shape test if that ever matters.
-  if (portability === "system_dependent") return false;
-  return isPlausiblySensitiveEnvValue(defaultValue);
+  if (portability === "system_dependent") return null;
+  return isPlausiblySensitiveEnvValue(defaultValue) ? "credential_shape" : null;
 }
 
 /**
- * Why only the value-shape branch warns.
+ * Emit whichever of this surface's two env-default warnings applies — at most one, never both.
  *
- * Not because the two branches export differently — they do not. Either arm of
- * `withholdsEnvInputDefault` yields `kind: "secret"` with an empty `defaultValue`, so the
+ * The three outcomes are mutually exclusive by construction, which is why they are resolved in
+ * one place rather than as two independently guarded pushes: a withheld default did not ship, so
+ * it cannot also have been "exported as system-dependent", and `withheldEnvInputDefaultReason`
+ * returns before its value arm on a `system_dependent` input, so a default that DOES survive can
+ * never also be credential-shaped. Two separate guards can encode that only by agreeing with each
+ * other; one function encodes it structurally.
+ *
+ * Why only the value-shape arm warns when a default is withheld.
+ *
+ * Not because the two arms export differently — they do not. Either arm of
+ * `withheldEnvInputDefaultReason` yields `kind: "secret"` with an empty `defaultValue`, so the
  * classification is identical and the warning marks no difference in what is emitted.
  *
  * What differs is how LEGIBLE the omission is to whoever reads the bundle. A sensitive-NAMED key
@@ -508,19 +525,25 @@ function withholdsEnvInputDefault(
  * self-describing case. Naming the reason is the only signal that separates withheld from absent.
  *
  * Lives here rather than inline because the `plain` and bare-string branches below would otherwise
- * each carry their own copy of this literal and its guard — the exact duplicate-spelling shape
+ * each carry their own copy of both literals and both guards — the exact duplicate-spelling shape
  * this change exists to remove from the key denylist.
  */
-function pushWithheldEnvDefaultWarning(
+function pushEnvDefaultWarning(
   warnings: string[],
   warningPrefix: string,
   key: string,
-  isSensitive: boolean,
+  portability: CompanyPortabilityEnvInput["portability"],
+  reason: WithheldEnvDefaultReason,
 ): void {
-  if (!isSensitive || isSensitiveEnvKey(key)) return;
-  warnings.push(
-    `${warningPrefix} env ${key} default was withheld because its value has the shape of a credential; re-supply it after import.`,
-  );
+  if (reason === "credential_shape") {
+    warnings.push(
+      `${warningPrefix} env ${key} default was withheld because its value has the shape of a credential; re-supply it after import.`,
+    );
+    return;
+  }
+  if (reason === null && portability === "system_dependent") {
+    warnings.push(`${warningPrefix} env ${key} default was exported as system-dependent.`);
+  }
 }
 
 function normalizePortableProjectEnv(value: unknown): AgentEnvConfig | null {
@@ -571,20 +594,17 @@ function extractPortableScopedEnvInputs(
       const portability = defaultValue && isAbsoluteCommand(defaultValue)
         ? "system_dependent"
         : "portable";
-      const isSensitive = withholdsEnvInputDefault(key, defaultValue ?? "", portability);
-      if (portability === "system_dependent" && !isSensitive) {
-        warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
-      }
-      // Warn only on the value-shape branch; see `pushWithheldEnvDefaultWarning`.
-      pushWithheldEnvDefaultWarning(warnings, scope.warningPrefix, key, isSensitive);
+      const withheld = withheldEnvInputDefaultReason(key, defaultValue ?? "", portability);
+      const isWithheld = withheld !== null;
+      pushEnvDefaultWarning(warnings, scope.warningPrefix, key, portability, withheld);
       inputs.push({
         key,
         description: `Optional default for ${key} on ${scope.label}`,
         agentSlug: scope.agentSlug,
         projectSlug: scope.projectSlug,
-        kind: isSensitive ? "secret" : "plain",
+        kind: isWithheld ? "secret" : "plain",
         requirement: "optional",
-        defaultValue: isSensitive ? "" : defaultValue ?? "",
+        defaultValue: isWithheld ? "" : defaultValue ?? "",
         portability,
       });
       continue;
@@ -592,19 +612,17 @@ function extractPortableScopedEnvInputs(
 
     if (typeof binding === "string") {
       const portability = isAbsoluteCommand(binding) ? "system_dependent" : "portable";
-      const isSensitive = withholdsEnvInputDefault(key, binding, portability);
-      if (portability === "system_dependent" && !isSensitive) {
-        warnings.push(`${scope.warningPrefix} env ${key} default was exported as system-dependent.`);
-      }
-      pushWithheldEnvDefaultWarning(warnings, scope.warningPrefix, key, isSensitive);
+      const withheld = withheldEnvInputDefaultReason(key, binding, portability);
+      const isWithheld = withheld !== null;
+      pushEnvDefaultWarning(warnings, scope.warningPrefix, key, portability, withheld);
       inputs.push({
         key,
         description: `Optional default for ${key} on ${scope.label}`,
         agentSlug: scope.agentSlug,
         projectSlug: scope.projectSlug,
-        kind: isSensitive ? "secret" : "plain",
+        kind: isWithheld ? "secret" : "plain",
         requirement: "optional",
-        defaultValue: isSensitive ? "" : binding,
+        defaultValue: isWithheld ? "" : binding,
         portability,
       });
     }
