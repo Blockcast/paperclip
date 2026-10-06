@@ -67,6 +67,9 @@ describe("inherited DB timeout exposition (PEN-3365)", () => {
     // PromQL, dashboards and alert rules; the help string is not read there.
     expect(DB_INHERITED_TIMEOUT_METRIC).toBe("paperclip_db_inherited_timeout_seconds");
     expect(DB_INHERITED_TIMEOUT_METRIC).not.toContain("effective");
+    // The pool series' name is a label value selected in PromQL too, so pin
+    // the literal: renaming the constant must not silently rename the series.
+    expect(POOL_IDLE_IN_TRANSACTION_SERIES).toBe("idle_in_transaction_session_timeout_pool");
   });
 
   it("publishes one series per setting, carrying the attributing source", async () => {
