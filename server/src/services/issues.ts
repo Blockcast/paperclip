@@ -11356,13 +11356,35 @@ export function issueService(db: Db) {
           const readinessMap = await listIssueDependencyReadinessMap(tx, lockedExisting.companyId, [id]);
           const readiness = readinessMap.get(id) ?? createIssueDependencyReadiness(id);
           if (readiness.unresolvedBlockerCount > 0) {
+            // BLO-20385: `unresolvedBlockerCount` conflates two causes with
+            // OPPOSITE remedies, and the payload used to emit neither the
+            // discriminator nor a message that distinguished them:
+            //
+            //   a) a genuinely live blocker (not `done`, or `cancelled`) — the
+            //      edge is real, the refusal is the guard working, do not retry;
+            //   b) a `done` blocker still behind the workspace-finalize barrier
+            //      — the blocker IS finished, the unpark is legitimate, and what
+            //      is wedged is an unfinalized workspace somewhere else.
+            //
+            // The old message asserted (a) unconditionally ("would delete live
+            // dependency edges"), which is factually wrong in case (b) where
+            // every edge points at a `done` issue. Three agents across two lanes
+            // mis-diagnosed a (b) refusal as a stale denormalized count or as an
+            // edge-existence read, and the "mechanism not established" reading
+            // propagated into the fleet instruction bundles. `readiness` has
+            // carried `pendingFinalizeBlockerIssueIds` all along — emit it, and
+            // say which case this is.
+            const pendingFinalizeBlockerIssueIds = readiness.pendingFinalizeBlockerIssueIds;
             throw conflict(
-              "Cannot unpark an issue that still has unresolved blockers: this patch shape clears blockedByIssueIds and would delete live dependency edges",
+              pendingFinalizeBlockerIssueIds.length === readiness.unresolvedBlockerCount
+                ? "Cannot unpark an issue whose blockers are all done but still behind the workspace-finalize barrier: this patch shape clears blockedByIssueIds, and the barrier may still lift. The blockers are not live — see pendingFinalizeBlockerIssueIds"
+                : "Cannot unpark an issue that still has unresolved blockers: this patch shape clears blockedByIssueIds and would delete live dependency edges",
               {
                 issueId: id,
                 reason: "delegate_recovery_unresolved_blockers",
                 unresolvedBlockerCount: readiness.unresolvedBlockerCount,
                 unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+                pendingFinalizeBlockerIssueIds,
               },
             );
           }

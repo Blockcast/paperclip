@@ -8297,6 +8297,10 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
           reason: "delegate_recovery_unresolved_blockers",
           unresolvedBlockerCount: 1,
           unresolvedBlockerIssueIds: [liveBlockerId],
+          // BLO-20385: empty here is half of the discriminating pair — see the
+          // pending-finalize test below, which asserts the same field non-empty
+          // for a refusal with the opposite remedy.
+          pendingFinalizeBlockerIssueIds: [],
         },
       });
 
@@ -8308,6 +8312,51 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         .where(eq(issues.id, dependentId))
         .then((rows) => rows[0] ?? null);
       expect(row?.status).toBe("blocked");
+    });
+
+    // BLO-20385: a `done` blocker can STILL count as unresolved, via the
+    // workspace-finalize barrier in `listIssueDependencyReadinessMap`. That
+    // refusal has the opposite remedy to the live-blocker one above — the
+    // blocker is genuinely finished and what is wedged is an unfinalized
+    // workspace elsewhere — so the payload has to say which case it is.
+    //
+    // Must be staged with a `done` blocker specifically. The sibling tests seed
+    // either zero edges or a live blocker, and both pass whether or not the
+    // discriminator is emitted; this is the only shape that can fail on it.
+    it("names the workspace-finalize barrier when the only unresolved blocker is done-but-unfinalized", async () => {
+      const { companyId, projectId, dependentId, doneBlockerId } = await seedUnparkScenario();
+      const executionWorkspaceId = randomUUID();
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: "Unfinalized blocker workspace",
+      });
+      await db.update(issues).set({ executionWorkspaceId }).where(eq(issues.id, doneBlockerId));
+      // Latest op on the workspace is not a succeeded `workspace_finalize`, and
+      // owes no readable run, so the barrier stays shut rather than releasing.
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        issueId: doneBlockerId,
+        phase: "worktree_prepare",
+        status: "succeeded",
+      });
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      await expect(svc.update(dependentId, { ...unparkPatch })).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining("workspace-finalize barrier"),
+        details: {
+          reason: "delegate_recovery_unresolved_blockers",
+          unresolvedBlockerCount: 1,
+          unresolvedBlockerIssueIds: [doneBlockerId],
+          pendingFinalizeBlockerIssueIds: [doneBlockerId],
+        },
+      });
+      expect(await readBlockedBy(dependentId)).toEqual([doneBlockerId]);
     });
 
     it("refuses when a blocker is committed after the readiness read but before the write", async () => {
