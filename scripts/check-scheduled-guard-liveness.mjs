@@ -672,18 +672,73 @@ const STOPPED_REASONS = new Set(["stopped", "disabled", "never-completed"]);
 const UNREADABLE_REASONS = new Set(["unreadable", "runs-unreadable"]);
 
 /**
+ * Why a guard landed in `unknown`, phrased for the headline.
+ *
+ * TWO live members, not one. `index-inconsistent` (`classifyGuard`, :391) is
+ * the BLO-38286 path — the run index served contradictory counts — and
+ * `unparsable-timestamp` (:508) is a run whose `updated_at` would not parse.
+ * They are different faults in different places, so the clause names the one(s)
+ * this run actually measured instead of asserting a disjunction the run has
+ * already resolved. The headline is the job's last line, so it is what an
+ * operator reads: a clause naming the wrong cause sends them to look for a
+ * malformed timestamp while an index is serving impossible counts. That is the
+ * same defect class the rest of this PR corrects — prose asserting what the
+ * code no longer does — and it shipped here because the clause was a literal
+ * with nothing holding it.
+ *
+ * A reason absent from this map names itself, exactly as `annotationFor`'s
+ * `titles` do, and for the same reason: a bare map would trade one silent
+ * mistitle for another, and an unfamiliar reason printed verbatim is visibly
+ * incomplete rather than plausibly wrong. Null-prototype so a reason named
+ * `constructor` cannot resolve off the prototype.
+ *
+ * NOT the filter, deliberately. `unknown` is still selected on `status`, never
+ * on membership here, so a future reason missing from this map keeps its
+ * accounting in `unknownCount` and loses only its phrasing. Selecting on the
+ * map would let a new reason vanish from the summary entirely, which is the
+ * failure this job exists to prevent rather than a tidier version of it.
+ */
+const UNKNOWN_REASON_CAUSES = Object.assign(Object.create(null), {
+  "index-inconsistent": "the run index disagreed with itself",
+  "unparsable-timestamp": "a run timestamp would not parse",
+});
+
+/**
+ * @param {ReturnType<typeof classifyGuard>[]} unknown results already filtered to `status === "unknown"`
+ * @returns {string[]}
+ */
+function unknownCauses(unknown) {
+  // Declaration order, so a mixed run reads the same way every time rather
+  // than inheriting the order guards happen to be watched in.
+  const causes = Object.keys(UNKNOWN_REASON_CAUSES)
+    .filter((reason) => unknown.some((r) => r.reason === reason))
+    .map((reason) => UNKNOWN_REASON_CAUSES[reason]);
+
+  for (const result of unknown) {
+    if (result.reason in UNKNOWN_REASON_CAUSES) continue;
+    const named = String(result.reason ?? "unspecified");
+    if (!causes.includes(named)) causes.push(named);
+  }
+
+  return causes;
+}
+
+/**
  * @param {ReturnType<typeof classifyGuard>[]} results
  */
 export function summarize(results) {
   const stale = results.filter((r) => r.status === "stale");
   const stopped = stale.filter((r) => STOPPED_REASONS.has(r.reason));
   const unreadable = stale.filter((r) => UNREADABLE_REASONS.has(r.reason));
-  // Unaged, not healthy. The sole member is the unparsable-timestamp case:
-  // `classifyGuard` could not age the run at all, so it declines to assert the
-  // guard stopped, and the headline must not assert the stronger thing, that it
-  // completed. Nothing reaches here by cross-check disagreement any more — that
-  // is an affirmative `ok`/`corroborated` (PEN-3462). They do not redden the
-  // run: exitCode stays keyed on `stale` alone.
+  // Unaged, not healthy. Two members, both live: `unparsable-timestamp`, where
+  // `classifyGuard` could not age the run at all, and `index-inconsistent`,
+  // where the index served impossible counts so every timestamp in the read is
+  // suspect. Neither declines to assert the guard stopped by accident — in both
+  // the evidence is unusable — and the headline must not assert the stronger
+  // thing, that the guard completed. Nothing reaches here by cross-check
+  // disagreement any more — that is an affirmative `ok`/`corroborated`
+  // (PEN-3462). They do not redden the run: exitCode stays keyed on `stale`
+  // alone.
   const unknown = results.filter((r) => r.status === "unknown");
   // Corroborated guards ARE healthy — the cross-check aged their completion
   // against the same bar `fresh` uses (PEN-3462). But the index fault that put
@@ -703,8 +758,9 @@ export function summarize(results) {
     );
   }
   if (unknown.length > 0) {
+    const causes = unknownCauses(unknown).join(", or ");
     clauses.push(
-      `${unknown.length} of ${checked} could not be assessed (a run timestamp would not parse), ` +
+      `${unknown.length} of ${checked} could not be assessed (${causes}), ` +
         `so their liveness is unknown, not asserted healthy`,
     );
   }

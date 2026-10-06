@@ -1865,15 +1865,22 @@ describe("annotationFor — the per-guard index-fault signal is the claim, so it
     );
   });
 
-  // The fallback above was asserted while the one mapped title that actually
-  // ships was not: `unparsable-timestamp` is the sole live `unknown` reason
-  // (classifyGuard, :313), so this is the string an operator really reads and
-  // the fallback is the one that should never fire. Asserting only the
-  // fallback is the inverse of the coverage wanted.
-  it("the one unknown reason that actually ships gets its mapped title", () => {
+  // The fallback above was asserted while the mapped titles that actually ship
+  // were not. Both `unknown` reasons are live — `unparsable-timestamp`
+  // (classifyGuard, :508) and `index-inconsistent` (:391) — so these are the
+  // strings an operator really reads and the fallback is the one that should
+  // never fire. Asserting only the fallback is the inverse of the coverage
+  // wanted. `index-inconsistent` was the half missing here until the Ally
+  // review of c0444d1d, which is also the half the headline clause had
+  // dropped: one unasserted title, two places it went wrong.
+  it("both unknown reasons that actually ship get their mapped titles", () => {
     assert.match(
       annotationFor({ status: "unknown", reason: "unparsable-timestamp", detail: "d" }),
       /title=Unparsable run timestamp::/,
+    );
+    assert.match(
+      annotationFor({ status: "unknown", reason: "index-inconsistent", detail: "d" }),
+      /title=Run index is internally inconsistent — liveness alarm suppressed::/,
     );
   });
 
@@ -1920,6 +1927,73 @@ describe("summarize — the corroborated clause carries severity, not just a cou
 
     assert.match(summary.headline, /the index is faulty/);
     assert.doesNotMatch(summary.headline, /worst index lag/, "null must not render as NaN or -1");
+  });
+});
+
+// Ally's review of c0444d1d. `unknown` has two live members and the clause had
+// been narrowed to one of them, so the headline gave a false diagnosis for the
+// whole BLO-38286 path — and nothing caught it, because the clause was a bare
+// literal: replacing the entire parenthetical with a placeholder left the suite
+// green. These assertions are what make that mutation fail.
+describe("summarize — the unknown clause names the cause it actually measured", () => {
+  const unknown = (reason) => ({ status: "unknown", reason });
+  const causes = (summary) => summary.headline.match(/could not be assessed \(([^)]*)\)/)?.[1];
+
+  it("names the index fault alone when that is the only cause present", () => {
+    const summary = summarize([unknown("index-inconsistent")]);
+
+    assert.equal(causes(summary), "the run index disagreed with itself");
+  });
+
+  it("names the timestamp fault alone when that is the only cause present", () => {
+    const summary = summarize([unknown("unparsable-timestamp")]);
+
+    assert.equal(causes(summary), "a run timestamp would not parse");
+  });
+
+  it("disjoins only when both causes are genuinely present", () => {
+    assert.equal(
+      causes(summarize([unknown("unparsable-timestamp"), unknown("index-inconsistent")])),
+      "the run index disagreed with itself, or a run timestamp would not parse",
+    );
+  });
+
+  it("orders the disjunction by declaration, not by which guard was watched first", () => {
+    // Otherwise the same two faults read two different ways depending on the
+    // order WATCHED_GUARDS happens to list them, and an operator comparing two
+    // runs sees a difference that is not one.
+    const forward = summarize([unknown("unparsable-timestamp"), unknown("index-inconsistent")]);
+    const reversed = summarize([unknown("index-inconsistent"), unknown("unparsable-timestamp")]);
+
+    assert.equal(causes(forward), causes(reversed));
+  });
+
+  // The failure mode this clause shipped with was a reason that reached the
+  // headline and got someone else's explanation. A future third reason must
+  // name itself instead — visibly incomplete beats plausibly wrong, which is
+  // the same rule `annotationFor`'s title fallback follows.
+  it("an unmapped reason names itself rather than borrowing another cause", () => {
+    const summary = summarize([unknown("brand-new-reason")]);
+
+    assert.equal(causes(summary), "brand-new-reason");
+    assert.doesNotMatch(summary.headline, /timestamp would not parse|index disagreed with itself/);
+  });
+
+  it("still counts an unmapped reason — the map phrases the clause, it does not filter", () => {
+    // Selecting `unknown` on map membership would tidy the wording and lose the
+    // guard from the accounting entirely, which is the failure this job exists
+    // to prevent rather than a neater version of it.
+    const summary = summarize([unknown("index-inconsistent"), unknown("brand-new-reason")]);
+
+    assert.equal(summary.unknownCount, 2, "an unfamiliar reason must not drop out of the count");
+    assert.equal(summary.headline.match(/^(\d+) of (\d+)/)?.[0], "0 of 2");
+  });
+
+  it("never renders a missing reason as the word undefined", () => {
+    const summary = summarize([unknown(undefined)]);
+
+    assert.equal(causes(summary), "unspecified");
+    assert.doesNotMatch(summary.headline, /\bundefined\b/);
   });
 });
 
@@ -2089,6 +2163,25 @@ describe("the run index is not self-consistent across filters (BLO-38286)", () =
     assert.equal(summary.exitCode, 0, "a lying index must not red the job");
     assert.equal(summary.unknownCount, 1);
     assert.doesNotMatch(summary.headline, /have stopped executing/);
+    // The headline is the job's final line, so it is the diagnosis an operator
+    // acts on. It named the wrong fault for this whole path until the Ally
+    // review of c0444d1d: the clause had been narrowed to the unparsable
+    // timestamp alone while `index-inconsistent` still reached it, sending an
+    // operator to look for a malformed timestamp when the timestamp parsed
+    // fine and the index was serving impossible counts. Anchored on the
+    // `could not be assessed` clause rather than the bare phrase, because the
+    // `corroborated` clause says "the filtered run index disagreed with
+    // itself" too and would satisfy a loose match from the other verdict.
+    assert.match(
+      summary.headline,
+      /could not be assessed \(the run index disagreed with itself\)/,
+      "the clause must name the fault actually measured, not the other unknown reason",
+    );
+    assert.doesNotMatch(
+      summary.headline,
+      /timestamp would not parse/,
+      "this guard's timestamp parsed fine — naming it is a false diagnosis",
+    );
   });
 
   // THE ARM'S REACHABILITY ENVELOPE, held behaviourally rather than by the
