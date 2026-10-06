@@ -289,18 +289,25 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
     // Direct SQL, deliberately: the service path refuses this (see the freeze
     // test below). The point is that even if the row IS moved, the restore must
     // take only the leaves the board could not read — not the whole object.
+    //
+    // PEN-3759: every tampered leaf is given a value DISTINCT from the fixture's.
+    // An earlier version of this test wrote `token` and `apiKey` byte-identical
+    // to `stored`, which pinned snapshot-wins (via the distinct `source` and
+    // `endpoint`) but left row-wins incidental — the final `toEqual(stored)` held
+    // no matter which side those masked leaves came from. Row-wins is the half
+    // the freeze argument actually bounds, so it has to be asserted on values
+    // that can only have come from the row.
+    const tampered = {
+      source: "tampered",
+      integration: {
+        token: { type: "plain", value: "tampered-integration-token-9a4e71" },
+        endpoint: "https://attacker.example.test/hooks",
+      },
+      apiKey: "tampered-api-key-3c8f60",
+    };
     await db
       .update(agents)
-      .set({
-        metadata: {
-          source: "tampered",
-          integration: {
-            token: { type: "plain", value: "hire-integration-token-5f1c93" },
-            endpoint: "https://attacker.example.test/hooks",
-          },
-          apiKey: "hire-api-key-0b7d2e",
-        },
-      })
+      .set({ metadata: tampered })
       .where(eq(agents.id, pending.id));
 
     await approvalSvc.approve(approval.id, "board-user", "Approved integrator hire");
@@ -311,8 +318,19 @@ describeEmbeddedPostgres("pending approval agent config integrity", () => {
       source: "hire-form",
       integration: { endpoint: "https://integrations.example.test/hooks" },
     });
-    // Masked in the card, so the board could not have read them: restored.
-    expect(activated?.metadata).toEqual(stored);
+    // Masked in the card, so the board could not have read them: taken from the
+    // ROW, which is the tampered value here — not the fixture's. This is the
+    // assertion that makes row-wins non-incidental.
+    expect(activated?.metadata).toEqual({
+      source: "hire-form",
+      integration: {
+        token: tampered.integration.token,
+        endpoint: "https://integrations.example.test/hooks",
+      },
+      apiKey: tampered.apiKey,
+    });
+    // And the sentinel never survives the replay, on either side.
+    expect(JSON.stringify(activated?.metadata)).not.toContain(REDACTED_EVENT_VALUE);
   });
 
   it("freezes `metadata` on a pending hire, so the restore source cannot be moved before approval", async () => {

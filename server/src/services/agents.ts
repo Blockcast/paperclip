@@ -1119,6 +1119,19 @@ export function agentService(db: Db) {
         // credential there is raw plaintext under a caller-chosen key, so the mask
         // is irreversible and the snapshot holds nothing to restore from.
         //
+        // `runtimeConfig` is the third column replayed on this path, and it is
+        // safe by a third mechanism again — not by either of the two above, so do
+        // not read this census as covering it by analogy. `mergeApprovedRuntimeConfig`
+        // starts from the stored row (`{ ...current }`) and `continue`s on any key
+        // whose requested and approved values are `jsonEqual`, so a value the board
+        // did not change keeps its stored form and the mask never lands on it.
+        // The one branch that guard does not cover is below: the merge runs only
+        // when `requestedConfigurationSnapshot.runtimeConfig` is present, and takes
+        // `approvedRuntimeConfig` verbatim otherwise. That is unreachable today —
+        // the sole producer (`routes/agents.ts`) sets it unconditionally in the
+        // snapshot literal — and is recorded here as what that invariant protects,
+        // not as a live defect (PEN-3759).
+        //
         // Restore from the stored row instead, which keeps the tamper control the
         // replay exists for: `restoreRedactedAgentMetadata` rewrites ONLY the
         // sentinel-bearing leaves, so every field the board could actually read in
