@@ -406,6 +406,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: null,
       comments: [allyComment(body, "2026-08-04T21:09:19Z")],
     });
 
@@ -418,6 +419,7 @@ describe("evaluateCommentReviewGate", () => {
     // is reported, not enforced.
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: null,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
         allyComment(
@@ -445,6 +447,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: null,
       comments: [
         allyComment(twoFindings, "2026-08-04T20:09:19Z"),
         allyComment(
