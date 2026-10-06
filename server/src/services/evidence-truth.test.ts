@@ -220,8 +220,8 @@ describe("buildGithubTruthProbe", () => {
   // never evaluated. It survives reverting the clause because Surface 2 never
   // reaches the read — not because the memo makes Surface 2 free. It IS
   // discriminating against a different mutation: moving the suppression up onto
-  // Surface 1's `authorUnknown` read at :283 flips `probeFailed` to `false` and
-  // turns this red. So do not read it as this clause's guard and delete the
+  // Surface 1's `authorUnknown` read at :286-287 flips `probeFailed` to `false`
+  // and turns this red. So do not read it as this clause's guard and delete the
   // blocking-route case below as redundant with it.
   it("an unreadable author on the CARRIED-finding route keeps the red and still reports", async () => {
     const r = await buildGithubTruthProbe(
