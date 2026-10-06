@@ -350,6 +350,26 @@ describe("BLO-39715: chunk-boundary splits", () => {
     expect(carry.take("stdout", "", { flush: true })).toBe("OUT-ONLY");
   });
 
+  it("leaves a needle split ACROSS streams unmatched rather than joining the streams", () => {
+    // Ally (paperclip#2213, Suggestion): the case above proves the carry's keys are separate,
+    // not the property the comment claims. Pinned here because the cheap wrong implementation
+    // — one shared buffer — would pass that case and silently concatenate two transcripts.
+    // Half a secret in each stream is correctly NOT redacted: neither stream ever contains the
+    // value, and masking on a cross-stream join would corrupt bytes the other stream owns.
+    const carry = createRunSecretBoundaryCarry(PLAN.needles);
+    const head = SECRET.slice(0, 12);
+    const tail = SECRET.slice(12);
+
+    carry.take("stdout", head);
+    carry.take("stderr", tail);
+    const out = carry.take("stdout", "", { flush: true });
+    const err = carry.take("stderr", "", { flush: true });
+
+    expect(out).toBe(head);
+    expect(err).toBe(tail);
+    expect(out + err).toBe(SECRET);
+  });
+
   it("emits whole lines only, so per-line classifiers still match what arrived", () => {
     // Ally (paperclip#2213, Critical): the heartbeat excerpt filter and run-liveness anchor
     // per line. Splitting at `len - holdbackChars` emitted every keepalive with its head or
