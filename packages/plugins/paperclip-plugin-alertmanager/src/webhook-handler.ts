@@ -1753,9 +1753,13 @@ const replayKey = (companyId: string, alert: AlertmanagerAlert): string =>
  *     status quo, so the worst case is no improvement.
  *   - too long — a genuine re-fire inside the window is skipped. It loses a
  *     `lastFiredAt` bump (write-only; nothing reads it) and one firing event.
- *     It cannot stall escalation, which runs off the `check-alert-escalations`
- *     sweep over issues rather than off the delivery, and it cannot mute an
- *     alert, because the next re-fire outside the window is processed normally.
+ *     It cannot mute an alert, because the next re-fire outside the window is
+ *     processed normally. Escalation is scheduled by the
+ *     `check-alert-escalations` sweep over issues, but a re-fire can *arm* it:
+ *     a suppression-expiry re-open is decided per delivery and restarts the
+ *     ladder. That is why an operator-suppressed pass never writes the marker
+ *     (see `firingApplied`), so the delivery that crosses the expiry is never
+ *     skipped.
  *
  * ponytail: wall-clock window, not an exact replay test. If Alertmanager ever
  * exposes a delivery/attempt id, key on that instead and delete this.
@@ -2380,7 +2384,20 @@ export async function handleFiring(
       // issue learned nothing, so the issue-side work is still owed and a later
       // delivery must do it. Marking those complete would skip the delivery
       // that re-opens the row (BLO-31736).
-      firingApplied = !(!decisionApplied || decision.kind === "issue_missing");
+      //
+      // `suppressed` is excluded too, for a different reason: it is the one
+      // decision whose successor depends on a wall-clock boundary rather than
+      // on what the delivery carries. Suppression expiry is evaluated only per
+      // delivery, so if it falls inside the replay window a skipped delivery
+      // would miss the `suppression_expired` re-open — leaving the issue
+      // terminal and its ladder frozen until a delivery lands outside the
+      // window, up to one `repeat_interval` later. The branch writes nothing
+      // to the issue, so this gives back only the fence claim, on a rare
+      // population.
+      firingApplied =
+        decisionApplied &&
+        decision.kind !== "issue_missing" &&
+        decision.kind !== "suppressed";
 
       // Same generation, re-read immediately before dispatch — but an
       // ownership *check*, not a fence, and named accordingly. It stops a

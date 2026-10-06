@@ -396,6 +396,61 @@ describe("BLO-33168 — replayed deliveries skip already-committed fingerprints"
     expect(mocks.issues.update).toHaveBeenCalled();
   });
 
+  it("an operator-suppressed pass writes no marker, so an in-window suppression expiry re-opens", async () => {
+    const { ctx, mocks, store } = mkCtx();
+
+    await deliver(ctx, healthyOnly(), "req-8");
+
+    // A human closes the issue while the alert keeps firing. Age the creation
+    // pass's marker out first: that pass legitimately committed, and only the
+    // suppressed pass after it is under test.
+    mocks.issues.get.mockImplementation(async (id: string) => ({
+      id,
+      status: "done",
+      assigneeUserId: null,
+      assigneeAgentId: "agent-fallback",
+    }));
+    shiftCachedCommit(ctx, FP_HEALTHY, -(60 * 60_000));
+    mocks.metrics.write.mockClear();
+
+    await deliver(ctx, healthyOnly(), "req-8-suppressed");
+    expect(metricNames(mocks.metrics.write)).toContain("alertmanager.firing.suppressed");
+
+    // The suppression window elapses between this delivery and its replay —
+    // the expiry instant falls inside the replay window. Backdate the anchor
+    // rather than fake the clock, and assert it matched so a renamed field
+    // cannot turn this into a vacuous pass.
+    let anchors = 0;
+    for (const [key, value] of store) {
+      const record = value as { operatorSuppressedAt?: string | null } | null;
+      if (!record?.operatorSuppressedAt) continue;
+      store.set(key, {
+        ...record,
+        operatorSuppressedAt: new Date(Date.now() - 25 * 60 * 60_000).toISOString(),
+      });
+      anchors += 1;
+    }
+    expect(anchors).toBeGreaterThan(0);
+    mocks.metrics.write.mockClear();
+    mocks.issues.update.mockClear();
+
+    await deliver(ctx, healthyOnly(), "req-8-retry");
+
+    expect(metricNames(mocks.metrics.write)).not.toContain(
+      "alertmanager.alert.replay_skipped",
+    );
+    expect(metricNames(mocks.metrics.write)).toContain(
+      "alertmanager.firing.suppression_expired",
+    );
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ status: "todo" }),
+      COMPANY_ID,
+      undefined,
+      expect.anything(),
+    );
+  });
+
   it("a delivery arriving after the replay window is processed, not skipped", async () => {
     const { ctx, mocks } = mkCtx();
 
