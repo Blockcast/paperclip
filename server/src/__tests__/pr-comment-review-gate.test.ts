@@ -1402,9 +1402,9 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * load-bearing: the pre-existing retirement test above feeds the same two
  * comments and asserts the stronger `{ state: "success", outcome:
  * "not_evaluated" }`, so it catches an unconditional ledger exclusion — but
- * it passes no `prAuthorLogin`, so it does NOT catch the author-threaded form
- * a fix actually reaches for. Only the witness below does; see the per-mutant
- * counts next.
+ * it passes `prAuthorLogin: null`, which no comment author can equal, so it
+ * does NOT catch the author-threaded form a fix actually reaches for. Only the
+ * witness below does; see the per-mutant counts next.
  *
  * WHAT EACH FIXTURE ACTUALLY DETECTS, because "runtime-identical to an
  * existing test" and "detects nothing new" are NOT the same claim and the
@@ -1415,8 +1415,13 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * `carriedFromHeadSha` too), the witness to "lets a later review's ledger
  * disposition a finding from a head it replaced", down to the same two
  * comments and timestamps. But a mutant that READS the author is exactly
- * where they stop being identical, because those pre-existing twins pass no
- * `prAuthorLogin` at all, so an author-reading exclusion never fires on them.
+ * where they stop being identical, because those pre-existing twins pass
+ * `prAuthorLogin: null` while both fixtures here pass `ALLY_BOT_LOGIN`, and an
+ * author-reading exclusion can only fire on a login a comment author actually
+ * carries — never on `null`. That distinction, not the mere presence of the
+ * argument, is what the counts below rest on: the twins carried no argument at
+ * all when these counts were taken, and BLO-38582 later gave them the explicit
+ * `null`, which is inert at the same sites for the same reason.
  * Measured at this head (113 tests), one mutation per run:
  *
  *   placement (1), always-exclude   24 fail — incl. this block's first; the
