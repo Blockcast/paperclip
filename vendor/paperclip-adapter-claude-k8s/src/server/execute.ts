@@ -1712,10 +1712,10 @@ async function deleteJobPodsAndWait(
   const coreApi = getCoreApi(kubeconfigPath);
   const labelSelector = `job-name=${jobName}`;
   const deadline = Date.now() + POD_TEARDOWN_TIMEOUT_MS;
-  // Whether the pods were actually marked for deletion.  The poll cannot tell:
-  // it only sees that pods exist, not that they are Terminating.  The delete is
-  // re-issued on every poll until accepted, so one transient fault heals into
-  // `alive` and `undeleted` means refused for the whole budget.
+  // Whether the most recent poll marked every pod it observed for deletion.
+  // Evaluated per poll rather than latched once: the delete is re-issued every
+  // poll, so one transient fault heals into `alive`, and `undeleted` means
+  // refused right up to the deadline.
   let deleteAccepted = false;
   // The delete error already written to the log, and the most recent one.  They
   // diverge when a transient fault degrades into a persistent one (503 on poll
@@ -1729,16 +1729,63 @@ async function deleteJobPodsAndWait(
   // still leaves us knowing pods were there, which is `alive`, not
   // `unobserved`.  Only a poll that never once succeeded is `unobserved`.
   let lastObserved: number | null = null;
+  // Pods whose delete the API already accepted, so a retry poll does not
+  // re-issue it.  Keyed by name because the delete is now per pod.
+  const deletedPods = new Set<string>();
   while (true) {
-    if (!deleteAccepted) {
-      try {
-        await coreApi.deleteCollectionNamespacedPod({ namespace, labelSelector });
-        deleteAccepted = true;
-      } catch (err) {
-        // A 404 means the namespace, and so its pods, are gone.
-        if (isK8s404(err)) {
-          deleteAccepted = true;
-        } else {
+    // List first — the delete below is per-pod, so it needs the names.
+    let observed: k8s.V1Pod[] | null = null;
+    try {
+      const podList = await coreApi.listNamespacedPod({ namespace, labelSelector });
+      observed = podList?.items ?? [];
+      lastObserved = observed.length;
+    } catch (err) {
+      // Can't observe the pods, so we can't prove they are gone — unless the
+      // namespace itself is gone, in which case they are.
+      if (isK8s404(err)) return "gone";
+      // Log the first non-404 once. A persistent RBAC/5xx failure retries
+      // silently to the deadline and then fails closed on the same path as a
+      // genuinely wedged pod, so without this the two are indistinguishable in
+      // a postmortem — and both leave the Job + Secrets behind.
+      if (!listErrorLogged) {
+        listErrorLogged = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        // `.catch`: see the delete-failure log below — a rejection here unwinds
+        // the cancel-path teardown before the Job is deleted.
+        await onLog(
+          "stderr",
+          `[paperclip] Warning: cannot list pods for job ${jobName} to confirm teardown: ${msg}\n`,
+        ).catch(() => undefined);
+      }
+    }
+    if (lastObserved === 0) return "gone";
+    if (observed !== null) {
+      // Per-pod `delete` over the list result, not one `deleteCollection`:
+      // Role/paperclip-k8s-adapters does not grant `deletecollection` on pods
+      // (SelfSubjectAccessReview from `paperclip:paperclip`, 2026-10-06 —
+      // `deletecollection` false, `delete` true, against a fake-subresource
+      // control reading false).  The collection call was therefore refused on
+      // every poll: every teardown returned `undeleted`, run Secrets were never
+      // deleted, and the cancel path never deleted the Job.
+      let pollAccepted = true;
+      for (const pod of observed) {
+        const name = pod.metadata?.name;
+        if (!name) continue;
+        // Already marked, or already accepted on an earlier poll.  Re-issuing
+        // is pure API load, and skipping it is what the collection-wide
+        // `deleteAccepted` latch this replaces was doing, now per pod.
+        if (pod.metadata?.deletionTimestamp || deletedPods.has(name)) continue;
+        try {
+          await coreApi.deleteNamespacedPod({ name, namespace });
+          deletedPods.add(name);
+        } catch (err) {
+          // A 404 on a *named* pod delete means that one pod is already gone,
+          // which is not a refusal.  Unlike the `deleteCollection`
+          // 404-as-accepted branch this replaces, it cannot fail open: `gone`
+          // is still returned only by a list that observed zero pods, never by
+          // anything the delete call reports.
+          if (isK8s404(err)) continue;
+          pollAccepted = false;
           lastDeleteError = err instanceof Error ? err.message : String(err);
           if (loggedDeleteError === null) {
             loggedDeleteError = lastDeleteError;
@@ -1754,30 +1801,8 @@ async function deleteJobPodsAndWait(
           }
         }
       }
+      deleteAccepted = pollAccepted;
     }
-    try {
-      const podList = await coreApi.listNamespacedPod({ namespace, labelSelector });
-      lastObserved = (podList?.items ?? []).length;
-    } catch (err) {
-      // Can't observe the pods, so we can't prove they are gone — unless the
-      // namespace itself is gone, in which case they are.
-      if (isK8s404(err)) return "gone";
-      // Log the first non-404 once. A persistent RBAC/5xx failure retries
-      // silently to the deadline and then fails closed on the same path as a
-      // genuinely wedged pod, so without this the two are indistinguishable in
-      // a postmortem — and both leave the Job + Secrets behind.
-      if (!listErrorLogged) {
-        listErrorLogged = true;
-        const msg = err instanceof Error ? err.message : String(err);
-        // `.catch`: see the delete-failure log above — a rejection here unwinds
-        // the cancel-path teardown before the Job is deleted.
-        await onLog(
-          "stderr",
-          `[paperclip] Warning: cannot list pods for job ${jobName} to confirm teardown: ${msg}\n`,
-        ).catch(() => undefined);
-      }
-    }
-    if (lastObserved === 0) return "gone";
     if (Date.now() >= deadline) {
       if (lastObserved === null) return "unobserved";
       if (deleteAccepted) return "alive";
@@ -2065,6 +2090,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let namespace!: string;
   // eslint-disable-next-line prefer-const
   let podLogPath!: string;
+  // Run Secrets whose ownerReference patch did not land, so the Job GC that
+  // collects the rest can never reach them.  Named on the retain path below.
+  const unownedSecrets: { name: string; namespace: string }[] = [];
   let promptSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let envSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let mcpConfigSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
@@ -2520,72 +2548,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // because a pod outlived teardown (BLO-35486), this ownerReference is the
     // only thing that will ever collect them; the adapter has no Secret reaper.
     //
-    // These three bodies are JSON Patch arrays, and their Content-Type is
-    // stated explicitly rather than inherited.  The generated client picks the
-    // first entry of its accepted-media-type list via
+    // The patch body is a JSON Patch array, and its Content-Type is stated
+    // explicitly rather than inherited.  The generated client picks the first
+    // entry of its accepted-media-type list via
     // `ObjectSerializer.getPreferredMediaType`, which happens to be
     // `application/json-patch+json` — so the default is load-bearing here, and
-    // a client-version change that reorders that list would break all three
-    // silently.  The adoption write at `createOrAdoptRunSecret` sets its own
-    // MergePatch header, so leaving these implicit would also make them the
-    // only unstated patch content-type in this file.
-    if (promptSecret && createdJobUid) {
-      try {
-        await coreApi.patchNamespacedSecret({
-          name: promptSecret.name,
-          namespace: promptSecret.namespace,
-          body: [
-            {
-              op: "add",
-              path: "/metadata/ownerReferences",
-              value: [
-                {
-                  apiVersion: "batch/v1",
-                  kind: "Job",
-                  name: jobName,
-                  uid: createdJobUid,
-                  blockOwnerDeletion: false,
-                },
-              ],
-            },
-          ],
-        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on prompt Secret: ${msg}\n`);
+    // a client-version change that reorders that list would break it silently.
+    // The adoption write at `createOrAdoptRunSecret` sets its own MergePatch
+    // header, so leaving this implicit would also make it the only unstated
+    // patch content-type in this file.
+    //
+    // A Secret whose patch did not land therefore has no collector at all, so
+    // the failures are tracked here and named on the retain path rather than
+    // logged once and forgotten.
+    for (const [label, secret] of [
+      ["prompt", promptSecret],
+      ["env", envSecret],
+      ["mcp-config", mcpConfigSecret],
+    ] as const) {
+      if (!secret) continue;
+      if (!createdJobUid) {
+        unownedSecrets.push(secret);
+        continue;
       }
-    }
-    if (envSecret && createdJobUid) {
-      try {
-        await coreApi.patchNamespacedSecret({
-          name: envSecret.name,
-          namespace: envSecret.namespace,
-          body: [
-            {
-              op: "add",
-              path: "/metadata/ownerReferences",
-              value: [
-                {
-                  apiVersion: "batch/v1",
-                  kind: "Job",
-                  name: jobName,
-                  uid: createdJobUid,
-                  blockOwnerDeletion: false,
-                },
-              ],
-            },
-          ],
-        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on env Secret: ${msg}\n`);
       }
-    }
-    if (mcpConfigSecret && createdJobUid) {
       try {
         await coreApi.patchNamespacedSecret({
-          name: mcpConfigSecret.name,
-          namespace: mcpConfigSecret.namespace,
+          name: secret.name,
+          namespace: secret.namespace,
           body: [
             {
               op: "add",
@@ -2604,7 +2594,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on mcp-config Secret: ${msg}\n`);
+        unownedSecrets.push(secret);
+        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on ${label} Secret: ${msg}\n`);
       }
     }
     if (!createdJobUid || !onExternalRuntimeLaunched) {
@@ -2945,6 +2936,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Job GC collects them, and a retained Job's pod must keep its mounts.
     if (podsGone) {
       await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+    } else if (unownedSecrets.length > 0) {
+      // These carry no ownerReference, so the Job GC that eventually collects
+      // the rest will never reach them and the adapter has no Secret reaper:
+      // they leak until someone deletes them by hand.  Deleting them here is
+      // the exact hazard this change exists to stop — a pod that outlived
+      // teardown still mounts them — so name them instead of reaping them.
+      await onLog(
+        "stderr",
+        `[paperclip] Warning: retaining ${unownedSecrets.length} Secret(s) for job ${jobName} ` +
+          `with no ownerReference, so no GC will ever collect them; delete by hand once the ` +
+          `pod is gone: ${unownedSecrets.map((s) => s.name).join(", ")}\n`,
+      ).catch(() => undefined);
     }
   }
 

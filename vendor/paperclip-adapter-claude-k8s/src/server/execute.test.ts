@@ -28,7 +28,7 @@ const mockBatchReadJob = vi.fn();
 const mockBatchDeleteJob = vi.fn();
 const mockBatchPatchJob = vi.fn();
 const mockCoreListPods = vi.fn();
-const mockCoreDeleteCollectionPods = vi.fn();
+const mockCoreDeletePod = vi.fn();
 const mockCoreReadPodLog = vi.fn();
 const mockCoreCreateSecret = vi.fn();
 const mockCoreReadSecret = vi.fn();
@@ -72,7 +72,7 @@ vi.mock("./k8s-client.js", () => ({
   }),
   getCoreApi: () => ({
     listNamespacedPod: mockCoreListPods,
-    deleteCollectionNamespacedPod: mockCoreDeleteCollectionPods,
+    deleteNamespacedPod: mockCoreDeletePod,
     readNamespacedPodLog: mockCoreReadPodLog,
     createNamespacedSecret: mockCoreCreateSecret,
     readNamespacedSecret: mockCoreReadSecret,
@@ -675,10 +675,10 @@ describe("execute: concurrency guard", () => {
     }));
     mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
-    // Model the real API: a successful pod deleteCollection makes the pods go
+    // Model the real API: a successful pod delete makes the pods go
     // away, so the BLO-35486 teardown poll observes an empty list. Tests that
     // want the "pod outlived teardown" branch override this.
-    mockCoreDeleteCollectionPods.mockImplementation(async () => {
+    mockCoreDeletePod.mockImplementation(async () => {
       mockCoreListPods.mockResolvedValue({ items: [] });
       return {};
     });
@@ -765,7 +765,7 @@ describe("execute: concurrency guard", () => {
 
     expect(result.errorCode).toBe("k8s_job_create_failed");
     expect(mockBatchDeleteJob).toHaveBeenCalledWith(expect.objectContaining({ name: "ac-job" }));
-    expect(mockCoreDeleteCollectionPods).not.toHaveBeenCalled();
+    expect(mockCoreDeletePod).not.toHaveBeenCalled();
   });
 
   it("deletes stale orphan and proceeds when the run-id lookup is missing", async () => {
@@ -1258,10 +1258,10 @@ describe("execute: job creation", () => {
     vi.resetAllMocks();
     mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
-    // Model the real API: a successful pod deleteCollection makes the pods go
+    // Model the real API: a successful pod delete makes the pods go
     // away, so the BLO-35486 teardown poll observes an empty list. Tests that
     // want the "pod outlived teardown" branch override this.
-    mockCoreDeleteCollectionPods.mockImplementation(async () => {
+    mockCoreDeletePod.mockImplementation(async () => {
       mockCoreListPods.mockResolvedValue({ items: [] });
       return {};
     });
@@ -1712,10 +1712,10 @@ describe("execute: waitForPod edge cases", () => {
     vi.resetAllMocks();
     mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
-    // Model the real API: a successful pod deleteCollection makes the pods go
+    // Model the real API: a successful pod delete makes the pods go
     // away, so the BLO-35486 teardown poll observes an empty list. Tests that
     // want the "pod outlived teardown" branch override this.
-    mockCoreDeleteCollectionPods.mockImplementation(async () => {
+    mockCoreDeletePod.mockImplementation(async () => {
       mockCoreListPods.mockResolvedValue({ items: [] });
       return {};
     });
@@ -2321,7 +2321,7 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
 
   it("deletes the pods, and confirms them gone, before deleting the run Secrets", async () => {
     const order: string[] = [];
-    mockCoreDeleteCollectionPods.mockImplementation(async () => {
+    mockCoreDeletePod.mockImplementation(async () => {
       order.push("deletePods");
       mockCoreListPods.mockResolvedValue({ items: [] });
       return {};
@@ -2338,8 +2338,8 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
     );
 
     expect(result.errorMessage).toContain("Pod startup failed");
-    expect(mockCoreDeleteCollectionPods).toHaveBeenCalledWith(
-      expect.objectContaining({ labelSelector: expect.stringContaining("job-name=") }),
+    expect(mockCoreDeletePod).toHaveBeenCalledWith(
+      expect.objectContaining({ name: expect.any(String), namespace: expect.any(String) }),
     );
     // Reverting the fix drops "deletePods" entirely, so this ordering assertion
     // fails rather than merely weakening.
@@ -2350,7 +2350,7 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
   it("gives a cold image pull 1800s by default, not 600s", async () => {
     vi.useFakeTimers();
     try {
-      mockCoreDeleteCollectionPods.mockImplementation(async () => {
+      mockCoreDeletePod.mockImplementation(async () => {
         mockCoreListPods.mockResolvedValue({ items: [] });
         return {};
       });
@@ -2376,9 +2376,9 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
   it("retains the run Secrets when a pod outlives teardown", async () => {
     vi.useFakeTimers();
     try {
-      // deleteCollection succeeds but the pod never goes away — the kubelet is
+      // the pod delete succeeds but the pod never goes away — the kubelet is
       // still wedged on the pull. Fail closed: the Secret must survive.
-      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      mockCoreDeletePod.mockResolvedValue({});
 
       const promise = execute(
         makeCtx({
@@ -2400,6 +2400,151 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
     }
   });
 
+  // Ally C1 on #2099 at 0dc2e567: `deleteCollectionNamespacedPod` needs the
+  // `deletecollection` verb, which Role/paperclip-k8s-adapters does not grant
+  // (SSAR from `paperclip:paperclip`, 2026-10-06: `deletecollection` false,
+  // `delete` true, fake-subresource control false). Every teardown therefore
+  // returned `undeleted`: Secrets were never deleted and cancel never deleted
+  // the Job. Deleting per pod over the list result needs only `delete`.
+  it("deletes each listed pod by name rather than issuing a collection delete", async () => {
+    vi.useFakeTimers();
+    try {
+      // Same pod shape as `startingPod` — the pod-start wait reads status —
+      // but two of them, which is what a collection delete hides.
+      const named = (name: string) => ({
+        ...startingPod.items[0],
+        metadata: { ...startingPod.items[0].metadata, name },
+      });
+      mockCoreListPods.mockResolvedValue({ items: [named("pod-a"), named("pod-b")] });
+      mockCoreDeletePod.mockImplementation(async () => {
+        mockCoreListPods.mockResolvedValue({ items: [] });
+        return {};
+      });
+
+      const promise = execute(
+        makeCtx({ config: { podStartTimeoutSec: 0 } } as Partial<AdapterExecutionContext>),
+      );
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      // Reverting to a collection delete leaves `deleteNamespacedPod` unused,
+      // so both of these fail rather than merely weakening.
+      expect(mockCoreDeletePod).toHaveBeenCalledWith({ name: "pod-a", namespace: "paperclip" });
+      expect(mockCoreDeletePod).toHaveBeenCalledWith({ name: "pod-b", namespace: "paperclip" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Ally I2 on #2099 at 0dc2e567: the old code read a 404 from the collection
+  // delete as "accepted" for the whole Job and latched it, so one 404 stopped
+  // every later retry and turned a persistently refused delete into `alive` —
+  // which the cancel path treats as licence to delete the Job. Per pod, a 404
+  // means only that one pod is gone and must not launder another's refusal.
+  it("does not let a 404 on one pod's delete launder a refusal on another", async () => {
+    vi.useFakeTimers();
+    try {
+      // `statusCode`, not `code`: isK8s404 reads response.statusCode /
+      // statusCode / the HTTP-Code message, so a `code` field is not a 404 to
+      // it and the whole test would pass vacuously (caught by mutation).
+      const notFound = () => Object.assign(new Error("Not Found"), { statusCode: 404 });
+      const forbidden = () => Object.assign(new Error("pods is forbidden"), { code: 403 });
+      mockCoreListPods.mockResolvedValue({
+        items: [{ metadata: { name: "pod-gone" } }, { metadata: { name: "pod-wedged" } }],
+      });
+      mockCoreDeletePod.mockImplementation(async ({ name }: { name: string }) => {
+        throw name === "pod-gone" ? notFound() : forbidden();
+      });
+      const onLog = vi.fn().mockResolvedValue(undefined);
+
+      const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      // `undeleted`, not `alive`: the refusal survives the sibling 404, so the
+      // cancel path fails closed and leaves the Job (and so its Secrets).
+      expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+      // Guard against a vacuous pass: both pods must actually have been tried.
+      expect(mockCoreDeletePod).toHaveBeenCalledWith({ name: "pod-gone", namespace: "paperclip" });
+      expect(mockCoreDeletePod).toHaveBeenCalledWith({ name: "pod-wedged", namespace: "paperclip" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Ally I2 on #2099 at 0dc2e567, other half: a 404 must never be evidence the
+  // pods are gone. Only a list observing zero pods may return `gone`.
+  it("retries a 404-ing pod delete instead of latching it as accepted", async () => {
+    vi.useFakeTimers();
+    try {
+      // `statusCode`, not `code` — see the sibling 404 test above.
+      const notFound = () => Object.assign(new Error("Not Found"), { statusCode: 404 });
+      mockCoreListPods.mockResolvedValue({
+        items: [{
+          ...startingPod.items[0],
+          metadata: { ...startingPod.items[0].metadata, name: "pod-ghost" },
+        }],
+      });
+      mockCoreDeletePod.mockRejectedValue(notFound());
+
+      const promise = execute(
+        makeCtx({
+          config: { podStartTimeoutSec: 0, env: { MY_API_KEY: "s3cret" } },
+        } as Partial<AdapterExecutionContext>),
+      );
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      // The list never showed zero, so the run Secrets are retained however
+      // the delete answered. Latching the 404 as accepted reaped them.
+      expect(mockCoreCreateSecret).toHaveBeenCalled();
+      expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+      expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Ally I3 on #2099 at 0dc2e567: the ownerReference patch failures were logged
+  // and dropped. A Secret whose patch did not land has no owner, so the Job GC
+  // that eventually collects its siblings never reaches it and the adapter has
+  // no Secret reaper — it leaks silently. Deleting it here is the exact hazard
+  // this change exists to stop, so it is named instead.
+  it("names a Secret whose ownerReference patch failed when a pod outlives teardown", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeletePod.mockResolvedValue({});
+      mockCorePatchSecret.mockRejectedValue(
+        Object.assign(new Error("secrets is forbidden"), { code: 403 }),
+      );
+      const onLog = vi.fn().mockResolvedValue(undefined);
+
+      const promise = execute(
+        makeCtx({
+          onLog,
+          config: { podStartTimeoutSec: 0, env: { MY_API_KEY: "s3cret" } },
+        } as Partial<AdapterExecutionContext>),
+      );
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      const log = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
+      expect(log).toContain("with no ownerReference, so no GC will ever collect them");
+      // Guard against a vacuous pass: a Secret must exist, and the escalation
+      // must name it rather than just counting.
+      expect(mockCoreCreateSecret).toHaveBeenCalled();
+      const created = mockCoreCreateSecret.mock.calls
+        .map(([arg]: [{ body?: { metadata?: { name?: string } } }]) => arg?.body?.metadata?.name)
+        .filter(Boolean) as string[];
+      expect(created.length).toBeGreaterThan(0);
+      for (const name of created) expect(log).toContain(name);
+      // Still fails closed: naming them is not licence to reap them.
+      expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // Ally Suggestion on #2099 at 09154619: the retention warning was the last
   // `await onLog` on the normal teardown path without a `.catch`. Its
   // `cleanupJob` call sites are all supervised, but one of them is the
@@ -2410,7 +2555,7 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
     try {
       // Same shape as the retention test above: the pod outlives teardown, so
       // the warning fires.
-      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      mockCoreDeletePod.mockResolvedValue({});
 
       let retentionLogged = false;
       const promise = execute(
@@ -2447,7 +2592,7 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
       // The delete is refused for the whole budget while the list keeps seeing
       // the pod (the beforeEach default): `undeleted`. Nothing is Terminating,
       // so there is no GC to defer to.
-      mockCoreDeleteCollectionPods.mockRejectedValue(
+      mockCoreDeletePod.mockRejectedValue(
         Object.assign(new Error("pods is forbidden"), { code: 403 }),
       );
 
@@ -2478,7 +2623,7 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
   it("omits the retain-cost clause when the pod delete was accepted", async () => {
     vi.useFakeTimers();
     try {
-      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      mockCoreDeletePod.mockResolvedValue({});
 
       const ctx = makeCtx({
         config: { podStartTimeoutSec: 0, env: { MY_API_KEY: "s3cret" } },
@@ -2501,11 +2646,11 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
   it("logs once when it cannot list pods to confirm teardown", async () => {
     vi.useFakeTimers();
     try {
-      // deleteCollection succeeds, then the list API starts refusing. The
+      // the pod delete succeeds, then the list API starts refusing. The
       // teardown poll can no longer prove the pods are gone, so it retries to
       // the deadline and fails closed — on exactly the same path as a genuinely
       // wedged pod. The log line is the only thing that tells them apart.
-      mockCoreDeleteCollectionPods.mockImplementation(async () => {
+      mockCoreDeletePod.mockImplementation(async () => {
         mockCoreListPods.mockRejectedValue(
           Object.assign(new Error("pods is forbidden"), { code: 403 }),
         );
@@ -2546,7 +2691,7 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
   ])("leaves retained Secrets owned by the Job when %s and a pod outlives teardown", async (_label, ack) => {
     vi.useFakeTimers();
     try {
-      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      mockCoreDeletePod.mockResolvedValue({});
 
       const promise = execute(
         makeCtx({
@@ -2590,7 +2735,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
   it("deletes the pods, and confirms them gone, before deleting the Job", async () => {
     const order: string[] = [];
     mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-pulling" } }] });
-    mockCoreDeleteCollectionPods.mockImplementation(async () => {
+    mockCoreDeletePod.mockImplementation(async () => {
       order.push("deletePods");
       mockCoreListPods.mockResolvedValue({ items: [] });
       return {};
@@ -2599,8 +2744,8 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
 
     await teardownCancelledJob("paperclip", "ac-job", vi.fn().mockResolvedValue(undefined));
 
-    expect(mockCoreDeleteCollectionPods).toHaveBeenCalledWith(
-      expect.objectContaining({ labelSelector: "job-name=ac-job" }),
+    expect(mockCoreDeletePod).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "pod-pulling", namespace: "paperclip" }),
     );
     // Reverting to a bare deleteNamespacedJob drops "deletePods" entirely, so
     // this fails rather than merely weakening.
@@ -2618,14 +2763,14 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
       // the fail-open sound. Keep it green — over-correcting the `unobserved`
       // fix into a blanket fail-closed reintroduces the hang.
       mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
-      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      mockCoreDeletePod.mockResolvedValue({});
       const onLog = vi.fn().mockResolvedValue(undefined);
 
       const promise = teardownCancelledJob("paperclip", "ac-job", onLog);
       await vi.advanceTimersByTimeAsync(90_000);
       await promise;
 
-      expect(mockCoreDeleteCollectionPods).toHaveBeenCalled();
+      expect(mockCoreDeletePod).toHaveBeenCalled();
       expect(mockBatchDeleteJob).toHaveBeenCalled();
       const warning = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
       expect(warning).toContain("still present after 60s");
@@ -2639,7 +2784,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
   // still there" and "I could not look" arrived as the same `false`. The
   // fail-open above then applied to both — but in the could-not-observe branch
   // the pod delete may never have been issued at all (a non-404
-  // deleteCollection failure is swallowed and falls through to the poll), so
+  // pod-delete failure is swallowed and falls through to the poll), so
   // deleting the Job reaps the run Secrets via ownerReference GC under a pod
   // that can still start. That is BLO-35486's defect on the cancel path.
   it("retains the Job when it cannot observe the pods and the pod delete never landed", async () => {
@@ -2647,7 +2792,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
     try {
       // One apiserver fault denying both verbs: RBAC on pods, or a 5xx.
       const forbidden = () => Object.assign(new Error("pods is forbidden"), { code: 403 });
-      mockCoreDeleteCollectionPods.mockRejectedValue(forbidden());
+      mockCoreDeletePod.mockRejectedValue(forbidden());
       mockCoreListPods.mockRejectedValue(forbidden());
       const onLog = vi.fn().mockResolvedValue(undefined);
 
@@ -2656,7 +2801,12 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
       await promise;
 
       // Guard against a vacuous pass: the teardown must actually have tried.
-      expect(mockCoreDeleteCollectionPods).toHaveBeenCalled();
+      // The guard is on the *list*, not the delete: the delete is per pod, so
+      // a list that never succeeds yields no pod names to delete and the
+      // delete is correctly never reached. That is `unobserved`, which fails
+      // closed on the same path.
+      expect(mockCoreListPods).toHaveBeenCalled();
+      expect(mockCoreDeletePod).not.toHaveBeenCalled();
       expect(mockBatchDeleteJob).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
@@ -2664,14 +2814,14 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
   });
 
   // Ally review on #2116: a successful list is not evidence the delete landed.
-  // `list` and `deletecollection` are separate verbs; a Role granting pods
-  // `list` but not `deletecollection` (or a 5xx on the delete alone) sees a pod
+  // `list` and `delete` are separate verbs; a Role granting pods
+  // `list` but not `delete` (or a 5xx on the delete alone) sees a pod
   // that was never marked Terminating. Failing open there reaps the run
   // Secrets under a pod that can still start, the same defect as above.
   it("retains the Job when the pod delete is refused even though the list sees the pod", async () => {
     vi.useFakeTimers();
     try {
-      mockCoreDeleteCollectionPods.mockRejectedValue(
+      mockCoreDeletePod.mockRejectedValue(
         Object.assign(new Error("pods is forbidden"), { code: 403 }),
       );
       mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-live" } }] });
@@ -2688,7 +2838,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
       expect(warning).toContain("the pod delete was refused");
       expect(warning).toContain("leaving the Job");
       // The delete is retried every poll but reported once, not once per 2s.
-      expect(mockCoreDeleteCollectionPods.mock.calls.length).toBeGreaterThan(1);
+      expect(mockCoreDeletePod.mock.calls.length).toBeGreaterThan(1);
       expect(warning.split("failed to delete pods for job").length - 1).toBe(1);
     } finally {
       vi.useRealTimers();
@@ -2702,7 +2852,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
   it("retries a refused pod delete, so one transient fault still fails open", async () => {
     vi.useFakeTimers();
     try {
-      mockCoreDeleteCollectionPods
+      mockCoreDeletePod
         .mockRejectedValueOnce(Object.assign(new Error("service unavailable"), { code: 503 }))
         .mockResolvedValue({});
       mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
@@ -2713,7 +2863,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
       await promise;
 
       // Retried once, then left alone once accepted.
-      expect(mockCoreDeleteCollectionPods).toHaveBeenCalledTimes(2);
+      expect(mockCoreDeletePod).toHaveBeenCalledTimes(2);
       expect(mockBatchDeleteJob).toHaveBeenCalled();
       const warning = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
       expect(warning).toContain("deleting the Job anyway");
@@ -2730,7 +2880,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
   it("treats a late list failure after a good read as observed-alive, not could-not-observe", async () => {
     vi.useFakeTimers();
     try {
-      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      mockCoreDeletePod.mockResolvedValue({});
       let listCalls = 0;
       mockCoreListPods.mockImplementation(async () => {
         if (++listCalls > 3) throw Object.assign(new Error("pods is forbidden"), { code: 403 });
@@ -2773,11 +2923,11 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
     };
     try {
       const alive = await warningsFor(() => {
-        mockCoreDeleteCollectionPods.mockResolvedValue({});
+        mockCoreDeletePod.mockResolvedValue({});
         mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
       });
       const unobserved = await warningsFor(() => {
-        mockCoreDeleteCollectionPods.mockResolvedValue({});
+        mockCoreDeletePod.mockResolvedValue({});
         mockCoreListPods.mockRejectedValue(
           Object.assign(new Error("pods is forbidden"), { code: 403 }),
         );
@@ -2803,7 +2953,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
     vi.useFakeTimers();
     try {
       // One transient refusal, then accepted → `alive` → the Job is deleted.
-      mockCoreDeleteCollectionPods
+      mockCoreDeletePod
         .mockRejectedValueOnce(Object.assign(new Error("service unavailable"), { code: 503 }))
         .mockResolvedValue({});
       mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
@@ -2829,7 +2979,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
   it("still returns when onLog rejects while logging a Job-delete failure", async () => {
     vi.useFakeTimers();
     try {
-      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      mockCoreDeletePod.mockResolvedValue({});
       mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
       mockBatchDeleteJob.mockRejectedValue(
         Object.assign(new Error("jobs is forbidden"), { code: 403 }),
@@ -2853,7 +3003,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
     try {
       // Good reads, then the list starts refusing: `lastObserved` survives, so
       // the outcome is `alive` and the Job must still be deleted.
-      mockCoreDeleteCollectionPods.mockResolvedValue({});
+      mockCoreDeletePod.mockResolvedValue({});
       let listCalls = 0;
       mockCoreListPods.mockImplementation(async () => {
         if (++listCalls > 3) throw Object.assign(new Error("pods is forbidden"), { code: 403 });
@@ -2881,7 +3031,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
   it("logs the final delete error at the deadline when the cause changed", async () => {
     vi.useFakeTimers();
     try {
-      mockCoreDeleteCollectionPods
+      mockCoreDeletePod
         .mockRejectedValueOnce(Object.assign(new Error("service unavailable"), { code: 503 }))
         .mockRejectedValue(Object.assign(new Error("pods is forbidden"), { code: 403 }));
       mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
@@ -2893,7 +3043,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
 
       const log = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
       // Guard against a vacuous pass: the degradation must actually have happened.
-      expect(mockCoreDeleteCollectionPods.mock.calls.length).toBeGreaterThan(1);
+      expect(mockCoreDeletePod.mock.calls.length).toBeGreaterThan(1);
       expect(log).toContain("service unavailable");
       expect(log).toContain("still refused at the teardown deadline: pods is forbidden");
       // The deadline line is emitted once, not once per 2s poll.
@@ -2909,7 +3059,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
   it("still returns when onLog rejects while logging the deadline delete error", async () => {
     vi.useFakeTimers();
     try {
-      mockCoreDeleteCollectionPods
+      mockCoreDeletePod
         .mockRejectedValueOnce(Object.assign(new Error("service unavailable"), { code: 503 }))
         .mockRejectedValue(Object.assign(new Error("pods is forbidden"), { code: 403 }));
       mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
@@ -2921,7 +3071,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
 
       // Guard against a vacuous pass: the cause must actually have changed, or
       // the deadline line is never reached and the test proves nothing.
-      expect(mockCoreDeleteCollectionPods.mock.calls.length).toBeGreaterThan(1);
+      expect(mockCoreDeletePod.mock.calls.length).toBeGreaterThan(1);
       // `undeleted` fails closed: the Job stays.
       expect(mockBatchDeleteJob).not.toHaveBeenCalled();
     } finally {
@@ -2935,7 +3085,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
   it("does not re-log an unchanged delete error at the deadline", async () => {
     vi.useFakeTimers();
     try {
-      mockCoreDeleteCollectionPods.mockRejectedValue(
+      mockCoreDeletePod.mockRejectedValue(
         Object.assign(new Error("pods is forbidden"), { code: 403 }),
       );
       mockCoreListPods.mockResolvedValue({ items: [{ metadata: { name: "pod-wedged" } }] });
@@ -2946,7 +3096,7 @@ describe("teardownCancelledJob: external-cancel path (BLO-35486)", () => {
       await promise;
 
       const log = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
-      expect(mockCoreDeleteCollectionPods.mock.calls.length).toBeGreaterThan(1);
+      expect(mockCoreDeletePod.mock.calls.length).toBeGreaterThan(1);
       expect(log).toContain("failed to delete pods for job");
       expect(log).not.toContain("still refused at the teardown deadline");
     } finally {
@@ -2970,10 +3120,10 @@ describe("execute: concurrency guard — multiple orphans", () => {
       json: async () => ({ id: "prior-run", status: "running", startedAt: new Date().toISOString() }),
     }));
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
-    // Model the real API: a successful pod deleteCollection makes the pods go
+    // Model the real API: a successful pod delete makes the pods go
     // away, so the BLO-35486 teardown poll observes an empty list. Tests that
     // want the "pod outlived teardown" branch override this.
-    mockCoreDeleteCollectionPods.mockImplementation(async () => {
+    mockCoreDeletePod.mockImplementation(async () => {
       mockCoreListPods.mockResolvedValue({ items: [] });
       return {};
     });
@@ -3053,10 +3203,10 @@ describe("execute: per-agent creation mutex prevents TOCTOU race", () => {
     vi.resetAllMocks();
     mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
-    // Model the real API: a successful pod deleteCollection makes the pods go
+    // Model the real API: a successful pod delete makes the pods go
     // away, so the BLO-35486 teardown poll observes an empty list. Tests that
     // want the "pod outlived teardown" branch override this.
-    mockCoreDeleteCollectionPods.mockImplementation(async () => {
+    mockCoreDeletePod.mockImplementation(async () => {
       mockCoreListPods.mockResolvedValue({ items: [] });
       return {};
     });
