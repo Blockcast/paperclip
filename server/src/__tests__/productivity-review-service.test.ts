@@ -6216,7 +6216,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     // counter. Without this, the test passes on a change that strips
     // `issueRunScopeSql` from `countIssueRunsSince` too — the cross-scope run
     // sits 3h back, so a loosened runs query would read `1/6h` here.
-    expect(description).toContain("Runs in rolling windows: 0/1h, 0/6h");
+    expect(description).toContain("Dispatched runs in rolling windows: 0/1h, 0/6h");
   });
 
   // BLO-35893, the other direction. The widened count is for the reported line
