@@ -280,9 +280,12 @@ describe("agent inbox-lite truncation signal (BLO-39015)", () => {
  *   - drop the `req.query.limit !== undefined` 400 -> both `limit` cases fail
  *     (BLO-40714);
  *   - move that `limit` check into `parseUnsupportedPaginationParams` instead
- *     -> these pass, but the `limit` negative control in
- *     issue-list-truncation-signal.test.ts fails. That is the pair: this file
- *     pins the rejection, that one pins the sibling endpoint keeping `limit`;
+ *     -> these pass, and issue-list-truncation-signal.test.ts goes red: 11
+ *     cases, because the sibling endpoint is paged BY `limit` throughout. The
+ *     one added for this (`still honours a caller-supplied limit`) is not the
+ *     only case that catches a blanket harmonisation — it is the one that
+ *     catches a PARTIAL one (reject `limit` only below the cap, say, which
+ *     every pre-existing case sends) and the one that says why in its name;
  *   - drop the `parseOffsetParam === null` 400 -> both rejection cases fail;
  *   - pass a literal `0` instead of `parsedOffset` -> the paging case fails;
  *   - weaken `parseOffsetParam`'s `Number.isSafeInteger` to `Number.isFinite`
