@@ -1688,6 +1688,13 @@
       "when": 1789900200000,
       "tag": "0249_github_commit_status_deliveries_reevaluate",
       "breakpoints": true
+    },
+    {
+      "idx": 252,
+      "version": "7",
+      "when": 1790875351921,
+      "tag": "0252_repair_exit_zero_timeouts_after_adapter_migration",
+      "breakpoints": true
     }
   ]
 }
