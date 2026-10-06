@@ -15,11 +15,15 @@ import test from "node:test";
 //   packages/services/designer/package-lock.json  -> express 5.x -> proxy-addr
 //
 // `express@5.2.1` declares `proxy-addr: ^2.0.7`, a range that already admits
-// 2.0.8 — so the pnpm override pins the floor rather than making it reachable.
-// It stops a future resolution drifting back down to 2.0.7 while that version
-// is still the one most of the ecosystem's integrity hashes point at. The
-// designer lockfile has no override mechanism; npm resolved it directly, so
-// the only thing that proves it took is what the lockfile resolved.
+// 2.0.8 — so an override pins the floor rather than making it reachable. It
+// stops a future resolution drifting back down to 2.0.7 while that version is
+// still the one most of the ecosystem's integrity hashes point at. Both
+// manifests carry one: `pnpm.overrides` in the root `package.json`, and npm's
+// own `overrides` in `packages/services/designer/package.json` — the same
+// mechanism that package already uses for `fast-uri`. Both are asserted here,
+// because without the declarative floor a re-resolution could legitimately
+// land back inside the advisory range and this guard would be the only thing
+// standing in the way, catching it after the fact rather than preventing it.
 //
 // The surviving `"proxy-addr": "^2.0.7"` range string in the designer lockfile
 // is express's own constraint, not a resolution. It is correct for it to stay,
@@ -33,7 +37,13 @@ const PATCHED_FLOOR = ">=2.0.8 <3";
 // the common case would report green on it.
 function assertPatched(versions, where) {
   assert.ok(versions.length > 0, `${where}: no proxy-addr resolution found`);
-  for (const [major, minor, patch] of versions) {
+  for (const { major, minor, patch, prerelease } of versions) {
+    // semver orders a prerelease BELOW its own release, so 2.0.8-beta.1 is
+    // inside `< 2.0.8` and must not pass on its numeric triple alone.
+    assert.ok(
+      !prerelease,
+      `${where} resolved prerelease proxy-addr ${major}.${minor}.${patch}${prerelease} (sorts below ${major}.${minor}.${patch}, i.e. inside GHSA-jqcg-44mw-7w3h)`,
+    );
     assert.ok(
       major > 2 || (major === 2 && (minor > 0 || patch >= 8)),
       `${where} resolved vulnerable proxy-addr ${major}.${minor}.${patch} (GHSA-jqcg-44mw-7w3h affects >= 1.1.0 < 2.0.8)`,
@@ -69,19 +79,39 @@ test("proxy-addr resolves above the GHSA-jqcg-44mw-7w3h floor", async () => {
 
   // Two spaces then a bare `proxy-addr@`: top-level package keys only, in both
   // the `packages:` and `snapshots:` sections. Requiring `:` or `(` after the
-  // version keeps a peer-suffixed key checked rather than silently skipped.
+  // version keeps a peer-suffixed key checked rather than silently skipped,
+  // and capturing the prerelease suffix keeps it checked rather than parsed
+  // away — see the prerelease assertion in assertPatched.
   const resolutions = [
-    ...lockfile.matchAll(/^ {2}'?proxy-addr@(\d+)\.(\d+)\.(\d+)[^\n]*?(?=[:(])/gm),
+    ...lockfile.matchAll(
+      /^ {2}'?proxy-addr@(\d+)\.(\d+)\.(\d+)(-[^\n:(]*)?[^\n]*?(?=[:(])/gm,
+    ),
   ];
   assertPatched(
-    resolutions.map((m) => m.slice(1).map(Number)),
+    resolutions.map((m) => ({
+      major: Number(m[1]),
+      minor: Number(m[2]),
+      patch: Number(m[3]),
+      prerelease: m[4],
+    })),
     "pnpm-lock.yaml",
   );
 });
 
 test("the designer npm lockfile resolves above the same floor", async () => {
   const designerPath = "packages/services/designer/package-lock.json";
+  const designerPkgPath = "packages/services/designer/package.json";
   const designer = JSON.parse(await readFile(designerPath, "utf8"));
+  const designerPkg = JSON.parse(await readFile(designerPkgPath, "utf8"));
+
+  // Prevention, not just detection: without this npm `overrides` entry the
+  // floor lives only in the lockfile, and express's own `^2.0.7` range still
+  // admits the vulnerable 2.0.7 on any re-resolution.
+  assert.equal(
+    designerPkg.overrides["proxy-addr"],
+    PATCHED_FLOOR,
+    `${designerPkgPath} overrides disagrees with the pnpm floor`,
+  );
 
   // Positive control, same reasoning as above: npm v3 lockfiles key resolved
   // packages under `packages`, and an empty or restructured file would make
@@ -99,12 +129,16 @@ test("the designer npm lockfile resolves above the same floor", async () => {
   const versions = Object.entries(designer.packages)
     .filter(([key]) => key === "proxy-addr" || key.endsWith("/proxy-addr"))
     .map(([key, entry]) => {
-      assert.match(
+      const parsed = /^(\d+)\.(\d+)\.(\d+)(-[\w.+-]*)?$/.exec(
         entry.version ?? "",
-        /^\d+\.\d+\.\d+/,
-        `${designerPath}: ${key} has no resolved version`,
       );
-      return entry.version.split(".").slice(0, 3).map(Number);
+      assert.ok(parsed, `${designerPath}: ${key} has no resolved version`);
+      return {
+        major: Number(parsed[1]),
+        minor: Number(parsed[2]),
+        patch: Number(parsed[3]),
+        prerelease: parsed[4],
+      };
     });
 
   assertPatched(versions, designerPath);
