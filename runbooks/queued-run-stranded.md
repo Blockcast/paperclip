@@ -553,7 +553,7 @@ reach the second one.
 
 Two claims this section used to make were falsified on 2026-09-25:
 
-- *"It does not self-heal."* The 7-day maximum hold — 8043s (2h14m), three
+- *"It does not self-heal."* The 7-day maximum hold to 2026-09-25 — 8043s (2h14m), three
   agents in lockstep — released on its own at 2026-09-24T03:15Z while the
   **same** `paperclip-0` process, up since 09-21T16:33Z, kept running for a
   further **7.75 h**. No restart. The routine case behaves the same way: the
@@ -992,7 +992,7 @@ That shape pages as `PaperclipAgentStartLockFleetStall` (same expr, `for: 10m`),
 one page per episode. It landed in `Blockcast/onprem-k8s` #4036 (BLO-35571) and
 is absent from this chart. The onprem-k8s `PaperclipAgentStartLockWedged`
 (`> 14400`, 4 h) cannot fire on this shape as measured: the 7-day maximum
-hold was 8043s (2h14m). Even past 4 h it would mostly not page — PEN-3328
+hold to 2026-09-25 was 8043s (2h14m). Even past 4 h it would mostly not page — PEN-3328
 aborts each held section at that boundary and a landed abort deletes the gauge
 series within a scrape, so what surfaces per agent is
 `PaperclipAgentStartLockAborted` (`warning`). Verify at `/api/v1/rules` before
