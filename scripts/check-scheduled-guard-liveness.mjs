@@ -214,7 +214,36 @@ export const WATCHED_GUARDS = [
   // consecutive runs. A missed cycle loses no coverage, which is exactly the
   // property the threshold is protecting — unlike the hourly guards, where a
   // skipped tick is a real gap.
-  { workflow: "commit-attribution-audit.yml", staleHours: 16 },
+  //
+  // `event: "schedule"` for the BLO-38228 reason: a non-schedule run must not
+  // satisfy this guard's newest-run query while the cron is dead. It buys two
+  // things here. It closes the `workflow_dispatch` masking window that the
+  // BLO-38228 test accepts as a stated exposure on the seven older guards — a
+  // manual dispatch can otherwise mask a dead cron for one threshold window,
+  // and that exposure was accepted there only because narrowing those seven
+  // would invalidate the gap distributions their bars were measured from. This
+  // guard has no measured distribution to protect, so it costs nothing. And it
+  // fails closed against a later edit adding an auto-firing trigger back.
+  //
+  // That second half is not hypothetical: an earlier revision of this PR DID
+  // carry a push trigger on this workflow's own file, to give the guard a
+  // completed run at merge. It was removed because this filter makes such a run
+  // inert, so the trigger bought nothing and cost a full audit job per edit.
+  //
+  // `graceUntil` is what covers that merge-day window instead. A schedule only
+  // fires from the DEFAULT branch, so at merge this workflow has zero completed
+  // `schedule` runs by construction and classifies `never-completed` — a
+  // threshold-INDEPENDENT branch the 16h above cannot cover. The date is the
+  // first cron after merge plus two full cycles of slack for GitHub's
+  // scheduled-run delay under load. Rotting here is FAIL-CLOSED: when it lapses
+  // the guard gets STRICTER, so a merge that slips past it reds on day one —
+  // loud, never silently green.
+  {
+    workflow: "commit-attribution-audit.yml",
+    staleHours: 16,
+    event: "schedule",
+    graceUntil: "2026-10-08T00:00:00.000Z",
+  },
 ];
 
 /**

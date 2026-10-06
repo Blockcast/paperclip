@@ -27,6 +27,15 @@ on:
     # shared by the whole agent fleet — an hourly run at a 7d window would be
     # ~6000 calls/hour on its own.
     - cron: "13 7,19 * * *"
+  # NO push trigger, deliberately. An earlier revision added one on this file's
+  # own path so the guard would have a completed run at merge and not read
+  # `never-completed` while it waited for the first tick. BLO-38228 landed the
+  # invariant that makes that unsound: a watched guard reachable by an
+  # auto-firing non-schedule trigger must be scoped to `event: "schedule"` in
+  # WATCHED_GUARDS, or its newest-run query is satisfied by push runs while the
+  # cron is dead. Under that filter a push run cannot count, so the trigger
+  # bought nothing and only cost a full audit job on every edit to this file.
+  # The merge-day window it was for is covered by `graceUntil` on the entry.
   workflow_dispatch:
     inputs:
       since:
@@ -40,6 +49,10 @@ on:
 
 permissions:
   contents: read
+  # `gh pr list` and `gh api repos/{repo}/pulls/{n}/commits` read the pulls API.
+  # An explicit block sets every unlisted scope to none, so without this the
+  # first call fails and the audit never produces a verdict.
+  pull-requests: read
 
 jobs:
   audit-merged:
@@ -52,6 +65,11 @@ jobs:
       - name: Audit merged PRs for App-attributed commits
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through env, not interpolated into `run:`. An expression is spliced
+          # into the script before the shell parses it, so a dispatched value
+          # could otherwise inject commands.
+          SINCE: ${{ inputs.since || '2d' }}
+          REPOS: ${{ inputs.repos || 'Blockcast/paperclip' }}
         # --since 2d, not the 7d default: the scheduled cadence is 12h, so 2d
         # overlaps three cycles. A single missed run therefore loses nothing,
         # which is what keeps the liveness bar on this guard from needing to be
@@ -69,5 +87,5 @@ jobs:
           node ./scripts/check-commit-author-attribution.mjs \
             --audit-merged \
             --gate merge \
-            --since "${{ inputs.since || '2d' }}" \
-            --repos "${{ inputs.repos || 'Blockcast/paperclip' }}"
+            --since "$SINCE" \
+            --repos "$REPOS"

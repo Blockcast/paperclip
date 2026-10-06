@@ -789,6 +789,42 @@ describe("classifyGuard — stop-modes a run-state scan cannot see", () => {
     assert.ok(grace < Date.parse("2026-10-05T00:00:00Z"), "an open-ended grace is a permanently muted guard");
   });
 
+  // Same bounds discipline for the second schedule-filtered guard (BLO-39345).
+  // Asserted per row rather than as a blanket "every schedule-filtered guard
+  // has a grace", because the bound that matters is each guard's OWN first
+  // cron, and a blanket rule would also wrongly demand one of a guard whose
+  // grace has legitimately been retired after it started enforcing.
+  it("sets commit-attribution-audit's grace past its first cron after merge", () => {
+    const row = WATCHED_GUARDS.find((guard) => guard.workflow === "commit-attribution-audit.yml");
+    const grace = Date.parse(row.graceUntil);
+
+    // Both fields asserted together because they are coupled, not merely
+    // adjacent: the grace is only needed BECAUSE the event filter makes the
+    // merge-day schedule-run count zero. Drop the filter and the grace becomes
+    // a window that mutes a guard for no reason.
+    //
+    // The filter needs its own assertion here rather than leaning on the
+    // auto-firing-trigger test above, which does not reach this row: that test
+    // demands the filter only for a guard whose workflow carries an auto-firing
+    // non-schedule trigger, and this workflow deliberately carries none. The
+    // filter is still doing work — it closes the `workflow_dispatch` masking
+    // window that the test above accepts as a stated exposure on the seven
+    // older guards. Mutation-tested: without this line, deleting
+    // `event: "schedule"` from the row leaves the whole suite green.
+    assert.equal(
+      row.event,
+      "schedule",
+      "the event filter was dropped — a manual dispatch can now mask a dead cron for a " +
+        "threshold window, and the graceUntil below is covering a window that no longer exists",
+    );
+
+    // Cron "13 7,19". The earliest tick this guard can have after the merge it
+    // ships in; a grace expiring before it means the guard reds on day one for
+    // a reason that is not its own failure.
+    assert.ok(grace > Date.parse("2026-10-06T07:13:00Z"), "expires before the first cron can fire");
+    assert.ok(grace < Date.parse("2026-10-10T00:00:00Z"), "an open-ended grace is a permanently muted guard");
+  });
+
   // Silently dropping a guard from the watched set is this row's whole defect,
   // so an unreadable workflow must fail loudly rather than skip.
   it("reds an unreadable workflow rather than skipping it", () => {
