@@ -259,3 +259,148 @@ describe("no helper declares a signal and drops it at the token mint", () => {
     expect(offenders).toEqual([]);
   });
 });
+
+/**
+ * A webhook handler must answer GitHub inside its ~10s delivery timeout, so a
+ * GitHub read it `await`s ahead of its first `respond(200, …)` has to be bound
+ * to GITHUB_REQUEST_TIMEOUT_MS rather than left on ghFetch's 30s default — two
+ * sequential unbounded hops is 60s, and the redelivery that follows is the
+ * storm shape BLO-38257 names in github-fetch.ts's own docstring.
+ *
+ * Both halves are DERIVED, not listed, and that is the deliverable (BLO-40593).
+ * The two guards above name their files by hand; this family has now been
+ * caught twice by a human reviewer and zero times by CI, because a hardcoded
+ * list cannot see the call site nobody has written yet. A new webhook route, or
+ * a new signal-accepting helper, is covered here without editing this test.
+ *
+ * Scope ceiling, stated so it is not mistaken for coverage: only helpers that
+ * DECLARE `signal?: AbortSignal` are checked. githubListIssueCommentBodies,
+ * githubListPullRequestCommits and githubPostIssueComment reach the network and
+ * accept no signal at all, so no call site can bound them — giving them one is
+ * BLO-38257 residual, not something this guard can report. Reachability is
+ * approximated by FILE, not by control flow: every call in a `*webhook*.ts`
+ * route is held to the request bound, including the handful reached only from
+ * the heartbeat tick. That is deliberate — over-binding a background read costs
+ * nothing, and proving reachability would need a call graph this does not have.
+ */
+function scanWebhookGithubCallSites(routesDir: string, servicesDir: string) {
+  const boundable = new Set<string>();
+  for (const file of readdirSync(servicesDir).filter((f) => f.startsWith("github") && f.endsWith(".ts"))) {
+    const source = readFileSync(join(servicesDir, file), "utf8");
+    for (const block of source.split(/\n(?=export (?:async )?function )/)) {
+      const name = /^export (?:async )?function (github\w+)/.exec(block)?.[1];
+      // Signature only. A `signal` the body threads onward is not a parameter
+      // the call site can supply, and counting it would make the guard demand
+      // an argument the helper does not accept.
+      const signature = block.slice(0, block.indexOf("): ") + 1);
+      if (name && /signal\?: AbortSignal/.test(signature)) boundable.add(name);
+    }
+  }
+
+  const sites: Array<{ file: string; line: number; helper: string; bound: boolean }> = [];
+  if (boundable.size === 0) return { boundable, sites };
+
+  for (const file of readdirSync(routesDir).filter((f) => f.includes("webhook") && f.endsWith(".ts"))) {
+    const source = readFileSync(join(routesDir, file), "utf8");
+    // A helper reached through a test/config override is still a call on this
+    // path, and a direct-call-only scan reports its absence as coverage. Both
+    // spellings in the tree bind the real helper as the fallback — an inline
+    // `(config.x ?? githubY)({…})`, and a named `const alias = config.x ?? githubY;`
+    // called later — so accept the inline form and resolve the alias by name.
+    const aliases = [...source.matchAll(/\bconst (\w+) = (?:[\w.]+ \?\? )?(github\w+);/g)]
+      .filter((match) => boundable.has(match[2] ?? ""))
+      .map((match) => match[1] ?? "");
+    const callPattern = new RegExp(`\\b(${[...boundable, ...aliases].join("|")})\\)?\\s*\\(`, "g");
+    for (const match of source.matchAll(callPattern)) {
+      const start = match.index ?? 0;
+      const open = start + match[0].length - 1;
+      let depth = 0;
+      let close = open;
+      while (close < source.length) {
+        if (source[close] === "(") depth += 1;
+        else if (source[close] === ")") {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+        close += 1;
+      }
+      sites.push({
+        file,
+        line: source.slice(0, start).split("\n").length,
+        helper: match[1] ?? "<unknown>",
+        bound: /\bsignal:/.test(source.slice(open, close + 1)),
+      });
+    }
+  }
+  return { boundable, sites };
+}
+
+function assertWebhookGithubCallsAreBounded(routesDir: string, servicesDir: string) {
+  const { sites } = scanWebhookGithubCallSites(routesDir, servicesDir);
+  // Non-vacuity: a scan that matched nothing fails here instead of reporting an
+  // empty offender list as a pass. Without this the guard reads green forever
+  // the day a rename puts the routes somewhere the scan does not look.
+  if (sites.length === 0) {
+    throw new Error(`scan matched no signal-accepting GitHub call sites under ${routesDir}`);
+  }
+  const offenders = sites.filter((site) => !site.bound).map((site) => `${site.file}:${site.line} ${site.helper}`);
+  if (offenders.length > 0) {
+    throw new Error(
+      `GitHub call on a request-blocking webhook path with no signal: ${offenders.join(", ")} ` +
+        "— pass signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS)",
+    );
+  }
+}
+
+const ROUTES_DIR = fileURLToPath(new URL("../routes/", import.meta.url));
+const SERVICES_DIR = fileURLToPath(new URL("../services/", import.meta.url));
+// A real directory that holds no webhook route, so the control stays honest
+// without a fixture to drift.
+const NO_WEBHOOK_DIR = fileURLToPath(new URL("../middleware/", import.meta.url));
+
+describe("every GitHub read on a request-blocking webhook path is bounded (BLO-40593)", () => {
+  it("every signal-accepting GitHub helper call in a webhook route supplies one", () => {
+    expect(() => assertWebhookGithubCallsAreBounded(ROUTES_DIR, SERVICES_DIR)).not.toThrow();
+  });
+
+  it("is non-vacuous: the same scan over a directory with no webhook routes fails rather than passing", () => {
+    expect(() => assertWebhookGithubCallsAreBounded(NO_WEBHOOK_DIR, SERVICES_DIR)).toThrow(
+      /scan matched no signal-accepting GitHub call sites/,
+    );
+  });
+
+  // The classification is checked, not asserted. Widening it to "mentions a
+  // signal anywhere in the function" silently admits githubGetWorkflowRun,
+  // whose `signal?: AbortSignal` sits in its BODY while its own parameter
+  // object is {repoFullName, runId} — and the guard would then demand an
+  // argument the helper does not accept, i.e. fail on correct code. Verified by
+  // a second, independent extraction (paren depth from the opening paren) so
+  // this is a real cross-check rather than a restatement of the scan.
+  it("never classifies a helper as boundable unless its own parameter list takes the signal", () => {
+    const { boundable } = scanWebhookGithubCallSites(ROUTES_DIR, SERVICES_DIR);
+    const sources = readdirSync(SERVICES_DIR)
+      .filter((f) => f.startsWith("github") && f.endsWith(".ts"))
+      .map((f) => readFileSync(join(SERVICES_DIR, f), "utf8"))
+      .join("\n");
+
+    const misclassified = [...boundable].filter((name) => {
+      const declared = sources.indexOf(`function ${name}(`);
+      if (declared < 0) return true;
+      const open = sources.indexOf("(", declared);
+      let depth = 0;
+      let close = open;
+      while (close < sources.length) {
+        if (sources[close] === "(") depth += 1;
+        else if (sources[close] === ")") {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+        close += 1;
+      }
+      return !/signal\?: AbortSignal/.test(sources.slice(open, close + 1));
+    });
+
+    expect(boundable.size).toBeGreaterThan(0);
+    expect(misclassified).toEqual([]);
+  });
+});
