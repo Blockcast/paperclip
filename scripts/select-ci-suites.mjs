@@ -196,19 +196,23 @@ function stripComments(text, isShell) {
 }
 
 const PATH_LIKE = /^(?:\.{1,2}\/)*[\w@.-]+(?:\/[\w@.-]*)*$/;
-const TOKEN_EDGE = /^[\s`'"()[\]{}<>,;:=$]+|[\s`'"()[\]{}<>,;:]+$/g;
+const TOKEN_EDGE = /^[\s`'"()[\]{}<>,;:=$\\]+|[\s`'"()[\]{}<>,;:\\]+$/g;
 
 // Every repo path a source file may reach, as repo-relative strings. Over-
 // approximates on purpose: a spurious reference only keeps a path relevant.
 // A string literal counts when it is in whole a path, or (if it contains
 // whitespace, i.e. a shell command or message) for each whitespace-separated
-// token that is rooted at a top-level repo entry or starts with ./ or ../ .
+// token that is rooted at a top-level repo entry or starts with ./ or ../ . A
+// path right after an interpolation (`${repoRoot}/doc/x.md`) is read as rooted,
+// and a shell script's bare words (`for f in scripts/a.sh; do`) are tokens too.
 export function referencedPaths(rawText, fileDir, topNames, { shell = false } = {}) {
   const refs = new Set();
   const text = stripComments(rawText, shell);
   const topAlt = topNames.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
   const rooted = new RegExp(`^(?:${topAlt})(?:/[\\w.@-]+)+/?$`);
-  // path.join(root, "a", "b") -> "a/b" so segment-wise joins read as one path.
+  // path.join(root, "a", "b") -> "a/b" so segment-wise joins read as one path. The
+  // rewrite also glues list entries (["a.md", "b.md"] -> "a.md/b.md"), so literals
+  // are read from the original text too.
   const joined = text.replace(/["'`]\s*,\s*["'`]/g, "/");
   const addPath = (candidate) => {
     if (candidate.length > 300) return;
@@ -219,9 +223,11 @@ export function referencedPaths(rawText, fileDir, topNames, { shell = false } = 
       refs.add(candidate.replace(/\/$/, ""));
     }
   };
-  for (const lit of joined.matchAll(/(["'`])((?:\\.|(?!\1)[^\\\n])*)\1/g)) {
+  const literal = /(["'`])((?:\\.|(?!\1)[^\\\n])*)\1/g;
+  for (const lit of [...text.matchAll(literal), ...joined.matchAll(literal)]) {
     let body = lit[2];
     if (body.includes("${")) {
+      for (const m of body.matchAll(/\}\/([\w@.-]+(?:\/[\w@.-]+)*)/g)) addPath(m[1]);
       body = body.slice(0, body.indexOf("${"));
       if (!body.endsWith("/")) body = body.replace(/[^/]*$/, "");
       if (body) addPath(body);
@@ -234,6 +240,12 @@ export function referencedPaths(rawText, fileDir, topNames, { shell = false } = 
         // `COPY vendor/x /dst` or `git -C packages/y` is an argument, not a read.
         if (/\.\w+$/.test(cleaned)) addPath(cleaned);
       }
+    }
+  }
+  if (shell) {
+    for (const token of text.split(/\s+/)) {
+      const cleaned = token.replace(TOKEN_EDGE, "");
+      if (/\.\w+$/.test(cleaned)) addPath(cleaned);
     }
   }
   // `repoRoot, "README.md"`: root-level files and bare directories anchored on a
@@ -298,10 +310,13 @@ export function computeReach(ctx, group) {
   const refs = new Set();
   const provenance = new Map();
   const scanned = new Set();
+  // Every file whose references were read, for scripts/__tests__/select-ci-suites.test.mjs.
+  const sources = new Set();
   const workspaceQueue = [];
   const looseQueue = [];
 
   const refsOf = (f) => {
+    sources.add(f);
     let cached = refCache.get(f);
     if (!cached) {
       const text = readText(root, f);
@@ -366,7 +381,7 @@ export function computeReach(ctx, group) {
     const f = looseQueue.shift();
     absorb(refsOf(f), f);
   }
-  return { closure, refs, provenance };
+  return { closure, refs, provenance, sources };
 }
 
 function referencedBy(file, reach) {

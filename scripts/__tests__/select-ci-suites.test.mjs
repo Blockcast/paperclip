@@ -9,9 +9,13 @@ import {
   GROUP_NAMES,
   UNIT_GROUP_A_ROOTS,
   buildContext,
+  classifyPath,
+  computeReach,
   decide,
   formatOutputs,
+  groupDefinitions,
   listWorkspaces,
+  readText,
   referencedPaths,
   vitestProjectDirs,
 } from "../select-ci-suites.mjs";
@@ -290,17 +294,27 @@ test("reference extraction: whole-path literals, joins, shell tokens; not prose 
   assert.ok(refs('const m = "cat docs/guide.md";').has("docs/guide.md"));
   assert.ok(refs('source "$(dirname "$0")/x.sh"', "scripts", { shell: true }).size === 0);
   assert.equal(refs('# docs/commented.md\necho hi', "scripts", { shell: true }).size, 0);
+  const list = refs('const files = ["doc/a.md", "deploy/b.yaml"];');
+  assert.ok(list.has("doc/a.md") && list.has("deploy/b.yaml"), "list entries are not glued into one path");
+  assert.ok(refs("readFileSync(`${repoRoot}/doc/x.md`)").has("doc/x.md"));
+  assert.ok(refs("const m = `see \\`docs/guide.md\\` first`;").has("docs/guide.md"));
+  assert.ok(refs("for f in \\\n  docs/a.md \\\n  scripts/b.sh; do", "scripts", { shell: true }).has("scripts/b.sh"));
 });
 
 // ---------------------------------------------------------------------------
 // The real repository: pin the properties the derivation relies on.
 // ---------------------------------------------------------------------------
 
+// One context for every real-repo test: computing the reach of all five groups
+// dominates this file's runtime, and decide() caches it on the context.
+let realRepoContext;
+const realContext = () => (realRepoContext ??= buildContext(repoRoot));
+
 test("real repo: vitest projects are exactly the server group plus the two workspace groups", () => {
   const dirs = vitestProjectDirs(repoRoot);
   const runner = readFileSync(path.join(repoRoot, "scripts/run-vitest-stable.mjs"), "utf8");
   const names = [...runner.match(/generalWorkspacesAProjects = \[([^\]]*)\]/)[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
-  const ctx = buildContext(repoRoot);
+  const ctx = realContext();
   const aDirs = names.map((name) => ctx.byName.get(name)?.dir);
   assert.deepEqual([...aDirs].sort(), [...UNIT_GROUP_A_ROOTS].sort(), "UNIT_GROUP_A_ROOTS must mirror run-vitest-stable.mjs");
   assert.ok(dirs.includes("server"));
@@ -324,15 +338,65 @@ test("real repo: paths that tests read, or that define what runs, are never skip
     "ui/src/main.tsx",
     "patches/postgres@3.4.9.patch",
   ];
-  const ctx = buildContext(repoRoot);
+  const ctx = realContext();
   for (const file of mustRun) {
     const decisions = decide({ root: repoRoot, changed: [file], ctx });
     assert.equal(decisions.server_tests_needed.needed, true, `${file} must run the server shards`);
   }
 });
 
+// The selector's silent failure mode is not a crash (decide() fails open on those)
+// but a confident `false`: a closure source reads an inert file through a path
+// shape referencedPaths does not reconstruct, so the suite skips and reports
+// green. This reader is deliberately not referencedPaths: it takes every
+// path-shaped run on a non-comment line of each source the selector itself
+// scanned for the group (string literals, multi-line templates and unquoted shell
+// words alike), as repo-rooted, as relative to the source when it starts with ./
+// or ../, or as rooted after an interpolation (`${repoRoot}/doc/x.md`).
+function namedRepoFiles(src, targets) {
+  const dir = path.posix.dirname(src);
+  const comment = src.endsWith(".sh") ? /^\s*#/ : /^\s*(?:\/\/|\/\*|\*)/;
+  const named = [];
+  readText(repoRoot, src).split("\n").forEach((line, index) => {
+    if (!line.includes("/") || comment.test(line)) return;
+    for (const m of line.matchAll(/[\w@.\-/]+/g)) {
+      const run = line[m.index - 1] === "}" ? m[0].replace(/^\/+/, "") : m[0];
+      const file = /^\.{1,2}\//.test(run) ? path.posix.normalize(path.posix.join(dir, run)) : run;
+      if (targets.has(file)) named.push({ file, line: index + 1 });
+    }
+  });
+  return named;
+}
+
+test("real repo: every inert file a closure source names stays relevant to that group", () => {
+  const ctx = realContext();
+  const groups = groupDefinitions(ctx.workspaces, vitestProjectDirs(repoRoot));
+  // Tracked files below a non-workspace directory: the inert directories plus the
+  // always-relevant ones, so the selector's INERT_DIRS is not restated here.
+  const targets = new Set([...ctx.looseFiles].filter((f) => f.includes("/")));
+  const namedBy = new Map();
+  const found = new Set();
+  const misses = [];
+  for (const name of GROUP_NAMES) {
+    const reach = computeReach(ctx, groups[name]);
+    assert.ok(reach.sources.size > 0, `${name}: the selector scanned no sources`);
+    for (const src of reach.sources) {
+      if (!namedBy.has(src)) namedBy.set(src, namedRepoFiles(src, targets));
+      for (const { file, line } of namedBy.get(src)) {
+        found.add(file);
+        const verdict = classifyPath(file, ctx, groups[name], reach);
+        if (!verdict.relevant) misses.push(`${name}: ${src}:${line} names ${file} (${verdict.why})`);
+      }
+    }
+  }
+  assert.ok(found.has("doc/execution-semantics.md"), "the scan no longer sees a read the selector is known to need");
+  assert.deepEqual(misses, [], "a closure source names these files, but a change to one alone would skip the suite");
+});
+
+// Explicit lock on the reads this selector was written for, kept beside the scan
+// above so a change to the scan cannot quietly drop them.
 test("real repo: files that server tests read by path stay relevant to the server shards", () => {
-  const ctx = buildContext(repoRoot);
+  const ctx = realContext();
   const present = (file) => ctx.files.includes(file);
   const pinned = [
     "doc/execution-semantics.md",
@@ -352,7 +416,7 @@ test("real repo: files that server tests read by path stay relevant to the serve
 });
 
 test("real repo: a prose-only diff skips every suite", () => {
-  const ctx = buildContext(repoRoot);
+  const ctx = realContext();
   const prose = ctx.files.filter((f) => f.startsWith("docs/") && f.endsWith(".md")).slice(0, 1);
   assert.equal(prose.length, 1, "expected at least one docs/*.md file");
   const decisions = decide({ root: repoRoot, changed: prose, ctx });
