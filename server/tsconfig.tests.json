@@ -1,9 +1,9 @@
 {
   "//": "Typechecks an ALLOWLIST of server test files, gated on tsc's exit code. tsconfig.json excludes src/__tests__ so tests stay out of dist/, and because `typecheck` and `build` share that one config, nothing ever typechecked a test -- so a required-and-nullable contract like evaluateCommentReviewGate's `prAuthorLogin` was unenforced at most of its call sites (BLO-38582). This is NOT tsconfig.typecheck.json: that one deliberately sees ALL tests, carries ~1140 pre-existing fixture-typing errors, and must never be gated on its exit code. This one is gated, so `include` may only ever list files that are already error-free. Add a file here once you have cleaned it; that is the ratchet. Do not wire this into `build`.",
+  "//ratchet-is-continuous": "Adding a file is not a one-time cost. CI typechecks the MERGE tree, so an entry binds every concurrent PR touching that file: a file error-free on master AND error-free on your branch still fails once the two combine, because master added call sites your branch never saw. That happened on this config's first real CI run (#2266). The errors will sit on lines your diff never touched, and the cheapest-looking repair -- dropping the entry from `include` -- silently retires the gate and leaves `typecheck` green. Rebase and sweep the new call sites instead; never shrink `include`.",
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "noEmit": true,
-    "rootDir": ".."
+    "noEmit": true
   },
   "include": ["src/__tests__/pr-comment-review-gate.test.ts"],
   "exclude": ["node_modules", "dist"]
