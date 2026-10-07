@@ -68,17 +68,20 @@
  * fallback dirs returned "not_a_checkout" cleanly in 14-53ms against a 5000ms
  * timeout.
  *
- * Two downstream effects of the cause change, neither obvious from here:
- * the action's `kind` moves "workspace_validation" -> "stranded_assigned_issue"
- * (service.ts:6115, `strandedRecoveryActionKind`), so anything filtering or
- * alerting on that kind stops seeing this class entirely — the diagnostics
- * survive on the issue comment; and the `git_worktree_branch_incoherence` arm
- * of the `nextAction` text became unreachable and was deleted (service.ts:6148),
- * because the heartbeat park sites now grant `workspace_validation_failed` only
- * on `gitProbeState: "checkout"`, whose sole producer (heartbeat.ts:4132-4145)
- * always writes reason `k8s_agent_home_git_bootstrap_unsupported`; the cause's
- * other writer, the BLO-31351 git-transport producer (service.ts:9322), sets it
- * on an `adapter_failed` run that carries no `workspaceValidation` payload.
+ * One downstream effect of the cause change is not obvious from here: for the
+ * parks that lose the cause, the action's `kind` moves "workspace_validation" ->
+ * "stranded_assigned_issue" (service.ts:6115, `strandedRecoveryActionKind`), so
+ * anything filtering or alerting on that kind stops seeing those rows — the
+ * diagnostics survive on the issue comment.
+ *
+ * ⚠ An earlier revision of this file also claimed the
+ * `git_worktree_branch_incoherence` arm of the `nextAction` text (service.ts:6148)
+ * "became unreachable and was deleted". That was wrong, and deleting the arm broke
+ * two master tests in `heartbeat-workspace-branch-containment.test.ts`. The claim
+ * rested on reading only the finalize-path producer (heartbeat.ts:33463) and
+ * missing BLO-32628's branch-containment producer (heartbeat.ts:3800), which
+ * reaches a positively confirmed divergence. The arm is reachable, is restored,
+ * and the containment tests are its positive control.
  */
 
 /**
@@ -90,32 +93,58 @@
  * human/agent can perform. That is the one park that has earned the no-wake
  * shape.
  *
- * Everything else fails open and must NOT, including the two managed-worktree
- * reasons, which an earlier revision of this file wrongly asserted were
- * "genuine configuration faults, not unanswered probes":
- *   - `git_worktree_base_not_git_checkout` comes from `isGitCheckout`
- *     (heartbeat.ts:3832), which is `.catch(() => false)` with no timeout — any
- *     probe error reads as a confirmed "not a checkout". This very file already
- *     refuses to use that helper for the dispatch guard for exactly that reason
- *     (heartbeat.ts:4127-4131).
- *   - `git_worktree_branch_incoherence` comes from
- *     `inspectManagedGitWorktreeBranch` (workspace-runtime.ts:3766), whose four
- *     `.catch(() => null)` arms each turn a git exec failure into a
- *     confirmed-sounding verdict; its own throw message concedes it, reporting
- *     that "the checked-out branch could not be verified".
+ * The second affirmative verdict is BLO-32628's
+ * `provenance.ancestryVerdict: "diverged"`. That is the same answered/unanswered
+ * shape one level down: `getGitWorktreeBranchAncestryVerdict`
+ * (workspace-runtime.ts:1811) runs `git merge-base --is-ancestor` and maps exit
+ * 0 -> "ancestor", exit 1 -> "diverged", and EVERY failure mode — missing
+ * expected/actual SHA, `.catch(() => null)` on the exec, any other exit code —
+ * to "unknown". So "diverged" means git answered and the recorded branch is
+ * provably not an ancestor of the checked-out one, with two resolved 40-hex
+ * SHAs on the payload to show for it. That is a confirmed hazard by
+ * construction, and it is why the predicate keys on the verdict rather than on
+ * `reason`.
  *
- * So the predicate is an allowlist, not a denylist. It governs only the two
- * heartbeat.ts park sites that call `workspaceValidationRecoveryCause` below,
- * not the BLO-31351 git-transport producer (service.ts:9322), which writes the
- * cause directly. At those two park sites, a reason code added later
- * is unlatched by default, and the worst case for a genuine configuration fault
- * is a bounded set of wake attempts followed by a visible escalation — against
- * a worst case of a permanent silent strand on the other side.
+ * Keying on `reason === "git_worktree_branch_incoherence"` instead would be
+ * wrong in the fail-open direction this file exists to close, because that
+ * reason has TWO producers and only one of them carries provenance:
+ *   - BLO-32628 branch containment (workspace-runtime.ts, via heartbeat.ts:3800)
+ *     — carries `provenance.ancestryVerdict`, so it can be judged. A park at
+ *     `ancestryVerdict: "unknown"` is a dead probe and must stay unlatched.
+ *   - the finalize-path check (heartbeat.ts:33463) — carries
+ *     `managedGitWorktreeBranch` and NO provenance, from
+ *     `inspectManagedGitWorktreeBranch` (workspace-runtime.ts:3765), whose four
+ *     `.catch(() => null)` arms each turn a git exec failure into a
+ *     confirmed-sounding reasonCode; its own throw message concedes it,
+ *     reporting that "the checked-out branch could not be verified". Nothing on
+ *     that payload separates a configuration fault from a dead probe, so it
+ *     stays unlatched.
+ *
+ * `git_worktree_base_not_git_checkout` stays unlatched for the same reason: it
+ * comes from `isGitCheckout` (heartbeat.ts:3832), which is `.catch(() => false)`
+ * with no timeout, so any probe error reads as a confirmed "not a checkout".
+ * This very file already refuses to use that helper for the dispatch guard for
+ * exactly that reason (heartbeat.ts:4127-4131).
+ *
+ * So the predicate is an allowlist of verdicts, not a denylist of reasons. It
+ * governs only the two heartbeat.ts park sites that call
+ * `workspaceValidationRecoveryCause` below, not the BLO-31351 git-transport
+ * producer (service.ts:9322), which writes the cause directly. At those two park
+ * sites, a reason code added later is unlatched by default, and the worst case
+ * for a genuine configuration fault is a bounded set of wake attempts followed
+ * by a visible escalation — against a worst case of a permanent silent strand on
+ * the other side.
  */
 export function isConfirmedWorkspaceGitHazard(
   workspaceValidationPayload: Record<string, unknown> | null | undefined,
 ): boolean {
-  return workspaceValidationPayload?.gitProbeState === "checkout";
+  if (workspaceValidationPayload?.gitProbeState === "checkout") return true;
+  // `provenance` arrives from a persisted resultJson blob, so it is typed only by
+  // convention. No typeof/Array guard: the `=== "diverged"` compare already rejects
+  // every non-object shape (a string or array has no `ancestryVerdict`), and `?.`
+  // covers null/undefined. Guards past that have no failing mutation.
+  return (workspaceValidationPayload?.provenance as Record<string, unknown> | undefined)
+    ?.ancestryVerdict === "diverged";
 }
 
 /** The no-wake recovery cause a confirmed workspace hazard keeps. */

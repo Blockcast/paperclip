@@ -6221,11 +6221,14 @@ export function recoveryService(
         : recoveryCause === "codex_output_inactivity_monitor"
           ? "Retry the same agent from durable progress after the output-inactivity termination."
         : recoveryCause === "workspace_validation_failed"
-          // BLO-19924: no `git_worktree_branch_incoherence` arm; it was unreachable. The heartbeat
-          // park sites grant this cause only on `gitProbeState: "checkout"` (reason always
-          // `k8s_agent_home_git_bootstrap_unsupported`, heartbeat.ts:4132-4145), and the BLO-31351
-          // writer (:9322) sets it on `adapter_failed` runs with no `workspaceValidation` payload.
-          ? "Repair the source issue workspace link, project workspace cwd, or git checkout before resuming adapter execution."
+          // BLO-19924: reachable via BLO-32628's branch-containment park, which keeps this
+          // cause on `provenance.ancestryVerdict: "diverged"` (a positively confirmed
+          // divergence). An earlier revision of that change deleted this arm as
+          // "unreachable" and broke heartbeat-workspace-branch-containment.test.ts, which
+          // is its positive control.
+          ? readWorkspaceValidationPayload(input.latestRun)?.reason === "git_worktree_branch_incoherence"
+            ? "Repair the source issue git worktree branch incoherence, or choose a new execution workspace, before resuming adapter execution."
+            : "Repair the source issue workspace link, project workspace cwd, or git checkout before resuming adapter execution."
         : recoveryCause === "configuration_incomplete"
           ? "Bind the missing secret(s) named in the run failure to the agent/project/routine env before resuming adapter execution."
         : recoveryCause === "execution_review_participant_recovery"
