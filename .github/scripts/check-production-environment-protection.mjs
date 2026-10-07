@@ -3,74 +3,57 @@
  * check-production-environment-protection.mjs
  *
  * Reads the live GitHub environment that gates `helm upgrade` (default:
- * paperclip-production) and asserts the controls the board ratified on
- * approval 60e271b7 (2026-09-14), which SUPERSEDES approval b75f8156
- * (2026-08-03) as the authoritative record of the intended shape:
- *   1. a `required_reviewers` protection rule whose reviewer list is non-empty
- *      and whose membership is exactly the ratified set
+ * paperclip-production) and asserts three controls:
+ *   1. the required_reviewers rule matches the ratified reviewer set — which is
+ *      currently EMPTY, so this assertion is dormant by default (see below)
  *   2. can_admins_bypass === false
  *   3. deployment_branch_policy.protected_branches === true
  *
- * WHICH RECORD IS AUTHORITATIVE (BLO-34896 / BLO-34527) — do not re-derive this.
- * b75f8156 ratified two reviewers plus prevent_self_review. On 2026-08-30 the
- * environment was narrowed to `[kkroo]` with prevent_self_review=false (⛔ but see
- * the 2026-10-04 correction below — the live value reads TRUE). Card
- * 60e271b7 asked the board which of the two shapes was intended and was
- * APPROVED on 2026-09-14T19:57:20Z, ruling (A): the narrowed shape IS the
- * intended shape, reconcile the guard and not the environment. The ruling is
- * recorded on BLO-34527. Three separate agent runs have now re-litigated this
- * question; the answer lives here so a fourth does not have to.
+ * ⛔ 2 AND 3 ARE NOW THE ENTIRE MACHINE-ENFORCED DEFENCE between a
+ * `workflow_dispatch` and production. Read this before relaxing either. Until
+ * 2026-10-06 the reviewer gate was the primary control and these two were
+ * defence in depth; with the reviewer gate gone (below) a silent flip of either
+ * is total loss with no backstop. Both must keep asserting hard, and #4913
+ * lists exactly these two first among the controls it relies on.
  *
- * WHY prevent_self_review IS NO LONGER ASSERTED.
+ * WHY THE REVIEWER ASSERTION IS DORMANT (BLO-34527 / BLO-34896) — do not
+ * re-derive this. On 2026-10-06 ~22:58Z the repo owner removed the
+ * required_reviewers rule from paperclip-production and recorded the decision in
+ * their own first-person PR, Blockcast/onprem-k8s#4913, merged 2026-10-07T01:13:11Z
+ * as 641271378 and merged by kkroo:
+ *     "The background security review flagged this commit as a security-control
+ *      regression. That is correct, and it is intended."
+ * #4913 also names the accepted risk — anyone with write access to
+ * Blockcast/paperclip can dispatch docker.yml and deploy any master commit with
+ * a production-admin kubeconfig, with no second person involved — and the
+ * controls that remain: the protected-branches-only deployment policy, master's
+ * own merge rules, the workflow's reachable-from-master check on `target_sha`,
+ * and the audit trail. It carries the revert recipe for the environment side.
  *
- * ⛔ CORRECTED 2026-10-04 (CEO, PEN-2918): THIS PARAGRAPH'S PREMISE IS FALSE
- * AGAINST THE LIVE ENVIRONMENT. The superseded sentence is kept here as a record
- * rather than silently deleted:
- *     "It was re-ratified as false by 60e271b7, so asserting it would make the
- *      guard permanently red about a deliberate board decision."
- * Live read of GET /repos/Blockcast/paperclip/environments/paperclip-production
- * on 2026-10-04: prevent_self_review = TRUE, alongside reviewers=[kkroo],
- * can_admins_bypass=false, protected_branches=true, updated_at=2026-08-30T07:13:06Z.
- * So :15-16's "narrowed to [kkroo] with prevent_self_review=false" does not
- * describe the environment either. Whether the 08-30 narrowing ever set it false
- * or this header mis-transcribed it is NOT readable from an agent seat — a GitHub
- * environment exposes no audit surface — so that half is left open, not guessed.
+ * This SUPERSEDES the reviewer clause of board approval 60e271b7 (2026-09-14),
+ * which itself superseded b75f8156 (2026-08-03). Superseded records, kept
+ * compactly so a fifth run does not re-litigate them: b75f8156 ratified
+ * [eyad-hussein, MohamedElmdary] plus prevent_self_review; 60e271b7 ratified
+ * [kkroo]. Verified live 2026-10-07: protection_rules holds branch_policy only,
+ * can_admins_bypass=false, protected_branches=true.
  *
- * The consequence is certain even though the history is not, and it is why this
- * correction is worth making: asserting prevent_self_review === true would be
- * GREEN today, not "permanently red". The field is therefore unasserted while
- * sitting in the STRICTER state, so a future flip to false is uncaught BY
- * CONSTRUCTION. That is a DIFFERENT MECHANISM from the 2026-08-08 drift described
- * at :68-73 below — that one attacked the same control by routing around it
- * (admin reviewer added + can_admins_bypass flipped), and this guard DOES assert
- * both of those: membership is compared against RATIFIED_REVIEWERS and
- * can_admins_bypass is asserted false, with a dedicated test ("flags the
- * 2026-08-08 WIDENING shape"). A direct flip of the field defeats the same
- * protection by a route the guard does not watch.
+ * `updated_at` still reads 2026-08-30T07:13:06Z — UNCHANGED across this edit and
+ * across the 2026-10-04 one before it. It does not track protection-rule changes
+ * on this object. Never promote it to a change detector (PEN-2918).
  *
- * ⛔ NOT CHANGED HERE, DELIBERATELY. Re-adding the assertion is a behaviour change
- * and is this file owner's call, not a passing reader's. The argument for it is one
- * line: ruling (A) says the narrowed shape IS the intended shape and the guard should
- * reconcile to the environment — and the live narrowed shape carries
- * prevent_self_review=true. This edit only removes the false premise so that decision
- * is made against the real value instead of a mis-transcribed one.
- *
- * ⛔ This is NOT the single-approver question. That is settled (PEN-2863 RESOLVED,
- * ruling (A) above), its residual risk is homed on BLO-22329, and nothing here
- * reopens it or proposes a second reviewer. It is a different field.
- *
- * The field is still reported under `observed` so the single-approver posture stays
- * visible in every alert and run log. The residual risk (one person can both dispatch
- * and approve a production deploy, and their unavailability is a total deploy outage)
- * is recorded on BLO-22329, not here: a detector should assert the ratified shape,
- * not re-argue it.
+ * prevent_self_review is reported under `observed` and never asserted. With no
+ * required_reviewers rule it reads null; it becomes meaningful again only if a
+ * reviewer is restored, which is a code change here (see RATIFIED_REVIEWERS).
+ * The single-approver residual risk is homed on BLO-22329, not here: a detector
+ * should assert the ratified shape, not re-argue it.
  *
  * Why the reviewer set is compared by membership and not merely for
  * non-emptiness (BLO-22329): the 2026-08-08 drift *added* `kkroo` — a repo
  * admin — as a third reviewer and flipped `can_admins_bypass` to true, which
  * together route around `prevent_self_review`. A "does a required_reviewers
- * rule exist?" check passes that shape. Both prior drifts were full lapses;
- * this one was a widening, so the detector has to notice membership changes.
+ * rule exist?" check passes that shape. Membership comparison is what catches a
+ * widening, and it is still live now that the ratified set is empty: any
+ * reviewer that appears reads as unexpected.
  *
  * Exit codes are load-bearing: a scheduled caller must be able to tell "drift"
  * apart from "I couldn't check" so an unreadable environment is never reported
@@ -83,12 +66,18 @@ import { writeFileSync } from 'node:fs';
 import { ghFetch } from './get-bot-token.mjs';
 
 /**
- * The reviewer set ratified on approval 60e271b7 (2026-09-14), superseding the
- * ['eyad-hussein', 'MohamedElmdary'] set of b75f8156. Changing it is
- * deliberately a code change: the PR is the audit trail that the two silent
- * edits lacked.
+ * The ratified reviewer set. EMPTY since Blockcast/onprem-k8s#4913 (2026-10-07)
+ * removed the reviewer gate by owner decision — see the header.
+ *
+ * Empty is NOT "unchecked". It means "nobody should be on this list", so a
+ * silently re-added reviewer is still flagged as a membership violation. What
+ * it switches off is only the no-gate-at-all clause below, which would
+ * otherwise be permanently red about a decision the owner made deliberately.
+ *
+ * Changing this is deliberately a code change: the PR is the audit trail that
+ * the silent environment edits of 2026-08-04 and 2026-08-08 lacked.
  */
-export const RATIFIED_REVIEWERS = ['kkroo'];
+export const RATIFIED_REVIEWERS = [];
 
 /** A reviewer entry is either a User (login) or a Team (slug). */
 function reviewerName(entry) {
@@ -128,32 +117,29 @@ export function evaluateEnvironmentProtection(env, options = {}) {
     ? rule.reviewers.map(reviewerName).filter(Boolean)
     : [];
 
-  // THE DANGEROUS STATE: no rule at all, or a rule with nobody on it. Either
-  // way there is no effective gate on a production deploy, which is the one
-  // thing this check exists to shout about. Never weaken this clause to make a
-  // run go green (BLO-34896 AC2).
+  // THE DANGEROUS STATE: a reviewer gate is expected and there is none — no
+  // rule, or a rule with nobody on it. Never weaken this clause to make a run
+  // go green (BLO-34896 AC2). The ONLY sanctioned way to switch it off is to
+  // empty RATIFIED_REVIEWERS, which is a reviewed code change recording an
+  // owner decision.
+  //
+  // `expected.length > 0` is that switch. With the set empty — the state since
+  // onprem-k8s#4913 — an absent rule IS the ratified shape, so evaluation falls
+  // through to the membership comparison below, where any reviewer that appears
+  // reads as unexpected. Restore a reviewer to RATIFIED_REVIEWERS and this
+  // clause re-arms unchanged.
   //
   // `prevent_self_review` is deliberately NOT a disjunct here. It used to be,
-  // and because `||` short-circuits, the then-observed prevent_self_review=false
-  // state sent every run down this branch and the membership comparison in the
-  // `else` below became UNREACHABLE — so the 2026-08-30 narrowing to [kkroo] was
-  // never actually reported as a membership change, only as a self-review
-  // complaint. A compound clause that skips a sibling check is how a tolerated
-  // drift masks an untolerated one; keep these conditions about "is there a gate
-  // at all".
+  // and because `||` short-circuits, an observed prevent_self_review=false sent
+  // every run down this branch and the membership comparison in the `else`
+  // became UNREACHABLE — so the 2026-08-30 narrowing to [kkroo] was never
+  // actually reported as a membership change, only as a self-review complaint.
+  // A compound clause that skips a sibling check is how a tolerated drift masks
+  // an untolerated one; keep this clause about "is there a gate at all".
   //
-  // See the header, 2026-10-04: the live value now reads TRUE, which is why the
-  // sentence above is past-tense. That re-anchors the history in time; it does
-  // not retract it. Whether the field was ever false — and so whether this
-  // short-circuit ever actually fired — is not readable from an agent seat, but
-  // either way it remains the reason the disjunct was removed, and the reason
-  // this clause must stay about "is there a gate at all".
-  //
-  // `rule == null` is SUBSUMED by `reviewers.length === 0` (an absent rule makes
-  // `reviewers` derive to []), so it survives mutation testing — it is kept for
-  // legibility, not coverage. Do not read the absent-rule test below as a guard
-  // on this term specifically.
-  if (rule == null || reviewers.length === 0) {
+  // An absent rule makes `reviewers` derive to [], so a `rule == null` term
+  // would be subsumed by `reviewers.length === 0` and is not spelled out.
+  if (expected.length > 0 && reviewers.length === 0) {
     violation(
       VIOLATION_KINDS.REQUIRED_REVIEWERS_RULE,
       'required_reviewers: rule is missing, or its reviewer list is empty — ' +
@@ -291,11 +277,12 @@ async function main() {
   if (compliant) {
     console.log(
       `PASS: ${repo} environment '${environmentName}' matches the ratified protection shape ` +
-        `(required_reviewers ${JSON.stringify(observed.reviewers)}, ` +
-        `can_admins_bypass=false, deployment_branch_policy.protected_branches=true). ` +
+        `(required_reviewers ${JSON.stringify(observed.reviewers)} against ratified ` +
+        `${JSON.stringify(expectedReviewers)}, can_admins_bypass=false, ` +
+        `deployment_branch_policy.protected_branches=true). ` +
         `Observed prevent_self_review=${JSON.stringify(observed.prevent_self_review)} ` +
-        '(reported, not asserted — board record 60e271b7; see this script\'s header ' +
-        'for the 2026-10-04 correction).',
+        '(reported, not asserted). The reviewer gate was removed by owner decision ' +
+        '— Blockcast/onprem-k8s#4913; see this script\'s header.',
     );
     writeSummary({ status: 'compliant', repo, environment: environmentName, observed });
     process.exitCode = 0;

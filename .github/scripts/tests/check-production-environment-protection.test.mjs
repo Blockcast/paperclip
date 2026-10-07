@@ -8,71 +8,76 @@ import {
 
 const user = (login) => ({ type: 'User', reviewer: { login } });
 
+/** A required_reviewers rule, for the tests that still need one present. */
+const reviewersRule = (logins, prevent_self_review = true) => ({
+  id: 61904232,
+  type: 'required_reviewers',
+  prevent_self_review,
+  reviewers: logins.map(user),
+});
+
 // ── evaluateEnvironmentProtection ────────────────────────────────────────────
 
-// A fixture modelled on the live shape of paperclip-production. Ratified as
-// intended by board approval 60e271b7 (2026-09-14), superseding b75f8156. This
-// fixture IS the acceptance criterion for BLO-34896, in the direction the board
-// ruled ("reconcile the guard, not the environment"): the guard must be made
-// green on this shape, rather than the environment being changed to suit the
-// guard. That is a claim about which side moves. It is NOT a claim that this
-// fixture transcribes the environment — see the correction immediately below,
-// which denies exactly that.
+// A TRANSCRIPT of the live shape of paperclip-production, read 2026-10-07:
+//   {"can_admins_bypass":false,"protected_branches":true,
+//    "rules":[{"id":61677470,"type":"branch_policy"}],
+//    "revs":[],"psr":[],"updated_at":"2026-08-30T07:13:06Z"}
+// There is no required_reviewers rule: the owner removed it on 2026-10-06 and
+// recorded the decision in Blockcast/onprem-k8s#4913 (merged 641271378, merged
+// by kkroo) — "That is correct, and it is intended." See the guard's header.
 //
-// ⛔ CORRECTED 2026-10-04 (PEN-2918). The superseded claim is kept as a record
-// rather than deleted, because it is evidence about which read was wrong:
-//     "The EXACT live shape of paperclip-production, re-read 2026-09-21T07:0xZ:
-//        {"can_admins_bypass":false,"updated_at":"2026-08-30T07:13:06Z",
-//         "rules":[{"type":"branch_policy"},
-//                  {"type":"required_reviewers","prevent_self_review":false,
-//                   "reviewers":["kkroo"]}]}"
-// The live read on 2026-10-04 returns prevent_self_review=TRUE, and agrees with
-// the abbreviated transcription above on every other field it records, including
-// `updated_at`. (Not byte-identical — the transcription renders
-// `protection_rules` as `rules` — but field-for-field, with prevent_self_review
-// the sole disagreement.) So this fixture is NOT a transcript of the live
-// environment and must not be cited as one. Which of the two reads is wrong is
-// not determinable from an agent seat: an unmoved `updated_at` across a changed
-// field would be surprising, but GitHub documents no guarantee that editing a
-// protection rule bumps it, and an environment exposes no audit surface either
-// way.
+// ⛔ The earlier fixture carried a `required_reviewers` rule and an explicit
+// note (PEN-2918) that it was NOT a transcript of the environment. That caveat
+// is retired rather than deleted, because it is the reason this one says which
+// it is: this fixture WAS read off the live environment in the run that changed
+// it, field for field.
 //
-// `prevent_self_review: false` below STAYS, and is not a transcription claim: it
-// is the input that proves a false value does not fail the run, which is the
-// whole point of BLO-34896. The true case is covered in the "reported, not
-// asserted" test below. See the guard script's header for the full correction.
+// `updated_at` is unchanged from the value recorded on 2026-08-30, across two
+// subsequent edits to the rules. It does not track protection-rule changes and
+// nothing asserts it.
 const COMPLIANT_ENV = {
   can_admins_bypass: false,
   updated_at: '2026-08-30T07:13:06Z',
-  protection_rules: [
-    { id: 61677470, type: 'branch_policy' },
-    {
-      id: 61904232,
-      type: 'required_reviewers',
-      prevent_self_review: false,
-      reviewers: RATIFIED_REVIEWERS.map(user),
-    },
-  ],
+  protection_rules: [{ id: 61677470, type: 'branch_policy' }],
   deployment_branch_policy: { protected_branches: true, custom_branch_policies: false },
 };
 
-test('evaluateEnvironmentProtection: passes the board-ratified shape', () => {
+test('evaluateEnvironmentProtection: passes the owner-ratified shape', () => {
   const result = evaluateEnvironmentProtection(COMPLIANT_ENV);
   assert.equal(result.compliant, true);
   assert.deepEqual(result.violations, []);
-  assert.deepEqual(result.observed.reviewers, RATIFIED_REVIEWERS);
+  assert.deepEqual(result.observed.reviewers, []);
 });
 
-test('evaluateEnvironmentProtection: the ratified reviewer set is the 60e271b7 set, not the superseded b75f8156 one', () => {
-  // Pins the record that BLO-34896 exists to stop re-deriving. If someone
-  // restores the two-reviewer set without a new board ruling, this fails and
-  // the PR diff is the place that conversation happens.
-  assert.deepEqual(RATIFIED_REVIEWERS, ['kkroo']);
+test('evaluateEnvironmentProtection: the ratified reviewer set is EMPTY per onprem-k8s#4913', () => {
+  // Pins the record that BLO-34527 exists to stop re-deriving. If someone
+  // restores a reviewer set without a new owner decision, this fails and the PR
+  // diff is the place that conversation happens. #4913 carries the recipe for
+  // the environment half of a revert.
+  assert.deepEqual(RATIFIED_REVIEWERS, []);
 });
 
-test('evaluateEnvironmentProtection: flags the 2026-08-04 lapse shape (required_reviewers gone, admin bypass true)', () => {
+test('evaluateEnvironmentProtection: an empty ratified set still flags a silently re-added reviewer', () => {
+  // Empty is "nobody should be on this list", not "stop looking". The no-gate
+  // clause is switched off; the membership comparison is not.
+  const result = evaluateEnvironmentProtection({
+    ...COMPLIANT_ENV,
+    protection_rules: [{ id: 61677470, type: 'branch_policy' }, reviewersRule(['kkroo'])],
+  });
+  assert.equal(result.compliant, false);
+  assert.deepEqual(result.violationKinds, ['required_reviewers_membership']);
+  assert.match(result.violations[0], /unexpected.*kkroo/);
+});
+
+test('evaluateEnvironmentProtection: flags the 2026-08-04 lapse shape (admin bypass true)', () => {
   // Exact shape from GET /repos/Blockcast/paperclip/environments/paperclip-production
   // as recorded on board approval 06ff894e (updated_at 2026-08-04T09:21:50Z).
+  //
+  // ⚠ This USED TO assert two violations — the missing reviewer rule and the
+  // bypass flip. The reviewer half is gone by owner decision (#4913), so the
+  // bypass assertion is now the ONLY thing standing between this shape and a
+  // PASS. That is precisely why can_admins_bypass must keep asserting hard: it
+  // is no longer defence in depth, it is the defence.
   const driftedEnv = {
     can_admins_bypass: true,
     protection_rules: [{ id: 61677470, type: 'branch_policy' }],
@@ -81,27 +86,22 @@ test('evaluateEnvironmentProtection: flags the 2026-08-04 lapse shape (required_
 
   const result = evaluateEnvironmentProtection(driftedEnv);
   assert.equal(result.compliant, false);
-  assert.equal(result.violations.length, 2);
-  assert.match(result.violations[0], /required_reviewers/);
-  assert.match(result.violations[1], /can_admins_bypass/);
+  assert.deepEqual(result.violationKinds, ['can_admins_bypass']);
 });
 
 test('evaluateEnvironmentProtection: flags the 2026-08-08 WIDENING shape (extra admin reviewers + admin bypass)', () => {
   // Exact live shape re-probed 2026-08-14T08:46Z: the 08-08 "temporary" override
   // that was never restored. A non-emptiness check passes this; membership
-  // comparison is what catches it. Regression guard for BLO-22329.
+  // comparison is what catches it. Regression guard for BLO-22329, and it still
+  // fires now that the ratified set is empty — all three reviewers read as
+  // unexpected rather than two.
   const widenedEnv = {
     ...COMPLIANT_ENV,
     can_admins_bypass: true,
     updated_at: '2026-08-08T06:52:28Z',
     protection_rules: [
       { id: 61677470, type: 'branch_policy' },
-      {
-        id: 61904232,
-        type: 'required_reviewers',
-        prevent_self_review: true,
-        reviewers: ['eyad-hussein', 'MohamedElmdary', 'kkroo'].map(user),
-      },
+      reviewersRule(['eyad-hussein', 'MohamedElmdary', 'kkroo']),
     ],
   };
 
@@ -112,20 +112,14 @@ test('evaluateEnvironmentProtection: flags the 2026-08-08 WIDENING shape (extra 
   assert.match(result.violations[1], /can_admins_bypass/);
 });
 
-test('evaluateEnvironmentProtection: flags a removed ratified reviewer', () => {
+test('evaluateEnvironmentProtection: flags a removed reviewer against a non-empty expected set', () => {
+  // The override path, which is how the membership check behaves if a reviewer
+  // is ever restored to RATIFIED_REVIEWERS.
   const env = {
     ...COMPLIANT_ENV,
-    protection_rules: [
-      { id: 1, type: 'branch_policy' },
-      {
-        id: 2,
-        type: 'required_reviewers',
-        prevent_self_review: true,
-        reviewers: [user('eyad-hussein')],
-      },
-    ],
+    protection_rules: [{ id: 1, type: 'branch_policy' }, reviewersRule(['eyad-hussein'])],
   };
-  const result = evaluateEnvironmentProtection(env);
+  const result = evaluateEnvironmentProtection(env, { expectedReviewers: ['kkroo'] });
   assert.equal(result.compliant, false);
   assert.match(result.violations[0], /required_reviewers membership.*missing.*kkroo/);
 });
@@ -133,23 +127,20 @@ test('evaluateEnvironmentProtection: flags a removed ratified reviewer', () => {
 test('evaluateEnvironmentProtection: reviewer membership is case-insensitive', () => {
   const env = {
     ...COMPLIANT_ENV,
-    protection_rules: [
-      { id: 1, type: 'branch_policy' },
-      {
-        id: 2,
-        type: 'required_reviewers',
-        prevent_self_review: true,
-        reviewers: [user('KKroo')],
-      },
-    ],
+    protection_rules: [{ id: 1, type: 'branch_policy' }, reviewersRule(['KKroo'])],
   };
-  assert.equal(evaluateEnvironmentProtection(env).compliant, true);
+  assert.equal(
+    evaluateEnvironmentProtection(env, { expectedReviewers: ['kkroo'] }).compliant,
+    true,
+  );
 });
 
 test('evaluateEnvironmentProtection: honours an explicit expectedReviewers override', () => {
-  const result = evaluateEnvironmentProtection(COMPLIANT_ENV, {
-    expectedReviewers: ['someone-else'],
-  });
+  const env = {
+    ...COMPLIANT_ENV,
+    protection_rules: [{ id: 1, type: 'branch_policy' }, reviewersRule(['kkroo'])],
+  };
+  const result = evaluateEnvironmentProtection(env, { expectedReviewers: ['someone-else'] });
   assert.equal(result.compliant, false);
   assert.match(result.violations[0], /required_reviewers membership/);
 });
@@ -173,20 +164,22 @@ test('evaluateEnvironmentProtection: resolves Team reviewers by slug', () => {
 });
 
 // ── the dangerous state: no effective gate (BLO-34896 AC2) ───────────────────
-// These two are the negative control for the reconciliation. The guard was made
-// green against the then-observed prevent_self_review=false shape (see the
-// fixture note above, corrected 2026-10-04); it must NOT have gone green by
-// weakening its detection of "there is no approval gate at all".
+// These two are the negative control for the reconciliation. The no-gate clause
+// is dormant for paperclip-production because the ratified set is empty — but
+// the code path must still work, so that restoring a reviewer to
+// RATIFIED_REVIEWERS re-arms it unchanged. They therefore pass an explicit
+// non-empty expected set rather than relying on the default.
+//
+// ⛔ These must NOT be deleted on the grounds that the clause is dormant. A
+// dormant guard with no test is a guard that silently stops working, and the
+// owner decision that made it dormant is revertible by design (#4913).
 
 test('evaluateEnvironmentProtection: flags empty reviewers as non-compliant even if the rule exists', () => {
   const env = {
     ...COMPLIANT_ENV,
-    protection_rules: [
-      { id: 1, type: 'branch_policy' },
-      { id: 2, type: 'required_reviewers', prevent_self_review: true, reviewers: [] },
-    ],
+    protection_rules: [{ id: 1, type: 'branch_policy' }, reviewersRule([])],
   };
-  const result = evaluateEnvironmentProtection(env);
+  const result = evaluateEnvironmentProtection(env, { expectedReviewers: ['kkroo'] });
   assert.equal(result.compliant, false);
   assert.match(result.violations[0], /required_reviewers/);
   assert.deepEqual(result.violationKinds, ['required_reviewers_rule']);
@@ -197,72 +190,44 @@ test('evaluateEnvironmentProtection: flags an absent required_reviewers rule', (
     ...COMPLIANT_ENV,
     protection_rules: [{ id: 1, type: 'branch_policy' }],
   };
-  const result = evaluateEnvironmentProtection(env);
+  const result = evaluateEnvironmentProtection(env, { expectedReviewers: ['kkroo'] });
   assert.equal(result.compliant, false);
   assert.deepEqual(result.violationKinds, ['required_reviewers_rule']);
 });
 
 test('evaluateEnvironmentProtection: prevent_self_review is REPORTED but not asserted', () => {
-  // A false value must not fail the run — that is the whole point of BLO-34896.
-  // It must still show up in `observed`, which is what carries the
-  // single-approver posture into every alert and run log.
-  //
-  // ⛔ CORRECTED 2026-10-04 (PEN-2918). This read "Re-ratified as permitted-false
-  // by approval 60e271b7 (2026-09-14)". The live environment reads
-  // prevent_self_review=TRUE, so that premise does not describe it; what the
-  // board ruled (A) is that the narrowed shape is the intended one, which is a
-  // statement about the reviewer set. The tolerance asserted here is still
-  // correct and still deliberate — the guard does not assert this field — but it
-  // is a design choice about the detector, not a board ruling about the value.
-  // See the guard script's header.
-  const result = evaluateEnvironmentProtection(COMPLIANT_ENV);
-  assert.equal(result.compliant, true);
-  assert.equal(result.observed.prevent_self_review, false);
+  // With no required_reviewers rule there is no field to read, so it reports
+  // null — and that must not fail the run.
+  assert.equal(evaluateEnvironmentProtection(COMPLIANT_ENV).observed.prevent_self_review, null);
 
-  // ...and flipping it the other way is a strengthening, not a violation.
-  const stricter = evaluateEnvironmentProtection({
-    ...COMPLIANT_ENV,
-    protection_rules: [
-      { id: 1, type: 'branch_policy' },
+  // When a rule IS present, both values are reported and neither is asserted.
+  // The single-approver posture rides into every alert and run log on this
+  // field; the residual risk is homed on BLO-22329, not asserted here.
+  for (const value of [false, true]) {
+    const result = evaluateEnvironmentProtection(
       {
-        id: 2,
-        type: 'required_reviewers',
-        prevent_self_review: true,
-        reviewers: RATIFIED_REVIEWERS.map(user),
+        ...COMPLIANT_ENV,
+        protection_rules: [{ id: 1, type: 'branch_policy' }, reviewersRule(['kkroo'], value)],
       },
-    ],
-  });
-  assert.equal(stricter.compliant, true);
-  // ...and is REPORTED as true, which is the half this test is named for. `true`
-  // is the live value as of 2026-10-04, so without this line the header's claim
-  // that the field "is still reported under `observed` so the single-approver
-  // posture stays visible in every alert and run log" is asserted only for the
-  // value production does NOT have.
-  assert.equal(stricter.observed.prevent_self_review, true);
+      { expectedReviewers: ['kkroo'] },
+    );
+    assert.equal(result.compliant, true, `prevent_self_review=${value} must not fail the run`);
+    assert.equal(result.observed.prevent_self_review, value);
+  }
 });
 
 test('evaluateEnvironmentProtection: prevent_self_review=false does NOT mask the membership check', () => {
-  // The defect this reconciliation fixed. `prevent_self_review !== true` used to
-  // be a disjunct of the required_reviewers_rule clause, and because `||`
-  // short-circuits, the then-observed false value sent every run down that branch
+  // The defect this guard's reconciliation fixed. `prevent_self_review !== true`
+  // used to be a disjunct of the required_reviewers_rule clause, and because
+  // `||` short-circuits, an observed false value sent every run down that branch
   // and the membership comparison in the `else` was unreachable. A tolerated
-  // drift was hiding an untolerated one. Mutation guard: re-add that disjunct and
-  // this fails, because the result collapses to required_reviewers_rule.
-  //
-  // Past tense as of 2026-10-04: the live value reads TRUE. See the guard
-  // script's header — the history is re-anchored in time, not retracted, and it
-  // remains the reason the disjunct was removed. This assertion is unaffected:
-  // its `false` below is an input, not a claim about the environment.
+  // drift was hiding an untolerated one. Mutation guard: re-add that disjunct
+  // and this fails, because the result collapses to required_reviewers_rule.
   const env = {
     ...COMPLIANT_ENV,
     protection_rules: [
       { id: 1, type: 'branch_policy' },
-      {
-        id: 2,
-        type: 'required_reviewers',
-        prevent_self_review: false,
-        reviewers: [user('somebody-unratified')],
-      },
+      reviewersRule(['somebody-unratified'], false),
     ],
   };
   const result = evaluateEnvironmentProtection(env);
@@ -283,10 +248,16 @@ test('evaluateEnvironmentProtection: flags a null deployment_branch_policy (neve
   assert.match(result.violations[0], /deployment_branch_policy/);
 });
 
-test('evaluateEnvironmentProtection: reports all three violations independently when everything is unset', () => {
+test('evaluateEnvironmentProtection: reports the remaining violations independently when everything is unset', () => {
+  // Two, not three: an absent reviewer rule is the ratified shape now. The two
+  // that remain are the whole machine-enforced defence — see the guard header.
   const result = evaluateEnvironmentProtection({});
   assert.equal(result.compliant, false);
-  assert.equal(result.violations.length, 3);
+  assert.deepEqual(result.violationKinds, ['can_admins_bypass', 'protected_branches']);
+
+  // ...and all three still fire when a reviewer gate is expected.
+  const expectingReviewers = evaluateEnvironmentProtection({}, { expectedReviewers: ['kkroo'] });
+  assert.equal(expectingReviewers.violations.length, 3);
 });
 
 // ── violationKinds ───────────────────────────────────────────────────────────
