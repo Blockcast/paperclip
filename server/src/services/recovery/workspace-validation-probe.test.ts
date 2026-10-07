@@ -29,18 +29,51 @@ describe("isConfirmedWorkspaceGitHazard", () => {
     })).toBe(false);
   });
 
-  it("does not confirm the managed-worktree reasons", () => {
-    // These carry no gitProbeState at all, and both are produced by helpers that
-    // fail OPEN — isGitCheckout is `.catch(() => false)` with no timeout, and
-    // inspectManagedGitWorktreeBranch turns each of four git exec failures into a
-    // confirmed-sounding reasonCode. Neither can tell a configuration fault from
-    // a dead probe, so neither may latch. An earlier revision asserted the
-    // opposite here and pinned it as a passing test.
+  it("keeps the manual-repair shape for a CONFIRMED branch divergence", () => {
+    // BLO-32628 branch containment. `ancestryVerdict: "diverged"` is exit 1 from
+    // `git merge-base --is-ancestor` — the probe answered, with two resolved head
+    // SHAs on the payload. Deleting this case is what broke the two
+    // heartbeat-workspace-branch-containment.test.ts cases on master.
+    expect(isConfirmedWorkspaceGitHazard({
+      reason: "git_worktree_branch_incoherence",
+      provenance: {
+        ancestryVerdict: "diverged",
+        expectedHeadSha: "a".repeat(40),
+        actualHeadSha: "b".repeat(40),
+        sameHead: false,
+      },
+    })).toBe(true);
+  });
+
+  it("does not confirm a branch incoherence whose ancestry probe did not answer", () => {
+    // `getGitWorktreeBranchAncestryVerdict` maps a missing SHA, a `.catch`ed exec
+    // failure and any unexpected exit code all to "unknown". This is the case that
+    // makes `reason === "git_worktree_branch_incoherence"` an unsound predicate:
+    // same reason, same producer, no verdict.
+    expect(isConfirmedWorkspaceGitHazard({
+      reason: "git_worktree_branch_incoherence",
+      provenance: { ancestryVerdict: "unknown", expectedHeadSha: null, actualHeadSha: null },
+    })).toBe(false);
+    expect(isConfirmedWorkspaceGitHazard({
+      reason: "git_worktree_branch_incoherence",
+      provenance: { ancestryVerdict: "ancestor" },
+    })).toBe(false);
+  });
+
+  it("does not confirm the finalize-path managed-worktree reasons", () => {
+    // These carry no gitProbeState AND no provenance, and both are produced by
+    // helpers that fail OPEN — isGitCheckout is `.catch(() => false)` with no
+    // timeout, and inspectManagedGitWorktreeBranch turns each of four git exec
+    // failures into a confirmed-sounding reasonCode. Neither can tell a
+    // configuration fault from a dead probe, so neither may latch. Note the
+    // second payload shares its `reason` with the confirmed case above: the
+    // verdict is the discriminator, not the reason.
     expect(isConfirmedWorkspaceGitHazard({
       reason: "git_worktree_base_not_git_checkout",
     })).toBe(false);
     expect(isConfirmedWorkspaceGitHazard({
       reason: "git_worktree_branch_incoherence",
+      managedGitWorktreeBranch: { reasonCode: "branch_mismatch", actualBranchName: null },
     })).toBe(false);
   });
 
@@ -57,20 +90,36 @@ describe("isConfirmedWorkspaceGitHazard", () => {
     expect(isConfirmedWorkspaceGitHazard({ gitProbeState: "CHECKOUT" })).toBe(false);
     expect(isConfirmedWorkspaceGitHazard({ gitProbeState: true })).toBe(false);
   });
+
+  it("does not read a verdict off a non-object or array provenance", () => {
+    // `provenance` arrives from a persisted resultJson blob, so it is only
+    // typed by convention. Guards the lookup against a truthiness test.
+    expect(isConfirmedWorkspaceGitHazard({ provenance: "diverged" })).toBe(false);
+    expect(isConfirmedWorkspaceGitHazard({ provenance: ["diverged"] })).toBe(false);
+    expect(isConfirmedWorkspaceGitHazard({ provenance: null })).toBe(false);
+    expect(isConfirmedWorkspaceGitHazard({ ancestryVerdict: "diverged" })).toBe(false);
+  });
 });
 
 describe("workspaceValidationRecoveryCause", () => {
-  it("keeps the no-wake cause only for a confirmed checkout", () => {
+  it("keeps the no-wake cause only for a positively confirmed hazard", () => {
     // `undefined` is not "no opinion" — it is the instruction to fall through to the
     // ordinary stranded cause, which is the only one carrying a wake and an attempt
     // budget. Both heartbeat.ts park sites route through here.
     expect(workspaceValidationRecoveryCause({ gitProbeState: "checkout" }))
       .toBe(WORKSPACE_VALIDATION_RECOVERY_CAUSE);
+    expect(workspaceValidationRecoveryCause({ provenance: { ancestryVerdict: "diverged" } }))
+      .toBe(WORKSPACE_VALIDATION_RECOVERY_CAUSE);
     expect(workspaceValidationRecoveryCause({ gitProbeState: "indeterminate" })).toBeUndefined();
-    // The allowlist direction: an unrecognised reason is unlatched by default, so a
-    // park reason added later cannot silently inherit the no-wake shape.
+    // The allowlist direction: the verdict decides, not the reason, so the same
+    // reason falls through whenever no probe answered — and a park reason added
+    // later cannot silently inherit the no-wake shape.
     expect(workspaceValidationRecoveryCause({ reason: "git_worktree_branch_incoherence" }))
       .toBeUndefined();
+    expect(workspaceValidationRecoveryCause({
+      reason: "git_worktree_branch_incoherence",
+      provenance: { ancestryVerdict: "unknown" },
+    })).toBeUndefined();
     expect(workspaceValidationRecoveryCause(null)).toBeUndefined();
   });
 });
