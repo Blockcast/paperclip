@@ -228,7 +228,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     // list. Both must move together — 87a865de was orphaned by adapter #62's squash
     // and is now asserted *against* over there, so leaving this line stale puts the
     // two suites in direct contradiction.
-    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=2075ae1ba249e97c49a77386c81a9d88b22c481d");
+    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=133f4c1a65085a6c141aab5aa8818afe51e2689c");
     expect(serverDockerfile).toContain(
       "npm test -- src/server/env-guard-plugin.test.ts src/server/execute.test.ts",
     );
