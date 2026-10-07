@@ -1,0 +1,88 @@
+name: Playwright cache prime
+
+# `pr.yml`'s e2e job restores `~/.cache/ms-playwright` under the key
+# `playwright-<os>-<playwright version>` and runs `playwright install chromium`
+# on a miss. A cache saved by a `merge_group` run lives on that run's
+# single-use `gh-readonly-queue/*` ref, and one saved by a `pull_request` run
+# on `refs/pull/<n>/merge`; neither is readable from the next queue entry or a
+# sibling PR. Nothing ever saved this key on `master`, which every ref CAN read.
+# The pnpm store in the same job hits on every run for exactly that reason:
+# `master-health.yml` saves it on `master`.
+#
+# Measured over 28 recent `pr.yml` runs (14 `merge_group`, 14 `pull_request`,
+# jobs API, 2026-10-06/07): the e2e `Install Playwright browser` step ran in
+# 14 of 14 `merge_group` jobs and 5 of 14 `pull_request` jobs (a `Post Cache
+# Playwright browser` save follows each). A merge_group log (run 37541326647,
+# job 112536543505) shows `Cache not found for input keys:
+# playwright-Linux-1.58.2` in the same job that logs `Cache hit for:
+# node-cache-Linux-x64-pnpm-...`. This job saves the key on `master` so those
+# runs restore it instead.
+#
+# What this changes: only whether the browser bundle comes from the cache or
+# from the network. The key embeds the resolved Playwright version, so a
+# version bump (a `pnpm-lock.yaml` change) is a different key and re-primes
+# here. It runs no tests and gates nothing.
+#
+# Not verifiable before merge: whether the e2e runner restores this entry. The
+# cache version also covers the path list and the compression tool, and both
+# are the same strings/tools as in `pr.yml`; confirm after the first run by
+# reading `Cache hit for: playwright-Linux-<version>` in the next e2e log.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - pnpm-lock.yaml
+      - .github/workflows/playwright-cache-prime.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prime:
+    name: Prime Playwright browser cache
+    runs-on: arc-light
+    # Floor enforced for every job that sets up pnpm by
+    # scripts/__tests__/pnpm-setup-retry.test.mjs. This job's own measured
+    # demand is smaller: the sum of the per-step maxima in the 28-run sample
+    # above (checkout 105 s, setup pnpm 28 s, setup node 95 s, install 97 s,
+    # browser install 201 s, cache save 53 s) is 579 s.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      # Same Node major and `cache: pnpm` as the e2e job, so the store restore
+      # hits the entry `master-health.yml` already saves.
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve Playwright version
+        id: playwright_version
+        run: |
+          version="$(node -p "require('@playwright/test/package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Path and key must stay byte-identical to the e2e job's
+      # `Cache Playwright browser` step in pr.yml.
+      - name: Cache Playwright browser
+        id: playwright_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright_version.outputs.version }}
+
+      - name: Install Playwright browser
+        if: steps.playwright_cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install chromium
