@@ -104,6 +104,15 @@ jobs:
       checks: read
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
+      # Path-scoped suite selection (scripts/select-ci-suites.mjs). Consumers
+      # compare against the literal 'false' and treat everything else -- 'true',
+      # empty, or an output that was never written because this step did not
+      # run -- as "run the suite", so a selector fault can only over-run.
+      server_tests_needed: ${{ steps.select_suites.outputs.server_tests_needed }}
+      workspaces_a_tests_needed: ${{ steps.select_suites.outputs.workspaces_a_tests_needed }}
+      workspaces_b_tests_needed: ${{ steps.select_suites.outputs.workspaces_b_tests_needed }}
+      ui_e2e_needed: ${{ steps.select_suites.outputs.ui_e2e_needed }}
+      release_dry_run_needed: ${{ steps.select_suites.outputs.release_dry_run_needed }}
 
     steps:
       - name: Checkout repository
@@ -178,6 +187,18 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
+
+      # Decides which of the expensive suites (server/workspaces test shards,
+      # Playwright e2e, release canary dry run) the diff can reach. FAIL OPEN: the
+      # script never exits non-zero on its own faults (it reports every suite as
+      # needed), and the consumers below only skip on the literal 'false'. For a
+      # merge_group this is the cumulative diff of every queued PR, because
+      # PR_BASE_SHA/PR_HEAD_SHA come from the merge_group event.
+      - name: Select suites reachable from this diff
+        id: select_suites
+        continue-on-error: true
+        run: node ./scripts/select-ci-suites.mjs
+        timeout-minutes: 3
 
       - name: Setup actionlint
         uses: ./.github/actions/setup-actionlint
@@ -839,6 +860,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/playwright-install-deps-retry.test.mjs
         timeout-minutes: 1
+
+      - name: Test CI suite selector
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/select-ci-suites.test.mjs
+        timeout-minutes: 3
 
       - name: Test PR server-shard folding
         if: ${{ !cancelled() }}
@@ -1531,14 +1557,44 @@ jobs:
             timeout_minutes: 45
 
     steps:
+      # Path-scoped selection. The job (and so its required-check name and the
+      # `verify` aggregation) always exists and always reports; when the diff
+      # cannot reach this group every heavy step below is skipped and the job
+      # succeeds in seconds. Only the literal 'false' skips, so a selector fault,
+      # an empty output or a policy fault runs the suite. A suite that runs and
+      # fails fails this job exactly as before: nothing here converts a failure
+      # into a skip.
+      - name: Resolve whether this diff can reach this suite group
+        id: select
+        env:
+          GROUP: ${{ matrix.group }}
+          SERVER_TESTS_NEEDED: ${{ needs.policy.outputs.server_tests_needed }}
+          WORKSPACES_A_TESTS_NEEDED: ${{ needs.policy.outputs.workspaces_a_tests_needed }}
+          WORKSPACES_B_TESTS_NEEDED: ${{ needs.policy.outputs.workspaces_b_tests_needed }}
+        run: |
+          case "$GROUP" in
+            general-server) needed="$SERVER_TESTS_NEEDED" ;;
+            general-workspaces-a) needed="$WORKSPACES_A_TESTS_NEEDED" ;;
+            general-workspaces-b) needed="$WORKSPACES_B_TESTS_NEEDED" ;;
+            *) needed=true ;;
+          esac
+          if [ "$needed" = "false" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=General tests skipped::policy's path selector found no changed path that can reach $GROUP (see its 'Select suites reachable from this diff' step)."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.select.outputs.run == 'true'
         uses: actions/checkout@v6
 
       - name: Setup pnpm
+        if: steps.select.outputs.run == 'true'
         uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
-        if: needs.policy.outputs.lockfile_regenerated == '1'
+        if: steps.select.outputs.run == 'true' && needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -1546,15 +1602,18 @@ jobs:
           path: .
 
       - name: Setup Node.js
+        if: steps.select.outputs.run == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
 
       - name: Install dependencies
+        if: steps.select.outputs.run == 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Run grouped general test suites
+        if: steps.select.outputs.run == 'true'
         run: |
           mkdir -p "$PAPERCLIP_VITEST_REPORT_DIR"
           args=(--group '${{ matrix.group }}')
@@ -1567,7 +1626,7 @@ jobs:
       # Postgres setup already paid for by each server shard. This removes four
       # ARC pod cold starts without reducing serialized-suite coverage.
       - name: Run serialized server test shard
-        if: matrix.group == 'general-server'
+        if: matrix.group == 'general-server' && steps.select.outputs.run == 'true'
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
 
       # BLO-28886 AC3. `if: always()` is the whole point and is guarded by
@@ -2034,6 +2093,10 @@ jobs:
   canary_dry_run:
     name: Canary Dry Run
     needs: [policy]
+    # Path-scoped (scripts/select-ci-suites.mjs). Only the literal 'false' skips;
+    # an empty/missing output runs the job. Neither this job nor its check name is
+    # in `verify`'s needs, so a skip cannot read as a failed or absent lane.
+    if: ${{ needs.policy.outputs.release_dry_run_needed != 'false' }}
     # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
     # pool so pull_request and merge_group traffic cannot starve each other.
     # See typecheck_release_registry above.
@@ -2099,6 +2162,10 @@ jobs:
 
   e2e:
     needs: [policy]
+    # Path-scoped (scripts/select-ci-suites.mjs). Only the literal 'false' skips;
+    # an empty/missing output runs the job. Neither this job nor its check name is
+    # in `verify`'s needs, so a skip cannot read as a failed or absent lane.
+    if: ${{ needs.policy.outputs.ui_e2e_needed != 'false' }}
     # Keep PR browser suites off the org-wide default pool. Merge groups use
     # the queue's reserved capacity so unrelated repos cannot delay admission.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}

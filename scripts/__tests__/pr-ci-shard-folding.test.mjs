@@ -35,7 +35,7 @@ test("server shards run general and serialized suites in the same jobs", () => {
   assert.match(general, /pnpm test:run:general -- "\$\{args\[@\]\}"/);
   assert.match(
     general,
-    /- name: Run serialized server test shard\n        if: matrix\.group == 'general-server'\n        run: pnpm test:run:serialized -- --shard-index \$\{\{ matrix\.shard_index \}\} --shard-count \$\{\{ matrix\.shard_count \}\}/,
+    /- name: Run serialized server test shard\n        if: matrix\.group == 'general-server' && steps\.select\.outputs\.run == 'true'\n        run: pnpm test:run:serialized -- --shard-index \$\{\{ matrix\.shard_index \}\} --shard-count \$\{\{ matrix\.shard_count \}\}/,
     "serialized suites must run only in the corresponding server shard",
   );
   assert.ok(
