@@ -1730,17 +1730,22 @@ describe("issue execution policy routes", () => {
       });
 
       // Negative control for both cases above: narrowing the clause must not take
-      // BLO-27586 AC1 down with it. `{"executionPolicy": {}}` is the documented
-      // monitor-clear and is the one body that still has to reach a fired monitor
-      // through the legacy path.
-      it("still clears a triggered monitor on the documented bare executionPolicy write", async () => {
-        seedWedged();
+      // BLO-27586 AC1 down with it. The bare `executionPolicy` write is the
+      // documented monitor-clear and is the one body that still has to reach a
+      // fired monitor through the legacy path. Both spellings take it: the clause
+      // keys on `nextExecutionPolicy == null`, and `issueExecutionPolicySchema` is
+      // `.optional().nullable()`, so an explicit `null` is admitted exactly as `{}`
+      // is. `doc/execution-semantics.md` names both, so both are pinned here.
+      for (const executionPolicy of [{}, null]) {
+        it(`still clears a triggered monitor on the documented ${JSON.stringify(executionPolicy)} executionPolicy write`, async () => {
+          seedWedged();
 
-        const res = await patchIssue({ executionPolicy: {} });
+          const res = await patchIssue({ executionPolicy });
 
-        expect(res.status, JSON.stringify(res.body)).toBe(200);
-        expect((lastPatch().executionState as { monitor: { status: string } }).monitor.status).toBe("cleared");
-      });
+          expect(res.status, JSON.stringify(res.body)).toBe(200);
+          expect((lastPatch().executionState as { monitor: { status: string } }).monitor.status).toBe("cleared");
+        });
+      }
     });
   });
 
