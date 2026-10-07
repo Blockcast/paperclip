@@ -1346,6 +1346,87 @@ function rebindAlertState(
   };
 }
 
+/**
+ * BLO-40764 — retrofit a configured owner onto a live aggregate row.
+ *
+ * Owner resolution used to run on the creation path only (`if (!retainedIssue
+ * && !terminal)`), so an operator who added `paperclip_assignee_email` — or an
+ * `ownerMap` entry — for an alertname that already owned an open row had no way
+ * to route it: every re-fire refreshed `{status, description}` and nothing else,
+ * and `findActiveAggregateIssue` counts `backlog` as active, so even a row
+ * parked for alert fatigue kept absorbing the alertname. The annotation was
+ * inert for the life of the row, invisible from both sides — the rule reads as
+ * correctly configured and the row reads as merely stale. The only remedy was
+ * closing the row, which is undiscoverable and looks like destroying the record.
+ * Worked instance: `RelayAtsProbeBRed`/`CRed`, 6 days inert behind BLO-30777 /
+ * BLO-30758.
+ *
+ * Two deliberate narrowings, both about blast radius:
+ *
+ *   - **Only an explicitly configured owner retrofits.** The create path's
+ *     `issueRouteMap` and named-fallback-agent legs are *not* consulted here.
+ *     Those two resolve for essentially every alert, so including them would
+ *     mass-reassign every legacy ownerless row on its next re-fire — a fleet-wide
+ *     write nobody asked for, arriving as a side effect of a routing fix.
+ *   - **A row that already has an `assigneeAgentId` is never touched**, and a
+ *     resolved *user* is applied only to a row with no assignee at all. An
+ *     agent target may land on a user-assigned row because that row is agent-null
+ *     by definition — it has no wake path, which is the whole defect — but a
+ *     deliberate reassignment, by a human or an agent, is never overwritten.
+ *
+ * Returns the patch that was applied, so the caller can fold it into the alert
+ * state record and the firing event rather than re-reading the row. `null` means
+ * nothing changed, which is the overwhelmingly common case.
+ */
+async function retrofitAggregateOwner(
+  ctx: PluginContext,
+  config: AlertmanagerPluginConfig,
+  alert: AlertmanagerAlert,
+  companyId: string,
+  aggregateKey: string,
+  firingToken: string,
+  issueId: string,
+  // Passed when the caller already holds the row (the aggregate-join path), so
+  // the common case costs no extra RPC. `null` on the same-fingerprint re-fire
+  // path, where a rebind can move the target out from under the row we read.
+  known: IssueReference | null,
+): Promise<{ assigneeAgentId?: string; assigneeUserId?: string } | null> {
+  // Resolution first: it is pure over labels/annotations/ownerMap, and the email
+  // leg is a cached lookup. Gating the issue read behind it keeps an alertname
+  // with no configured owner — i.e. nearly all of them — at zero added cost.
+  const { assigneeAgentId, assigneeUserId } = await resolveAssigneeUserId(
+    ctx,
+    alert,
+    config.ownerMap,
+  );
+  if (!assigneeAgentId && !assigneeUserId) return null;
+
+  const issue = known ?? (await ctx.issues.get(issueId, companyId));
+  // Read the *row*, not the alert state record: a human may have assigned this
+  // issue by hand, and the state record would not know.
+  if (!issue || nonEmptyString(issue.assigneeAgentId ?? undefined)) return null;
+  const patch = assigneeAgentId
+    ? { assigneeAgentId }
+    : assigneeUserId && !nonEmptyString(issue.assigneeUserId ?? undefined)
+      ? { assigneeUserId }
+      : null;
+  if (!patch) return null;
+
+  await ctx.issues.update(issueId, patch, companyId, undefined, {
+    fencing: firingFence(companyId, aggregateKey, firingToken),
+  });
+  ctx.logger.info(
+    `Alertmanager: retrofitted owner ${
+      patch.assigneeAgentId ? `agent:${patch.assigneeAgentId}` : patch.assigneeUserId
+    } onto aggregate issue ${issueId} for ${alert.labels.alertname ?? "(unknown)"} (BLO-40764)`,
+  );
+  await ctx.metrics.write("alertmanager.owner.retrofitted", 1, {
+    alertname: alert.labels.alertname ?? "unknown",
+    target: patch.assigneeAgentId ? "agent" : "user",
+  });
+  return patch;
+}
+
 function isAggregateCreationConflict(err: unknown): boolean {
   const message =
     err instanceof Error
@@ -2094,6 +2175,36 @@ export async function handleFiring(
         if (terminal) throw err;
       }
 
+      // BLO-40764: re-read the configured owner and apply it if this row still
+      // has no agent. Gated on a decision we actually applied and on the two
+      // kinds that leave a live row behind: `suppressed` must not be touched
+      // (an operator closed it deliberately), `issue_missing` has no row, and a
+      // terminal severity is forced unassigned above by BLO-24177. Placed after
+      // the decision so the retrofit lands on the post-rebind target.
+      if (
+        !terminal &&
+        decisionApplied &&
+        (decision.kind === "refresh" || decision.kind === "reopen")
+      ) {
+        const retrofit = await retrofitAggregateOwner(
+          ctx,
+          config,
+          alert,
+          tracked.paperclipCompanyId,
+          aggregateKey,
+          firingToken,
+          tracked.paperclipIssueId,
+          null,
+        );
+        if (retrofit) {
+          tracked = {
+            ...tracked,
+            assigneeAgentId: retrofit.assigneeAgentId ?? tracked.assigneeAgentId,
+            assigneeUserId: retrofit.assigneeUserId ?? tracked.assigneeUserId,
+          };
+        }
+      }
+
       // Ladder restart keeps its original trigger — the alert going
       // resolved → firing — which is independent of the issue's status: an
       // operator may have re-opened the issue by hand, in which case the branch
@@ -2463,12 +2574,30 @@ export async function handleFiring(
       }
     }
   }
+  // BLO-40764: the other half of the create-only gate. A *new* fingerprint that
+  // joins an existing aggregate row skips owner resolution entirely — the code
+  // above records `assigneeResolutionSource = "aggregate-winner"` in as many
+  // words — so the winner keeps whatever owner it was created with forever.
+  // Retrofit here, on the same terms as the re-fire path.
+  const retrofit =
+    created || terminal
+      ? null
+      : await retrofitAggregateOwner(
+          ctx,
+          config,
+          alert,
+          companyId,
+          aggregateKey,
+          firingToken,
+          issue.id,
+          issue,
+        );
   const effectiveAssigneeUserId = created
     ? createAssigneeUserId ?? null
-    : issue.assigneeUserId ?? null;
+    : retrofit?.assigneeUserId ?? issue.assigneeUserId ?? null;
   const effectiveAssigneeAgentId = created
     ? finalAssigneeAgentId ?? null
-    : issue.assigneeAgentId ?? null;
+    : retrofit?.assigneeAgentId ?? issue.assigneeAgentId ?? null;
 
   const record: AlertStateRecord = {
     paperclipIssueId: issue.id,
