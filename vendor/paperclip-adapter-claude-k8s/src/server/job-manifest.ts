@@ -1174,6 +1174,16 @@ function buildEnvVars(
 
   // HOME must live on the mounted data PVC to enable session resume. Isolated
   // mode scopes Claude config/cache/session state away from shared /paperclip.
+  //
+  // That is a state boundary, not a trust boundary: every Job runs as uid 1000
+  // with the whole PVC read-write, isolation roots included. The adapter relies
+  // on that once, deliberately — the managed Claude Code runtime
+  // (runtime-pin.ts) lives under the data mount, not `isolation.homeRoot`, so
+  // it is the first executable on PATH shared across isolation keys (and
+  // companies). Accepted because it grants no write the PVC does not already
+  // grant, and its content is adapter-written at an exact version; if per-key
+  // write separation ever lands, move that runtime per key with it. Full
+  // rationale in runtime-pin.ts.
   merged.HOME = isolation.enabled ? isolation.homeRoot : "/paperclip";
   // BLO-34477: zsh sources $ZDOTDIR/.zshenv on every start, and bash sources
   // $BASH_ENV on a non-interactive start ONLY when it does not take its

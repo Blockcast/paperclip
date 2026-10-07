@@ -21,6 +21,22 @@
  * bundled CLI with a loud stderr line rather than failing outright — a model
  * the old CLI supports keeps working, and a model it does not support fails
  * with the same API error it fails with today.
+ *
+ * Trust assumption. The runtime root is derived from the data mount, not from
+ * the isolation root, so one installed copy serves every Job on the PVC across
+ * isolation keys, agents and companies. That makes the managed `claude` the
+ * first executable on PATH shared across the isolation split: a file one Job
+ * wrote, run by every other Job ahead of the image's CLI. It is accepted
+ * because it grants no write the PVC does not already grant: every Job runs as
+ * uid 1000 with the whole PVC mounted read-write, isolation roots included, so
+ * any Job can already rewrite another key's CLAUDE_CONFIG_DIR (whose settings
+ * hooks run commands) or HOME. Isolation keys separate state, not trust; a
+ * per-key runtime would buy no boundary and cost one CLI install per key. Its
+ * content is never agent-chosen either: only this snippet writes it, from the
+ * registry, at an exact version. If the PVC ever gains per-key write separation
+ * (distinct uids, per-key mounts), move the runtime under `isolation.homeRoot`
+ * in the same change — from then on this sharing is the hole. The isolation
+ * contract in job-manifest.ts (where HOME is set) points back here.
  */
 
 /** npm package that ships the Claude Code CLI. */
@@ -80,16 +96,23 @@ function shellSingleQuote(value: string): string {
  * Layout on the PVC:
  *   <data>/.local/lib/paperclip-k8s-runtimes/claude-code/<version>/   installed prefix
  *   .../<version>/.complete                                            written last
- *   .../.lock-<version>                                                mkdir lock
- *   .../.tmp-<version>-<pid>                                           staging dir
+ *   .../.lock-<version>/owner                                          mkdir lock + owner token
+ *   .../.tmp-<version>-<owner>                                         staging dir
  *
  * Properties:
  * - idempotent: a complete install is reused by every later Job, any isolation key;
  * - serialized: `mkdir` of the lock dir is atomic on CephFS/NFS; losers wait
- *   (up to 5 min) for the winner's `.complete` marker instead of installing twice;
+ *   (up to 5 min) for the winner's `.complete` marker instead of installing twice,
+ *   and the holder re-checks `.complete` once it has the lock, so an install that
+ *   finished in between is reused rather than torn down;
+ * - owned: the lock holds a random owner token (`$$` alone is useless — the
+ *   Job's `sh -c` is PID 1 in every pod) and is released only by its owner, so
+ *   an installer whose lock was reclaimed cannot free its successor's;
  * - crash-safe: a lock older than 20 min is reclaimed, a dir without `.complete`
  *   is rebuilt, and the staging dir is renamed into place only after the fresh
- *   binary answers `--version`;
+ *   binary answers `--version`, with `mv -T` so that a runtime a concurrent
+ *   installer already published makes the rename fail (that runtime is reused
+ *   and the staging dir removed) instead of nesting the staging dir inside it;
  * - fail-open: if nothing usable exists afterwards the image CLI is used and
  *   the pod log says so;
  * - deterministic: DISABLE_AUTOUPDATER=1 keeps the managed copy at the pin
@@ -108,16 +131,21 @@ export function buildClaudeCodeRuntimeShell(opts: { version: string; dataMountPa
     '__pcbin="$__pcdir/node_modules/.bin/claude"',
     'if [ ! -f "$__pcdir/.complete" ] || [ ! -x "$__pcbin" ]; then ' +
       'mkdir -p "$__pcroot" 2>/dev/null; __pclock="$__pcroot/.lock-$__pcver"; ' +
+      '__pcown="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)-$$"; ' +
       'if [ -d "$__pclock" ] && [ -n "$(find "$__pclock" -maxdepth 0 -mmin +20 2>/dev/null)" ]; then ' +
-        'echo "[paperclip] reclaiming stale claude-code install lock $__pclock" >&2; rmdir "$__pclock" 2>/dev/null; fi; ' +
+        'echo "[paperclip] reclaiming stale claude-code install lock $__pclock" >&2; rm -rf "$__pclock"; fi; ' +
       'if mkdir "$__pclock" 2>/dev/null; then ' +
-        '__pctmp="$__pcroot/.tmp-$__pcver-$$"; rm -rf "$__pctmp" "$__pcdir"; mkdir -p "$__pctmp"; ' +
-        `echo "[paperclip] installing ${spec} into $__pcdir" >&2; ` +
-        `if npm install --prefix "$__pctmp" --omit=dev --no-audit --no-fund --no-package-lock --loglevel=error "${spec}" >&2 ` +
-          '&& "$__pctmp/node_modules/.bin/claude" --version >/dev/null 2>&1; then ' +
-          'mv "$__pctmp" "$__pcdir" && : > "$__pcdir/.complete"; ' +
-        `else echo "[paperclip] ${spec} install failed" >&2; rm -rf "$__pctmp"; fi; ` +
-        'rmdir "$__pclock" 2>/dev/null; ' +
+        'echo "$__pcown" > "$__pclock/owner"; ' +
+        'if [ ! -f "$__pcdir/.complete" ] || [ ! -x "$__pcbin" ]; then ' +
+          '__pctmp="$__pcroot/.tmp-$__pcver-$__pcown"; rm -rf "$__pctmp" "$__pcdir"; mkdir -p "$__pctmp"; ' +
+          `echo "[paperclip] installing ${spec} into $__pcdir" >&2; ` +
+          `if npm install --prefix "$__pctmp" --omit=dev --no-audit --no-fund --no-package-lock --loglevel=error "${spec}" >&2 ` +
+            '&& "$__pctmp/node_modules/.bin/claude" --version >/dev/null 2>&1; then ' +
+            'if mv -T "$__pctmp" "$__pcdir" 2>/dev/null; then : > "$__pcdir/.complete"; ' +
+            'else echo "[paperclip] $__pcdir was published by a concurrent install; reusing it" >&2; rm -rf "$__pctmp"; fi; ' +
+          `else echo "[paperclip] ${spec} install failed" >&2; rm -rf "$__pctmp"; fi; ` +
+        'fi; ' +
+        '[ "$(cat "$__pclock/owner" 2>/dev/null)" = "$__pcown" ] && rm -rf "$__pclock"; ' +
       'else ' +
         `echo "[paperclip] waiting for a concurrent ${spec} install" >&2; ` +
         '__pci=0; while [ ! -f "$__pcdir/.complete" ] && [ -d "$__pclock" ] && [ "$__pci" -lt 300 ]; do sleep 1; __pci=$((__pci+1)); done; ' +
