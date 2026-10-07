@@ -416,3 +416,166 @@ test('WITH a waiting run under threshold the record IS decisive, so a failed rea
     'the record can flip the verdict here, which is why a failed read must still fail',
   );
 });
+
+// --- PEN-3744: the delivery gap on the notifying surface ---------------------
+//
+// These tests exist because the thing that failed in production was not the
+// rule, the threshold or the delivery — it was that the ONE alert Alertmanager
+// lets through could not express how far behind production actually was. The
+// sibling that could, `PaperclipApiProductionDeployStalled`, is inhibited by
+// this alert (onprem-k8s BLO-37835) and read `suppressed` with
+// `silencedBy: []` for seven days while 612 commits piled up.
+
+/**
+ * Reproduces what the Slack relay actually forwards from a description:
+ * the first blank-line-delimited paragraph, whitespace-collapsed, truncated at
+ * 400 chars (onprem-k8s monitoring/alertmanager-slack-relay.yaml,
+ * `lead_paragraph` / `DESC_LEAD_MAX`). Without this the tests could assert text
+ * a human never sees.
+ */
+const DESC_LEAD_MAX = 400;
+const slackLead = (description) =>
+  description.trim().split('\n\n', 1)[0].split(/\s+/).join(' ');
+
+const STALLED_GAP = {
+  commitsBehind: 612,
+  days: 12.52,
+  deployedSha: 'f06c717a6b1d3d1cbaca3a2708c21adf81fd7bba',
+  landedAt: '2026-09-21T16:38:56Z',
+  deployRunUrl: 'https://github.com/Blockcast/paperclip/actions/runs/35623928344',
+  compareStatus: 'ahead',
+  deployedCommitAt: '2026-09-20T22:55:03Z',
+};
+
+const stuckAlert = (extra = {}) => {
+  const verdict = selectStuckApproval({
+    pendingRuns: [waitingRun('2026-09-01T02:00:00.000Z')],
+    alertAfterHours: 6,
+    now: NOW,
+  });
+  return buildAlert({
+    ...verdict,
+    alertAfterHours: 6,
+    runUrl: 'https://github.com/Blockcast/paperclip/actions/runs/99',
+    repo: 'Blockcast/paperclip',
+    environment: 'paperclip-production',
+    now: NOW,
+    ...extra,
+  });
+};
+
+test('PEN-3744: the SUMMARY carries the delivery gap — the relay never truncates it', () => {
+  const alert = stuckAlert({ deliveryGap: STALLED_GAP });
+
+  assert.match(alert.annotations.summary, /612 commits \/ 12\.5d behind master/);
+  // The approval age must survive too: it is the actionable half.
+  assert.match(alert.annotations.summary, /awaiting human approval for 10\.0h/);
+});
+
+test('PEN-3744: the gap is in the FIRST paragraph and the Slack lead fits in 400 chars', () => {
+  // This is the positive control for the whole change. A gap that lands in
+  // paragraph 2, or overruns the cap, is a gap the human reading Slack does
+  // not get — which is indistinguishable from not having fixed anything.
+  const alert = stuckAlert({ deliveryGap: STALLED_GAP, stallStartedAt: '2026-08-31T20:00:00.000Z' });
+  const lead = slackLead(alert.annotations.description);
+
+  assert.match(lead, /612 commits \/ 12\.5d behind master/);
+  assert.match(lead, /f06c717a landed 2026-09-21T16:38:56Z/);
+  assert.ok(
+    lead.length <= DESC_LEAD_MAX,
+    `Slack lead is ${lead.length} chars, over the ${DESC_LEAD_MAX} cap: ${lead}`,
+  );
+  // And the approval clause, which this paragraph used to be entirely about,
+  // is still inside the same lead rather than pushed out by the new text.
+  assert.match(lead, /parked on the paperclip-production reviewer gate/);
+});
+
+test('PEN-3744: says out loud that the approval age is the SMALLER number', () => {
+  // The filed defect was read as a ~48x understatement because the approval
+  // age looked like the stall clock. Both numbers now appear together, so the
+  // alert has to say which is which or it invites the same misreading.
+  const alert = stuckAlert({ deliveryGap: STALLED_GAP });
+  assert.match(slackLead(alert.annotations.description), /SMALLER, different number/);
+});
+
+test('PEN-3744: names the inhibited sibling so its silence is not read as a small gap', () => {
+  const alert = stuckAlert({ deliveryGap: STALLED_GAP });
+  assert.match(alert.annotations.description, /PaperclipApiProductionDeployStalled/);
+  assert.match(alert.annotations.description, /INHIBITED by this alert/);
+});
+
+test('PEN-3744: machine annotations carry the gap for anyone querying /api/v2/alerts', () => {
+  const alert = stuckAlert({ deliveryGap: STALLED_GAP });
+
+  assert.equal(alert.annotations.delivery_gap_commits, '612');
+  assert.equal(alert.annotations.delivery_gap_days, '12.5');
+  assert.equal(alert.annotations.deployed_commit, STALLED_GAP.deployedSha);
+  assert.equal(alert.annotations.last_deploy_at, '2026-09-21T16:38:56Z');
+  assert.equal(alert.annotations.delivery_gap_unavailable, undefined);
+});
+
+test('PEN-3744: with NO gap the SUMMARY and LEAD are byte-identical to the pre-change wording', () => {
+  // The enrichment must degrade to today's behaviour, never to silence and
+  // never to a confusing half-sentence: an unmeasured gap is a GitHub blip on
+  // the one path that reaches a human.
+  //
+  // Scoped deliberately to the summary and the LEAD PARAGRAPH, which are the
+  // two things the Slack relay forwards. The description as a whole is NOT
+  // byte-identical — it gains a paragraph explaining that neither surface is
+  // reporting the gap — and the looser `startsWith` this used to assert let
+  // exactly that change through unnoticed (Ally review of #2225).
+  const alert = stuckAlert();
+
+  assert.equal(
+    alert.annotations.summary,
+    'Blockcast/paperclip production deploy has been awaiting human approval for 10.0h — ' +
+      'the daily dispatcher is a no-op until it clears',
+  );
+  assert.equal(
+    slackLead(alert.annotations.description),
+    'A docker.yml deploy has been parked on the paperclip-production reviewer gate since ' +
+      '2026-09-01T02:00:00.000Z (10.0h; threshold 6h).',
+  );
+  assert.equal(alert.annotations.delivery_gap_commits, undefined);
+});
+
+test('PEN-3744: with no gap the alert does not claim to be carrying one', () => {
+  // The inhibition paragraph used to assert "this is the only notification
+  // carrying that figure" unconditionally — including on the branch whose own
+  // lead says the gap could not be measured. Two paragraphs apart, flatly
+  // contradictory (Ally review of #2225).
+  const withGap = stuckAlert({ deliveryGap: STALLED_GAP }).annotations.description;
+  const without = stuckAlert({ deliveryGapReason: 'lookup failed: 503 upstream' }).annotations
+    .description;
+
+  assert.match(withGap, /this is the only notification carrying that figure/);
+  assert.doesNotMatch(without, /is the only notification carrying that figure/);
+  assert.match(without, /would carry that figure/);
+  // The warning itself must survive — it matters MORE when nothing is
+  // reporting the gap, not less.
+  assert.match(without, /NO surface is currently reporting the gap/);
+  assert.match(without, /Do not read either silence as the gap being small/);
+});
+
+test('PEN-3744: a FAILED lookup is reported on the alert, not silently absent', () => {
+  // "the gap is small" and "the gap was never measured" must not look the same
+  // to the next reader.
+  const alert = stuckAlert({ deliveryGapReason: 'lookup failed: 503 upstream' });
+
+  assert.equal(alert.annotations.delivery_gap_unavailable, 'lookup failed: 503 upstream');
+  assert.match(slackLead(alert.annotations.description), /could not be measured \(lookup failed/);
+  assert.ok(slackLead(alert.annotations.description).length <= DESC_LEAD_MAX);
+});
+
+test('PEN-3744: an unbounded failure reason cannot blow the 400-char Slack lead', () => {
+  const alert = stuckAlert({ deliveryGapReason: `lookup failed: ${'x'.repeat(4000)}` });
+  assert.ok(slackLead(alert.annotations.description).length <= DESC_LEAD_MAX);
+});
+
+test('PEN-3744: an unparseable deploy timestamp still delivers the commit count', () => {
+  const alert = stuckAlert({ deliveryGap: { ...STALLED_GAP, days: null } });
+
+  assert.match(alert.annotations.summary, /612 commits behind master/);
+  assert.equal(alert.annotations.delivery_gap_days, undefined);
+  assert.equal(alert.annotations.delivery_gap_commits, '612');
+});

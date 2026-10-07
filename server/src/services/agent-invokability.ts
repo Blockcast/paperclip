@@ -72,7 +72,10 @@ function invalidChainReason(health: AgentOrgChainHealth): AgentInvokabilityBlock
 
 export function evaluateAgentInvokability(
   agent: AgentOrgRow | null | undefined,
-  companyAgents: AgentOrgRow[],
+  // `readonly` so a memoised roster (one frozen array shared by every hit within the TTL)
+  // can be passed without a defensive copy. This function only reads and `map`s, so the
+  // narrowing costs nothing and every existing mutable-array caller still type-checks.
+  companyAgents: readonly AgentOrgRow[],
 ): AgentInvokability {
   if (!agent) {
     return blocked("missing", "Agent no longer exists", {}, false);
@@ -115,14 +118,25 @@ export function evaluateAgentInvokability(
   );
 }
 
-export async function evaluateAgentInvokabilityFromDb(
-  // Callers holding an advisory lock MUST pass their own transaction — a second
-  // pool connection here is what convoyed on BLO-34207.
-  db: Db | DbTransaction,
-  agent: AgentOrgRow | null | undefined,
-): Promise<AgentInvokability> {
-  if (!agent) return evaluateAgentInvokability(agent, []);
-  const companyAgents = await db
+/**
+ * The company-roster read behind `evaluateAgentInvokabilityFromDb`.
+ *
+ * Exported so a caller that wants to *memoise* the read can reuse the exact query
+ * rather than restate it (PEN-3636). The column list is the load-bearing part: it is
+ * what `evaluateAgentInvokability` destructures, so a second copy that drifts from
+ * this one produces an `AgentOrgRow` missing a field the pure evaluator reads. Lifting
+ * it to one definition is the same correction Ally asked for on #2194's three-times
+ * duplicated pause-hold predicate — the superset property should hold by construction,
+ * not by two call sites being edited together.
+ *
+ * Deliberately NOT id-filtered: the org-chain walk needs every agent in the company,
+ * which is exactly why this read is expensive enough to be worth memoising.
+ */
+export async function readCompanyAgentRoster(
+  db: Pick<Db, "select">,
+  companyId: string,
+): Promise<AgentOrgRow[]> {
+  return db
     .select({
       id: agents.id,
       companyId: agents.companyId,
@@ -131,13 +145,53 @@ export async function evaluateAgentInvokabilityFromDb(
       status: agents.status,
     })
     .from(agents)
-    .where(eq(agents.companyId, agent.companyId));
+    .where(eq(agents.companyId, companyId));
+}
+
+/**
+ * Serves `readCompanyAgentRoster` from a short-lived per-pass memo.
+ *
+ * Structurally identical to `ActivePauseHoldPrefilter` and implemented in
+ * `recovery/agent-roster-memo.ts`; declared here as a bare shape so this module keeps
+ * no dependency on the recovery sweep and no caching policy of its own.
+ */
+export type CompanyAgentRosterReader = {
+  // `readonly` because a memo serves one array instance to every hit: see
+  // `AgentRosterMemo.companyAgents`. Widening it here would let a consumer sort the
+  // shared entry in place.
+  companyAgents(companyId: string): Promise<readonly AgentOrgRow[]>;
+};
+
+export async function evaluateAgentInvokabilityFromDb(
+  // Callers holding an advisory lock MUST pass their own transaction — a second
+  // pool connection here is what convoyed on BLO-34207.
+  db: Db | DbTransaction,
+  agent: AgentOrgRow | null | undefined,
+  // PEN-3636: optional, and omitting it preserves today's behaviour exactly — every
+  // caller that does not pass one still takes a live roster read per call. A sweep
+  // passes one so a run of candidates sharing a company reads the roster once.
+  //
+  // ⚠️ A reader supplied here reads on whatever handle it was built with, which this
+  // function cannot check and the type cannot express. Supplying one whose handle
+  // disagrees with `db` — a pool-bound memo passed alongside a transaction — yields a
+  // roster blind to that transaction's uncommitted writes. Caller's obligation.
+  rosterReader?: CompanyAgentRosterReader,
+): Promise<AgentInvokability> {
+  if (!agent) return evaluateAgentInvokability(agent, []);
+  const companyAgents = rosterReader
+    ? await rosterReader.companyAgents(agent.companyId)
+    : await readCompanyAgentRoster(db, agent.companyId);
   return evaluateAgentInvokability(agent, companyAgents);
 }
 
 export function listInvalidOrgChainDescendantIds(
   terminatedAgentId: string,
-  companyAgents: AgentOrgRow[],
+  // `readonly` for the same reason as `evaluateAgentInvokability` (PEN-3636): this is the
+  // module's other company-roster consumer, and a memo hands the SAME frozen array to
+  // every hit. Nothing here mutates the input — rows are pushed into map-owned arrays
+  // built locally and `stack` is a fresh spread — so this is a no-op for both existing
+  // callers, which pass mutable arrays. It only stops the type refusing a frozen roster.
+  companyAgents: readonly AgentOrgRow[],
 ): string[] {
   const byManager = new Map<string | null, AgentOrgRow[]>();
   for (const row of companyAgents) {

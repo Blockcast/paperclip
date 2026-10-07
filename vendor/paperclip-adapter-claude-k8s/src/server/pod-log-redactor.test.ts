@@ -13,7 +13,8 @@
 // store whose safety was in question.
 
 import { describe, expect, it, beforeAll } from "vitest";
-import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable, type Transform } from "node:stream";
@@ -27,6 +28,7 @@ import {
   POD_LOG_REDACTOR_FILENAME,
   POD_LOG_FILTER_ARG_VAR,
   POD_LOG_FILTER_VAR,
+  POD_LOG_UNREDACTED_SUFFIX,
   buildPodLogRedactorSetupShell,
 } from "./pod-log-redactor.js";
 
@@ -283,8 +285,10 @@ describe("pod-log-redactor: stream transform", () => {
 });
 
 describe("pod-log-redactor: shell wiring", () => {
+  const POD_LOG = "/paperclip/instances/default/data/run-logs/co1/agent-abc/run-abc.pod.ndjson";
+
   it("installs write-once and never truncates the shared inode", () => {
-    const shell = buildPodLogRedactorSetupShell();
+    const shell = buildPodLogRedactorSetupShell(POD_LOG);
     // `[ -f ] ||` + tmp + `mv -f`: the CephFS truncate-wedge invariant.
     expect(shell).toContain(`[ -f "$GUARD_DIR/${POD_LOG_REDACTOR_FILENAME}" ] ||`);
     expect(shell).toContain("mv -f");
@@ -292,7 +296,7 @@ describe("pod-log-redactor: shell wiring", () => {
   });
 
   it("falls open to cat when the script is not on disk", () => {
-    const shell = buildPodLogRedactorSetupShell();
+    const shell = buildPodLogRedactorSetupShell(POD_LOG);
     expect(shell).toContain(`${POD_LOG_FILTER_VAR}=cat`);
     const guarded = shell.indexOf(`[ -f "$GUARD_DIR/${POD_LOG_REDACTOR_FILENAME}" ] && {`);
     expect(guarded).toBeGreaterThan(shell.indexOf(`${POD_LOG_FILTER_VAR}=cat`));
@@ -303,7 +307,7 @@ describe("pod-log-redactor: shell wiring", () => {
   // about node being runnable. `[ -f ]` covers "script missing", not
   // "node missing" — probe for it rather than assuming.
   it("falls open to cat when node is not runnable", () => {
-    const shell = buildPodLogRedactorSetupShell();
+    const shell = buildPodLogRedactorSetupShell(POD_LOG);
     expect(shell).toContain("command -v node >/dev/null 2>&1 &&");
     expect(shell.indexOf("command -v node")).toBeLessThan(
       shell.indexOf(`${POD_LOG_FILTER_VAR}=node`),
@@ -317,7 +321,7 @@ describe("pod-log-redactor: shell wiring", () => {
   // use site without also quoting `cat` into a one-word command that happens to
   // work, and cannot be left unquoted without word-splitting the path.
   it("keeps the command word and the script path in separate variables", () => {
-    const shell = buildPodLogRedactorSetupShell();
+    const shell = buildPodLogRedactorSetupShell(POD_LOG);
     expect(shell).toContain(`${POD_LOG_FILTER_VAR}=node;`);
     expect(shell).toContain(
       `${POD_LOG_FILTER_ARG_VAR}="$GUARD_DIR/${POD_LOG_REDACTOR_FILENAME}"`,
@@ -325,6 +329,99 @@ describe("pod-log-redactor: shell wiring", () => {
     // The old single-variable form is the regression this pins.
     expect(shell).not.toContain(`${POD_LOG_FILTER_VAR}="node `);
     expect(shell).toContain(`export ${POD_LOG_FILTER_VAR} ${POD_LOG_FILTER_ARG_VAR}`);
+  });
+
+  // Every other test in this describe is a STRING match on the fragment, which
+  // cannot settle a precedence question: `A && B && { ... } || C` fires C when
+  // EITHER probe fails, and would also fire it spuriously if the braced group
+  // ever returned non-zero (leaving a "not installed" warning next to a filter
+  // that IS installed). Run the real fragment in a real shell instead.
+  //
+  // The container command is `sh -c` (job-manifest.ts), so /bin/sh is the
+  // binding target; bash is included only to catch a bashism creeping in.
+  describe("the fragment actually behaves, under a real shell", () => {
+    /** Runs the real setup fragment, then reports what it set. `$GUARD_DIR` is
+     *  a tmpdir; pre-creating the target short-circuits the `[ -f ] ||` install
+     *  so the only commands needed are shell builtins — which is what lets the
+     *  node-missing case use an empty PATH without also breaking `base64`. */
+    function runFragment(opts: { node: boolean; script: boolean; logDir?: boolean; errexit?: boolean }) {
+      const root = mkdtempSync(path.join(tmpdir(), "pod-log-redactor-shell-"));
+      const guardDir = path.join(root, "guard");
+      mkdirSync(guardDir);
+      // A space and a quote, so the sentinel path's quoting is exercised too.
+      // Created unless told not to, as `preparePodLog` does in job-manifest.ts.
+      const logDir = path.join(root, "pod log's dir");
+      if (opts.logDir !== false) mkdirSync(logDir);
+      const podLogPath = path.join(logDir, "run.pod.ndjson");
+      if (opts.script) {
+        writeFileSync(path.join(guardDir, POD_LOG_REDACTOR_FILENAME), "// placeholder\n");
+      }
+      let binPath = "/nonexistent";
+      if (opts.node) {
+        const bin = path.join(root, "bin");
+        mkdirSync(bin);
+        writeFileSync(path.join(bin, "node"), "#!/bin/sh\n");
+        chmodSync(path.join(bin, "node"), 0o755);
+        binPath = bin;
+      }
+      const stderrPath = path.join(root, "stderr");
+      // Redirect inside `-c` rather than via stdio: `$?` after the braced group
+      // is still the fragment's own status, which is the thing under test.
+      const stdout = execFileSync(
+        "/bin/sh",
+        [
+          "-c",
+          `${opts.errexit ? "set -e; " : ""}{ ${buildPodLogRedactorSetupShell(podLogPath)}; } 2>"${stderrPath}"; ` +
+            `echo "rc=$? filter=$${POD_LOG_FILTER_VAR} arg=$${POD_LOG_FILTER_ARG_VAR}"`,
+        ],
+        { env: { PATH: binPath, GUARD_DIR: guardDir }, encoding: "utf8" },
+      );
+      return {
+        stdout: stdout.trim(),
+        stderr: readFileSync(stderrPath, "utf8"),
+        guardDir,
+        sentinel: existsSync(`${podLogPath}${POD_LOG_UNREDACTED_SUFFIX}`),
+      };
+    }
+
+    it("sets node + the script path when both are available, and warns nothing", () => {
+      const { stdout, stderr, guardDir, sentinel } = runFragment({ node: true, script: true });
+      expect(stdout).toBe(
+        `rc=0 filter=node arg=${path.join(guardDir, POD_LOG_REDACTOR_FILENAME)}`,
+      );
+      expect(stderr).toBe("");
+      expect(sentinel).toBe(false);
+    });
+
+    // The whole point of announcing the degradation: silently, "redacted" and
+    // "fell open to cat" are indistinguishable after the fact.
+    it("falls open to cat and SAYS SO when node is missing", () => {
+      const { stdout, stderr, sentinel } = runFragment({ node: false, script: true });
+      expect(stdout).toContain("filter=cat");
+      expect(stdout).toContain("rc=0"); // must not poison `set -o pipefail`
+      expect(stderr).toContain("pod log is UNREDACTED");
+      // stderr is reaped with the Job; the sentinel is what outlives the pod.
+      expect(sentinel).toBe(true);
+    });
+
+    it("falls open to cat and SAYS SO when the script is missing", () => {
+      const { stdout, stderr, sentinel } = runFragment({ node: true, script: false });
+      expect(stdout).toContain("filter=cat");
+      expect(stdout).toContain("rc=0");
+      expect(stderr).toContain("pod log is UNREDACTED");
+      expect(sentinel).toBe(true);
+    });
+
+    // `:` is a special builtin: under dash a redirection error on one exits the
+    // shell, so `: > sentinel` with no directory would kill the whole run.
+    // `set -e` is what makes a failed write's status observable here: the
+    // fragment's own last statement is `export`, which would mask it.
+    it("survives a missing pod-log directory: rc=0, still falls open, still warns", () => {
+      const { stdout, stderr, sentinel } = runFragment({ node: false, script: true, logDir: false, errexit: true });
+      expect(stdout).toBe("rc=0 filter=cat arg=");
+      expect(stderr).toContain("pod log is UNREDACTED");
+      expect(sentinel).toBe(false);
+    });
   });
 
   it("content-addresses the filename so a rule change lands as a new file", () => {

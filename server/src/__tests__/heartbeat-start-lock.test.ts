@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   _resetAgentStartLocksForTesting,
   _settleDetachedAgentStartLockWorkForTesting,
+  agentStartLockSweepContext,
+  runDetachedFromAgentStartLock,
   withAgentStartLock,
 } from "../services/agent-start-lock.js";
 
@@ -267,6 +269,7 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
   it("caps nesting depth by detaching the deepest call instead of dropping it", async () => {
     const ids = Array.from({ length: 6 }, () => randomUUID());
     const calls: string[] = [];
+    const sweepScopes: Array<true | undefined> = [];
 
     const nest = async (depth: number): Promise<string> => {
       if (depth >= ids.length) return "leaf";
@@ -274,6 +277,7 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
         ids[depth],
         async () => {
           calls.push(ids[depth]);
+          sweepScopes.push(agentStartLockSweepContext.getStore());
           return nest(depth + 1);
         },
         { onCoalesced: () => "depth-capped" as const },
@@ -283,7 +287,7 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
     // The chain is CUT at the depth bound rather than recursed through: the
     // 5th call returns `onCoalesced()` to its caller instead of the nested
     // result, so the top-level call never sees "leaf".
-    await expect(nest(0)).resolves.toBe("depth-capped");
+    await expect(agentStartLockSweepContext.run(true, () => nest(0))).resolves.toBe("depth-capped");
 
     // ...but the demand must not be discarded. Previously the depth guard
     // returned `onCoalesced()` without registering anything, so when the 5th
@@ -292,6 +296,28 @@ describe("heartbeat agent start lock (BLO-20396)", () => {
     // because that resets the depth the rest of the chain proceeds from there.
     await _settleDetachedAgentStartLockWorkForTesting();
     expect(calls).toEqual(ids);
+    expect(sweepScopes).toEqual([true, true, true, true, undefined, undefined]);
+  });
+
+  it("clears the sweep scope from detached execution and coalesced follow-ups", async () => {
+    await agentStartLockSweepContext.run(true, async () => {
+      await runDetachedFromAgentStartLock(async () => {
+        await Promise.resolve();
+        expect(agentStartLockSweepContext.getStore()).toBeUndefined();
+      });
+      expect(agentStartLockSweepContext.getStore()).toBe(true);
+
+      const agentId = randomUUID();
+      const followUpScopes: Array<true | undefined> = [];
+      await withAgentStartLock(agentId, async () => {
+        await withAgentStartLock(agentId, async () => {
+          followUpScopes.push(agentStartLockSweepContext.getStore());
+        }, { onCoalesced: () => undefined });
+      }, { onCoalesced: () => undefined });
+      await _settleDetachedAgentStartLockWorkForTesting();
+      expect(followUpScopes).toEqual([undefined]);
+      expect(agentStartLockSweepContext.getStore()).toBe(true);
+    });
   });
 
   it("serializes a burst so each queued item is handed out at most once", async () => {

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME } from "./pod-log-redactor.js";
+import { POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME, POD_LOG_UNREDACTED_SUFFIX } from "./pod-log-redactor.js";
 import {
   buildJobManifest,
   buildPodLogPath,
@@ -1307,6 +1307,17 @@ describe("buildJobManifest", () => {
       expect(env.get("CLAUDE_CONFIG_DIR")).toBe("/paperclip/k8s-isolation/workspace-1/session/.claude");
       expect(env.get("TMPDIR")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/tmp");
       expect(env.get("XDG_CACHE_HOME")).toBe("/runtime-cache/paperclip-workspaces/workspace-1/cache/xdg");
+      // BLO-15567: CARGO_TARGET_DIR defaults to <pkg>/target inside the
+      // checkout, which is on the PVC here — that is the byte-moving fix.
+      // CARGO_HOME is image-set (/home/node/.cargo, overlay); pinned anyway so
+      // the value does not depend on image-rollout state. Cargo honours a
+      // cross-device redirect (verified with CWD on the PVC), so assert both
+      // land off /paperclip. pnpm does NOT and is handled elsewhere — see the
+      // CARGO_CACHE_ENV doc comment.
+      for (const [key, leaf] of [["CARGO_HOME", "cargo"], ["CARGO_TARGET_DIR", "cargo-target"]]) {
+        expect(env.get(key)).toBe(`/runtime-cache/paperclip-workspaces/workspace-1/cache/${leaf}`);
+        expect(env.get(key)?.startsWith("/paperclip")).toBe(false);
+      }
       expect(container?.command?.join(" ")).not.toContain("git clone --shared");
     });
 
@@ -1385,6 +1396,14 @@ describe("buildJobManifest", () => {
       expect(env.get("BUN_INSTALL_CACHE")).toBe("/runtime-cache/bun");
       expect(env.get("PIP_CACHE_DIR")).toBe("/runtime-cache/pip");
       expect(env.get("PLAYWRIGHT_BROWSERS_PATH")).toBe("/runtime-cache/ms-playwright");
+      // BLO-15567: CARGO_TARGET_DIR is unset in the image (defaults into the
+      // checkout); CARGO_HOME is image-set and pinned here so the manifest
+      // value does not depend on image-rollout state.
+      expect(env.get("CARGO_HOME")).toBe("/runtime-cache/cargo");
+      expect(env.get("CARGO_TARGET_DIR")).toBe("/runtime-cache/cargo-target");
+      // RUSTUP_HOME must stay at the image default (/usr/local/rustup) — an
+      // empty ephemeral dir has no toolchains and breaks cargo/rustc.
+      expect(env.get("RUSTUP_HOME")).toBeUndefined();
     });
 
     it("overrides inherited cache paths with the job-local runtime-cache mount", () => {
@@ -2184,7 +2203,7 @@ describe("buildJobManifest", () => {
     // downstream scrubs a copy that already landed on the shared PVC — the same
     // objection that ruled out retroactive scrubbing on that ticket.
     it("pipes claude through the pod-log redactor BEFORE tee (BLO-29553)", () => {
-      const { job } = buildJobManifest({ ctx, selfPod });
+      const { job, podLogPath } = buildJobManifest({ ctx, selfPod });
       const command = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
 
       const filter = command.indexOf(
@@ -2211,6 +2230,13 @@ describe("buildJobManifest", () => {
       // degrades to `cat` rather than failing every run in the fleet through
       // `set -o pipefail`.
       expect(command).toContain(`${POD_LOG_FILTER_VAR}=cat`);
+
+      // ...and leaves `<podLogPath>.unredacted` beside the pod log, which needs
+      // the pod log's directory to exist by then.
+      const sentinel = command.indexOf(`true > '${podLogPath}${POD_LOG_UNREDACTED_SUFFIX}'`);
+      expect(sentinel).toBeGreaterThan(-1);
+      expect(command.indexOf("mkdir -p '/paperclip/instances/default/data/run-logs")).toBeGreaterThan(-1);
+      expect(command.indexOf("mkdir -p '/paperclip/instances/default/data/run-logs")).toBeLessThan(sentinel);
 
       // $GUARD_DIR derives from the operator-configurable CLAUDE_CONFIG_DIR, so
       // the script path can contain a space. An unquoted single `$VAR` holding

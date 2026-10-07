@@ -85,6 +85,28 @@ export function buildExecutionPolicy(input: {
   const stages: IssueExecutionPolicy["stages"] = [];
   const monitor = input.existingPolicy?.monitor ?? null;
   const productivityReviewDisabled = input.existingPolicy?.productivityReviewDisabled === true;
+  // BLO-40082: `PATCH /issues/:id` is a whole-policy REPLACE with no server-side
+  // merge, so every field this helper fails to re-emit is silently deleted. The
+  // old field-by-field rebuild dropped `reviewPreset` and `authorizationPolicy`
+  // — including `authorizationPolicy.trustBoundary`, which no board control can
+  // read, render or set, so the drop can never be an intended edit.
+  //
+  // Carry forward by destructuring out only what is rebuilt below, rather than
+  // enumerating what is preserved: the enumerating form is what rotted, and it
+  // rots again on the next field added to IssueExecutionPolicy. Mirrors the
+  // server's own `mergeIssueExecutionPolicyMonitor` (`{ ...previous, monitor }`).
+  //
+  // `productivityReviewDisabled` is excluded because it IS rebuilt below, with
+  // BLO-39945's true-only emission: carrying it here instead would preserve a
+  // literal `false`, which that fix deliberately drops.
+  const {
+    mode: _rebuiltMode,
+    commentRequired: _rebuiltCommentRequired,
+    stages: _rebuiltStages,
+    monitor: _rebuiltMonitor,
+    productivityReviewDisabled: _rebuiltProductivityReviewDisabled,
+    ...carried
+  } = input.existingPolicy ?? ({} as IssueExecutionPolicy);
 
   const existingReviewStage = input.existingPolicy?.stages.find((stage) => stage.type === "review");
   const reviewParticipants = mergeParticipants(existingReviewStage?.participants, input.reviewerValues);
@@ -108,18 +130,20 @@ export function buildExecutionPolicy(input: {
     });
   }
 
-  // BLO-39945: mirrors the collapse guard in the server's
-  // `normalizeIssueExecutionPolicy`. Without the third conjunct a board user
-  // toggling a reviewer on a stageless, monitorless, opted-out row collapses
-  // the whole policy to null and silently drops the opt-out.
+  // Collapse only when there is genuinely nothing to keep. Mirrors the server's
+  // `normalizeIssueExecutionPolicy` guard.
   //
-  // Known gap, pre-existing and deliberately out of scope here: this helper
-  // also drops `reviewPreset` and `authorizationPolicy`, so the same clobber
-  // exists for those — BLO-40082. Do not read this guard as proof that every
-  // policy field survives a UI edit.
-  if (stages.length === 0 && !monitor && !productivityReviewDisabled) return null;
+  // BLO-39945 added the `productivityReviewDisabled` conjunct; BLO-40082 adds
+  // `carried`, which covers `reviewPreset` and `authorizationPolicy` and every
+  // field added after them. `carried` is empty for a policy holding only the
+  // rebuilt fields, so those still collapse to null byte-identically.
+  if (stages.length === 0 && !monitor && !productivityReviewDisabled && Object.keys(carried).length === 0) {
+    return null;
+  }
 
   return {
+    // Spread first so a carried key can never shadow a rebuilt one.
+    ...carried,
     mode,
     commentRequired: true,
     stages,

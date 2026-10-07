@@ -1119,6 +1119,33 @@ export function agentService(db: Db) {
         // credential there is raw plaintext under a caller-chosen key, so the mask
         // is irreversible and the snapshot holds nothing to restore from.
         //
+        // `runtimeConfig` is the third column replayed on this path, and it is
+        // safe by a third mechanism again — not by either of the two above, so do
+        // not read this census as covering it by analogy. `mergeApprovedRuntimeConfig`
+        // starts from the stored row (`{ ...current }`) and `continue`s on any key
+        // whose requested and approved values are `jsonEqual`, so a value the board
+        // did not change keeps its stored form and the mask never lands on it.
+        // The one branch that guard does not cover is below: the merge runs only
+        // when `requestedConfigurationSnapshot.runtimeConfig` is present, and takes
+        // `approvedRuntimeConfig` verbatim otherwise. That branch IS reachable, so
+        // do not read this census as clearing `runtimeConfig` on every path:
+        // - At creation it is reachable but benign. `routes/agents.ts` always sets
+        //   the snapshot, and `POST /companies/:companyId/approvals` refuses a
+        //   `hire_agent` carrying `agentId`, but `built-in-agents.ts` and
+        //   `plugin-managed-agents.ts` file bound hires with no snapshot. Their
+        //   `runtimeConfig` is the unredacted row value, and `update` refuses to
+        //   change it while pending, so the verbatim write puts back what the row
+        //   already holds.
+        // - On `POST /approvals/:id/resubmit` it is a live gap. The route replaces
+        //   the stored payload wholesale with the caller's body and re-binds
+        //   `agentId` from `linkedAgentId`; neither it nor `svc.resubmit()`
+        //   re-derives the snapshot. A resubmitted payload without
+        //   `requestedConfigurationSnapshot` reaches here with
+        //   `requestedSnapshot === null`, and its `runtimeConfig` — e.g. copied from
+        //   the redacted read projection — is written verbatim, sentinels included:
+        //   the same corruption mode as above. Pre-existing, not closed by
+        //   PEN-3759, and needs its own follow-up.
+        //
         // Restore from the stored row instead, which keeps the tamper control the
         // replay exists for: `restoreRedactedAgentMetadata` rewrites ONLY the
         // sentinel-bearing leaves, so every field the board could actually read in

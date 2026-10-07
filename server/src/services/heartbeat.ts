@@ -264,6 +264,7 @@ import {
   resolveAgentEmptyWorkspaceSourceDir,
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
+  resolvePaperclipHomeDir,
 } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
@@ -534,6 +535,7 @@ import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run
 import { taskWatchdogService } from "./task-watchdogs.js";
 import {
   LOCK_HELD_WARN_MS,
+  agentStartLockSweepContext,
   markAgentStartLockPhase,
   runDetachedFromAgentStartLock,
   withAgentStartLock,
@@ -2032,7 +2034,14 @@ export function isRetryableInteractionContinuationInfrastructureFailure(
     const workspaceValidation = parseObject(parseObject(run.resultJson).workspaceValidation);
     if (
       readNonEmptyString(workspaceValidation.reason) ===
-      "k8s_agent_home_git_bootstrap_unsupported"
+        "k8s_agent_home_git_bootstrap_unsupported" &&
+      // BLO-40317: non-retryable only on a verdict. `gitProbeState:
+      // "indeterminate"` means the probe could not tell whether the fallback cwd
+      // is a checkout, which is not evidence that anything needs repairing —
+      // a credential shim ahead of `git` on PATH produced it fleet-wide on
+      // 2026-10-05 over directories that were fine. Keep that retryable so it
+      // re-tests instead of latching.
+      readNonEmptyString(workspaceValidation.gitProbeState) !== "indeterminate"
     ) {
       return false;
     }
@@ -3841,7 +3850,7 @@ async function hasGitMetadata(cwd: string | null | undefined) {
 async function isGitCheckout(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized })
+  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized, env: strictGitCheckoutProbeEnv() })
     .then((result) => Boolean(readNonEmptyString(result.stdout)))
     .catch(() => false);
 }
@@ -3855,6 +3864,31 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
   }
 }
 
+// BLO-40317: resolve `git` for local-only reads (the strict probe below,
+// isGitCheckout() and hasGitPushRemote(), none of which contacts a remote)
+// WITHOUT the Paperclip home bin dirs on PATH. `/paperclip/.local/bin/git` is a
+// credential shim that execs the real git through a token wrapper and exits 1
+// when its token file is unreadable. That stderr is neither ENOENT nor "not a
+// git repository", so the probe below returned `indeterminate` and dispatch was
+// refused for every workspace-less row in the fleet (134 of 146 blocked rows on
+// 2026-10-05) — on an unrelated credential fault, for a `rev-parse` that reads
+// only the local filesystem and needs no credentials at all. The other two
+// readers fail the same way under the shim, as a false
+// git_worktree_base_not_git_checkout and a false missing_git_push_remote.
+// Filtering the home prefix rather than hardcoding /usr/bin keeps these
+// working on dev machines and in CI, and excludes any future agent-home
+// shim for free.
+function strictGitCheckoutProbeEnv(): NodeJS.ProcessEnv {
+  const home = path.resolve(resolvePaperclipHomeDir());
+  const entries = (process.env.PATH ?? "").split(path.delimiter).filter((entry) => {
+    const trimmed = entry.trim();
+    if (!trimmed) return false;
+    const resolved = path.resolve(trimmed);
+    return resolved !== home && !resolved.startsWith(`${home}${path.sep}`);
+  });
+  return { ...process.env, PATH: entries.join(path.delimiter) };
+}
+
 // Unlike isGitCheckout(), this does not fail open: a probe error that isn't
 // positively identifiable as "cwd is not a git checkout" (missing directory,
 // or git's own "not a git repository" fatal) is treated as "could be a
@@ -3864,13 +3898,14 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
 // itself couldn't complete. Uses try/await rather than .then/.catch because
 // execFile can throw synchronously (e.g. ENOTDIR when cwd is not a
 // directory) before returning a promise to chain onto.
-async function probeGitCheckoutStateStrict(
+export async function probeGitCheckoutStateStrict(
   cwd: string,
 ): Promise<"checkout" | "not_a_checkout" | "indeterminate"> {
   try {
     const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
       cwd,
       timeout: strictGitCheckoutProbeTimeoutMs(),
+      env: strictGitCheckoutProbeEnv(),
     });
     return readNonEmptyString(result.stdout) ? "checkout" : "indeterminate";
   } catch (error: unknown) {
@@ -3895,7 +3930,8 @@ function sameResolvedPath(left: string | null | undefined, right: string | null 
 async function hasGitPushRemote(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  const remoteNames = await execFile("git", ["remote"], { cwd: normalized })
+  const env = strictGitCheckoutProbeEnv();
+  const remoteNames = await execFile("git", ["remote"], { cwd: normalized, env })
     .then((result) =>
       result.stdout
         .split(/\r?\n/)
@@ -3905,7 +3941,7 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
     .catch(() => []);
 
   for (const remoteName of remoteNames) {
-    const pushUrl = await execFile("git", ["remote", "get-url", "--push", remoteName], { cwd: normalized })
+    const pushUrl = await execFile("git", ["remote", "get-url", "--push", remoteName], { cwd: normalized, env })
       .then((result) => readNonEmptyString(result.stdout))
       .catch(() => null);
     if (pushUrl) return true;
@@ -7442,6 +7478,12 @@ const K8S_ISOLATION_OWNED_ENV_KEYS = new Set([
   "BUN_INSTALL_CACHE",
   "PIP_CACHE_DIR",
   "PLAYWRIGHT_BROWSERS_PATH",
+  // BLO-15567: CARGO_TARGET_DIR is unset in the image and defaults to
+  // <pkg>/target inside the checkout, i.e. on the persistent PVC. CARGO_HOME
+  // is image-set (/home/node/.cargo, container overlay) — owned here so the
+  // manifest value is independent of image-rollout state. See CARGO_CACHE_ENV.
+  "CARGO_HOME",
+  "CARGO_TARGET_DIR",
   "PAPERCLIP_WORKSPACE_CWD",
   "GIT_DIR",
   "GIT_WORK_TREE",
@@ -26848,7 +26890,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   let joinableStartLockReap: Promise<unknown> | null = null;
   let inFlightStartLockReap: Promise<unknown> | null = null;
   let sharedStartLockReapCompletedAtMs = 0;
-
+  /**
+   * Marks the async scope of a shared start-lock sweep (BLO-35940). The sweep
+   * can start another agent's dispatch and await it: `releaseIssueExecutionAndPromote`
+   * calls `startNextQueuedRunForAgent` for a promoted wake without consulting
+   * `suppressDispatchAfterReap`, and `withAgentStartLock` runs a free agent's
+   * section inline. That dispatch's own reap must not join or chain behind the
+   * sweep it is running inside, because that sweep is waiting for it.
+   */
   function scheduleStartLockReap(after: Promise<unknown>) {
     const sweep = after.then(() => {
       // The sweep reads fleet state from here on, so a later arrival must not
@@ -26856,7 +26905,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // a TTL set a failing sweep backs off instead of being retried by every
       // waking agent.
       joinableStartLockReap = null;
-      const running: Promise<unknown> = reapOrphanedRuns({ suppressDispatchAfterReap: true }).finally(() => {
+      const running: Promise<unknown> = agentStartLockSweepContext.run(true, () =>
+        reapOrphanedRuns({ suppressDispatchAfterReap: true }),
+      ).finally(() => {
         sharedStartLockReapCompletedAtMs = Date.now();
         if (inFlightStartLockReap === running) inFlightStartLockReap = null;
       });
@@ -26910,8 +26961,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * Direct callers of `reapOrphanedRuns` (the periodic reaper, tests) are
    * deliberately left alone: this is a dispatch-path fix, and the row-level
    * dedup those callers rely on is a separate, still-tested invariant.
+   *
+   * A caller already inside a shared sweep (a dispatch the sweep started and is
+   * awaiting) runs its own unshared sweep instead. Joining or chaining would wait
+   * on the sweep that is waiting on it, and every later start-lock caller then
+   * queues behind that cycle (BLO-35940). `MAX_NESTED_DISPATCH_DEPTH` bounds
+   * stack depth, not total sweep count; excess dispatch work detaches with
+   * the sweep marker cleared and follows the ordinary coalescing path.
+   *
+   * Production callers must hold an agent start lock. Its cross-agent guard
+   * prevents a sweep from awaiting an independently busy agent whose reap
+   * already waits on this sweep. A lock-free caller lacks that guard; tests
+   * using this entry directly must not introduce concurrent busy dispatch.
    */
-  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh"> {
+  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh" | "nested"> {
+    if (agentStartLockSweepContext.getStore()) {
+      await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      return "nested";
+    }
     if (joinableStartLockReap) {
       await joinableStartLockReap;
       return "joined";
@@ -29630,13 +29697,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // another agent's in-flight sweep, which is still time this lock was held.
         markAgentStartLockPhase(agentId, "reap");
         const reapStartedAtMs = Date.now();
-        let reapDisposition: "ran" | "joined" | "skipped_fresh" | undefined;
+        let reapDisposition: "ran" | "joined" | "skipped_fresh" | "nested" | undefined;
         try {
           reapDisposition = await reapOrphanedRunsForStartLock();
         } finally {
           const reapMs = Date.now() - reapStartedAtMs;
           if (reapMs >= LOCK_HELD_WARN_MS) {
-            logger.warn(
+            // A nested sweep is unshared by design (BLO-35940), so its cost here
+            // is expected; keep the warn for the paths where it is an anomaly.
+            (reapDisposition === "nested" ? logger.info : logger.warn).call(
+              logger,
               { agentId, reapMs, reapDisposition, warnAfterMs: LOCK_HELD_WARN_MS },
               "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
             );

@@ -38,11 +38,13 @@ import {
   setAgentStartLockHeldMetrics,
   setDbPoolStats,
   setExternalRuntimeReservationStrandMetricsRefreshSuccess,
+  setFdClassMetrics,
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
   setScheduledRetryParkHorizonRefreshSuccess,
   type DbPoolStats,
 } from "./metrics.js";
+import { collectFdClassSnapshot } from "./fd-class-metrics.js";
 
 /** Scrape interval is 15 s; refreshing on the same cadence keeps every scrape at most one tick behind. */
 const DEFAULT_INTERVAL_MS = 15_000;
@@ -168,6 +170,36 @@ export function refreshDbPoolMetrics(db: Db): void {
  */
 export function refreshAgentStartLockMetrics(): void {
   setAgentStartLockHeldMetrics(describeHeldAgentStartLocks());
+}
+
+/**
+ * Publish the descriptor-class histogram (PEN-3314). Synchronous and DB-free
+ * like its two neighbours. Its cost is a bounded constant rather than a cheap
+ * one, and the distinction matters: `/proc` is kernel memory, so the walk is
+ * `readdir`/`readlink` syscalls with no I/O wait — but they are synchronous
+ * syscalls on the event loop, and no I/O wait is not the same as not blocking.
+ * Measured on a Linux container, 33 fds → 0.33 ms and 4033 fds → 43.7 ms, so at
+ * the inspection cap it holds the loop for ~43 ms. What makes it admissible on
+ * a request path whose whole design constraint (BLO-33243) is that nothing on
+ * it may block is the amortisation, not the speed: once per 15 s scrape is a
+ * ~0.3% duty cycle against a 10 s timeout, and the cap keeps that figure from
+ * growing with the leak.
+ *
+ * On the scrape path rather than in {@link REFRESHES} for the same reason as
+ * {@link refreshAgentStartLockMetrics}, and it is the load-bearing one: the
+ * collector's tick awaits five database refreshes in series, so a process
+ * wedged on Postgres publishes nothing from it. That is a state in which a
+ * descriptor histogram is *more* wanted, not less — a pool wedge and a
+ * descriptor leak are two of the shapes this worker actually fails in, and an
+ * instrument that goes dark during one of them cannot distinguish them.
+ *
+ * The second reason is sampling skew: this gauge exists to be correlated
+ * against `process_open_fds` and the heap gauges, all of which are rendered at
+ * scrape time. A one-tick offset between them would be invisible and would show
+ * up as noise in exactly the correlation it is meant to sharpen.
+ */
+export function refreshFdClassMetrics(): void {
+  setFdClassMetrics(collectFdClassSnapshot());
 }
 
 export interface ScrapeMetricsCollectorOptions {

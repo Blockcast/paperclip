@@ -214,13 +214,24 @@ export function containsRedactedAdapterValue(value: unknown): boolean {
  * this with the `containsRedactedAdapterValue` short-circuit that keeps an
  * unmasked payload byte-identical.
  *
- * Caution if you call it directly: with a masked scalar and an `undefined`
- * prior this returns the private `OMIT_REDACTED_ADAPTER_VALUE` symbol at the
- * top level rather than a value. Nested occurrences are consumed by the
- * object/array walk; only the top-level one can escape. Every call site in this
- * repo passes a record for `existing`, so it does not arise today.
+ * A masked scalar with an `undefined` prior has nothing to restore from, and
+ * reports that as `undefined` rather than as the private
+ * `OMIT_REDACTED_ADAPTER_VALUE` symbol: the walk below uses that symbol to tell
+ * "drop this key" apart from "the stored value is `undefined`", but it is an
+ * internal token and must not cross this boundary. Nested occurrences are
+ * consumed by the object/array walk, so only the top-level one could ever
+ * escape, and the wrapper here maps it. Every call site in this repo passes a
+ * record for `existing`, so the case does not arise today — this keeps the
+ * hazard unreachable by construction rather than by that fact, since the
+ * failure mode is silent (a `Symbol` serialized into a config column) and this
+ * is a leaf module's public surface (PEN-3759).
  */
 export function restoreRedactedAdapterValue(incoming: unknown, existing: unknown): unknown {
+  const restored = restoreRedactedAdapterValueInner(incoming, existing);
+  return restored === OMIT_REDACTED_ADAPTER_VALUE ? undefined : restored;
+}
+
+function restoreRedactedAdapterValueInner(incoming: unknown, existing: unknown): unknown {
   // PEN-2747: the URI-credential rule masks only the credential *component* of
   // a URL, so the round-tripped value is `https://user:***REDACTED***@host/mcp`
   // — a string that merely CONTAINS the sentinel rather than equalling it. An
@@ -243,7 +254,7 @@ export function restoreRedactedAdapterValue(incoming: unknown, existing: unknown
   if (Array.isArray(incoming)) {
     const existingArray = Array.isArray(existing) ? existing : [];
     return incoming.flatMap((value, index) => {
-      const restored = restoreRedactedAdapterValue(value, existingArray[index]);
+      const restored = restoreRedactedAdapterValueInner(value, existingArray[index]);
       return restored === OMIT_REDACTED_ADAPTER_VALUE ? [] : [restored];
     });
   }
@@ -255,7 +266,7 @@ export function restoreRedactedAdapterValue(incoming: unknown, existing: unknown
       : {};
   const restored: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(incoming as Record<string, unknown>)) {
-    const restoredValue = restoreRedactedAdapterValue(value, existingRecord[key]);
+    const restoredValue = restoreRedactedAdapterValueInner(value, existingRecord[key]);
     if (restoredValue !== OMIT_REDACTED_ADAPTER_VALUE) restored[key] = restoredValue;
   }
   return restored;
@@ -338,6 +349,16 @@ export function stripRedactedEnvBindingsFromAdapterConfig(
  * `adapterConfig.env`, `metadata` supports array values as a first-class shape
  * (`keepSanitizedAgentMetadata` preserves them rather than flattening), so this
  * is reachable on this column in a way it is not on the one it was written for.
+ *
+ * That ceiling is scoped to the client `PATCH` round-trip, where the array the
+ * caller sends back is whatever the caller chose to send. It is **not** reachable
+ * on the hire-approval replay (`services/agents.ts`), because there the
+ * "incoming" side is a `redactEventPayload` snapshot of the stored row, and every
+ * array branch in that redactor is length-preserving: `sanitizeValue` and
+ * `sanitizeSecretMatchedValue` both `.map()`, and `sanitizeCommandArgs` returns
+ * the flag verbatim and masks the following element in place. Snapshot and row
+ * therefore stay index-aligned by construction on that path. Keep the two apart
+ * when reading this: only a caller-supplied array can misalign (PEN-3759).
  */
 export function restoreRedactedAgentMetadata(incoming: unknown, existing: unknown): unknown {
   if (!containsRedactedAdapterValue(incoming)) return incoming;
