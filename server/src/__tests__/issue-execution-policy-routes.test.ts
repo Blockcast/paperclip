@@ -5,6 +5,7 @@ import {
   computeIssueMonitorGateFingerprint,
   isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
 
 /**
@@ -1200,8 +1201,23 @@ describe("issue execution policy routes", () => {
       identifier: "PAP-12852",
       title: "Wedged triggered monitor",
       executionPolicy: null,
+      // Every stage field here is nullable but REQUIRED by `issueExecutionStateSchema`,
+      // so a `status` + `monitor` shorthand is rejected outright: `parseIssueExecutionState`
+      // fails closed to `null` and the route's `summarizeIssueMonitor(...).status` reads
+      // `null` instead of "triggered". That is invisible from the service layer, which
+      // reads the monitor off the *columns* via `derivePersistedMonitorState` — so a route
+      // test keying on live monitor status goes vacuously green against the short shape.
+      // This is the shape the trigger actually persists; keep it parseable. (BLO-39219)
       executionState: {
         status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
         monitor: {
           status: "triggered",
           nextCheckAt: null,
@@ -1219,6 +1235,20 @@ describe("issue execution policy routes", () => {
       monitorLastTriggeredAt: new Date("2026-07-29T18:51:23.137Z"),
       monitorNotes: "stale signature written at 18:51Z",
       monitorScheduledBy: "assignee",
+    });
+
+    // Guard for the fixture above, not for the routes. `summarizeIssueMonitor` is
+    // module-private to `routes/issues.ts`, so assert the link that actually breaks:
+    // it reads the live monitor off `parseIssueExecutionState`, which fails closed to
+    // `null` on a short `executionState`. Every route assertion in this file that keys
+    // on live monitor status is vacuous when this returns `null` — drop a stage field
+    // from `wedgedIssue()` and this goes red immediately, instead of a route test
+    // quietly agreeing with whatever the route did. (BLO-39219)
+    it("fixture: wedgedIssue()'s executionState parses, so the route reads a live triggered monitor", () => {
+      const parsed = parseIssueExecutionState(wedgedIssue().executionState);
+
+      expect(parsed, "short executionState shapes are rejected outright").not.toBeNull();
+      expect(parsed?.monitor?.status).toBe("triggered");
     });
 
     // Same row, but carrying policy fields that a monitor write must not take down with it.
@@ -1618,28 +1648,13 @@ describe("issue execution policy routes", () => {
     // re-gate it on `req.body.executionPolicy !== undefined`; the third hands it
     // to recovery revalidation raw.
     describe("the triggered-monitor clear clause does not leak onto unrelated writes", () => {
-      // `wedgedIssue`'s `executionState` carries only `status` + `monitor`, which
-      // `issueExecutionStateSchema` REJECTS — every stage field on it is nullable
-      // but required. `derivePersistedMonitorState` still reads "triggered" off
-      // the columns, so the service-layer cases above are unaffected; but the
-      // route reads the live status through `summarizeIssueMonitor`, which goes
-      // via `parseIssueExecutionState` and therefore sees `null`. Asserting
-      // against the short fixture passes whatever the route does — a vacuous
-      // green. This is the shape the trigger actually persists.
-      const wedgedExecutionState = () => ({
-        status: "idle" as const,
-        currentStageId: null,
-        currentStageIndex: null,
-        currentStageType: null,
-        currentParticipant: null,
-        returnAssignee: null,
-        completedStageIds: [],
-        lastDecisionId: null,
-        lastDecisionOutcome: null,
-        monitor: wedgedIssue().executionState.monitor,
-      });
+      // `wedgedIssue().executionState` is parseable by construction, so the route's
+      // `summarizeIssueMonitor` reads "triggered" here rather than `null`. Two guards
+      // hold that: the explicit fixture test next to the fixture, and the bare-`{}`
+      // clear at the bottom of this block — which only reaches the clear while
+      // `liveMonitorStatus` is non-null, so a short fixture turns it red. (BLO-39219)
       const seedWedged = (overrides: Record<string, unknown> = {}) => {
-        const issue = { ...wedgedIssue(), executionState: wedgedExecutionState(), ...overrides };
+        const issue = { ...wedgedIssue(), ...overrides };
         mockIssueService.getById.mockResolvedValue(issue);
         mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
           ...issue,
@@ -1683,7 +1698,7 @@ describe("issue execution policy routes", () => {
           commentRequired: true,
           stages: [{ type: "review", participants: [{ type: "agent", agentId: REVIEWER_AGENT_ID }] }],
         });
-        const issue = seedWedged({ executionPolicy: strippedPolicy });
+        seedWedged({ executionPolicy: strippedPolicy });
 
         const res = await patchIssue({
           executionPolicy: {
@@ -1697,10 +1712,21 @@ describe("issue execution policy routes", () => {
         });
 
         expect(res.status, JSON.stringify(res.body)).toBe(200);
-        const nextState = lastPatch().executionState as { monitor?: { status?: string } } | undefined;
-        // Still triggered: the sweep that owes this monitor a `recoveryPolicy`
-        // keys on exactly this state.
-        expect(nextState?.monitor?.status ?? issue.executionState.monitor.status).toBe("triggered");
+        const patch = lastPatch();
+        // Assert the route actually wrote, so the monitor assertion below cannot
+        // pass by the route having done nothing at all.
+        expect(patch, "the stages-only write must still reach issueService.update").toBeDefined();
+        expect(patch.executionPolicy).toBeDefined();
+        const nextState = patch.executionState as { monitor?: { status?: string } } | undefined;
+        // Measured: on the narrow clause this path writes NO `executionState` —
+        // the monitor is left exactly as the trigger persisted it, which is what
+        // `tickExpiredIssueMonitors` still owes a `recoveryPolicy`. Under the wide
+        // clause it writes one carrying `monitor.status: "cleared"`, so keying on
+        // "not cleared" is what discriminates. The old
+        // `?? issue.executionState.monitor.status` fallback read "triggered" off
+        // the fixture by construction and never observed the route at all.
+        // (BLO-39219)
+        expect(nextState?.monitor?.status).not.toBe("cleared");
       });
 
       // Negative control for both cases above: narrowing the clause must not take
