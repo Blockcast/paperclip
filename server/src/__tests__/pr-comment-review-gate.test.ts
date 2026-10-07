@@ -1381,9 +1381,9 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * discriminator exists yet.
  *
  * `prAuthorLogin` is INERT on the path both fixtures exercise, and that is
- * deliberate rather than an oversight: `evaluateCommentReviewGate` reads it
- * only inside the `if (forHead)` branch (`pr-comment-review-gate.ts:399`,
- * `:412`), and neither fixture attests CURRENT_HEAD, so control reaches
+ * deliberate rather than an oversight: it is read only inside the
+ * `if (forHead)` branch of `evaluateCommentReviewGate`, and neither fixture
+ * attests CURRENT_HEAD, so control reaches
  * `headsWithUndispositionedFinding(comments, reviewerBotLogin)` — which takes
  * no author argument at all. Setting it here encodes the assumption these
  * fixtures exist to fence: it becomes load-bearing only once a fix threads an
@@ -1423,12 +1423,14 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * what the counts below rest on: the twins carried no argument at all when
  * these counts were taken, and BLO-38582 later gave them the explicit `null`,
  * which is inert at the same sites for the same reason. The fail-closed form
- * the attestation path already uses (`pr-comment-review-gate.ts:457`,
- * `authorUnknown: true`) treats `null` as self-attested instead, so it would
- * fire on the twins too and a run taken under it shows the witness red
- * alongside them. That does not make the witness redundant: the credits-unknown
- * form still reaches it alone. The counts below are for the credits-unknown
- * form. Measured at this head (113 tests), one mutation per run:
+ * the attestation path already uses (the `!prAuthorLogin` arm of
+ * `evaluateCommentReviewGate`, `authorUnknown: true`) treats `null` as
+ * self-attested instead, so it would fire on the twins too and a run taken
+ * under it shows the witness red alongside them. That does not make the
+ * witness redundant: the credits-unknown form still reaches it alone. The
+ * counts below are for the credits-unknown form. Measured at the BLO-34389
+ * head that wrote this block (113 tests there; vitest reports 151 for this
+ * file at BLO-38582's head), one mutation per run:
  *
  *   placement (1), always-exclude   24 fail — incl. this block's first; the
  *                                   pre-existing twin catches it too
