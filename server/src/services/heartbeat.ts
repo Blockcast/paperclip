@@ -1825,6 +1825,22 @@ function isPrReviewRetryContext(contextSnapshot: Record<string, unknown>) {
   return taskKey?.startsWith("pr_review:") === true;
 }
 
+// BLO-35488: the stale-maintenance sweep assumes "the current or next timer
+// wake represents latest state". A pr_review run has no such successor: the
+// GitHub webhook fires once per push or review request, so cancelling its
+// transient retry silently drops the review (2026-10-06: 22 reviews in ~2h, 15
+// never re-run). Never sweep one, however deep the queue.
+export function isStaleMaintenanceSweepCandidate(contextSnapshot: Record<string, unknown>) {
+  const wakeReason = readNonEmptyString(contextSnapshot.wakeReason);
+  return (
+    !readNonEmptyString(contextSnapshot.issueId) &&
+    !readNonEmptyString(contextSnapshot.taskId) &&
+    wakeReason !== null &&
+    (STALE_QUEUED_MAINTENANCE_WAKE_REASONS as readonly string[]).includes(wakeReason) &&
+    !isPrReviewRetryContext(contextSnapshot)
+  );
+}
+
 type PrReviewFairnessRun = Pick<
   typeof heartbeatRuns.$inferSelect,
   "id" | "createdAt" | "contextSnapshot"
@@ -28524,15 +28540,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   function isQueuedMaintenanceWake(run: typeof heartbeatRuns.$inferSelect) {
-    const context = parseObject(run.contextSnapshot);
-    const wakeReason = readNonEmptyString(context.wakeReason);
-    return (
-      run.status === "queued" &&
-      !issueIdFromRunContext(context) &&
-      Boolean(wakeReason && STALE_QUEUED_MAINTENANCE_WAKE_REASONS.includes(
-        wakeReason as (typeof STALE_QUEUED_MAINTENANCE_WAKE_REASONS)[number],
-      ))
-    );
+    return run.status === "queued" && isStaleMaintenanceSweepCandidate(parseObject(run.contextSnapshot));
   }
 
   async function cancelStaleQueuedMaintenanceRun(run: typeof heartbeatRuns.$inferSelect, now: Date) {
@@ -28591,6 +28599,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             sql<string>`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`,
             [...STALE_QUEUED_MAINTENANCE_WAKE_REASONS],
           ),
+          // Mirrors isPrReviewRetryContext so pr_review rows, which are never
+          // swept (BLO-35488), cannot fill the batch and starve real candidates.
+          sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'reviewKind', '') <> 'pr_review'`,
+          sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'taskKey', '') not like 'pr_review:%'`,
         ),
       )
       .orderBy(asc(heartbeatRuns.updatedAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
