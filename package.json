@@ -206,6 +206,7 @@
       "multer": ">=2.3.0 <3",
       "browserslist": ">=4.28.7 <5",
       "http-cache-semantics": ">=4.3.0 <5",
+      "source-map-js": ">=1.2.2 <2",
       "tinypool": ">=2.1.2 <3",
       "react": "^19.2.7",
       "react-dom": "^19.2.7",

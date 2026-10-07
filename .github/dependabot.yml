@@ -10,15 +10,18 @@
 #   vendor/paperclip-adapter-claude-k8s/package-lock.json -> DELIBERATELY EXCLUDED
 #
 # The vendored adapter is excluded because an automated bump there cannot pass
-# CI. `vendor_claude_k8s` in .github/workflows/pr.yml recomputes a sha256
-# manifest over `git ls-files` for that directory (excluding only LICENSE and
-# PROVENANCE.md) and fails unless it matches the hash recorded in
-# PROVENANCE.md. package-lock.json is a tracked file inside that manifest, so
-# any bump changes the hash, Dependabot cannot update PROVENANCE.md in the same
-# PR, and `vendor_claude_k8s` is on the required `verify` path — every such PR
-# would be born red and unmergeable. That directory also carries a manual
-# `-blockcast.N` version-bump convention (see its PROVENANCE.md). Bump it by
-# hand, as an ordinary in-tree PR, per vendor/README.md.
+# CI. `scripts/check-vendored-provenance-log.mjs` (the `policy` job, on the
+# required `verify` path) fails any PR that changes a tracked file under that
+# directory without also adding a new entry file under its
+# PROVENANCE-CHANGES.d/ — only LICENSE, PROVENANCE.md, and that entry
+# directory's own contents are exempt, so editing an existing entry does not
+# itself demand a further one. package-lock.json is not exempt, and Dependabot
+# cannot author that entry, so every such PR would be born red and unmergeable.
+# (The guard that used to be cited here was replaced under BLO-35109; the
+# exclusion decision is unchanged.)
+# That directory also carries a manual `-blockcast.N` version-bump convention
+# (see its PROVENANCE.md). Bump it by hand, as an ordinary in-tree PR, per
+# vendor/README.md.
 version: 2
 updates:
   - package-ecosystem: npm

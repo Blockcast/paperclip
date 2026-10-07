@@ -49,6 +49,7 @@
     "vitest": "^4.1.4"
   },
   "overrides": {
-    "js-yaml": ">=4.3.2 <5"
+    "js-yaml": ">=4.3.2 <5",
+    "source-map-js": ">=1.2.2 <2"
   }
 }
