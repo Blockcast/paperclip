@@ -23,6 +23,8 @@ import {
   renderMetrics,
   SCHEDULED_RETRY_PARK_HORIZON_METRIC,
   SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC,
+  TRANSIENT_FLOOR_PARK_REASON,
+  TRANSIENT_QUOTA_FLOOR_PARK_REASON,
 } from "../services/metrics.js";
 import {
   refreshOverdueScheduledRetryAgeMetrics,
@@ -600,6 +602,145 @@ describeEmbeddedPostgres("refreshOverdueScheduledRetryAgeMetrics (BLO-22094)", (
     expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="none"} 0`);
   });
 
+  // BLO-31174, Ally C1 on onprem-k8s#4145. `transient_failure` is THREE writer
+  // paths under one column value, and the alert rule can only bound what it can
+  // see. Before the refinement all three rows below collapse to a single
+  // `reason="transient_failure"` series carrying 259200 -- 28x the ladder
+  // ceiling the rule bounds that label at, so two correct floor adoptions page
+  // and the ladder value they mask is gone.
+  //
+  // Every fixture here builds `contextSnapshot` the way `scheduleBoundedRetry
+  // ForRun` does and leaves `resultJson` unset, because that is what the writer
+  // inserts. Writing `resultJson` by hand is what makes a classifier that reads
+  // the wrong column look correct.
+  it("splits transient_failure by ceiling: ladder, clamped floor, and unbounded quota floor", async () => {
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-09-29T01:16:00.000Z");
+    const floorAt = new Date(now.getTime() + MAX_TRANSIENT_RETRY_HORIZON_MS);
+    const quotaAt = new Date(now.getTime() + 3 * 86_400_000);
+    const base = {
+      companyId,
+      agentId,
+      invocationSource: "assignment" as const,
+      status: "scheduled_retry" as const,
+      createdAt: now,
+      updatedAt: now,
+      scheduledRetryReason: "transient_failure",
+    };
+
+    await db.insert(heartbeatRuns).values([
+      {
+        ...base,
+        // No floor: the ladder's final 2h hop plus jitter, inside [7200, 9000].
+        scheduledRetryAt: new Date(now.getTime() + 8_630_000),
+        scheduledRetryAttempt: 4,
+        contextSnapshot: { retryReason: "transient_failure", errorFamily: "transient_upstream" },
+      },
+      {
+        ...base,
+        // transient_upstream floor, horizon-clamped to MAX_TRANSIENT_RETRY_HORIZON_MS.
+        // 9.6x the ladder bound and entirely correct.
+        scheduledRetryAt: floorAt,
+        scheduledRetryAttempt: 2,
+        contextSnapshot: {
+          retryReason: "transient_failure",
+          errorFamily: "transient_upstream",
+          transientRetryNotBefore: floorAt.toISOString(),
+          transientRetryHorizonClampedFrom: new Date(now.getTime() + 5 * 86_400_000).toISOString(),
+        },
+      },
+      {
+        ...base,
+        // provider_quota floor: never clamped, so a 3-day park is the contract
+        // being honoured. No bound can be correct for this row.
+        scheduledRetryAt: quotaAt,
+        scheduledRetryAttempt: 1,
+        contextSnapshot: {
+          retryReason: "transient_failure",
+          errorFamily: "provider_quota",
+          transientRetryNotBefore: quotaAt.toISOString(),
+          providerQuotaRetryNotBefore: quotaAt.toISOString(),
+        },
+      },
+    ]);
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    const { body } = await renderMetrics();
+    const series = (reason: string) => `${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="${reason}"}`;
+    expect(body).toContain(`${series("transient_failure")} 8630`);
+    expect(body).toContain(`${series(TRANSIENT_FLOOR_PARK_REASON)} ${MAX_TRANSIENT_RETRY_HORIZON_MS / 1000}`);
+    expect(body).toContain(`${series(TRANSIENT_QUOTA_FLOOR_PARK_REASON)} ${3 * 86_400}`);
+  });
+
+  // The column-choice regression, pinned directly. `scheduleBoundedRetryForRun`
+  // inserts the parked row with no `resultJson`; the recovery metadata in
+  // `result_json` belongs to the FAILED PARENT run (`retry_of_run_id`). A
+  // classifier reading `result_json` on this row sees NULL, labels an unbounded
+  // quota park as the ladder, and pages on a correct 3-day park -- the exact
+  // defect the split repairs, one layer down. This fixture inverts the two
+  // columns so only a `context_snapshot` reader can pass it.
+  it("classifies off context_snapshot, not the parent run's result_json", async () => {
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-09-29T01:16:00.000Z");
+    const quotaAt = new Date(now.getTime() + 172_800_000);
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      createdAt: now,
+      updatedAt: now,
+      scheduledRetryAt: quotaAt,
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      // Deliberately contradictory: the truth for THIS row is the snapshot.
+      resultJson: { errorFamily: "transient_upstream" },
+      contextSnapshot: {
+        retryReason: "transient_failure",
+        errorFamily: "provider_quota",
+        transientRetryNotBefore: quotaAt.toISOString(),
+        providerQuotaRetryNotBefore: quotaAt.toISOString(),
+      },
+    });
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="${TRANSIENT_QUOTA_FLOOR_PARK_REASON}"} 172800`,
+    );
+  });
+
+  // The refinement applies to `transient_failure` and nothing else. A floor on
+  // any other reason must not mint a `_floor` series: those classes have one
+  // ceiling each, and splitting them would silently drop their bound's subject.
+  it("leaves non-transient reasons unrefined even when a floor is present", async () => {
+    const { companyId, agentId } = await insertCompanyAndAgent();
+    const now = new Date("2026-09-29T01:16:00.000Z");
+
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      createdAt: now,
+      updatedAt: now,
+      scheduledRetryAt: new Date(now.getTime() + 3_600_000),
+      scheduledRetryAttempt: 2,
+      scheduledRetryReason: "ccrotate_capacity",
+      contextSnapshot: {
+        retryReason: "ccrotate_capacity",
+        transientRetryNotBefore: now.toISOString(),
+        providerQuotaRetryNotBefore: now.toISOString(),
+      },
+    });
+
+    await refreshScheduledRetryParkHorizonMetrics(db);
+    const { body } = await renderMetrics();
+    expect(body).toContain(`${SCHEDULED_RETRY_PARK_HORIZON_METRIC}{agent_id="${agentId}",reason="ccrotate_capacity"} 3600`);
+    expect(body).not.toContain(`reason="${TRANSIENT_QUOTA_FLOOR_PARK_REASON}"`);
+  });
+
   it("zero-fills an agent with no live park without inventing a park class", async () => {
     const { agentId } = await insertCompanyAndAgent();
 
@@ -660,7 +801,10 @@ describe("scheduled-retry park horizon help text (BLO-31174)", () => {
       ["transient_failure", ladderCeilingS],
     ];
     for (const [reason, seconds] of ceilings) expect(help).toContain(`${reason} ${seconds}s`);
-    expect(help).toContain(`up to ${flooredCeilingS}s when it adopts an upstream retryNotBefore floor`);
+    expect(help).toContain(
+      `up to ${flooredCeilingS}s when an unclamped upstream retryNotBefore floor `
+        + "is at or just under the 24h horizon",
+    );
     expect(help).toContain("unbounded for a provider_quota floor");
 
     const finite = [...ceilings.map(([, seconds]) => seconds), flooredCeilingS];

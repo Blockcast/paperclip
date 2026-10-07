@@ -246,6 +246,10 @@ export const POD_LOG_REDACTOR_FILENAME = `paperclip-pod-log-redactor.${createHas
 export const POD_LOG_FILTER_VAR = "PAPERCLIP_POD_LOG_FILTER";
 export const POD_LOG_FILTER_ARG_VAR = "PAPERCLIP_POD_LOG_FILTER_ARG";
 
+/** Suffix of the empty sentinel left beside the pod log when the filter falls
+ *  open to `cat`: `<podLogPath>.unredacted`. */
+export const POD_LOG_UNREDACTED_SUFFIX = ".unredacted";
+
 /**
  * `;`-joinable fragment that installs the redactor and sets
  * `$PAPERCLIP_POD_LOG_FILTER` (+ `_ARG`) to the command that goes in front of
@@ -259,16 +263,32 @@ export const POD_LOG_FILTER_ARG_VAR = "PAPERCLIP_POD_LOG_FILTER_ARG";
  * The fallback to `cat` is the fail-open: if the install lost a race, the
  * volume is unwritable, or node is missing, the pipeline degrades to today's
  * behaviour instead of `set -o pipefail` failing every run in the fleet.
+ *
+ * That degradation is announced on stderr. Silently, "redacted" and "degraded
+ * to `cat`" are indistinguishable after the fact — on the one control whose
+ * whole purpose is that it held — so a pod log could be read as scrubbed when
+ * nothing scrubbed it. The `||` also makes the statement exit 0 rather than
+ * leaving a non-zero status mid-fragment.
+ *
+ * Stderr alone does not cover "after the fact": it reaches only `kubectl logs`
+ * (the pipeline has no `2>&1` into `tee`), and the Job is reaped at
+ * `ttlSecondsAfterFinished`. So the same branch also leaves an empty
+ * `<podLogPath>.unredacted` sentinel beside the pod log, which outlives the pod.
+ * Never into the log itself — the server parses that as one JSON object per line.
+ * The caller must have created the pod log's directory first. The write is
+ * `true >`, not `: >`: `:` is a special builtin, and under dash a redirection
+ * error on one exits the shell, taking the run down with it.
  */
-export function buildPodLogRedactorSetupShell(): string {
+export function buildPodLogRedactorSetupShell(podLogPath: string): string {
   const b64 = Buffer.from(POD_LOG_REDACTOR_SCRIPT, "utf8").toString("base64");
   const target = `$GUARD_DIR/${POD_LOG_REDACTOR_FILENAME}`;
   const tmp = `$GUARD_DIR/.${POD_LOG_REDACTOR_FILENAME}.$$.tmp`;
+  const sentinel = `'${`${podLogPath}${POD_LOG_UNREDACTED_SUFFIX}`.replace(/'/g, "'\\''")}'`;
   return [
     `[ -f "${target}" ] || { printf %s '${b64}' | base64 -d > "${tmp}" && mv -f "${tmp}" "${target}"; }`,
     `${POD_LOG_FILTER_VAR}=cat`,
     `${POD_LOG_FILTER_ARG_VAR}=`,
-    `command -v node >/dev/null 2>&1 && [ -f "${target}" ] && { ${POD_LOG_FILTER_VAR}=node; ${POD_LOG_FILTER_ARG_VAR}="${target}"; }`,
+    `command -v node >/dev/null 2>&1 && [ -f "${target}" ] && { ${POD_LOG_FILTER_VAR}=node; ${POD_LOG_FILTER_ARG_VAR}="${target}"; } || { echo '[paperclip-pod-log-redactor] not installed; pod log is UNREDACTED' >&2; { true > ${sentinel}; } 2>/dev/null || :; }`,
     `export ${POD_LOG_FILTER_VAR} ${POD_LOG_FILTER_ARG_VAR}`,
   ].join("; ");
 }

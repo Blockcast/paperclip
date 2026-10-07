@@ -1807,6 +1807,11 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
     expect(reviews[0]?.description).toContain("Route to platform/SRE");
     expect(reviews[0]?.description).not.toContain("Request decomposition");
+    // BLO-37265: the rolling-window counts exclude pre-dispatch cancellations
+    // (BLO-36927), and this evidence line renders on EVERY trigger — not just
+    // `high_churn`. Pin the label here too so a rename cannot reintroduce the
+    // label/number mismatch on a non-churn review.
+    expect(reviews[0]?.description).toContain("Dispatched runs in rolling windows:");
   });
 
   it("excludes never-executed runs from the no-comment streak without breaking it — real silent completions still trip it (BLO-21769)", async () => {
@@ -2962,7 +2967,41 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `high_churn`");
   });
 
-  // BLO-22887 AC2: the two cells above are the "still warranted on other
+  // BLO-37265. Pins the `status = 'cancelled'` arm of `notPreDispatchCancelledSql`,
+  // which the comment beside it calls load-bearing. Neither control above kills a
+  // mutation that deletes it: both seed `errorCode: null`, so the `isNull(errorCode)`
+  // arm carries them either way. This cell is the only one where that arm cannot —
+  // a live `scheduled_retry` row carrying a pre-dispatch `errorCode`, which is
+  // exactly what `enqueueWakeup` (heartbeat.ts) writes when the provider-capacity
+  // gate parks a wake, except that its `rate_limit_exhausted` is not yet in
+  // PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES. Drop `ne(status, "cancelled")` and these
+  // 15 parked-but-live runs stop counting, the window falls to 15 against a bar of
+  // 30, and `high_churn` silently stops firing.
+  it("still generates a high-churn review when half the window is parked scheduled_retry runs carrying a pre-dispatch errorCode (BLO-37265)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await churnExecutedRuns(seeded, now);
+    await churnSecondHalf(seeded, now, {
+      status: "scheduled_retry",
+      errorCode: "issue_dependencies_blocked",
+      startedAt: null,
+      finishedAt: null,
+      livenessState: null,
+      usageJson: null,
+      logStore: null,
+      logBytes: 0,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+  });
+
+  // BLO-22887 AC2: the two BLO-22436 cells above titled "still generates ...
+  // for a dependency-blocked issue" are the "still warranted on other
   // grounds" case — BLO-22436 suppresses a dependency-blocked source whose
   // fired set is entirely closable, so *every* blocked source that reaches the
   // body builder is one a blocker does not excuse. Until now the body said
@@ -3198,6 +3237,10 @@ describeEmbeddedPostgres("productivity review service", () => {
       "Comment-policy-exempt runs that DID execute (eligible for the streak walk by design, not a gap):",
     );
     expect(refreshComments.at(-1)?.body).not.toContain("not excluded from the streak walk");
+    // BLO-37265: the refresh comment renders its own copy of the rolling-window
+    // counts, from the same pre-dispatch-filtered numbers. Pinned separately
+    // from the review-markdown label so the two cannot drift apart silently.
+    expect(refreshComments.at(-1)?.body).toContain("Dispatched runs/assignee comments:");
   });
 
   // BLO-22436: once the blocker resolves (or the edge is removed), the same
@@ -6174,7 +6217,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     // counter. Without this, the test passes on a change that strips
     // `issueRunScopeSql` from `countIssueRunsSince` too — the cross-scope run
     // sits 3h back, so a loosened runs query would read `1/6h` here.
-    expect(description).toContain("Runs in rolling windows: 0/1h, 0/6h");
+    expect(description).toContain("Dispatched runs in rolling windows: 0/1h, 0/6h");
   });
 
   // BLO-35893, the other direction. The widened count is for the reported line
@@ -10685,7 +10728,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.monitorScheduledSuppressed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `high_churn`");
-    expect(review?.description).toContain("Runs in rolling windows: 10/1h");
+    expect(review?.description).toContain("Dispatched runs in rolling windows: 10/1h");
   });
 
   it("ignores non-assignee comments when evaluating high-churn productivity reviews", async () => {

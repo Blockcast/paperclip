@@ -100,6 +100,7 @@ import {
   recordGithubReviewRequestDelivery,
   recordGithubReviewRequestSuppressed,
   recordGithubReviewPosted,
+  recordGithubWebhookDelivery,
   recordGithubWorkflowRunConclusion,
   type GithubReviewSurface,
 } from "../services/metrics.js";
@@ -5171,6 +5172,48 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
   const router = Router();
 
   router.post("/", async (req, res) => {
+    // BLO-39378: count every inbound delivery that reaches this router, on
+    // every exit path, from one listener. `close` always fires — unlike
+    // `finish`, which an aborted response never reaches — so no delivery
+    // handled here escapes and reads back later as "GitHub stopped
+    // delivering". Counting here rather than at each `res.status(...)` call
+    // site is also what keeps a future early return from silently falling
+    // out of the denominator; this counter's whole job is that its flatline
+    // is the fault.
+    //
+    // ⚠ Boundary, stated rather than left implicit because this gap INVERTS
+    // attribution instead of hiding it. `registerBodyParsers(app)`
+    // (server/src/app.ts) mounts `express.json({ limit: "10mb" })` app-wide
+    // ahead of this router, and a parse failure is answered by `next(err)` —
+    // which skips every remaining non-error middleware, this one included.
+    // So an oversized-payload 413, or a malformed-JSON 400, never registers
+    // this listener. Detection still survives (the counter stays flat and an
+    // `== 0` alert still fires), but the flatline then reads as "GitHub
+    // stopped delivering" when deliveries are in fact arriving and being
+    // refused at our own edge — one of the shape-B causes this counter is
+    // for. Closing it means hoisting this listener into a middleware mounted
+    // before the parser; deliberately not done here. GitHub does not emit
+    // malformed JSON, so the reachable half is the 10 MB cap.
+    res.on("close", () => {
+      // A throw here is an uncaught exception, not a 500: this listener runs
+      // outside Express's error handling, so an unguarded metrics fault would
+      // take the api down on the delivery path it exists to measure.
+      try {
+        recordGithubWebhookDelivery({
+          event: req.header("x-github-event"),
+          outcome: !res.writableEnded
+            ? "error"
+            : res.statusCode === 401
+              ? "rejected_signature"
+              : res.statusCode < 400
+                ? "accepted"
+                : "error",
+        });
+      } catch (err) {
+        logger.warn({ err }, "failed to record github webhook delivery metric");
+      }
+    });
+
     if (!config.webhookSecret) {
       logger.warn("github webhook received but GITHUB_WEBHOOK_SECRET is not configured; refusing");
       res.status(503).json({ error: "github webhook not configured" });

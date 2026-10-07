@@ -851,7 +851,7 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
   {
     name: "DOCKER_HOST",
     classification: "SAFE_LITERAL",
-    reason: "unix:///var/run/docker.sock — the DinD sidecar socket path. Constant, no credential.",
+    reason: "unix:///var/run/dind/docker.sock — the DinD sidecar socket path. Constant, no credential.",
   },
   {
     name: "DOCKER_TLS_CERTDIR",
@@ -1330,7 +1330,27 @@ function buildEnvVars(
 }
 
 /**
- * docker:dind sidecar exposing /var/run/docker.sock to the agent container
+ * Directory holding the shared DinD socket, mounted into both the sidecar and
+ * the agent container from one emptyDir.
+ *
+ * Deliberately NOT `/var/run`. Mounting the emptyDir over the whole of
+ * `/var/run` hid every sibling mount beneath it — the inherited
+ * `gbrain-authbot-service-key` Secret at `/var/run/authbot` in particular, so
+ * PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE resolved into an empty tmpfs
+ * (BLO-40401). Silent, like BLO-40279 before it: the Secret is still in the
+ * Pod spec and `kubectl describe pod` still shows it mounted; only a read
+ * inside the container reveals it is gone.
+ *
+ * A dedicated directory keeps the socket a SIBLING of whatever else the
+ * Deployment mounts under `/var/run`, so neither can shadow the other. Not
+ * `/var/run/docker` — dockerd puts its own runtime state there. Consumers
+ * reach the socket through DOCKER_HOST, which every docker CLI and SDK reads.
+ */
+const DIND_SOCKET_DIR = "/var/run/dind";
+const DIND_SOCKET_PATH = `${DIND_SOCKET_DIR}/docker.sock`;
+
+/**
+ * docker:dind sidecar exposing the shared docker socket to the agent container
  * via a shared emptyDir. Deployed as a native Kubernetes 1.29+ sidecar
  * (initContainer with restartPolicy: "Always"): starts before the main
  * container, lives for the duration of the Job, terminates when main exits.
@@ -1358,11 +1378,11 @@ function buildDindSidecar(opts: {
     name: "dind",
     image: opts.image,
     imagePullPolicy: "IfNotPresent",
-    // `--group=1000` makes dockerd create /var/run/docker.sock with group 1000
-    // (mode 0660 root:1000). The main agent container runs as uid 1000 with
-    // the pod's primary runAsGroup=1000, so without this it can't connect to
-    // the socket (dockerd otherwise creates it root:root mode 0660). BLO-5492.
-    args: ["dockerd", "--host=unix:///var/run/docker.sock", "--storage-driver=overlay2", "--group=1000"],
+    // `--group=1000` makes the socket appear with group 1000 (mode 0660
+    // root:1000). The main agent container runs as uid 1000 with the pod's
+    // primary runAsGroup=1000, so without this it can't connect to the socket
+    // (dockerd otherwise creates it root:root mode 0660). BLO-5492.
+    args: ["dockerd", `--host=unix://${DIND_SOCKET_PATH}`, "--storage-driver=overlay2", "--group=1000"],
     securityContext: { privileged: true, runAsUser: 0, runAsNonRoot: false },
     env: [{ name: "DOCKER_TLS_CERTDIR", value: "" }],
     resources: {
@@ -1371,7 +1391,7 @@ function buildDindSidecar(opts: {
     },
     volumeMounts: [
       { name: "docker-graph", mountPath: "/var/lib/docker" },
-      { name: "docker-sock", mountPath: "/var/run" },
+      { name: "docker-sock", mountPath: DIND_SOCKET_DIR },
     ],
     restartPolicy: "Always",
   };
@@ -1380,13 +1400,13 @@ function buildDindSidecar(opts: {
 
 /**
  * Shell snippet the main container prepends to its command when the DinD
- * sidecar is enabled. Polls for /var/run/docker.sock to appear (sidecar
+ * sidecar is enabled. Polls for the shared socket to appear (sidecar
  * dockerd needs ~5–15 s to come up) and bails out if it never does, so
  * agent runs never silently proceed without docker available.
  */
 const DIND_WAIT_PREAMBLE =
-  `i=0; while [ ! -S /var/run/docker.sock ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done; ` +
-  `if [ ! -S /var/run/docker.sock ]; then echo "dind sidecar socket /var/run/docker.sock never appeared after 30s" >&2; exit 1; fi`;
+  `i=0; while [ ! -S ${DIND_SOCKET_PATH} ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done; ` +
+  `if [ ! -S ${DIND_SOCKET_PATH} ]; then echo "dind sidecar socket ${DIND_SOCKET_PATH} never appeared after 30s" >&2; exit 1; fi`;
 
 /**
  * Resolve the ServiceAccount a Job pod runs as. An unset per-agent
@@ -1889,8 +1909,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // of the path, not whether the path is already taken.
   //
   // Fail closed at construction with a message that names the conflict. Only
-  // EXACT duplicates are a conflict — nesting (`/paperclip` alongside
-  // `/paperclip/cache`) is legal and stays allowed.
+  // EXACT duplicates are a conflict HERE — nesting (`/paperclip` alongside
+  // `/paperclip/cache`) is legal when the parent is declared first, and stays
+  // allowed. The per-container backstop below rejects the one nesting order
+  // that is not legal: a parent declared AFTER the child it would hide
+  // (BLO-40401).
   const normalizeMountPath = (value: string): string =>
     value.length > 1 ? value.replace(/\/+$/, "") : value;
   const claimedMountPaths = new Map<string, string>();
@@ -2336,7 +2359,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // every run on that config through `set -o pipefail`. `${_ARG:+"$_ARG"}` is
   // the empty-safe form: it expands to nothing at all for the `cat` fallback
   // rather than passing `cat` an empty argument.
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${buildPodLogRedactorSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  //
+  // The redactor setup follows `preparePodLog`: on fall-open it writes a
+  // `<podLogPath>.unredacted` sentinel, which needs the directory to exist.
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(podLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
@@ -2351,8 +2377,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       { name: "docker-graph", emptyDir: {} },
       { name: "docker-sock", emptyDir: {} },
     );
-    volumeMounts.push({ name: "docker-sock", mountPath: "/var/run" });
-    envVars.push({ name: "DOCKER_HOST", value: "unix:///var/run/docker.sock" });
+    volumeMounts.push({ name: "docker-sock", mountPath: DIND_SOCKET_DIR });
+    envVars.push({ name: "DOCKER_HOST", value: `unix://${DIND_SOCKET_PATH}` });
   }
 
   // Decide prompt delivery strategy: env var (small) or Secret volume (large).
@@ -2445,17 +2471,27 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   initCommandParts.push(
     ...buildToolRlimitInitShell(TOOL_RLIMIT_DIR, resolveToolMemoryLimitKb(config, containerResources.limits?.memory ?? "")),
   );
+  // Declared in the SAME ORDER as the main container's list above. Mounts are
+  // applied in declaration order, so a nested pair is shadowed in whichever
+  // container declares the parent second — and this list used to lead with
+  // `data`, i.e. the exact opposite of the main container. A workspaceMountPath
+  // of /runtime-cache/workspace was then visible in `claude` and hidden in
+  // `write-prompt`, so the init container's `mkdir -p ${dataMountPath}/...`
+  // landed in the runtime-cache emptyDir and the main container never saw it.
+  // Keeping one order means the shadowing verdict is the same in both
+  // containers, which is what makes the backstop below decidable (BLO-40401).
+  //
   // The `data` volume is declared unconditionally above (PVC-backed, or an
   // `emptyDir` when no claim is configured), so this mount needs no condition
   // and cannot drift from the main container's list. `job-manifest.test.ts` pins
   // the invariant ("every volumeMount resolves to a declared volume", asserted
   // across both containers and every PVC/secret combination).
   const initVolumeMounts: k8s.V1VolumeMount[] = [
-    { name: "data", mountPath: dataMountPath },
     { name: "prompt", mountPath: "/tmp/prompt" },
     // Needed so the BrowserMetrics symlink target above resolves in the init
     // container; same emptyDir instance the main container mounts.
     { name: RUNTIME_CACHE_VOLUME_NAME, mountPath: RUNTIME_CACHE_MOUNT_PATH },
+    { name: "data", mountPath: dataMountPath },
   ];
   if (useLargePromptPath) {
     initVolumeMounts.push({
@@ -2485,15 +2521,31 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     },
   };
 
-  // Backstop for the duplicate-mountPath rule, asserted once both lists are
+  // Backstop for the mount-shadowing rules, asserted once both lists are
   // final. The targeted check on `config.workspaceMountPath` above gives the
   // better error message and catches the operator-reachable case, but it runs
-  // before `docker-sock` (/var/run), `prompt-secret` and `mcp-config-secret` are
+  // before `docker-sock`, `prompt-secret` and `mcp-config-secret` are
   // appended — and the init container keeps a SECOND, independently-built list.
   // Kubernetes rejects the whole Pod for a duplicate path in *any* container, so
   // assert the invariant per container rather than trusting each append site to
   // remember it. This is the same "assert the invariant, don't duplicate the
   // condition" shape already used for volume/mount correspondence.
+  //
+  // Two distinct failures, and only the first is one Kubernetes catches:
+  //
+  //   duplicate — two mounts at the SAME path. Admission error, loud.
+  //   shadowing — a mount that is a strict PARENT of one declared EARLIER.
+  //               Mounts are applied in declaration order, so the later parent
+  //               stacks over the child and the child's content is unreachable
+  //               from inside the container. Kubernetes admits this Pod happily
+  //               and `kubectl describe pod` still lists the hidden mount; only
+  //               a read inside the container shows it is gone. That is how
+  //               BLO-40401 (docker-sock at /var/run over the inherited authbot
+  //               Secret at /var/run/authbot) and BLO-40279 before it stayed
+  //               invisible. Fail closed at construction instead.
+  //
+  // The reverse order — parent declared first, child after — is legal, visible,
+  // and stays allowed (`/runtime-cache` alongside `/runtime-cache/workspace`).
   for (const [containerName, mounts] of [
     ["write-prompt (init)", initVolumeMounts],
     ["claude (main)", volumeMounts],
@@ -2506,6 +2558,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         throw new Error(
           `container ${containerName} would declare duplicate volumeMounts at ${normalized} (volumes "${previous}" and "${mount.name}"); Kubernetes rejects such a Pod`,
         );
+      }
+      const childPrefix = normalized === "/" ? "/" : `${normalized}/`;
+      for (const [earlierPath, earlierName] of seen) {
+        if (earlierPath.startsWith(childPrefix)) {
+          throw new Error(
+            `container ${containerName} would mount "${mount.name}" at ${normalized}, hiding the earlier "${earlierName}" mount at ${earlierPath}; Kubernetes admits such a Pod but the nested mount is unreachable from inside the container`,
+          );
+        }
       }
       seen.set(normalized, mount.name);
     }

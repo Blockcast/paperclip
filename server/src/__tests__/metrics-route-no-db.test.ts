@@ -42,6 +42,7 @@ const INLINE_REFRESHES = [
   "expireStaleRefreshFreshness",
   "refreshDbPoolMetrics",
   "refreshAgentStartLockMetrics",
+  "refreshFdClassMetrics",
 ];
 
 /** Extract a route handler body by brace-matching from its `app.get(...)` declaration. */

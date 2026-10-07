@@ -104,6 +104,7 @@ import {
   envBindingSchema,
   isSensitiveEnv,
   isEnvironmentDriverSupportedForAdapter,
+  promptTokens,
   type BillingType,
   type CostStatus,
   type EnvironmentLeaseStatus,
@@ -263,6 +264,7 @@ import {
   resolveAgentEmptyWorkspaceSourceDir,
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
+  resolvePaperclipHomeDir,
 } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
@@ -507,7 +509,7 @@ import {
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
-  runUsageTokenCounts,
+  runUsageHasNoModelTokens,
   SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
   SESSION_UNAVAILABLE_RECOVERY_RETRY_REASON,
   ZERO_TOKEN_SESSION_RESET_RETRY_REASON,
@@ -2031,7 +2033,14 @@ export function isRetryableInteractionContinuationInfrastructureFailure(
     const workspaceValidation = parseObject(parseObject(run.resultJson).workspaceValidation);
     if (
       readNonEmptyString(workspaceValidation.reason) ===
-      "k8s_agent_home_git_bootstrap_unsupported"
+        "k8s_agent_home_git_bootstrap_unsupported" &&
+      // BLO-40317: non-retryable only on a verdict. `gitProbeState:
+      // "indeterminate"` means the probe could not tell whether the fallback cwd
+      // is a checkout, which is not evidence that anything needs repairing —
+      // a credential shim ahead of `git` on PATH produced it fleet-wide on
+      // 2026-10-05 over directories that were fine. Keep that retryable so it
+      // re-tests instead of latching.
+      readNonEmptyString(workspaceValidation.gitProbeState) !== "indeterminate"
     ) {
       return false;
     }
@@ -3840,7 +3849,7 @@ async function hasGitMetadata(cwd: string | null | undefined) {
 async function isGitCheckout(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized })
+  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized, env: strictGitCheckoutProbeEnv() })
     .then((result) => Boolean(readNonEmptyString(result.stdout)))
     .catch(() => false);
 }
@@ -3854,6 +3863,31 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
   }
 }
 
+// BLO-40317: resolve `git` for local-only reads (the strict probe below,
+// isGitCheckout() and hasGitPushRemote(), none of which contacts a remote)
+// WITHOUT the Paperclip home bin dirs on PATH. `/paperclip/.local/bin/git` is a
+// credential shim that execs the real git through a token wrapper and exits 1
+// when its token file is unreadable. That stderr is neither ENOENT nor "not a
+// git repository", so the probe below returned `indeterminate` and dispatch was
+// refused for every workspace-less row in the fleet (134 of 146 blocked rows on
+// 2026-10-05) — on an unrelated credential fault, for a `rev-parse` that reads
+// only the local filesystem and needs no credentials at all. The other two
+// readers fail the same way under the shim, as a false
+// git_worktree_base_not_git_checkout and a false missing_git_push_remote.
+// Filtering the home prefix rather than hardcoding /usr/bin keeps these
+// working on dev machines and in CI, and excludes any future agent-home
+// shim for free.
+function strictGitCheckoutProbeEnv(): NodeJS.ProcessEnv {
+  const home = path.resolve(resolvePaperclipHomeDir());
+  const entries = (process.env.PATH ?? "").split(path.delimiter).filter((entry) => {
+    const trimmed = entry.trim();
+    if (!trimmed) return false;
+    const resolved = path.resolve(trimmed);
+    return resolved !== home && !resolved.startsWith(`${home}${path.sep}`);
+  });
+  return { ...process.env, PATH: entries.join(path.delimiter) };
+}
+
 // Unlike isGitCheckout(), this does not fail open: a probe error that isn't
 // positively identifiable as "cwd is not a git checkout" (missing directory,
 // or git's own "not a git repository" fatal) is treated as "could be a
@@ -3863,13 +3897,14 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
 // itself couldn't complete. Uses try/await rather than .then/.catch because
 // execFile can throw synchronously (e.g. ENOTDIR when cwd is not a
 // directory) before returning a promise to chain onto.
-async function probeGitCheckoutStateStrict(
+export async function probeGitCheckoutStateStrict(
   cwd: string,
 ): Promise<"checkout" | "not_a_checkout" | "indeterminate"> {
   try {
     const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
       cwd,
       timeout: strictGitCheckoutProbeTimeoutMs(),
+      env: strictGitCheckoutProbeEnv(),
     });
     return readNonEmptyString(result.stdout) ? "checkout" : "indeterminate";
   } catch (error: unknown) {
@@ -3894,7 +3929,8 @@ function sameResolvedPath(left: string | null | undefined, right: string | null 
 async function hasGitPushRemote(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  const remoteNames = await execFile("git", ["remote"], { cwd: normalized })
+  const env = strictGitCheckoutProbeEnv();
+  const remoteNames = await execFile("git", ["remote"], { cwd: normalized, env })
     .then((result) =>
       result.stdout
         .split(/\r?\n/)
@@ -3904,7 +3940,7 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
     .catch(() => []);
 
   for (const remoteName of remoteNames) {
-    const pushUrl = await execFile("git", ["remote", "get-url", "--push", remoteName], { cwd: normalized })
+    const pushUrl = await execFile("git", ["remote", "get-url", "--push", remoteName], { cwd: normalized, env })
       .then((result) => readNonEmptyString(result.stdout))
       .catch(() => null);
     if (pushUrl) return true;
@@ -4592,6 +4628,7 @@ export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, 
 // Imported for local use below and re-exported so existing importers and tests keep
 // their current entry point.
 import { compactRunLogChunk, sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
+import { buildRunSecretRedactionPlan, createRunSecretBoundaryCarry } from "./run-secret-redaction.js";
 export { compactRunLogChunk, sanitizeRunLogChunkForStorage };
 
 /**
@@ -4877,6 +4914,8 @@ interface WakeupOptions {
 type UsageTotals = {
   inputTokens: number;
   cachedInputTokens: number;
+  /** BLO-29842: cache WRITE, billed 1.25x-2x input. Never part of inputTokens. */
+  cacheCreationInputTokens: number;
   outputTokens: number;
 };
 
@@ -5661,9 +5700,26 @@ function stripAdapterProviderCapacityResetMetadata(
   return sanitized;
 }
 
-function zeroTokenUsage(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } | undefined) {
+function zeroTokenUsage(
+  usage:
+    | {
+        inputTokens?: number;
+        outputTokens?: number;
+        cachedInputTokens?: number;
+        cacheCreationInputTokens?: number;
+      }
+    | undefined,
+) {
   if (!usage) return true;
-  return (usage.inputTokens ?? 0) <= 0 && (usage.outputTokens ?? 0) <= 0 && (usage.cachedInputTokens ?? 0) <= 0;
+  // BLO-29842: cache creation is billed model work. Omitting it here would let a
+  // run that only wrote cache read as "zero tokens" and be misclassified as a
+  // throttled/idle run that never reached the model.
+  return (
+    (usage.inputTokens ?? 0) <= 0 &&
+    (usage.outputTokens ?? 0) <= 0 &&
+    (usage.cachedInputTokens ?? 0) <= 0 &&
+    (usage.cacheCreationInputTokens ?? 0) <= 0
+  );
 }
 
 export function isRetryableK8sCcrotateThrottleResult(result: {
@@ -5672,7 +5728,12 @@ export function isRetryableK8sCcrotateThrottleResult(result: {
   errorFamily?: string | null;
   retryNotBefore?: string | null;
   resultJson?: Record<string, unknown> | null;
-  usage?: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number };
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedInputTokens?: number;
+    cacheCreationInputTokens?: number;
+  };
 }) {
   if (!zeroTokenUsage(result.usage)) return false;
   if (result.errorFamily === "rate_limit_exhausted") return true;
@@ -6459,9 +6520,14 @@ export function resolveLedgerCostStatus(input: {
   costUsd: number | null | undefined;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
 }): CostStatus {
-  const hasTokenUsage = input.inputTokens > 0 || input.cachedInputTokens > 0 || input.outputTokens > 0;
+  const hasTokenUsage =
+    input.inputTokens > 0 ||
+    input.cachedInputTokens > 0 ||
+    input.cacheCreationInputTokens > 0 ||
+    input.outputTokens > 0;
   return input.costUsd == null && hasTokenUsage ? "unpriced" : "reported";
 }
 
@@ -6573,6 +6639,7 @@ function normalizeUsageTotals(usage: UsageSummary | null | undefined): UsageTota
   return {
     inputTokens: Math.max(0, Math.floor(asNumber(usage.inputTokens, 0))),
     cachedInputTokens: Math.max(0, Math.floor(asNumber(usage.cachedInputTokens, 0))),
+    cacheCreationInputTokens: Math.max(0, Math.floor(asNumber(usage.cacheCreationInputTokens, 0))),
     outputTokens: Math.max(0, Math.floor(asNumber(usage.outputTokens, 0))),
   };
 }
@@ -6589,18 +6656,25 @@ function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
     0,
     Math.floor(asNumber(parsed.rawCachedInputTokens, asNumber(parsed.cachedInputTokens, 0))),
   );
+  const cacheCreationInputTokens = Math.max(
+    0,
+    Math.floor(
+      asNumber(parsed.rawCacheCreationInputTokens, asNumber(parsed.cacheCreationInputTokens, 0)),
+    ),
+  );
   const outputTokens = Math.max(
     0,
     Math.floor(asNumber(parsed.rawOutputTokens, asNumber(parsed.outputTokens, 0))),
   );
 
-  if (inputTokens <= 0 && cachedInputTokens <= 0 && outputTokens <= 0) {
+  if (inputTokens <= 0 && cachedInputTokens <= 0 && cacheCreationInputTokens <= 0 && outputTokens <= 0) {
     return null;
   }
 
   return {
     inputTokens,
     cachedInputTokens,
+    cacheCreationInputTokens,
     outputTokens,
   };
 }
@@ -6615,6 +6689,9 @@ function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: Usage
   const cachedInputTokens = current.cachedInputTokens >= previous.cachedInputTokens
     ? current.cachedInputTokens - previous.cachedInputTokens
     : current.cachedInputTokens;
+  const cacheCreationInputTokens = current.cacheCreationInputTokens >= previous.cacheCreationInputTokens
+    ? current.cacheCreationInputTokens - previous.cacheCreationInputTokens
+    : current.cacheCreationInputTokens;
   const outputTokens = current.outputTokens >= previous.outputTokens
     ? current.outputTokens - previous.outputTokens
     : current.outputTokens;
@@ -6622,6 +6699,7 @@ function deriveNormalizedUsageDelta(current: UsageTotals | null, previous: Usage
   return {
     inputTokens: Math.max(0, inputTokens),
     cachedInputTokens: Math.max(0, cachedInputTokens),
+    cacheCreationInputTokens: Math.max(0, cacheCreationInputTokens),
     outputTokens: Math.max(0, outputTokens),
   };
 }
@@ -6635,17 +6713,33 @@ export function parseSessionCompactionPolicy(agent: typeof agents.$inferSelect):
   return resolveSessionCompactionPolicy(agent.adapterType, agent.runtimeConfig).policy;
 }
 
+// BLO-29842: the rotation trigger's input basis, as one named unit so it can be
+// pinned. Cache creation used to be summed into `inputTokens` upstream; reading
+// `inputTokens` alone here would quietly shrink the trigger by the whole
+// cache-write volume — most of the prompt on this fleet — and rotate far later
+// than the policy asks. The threshold is unchanged; only what feeds it is.
+// Deliberately the shared `promptTokens` rather than a heartbeat-local twin:
+// two names for one concept is how a third spelling arrives. Kept exported and
+// separate from evaluateSessionCompaction (which needs a DB harness) so that
+// reverting this to `.inputTokens` fails a test instead of passing silently.
+export function sessionRotationInputTokens(usageJson: unknown): number | null {
+  const usage = readRawUsageTotals(usageJson);
+  return usage ? promptTokens(usage) : null;
+}
+
 // Pure rotation-trigger decision, factored out of evaluateSessionCompaction so the
 // boundary semantics are unit-testable without a DB harness (BLO-8827). Returns the
 // human-readable rotation reason, or null to keep the current session. Trigger
 // precedence is consecutive-failures → runs → raw-input → age (first match wins);
 // consecutive-failures is checked first because a poisoned session that never does
 // any model work will never trip the other thresholds (BLO-10889 / BLO-10866 WS2).
-// `latestRawInputTokens` is the NON-cached raw input of the latest run
-// (readRawUsageTotals prefers rawInputTokens, which excludes cached reads) — the
-// ceiling gates re-inflation across wakes, not cache hits. The raw-input comparison
-// is inclusive (>=), so a wake that lands exactly on the threshold rotates. A
-// zero/disabled threshold (value <= 0) disables that trigger.
+// `latestRawInputTokens` is the latest run's raw prompt input: fresh input plus
+// cache creation, via the shared `promptTokens`, with cache READS the one input
+// class left out (BLO-29842). readRawUsageTotals supplies both legs from their
+// raw, pre-compaction counts. The ceiling gates re-inflation across wakes, not
+// cache hits. The raw-input comparison is inclusive (>=), so a wake that lands
+// exactly on the threshold rotates. A zero/disabled threshold (value <= 0)
+// disables that trigger.
 export function computeSessionCompactionReason(input: {
   policy: SessionCompactionPolicy;
   runsCount: number;
@@ -6711,8 +6805,7 @@ function isFailedOrZeroTokenResume(run: {
   ) {
     return true;
   }
-  const { inputTokens, outputTokens } = runUsageTokenCounts(run.usageJson);
-  return inputTokens === 0 && outputTokens === 0;
+  return runUsageHasNoModelTokens(run.usageJson);
 }
 
 function heartbeatRunTokenUsage(usageJson: Record<string, unknown> | null): UsageTotals {
@@ -6725,6 +6818,10 @@ function heartbeatRunTokenUsage(usageJson: Record<string, unknown> | null): Usag
     cachedInputTokens: Math.max(
       0,
       Math.floor(asNumber(parsed.rawCachedInputTokens, asNumber(parsed.cachedInputTokens, asNumber(parsed.cached_input_tokens, 0)))),
+    ),
+    cacheCreationInputTokens: Math.max(
+      0,
+      Math.floor(asNumber(parsed.rawCacheCreationInputTokens, asNumber(parsed.cacheCreationInputTokens, asNumber(parsed.cache_creation_input_tokens, 0)))),
     ),
     outputTokens: Math.max(
       0,
@@ -6739,7 +6836,12 @@ function isZeroTokenCompletedRun(run: {
 }): boolean {
   if (!isHeartbeatRunTerminalStatus(run.status)) return false;
   const usage = heartbeatRunTokenUsage(run.usageJson);
-  return usage.inputTokens === 0 && usage.cachedInputTokens === 0 && usage.outputTokens === 0;
+  return (
+    usage.inputTokens === 0 &&
+    usage.cachedInputTokens === 0 &&
+    usage.cacheCreationInputTokens === 0 &&
+    usage.outputTokens === 0
+  );
 }
 
 export function countConsecutiveZeroTokenCompletedRuns(
@@ -16735,7 +16837,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       policy.maxSessionAgeHours > 0
         ? await getOldestRunForSession(agent.id, sessionId)
         : runs[runs.length - 1] ?? latestRun;
-    const latestRawUsage = readRawUsageTotals(latestRun?.usageJson);
     const sessionAgeHours =
       latestRun && oldestRun
         ? Math.max(
@@ -16748,7 +16849,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reason = computeSessionCompactionReason({
       policy,
       runsCount: runs.length,
-      latestRawInputTokens: latestRawUsage?.inputTokens ?? null,
+      // BLO-29842: fresh input + cache creation. See sessionRotationInputTokens.
+      latestRawInputTokens: sessionRotationInputTokens(latestRun?.usageJson),
       sessionAgeHours,
       consecutiveFailedOrZeroTokenResumes,
     });
@@ -28891,13 +28993,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const inputTokens = usage?.inputTokens ?? 0;
     const outputTokens = usage?.outputTokens ?? 0;
     const cachedInputTokens = usage?.cachedInputTokens ?? 0;
+    const cacheCreationInputTokens = usage?.cacheCreationInputTokens ?? 0;
     const billingType = normalizeLedgerBillingType(result.billingType);
     const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType);
-    const hasTokenUsage = inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0;
+    const hasTokenUsage =
+      inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0 || cacheCreationInputTokens > 0;
     const costStatus = resolveLedgerCostStatus({
       costUsd: result.costUsd,
       inputTokens,
       cachedInputTokens,
+      cacheCreationInputTokens,
       outputTokens,
     });
     const provider = result.provider ?? "unknown";
@@ -28968,6 +29073,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         model: result.model ?? "unknown",
         inputTokens,
         cachedInputTokens,
+        cacheCreationInputTokens,
         outputTokens,
         costCents: additionalCostCents,
         occurredAt: new Date(),
@@ -31807,6 +31913,76 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } else {
       delete context.paperclipSecrets;
     }
+    // BLO-39715: build this run's secret-VALUE redaction dictionary here, because this is the
+    // one point where every value the run can see is simultaneously in memory. `secretManifest`
+    // deliberately carries no values, so it cannot serve — only `resolvedConfig` can.
+    //
+    // Scope honestly, because this block is the authoritative statement a later reader will
+    // rely on when deciding what is ALREADY covered — an overstated class here becomes someone
+    // else's false absence claim. Two axes, kept apart: conflating them is how a reader
+    // mistakes a list of value-classes for an inventory of sinks.
+    //
+    // VALUES covered: env-scope secret bindings (environment + agent + project + routine) and
+    // adapter top-level schema secret fields. NOT covered: `PAPERCLIP_API_KEY`, which the
+    // adapter injects later; server-pod inherited env; MCP header/arg credentials — none of
+    // these reach `resolvedConfig` on this path at all. Base64 is a known-uncovered ENCODING:
+    // `kubectl get secret -o yaml` emits it, but base64 is offset-sensitive, so matching a
+    // value embedded mid-stream needs all three alignment variants — a deliberate design
+    // decision, not a variant to bolt onto the list in `buildRunSecretRedactionPlan`.
+    //
+    // SINKS covered: the run-log chunk write path (`sanitizeRunLogChunkForStorage`) only. NOT
+    // covered by THIS dictionary — each is handled by a different, name-anchored oracle, so
+    // read these as "not value-anchored", not as "unprotected": (1) the run row's own `error`
+    // and `resultJson` columns, which funnel through `sanitizeRunPatchForStorage` — a
+    // key-name classifier plus a value heuristic, not this run's resolved secret set — and
+    // which are MORE durable than the log store, reaching backups, exports and the
+    // `result_summary`/`result_result` generated columns; (2) the adapter's `meta.command`
+    // and `meta.commandArgs` run-event payload, scrubbed by `redactSensitiveText` (shape-
+    // anchored) and `sanitizeCommandArgs` (flag-anchored) respectively — `command` is
+    // REQUIRED on `AdapterInvocationMeta` and `commandArgs` optional, so naming only the
+    // latter would read as the former being covered; (3) the `workspace-operations` sinks,
+    // whose commands run with the SERVER environment rather than a run's resolved secret set,
+    // so this dictionary would be the wrong one for them. Threading the needles into
+    // `sanitizeRunPatchForStorage` is not the one-liner the `onLog` change was:
+    // `setRunStatus(runId, …)` is also called by the BLO-16850 reaper and the
+    // external-lifecycle finalizer, neither of which ran run setup and either of which may be
+    // a different process, so it needs a runId→needles store with a real lifecycle. Scope
+    // that reason precisely: `runSecretRedaction` IS lexically live at the two in-run
+    // terminal writes, so a partial fix by per-site argument was reachable and was declined —
+    // per-site threading is the shape PEN-3153 centralised away from, and partial coverage
+    // would make this block harder to state honestly, not easier.
+    // Absence claims must be scoped accordingly.
+    const runSecretRedaction = buildRunSecretRedactionPlan(
+      resolvedConfig as Record<string, unknown>,
+      secretKeys,
+    );
+    if (runSecretRedaction.uncoveredKeys.length > 0) {
+      // Never silently skip: a value too short or too plain to replace literally would
+      // otherwise be an invisible hole, which is exactly the failure this control exists to
+      // close. Reported by KEY NAME only — never the value — so the gap is attributable and
+      // fixable by rotating to a longer value.
+      logger.warn(
+        {
+          runId: run.id,
+          agentId: agent.id,
+          uncoveredSecretKeys: runSecretRedaction.uncoveredKeys,
+        },
+        "run secret values below the transcript redaction threshold; rotate these to longer values",
+      );
+    }
+    if (runSecretRedaction.unresolvedKeys.length > 0) {
+      // Separate from the above because the remedy is different: this means a key was declared
+      // secret-backed but its value sits in a namespace the plan builder does not read, so the
+      // fix is in `run-secret-redaction.ts`, not in whoever owns the credential.
+      logger.warn(
+        {
+          runId: run.id,
+          agentId: agent.id,
+          unresolvedSecretKeys: runSecretRedaction.unresolvedKeys,
+        },
+        "run secret keys not locatable in the resolved adapter config; transcript redaction cannot cover them",
+      );
+    }
     const effectiveResolvedConfig = applyRunScopedMentionedSkillKeys(
       resolvedConfig,
       runScopedMentionedSkillKeys,
@@ -33009,28 +33185,69 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, runId));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+      // BLO-39715: a secret can straddle two chunks, and then neither chunk contains the
+      // needle so neither is redacted. See `createRunSecretBoundaryCarry` for why chunk
+      // boundaries are arbitrary on every adapter path, not just the sandbox tailer.
+      const runSecretBoundaryCarry = createRunSecretBoundaryCarry(runSecretRedaction.needles);
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const sanitizedChunk = sanitizeRunLogChunkForStorage(chunk, currentUserRedactionOptions);
-        const countsAsRunProgress = !isSyntheticNonProgressRunLogChunk(sanitizedChunk);
-        if (countsAsRunProgress && stream === "stdout") {
+        // BLO-39715: run progress is a property of what the adapter SENT, so it is classified
+        // here, on the arriving chunk, before the carry re-slices the stream. The carry's
+        // output is the wrong input on both counts. It is not arrival-aligned: held lines are
+        // released together with a later arrival, so classifying it would credit output to
+        // the wrong moment. And it is empty while the window fills, so stamping on it would
+        // record nothing for real early output and let a live run accrue silence from
+        // `startedAt`. An empty arrival is the settle flush below, not output, so it stamps
+        // nothing.
+        const countsAsRunProgress = chunk.length > 0 && !isSyntheticNonProgressRunLogChunk(chunk);
+        // Hold-back is released once the adapter has settled: everything logged after that
+        // point is a complete in-process `[paperclip] …` string rather than a stream slice,
+        // and leaving the carry armed there would withhold the tail of a message with no
+        // later chunk to flush it.
+        const carried = runSecretBoundaryCarry.take(stream, chunk, { flush: adapterExecutionSettled });
+        // The carry has already redacted run-secret values, so the needles below are a
+        // second, idempotent pass. That is deliberate and not an oversight: keeping them
+        // means deleting or bypassing the carry degrades to the pre-BLO-39715 behaviour
+        // (whole-chunk matches still redacted) rather than to no value redaction at all.
+        // The alternative — passing `[]` here — would make the carry line load-bearing in
+        // a way no reviewer of a later diff could see.
+        const sanitizedChunk = sanitizeRunLogChunkForStorage(
+          carried,
+          currentUserRedactionOptions,
+          runSecretRedaction.needles,
+        );
+        // The excerpt is a copy of persisted bytes, so it classifies the bytes it copies, not
+        // the arrival: gating it on `countsAsRunProgress` would drop real output whenever its
+        // held-back tail is released by a keepalive arrival. The carry emits whole lines only,
+        // so a keepalive reaches this anchored match intact and stays out of the excerpt (and
+        // so out of `classifyRunLiveness`'s useful-output check). One released in the same
+        // emission as real output does reach the excerpt, next to output that is genuinely
+        // useful.
+        const belongsInExcerpt = !isSyntheticNonProgressRunLogChunk(sanitizedChunk);
+        if (belongsInExcerpt && stream === "stdout") {
           stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
         }
-        if (countsAsRunProgress && stream === "stderr") {
+        if (belongsInExcerpt && stream === "stderr") {
           stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
         }
         const ts = new Date().toISOString();
 
-        outputSeq += 1;
-        const chunkSeq = outputSeq;
+        // Persistence and the live view are gated on `carried`; the activity stamps below are
+        // not, for the reason given at the top of this function. A chunk the carry withheld
+        // persists nothing, so its progress stamp points at the newest persisted seq.
+        let chunkSeq = outputSeq;
         let appendedBytes = 0;
-        if (handle) {
-          appendedBytes = await runLogStore.append(handle, {
-            stream,
-            chunk: sanitizedChunk,
-            ts,
-            seq: chunkSeq,
-          });
-          persistedLogBytes += appendedBytes;
+        if (carried) {
+          outputSeq += 1;
+          chunkSeq = outputSeq;
+          if (handle) {
+            appendedBytes = await runLogStore.append(handle, {
+              stream,
+              chunk: sanitizedChunk,
+              ts,
+              seq: chunkSeq,
+            });
+            persistedLogBytes += appendedBytes;
+          }
         }
         if (countsAsRunProgress) {
           outputProgressState.pending = {
@@ -33049,6 +33266,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // event stream on every 250ms tail chunk.
         const logActivityAt = new Date(ts);
         if (
+          chunk.length > 0 &&
           isHeartbeatRunRuntimeStatusActive(run.status) &&
           logActivityAt.getTime() - lastLogRuntimeStatusTouchMs >=
             ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS
@@ -33064,6 +33282,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (touchedStatus) publishHeartbeatRunRuntimeProgress(touchedStatus);
         }
 
+        if (!carried) return;
         const payloadChunk =
           sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
             ? sanitizedChunk.slice(sanitizedChunk.length - MAX_LIVE_LOG_CHUNK_BYTES)
@@ -33962,6 +34181,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // every ccrotate retry). Anything `onEvent` delivers from here on is a
         // late event from a continuation that outlived execute().
         adapterExecutionSettled = true;
+        // BLO-39715: flush the boundary carry. Streamed output has stopped, so the trailing
+        // `holdbackChars` of each stream have no later chunk to ride out on and would be
+        // silently dropped from the transcript. `adapterExecutionSettled` is already true
+        // above, so these calls take the flush path. Best-effort and logged rather than
+        // thrown: losing the run's last few characters must not convert a successful run
+        // into a failed one.
+        try {
+          await onLog("stdout", "");
+          await onLog("stderr", "");
+        } catch (flushErr) {
+          logger.warn(
+            { err: flushErr, runId: run.id },
+            "failed to flush run-secret boundary carry; trailing log characters may be missing",
+          );
+        }
         if (branchClaimRenewalTimer) {
           clearInterval(branchClaimRenewalTimer);
         }
@@ -34466,6 +34700,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? "timed_out"
               : "failed";
 
+      // BLO-29842: this is the ONLY writer of `usage_json`, so it defines the
+      // spellings a reader can encounter on rows it wrote. For cache creation
+      // there are exactly two, both camelCase: `cacheCreationInputTokens` (via
+      // the `normalizedUsage` spread) and `rawCacheCreationInputTokens` below.
+      // Snake_case — `cache_creation_input_tokens` — is the *Anthropic API*
+      // field name; adapters normalize it away at the boundary, so this writer
+      // never emits it. The snake_case arms at the read sites are therefore
+      // DEFENSIVE, not reachable-from-here: the input/cached/output legs have
+      // carried them since before this change, and cache creation matches that
+      // shape rather than being the one leg of four that drops them. Extend
+      // this list when the emitted shape changes, rather than widening a read
+      // site to a guess.
       const usageJson =
         normalizedUsage || adapterResult.costUsd != null
           ? ({
@@ -34473,6 +34719,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ...(rawUsage ? {
                 rawInputTokens: rawUsage.inputTokens,
                 rawCachedInputTokens: rawUsage.cachedInputTokens,
+                rawCacheCreationInputTokens: rawUsage.cacheCreationInputTokens,
                 rawOutputTokens: rawUsage.outputTokens,
               } : {}),
               ...(sessionUsageResolution.derivedFromSessionTotals
@@ -34501,6 +34748,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 costUsd: adapterResult.costUsd,
                 inputTokens: normalizedUsage?.inputTokens ?? 0,
                 cachedInputTokens: normalizedUsage?.cachedInputTokens ?? 0,
+                cacheCreationInputTokens: normalizedUsage?.cacheCreationInputTokens ?? 0,
                 outputTokens: normalizedUsage?.outputTokens ?? 0,
               }),
               billingType: normalizeLedgerBillingType(adapterResult.billingType),

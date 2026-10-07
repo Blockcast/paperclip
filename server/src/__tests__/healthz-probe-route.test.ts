@@ -78,6 +78,20 @@ describe("/healthz probe route", () => {
     expect(res.headers["cache-control"]).toBe("no-store");
   });
 
+  it("serves /livez through the real stack, and ahead of the hostname guard", async () => {
+    // BLO-40591. The unit tests in api-pipeline-liveness.test.ts cover the
+    // detector; this covers the wiring — that the route is mounted at all, and
+    // mounted early enough that a probe cannot be failed by the `Host:`
+    // allowlist. A healthy app must answer 200: a liveness route that 503s a
+    // quiet instance restarts the singleton worker for no reason.
+    const probe = await request(app).get("/livez").set("Host", "not-allowlisted.example");
+
+    expect(probe.status).toBe(200);
+    expect(probe.body?.status).toBe("ok");
+    expect(probe.body?.wedged).toBe(false);
+    expect(probe.headers["cache-control"]).toBe("no-store");
+  });
+
   it("answers before the private-hostname guard can reject the probe", async () => {
     // The chart currently sends `Host: 127.0.0.1:3100` to satisfy the
     // allowlist. Being mounted ahead of the guard is what makes that header
@@ -170,10 +184,12 @@ describe("/healthz probe route", () => {
     // routing probes back into the SPA catch-all.
     //
     // BLO-35948 widened this from "every probe is /healthz" to "every probe is
-    // one of the two routes the server actually declares". Worker readiness
-    // now targets `/api/health` so a dead connection pool takes the pod
-    // NotReady; liveness and startup stay on `/healthz`. Which probe gets
-    // which path is asserted against the *rendered* chart in
+    // one of the routes the server actually declares". Worker readiness
+    // targets `/api/health` so a dead connection pool takes the pod NotReady;
+    // BLO-40591 moved worker liveness to `/livez`, which is dependency-free
+    // like `/healthz` but can report an API pipeline that accepts requests and
+    // answers none. Startup stays on `/healthz`. Which probe gets which path
+    // is asserted against the *rendered* chart in
     // `deploy/helm/paperclip/tests/probes.test.mjs`, where the probe blocks
     // are parsed individually — this test only pins that no probe points at a
     // path nothing serves.
@@ -181,6 +197,7 @@ describe("/healthz probe route", () => {
     expect([...new Set(probePaths)].sort()).toEqual([
       "/api/health",
       "/healthz",
+      "/livez",
     ]);
   });
 });

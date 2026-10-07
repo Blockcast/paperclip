@@ -162,14 +162,20 @@ test("worker probes keep the BLO-35948 split: readiness checks the DB, liveness 
   );
 
   for (const name of ["livenessProbe", "startupProbe"]) {
-    assert.equal(
+    assert.notEqual(
       probeSettings(rendered, name).path,
-      "/healthz",
-      `worker ${name} must stay on the DB-free /healthz: a query here imports pool ` +
+      "/api/health",
+      `worker ${name} must not query the database: a query here imports pool ` +
         `latency into a kill decision and restarts the singleton worker (and every ` +
         `in-flight agent run on it) for a saturation problem. See BLO-35948.`,
     );
   }
+
+  assert.equal(
+    probeSettings(rendered, "startupProbe").path,
+    "/healthz",
+    "worker startup must stay on the dependency-free /healthz. See BLO-35948.",
+  );
 
   // `/api/health` has its own, much longer tail than `/healthz` — 13.19s
   // measured under pool saturation on 2026-09-10 — so BLO-31945's "never set
@@ -184,5 +190,61 @@ test("worker probes keep the BLO-35948 split: readiness checks the DB, liveness 
       `${API_HEALTH_SATURATION_TAIL_SECONDS}s while it targets /api/health, measured at 13.19s ` +
       `under pool saturation on 2026-09-10. A shorter timeout fails on a slow pool rather than ` +
       `a dead one and 502s all plugin traffic. See BLO-35948.`,
+  );
+});
+
+// BLO-40591. The 2026-10-05 wedge: `/api/*` served zero bytes for ~29 minutes
+// while this probe passed every time, `restartCount: 0` before and after, with
+// no upper bound on the outage — it happened to self-clear. `/healthz` is
+// declared ahead of the hostname guard, actorMiddleware and the `/api` router,
+// so it answers from upstream of everything that can wedge and can never go
+// red for this. Readiness on `/api/health` (BLO-35948) produces a signal for
+// the sibling case but restarts nothing, which is why the window was unbounded.
+//
+// Liveness now targets `/livez`: same dependency-free shape, plus one
+// in-memory test for "requests arriving, nothing completing". Keying on
+// completions rather than latency is what keeps BLO-35948's prohibition
+// intact — the 13.19s saturation regime completes requests and stays green.
+test("worker liveness can detect an API wedge without acquiring the database", () => {
+  const rendered = renderTemplate("templates/statefulset.yaml");
+  const liveness = probeSettings(rendered, "livenessProbe");
+
+  assert.equal(
+    liveness.path,
+    "/livez",
+    "worker liveness must target /livez: on /healthz it answers from upstream of " +
+      "the API pipeline and stays green through a total API outage, removing the " +
+      "only automatic recovery the control plane has. See BLO-40591.",
+  );
+
+  // The stall window in services/api-pipeline-liveness.ts is 180s. These two
+  // knobs decide how long a wedge runs past it before a kill lands, and a
+  // reader tightening them to "react faster" would be shortening the wrong
+  // budget — the window, not the probe, is where sensitivity belongs.
+  // 6 x 30s keeps the total at roughly 3-6 minutes against the measured 29.
+  assert.ok(
+    liveness.failureThreshold * liveness.periodSeconds >= 120,
+    `worker liveness needs at least 120s of probe budget (got ` +
+      `${liveness.failureThreshold} x ${liveness.periodSeconds}s) so a single late ` +
+      `/livez cannot restart the singleton worker. See BLO-40591.`,
+  );
+
+  // Readiness timeoutSeconds is the /livez wedge detector's saturation margin.
+  // The detector counts only completed `/api` responses, kubelet abandons a
+  // probe at its timeout, and once readiness drops the only endpoint the probe
+  // is the only `/api` traffic left. So an `/api/health` slower than this
+  // timeout for the 180s window reads as a wedge and restarts the worker.
+  // 20s is ~1.5x the 13.19s worst non-wedge sample; tightening it toward that
+  // tail turns pool saturation into a restart. Not scoped to replicas === 1:
+  // the detector is per-pod.
+  const LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS = 20;
+  const readiness = probeSettings(rendered, "readinessProbe");
+  assert.ok(
+    readiness.timeoutSeconds >= LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS,
+    `readiness timeoutSeconds (${readiness.timeoutSeconds}s) must be at least ` +
+      `${LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS}s: it is the /livez wedge detector's ` +
+      `saturation margin. A /api/health probe abandoned at its timeout counts as an ` +
+      `arrival without a completion, so pool saturation above it restarts the singleton ` +
+      `worker. See BLO-40591.`,
   );
 });

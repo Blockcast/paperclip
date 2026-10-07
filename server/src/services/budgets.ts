@@ -500,6 +500,25 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     // separate `new Date()` readings would let the payload disagree with itself.
     const now = new Date();
     const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind, now);
+    // Suppress only while an incident for this (policy, window, threshold) is still
+    // *open*. Closed rows must not hold the slot: `raise_budget_and_resume` resolves
+    // every open incident on the policy, so a `ne(status, "dismissed")` check -- what
+    // this was until BLO-28908 -- meant one cap raise silenced the policy for the rest
+    // of the window on both thresholds. The hard path made that dangerous rather than
+    // merely quiet, because `pauseAndCancelScopeForBudget` is not gated on the card
+    // being filed: the next wall in the same window paused the scope with no board
+    // card at all. Zero notice, where BLO-28793 was filed over 76 ms of it.
+    //
+    // `open` is the right key rather than "the cap changed since the last card"
+    // (`amountLimit != policy.amount`), which was the first shape considered: a board
+    // that raises a cap to clear a burst and later lowers it back would match the
+    // earlier row again and re-silence the policy at exactly the cap that already
+    // proved too low. What a still-open incident means is "the board has a live card
+    // for this and has not acted"; anything closed is a decided crossing, and the next
+    // crossing is a new event that deserves its own card.
+    //
+    // `budget_incidents_policy_window_threshold_idx` carries the same predicate and is
+    // the backstop if these two ever drift.
     const existing = await db
       .select()
       .from(budgetIncidents)
@@ -508,7 +527,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           eq(budgetIncidents.policyId, policy.id),
           eq(budgetIncidents.windowStart, start),
           eq(budgetIncidents.thresholdType, thresholdType),
-          ne(budgetIncidents.status, "dismissed"),
+          eq(budgetIncidents.status, "open"),
         ),
       )
       .then((rows) => rows[0] ?? null);
@@ -577,15 +596,17 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         // with no predicate -- that matches no partial index and is itself a 42P10.
         .onConflictDoNothing({
           target: [budgetIncidents.policyId, budgetIncidents.windowStart, budgetIncidents.thresholdType],
-          where: sql`${budgetIncidents.status} <> 'dismissed'`,
+          where: sql`${budgetIncidents.status} = 'open'`,
         })
         .returning()
         .then((rows) => rows[0] ?? null);
 
       // Lost the race: a concurrent pass committed this incident, and its card, between
       // our read above and this insert. Return the winner's row rather than filing a
-      // second card for one threshold crossing. A *dismissed* incident is outside the
-      // partial index, so re-crossing after a dismissal still claims a fresh row here.
+      // second card for one threshold crossing. A *closed* incident is outside the
+      // partial index, so re-crossing after a dismissal or a cap raise still claims a
+      // fresh row here -- and the predicate below must match the index for the same
+      // reason the fast-path read does (BLO-28908).
       if (!claimed) {
         const winner = await tx
           .select()
@@ -595,7 +616,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
               eq(budgetIncidents.policyId, policy.id),
               eq(budgetIncidents.windowStart, start),
               eq(budgetIncidents.thresholdType, thresholdType),
-              ne(budgetIncidents.status, "dismissed"),
+              eq(budgetIncidents.status, "open"),
             ),
           )
           .then((rows) => rows[0] ?? null);
@@ -1343,7 +1364,14 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             resolvedAt: new Date(),
             updatedAt: new Date(),
           })
-          .where(eq(budgetIncidents.id, incident.id));
+          // Same `status = "open"` filter the raise branch uses above. Without it a
+          // stale `keep_paused` against an already-`resolved` incident rewrites that
+          // decided crossing to `dismissed` and overwrites its `resolvedAt`, while
+          // `markApprovalStatus`'s `pending` guard leaves the card `approved` -- a
+          // dismissed incident carrying an approved card, for a scope that is
+          // running, because the dismiss branch never pauses (#2190 review).
+          // No legitimate dismissal targets a non-open incident.
+          .where(and(eq(budgetIncidents.id, incident.id), eq(budgetIncidents.status, "open")));
         await markApprovalStatus(db, incident.approvalId ?? null, "rejected", input.decisionNote, actorUserId);
       }
 
@@ -1362,12 +1390,20 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         },
       });
 
-      const [updated] = await hydrateIncidentRows([{
-        ...incident,
-        status: input.action === "raise_budget_and_resume" ? "resolved" : "dismissed",
-        resolvedAt: new Date(),
-        updatedAt: new Date(),
-      }]);
+      // Report the row as it actually is now, not as the requested action implies.
+      // Both branches close incidents under a `status = "open"` filter, so a submit
+      // against an already-resolved or dismissed incident id leaves that row
+      // untouched -- it resolves whatever was open, resumes the scope and withdraws
+      // the other cards, all correctly, but the incident named in the request did not
+      // change. Echoing the requested outcome back told the caller otherwise
+      // (BLO-28908, from the #1415 review). The side effects were always right; the
+      // return value was the part that lied.
+      const finalRow = await db
+        .select()
+        .from(budgetIncidents)
+        .where(eq(budgetIncidents.id, incident.id))
+        .then((rows) => rows[0] ?? null);
+      const [updated] = await hydrateIncidentRows([finalRow ?? incident]);
       return updated!;
     },
   };

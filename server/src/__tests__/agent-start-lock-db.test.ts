@@ -403,4 +403,40 @@ describe("agent start lock database cancellation seam (PEN-3328)", () => {
     expect(wrapped.savepoint).toBe(wrapped.savepoint);
     expect(wrapped.unsafe).toBe(wrapped.unsafe);
   });
+
+  it("memoizes on presence, so a `buildMethod` branch returning undefined still builds once (PEN-3686)", () => {
+    // The hazard the `methodByProp.has(prop)` check exists for. All three
+    // `buildMethod` branches return a function today, so the test above passes
+    // under either form of the check and cannot distinguish them — a cache
+    // keyed on `get(prop) !== undefined` only looks correct because of an
+    // invariant the code never states.
+    //
+    // This drives a branch to return `undefined` through the public surface
+    // rather than by injecting a seam: the pass-through branch returns
+    // `value.bind(target)`, and `bind` is an ordinary property an own-property
+    // assignment shadows. A `bind` that yields `undefined` therefore makes
+    // `buildMethod` return `undefined` for this prop, which is exactly the
+    // future branch being guarded against. Counting the `bind` calls counts
+    // the rebuilds.
+    const client = makeFakeClient("immediate");
+    let bindCalls = 0;
+    const passThrough = function end() {} as unknown as (() => void) & { bind: () => undefined };
+    passThrough.bind = () => {
+      bindCalls += 1;
+      return undefined;
+    };
+    (client as unknown as Record<string, unknown>).end = passThrough;
+
+    const db = withAgentStartLockAbortableDb(makeFakeDb(client));
+    const wrapped = (db as Db & { $client: Record<string, unknown> }).$client;
+
+    // Three reads of a prop whose wrapper is `undefined`.
+    expect(wrapped.end).toBeUndefined();
+    expect(wrapped.end).toBeUndefined();
+    expect(wrapped.end).toBeUndefined();
+
+    // Negative control: against `if (memoized !== undefined)` the memo misses
+    // every time and this reads 3.
+    expect(bindCalls).toBe(1);
+  });
 });

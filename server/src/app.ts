@@ -68,11 +68,13 @@ import { pluginRoutes } from "./routes/plugins.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gateway.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { metricsIngestRoutes } from "./routes/metrics-ingest.js";
+import { inspectApiPipeline } from "./services/api-pipeline-liveness.js";
 import { renderMetrics } from "./services/metrics.js";
 import {
   expireStaleRefreshFreshness,
   refreshAgentStartLockMetrics,
   refreshDbPoolMetrics,
+  refreshFdClassMetrics,
   startScrapeMetricsCollector,
 } from "./services/scrape-metrics-collector.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
@@ -325,12 +327,18 @@ export async function createApp(
   // `refreshDbPoolMetrics` and `refreshAgentStartLockMetrics` are synchronous
   // in-memory reads, not queries — which is load-bearing for the last one
   // (PEN-3305): it reports dispatch sections wedged on the database, so it must
-  // not itself need the database to be reachable.
+  // not itself need the database to be reachable. `refreshFdClassMetrics`
+  // (PEN-3314) joins them on the same terms: procfs is kernel memory, so the
+  // descriptor walk is syscalls without I/O wait. That alone does not make it
+  // non-blocking (~43 ms at the inspection cap); it is admissible because the
+  // cost is a bounded constant amortised over the scrape interval -- see
+  // fd-class-metrics.ts and scrape-metrics-collector.ts.
   app.get("/metrics", async (_req, res, next) => {
     try {
       expireStaleRefreshFreshness();
       refreshDbPoolMetrics(db);
       refreshAgentStartLockMetrics();
+      refreshFdClassMetrics();
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {
@@ -376,6 +384,31 @@ export async function createApp(
   // information, so exposing it unauthenticated costs nothing.
   app.get("/healthz", (_req, res) => {
     res.status(200).set("Cache-Control", "no-store").json({ status: "ok" });
+  });
+
+  // Liveness probe (BLO-40591). `/healthz` above answers from a point
+  // upstream of the hostname guard, actor resolution and the whole `/api`
+  // router, so it cannot report on the API pipeline: on 2026-10-05 it stayed
+  // green through 29 minutes of `/api/*` serving zero bytes, and the pod was
+  // never restarted. This route answers the next question along -- "are
+  // requests arriving and nothing coming out" -- from two in-memory
+  // timestamps maintained by httpMetricsMiddleware.
+  //
+  // Same dependency rules as `/healthz`, for the same reasons: no query, no
+  // disk, nothing deferred, mounted ahead of logging and auth. The detector
+  // deliberately keys on completions rather than latency so that pool
+  // saturation, which completes requests slowly, stays green while a wedge,
+  // which completes nothing, goes red. See services/api-pipeline-liveness.ts
+  // for the full rationale and the measured thresholds.
+  //
+  // Rollback is a one-line chart change: point the worker liveness probe back
+  // at `/healthz`.
+  app.get("/livez", (_req, res) => {
+    const pipeline = inspectApiPipeline();
+    res
+      .status(pipeline.wedged ? 503 : 200)
+      .set("Cache-Control", "no-store")
+      .json({ status: pipeline.wedged ? "api_pipeline_wedged" : "ok", ...pipeline });
   });
 
   // Respect the operator's `TRUST_PROXY` env var (see middleware/trust-proxy.ts).

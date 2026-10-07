@@ -616,7 +616,15 @@ jobs:
       # escalation's stall clock. Both properties are unobservable in production
       # until a deploy is already stuck for hours, which is the wrong moment to
       # discover either of them regressed.
-      - name: Test stuck production-approval escalation (PEN-2848, BLO-33400, PEN-3315)
+      #
+      # PEN-3744 adds the delivery-gap suite. Its subject is a property of the
+      # DELIVERED text, not of the code: the Slack relay forwards `summary`
+      # whole but cuts the description to its first paragraph at 400 chars, so a
+      # gap figure that lands in paragraph 2 or overruns that bound is a gap the
+      # human reading Slack never sees — indistinguishable in CI from having
+      # fixed nothing. That bound lives in another repository's relay config and
+      # nothing here could otherwise observe it.
+      - name: Test stuck production-approval escalation (PEN-2848, BLO-33400, PEN-3315, PEN-3744)
         if: ${{ !cancelled() }}
         run: |
           node --test \
@@ -624,7 +632,8 @@ jobs:
             ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs \
             ./.github/scripts/tests/supersede-stale-deploy.test.mjs \
             ./.github/scripts/tests/deploy-stall-record.test.mjs \
-            ./.github/scripts/tests/deploy-stall-chain.test.mjs
+            ./.github/scripts/tests/deploy-stall-chain.test.mjs \
+            ./.github/scripts/tests/deploy-delivery-gap.test.mjs
         timeout-minutes: 1
 
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs
@@ -885,6 +894,10 @@ jobs:
       - name: Test http-cache-semantics security override
         if: ${{ !cancelled() }}
         run: pnpm run test:http-cache-semantics-security-override
+
+      - name: Test proxy-addr security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:proxy-addr-security-override
 
       - name: Test agent-health preflight fixtures
         if: ${{ !cancelled() }}
@@ -1457,6 +1470,13 @@ jobs:
     # runner-to-runner speed, and a shard that is well-packed can still be
     # slow. Lower these only against observed `Vitest phase durations` rows
     # from three consecutive master-based runs, not against the prediction.
+    #
+    # BLO-36439: every percentage above was measured at shard_count=4 and is
+    # now HISTORICAL -- the matrix is 6. Measured critical shard falls ~68.5m
+    # -> ~48.5m, so 110 is looser than the 82% it describes, not tighter. Left
+    # deliberately: per BLO-35615 this cap is a hang detector, not a
+    # performance budget, and is not re-tuned from observed durations. Re-derive
+    # it by that rule -- do not scale these numbers by 4/6.
     timeout-minutes: ${{ matrix.timeout_minutes }}
     # BLO-28886 AC3. Read by vitest.config.ts, which only registers the JSON
     # reporter when this is set -- so a local `pnpm test` is unchanged. A
@@ -1488,28 +1508,42 @@ jobs:
       # Every matrix entry gets an isolated ARC pod/database. Serializing this
       # matrix only lengthens the critical path and leaves on-prem capacity
       # unused when it is available.
-      max-parallel: 6
+      # BLO-36439: 8 = the whole matrix (6 server + 2 workspaces). This MUST
+      # track the matrix size -- at 6 it would hold two server shards back
+      # behind a full shard duration and make the critical path WORSE than the
+      # four-shard layout it replaces, which is the one way this change loses.
+      max-parallel: 8
       matrix:
         include:
           - group: general-server
-            group_label: server 1/4
+            group_label: server 1/6
             shard_index: 0
-            shard_count: 4
+            shard_count: 6
             timeout_minutes: 110
           - group: general-server
-            group_label: server 2/4
+            group_label: server 2/6
             shard_index: 1
-            shard_count: 4
+            shard_count: 6
             timeout_minutes: 110
           - group: general-server
-            group_label: server 3/4
+            group_label: server 3/6
             shard_index: 2
-            shard_count: 4
+            shard_count: 6
             timeout_minutes: 110
           - group: general-server
-            group_label: server 4/4
+            group_label: server 4/6
             shard_index: 3
-            shard_count: 4
+            shard_count: 6
+            timeout_minutes: 110
+          - group: general-server
+            group_label: server 5/6
+            shard_index: 4
+            shard_count: 6
+            timeout_minutes: 110
+          - group: general-server
+            group_label: server 6/6
+            shard_index: 5
+            shard_count: 6
             timeout_minutes: 110
           - group: general-workspaces-a
             group_label: workspaces-a
@@ -1727,7 +1761,7 @@ jobs:
 
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
-    # Serialized server suites run inside the four general-server matrix jobs,
+    # Serialized server suites run inside the general-server matrix jobs,
     # so general_tests remains the required aggregate for both test families.
     name: verify
     if: ${{ always() && !cancelled() }}

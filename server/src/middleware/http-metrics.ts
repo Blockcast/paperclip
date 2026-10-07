@@ -1,6 +1,17 @@
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 
+import {
+  noteApiRequestReceived,
+  noteApiResponseCompleted,
+} from "../services/api-pipeline-liveness.js";
 import { recordHttpRequest } from "../services/metrics.js";
+
+/** True for requests the API pipeline is responsible for answering. Static
+ * assets and the SPA catch-all are served upstream of everything that wedges,
+ * so counting them would keep the liveness clock fresh through an outage. */
+function isApiPath(path: string): boolean {
+  return path === "/api" || path.startsWith("/api/");
+}
 
 /**
  * Per-route HTTP status instrumentation (PEN-3702).
@@ -109,6 +120,14 @@ export function httpMetricsMiddleware(): RequestHandler {
     }
     instrumentable[INSTRUMENTED] = true;
 
+    // BLO-40591. Both halves of the wedge detector hang off this middleware
+    // because it is the one place that sees an /api request enter and sees
+    // whether its response ever finished. Mounted ahead of the hostname guard
+    // and actorMiddleware, so it observes requests the pipeline accepted but
+    // never answered.
+    const apiRequest = isApiPath(req.path);
+    if (apiRequest) noteApiRequestReceived();
+
     let capturedRoute: string | null = null;
     let emptyList = false;
 
@@ -155,6 +174,11 @@ export function httpMetricsMiddleware(): RequestHandler {
     const record = () => {
       if (recorded) return;
       recorded = true;
+      // `writableFinished` is the same discriminator the `status` label uses
+      // below: an abandoned or ingress-timed-out response is not a completion.
+      // Counting one would let a wedge refresh the liveness clock from its own
+      // timed-out clients. See services/api-pipeline-liveness.ts.
+      if (apiRequest && res.writableFinished) noteApiResponseCompleted();
       try {
         const fallbackRoute = capturedRoute
           ? null

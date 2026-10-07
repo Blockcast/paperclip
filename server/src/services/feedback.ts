@@ -1160,6 +1160,7 @@ async function buildAgentContext(
         billingType: costEvents.billingType,
         model: costEvents.model,
         inputTokens: costEvents.inputTokens,
+        cacheCreationInputTokens: costEvents.cacheCreationInputTokens,
         cachedInputTokens: costEvents.cachedInputTokens,
         outputTokens: costEvents.outputTokens,
         costCents: costEvents.costCents,
@@ -1194,6 +1195,12 @@ async function buildAgentContext(
           model: asString(usage.model),
           inputTokens: asNumber(usage.inputTokens) ?? asNumber(usage.rawInputTokens),
           cachedInputTokens: asNumber(usage.cachedInputTokens) ?? asNumber(usage.rawCachedInputTokens),
+          // BLO-29842: cache WRITE, split out of inputTokens. This snapshot is
+          // sanitized and persisted into the bundle, so omitting it bakes in a
+          // shortfall of the whole cache-write volume rather than under-reporting
+          // on read. Kept separate here (unlike costSummary.inputTokens below,
+          // which sums) because this mirrors the raw usage blob field-for-field.
+          cacheCreationInputTokens: asNumber(usage.cacheCreationInputTokens) ?? asNumber(usage.rawCacheCreationInputTokens),
           outputTokens: asNumber(usage.outputTokens) ?? asNumber(usage.rawOutputTokens),
           costUsd: asNumber(usage.costUsd),
           usageSource: asString(usage.usageSource),
@@ -1211,7 +1218,10 @@ async function buildAgentContext(
         billers: uniqueNonEmpty(runCosts.map((row) => row.biller)),
         billingTypes: uniqueNonEmpty(runCosts.map((row) => row.billingType)),
         models: uniqueNonEmpty(runCosts.map((row) => row.model)),
-        inputTokens: runCosts.reduce((sum, row) => sum + row.inputTokens, 0),
+        // BLO-29842: cache writes used to live inside input_tokens. This is a
+        // volume figure, not a rate-card regressor, so sum both to keep it
+        // measuring what it measured before the column was split out.
+        inputTokens: runCosts.reduce((sum, row) => sum + row.inputTokens + row.cacheCreationInputTokens, 0),
         cachedInputTokens: runCosts.reduce((sum, row) => sum + row.cachedInputTokens, 0),
         outputTokens: runCosts.reduce((sum, row) => sum + row.outputTokens, 0),
         costCents: runCosts.reduce((sum, row) => sum + row.costCents, 0),

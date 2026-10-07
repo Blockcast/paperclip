@@ -52,6 +52,66 @@ async function copyLockfileFixture(fixtureRoot: string) {
   }
 }
 
+describe("securityAuditRemediations ledger", () => {
+  // BLO-40334 decision: the per-package readers below stay hardcoded rather
+  // than becoming one generic loop. A package entry's value is the *set of
+  // advisory IDs* its floor rests on, which is semantic and belongs beside
+  // that remediation's own reasoning — a generic shape test can assert that
+  // `advisories` is a non-empty array of strings, which is exactly the part
+  // that never regresses. BLO-39519's entry is already asserted in full by
+  // `scripts/http-cache-semantics-security-override.test.js`.
+  //
+  // The real gap a generic test would have closed is an entry landing with no
+  // guard at all. This pins the key set instead — at BOTH levels, because the
+  // ledger nests ticket -> package and entries accumulate at the *package*
+  // level. A ticket-level pin alone does not see a new package added inside an
+  // existing ticket, which is the common case: a 7th entry under PEN-1198
+  // leaves the ticket key set unchanged.
+  it("has a guard wired for every ticket bucket", () => {
+    expect(
+      Object.keys(rootPackageJson.securityAuditRemediations).sort(),
+    ).toEqual([
+      // scripts/http-cache-semantics-security-override.test.js
+      "BLO-39519",
+      // scripts/proxy-addr-security-override.test.js
+      "BLO-40607",
+      // the PEN-1198 suite below
+      "PEN-1198",
+    ]);
+  });
+
+  // Adding a package entry fails here until someone lists it and says which
+  // guard covers it. Two entries are knowingly listed as UNGUARDED rather than
+  // quietly omitted — the point of this pin is that the unguarded set is
+  // explicit and cannot grow silently. Closing those two is separate work.
+  it("accounts for every package entry inside each ticket bucket", () => {
+    const ledger = rootPackageJson.securityAuditRemediations;
+
+    expect(Object.keys(ledger["BLO-39519"]).sort()).toEqual([
+      // scripts/http-cache-semantics-security-override.test.js
+      "http-cache-semantics",
+    ]);
+    expect(Object.keys(ledger["BLO-40607"]).sort()).toEqual([
+      // scripts/proxy-addr-security-override.test.js
+      "proxy-addr",
+    ]);
+    expect(Object.keys(ledger["PEN-1198"]).sort()).toEqual([
+      // UNGUARDED: no advisories assertion anywhere in the repo.
+      "@babel/core",
+      // "documents the advisories ..." below
+      "@connectrpc/connect-node>undici",
+      // UNGUARDED: no advisories assertion anywhere in the repo.
+      "esbuild",
+      // "documents the advisories ..." below
+      "js-yaml",
+      // "documents the advisories ..." below
+      "jsdom>undici",
+      // scripts/multer-security-override.test.js
+      "multer",
+    ]);
+  });
+});
+
 describe("PEN-1198 audit dependency remediation", () => {
   it("keeps high-risk production dependency paths on patched ranges", () => {
     const overrides = rootPackageJson.pnpm.overrides;

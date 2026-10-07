@@ -460,7 +460,113 @@ async function probeOne(
       newest !== undefined &&
       countAllyDeferredPriorFindings(newest.body) > 0 &&
       !(formalDeferredAttestedHead !== null && formalDeferredAttestedHead !== normalizedHead);
-    if (formalAttestingReview !== undefined) {
+    // `!commentBlocking` for two reasons. COST came first; CORRECTNESS is a
+    // CONSEQUENCE of this clause rather than a motive for it, and only exists
+    // because the clause does.
+    //
+    // COST: `formalClean` reaches `out.clean` only through a conjunction that
+    // `commentBlocking` has already falsified — so once Surface 1 is red this
+    // read cannot change a verdict, and can only LOSE one: an unreadable
+    // `GET /pulls/{n}` would set `failed`, which `evidence-gate.ts` reads as
+    // "could not ask" and uses to suppress the
+    // `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` promotion — demoting a fully
+    // justified block to a warn and blaming an unreadable probe for a red this
+    // probe was holding in its hand (Ally review of #1966).
+    //
+    // CORRECTNESS (Ally review of #2143): this clause SUBSUMES the
+    // `!commentBlocking` conjunct in `out.clean` below, which consequently has
+    // no failing mutation and cannot be given one. `commentBlocking` implies
+    // `formalClean` is false (its only assignment is inside this guard) AND
+    // `commentClean` is false (that needs `state === "success"` on the same
+    // `commentVerdict`, both read after its last assignment), so
+    // `(commentClean || formalClean)` is already false and the conjunct below
+    // cannot change the result for ANY input. Unlike `formalDeferred` above —
+    // whose keying asymmetry leaves its veto reachable on bodies this guard
+    // never sees — no input distinguishes it, so no replacement test is
+    // possible.
+    //
+    // It is NOT thereby inert, and the relation is 2-of-2 rather than one arm
+    // winning (Ally review of #2143 again, correcting an earlier revision of
+    // this paragraph): relax THIS clause alone and the veto still falsifies
+    // `out.clean`; delete the veto alone and this clause still keeps
+    // `formalClean` false. Either one alone holds the invariant; losing BOTH
+    // is a false `review:ally-clean` on a blocking head. So neither may be
+    // removed on the ground that the other covers it — and relaxing this
+    // clause to compute `formalClean` anyway (the tempting form is "cheap
+    // enough, keep it for telemetry") still reintroduces the COST regression
+    // above, veto or no veto. That is the consequence to weigh; a false clean
+    // is NOT, and claiming it was made this prohibition rest on a premise a
+    // reader could disprove in thirty seconds.
+    //
+    // Measured, not reasoned — re-runnable mutation ladder over
+    // `evidence-truth.test.ts` + `evidence-gate.test.ts` (50 cases):
+    //
+    //   drop `&& !commentBlocking` here  -> 2 red, both REPORTED as a call
+    //                                       count ("suppresses the Surface 2
+    //                                       author read entirely" /
+    //                                       "author-blind CARRIED finding").
+    //                                       The `probeFailed`/diagnostic
+    //                                       assertions in those same two cases
+    //                                       also flip, but they sit after the
+    //                                       `authorCalls` one and `expect`
+    //                                       throws on first failure, so the
+    //                                       COST regression is MEASURED AND
+    //                                       NOT PRINTED (Ally review of #2143;
+    //                                       confirmed by neutralizing the
+    //                                       `authorCalls` asserts, which turns
+    //                                       both reds into `probeFailed`
+    //                                       true-vs-false). Read "2 red, call
+    //                                       counts" as the runner's output,
+    //                                       NOT as the full cost. No verdict
+    //                                       moves.
+    //   drop `!commentBlocking` below    -> 50/50 GREEN. No failing mutation.
+    //   drop BOTH                        -> the same 2, PLUS "a blocking
+    //                                       verdict on either surface beats a
+    //                                       clean one on the other"
+    //                                       going red on a detected
+    //                                       `review:ally-clean`. That third
+    //                                       failure is the false clean.
+    //
+    // That reach asymmetry is also why reason (2) above refuses a guard copy
+    // of `!formalDeferred` while this clause IS a guard copy of the veto
+    // below: the same two-arms question, answered oppositely because the arms
+    // differ in reach. A `formalDeferred` copy would be a strictly narrower
+    // arm that could only mask the wider one; these two are coextensive, so
+    // each is a real backstop for the other's mutation — and this one
+    // additionally buys the COST saving above, which is its actual motive.
+    //
+    // The route this is REACHABLE on is `blocking_finding`, which stays
+    // author-blind on purpose ("a finding is a finding whoever wrote it",
+    // `pr-comment-review-gate.ts`): Surface 1 never reads the author there, so
+    // this read is a genuine extra call against a deliberately scarce budget.
+    // NOT the `authorUnknown`-CARRYING `carried_finding` sub-shape, which that
+    // review named. `authorUnknown` rides that route only through
+    // `withheldPositive`, which is assigned only inside `if (forHead)` — i.e.
+    // only when a comment passing `isAllyConsolidatedReviewComment` attests
+    // this head. There, Surface 1 has already read and `readPrAuthor`'s memo
+    // makes this one free with its `failed` already set, so reverting this
+    // clause is green on that sub-shape and a guard written against it would
+    // measure nothing.
+    //
+    // The OTHER carried sub-shape DOES reach here, so the exclusion above is
+    // not a universal (Ally review of #2143): an at-head body that attests but
+    // fails the `## Ally` grammar leaves `withheldPositive` null, so the carry
+    // returns author-blind exactly like `blocking_finding` while still being
+    // `commentBlocking`. So do not delete this clause as redundant with
+    // Surface 1, and do not re-justify it from the authorUnknown-carrying
+    // route. `evidence-truth.test.ts` pins both reachable routes, and its "a
+    // formal Ally review whose body lacks the consolidated heading is still
+    // clean" case is the control in the OTHER direction: `commentBlocking` is
+    // false there and Surface 2's read is the only thing that can set
+    // `review:ally-clean`, so widening this guard turns it red. NOT the "read
+    // at most once even when both surfaces ask" case, which this comment named
+    // until the Ally review of #2143 — its one assertion is a call COUNT, and
+    // the memo means Surface 1 has already spent the single call, so it holds
+    // with this clause present, reverted, OR widened to `if (false)`. It pins
+    // the memo, not this clause. The memoized carried sub-shape two paragraphs
+    // up has no test and should not get one: by the argument above it would
+    // measure nothing.
+    if (formalAttestingReview !== undefined && !commentBlocking) {
       const prAuthorLogin = await readPrAuthor();
       // An unread author leaves this false: it cannot establish independence,
       // and `readPrAuthor` has already set `failed` and reported it.
@@ -508,6 +614,13 @@ async function probeOne(
     // `review:ally-clean` for a head with a live accepted residual (BLO-36903).
     const commentDeferred = commentVerdict.outcome === "deferred_finding";
     out.clean =
+      // The `!commentBlocking` conjunct below is DEAD since the
+      // `!commentBlocking` guard above subsumed it, and it cannot be given a
+      // failing mutation — see the CORRECTNESS paragraph there. It is dormant
+      // ENFORCEMENT, not scaffolding: it is what makes relaxing that guard
+      // survivable, exactly as that guard is what makes this conjunct's
+      // deletability survivable. Do not read its deletability as license to
+      // drop either one.
       !commentBlocking &&
       !formalBlocking &&
       !commentDeferred &&
