@@ -30,6 +30,7 @@ import {
   TOOL_RLIMIT_ZDOTDIR,
   ZSH_DOTFILES,
 } from "./job-manifest.js";
+import { DEFAULT_CLAUDE_CODE_VERSION } from "./runtime-pin.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
 function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
@@ -2088,6 +2089,65 @@ describe("buildJobManifest", () => {
       const init = job.spec?.template?.spec?.initContainers?.[0];
       const promptEnv = init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT");
       expect(Buffer.byteLength(`PROMPT_CONTENT=${promptEnv?.value ?? ""}`, "utf-8") + 1).toBe(MAX_ARG_STRLEN);
+    });
+  });
+
+  describe("adapter-managed Claude Code runtime (claudeCodeVersion)", () => {
+    // Job pods inherit the paperclip image, whose root-owned, layer-cached
+    // `@anthropic-ai/claude-code@latest` froze at 2.1.210 while Opus 5.5 needs
+    // 2.1.280+ ("Claude Code 2.1.210 does not support this model"). The main
+    // command therefore bootstraps the pinned CLI onto the data PVC and puts it
+    // first on PATH before `claude` runs. See runtime-pin.ts.
+    it("bootstraps the default pin between the env guard and the ccrotate preflight", () => {
+      const built = buildJobManifest({ ctx, selfPod });
+      const command = built.job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(built.claudeCodeVersion).toBe(DEFAULT_CLAUDE_CODE_VERSION);
+      expect(command).toContain(`__pcver='${DEFAULT_CLAUDE_CODE_VERSION}'`);
+      expect(command).toContain("__pcroot='/paperclip/.local/lib/paperclip-k8s-runtimes/claude-code'");
+      expect(command).toContain('export PATH="$__pcdir/node_modules/.bin:$PATH"');
+      // Vendored tree: the env guard and the pod-log redactor are set up first;
+      // the runtime bootstrap must come after both and before ccrotate.
+      const pipefailIdx = command.indexOf("set -o pipefail;");
+      const redactorIdx = command.indexOf("POD_LOG_FILTER");
+      const runtimeIdx = command.indexOf("__pcver=");
+      const ccrotateIdx = command.indexOf("ccrotate next");
+      const claudeIdx = command.indexOf("cat /tmp/prompt/prompt.txt | claude");
+      expect(pipefailIdx).toBe(0);
+      expect(redactorIdx).toBeGreaterThan(-1);
+      expect(runtimeIdx).toBeGreaterThan(redactorIdx);
+      expect(ccrotateIdx).toBeGreaterThan(runtimeIdx);
+      expect(claudeIdx).toBeGreaterThan(ccrotateIdx);
+    });
+
+    it("honours an explicit exact version", () => {
+      ctx.config = { claudeCodeVersion: "2.1.300" };
+      const built = buildJobManifest({ ctx, selfPod });
+      const command = built.job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(built.claudeCodeVersion).toBe("2.1.300");
+      expect(command).toContain("__pcver='2.1.300'");
+      expect(command).toContain('"@anthropic-ai/claude-code@$__pcver"');
+    });
+
+    it('"image" disables the bootstrap and leaves the pipeline on the bundled CLI', () => {
+      ctx.config = { claudeCodeVersion: "image" };
+      const built = buildJobManifest({ ctx, selfPod });
+      const command = built.job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(built.claudeCodeVersion).toBe("");
+      expect(command).not.toContain("__pcver=");
+      expect(command).not.toContain("paperclip-k8s-runtimes");
+      expect(command).toMatch(/^set -o pipefail; .*\(command -v ccrotate .*cat \/tmp\/prompt\/prompt\.txt \| claude /);
+    });
+
+    it("rejects a non-exact version instead of interpolating it into the shell", () => {
+      ctx.config = { claudeCodeVersion: "latest" };
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/claudeCodeVersion must be an exact version/);
+    });
+
+    it("installs under the configured workspace mount path when the execution target overrides it", () => {
+      ctx.config = { workspaceVolumeClaim: "agent-data", workspaceMountPath: "/data" };
+      const built = buildJobManifest({ ctx, selfPod });
+      const command = built.job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(command).toContain("__pcroot='/data/.local/lib/paperclip-k8s-runtimes/claude-code'");
     });
   });
 
