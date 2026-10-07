@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, max, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 
@@ -26782,6 +26783,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   let joinableStartLockReap: Promise<unknown> | null = null;
   let inFlightStartLockReap: Promise<unknown> | null = null;
   let sharedStartLockReapCompletedAtMs = 0;
+  /**
+   * Marks the async scope of a shared start-lock sweep (BLO-35940). The sweep
+   * can start another agent's dispatch and await it: `releaseIssueExecutionAndPromote`
+   * calls `startNextQueuedRunForAgent` for a promoted wake without consulting
+   * `suppressDispatchAfterReap`, and `withAgentStartLock` runs a free agent's
+   * section inline. That dispatch's own reap must not join or chain behind the
+   * sweep it is running inside, because that sweep is waiting for it.
+   */
+  const insideStartLockSweep = new AsyncLocalStorage<true>();
 
   function scheduleStartLockReap(after: Promise<unknown>) {
     const sweep = after.then(() => {
@@ -26790,7 +26800,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // a TTL set a failing sweep backs off instead of being retried by every
       // waking agent.
       joinableStartLockReap = null;
-      const running: Promise<unknown> = reapOrphanedRuns({ suppressDispatchAfterReap: true }).finally(() => {
+      const running: Promise<unknown> = insideStartLockSweep.run(true, () =>
+        reapOrphanedRuns({ suppressDispatchAfterReap: true }),
+      ).finally(() => {
         sharedStartLockReapCompletedAtMs = Date.now();
         if (inFlightStartLockReap === running) inFlightStartLockReap = null;
       });
@@ -26844,8 +26856,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * Direct callers of `reapOrphanedRuns` (the periodic reaper, tests) are
    * deliberately left alone: this is a dispatch-path fix, and the row-level
    * dedup those callers rely on is a separate, still-tested invariant.
+   *
+   * A caller already inside a shared sweep (a dispatch the sweep started and is
+   * awaiting) runs its own unshared sweep instead. Joining or chaining would wait
+   * on the sweep that is waiting on it, and every later start-lock caller then
+   * queues behind that cycle (BLO-35940). Nesting stays bounded
+   * by `MAX_NESTED_DISPATCH_DEPTH` in `withAgentStartLock`, as before BLO-36922.
    */
-  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh"> {
+  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh" | "nested"> {
+    if (insideStartLockSweep.getStore()) {
+      await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      return "nested";
+    }
     if (joinableStartLockReap) {
       await joinableStartLockReap;
       return "joined";
@@ -29560,7 +29582,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // another agent's in-flight sweep, which is still time this lock was held.
         markAgentStartLockPhase(agentId, "reap");
         const reapStartedAtMs = Date.now();
-        let reapDisposition: "ran" | "joined" | "skipped_fresh" | undefined;
+        let reapDisposition: "ran" | "joined" | "skipped_fresh" | "nested" | undefined;
         try {
           reapDisposition = await reapOrphanedRunsForStartLock();
         } finally {

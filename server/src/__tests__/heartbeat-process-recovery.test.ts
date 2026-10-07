@@ -355,6 +355,11 @@ async function waitForPidExit(pid: number, timeoutMs = 2_000) {
   return !isPidAlive(pid);
 }
 
+// BLO-35940: a deadlocked sweep never settles, so any bound separates it from a
+// healthy one; this one is half of `testTimeout` (60s in vitest.config.ts) so the
+// assertions after the race still run, and ~8x the 3.5s the passing test measured.
+const SHARED_SWEEP_SETTLE_BOUND_MS = 30_000;
+
 async function waitForRunToSettle(
   heartbeat: ReturnType<typeof heartbeatService>,
   runId: string,
@@ -2377,6 +2382,65 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       state: "released",
       releaseReason: "job_missing",
     });
+  });
+
+  it("settles a shared start-lock sweep that promotes a deferred wake for an idle external agent (BLO-35940)", async () => {
+    // The shared sweep finalizes this run and promotes the deferred wake, which
+    // dispatches the now-idle agent through `withAgentStartLock` and awaits it.
+    // That dispatch's own start-lock reap used to join the sweep awaiting it,
+    // so neither promise ever settled and every later start queued behind them.
+    const jobName = "agent-opencode-shared-sweep-promote";
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+      externalRunId: jobName,
+      lastOutputAt: new Date(),
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    const wakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId,
+      agentId,
+      source: "timer",
+      status: "deferred_issue_execution",
+      payload: { issueId },
+    });
+    mockListManagedAgentJobs.mockImplementation(async () => []);
+    mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+      name === jobName ? { phase: "missing" as const, reason: "NotFound" as const, name } : null,
+    );
+    // Pods observable and none belong to the run: quiescence is proven, so the
+    // successor is promoted rather than held (see the BLO-21460 tests).
+    mockListManagedAgentPods.mockImplementation(async () => []);
+
+    try {
+      const sweep = heartbeat.reapOrphanedRunsForStartLock();
+      const outcome = await Promise.race([
+        sweep.then(() => "settled" as const),
+        new Promise<"deadlocked">((resolve) => setTimeout(() => resolve("deadlocked"), SHARED_SWEEP_SETTLE_BOUND_MS)),
+      ]);
+
+      expect(outcome).toBe("settled");
+      expect(await heartbeat.getRun(runId)).toMatchObject({ status: "failed", errorCode: "job_missing" });
+      // Without these the test could pass by never reaching the nested reap:
+      // the wake was promoted, and the promoted dispatch ran its own sweep.
+      const wake = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeId))
+        .then((rows) => rows[0]);
+      expect(wake?.status).not.toBe("deferred_issue_execution");
+      expect(mockListManagedAgentJobs).toHaveBeenCalledTimes(2);
+    } finally {
+      mockListManagedAgentJobs.mockImplementation(async () => null);
+      mockReadAgentJobRunStatusByName.mockImplementation(async () => null);
+      mockListManagedAgentPods.mockImplementation(async () => null);
+    }
   });
 
   it("records an external-finalizer failure immediately after the terminal claim", async () => {
