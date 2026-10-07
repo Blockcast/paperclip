@@ -44,6 +44,13 @@ import type { Db } from "@paperclipai/db";
 import { issueWorkProducts, pullRequestReviewState } from "@paperclipai/db";
 import { getInstallationTokenResult } from "./github-app-auth.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import {
+  emptyGateRedriveResult,
+  mergeSweepCounters,
+  redriveStaleCommentReviewGates,
+  type GateRedriveCandidate,
+  type GateRedriveResult,
+} from "./pr-comment-review-gate-redrive.js";
 import { logger as defaultLogger } from "../middleware/logger.js";
 
 const GITHUB_HOST = "github.com";
@@ -72,8 +79,27 @@ type OpenPullRequest = {
   authorLogin: string | null;
   createdAt: string;
   isDraft: boolean;
+  /**
+   * Head sha, free from the list payload. Optional on purpose: a missing one
+   * must NOT count as malformed, because malformed suppresses the prune and a
+   * field only the gate re-drive reads has no business doing that.
+   */
+  headSha: string | null;
 };
 
+/**
+ * One pass's reconcile tallies.
+ *
+ * Merged field-by-field by {@link mergeSweepCounters}, so it is bound by the
+ * same load-bearing invariant stated on {@link GateRedriveResult}: every
+ * `number` here is ADDITIVE across repos and every `boolean` is "happened in at
+ * least one repo this tick". A field added here that breaks it (a ratio, an
+ * echoed-back ceiling, an epoch timestamp, an AND-shaped flag) is summed or
+ * OR'd into nonsense with no type error and no test failure. All seven below
+ * obey it. Add fields that obey it, or change the merge first.
+ *
+ * @see GateRedriveResult for the full statement of the invariant.
+ */
 export type ReviewStateReconcileResult = {
   enumerated: number;
   written: number;
@@ -83,6 +109,8 @@ export type ReviewStateReconcileResult = {
   truncated: boolean;
   /** Unparseable list entries. Non-zero also suppresses the prune. */
   malformed: number;
+  /** Stale comment-review gates re-driven this pass (BLO-39871). */
+  gateRedrive: GateRedriveResult;
 };
 
 type Logger = { info: (o: unknown, m?: string) => void; warn: (o: unknown, m?: string) => void };
@@ -157,6 +185,7 @@ export async function listOpenPullRequests(input: {
         draft?: boolean | null;
         created_at?: string | null;
         user?: { login?: string | null } | null;
+        head?: { sha?: string | null } | null;
       }>;
 
       for (const pr of batch) {
@@ -171,6 +200,7 @@ export async function listOpenPullRequests(input: {
           authorLogin: pr.user?.login ?? null,
           createdAt: pr.created_at,
           isDraft: pr.draft === true,
+          headSha: typeof pr.head?.sha === "string" ? pr.head.sha : null,
         });
         if (pullRequests.length >= input.maxPullRequests) {
           return { pullRequests, truncated: true, malformed };
@@ -358,6 +388,7 @@ export async function reconcileRepoReviewState(
   let written = 0;
   let unreadable = 0;
   const observedNumbers: number[] = [];
+  const gateCandidates: GateRedriveCandidate[] = [];
 
   for (const pr of listed.pullRequests) {
     observedNumbers.push(pr.number);
@@ -436,8 +467,23 @@ export async function reconcileRepoReviewState(
         },
       });
     written += 1;
-  }
 
+    // The gate re-drive rides on this enumeration rather than repeating it: the
+    // open-PR list and the per-PR reviews are the expensive calls, and both are
+    // already paid for here. `reviews === null` is carried through as
+    // `reviewsReadable: false` rather than `[]`, for the same reason this module
+    // refuses that coercion everywhere else.
+    gateCandidates.push({
+      prNumber: pr.number,
+      headSha: pr.headSha,
+      prUrl: pr.url,
+      reviewsReadable: reviews !== null,
+      reviews: (reviews ?? []).map((review) => ({
+        authorLogin: review.authorLogin,
+        submittedAt: review.submittedAt,
+      })),
+    });
+  }
   // Prune only behind an enumeration known to be COMPLETE. Two things break
   // that, and both must suppress it:
   //
@@ -477,6 +523,16 @@ export async function reconcileRepoReviewState(
     );
   }
 
+  // Independent of the prune, and deliberately after it: a truncated
+  // enumeration is a reason not to DELETE rows, not a reason to leave a stale
+  // red standing on the PRs we did read.
+  const gateRedrive = await redriveStaleCommentReviewGates({
+    db,
+    repoFullName: input.repoFullName,
+    candidates: gateCandidates,
+    logger: log,
+  });
+
   return {
     enumerated: listed.pullRequests.length,
     written,
@@ -484,6 +540,7 @@ export async function reconcileRepoReviewState(
     unreadable,
     truncated: listed.truncated,
     malformed: listed.malformed,
+    gateRedrive,
   };
 }
 
@@ -507,6 +564,7 @@ export async function prReviewStateReconcilerTick(
     unreadable: 0,
     truncated: false,
     malformed: 0,
+    gateRedrive: emptyGateRedriveResult(),
   };
 
   const tokenResult = await getInstallationTokenResult();
@@ -532,12 +590,13 @@ export async function prReviewStateReconcilerTick(
         maxPullRequests: input.maxPullRequests,
         logger: log,
       });
-      totals.enumerated += result.enumerated;
-      totals.written += result.written;
-      totals.pruned += result.pruned;
-      totals.unreadable += result.unreadable;
-      totals.truncated = totals.truncated || result.truncated;
-      totals.malformed += result.malformed;
+      // Keys-driven for the WHOLE result, nested `gateRedrive` included. The
+      // six fields this used to accumulate by hand carried the same defect as
+      // the nested one: `totals` is initialised with every field zeroed above,
+      // so a seventh added to `ReviewStateReconcileResult` and forgotten here
+      // compiles clean and reports zero fleet-wide. Specialising the helper to
+      // the nested type closed half the class and left this half open.
+      mergeSweepCounters(totals, result);
       ok += 1;
     } catch (err) {
       failed += 1;

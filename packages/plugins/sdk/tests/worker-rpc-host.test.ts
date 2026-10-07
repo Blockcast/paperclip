@@ -155,6 +155,95 @@ describe("worker performAction context", () => {
   });
 });
 
+describe("worker handleWebhook result (BLO-38643)", () => {
+  /**
+   * The disposition a plugin returns from `onWebhook` must survive the RPC hop.
+   *
+   * The host echoes it into the webhook's 200 response body so a sender can tell
+   * an ingested payload from a deliberately dropped one — both of which answer
+   * 200, by design, so that real Alertmanager stops retrying a body that can
+   * never parse. `handleWebhook` used to `await` the handler and discard its
+   * value, which made that distinction unreachable however carefully the plugin
+   * reported it.
+   *
+   * Driven through the real JSON-RPC loop rather than by calling the handler
+   * directly: discarding the value is invisible to a direct call, and the hop is
+   * exactly where it was being lost.
+   */
+  it("returns the plugin's disposition to the host instead of discarding it", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    let nextRequestId = 1;
+    const plugin = definePlugin({
+      async setup() {},
+      async onWebhook() {
+        return { accepted: 0, rejected: "malformed" };
+      },
+    });
+    const worker = startWorkerRpcHost({
+      plugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+
+    function callWorker(method: string, params: unknown) {
+      const id = `host-${nextRequestId++}`;
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new Error(response.error.message));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (!isJsonRpcResponse(message)) return;
+      pending.get(String(message.id))?.(message);
+      pending.delete(String(message.id));
+    });
+
+    try {
+      await expect(callWorker("initialize", {
+        manifest: {
+          id: "paperclip.test-webhook-result",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Webhook Result Test",
+          description: "Test plugin",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: [],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      })).resolves.toMatchObject({ ok: true });
+
+      await expect(callWorker("handleWebhook", {
+        companyId: "company-1",
+        endpointKey: "alertmanager",
+        headers: {},
+        rawBody: "{}",
+        parsedBody: {},
+        requestId: "req-1",
+      })).resolves.toEqual({ accepted: 0, rejected: "malformed" });
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  });
+});
+
 describe("worker config bootstrap", () => {
   it("returns the empty bootstrap config during unscoped setup without a host call", async () => {
     const hostToWorker = new PassThrough();

@@ -297,7 +297,7 @@ describe("BLO-31036 — a fence abandoned by a dead process stops wedging its ag
     });
     const { ctx } = mkCtx();
 
-    await expect(deliver(ctx)).resolves.toBeUndefined();
+    await expect(deliver(ctx)).resolves.toEqual({ accepted: 1 });
 
     // Reclaimed, then released cleanly in the `finally` — back to `active`
     // rather than newly wedged.
@@ -420,7 +420,7 @@ describe("BLO-31036 — a fence abandoned by a dead process stops wedging its ag
     });
     const { ctx } = mkCtx();
 
-    await expect(deliver(ctx)).resolves.toBeUndefined();
+    await expect(deliver(ctx)).resolves.toEqual({ accepted: 1 });
     expect((await readFence())?.phase).toBe("active");
   });
 });
@@ -459,7 +459,7 @@ describe("BLO-32113 — a fence held past the abandonment backstop is reclaimed 
     });
     const { ctx } = mkCtx();
 
-    await expect(deliver(ctx)).resolves.toBeUndefined();
+    await expect(deliver(ctx)).resolves.toEqual({ accepted: 1 });
 
     // Reclaimed and then released cleanly, not merely stolen.
     const fence = await readFence();
@@ -480,7 +480,7 @@ describe("BLO-32113 — a fence held past the abandonment backstop is reclaimed 
     });
     const { ctx } = mkCtx();
 
-    await expect(deliver(ctx)).resolves.toBeUndefined();
+    await expect(deliver(ctx)).resolves.toEqual({ accepted: 1 });
     expect((await readFence())?.phase).toBe("active");
   });
 
@@ -497,7 +497,7 @@ describe("BLO-32113 — a fence held past the abandonment backstop is reclaimed 
     });
     const { ctx } = mkCtx();
 
-    await expect(deliver(ctx)).resolves.toBeUndefined();
+    await expect(deliver(ctx)).resolves.toEqual({ accepted: 1 });
     expect((await readFence())?.phase).toBe("active");
   });
 

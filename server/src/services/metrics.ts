@@ -937,9 +937,11 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC 
  *
  * Emitted only for agents whose lock is held right now, matching the
  * convention of the per-agent backlog gauges: an absent series means no lock
- * is held, not a zero-length hold. A healthy section is sub-second, so this is
- * near-empty in normal operation and anything above a few seconds is real —
- * `max by (agent_id) (...)` over it is the whole detector.
+ * is held, not a zero-length hold. Holds of minutes to a couple of hours are
+ * routine and release on their own, so this is NOT near-empty in normal
+ * operation and "anything above a few seconds" is not the detector — the
+ * detector is `max by (agent_id) (...)` past the 4h abort boundary, which is
+ * where `PaperclipAgentStartLockWedged` sits.
  */
 export const AGENT_START_LOCK_HELD_SECONDS_METRIC = "paperclip_agent_start_lock_held_seconds";
 /**
@@ -962,6 +964,30 @@ export const AGENT_START_LOCK_HELD_SECONDS_METRIC = "paperclip_agent_start_lock_
  * `markAgentStartLockPhase`; never let an id reach it.
  */
 export const AGENT_START_LOCK_PHASE_SECONDS_METRIC = "paperclip_agent_start_lock_phase_seconds";
+
+/**
+ * Dispatch sections cancelled for overrunning the start-lock budget (PEN-3328).
+ *
+ * The companion to {@link AGENT_START_LOCK_HELD_SECONDS_METRIC}, and it exists
+ * because that gauge cannot answer this question. A cancelled section releases
+ * its lock, so its series *disappears* — the gauge is how you see a wedge while
+ * it is happening, and this is how you see that it happened at all. Without it
+ * an abort at 03:00 leaves no durable trace anywhere Prometheus can reach.
+ *
+ * Deliberately unlabelled beyond the agent, and in particular it does NOT carry
+ * a "did the cancellation land" label. The two are different shapes: an abort
+ * is an event and belongs on a counter, while "still wedged afterwards" is a
+ * *condition* and is already exactly what the gauge reports — a series that
+ * stays high past the budget instead of vanishing. Splitting the counter would
+ * make every recovered abort also increment the alerting series.
+ *
+ * Any non-zero rate is a defect worth chasing. Not because a healthy section is
+ * fast — holds of minutes to a couple of hours are routine and settle on their
+ * own (worst measured: 8073s) — but because the abort budget is four hours,
+ * set deliberately to clear that settling tail. Reaching it means something
+ * inside dispatch stopped responding rather than merely ran slow.
+ */
+export const AGENT_START_LOCK_ABORTED_METRIC = "paperclip_agent_start_lock_aborted_total";
 /**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
@@ -1236,6 +1262,75 @@ export const DB_INHERITED_TIMEOUT_METRIC = "paperclip_db_inherited_timeout_secon
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
+/**
+ * BLO-25024. Time-to-dispatch for EVERY heartbeat run, not just PR-review ones.
+ *
+ * The metric above has the same shape but is gated on a `pr_review:` task key,
+ * so fleet-wide dispatch latency was measurable only by hand-reading one
+ * issue's run list — which is how multi-hour queue waits went unnoticed from
+ * 2026-08-10 to 2026-10-04. Observed at the same guarded queued-to-running
+ * transition, so the two cannot disagree about when a run started.
+ *
+ * Buckets deliberately start at 10s: healthy dispatch on this fleet is
+ * sub-minute (the week of 2026-08-24 ran a median of ~36s), so buckets that
+ * begin at 60s like the PR-review set above cannot distinguish "healthy" from
+ * "a minute late" and would make the recovery target unverifiable.
+ *
+ * `invocation_source` is the only label. It is bounded by
+ * HEARTBEAT_INVOCATION_SOURCES (4 values) and normalized against it, because
+ * the remedy differs by source: a slow `timer` run costs cadence, a slow
+ * `assignment` run costs a human waiting. No agent_id/company_id label — those
+ * grow without bound and this is a histogram.
+ */
+export const RUN_DISPATCH_WAIT_METRIC = "paperclip_run_dispatch_wait_seconds";
+/**
+ * Local copy of `HEARTBEAT_INVOCATION_SOURCES` from `@paperclip/shared`.
+ *
+ * Restated here rather than imported because this module deliberately keeps no
+ * runtime dependency outside prom-client and the logger (see the type-only
+ * import note at the top), and because every other label allow-list in this
+ * file — {@link KNOWN_BLOCKED_REASONS}, KNOWN_ISOLATION_MODES — is local for
+ * the same reason. The drift this invites is pinned by a test that asserts
+ * this array equals the shared constant, so a new invocation source fails CI
+ * here instead of silently collapsing into "other" in production.
+ *
+ * ⚠ NOT {@link KNOWN_INVOCATION_SOURCES}, despite the near-identical name.
+ * That list is the *wake-reason* vocabulary (`issue_assigned`,
+ * `github_pr_opened`, …); this one is the `heartbeat_runs.invocation_source`
+ * COLUMN vocabulary (`timer`, `assignment`, `on_demand`, `automation`). The
+ * two sets are disjoint, so normalizing this column through
+ * {@link normalizeInvocationSource} would collapse EVERY sample to "other" —
+ * a fully-populated histogram with one meaningless label. Do not merge them.
+ */
+export const RUN_DISPATCH_WAIT_INVOCATION_SOURCES = [
+  "timer",
+  "assignment",
+  "on_demand",
+  "automation",
+] as const;
+/**
+ * Day-granular edges past 86400 because the regime this metric was filed for
+ * is multi-day: the worst wait measured on BLO-25024 was 28h 19m. With 86400
+ * as the top finite edge that sample lands in +Inf, and histogram_quantile()
+ * then returns +Inf for the p95 exactly while the incident is happening.
+ */
+export const RUN_DISPATCH_WAIT_BUCKETS_SECONDS = [
+  10,
+  30,
+  60,
+  120,
+  300,
+  600,
+  900,
+  1800,
+  3600,
+  7200,
+  14400,
+  28800,
+  86400,
+  172800,
+  259200,
+];
 /**
  * BLO-21460 (2026-08-03 incident follow-up). Unlike the two metrics above
  * (which count every unreleased reservation, healthy in-flight ones
@@ -2143,8 +2238,12 @@ export const PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC =
  * When you add a code here you must also add a row for it to the Step 2
  * action table in `runbooks/agent-wakeup-terminal-failed.md`. Listing a code
  * here removes it from the table's `other` escape hatch, so an operator paged
- * on it would otherwise see a label with no row and no fallback. Nothing
- * asserts the two match — the drift is silent.
+ * on it would otherwise see a label with no row and no fallback.
+ *
+ * BLO-35668: that drift used to be silent. It is now asserted set-for-set by
+ * `terminal-failed-wake-runbook-parity.test.ts`, so a code added here without a
+ * runbook row (or a row with no code) fails CI instead of surfacing as a paged
+ * label with no instruction.
  */
 export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   "external_lifecycle_stale_killed",
@@ -2156,6 +2255,17 @@ export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
   "job_missing",
   "adapter_failed",
+  // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) is the
+  // RENAME of the `adapter_failed` directly above, at the one claude-k8s emit
+  // site that names a skill-source fault — so like `caveman_proxy_not_ready`
+  // these runs WERE a member before the relabel, and omitting it moved them to
+  // `other` with nothing upstream having changed. That is the gauge's own
+  // triage instruction (`other` means "triage it into this list") firing on a
+  // code that already had a home; it is a label-set correction only, and
+  // nothing was suppressed by its absence because the
+  // `PaperclipPrReviewWakeTerminallyFailed` alert keys on
+  // `…_oldest_age_seconds`, not on `error_code`.
+  "skill_materialization_pending",
   "process_lost",
   "agent_not_found",
 ] as const;
@@ -3177,6 +3287,7 @@ let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
 let agentStartLockPhaseSeconds: Gauge<"agent_id" | "phase"> | null = null;
+let agentStartLockAbortedTotal: Counter<"agent_id"> | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -3264,6 +3375,7 @@ const pluginMetricCombinations = new Map<string, Set<string>>();
 const pluginMetricNames = new Map<string, Set<string>>();
 let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
 let prReviewQueueWait: Histogram | null = null;
+let runDispatchWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let httpRequests: Counter<"route" | "method" | "status"> | null = null;
 let httpEmptyListResponses: Counter<"route" | "method" | "status"> | null = null;
@@ -3358,7 +3470,9 @@ function ensureRegistry(): {
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
   agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
+  agentStartLockAbortedTotalCounter: Counter<"agent_id">;
   prReviewQueueWaitHistogram: Histogram;
+  runDispatchWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   httpRequestsCounter: Counter<"route" | "method" | "status">;
   httpEmptyListResponsesCounter: Counter<"route" | "method" | "status">;
@@ -3422,6 +3536,7 @@ function ensureRegistry(): {
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
     || !agentStartLockHeldSeconds
     || !agentStartLockPhaseSeconds
+    || !agentStartLockAbortedTotal
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -3450,6 +3565,7 @@ function ensureRegistry(): {
     || !pluginMetricDropped
     || !pluginStatusCollectorLastSuccess
     || !prReviewQueueWait
+    || !runDispatchWait
     || !authRequest
     || !httpRequests
     || !httpEmptyListResponses
@@ -3525,10 +3641,18 @@ function ensureRegistry(): {
         "Count of heartbeat runs that reached terminal status 'failed', labeled by agent, source issue, "
         + "adapter, error_code, invocation_source (wake reason), and bounded isolation_mode. Used to "
         + "compute webhook-driven PR-review failure rate and detect repeated execution-pod "
-        + "failures (BLO-7457 / BLO-9147 / BLO-17953). Agent and issue identifiers are "
-        + "retained for k8s_pod_schedule_failed in every isolation mode (run, workspace and shared are "
-        + "all execution pods); other error codes collapse them to bounded fallbacks. Note issue_id is "
-        + "legitimately 'none' for stateless PR-review runs, which are issue-less by construction.",
+        + "failures (BLO-7457 / BLO-9147 / BLO-17953). agent_id is retained for EVERY error code "
+        + "and bounded to the company agent roster by normalizeAgentId, so agent_id='unknown' means "
+        + "the run carried no agent id, an id that is not a real agent, or an id the 30s roster "
+        + "cache had not yet observed — not that policy collapsed it. That last case is reachable "
+        + "only for that agent's failing runs within 30s of its creation, and every one of them "
+        + "collapses, not just the first: nothing invalidates the cache on agent creation, and an "
+        + "unrecognized id does not trigger a refresh (normalizeAgentId is a pure membership "
+        + "test). issue_id is unbounded and is retained only "
+        + "for k8s_pod_schedule_failed, in every isolation mode (run, workspace and shared are all "
+        + "execution pods); every other error code collapses it to 'none' (BLO-17953 A1f). Note "
+        + "issue_id is also legitimately 'none' for stateless PR-review runs, which are issue-less "
+        + "by construction — that is not an attribution defect.",
       labelNames: ["agent_id", "issue_id", "adapter", "error_code", "invocation_source", "isolation_mode"],
       registers: [registry],
     });
@@ -3740,11 +3864,33 @@ function ensureRegistry(): {
       name: AGENT_START_LOCK_HELD_SECONDS_METRIC,
       help:
         "Seconds the per-agent queued-run dispatch start lock has currently been held (PEN-3305). "
-        + "withAgentStartLock has no timeout by design, so a section that never settles holds its "
-        + "agent's lock forever and that agent silently stops dispatching -- while still reading "
+        + "A section that never settles holds its agent's lock until the PEN-3328 abort fires at 4h "
+        + "and that agent silently stops dispatching in the meantime -- while still reading "
         + "status=idle, errorReason=null, orgChainHealth=healthy. Series exist only while a lock is "
-        + "held, so absence means no hold, not a zero-length one. A healthy section is sub-second; "
-        + "sustained tens of seconds is a wedge. Per-pod, because the lock is per-process.",
+        + "held, so absence means no hold, not a zero-length one. Holds of minutes to a couple of "
+        + "hours are routine and settle on their own (worst measured 8073s), so this is NOT "
+        + "near-empty in normal operation and tens of seconds is not a wedge; past the 4h abort "
+        + "boundary is. Per-pod, because the lock is per-process.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    agentStartLockAbortedTotal = new Counter({
+      name: AGENT_START_LOCK_ABORTED_METRIC,
+      help:
+        "Queued-run dispatch sections cancelled for holding the per-agent start lock past its 4h "
+        + "abort budget (PEN-3328). Counterpart to " + AGENT_START_LOCK_HELD_SECONDS_METRIC + ", which "
+        + "cannot answer this: a cancelled section releases its lock, so its gauge series "
+        + "disappears and the event leaves no durable trace. The budget clears the observed "
+        + "settling tail (worst hold that released on its own: 8073s), so any non-zero rate means "
+        + "something inside dispatch stopped responding rather than merely ran slow. This counts the "
+        + "abort, not its outcome: if the cancellation did NOT land, the agent is still wedged and "
+        + "the gauge above keeps reporting it -- that condition is the gauge's job, not a label "
+        + "here. Per-pod, because the lock is per-process. Seeded at 0 by "
+        + "seedAgentStartLockAbortedSeries when an agent takes the lock, so a series exists before "
+        + "its first event and the first abort reads as a 0->1 transition: `increase()` takes "
+        + "last-first, so a series born at 1 would evaluate to 0 forever and the alert would never "
+        + "fire. A 0 here therefore means \"this agent dispatched on this pod and was never "
+        + "aborted\", which is the healthy reading, NOT a missing metric.",
       labelNames: ["agent_id"],
       registers: [registry],
     });
@@ -4263,6 +4409,15 @@ function ensureRegistry(): {
         "Seconds from creation until start for heartbeat runs with a pr_review: task key. "
         + "Observed once at the guarded queued-to-running transition; no repo, PR, agent, or other unbounded labels.",
       buckets: PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS,
+      registers: [registry],
+    });
+    runDispatchWait = new Histogram({
+      name: RUN_DISPATCH_WAIT_METRIC,
+      help:
+        "Seconds from queue entry (queued_at, else created_at) until start for every heartbeat run (BLO-25024). "
+        + "Observed once at the guarded queued-to-running transition, labeled only by bounded invocation_source.",
+      labelNames: ["invocation_source"],
+      buckets: RUN_DISPATCH_WAIT_BUCKETS_SECONDS,
       registers: [registry],
     });
     authRequest = new Counter({
@@ -4793,6 +4948,7 @@ function ensureRegistry(): {
       externalRuntimeReservationStrandMetricsRefreshSuccess,
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
     agentStartLockPhaseSecondsGauge: agentStartLockPhaseSeconds,
+    agentStartLockAbortedTotalCounter: agentStartLockAbortedTotal,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -4821,6 +4977,7 @@ function ensureRegistry(): {
     pluginMetricDroppedCounter: pluginMetricDropped,
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
     prReviewQueueWaitHistogram: prReviewQueueWait,
+    runDispatchWaitHistogram: runDispatchWait,
     authRequestCounter: authRequest,
     httpRequestsCounter: httpRequests,
     httpEmptyListResponsesCounter: httpEmptyListResponses,
@@ -4961,6 +5118,8 @@ export interface RecordHeartbeatRunFailedInput {
   invocationSource: string | null | undefined;
   /** K8s workspace isolation mode; non-K8s and malformed values become unknown. */
   isolationMode: string | null | undefined;
+  /** Active company agent roster used to bound the `agent_id` label. */
+  knownAgentIds: ReadonlySet<string>;
 }
 
 /**
@@ -4971,34 +5130,60 @@ export interface RecordHeartbeatRunFailedInput {
 export function recordHeartbeatRunFailed(
   input: RecordHeartbeatRunFailedInput,
 ): Record<HeartbeatRunFailedLabel, string> {
-  // Per-issue labels are intentionally limited to the retry-loop failure this
-  // monitor needs. Keeping them on every terminal failure would retain one
-  // Prometheus counter series per historical issue for the process lifetime.
-  // The `error_code` gate alone supplies that bound: it is what confines the
-  // per-issue series to one failure mode.
+  // The two source identifiers have COMPLETELY DIFFERENT cardinality cost, so
+  // BLO-17953 A1f splits them rather than extending one allow-list code by code:
   //
-  // BLO-17953: this deliberately does NOT also gate on `isolationMode === "run"`.
+  //   `issue_id` is UNBOUNDED — it accrues a new permanent series for every
+  //   issue that ever fails — so it stays behind the narrow `error_code` gate
+  //   below. Keeping it on every terminal failure would retain one counter
+  //   series per historical issue for the process lifetime.
+  //
+  //   `agent_id` is BOUNDED BY THE ROSTER (tens) and is therefore retained for
+  //   EVERY error code. That bound is ENFORCED, not asserted: `normalizeAgentId`
+  //   collapses any id outside the company roster to `unknown`, exactly as the
+  //   seven other `agent_id`-labeled recorders in this module do. The roster is
+  //   membership, not runtime status (`agent-roster.ts`), so a paused or retired
+  //   agent still reports under its own id. Two ids collapse: one that is not a
+  //   real agent (the case worth collapsing), and — rarely — a real one the 30s
+  //   roster cache has not yet observed, i.e. an agent's failing runs inside
+  //   30s of its creation. Every failing run in that window collapses, not just
+  //   the first: nothing invalidates the cache on agent creation, and a miss
+  //   does not populate it (`normalizeAgentId` is a pure membership test), so
+  //   fast-failing codes can emit several. The second is an accepted,
+  //   self-correcting cost that
+  //   errs toward `unknown`, so it can never breach the bound. "Which
+  //   lane is losing runs to X" is a question worth answering for every failure
+  //   mode, and answering it per-code meant relitigating the allow-list each
+  //   time (BLO-33441 added exactly one code; A1c proposed another before its
+  //   premise was falsified ~1000x).
+  //
+  // Measured cost before this split (2026-10-03, 7d): 153 of 543 series sat at
+  // agent_id="unknown". They now fan out by the agents that actually produce
+  // them — bounded above by 153 x roster(~21), and in practice far less. The
+  // unbounded dimension is untouched, which is what makes that bound hold.
+  //
+  // That bound is a SNAPSHOT of today's error-code population, not an enforced
+  // ceiling: `error_code` is a raw pass-through. It is safe today because every
+  // source stamps a code-literal (`classifyAgentJobFailureErrorCode` returns a
+  // 3-value union or null; the setup-failure path stamps constants such as
+  // `setup_failed` and `workspace_validation_failed`). Retaining
+  // `agent_id` for every code multiplied this dimension's cost by the roster,
+  // so the day anything stamps a TEMPLATED or caller-supplied code, gate it
+  // through a KNOWN_ERROR_CODES set here before it ships.
+  //
+  // BLO-17953: this deliberately does NOT gate on `isolationMode === "run"`.
   // `resolveK8sRunIsolationIdentity` returns run | workspace | shared for every
   // k8s adapter and all three are execution pods, so gating on "run" erased
-  // `agent_id` AND `issue_id` together — one boolean feeds both labels below —
-  // for the majority of the population the alert exists to catch (measured
-  // 2026-09-12: 54.1 of 96.2 pod-schedule failures over 24h sat in
-  // workspace/shared and were therefore unattributable). Narrowing by isolation
-  // mode never added a cardinality bound; the error code already was the bound.
+  // both labels together for the majority of the population the alert exists to
+  // catch (measured 2026-09-12: 54.1 of 96.2 pod-schedule failures over 24h sat
+  // in workspace/shared and were therefore unattributable). Narrowing by
+  // isolation mode never added a cardinality bound; the error code already was
+  // the bound — and it bounds `issue_id` only.
   const isolationMode = normalizeIsolationMode(input.isolationMode);
-  const retainSourceIds = input.errorCode === "k8s_pod_schedule_failed";
-  // BLO-33441: `agent_id` only — NOT `issue_id`. "Which lane is losing runs to
-  // proxy startup" is the question this code exists to answer, and the agent
-  // roster is bounded (tens), so the series count is bounded with it. `issue_id`
-  // is unbounded and stays collapsed, which is the distinction the comment above
-  // is really about.
-  const retainAgentId = retainSourceIds
-    || input.errorCode === CAVEMAN_PROXY_NOT_READY_ERROR_CODE;
+  const retainIssueId = input.errorCode === "k8s_pod_schedule_failed";
   const labels = {
-    agent_id: retainAgentId && typeof input.agentId === "string" && input.agentId.length > 0
-      ? input.agentId
-      : UNKNOWN_AGENT_ID,
-    issue_id: retainSourceIds && typeof input.issueId === "string" && input.issueId.length > 0
+    agent_id: normalizeAgentId(input.agentId, input.knownAgentIds),
+    issue_id: retainIssueId && typeof input.issueId === "string" && input.issueId.length > 0
       ? input.issueId
       : "none",
     adapter: typeof input.adapter === "string" && input.adapter.length > 0 ? input.adapter : "unknown",
@@ -5389,7 +5574,7 @@ export function setScheduledRetryParkHorizonMetrics(
     // `transient_failure` refinements above split one GROUP BY key into
     // several while several fold back into one -- so re-max here rather than
     // trusting the query's GROUP BY to have produced unique keys.
-    const key = `${agentId} ${reason}`;
+    const key = `${agentId}\u0000${reason}`;
     const current = maxByLabels.get(key);
     if (current === undefined || horizonSeconds > current.horizonSeconds) {
       maxByLabels.set(key, { agentId, reason, horizonSeconds });
@@ -5465,6 +5650,57 @@ export function setDbInheritedTimeouts(settings: readonly DbInheritedTimeoutSett
   for (const { name, valueMs, source } of settings) {
     dbInheritedTimeoutGauge.set({ setting: name, source }, valueMs === null ? 0 : valueMs / 1000);
   }
+}
+
+/**
+ * Count one dispatch section cancelled for overrunning the start-lock budget
+ * (PEN-3328).
+ *
+ * Incremented from the lock itself rather than from a scrape-path refresh: an
+ * abort is an *event*, and by the time the next scrape arrives the section has
+ * released its lock and left nothing behind to sample. Whether the cancellation
+ * then landed is not recorded here — see the metric's doc comment; a
+ * cancellation that did not land leaves the gauge high, which is the reading
+ * that already means "this agent is still not dispatching".
+ */
+export function recordAgentStartLockAborted(agentId: string): void {
+  ensureRegistry().agentStartLockAbortedTotalCounter.inc({ agent_id: agentId });
+}
+
+/**
+ * Create this agent's aborted-counter series at 0 when it takes the start lock,
+ * before any abort has happened (PEN-3328 review).
+ *
+ * Load-bearing for PaperclipAgentStartLockAborted, not cosmetic. prom-client
+ * renders no series at all for a labelled metric that has never been written
+ * (confirmed against the pinned 15.1.3), so without this seed the series is
+ * BORN AT 1 on the first abort. `increase()` needs two samples in the range and
+ * takes `last - first`: at the first evaluation after birth there is one sample
+ * and the element is dropped, and at every later one the samples read
+ * `[1, 1, …]`, so the result is 0. Prometheus's counter-birth extrapolation in
+ * `extrapolatedRate` is gated on `resultValue > 0` and therefore does not
+ * rescue it. `increase(...[1h]) > 0` would be permanently false for the FIRST
+ * abort of any `agent_id` on any pod — and since the 4h budget is ~1.8x the
+ * worst hold ever measured settling on its own, and a deploy resets the series,
+ * in practice every real abort is a first abort. The alert would have been
+ * silent for all of them, leaving exactly the self-healed-wedge blind spot it
+ * was added to close.
+ *
+ * Seeded at ACQUISITION rather than at process start because that is what keeps
+ * the `agent_id` label the alert's annotation reads — a boot-time seed has no
+ * agent to name. The gap between this 0 and any increment is LOCK_ABORT_MS (4h),
+ * thousands of scrape intervals, so the 0 is always sampled long before the 1;
+ * the seed could not be squeezed into a single scrape even deliberately.
+ * Cardinality is one series per agent per pod, the same bound the held gauge
+ * already accepts while locks are held.
+ *
+ * Same discipline, and for the same reason, as ALERTING_GITHUB_SUPPRESSION_CAUSES
+ * and the unlabeled `heartbeatTimerChecked` above: a series an alert *selects*
+ * must exist before its first event, because absent-vs-zero is not a
+ * distinction the query language can make after the fact.
+ */
+export function seedAgentStartLockAbortedSeries(agentId: string): void {
+  ensureRegistry().agentStartLockAbortedTotalCounter.inc({ agent_id: agentId }, 0);
 }
 
 /**
@@ -5588,6 +5824,55 @@ export function recordPrReviewQueueWait(input: {
   const waitSeconds = computePrReviewQueueWaitSeconds(input.taskKey, input.createdAt, input.startedAt);
   if (waitSeconds === null) return null;
   ensureRegistry().prReviewQueueWaitHistogram.observe(waitSeconds);
+  return waitSeconds;
+}
+
+/**
+ * Seconds a run spent queued before it started (BLO-25024).
+ *
+ * Unlike `computePrReviewQueueWaitSeconds` there is no task-key gate — every
+ * run counts. Returns null only when the interval is genuinely unmeasurable
+ * (a missing or unparseable timestamp), so an absent observation always means
+ * "no sample", never "a sample of zero". Clamped at 0 so clock skew between
+ * the inserting and claiming processes cannot emit a negative observation,
+ * which would corrupt the histogram sum and therefore any p95 derived from it.
+ */
+export function computeRunDispatchWaitSeconds(
+  queueEnteredAt: Date | string | null | undefined,
+  startedAt: Date | string | null | undefined,
+): number | null {
+  if (!queueEnteredAt || !startedAt) return null;
+  const queueEnteredMs = new Date(queueEnteredAt).getTime();
+  const startedMs = new Date(startedAt).getTime();
+  if (!Number.isFinite(queueEnteredMs) || !Number.isFinite(startedMs)) return null;
+  return Math.max(0, (startedMs - queueEnteredMs) / 1000);
+}
+
+/**
+ * The dispatch-wait clock starts at `coalesce(queuedAt, createdAt)`, the same
+ * expression `refreshQueuedRunAgeMetrics` ages off (BLO-21116). `queuedAt` is
+ * null for a fresh insert, where `createdAt` already is the queue-entry time,
+ * and is stamped by the transitions that put an existing row back into
+ * `queued` (`promoteScheduledRetryRun`, `deferRunForK8sIsolationConflict`,
+ * `deferRunForBranchClaimConflict`).
+ * Measuring from bare `createdAt` would report a promoted retry's whole
+ * `scheduled_retry` backoff, or a re-queued run's whole prior execution, as
+ * dispatch wait.
+ */
+export function recordRunDispatchWait(input: {
+  invocationSource: string | null | undefined;
+  queuedAt: Date | string | null | undefined;
+  createdAt: Date | string | null | undefined;
+  startedAt: Date | string | null | undefined;
+}): number | null {
+  const waitSeconds = computeRunDispatchWaitSeconds(input.queuedAt ?? input.createdAt, input.startedAt);
+  if (waitSeconds === null) return null;
+  const invocation_source = RUN_DISPATCH_WAIT_INVOCATION_SOURCES.includes(
+    input.invocationSource as (typeof RUN_DISPATCH_WAIT_INVOCATION_SOURCES)[number],
+  )
+    ? (input.invocationSource as string)
+    : "other";
+  ensureRegistry().runDispatchWaitHistogram.observe({ invocation_source }, waitSeconds);
   return waitSeconds;
 }
 
@@ -6782,6 +7067,7 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
   agentStartLockHeldSeconds = null;
   agentStartLockPhaseSeconds = null;
+  agentStartLockAbortedTotal = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
@@ -6807,6 +7093,7 @@ export function __resetMetricsForTest(): void {
   pluginMetricNames.clear();
   pluginStatusCollectorLastSuccess = null;
   prReviewQueueWait = null;
+  runDispatchWait = null;
   authRequest = null;
   httpRequests = null;
   httpEmptyListResponses = null;

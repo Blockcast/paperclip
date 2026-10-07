@@ -332,3 +332,121 @@ describeEmbeddedPostgres("PATCH /agents/:agentId/budgets records a config revisi
     expect((await patch).status).toBe(200);
   });
 });
+
+/**
+ * PEN-3707 §5 / PEN-3726. `PATCH /agents/:agentId/budgets` returned the full
+ * agent row with no redactor at all — the exact shape BLO-18969 fixed on
+ * `PATCH /api/agents/:id`, where a budget-only write handed the caller the
+ * agent's entire credential set and it landed verbatim in agent transcripts
+ * and run logs. §5 was accepted as board-gated at the time only because
+ * `redactAgentSecrets` was closure-private to the `agentRoutes` factory; the
+ * move to the `agent-redaction.ts` leaf removed that reason.
+ *
+ * The route being board-gated is why this is a defence-in-depth guard rather
+ * than a live-leak fix — but without an assertion the change is invisible to
+ * the suite: reverting `redactAgentSecrets(updated)` to `updated` left every
+ * other test in this file green.
+ *
+ * Three columns, because `redactAgentSecrets` disposes of them by three
+ * different rules: top-level `env` values take the short `***` sentinel the UI
+ * round-trips, `{type:"plain"}` bindings take `***REDACTED***`, and `metadata`
+ * goes through `containAgentMetadata`.
+ */
+describeEmbeddedPostgres("PATCH /agents/:agentId/budgets redacts the agent row it returns", () => {
+  const ENV_SECRET = "budgets-env-plaintext-secret-13579";
+  const BINDING_SECRET = "budgets-binding-plaintext-secret-24680";
+  const METADATA_SECRET = "budgets-metadata-plaintext-secret-86420";
+
+  let db!: Db;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-budgets-route-redaction-");
+    db = createDb(tempDb.connectionString);
+  });
+
+  afterEach(async () => {
+    await db.delete(activityLog);
+    await db.delete(agentConfigRevisions);
+    await db.delete(budgetPolicies);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await db?.$client.end();
+    await tempDb?.cleanup();
+  });
+
+  async function seedWithSecrets() {
+    const companyId = randomUUID();
+    const [company] = await db
+      .insert(companies)
+      .values({ id: companyId, name: "Paperclip", issuePrefix: issuePrefix(companyId) })
+      .returning();
+    const [agent] = await db
+      .insert(agents)
+      .values({
+        companyId,
+        name: "MulticastEngineer",
+        role: "engineer",
+        title: "Software Engineer",
+        capabilities: "Delivers multicast work",
+        adapterType: "process",
+        adapterConfig: {
+          command: "echo safe",
+          env: { ANTHROPIC_API_KEY: ENV_SECRET },
+          leakedBinding: { type: "plain", value: BINDING_SECRET },
+        },
+        metadata: { leaked: { type: "plain", value: METADATA_SECRET } },
+        budgetMonthlyCents: 500_000,
+      })
+      .returning();
+    return { company: company!, agent: agent! };
+  }
+
+  it("masks adapterConfig credentials and contains metadata on the response", async () => {
+    const { company, agent } = await seedWithSecrets();
+    const app = createApp(db, boardActor(company));
+
+    const res = await request(app)
+      .patch(`/api/agents/${agent.id}/budgets`)
+      .send({ budgetMonthlyCents: 800_000 });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    // Precondition: the write itself still happened, so this is asserting a
+    // redacted SUCCESS rather than passing because the route 4xx'd.
+    expect(res.body.budgetMonthlyCents).toBe(800_000);
+
+    const responseConfig = res.body.adapterConfig as Record<string, any>;
+    expect(responseConfig.env.ANTHROPIC_API_KEY).toBe("***");
+    expect(responseConfig.leakedBinding).toEqual({ type: "plain", value: "***REDACTED***" });
+    expect(res.body.metadata).toEqual({ leaked: { type: "plain", value: "***REDACTED***" } });
+    // Non-credential config is not collateral damage.
+    expect(responseConfig.command).toBe("echo safe");
+
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain(ENV_SECRET);
+    expect(serialized).not.toContain(BINDING_SECRET);
+    expect(serialized).not.toContain(METADATA_SECRET);
+  });
+
+  it("redacts only the response, leaving the stored row intact", async () => {
+    const { company, agent } = await seedWithSecrets();
+    const app = createApp(db, boardActor(company));
+
+    const res = await request(app)
+      .patch(`/api/agents/${agent.id}/budgets`)
+      .send({ budgetMonthlyCents: 800_000 });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    // The sentinel must not be written back: a redactor that persists its own
+    // output destroys the credential (BLO-5xxx — a `***` PATH in opencode_k8s
+    // pods made runc fail to find `sh` and every run died as StartError).
+    const [stored] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    const storedConfig = stored!.adapterConfig as Record<string, any>;
+    expect(storedConfig.env.ANTHROPIC_API_KEY).toBe(ENV_SECRET);
+    expect(storedConfig.leakedBinding.value).toBe(BINDING_SECRET);
+    expect((stored!.metadata as Record<string, any>).leaked.value).toBe(METADATA_SECRET);
+  });
+});

@@ -15,6 +15,10 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   runStatusHoldsIssueExecutionLock,
 } from "../services/issue-execution-lock.js";
+import {
+  RECOVERY_MODEL_PROFILE_KEY,
+  STATUS_ONLY_RECOVERY_GUARD_CONTEXT,
+} from "../services/recovery/model-profile-hint.js";
 
 /**
  * BLO-19749. The defect these tests pin was not a wrong value in one place — it
@@ -158,7 +162,10 @@ describeEmbeddedPostgres("activeRun hydration agrees with checkout (BLO-25410)",
    * Seeds an issue whose `executionRunId` names a run in `runStatus`, i.e. the
    * exact state `checkout()` evaluates its conflict against.
    */
-  async function seedIssueHeldByRunWithStatus(runStatus: string) {
+  async function seedIssueHeldByRunWithStatus(
+    runStatus: string,
+    contextSnapshot: Record<string, unknown> = {},
+  ) {
     const companyId = await seedCompany();
     const agentId = await seedAgent(companyId);
     const issueId = randomUUID();
@@ -178,7 +185,7 @@ describeEmbeddedPostgres("activeRun hydration agrees with checkout (BLO-25410)",
       agentId,
       invocationSource: "assignment",
       status: runStatus,
-      contextSnapshot: { issueId },
+      contextSnapshot: { issueId, ...contextSnapshot },
     });
     await db
       .update(issues)
@@ -247,5 +254,59 @@ describeEmbeddedPostgres("activeRun hydration agrees with checkout (BLO-25410)",
       await db.delete(agents);
       await db.delete(companies);
     }
+  });
+
+  /**
+   * PEN-3275. `writeContainment` is derived from `heartbeat_runs.context_snapshot`,
+   * so the field is only honest while that column stays in `activeRunMapForIssues`'s
+   * select — and nothing above pins it there.
+   *
+   * The failure is silent and it fails OPEN. Drop the column and
+   * `readRecoveryRunWriteClass(undefined)` returns `null` for every run, so every
+   * write-contained run reports `writeContainment: null` — "unconstrained". That is
+   * the exact defect the field exists to remove, except now stated affirmatively by
+   * the API rather than merely unavailable, which is worse.
+   *
+   * Neither of the other two guards sees it. `activeRunMapForIssues` takes
+   * `dbOrTx: any`, so `rows` is `any` and the parameter type on
+   * `toIssueActiveRunRow` type-checks nothing at the only production call site;
+   * and the unit suite
+   * (`issue-active-run-write-containment.test.ts`) calls that function directly,
+   * always supplying a snapshot, so it cannot observe the select at all. These two
+   * cases go through `svc.getActiveRun` — the real query — which is what makes
+   * removing the column a failing test rather than a comment violation.
+   */
+  it("derives writeContainment from the real select, not from a supplied snapshot", async () => {
+    const { companyId, runId } = await seedIssueHeldByRunWithStatus("running", {
+      modelProfile: RECOVERY_MODEL_PROFILE_KEY,
+      ...STATUS_ONLY_RECOVERY_GUARD_CONTEXT,
+    });
+
+    const activeRun = await svc.getActiveRun({ companyId, executionRunId: runId });
+
+    expect(activeRun?.id).toBe(runId);
+    expect(
+      activeRun?.writeContainment,
+      "dropping context_snapshot from the activeRun select silently reports every contained run as unconstrained",
+    ).toBe("status_only");
+    // The snapshot is selected only to derive the class above; it must not ride
+    // out on the response. Asserted here as well as in the unit suite because
+    // this is the path that actually returns a DB row.
+    expect(Object.keys(activeRun ?? {})).not.toContain("contextSnapshot");
+  });
+
+  it("reports an unconstrained holding run as present-and-null, not absent", async () => {
+    // Negative control for the case above: same path, same run status, no guard
+    // tuple. Without it a projection that hard-coded `"status_only"` — or read
+    // the class off the run's mere existence rather than off its snapshot —
+    // would satisfy the assertion above while being wrong for every
+    // unconstrained run, which is the majority of them.
+    const { companyId, runId } = await seedIssueHeldByRunWithStatus("running");
+
+    const activeRun = await svc.getActiveRun({ companyId, executionRunId: runId });
+
+    expect(activeRun?.id).toBe(runId);
+    expect(activeRun?.writeContainment).toBeNull();
+    expect(Object.keys(activeRun ?? {})).toContain("writeContainment");
   });
 });

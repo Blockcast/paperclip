@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 import { issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
@@ -22,18 +22,40 @@ export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const 
  * new budget (BLO-18996), it keeps the handoff comment grant open, and it keeps the
  * owner able to check the issue out. What it does NOT do is wake anyone:
  *
- *   - Three writers set `escalated`, and each does so only on a bound that
- *     `strandedRecoveryWakeAttemptsExhausted` already reports as exhausted:
- *     `escalateExpiredWakeHorizons` on `maxAttempts !== null && timeoutAt !== null &&
- *     timeoutAt <= now`, and `retireAndReleaseWakeAttempt` / `retireWakeAction` on the
- *     attempt budget (BLO-19124). (`upsertSourceScoped` never creates one — it only
- *     preserves, or lifts an `attempt_budget` retirement when the OWNER changes, which
- *     returns the row to `active` with a fresh budget rather than making a new way in.)
+ *   - Three writers set `escalated`, and each does so only on a bound that no sweep will
+ *     spend: `escalateExpiredWakeHorizons` on a burned wake horizon — `maxAttempts !== null
+ *     && timeoutAt !== null && timeoutAt <= now`, or (BLO-40297) the derived horizon for a
+ *     row that never persisted one, `maxAttempts === null && ownerAgentId !== null &&
+ *     createdAt <= now - recoveryActionTimeoutMs` — and `retireAndReleaseWakeAttempt` /
+ *     `retireWakeAction` on the attempt budget (BLO-19124). (`upsertSourceScoped` never
+ *     creates one — it only
+ *     preserves, or lifts a retirement that the same write invalidates: an `attempt_budget`
+ *     bound when the OWNER changes, or (BLO-40297) a derived `timeout_horizon` bound when the
+ *     row takes its FIRST real horizon. Both return the row to `active` with a fresh bound
+ *     rather than making a new way in.)
  *     This bullet read "`escalateExpiredWakeHorizons` is the ONLY writer" until BLO-19124
  *     added the other two; the premise changed, the conclusion below did not.
- *   - So every `escalated` action is already wake-exhausted.
- *     `reconcileStrandedRecoveryWakeBackstop` selects it and then always drops it at
- *     `exhaustedSkipped`. Should a later re-upsert ever null out `maxAttempts`, the
+ *   - So every `escalated` action is already wake-exhausted. ⚠ BLO-40297 made that true by
+ *     a DIFFERENT route for the derived arm: `strandedRecoveryWakeAttemptsExhausted` returns
+ *     `false` on a `maxAttempts === null` row, so the guarantee there rests on
+ *     `retiringBound` being non-null — which `reconcileStrandedRecoveryWakeBackstop` filters
+ *     on directly (`isNull(retiringBound)`) and which `resolveStrandedEscalationStatus`
+ *     reaches via `isWakeExhaustedEscalation: action.status === "escalated"`. Both read the
+ *     written fact, not the predicate, so neither re-wakes a derived-arm row.
+ *
+ *     A third consumer reads the PREDICATE, not the fact: the enqueue gate
+ *     `strandedRecoveryWakeAttemptsExhausted(input.action)` in
+ *     `enqueueSourceScopedStrandedRecoveryWake`. For the owned `workspace_validation_failed`
+ *     / `configuration_incomplete` shape that gate is unreachable — the function returns
+ *     above it on exactly those two causes — but that is an accident of an unrelated early
+ *     return, not something this arm controls. The shape it does NOT cover is a legacy owned
+ *     row with a WAKING cause: re-upserting one sets `maxAttempts` and adopts a fresh
+ *     horizon, the predicate goes back to `false`, and the owner is woken on a row marked
+ *     retired. `liftsDerivedHorizonRetirement` closes that by construction — the write that
+ *     makes the predicate false also clears `retiringBound` and returns the row to `active`,
+ *     so "escalated ⇒ wake-exhausted" does not depend on the early return.
+ *
+ *     Should a later re-upsert ever null out `maxAttempts`, the
  *     conclusion is unchanged: a null budget is reserved for the causes that never wake
  *     an owner at all.
  *
@@ -474,6 +496,35 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       const wakeHorizonAt = isNewlyBoundedSequence
         ? (input.timeoutAt ?? null)
         : carriedWakeHorizonAt;
+      // BLO-40297 (review): a `timeout_horizon` retirement written by the DERIVED arm must be
+      // lifted by the same event that gives the row its first real horizon, for the same
+      // reason `liftsAttemptBudgetRetirement` exists — otherwise the row's recorded state and
+      // its behaviour disagree. The derived arm retires a legacy `maxAttempts: null` row and
+      // announces "Paperclip has stopped waking anyone for it"; if that row later takes a
+      // waking cause, the lines above adopt a FRESH horizon and set `maxAttempts`, at which
+      // point `strandedRecoveryWakeAttemptsExhausted` goes back to `false` and the owner IS
+      // woken again — on a row still carrying `retiringBound: "timeout_horizon"`. The notice
+      // is then false, and `resolveStrandedEscalationStatus` reads `isWakeExhaustedEscalation:
+      // true`, computes `hasLiveRecoveryOwner: false`, and leaves the issue dispatchable while
+      // a wake is in flight. Lifting makes the row honestly bounded-and-active, and the
+      // persisted arm re-retires it when the fresh horizon burns.
+      //
+      // This does NOT weaken BLO-24662's "owner churn must not restore a burned horizon".
+      // That rule protects a row that HAS a persisted horizon, and such a row has a non-null
+      // `carriedWakeHorizonAt` (evidence key, or `timeoutAt` with a non-null `maxAttempts`),
+      // so `isNewlyBoundedSequence` is false and nothing is lifted. The one exception is the
+      // single-shot backfill cohort the ROLLOUT NOTE above describes — a pre-evidence-key row
+      // already mid-ownerless-phase at deploy has `maxAttempts: null` AND no evidence key, so
+      // `carriedWakeHorizonAt` is null and a `timeout_horizon` retirement written by the
+      // PERSISTED arm is lifted too. That is still correct: the same sweep re-arms a fresh
+      // horizon for that row either way, so `active` is the honest status, and the persisted
+      // arm re-retires it when the new horizon burns. Do not read the rule as absolute when
+      // deciding whether the gate is safe to widen. The gate otherwise fires only where the
+      // horizon is being created for the first time. `discharged` and `cancelled` are
+      // explicit disposals and are excluded by the bound check.
+      const liftsDerivedHorizonRetirement = isNewlyBoundedSequence &&
+        existing.retiringBound === "timeout_horizon";
+      const liftsRetirement = liftsAttemptBudgetRetirement || liftsDerivedHorizonRetirement;
       // BLO-20263: refresh the handoff-grant anchor only when the transfer actually
       // moves the issue away from a different source agent. Every sweep passes
       // `previousOwnerAgentId: issue.assigneeAgentId`, and the prior recovery sweep
@@ -552,11 +603,13 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           // below). Re-setting `active` here would silently un-retire an action on the very
           // next sweep and put it straight back into the invisible state the transition
           // exists to end. The one exception is an `attempt_budget` retirement lifted by a
-          // genuine owner change — see `liftsAttemptBudgetRetirement`.
-          status: existing.status === "escalated" && !liftsAttemptBudgetRetirement
+          // genuine owner change — see `liftsAttemptBudgetRetirement` — or (BLO-40297) a
+          // derived `timeout_horizon` retirement on a row that is only now getting its
+          // first real horizon; see `liftsDerivedHorizonRetirement`.
+          status: existing.status === "escalated" && !liftsRetirement
             ? "escalated"
             : "active",
-          retiringBound: liftsAttemptBudgetRetirement ? null : existing.retiringBound,
+          retiringBound: liftsRetirement ? null : existing.retiringBound,
           ownerType,
           ownerAgentId: input.ownerAgentId ?? null,
           ownerUserId: input.ownerUserId ?? null,
@@ -571,7 +624,25 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
-          attemptCount: isNewOwnerSequence ? 1 : existing.attemptCount + 1,
+          // BLO-40297 (review): a lifted row must be WAKEABLE, not merely un-retired.
+          // `liftsAttemptBudgetRetirement` gets that for free because it requires
+          // `isNewOwnerSequence`, which resets the counter on this same line.
+          // `liftsDerivedHorizonRetirement` has no such requirement and fires on an UNCHANGED
+          // owner, so without this it can return a row to `active` already over its new
+          // budget: a legacy owned row with a waking cause keeps climbing `attemptCount`
+          // un-refunded while `maxAttempts` is null (`strandedRecoveryWakeAttemptsExhausted`
+          // short-circuits false on a null budget), so the derived arm retires it at N >> 5.
+          // The lift would then write `active` + `maxAttempts: 5` + `attemptCount: N + 1` —
+          // exhausted on arrival. That is strictly worse than leaving it retired:
+          // `resolveStrandedEscalationStatus` reads `isWakeExhaustedEscalation` from
+          // `status === "escalated"`, so `active` makes `hasLiveRecoveryOwner` TRUE and holds
+          // the source issue `blocked` while no wake can ever fire — the "held, with nobody
+          // coming" state this ticket exists to end. The count being reset is the honest
+          // reading: it was spent under no budget at all, and the lift starts a genuinely new
+          // bounded sequence.
+          attemptCount: isNewOwnerSequence || liftsDerivedHorizonRetirement
+            ? 1
+            : existing.attemptCount + 1,
           maxAttempts: inputMaxAttempts,
           // BLO-18996: PRESERVE the existing horizon, once the row is actually bounded.
           // `timeoutAt` is the one bound on this row that owner churn cannot reset, and it
@@ -815,10 +886,46 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
    * let the next sweep open a brand-new action with a fresh budget and a fresh horizon,
    * reinstating the unbounded re-fire loop BLO-18996 closed.
    *
-   * Only rows that carry a budget are eligible (`maxAttempts is not null`), matching the
-   * gate in `strandedRecoveryWakeAttemptsExhausted`: the monitor-only and manual-repair
-   * shapes are expected to sit open across many sweeps and a `timeoutAt` on those belongs
-   * to the provider-quota scheduler's `retryAt`, not to a wake horizon.
+   * Two arms, and the second is BLO-40297.
+   *
+   * **Persisted horizon** — `maxAttempts` and `timeoutAt` both set, `timeoutAt` in the
+   * past. The original BLO-24662 arm, unchanged.
+   *
+   * **Derived horizon** — `maxAttempts is null`, so the row never persisted a horizon at
+   * all, anchored on `createdAt` instead. Such a row matched NEITHER sweep predicate, so it
+   * could not escalate, could not expire, and could not be retired by any path — permanently
+   * `active` while holding `issue_recovery_actions_active_source_uq`, which blocks the
+   * source issue from ever opening a fresh recovery action. Measured 2026-10-05: 21 rows
+   * company-wide in that shape, oldest 122 days.
+   *
+   * ⚠ This arm deliberately does NOT read `timeoutAt`. On an unbounded row any value there
+   * belongs to the provider-quota scheduler's `retryAt` and is routinely already in the past
+   * (see `upsertSourceScopedUnlocked`'s `carriedWakeHorizonAt`); reading it as a wake horizon
+   * would manufacture a false exhaustion the moment such a row is created. `createdAt` is the
+   * only anchor an unbounded row has.
+   *
+   * `ownerAgentId is not null` keeps the documented carve-out, and the reason is that an
+   * ownerless row still has a LIVE wake path — not that it wakes nobody. An ownerless action
+   * is the provider-quota monitor wait (`isProviderQuotaWait` in `recovery/service.ts`:
+   * `provider_quota && !ownerAgentId && returnOwnerAgentId`), whose wake arrives through the
+   * monitor armed for `returnOwnerAgentId`; retiring it would cut a path that is about to
+   * fire. "Wakes nobody by construction" would NOT pick out that set: it is equally true of
+   * OWNED `workspace_validation_failed` / `configuration_incomplete` rows, which
+   * `enqueueSourceScopedStrandedRecoveryWake` drops before any enqueue — and those are
+   * exactly the rows this arm must retire. Reasoning from "wakes nobody" would therefore
+   * justify excluding them and reopen the hole.
+   *
+   * Owned-but-unbounded causes — `workspace_validation_failed`, `configuration_incomplete` —
+   * ARE covered, which is the point: the hole is kind-agnostic, and closing it per-kind would
+   * leave it open for the next cause added to that list. Measured blast radius on the live
+   * population: 118 of 121 `workspace_validation` actions drain inside 6h, so this retires
+   * ~2-3/day of holds that have already been failing for a full horizon, plus the one that
+   * had been stuck 26 days.
+   *
+   * Residual, stated so it is not mistaken for closed: an ownerless unbounded row holds
+   * `issue_recovery_actions_active_source_uq` exactly as hard as an owned one, so the "blocks
+   * the source issue from ever opening a fresh recovery action" harm is only partly closed
+   * here. Bounding the quota wait needs the monitor's own horizon, not this sweep's.
    *
    * The `status` re-check inside the UPDATE is what makes concurrent sweeps safe: only
    * rows this call actually transitioned come back, so the caller announces once.
@@ -827,14 +934,34 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     now?: Date;
     companyId?: string | null;
     limit?: number;
+    /**
+     * How long an action with no persisted horizon may stay `active` before this sweep
+     * retires it, measured from `createdAt`. Callers pass `recoveryActionTimeoutMs` — the
+     * same horizon every bounded action gets — so there is one tunable, not two. Omitted
+     * means the derived arm is off, which is what the pre-BLO-40297 callers get.
+     */
+    unboundedHorizonMs?: number | null;
   } = {}): Promise<IssueRecoveryAction[]> {
     const now = input.now ?? new Date();
     const limit = Math.max(1, Math.floor(input.limit ?? 200));
-    const candidatePredicates = [
-      eq(issueRecoveryActions.status, "active"),
+    const persistedHorizonExpired = and(
       isNotNull(issueRecoveryActions.maxAttempts),
       isNotNull(issueRecoveryActions.timeoutAt),
       lte(issueRecoveryActions.timeoutAt, now),
+    )!;
+    const unboundedHorizonMs = input.unboundedHorizonMs ?? null;
+    const derivedHorizonExpired = unboundedHorizonMs !== null && unboundedHorizonMs > 0
+      ? and(
+        isNull(issueRecoveryActions.maxAttempts),
+        isNotNull(issueRecoveryActions.ownerAgentId),
+        lte(issueRecoveryActions.createdAt, new Date(now.getTime() - unboundedHorizonMs)),
+      )!
+      : null;
+    const candidatePredicates = [
+      eq(issueRecoveryActions.status, "active"),
+      derivedHorizonExpired
+        ? or(persistedHorizonExpired, derivedHorizonExpired)!
+        : persistedHorizonExpired,
     ];
     if (input.companyId) {
       candidatePredicates.push(eq(issueRecoveryActions.companyId, input.companyId));
@@ -844,7 +971,13 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       .select({ id: issueRecoveryActions.id })
       .from(issueRecoveryActions)
       .where(and(...candidatePredicates))
-      .orderBy(asc(issueRecoveryActions.timeoutAt))
+      // ponytail: `timeoutAt ASC` puts rows with a NULL `timeoutAt` last, so a sweep that
+      // caps out on 200 persisted-horizon rows would starve them. That is most of the derived
+      // cohort but not all of it — the arm keys on `maxAttempts`, and an unbounded row can
+      // carry the quota scheduler's `retryAt` in `timeoutAt` (see the ⚠ above), which sorts
+      // first. That shape is itself an incident and the derived cohort is 21; add
+      // `NULLS FIRST` if it ever stops draining.
+      .orderBy(asc(issueRecoveryActions.timeoutAt), asc(issueRecoveryActions.createdAt))
       .limit(limit)
       .then((rows) => rows.map((row) => row.id));
     if (candidateIds.length === 0) return [];

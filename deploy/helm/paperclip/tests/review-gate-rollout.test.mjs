@@ -28,21 +28,35 @@ function render(template, extraArgs = []) {
   );
 }
 
-const reviewGateEnvNames = [
-  "PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED",
-  "PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED",
-  "PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES",
-  "PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID",
-  "PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID",
-];
 
-test("Blockcast rollout keeps review-gate capture and authority disabled", () => {
+// PEN-2073 step 3 taken 2026-10-04 (BLO-38934): capture is ON in
+// values.blockcast.yaml, the authority is still OFF. Capture-only performs a
+// database insert and makes no GitHub call, so this asserts the live rollout
+// state rather than the pre-step-3 "both off".
+test("Blockcast rollout captures deliveries with the authority still disabled", () => {
   for (const template of ["templates/statefulset.yaml", "templates/deployment-api.yaml"]) {
     const extraArgs = template.endsWith("deployment-api.yaml")
       ? ["--set", "api.enabled=true"]
       : [];
     const rendered = render(template, extraArgs);
-    for (const name of reviewGateEnvNames) assert.doesNotMatch(rendered, new RegExp(name));
+    assert.match(
+      rendered,
+      /- name: PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED\n\s+value: "true"/,
+    );
+    // The step-5 flag. Nothing in this repo writes a GitHub status until it is set.
+    assert.doesNotMatch(rendered, /- name: PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED/);
+    assert.match(
+      rendered,
+      /- name: PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES\n\s+value: "Blockcast\/penstock-llm-proxy-core"/,
+    );
+    assert.match(
+      rendered,
+      /- name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_APP_ID\n\s+value: "3966421"/,
+    );
+    assert.match(
+      rendered,
+      /- name: PAPERCLIP_GITHUB_REVIEW_GATE_EXPECTED_INSTALLATION_ID\n\s+value: "138085375"/,
+    );
   }
 });
 
@@ -102,6 +116,10 @@ test("incomplete or out-of-order review-gate enablement fails the Helm render", 
   );
   assert.throws(
     () => render("templates/statefulset.yaml", [
+      // Explicit: capture is true in values.blockcast.yaml since step 3, so the
+      // out-of-order case has to turn it back off to be the out-of-order case.
+      "--set",
+      "githubApp.reviewGateCaptureEnabled=false",
       "--set",
       "githubApp.reviewGateEnabled=true",
     ]),

@@ -284,6 +284,23 @@ describe("inspectReviewAttestation", () => {
     expect(inspectReviewAttestation(body)).toEqual({ kind: "well-formed", sha: MEDIAMTX_HEAD });
   });
 
+  // A body read from disk with CRLF line endings. The fence opener admits the
+  // trailing `\r` and the closer does not, so without normalisation the fence
+  // never closes and the attestation after it is blanked: `absent` for a body
+  // that plainly attests (Ally, #1721 at b8322735, Important 1).
+  it("reads an attestation after a fenced block in a CRLF body", () => {
+    const body = [
+      "## Ally — Consolidated PR Review",
+      "```ts",
+      `Reviewed head: ${PIM_2864_HEAD}`,
+      "```",
+      `Reviewed head: ${MEDIAMTX_HEAD}`,
+      "### Critical Issues (0)",
+    ].join("\r\n");
+
+    expect(inspectReviewAttestation(body)).toEqual({ kind: "well-formed", sha: MEDIAMTX_HEAD });
+  });
+
   it("ignores an attestation indented into a code block", () => {
     expect(inspectReviewAttestation(`text\n    Reviewed head: ${PIM_2864_HEAD}`)).toEqual({
       kind: "absent",

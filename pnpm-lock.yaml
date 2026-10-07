@@ -29,10 +29,11 @@ overrides:
   '@babel/core': '>=7.29.7 <8'
   js-yaml: '>=4.3.2 <5'
   esbuild: '>=0.28.1 <0.29'
-  '@connectrpc/connect-node>undici': '>=6.27.0 <7'
+  '@connectrpc/connect-node>undici': '>=6.28.1 <7'
   jsdom>undici: '>=7.29.1 <8'
   multer: '>=2.3.0 <3'
   browserslist: '>=4.28.7 <5'
+  http-cache-semantics: '>=4.3.0 <5'
   react: ^19.2.7
   react-dom: ^19.2.7
   lexical: 0.46.0
@@ -54,7 +55,7 @@ patchedDependencies:
     hash: 55uhvnotpqyiy37rn3pqpukhei
     path: patches/embedded-postgres@18.1.0-beta.16.patch
   postgres@3.4.9:
-    hash: pq7lfgp74r6kw5xdwb4saxksoa
+    hash: k7x7qrw3u3timuuu4w6vtvnck4
     path: patches/postgres@3.4.9.patch
 
 importers:
@@ -75,7 +76,7 @@ importers:
         version: 10.1.0
       drizzle-orm:
         specifier: 0.45.2
-        version: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7)
+        version: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7)
       esbuild:
         specifier: '>=0.28.1 <0.29'
         version: 0.28.1
@@ -144,7 +145,7 @@ importers:
         version: 17.4.2
       drizzle-orm:
         specifier: 0.45.2
-        version: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7)
+        version: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7)
       embedded-postgres:
         specifier: ^18.1.0-beta.16
         version: 18.1.0-beta.16(patch_hash=55uhvnotpqyiy37rn3pqpukhei)
@@ -369,13 +370,13 @@ importers:
         version: link:../shared
       drizzle-orm:
         specifier: ^0.45.2
-        version: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7)
+        version: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7)
       embedded-postgres:
         specifier: ^18.1.0-beta.16
         version: 18.1.0-beta.16(patch_hash=55uhvnotpqyiy37rn3pqpukhei)
       postgres:
         specifier: ^3.4.9
-        version: 3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa)
+        version: 3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4)
     devDependencies:
       '@types/node':
         specifier: ^24.6.0
@@ -938,7 +939,7 @@ importers:
         version: 3.0.1(ajv@8.20.0)
       better-auth:
         specifier: 1.6.23
-        version: 1.6.23(@opentelemetry/api@1.9.1)(drizzle-kit@0.31.10)(drizzle-orm@0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7))(pg@8.18.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vitest@4.1.8(@opentelemetry/api@1.9.1)(@types/node@24.12.0)(jsdom@28.1.0(@noble/hashes@2.0.1))(vite@6.4.3(@types/node@24.12.0)(jiti@2.6.1)(lightningcss@1.32.0)(tsx@4.23.1)))
+        version: 1.6.23(@opentelemetry/api@1.9.1)(drizzle-kit@0.31.10)(drizzle-orm@0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7))(pg@8.18.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vitest@4.1.8(@opentelemetry/api@1.9.1)(@types/node@24.12.0)(jsdom@28.1.0(@noble/hashes@2.0.1))(vite@6.4.3(@types/node@24.12.0)(jiti@2.6.1)(lightningcss@1.32.0)(tsx@4.23.1)))
       chokidar:
         specifier: ^4.0.3
         version: 4.0.3
@@ -953,7 +954,7 @@ importers:
         version: 17.4.2
       drizzle-orm:
         specifier: ^0.45.2
-        version: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7)
+        version: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7)
       embedded-postgres:
         specifier: ^18.1.0-beta.16
         version: 18.1.0-beta.16(patch_hash=55uhvnotpqyiy37rn3pqpukhei)
@@ -6371,8 +6372,8 @@ packages:
   html-void-elements@3.0.0:
     resolution: {integrity: sha512-bEqo66MRXsUGxWHV5IP0PUiAWwoEjba4VCzg0LjFJBpchPaTfyfCKTG6bc5F8ucKec3q5y6qOdGyYTSBEvhCrg==}
 
-  http-cache-semantics@4.2.0:
-    resolution: {integrity: sha512-dTxcvPXqPvXBQpq5dUr6mEMJX4oIEFv6bwom3FDwKRDsuIjjJGANqhBuoAn9c1RQJIdAKav33ED65E2ys+87QQ==}
+  http-cache-semantics@4.3.0:
+    resolution: {integrity: sha512-M5t5LlJpS1UHMjvwRQVdFHvPISGeLAxNcrWuJkeGh0KxsqCHZ1O3NXZU/8x7cD0BDcGW8kapxMKTvwlqrNkHkA==}
 
   http-errors@2.0.1:
     resolution: {integrity: sha512-4FbRdAX+bSdmo4AUFuS0WNiPz8NgFt+r8ThgNWmlrjQjt1Q7ZR9+zTlce2859x4KSXrwIsaeTqDoKQmtP8pLmQ==}
@@ -8156,8 +8157,8 @@ packages:
   undici-types@7.24.4:
     resolution: {integrity: sha512-cRaY9PagdEZoRmcwzk3tUV3SVGrVQkR6bcSilav/A0vXsfpW4Lvd0BvgRMwTEDTLLGN+QdyBTG+nnvTgJhdt6w==}
 
-  undici@6.27.0:
-    resolution: {integrity: sha512-YmfV3YnEDzXRC5lZ2jWtWWHKGUm1zIt8AhesR1tens+HTNv+YZlN/dp6G727LOvMJ8xjP9Be7Y2Sdr96LDm+pg==}
+  undici@6.29.0:
+    resolution: {integrity: sha512-R+RODBqp6i2pPflGdq+xIOUkl+RNfGgHwoinecKu/JCuf2uO06cOKoDbI2P7Dn6KcswdKwrczbU6IYJ6K8X+wg==}
     engines: {node: '>=18.17'}
 
   undici@7.30.0:
@@ -9185,12 +9186,12 @@ snapshots:
     optionalDependencies:
       '@opentelemetry/api': 1.9.1
 
-  '@better-auth/drizzle-adapter@1.6.23(@better-auth/core@1.6.23(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(@opentelemetry/api@1.9.1)(better-call@1.3.7(zod@3.25.76))(jose@6.2.3)(kysely@0.28.17)(nanostores@1.3.0))(@better-auth/utils@0.4.2)(drizzle-orm@0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7))':
+  '@better-auth/drizzle-adapter@1.6.23(@better-auth/core@1.6.23(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(@opentelemetry/api@1.9.1)(better-call@1.3.7(zod@3.25.76))(jose@6.2.3)(kysely@0.28.17)(nanostores@1.3.0))(@better-auth/utils@0.4.2)(drizzle-orm@0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7))':
     dependencies:
       '@better-auth/core': 1.6.23(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(@opentelemetry/api@1.9.1)(better-call@1.3.7(zod@3.25.76))(jose@6.2.3)(kysely@0.28.17)(nanostores@1.3.0)
       '@better-auth/utils': 0.4.2
     optionalDependencies:
-      drizzle-orm: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7)
+      drizzle-orm: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7)
 
   '@better-auth/kysely-adapter@1.6.23(@better-auth/core@1.6.23(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(@opentelemetry/api@1.9.1)(better-call@1.3.7(zod@3.25.76))(jose@6.2.3)(kysely@0.28.17)(nanostores@1.3.0))(@better-auth/utils@0.4.2)(kysely@0.28.17)':
     dependencies:
@@ -9557,7 +9558,7 @@ snapshots:
     dependencies:
       '@bufbuild/protobuf': 1.10.0
       '@connectrpc/connect': 1.7.0(@bufbuild/protobuf@1.10.0)
-      undici: 6.27.0
+      undici: 6.29.0
 
   '@connectrpc/connect-web@1.7.0(@bufbuild/protobuf@1.10.0)(@connectrpc/connect@1.7.0(@bufbuild/protobuf@1.10.0))':
     dependencies:
@@ -12950,10 +12951,10 @@ snapshots:
     dependencies:
       tweetnacl: 0.14.5
 
-  better-auth@1.6.23(@opentelemetry/api@1.9.1)(drizzle-kit@0.31.10)(drizzle-orm@0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7))(pg@8.18.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vitest@4.1.8(@opentelemetry/api@1.9.1)(@types/node@24.12.0)(jsdom@28.1.0(@noble/hashes@2.0.1))(vite@6.4.3(@types/node@24.12.0)(jiti@2.6.1)(lightningcss@1.32.0)(tsx@4.23.1))):
+  better-auth@1.6.23(@opentelemetry/api@1.9.1)(drizzle-kit@0.31.10)(drizzle-orm@0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7))(pg@8.18.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vitest@4.1.8(@opentelemetry/api@1.9.1)(@types/node@24.12.0)(jsdom@28.1.0(@noble/hashes@2.0.1))(vite@6.4.3(@types/node@24.12.0)(jiti@2.6.1)(lightningcss@1.32.0)(tsx@4.23.1))):
     dependencies:
       '@better-auth/core': 1.6.23(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(@opentelemetry/api@1.9.1)(better-call@1.3.7(zod@3.25.76))(jose@6.2.3)(kysely@0.28.17)(nanostores@1.3.0)
-      '@better-auth/drizzle-adapter': 1.6.23(@better-auth/core@1.6.23(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(@opentelemetry/api@1.9.1)(better-call@1.3.7(zod@3.25.76))(jose@6.2.3)(kysely@0.28.17)(nanostores@1.3.0))(@better-auth/utils@0.4.2)(drizzle-orm@0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7))
+      '@better-auth/drizzle-adapter': 1.6.23(@better-auth/core@1.6.23(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(@opentelemetry/api@1.9.1)(better-call@1.3.7(zod@3.25.76))(jose@6.2.3)(kysely@0.28.17)(nanostores@1.3.0))(@better-auth/utils@0.4.2)(drizzle-orm@0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7))
       '@better-auth/kysely-adapter': 1.6.23(@better-auth/core@1.6.23(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(@opentelemetry/api@1.9.1)(better-call@1.3.7(zod@3.25.76))(jose@6.2.3)(kysely@0.28.17)(nanostores@1.3.0))(@better-auth/utils@0.4.2)(kysely@0.28.17)
       '@better-auth/memory-adapter': 1.6.23(@better-auth/core@1.6.23(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(@opentelemetry/api@1.9.1)(better-call@1.3.7(zod@3.25.76))(jose@6.2.3)(kysely@0.28.17)(nanostores@1.3.0))(@better-auth/utils@0.4.2)
       '@better-auth/mongo-adapter': 1.6.23(@better-auth/core@1.6.23(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(@opentelemetry/api@1.9.1)(better-call@1.3.7(zod@3.25.76))(jose@6.2.3)(kysely@0.28.17)(nanostores@1.3.0))(@better-auth/utils@0.4.2)
@@ -12971,7 +12972,7 @@ snapshots:
       zod: 4.4.3
     optionalDependencies:
       drizzle-kit: 0.31.10
-      drizzle-orm: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7)
+      drizzle-orm: 0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7)
       pg: 8.18.0
       react: 19.2.7
       react-dom: 19.2.7(react@19.2.7)
@@ -13588,13 +13589,13 @@ snapshots:
       esbuild: 0.28.1
       tsx: 4.23.1
 
-  drizzle-orm@0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa))(sqlite3@5.1.7):
+  drizzle-orm@0.45.2(@electric-sql/pglite@0.3.15)(@opentelemetry/api@1.9.1)(kysely@0.28.17)(pg@8.18.0)(postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4))(sqlite3@5.1.7):
     optionalDependencies:
       '@electric-sql/pglite': 0.3.15
       '@opentelemetry/api': 1.9.1
       kysely: 0.28.17
       pg: 8.18.0
-      postgres: 3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa)
+      postgres: 3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4)
       sqlite3: 5.1.7
 
   dunder-proto@1.0.1:
@@ -14161,7 +14162,7 @@ snapshots:
 
   html-void-elements@3.0.0: {}
 
-  http-cache-semantics@4.2.0:
+  http-cache-semantics@4.3.0:
     optional: true
 
   http-errors@2.0.1:
@@ -14498,7 +14499,7 @@ snapshots:
     dependencies:
       agentkeepalive: 4.6.0
       cacache: 15.3.0
-      http-cache-semantics: 4.2.0
+      http-cache-semantics: 4.3.0
       http-proxy-agent: 4.0.1
       https-proxy-agent: 5.0.1
       is-lambda: 1.0.1
@@ -15546,7 +15547,7 @@ snapshots:
     dependencies:
       xtend: 4.0.2
 
-  postgres@3.4.9(patch_hash=pq7lfgp74r6kw5xdwb4saxksoa): {}
+  postgres@3.4.9(patch_hash=k7x7qrw3u3timuuu4w6vtvnck4): {}
 
   powershell-utils@0.1.0: {}
 
@@ -16523,7 +16524,7 @@ snapshots:
 
   undici-types@7.24.4: {}
 
-  undici@6.27.0: {}
+  undici@6.29.0: {}
 
   undici@7.30.0: {}
 

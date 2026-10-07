@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
+import { isNonHumanUserSentinel } from "@paperclipai/shared";
 import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, alertStateRef } from "./constants.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
@@ -145,7 +146,19 @@ async function createCover(
   const windowMinutes = config.coverDedupWindowMinutes ?? DEFAULT_COVER_DEDUP_WINDOW_MINUTES;
   const fingerprint = coverDedupFingerprint(alertname, windowMinutes, now);
   const members = await ctx.access.members.list({ companyId });
-  const owner = members.find((member) => member.principalType === "user" && member.status === "active" && ["owner", "admin"].includes(member.membershipRole ?? ""));
+  // `local-board` is a real `user` row with an owner membership, so a bare
+  // role test picks it first and the cover — whose whole text is "Board
+  // direction is required" — is addressed to a principal no person reads.
+  // Measured on BLO-19560: 19 of 19 live covers, 100% undelivered. Skipping
+  // the sentinel falls through to a genuine board member; when none exists
+  // the `?? null` below is unchanged.
+  const owner = members.find(
+    (member) =>
+      member.principalType === "user" &&
+      member.status === "active" &&
+      !isNonHumanUserSentinel(member.principalId) &&
+      ["owner", "admin"].includes(member.membershipRole ?? ""),
+  );
 
   // At most 2 attempts: the second only fires if the conflicting cover
   // vanished (or already fully resolved) between our failed create and the

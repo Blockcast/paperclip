@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -106,6 +108,31 @@ describe("ghFetch deadline (BLO-38257)", () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]?.aborted).toBe(true);
   });
+
+  it(
+    "returns a FALSY caller abort reason as-is instead of misreporting it as a connect failure",
+    async () => {
+      // Deliberately NOT neverResolvingFetch(): its `?? new Error("aborted")`
+      // substitutes a truthy reason, which would hide the bug under test.
+      _setGhFetchDeadlineMsForTest(5_000);
+      vi.stubGlobal(
+        "fetch",
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+          }),
+      );
+
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(null), 60);
+
+      // With a truthiness test in ghFetch this rejects with the "Could not
+      // connect" message instead — on-call sent to check URL configuration for
+      // a request the caller itself cancelled (BLO-38471).
+      await expect(ghFetch(URL_UNDER_TEST, { signal: controller.signal })).rejects.toBeNull();
+    },
+    10_000,
+  );
 });
 
 describe("ghReadBody: the deadline stays armed through the body read (BLO-38257)", () => {
@@ -145,15 +172,64 @@ describe("ghReadBody: the deadline stays armed through the body read (BLO-38257)
     await expect(ghReadBody(URL_UNDER_TEST, () => Promise.reject(parseError))).rejects.toBe(parseError);
   });
 
-  it("every ghFetch body read in the unprocessable-convention helpers goes through ghReadBody", () => {
-    const offenders = ["company-portability.ts", "company-skills.ts", "skills-catalog.ts"].flatMap((file) =>
-      readFileSync(fileURLToPath(new URL(`../services/${file}`, import.meta.url)), "utf8")
-        .split("\n")
-        .filter((line) => /\.(?:text|json|arrayBuffer|blob|bytes)\(\)/.test(line) && !line.includes("ghReadBody("))
-        .map((line) => `${file}: ${line.trim()}`),
-    );
+  /**
+   * Derived, not enumerated (BLO-38471). The previous form named three files,
+   * so it certified exactly those three and a NEW service adopting the
+   * convention escaped it silently — the failure mode worth closing, more than
+   * any individual unwrapped read.
+   *
+   * Membership is `ghFetch(` AND `unprocessable(`: `ghFetch` is what arms the
+   * deadline through the body read, and `unprocessable(` is what makes the file
+   * one of the helpers whose callers are promised a structured rejection.
+   * Known ceiling: a file that mentions `ghFetch` and does NOT use
+   * `unprocessable` is out of scope here. Recompute that set instead of keeping a
+   * list of it, which is how the previous form rotted: from `server/src/services`,
+   * `grep -L unprocessable $(grep -l ghFetch *.ts)`. At BLO-38471 it held four
+   * files, and every body read in them was inside a try/catch or carried
+   * `.catch(() => …)`. Widening to `ghFetch(` alone needs a try/catch-aware
+   * scanner, which is a parser; do that only if a file in that set grows an
+   * unhandled read.
+   */
+  function scanGhFetchBodyReads(dir: string) {
+    const scanned: string[] = [];
+    const offenders: string[] = [];
+    let bodyReads = 0;
 
+    for (const file of readdirSync(dir).filter((f) => f.endsWith(".ts"))) {
+      const source = readFileSync(join(dir, file), "utf8");
+      if (!source.includes("ghFetch(") || !source.includes("unprocessable(")) continue;
+      scanned.push(file);
+      for (const line of source.split("\n")) {
+        if (!/\.(?:text|json|arrayBuffer|blob|bytes)\(\)/.test(line)) continue;
+        bodyReads += 1;
+        if (!line.includes("ghReadBody(")) offenders.push(`${file}: ${line.trim()}`);
+      }
+    }
+
+    return { scanned, bodyReads, offenders };
+  }
+
+  const SERVICES_DIR = fileURLToPath(new URL("../services/", import.meta.url));
+
+  it("every ghFetch body read in the unprocessable-convention helpers goes through ghReadBody", () => {
+    const { scanned, bodyReads, offenders } = scanGhFetchBodyReads(SERVICES_DIR);
+
+    // Non-vacuity: a scan that matched nothing would report zero offenders and
+    // pass while certifying nothing at all.
+    expect(bodyReads).toBeGreaterThan(0);
+    // The file this guard was widened for. Not the membership rule — an anchor
+    // proving the derived scan actually reaches it.
+    expect(scanned).toContain("issue-pull-requests.ts");
     expect(offenders).toEqual([]);
+  });
+
+  it("the guard counts real matches: an empty directory yields no body reads", () => {
+    const empty = mkdtempSync(join(tmpdir(), "ghfetch-scan-"));
+    try {
+      expect(scanGhFetchBodyReads(empty)).toEqual({ scanned: [], bodyReads: 0, offenders: [] });
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
   });
 });
 

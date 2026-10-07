@@ -262,10 +262,23 @@ function deferred<T = void>() {
  * It must nonetheless stay strictly BELOW the enclosing test budget, or vitest
  * kills the case first and the named message below is unreachable — which would
  * reintroduce the opaque timeout this helper exists to remove. This package sets
- * `testTimeout: 60_000` (vitest.config.ts, BLO-37114); the single case using
- * this helper arms two backstops in sequence, so 15s each bounds the diagnostic
- * path at 30s and leaves the same again for the PGlite work itself. Raising this
- * past ~25s silently disarms the second one.
+ * `testTimeout: 60_000` (vitest.config.ts, BLO-37114).
+ *
+ * The two backstops in the contention case are NOT three sequential spans, and
+ * reading them as one is how the margin gets mis-stated. The second backstop
+ * (the `bRefusals >= 2 || bSettled` wait) runs entirely INSIDE delivery B's own
+ * `budgetMs: 30_000`, because B is constructed before that wait begins. So the
+ * worst case for a PASSING run is backstop #1 (15s) followed by B's budget
+ * (30s, which subsumes backstop #2) = 45s, leaving ~15s inside the 60s case
+ * budget. The naive 15 + 15 + 30 = 60 reads the nested span twice and so
+ * reports zero headroom where there is 15s.
+ *
+ * Two invariants bound this default, and both are violated at 30s, not 25s:
+ *   - 2 x timeoutMs < testTimeout, or backstop #2 is pre-empted and silent.
+ *   - timeoutMs < B's budgetMs, or B can exhaust its budget and reject while A
+ *     is still deliberately held, which is the very failure this case asserts
+ *     against.
+ * 15s satisfies both with 2x margin. Do not raise it without re-deriving these.
  */
 async function waitUntil(
   condition: () => boolean,
@@ -275,7 +288,13 @@ async function waitUntil(
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
     if (Date.now() > deadline) throw new Error(describeFailure());
-    await new Promise((r) => setTimeout(r, 1));
+    // 10ms, matching the sibling helper in adapter-utils/src/server-utils.test.ts.
+    // What this polls for is delivery B's real PGlite work on this same event
+    // loop, so a 1ms self-reschedule (~1000x/s) competes with the thing it is
+    // measuring — worst on the scheduling-starved ARC pod this change targets
+    // (PEN-3528). B's backoff delays are 5-20ms, so 10ms is indistinguishable
+    // for every condition asserted here and strictly cheaper.
+    await new Promise((r) => setTimeout(r, 10));
   }
 }
 
@@ -409,8 +428,8 @@ describe("PEN-3013 — two distinct objects under one alertname both deliver", (
     holdFirst.resolve();
 
     // The headline criterion: neither delivery fails.
-    await expect(a).resolves.toBeUndefined();
-    await expect(b).resolves.toBeUndefined();
+    await expect(a).resolves.toEqual({ accepted: 1 });
+    await expect(b).resolves.toEqual({ accepted: 1 });
 
     // ...and B got there by WAITING, not by sailing through uncontended. This is
     // what fails if the bounded wait is removed: B would reject instead.
@@ -705,7 +724,11 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
             `saw ${localFenceWaiterCount(COMPANY_ID, AGG_KEY)}`,
         );
       }
-      await new Promise((r) => setTimeout(r, 1));
+      // 10ms for the same reason as `waitUntil` above: this shares an event
+      // loop with the deliveries it observes. Safe to coarsen because every
+      // caller waits for a waiter that stays queued until a release later in
+      // the same test, so there is no transient state a 10ms poll can miss.
+      await new Promise((r) => setTimeout(r, 10));
     }
   }
 
@@ -720,7 +743,11 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
       if (Date.now() > deadline) {
         throw new Error(`${what}: the fence was never held, so nothing contended`);
       }
-      await new Promise((r) => setTimeout(r, 1));
+      // 10ms, and this one matters most: the loop body is a real PGlite query,
+      // so polling at 1ms issued ~1000 WASM Postgres round-trips a second
+      // against the very delivery it is waiting for. The fence stays `firing`
+      // until a deferred resolved later in the test, so nothing is missed.
+      await new Promise((r) => setTimeout(r, 10));
     }
   }
 
@@ -749,8 +776,8 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
 
     const releasedAt = Date.now();
     holdFirst.resolve();
-    await expect(a).resolves.toBeUndefined();
-    await expect(b).resolves.toBeUndefined();
+    await expect(a).resolves.toEqual({ accepted: 1 });
+    await expect(b).resolves.toEqual({ accepted: 1 });
     const handoffMs = Date.now() - releasedAt;
 
     // The discriminating assertion. B's own timer could not have fired for
@@ -940,8 +967,8 @@ describe("PEN-3013 — a local release hands the fence to the next waiter", () =
 
     const releasedAt = Date.now();
     holdC.resolve();
-    await expect(c).resolves.toBeUndefined();
-    await expect(b).resolves.toBeUndefined();
+    await expect(c).resolves.toEqual({ accepted: 1 });
+    await expect(b).resolves.toEqual({ accepted: 1 });
 
     // B's own timer could not fire for another ~5s, so finishing this quickly
     // proves C's release reached B through the queue it was put back on.

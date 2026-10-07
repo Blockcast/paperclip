@@ -48,6 +48,7 @@ import {
   feedbackVoteValueSchema,
   upsertIssueFeedbackVoteSchema,
   upsertIssueWatchdogSchema,
+  issueExecutionMonitorPolicySchema,
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
@@ -220,12 +221,14 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  applyIssueMonitorPolicyTransition,
   isMonitorNextCheckAtLive,
   mergeIssueExecutionPolicyMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
+  stripMonitorFromExecutionPolicy,
   type IssueMonitorConvergence,
 } from "../services/issue-execution-policy.js";
 import { monitorConvergenceComment } from "../services/issue-monitor-convergence-message.js";
@@ -645,6 +648,7 @@ async function listIssueLinkedCases(db: Db, companyId: string, issueId: string) 
 }
 
 type ParsedExecutionState = NonNullable<ReturnType<typeof parseIssueExecutionState>>;
+type IssueExecutionMonitorPolicyInput = z.infer<typeof issueExecutionMonitorPolicySchema>;
 type NormalizedExecutionPolicy = NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>;
 type IssueRouteSnapshot = typeof issueRows.$inferSelect;
 type RecoveryRevalidationTrigger =
@@ -1398,7 +1402,9 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_SOURCES = new Set([
   "automation",
 ]);
 
-const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
+// Exported only so the writer-derived tests can read membership; `ReadonlySet` keeps
+// that a read. Every consumer in and out of this module uses `.has()`.
+export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set([
   "issue_assigned",
   "issue_blockers_resolved",
   "issue_commented",
@@ -1411,6 +1417,59 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "heartbeat.disabled",
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
+  // PEN-3727: every reason below is written by `heartbeat.wakeup` on a path that
+  // deliberately produces NO `heartbeat_runs` row -- the wake is deferred behind the
+  // issue execution lock, merged into a live run, or suppressed outright. Those are
+  // exactly the cases an operator reaches this route to explain ("my comment woke
+  // nobody"), and this route is the only surface that can read `agent_wakeup_requests`
+  // at all. Projecting them to "other" erased the answer: a PEN-3164 comment wake sat
+  // `deferred_issue_execution` for 10h53m behind another agent's queued run, and the
+  // one row that said so reported `reason: "other"`. All are server-authored literals,
+  // so admitting them widens nothing -- the allowlist exists to keep operator- and
+  // adapter-supplied strings out of the response, not these.
+  //
+  // Spelling is load-bearing, which is why the skip family below is asserted against
+  // its writer in `issue-wake-diagnostics-routes.test.ts` rather than restated here.
+  // `writeSkippedHeartbeatRequest` puts the DOTTED `heartbeat.*` form in the `reason`
+  // COLUMN and the bare form only in nested `payload.heartbeatSkip.reason`, which
+  // `projectWakeDiagnosticReason` never reads -- so a bare entry is inert while
+  // looking admitted. The first revision of this list carried bare
+  // `worktree_execution_cutoff` and left exactly the defect this list exists to fix.
+  //
+  // Deliberately NOT admitted: the timer-scheduler skips `provider_capacity_deferred`
+  // and `no_in_flight_work`. Both are agent-scoped rows whose payload carries no
+  // `issueId`, `taskId` or `_paperclipWakeContext`, so `wakeRequestTargetsIssue` can
+  // never return them on this route. Listing them would assert a reachability this
+  // route does not have.
+  "issue_execution_deferred",
+  "issue_execution_promoted",
+  "issue_execution_same_name",
+  "issue_execution_issue_not_found",
+  "issue_external_wait_wake_suppressed",
+  "issue_rewake_throttled",
+  "retry_execution_duplicate",
+  "github_state_change_queued_coalesced",
+  "task_scope_queued_coalesced",
+  "zero_token_session_reset_superseded",
+  "pipeline_stage_exit_cancellation_pending",
+  "heartbeat.scheduling_suppressed",
+  "heartbeat.worktree_execution_cutoff",
+  // Written as a const identifier rather than an inline literal, which is why the
+  // writer-derived scan missed them and `workspace_worktree_requires_project` survived
+  // the revision that added this list. Both resolve to server-authored literals; the
+  // scan now resolves `SCREAMING_SNAKE` consts, so these are protected from drift by
+  // the same control as every entry above rather than by being restated as symbols.
+  //
+  // `workspace_worktree_requires_project` is the same no-run-row family as the block
+  // above -- the worktree pre-flight marks the issue `blocked`, writes this row
+  // `skipped`, and returns without inserting into `heartbeat_runs`. It is also the
+  // most actionable of the set: its payload already carries a `remediation` string
+  // while the one surface that could print it reported `reason: "other"`.
+  // `execution_review_participant_recovery` is the exception that shows this list is
+  // not *only* no-run-row reasons (neither is `issue_commented`) -- it does queue a
+  // run, but it is issue-scoped and reachable here, so naming it beats "other".
+  "workspace_worktree_requires_project",
+  "execution_review_participant_recovery",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
@@ -6467,6 +6526,7 @@ export function issueRoutes(
     if (!requestedPolicy?.monitor) return false;
     if (requestedPolicy.stages.length > 0) return false;
     if (requestedPolicy.reviewPreset || requestedPolicy.authorizationPolicy) return false;
+    if (requestedPolicy.productivityReviewDisabled) return false;
     return true;
   }
 
@@ -11945,6 +12005,235 @@ export function issueRoutes(
     res.json({ ok: true, ...result });
   });
 
+  /**
+   * BLO-18294: the arm was refused and the issue is now `blocked`. Name who can
+   * actually unblock it so the blocker set becomes routed work rather than a
+   * stalled timer nobody reads. Shared by `PATCH /issues/:id` and the
+   * monitor-only write path, so an arm refused through either one escalates the
+   * same way.
+   */
+  async function recordMonitorConvergenceEscalation(input: {
+    issue: { id: string; companyId: string };
+    convergence: IssueMonitorConvergence;
+    blockerIssueIds: readonly string[];
+    actor: ReturnType<typeof getActorInfo>;
+  }) {
+    const { issue, convergence, blockerIssueIds, actor } = input;
+    try {
+      const unblockOwners = await loadIssueUnblockOwners(issue.companyId, blockerIssueIds);
+      await svc.addComment(issue.id, monitorConvergenceComment({
+        convergence,
+        unblockOwners,
+      }), {
+        runId: actor.runId,
+      }, {
+        authorType: "system",
+      });
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.monitor_convergence_stalled",
+        entityType: "issue",
+        entityId: issue.id,
+        issueId: issue.id,
+        details: {
+          gateSource: convergence.source,
+          convergenceCount: convergence.count,
+          threshold: convergence.threshold,
+          unresolvedBlockerIssueIds: blockerIssueIds,
+          unblockOwners,
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "failed to record monitor convergence escalation side effects");
+    }
+  }
+
+  /**
+   * BLO-18816 — monitor-only write path.
+   *
+   * `PATCH /issues/:id` replaces `executionPolicy` wholesale, so arming a
+   * monitor through it is a read-modify-write: re-send the complete current
+   * policy or you silently delete another agent's `stages`, `reviewPreset` and
+   * `authorizationPolicy`. These two routes write the monitor and nothing else,
+   * so there is no policy to read, nothing to lose, and no lost-update race on
+   * the hottest agent-facing write in the fleet.
+   *
+   * `PATCH /issues/:id` keeps its replace semantics for back-compat.
+   */
+  async function writeIssueMonitor(
+    req: Request,
+    res: Response,
+    monitor: IssueExecutionMonitorPolicyInput | null,
+  ) {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!existing) return;
+    // `assertCanManageIssueMonitor` is the whole gate here, matching
+    // `POST /issues/:id/monitor/check-now`. Deliberately NOT also
+    // `assertLowTrustControlPlaneDenied`: `PATCH /issues/:id` applies that only
+    // to reopen/resume/blocker writes, never to monitor writes, and a low-trust
+    // issue's own assignee arming its monitor is how that issue stays live.
+    //
+    // BLO-32774: `monitorArmed` must be named, exactly as the legacy path names
+    // it. The option defaults to "treat as arming" (fail-closed), so omitting it
+    // runs the run-class refusal on `DELETE` too — and a cheap status-only
+    // recovery run clearing the wedged monitor it was woken for would get
+    // `403 "Cheap status-only recovery runs cannot arm issue monitors"`, which
+    // is the strand this route exists to end.
+    await assertCanManageIssueMonitor(access, req, existing.companyId, existing, true, {
+      monitorArmed: monitor !== null,
+    });
+
+    const actor = getActorInfo(req);
+    const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+    const previousMonitor = summarizeIssueMonitor(existing, previousExecutionPolicy);
+    // BLO-18294: convergence is only scored on an arm, so a clear skips the
+    // query entirely — same rule as `PATCH /issues/:id`.
+    const unresolvedBlockerIssueIds = monitor
+      ? await loadUnresolvedBlockerIssueIds(existing.companyId, existing.id)
+      : [];
+    // Merge rather than replace: `mergeIssueExecutionPolicyMonitor` keeps every
+    // other field of the stored policy byte-identical (BLO-22860 built it for
+    // the manager re-arm, which has the same "touch only the monitor" need).
+    const nextExecutionPolicy = monitor
+      ? applyActorMonitorScheduledBy(
+        mergeIssueExecutionPolicyMonitor(
+          previousExecutionPolicy,
+          normalizeIssueExecutionPolicy({ monitor })?.monitor ?? null,
+        ),
+        actor.actorType === "user" ? "user" : "agent",
+      )
+      : previousExecutionPolicy;
+
+    const transition = applyIssueMonitorPolicyTransition({
+      issue: existing,
+      policy: monitor ? nextExecutionPolicy : stripMonitorFromExecutionPolicy(previousExecutionPolicy),
+      previousPolicy: previousExecutionPolicy,
+      requestedAssigneePatch: {},
+      unresolvedBlockerIssueIds,
+      actor: {
+        agentId: actor.agentId ?? null,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      },
+      // The whole point of this route: the caller wrote the monitor, explicitly.
+      // On a clear that is what reaches the `executionState`-keyed branch in
+      // `applyMonitorTransition`, so a `triggered` (and even an exhausted)
+      // monitor clears here where `PATCH {"executionPolicy": {}}` used to no-op.
+      monitorExplicitlyUpdated: true,
+    });
+
+    const patch: Record<string, unknown> = { ...transition.patch };
+    if (transition.patch.executionPolicy === undefined) {
+      // On this route the one branch that writes `executionPolicy` is the
+      // convergence-stalled refusal, where `applyMonitorTransition` has already
+      // stripped the monitor for its own reasons — leave that alone. The other
+      // two refusals cannot reach here: `monitorExplicitlyUpdated` is always
+      // true above, and under it the invalid and bounds-exhausted branches
+      // throw `unprocessable` (`issue-execution-policy.ts`) rather than writing
+      // a patch, so the route 422s before `svc.update`. The `=== undefined`
+      // check stays because it is correct either way. Every other outcome needs
+      // the merged policy carried through explicitly, or the stored
+      // `executionPolicy.monitor` keeps the previous `nextCheckAt` while the
+      // columns move.
+      patch.executionPolicy = monitor
+        ? nextExecutionPolicy
+        : stripMonitorFromExecutionPolicy(previousExecutionPolicy);
+    }
+
+    const issue = await svc.update(id, {
+      ...patch,
+      actorAgentId: actor.agentId ?? null,
+      actorUserId: actor.actorType === "user" ? actor.actorId : null,
+    });
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+
+    const nextMonitor = summarizeIssueMonitor(issue, normalizeIssueExecutionPolicy(issue.executionPolicy ?? null));
+    if (transition.monitorConvergence?.converged) {
+      await recordMonitorConvergenceEscalation({
+        issue,
+        convergence: transition.monitorConvergence,
+        blockerIssueIds: unresolvedBlockerIssueIds ?? [],
+        actor,
+      });
+    }
+    // An arm through `PATCH /issues/:id` reaches recovery revalidation via
+    // `monitorChanged`; without this an arm here leaves `active` the same
+    // recovery action that path retires, and the two paths disagree about a
+    // wake-path signal the fleet's attendance predicates read.
+    //
+    // A clear is skipped on purpose. It changes neither status nor assignee, so
+    // the status-keyed branches above the kind guard in
+    // `classifySourceRecoveryRevalidation` have nothing new to fold, and every
+    // branch below it cancels because the issue NOW has its own wake path while
+    // a clear only removes one: revalidating here could only cancel an action
+    // the row may still need. The legacy
+    // `{"executionPolicy": {}}` clear still revalidates; doc/execution-semantics.md
+    // records the asymmetry.
+    if (monitor) {
+      await revalidateActiveSourceRecoveryAfterCommittedWrite({
+        issue,
+        trigger: "issue_update",
+        actor,
+        // The convergence-stalled refusal moves the issue to `blocked`.
+        statusChanged: existing.status !== issue.status,
+        assigneeChanged:
+          existing.assigneeAgentId !== issue.assigneeAgentId ||
+          existing.assigneeUserId !== issue.assigneeUserId,
+        monitorChanged: true,
+      });
+    }
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: monitor ? "issue.monitor_scheduled" : "issue.monitor_cleared",
+      entityType: "issue",
+      entityId: issue.id,
+      details: monitor
+        ? {
+            identifier: issue.identifier,
+            nextCheckAt: nextMonitor.nextCheckAt,
+            previousNextCheckAt: previousMonitor.nextCheckAt,
+            notes: nextMonitor.notes,
+            scheduledBy: nextMonitor.scheduledBy,
+            serviceName: nextMonitor.serviceName,
+            timeoutAt: nextMonitor.timeoutAt,
+            maxAttempts: nextMonitor.maxAttempts,
+            recoveryPolicy: nextMonitor.recoveryPolicy,
+            via: "issue_monitor_route",
+          }
+        : {
+            identifier: issue.identifier,
+            previousNextCheckAt: previousMonitor.nextCheckAt,
+            previousStatus: previousMonitor.status,
+            reason: nextMonitor.clearReason ?? "manual",
+            notes: previousMonitor.notes,
+            via: "issue_monitor_route",
+          },
+    });
+
+    res.json(issue);
+  }
+
+  router.patch("/issues/:id/monitor", validate(issueExecutionMonitorPolicySchema), async (req, res) => {
+    await writeIssueMonitor(req, res, req.body as IssueExecutionMonitorPolicyInput);
+  });
+
+  router.delete("/issues/:id/monitor", async (req, res) => {
+    await writeIssueMonitor(req, res, null);
+  });
+
   router.post("/issues/:id/scheduled-retry/retry-now", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
@@ -12418,7 +12707,8 @@ export function issueRoutes(
       // rewrite the policy. `isLapsedMonitorRearmPatch` already rejects a
       // request carrying anything but a monitor; merging rather than replacing
       // closes the other half — the write itself must not silently drop stages,
-      // reviewPreset, authorizationPolicy or mode that the assignee set.
+      // reviewPreset, authorizationPolicy, mode or the productivity-review
+      // opt-out that the assignee set.
       updateFields.executionPolicy = managerMonitorRearmAuthorized
         ? mergeIssueExecutionPolicyMonitor(
           normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),
@@ -12450,7 +12740,33 @@ export function issueRoutes(
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
       updateFields.assigneeUserId = null;
     }
-    const monitorChanged = monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false;
+    const liveMonitorStatus = summarizeIssueMonitor(existing, previousExecutionPolicy).status;
+    const monitorChanged =
+      monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false ||
+      // BLO-18816 / BLO-27586 AC1: a monitor that has already fired was stripped
+      // out of `executionPolicy` by the trigger, so `monitorPoliciesEqual` diffs
+      // null against null and reports "unchanged" — which is why
+      // `PATCH {"executionPolicy": {}}` against a `triggered` monitor returned
+      // 200 with the monitor byte-identical.
+      //
+      // Scoped to the body that collapses the *whole* policy — `{}` or `null`,
+      // the documented monitor-clear — rather than to any policy write that
+      // happens to carry no monitor. Both wider readings were live defects:
+      //   - no `executionPolicy` in the body at all (`PATCH {"priority":...}`)
+      //     still reaches `revalidateActiveSourceRecoveryAfterCommittedWrite`
+      //     below, which folds `monitorChanged` into `durableSourceChange` and
+      //     cancels an *active recovery action* — one of the five wake paths —
+      //     on every unrelated edit to a fired-monitor issue;
+      //   - a read-modify-write that edits `stages` and re-sends the policy
+      //     complete would read as "the caller wrote the monitor", clearing a
+      //     `triggered` monitor and with it the `tickExpiredIssueMonitors`
+      //     sweep that still owes it a `recoveryPolicy`.
+      // `DELETE /issues/:id/monitor` is the unambiguous clear for everything
+      // this narrowing excludes, so no caller loses a path.
+      (req.body.executionPolicy !== undefined &&
+        nextExecutionPolicy == null &&
+        liveMonitorStatus != null &&
+        liveMonitorStatus !== "cleared");
     await assertCanManageIssueMonitor(
       access,
       req,
@@ -12847,39 +13163,12 @@ export function issueRoutes(
     // unblock it so the blocker set becomes routed work rather than a stalled
     // timer nobody reads.
     if (transition.monitorConvergence?.converged) {
-      try {
-        const blockerIssueIds = unresolvedBlockerIssueIds ?? [];
-        const unblockOwners = await loadIssueUnblockOwners(existing.companyId, blockerIssueIds);
-        await svc.addComment(issue.id, monitorConvergenceComment({
-          convergence: transition.monitorConvergence,
-          unblockOwners,
-        }), {
-          runId: actor.runId,
-        }, {
-          authorType: "system",
-        });
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action: "issue.monitor_convergence_stalled",
-          entityType: "issue",
-          entityId: issue.id,
-          issueId: issue.id,
-          details: {
-            gateSource: transition.monitorConvergence.source,
-            convergenceCount: transition.monitorConvergence.count,
-            threshold: transition.monitorConvergence.threshold,
-            unresolvedBlockerIssueIds: blockerIssueIds,
-            unblockOwners,
-          },
-        });
-      } catch (err) {
-        logger.warn({ err, issueId: issue.id }, "failed to record monitor convergence escalation side effects");
-      }
+      await recordMonitorConvergenceEscalation({
+        issue,
+        convergence: transition.monitorConvergence,
+        blockerIssueIds: unresolvedBlockerIssueIds ?? [],
+        actor,
+      });
     }
 
     let cancelledStatusRunId: string | null = null;

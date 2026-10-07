@@ -17,7 +17,8 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issuePullRequests, issues } from "@paperclipai/db";
-import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import { ghFetch, ghReadBody, gitHubApiBase } from "./github-fetch.js";
+import { unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { computeAuthoredLoc, type GithubPullFile } from "./authored-loc.js";
 import {
@@ -232,9 +233,9 @@ export async function fetchPullRequestFiles(
     const url = `${apiBase}/repos/${repoFullName}/pulls/${prNumber}/files?per_page=${perPage}&page=${page}`;
     const res = await ghFetch(url, { headers });
     if (!res.ok) {
-      throw new Error(`pulls/${prNumber}/files page ${page} -> ${res.status}`);
+      throw unprocessable(`pulls/${prNumber}/files page ${page} -> ${res.status}`);
     }
-    const batch = (await res.json()) as GithubPullFile[];
+    const batch = (await ghReadBody(url, () => res.json())) as GithubPullFile[];
     files.push(...batch);
     if (batch.length < perPage) break;
   }
@@ -361,8 +362,11 @@ export async function reconcileMergedPullRequests(
   for (let page = 1; page <= 10; page += 1) {
     const url = `${apiBase}/search/issues?q=${encodeURIComponent(q)}&per_page=100&page=${page}`;
     const res = await ghFetch(url, { headers });
-    if (!res.ok) throw new Error(`search merged PRs page ${page} -> ${res.status}`);
-    const json = (await res.json()) as { items?: GithubSearchItem[]; total_count?: number };
+    if (!res.ok) throw unprocessable(`search merged PRs page ${page} -> ${res.status}`);
+    const json = (await ghReadBody(url, () => res.json())) as {
+      items?: GithubSearchItem[];
+      total_count?: number;
+    };
     const items = (json.items ?? []).filter((it) => it.pull_request);
     if (items.length === 0) break;
 
@@ -371,8 +375,9 @@ export async function reconcileMergedPullRequests(
       // Search results lack branch + additions/deletions; fetch the PR detail.
       let detail: GithubPullDetail | null = null;
       try {
-        const prRes = await ghFetch(`${apiBase}/repos/${input.repoFullName}/pulls/${item.number}`, { headers });
-        if (prRes.ok) detail = (await prRes.json()) as GithubPullDetail;
+        const prUrl = `${apiBase}/repos/${input.repoFullName}/pulls/${item.number}`;
+        const prRes = await ghFetch(prUrl, { headers });
+        if (prRes.ok) detail = (await ghReadBody(prUrl, () => prRes.json())) as GithubPullDetail;
       } catch (err) {
         logger.warn({ err, prNumber: item.number }, "reconciler PR detail fetch failed");
       }

@@ -15,6 +15,7 @@ import {
   crossCheckCompletions,
   describeStopMode,
   makeGuardReaders,
+  observeWorkflow,
   resolveStaleHours,
   resolveWatched,
   selectNewestCompleted,
@@ -570,7 +571,7 @@ describe("crossCheckCompletions — the corroborating read's own failure modes",
       }),
     );
 
-    assert.deepEqual(observed, { newestCompletedAt: "2026-09-18T06:42:30.000Z" });
+    assert.deepEqual(observed, { newestCompletedAt: "2026-09-18T06:42:30.000Z", allCount: null });
   });
 
   it("reports null — not an error — when the page genuinely holds no completed run", () => {
@@ -582,7 +583,10 @@ describe("crossCheckCompletions — the corroborating read's own failure modes",
 
     // Distinct from {error: true}: this is a successful read that found
     // nothing, which is evidence. An error is the absence of evidence.
-    assert.deepEqual(observed, { newestCompletedAt: null });
+    // `allCount: null` is the same distinction one field over — the body
+    // carried no `total_count`, so the cardinality check has nothing to weigh
+    // and must not invent a number for it (BLO-38286).
+    assert.deepEqual(observed, { newestCompletedAt: null, allCount: null });
   });
 
   it("reports {error: true} when the read throws, so the red is left standing", () => {
@@ -611,7 +615,7 @@ describe("crossCheckCompletions — the corroborating read's own failure modes",
   it("tolerates a well-formed body with no workflow_runs key", () => {
     const observed = crossCheckCompletions("Blockcast/paperclip", "relay-ssl-multicert-guard.yml", reader({}));
 
-    assert.deepEqual(observed, { newestCompletedAt: null });
+    assert.deepEqual(observed, { newestCompletedAt: null, allCount: null });
   });
 });
 
@@ -1420,7 +1424,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     }
   });
 
-  it("carries the six PEN-3281 guards, the security control the original list missed, and the clock-rot guard", () => {
+  it("carries the six PEN-3281 guards, the security control the original list missed, the clock-rot guard, and the consumer merge-control guard", () => {
     assert.deepEqual(
       [...WATCHED_WORKFLOWS].sort(),
       [
@@ -1431,6 +1435,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         "master-health.yml",
         "production-environment-protection-guard.yml",
         "relay-ssl-multicert-guard.yml",
+        "review-gate-consumer-protection-guard.yml",
         "review-gate-sweep.yml",
       ],
     );
@@ -1453,11 +1458,26 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(dailyClockRot > 24, "a daily cron must clear one full cycle plus GitHub's delay");
     assert.ok(dailyClockRot <= 48, "looser than two missed cycles stops being a backstop at all");
 
+    // BLO-26736: the consumer merge-control guard shares the twice-daily
+    // cadence and INHERITS the same bar. Asserted equal to the measured one
+    // rather than to a second literal, so that if the 14.60h/17.71h band is
+    // ever re-derived both move together — the alternative is a copy that rots
+    // out of the band silently.
+    assert.equal(
+      byWorkflow.get("review-gate-consumer-protection-guard.yml"),
+      twiceDaily,
+      "the twice-daily guards must share one bar until this one has gaps of its own",
+    );
+
     // The hourly six share one bar; a shared GLOBAL threshold across cadences is
     // the bug this replaced. Asserted against DEFAULT_STALE_HOURS rather than a
     // literal so moving the bar stays a one-line change with a reason attached
     // (PEN-3379 moved it 4h -> 2.75h).
-    const notHourly = new Set(["production-environment-protection-guard.yml", "master-health.yml"]);
+    const notHourly = new Set([
+      "production-environment-protection-guard.yml",
+      "review-gate-consumer-protection-guard.yml",
+      "master-health.yml",
+    ]);
     for (const workflow of WATCHED_WORKFLOWS) {
       if (notHourly.has(workflow)) continue;
       assert.equal(
@@ -1581,5 +1601,200 @@ describe("summarize — 'could not read' is a different claim from 'stopped exec
       summary.headline,
       new RegExp(`All ${WATCHED_WORKFLOWS.length} watched scheduled guards have completed`),
     );
+  });
+});
+
+describe("the run index is not self-consistent across filters (BLO-38286)", () => {
+  // Reconstructed from the production false red: run 36692972253,
+  // 2026-09-30T08:59Z. `relay-ssl-multicert-guard` was cited at 436h stale and
+  // was completing on schedule the whole time. The PEN-3379 timestamp
+  // cross-check had been live since 09-27 and did NOT suppress it — the log
+  // carries no "could not be made" note, so the corroborating read was made
+  // cleanly and AGREED. Both reads were served the same pinned index.
+  //
+  // That is the gap this block holds: a second read taken at the same instant
+  // cannot see a fault that is windowed rather than per-call.
+  const CLAIMED = "2026-09-12T04:32:39Z";
+  const NOW = Date.parse("2026-09-30T08:59:35Z");
+  const WORKFLOW = "relay-ssl-multicert-guard.yml";
+
+  // Measured counts, codeowners-guard.yml + event=schedule, inside ~4 minutes.
+  // Adding a filter INCREASED the count, which is impossible over a fixed set.
+  const COMPLETED_COUNT = 1058;
+  const ALL_COUNT = 632;
+
+  function observation({ completedCount, allCount, newest = true, crossCheckNewest = CLAIMED }) {
+    return {
+      state: "active",
+      name: "Relay SSL Multicert Guard",
+      completedCount,
+      newest: newest
+        ? { updatedAt: CLAIMED, conclusion: "success", htmlUrl: "https://example.invalid/1" }
+        : null,
+      // Timestamp-agreeing, exactly as production saw it: the cross-check is
+      // readable and is NOT newer, so the PEN-3379 arm has nothing to fire on.
+      crossCheck: { newestCompletedAt: crossCheckNewest, allCount },
+    };
+  }
+
+  const classify = (obs) => classifyGuard(WORKFLOW, obs, { now: NOW, staleHours: 2.75 });
+
+  // POSITIVE CONTROL. Without the impossible counts this fixture must still
+  // red, or the two assertions below prove nothing about the fix — they would
+  // pass just as happily against a classifier that never reds at all.
+  it("still reds when the counts are consistent (shipped behaviour, timestamp arm blind)", () => {
+    const result = classify(observation({ completedCount: 600, allCount: ALL_COUNT }));
+
+    assert.equal(result.status, "stale");
+    assert.equal(result.reason, "stopped");
+    assert.ok(result.ageMinutes > 400 * 60, "the fixture really does carry the ~436h bogus age");
+  });
+
+  it("suppresses the red once completed > total proves the reads disagree", () => {
+    const result = classify(observation({ completedCount: COMPLETED_COUNT, allCount: ALL_COUNT }));
+
+    assert.equal(result.status, "unknown", "must not assert a healthy guard stopped");
+    assert.equal(result.reason, "index-inconsistent");
+    assert.match(result.detail, /1058 completed run\(s\) but only 632 run\(s\) in total/);
+  });
+
+  // The same distrusted index makes a STRONGER claim on this path, so it is
+  // gated too: `classifyWatched` spends the cross-check on both reasons. The
+  // cross-check found no completion either, so without the proof this is the
+  // `never-completed` red (not the cross-check-refuted `stopped` one below).
+  it("suppresses 'never completed' on the same proof", () => {
+    const obs = { completedCount: COMPLETED_COUNT, allCount: ALL_COUNT, newest: false, crossCheckNewest: null };
+    assert.equal(classify(observation({ ...obs, completedCount: 1 })).reason, "never-completed");
+
+    const result = classify(observation(obs));
+
+    assert.equal(result.status, "unknown");
+    assert.equal(result.reason, "index-inconsistent");
+  });
+
+  // THE BOUND (Ally review of 3216098b). The proof says the reads are
+  // untrustworthy, not that the guard is alive, so it must not override a red
+  // the cross-check proves on its own: a strictly better completion that is
+  // itself past the bar means the guard is dead by either read. Before this
+  // arm existed both fixtures below red, and it must not mute them.
+  it("does not preempt a red the cross-check's own better timestamp proves", () => {
+    const stoppedAt = "2026-09-20T00:00:00Z"; // newer than CLAIMED, still ~248h old
+    for (const obs of [
+      observation({ completedCount: COMPLETED_COUNT, allCount: ALL_COUNT, crossCheckNewest: stoppedAt }),
+      observation({ completedCount: COMPLETED_COUNT, allCount: ALL_COUNT, newest: false }),
+    ]) {
+      const result = classify(obs);
+      assert.equal(result.status, "stale", `newest=${obs.newest?.updatedAt ?? null}`);
+      assert.equal(result.reason, "stopped");
+      assert.equal(result.ageMinutes, Math.floor((NOW - Date.parse(obs.crossCheck.newestCompletedAt)) / 60000));
+    }
+
+    // Deferring is not an unconditional red: a FRESH better completion is
+    // suppressed by the timestamp arm itself, on evidence the guard is alive.
+    const fresh = classify(
+      observation({ completedCount: COMPLETED_COUNT, allCount: ALL_COUNT, crossCheckNewest: "2026-09-30T08:30:00Z" }),
+    );
+    assert.equal(fresh.status, "unknown");
+    assert.equal(fresh.reason, "cross-check-disagreement");
+  });
+
+  // Without this, an arm that returned `unknown` unconditionally would pass
+  // every assertion above. A suppression that cannot tell the two apart is a
+  // mute switch, which is the failure this whole file exists to prevent.
+  it("does NOT suppress when the counts are possible — equality is not a violation", () => {
+    for (const [completedCount, allCount] of [
+      [632, 632],
+      [0, 0],
+      [1, 632],
+    ]) {
+      const result = classify(observation({ completedCount, allCount }));
+      assert.equal(result.status, "stale", `completed=${completedCount} total=${allCount}`);
+      assert.equal(result.reason, "stopped");
+    }
+  });
+
+  it("does not fire on a missing or unreadable count rather than guessing", () => {
+    for (const obs of [
+      observation({ completedCount: undefined, allCount: ALL_COUNT }),
+      observation({ completedCount: COMPLETED_COUNT, allCount: null }),
+      { ...observation({ completedCount: COMPLETED_COUNT, allCount: ALL_COUNT }), crossCheck: { error: true } },
+    ]) {
+      assert.equal(classify(obs).status, "stale", "absence of evidence must not weaken the red");
+    }
+  });
+
+  // THE LEGS THAT CARRY THE COUNTS. The arm above is pure and would stay green
+  // forever while being unreachable in production if either read stopped
+  // returning its `total_count` — the exact unguarded-leg mutation this file
+  // has already shipped twice (`event` on the observe closure, then on the
+  // cross-check closure). Hold both behaviourally.
+  it("observeWorkflow carries the filtered read's total_count", () => {
+    const read = (args) =>
+      args[1].includes("/runs")
+        ? JSON.stringify({
+            total_count: COMPLETED_COUNT,
+            workflow_runs: [{ updated_at: CLAIMED, conclusion: "success", html_url: "u" }],
+          })
+        : JSON.stringify({ state: "active", name: "Relay SSL Multicert Guard" });
+
+    assert.equal(observeWorkflow("o/r", WORKFLOW, read).completedCount, COMPLETED_COUNT);
+  });
+
+  it("observeWorkflow carries total_count on the no-completed-run path too", () => {
+    const read = (args) =>
+      args[1].includes("/runs")
+        ? JSON.stringify({ total_count: COMPLETED_COUNT, workflow_runs: [] })
+        : JSON.stringify({ state: "active", name: "Relay SSL Multicert Guard" });
+
+    const observed = observeWorkflow("o/r", WORKFLOW, read);
+    assert.equal(observed.newest, null);
+    assert.equal(observed.completedCount, COMPLETED_COUNT);
+  });
+
+  it("crossCheckCompletions carries the unfiltered read's total_count", () => {
+    const read = () => JSON.stringify({ total_count: ALL_COUNT, workflow_runs: [] });
+
+    assert.equal(crossCheckCompletions("o/r", WORKFLOW, read).allCount, ALL_COUNT);
+  });
+
+  it("a suppressed guard exits 0 and is not reported as healthy", () => {
+    const summary = summarize([classify(observation({ completedCount: COMPLETED_COUNT, allCount: ALL_COUNT }))]);
+
+    assert.equal(summary.exitCode, 0, "a lying index must not red the job");
+    assert.equal(summary.unknownCount, 1);
+    assert.doesNotMatch(summary.headline, /have stopped executing/);
+  });
+
+  // THE ARM'S REACHABILITY ENVELOPE, held behaviourally rather than by the
+  // comment that used to state it — and used to state it WRONGLY (Ally review
+  // of 9b3251c0). `classifyGuard` evaluates this arm before the
+  // `unparsable-timestamp` arm, which reads as "an unparsable timestamp plus
+  // impossible counts answers `index-inconsistent`". It does not: the first
+  // pass answers `unparsable-timestamp`, which is not `stale`, so
+  // `classifyWatched` returns before spending the cross-check and no
+  // `allCount` ever reaches the arm. Both halves matter — the verdict, and the
+  // request NOT spent. This file's standing doctrine is that a property worth
+  // relying on is held by behaviour, because a comment is what shipped the
+  // error this test exists to prevent.
+  it("never reaches the index-inconsistent arm when the timestamp is unreadable", () => {
+    let crossChecks = 0;
+    const [result] = classifyWatched(
+      [{ workflow: WORKFLOW, staleHours: 2.75, event: "schedule" }],
+      () => ({
+        state: "active",
+        name: "Relay SSL Multicert Guard",
+        completedCount: COMPLETED_COUNT,
+        newest: { updatedAt: "not-a-date", conclusion: "success", htmlUrl: "https://example.invalid/1" },
+      }),
+      () => {
+        crossChecks += 1;
+        return { newestCompletedAt: null, allCount: ALL_COUNT };
+      },
+      { now: NOW },
+    );
+
+    assert.equal(result.reason, "unparsable-timestamp", "the arm fired on a guard it cannot see in production");
+    assert.equal(result.status, "unknown");
+    assert.equal(crossChecks, 0, "spent a corroborating request on a verdict that was never stale");
   });
 });

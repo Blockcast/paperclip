@@ -49,8 +49,10 @@
 # RUN, which is pinned to the sha it was dispatched with; the dispatcher itself
 # has always computed each dispatch against origin/master at dispatch time.
 #
-# So on the `skipped-pending` path, past the SAME threshold that arms the
-# escalation, a `waiting` dispatch whose head is a strict ancestor of
+# So on the `skipped-pending` path, past PENDING_DEPLOY_SUPERSEDE_HOURS — its
+# OWN threshold, deliberately NOT the one that arms the escalation; see the
+# `supersede-stale-deploy.mjs` step comment below for the BLO-25050 reasoning —
+# a `waiting` dispatch whose head is a strict ancestor of
 # origin/master is cancelled and re-dispatched at master. It APPROVES NOTHING —
 # the 2026-08-28 rejection of auto-approval is untouched. A human still presses
 # the button; they press it on a current head, so the click that eventually lands
@@ -137,10 +139,63 @@ jobs:
           # which needs the waiting run's head to test whether a cancelled
           # predecessor is a strict ancestor of it — i.e. whether it was
           # superseded rather than cancelled for some other reason.
-          gh run list --repo "$REPO" --workflow=docker.yml \
-              --event=workflow_dispatch --limit 20 \
-              --json databaseId,status,createdAt,url,headSha \
-              --jq '[.[] | select(.status == "waiting" or .status == "in_progress" or .status == "queued")]' \
+          #
+          # BLO-38907: this read used to be
+          #   gh run list --workflow=docker.yml --event=workflow_dispatch --limit 20
+          # and that form INTERMITTENTLY RETURNS A STALE SLICE. Measured live on
+          # 2026-10-01 while run 36850416203 was `waiting`: the identical query
+          # returned a page whose newest entry was 2026-09-10T12:15:25Z — no
+          # October run at all, at --limit 20 AND --limit 50 — so the guard counted
+          # zero pending. This run's own 17:31Z slot hit it in production and
+          # reported `checked-no-pending` with a deploy sitting on the gate.
+          #
+          # That failure is silent in the worst direction. Guard (1) reading zero
+          # means: no `skipped-pending`, so no ProductionDeployApprovalStuck
+          # escalation and no supersede (the approvable head froze 14 commits
+          # behind master); a GREEN run, when PEN-2848 made `conclusion` itself
+          # the stall signal; and on the daily slot it falls through to guard (2)
+          # and dispatches a SECOND deploy — the double-roll guard (1) exists to
+          # prevent (observed 2026-08-30).
+          #
+          # Two changes, both aimed at that:
+          #   1. Read the REST endpoint `gh run list` wraps, rather than the CLI
+          #      path where the divergence was measured. The raw endpoint returned
+          #      the waiting run, first, on every attempt.
+          #   2. UNION it with one `status=` query per non-terminal status the
+          #      filter below selects (`waiting`, `queued`, `in_progress` — the API's
+          #      `status` takes one value) and take unique ids. This is the
+          #      fail-closed half and does not depend on any read being proven
+          #      sound: a stale slice can only ever REMOVE rows, so every pending
+          #      status has two independent sources and a union cannot produce a
+          #      false "nothing pending". The worst case is a skipped dispatch,
+          #      which the next daily slot retries; the worst case of a false zero
+          #      is a stacked approval on production.
+          # A read that fails outright still aborts the step, which is red and
+          # visible — never a silent zero. That is `set -o pipefail` (top of this
+          # step), NOT `set -e`: the `gh api` calls are on the left of a pipe, so
+          # without pipefail the pipeline's status is `jq`'s, which succeeds on
+          # empty input and yields exactly the false zero this guard exists to stop.
+          {
+            gh api "repos/$REPO/actions/workflows/docker.yml/runs?event=workflow_dispatch&per_page=50" \
+                --jq '.workflow_runs[]'
+            gh api "repos/$REPO/actions/workflows/docker.yml/runs?status=waiting&per_page=50" \
+                --jq '.workflow_runs[]'
+            gh api "repos/$REPO/actions/workflows/docker.yml/runs?status=queued&per_page=50" \
+                --jq '.workflow_runs[]'
+            gh api "repos/$REPO/actions/workflows/docker.yml/runs?status=in_progress&per_page=50" \
+                --jq '.workflow_runs[]'
+          } | jq -s '[ .[]
+                | select(.event == "workflow_dispatch")
+                # Keep every arm in the .status == "x" form. The schedule test derives
+                # the required status= query set from this gh api | jq pipeline; an arm
+                # written any other way (test("x"), IN(...)) is invisible to it and lands
+                # with that status sourced only from the event read, which is the read
+                # measured to go stale: a false zero, i.e. the missed skip and the
+                # 2026-08-30 double roll.
+                | select(.status == "waiting" or .status == "in_progress" or .status == "queued")
+                | { databaseId: .id, status: .status, createdAt: .created_at,
+                    url: .html_url, headSha: .head_sha } ]
+              | unique_by(.databaseId) | sort_by(.createdAt) | reverse' \
               > "$PENDING_JSON_PATH"
           PENDING="$(jq 'length' "$PENDING_JSON_PATH")"
           if [ "${PENDING:-0}" -gt 0 ]; then
@@ -287,10 +342,16 @@ jobs:
         run: node .github/scripts/post-pending-deploy-alert.mjs
 
       # PEN-3315. Guard (1)'s bounded exit: cancel a dispatch that has been on the
-      # reviewer gate past the SAME threshold and whose head is a strict ancestor
-      # of master, then dispatch fresh at master. Deliberately reuses
-      # PENDING_DEPLOY_ALERT_HOURS rather than adding a tunable, so the condition
-      # that supersedes is the condition that already escalates.
+      # reviewer gate past PENDING_DEPLOY_SUPERSEDE_HOURS and whose head is a
+      # strict ancestor of master, then dispatch fresh at master.
+      #
+      # BLO-25050: this reused PENDING_DEPLOY_ALERT_HOURS until 2026-10-04, "so
+      # the condition that supersedes is the condition that already escalates".
+      # That was right when the gate had one consumer. It now has two — a
+      # Paperclip board card pins to the waiting run id and is retired when that
+      # run dies — and a 6h supersede destroyed the card's handle roughly six
+      # times per decision cycle, measured. The ESCALATION threshold is unchanged
+      # at 6h; only the supersede moved. See supersede-stale-deploy.mjs.
       #
       # `!cancelled()` rather than `success()`: the escalation above is fatal on a
       # failed Alertmanager push, and an Alertmanager outage must not also freeze
@@ -304,7 +365,7 @@ jobs:
         if: ${{ !cancelled() && steps.dispatch.outputs.outcome == 'skipped-pending' }}
         env:
           PENDING_JSON_PATH: ${{ runner.temp }}/pending-dispatches.json
-          ALERT_AFTER_HOURS: ${{ vars.PENDING_DEPLOY_ALERT_HOURS || '6' }}
+          SUPERSEDE_AFTER_HOURS: ${{ vars.PENDING_DEPLOY_SUPERSEDE_HOURS || '48' }}
           MASTER_SHA: ${{ steps.dispatch.outputs.master_sha }}
           STALL_ISSUE_NUMBER: ${{ steps.escalate.outputs.stall_issue_number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

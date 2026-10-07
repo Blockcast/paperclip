@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
+  TOKEN="${GH_SEAT_TOKEN_VALUE}"
+  while :; do
+    case "${TOKEN}" in
+      [[:space:]]*) TOKEN="${TOKEN#?}" ;;
+      *[[:space:]]) TOKEN="${TOKEN%?}" ;;
+      *) break ;;
+    esac
+  done
+  if [ -z "${TOKEN}" ]; then
+    echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+    exit 64
+  fi
+  case "${TOKEN}" in
+    *[[:space:]]*)
+      echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE contains embedded whitespace; refusing to guess at the intended token" >&2
+      exit 64
+      ;;
+  esac
+  export GH_TOKEN="${TOKEN}"
+  export GITHUB_TOKEN="${TOKEN}"
+  export GITHUB_PERSONAL_ACCESS_TOKEN="${TOKEN}"
+  exec "$@"
+fi
+TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
+if [ ! -r "${TOKEN_FILE}" ]; then
+  echo "paperclip github token file not readable: ${TOKEN_FILE}" >&2
+  exit 1
+fi
+TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}")"
+if [ -z "${TOKEN}" ]; then
+  echo "paperclip github token file is empty: ${TOKEN_FILE}" >&2
+  exit 1
+fi
+export GH_TOKEN="${TOKEN}"
+export GITHUB_TOKEN="${TOKEN}"
+export GITHUB_PERSONAL_ACCESS_TOKEN="${TOKEN}"
+exec "$@"

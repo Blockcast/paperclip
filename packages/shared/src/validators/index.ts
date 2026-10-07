@@ -387,6 +387,7 @@ export {
   issueParkedDispositionSchema,
   PARKED_DISPOSITION_MAX_HORIZON_DAYS,
   PARKED_DISPOSITION_MAX_HORIZON_MS,
+  issueExecutionMonitorPolicySchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   issueRecoveryActionReadModelSchema,

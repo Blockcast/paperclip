@@ -2415,7 +2415,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       });
       const { body: metrics } = await renderMetrics();
       expect(metrics.split("\n")).toContain(
-        'paperclip_heartbeat_run_failed_total{agent_id="unknown",issue_id="none",adapter="opencode_k8s",error_code="job_missing",invocation_source="other",isolation_mode="unknown"} 1',
+        // BLO-17953 A1f: agent_id is retained for EVERY error code (roster-bounded),
+        // so job_missing now carries real agent attribution. issue_id stays "none" —
+        // it is the unbounded label and remains gated on k8s_pod_schedule_failed.
+        `paperclip_heartbeat_run_failed_total{agent_id="${agentId}",issue_id="none",adapter="opencode_k8s",error_code="job_missing",invocation_source="other",isolation_mode="unknown"} 1`,
       );
     } finally {
       updateSpy.mockRestore();
@@ -2506,7 +2509,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }) as typeof db.select);
 
     const sample =
-      'paperclip_heartbeat_run_failed_total{agent_id="unknown",issue_id="none",adapter="opencode_k8s",error_code="job_missing",invocation_source="other",isolation_mode="unknown"} 1';
+      // BLO-17953 A1f: agent_id retained for every error code; issue_id still gated.
+      `paperclip_heartbeat_run_failed_total{agent_id="${agentId}",issue_id="none",adapter="opencode_k8s",error_code="job_missing",invocation_source="other",isolation_mode="unknown"} 1`;
     try {
       const firstPass = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
       expect(firstPass.runIds).toContain(runId);
@@ -4119,6 +4123,103 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     expect(source?.contextSnapshot).toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
+  });
+
+  // PEN-3582 (carried from Ally's non-blocking review 2 on PR #2003).
+  //
+  // PR #2003 guarded three `startNextQueuedRunForAgent` call sites so one
+  // agent's rejecting dispatch could not abandon the batch around it. Two got
+  // discriminators; this one — the post-reap dispatch inside
+  // `for (const { run } of activeRuns)` — did not. Unguarded, the rejection
+  // escaped `reapOrphanedRuns` entirely: every orphan behind the failing one
+  // went unreaped, still holding its environment leases and issue lock, and
+  // even the run being reaped lost the `appendRunEvent` that sits AFTER the
+  // dispatch call — after its terminal status had already been persisted, so
+  // the row went terminal with no lifecycle event explaining why.
+  //
+  // Vacuous-pass hazard, the same one that applied to the sibling test:
+  // `startNextQueuedRunForAgent` returns `[]` early on several screens (the
+  // api-tier fence, scheduling suppression, `dispatchStopped`) before reaching
+  // anything observable from out here, so "dispatch succeeded" and "dispatch
+  // was never attempted" look identical to an outcome assertion. The injection
+  // hook is therefore also the attempt record: `beforeQueuedDispatchPassForTest`
+  // fires inside the per-agent start lock, past all three screens, so an agent
+  // in `attemptedAgentIds` is evidence its dispatch really ran rather than an
+  // assumption that it did.
+  it("reaps every orphan when one agent's post-reap dispatch rejects", async () => {
+    // Two orphans on two agents. `seedRunFixture` mints a fresh company+agent
+    // per call, so these are independent loop iterations of the same pass.
+    const first = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      includeIssue: false,
+    });
+    const second = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_998,
+      includeIssue: false,
+    });
+    const orphanAgentIds = new Set([first.agentId, second.agentId]);
+
+    // Fail whichever agent the pass reaches FIRST rather than naming one: the
+    // reap's row order is not pinned by this fixture, and pinning the failure
+    // to a specific agent would make the test pass vacuously on every run where
+    // that agent happened to sort last (there would then be no iteration behind
+    // it for the abort to destroy).
+    const attemptedAgentIds: string[] = [];
+    let failedAgentId: string | null = null;
+    const heartbeat = createHeartbeat({
+      beforeQueuedDispatchPassForTest: ({ agentId }) => {
+        // Other suites' agents can share the embedded database; scope both the
+        // injection and the attempt record to this fixture's two agents.
+        if (!orphanAgentIds.has(agentId)) return;
+        attemptedAgentIds.push(agentId);
+        if (failedAgentId !== null) return;
+        failedAgentId = agentId;
+        throw new Error("injected post-reap dispatch failure");
+      },
+    });
+
+    // Resolves rather than rejecting, and that asymmetry with `resumeQueuedRuns`
+    // is deliberate: this site sits MID-chain in the periodic tick, so
+    // rethrowing would skip `promoteDueScheduledRetries` and `resumeQueuedRuns`
+    // for the whole tick and discard the reap summary with them.
+    const result = await heartbeat.reapOrphanedRuns();
+
+    // The injection really bit, so nothing below is passing against a
+    // failure-free pass.
+    expect(failedAgentId).not.toBeNull();
+    const survivingAgentId = failedAgentId === first.agentId ? second.agentId : first.agentId;
+    const failedRunId = failedAgentId === first.agentId ? first.runId : second.runId;
+
+    // The discriminator: the orphan behind the throwing one was still reaped.
+    // Unguarded, `reapOrphanedRuns` rejects and the pass never gets here.
+    expect(result.runIds).toEqual(expect.arrayContaining([first.runId, second.runId]));
+    expect(result.reaped).toBe(2);
+
+    // ...and its dispatch was genuinely ATTEMPTED, not skipped by one of the
+    // early `return []` screens. Without this, a guard that silently stopped
+    // dispatching after the first failure would still satisfy the reap counts
+    // above.
+    expect(attemptedAgentIds).toContain(survivingAgentId);
+
+    // The failing run's own post-dispatch `appendRunEvent` still ran. This is
+    // the second harm in the unguarded shape and it is invisible to the reap
+    // counts: the throw landed between the terminal write and this event.
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, failedRunId));
+    expect(events.filter((event) => event.eventType === "lifecycle")).not.toHaveLength(0);
+
+    // Both rows reached a terminal status, so "reaped" is not merely a counter
+    // the pass incremented on its way out.
+    for (const runId of [first.runId, second.runId]) {
+      expect(await heartbeat.getRun(runId)).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
+      });
+    }
   });
 
   it("does not retry a lost monitor dispatch while another monitor wake remains scheduled", async () => {
@@ -9254,6 +9355,100 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
       expect(await getWakeStatus(wakeId)).not.toBe("deferred_issue_execution");
       expect((await getReservation(runId))?.state).toBe("released");
+    });
+
+    // ---------------------------------------------------------------------
+    // BLO-32052: the orphaned-lease sweep gated on `activeRunExecutions`,
+    // which is an in-memory Set that `executeRun` never clears when its await
+    // does not resolve. That turned a one-pass deferral into a permanent
+    // quarantine: measured in production, two single-slot agents were locked
+    // out of external-runtime work for 77h and 49h against a worker up 6.6
+    // days. The reaper's main loop already carried the external-lifecycle
+    // bypass; this loop did not. (The sibling reservation sweep has the same
+    // defect and is fixed separately by PEN-3640 / #2137.) Attribution: the
+    // 77h/49h figures evidence the shared `activeRunExecutions` defect class,
+    // not this sweep alone. External-runtime slot capacity is gated by the
+    // reservation row (`ACTIVE_RUNTIME_SLOT_CONSTRAINT`), so the slot lockout
+    // they measure clears with #2137; this PR clears the environment-lease
+    // half. The measured symptom needs both.
+    // ---------------------------------------------------------------------
+    it("releases an orphaned external-lifecycle lease whose executor is wedged in activeRunExecutions (BLO-32052)", async () => {
+      const { runId, leaseId, reservation } = await seedTerminalExternalRunWithLease();
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+      mockListManagedAgentPods.mockResolvedValue([]);
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(1);
+
+      expect((await getLease(leaseId))?.status).toBe("failed");
+    });
+
+    it("still defers to an in-process executor for a LOCAL adapter lease (BLO-32052 negative control)", async () => {
+      // The guard was narrowed, not deleted, and this is the half that proves
+      // it. A local run has no Job to re-verify against, so in-process
+      // ownership really is the only liveness signal and must still win. If
+      // this passes with the external-lifecycle test above also passing, the
+      // predicate genuinely discriminates rather than voting one way for
+      // everything.
+      const { companyId, runId, issueId } = await seedRunFixture({
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      mockListManagedAgentPods.mockResolvedValue([]);
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(0);
+
+      expect((await getLease(leaseId))?.status).toBe("active");
+    });
+
+    it("falls back to the pod arm alone once the reservation is released, and is fail-closed there (BLO-32052)", async () => {
+      // The production-reachable shape on the `reapOrphanedRuns` path, and the
+      // one the two tests above do NOT cover: they seed a launched reservation,
+      // so `confirmStaleKilledJobQuiesced` finds a live `jobName` and the Job
+      // arm does the work. The probe sources its name from
+      // `getActiveExternalRuntimeReservation` (filtered `released_at IS NULL`),
+      // and the sibling reservation sweep runs first in the real pass. Until
+      // PEN-3640 / #2137 lands, that sweep still skips a wedged run, so its
+      // reservation is not released first and the Job arm is still live for
+      // it. Once #2137 removes that guard, the sweep has usually just released
+      // the row, `jobName` is null, and `listManagedAgentPods` is the ONLY
+      // thing deciding. That is the state this path must rest on, so the
+      // fail-closed `pods !== null` arm is pinned here rather than assumed.
+      //
+      // No reservation is seeded at all, which is the same observable state as
+      // one already released.
+      const { companyId, runId, issueId } = await seedRunFixture({
+        adapterType: "claude_k8s",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: true,
+      });
+      const { leaseId } = await seedEnvironmentLeaseFixture({ companyId, runId, issueId });
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+      // Arm 1 — kube unreadable. Quiescence is unproven, so the lease is KEPT.
+      mockListManagedAgentPods.mockResolvedValue(null);
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(0);
+      expect((await getLease(leaseId))?.status).toBe("active");
+      // Pins "only the pod arm evaluates": with no active reservation there is
+      // no job name to probe, so the Job arm must not have run.
+      expect(mockReadAgentJobRunStatusByName).not.toHaveBeenCalled();
+
+      // Arm 2 — same fixture, pods now observable and empty. Proven quiesced,
+      // so the lease is released. Without this half, arm 1 would also pass on a
+      // sweep that never releases anything.
+      mockListManagedAgentPods.mockResolvedValue([]);
+      await expect(heartbeat.reconcileOrphanedEnvironmentLeases()).resolves.toBe(1);
+      expect((await getLease(leaseId))?.status).toBe("failed");
     });
 
     it("lease sweep isolates a per-row probe failure and still releases the other row", async () => {

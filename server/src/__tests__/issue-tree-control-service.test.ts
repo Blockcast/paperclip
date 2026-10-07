@@ -689,6 +689,79 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
     });
   });
 
+  // PEN-3636: `hasAnyActivePauseHold` is the company-scoped half of `getActivePauseHoldGate`,
+  // split out so a sweep can answer thousands of per-candidate gate calls from one read. The
+  // whole optimisation rests on a DIRECTIONAL invariant — the prefilter's predicate must stay
+  // a SUPERSET of the gate's, so that `false` is a proof the gate cannot fire for any issue.
+  //
+  // That invariant is NOT what this test defends, and the distinction matters enough to state:
+  // it is held by CONSTRUCTION, by both queries composing `activePauseHoldPredicate`
+  // (`issue-tree-control.ts`). A test cannot defend it, because the drift that breaks it is a
+  // term added to one query and not the other — and any fixture this test builds satisfies, or
+  // fails, both new terms together. Adding `isNull(expiresAt)` to the prefilter alone would
+  // leave this fixture's null-expiry hold matching, and every assertion below green, while a
+  // hold that *did* carry an expiry failed open.
+  //
+  // What this test genuinely pins is narrower and still worth having against real SQL rather
+  // than a fake service: a plain active pause hold makes the prefilter `true` while the gate
+  // declines an unrelated issue, and the prefilter is company-scoped. The second is a live
+  // check — drop the `companyId` term and it goes red.
+  it("reports a plain active pause hold to the prefilter, scoped to its own company", async () => {
+    const companyId = randomUUID();
+    const heldRootIssueId = randomUUID();
+    const unrelatedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      {
+        id: heldRootIssueId,
+        companyId,
+        title: "Paused tree root",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: unrelatedIssueId,
+        companyId,
+        title: "Unrelated tree",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const treeSvc = issueTreeControlService(db);
+
+    // No holds at all: both halves agree on the negative. This is the branch the sweep
+    // short-circuits on, so it is the one that must never report `false` wrongly.
+    expect(await treeSvc.hasAnyActivePauseHold(companyId)).toBe(false);
+    expect(await treeSvc.getActivePauseHoldGate(companyId, heldRootIssueId)).toBeNull();
+
+    await treeSvc.createHold(companyId, heldRootIssueId, {
+      mode: "pause",
+      reason: "board paused this tree",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+
+    // A hold anywhere in the company makes the prefilter `true` even for an issue the gate
+    // declines. Asserting the gate is null for `unrelatedIssueId` is what keeps this from
+    // being a restatement of the line above — but note it exercises one plain hold, so it
+    // samples the construction-held invariant rather than guarding it.
+    expect(await treeSvc.hasAnyActivePauseHold(companyId)).toBe(true);
+    expect(await treeSvc.getActivePauseHoldGate(companyId, unrelatedIssueId)).toBeNull();
+    expect(await treeSvc.getActivePauseHoldGate(companyId, heldRootIssueId)).not.toBeNull();
+
+    // Company scoping, against real SQL: another company's hold must not make this one's
+    // prefilter `true`. A missing `companyId` predicate would be invisible to every
+    // single-company fixture above.
+    const otherCompanyId = randomUUID();
+    expect(await treeSvc.hasAnyActivePauseHold(otherCompanyId)).toBe(false);
+  });
+
   // BLO-3855: in-txn callers must route via tx, not the outer pool, or FOR UPDATE locks deadlock the pool. Visibility of uncommitted writes inside the same txn proves tx was used.
   it("routes getActivePauseHoldGate through tx so callers see uncommitted txn state", async () => {
     const companyId = randomUUID();

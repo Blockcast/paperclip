@@ -3,6 +3,10 @@ import type * as k8s from "@kubernetes/client-node";
 import { ApiException } from "@kubernetes/client-node";
 import type { Writable } from "node:stream";
 import { readFile } from "node:fs/promises";
+// Default export, not the named binding above: execute.ts calls `fs.unlink(…)`
+// as a property read on this same object, so spying here patches the call it
+// actually makes.
+import fsPromises from "node:fs/promises";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
 // This suite doesn't exercise per-agent mcp.json layering (that's covered in
@@ -27,8 +31,25 @@ const mockCoreListPods = vi.fn();
 const mockCoreReadPodLog = vi.fn();
 const mockCoreCreateSecret = vi.fn();
 const mockCoreReadSecret = vi.fn();
-const mockCoreReplaceSecret = vi.fn();
 const mockCorePatchSecret = vi.fn();
+
+/**
+ * Adoption became a merge PATCH in BLO-32424 (the service account holds
+ * `patch` on secrets but not `update`, so the old PUT was refused 403 on every
+ * collision).  That lands it on the same `patchNamespacedSecret` the
+ * ownerReference attach already uses, so a raw call count now conflates two
+ * unrelated writes.  They are distinguishable by body shape: the
+ * ownerReference attach sends a JSON Patch *array*, adoption sends a
+ * merge-patch *object*.
+ */
+function adoptPatchCalls(): { name: string; body: { metadata?: { resourceVersion?: string } } }[] {
+  return mockCorePatchSecret.mock.calls.map((c) => c[0]).filter((arg) => !Array.isArray(arg?.body));
+}
+
+/** The complement of `adoptPatchCalls()` — the JSON Patch *array* writes. */
+function ownerRefPatchCalls(): [{ name: string; body: unknown[] }, { middleware: { pre: (c: unknown) => void }[] }][] {
+  return mockCorePatchSecret.mock.calls.filter((c) => Array.isArray(c[0]?.body)) as never;
+}
 const mockCoreDeleteSecret = vi.fn();
 // vi.hoisted ensures a single vi.fn() instance shared between the mock factory
 // (which runs at hoist time) and the test body (which calls mockResolvedValue).
@@ -53,7 +74,6 @@ vi.mock("./k8s-client.js", () => ({
     readNamespacedPodLog: mockCoreReadPodLog,
     createNamespacedSecret: mockCoreCreateSecret,
     readNamespacedSecret: mockCoreReadSecret,
-    replaceNamespacedSecret: mockCoreReplaceSecret,
     patchNamespacedSecret: mockCorePatchSecret,
     deleteNamespacedSecret: mockCoreDeleteSecret,
   }),
@@ -738,6 +758,76 @@ describe("execute: concurrency guard", () => {
     expect(result.errorCode).toBe("k8s_job_create_failed");
   });
 
+  // BLO-37704: the stale-Job branch used to call cleanupJob() with no
+  // podLogPath, so it deleted the Job and left the *other* run's
+  // .pod.ndjson behind — a leak of someone else's audit record. The guard's
+  // label selector pins agent-id, so company and agent are this run's own;
+  // only the run id and the isolation segment come off the stale Job.
+  //
+  // These assert the argument reaches fs.unlink, not that cleanupJob can
+  // unlink — dropping the argument at the call site is exactly the mutation
+  // they have to catch, and cleanupJob stays green under it.
+  describe("stale-Job pod-log reaping", () => {
+    async function runStaleBranch(orphan: k8s.V1Job): Promise<string[]> {
+      const unlink = vi.spyOn(fsPromises, "unlink").mockResolvedValue(undefined);
+      try {
+        mockBatchListJobs.mockResolvedValue({ items: [orphan] });
+        mockBatchDeleteJob.mockResolvedValue({});
+        mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+        mockPrepareBundle.mockResolvedValue(makeBundle());
+        vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404 }));
+
+        await execute(makeCtx({ context: { taskId: "task-current" } } as Partial<AdapterExecutionContext>));
+
+        expect(mockBatchDeleteJob).toHaveBeenCalledWith({
+          name: "ac-job",
+          namespace: "paperclip",
+          body: { propagationPolicy: "Background" },
+        });
+        return unlink.mock.calls.map((c) => String(c[0]));
+      } finally {
+        unlink.mockRestore();
+      }
+    }
+
+    it("unlinks the stale run's pod log, not just its Job", async () => {
+      expect(await runStaleBranch(makeJob({ runId: "prior-run", agentId: "agent-abc" }))).toContain(
+        "/paperclip/instances/default/data/run-logs/co1/agent-abc/prior-run.pod.ndjson",
+      );
+    });
+
+    it("reads the isolation segment off the stale Job, not off this run", async () => {
+      expect(
+        await runStaleBranch(makeJob({
+          runId: "prior-run",
+          agentId: "agent-abc",
+          isolationMode: "workspace",
+          isolationKey: "ws-7",
+        })),
+      ).toContain(
+        "/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/ws-7/prior-run.pod.ndjson",
+      );
+    });
+
+    // buildJobManifest writes the isolation labels when `enabled || source ===
+    // "runtime"` but only puts the key in the path when `enabled` — and a
+    // runtime descriptor with isolationMode "shared" is enabled:false carrying
+    // a non-empty key. Keying off the key label would build a path that Job
+    // never wrote, leaving the real orphan behind.
+    it("ignores the isolation key on a shared-mode Job, whose log is not isolation-keyed", async () => {
+      expect(
+        await runStaleBranch(makeJob({
+          runId: "prior-run",
+          agentId: "agent-abc",
+          isolationMode: "shared",
+          isolationKey: "ws-7",
+        })),
+      ).toContain(
+        "/paperclip/instances/default/data/run-logs/co1/agent-abc/prior-run.pod.ndjson",
+      );
+    });
+  });
+
   it("blocks when the run-id lookup is still active", async () => {
     process.env.PAPERCLIP_API_URL = "https://paperclip.test";
     const orphan = makeJob({ runId: "active-run", agentId: "agent-abc", taskId: "task-current" });
@@ -1153,7 +1243,7 @@ describe("execute: job creation", () => {
     // undefined` from the read and a TypeError masked into a secret-create
     // failure — the exact trap the comment above was written about.
     mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
-    mockCoreReplaceSecret.mockResolvedValue({});
+    mockCorePatchSecret.mockResolvedValue({});
   });
 
   it("returns k8s_job_create_failed when createNamespacedJob throws", async () => {
@@ -1210,13 +1300,63 @@ describe("execute: job creation", () => {
         labels: { "app.kubernetes.io/managed-by": "paperclip", "paperclip.io/run-id": "run-test-001" },
       },
     });
-    mockCoreReplaceSecret.mockResolvedValue({});
+    mockCorePatchSecret.mockResolvedValue({});
 
     const result = await execute(largePromptCtx());
 
     expect(result.errorCode).not.toBe("k8s_prompt_secret_create_failed");
-    expect(mockCoreReplaceSecret).toHaveBeenCalledTimes(1);
+    expect(adoptPatchCalls()).toHaveLength(1);
     expect(mockBatchCreateJob).toHaveBeenCalled();
+  });
+
+  it("states the JSON Patch Content-Type explicitly on every ownerReference attach", async () => {
+    // Ally review suggestion on #1873. Adoption sets its Content-Type
+    // explicitly; these three attaches used to inherit the client's default.
+    // That default is load-bearing and invisible: the generated client picks
+    // the FIRST entry of its accepted-media-type list via
+    // `ObjectSerializer.getPreferredMediaType`, which is currently
+    // `application/json-patch+json` — so a client-version bump that reorders
+    // that list would send these array bodies as a merge patch, and the API
+    // would reject them, with no diff anywhere in this repo.
+    //
+    // `adoptPatchCalls()` discriminates on body shape, so it cannot see this
+    // regression; only reading the header can. Drop the explicit argument and
+    // `options` is undefined here, so this fails.
+    // The launch outcome is deliberately not asserted: the attaches happen
+    // immediately after the Job create, and this fixture goes on to fail pod
+    // scheduling. What matters is the header on the writes that did happen.
+    await execute(largePromptCtx());
+
+    const calls = ownerRefPatchCalls();
+    expect(calls.length).toBeGreaterThan(0);
+
+    for (const [, options] of calls) {
+      const headers: Record<string, string> = {};
+      for (const mw of options.middleware) {
+        mw.pre({ setHeaderParam: (k: string, v: string) => void (headers[k] = v) } as never);
+      }
+      expect(headers["Content-Type"]).toBe("application/json-patch+json");
+    }
+  });
+
+  it("carries an explicit JSON Patch Content-Type on ALL THREE ownerReference attaches", async () => {
+    // The runtime test above reaches only two of the three. `mcpConfigSecret`
+    // is unreachable in this suite by construction: line 14 pins
+    // PAPERCLIP_SHARED_MCP_BASELINE_PATH to "" so buildJobManifest() never
+    // stages an mcp Secret here. Mutation-testing confirmed it — reverting the
+    // prompt or env attach reddens the test above, reverting the mcp attach
+    // does not. So that one needs a static pin, in the style BLO-33894 used
+    // for the 2>&1-free tee pipeline.
+    //
+    // Counts rather than positions, so the pin survives the call sites moving.
+    // `patchNamespacedSecret({` is the single-argument-object call shape the
+    // three attaches share; the adoption write opens its argument list on the
+    // next line and so is deliberately not counted.
+    const src = await readFile(new URL("./execute.ts", import.meta.url), "utf8");
+    const attaches = src.match(/patchNamespacedSecret\(\{/g) ?? [];
+    const explicit = src.match(/PatchStrategy\.JsonPatch/g) ?? [];
+    expect(attaches).toHaveLength(3);
+    expect(explicit).toHaveLength(attaches.length);
   });
 
   it("re-creates when the leftover Secret is deleted between create and read", async () => {
@@ -1228,7 +1368,7 @@ describe("execute: job creation", () => {
     const result = await execute(largePromptCtx());
 
     expect(result.errorCode).not.toBe("k8s_prompt_secret_create_failed");
-    expect(mockCoreReplaceSecret).not.toHaveBeenCalled();
+    expect(adoptPatchCalls()).toHaveLength(0);
     expect(mockBatchCreateJob).toHaveBeenCalled();
   });
 
@@ -1244,7 +1384,7 @@ describe("execute: job creation", () => {
 
     expect(result.errorCode).toBe("k8s_prompt_secret_create_failed");
     expect(result.errorMessage).toContain("belongs to run some-other-run");
-    expect(mockCoreReplaceSecret).not.toHaveBeenCalled();
+    expect(adoptPatchCalls()).toHaveLength(0);
     expect(mockBatchCreateJob).not.toHaveBeenCalled();
   });
 
@@ -1259,7 +1399,7 @@ describe("execute: job creation", () => {
         labels: { "app.kubernetes.io/managed-by": "paperclip", "paperclip.io/run-id": "run-test-001" },
       },
     });
-    mockCoreReplaceSecret.mockResolvedValue({});
+    mockCorePatchSecret.mockResolvedValue({});
 
     const result = await execute(envSecretCtx());
 
@@ -1267,8 +1407,8 @@ describe("execute: job creation", () => {
     // The Secret that 409'd must be the env one, or this test is silently
     // re-testing the prompt path with different scaffolding.
     expect(mockCoreCreateSecret.mock.calls[0][0].body.metadata.name).toMatch(/-env$/);
-    expect(mockCoreReplaceSecret).toHaveBeenCalledTimes(1);
-    expect(mockCoreReplaceSecret.mock.calls[0][0].name).toMatch(/-env$/);
+    expect(adoptPatchCalls()).toHaveLength(1);
+    expect(adoptPatchCalls()[0].name).toMatch(/-env$/);
     expect(mockBatchCreateJob).toHaveBeenCalled();
   });
 
@@ -1302,7 +1442,7 @@ describe("execute: job creation", () => {
     mockCoreCreateSecret.mockResolvedValue({});
     mockCoreDeleteSecret.mockResolvedValue({});
     mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
-    mockCoreReplaceSecret.mockResolvedValue({});
+    mockCorePatchSecret.mockResolvedValue({});
   }
 
   /**

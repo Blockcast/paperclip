@@ -1,7 +1,13 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { agentRoutes, stripRedactedEnvBindingsFromAdapterConfig } from "../routes/agents.js";
+import {
+  agentRoutes,
+  restoreRedactedAgentMetadata,
+  stripRedactedEnvBindingsFromAdapterConfig,
+} from "../routes/agents.js";
+import { containAgentMetadata } from "../agent-redaction.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { errorHandler } from "../middleware/index.js";
 
 const agentId = "11111111-1111-4111-8111-111111111111";
@@ -136,6 +142,10 @@ const mockCompanySkillService = vi.hoisted(() => ({
   resolveRequestedSkillKeys: vi.fn(),
 }));
 
+const mockBuiltInAgentService = vi.hoisted(() => ({
+  ensureCompanyDefaultAgentGrants: vi.fn(),
+}));
+
 const mockWorkspaceOperationService = vi.hoisted(() => ({}));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
@@ -144,6 +154,10 @@ vi.mock("../services/index.js", () => ({
   agentInstructionsService: () => mockAgentInstructionsService,
   accessService: () => mockAccessService,
   approvalService: () => mockApprovalService,
+  // Only reached on the direct-create path, which no test drove to a 2xx until
+  // PEN-3726 needed to assert what that path persists. Unmocked it throws, which
+  // is why the pre-existing create test could only ever assert its 403.
+  builtInAgentService: () => mockBuiltInAgentService,
   companySkillService: () => mockCompanySkillService,
   budgetService: () => mockBudgetService,
   heartbeatService: () => mockHeartbeatService,
@@ -485,9 +499,150 @@ describe("agent secret redaction on mutating responses", () => {
       wakeupsCancelled: 0,
     });
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
+    mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockResolvedValue(undefined);
     mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => config);
     mockSecretService.resolveAdapterConfigForRuntime.mockImplementation(async (_companyId, config) => ({ config }));
     mockLogActivity.mockResolvedValue(undefined);
+  });
+
+  // The write side of the containment this PR adds on the read side. Masking
+  // `metadata` on GET gave it the read-modify-write hazard `adapterConfig` has
+  // been guarded against since BLO-5xxx; this pins the PATCH wiring, which a
+  // unit test of `restoreRedactedAgentMetadata` alone would not notice missing.
+  it("PATCH /agents/:id does not persist a round-tripped metadata sentinel over the stored value", async () => {
+    const storedMetadata = {
+      paperclipBuiltInAgent: "cto",
+      token: { type: "plain", value: "metadata-patch-secret-24681357" },
+    };
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, metadata: storedMetadata });
+    mockAgentService.update.mockResolvedValue({ ...baseAgent, metadata: storedMetadata });
+
+    // Exactly what a client gets back from GET, fed straight back in.
+    const roundTripped = containAgentMetadata(storedMetadata);
+    expect(JSON.stringify(roundTripped)).toContain(REDACTED_EVENT_VALUE);
+
+    const app = createApp(boardActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({ metadata: roundTripped });
+
+    expect(res.status).toBe(200);
+    const persisted = mockAgentService.update.mock.calls[0]?.[1] as { metadata?: unknown };
+    expect(persisted.metadata).toEqual(storedMetadata);
+    expect(JSON.stringify(persisted.metadata)).not.toContain(REDACTED_EVENT_VALUE);
+  });
+
+  // The same guard on the two CREATE paths. `stripRedactedEnvBindingsFromAdapterConfig`
+  // is applied at four call sites; the `metadata` analogue initially reached only
+  // the PATCH one, so the column was guarded on write via PATCH and unguarded via
+  // POST. These pin the remaining two.
+  //
+  // A create has no prior value, so the helper SCRUBS rather than restores: the
+  // masked key is dropped. Asserting the key is absent (not merely "not equal to
+  // the sentinel") is the point — persisting `{type:"plain",value:"***REDACTED***"}`
+  // as a real credential is the failure, and a junk value that merely differs from
+  // the stored one would still satisfy a weaker assertion.
+  const CLONED_SECRET = "metadata-create-clone-secret-97531864";
+
+  it("POST /companies/:companyId/agents drops a round-tripped metadata sentinel instead of storing it", async () => {
+    // The clone-an-agent flow: read an existing agent, paste its (masked)
+    // metadata into a create. Fed from the read path's own output so the
+    // fixture cannot rot into a hand-written literal.
+    const masked = containAgentMetadata({
+      paperclipBuiltInAgent: "cto",
+      token: { type: "plain", value: CLONED_SECRET },
+    });
+    expect(JSON.stringify(masked)).toContain(REDACTED_EVENT_VALUE);
+
+    mockAgentService.create.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { ...baseAgent.adapterConfig, instructionsRootPath: "/workspace/instructions" },
+    });
+
+    const res = await request(createApp(boardActor))
+      .post(`/api/companies/${companyId}/agents`)
+      .send({ name: "Clone", role: "engineer", adapterType: "claude_local", metadata: masked });
+
+    expect(res.status).toBe(201);
+    const persisted = mockAgentService.create.mock.calls[0]?.[1] as { metadata?: Record<string, unknown> };
+    expect(persisted.metadata).toEqual({ paperclipBuiltInAgent: "cto" });
+    expect(persisted.metadata).not.toHaveProperty("token");
+    expect(JSON.stringify(persisted.metadata)).not.toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("POST /companies/:companyId/agent-hires drops the sentinel from BOTH the agent row and the approval payload", async () => {
+    // The hire path persists `metadata` twice: once via `svc.create`, and again
+    // in the approval snapshot, which `activatePendingApproval` replays verbatim
+    // over the agent row. Scrubbing before `normalizedHireInput` is built is what
+    // makes the single pass cover both — a guard placed at `svc.create` alone
+    // would leave the sentinel to land on approval instead.
+    const masked = containAgentMetadata({
+      paperclipBuiltInAgent: "cto",
+      token: { type: "plain", value: CLONED_SECRET },
+    });
+    expect(JSON.stringify(masked)).toContain(REDACTED_EVENT_VALUE);
+
+    mockAgentService.create.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { ...baseAgent.adapterConfig, instructionsRootPath: "/workspace/instructions" },
+      metadata: null,
+    });
+    mockApprovalService.create.mockImplementation(async (_companyId: string, row: unknown) => ({
+      id: "55555555-5555-4555-8555-555555555555",
+      status: "pending",
+      ...(row as Record<string, unknown>),
+    }));
+
+    const res = await request(createApp(boardActor, true))
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({ name: "Hire", role: "engineer", adapterType: "claude_local", metadata: masked });
+
+    expect(res.status).toBe(201);
+
+    const persisted = mockAgentService.create.mock.calls[0]?.[1] as { metadata?: Record<string, unknown> };
+    expect(persisted.metadata).toEqual({ paperclipBuiltInAgent: "cto" });
+    expect(persisted.metadata).not.toHaveProperty("token");
+
+    const approvalPayload = (
+      mockApprovalService.create.mock.calls[0]?.[1] as { payload?: { metadata?: Record<string, unknown> } }
+    )?.payload;
+    expect(approvalPayload?.metadata).not.toHaveProperty("token");
+    expect(JSON.stringify(approvalPayload?.metadata)).not.toContain(REDACTED_EVENT_VALUE);
+  });
+
+  // The negative control for the two cases above, and the branch none of them
+  // reaches. `restoreRedactedAgentMetadata` scrubs only when a sentinel is
+  // actually present — `containsRedactedAdapterValue` short-circuits and returns
+  // `incoming` untouched otherwise — and that short-circuit is the only thing
+  // standing between a create and "no prior value, therefore drop everything".
+  // Every assertion above drives a MASKED payload, so a future change that
+  // scrubbed unconditionally would keep this whole file green while silently
+  // dropping a legitimate credential on every create. Pin the other side: a real
+  // value, under a key the redactor would have masked on the way out, reaches the
+  // column byte-for-byte. The short-circuit is shared by all four call sites, so
+  // one case covers the branch for each.
+  it("POST /companies/:companyId/agents persists a genuine metadata credential unchanged", async () => {
+    const realMetadata = {
+      paperclipBuiltInAgent: "cto",
+      // Tier-1 key names, deliberately: these are exactly the keys that come back
+      // masked from a read, so they are the ones an over-eager scrub would eat.
+      token: { type: "plain", value: "metadata-create-real-secret-24681357" },
+      nested: { apiKey: "metadata-create-real-nested-86420975" },
+    };
+    expect(JSON.stringify(realMetadata)).not.toContain(REDACTED_EVENT_VALUE);
+
+    mockAgentService.create.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { ...baseAgent.adapterConfig, instructionsRootPath: "/workspace/instructions" },
+    });
+
+    const res = await request(createApp(boardActor))
+      .post(`/api/companies/${companyId}/agents`)
+      .send({ name: "Real", role: "engineer", adapterType: "claude_local", metadata: realMetadata });
+
+    expect(res.status).toBe(201);
+    const persisted = mockAgentService.create.mock.calls[0]?.[1] as { metadata?: Record<string, unknown> };
+    expect(persisted.metadata).toEqual(realMetadata);
   });
 
   // The reported case: a patch that touches no credential field at all.
@@ -1585,5 +1740,264 @@ describe("agent self-service secret binding guard", () => {
 
     expect(res.status).toBe(403);
     expect(mockAgentService.create).not.toHaveBeenCalled();
+  });
+});
+
+// PEN-3726. `agents.metadata` is a caller-writable open bag — `jsonb` validated
+// only as `z.record(z.string(), z.unknown())`, with no secret-sentinel pass on
+// write the way `adapterConfig` gets one. Three of the five agent projections
+// already declined to emit it as stored (two enumerate their output, one
+// sanitizes it structurally); the two SPREAD-based helpers emitted it verbatim
+// across ~13 exits.
+//
+// The asymmetry that makes this worth pinning rather than tidying: the same
+// column was treated as needing a structural sanitize on the config-revision
+// path and as inert on the two common read paths, and the inert pair includes
+// the LOWER-privilege `redactForRestrictedAgentView` — which withholds both
+// config columns outright and still handed over the bag beside them.
+describe("agent metadata containment on the spread-based redactors", () => {
+  const METADATA_SECRET = "agent-metadata-secret-under-an-ordinary-key";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAgentService.getChainOfCommand.mockResolvedValue([]);
+    mockAccessService.getMembership.mockResolvedValue({
+      id: "membership-1",
+      companyId,
+      principalType: "agent",
+      principalId: agentId,
+      status: "active",
+      membershipRole: "member",
+      createdAt: new Date("2026-03-19T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+    mockAccessService.listPrincipalGrants.mockResolvedValue([]);
+    mockAccessService.canUser.mockResolvedValue(true);
+    mockAccessService.decide.mockResolvedValue({ allowed: true });
+    mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
+  });
+
+  function withMetadata(metadata: unknown) {
+    const agent = { ...baseAgent, metadata } as typeof baseAgent;
+    mockAgentService.getById.mockResolvedValue(agent);
+    mockAgentService.list.mockResolvedValue([agent]);
+    return agent;
+  }
+
+  // Drives the `redactForRestrictedAgentView` arm of
+  // `GET /companies/:companyId/agents`: a peer agent that may READ the agent
+  // (`agent:read` allowed) but may not read its configuration.
+  function denyConfigReadOnly() {
+    mockAccessService.decide.mockImplementation(async ({ action }: { action: string }) => ({
+      allowed: action !== "agent_config:read",
+    }));
+  }
+
+  describe("redactAgentSecrets", () => {
+    it("masks a plain binding planted in metadata", async () => {
+      withMetadata({ leaked: { type: "plain", value: METADATA_SECRET } });
+      const app = createApp(boardActor);
+      const res = await request(app).get(`/api/agents/${agentId}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.metadata).toEqual({ leaked: { type: "plain", value: "***REDACTED***" } });
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    it("masks a tier-1 key name nested at depth in metadata", async () => {
+      withMetadata({ a: { b: { apiKey: METADATA_SECRET } } });
+      const app = createApp(boardActor);
+      const res = await request(app).get(`/api/agents/${agentId}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.metadata).toEqual({ a: { b: { apiKey: "***REDACTED***" } } });
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    // Asserted as a pair with the foreign-prototype case below, for the same
+    // reason the config-revision tests are: the array case must SURVIVE as a
+    // masked array and the foreign-prototype case must be WITHHELD. A fix that
+    // collapses either into the other passes one assertion and fails the other.
+    it("keeps an ARRAY-valued metadata as an element-wise-masked array", async () => {
+      withMetadata([{ type: "plain", value: METADATA_SECRET }]);
+      const app = createApp(boardActor);
+      const res = await request(app).get(`/api/agents/${agentId}`);
+
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.metadata)).toBe(true);
+      expect(res.body.metadata).toEqual([{ type: "plain", value: "***REDACTED***" }]);
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    it("withholds a metadata whose prototype is not Object.prototype", async () => {
+      withMetadata(Object.assign(Object.create({ inherited: true }), {
+        leaked: { type: "plain", value: METADATA_SECRET },
+      }));
+      const app = createApp(boardActor);
+      const res = await request(app).get(`/api/agents/${agentId}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.metadata).toBeNull();
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    it("leaves the built-in marker readable", async () => {
+      withMetadata({ paperclipBuiltInAgent: "security-engineer" });
+      const app = createApp(boardActor);
+      const res = await request(app).get(`/api/agents/${agentId}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.metadata).toEqual({ paperclipBuiltInAgent: "security-engineer" });
+    });
+  });
+
+  describe("redactForRestrictedAgentView", () => {
+    it("masks a plain binding planted in metadata", async () => {
+      withMetadata({ leaked: { type: "plain", value: METADATA_SECRET } });
+      denyConfigReadOnly();
+      const app = createApp(agentActor);
+      const res = await request(app).get(`/api/companies/${companyId}/agents`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(1);
+      // Precondition: this really is the restricted arm, not the secrets arm.
+      expect(res.body[0].adapterConfig).toEqual({});
+      expect(res.body[0].metadata).toEqual({ leaked: { type: "plain", value: "***REDACTED***" } });
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    // The array/foreign-prototype pair, asserted on this arm too. Both arms
+    // call one `containAgentMetadata`, so this is cheap insurance rather than
+    // a hole — but the pair is only self-checking when both halves are present
+    // on both arms, which is what the comment on the secrets arm asks for.
+    it("keeps an ARRAY-valued metadata as an element-wise-masked array", async () => {
+      withMetadata([{ type: "plain", value: METADATA_SECRET }]);
+      denyConfigReadOnly();
+      const app = createApp(agentActor);
+      const res = await request(app).get(`/api/companies/${companyId}/agents`);
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].adapterConfig).toEqual({});
+      expect(Array.isArray(res.body[0].metadata)).toBe(true);
+      expect(res.body[0].metadata).toEqual([{ type: "plain", value: "***REDACTED***" }]);
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+
+    it("withholds a metadata whose prototype is not Object.prototype", async () => {
+      withMetadata(Object.assign(Object.create({ inherited: true }), {
+        leaked: { type: "plain", value: METADATA_SECRET },
+      }));
+      denyConfigReadOnly();
+      const app = createApp(agentActor);
+      const res = await request(app).get(`/api/companies/${companyId}/agents`);
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].adapterConfig).toEqual({});
+      expect(res.body[0].metadata).toBeNull();
+      expect(JSON.stringify(res.body)).not.toContain(METADATA_SECRET);
+    });
+  });
+});
+
+describe("restoreRedactedAgentMetadata — metadata round-trip guard", () => {
+  // The containment this PR added (PEN-3726) masks `metadata` on the way out,
+  // which gave that column the same read-modify-write hazard `adapterConfig`
+  // has carried since BLO-5xxx: read an agent, edit an unrelated field, PATCH
+  // the object back, and the sentinel lands on top of the stored value.
+  // `stripRedactedEnvBindingsFromAdapterConfig` guards the sibling column; this
+  // is the `metadata` analogue, composed from the same primitives so the two
+  // cannot drift apart on the write side.
+  const STORED_SECRET = "metadata-roundtrip-secret-13572468";
+
+  // Positive control. Every case below feeds the read path's OWN output back in
+  // as the write payload rather than a hand-written "***REDACTED***" literal:
+  // if containment ever stopped masking this shape, a hand-written fixture
+  // would keep passing while the real round-trip quietly stopped being tested.
+  // This asserts the masking actually happened before anything is restored.
+  function maskedByReadPath(stored: unknown): unknown {
+    const masked = containAgentMetadata(stored);
+    expect(JSON.stringify(masked)).toContain(REDACTED_EVENT_VALUE);
+    expect(JSON.stringify(masked)).not.toContain(STORED_SECRET);
+    return masked;
+  }
+
+  it("restores the stored value when the read path's masked output is PATCHed back", () => {
+    const stored = { token: { type: "plain", value: STORED_SECRET }, paperclipBuiltInAgent: "cto" };
+    const incoming = maskedByReadPath(stored);
+
+    expect(restoreRedactedAgentMetadata(incoming, stored)).toEqual(stored);
+  });
+
+  it("keeps a genuine edit made in the same PATCH as a restored sentinel", () => {
+    // The failure this guards is over-restoring: reverting a field the caller
+    // deliberately changed, because it sat beside a masked one.
+    const stored = { token: { type: "plain", value: STORED_SECRET }, label: "before" };
+    const incoming = { ...(maskedByReadPath(stored) as Record<string, unknown>), label: "after" };
+
+    expect(restoreRedactedAgentMetadata(incoming, stored)).toEqual({
+      token: { type: "plain", value: STORED_SECRET },
+      label: "after",
+    });
+  });
+
+  it("restores sentinels nested under objects and arrays", () => {
+    const stored = {
+      nested: { deep: { type: "plain", value: STORED_SECRET } },
+      list: [{ type: "plain", value: STORED_SECRET }, "plain-element"],
+    };
+    const incoming = maskedByReadPath(stored);
+
+    expect(restoreRedactedAgentMetadata(incoming, stored)).toEqual(stored);
+  });
+
+  it("passes an ordinary no-sentinel write through untouched, by reference", () => {
+    // Identity, not just equality: a payload carrying no sentinel must not be
+    // rebuilt, so the guard cannot perturb a write it has no business touching.
+    const incoming = { paperclipBuiltInAgent: "cto", pluginManagedAgent: true };
+
+    expect(restoreRedactedAgentMetadata(incoming, { paperclipBuiltInAgent: "cto" })).toBe(incoming);
+  });
+
+  it("omits a masked key that has nothing stored to restore, rather than persisting the placeholder", () => {
+    // The whole point: when there is no prior value, writing the sentinel
+    // through would be the corruption. Dropping the key is the safe outcome.
+    const incoming = maskedByReadPath({ token: { type: "plain", value: STORED_SECRET } });
+
+    const restored = restoreRedactedAgentMetadata(incoming, {}) as Record<string, unknown>;
+    expect(restored).toEqual({});
+    expect(JSON.stringify(restored)).not.toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("scrubs on a `null` prior, which is how the create paths call it", () => {
+    // The create paths have no prior row at all, so they pass `null` rather
+    // than `{}`. That must behave the same way — drop the masked key, keep the
+    // rest — and not throw or pass the sentinel through. `null` reaching the
+    // object branch as a prior is the case a `?? {}` omission would break.
+    const incoming = maskedByReadPath({
+      paperclipBuiltInAgent: "cto",
+      token: { type: "plain", value: STORED_SECRET },
+    });
+
+    const restored = restoreRedactedAgentMetadata(incoming, null) as Record<string, unknown>;
+    expect(restored).toEqual({ paperclipBuiltInAgent: "cto" });
+    expect(JSON.stringify(restored)).not.toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("leaves a null or absent metadata alone on a create", () => {
+    // `metadata` is `.optional().nullable()`, so both reach the helper. Neither
+    // carries a sentinel, so both must round-trip unchanged rather than being
+    // coerced into an object the caller never sent.
+    expect(restoreRedactedAgentMetadata(null, null)).toBeNull();
+    expect(restoreRedactedAgentMetadata(undefined, null)).toBeUndefined();
+  });
+
+  it("restores a URI whose credential component alone was masked (PEN-2747)", () => {
+    // Here the round-tripped value CONTAINS the sentinel rather than equalling
+    // it, so an equality test would miss it and persist a broken upstream URL.
+    const stored = { endpoint: `https://user:${STORED_SECRET}@host/mcp` };
+    const incoming = maskedByReadPath(stored);
+
+    expect(JSON.stringify(incoming)).not.toBe(JSON.stringify(stored));
+    expect(restoreRedactedAgentMetadata(incoming, stored)).toEqual(stored);
   });
 });

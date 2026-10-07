@@ -448,6 +448,7 @@ import {
   setExternalLifecycleRunningRuns,
   recordExternalLifecycleRunSilenceGap,
   recordPrReviewQueueWait,
+  recordRunDispatchWait,
   setAgentLivenessMetrics,
   setReleasePendingExternalRuntimeReservationMetrics,
   setOrphanedEnvironmentLeaseMetrics,
@@ -484,6 +485,11 @@ import {
   isExecutionForcedToKubernetes,
 } from "./execution-allowlist.js";
 import {
+  WAKE_COMMENT_IDS_KEY,
+  extractWakeCommentIds,
+  shouldReopenTerminalIssueForDeferredWake,
+} from "./deferred-wake-reopen.js";
+import {
   RECOVERY_ORIGIN_KINDS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -515,7 +521,12 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import type { RecoveryRunWriteClassNoticeText } from "./recovery/model-profile-hint.js";
-import { recoveryService, STALE_PRE_CLAIM_ISSUE_LOCK_MS } from "./recovery/service.js";
+import {
+  EXTERNAL_WAIT_RESUME_WAKE_REASONS,
+  GITHUB_STATE_CHANGE_WAKE_REASONS,
+  recoveryService,
+  STALE_PRE_CLAIM_ISSUE_LOCK_MS,
+} from "./recovery/service.js";
 import { PROVIDER_CAPACITY_MAX_HORIZON_MS } from "./provider-capacity-horizon-bound.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
@@ -692,7 +703,6 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_released",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
-const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
@@ -791,10 +801,11 @@ const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 // hardcoded literal in recovery/service.ts. Identical, with nothing holding them so.
 // recovery/service.js is the leaf (heartbeat imports it; it cannot import back) and now
 // owns both — see the rationale beside the declarations there.
-import {
-  EXTERNAL_WAIT_RESUME_WAKE_REASONS,
-  GITHUB_STATE_CHANGE_WAKE_REASONS,
-} from "./recovery/service.js";
+//
+// PEN-3582 (Ally non-blocking 3): the `import` that used to sit here has been folded
+// into the single `./recovery/service.js` import near the top of this file. The
+// re-export below is NOT redundant with it and must stay — it is what lets the
+// PEN-2400 divergence test reach the same set object through both modules.
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -7101,6 +7112,8 @@ export function buildHeartbeatRunFailedMetricInput(input: {
   issueId: string | null;
   run: { errorCode: string | null; contextSnapshot: unknown };
   k8sRunIsolation: { isolationMode: string } | null;
+  /** Active company agent roster used to bound the `agent_id` label. */
+  knownAgentIds: ReadonlySet<string>;
 }) {
   const contextSnapshotObj = parseObject(input.run.contextSnapshot);
   const persistedIsolation = parseObject(contextSnapshotObj.paperclipK8sIsolation);
@@ -7109,6 +7122,7 @@ export function buildHeartbeatRunFailedMetricInput(input: {
     issueId: input.issueId,
     adapter: input.agent.adapterType,
     errorCode: input.run.errorCode,
+    knownAgentIds: input.knownAgentIds,
     invocationSource:
       readNonEmptyString(contextSnapshotObj.wakeReason) ??
       readNonEmptyString(contextSnapshotObj.retryReason),
@@ -9448,19 +9462,9 @@ function deriveCommentId(
   );
 }
 
-export function extractWakeCommentIds(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-): string[] {
-  const raw = contextSnapshot?.[WAKE_COMMENT_IDS_KEY];
-  if (!Array.isArray(raw)) return [];
-  const out: string[] = [];
-  for (const entry of raw) {
-    const value = readNonEmptyString(entry);
-    if (!value || out.includes(value)) continue;
-    out.push(value);
-  }
-  return out;
-}
+// Re-exported from the shared leaf module so the promoter below and the
+// lockless drain in `recovery/service.ts` read wake comment ids the same way.
+export { extractWakeCommentIds };
 
 function mergeWakeCommentIds(...values: Array<unknown>): string[] {
   const merged: string[] = [];
@@ -13352,6 +13356,19 @@ export function resolveHeartbeatSchedulingSuppression(
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  // PEN-3328. The queued-run dispatch critical section's database work is made
+  // cancellable by wrapping the postgres.js client, but that wrap is applied at
+  // the composition root (`index.ts`, right after `createDb`) rather than here,
+  // so this function takes the handle as given.
+  //
+  // It used to be applied here, and that was wrong. Installing it meant
+  // rebuilding a `Db` from the handle's `$client`, which silently discards any
+  // decoration the caller had layered on the handle itself — a caller passing a
+  // `Db` whose `transaction` is wrapped got a service that quietly ignored the
+  // wrapping and talked to the raw client instead. Two rollback-behaviour tests
+  // caught exactly that. Wrapping the client once, before any `Db` exists, has
+  // the same effect on the section and cannot drop a decoration because there
+  // is nothing decorated yet.
   const envNodeRole = process.env.PAPERCLIP_NODE_ROLE;
   const paperclipNodeRole =
     options.paperclipNodeRole ??
@@ -16173,6 +16190,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         mode: previousPolicy?.mode ?? "normal",
         commentRequired: previousPolicy?.commentRequired ?? true,
         stages: previousPolicy?.stages ?? [],
+        // BLO-39945: this rebuild is field-by-field, so the opt-out has to be
+        // carried explicitly or a watchdog re-arm silently clears it. Only the
+        // top-level home is carryable: the monitor-nested one is already gone
+        // by the time this runs, because clearing the fired monitor ran it
+        // through `stripMonitorFromExecutionPolicy`, which drops `monitor`
+        // wholesale (and collapses a monitor-only policy to null outright).
+        productivityReviewDisabled: previousPolicy?.productivityReviewDisabled ?? false,
         monitor: {
           nextCheckAt: nextCheckAt.toISOString(),
           notes: previousMonitor.notes ?? "Re-check monitor wake dispatch",
@@ -23355,6 +23379,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       startedAt: claimed.startedAt,
     });
 
+    // BLO-25024: same transition, no task-key gate. The PR-review recorder
+    // above only observes `pr_review:` runs, which is why fleet-wide dispatch
+    // latency was invisible to every dashboard for ~8 weeks. queuedAt is
+    // passed so a promoted retry or a k8s-isolation re-queue is measured from
+    // its re-queue instant, not from an old createdAt (BLO-21116).
+    recordRunDispatchWait({
+      invocationSource: claimed.invocationSource,
+      queuedAt: claimed.queuedAt,
+      createdAt: claimed.createdAt,
+      startedAt: claimed.startedAt,
+    });
+
     publishLiveEvent({
       companyId: claimed.companyId,
       type: "heartbeat.run.status",
@@ -25510,6 +25546,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueId: readNonEmptyString(parseObject(finalizedRun.contextSnapshot).issueId),
         run: finalizedRun,
         k8sRunIsolation: null,
+        knownAgentIds: await getActiveAgentIds(db, finalizationAgent.companyId),
       }));
     }
 
@@ -26353,7 +26390,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // A run finalizing right now in this process releases its own leases
         // in its `finally` block; racing it here risks acting on a status
         // snapshot from just before that block runs. Let it win.
-        if (activeRunExecutions.has(run.runId)) continue;
+        //
+        // BLO-32052: but only for adapters whose lifecycle this process
+        // actually owns. For external-lifecycle runs the kube Job is the
+        // source of truth, and a hung `executeRun` await leaves the runId in
+        // `activeRunExecutions` forever (the Set is in-memory and only a
+        // process restart clears it), which quarantined orphaned leases
+        // permanently instead of deferring them by a pass. Same defect and
+        // same Set as the `externalLifecycleRun` bypass in reapOrphanedRuns,
+        // and as PEN-3640 (#2137) fixes in the reservation sweep above.
+        // External-lifecycle runs are not left unguarded:
+        // `confirmStaleKilledJobQuiesced` below is a fail-closed quiescence
+        // probe that keeps the lease whenever the runtime is still active or
+        // merely unobservable.
+        //
+        // One caveat on that probe in *this* caller: it sources its Job name
+        // from `getActiveExternalRuntimeReservation`, which filters
+        // `released_at IS NULL`, and in `reapOrphanedRuns` the reservation
+        // sweep above runs first in the same pass. For a run NOT in
+        // `activeRunExecutions` that sweep has usually just released the row,
+        // so `jobName` is null and only the pod arm (`listManagedAgentPods`,
+        // fail-closed on a null read) evaluates; that is pre-existing.
+        //
+        // Ordering dependency on PEN-3640 (#2137) for the wedged runs this
+        // change unblocks: until #2137 lands, the reservation sweep's first
+        // statement still skips any run in `activeRunExecutions`, so a wedged
+        // run's reservation is NOT released first, `jobName` is non-null, and
+        // the Job arm is live here alongside the pod arm. Once #2137 removes
+        // that sibling guard, wedged runs join the case above and the pod arm
+        // is what this path must rest on. That is still safe, because the
+        // sibling sweep verified the Job moments earlier and coverage holds
+        // across the pair, but do not rely on the Job arm being live here.
+        if (!hasExternalLifecycle(run.adapterType) && activeRunExecutions.has(run.runId)) continue;
         if (hasExternalLifecycle(run.adapterType)) {
           // Background Job deletion does not prove that the Job or its
           // run-labelled pods have stopped. Reuse the same fail-closed probe as
@@ -27853,11 +27921,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // function rejects when a dispatch fails.
     //
     // Rethrowing is free HERE specifically because `resumeQueuedRuns` is the
-    // last pass in the periodic chain in index.ts — nothing downstream is
-    // skipped by it. That is exactly why `reapOrphanedRuns` below swallows
-    // instead: it sits MID-chain, so rethrowing there would abandon
-    // `promoteDueScheduledRetries` and this function for the whole tick,
-    // reproducing the same abandon-the-rest harm one level up.
+    // last pass in the PERIODIC chain in index.ts — that `.then()`'s only tail
+    // is logging, and `reconcileStrandedAssignedIssues` is a separately
+    // scheduled `trackHeartbeatSchedulerWork` call, so nothing downstream of
+    // the periodic chain is skipped by it. That is exactly why
+    // `reapOrphanedRuns` below swallows instead: it sits MID-chain, so
+    // rethrowing there would abandon `promoteDueScheduledRetries` and this
+    // function for the whole tick, reproducing the same abandon-the-rest harm
+    // one level up.
+    //
+    // PEN-3582 (Ally non-blocking 1): "periodic" is load-bearing. The STARTUP
+    // sequence in index.ts calls these same three passes serially under one
+    // terminal `.catch()`, so a rejection here DID skip every later pass there.
+    // That call site now wraps the dispatch pair in its own try/catch, the way
+    // its neighbours already did — do not read this paragraph as a claim that
+    // rethrowing is downstream-safe by construction.
     const dispatchFailures: unknown[] = [];
     for (const agentId of agentIds) {
       await startNextQueuedRunForAgent(agentId).catch((error: unknown) => {
@@ -30942,6 +31020,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processGroupId: null,
         processStartedAt: null,
         contextSnapshot: context,
+        // BLO-25024: same as deferRunForK8sIsolationConflict above. This run was
+        // already running, so reset its dispatch-wait clock to this re-queue.
+        queuedAt: now,
         updatedAt: now,
       })
       .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
@@ -34630,6 +34711,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueId,
             run: livenessRun,
             k8sRunIsolation,
+            knownAgentIds: await getActiveAgentIds(db, agent.companyId),
           }));
         }
         await recordZeroTokenCompletedRunStreak(agent);
@@ -35118,6 +35200,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   issueId: setupFailureIssueId,
                   run: livenessRun,
                   k8sRunIsolation: null,
+                  knownAgentIds: await getActiveAgentIds(db, failedAgent.companyId),
                 }));
                 await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
               }
@@ -35977,16 +36060,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           continue;
         }
 
-        // Only human/comment-reopen interactions should revive completed issues;
-        // system follow-ups such as retry or cleanup wakes must not reopen closed work.
-        const shouldReopenDeferredCommentWake =
-          deferredCommentIds.length > 0 &&
-          !deferredCommentWakeIsSelfAuthored &&
-          (issue.status === "done" || issue.status === "cancelled") &&
-          (
-            deferred.requestedByActorType === "user" ||
-            deferredWakeReason === "issue_reopened_via_comment"
-          );
+        // Shared with the lockless drain in `recovery/service.ts`, which
+        // promotes these same wakes when no run will ever finalize on the
+        // issue. The two sites disagreed on this predicate once (PEN-3739); the
+        // helper is what stops that recurring.
+        const shouldReopenDeferredCommentWake = shouldReopenTerminalIssueForDeferredWake({
+          issueStatus: issue.status,
+          commentIds: deferredCommentIds,
+          commentWakeIsSelfAuthored: deferredCommentWakeIsSelfAuthored,
+          requestedByActorType: deferred.requestedByActorType,
+          wakeReason: deferredWakeReason,
+        });
         let reopenedActivity: LogActivityInput | null = null;
 
         if (shouldReopenDeferredCommentWake) {

@@ -84,6 +84,7 @@ import {
   findReusableHumanJoinRequest,
 } from "../lib/join-request-dedupe.js";
 import { assertAuthenticated, assertCompanyAccess } from "./authz.js";
+import { redactInviteRecord, redactJoinRequestRecord } from "./invite-response.js";
 import {
   claimBoardOwnership,
   inspectBoardClaimChallenge
@@ -366,8 +367,10 @@ function listAvailableSkills(): AvailableSkill[] {
 }
 
 function toJoinRequestResponse(row: typeof joinRequests.$inferSelect) {
-  const { claimSecretHash: _claimSecretHash, ...safe } = row;
-  return safe;
+  // Strips `claimSecretHash` and masks the adapter credentials inside
+  // `agentDefaultsPayload` — see `invite-response.ts` for why the mask is
+  // unconditional and why no write-side restore is needed (PEN-3725).
+  return redactJoinRequestRecord(row);
 }
 
 type JoinDiagnostic = {
@@ -1533,7 +1536,10 @@ async function loadCompanyInviteRecords(
 
   return {
     invites: visibleRows.map((invite) => ({
-      ...invite,
+      // `humanRole` / `inviteMessage` below are derived from the RAW row on purpose: they read
+      // `defaultsPayload.human.role` and `.agentMessage`, neither of which is credential material,
+      // so they must be computed before the spread is masked (PEN-3725).
+      ...redactInviteRecord(invite),
       companyName,
       humanRole: extractInviteHumanRole(invite),
       inviteMessage: extractInviteMessage(invite),
@@ -3562,7 +3568,7 @@ export function accessRoutes(
         companyBranding
       );
       res.status(201).json({
-        ...created,
+        ...redactInviteRecord(created),
         token,
         invitePath: inviteSummary.invitePath,
         inviteUrl: inviteSummary.inviteUrl,
@@ -3616,7 +3622,7 @@ export function accessRoutes(
         companyBranding
       );
       res.status(201).json({
-        ...created,
+        ...redactInviteRecord(created),
         token,
         invitePath: inviteSummary.invitePath,
         inviteUrl: inviteSummary.inviteUrl,
@@ -4343,7 +4349,7 @@ export function accessRoutes(
       await assertCompanyPermission(req, invite.companyId, "users:invite");
     }
     if (invite.acceptedAt) throw conflict("Invite already consumed");
-    if (invite.revokedAt) return res.json(invite);
+    if (invite.revokedAt) return res.json(redactInviteRecord(invite));
 
     const revoked = await db
       .update(invites)
@@ -4366,7 +4372,7 @@ export function accessRoutes(
       });
     }
 
-    res.json(revoked);
+    res.json(redactInviteRecord(revoked));
   });
 
   router.get("/companies/:companyId/invites", async (req, res) => {

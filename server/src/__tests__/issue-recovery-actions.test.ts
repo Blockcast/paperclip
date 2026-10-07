@@ -51,6 +51,7 @@ import {
   strandedRecoveryWakeAttemptsExhausted,
   summarizeStrandedRecoveryHandBackPass,
 } from "../services/recovery/service.js";
+import { postRoutineDispatchFailureHeartbeat } from "../services/recovery/routine-scheduler-heartbeat.js";
 
 // BLO-19160: seam for the adoption-interleaving regression test. The stranded
 // sweep reads its candidates as one bulk snapshot and only reaches the
@@ -316,6 +317,201 @@ describe("issueRecoveryActionService", () => {
       sourceScopedWakeHorizonAt: originalHorizon.toISOString(),
     });
     expect(updates.at(-1)).toMatchObject({ timeoutAt: originalHorizon });
+  });
+
+  // BLO-40297 (review). The derived arm retires a legacy `maxAttempts: null` row as
+  // `timeout_horizon` and announces "Paperclip has stopped waking anyone for it". If that row
+  // later takes a waking cause, the upsert gives it `maxAttempts` and a FRESH horizon — at
+  // which point `strandedRecoveryWakeAttemptsExhausted` returns false again and the owner IS
+  // woken, on a row still marked retired. The notice is then false and
+  // `resolveStrandedEscalationStatus` leaves the issue dispatchable mid-wake. The write that
+  // makes the predicate false must therefore also lift the retirement.
+  it("lifts a derived timeout_horizon retirement when the row takes its first real horizon", async () => {
+    const freshHorizon = new Date("2026-06-01T00:00:00.000Z");
+    // The derived-arm shape exactly: retired without ever persisting a horizon, so no
+    // `sourceScopedWakeHorizonAt` evidence key and a null `maxAttempts`.
+    let row = makeRecoveryActionRow({
+      id: "derived-retired-action",
+      status: "escalated",
+      retiringBound: "timeout_horizon",
+      // Pinned, not inherited from the helper default: the whole point of this fixture is
+      // the UNCHANGED-owner path. If this ever drifts from the `ownerAgentId` in the upsert
+      // below, `isNewOwnerSequence` goes true, resets `attemptCount` for a different reason,
+      // and the test passes via the branch it is not trying to cover.
+      ownerAgentId: "agent-1",
+      // Above the input `maxAttempts` of 5. A legacy row climbs its counter un-refunded
+      // while `maxAttempts` is null, so the real cohort arrives here well over any budget
+      // it is about to be given. With the counter left at the helper default of 1 this
+      // fixture cannot observe the lift returning an exhausted row to `active`.
+      attemptCount: 9,
+      maxAttempts: null,
+      timeoutAt: null,
+      evidence: { latestRunId: "run-1" },
+    });
+    const makeSelectQuery = () => ({
+      from() { return this; },
+      where() { return this; },
+      orderBy() { return this; },
+      limit() { return Promise.resolve(row ? [row] : []); },
+    });
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery()),
+      update: vi.fn(() => ({
+        set: vi.fn((patch: Record<string, unknown>) => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => {
+              row = { ...row, ...patch };
+              return [row];
+            }),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+
+    const rebound = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: "agent-1",
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:rebound",
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+      timeoutAt: freshHorizon,
+    });
+
+    // Honestly bounded-and-active: the row now has a budget and a live horizon, so it must
+    // not also claim to be retired. `escalateExpiredWakeHorizons`'s PERSISTED arm re-retires
+    // it when `freshHorizon` burns, so this is not a way back into the unbounded loop.
+    expect(rebound).toMatchObject({
+      status: "active",
+      retiringBound: null,
+      maxAttempts: 5,
+    });
+    expect(new Date(rebound.timeoutAt as unknown as string).getTime()).toBe(freshHorizon.getTime());
+    // The load-bearing half: un-retiring a row that is still over budget is WORSE than
+    // leaving it retired. `resolveStrandedEscalationStatus` derives
+    // `isWakeExhaustedEscalation` from `status === "escalated"`, so an `active` row counts as
+    // a live owner and holds the source issue `blocked` — while this predicate says no wake
+    // can fire. Lifting must therefore also refund the count spent under no budget.
+    expect(rebound.attemptCount).toBe(1);
+    expect(
+      strandedRecoveryWakeAttemptsExhausted(rebound, new Date("2026-05-31T00:00:00.000Z")),
+    ).toBe(false);
+  });
+
+  // Negative control for the lift above: BLO-24662's "owner churn must not restore a burned
+  // horizon" is unchanged. A row that actually HAS a persisted horizon carries a non-null
+  // `carriedWakeHorizonAt`, so `isNewlyBoundedSequence` is false and nothing is lifted. If
+  // this test ever goes green on `active`, the lift has widened past the derived arm.
+  it("keeps a persisted timeout_horizon retirement sticky across an owner change", async () => {
+    const burnedHorizon = new Date("2026-05-01T00:00:00.000Z");
+    let row = makeRecoveryActionRow({
+      id: "persisted-retired-action",
+      status: "escalated",
+      retiringBound: "timeout_horizon",
+      ownerAgentId: "agent-1",
+      maxAttempts: 5,
+      timeoutAt: burnedHorizon,
+      evidence: { latestRunId: "run-1" },
+    });
+    const makeSelectQuery = () => ({
+      from() { return this; },
+      where() { return this; },
+      orderBy() { return this; },
+      limit() { return Promise.resolve(row ? [row] : []); },
+    });
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery()),
+      update: vi.fn(() => ({
+        set: vi.fn((patch: Record<string, unknown>) => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => {
+              row = { ...row, ...patch };
+              return [row];
+            }),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+
+    const swept = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: "agent-2",
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:sticky",
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+      timeoutAt: new Date("2026-06-01T00:00:00.000Z"),
+    });
+
+    expect(swept).toMatchObject({ status: "escalated", retiringBound: "timeout_horizon" });
+    expect(new Date(swept.timeoutAt as unknown as string).getTime()).toBe(burnedHorizon.getTime());
+  });
+
+  // Second negative control, for the `retiringBound === "timeout_horizon"` clause rather than
+  // for `isNewlyBoundedSequence`. Becoming newly bounded is not on its own a reason to lift
+  // SOME OTHER bound: an `attempt_budget` retirement is lifted by an owner CHANGE and by
+  // nothing else (BLO-19124), because the budget belongs to the owner that spent it. A legacy
+  // row can reach `maxAttempts: null` with no evidence key while retired on the budget (the
+  // bounded -> ownerless -> bounded flap in the ROLLOUT NOTE), which is exactly where a lift
+  // keyed only on `isNewlyBoundedSequence` would hand an unchanged owner a budget it never
+  // earned back.
+  it("does not lift an attempt_budget retirement just because the row becomes newly bounded", async () => {
+    let row = makeRecoveryActionRow({
+      id: "budget-retired-action",
+      status: "escalated",
+      retiringBound: "attempt_budget",
+      ownerAgentId: "agent-1",
+      maxAttempts: null,
+      timeoutAt: null,
+      evidence: { latestRunId: "run-1" },
+    });
+    const makeSelectQuery = () => ({
+      from() { return this; },
+      where() { return this; },
+      orderBy() { return this; },
+      limit() { return Promise.resolve(row ? [row] : []); },
+    });
+    const fakeDb = {
+      select: vi.fn(() => makeSelectQuery()),
+      update: vi.fn(() => ({
+        set: vi.fn((patch: Record<string, unknown>) => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => {
+              row = { ...row, ...patch };
+              return [row];
+            }),
+          })),
+        })),
+      })),
+      insert: vi.fn(),
+    };
+
+    const swept = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      // SAME owner, so `liftsAttemptBudgetRetirement` does not fire either.
+      ownerAgentId: "agent-1",
+      cause: "stranded_assigned_issue",
+      fingerprint: "source-scoped:fingerprint:budget",
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+      timeoutAt: new Date("2026-06-01T00:00:00.000Z"),
+    });
+
+    expect(swept).toMatchObject({ status: "escalated", retiringBound: "attempt_budget" });
   });
 
   // BLO-20263. The handoff comment grant's TTL is measured from this anchor, so if
@@ -2509,6 +2705,54 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueThreadInteractions.issueId, sourceIssueId));
     expect(card?.status).toBe("pending");
     expect(updatedIssue?.monitorNextCheckAt === null).toBe(providerQuotaMonitored === 0);
+  });
+
+  // PEN-3636: pins the WIRING, which is the one part the prefilter's own suite cannot
+  // reach. `recovery-pause-hold-prefilter.test.ts` constructs its own prefilter and
+  // `isAutomaticRecoverySuppressedByPauseHold`'s no-prefilter path is deliberately
+  // behaviour-preserving, so dropping the `activePauseHoldPrefilter` argument from the
+  // sweep's guard call used to leave BOTH suites green while silently restoring the
+  // O(candidates) company read this whole change exists to remove. The counters make that
+  // observable: with two candidates in one company the company-scoped question is asked
+  // once and answered from the memo thereafter, so a dropped argument reads 0/0 here.
+  it("answers the sweep's per-candidate pause-hold guard from one company-scoped read", async () => {
+    const { companyId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const secondIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId,
+      title: "Second stranded candidate",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    for (const issueId of [sourceIssueId, secondIssueId]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "manual",
+        status: "failed",
+        error: "adapter crashed",
+        errorCode: "adapter_failed",
+        startedAt: new Date("2026-07-15T20:00:00.000Z"),
+        finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+        contextSnapshot: { issueId },
+      });
+    }
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // Both rows reached the guard, so the company question was genuinely asked twice.
+    expect(result.candidatesScanned).toBeGreaterThanOrEqual(2);
+    // Asked of the database exactly once, and served from the memo for every candidate
+    // after the first. `liveReads === 1` is the assertion that goes red if the sweep stops
+    // passing its prefilter; `memoHits` is what that saved.
+    expect(result.pauseHoldPrefilterLiveReads).toBe(1);
+    expect(result.pauseHoldPrefilterMemoHits).toBeGreaterThanOrEqual(1);
   });
 
   it("schedules a provider-quota monitor for the original assignee without creating recovery work", async () => {
@@ -9278,6 +9522,66 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(afterCancel[0]!.idempotencyKey).toBe(`scheduler-heartbeat:${routineId}:${windowKey}`);
       // The surviving row is the original strand-time one, not a rewrite.
       expect(afterCancel[0]!.body).toContain("external_lifecycle_stale_killed");
+    });
+
+    // BLO-40337 AC3: the dispatch-failure receipt shares that same key, so a
+    // window whose dispatch failed and whose *later* catch-up fire then
+    // stranded still carries at most one scheduler receipt in total.
+    it("collapses a dispatch-failure and a later strand-time receipt onto one row", async () => {
+      const { companyId, managerId, coderId, prefix } = await seedCompany();
+      const { alertIssueId, routineId } = await seedRoutineWithAlertSurface({
+        companyId,
+        prefix,
+        assigneeAgentId: managerId,
+      });
+      const triggeredAt = new Date("2026-09-21T00:07:11.010Z");
+      const { issue, routineRunId } = await seedRoutineExecutionIssue({
+        companyId,
+        prefix,
+        assigneeAgentId: coderId,
+        routineId,
+        triggeredAt,
+        siblingTriggeredAt: [
+          new Date("2026-09-20T18:07:11.010Z"),
+          new Date("2026-09-20T12:07:11.010Z"),
+        ],
+        issueNumber: 520,
+      });
+
+      await postRoutineDispatchFailureHeartbeat(
+        { db, addComment: issueService(db).addComment, logger },
+        {
+          companyId,
+          routineId,
+          run: {
+            id: routineRunId,
+            triggeredAt,
+            // The live shape from the six measured windows.
+            failureReason: "Failed query: select pg_advisory_xact_lock(hashtextextended($1, 0))",
+          },
+        },
+      );
+
+      const windowKey = triggeredAt.toISOString();
+      const afterDispatchFailure = await db
+        .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(afterDispatchFailure).toHaveLength(1);
+      expect(afterDispatchFailure[0]!.idempotencyKey).toBe(
+        `scheduler-heartbeat:${routineId}:${windowKey}`,
+      );
+      expect(afterDispatchFailure[0]!.body).toContain("pg_advisory_xact_lock");
+
+      await issueService(db).update(issue.id, { status: "cancelled" });
+
+      const afterCancel = await db
+        .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId));
+      expect(afterCancel).toHaveLength(1);
+      // The surviving row is the dispatch-failure one, not a rewrite.
+      expect(afterCancel[0]!.body).toContain("pg_advisory_xact_lock");
     });
 
     /**

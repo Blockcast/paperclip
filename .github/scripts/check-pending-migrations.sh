@@ -92,6 +92,17 @@ spec:
         paperclip.dev/purpose: migration-preflight
     spec:
       restartPolicy: Never
+      # Every schedulable node is tainted: the paperclip pool with
+      # dedicated=paperclip, the data pool with pool=data (onprem-k8s#4345), the
+      # control plane with its role. Kyverno's default data-pool toleration skips
+      # this namespace by design, so a pod tolerating neither pool never schedules
+      # and the pre-flight dies INCONCLUSIVE at its startup budget. Tolerate the
+      # pool the API itself runs on (the tolerations list in values.blockcast.yaml).
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: paperclip
+          effect: NoSchedule
       containers:
         - name: preflight
           image: ${IMAGE_REPO}@${DIGEST}

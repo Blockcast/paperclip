@@ -38,6 +38,7 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { issueService } from "../services/issues.ts";
 import { AGENT_POD_BUSY_MAX_STALE_MS } from "../services/k8s-job-liveness.ts";
 import { STALE_RUNNING_ISSUE_LOCK_MS } from "../services/recovery/service.ts";
+import { LOCKLESS_DEFERRED_WAKE_MIN_AGE_MS } from "../services/recovery/service.ts";
 import { NON_LIVE_EXECUTION_SILENCE_MS } from "../services/productivity-review.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -3256,6 +3257,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         status: "in_progress",
         priority: "high",
         assigneeAgentId: agentId,
+        responsibleUserId: "pen-3739-responsible-user",
         executionRunId: runningRunId,
         executionLockedAt: new Date(),
         checkoutRestoreStatus: "todo",
@@ -3306,6 +3308,532 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       // the drain would mint a row with no wake path of any kind.
       expect((await readRow(strandedId))?.status).toBe("todo");
       expect((await readRow(genuinelyBlockedId))?.status).toBe("blocked");
+    });
+  });
+
+  // PEN-3739. The sibling of the block above, for deferred WAKES rather than
+  // checkout promotions, and stranded by the same selection criterion: the
+  // sweep's candidate scan needs a non-null lock column and its own repair nulls
+  // both, so every pass mints rows the next pass cannot select.
+  //
+  // Each case seeds a wake older than LOCKLESS_DEFERRED_WAKE_MIN_AGE_MS against
+  // an issue with NO execution lock and NO finalizing run — the shape whose only
+  // other promoter is "the next run that finalizes on this issue", which on a
+  // quiet issue is never.
+  describe("lockless deferred issue-wake drain (PEN-3739)", () => {
+    // The promote arm re-enters the live `enqueueWakeup`, which dispatches the
+    // run it queues. Dispatch is not what these cases are about, and letting it
+    // run races the suite's own teardown (a dispatched run writes
+    // heartbeat_run_events after the test body returns, and the afterEach
+    // delete order then trips the FK). Suppressing it leaves exactly the signal
+    // under test: the wake reached the queue.
+    const drainSweep = () => heartbeatService(db, { skipQueuedRunDispatch: true });
+
+    async function seedDeferredWake(input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      reason?: string;
+      requestedByActorType?: "user" | "agent" | "system";
+      requestedAt?: Date;
+      wakeCommentIds?: string[];
+    }) {
+      const wakeId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        source: "automation",
+        triggerDetail: "system",
+        // What the deferral insert actually writes — it hardcodes this constant
+        // and the real wake reason rides in the context snapshot. The fixture
+        // used to put the reason here too, which is a divergence no production
+        // producer has, and it hid the fact that the drain was carrying the
+        // deferral reason forward onto the wake it promoted.
+        reason: "issue_execution_deferred",
+        payload: {
+          issueId: input.issueId,
+          _paperclipWakeContext: {
+            issueId: input.issueId,
+            wakeReason: input.reason ?? "issue_comment_added",
+            wakeCommentId: "comment-under-test",
+            ...(input.wakeCommentIds ? { wakeCommentIds: input.wakeCommentIds } : {}),
+          },
+        },
+        requestedByActorType: input.requestedByActorType ?? "agent",
+        status: "deferred_issue_execution",
+        requestedAt: input.requestedAt ?? new Date(Date.now() - 2 * 60 * 60 * 1000),
+      });
+      return wakeId;
+    }
+
+    // A comment the reopen predicate can actually resolve an author for.
+    // `createdByRunId: null` is a human comment; passing a run id makes it
+    // agent-authored, which is what the self-wake conjunct screens on.
+    async function seedIssueComment(input: {
+      companyId: string;
+      issueId: string;
+      createdByRunId?: string | null;
+    }) {
+      const commentId = randomUUID();
+      await db.insert(issueComments).values({
+        id: commentId,
+        companyId: input.companyId,
+        issueId: input.issueId,
+        body: "Please pick this back up.",
+        authorType: "user",
+        authorUserId: "pen-3739-human",
+        createdByRunId: input.createdByRunId ?? null,
+      });
+      return commentId;
+    }
+
+    async function seedLocklessIssue(input: {
+      companyId: string;
+      agentId: string;
+      status?: "todo" | "in_progress" | "done" | "cancelled";
+    }) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        title: "Quiet issue with a stranded deferred wake",
+        status: input.status ?? "in_progress",
+        priority: "high",
+        assigneeAgentId: input.agentId,
+        // enqueueWakeup refuses to seed a run it cannot attribute
+        // (`responsible_user_unresolved`, 422). A real issue carries this; a
+        // fixture without it would make the promote arm vacuously unreachable
+        // and every assertion below meaningless.
+        responsibleUserId: "pen-3739-responsible-user",
+        // The whole point: no lock for the sweep's candidate scan to find.
+        checkoutRunId: null,
+        executionRunId: null,
+        executionLockedAt: null,
+      });
+      return issueId;
+    }
+
+    const readWake = (wakeId: string) =>
+      db
+        .select({
+          status: agentWakeupRequests.status,
+          error: agentWakeupRequests.error,
+          reason: agentWakeupRequests.reason,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeId))
+        .then((rows) => rows[0] ?? null);
+
+    const readIssue = (issueId: string) =>
+      db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+
+    it("promotes a lockless deferred wake and attributes the promotion to the drain", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId });
+      const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
+
+      const result = await drainSweep().sweepStaleIssueLocks();
+
+      // Attributable by the drain's own emitted evidence. A row merely leaving
+      // `deferred_issue_execution` proves nothing while
+      // releaseIssueExecutionAndPromote could equally have caused it — and here
+      // there is no run to finalize, which is exactly the point.
+      expect(result.drainedDeferredWakePromotions).toBe(1);
+      expect(result.drainedDeferredWakePromotionWakeIds).toEqual([wakeId]);
+      expect(result.drainedDeferredWakeCancellations).toBe(0);
+
+      const wake = await readWake(wakeId);
+      expect(wake?.status).toBe("cancelled");
+      expect(wake?.error).toContain("lockless drain");
+
+      // Re-entered through the live entry point rather than hand-promoted, so a
+      // real run exists for the issue.
+      const queued = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`);
+      expect(queued).toHaveLength(1);
+    });
+
+    it("cancels a lockless deferred wake whose issue has an unresolved blocker", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId });
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Blocker",
+        status: "todo",
+        priority: "high",
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
+      const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
+
+      const result = await drainSweep().sweepStaleIssueLocks();
+
+      // A policy choice, not a forced one — promoting would write a durable
+      // dep-blocked park rather than re-queueing into suppression. What the
+      // cancel avoids is this drain re-selecting the row and minting a fresh
+      // park every pass, because `enqueueWakeup` returns `null` for a park and
+      // a decline alike. Grounds in full at the arm.
+      expect(result.drainedDeferredWakeCancellations).toBe(1);
+      expect(result.drainedDeferredWakeCancellationWakeIds).toEqual([wakeId]);
+      expect(result.drainedDeferredWakePromotions).toBe(0);
+      expect((await readWake(wakeId))?.error).toContain("dependency blocker");
+
+      const queued = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`);
+      expect(queued).toHaveLength(0);
+    });
+
+    it("cancels a system wake on a closed issue but keeps one that can reopen it", async () => {
+      const { companyId, agentId } = await seed();
+      const closedIssueId = await seedLocklessIssue({ companyId, agentId, status: "done" });
+      const reopenableIssueId = await seedLocklessIssue({
+        companyId,
+        agentId,
+        status: "done",
+      });
+      const systemWakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId: closedIssueId,
+        reason: "scheduled_retry",
+        requestedByActorType: "system",
+      });
+      // A human follow-up: a comment with no authoring run. Both the
+      // comment-referenced and the not-self-authored conjuncts need this to be
+      // a real row — a wake naming no resolvable comment is not reopen-eligible.
+      const humanCommentId = await seedIssueComment({
+        companyId,
+        issueId: reopenableIssueId,
+      });
+      const reopenWakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId: reopenableIssueId,
+        reason: "issue_reopened_via_comment",
+        requestedByActorType: "user",
+        wakeCommentIds: [humanCommentId],
+      });
+
+      const result = await drainSweep().sweepStaleIssueLocks();
+
+      // Not a blanket terminal cancel: releaseIssueExecutionAndPromote reopens a
+      // closed issue for a human or comment-reopen wake, and cancelling those
+      // would destroy the one wake class whose purpose is reviving closed work.
+      expect(result.drainedDeferredWakeCancellationWakeIds).toEqual([systemWakeId]);
+      expect((await readWake(systemWakeId))?.error).toContain("cannot reopen it");
+      expect(result.drainedDeferredWakePromotionWakeIds).toEqual([reopenWakeId]);
+
+      // The arm's whole purpose. Promoting without this delivers the wake
+      // against an issue still `done` — the agent wakes on closed work with no
+      // reopen in context, and the deferred row is retired anyway, so the wake
+      // is consumed without reviving anything. Asserting only the wake-id
+      // bookkeeping above cannot see that.
+      expect((await readIssue(reopenableIssueId))?.status).toBe("todo");
+      expect((await readIssue(closedIssueId))?.status).toBe("done");
+
+      // The reopen is attributable to the drain, not to a finalizing run —
+      // there is none, which is the condition this drain exists to repair.
+      const reopenActivity = await db
+        .select({ details: activityLog.details, runId: activityLog.runId })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.action, "issue.updated"),
+            eq(activityLog.entityId, reopenableIssueId),
+            // Scoped to the drain's own row rather than to every `issue.updated`
+            // on this issue. `issuesSvc.update` logging one of its own would
+            // make the length assertion below fail for a reason that has nothing
+            // to do with the drain — an invariant of a service this test does
+            // not own.
+            sql`${activityLog.details} ->> 'source' = 'lockless_deferred_wake_drain'`,
+          ),
+        );
+      expect(reopenActivity).toHaveLength(1);
+      expect(reopenActivity[0]?.runId).toBeNull();
+      expect(reopenActivity[0]?.details).toMatchObject({
+        reopened: true,
+        reopenedFrom: "done",
+        source: "lockless_deferred_wake_drain",
+      });
+
+      // The promoted run carries the reopen in its context, as the steady-state
+      // promoter's `promotedContextSeed.reopenedFrom` does.
+      const promotedRun = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${reopenableIssueId}`);
+      expect(promotedRun).toHaveLength(1);
+      expect(
+        (promotedRun[0]?.contextSnapshot as Record<string, unknown> | null)?.reopenedFrom,
+      ).toBe("done");
+    });
+
+    it("cancels a terminal wake whose only comment is the waking agent's own (BLO-23206 shape)", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId, status: "done" });
+      // Local-CLI agents post under *user* auth, so this arrives indistinguishable
+      // from a human follow-up on every field except the comment's authoring run.
+      const selfCommentId = await seedIssueComment({
+        companyId,
+        issueId,
+        createdByRunId: failedRunId,
+      });
+      const selfWakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        reason: "issue_comment_added",
+        requestedByActorType: "user",
+        wakeCommentIds: [selfCommentId],
+      });
+
+      const result = await drainSweep().sweepStaleIssueLocks();
+
+      // The `user` actor type alone would have made this reopen-eligible, which
+      // is what re-queues an agent onto the issue its own run just closed.
+      expect(result.drainedDeferredWakeCancellationWakeIds).toEqual([selfWakeId]);
+      expect((await readIssue(issueId))?.status).toBe("done");
+    });
+
+    it("does not let a self-authored comment vouch for an unresolved sibling id in the same wake", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId, status: "done" });
+      const selfCommentId = await seedIssueComment({
+        companyId,
+        issueId,
+        createdByRunId: failedRunId,
+      });
+      // A deleted comment: the id resolves to no row. Alone it reads as
+      // reopen-eligible; batched beside a self-authored id it must too.
+      const vanishedCommentId = randomUUID();
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        reason: "issue_comment_added",
+        requestedByActorType: "user",
+        wakeCommentIds: [selfCommentId, vanishedCommentId],
+      });
+
+      const result = await drainSweep().sweepStaleIssueLocks();
+
+      expect(result.drainedDeferredWakeCancellationWakeIds).toEqual([]);
+      expect(result.drainedDeferredWakePromotionWakeIds).toEqual([wakeId]);
+      expect((await readIssue(issueId))?.status).toBe("todo");
+    });
+
+    it("records a drained promotion as promoted, not as the deferral it carried", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId });
+      await seedDeferredWake({ companyId, agentId, issueId });
+
+      await drainSweep().sweepStaleIssueLocks();
+
+      // The deferral insert hardcodes `issue_execution_deferred`. Carrying that
+      // forward left a drained wake indistinguishable from a fresh deferral in
+      // the table, against the attributability this drain is built around.
+      const promoted = await db
+        .select({ reason: agentWakeupRequests.reason })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, "queued"),
+          ),
+        );
+      expect(promoted).toHaveLength(1);
+      expect(promoted[0]?.reason).toBe("issue_execution_promoted");
+    });
+
+    it("leaves a deferred wake alone while the issue still holds an execution lock", async () => {
+      const { companyId, agentId, runningRunId } = await seed();
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Live holder",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionRunId: runningRunId,
+        executionLockedAt: new Date(),
+      });
+      const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
+
+      const result = await drainSweep().sweepStaleIssueLocks();
+
+      // The existing lock-clearing pass owns this row; the drain must not race
+      // it or force a run past a live holder.
+      expect(result.drainedDeferredWakePromotions).toBe(0);
+      expect(result.drainedDeferredWakeCancellations).toBe(0);
+      expect((await readWake(wakeId))?.status).toBe("deferred_issue_execution");
+    });
+
+    it("leaves a wake younger than the quiet period, then drains it once it ages", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId });
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        // Inside the window where a finalizer's own promotion loop is the
+        // expected promoter; acting here would race the steady-state path.
+        requestedAt: new Date(Date.now() - 60 * 1000),
+      });
+
+      const heartbeat = drainSweep();
+      expect((await heartbeat.sweepStaleIssueLocks()).drainedDeferredWakePromotions).toBe(0);
+      expect((await readWake(wakeId))?.status).toBe("deferred_issue_execution");
+
+      await db
+        .update(agentWakeupRequests)
+        .set({ requestedAt: new Date(Date.now() - LOCKLESS_DEFERRED_WAKE_MIN_AGE_MS - 60_000) })
+        .where(eq(agentWakeupRequests.id, wakeId));
+
+      expect((await heartbeat.sweepStaleIssueLocks()).drainedDeferredWakePromotionWakeIds)
+        .toEqual([wakeId]);
+    });
+
+    it("does not reopen a closed issue when the assignee cannot be invoked", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId, status: "done" });
+      const humanCommentId = await seedIssueComment({ companyId, issueId });
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        // Reopen-eligible on every conjunct, so the ONLY thing standing between
+        // this row and a `done` -> `todo` write is the invokability gate.
+        reason: "issue_reopened_via_comment",
+        requestedByActorType: "user",
+        wakeCommentIds: [humanCommentId],
+      });
+      await db
+        .update(agents)
+        .set({ status: "paused" })
+        .where(eq(agents.id, agentId));
+
+      const heartbeat = drainSweep();
+      const first = await heartbeat.sweepStaleIssueLocks();
+
+      // The reopen used to run ABOVE this gate, so pass 1 wrote the issue to
+      // `todo` and then skipped — and pass 2 saw a non-terminal issue, took the
+      // ordinary promote path, and skipped again. Net: closed work silently
+      // reopened, the wake that justified reopening never delivered, and the row
+      // still stranded. Both halves have to hold, so assert both.
+      expect(first.drainedDeferredWakePromotions).toBe(0);
+      expect(first.drainedDeferredWakeCancellations).toBe(0);
+      expect((await readIssue(issueId))?.status).toBe("done");
+      expect((await readWake(wakeId))?.status).toBe("deferred_issue_execution");
+
+      // Skipping is a real verb, but it holds a batch slot, so it is reported
+      // rather than silent: zero promotions and zero cancellations otherwise
+      // read identically to "nothing to drain".
+      expect(first.drainedDeferredWakeSkips).toBe(1);
+      expect(first.drainedDeferredWakeSkippedWakeIds).toEqual([wakeId]);
+
+      // Stable across passes — not reopened on the second one either.
+      const second = await heartbeat.sweepStaleIssueLocks();
+      expect(second.drainedDeferredWakeSkippedWakeIds).toEqual([wakeId]);
+      expect((await readIssue(issueId))?.status).toBe("done");
+
+      // And it drains for real once the seat comes back, so the gate defers the
+      // reopen rather than permanently refusing it.
+      await db
+        .update(agents)
+        .set({ status: "active" })
+        .where(eq(agents.id, agentId));
+
+      const third = await heartbeat.sweepStaleIssueLocks();
+      expect(third.drainedDeferredWakePromotionWakeIds).toEqual([wakeId]);
+      expect(third.drainedDeferredWakeSkips).toBe(0);
+      expect((await readIssue(issueId))?.status).toBe("todo");
+    });
+
+    it("still retires both cancel arms behind a paused assignee, rather than skipping them", async () => {
+      const { companyId, agentId } = await seed();
+
+      // Arm 1: an unresolved dependency edge.
+      const blockedIssueId = await seedLocklessIssue({ companyId, agentId });
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Blocker",
+        status: "todo",
+        priority: "high",
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      });
+      const blockedWakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId: blockedIssueId,
+      });
+
+      // Arm 2: a closed issue whose wake cannot reopen it.
+      const closedIssueId = await seedLocklessIssue({ companyId, agentId, status: "done" });
+      const closedWakeId = await seedDeferredWake({ companyId, agentId, issueId: closedIssueId });
+
+      await db
+        .update(agents)
+        .set({ status: "paused" })
+        .where(eq(agents.id, agentId));
+
+      const result = await drainSweep().sweepStaleIssueLocks();
+
+      // The invokability gate sits BELOW both cancel arms on purpose, and
+      // nothing else pins that. Hoisting it above them — which is the ordering
+      // a reader following "match the promoter" would reach for — leaves every
+      // other case in this describe green while turning both of these into
+      // skips, re-creating in the two arms that drain cleanly the exact batch
+      // starvation the gate exists to bound. Each arm decides on a fact about
+      // the row that is true whatever the assignee's state, so a paused seat
+      // must not hold either one.
+      expect(result.drainedDeferredWakeCancellations).toBe(2);
+      expect([...result.drainedDeferredWakeCancellationWakeIds].sort()).toEqual(
+        [blockedWakeId, closedWakeId].sort(),
+      );
+      expect(result.drainedDeferredWakeSkips).toBe(0);
+      expect(result.drainedDeferredWakeSkippedWakeIds).toEqual([]);
+      expect((await readWake(blockedWakeId))?.status).toBe("cancelled");
+      expect((await readWake(closedWakeId))?.status).toBe("cancelled");
+
+      // Retired, not reopened — the gate is below the cancel arms but still
+      // above the only irreversible write.
+      expect((await readIssue(closedIssueId))?.status).toBe("done");
+    });
+
+    it("is idempotent — a second pass finds nothing left to drain", async () => {
+      const { companyId, agentId } = await seed();
+      const issueId = await seedLocklessIssue({ companyId, agentId });
+      await seedDeferredWake({ companyId, agentId, issueId });
+
+      const heartbeat = drainSweep();
+      expect((await heartbeat.sweepStaleIssueLocks()).drainedDeferredWakePromotions).toBe(1);
+
+      const second = await heartbeat.sweepStaleIssueLocks();
+      expect(second.drainedDeferredWakePromotions).toBe(0);
+      expect(second.drainedDeferredWakeCancellations).toBe(0);
     });
   });
 });

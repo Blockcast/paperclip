@@ -1,0 +1,490 @@
+/**
+ * Re-drive `gate/ally-comment-findings` when GitHub never delivered the review
+ * event (BLO-39871).
+ *
+ * Three distinct ways this gate goes stale, and only this module covers the
+ * third:
+ *
+ *   1. **Missing branch** — the evaluator never ran on `pull_request_review`
+ *      at all. Fixed and deployed (BLO-29853).
+ *   2. **Lost evaluation** — the delivery arrives, the evaluation runs, the
+ *      status write fails and is never retried. Fixed by the durable outbox in
+ *      #2061 (BLO-36819).
+ *   3. **Lost trigger** — *the delivery never arrives*. Measured on
+ *      `Blockcast/trafficcontrol#2022` @ `0ad8773c`: the gate went `failure` at
+ *      06:47:35Z, Ally submitted an APPROVED review at that exact head at
+ *      07:29:34Z, and no `pull_request_review` event was ever delivered for it
+ *      (repo hook deliveries are contiguous across the window and contain none;
+ *      no handler log exists). Nothing recovers it: #2061's backstop is enqueued
+ *      *inside* the webhook handler, so no webhook means no backstop row, and
+ *      the `issue_comment` branch requires a consolidated-review heading that a
+ *      `<!-- paperclip:review-request -->` marker does not carry. The red stood
+ *      until a human hand-verified Ally 0/0 and overrode it.
+ *
+ * ## Why a sweep and not a new trigger
+ *
+ * Letting marker comments return a gate trigger gives a *manual* re-drive —
+ * someone still has to notice the stale red, which is the part that failed. It
+ * also routes recovery through the one branch #2061 deliberately leaves
+ * unbackstopped (an `issue_comment` payload carries no head sha, so taking one
+ * would mean an API read before the webhook ack). This sweep recovers with no
+ * human in the loop, and its own re-drive IS covered by #2061's backstop once
+ * that lands: it calls the same `runPrCommentReviewGateCheck`, whose status
+ * writes go through the same outbox as the webhook path.
+ *
+ * ## Why it is self-cancelling
+ *
+ * A PR is a candidate only while its gate status at the head is older than the
+ * reviewer's latest review, or absent entirely. Re-driving writes a status whose
+ * `created_at` postdates that review, so the next sweep skips it. A PR whose
+ * status already postdates its latest review is never probed past one cheap
+ * status read, and a PR with no reviewer review at all costs nothing.
+ *
+ * That argument holds only while the gate actually publishes, and one reachable
+ * path does not: an author-blind `success` with `authorUnknown` plus an
+ * unreadable `GET /pulls/{n}` returns `{posted: false, reason: "fetch_failed"}`
+ * before writing anything, and `githubFetchPrAuthorLogin` returns `null` on any
+ * non-ok response *or* a missing `user` — so that condition need not be
+ * transient. Such a PR stays stale and is re-attempted every sweep. The cap
+ * below is keyed on attempts precisely so that costs a bounded number of
+ * evaluations per sweep rather than one per candidate; retiring the PR itself
+ * needs the persisted per-PR attempt counter named there.
+ *
+ * Keying the cap on attempts also makes starvation deterministic rather than
+ * merely possible: candidates are walked in enumeration order, which is stable
+ * across sweeps, so `maxRedrives` permanently-wedged PRs spend the whole budget
+ * every sweep and the PRs behind them are never reached. `capped: true` is the
+ * signal that this is happening. See the ceiling note on the cap itself.
+ *
+ * ## No fail-open
+ *
+ * This module decides *when* to ask, never *what* the answer is. The verdict
+ * still comes from `runPrCommentReviewGateCheck`, which re-lists both surfaces
+ * live and filters by reviewer identity. Nothing here is read from a webhook
+ * payload body or author, because there is no payload — that is the whole point.
+ * The head sha is deliberately NOT passed through: the gate resolves the live
+ * head itself, so a head that moved since enumeration is evaluated as it is now
+ * rather than as the sweep remembers it.
+ */
+
+import type { Db } from "@paperclipai/db";
+import { loadConfig } from "../config.js";
+import { githubGetLatestCommitStatusForContext, githubReviewerIdentityMatches } from "./github-app-auth.js";
+import { enqueueGithubCommitStatusDelivery } from "./github-status-delivery-outbox.js";
+import { runPrCommentReviewGateCheck } from "./pr-comment-review-gate.js";
+import { logger as defaultLogger } from "../middleware/logger.js";
+
+/**
+ * Gate evaluations *attempted* per repo per sweep.
+ *
+ * ponytail: a flat cap, not a backoff. It bounds the one branch that spends API
+ * budget, which matters because the condition that strands a gate write —
+ * installation rate-limit exhaustion — is also the condition under which a
+ * re-drive is most likely to fail and be retried next sweep. It bounds cost per
+ * sweep, not repetition across sweeps: a PR whose re-drive never publishes is
+ * re-attempted forever, and because candidate order is stable, that PR consumes
+ * the same slot every sweep and starves whatever sits past the cap. Reaching
+ * that needs `maxRedrives` concurrently-wedged PRs whose *status* reads still
+ * succeed — a rate-limited repo fails the status read and consumes no attempt —
+ * so it is documented, not designed around. If re-drives routinely hit this cap,
+ * give each PR a persisted attempt counter rather than raising it; add a
+ * rotating start offset only if starvation is actually observed.
+ */
+export const DEFAULT_MAX_GATE_REDRIVES_PER_REPO = 20;
+
+export type GateRedriveCandidate = {
+  prNumber: number;
+  /** Head sha from the open-PR list payload. `null` disqualifies: nothing to probe. */
+  headSha: string | null;
+  prUrl: string | null;
+  /** False means the reviews probe failed — absence of reviews is then unproven. */
+  reviewsReadable: boolean;
+  reviews: Array<{ authorLogin: string | null; submittedAt: string }>;
+};
+
+/**
+ * One pass's re-drive tallies.
+ *
+ * **Invariant, and it is load-bearing rather than descriptive:** every `number`
+ * here is ADDITIVE across repos and every `boolean` is "happened in at least one
+ * repo this tick". {@link mergeSweepCounters} dispatches on the runtime
+ * type of each value, so it inherits that invariant rather than checking it — a
+ * field added here that breaks it (a configured ceiling echoed back, a ratio, an
+ * epoch timestamp, an AND-shaped flag) is summed or OR'd into nonsense with no
+ * type error and no test failure. A value that is neither number, boolean, nor a
+ * nested result object is skipped entirely, which is the same class. Add fields
+ * that obey it, or change the merge first.
+ */
+export type GateRedriveResult = {
+  /** Candidates offered to this pass. */
+  considered: number;
+  /** Candidates that cost a commit-status read. */
+  probed: number;
+  /**
+   * Gate evaluations started. This — not {@link GateRedriveResult.redriven} — is
+   * what the cap is keyed on: a `runGateCheck` call spends the same API budget
+   * whether or not it ends up publishing.
+   */
+  attempted: number;
+  /** Re-drives that published a status (so the next sweep skips the PR). */
+  redriven: number;
+  /**
+   * Every re-drive whose live status published but whose retired-context
+   * cleanup failed. Counted per CANDIDATE, and incremented before the retry is
+   * attempted, so it says nothing about whether one was armed.
+   *
+   * Its candidates are a superset of the candidates behind
+   * {@link GateRedriveResult.retirementRetryFailed} — but that counter is
+   * incremented per DELIVERY, so the two are in different units and the NUMBERS
+   * do not nest: one candidate with two failed deliveries is `1` here and `2`
+   * there. Do not read `retirementFailed >= retirementRetryFailed`.
+   *
+   * Read the pair, never this field alone. Alerting on `retirementFailed` by
+   * itself reads a stranded PR as recovered, which is the exact inversion the
+   * second counter exists to expose; the unit mismatch is also why the
+   * alertable condition is `retirementRetryFailed != 0` rather than any
+   * arithmetic between the two.
+   *
+   * Counted separately from `failed` because the PR has converged, so `failed`
+   * would state the opposite, and `redriven` alone cannot distinguish a clean
+   * re-drive from one leaving superseded contexts behind on every PR it touches.
+   */
+  retirementFailed: number;
+  /**
+   * Retirement deliveries that could not even be handed to the durable outbox,
+   * counted per delivery rather than per candidate.
+   *
+   * Non-zero means the retry was NOT armed, which returns the PR to the pre-fix
+   * state: a stale red standing on a retired context that no later sweep can
+   * reach, because the live-context probe this module re-drives on has just been
+   * satisfied. This is the alertable half of the pair.
+   */
+  retirementRetryFailed: number;
+  /** Re-drives that threw or returned without writing anything. */
+  failed: number;
+  /** Candidates skipped because the list payload carried no head sha. */
+  headless: number;
+  /** True when {@link DEFAULT_MAX_GATE_REDRIVES_PER_REPO} stopped the pass early. */
+  capped: boolean;
+};
+
+type Logger = { info: (o: unknown, m?: string) => void; warn: (o: unknown, m?: string) => void };
+
+const EMPTY_RESULT: GateRedriveResult = {
+  considered: 0,
+  probed: 0,
+  attempted: 0,
+  redriven: 0,
+  retirementFailed: 0,
+  retirementRetryFailed: 0,
+  failed: 0,
+  headless: 0,
+  capped: false,
+};
+
+/**
+ * A zeroed result.
+ *
+ * Exported so a caller accumulating these never hand-writes the field list: an
+ * initialiser that omits a counter is not a type error either, it just starts
+ * the field at `undefined` and makes every later `+=` produce `NaN`.
+ */
+export function emptyGateRedriveResult(): GateRedriveResult {
+  return { ...EMPTY_RESULT };
+}
+
+/**
+ * Accumulate `next` into `totals`, in place. Counters sum, flags OR, nested
+ * result objects recurse.
+ *
+ * Keys-driven, and that is the entire point. A caller summing these
+ * field-by-field gets no completeness check from the type system — every field
+ * is already initialised to `0`, so a counter added to a result type and
+ * forgotten at the accumulation site compiles clean and reports zero fleet
+ * wide, which reads as "this never happens" rather than as a bug.
+ *
+ * Generic over the result shape rather than over {@link GateRedriveResult}
+ * alone, because the body only ever dispatched on `typeof` and the enclosing
+ * `ReviewStateReconcileResult` has the identical defect class at its own
+ * accumulation site. Specialising it there bought nothing and left half the
+ * class open.
+ *
+ * A number or boolean is accumulated against whatever `totals` holds, with no
+ * guard on it — deliberately. An initialiser that omits a counter leaves
+ * `undefined`, and `undefined + n` is `NaN`, which is loud. Guarding that into a
+ * skip would report a healthy `0` instead, which is the very defect this helper
+ * exists to prevent, wearing the guard as a disguise. The recursion branch is
+ * the one exception and only because it has no loud option: it requires the
+ * counterpart in `totals` to be an object too, since there is nothing to recurse
+ * into otherwise and fabricating one would hide the same omission.
+ */
+export function mergeSweepCounters<T extends object>(totals: T, next: T): T {
+  const target = totals as unknown as Record<string, unknown>;
+  for (const [key, value] of Object.entries(next)) {
+    if (typeof value === "number") {
+      target[key] = (target[key] as number) + value;
+    } else if (typeof value === "boolean") {
+      target[key] = (target[key] as boolean) || value;
+    } else if (isPlainResultObject(value) && isPlainResultObject(target[key])) {
+      mergeSweepCounters(target[key] as object, value);
+    }
+  }
+  return totals;
+}
+
+function isPlainResultObject(value: unknown): value is object {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Timestamp of the reviewer's most recent review, or `null` when they have not
+ * reviewed.
+ *
+ * Deliberately no `state` filter. The question this answers is "could the
+ * evaluator now compute something different?", and every submitted state can
+ * change the verdict — including `DISMISSED`, which the evaluator's own reader
+ * drops, so dismissing a blocking review changes the answer exactly as much as
+ * submitting a clean one does. The same reasoning the `pull_request_review`
+ * webhook branch gives for accepting all three mutating actions.
+ */
+export function latestReviewerReviewAt(
+  reviews: Array<{ authorLogin: string | null; submittedAt: string }>,
+  reviewerBotLogin: string,
+): string | null {
+  let latest: number | null = null;
+  let latestRaw: string | null = null;
+  for (const review of reviews) {
+    if (!githubReviewerIdentityMatches(review.authorLogin ?? "", reviewerBotLogin)) continue;
+    const parsed = Date.parse(review.submittedAt);
+    if (!Number.isFinite(parsed)) continue;
+    if (latest === null || parsed > latest) {
+      latest = parsed;
+      latestRaw = review.submittedAt;
+    }
+  }
+  return latestRaw;
+}
+
+/**
+ * Is the published gate status older than the review that should have re-driven
+ * it?
+ *
+ * An absent status counts as stale: that is the shape a lost *first* delivery
+ * leaves behind, and it converges after one re-drive because the gate always
+ * publishes. An unparseable status timestamp is treated the same way rather than
+ * as "current" — the failure direction has to be "ask again", never "assume the
+ * red was deliberate".
+ */
+export function gateStatusIsStale(statusCreatedAt: string | null, latestReviewAt: string): boolean {
+  const reviewTime = Date.parse(latestReviewAt);
+  if (!Number.isFinite(reviewTime)) return false;
+  if (statusCreatedAt === null) return true;
+  const statusTime = Date.parse(statusCreatedAt);
+  if (!Number.isFinite(statusTime)) return true;
+  return statusTime < reviewTime;
+}
+
+/**
+ * One re-drive pass over a repo's open PRs.
+ *
+ * Takes candidates the caller has already enumerated rather than enumerating
+ * again: the open-PR list and the per-PR reviews are the expensive part, and
+ * `pr-review-state-reconciler` has both in hand by the time it calls this.
+ */
+export async function redriveStaleCommentReviewGates(input: {
+  db: Db;
+  repoFullName: string;
+  candidates: GateRedriveCandidate[];
+  reviewerBotLogin?: string;
+  statusContext?: string;
+  maxRedrives?: number;
+  logger?: Logger;
+  deps?: {
+    readStatus?: typeof githubGetLatestCommitStatusForContext;
+    runGateCheck?: typeof runPrCommentReviewGateCheck;
+    enqueueDelivery?: typeof enqueueGithubCommitStatusDelivery;
+  };
+}): Promise<GateRedriveResult> {
+  const config = loadConfig();
+  const statusContext = (input.statusContext ?? config.prCommentReviewGateStatusContext).trim();
+  // A deployment that has not opted into the gate must not pay a status read per
+  // PR per sweep for a context nobody publishes.
+  if (!statusContext) return { ...EMPTY_RESULT };
+
+  const reviewerBotLogin = (input.reviewerBotLogin ?? config.prReviewerBotLogin).trim();
+  if (!reviewerBotLogin) return { ...EMPTY_RESULT };
+
+  const log = input.logger ?? defaultLogger;
+  const readStatus = input.deps?.readStatus ?? githubGetLatestCommitStatusForContext;
+  const runGateCheck = input.deps?.runGateCheck ?? runPrCommentReviewGateCheck;
+  const enqueueDelivery = input.deps?.enqueueDelivery ?? enqueueGithubCommitStatusDelivery;
+  const maxRedrives = input.maxRedrives ?? DEFAULT_MAX_GATE_REDRIVES_PER_REPO;
+
+  const result: GateRedriveResult = { ...EMPTY_RESULT, considered: input.candidates.length };
+
+  for (const candidate of input.candidates) {
+    // An unreadable reviews probe is not "no reviews". Skipping is the only safe
+    // reading: re-driving every PR on an unreadable repo is an evaluation storm,
+    // and the next sweep re-reads.
+    if (!candidate.reviewsReadable) continue;
+    // Counted rather than skipped silently: if the list payload ever stops
+    // carrying `head.sha` the sweep stops re-driving entirely, and every other
+    // field in this result reads a healthy zero while it does.
+    if (!candidate.headSha) {
+      result.headless += 1;
+      continue;
+    }
+    const latestReviewAt = latestReviewerReviewAt(candidate.reviews, reviewerBotLogin);
+    if (!latestReviewAt) continue;
+
+    // Keyed on attempts, not on publishes. A `runGateCheck` that returns
+    // `posted: false` has already spent a full gate evaluation, so counting
+    // only the publishing ones leaves the budget unbounded in exactly the
+    // regime this cap exists for — a repo whose re-drives all fail would run
+    // one evaluation per candidate with `capped` reporting false.
+    if (result.attempted >= maxRedrives) {
+      result.capped = true;
+      break;
+    }
+
+    result.probed += 1;
+    const status = await readStatus({
+      repoFullName: input.repoFullName,
+      sha: candidate.headSha,
+      context: statusContext,
+    });
+    // Fail closed on an unreadable status for the same reason as above: the
+    // commonest cause is an exhausted installation budget, and re-driving blind
+    // under that condition spends the budget that would have recovered it.
+    if (!status.ok) continue;
+    if (!gateStatusIsStale(status.status?.createdAt ?? null, latestReviewAt)) continue;
+
+    try {
+      result.attempted += 1;
+      const check = await runGateCheck({
+        repoFullName: input.repoFullName,
+        prNumber: candidate.prNumber,
+        prUrl: candidate.prUrl,
+        db: input.db,
+      });
+      if (check.posted) {
+        result.redriven += 1;
+        log.info(
+          {
+            repoFullName: input.repoFullName,
+            prNumber: candidate.prNumber,
+            headSha: candidate.headSha,
+            staleStatusAt: status.status?.createdAt ?? null,
+            latestReviewAt,
+            state: check.verdict.state,
+          },
+          "comment-review gate re-driven after an undelivered review event (BLO-39871)",
+        );
+      } else if (check.reason === "retirement_failed") {
+        // The live status DID publish; only the retired-context cleanup failed
+        // (`pr-comment-review-gate.ts`, `supersedeRetiredContexts`). So the PR
+        // has converged and this is not the thing `failed` is alerted on —
+        // reporting it there would state the opposite of what happened.
+        result.redriven += 1;
+        result.retirementFailed += 1;
+        // The counter alone is not enough. A retired context keeps its PREVIOUS
+        // value when its post fails, and the retirement row mirrors the live
+        // verdict (`commentReviewGateRetirementStatus`) precisely because a
+        // still-required legacy context must not sit green while the live one
+        // blocks — so a failed retirement can leave a stale red standing. The
+        // sweep cannot re-reach it: `readStatus` above probes the LIVE context
+        // only, which this re-drive just published, so `gateStatusIsStale` is
+        // false on every later sweep and the PR is never offered again. The
+        // webhook caller enqueues these (`github-webhook.ts`); dropping them
+        // here strands exactly the failure class this module exists to clear.
+        const retirementDeliveries = check.retirementDeliveries ?? [];
+        // `allSettled`, not `all`: these are independent recoveries, and `all`
+        // rejects on the FIRST one, leaving the rest subscribed-but-ignored —
+        // so several stranded contexts reported as one, named as none. It also
+        // never rejects, which is what keeps this candidate out of the outer
+        // handler: that one increments `failed`, and the candidate is already
+        // counted as `redriven`. One candidate must never land in both.
+        const settled = await Promise.allSettled(
+          retirementDeliveries.map((delivery) =>
+            enqueueDelivery(input.db, {
+              // Provenance-less for the same reason as the webhook path: a
+              // retirement belongs to no company and no agent run. `null`
+              // rather than omitted — the NULL semantics of
+              // `preserveExistingDelivery` depend on it.
+              companyId: null,
+              sourceRunId: null,
+              repoFullName: input.repoFullName,
+              sha: delivery.sha,
+              context: delivery.context,
+              state: delivery.state,
+              description: delivery.description,
+              targetUrl: delivery.targetUrl,
+              prNumber: candidate.prNumber,
+              prUrl: candidate.prUrl,
+              forceWrite: true,
+            }),
+          ),
+        );
+        // Counted, not just logged. The enqueue is the recovery for a failure,
+        // so its own failure needs a signal at least as alertable as the thing
+        // it recovers — otherwise a dropped retry is visible only in log text,
+        // which is the gap that earned `retirementFailed` its counter.
+        const unarmed = settled.flatMap((outcome, index) =>
+          outcome.status === "rejected"
+            ? [{ context: retirementDeliveries[index]?.context ?? "(unknown)", err: outcome.reason }]
+            : [],
+        );
+        if (unarmed.length > 0) {
+          result.retirementRetryFailed += unarmed.length;
+          const contexts = unarmed.map((entry) => entry.context);
+          // One line per cause, each with its cause under `err` — NOT one line
+          // carrying an `errs` array. Pino serialises the configured `errorKey`
+          // ("err") and nothing else, and `middleware/logger.ts` passes neither
+          // `serializers` nor `errorKey`; `message`/`stack` are non-enumerable
+          // on `Error`, so an array of them under any other key JSON-stringifies
+          // to `[{},{}]` — a line that looks populated and has had every cause
+          // erased. Measured on pino 9.14.0 with that exact config. Hand-rolling
+          // `String(err)` + `.stack` into a plain object would also work and is
+          // worse: it re-implements a serialiser pino already has, drops `type`,
+          // and silently stops matching the real one if `errorKey` is ever set.
+          // N is the retired-context count for ONE PR, so looping is cheap, and
+          // it pairs each cause to its own context instead of leaving two
+          // parallel arrays to be zipped by eye. `contexts` stays on every line
+          // so a single line still shows the whole blast radius. The alert is on
+          // the `retirementRetryFailed` counter, not on a line count, so emitting
+          // N lines does not inflate it.
+          for (const entry of unarmed) {
+            log.warn(
+              {
+                repoFullName: input.repoFullName,
+                prNumber: candidate.prNumber,
+                contexts,
+                context: entry.context,
+                err: entry.err,
+              },
+              "comment-review gate retired-context retry enqueue failed; stale red may stand unrecovered",
+            );
+          }
+        }
+        log.warn(
+          { repoFullName: input.repoFullName, prNumber: candidate.prNumber, reason: check.reason },
+          "comment-review gate re-driven, but retiring the superseded contexts failed",
+        );
+      } else {
+        result.failed += 1;
+        log.warn(
+          { repoFullName: input.repoFullName, prNumber: candidate.prNumber, reason: check.reason },
+          "comment-review gate re-drive did not post",
+        );
+      }
+    } catch (err) {
+      result.failed += 1;
+      log.warn(
+        { err, repoFullName: input.repoFullName, prNumber: candidate.prNumber },
+        "comment-review gate re-drive threw (isolated)",
+      );
+    }
+  }
+
+  return result;
+}

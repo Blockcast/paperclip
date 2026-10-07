@@ -40,6 +40,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import * as providerRegistry from "../secrets/provider-registry.js";
 import type { SecretProviderModule } from "../secrets/types.js";
 import { routineService } from "../services/routines.js";
+import { postRoutineDispatchFailureHeartbeat } from "../services/recovery/routine-scheduler-heartbeat.js";
 import {
   getRoutineDispatchMetric,
   resetRoutineDispatchMetrics,
@@ -3382,6 +3383,218 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .where(eq(issues.originId, routine.id));
 
     expect(routineIssues).toHaveLength(0);
+  });
+
+  // BLO-40337: a dispatch that dies before `issue_created` leaves a `failed`
+  // run row with `linkedIssueId IS NULL`. The issue-keyed scheduler heartbeat
+  // (BLO-21395) takes an execution issue, so it cannot see this class at all --
+  // six windows of the live agent-health routine went dark in September with a
+  // `failed` run row sitting right there and nothing on the alert surface. The
+  // receipt is emittable from the run row alone.
+  describe("scheduler-side heartbeat for a dispatch that fails before issue creation", () => {
+    async function seedWithAlertSurface(opts?: Parameters<typeof seedFixture>[0]) {
+      const fixture = await seedFixture(opts);
+      const alertIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: alertIssueId,
+        companyId: fixture.companyId,
+        title: "[Sweep] Agent health & stalled-issue alerts",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 9100,
+      });
+      await db.update(routines).set({ parentIssueId: alertIssueId })
+        .where(eq(routines.id, fixture.routine.id));
+      return { ...fixture, alertIssueId };
+    }
+
+    async function schedulerReceipts(alertIssueId: string) {
+      return db
+        .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, alertIssueId))
+        .then((rows) =>
+          rows.filter((row) => row.idempotencyKey?.startsWith("scheduler-heartbeat:"))
+        );
+    }
+
+    it("emits exactly one receipt naming the run, window and failure reason", async () => {
+      const { routine, svc, alertIssueId } = await seedWithAlertSurface({
+        wakeup: async () => {
+          throw new Error("queue unavailable");
+        },
+      });
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" });
+      expect(run.status).toBe("failed");
+      expect(run.linkedIssueId).toBeNull();
+
+      const receipts = await schedulerReceipts(alertIssueId);
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.idempotencyKey).toBe(
+        `scheduler-heartbeat:${routine.id}:${run.triggeredAt.toISOString()}`,
+      );
+      expect(receipts[0]!.body).toContain(run.id);
+      expect(receipts[0]!.body).toContain("queue unavailable");
+      expect(receipts[0]!.body).toContain(
+        "dispatch failed before the execution issue was created",
+      );
+      // A timestamped observation, never a terminal claim: a later catch-up
+      // fire that emits normally must read as "stranded, then recovered".
+      expect(receipts[0]!.body).toMatch(/As of `[^`]+`, window `[^`]+`/);
+    });
+
+    it("emits no receipt when the window already carries the runbook's own receipt", async () => {
+      const { companyId, routine, svc, alertIssueId } = await seedWithAlertSurface({
+        wakeup: async () => {
+          throw new Error("queue unavailable");
+        },
+      });
+      // Keyed inside this window: the runbook floors to its own slot, so the
+      // match is by interval, not by string equality (BLO-28871).
+      await db.insert(issueComments).values({
+        id: randomUUID(),
+        companyId,
+        issueId: alertIssueId,
+        authorType: "system",
+        body: "Agent health sweep completed normally for this window.",
+        idempotencyKey: `agent-health:${new Date().toISOString()}:fingerprint`,
+      });
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" });
+      expect(run.status).toBe("failed");
+
+      expect(await schedulerReceipts(alertIssueId)).toHaveLength(0);
+    });
+
+    it("emits no receipt for a dispatch that reaches issue_created", async () => {
+      const { routine, svc, alertIssueId } = await seedWithAlertSurface();
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" });
+      expect(run.status).toBe("issue_created");
+
+      expect(await schedulerReceipts(alertIssueId)).toHaveLength(0);
+    });
+
+    // AC5. Driving this through `runRoutine` cannot test it: every reachable
+    // way to break the receipt from outside -- deleting the alert surface,
+    // pointing `parentIssueId` at nothing -- either nulls the column (early
+    // return, no throw) or is refused by its own FK. So inject the failure at
+    // the module boundary, and note the other half of the contract is
+    // structural: `postDispatchFailureHeartbeat` in routines.ts deliberately
+    // wraps this call in no try/catch of its own, so this swallow is the only
+    // thing standing between a failed receipt and a worse dispatch failure.
+    it("swallows its own errors so a failed receipt cannot reach the dispatch path", async () => {
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        await expect(postRoutineDispatchFailureHeartbeat(
+          {
+            db: {
+              select: () => {
+                throw new Error("connection terminated");
+              },
+            } as never,
+            addComment: async () => undefined,
+            logger,
+          },
+          {
+            companyId: randomUUID(),
+            routineId: randomUUID(),
+            run: { id: randomUUID(), triggeredAt: new Date(), failureReason: "boom" },
+          },
+        )).resolves.toBeUndefined();
+        expect(warn).toHaveBeenCalledWith(
+          expect.objectContaining({ err: expect.any(Error) }),
+          "failed to post scheduler-side failure heartbeat",
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("leaves the dispatch failure itself intact", async () => {
+      const { routine, svc, alertIssueId } = await seedWithAlertSurface({
+        wakeup: async () => {
+          throw new Error("queue unavailable");
+        },
+      });
+
+      const run = await svc.runRoutine(routine.id, { source: "manual" });
+      expect(run.status).toBe("failed");
+      expect(run.failureReason).toContain("queue unavailable");
+      expect(await schedulerReceipts(alertIssueId)).toHaveLength(1);
+    });
+
+    // Ally review: every test above throws a plain JS error from `wakeup`, which
+    // never aborts the transaction, so they only reach the post-commit call
+    // site. This one aborts the transaction for real -- the same
+    // `pg_terminate_backend` technique as the BLO-28952 test below -- so only
+    // `reconcileRolledBackDispatch` can emit the receipt. The issue INSERT runs
+    // on the service's own pool, so a trigger on it is the only hook between
+    // the run INSERT and `issueSvc.create`; it raises so the abort lands before
+    // an execution issue exists.
+    it("emits the receipt from the rollback path, and none once the execution issue exists", async () => {
+      const terminateDispatchSession = sql`
+        select pg_terminate_backend(pid)
+        from pg_stat_activity
+        where datname = current_database()
+          and pid <> pg_backend_pid()
+          and state = 'idle in transaction'
+      `;
+
+      const beforeIssue = await seedWithAlertSurface();
+      await db.execute(sql.raw(`
+        create function abort_dispatch_before_issue() returns trigger language plpgsql as $$
+        begin
+          perform pg_terminate_backend(pid)
+          from pg_stat_activity
+          where datname = current_database()
+            and pid <> pg_backend_pid()
+            and state = 'idle in transaction';
+          raise exception 'injected issue insert failure';
+        end
+        $$
+      `));
+      await db.execute(sql.raw(`
+        create trigger abort_dispatch_before_issue
+        before insert on issues
+        for each row
+        when (new.origin_id = '${beforeIssue.routine.id}')
+        execute function abort_dispatch_before_issue()
+      `));
+      try {
+        await expect(beforeIssue.svc.runRoutine(beforeIssue.routine.id, { source: "manual" })).rejects.toThrow();
+      } finally {
+        await db.execute(sql.raw("drop trigger if exists abort_dispatch_before_issue on issues"));
+        await db.execute(sql.raw("drop function if exists abort_dispatch_before_issue()"));
+      }
+
+      // Re-persisted by the rollback path: the in-transaction catch rolled back.
+      const [rolledBackRun] = await db.select().from(routineRuns)
+        .where(eq(routineRuns.routineId, beforeIssue.routine.id));
+      expect(rolledBackRun).toMatchObject({ status: "failed", linkedIssueId: null });
+      const receipts = await schedulerReceipts(beforeIssue.alertIssueId);
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.idempotencyKey).toBe(
+        `scheduler-heartbeat:${beforeIssue.routine.id}:${rolledBackRun!.triggeredAt.toISOString()}`,
+      );
+
+      // An abort that reached `issueSvc.create` leaves a durable orphan issue,
+      // which the issue-keyed heartbeat owns; a dispatch-failure receipt here
+      // would double-report it.
+      const afterIssue = await seedWithAlertSurface({
+        wakeup: async () => {
+          await db.execute(terminateDispatchSession);
+          return null;
+        },
+      });
+      await expect(afterIssue.svc.runRoutine(afterIssue.routine.id, { source: "manual" })).rejects.toThrow();
+      const [orphanedRun] = await db.select().from(routineRuns)
+        .where(eq(routineRuns.routineId, afterIssue.routine.id));
+      expect(orphanedRun?.status).toBe("failed");
+      expect(orphanedRun?.linkedIssueId).toBeTruthy();
+      expect(await schedulerReceipts(afterIssue.alertIssueId)).toHaveLength(0);
+    });
   });
 
   it("accepts standard second-precision webhook timestamps for HMAC triggers", async () => {

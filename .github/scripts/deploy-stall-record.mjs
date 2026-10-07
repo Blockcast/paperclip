@@ -27,10 +27,12 @@
  * PEN-3315 adds supersede-stale-deploy.mjs, which cancels a stale `waiting`
  * dispatch and re-dispatches at master. That is the point of the change, and it
  * has one bad side effect: the replacement run's `createdAt` is NOW, so the
- * escalation's age basis resets on every supersede. A 41h stall would report as
- * a series of 6.0h stalls, and the alert would flap firing/resolved on a ~6h
- * cycle instead of firing continuously with a climbing age. That is a regression
- * in the one control that actually worked during the incident.
+ * escalation's age basis resets on every supersede. A stall outliving
+ * SUPERSEDE_AFTER_HOURS (48h since 2026-10-04, BLO-25050; 6h before that) would
+ * report as a series of threshold-length stalls rather than one continuously
+ * climbing age — and at the 6h this was written against, it also flapped the
+ * alert firing/resolved on that cycle. That is a regression in the one control
+ * that actually worked during the incident.
  *
  * This record is the state the dispatcher otherwise does not have: it is opened
  * at the FIRST escalation of a stall and carries `stallStartedAt` in a marker

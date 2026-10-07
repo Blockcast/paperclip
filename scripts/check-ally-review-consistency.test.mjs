@@ -16,6 +16,7 @@ import {
   assertMergeStateFetched,
   assertPrListComplete,
   attestedHead,
+  canonicalReviewHead,
   duplicateBodyAcrossIdentities,
   findPrViolations,
   findViolations,
@@ -58,6 +59,16 @@ function review(overrides = {}) {
 
 function canonicalBody(head = HEAD, extra = "") {
   return `## Ally — Consolidated PR Review\nReviewed head: ${head}\n${extra}`;
+}
+
+/**
+ * A body in the shape the live producer actually emits: canonical heading, the
+ * prose attestation, then the structured block. `findings` is passed verbatim
+ * so a test can state a partial payload.
+ */
+function verdictBody(findings, extra = "", dispositions = [], head = HEAD) {
+  const payload = JSON.stringify({ head, findings, dispositions }, null, 2);
+  return `## Ally — Consolidated PR Review\nReviewed head: ${head}\n\n<!-- ally-verdict:1\n${payload}\n-->\n${extra}`;
 }
 
 function appReview(overrides = {}) {
@@ -174,6 +185,92 @@ describe("hasStillPresentDisposition", () => {
     );
   });
 
+  // The gate (ally-review-detection.ts) and the sweep (sweep-stalled-ally-reviews.py)
+  // read the prose ledger with PRIOR_FINDING_DISPOSITION_PATTERN; this auditor
+  // must accept exactly the entries they accept, or the gate goes red on
+  // `unreadable_verdict` while the auditor reads a cleanly-attesting review.
+  // Drive the same ledger strings through all three sources, taken from the
+  // committed files rather than retyped.
+  it("accepts exactly the ledger entries the gate and the sweep accept", () => {
+    const tsSource = readFileSync(
+      new URL("../server/src/services/ally-review-detection.ts", import.meta.url),
+      "utf8",
+    );
+    // The interpolated sub-pattern comes out of the same source, not a retyped
+    // copy: a retyped copy would keep this test green after an edit to the
+    // constant every line-anchored gate pattern shares.
+    const tsNotIndented = tsSource.match(/NOT_INDENTED_CODE = String\.raw`([^`]+)`/);
+    assert.ok(tsNotIndented, "ally-review-detection.ts still defines NOT_INDENTED_CODE");
+    // Bind the constant itself, not only the subset of it this corpus can
+    // reach: the ledger pattern's ` {0,3}` already rejects a tab before the
+    // `-`, so dropping the tab half from the gate's copy left every row below
+    // green, while REVIEWED_HEAD_ATTESTATION_PATTERN (which shares it) would
+    // then attest a head from a tab-indented line.
+    const mjsNotIndented = readFileSync(
+      new URL("./check-ally-review-consistency.mjs", import.meta.url),
+      "utf8",
+    ).match(/NOT_INDENTED_CODE = String\.raw`([^`]+)`/);
+    assert.ok(mjsNotIndented, "check-ally-review-consistency.mjs still defines NOT_INDENTED_CODE");
+    assert.equal(
+      tsNotIndented[1],
+      mjsNotIndented[1],
+      "NOT_INDENTED_CODE must not drift between the gate and this auditor",
+    );
+    const tsRaw = tsSource.match(
+      /PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"([dgimsuvy]+)",/,
+    );
+    assert.ok(tsRaw, "ally-review-detection.ts still defines PRIOR_FINDING_DISPOSITION_PATTERN");
+    // Capture the flags; do not pin them. Spelling `"gim"` inline here compared
+    // the pattern *source* across the readers while silently supplying the
+    // flags itself, so it could not see the axis Important 1 of #1721 at
+    // 1bc85198 found diverged -- and the literal then broke the moment the `m`
+    // came off, which is how the hole surfaced. The rule it belongs to is
+    // pinned at the bottom of this file.
+    assert.ok(tsRaw[2].includes("g"), "the ledger pattern must stay global for matchAll");
+    assert.ok(!tsRaw[2].includes("m"), "the gate's ledger pattern must not carry `m`");
+    // Function replacement, not a string one: a string replacement interprets
+    // `$&`/`` $` ``/`$'`/`$$` in the spliced-in source text, so a future
+    // NOT_INDENTED_CODE containing `$` would be silently mangled rather than
+    // failing loudly. `$&` alone would rebuild the literal `${NOT_INDENTED_CODE}`.
+    const gatePattern = new RegExp(
+      tsRaw[1].replace("${NOT_INDENTED_CODE}", () => tsNotIndented[1]),
+      tsRaw[2],
+    );
+
+    const pySource = readFileSync(
+      new URL("../.github/scripts/sweep-stalled-ally-reviews.py", import.meta.url),
+      "utf8",
+    );
+    const pyRaw = pySource.match(
+      /PRIOR_FINDING_DISPOSITION_PATTERN = re\.compile\(\n\s*r"([^"]+)"\n\s*r"([^"]+)",/,
+    );
+    assert.ok(pyRaw, "sweep-stalled-ally-reviews.py still defines PRIOR_FINDING_DISPOSITION_PATTERN");
+    // The sweep's own source still spells `^` under re.MULTILINE, which is the
+    // correct Python reading, so emulating that source in JS legitimately keeps
+    // `m` here. Only the JS readers changed: they now spell the anchor out. The
+    // corpus below is LF-only, where the two readings coincide.
+    const sweepPattern = new RegExp(pyRaw[1] + pyRaw[2], "gim");
+
+    const blocksUnder = (pattern, verbGroup, text) =>
+      [...text.matchAll(pattern)].some((m) => m[verbGroup].toLowerCase() === "still-present");
+
+    const corpus = [
+      ["canonical", "- **prior:354d5b9 important 1** — still-present — not mirrored", true],
+      ["en dash separator", "- **prior:354d5b9 important 1** – still-present – not mirrored", true],
+      ["space after the emphasis", "- ** prior:354d5b9 important 1** — still-present — not mirrored", true],
+      ["3-space indent", "   - **prior:354d5b9 important 1** — still-present — not mirrored", true],
+      ["trailing parenthetical after the index", "- **prior:354d5b9 important 1 (see below)** — still-present — not mirrored", false],
+      ["fixed verb", "- **prior:354d5b9 important 1** — fixed — closed", false],
+      ["verb in prose only", "still-present in quoted prose\n- prior:354d5b9 important 1 still-present", false],
+    ];
+    for (const [name, text, expected] of corpus) {
+      const gate = blocksUnder(gatePattern, 4, text);
+      const sweep = blocksUnder(sweepPattern, 1, text);
+      assert.equal(gate, expected, `gate reader: ${name}`);
+      assert.equal(sweep, expected, `sweep reader: ${name}`);
+      assert.equal(hasStillPresentDisposition(text), expected, `auditor: ${name}`);
+    }
+  });
   // BLO-36903 AC5. This auditor and the merge gate
   // (server/src/services/ally-review-detection.ts) must agree on every verb, and
   // they model the vocabulary differently: the gate enumerates all four kinds,
@@ -191,6 +288,63 @@ describe("hasStillPresentDisposition", () => {
       ),
       false,
     );
+  });
+});
+
+// Ally, #1721 at 2dfdfafe, Important 1. The sweep decides "Ally already reviewed
+// this head" from CONSOLIDATED_HEADING_PATTERN and the gate credits a review
+// from ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN. A heading one credits and the
+// other does not is the re-request loop (BLO-22892/BLO-28203), so the sweep's
+// copy is held to the gate's source, taken from the committed files.
+describe("the sweep's consolidated heading is the gate's", () => {
+  const tsSource = readFileSync(
+    new URL("../server/src/services/ally-review-detection.ts", import.meta.url),
+    "utf8",
+  );
+  const notIndented = tsSource.match(/NOT_INDENTED_CODE = String\.raw`([^`]+)`/);
+  const tsRaw = tsSource.match(
+    /ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN = new RegExp\(\n\s*String\.raw`([^`]+)`,\n\s*"([a-z]*)",/,
+  );
+  const pyRaw = readFileSync(
+    new URL("../.github/scripts/sweep-stalled-ally-reviews.py", import.meta.url),
+    "utf8",
+  ).match(/CONSOLIDATED_HEADING_PATTERN = re\.compile\(\n\s*r"([^"]+)",\n\s*([^\n]+),\n\)/);
+
+  it("is spelled from the same pieces", () => {
+    assert.ok(notIndented, "ally-review-detection.ts still defines NOT_INDENTED_CODE");
+    assert.ok(tsRaw, "ally-review-detection.ts still defines ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN");
+    assert.ok(pyRaw, "sweep-stalled-ally-reviews.py still defines CONSOLIDATED_HEADING_PATTERN");
+    // The gate anchors with `(?:^|\n)` and no `m`; the sweep with `^` under
+    // re.MULTILINE. Over the `\n`-normalised text both read, the two agree.
+    assert.equal(
+      pyRaw[1],
+      tsRaw[1].replace("(?:^|\\n)${NOT_INDENTED_CODE}", () => `^${notIndented[1]}`),
+    );
+    assert.equal(tsRaw[2], "i");
+    assert.match(pyRaw[2], /re\.IGNORECASE/);
+    assert.match(pyRaw[2], /re\.MULTILINE/);
+  });
+
+  it("credits exactly the headings the gate credits", () => {
+    const gate = new RegExp(tsRaw[1].replace("${NOT_INDENTED_CODE}", () => notIndented[1]), tsRaw[2]);
+    const sweep = new RegExp(pyRaw[1], "im");
+    const corpus = [
+      ["## Ally \u2014 Consolidated PR Review", true],
+      ["### Ally \u2014 Consolidated PR Review", true],
+      ["# Ally \u2014 Consolidated PR Review", true],
+      ["**Ally \u2014 Consolidated PR Review**", true],
+      ["Ally \u2014 Consolidated PR Review", true],
+      ["## Ally \u2014 Consolidated  PR  Review", true],
+      ["## Ally: Consolidated PR Review", true],
+      ["##Ally \u2014 Consolidated PR Review", false],
+      ["## Ally -- Consolidated PR Review", false],
+      ["    ## Ally \u2014 Consolidated PR Review", false],
+      ["\t## Ally \u2014 Consolidated PR Review", false],
+    ];
+    for (const [heading, expected] of corpus) {
+      assert.equal(gate.test(heading), expected, `gate reader: ${JSON.stringify(heading)}`);
+      assert.equal(sweep.test(heading), expected, `sweep reader: ${JSON.stringify(heading)}`);
+    }
   });
 });
 
@@ -246,12 +400,277 @@ describe("attestedHead", () => {
     assert.equal(attestedHead(`_Reviewed head: \`${HEAD}\`_`), HEAD);
   });
 
+  // This reader was left on the narrow `(?:[_*]+)?` / `` \`? `` form while the
+  // gate and the Python sweep were both widened, so the emphasis forms below
+  // measured gate 1 / python 1 / mjs 0 on the same bodies. The first is named
+  // verbatim in ally-review-detection.ts's own comment as the BLO-31730 shape
+  // — the single permitted run is consumed by `**` and cannot then cross the
+  // space to reach the backtick.
+  //
+  // Block-carrying bodies masked it, because attestedHead falls through to the
+  // block's head. The harm landed on the whole pre-block population, where
+  // operativeAllyReviews dropped a review the gate reads fine — in a script
+  // whose stated purpose is reader parity. Found by Ally reviewing #1721 at
+  // 8e6e84bd. No block in these fixtures, deliberately: with one they pass
+  // whether or not the prose regex works.
+  for (const [label, line] of [
+    ["emphasis closing after the colon", `**Reviewed head:** \`${HEAD}\``],
+    ["underscore emphasis closing after the colon", `_Reviewed head:_ ${HEAD}`],
+    ["a bold wrapper around the whole line", `**Reviewed head: ${HEAD}**`],
+    ["a backticked SHA with no emphasis", `Reviewed head: \`${HEAD}\``],
+  ]) {
+    it(`parses ${label}, as the gate and the Python sweep do`, () => {
+      assert.equal(attestedHead(line), HEAD);
+    });
+  }
+
+  it("does not widen past the gate's own indent bound", () => {
+    // The converse check: the widening has a direction, and accepting a line
+    // the gate rejects is the same divergence one delimiter out. The gate
+    // bounds the run between emphasis and the label at `[ \t]{0,3}`, and
+    // treats four leading spaces, or a tab, as indented code.
+    assert.equal(attestedHead(`**    Reviewed head:** \`${HEAD}\``), null);
+    assert.equal(attestedHead(`    Reviewed head: ${HEAD}`), null);
+    assert.equal(attestedHead(`\tReviewed head: ${HEAD}`), null);
+  });
+
   it("returns null when no attestation is present", () => {
     assert.equal(attestedHead("## Ally — Consolidated PR Review"), null);
   });
 
   it("ignores a SHA mentioned mid-sentence", () => {
     assert.equal(attestedHead(`I reviewed head: ${HEAD} earlier today`), null);
+  });
+
+  // The structured block is the primary source here exactly as it is in
+  // server/src/services/ally-review-detection.ts. Before this, a body carrying
+  // a block plus a #1675-shaped prose line read as "no attestation" to this
+  // script while the merge gate read it as attesting — the readers disagreed
+  // about which tree was reviewed, which is the BLO-32695 finding.
+  const block = (head) =>
+    `<!-- ally-verdict:1\n{"head":"${head}","findings":{"critical":0,"important":0,"suggestions":0}}\n-->`;
+
+  it("reads the structured block when the prose line is unparseable (#1675)", () => {
+    const body = `${block(HEAD)}\n\n## Ally — Consolidated PR Review\nReviewed head: ${HEAD} (unchanged since my last pass — no new commits)\n`;
+    assert.equal(attestedHead(body), HEAD);
+  });
+
+  it("reads the structured block when no prose line is present", () => {
+    assert.equal(attestedHead(block(HEAD)), HEAD);
+  });
+
+  it("fails closed when the block and the prose line name different heads", () => {
+    const other = "a".repeat(40);
+    assert.equal(attestedHead(`${block(HEAD)}\nReviewed head: ${other}`), null);
+  });
+
+  // Peer review of #1721 at 8e6e84bd -- shared identically by all three
+  // readers, so none of them caught it. `JSON.parse` keeps "critical" and
+  // "Critical" as distinct keys; they become one severity only at the
+  // `toLowerCase` in severityCountsIn, where an unconditional `set` let the
+  // last one win, so a block stating a Critical could read clean. Reachable
+  // because the keys differ in CASE -- an exact duplicate is collapsed by the
+  // parser first. Both orders, because last-wins made the verdict depend on
+  // key order and a guard catching one order leaves the dangerous one live.
+  for (const findings of [
+    `{"critical":0,"Critical":1,"important":0}`,
+    `{"Critical":1,"critical":0,"important":0}`,
+  ]) {
+    it(`fails closed on two keys normalizing to one severity: ${findings}`, () => {
+      assert.equal(
+        attestedHead(`<!-- ally-verdict:1\n{"head":"${HEAD}","findings":${findings}}\n-->`),
+        null,
+      );
+    });
+  }
+
+  it("still accepts distinct severities", () => {
+    // Control: without it the guard would reject every honest verdict.
+    assert.equal(
+      attestedHead(
+        `<!-- ally-verdict:1\n{"head":"${HEAD}","findings":{"critical":0,"important":0,"suggestions":1}}\n-->`,
+      ),
+      HEAD,
+    );
+  });
+
+  it("fails closed on two blocks rather than falling back to prose", () => {
+    const body = `${block(HEAD)}\n${block(HEAD)}\nReviewed head: ${HEAD}`;
+    assert.equal(attestedHead(body), null);
+  });
+
+  it("fails closed on an unterminated block rather than falling back to prose", () => {
+    const body = `<!-- ally-verdict:1\n{"head":"${HEAD}"}\nReviewed head: ${HEAD}`;
+    assert.equal(attestedHead(body), null);
+  });
+
+  it("fails closed on an unsupported block version", () => {
+    assert.equal(attestedHead(`<!-- ally-verdict:2\n{"head":"${HEAD}"}\n-->`), null);
+  });
+
+  it("fails closed on a block whose head is not a complete SHA", () => {
+    assert.equal(attestedHead(`<!-- ally-verdict:1\n{"head":"${HEAD.slice(0, 7)}"}\n-->`), null);
+  });
+
+  it("ignores a quoted block — that is a body discussing one, not emitting one", () => {
+    const body = `> ${block(HEAD).split("\n").join("\n> ")}\nReviewed head: ${HEAD}`;
+    assert.equal(attestedHead(body), HEAD);
+  });
+
+  // Peer review of #1721, Important 2 — the count rule landed in one reader of
+  // three. The merge gate treats a block contradicted by its own emitted
+  // buckets as unreadable; this script read the same body as a good
+  // attestation, so the two disagreed about the field that decides whether a
+  // merge is blocked.
+  const counted = (findings, ...prose) =>
+    [
+      `<!-- ally-verdict:1\n{"head":"${HEAD}","findings":${findings}}\n-->`,
+      "",
+      "## Ally — Consolidated PR Review",
+      ...prose,
+    ].join("\n");
+
+  it("fails closed when an emitted bucket contradicts the block's zero", () => {
+    assert.equal(attestedHead(counted('{"critical":0,"important":0}', "### Critical Issues (2)")), null);
+  });
+
+  it("control: agreeing counts still attest", () => {
+    assert.equal(
+      attestedHead(counted('{"critical":0,"important":0}', "### Critical Issues (0)")),
+      HEAD,
+    );
+  });
+
+  // Ally, #1721 at 5f4d5302, Important 1 and 2 -- the gate's two count gaps.
+  it("fails closed when an unterminated fence hides a bucket the block undercounts", () => {
+    const body = counted('{"critical":0,"important":0}', `Reviewed head: ${HEAD}`, "```ts", "### Critical Issues (1)");
+    assert.equal(attestedHead(body), null);
+  });
+
+  it("fails closed when the block counts fewer than the emitted bucket, not only zero", () => {
+    assert.equal(attestedHead(counted('{"critical":1,"important":0}', "### Critical Issues (3)")), null);
+    // Controls: agreeing, and a block reporting more, both still attest.
+    assert.equal(attestedHead(counted('{"critical":3,"important":0}', "### Critical Issues (3)")), HEAD);
+    assert.equal(attestedHead(counted('{"critical":3,"important":0}', "### Critical Issues (1)")), HEAD);
+  });
+
+  // Ally, #1721 at 5f4d5302, Important 3: the head rule must compare the bytes
+  // the gate reads. A fenced copy of the emitted line made the raw prose
+  // ambiguous, so this fell back to the block head the gate refuses.
+  it("reads the prose attestation over fence-stripped text", () => {
+    const OTHER = "b".repeat(40);
+    const line = `Reviewed head: ${OTHER}`;
+    assert.equal(attestedHead(counted('{"critical":0,"important":0}', line, "```", line, "```")), null);
+  });
+
+  // Ally, #1721 at 5f4d5302, Critical 3 and Important 4.
+  it("reads a CRLF body exactly as its LF twin", () => {
+    const bodies = [
+      counted('{"critical":0,"important":0}', `Reviewed head: ${HEAD}`, "```ts", "x", "```"),
+      ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD}`, "### Critical Issues (0)"].join("\n"),
+      counted('{"critical":0,"important":0}', `Reviewed head: ${HEAD}`, "```ts", "### Critical Issues (2)", "```"),
+    ];
+    for (const lf of bodies) {
+      const crlf = lf.replace(/\n/g, "\r\n");
+      assert.equal(attestedHead(crlf), attestedHead(lf), JSON.stringify(crlf));
+      assert.equal(canonicalReviewHead(crlf), canonicalReviewHead(lf), JSON.stringify(crlf));
+      assert.notEqual(attestedHead(lf), null, JSON.stringify(lf));
+    }
+  });
+
+  it("anchors the attestation on `\\n` exactly as the gate does", () => {
+    // JS's multiline `$` also stops before U+2028, which the gate's
+    // `(?=\n|$)` does not, so this credited a line the gate cannot read.
+    const body = ["## Ally \u2014 Consolidated PR Review", `Reviewed head: ${HEAD}\u2028trailing`].join("\n");
+    assert.equal(attestedHead(body), null);
+  });
+
+  // Ally, #1721 at 1bc85198, Important 1. The pass above took `m` off the
+  // attestation pattern and left it on the count and ledger patterns -- the two
+  // that drive the new cross-checks -- so the same divergence survived where it
+  // does the most harm. The loop it opens is the one this row exists to close:
+  // over a body whose block states 0 and whose bucket is U+2028-terminated, the
+  // gate counts the bucket and reds the head, while the sweep counts nothing,
+  // reads the head as attested, and suppresses the re-request that would clear
+  // the red. Python's re.MULTILINE recognises only `\n`, and U+2028 is not a
+  // CommonMark line ending, so Python was the correct reading throughout.
+  it("does not read a U+2028-terminated bucket as an emitted bucket", () => {
+    const body = counted('{"critical":0,"important":0}', "### Critical Issues (3)\u2028trailing prose");
+    assert.equal(attestedHead(body), HEAD);
+  });
+
+  it("does not read a U+2028-introduced ledger entry as a disposition", () => {
+    const body = [
+      "## Ally \u2014 Consolidated PR Review",
+      `Reviewed head: ${HEAD}`,
+      "intro\u2028- **prior:abc1234 critical 1** \u2014 still-present \u2014 not mirrored",
+    ].join("\n");
+    assert.equal(hasStillPresentDisposition(body), false);
+  });
+
+  it("control: the same two shapes on `\\n` are still read", () => {
+    // Without these, the pair above also passes on a reader that stopped
+    // matching altogether -- the other way to make the two readers agree.
+    assert.equal(
+      attestedHead(counted('{"critical":0,"important":0}', "### Critical Issues (3)")),
+      null,
+    );
+    assert.equal(
+      hasStillPresentDisposition(
+        [
+          "## Ally \u2014 Consolidated PR Review",
+          `Reviewed head: ${HEAD}`,
+          "intro",
+          "- **prior:abc1234 critical 1** \u2014 still-present \u2014 not mirrored",
+        ].join("\n"),
+      ),
+      true,
+    );
+  });
+
+  it("does not fail closed on a referenced, quoted or fenced bucket", () => {
+    // Over-matching here reds a clean review, which is the false red this row
+    // retires — so the cross-check reads only the emitted heading form.
+    for (const prose of [
+      "Both Critical Issues (2) from the previous pass are fixed.",
+      "> ### Critical Issues (2)",
+      "```\n### Critical Issues (2)\n```",
+    ]) {
+      assert.equal(attestedHead(counted('{"critical":0,"important":0}', prose)), HEAD, prose);
+    }
+  });
+
+  // Peer review of #1721, Important at 1d6f3785 — the same rule on the other
+  // field. `structuredBlocking(body, "stillPresent") ?? hasStillPresentDisposition(body)`
+  // gives the block precedence, so a block retiring everything suppressed a
+  // prose ledger entry saying a prior finding stands. Identical fail-open to
+  // the gate's, in the reader whose job is to notice the gate's.
+  const ledgered = (dispositions, verb) =>
+    [
+      `<!-- ally-verdict:1\n{"head":"${HEAD}","findings":{"critical":0,"important":0}${dispositions}}\n-->`,
+      "",
+      "## Ally — Consolidated PR Review",
+      "### Critical Issues (0)",
+      `- **prior:abc1234 critical 1** — ${verb} — the guard is unchanged.`,
+    ].join("\n");
+
+  it("fails closed when a prose ledger still stands against a block retiring everything", () => {
+    for (const dispositions of ["", ',"dispositions":[]']) {
+      assert.equal(attestedHead(ledgered(dispositions, "still-present")), null, dispositions || "absent");
+    }
+  });
+
+  it("control: a prose ledger that only retires still attests", () => {
+    // Keeps this a fail-closed rule rather than a widening: a `fixed` entry
+    // the block omits clears either way, so reddening it buys nothing.
+    assert.equal(attestedHead(ledgered(',"dispositions":[]', "fixed")), HEAD);
+  });
+
+  it("control: a block that already carries the standing entry still attests", () => {
+    // It blocks — but as a structured verdict, not as an unreadable one, or
+    // every contract-compliant still-present review reads broken.
+    const dispositions = ',"dispositions":[{"head":"abc1234","severity":"critical","index":1,"verb":"still-present"}]';
+    assert.equal(attestedHead(ledgered(dispositions, "still-present")), HEAD);
   });
 });
 
@@ -391,6 +810,115 @@ describe("findPrViolations", () => {
     const violations = findPrViolations(pr);
     assert.equal(violations.length, 1);
     assert.match(violations[0], /^I2c PR #5 @ff1c72db: Ally App review 12 is APPROVED/);
+  });
+
+  // A review may head its buckets `### 🚨 Critical` with no `(N)` -- the form the
+  // producer template prescribed until #1721 corrected it to the counted one,
+  // and the form every body posted before that correction still carries. Every
+  // prose reader here sees such a review as clean, so the structured counts are
+  // the only place the finding is actually stated.
+  it("I2a: catches a structured blocking verdict whose prose carries no counted headings", () => {
+    const pr = {
+      number: 1721,
+      headSha: HEAD,
+      reviews: [
+        appReview({
+          id: 21,
+          state: "APPROVED",
+          body: verdictBody({ critical: 0, important: 1 }, "\n### ⚠️ Important\n- **[codex]** something real\n"),
+        }),
+      ],
+    };
+    const violations = findPrViolations(pr);
+    assert.equal(violations.length, 1);
+    assert.match(violations[0], /^I2a PR #1721 @ff1c72db: Ally App review 21 is APPROVED/);
+  });
+
+  it("I2c: catches a structured still-present disposition with no prose ledger line", () => {
+    const pr = {
+      number: 1722,
+      headSha: HEAD,
+      reviews: [
+        appReview({
+          id: 22,
+          state: "APPROVED",
+          body: verdictBody({ critical: 0, important: 0 }, "\n### ✅ Strengths\n- clean\n", [
+            { head: "d40c450", severity: "important", index: 1, verb: "still-present" },
+          ]),
+        }),
+      ],
+    };
+    const violations = findPrViolations(pr);
+    assert.equal(violations.length, 1);
+    assert.match(violations[0], /^I2c PR #1722 @ff1c72db: Ally App review 22 is APPROVED/);
+  });
+
+  // The control for the two above: the same uncounted prose with a verdict that
+  // explicitly reports nothing must stay clean, or the fix is just a blanket red.
+  it("allows an APPROVED whose structured verdict explicitly reports zero findings", () => {
+    const pr = {
+      number: 1723,
+      headSha: HEAD,
+      reviews: [
+        appReview({
+          id: 23,
+          state: "APPROVED",
+          body: verdictBody({ critical: 0, important: 0 }, "\n### 🚨 Critical\n### ⚠️ Important\n"),
+        }),
+      ],
+    };
+    assert.deepEqual(findPrViolations(pr), []);
+  });
+
+  // A block Ally tried and failed to state is not a review that predates the
+  // block, so it must not reach the prose path the block exists to replace.
+  //
+  // Reported as I2e, and as I2e ONLY. It used to raise I2a *and* I2c, whose
+  // texts assert two mutually exclusive things -- an open finding, and a prior
+  // finding marked still-present -- neither of which was read off a body that
+  // could not be read at all (Ally, #1721 at 5f4d5302, Suggestion 1). The
+  // negative assertions are the point of the test: dropping them lets the
+  // fan-out come back while the positive one still passes.
+  it("I2e: fails closed on an APPROVED whose verdict block omits a blocking count", () => {
+    const pr = {
+      number: 1724,
+      headSha: HEAD,
+      reviews: [
+        appReview({
+          id: 24,
+          state: "APPROVED",
+          body: verdictBody({ suggestions: 0 }, "\n### ✅ Strengths\n- clean\n"),
+        }),
+      ],
+    };
+    const violations = findPrViolations(pr);
+    assert.ok(violations.some((v) => /^I2e PR #1724 /.test(v)), violations.join("\n"));
+    assert.deepEqual(violations.filter((v) => /^I2a |^I2c /.test(v)), []);
+  });
+
+  // The other half of the same change, and the half with no natural assertion:
+  // the field queries stopped answering for `unreadable`, so `hasBlockingVerdict`
+  // has to name it as a term of its own. Drop that term and an unreadable block
+  // reads as a *clean* verdict in the roll-up -- I4 then fires on a COMMENTED
+  // review that is correctly withholding approval, and `appBlockers` stops
+  // counting it. That mutation left the whole suite green before this test
+  // existed, which is the only reason it is here rather than being obvious.
+  it("I4: an unreadable block still counts as blocking, so a COMMENTED review is not reported", () => {
+    const pr = {
+      number: 1725,
+      // Not App-authored, so the clean-self-review exemption cannot be what
+      // suppresses I4 here -- only the blocking roll-up can.
+      author: { login: "kkroo", is_bot: false },
+      headSha: HEAD,
+      reviews: [
+        appReview({
+          id: 25,
+          state: "COMMENTED",
+          body: verdictBody({ suggestions: 0 }, "\n### ✅ Strengths\n- clean\n"),
+        }),
+      ],
+    };
+    assert.deepEqual(findPrViolations(pr).filter((v) => /^I4 /.test(v)), []);
   });
 
   it("I3: catches an App review whose body attests a head other than the recorded commit", () => {
@@ -1390,6 +1918,365 @@ describe("partitionByMergeEligibility", () => {
 
   it("passes an empty finding set through untouched", () => {
     assert.deepEqual(partitionByMergeEligibility([], []), { failing: [], deferred: [] });
+  });
+});
+
+/**
+ * Peer review of #1721 at 97b4ddd1 — this reader counted verdict blocks over
+ * the raw body while the gate counts them over fence-stripped text.
+ *
+ * Same body, different verdict across two of the four readers the PR's central
+ * invariant names. It fires first on a review that quotes the template inside a
+ * fence, which is the likeliest shape for a review *of this feature* — the same
+ * self-referential trigger the block's own line anchoring exists for.
+ */
+describe("BLO-32695 — a fenced example of the marker is not a second block", () => {
+  const block = (head) =>
+    `<!-- ally-verdict:1\n{"head":"${head}","findings":{"critical":0,"important":0}}\n-->`;
+  const body = (...rest) =>
+    [block(HEAD), "", "## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`, ...rest].join("\n");
+
+  it("reads the head through a fenced quote of the marker", () => {
+    assert.equal(attestedHead(body("As emitted:", "", "```markdown", block(HEAD), "```")), HEAD);
+  });
+
+  it("control: a real second block is still unreadable", () => {
+    // Without this the test above passes for a reader that stopped counting.
+    assert.equal(attestedHead(body("", block(HEAD))), null);
+  });
+
+  it("control: a fenced opener alone does not mint a truncated-payload red", () => {
+    // openers > blocks is the fail-closed branch; stripping fences has to move
+    // both counts together or it trades one divergence for another.
+    assert.equal(attestedHead(body("```markdown", "<!-- ally-verdict:1 {", "```")), HEAD);
+  });
+
+  it("reads the head through a tilde fence and through a longer backtick run", () => {
+    // The case above pinned ``` only, so every other CommonMark fence the gate
+    // handles stayed a divergence: this reader saw blocks=2 where the gate saw
+    // one quoted example.
+    for (const [open, close] of [
+      ["~~~", "~~~"],
+      ["````markdown", "````"],
+    ]) {
+      assert.equal(attestedHead(body("As emitted:", "", open, block(HEAD), close)), HEAD, open);
+    }
+  });
+
+  it("only a same-char run at least as long closes a fence", () => {
+    // Fence-length and fence-char matching are the halves a delimiter widening
+    // leaves behind: if ``` closed a ```` fence, or ~~~ closed a ``` one, the
+    // quoted block after it would re-appear as a second block.
+    for (const [open, inner, close] of [
+      ["````markdown", "```", "````"],
+      ["```markdown", "~~~", "```"],
+    ]) {
+      assert.equal(
+        attestedHead(body("As emitted:", "", open, block(HEAD), inner, block(HEAD), close)),
+        HEAD,
+        open,
+      );
+    }
+  });
+
+  it("an inline backtick span does not open a phantom fence", () => {
+    // CommonMark bars a backtick from a backtick fence's info string. Without
+    // that rule this line opens a fence that never closes, blanking the rest of
+    // the body — so the second block goes unseen and an unreadable body reads
+    // `ok`. Same assertion as the real-second-block control because the harm is
+    // masking exactly that.
+    assert.equal(attestedHead(body("``` `example` is prose, not a fence opener", block(HEAD))), null);
+  });
+
+  // Ally, #1721 at 068806d6, Important 1. JS's `.` excludes U+2028/U+2029 and
+  // Python's does not, so with a bare `.` this opener skipped a fence the
+  // sweep's FENCE_OPEN_PATTERN opened: the quoted block counted as a second
+  // block here, the head went unreadable, and the sweep read it as attested and
+  // never re-requested the review that would clear the red. The info string is
+  // `[^\n]*` at both JS sites now.
+  it("opens a fence whose info string carries U+2028, as the sweep does", () => {
+    assert.equal(attestedHead(body("As emitted:", "", "```markdown\u2028x", block(HEAD), "```")), HEAD);
+  });
+
+  it("control: the same fence with a plain info string also opens", () => {
+    // Pins that the assertion above turns on the character, not the fixture.
+    assert.equal(attestedHead(body("As emitted:", "", "```markdown x", block(HEAD), "```")), HEAD);
+  });
+});
+
+// Ally, #1721 at 1bc85198, Important 1 + Suggestion 1. The rule, not the
+// instances.
+//
+// Every pattern in the two JS readers is a markdown line-structure reader over
+// the same review bodies, and U+2028 reaches them through TWO doors:
+//
+//   flag axis  JS's `m` makes `^`/`$` stop at `\r`, U+2028 and U+2029 as well
+//              as `\n`, where Python's re.MULTILINE and CommonMark recognise
+//              only `\n`.
+//   dot axis   JS's `.` excludes `\r`, U+2028 and U+2029, where Python's
+//              excludes only `\n` -- so a bare `.` diverges with no `m`
+//              anywhere (Ally, #1721 at 068806d6, Important 1).
+//
+// `\r` is normalised away at entry by reviewBody/reviewText, so U+2028/U+2029
+// are what is left. Either door opens the same deadlock this row exists to
+// close, in the silent direction.
+//
+// Pinned as a rule because the previous pass fixed the attestation pattern
+// alone and left thirteen siblings, four of which drive these cross-checks --
+// enumerating the instances you have seen guarantees a next round. The dot axis
+// is the proof: the flag scan below read green over a live instance of it for a
+// whole cycle, because a scan is only a rule over the axis it reads.
+//
+// Reach, so the next reader does not have to infer it: the flag scan sees a
+// quoted flags argument and a regex-literal suffix; the dot scan sees a regex
+// literal bound to a name and a String.raw template. Neither sees an inline
+// regex passed straight to a call, and neither sees a third axis nobody has
+// named yet. Mirrors TestPatternCharacterClassesAreAsciiOnly in
+// .github/scripts/test_sweep_stalled_ally_reviews.py, which pins the same kind
+// of rule on the Python side for re.ASCII.
+describe("BLO-32695 -- no reader pattern may treat U+2028/U+2029 as a line break", () => {
+  // Both construction forms: a quoted flags argument to `new RegExp`, and the
+  // suffix of a regex literal.
+  // Ally, #1721 at 068806d6, Suggestion 1. The literal-form boundary carries
+  // `}` and `:` so `{re:/^a$/im}` is seen, not just the space-separated
+  // `{ re: /^a$/im }`. Kept as an explicit terminator set rather than
+  // `(?![dgimsuvy])`: that negative form also matches inside a path like
+  // `server/dist/...`, which costs false clusters for no extra reach.
+  const flagClusters = (source) =>
+    source.split("\n").flatMap((line, i) =>
+      [/"([dgimsuvy]+)"/g, /\/([dgimsuvy]+)(?=[\s;,)\].}:]|$)/g].flatMap((re) => {
+        re.lastIndex = 0;
+        const out = [];
+        let m;
+        while ((m = re.exec(line)) !== null) out.push({ line: i + 1, flags: m[1], text: line.trim() });
+        return out;
+      }),
+    );
+
+  // A floor, not an exact count: an exact count churns on every unrelated
+  // regex, while a floor still fails if the scan stops matching -- which is the
+  // way every source-text guard dies. Real counts at this head are 18 and 11.
+  for (const [rel, floor] of [
+    ["../server/src/services/ally-review-detection.ts", 12],
+    ["./check-ally-review-consistency.mjs", 8],
+  ]) {
+    it(`carries no \`m\` flag in ${rel}`, () => {
+      const clusters = flagClusters(readFileSync(new URL(rel, import.meta.url), "utf8"));
+      assert.ok(
+        clusters.length >= floor,
+        `the flag scan found ${clusters.length} clusters in ${rel}, under the ${floor} floor -- the scan broke rather than the file getting cleaner`,
+      );
+      assert.deepEqual(
+        clusters.filter((c) => c.flags.includes("m")).map((c) => `${rel}:${c.line}: ${c.text}`),
+        [],
+      );
+    });
+  }
+
+  it("control: the scan sees an `m` in both construction forms", () => {
+    // Without this the assertions above pass on a scan that matches nothing,
+    // and so does the whole rule. The third row pins that a flag cluster
+    // without `m` is reported but not flagged.
+    const injected = [
+      'const A = new RegExp(String.raw`^a`, "gim");',
+      "const B = /^b$/im;",
+      "const C = /^c$/i;",
+      "const D = {re:/^d$/im};",
+    ].join("\n");
+    assert.deepEqual(flagClusters(injected).map((c) => c.flags), ["gim", "im", "i", "im"]);
+  });
+
+  // Ally, #1721 at 068806d6, Important 1. The flag scan above is one axis of
+  // the rule and cannot reach the other: JS's `.` excludes U+2028/U+2029 where
+  // Python's `.` excludes only `\n`, so a bare `.` in a line-structure pattern
+  // re-opens the identical gate-red/sweep-satisfied deadlock with no `m`
+  // anywhere. The scan above read green over a live instance of it
+  // (FENCE_DELIMITER_PATTERN / FENCE_OPEN_RE) while its comment claimed to fail
+  // for "a shape nobody has written yet".
+  //
+  // Reach, stated rather than implied: this scans regex literals bound to a
+  // name, including one on the line after its `=`, and String.raw templates,
+  // including multi-line ones. That is how every named pattern in both files
+  // is declared. It runs over the whole source rather than line by line,
+  // because a line split cannot see a literal whose `=` is on the line above
+  // (Ally, #1721 at b8322735, Important 2); `\n` is excluded from the literal
+  // body instead. An inline regex passed straight to a call -- `.replace(
+  // /\r\n?/g, ...)` -- is NOT covered. That is deliberate: those are not line-
+  // structure readers, and widening to every `/.../ ` in the source means
+  // parsing JS to tell a regex from a division.
+  const bareDotSites = (source) => {
+    const lines = source.split("\n");
+    return [
+      /=\s*(\/(?:\\.|\[(?:\\.|[^\]\\\n])*\]|[^/\\\n])+\/)/g,
+      /String\.raw`((?:[^`\\]|\\.)*)`/g,
+    ].flatMap((re) => {
+      const out = [];
+      for (const m of source.matchAll(re)) {
+        // `${...}` first: its body is a JS expression, not regex source, so
+        // the dot in `COUNTED_SEVERITIES.join("|")` is not a wildcard. The
+        // interpolated constants are themselves String.raw templates and
+        // are scanned where they are declared, so dropping the hole here
+        // loses no coverage (pinned by the attestation-fragment control
+        // below, which fails if one is a quoted string again). Then strip
+        // escapes, then character classes:
+        // what survives is a wildcard `.`, while `\.` and `[.)]` are
+        // literal dots and fine.
+        const wildcards = m[1]
+          .replace(/\$\{[^}]*\}/g, "")
+          .replace(/\\./g, "")
+          .replace(/\[(?:[^\]\\]|\\.)*\]/g, "");
+        if (!wildcards.includes(".")) continue;
+        // The line the pattern itself starts on, not the `=` before it.
+        const line = source.slice(0, m.index + m[0].indexOf(m[1])).split("\n").length;
+        out.push({ line, text: lines[line - 1].trim() });
+      }
+      return out;
+    });
+  };
+
+  for (const rel of [
+    "../server/src/services/ally-review-detection.ts",
+    "./check-ally-review-consistency.mjs",
+  ]) {
+    it(`uses no wildcard \`.\` in a named pattern in ${rel}`, () => {
+      assert.deepEqual(
+        bareDotSites(readFileSync(new URL(rel, import.meta.url), "utf8")).map(
+          (c) => `${rel}:${c.line}: ${c.text}`,
+        ),
+        [],
+      );
+    });
+  }
+
+  // The fence opener is the one pattern that exists in a THIRD JS reader of the
+  // same review bodies -- packages/adapter-utils/src/github-review-attestation.ts,
+  // whose own comment says it mirrors ally-review-detection.ts. A whole-file dot
+  // scan over that file would false-positive on its URL and argv regexes, where
+  // `.` is correct, so the mirror is pinned directly instead: all three sources
+  // byte-identical. Without this, fixing the two readers this row scopes would
+  // silently break the mirror the third one claims.
+  it("the fence opener is byte-identical across all three JS readers", () => {
+    const sources = [
+      ["../server/src/services/ally-review-detection.ts", "FENCE_DELIMITER_PATTERN"],
+      ["./check-ally-review-consistency.mjs", "FENCE_OPEN_RE"],
+      ["../packages/adapter-utils/src/github-review-attestation.ts", "FENCE_DELIMITER_PATTERN"],
+    ].map(([rel, name]) => {
+      const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+      const m = new RegExp(`const ${name} = (/.*/);`).exec(src);
+      assert.ok(m, `${name} not found in ${rel} -- the scan broke, not the file`);
+      return `${rel}: ${m[1]}`;
+    });
+    const [first] = sources;
+    for (const s of sources) {
+      assert.equal(
+        s.replace(/^[^:]*: /, ""),
+        first.replace(/^[^:]*: /, ""),
+        `fence openers diverged:\n${sources.join("\n")}`,
+      );
+    }
+    // Positive control: the shape this rule asks for, so the assertion above
+    // cannot pass on three readers that agreed on a bare `.`.
+    assert.match(first, /\(\[\^\\n\]\*\)\$\/$/);
+  });
+
+  // Ally, #1721 at b8322735, Important 2. Three named patterns in the two
+  // scanned files put the literal on the line after its `=`, and BLOCKING_SECTION_RE
+  // is the in-file precedent for `[^\n]*`. A line-split scan cannot see any of
+  // them, so the injection runs against the real declarations, not a fixture.
+  it("control: the dot scan sees a literal declared on the line after its `=`", () => {
+    for (const [rel, name, from, to] of [
+      ["./check-ally-review-consistency.mjs", "BLOCKING_SECTION_RE", "[^\\n]*", "."],
+      ["../server/src/services/ally-review-detection.ts", "UNCOUNTED_FINDINGS_HEADING_REGEX", "[ \\t]+", ".+"],
+    ]) {
+      const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+      const decl = new RegExp(`const ${name} =\\n[^\\n]*\\n`).exec(src);
+      assert.ok(decl, `${name} is no longer split across two lines in ${rel} -- re-aim this control`);
+      const injected = src.replace(decl[0], decl[0].replace(from, to));
+      assert.notEqual(injected, src, `${from} not found in ${name} -- the injection is a no-op`);
+      const line = src.slice(0, decl.index).split("\n").length + 1;
+      assert.deepEqual(
+        bareDotSites(injected).map((c) => `${rel}:${c.line}`),
+        [`${rel}:${line}`],
+        `a wildcard \`.\` injected into ${name} was not reported`,
+      );
+    }
+  });
+
+  // Ally, #1721 at 1aaf72ac, Important 1. The attestation reader is composed
+  // from named fragments, and two of them were quoted strings, which neither
+  // scan form reaches. A wildcard there is fail-OPEN: an unattested review goes
+  // to not_evaluated instead of red. So each fragment, and the pattern that
+  // composes them, gets a dot injected into its real declaration.
+  it("control: the dot scan sees every fragment of the attestation pattern", () => {
+    const rel = "../server/src/services/ally-review-detection.ts";
+    const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+    for (const [name, from, to] of [
+      ["MARKDOWN_EMPHASIS_RUN", "{0,3}", ".{0,3}"],
+      ["ATTESTATION_WRAPPER_RUN", "{0,6}", ".{0,6}"],
+      ["REVIEWED_HEAD_ATTESTATION_PATTERN", "reviewed head:", "reviewed.head:"],
+    ]) {
+      const decl = new RegExp("const " + name + " = (?:new RegExp\\(\\n[ \\t]*)?String\\.raw`[^\\n]*").exec(src);
+      assert.ok(decl, `${name} is not declared as a String.raw template in ${rel}, so the dot scan cannot see it`);
+      const injected = src.replace(decl[0], decl[0].replace(from, to));
+      assert.notEqual(injected, src, `${from} not found in ${name} -- the injection is a no-op`);
+      const line = src.slice(0, decl.index + decl[0].lastIndexOf("String.raw")).split("\n").length;
+      assert.deepEqual(
+        bareDotSites(injected).map((c) => `${rel}:${c.line}`),
+        [`${rel}:${line}`],
+        `a wildcard \`.\` injected into ${name} was not reported`,
+      );
+    }
+  });
+
+  it("control: the dot scan catches both construction forms and spares literal dots", () => {
+    // No floor is possible here -- the correct count is zero -- so the scan's
+    // liveness has to be pinned by injection instead. Rows 3-5 are the ways a
+    // naive `includes(".")` would fire on a pattern that is already correct.
+    const caught = (src) => bareDotSites(src).length;
+    assert.equal(caught("const A = /^a.*$/;"), 1, "regex literal");
+    assert.equal(caught('const B = new RegExp(String.raw`^b.+$`, "g");'), 1, "String.raw");
+    assert.equal(caught("const C = /^c\\.d$/;"), 0, "escaped dot is a literal");
+    assert.equal(caught("const D = /^[.]e$/;"), 0, "dot in a character class is a literal");
+    assert.equal(caught("const E = /^f[^\\n]*$/;"), 0, "the shape this rule asks for");
+    assert.equal(caught("const H =\n  /^h.*$/;"), 1, "a literal on the line after its `=`");
+    assert.equal(
+      caught("const F = new RegExp(String.raw`^g${SEVERITIES.join(\"|\")}$`);"),
+      0,
+      "a dot inside `${}` is JS, not regex source",
+    );
+    assert.equal(
+      caught("const G = new RegExp(String.raw`^h${X}.*$`);"),
+      1,
+      "the `${}` hole does not blind the scan to a wildcard beside it",
+    );
+  });
+
+  // Moving the scan to the whole source made `\n` load-bearing in the literal
+  // body: a JS regex literal cannot carry a raw newline, so without that
+  // exclusion a `/` that never closes on its own line runs on until it finds
+  // one further down and swallows whatever lies between. Measured: with the
+  // exclusion removed, all other assertions in this file -- including the
+  // real-source injections above -- still pass, so nothing else pins it.
+  //
+  // Both directions are asserted because the mutation fails both ways, and the
+  // first is the silent one: the runaway match consumes the genuine wildcard
+  // below it and the scan reports nothing at all.
+  it("control: the literal body stops at a newline, both directions", () => {
+    const sites = (src) => bareDotSites(src).map((c) => c.text);
+
+    // Dangerous direction -- a real bare dot goes UNREPORTED.
+    assert.deepEqual(
+      sites('const A = /a\nconst B = "x";\nconst C = /^c.d$/;'),
+      ["const C = /^c.d$/;"],
+      "an unclosed `/` above must not swallow the wildcard below it",
+    );
+
+    // Noisy direction -- a span that is not a regex literal at all is reported.
+    assert.deepEqual(
+      sites('const A = /start\nconst B = ".";\nconst C = /end/;'),
+      [],
+      "a match must not span lines to manufacture a literal",
+    );
   });
 });
 

@@ -23,14 +23,21 @@ vi.mock("../services/github-fetch.js", () => ({
   gitHubApiBase: () => "https://api.github.com",
 }));
 
+// Spread the real module and override only the token: the tick refuses to sweep
+// without one, and that is its first statement. Everything else in here stays
+// real so the mock cannot drift into asserting against a stub of itself.
+vi.mock("../services/github-app-auth.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/github-app-auth.js")>();
+  return { ...actual, getInstallationTokenResult: async () => ({ ok: true, token: "t" }) };
+});
+
 const { and, eq } = await import("drizzle-orm");
 const { companies, createDb, pullRequestReviewState } = await import("@paperclipai/db");
 const { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } = await import(
   "./helpers/embedded-postgres.js"
 );
-const { reconcileRepoReviewState, selectReviewStateTargets } = await import(
-  "../services/pr-review-state-reconciler.js"
-);
+const { reconcileRepoReviewState, listOpenPullRequests, selectReviewStateTargets, prReviewStateReconcilerTick } =
+  await import("../services/pr-review-state-reconciler.js");
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -93,6 +100,34 @@ function openPr(number: number, overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+describe("open-PR enumeration: head sha capture (BLO-39871)", () => {
+  // The gate re-drive probes the commit status at the head, so it needs a sha
+  // the enumeration is already being handed for free. The second case is the
+  // one with teeth: head sha must NOT be a required field, because `malformed`
+  // suppresses the prune — making a field only the re-drive reads able to stop
+  // rows being pruned would be a destructive coupling.
+  beforeEach(() => {
+    // Braces matter: a `beforeEach` that RETURNS a value has that value treated
+    // as a cleanup hook, and `mockReset()` returns the mock itself — vitest then
+    // calls the mock with no arguments during teardown.
+    ghFetchMock.mockReset();
+  });
+
+  it("captures the head sha from the list payload", async () => {
+    routeGithub({ openPrPages: [[openPr(2022, { head: { sha: "0ad8773c" } })]] });
+    const listed = await listOpenPullRequests({ repoFullName: REPO, token: "t", maxPullRequests: 10 });
+    expect(listed?.pullRequests[0]?.headSha).toBe("0ad8773c");
+  });
+
+  it("keeps a PR with no readable head sha, and does not call it malformed", async () => {
+    routeGithub({ openPrPages: [[openPr(2023, { head: null })]] });
+    const listed = await listOpenPullRequests({ repoFullName: REPO, token: "t", maxPullRequests: 10 });
+    expect(listed?.malformed).toBe(0);
+    expect(listed?.pullRequests).toHaveLength(1);
+    expect(listed?.pullRequests[0]?.headSha).toBeNull();
+  });
+});
 
 describeEmbeddedPostgres("pr-review-state reconciler", () => {
   let db!: ReturnType<typeof createDb>;
@@ -349,5 +384,92 @@ describeEmbeddedPostgres("pr-review-state reconciler", () => {
     expect(targets).toContainEqual({ companyId, repoFullName: REPO });
     await db.delete(issueWorkProducts).where(and(eq(issueWorkProducts.companyId, companyId)));
     await db.delete(issues).where(eq(issues.companyId, companyId));
+  });
+
+  // The tick accumulates the whole result through one keys-driven merge. A field
+  // that is never accumulated is NOT a type error: `totals` is initialised with
+  // every field present and zeroed, so the omission compiles clean and reports a
+  // healthy zero fleet-wide. Nothing else in this suite drives the tick, so this
+  // is the only place that class is observable at the call site — the helper's
+  // own suite pins `mergeSweepCounters`, not the fact that the tick calls it.
+  it("sums every field across two repos, so a counter dropped at the call site cannot read as zero", async () => {
+    const { issueWorkProducts, issues } = await import("@paperclipai/db");
+    const REPO_B = "Blockcast/trafficcontrol";
+    // The gate re-drive returns an empty result unless a status context is
+    // configured, which would leave `gateRedrive` zero on both repos and make
+    // the one field this PR added unobservable here.
+    const priorContext = process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT = "gate/ally-comment-findings";
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      issueNumber: 1,
+      identifier: "RWP-1",
+      title: "carrier issue",
+      status: "in_progress",
+      priority: "medium",
+      originKind: "manual",
+      originFingerprint: "default",
+    });
+    for (const [repo, prNumber] of [
+      [REPO, 1],
+      [REPO_B, 2],
+    ] as const) {
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: `${repo}#${prNumber}`,
+        title: "an OPEN pr",
+        status: "ready_for_review",
+        metadata: { repoFullName: repo, prNumber },
+      });
+    }
+
+    // Deliberately asymmetric where it discriminates, and symmetric where the
+    // previous shape did not. BOTH repos contribute one headless candidate, so
+    // `headless` is 2 summed and 1 overwritten *whichever repo comes last* —
+    // `selectReviewStateTargets` returns no guaranteed order, and with only B
+    // headless an overwrite-by-last-repo bug still yields 1 and the assertion
+    // passes. Reviews stay empty, which makes every candidate skip before the
+    // status read — `considered` is counted up front, so the aggregation is
+    // observable without driving a gate evaluation or a single extra fetch.
+    ghFetchMock.mockImplementation(async (url: string) => {
+      const repo = url.includes(REPO_B) ? REPO_B : REPO;
+      if (url.includes("/requested_reviewers")) return jsonResponse({ users: [], teams: [] });
+      if (url.includes("/reviews")) return jsonResponse([]);
+      if (url.includes("/timeline")) return jsonResponse([]);
+      const page = Number(/[?&]page=(\d+)/.exec(url)?.[1] ?? 1);
+      if (page > 1) return jsonResponse([]);
+      return jsonResponse(
+        repo === REPO
+          ? [openPr(11, { head: { sha: "aaa1" } }), openPr(12, { head: null })]
+          : [openPr(21, { head: { sha: "bbb1" } }), openPr(22, { head: null })],
+      );
+    });
+
+    try {
+      const sweep = await prReviewStateReconcilerTick(db, { maxPullRequests: 10 });
+
+      expect(sweep.targets).toBe(2);
+      expect(sweep.ok).toBe(2);
+      expect(sweep.failed).toBe(0);
+      expect(sweep.totals.enumerated).toBe(4);
+      expect(sweep.totals.written).toBe(4);
+      // `considered` proves the nested result is summed at all (4 summed, 2
+      // overwritten). `headless` proves it is summed FIELD-WISE rather than
+      // overwritten by the last repo — 2 summed against 1 under an overwrite,
+      // under either target ordering, which is why both repos carry one.
+      expect(sweep.totals.gateRedrive.considered).toBe(4);
+      expect(sweep.totals.gateRedrive.headless).toBe(2);
+    } finally {
+      if (priorContext === undefined) delete process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT;
+      else process.env.PAPERCLIP_PR_COMMENT_REVIEW_GATE_STATUS_CONTEXT = priorContext;
+      await db.delete(issueWorkProducts).where(and(eq(issueWorkProducts.companyId, companyId)));
+      await db.delete(issues).where(eq(issues.companyId, companyId));
+    }
   });
 });

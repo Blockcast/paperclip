@@ -14,12 +14,14 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scoped-test-state.js";
 import {
   BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
   issueRecoveryActionService,
 } from "../services/issue-recovery-actions.js";
 import { attentionService } from "../services/attention.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { reconcileStrandedBlockedIssues } from "../services/stranded-blocked-issue-reconciler.js";
 import {
   RECOVERY_HORIZON_EXPIRED_METRIC,
   __resetMetricsForTest,
@@ -48,13 +50,15 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
   }, 120_000);
 
   afterEach(async () => {
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    // Before `agents`/`companies`: heartbeat_runs has FKs onto both.
-    await db.delete(heartbeatRuns);
-    await db.delete(agents);
-    await db.delete(companies);
+    // One TRUNCATE ... CASCADE rooted at `companies` reaches every table this
+    // suite writes, so cleanup cannot go stale against a new FK. The burst case
+    // drives `reconcileStrandedBlockedIssues`, which writes an
+    // `issue.stranded_blocked_reconciled` activity_log row per issue it resumes.
+    // That row populates `company_id` only today, but `activity_log` carries FKs
+    // to `companies`, `agents` AND `heartbeat_runs`, the last two without an
+    // `onDelete` action (BLO-22231) — so a hand-ordered delete list has to track
+    // every FK this table grows; this gets them for free.
+    await truncateCompanyScopedTestState(db);
   });
 
   afterAll(async () => {
@@ -293,18 +297,104 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     expect((await readAction(actionId)).status).toBe("active");
   });
 
-  it("leaves an unbounded action alone even with a past timeoutAt", async () => {
+  it("leaves a RECENT unbounded action alone even with a past timeoutAt", async () => {
     // `maxAttempts: null` is the monitor-only / manual-repair shape. A `timeoutAt` there
     // belongs to the provider-quota scheduler's `retryAt`, not to a wake horizon, and is
     // routinely already in the past — retiring on it would manufacture a false exhaustion.
+    //
+    // BLO-40297 added a second arm that DOES retire unbounded rows, anchored on `createdAt`.
+    // This case is what keeps the two apart, so the fixture's `createdAt` is now load-bearing
+    // and stated rather than defaulted: fresh, so only the `timeoutAt` arm could fire. If the
+    // derived arm ever starts reading `timeoutAt`, this goes red — which is the whole job.
     const seeded = await seed();
-    const actionId = await insertAction(seeded, { maxAttempts: null });
+    const actionId = await insertAction(seeded, { maxAttempts: null, createdAt: now });
     const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
 
     const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
 
     expect(result).toMatchObject({ escalated: 0 });
     expect((await readAction(actionId)).status).toBe("active");
+  });
+
+  it("retires an unbounded action once it is older than the derived horizon (BLO-40297)", async () => {
+    // The shape this ticket is about: BOTH `maxAttempts` and `timeoutAt` null, so the row
+    // matched neither sweep predicate and was structurally un-retireable — permanently
+    // `active` while holding `issue_recovery_actions_active_source_uq`, which blocks the
+    // source issue from ever opening a fresh recovery action. 21 such rows company-wide on
+    // 2026-10-05, oldest 122 days.
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, {
+      maxAttempts: null,
+      timeoutAt: null,
+      lastAttemptAt: null,
+      createdAt: new Date(now.getTime() - 90 * 24 * 60 * 60_000),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 1, announced: 1 });
+    const action = await readAction(actionId);
+    expect(action.status).toBe("escalated");
+    // AC2: retired through the existing terminal path, carrying a bound. `outcome` MUST stay
+    // null — writing one frees the active-source unique index and re-opens the unbounded
+    // re-fire loop BLO-18996 closed.
+    expect(action.retiringBound).toBe("timeout_horizon");
+    expect(action.outcome).toBeNull();
+
+    // The announcement must not render `horizon \`null\``: an operator reading the notice has
+    // to be able to see which horizon was burned. (Dedup is unaffected either way — the
+    // marker embeds the unique `action.id`.)
+    const [comment] = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, seeded.sourceIssueId));
+    expect(comment!.body).not.toContain("horizon `null`");
+    expect(comment!.body).toContain("derived from `createdAt`");
+  });
+
+  it("leaves an OWNERLESS unbounded action alone however old it is (BLO-40297)", async () => {
+    // The documented carve-out, and the negative control for the arm above. `wakesOwner` is
+    // `Boolean(ownerAgentId) && …`, so an ownerless action wakes nobody by construction and
+    // has no wake horizon to burn — the provider-quota monitor wait is expected to sit open
+    // across many sweeps. Without this, the derived arm would retire it on age alone.
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, {
+      maxAttempts: null,
+      timeoutAt: null,
+      lastAttemptAt: null,
+      ownerType: "system",
+      ownerAgentId: null,
+      createdAt: new Date(now.getTime() - 90 * 24 * 60 * 60_000),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 0 });
+    expect((await readAction(actionId)).status).toBe("active");
+  });
+
+  it("retires an unbounded action of ANY kind, not just stranded_assigned_issue (BLO-40297)", async () => {
+    // AC4: the hole is kind-agnostic. `workspace_validation` and `pr_review_non_convergence`
+    // are both in the measured cohort because `wakesOwner` excludes their causes outright, so
+    // they are created unbounded TODAY — a `stranded_assigned_issue`-only fix would leave the
+    // hole open for the next cause added to that list.
+    const seeded = await seed();
+    const actionId = await insertAction(seeded, {
+      kind: "workspace_validation",
+      cause: "workspace_validation_failed",
+      maxAttempts: null,
+      timeoutAt: null,
+      lastAttemptAt: null,
+      createdAt: new Date(now.getTime() - 26 * 24 * 60 * 60_000),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+    const result = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+    expect(result).toMatchObject({ escalated: 1 });
+    expect((await readAction(actionId)).status).toBe("escalated");
   });
 
   it("is idempotent — a second sweep neither re-escalates nor re-announces", async () => {
@@ -570,12 +660,42 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     // `BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES` (issues.ts), and
     // `escalated` is deliberately not in that set. Leave 1 of 25 `active` and the
     // resumer skips that row forever — which is the pre-bounds strand.
+    //
+    // Kept as the narrow unit check, with signal (d) driven end to end below it. The two
+    // are not the same claim: this one proves the resumer is ALLOWED to run, not that any
+    // row ever leaves `blocked`.
     const stillSuppressing = rows.filter((row) =>
       (BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES as readonly string[]).includes(
         row.status,
       ),
     );
     expect(stillSuppressing).toHaveLength(0);
+
+    // Signal (d), driven rather than inferred: "no source issue is left `blocked` with
+    // `unresolvedBlockerCount == 0`".
+    //
+    // WHY THIS IS NOT CEREMONY ON TOP OF `stillSuppressing`. The CEO's 2026-10-01
+    // amendment replaced signal (b) with "the burst was retired on strictly fewer than N
+    // delivered wakes, and every action reached a terminal bound" — and attached a
+    // condition to it: scored together with (d), NEVER alone, because "scored alone, (b)
+    // would reward a mechanism that simply never wakes anybody". This burst is the
+    // extreme of exactly that: `enqueueWakeup` is asserted above to have been called
+    // ZERO times. So (b') here is satisfied by a mechanism that woke nobody at all, and
+    // (d) is the entire thing standing between that and a passing test over 25 issues
+    // sitting `blocked` with no blockers and no wake path. Inferring (d) from a released
+    // suppression does not discharge it: the resumer has its own candidate gate
+    // (stranded-blocked-issue-reconciler.ts) and an issue can clear the recovery
+    // suppression and still be held there. Both halves must be scored on ONE fixture,
+    // which is what the amendment asks for and what no single test did before.
+    const resumed = await reconcileStrandedBlockedIssues(db);
+    expect(resumed.reconciled).toBe(N);
+    const resumedIssues = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(inArray(issues.id, issueIds));
+    expect(resumedIssues).toHaveLength(N);
+    // Named per-row rather than as a count, so a failure says WHICH rows stranded.
+    expect(resumedIssues.filter((row) => row.status === "blocked").map((row) => row.id)).toEqual([]);
   });
 
   /**

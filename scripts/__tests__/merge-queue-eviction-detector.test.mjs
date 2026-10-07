@@ -304,3 +304,67 @@ test("webhook gates the eviction marker with startsWith, not a substring test", 
   // spoof an eviction notice.
   assert.match(source, /\.startsWith\(MERGE_QUEUE_EVICTION_MARKER\)/);
 });
+
+// ---------------------------------------------------------------------------
+// BLO-40351: the detector's TRIGGER is the thing that failed, not its logic.
+//
+// Shipped on `pull_request`, this workflow executed on 98/98 dequeues that were
+// MERGES and was quarantined in `action_required` with zero jobs on 9/9 dequeues
+// that were genuine EVICTIONS -- a perfect inversion, because GitHub keys the
+// approval gate on the triggering actor and the actor is itself a function of
+// the outcome (`github-merge-queue[bot]` only ever appears on the eviction
+// path). It provided zero coverage for the entire time it was deployed while
+// showing a 92-green run history, which is positive evidence of the wrong
+// thing.
+//
+// These two tests exist so that regression is caught at PR time -- where it
+// would be introduced -- rather than by nobody, which is what happened.
+// ---------------------------------------------------------------------------
+
+const DETECTOR_WORKFLOW_PATH = new URL(
+  "../../.github/workflows/merge-queue-eviction-detector.yml",
+  import.meta.url,
+);
+
+test("detector workflow triggers on pull_request_target, never bare pull_request (BLO-40351)", () => {
+  const source = readFileSync(DETECTOR_WORKFLOW_PATH, "utf8");
+  const onBlock = source.slice(source.search(/^on:$/m));
+
+  assert.match(
+    onBlock,
+    /^ {2}pull_request_target:\n {4}types:\n {6}- dequeued$/m,
+    "the `on:` block must trigger on `pull_request_target` with the `dequeued` activity type. " +
+      "A bare `pull_request` trigger is approval-gated for the `github-merge-queue[bot]` actor, " +
+      "which fires on EVERY eviction and NO merge -- i.e. it silently disables this detector " +
+      "entirely while leaving its run history green. See BLO-40351.",
+  );
+  assert.doesNotMatch(
+    onBlock,
+    /^ {2}pull_request:$/m,
+    "`pull_request:` reappeared as a trigger key; that is the exact BLO-40351 regression.",
+  );
+});
+
+test("detector workflow has no half-migrated `pull_request` event_name guard (BLO-40351)", () => {
+  const source = readFileSync(DETECTOR_WORKFLOW_PATH, "utf8");
+
+  // The trigger rename is only half the change. Two conditionals gate on
+  // `github.event_name`: the trigger-timestamp step, and the `--comment true`
+  // argument that is the entire user-visible output. Leaving either comparing
+  // against bare 'pull_request' makes every real eviction run, find the
+  // eviction, and then decline to notify anybody -- which reads on every
+  // dashboard as "ran, found nothing" rather than as a failure.
+  assert.doesNotMatch(
+    source,
+    /event_name\s*==\s*'pull_request'/,
+    "a `github.event_name == 'pull_request'` comparison survives alongside the " +
+      "`pull_request_target` trigger, so it can never be true. Under the real trigger this " +
+      "silently suppresses the eviction comment. Compare against 'pull_request_target'.",
+  );
+  assert.match(
+    source,
+    /--comment "\$\{\{ github\.event_name == 'pull_request_target' && 'true'/,
+    "the notify step must pass --comment true on the real trigger; without it the detector " +
+      "classifies the eviction and tells nobody, which is indistinguishable from no eviction.",
+  );
+});

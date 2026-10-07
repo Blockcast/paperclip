@@ -590,7 +590,7 @@ describe("unrecognized ledger verbs cannot carry a credential (PEN-3157 #3)", ()
       path.join(repoRoot, "server/src/services/ally-review-detection.ts"),
       "utf8",
     );
-    const pattern = /PRIOR_FINDING_DISPOSITION_PATTERN[\s\S]{0,600}?"gim"/.exec(source);
+    const pattern = /PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp\([\s\S]{0,600}?"gi",/.exec(source);
     expect(pattern, "PRIOR_FINDING_DISPOSITION_PATTERN moved or changed shape").not.toBeNull();
     expect((pattern as RegExpExecArray)[0]).toContain("([a-z][a-z-]*)");
   });
