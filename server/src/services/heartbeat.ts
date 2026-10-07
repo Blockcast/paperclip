@@ -535,6 +535,7 @@ import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run
 import { taskWatchdogService } from "./task-watchdogs.js";
 import {
   LOCK_HELD_WARN_MS,
+  agentStartLockSweepContext,
   markAgentStartLockPhase,
   runDetachedFromAgentStartLock,
   withAgentStartLock,
@@ -26889,7 +26890,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   let joinableStartLockReap: Promise<unknown> | null = null;
   let inFlightStartLockReap: Promise<unknown> | null = null;
   let sharedStartLockReapCompletedAtMs = 0;
-
+  /**
+   * Marks the async scope of a shared start-lock sweep (BLO-35940). The sweep
+   * can start another agent's dispatch and await it: `releaseIssueExecutionAndPromote`
+   * calls `startNextQueuedRunForAgent` for a promoted wake without consulting
+   * `suppressDispatchAfterReap`, and `withAgentStartLock` runs a free agent's
+   * section inline. That dispatch's own reap must not join or chain behind the
+   * sweep it is running inside, because that sweep is waiting for it.
+   */
   function scheduleStartLockReap(after: Promise<unknown>) {
     const sweep = after.then(() => {
       // The sweep reads fleet state from here on, so a later arrival must not
@@ -26897,7 +26905,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // a TTL set a failing sweep backs off instead of being retried by every
       // waking agent.
       joinableStartLockReap = null;
-      const running: Promise<unknown> = reapOrphanedRuns({ suppressDispatchAfterReap: true }).finally(() => {
+      const running: Promise<unknown> = agentStartLockSweepContext.run(true, () =>
+        reapOrphanedRuns({ suppressDispatchAfterReap: true }),
+      ).finally(() => {
         sharedStartLockReapCompletedAtMs = Date.now();
         if (inFlightStartLockReap === running) inFlightStartLockReap = null;
       });
@@ -26951,8 +26961,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * Direct callers of `reapOrphanedRuns` (the periodic reaper, tests) are
    * deliberately left alone: this is a dispatch-path fix, and the row-level
    * dedup those callers rely on is a separate, still-tested invariant.
+   *
+   * A caller already inside a shared sweep (a dispatch the sweep started and is
+   * awaiting) runs its own unshared sweep instead. Joining or chaining would wait
+   * on the sweep that is waiting on it, and every later start-lock caller then
+   * queues behind that cycle (BLO-35940). `MAX_NESTED_DISPATCH_DEPTH` bounds
+   * stack depth, not total sweep count; excess dispatch work detaches with
+   * the sweep marker cleared and follows the ordinary coalescing path.
+   *
+   * Production callers must hold an agent start lock. Its cross-agent guard
+   * prevents a sweep from awaiting an independently busy agent whose reap
+   * already waits on this sweep. A lock-free caller lacks that guard; tests
+   * using this entry directly must not introduce concurrent busy dispatch.
    */
-  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh"> {
+  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh" | "nested"> {
+    if (agentStartLockSweepContext.getStore()) {
+      await reapOrphanedRuns({ suppressDispatchAfterReap: true });
+      return "nested";
+    }
     if (joinableStartLockReap) {
       await joinableStartLockReap;
       return "joined";
@@ -29671,13 +29697,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // another agent's in-flight sweep, which is still time this lock was held.
         markAgentStartLockPhase(agentId, "reap");
         const reapStartedAtMs = Date.now();
-        let reapDisposition: "ran" | "joined" | "skipped_fresh" | undefined;
+        let reapDisposition: "ran" | "joined" | "skipped_fresh" | "nested" | undefined;
         try {
           reapDisposition = await reapOrphanedRunsForStartLock();
         } finally {
           const reapMs = Date.now() - reapStartedAtMs;
           if (reapMs >= LOCK_HELD_WARN_MS) {
-            logger.warn(
+            // A nested sweep is unshared by design (BLO-35940), so its cost here
+            // is expected; keep the warn for the paths where it is an anomaly.
+            (reapDisposition === "nested" ? logger.info : logger.warn).call(
+              logger,
               { agentId, reapMs, reapDisposition, warnAfterMs: LOCK_HELD_WARN_MS },
               "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
             );

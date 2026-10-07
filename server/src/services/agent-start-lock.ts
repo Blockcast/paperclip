@@ -239,6 +239,10 @@ const detachedFollowUps = new Set<Promise<unknown>>();
 /** Agent ids whose locks are held by the current async execution path. */
 const heldAgentIds = new AsyncLocalStorage<ReadonlySet<string>>();
 
+/** Shared reap scope: nested dispatch must not wait on its enclosing sweep.
+ * Kept with the lock stores so every detached path clears it as well. */
+export const agentStartLockSweepContext = new AsyncLocalStorage<true>();
+
 /**
  * The abort signal of the critical section running on the current async path.
  *
@@ -544,7 +548,7 @@ export async function withAgentStartLock<T>(
     const running = runningByAgent.get(agentId);
     const followUp = running
       ? ensureCoalescedFollowUp(agentId, fn, running)
-      : heldAgentIds.exit(() => runExclusively(agentId, fn));
+      : runDetachedFromAgentStartLock(() => runExclusively(agentId, fn));
     trackDetachedFollowUp(agentId, followUp);
     return options.onCoalesced();
   }
@@ -596,7 +600,7 @@ function ensureCoalescedFollowUp<T>(
   // caller's nesting depth.
   const followUp = running.then(() => {
     followUpByAgent.delete(agentId);
-    return heldAgentIds.exit(() => runExclusively(agentId, fn));
+    return runDetachedFromAgentStartLock(() => runExclusively(agentId, fn));
   });
   followUpByAgent.set(agentId, followUp);
   return followUp;
@@ -636,9 +640,13 @@ function trackDetachedFollowUp(agentId: string, followUp: Promise<unknown>): voi
  * launched by a section that later aborts would inherit that section's signal,
  * so the abort would cancel the *run's* database work — tearing down live work
  * that has nothing to do with queue selection.
+ *
+ * The shared-reap scope must be dropped too: detached work no longer belongs
+ * to the sweep awaiting its parent. Keeping that marker would make every
+ * later dispatch in the detached chain bypass fleet-wide reap coalescing.
  */
 export function runDetachedFromAgentStartLock<T>(fn: () => T): T {
-  return heldAgentIds.exit(() => sectionSignals.exit(fn));
+  return heldAgentIds.exit(() => sectionSignals.exit(() => agentStartLockSweepContext.exit(fn)));
 }
 
 /**
