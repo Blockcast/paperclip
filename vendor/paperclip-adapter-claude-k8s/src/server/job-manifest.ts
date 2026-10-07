@@ -2359,7 +2359,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // every run on that config through `set -o pipefail`. `${_ARG:+"$_ARG"}` is
   // the empty-safe form: it expands to nothing at all for the `cat` fallback
   // rather than passing `cat` an empty argument.
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${buildPodLogRedactorSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  //
+  // The redactor setup follows `preparePodLog`: on fall-open it writes a
+  // `<podLogPath>.unredacted` sentinel, which needs the directory to exist.
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(podLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.

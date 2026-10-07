@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME } from "./pod-log-redactor.js";
+import { POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME, POD_LOG_UNREDACTED_SUFFIX } from "./pod-log-redactor.js";
 import {
   buildJobManifest,
   buildPodLogPath,
@@ -2184,7 +2184,7 @@ describe("buildJobManifest", () => {
     // downstream scrubs a copy that already landed on the shared PVC — the same
     // objection that ruled out retroactive scrubbing on that ticket.
     it("pipes claude through the pod-log redactor BEFORE tee (BLO-29553)", () => {
-      const { job } = buildJobManifest({ ctx, selfPod });
+      const { job, podLogPath } = buildJobManifest({ ctx, selfPod });
       const command = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
 
       const filter = command.indexOf(
@@ -2211,6 +2211,13 @@ describe("buildJobManifest", () => {
       // degrades to `cat` rather than failing every run in the fleet through
       // `set -o pipefail`.
       expect(command).toContain(`${POD_LOG_FILTER_VAR}=cat`);
+
+      // ...and leaves `<podLogPath>.unredacted` beside the pod log, which needs
+      // the pod log's directory to exist by then.
+      const sentinel = command.indexOf(`true > '${podLogPath}${POD_LOG_UNREDACTED_SUFFIX}'`);
+      expect(sentinel).toBeGreaterThan(-1);
+      expect(command.indexOf("mkdir -p '/paperclip/instances/default/data/run-logs")).toBeGreaterThan(-1);
+      expect(command.indexOf("mkdir -p '/paperclip/instances/default/data/run-logs")).toBeLessThan(sentinel);
 
       // $GUARD_DIR derives from the operator-configurable CLAUDE_CONFIG_DIR, so
       // the script path can contain a space. An unquoted single `$VAR` holding
