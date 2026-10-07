@@ -2185,7 +2185,9 @@ describe("buildJobManifest", () => {
       let sawEnvPath = false;
       for (const kib of [1, 64, 119, 120, 121, 128, 130, 160, 200, 300]) {
         ctx.config = { promptTemplate: "x".repeat(kib * 1024) };
-        const value = promptEnvValue(buildJobManifest({ ctx, selfPod }).job);
+        const value = buildJobManifest({ ctx, selfPod }).job.spec?.template?.spec?.initContainers?.[0]?.env?.find(
+          (e) => e.name === "PROMPT_CONTENT",
+        )?.value;
         if (value === undefined) continue; // took the Secret path — not exec'd as a string
         sawEnvPath = true;
         expect(
