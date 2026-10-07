@@ -71,6 +71,25 @@ The orc8r identity is fixed by the bridge contract: `st_uuid` is the seeded
 issuer is `nop.blockcast.net`. NOP must not accept issuer or subject from an
 untrusted client or manufacture a second identity when a retry times out.
 
+A `gateway_hwid` already bound to a live `individual_beacon` member MUST NOT be
+minted under a second `wallet`. Because the idempotency key is
+`(gateway_hwid, wallet)`, a wallet change is a *different* key, so the key alone
+cannot catch this: NOP MUST check the hardware binding, not only the key, before
+calling `MintMember`. A mismatch is a non-retryable identity error — the intent
+transitions to `registration_failed` per "Local-first ordering and pending
+state", recording the existing `mb_uuid` and the conflicting wallet in
+`last_error`. NOP MUST NOT retry and MUST NOT mint.
+
+Rebinding a gateway to a new wallet is a legitimate lifecycle event — hardware is
+sold, re-keyed, or the owner moves — but it is not a side effect of registration,
+for the same reason organization attachment is not (see "Explicit tenant-target
+rule"): registration is driven by an untrusted client, so an implicit rebind lets
+any wallet claim hardware already in service and redirect its earnings. Rebind
+requires an authorized transfer operation that evidences the change and retires
+the prior `mb_uuid` explicitly; until that operation exists it is an operator
+action, not a registration outcome. Rejecting here does not strand sold hardware
+— it routes it to that path instead of silently creating a second live member.
+
 ### Explicit tenant-target rule
 
 The minted member is written under the orc8r `st_public` umbrella. It is not
@@ -119,6 +138,15 @@ operator-triggered repair:
 - Group orc8r members by `(st_uuid, normalized gateway_hwid, wallet)` and
   surface duplicates. Keep the earliest authoritative `mb_uuid`, quarantine
   later rows, and require explicit repair before deletion or reassignment.
+- Group orc8r members by `(st_uuid, normalized gateway_hwid)` alone and surface
+  any hardware carrying more than one live member. This grouping is deliberately
+  coarser than the idempotency key: the key includes `wallet`, so a
+  same-hardware / different-wallet pair falls into two groups and the bullet
+  above cannot see it. Treat the pair as a duplicate — keep the earliest
+  authoritative `mb_uuid`, quarantine the later row, and require explicit repair
+  before deletion or reassignment. Count it separately from a same-wallet
+  duplicate: it means the rebind rejection in "MintMember identity and
+  idempotency" did not hold.
 - Emit counts for pending, orphaned, duplicate, repaired, and quarantined
   rows. Query failure is an unhealthy sweep, not a clean zero-count result.
 
@@ -131,9 +159,13 @@ delete based only on a stale read.
 The completeness suite MUST prove that concurrent retries with the same
 `(gateway_hwid, wallet)` yield one member; a timeout leaves `pending_orc8r`;
 a later retry converges to `registered`; a result under a non-`st_public`
-tenant is rejected; and the sweep reports and quarantines an orphan/duplicate
-without silently reassigning it. Manual verification must inspect persisted
-registration state and orchestrator logs for the idempotency key.
+tenant is rejected; a second registration of an already-bound `gateway_hwid`
+under a different `wallet` is rejected as non-retryable, leaves the intent
+`registration_failed`, and mints no second member; the `gateway_hwid`-only sweep
+grouping surfaces such a pair when one is seeded directly; and the sweep reports
+and quarantines an orphan/duplicate without silently reassigning it. Manual
+verification must inspect persisted registration state and orchestrator logs for
+the idempotency key.
 
 ### Dependency boundary
 
@@ -147,14 +179,15 @@ NOP to add a second caller-verification implementation.
 ## Prerequisites
 
 - Magma migration **`2026051500000001_typed_uuid_schema`** has run
-  (creates the `system_principals` table + `sp_uuid_t` DOMAIN +
-  `nop_bridge` kind in the CHECK enum). PR
+  (creates the `system_principals` and `revocation_blocklist` tables +
+  `sp_uuid_t` DOMAIN + `nop_bridge` kind in the CHECK enum). PR
   [magma#847](https://github.com/Blockcast/magma/pull/847).
 - Magma migration **`2026051600000001_seed_st_public_tenant`** has run
   (creates the singleton `st_public` row in `tenant_identity`). This is
   S4 of BLO-5298 (this same parent ticket).
 - You have `psql` access to the orc8r postgres pool with write
-  permissions on `system_principals`.
+  permissions on `system_principals` and `revocation_blocklist` (the
+  Revocation section writes the latter).
 
 ## One-time INSERT
 
@@ -339,7 +372,7 @@ reissue needed.
 
 To revoke NOP's bridge identity (e.g. during an incident):
 
-1. Add a row to `revocation_blocklist`:
+1. (After enforcement lands.) Add a row to `revocation_blocklist`:
 
 ```sql
 INSERT INTO revocation_blocklist (
