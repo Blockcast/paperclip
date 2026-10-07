@@ -2755,6 +2755,13 @@ export async function handleFiring(
     alertname,
     severity,
   });
+  } catch (err) {
+    // A decision is not replay-complete until every awaited tail operation
+    // below the state write has succeeded. If one of those operations fails,
+    // the fence can still be released in `finally`, but this delivery must be
+    // retried instead of being suppressed by the replay cache.
+    firingApplied = false;
+    throw err;
   } finally {
     await finishAggregateFiring(ctx, companyId, aggregateKey, firingToken);
     // BLO-33168: reached only when the body AND the fence release both

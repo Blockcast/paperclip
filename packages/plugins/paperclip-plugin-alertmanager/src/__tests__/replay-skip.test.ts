@@ -358,6 +358,49 @@ describe("BLO-33168 — replayed deliveries skip already-committed fingerprints"
     expect(mocks.issues.update).not.toHaveBeenCalled();
   });
 
+  it("does not mark a creation pass when an awaited tail rejects once", async () => {
+    const { ctx, mocks } = mkCtx();
+
+    mocks.events.emit.mockRejectedValueOnce(new Error("simulated event tail failure"));
+    await expect(deliver(ctx, healthyOnly(), "req-tail-create")).rejects.toBeInstanceOf(
+      AlertDeliveryIncompleteError,
+    );
+
+    mocks.metrics.write.mockClear();
+    mocks.issues.update.mockClear();
+    await expect(
+      deliver(ctx, healthyOnly(), "req-tail-create-retry"),
+    ).resolves.not.toThrow();
+
+    expect(metricNames(mocks.metrics.write)).not.toContain(
+      "alertmanager.alert.replay_skipped",
+    );
+    expect(mocks.issues.update).toHaveBeenCalled();
+  });
+
+  it("does not mark a re-fire pass when an awaited tail rejects once", async () => {
+    const { ctx, mocks } = mkCtx();
+
+    await deliver(ctx, healthyOnly(), "req-tail-refire-initial");
+    shiftCachedCommit(ctx, FP_HEALTHY, -(60 * 60_000));
+    mocks.events.emit.mockRejectedValueOnce(new Error("simulated event tail failure"));
+
+    await expect(
+      deliver(ctx, healthyOnly(), "req-tail-refire-failure"),
+    ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+
+    mocks.metrics.write.mockClear();
+    mocks.issues.update.mockClear();
+    await expect(
+      deliver(ctx, healthyOnly(), "req-tail-refire-retry"),
+    ).resolves.not.toThrow();
+
+    expect(metricNames(mocks.metrics.write)).not.toContain(
+      "alertmanager.alert.replay_skipped",
+    );
+    expect(mocks.issues.update).toHaveBeenCalled();
+  });
+
   it("a new firing episode for the same fingerprint is not skipped", async () => {
     const { ctx, mocks } = mkCtx();
 
