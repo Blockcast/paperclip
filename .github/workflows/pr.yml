@@ -899,6 +899,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:proxy-addr-security-override
 
+      - name: Test @hono/node-server security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:hono-node-server-security-override
+
       - name: Test agent-health preflight fixtures
         if: ${{ !cancelled() }}
         run: pnpm run test:agent-health-preflight
