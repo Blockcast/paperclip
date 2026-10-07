@@ -264,6 +264,7 @@ import {
   resolveAgentEmptyWorkspaceSourceDir,
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
+  resolvePaperclipHomeDir,
 } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
@@ -2032,7 +2033,14 @@ export function isRetryableInteractionContinuationInfrastructureFailure(
     const workspaceValidation = parseObject(parseObject(run.resultJson).workspaceValidation);
     if (
       readNonEmptyString(workspaceValidation.reason) ===
-      "k8s_agent_home_git_bootstrap_unsupported"
+        "k8s_agent_home_git_bootstrap_unsupported" &&
+      // BLO-40317: non-retryable only on a verdict. `gitProbeState:
+      // "indeterminate"` means the probe could not tell whether the fallback cwd
+      // is a checkout, which is not evidence that anything needs repairing —
+      // a credential shim ahead of `git` on PATH produced it fleet-wide on
+      // 2026-10-05 over directories that were fine. Keep that retryable so it
+      // re-tests instead of latching.
+      readNonEmptyString(workspaceValidation.gitProbeState) !== "indeterminate"
     ) {
       return false;
     }
@@ -3841,7 +3849,7 @@ async function hasGitMetadata(cwd: string | null | undefined) {
 async function isGitCheckout(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized })
+  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized, env: strictGitCheckoutProbeEnv() })
     .then((result) => Boolean(readNonEmptyString(result.stdout)))
     .catch(() => false);
 }
@@ -3855,6 +3863,31 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
   }
 }
 
+// BLO-40317: resolve `git` for local-only reads (the strict probe below,
+// isGitCheckout() and hasGitPushRemote(), none of which contacts a remote)
+// WITHOUT the Paperclip home bin dirs on PATH. `/paperclip/.local/bin/git` is a
+// credential shim that execs the real git through a token wrapper and exits 1
+// when its token file is unreadable. That stderr is neither ENOENT nor "not a
+// git repository", so the probe below returned `indeterminate` and dispatch was
+// refused for every workspace-less row in the fleet (134 of 146 blocked rows on
+// 2026-10-05) — on an unrelated credential fault, for a `rev-parse` that reads
+// only the local filesystem and needs no credentials at all. The other two
+// readers fail the same way under the shim, as a false
+// git_worktree_base_not_git_checkout and a false missing_git_push_remote.
+// Filtering the home prefix rather than hardcoding /usr/bin keeps these
+// working on dev machines and in CI, and excludes any future agent-home
+// shim for free.
+function strictGitCheckoutProbeEnv(): NodeJS.ProcessEnv {
+  const home = path.resolve(resolvePaperclipHomeDir());
+  const entries = (process.env.PATH ?? "").split(path.delimiter).filter((entry) => {
+    const trimmed = entry.trim();
+    if (!trimmed) return false;
+    const resolved = path.resolve(trimmed);
+    return resolved !== home && !resolved.startsWith(`${home}${path.sep}`);
+  });
+  return { ...process.env, PATH: entries.join(path.delimiter) };
+}
+
 // Unlike isGitCheckout(), this does not fail open: a probe error that isn't
 // positively identifiable as "cwd is not a git checkout" (missing directory,
 // or git's own "not a git repository" fatal) is treated as "could be a
@@ -3864,13 +3897,14 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
 // itself couldn't complete. Uses try/await rather than .then/.catch because
 // execFile can throw synchronously (e.g. ENOTDIR when cwd is not a
 // directory) before returning a promise to chain onto.
-async function probeGitCheckoutStateStrict(
+export async function probeGitCheckoutStateStrict(
   cwd: string,
 ): Promise<"checkout" | "not_a_checkout" | "indeterminate"> {
   try {
     const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
       cwd,
       timeout: strictGitCheckoutProbeTimeoutMs(),
+      env: strictGitCheckoutProbeEnv(),
     });
     return readNonEmptyString(result.stdout) ? "checkout" : "indeterminate";
   } catch (error: unknown) {
@@ -3895,7 +3929,8 @@ function sameResolvedPath(left: string | null | undefined, right: string | null 
 async function hasGitPushRemote(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  const remoteNames = await execFile("git", ["remote"], { cwd: normalized })
+  const env = strictGitCheckoutProbeEnv();
+  const remoteNames = await execFile("git", ["remote"], { cwd: normalized, env })
     .then((result) =>
       result.stdout
         .split(/\r?\n/)
@@ -3905,7 +3940,7 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
     .catch(() => []);
 
   for (const remoteName of remoteNames) {
-    const pushUrl = await execFile("git", ["remote", "get-url", "--push", remoteName], { cwd: normalized })
+    const pushUrl = await execFile("git", ["remote", "get-url", "--push", remoteName], { cwd: normalized, env })
       .then((result) => readNonEmptyString(result.stdout))
       .catch(() => null);
     if (pushUrl) return true;
