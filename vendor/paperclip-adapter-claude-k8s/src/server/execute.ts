@@ -27,9 +27,7 @@ import {
 import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
 import {
   buildJobManifest,
-  buildPodLogPath,
   resolveJobIsolation,
-  sanitizeForK8sPath,
   sanitizeLabelValue,
   type JobIsolation,
 } from "./job-manifest.js";
@@ -148,40 +146,6 @@ function readJobGuardIdentity(job: k8s.V1Job): GuardIdentity {
     sessionId: readOptionalString(labels[SESSION_ID_LABEL]),
     validIsolationMetadata: isolationMode !== null && isolationKey !== null,
   };
-}
-
-/**
- * Pod-log path of a *foreign* Job the concurrency guard found (BLO-37704).
- *
- * The guard's label selector pins `paperclip.io/agent-id`, so every Job it
- * returns belongs to this agent — and therefore this company. Only the run id
- * and the isolation segment have to be recovered from the Job's own labels,
- * and both are written by `buildJobManifest` on every Job it creates.
- *
- * The isolation segment is keyed off the *mode* label, not the presence of the
- * key label, because those two diverge. `buildJobManifest` writes both labels
- * whenever `enabled || source === "runtime"`, but `buildPodLogPath` is only
- * given the key when `enabled` — and a runtime descriptor with
- * `isolationMode: "shared"` is `enabled: false` carrying a non-empty key. On
- * that Job, keying off the key label would build a path no run ever wrote.
- */
-function podLogPathForForeignJob(
-  agent: { id: string; companyId: string },
-  job: k8s.V1Job,
-): string | undefined {
-  const labels = job.metadata?.labels ?? {};
-  const companyId = sanitizeForK8sPath(agent.companyId);
-  const agentId = sanitizeForK8sPath(agent.id);
-  const runId = sanitizeForK8sPath(readOptionalString(labels[RUN_ID_LABEL]) ?? "");
-  if (!companyId || !agentId || !runId) return undefined;
-  const isolationMode = readOptionalString(labels[ISOLATION_MODE_LABEL]);
-  const isolationKey = readOptionalString(labels[ISOLATION_KEY_LABEL]);
-  return buildPodLogPath(
-    companyId,
-    agentId,
-    runId,
-    isolationMode && isolationMode !== "shared" && isolationKey ? isolationKey : undefined,
-  );
 }
 
 function readCurrentGuardIdentity(ctx: AdapterExecutionContext, isolation: JobIsolation): GuardIdentity {
