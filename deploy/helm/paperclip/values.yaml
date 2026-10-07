@@ -439,9 +439,29 @@ workerProbes:
   # saturation while `/healthz` answered in 6ms in the same second. A query
   # here would import that stall onto the liveness path and kill the singleton
   # worker for pool saturation, converting a latency problem into an outage.
+  #
+  # BLO-40591 — why this targets `/livez` and not `/healthz`.
+  #
+  # On 2026-10-05 `/api/*` served zero bytes for ~29 minutes while this probe
+  # passed every time: `restartCount` was 0 before and after, and the outage
+  # had no upper bound — it happened to self-clear. `/healthz` is declared
+  # ahead of the hostname guard, actorMiddleware and the whole `/api` router,
+  # so it answers from upstream of everything that can wedge and is
+  # structurally unable to report this. BLO-35948 gave readiness a real signal
+  # for the sibling case, but readiness does not restart anything, which is
+  # exactly why the window stayed unbounded.
+  #
+  # `/livez` is the same dependency-free shape as `/healthz` — no query, no
+  # disk, synchronous — and adds one in-memory test: have `/api` requests been
+  # arriving with nothing completing for 180s. That keys on completions rather
+  # than latency, so the 13.19s saturation regime above (slow but completing)
+  # stays green and only a genuine wedge goes red. The prohibition above is
+  # unchanged and still binds.
+  #
+  # Rollback: set this back to `/healthz`. Nothing else has to move.
   liveness:
     httpGet:
-      path: /healthz
+      path: /livez
       port: http
       httpHeaders:
         - name: Host
