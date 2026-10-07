@@ -296,8 +296,16 @@ function wrapClient<T extends object>(client: T): T {
       const value = Reflect.get(target, prop, receiver);
       if (typeof value !== "function") return value;
 
-      const memoized = methodByProp.get(prop);
-      if (memoized !== undefined) return memoized;
+      // Presence, not value (PEN-3686). `get(prop) !== undefined` would be
+      // correct only for as long as every `buildMethod` branch returns a
+      // function, which all three do today but which nothing here states or
+      // enforces. A branch that ever returned `undefined` would miss the cache
+      // on every read and rebuild a fresh wrapper each time — silently
+      // reinstating the `client.end !== client.end` identity hazard this map
+      // exists to remove, and per the note above that is specifically a
+      // regression nothing in drizzle would surface. `has` costs the same and
+      // holds regardless of what the branches return.
+      if (methodByProp.has(prop)) return methodByProp.get(prop);
       const built = buildMethod(target, prop, value as (...a: unknown[]) => unknown);
       methodByProp.set(prop, built);
       return built;
