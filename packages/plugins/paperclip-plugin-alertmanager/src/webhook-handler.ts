@@ -973,7 +973,10 @@ async function claimAggregateFiringWaiting(
  * per-claim steal can still recover. Throwing here would prevent the worker
  * from starting at all and turn a partial outage into a total one. The split
  * below does not change that: both statements sit inside the one `catch`, so a
- * failure in either still returns zeros rather than aborting startup.
+ * failure in either still returns rather than aborting startup. The two
+ * statements are separate autocommits, so a failure in the age statement does
+ * not undo the identity release before it; the catch returns the counts of
+ * whatever already committed, not zeros.
  *
  * The two arms are counted separately because they mean opposite things to an
  * operator and the combined total hid that (BLO-32481). An identity reclaim is
@@ -999,6 +1002,8 @@ export async function reconcileAbandonedAggregateFences(
            owner_slot = NULL,
            updated_at = now()
        WHERE phase IN ('firing', 'cancelling')`;
+  let byIdentity = 0;
+  let byAge = 0;
   try {
     const fences = q(ctx.db.namespace, AGGREGATE_LIFECYCLE_FENCES_TABLE);
 
@@ -1013,6 +1018,17 @@ export async function reconcileAbandonedAggregateFences(
          AND (owner_slot IS NULL OR owner_slot = $2)`,
       [WORKER_INSTANCE_ID, WORKER_SLOT],
     );
+    byIdentity = identity.rowCount;
+    // Logged before the age statement runs: this release is already committed,
+    // so a failure below must not hide that it happened.
+    if (byIdentity > 0) {
+      ctx.logger.info(
+        `paperclip-plugin-alertmanager: released ${byIdentity} aggregate lifecycle fence(s) ` +
+          `abandoned by a previous occupant of slot ${WORKER_SLOT}. Each of these was refusing ` +
+          `every firing delivery for its aggregate until now. This is the ordinary post-rollout ` +
+          `drain: the previous process died holding them.`,
+      );
+    }
 
     // Whatever is still held past the horizon is, by construction, what the
     // identity arm just declined to take: owned by this live process, or by a
@@ -1026,35 +1042,27 @@ export async function reconcileAbandonedAggregateFences(
          AND updated_at < now() - ($1::bigint * interval '1 millisecond')`,
       [AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS],
     );
-
-    if (identity.rowCount > 0) {
-      ctx.logger.info(
-        `paperclip-plugin-alertmanager: released ${identity.rowCount} aggregate lifecycle fence(s) ` +
-          `abandoned by a previous occupant of slot ${WORKER_SLOT}. Each of these was refusing ` +
-          `every firing delivery for its aggregate until now. This is the ordinary post-rollout ` +
-          `drain: the previous process died holding them.`,
-      );
-    }
-    if (age.rowCount > 0) {
+    byAge = age.rowCount;
+    if (byAge > 0) {
       // warn, not info, and deliberately louder than the line above: identity
       // could not claim these, so they were held past the backstop by an owner
       // that is either this live process or a slot that never restarted. Both
       // mean a fence was leaked by a process that was still running — the
       // condition BLO-32113 could not settle, and the one worth investigating.
       ctx.logger.warn(
-        `paperclip-plugin-alertmanager: released ${age.rowCount} aggregate lifecycle fence(s) held past ` +
+        `paperclip-plugin-alertmanager: released ${byAge} aggregate lifecycle fence(s) held past ` +
           `the ${AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS}ms abandonment backstop by an owner identity ` +
           `could not reclaim. A live process leaked these; investigate rather than treating it as a ` +
           `restart drain. A non-zero count here on consecutive boots means the leak is ongoing.`,
       );
     }
-    return { byIdentity: identity.rowCount, byAge: age.rowCount };
+    return { byIdentity, byAge };
   } catch (err) {
     ctx.logger.error(
       `paperclip-plugin-alertmanager: aggregate lifecycle fence reconciliation failed: ${String(err)}. ` +
         `Aggregates abandoned by a previous process stay wedged until their next firing delivery reclaims them.`,
     );
-    return { byIdentity: 0, byAge: 0 };
+    return { byIdentity, byAge };
   }
 }
 

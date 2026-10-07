@@ -845,9 +845,10 @@ describe("BLO-32481 — the sweep counts its two arms separately", () => {
     });
   });
 
-  it("stays non-fatal, and reports zero on both arms, when a statement fails", async () => {
-    // AC4. The split added a second statement inside the same `catch`; this is
-    // the regression that would catch someone moving one of them outside it.
+  it("stays non-fatal, and reports zero on both arms, when the identity statement fails", async () => {
+    // AC4. `mocks.db.execute` is one shared mock, so "once" rejects call 1 —
+    // the identity statement. The age statement is never reached here; the
+    // case below covers it.
     const { ctx, mocks, logger } = mkCtx();
     mocks.db.execute.mockRejectedValueOnce(new Error("connection reset"));
 
@@ -855,6 +856,37 @@ describe("BLO-32481 — the sweep counts its two arms separately", () => {
       byIdentity: 0,
       byAge: 0,
     });
+    expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "reconciliation failed",
+    );
+  });
+
+  it("stays non-fatal, and keeps the committed identity count, when only the age statement fails", async () => {
+    // AC4 for the second statement. The two statements are separate
+    // autocommits, so the identity release is durable before the age statement
+    // runs; reporting zeros here would hide a drain that happened. Moving the
+    // age statement outside the `catch`, or returning literal zeros from it,
+    // turns this red.
+    await seedFence({
+      phase: "firing",
+      firingToken: "token-from-the-dead-process",
+      ownerInstanceId: DEAD_PREDECESSOR.instanceId,
+      ownerSlot: DEAD_PREDECESSOR.slot,
+    });
+    const { ctx, mocks, logger } = mkCtx();
+    const passthrough = mocks.db.execute.getMockImplementation()!;
+    mocks.db.execute
+      .mockImplementationOnce(passthrough)
+      .mockRejectedValueOnce(new Error("connection reset"));
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({
+      byIdentity: 1,
+      byAge: 0,
+    });
+    expect((await readFence())?.phase).toBe("active");
+    expect(logger.info.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "abandoned by a previous occupant",
+    );
     expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
       "reconciliation failed",
     );
