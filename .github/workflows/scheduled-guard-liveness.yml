@@ -121,12 +121,29 @@
 # reproducible afterwards and the root cause is NOT established.
 #
 # So no stale verdict is trusted on one read. Before a red is emitted the same
-# history is re-read UNFILTERED, and DISAGREEMENT SUPPRESSES THE ALARM rather
-# than firing it — a cross-check finding a newer completion demotes the verdict
-# to a warning, because the age was measured off a fiction. Absence of
-# corroboration is not agreement: an unreadable cross-check leaves the red
-# standing, annotated, so a persistently failing second read cannot become a
-# mute switch. The extra call is spent only on the path that was about to red.
+# history is re-read UNFILTERED, and DISAGREEMENT CORROBORATES rather than
+# suppresses. THIS PARAGRAPH USED TO SAY THE OPPOSITE — "disagreement suppresses
+# the alarm ... demotes the verdict to a warning" — and PEN-3462 falsified it.
+# A cross-check finding a newer completion does not merely refute the age; to
+# disagree at all, that completion must sit inside the same staleHours bar the
+# `fresh` branch applies to the filtered read, so it POSITIVELY MEASURES the
+# guard's liveness. The verdict is `ok`/`corroborated`, an affirmative statement
+# that the guard is alive — not a withheld one. A warning still prints, but it
+# names the INDEX fault, which is the part that is genuinely unresolved.
+#
+# The correction is not pedantry: PEN-3462 was filed to bound "suppression" as
+# an unbounded mute, a premise taken from this prose, and the measurement then
+# refuted it (72 of 297 production runs 2026-09-18 -> 2026-09-30 were these
+# confirmations, mislabelled as gaps). Leaving the old reading here would invite
+# the same ticket again.
+#
+# Absence of corroboration is not agreement: an unreadable cross-check leaves
+# the red standing, annotated, so a persistently failing second read cannot
+# become a clear switch — under the verdict above that would be an affirmative
+# "this guard is alive" resting on a read that could not be made. Nor does a
+# newer completion PAST the bar clear anything — the guard is then dead by
+# either read and the red stands, citing the better timestamp. The extra call
+# is spent only on the path that was about to red.
 #
 # WHY arc-light AND NOT default
 #
