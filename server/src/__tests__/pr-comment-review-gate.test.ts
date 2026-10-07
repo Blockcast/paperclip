@@ -828,6 +828,7 @@ describe("evaluateCommentReviewGate", () => {
     const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
     const verdictFor = (severityKey: string) =>
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [
           allyComment(
@@ -894,6 +895,7 @@ describe("evaluateCommentReviewGate", () => {
 
     const carriedFor = (verb: string) =>
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [
           allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -2350,6 +2352,7 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     // This is the assertion that would have caught the regression.
     expect(
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [allyComment(blockCarryingStillPresent(CURRENT_HEAD, "still-present"), "2026-08-04T21:09:19Z")],
       }),
@@ -2373,7 +2376,9 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
   // template mandates emitting both the block and the prose ledger, which is
   // exactly how the two come to disagree on this field. Found by Ally in
   // review of #1721 at 1d6f3785.
-  const proseLedgerAgainstBlock = (verb: string, dispositions?: unknown[]) =>
+  // `readonly unknown[]`, not `unknown[]`: the table below is `as const`, and
+  // this only reads the value into JSON.stringify.
+  const proseLedgerAgainstBlock = (verb: string, dispositions?: readonly unknown[]) =>
     [
       "## Ally — Consolidated PR Review",
       "",
@@ -2414,6 +2419,7 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     // route, which is how this family of fail-opens has escaped every time.
     expect(
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [allyComment(proseLedgerAgainstBlock("still-present", []), "2026-08-04T21:09:19Z")],
       }),
@@ -2685,7 +2691,7 @@ describe("equal-timestamp ties resolve to the conservative verdict", () => {
     ];
 
     for (const order of [comments, [...comments].reverse()]) {
-      expect(evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: order })).toMatchObject({
+      expect(evaluateCommentReviewGate({ prAuthorLogin: null, headSha: CURRENT_HEAD, comments: order })).toMatchObject({
         state: "success",
         outcome: "not_evaluated",
       });
