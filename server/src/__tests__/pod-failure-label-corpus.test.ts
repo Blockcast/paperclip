@@ -59,8 +59,12 @@ function readAdapterLabels(): Set<string> {
     (m) => m[1],
   );
   // The fallback label is read from source like the other six, so renaming it is
-  // caught too. Anchored on the `: "` of the ternary's else-arm.
-  const fallback = /: "(Pod failure \([^"]+\))"/.exec(src);
+  // caught too. Anchored on the `PodWaitError` ternary itself, not on a bare `: "`
+  // (Ally review 5426857013): an unanchored match takes the FIRST `: "Pod failure
+  // (...)"` anywhere in the file, so an unrelated string of that shape appearing
+  // earlier would silently become the 7th label while `labels.length` still read 7.
+  const fallback =
+    /err instanceof PodWaitError\s*\?[^:]*:\s*"(Pod failure \([^"]+\))"/.exec(src);
   if (!fallback) {
     throw new Error(
       `Could not find the "Pod failure (...)" fallback label in ${executePath}. ` +
@@ -89,8 +93,14 @@ const FIXTURE_PATTERNS = [
 
 function findFixtureLabels(): { file: string; label: string; pattern: number }[] {
   const found: { file: string; label: string; pattern: number }[] = [];
-  for (const entry of readdirSync(testsDir)) {
-    if (!entry.endsWith(".ts")) continue;
+  // `recursive: true` (Ally review 5426857013): `__tests__/` has `fixtures/` and
+  // `helpers/` subdirectories. Neither carries a pod-failure wire string today, but
+  // a non-recursive scan drops any fixture moved into one, and the per-pattern
+  // control keeps passing on the remaining root-level hits — so the coverage loss
+  // is silent. Entries come back repo-relative, which `path.join` and the `.ts`
+  // filter both already handle, and which makes `file` more precise in failures.
+  for (const entry of readdirSync(testsDir, { recursive: true })) {
+    if (typeof entry !== "string" || !entry.endsWith(".ts")) continue;
     const src = readFileSync(path.join(testsDir, entry), "utf8");
     FIXTURE_PATTERNS.forEach((re, pattern) => {
       for (const m of src.matchAll(re)) {
