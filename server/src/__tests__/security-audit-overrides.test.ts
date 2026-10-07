@@ -73,6 +73,8 @@ describe("securityAuditRemediations ledger", () => {
     ).toEqual([
       // scripts/http-cache-semantics-security-override.test.js
       "BLO-39519",
+      // scripts/proxy-addr-security-override.test.js
+      "BLO-40607",
       // the PEN-1198 suite below
       "PEN-1198",
     ]);
@@ -88,6 +90,12 @@ describe("securityAuditRemediations ledger", () => {
     expect(Object.keys(ledger["BLO-39519"]).sort()).toEqual([
       // scripts/http-cache-semantics-security-override.test.js
       "http-cache-semantics",
+    ]);
+    expect(Object.keys(ledger["BLO-40607"]).sort()).toEqual([
+      // scripts/proxy-addr-security-override.test.js — asserts the resolved
+      // version floor above GHSA-jqcg-44mw-7w3h in both lockfiles rather than
+      // the `advisories` string, so it guards the property, not the prose.
+      "proxy-addr",
     ]);
     expect(Object.keys(ledger["PEN-1198"]).sort()).toEqual([
       // UNGUARDED: no advisories assertion anywhere in the repo.
