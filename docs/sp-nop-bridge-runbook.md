@@ -71,6 +71,21 @@ The orc8r identity is fixed by the bridge contract: `st_uuid` is the seeded
 issuer is `nop.blockcast.net`. NOP must not accept issuer or subject from an
 untrusted client or manufacture a second identity when a retry times out.
 
+The `oidc_subject` contract is fixed too, and it is load-bearing rather than
+cosmetic. `MintMemberRequest` carries only `(st_uuid, oidc_issuer,
+oidc_subject)`, and the servicer's sole idempotency mechanism is `ON CONFLICT
+(st_uuid, oidc_issuer, oidc_subject)` against the `members` unique constraint:
+there is no `gateway_hwid` or `wallet` field on the wire and no such column on
+`members`. The logical key above is therefore the orc8r key only if the subject
+carries it. `oidc_subject` MUST be
+`individual_beacon:<normalized gateway_hwid>:<normalized wallet>`, using the
+same normalized forms as the registration store, and those forms MUST exclude
+`:` so the parse back out is unambiguous (both are hex today; if that ever
+stops holding, the encoding MUST become length-prefixed or percent-encoded
+rather than ambiguous). This is what makes `MintMember` idempotent on
+`(gateway_hwid, wallet)`, and it is the only way the reconciliation sweep can
+recover either field from an orc8r member row alone.
+
 A `gateway_hwid` already bound to a live `individual_beacon` member MUST NOT be
 minted under a second `wallet`. A member is *live* while its orc8r `members` row
 has `disabled_at IS NULL`. Quarantine (see "Reconciliation sweep") is NOP-side
@@ -94,8 +109,12 @@ non-retryable identity error: the conflicting registration is recorded as a
 the existing binding (its `mb_uuid`, or the pending intent if not yet minted)
 and the conflicting wallet in `last_error`. NOP MUST NOT retry and MUST NOT
 mint. That detail is operator-visible only: the caller-facing rejection says the
-hardware is unavailable and nothing more, so it cannot be used to learn whether
-a `gateway_hwid` is deployed or which member holds it.
+hardware is unavailable and nothing more. It therefore does not reveal which
+member holds the hardware, which wallet it is bound to, or that any binding
+exists at all. It does tell the caller that this `gateway_hwid` cannot be
+registered right now, which is irreducible given that we reject at all; size
+rate-limiting and caller verification against that, not against a secrecy
+property registration does not have.
 
 Rebinding a gateway to a new wallet is a legitimate lifecycle event — hardware is
 sold, re-keyed, or the owner moves — but it is not a side effect of registration,
@@ -103,12 +122,19 @@ for the same reason organization attachment is not (see "Explicit tenant-target
 rule"): registration is driven by an untrusted client, so an implicit rebind lets
 any wallet claim hardware already in service and redirect its earnings. Rebind
 requires an authorized transfer operation that evidences the change and retires
-the prior `mb_uuid` explicitly: it disables the prior orc8r member and releases
-its intent from the constraint above, since either half left in place keeps the
-hardware bound. Until that operation exists it is an operator action, not a
-registration outcome. Rejecting here does not strand sold hardware — it routes
-it to that path (in Wave 1, the operator procedure under "Troubleshooting")
-instead of silently creating a second live member.
+the prior `mb_uuid` explicitly: it disables the prior orc8r member
+(`disabled_at`) and moves its intent to `retired`, since either half left in
+place keeps the hardware bound. `retired` is a fourth terminal state, set only
+by that operation or by the Wave 1 operator procedure — never by registration,
+and never by a failure path, which is why `registration_failed` is not reused
+here: the binding did not fail, it was superseded. The hardware constraint is
+partial over `pending_orc8r` and `registered` only, so a `retired` row coexists
+with a fresh intent for the same `gateway_hwid`. The row is retained rather
+than deleted: it is the record of who held the hardware and when, which the
+sweep and any later dispute both need. Until that operation exists it is an
+operator action, not a registration outcome. Rejecting here does not strand
+sold hardware — it routes it to that path (in Wave 1, the operator procedure
+under "Troubleshooting") instead of silently creating a second live member.
 
 ### Explicit tenant-target rule
 
@@ -132,8 +158,15 @@ they are not side effects of gateway registration.
 Registration MUST use this order:
 
 1. In one local transaction, upsert the registration intent and its
-   `(gateway_hwid, wallet)` idempotency key. The row starts in explicit
-   `pending_orc8r` state; no local success state is written yet.
+   `(gateway_hwid, wallet)` idempotency key, with that key as the upsert's
+   conflict target. The row starts in explicit `pending_orc8r` state; no local
+   success state is written yet. The store also carries the hardware
+   constraint from "MintMember identity and idempotency" — at most one
+   `pending_orc8r` or `registered` intent per normalized `gateway_hwid`. The
+   two compose: a same-wallet retry matches the conflict target and takes the
+   update path, while a different-wallet insert raises on the hardware
+   constraint. That falls out of the arbiter-index choice, so both indexes are
+   part of the contract, not an implementation detail.
 2. Call `MintMember` with the same derived identity and bridge mTLS
    credential.
 3. In a second local transaction, validate the returned `mb_uuid`, bind it
@@ -144,7 +177,9 @@ intent as `pending_orc8r` with `last_error`, `next_retry_at`, and an attempt
 counter. Return a pending response. Never report success, create an unbound
 local member, or silently discard the intent. Non-retryable identity,
 tenant-target, or authorization errors transition to `registration_failed`
-and require operator-visible remediation.
+and require operator-visible remediation. The intent states are therefore
+`pending_orc8r`, `registered`, `registration_failed`, and `retired`;
+registration writes the first three and never the fourth.
 
 ### Reconciliation sweep
 
@@ -158,6 +193,14 @@ operator-triggered repair:
 - Group orc8r members by `(st_uuid, normalized gateway_hwid, wallet)` and
   surface duplicates. Keep the earliest authoritative `mb_uuid`, quarantine
   later rows, and require explicit repair before deletion or reassignment.
+  Both this grouping and the next recover `gateway_hwid` and `wallet` by
+  parsing `oidc_subject` per the subject contract in "MintMember identity and
+  idempotency". They MUST NOT join back to NOP-side registration records to
+  obtain them: the bindings this sweep exists to find are exactly the ones the
+  local store cannot see, so a join would make the backstop circular. A member
+  under this `st_uuid`/issuer whose subject does not parse is itself surfaced,
+  as a malformed member needing repair — never skipped, since a bypass-minted
+  row is the likeliest thing to carry a non-conforming subject.
 - Group orc8r members by `(st_uuid, normalized gateway_hwid)` alone and surface
   any hardware carrying more than one live member. This grouping is deliberately
   coarser than the idempotency key: the key includes `wallet`, so a
@@ -167,8 +210,12 @@ operator-triggered repair:
   before deletion or reassignment. Count it separately from a same-wallet
   duplicate: it means the rebind rejection in "MintMember identity and
   idempotency" did not hold.
-- Emit counts for pending, orphaned, duplicate, repaired, and quarantined
-  rows. Query failure is an unhealthy sweep, not a clean zero-count result.
+- Emit counts for pending, orphaned, duplicate, repaired, quarantined, and
+  malformed-subject rows. Query failure is an unhealthy sweep, not a clean
+  zero-count result. A persistently nonzero quarantined count is expected, not
+  a sweep failing to converge: quarantine does not clear liveness, so a
+  quarantined pair stays live and the hwid-only grouping re-surfaces it on
+  every run until explicit repair.
 
 The sweep must be safe to run concurrently with registration. It must use
 the same unique constraint/idempotency path as the registration call and must
@@ -185,8 +232,14 @@ of an already-bound `gateway_hwid` under a different `wallet` is rejected as
 non-retryable, leaves the intent `registration_failed`, and mints no second
 member, both serially and when the two registrations run concurrently; and that
 the `gateway_hwid`-only sweep grouping surfaces such a pair when one is seeded
-directly. Manual verification must inspect persisted registration state and
-orchestrator logs for the idempotency key.
+directly. It MUST also prove the retirement round-trip: with the prior member
+disabled and its intent `retired`, the same `gateway_hwid` registers
+successfully under the new wallet, while retiring only one of the two halves
+still rejects. Finally it MUST prove that the sweep recovers `gateway_hwid` and
+`wallet` from `oidc_subject` alone, with no NOP-side registration row present,
+and surfaces a member whose subject does not parse rather than skipping it.
+Manual verification must inspect persisted registration state and orchestrator
+logs for the idempotency key.
 
 ### Dependency boundary
 
@@ -209,6 +262,12 @@ NOP to add a second caller-verification implementation.
 - You have `psql` access to the orc8r postgres pool with write
   permissions on `system_principals` and `revocation_blocklist` (the
   Revocation section writes the latter).
+- For the Wave 1 rebind procedure only (see "Troubleshooting"), you also have
+  write access to the **NOP-side registration store**, which is a different
+  database from the orc8r pool above and is not otherwise described by this
+  runbook. The procedure sets `disabled_at` on one side and `retired` on the
+  other; orc8r access alone cannot complete it, and completing only the orc8r
+  half leaves the hardware bound.
 
 ## One-time INSERT
 
@@ -482,10 +541,13 @@ The failure modes you're most likely to hit:
   "MintMember identity and idempotency"). The owner sees only that the hardware
   is unavailable, and Wave 1 has no self-serve remediation: the transfer
   operation is not built. Treat it as a rebind request. Verify the ownership
-  change out of band, then retire the prior `mb_uuid`: set `disabled_at` on its
-  orc8r member and release its intent from the hardware constraint.
-  Quarantining it does not free the hardware. Then have the new wallet register
-  again.
+  change out of band, then retire the prior `mb_uuid` in both places, in this
+  order: set `disabled_at` on its orc8r member (`psql` on the orc8r pool), then
+  set its registration intent to `retired` in the NOP-side registration store,
+  which is a separate database — see Prerequisites. Quarantining it does not
+  free the hardware, and doing only the orc8r half does not either: the
+  hardware constraint is over the intent, so the final step below fails against
+  a constraint that still holds. Then have the new wallet register again.
 
 ## Related
 
