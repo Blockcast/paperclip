@@ -741,7 +741,7 @@ githubApp:
   # Watch during the soak, because this is a soak and not a flip-and-forget: for
   # repos in reviewGateRepositories the webhook handler now returns 202 with a
   # receipt, and an insert failure returns 503/409 and SHORT-CIRCUITS the handler
-  # before any other webhook processing (server/src/services/github-webhook.ts).
+  # before any other webhook processing (server/src/routes/github-webhook.ts).
   # It fails loud — GitHub retries a 503 — but while it fails, other
   # webhook-driven behaviour for that repo stops too, including agent PR wakes.
   # Step 5 is not pre-authorized; it needs the soak numbers first.
