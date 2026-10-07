@@ -1132,6 +1132,60 @@ export function coerceRetryScheduleReason(reason: string | null | undefined): Re
  */
 export const NO_SCHEDULED_RETRY_PARK_REASON = "none";
 /**
+ * Park-horizon-only refinements of `transient_failure` (BLO-31174, Ally C1 on
+ * onprem-k8s#4145). The raw column says `transient_failure` for THREE writer
+ * paths whose ceilings differ by more than 9x and one of which has no ceiling
+ * at all, so a single bound on that label is wrong by construction -- which is
+ * the exact defect the per-class bounds were built to remove:
+ *
+ *  - ladder (neither constant below): `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS`
+ *    final 2h hop plus 25% jitter = **9,000s**. Keeps the bare
+ *    `transient_failure` label.
+ *  - {@link TRANSIENT_FLOOR_PARK_REASON}: an upstream `retryNotBefore` floor
+ *    won. An unclamped floor at or just under the horizon can add up to
+ *    `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` (300s), while a floor that
+ *    `clampTransientRetryHorizon` actually clamps carries no forward jitter;
+ *    the maximum is therefore `MAX_TRANSIENT_RETRY_HORIZON_MS` (86,400s) plus
+ *    300s = **86,700s**.
+ *  - {@link TRANSIENT_QUOTA_FLOOR_PARK_REASON}: a `provider_quota` floor.
+ *    `clampTransientHorizon` deliberately excludes this family -- it is a
+ *    contractual session/billing boundary carrying an authoritative reset
+ *    instant, not a capacity estimate -- so the floor is honoured verbatim and
+ *    has **no upper bound**. A multi-day park here is correct behaviour. An
+ *    alert rule must EXCLUDE this label rather than invent a bound for it;
+ *    bounding it would page on the designed path, which is the defect, not the
+ *    fix.
+ *
+ * Deliberately outside {@link KNOWN_RETRY_SCHEDULE_REASONS}: that list is the
+ * vocabulary of the raw column, which never holds either of these, and it is
+ * shared with the outcome counter. Refining it there would mint two counter
+ * series that can never be written.
+ */
+export const TRANSIENT_FLOOR_PARK_REASON = "transient_failure_floor";
+/** See {@link TRANSIENT_FLOOR_PARK_REASON}. Unbounded by design. */
+export const TRANSIENT_QUOTA_FLOOR_PARK_REASON = "transient_failure_quota_floor";
+/**
+ * Refine a coerced park reason using facts already on the parked row. Only
+ * `transient_failure` refines; every other reason passes through untouched, so
+ * this is a no-op for 13 of the 14 known reasons.
+ *
+ * `hasRetryFloor` is floor PRESENCE, not "the floor won" -- recovering the
+ * latter would mean recomputing the ladder value the park did not keep. When a
+ * present floor loses to the ladder the row is labelled floor anyway and is
+ * judged against 86,700s instead of 9,000s. That is a LOOSER bound on a park
+ * that is already provably under the tighter one, i.e. weaker monitoring of a
+ * known-good case, never a false page.
+ */
+export function refineScheduledRetryParkReason(input: {
+  reason: string | null | undefined;
+  hasRetryFloor?: boolean | null;
+  isProviderQuotaFamily?: boolean | null;
+}): string {
+  const reason = coerceRetryScheduleReason(input.reason);
+  if (reason !== "transient_failure" || !input.hasRetryFloor) return reason;
+  return input.isProviderQuotaFamily ? TRANSIENT_QUOTA_FLOOR_PARK_REASON : TRANSIENT_FLOOR_PARK_REASON;
+}
+/**
  * postgres.js connection-pool occupancy, by `state` (BLO-33243).
  *
  * There was no pool instrumentation anywhere in this fleet, which made pool
@@ -3807,8 +3861,9 @@ function ensureRegistry(): {
         + "`reason` is load-bearing, not decoration: legitimate ceilings differ by class and span "
         + "at least 289x (max_turns_continuation 300s, ccrotate_capacity 1080s as a 15min clamp plus "
         + "20% forward jitter, dependency_blocked "
-        + "3600s, transient_failure 9000s on the backoff ladder but up to 86700s when it adopts an "
-        + "upstream retryNotBefore floor, 24h clamp plus 5min forward jitter, and unbounded for a "
+        + "3600s, transient_failure 9000s on the backoff ladder but up to 86700s when an unclamped "
+        + "upstream retryNotBefore floor is at or just under the 24h horizon and takes up to 5min forward "
+        + "jitter; a floor actually clamped to 24h carries no forward jitter, and it is unbounded for a "
         + "provider_quota floor, which is never clamped), so any single threshold across all of "
         + "them fires on designed backoff in one class while missing a 5x clamp breach in another. "
         + "Bound each reason against its own ceiling. reason='none' is a per-agent zero floor emitted for every "
@@ -5579,12 +5634,19 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
  * `provider_quota` floor has no ceiling) can only be thresholded at a value
  * that is simultaneously below one class's designed backoff and above
  * another's clamp.
+ *
+ * The reason is {@link refineScheduledRetryParkReason}d, not merely coerced:
+ * the raw column's `transient_failure` covers three paths with three different
+ * ceilings, so the bare column value cannot be bounded either. See that
+ * function for the split and for why the quota path carries no bound at all.
  */
 export function setScheduledRetryParkHorizonMetrics(
   entries: ReadonlyArray<{
     agentId: string | null | undefined;
     reason: string | null | undefined;
     horizonSeconds: number;
+    hasRetryFloor?: boolean | null;
+    isProviderQuotaFamily?: boolean | null;
   }>,
   knownAgentIds: ReadonlySet<string>,
 ): void {
@@ -5600,10 +5662,12 @@ export function setScheduledRetryParkHorizonMetrics(
   const maxByLabels = new Map<string, { agentId: string; reason: string; horizonSeconds: number }>();
   for (const entry of entries) {
     const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
-    const reason = coerceRetryScheduleReason(entry.reason);
+    const reason = refineScheduledRetryParkReason(entry);
     const horizonSeconds = Number.isFinite(entry.horizonSeconds) ? Math.max(0, entry.horizonSeconds) : 0;
-    // Distinct reasons can fold to the same `other` label, so re-max here
-    // rather than trusting the query's GROUP BY to have produced unique keys.
+    // Distinct reasons can fold to the same `other` label -- and the three
+    // `transient_failure` refinements above split one GROUP BY key into
+    // several while several fold back into one -- so re-max here rather than
+    // trusting the query's GROUP BY to have produced unique keys.
     const key = `${agentId}\u0000${reason}`;
     const current = maxByLabels.get(key);
     if (current === undefined || horizonSeconds > current.horizonSeconds) {
