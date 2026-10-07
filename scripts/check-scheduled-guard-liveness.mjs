@@ -235,14 +235,16 @@ export const WATCHED_GUARDS = [
   // `schedule` runs by construction and classifies `never-completed` — a
   // threshold-INDEPENDENT branch the 16h above cannot cover. The date is the
   // first cron after merge plus two full cycles of slack for GitHub's
-  // scheduled-run delay under load. Rotting here is FAIL-CLOSED: when it lapses
+  // scheduled-run delay under load: it holds for a merge before
+  // 2026-10-08T07:13Z (moved from 2026-10-08T00:00Z after a queue ejection
+  // burned that runway). Rotting here is FAIL-CLOSED: when it lapses
   // the guard gets STRICTER, so a merge that slips past it reds on day one —
   // loud, never silently green.
   {
     workflow: "commit-attribution-audit.yml",
     staleHours: 16,
     event: "schedule",
-    graceUntil: "2026-10-08T00:00:00.000Z",
+    graceUntil: "2026-10-09T12:00:00.000Z",
   },
 ];
 

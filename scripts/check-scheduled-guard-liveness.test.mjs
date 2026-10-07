@@ -1500,10 +1500,21 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     // outliers are 17.71h and 22.21h. The bar must sit strictly between.
     // commit-attribution-audit.yml ADOPTS this band rather than having
     // measured its own — see the note on its WATCHED_GUARDS entry.
+    //
+    // Each bar is also asserted EQUAL to the measured one (BLO-26736), not just
+    // in the band, so that if the 14.60h/17.71h band is ever re-derived they
+    // all move together — the alternative is a copy that rots out of the band
+    // silently, or bars that quietly diverge inside it.
+    const measured = byWorkflow.get("production-environment-protection-guard.yml");
     for (const workflow of TWICE_DAILY) {
       const bar = byWorkflow.get(workflow);
       assert.ok(bar > 14.6, `${workflow} would red on ordinary twice-daily jitter`);
       assert.ok(bar < 17.71, `${workflow} would sail over the 2026-09-15 outage it must catch`);
+      assert.equal(
+        bar,
+        measured,
+        `${workflow}: the twice-daily guards must share one bar until each has gaps of its own`,
+      );
     }
 
     // BLO-38228: the daily clock-rot guard is on 48h, deliberately loose because
