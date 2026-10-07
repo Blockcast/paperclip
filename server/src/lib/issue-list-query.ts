@@ -30,6 +30,40 @@ export function parseUnsupportedPaginationParams(query: {
   ];
 }
 
+// BLO-40145: the same endpoint implements NO time-bound filter at all, and
+// Express hands unknown query params through unread. So `?updated_after=T` is
+// discarded exactly like a fabricated param name — measured: `updated_after`
+// set to the year 2099 returns byte-identical rows to no filter and to
+// `?zzz_not_a_filter=1`.
+//
+// That is worse than the BLO-24495 page/perPage case it mirrors, because the
+// default sort is priority-band then recency: the head of the `critical` band
+// is churning alert rows updated seconds ago, so a spot check with a recent
+// floor and a small `limit` PASSES on rows that were never filtered. The
+// filter looks honoured until a second filter moves the window off that
+// recency-hot prefix, which reads as "the time bound composes badly" rather
+// than "there is no time bound". A census written as "rows in class C since
+// the fix" silently becomes "the first N rows of the corpus", and since the
+// fix is recent almost nothing in that prefix post-dates it — so the read
+// returns a small number, or zero, and that reads as the fix holding.
+//
+// Matched by SHAPE rather than an enumerated denylist: a caller reaching for a
+// time bound invents `updated_after`, `updatedSince`, `createdBefore` and so
+// on, and listing them one at a time only ever catches the alias someone
+// already tripped over. No supported param on this route has this shape, so
+// the rule cannot swallow a real filter. An allowlist over every param would
+// be the fuller fix and is deliberately not taken here: this is a hot read
+// path shared with the board UI, and one missing entry turns a wrong-census
+// bug into a 400 on every list request.
+const TIME_FILTER_PARAM_PATTERN =
+  /^(updated|created|started|completed|resolved|closed|modified)_?(after|before|since|until|within|from|to)$/i;
+
+export function parseUnsupportedTimeFilterParams(query: Record<string, unknown>): string[] {
+  return Object.keys(query)
+    .filter((key) => TIME_FILTER_PARAM_PATTERN.test(key))
+    .sort();
+}
+
 /**
  * Parse an `offset` query param for a paged issue-list surface.
  *
