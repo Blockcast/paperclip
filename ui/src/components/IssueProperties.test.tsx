@@ -9,6 +9,7 @@ import type {
   IssueExecutionState,
   IssueLabel,
   Project,
+  TrustAuthorizationPolicy,
   WorkspaceRuntimeService,
 } from "@paperclipai/shared";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -2101,6 +2102,332 @@ describe("IssueProperties", () => {
     expect(written?.productivityReviewDisabled).toBe(true);
 
     act(() => root.unmount());
+  });
+
+  // BLO-40082. Both of these go through hand-rolled object literals in
+  // IssueProperties rather than through buildExecutionPolicy, so the lib-level
+  // suite cannot see them.
+  describe("board monitor edits do not clobber unrendered policy fields (BLO-40082)", () => {
+    // Relative to the wall clock, not a fixed date: the spent-bound rule below
+    // compares against `Date.now()`, so a hardcoded 2026 literal would silently
+    // flip these two fixtures into each other as time passes.
+    const FUTURE_TIMEOUT_AT = new Date(Date.now() + 86_400_000).toISOString();
+    const PAST_TIMEOUT_AT = new Date(Date.now() - 86_400_000).toISOString();
+    // The two ±1d fixtures above are safe at collection scope. The skew-margin
+    // pair below is NOT, and is built inside its own `it`: those offsets are
+    // tens of seconds, so evaluating them here would hand the assertion a
+    // wall-clock budget equal to the margin minus the offset, spent by every
+    // test that runs in between. Same failure the comment above warns about,
+    // 1728× tighter.
+    const REVIEW_PRESET = { id: "low_trust_review", version: 1, rawOutputDisposition: "quarantine" } as const;
+    const AUTHORIZATION_POLICY: TrustAuthorizationPolicy = {
+      trustPreset: "low_trust_review",
+      reviewPreset: REVIEW_PRESET,
+      trustBoundary: {
+        mode: "low_trust_review",
+        allowedAgentIds: ["agent-1"],
+        allowedToolClasses: ["git.read"],
+        allowedSecretBindingIds: ["binding-1"],
+        outputPromotionTarget: { type: "issue", issueId: "issue-9" },
+      },
+    };
+
+    async function openMonitorEditor(
+      container: HTMLDivElement,
+      onUpdate: ComponentProps<typeof IssueProperties>["onUpdate"],
+      policyOverrides: Partial<IssueExecutionPolicy>,
+    ) {
+      const root = renderProperties(container, {
+        issue: createIssue({
+          status: "in_progress",
+          assigneeAgentId: "agent-1",
+          executionPolicy: createExecutionPolicy(policyOverrides),
+        }),
+        childIssues: [],
+        onUpdate,
+        inline: true,
+      });
+      await flush();
+      const monitorTrigger = Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.includes("Next check"));
+      await act(async () => {
+        monitorTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flush();
+      return root;
+    }
+
+    function clickMonitorButton(container: HTMLDivElement, label: string) {
+      const button = Array.from(container.querySelectorAll("button"))
+        .find((candidate) => candidate.textContent?.trim() === label);
+      expect(button, `expected a "${label}" button`).toBeTruthy();
+      act(() => {
+        button!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+    }
+
+    it("carries reviewPreset and authorizationPolicy through arming a monitor", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: "Check deployment", scheduledBy: "board" },
+        reviewPreset: REVIEW_PRESET,
+        authorizationPolicy: AUTHORIZATION_POLICY,
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written.authorizationPolicy).toEqual(AUTHORIZATION_POLICY);
+      expect(written.reviewPreset).toEqual(REVIEW_PRESET);
+      expect(written.authorizationPolicy?.trustBoundary).toEqual(AUTHORIZATION_POLICY.trustBoundary);
+
+      act(() => root.unmount());
+    });
+
+    it("carries reviewPreset, authorizationPolicy and productivityReviewDisabled through clearing a monitor", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: "Check deployment", scheduledBy: "board" },
+        authorizationPolicy: AUTHORIZATION_POLICY,
+        // The clear path rebuilds this flag on its own arm of `updateMonitor`,
+        // so the arm-path test does not cover it here.
+        productivityReviewDisabled: true,
+      });
+
+      clickMonitorButton(container, "Clear");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written).not.toBeNull();
+      expect(written.monitor).toBeUndefined();
+      expect(written.authorizationPolicy).toEqual(AUTHORIZATION_POLICY);
+      expect(written.productivityReviewDisabled).toBe(true);
+
+      act(() => root.unmount());
+    });
+
+    it("preserves the monitor fields the dialog has no control for", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          notes: "Check deployment",
+          scheduledBy: "assignee",
+          // None of these five are rendered by the monitor dialog, so a board
+          // edit used to delete them. `gateSignals` is the sharp one: losing it
+          // drops the BLO-18294 convergence guard back onto `notes`.
+          gateSignals: ["pr:Blockcast/paperclip#2228:checks"],
+          maxAttempts: 5,
+          timeoutAt: FUTURE_TIMEOUT_AT,
+          recoveryPolicy: "wake_owner",
+          externalRef: "run-123",
+        },
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written.monitor?.gateSignals).toEqual(["pr:Blockcast/paperclip#2228:checks"]);
+      expect(written.monitor?.maxAttempts).toBe(5);
+      expect(written.monitor?.timeoutAt).toBe(FUTURE_TIMEOUT_AT);
+      expect(written.monitor?.recoveryPolicy).toBe("wake_owner");
+      expect(written.monitor?.externalRef).toBe("run-123");
+      // Still authored by the controls that do exist.
+      expect(written.monitor?.scheduledBy).toBe("board");
+      expect(written.monitor?.notes).toBe("Check deployment");
+
+      act(() => root.unmount());
+    });
+
+    // Carrying the bounds forward unconditionally would 422 the board out of the
+    // one job this dialog has on a wedged monitor: the server throws
+    // "Monitor bounds are already exhausted" on an explicit re-arm rather than
+    // stripping, and there is no control here for either field.
+    it("drops a lapsed timeoutAt so a board reschedule still re-arms", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+          notes: null,
+          timeoutAt: PAST_TIMEOUT_AT,
+          gateSignals: ["deploy:paperclip-api"],
+        },
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written.monitor?.timeoutAt).toBeNull();
+      // Everything else still carries — this drops a spent bound, not the policy.
+      expect(written.monitor?.gateSignals).toEqual(["deploy:paperclip-api"]);
+
+      act(() => root.unmount());
+    });
+
+    // The drop test runs on the browser clock; the server re-runs the same
+    // predicate on its own. A client running AHEAD would otherwise read a
+    // still-live deadline as spent and delete it, with no control here to put
+    // it back — the silent-drop class this whole fix exists to close. Skew
+    // inside the margin must resolve to "keep".
+    it("keeps a timeoutAt that lapsed within the clock-skew margin", async () => {
+      // Built here, not in the describe body: 10s of a 60s margin, so at
+      // collection scope the assertion would carry a 50s wall-clock budget
+      // spanning every intervening test. Here the gap is microseconds.
+      const justLapsed = new Date(Date.now() - 10_000).toISOString();
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+          notes: null,
+          timeoutAt: justLapsed,
+        },
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written.monitor?.timeoutAt).toBe(justLapsed);
+
+      act(() => root.unmount());
+    });
+
+    // Pins the MAGNITUDE of the margin, not just its direction. The 10s keep
+    // above and the 1d drop earlier hold for any margin between ~10s and ~24h,
+    // so widening the constant to e.g. 12h — which would hold a genuinely
+    // wedged monitor unresettable for half a day, re-opening the 422 dead end
+    // that the lapsed-bound drop closed — passes both of them untouched.
+    //
+    // The offset is a LITERAL on purpose. Deriving it from the constant
+    // (`-(MONITOR_BOUND_SKEW_MARGIN_MS + 5_000)`) moves the fixture with any
+    // mutation of the constant, so the test stays green for every value and
+    // pins nothing — the exact mutation-blindness this test exists to remove.
+    // With 65s asserted dropped and 10s asserted kept, the margin is bracketed
+    // to (10s, 65s): widen or narrow past either edge and one of them reddens.
+    it("drops a timeoutAt that lapsed just outside the clock-skew margin", async () => {
+      const justOutsideMargin = new Date(Date.now() - 65_000).toISOString();
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+          notes: null,
+          timeoutAt: justOutsideMargin,
+        },
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written.monitor?.timeoutAt).toBeNull();
+
+      act(() => root.unmount());
+    });
+
+    it("drops a maxAttempts the monitor has already reached, and keeps one it has not", async () => {
+      const onUpdate = vi.fn();
+      const root = renderProperties(container, {
+        issue: createIssue({
+          status: "in_progress",
+          assigneeAgentId: "agent-1",
+          monitorAttemptCount: 5,
+          executionPolicy: createExecutionPolicy({
+            monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: null, scheduledBy: "assignee", maxAttempts: 5 },
+          }),
+        }),
+        childIssues: [],
+        onUpdate,
+        inline: true,
+      });
+      await flush();
+      await act(async () => {
+        Array.from(container.querySelectorAll("button"))
+          .find((button) => button.textContent?.includes("Next check"))!
+          .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flush();
+
+      clickMonitorButton(container, "Schedule");
+      expect(
+        (onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy).monitor?.maxAttempts,
+      ).toBeNull();
+
+      act(() => root.unmount());
+
+      // Negative control: a budget with road left is not touched, so this is a
+      // spent-bound rule and not an unconditional strip.
+      const liveOnUpdate = vi.fn();
+      const liveRoot = await openMonitorEditor(container, liveOnUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: null, scheduledBy: "assignee", maxAttempts: 5 },
+      });
+      clickMonitorButton(container, "Schedule");
+      expect(
+        (liveOnUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy).monitor?.maxAttempts,
+      ).toBe(5);
+
+      act(() => liveRoot.unmount());
+    });
+
+    it("clears externalRef only when a service name that was set gets cleared", async () => {
+      const externalWait = {
+        nextCheckAt: "2026-04-11T12:30:00.000Z",
+        scheduledBy: "assignee" as const,
+        notes: null,
+        kind: "external_service" as const,
+        serviceName: "github-actions",
+        externalRef: "run-123",
+      };
+
+      // Untouched: the reference to the wait survives, per the carry-forward rule.
+      const keptOnUpdate = vi.fn();
+      const keptRoot = await openMonitorEditor(container, keptOnUpdate, { monitor: externalWait });
+      clickMonitorButton(container, "Schedule");
+      expect(
+        (keptOnUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy).monitor?.externalRef,
+      ).toBe("run-123");
+      act(() => keptRoot.unmount());
+
+      // Cleared: `kind`/`serviceName`/`externalRef` go together, so do not leave
+      // a reference to a wait the user just said is over.
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, { monitor: externalWait });
+      const serviceInput = Array.from(container.querySelectorAll("input"))
+        .find((input) => input.getAttribute("placeholder") === "External service");
+      expect(serviceInput, "expected the service-name input").toBeTruthy();
+      expect(serviceInput!.value).toBe("github-actions");
+
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set
+          ?.call(serviceInput!, "");
+        serviceInput!.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await flush();
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(written.monitor?.serviceName).toBeNull();
+      expect(written.monitor?.kind).toBeNull();
+      expect(written.monitor?.externalRef).toBeNull();
+
+      act(() => root.unmount());
+    });
+
+    // Negative control: without this, the three tests above also pass on an
+    // implementation that emits these keys unconditionally.
+    it("invents no keys when the existing policy carries none of them", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: "Check deployment", scheduledBy: "board" },
+      });
+
+      clickMonitorButton(container, "Schedule");
+
+      const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
+      expect(Object.keys(written).sort()).toEqual(["commentRequired", "mode", "monitor", "stages"]);
+      expect(Object.keys(written.monitor ?? {}).sort()).toEqual(["kind", "nextCheckAt", "notes", "scheduledBy", "serviceName"]);
+
+      act(() => root.unmount());
+    });
   });
 
   const watchdogAgent = {

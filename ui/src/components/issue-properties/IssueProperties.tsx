@@ -130,6 +130,10 @@ interface IssuePropertiesProps {
 
 const ISSUE_BLOCKER_SEARCH_LIMIT = 50;
 const ISSUE_PROPERTY_RELATION_PREVIEW_COUNT = 5;
+// Browser-vs-server clock skew allowance before this dialog will call a monitor
+// `timeoutAt` spent. Only ever widens the "keep the bound" side — see the
+// asymmetry argument at the drop site in `saveMonitor`.
+const MONITOR_BOUND_SKEW_MARGIN_MS = 60_000;
 
 export function IssueProperties({
   issue,
@@ -962,15 +966,33 @@ export function IssueProperties({
       onUpdate({ executionPolicy: null });
       return;
     }
+    // BLO-40082: second field-by-field rebuild, same clobber. Carry everything
+    // that is not rebuilt here straight off the issue, so `reviewPreset` and
+    // `authorizationPolicy` survive a board monitor edit. Read off the issue
+    // rather than `basePolicy` so it holds even if that guard is loosened.
+    //
+    // `productivityReviewDisabled` is excluded because it IS rebuilt below,
+    // true-only, per BLO-39945; carrying it would preserve a literal `false`.
+    const {
+      mode: _rebuiltMode,
+      commentRequired: _rebuiltCommentRequired,
+      stages: _rebuiltStages,
+      monitor: _rebuiltMonitor,
+      productivityReviewDisabled: _rebuiltProductivityReviewDisabled,
+      ...carriedPolicy
+    } = issue.executionPolicy ?? {};
     onUpdate({
       executionPolicy: {
+        ...carriedPolicy,
         mode: basePolicy?.mode ?? issue.executionPolicy?.mode ?? "normal",
         commentRequired: true,
         stages: basePolicy?.stages ?? [],
         // BLO-39945: a second field-by-field rebuild, so it needs the same
         // carry-forward as `buildExecutionPolicy`. Read off the issue rather
         // than `basePolicy` so it survives even if that guard is loosened.
-        ...(issue.executionPolicy?.productivityReviewDisabled ? { productivityReviewDisabled: true as const } : {}),
+        ...(issue.executionPolicy?.productivityReviewDisabled === true
+          ? { productivityReviewDisabled: true as const }
+          : {}),
         ...(nextMonitor ? { monitor: nextMonitor } : {}),
       },
     });
@@ -980,13 +1002,64 @@ export function IssueProperties({
     const nextCheckAt = new Date(monitorAtInput);
     if (Number.isNaN(nextCheckAt.getTime())) return;
     const serviceName = monitorServiceInput.trim() || null;
+    const carried = issue.executionPolicy?.monitor;
+    // BLO-40082: carry the two bounds forward, but drop one that is already
+    // spent. A board "Schedule" always sets `monitorExplicitlyUpdated`
+    // server-side (routes/issues.ts), and on that path
+    // `applyIssueExecutionPolicyTransition` *throws* 422 "Monitor bounds are
+    // already exhausted" rather than stripping them
+    // (services/issue-execution-policy.ts). The dialog renders no control for
+    // either field, so re-sending a lapsed `timeoutAt` or a `maxAttempts` the
+    // monitor has already reached would leave the board unable to reset exactly
+    // the wedged monitors it exists to reset — the "omit `maxAttempts` when
+    // resetting a wedged monitor" path the monitor contract documents, and the
+    // BLO-18294 convergence-stall reset that requires a non-assignee actor.
+    // `null` is how you omit here: the server replaces the monitor wholesale and
+    // `exhaustedMonitorClearReason` reads both through `?? null`.
+    const attemptCount = issue.monitorAttemptCount ?? issue.executionState?.monitor?.attemptCount ?? 0;
+    const timeoutAt = carried?.timeoutAt ?? null;
+    const maxAttempts = carried?.maxAttempts ?? null;
     updateMonitor({
+      // The same clobber one nesting level down. This literal used to re-emit
+      // 6 of the 11 fields on IssueExecutionMonitorPolicy, so a board user
+      // changing the next-check time silently cleared `timeoutAt`,
+      // `maxAttempts`, `recoveryPolicy`, `gateSignals`, `externalRef` and the
+      // nested `productivityReviewDisabled`. `gateSignals` is the sharp one:
+      // losing it drops the convergence guard back onto the free-form `notes`
+      // signature, which is the precise failure BLO-18294 added it to prevent.
+      // Spread first, then override only the fields this dialog authors.
+      ...carried,
       nextCheckAt: nextCheckAt.toISOString(),
       notes: monitorNotesInput.trim() || null,
       scheduledBy: "board",
       kind: serviceName ? "external_service" : null,
       serviceName,
-      externalRef: null,
+      // `kind`/`serviceName`/`externalRef` are one cluster describing an
+      // external wait. Clearing a service name that WAS set is the one case
+      // where the user has expressed intent about the cluster, so do not leave
+      // a reference to a wait that no longer exists. An empty input over a
+      // monitor that never had a `serviceName` expresses nothing — clearing
+      // there would be the same silent drop as the rest of this fix.
+      ...(carried?.serviceName && !serviceName && carried.externalRef != null
+        ? { externalRef: null }
+        : {}),
+      // Override only to DROP a spent bound — never to invent a key the stored
+      // monitor did not carry, which is what the negative-control tests pin.
+      //
+      // The lapsed test runs on the BROWSER clock and the server re-evaluates
+      // the same predicate on its own, so the two can disagree. The skew
+      // directions are not symmetric: a client behind sends a bound the server
+      // still reads as spent and gets a loud, retryable 422, but a client ahead
+      // reads a still-live `timeoutAt` as spent and sends `timeoutAt: null`,
+      // permanently deleting a deadline this dialog renders no control to
+      // restore — the exact silent-drop class this fix exists to close. The
+      // margin collapses the window to the safe direction: it still clears
+      // every genuinely wedged monitor, and costs at worst one retryable 422 on
+      // a bound expiring inside the next minute.
+      ...(timeoutAt && new Date(timeoutAt).getTime() <= Date.now() - MONITOR_BOUND_SKEW_MARGIN_MS
+        ? { timeoutAt: null }
+        : {}),
+      ...(maxAttempts !== null && maxAttempts <= attemptCount ? { maxAttempts: null } : {}),
     });
     setMonitorOpen(false);
   };
