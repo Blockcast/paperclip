@@ -43,6 +43,37 @@ import test from "node:test";
 
 const PATCHED_FLOOR = ">=4.3.0 <5";
 
+// The two advisories this floor stands on. Pinned exactly, not
+// `arrayContaining`: ch52 is the one Dependabot alerts on and f27v is the one
+// 4.3.0 actually fixes, and the comment above explains why dropping either
+// misrepresents the override. An unpinned array lets that justification revert
+// silently. `deepEqual` under `node:assert/strict` is `deepStrictEqual`, so
+// order is pinned too — deliberate for a hand-maintained two-element list, and
+// the failure message says so rather than claiming an ID went missing.
+const ADVISORIES = ["GHSA-ch52-4w7c-c8xp", "GHSA-f27v-pv5m-c5g6"];
+
+// Derive the numeric comparison from PATCHED_FLOOR rather than restating it.
+// A hardcoded `minor >= 3` beside a declared `>=4.3.0 <5` reads as though the
+// constant drives the check while the two can drift apart: raising the
+// constant to `>=4.4.0 <5` over a lockfile still resolving 4.3.0 used to stay
+// green. Fail loudly if the constant stops being parseable — never degrade to
+// a comparison that passes everything.
+const FLOOR_MATCH = /^>=(\d+)\.(\d+)\.(\d+) <(\d+)$/.exec(PATCHED_FLOOR);
+assert.ok(
+  FLOOR_MATCH,
+  `PATCHED_FLOOR ${JSON.stringify(PATCHED_FLOOR)} is not a '>=x.y.z <M' range, so no numeric floor can be derived from it`,
+);
+const [FLOOR_MAJOR, FLOOR_MINOR, FLOOR_PATCH, CEIL_MAJOR] = FLOOR_MATCH.slice(
+  1,
+).map(Number);
+
+function satisfiesFloor([major, minor, patch]) {
+  if (major >= CEIL_MAJOR) return false;
+  if (major !== FLOOR_MAJOR) return major > FLOOR_MAJOR;
+  if (minor !== FLOOR_MINOR) return minor > FLOOR_MINOR;
+  return patch >= FLOOR_PATCH;
+}
+
 // Assert on EVERY resolution, not the first: a single outlier entry left inside
 // the vulnerable range is the whole question, and a check that stops at the
 // common case would report green on it.
@@ -51,10 +82,10 @@ function assertPatched(versions, where) {
     versions.length > 0,
     `${where}: no http-cache-semantics resolution found`,
   );
-  for (const [major, minor, patch] of versions) {
+  for (const version of versions) {
     assert.ok(
-      major > 4 || (major === 4 && minor >= 3),
-      `${where} resolved vulnerable http-cache-semantics ${major}.${minor}.${patch} (GHSA-ch52-4w7c-c8xp affects <= 4.2.0)`,
+      satisfiesFloor(version),
+      `${where} resolved http-cache-semantics ${version.join(".")} outside ${PATCHED_FLOOR} (floor rests on ${ADVISORIES.join(", ")})`,
     );
   }
 }
@@ -73,6 +104,13 @@ test("http-cache-semantics resolves above the GHSA-ch52-4w7c-c8xp floor", async 
     ].patchedRange,
     PATCHED_FLOOR,
     "securityAuditRemediations ledger disagrees with pnpm.overrides",
+  );
+  assert.deepEqual(
+    packageJson.securityAuditRemediations["BLO-39519"][
+      "http-cache-semantics"
+    ].advisories,
+    ADVISORIES,
+    "securityAuditRemediations ledger advisories differ from the pinned set (exact contents and order)",
   );
 
   // Positive control. Every assertion below is satisfied by a lockfile that
