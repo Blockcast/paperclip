@@ -3147,8 +3147,64 @@ async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: s
   return findGitWorktreeEntryByBranch(entries, branchName);
 }
 
+export type GitCheckoutProbe =
+  | { state: "checkout"; reason: null }
+  | { state: "not_a_checkout"; reason: string }
+  | { state: "indeterminate"; reason: string };
+
+// PEN-3633: git's own stderr and exit status are already in hand when the
+// probe fails, and `.catch(() => null)` used to discard them one line later.
+// That collapsed every distinct failure — a directory that genuinely holds no
+// repository, dubious ownership, lock contention, a stale handle, a spawn
+// failure inside the API pod — into one indistinguishable `false`, and the
+// refusal downstream then described a repo-identity mismatch it had never
+// tested. A measured 8.6-hour episode (33 runs, 19 issues) was unattributable
+// for exactly this reason: the record was not missing, it was dropped here.
+//
+// Only git's own "not a git repository" fatal is positively attributable to
+// the directory; every other failure means the probe did not reach a verdict,
+// which is reported as `indeterminate` rather than asserted as absence. This
+// mirrors `probeGitCheckoutStateStrict` in heartbeat.ts, which cannot be
+// reused directly because heartbeat.ts imports from this module.
+export function classifyGitCheckoutProbeFailure(
+  error: unknown,
+): Extract<GitCheckoutProbe, { reason: string }> {
+  const reason = (error instanceof Error ? error.message : String(error ?? "")).trim();
+  if (/not a git repository/i.test(reason)) return { state: "not_a_checkout", reason };
+  return {
+    state: "indeterminate",
+    reason: reason || "git rev-parse --git-dir failed without emitting a diagnostic",
+  };
+}
+
+export async function probeGitCheckout(cwd: string): Promise<GitCheckoutProbe> {
+  try {
+    // Preserves the original `Boolean(stdout)` semantic: an exit-0 probe that
+    // prints no git directory is not evidence of a checkout, so it stays
+    // falsey — but it is now reported as unverified rather than as absence.
+    const gitDir = await runGit(["rev-parse", "--git-dir"], cwd);
+    if (!gitDir) {
+      return {
+        state: "indeterminate",
+        reason: "git rev-parse --git-dir exited 0 but printed no git directory",
+      };
+    }
+    return { state: "checkout", reason: null };
+  } catch (error: unknown) {
+    const classified = classifyGitCheckoutProbeFailure(error);
+    // A cwd that is not a directory at all is positively attributable the same
+    // way git's own fatal is — and `runGit` cannot say so itself, because an
+    // ENOENT on the spawn carries no stderr for it to surface. Mirrors the
+    // `pathIsAbsent` arm of `probeGitCheckoutStateStrict`.
+    if (classified.state === "indeterminate" && !await directoryExists(cwd)) {
+      return { state: "not_a_checkout", reason: `no directory exists at "${cwd}"` };
+    }
+    return classified;
+  }
+}
+
 async function isGitCheckout(cwd: string): Promise<boolean> {
-  return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
+  return (await probeGitCheckout(cwd)).state === "checkout";
 }
 
 function normalizeRepoIdentity(repoUrl: string | null | undefined): string | null {
@@ -4724,7 +4780,8 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   if (strategy !== "git_worktree") {
     const repoUrl = asString(input.workspace.repoUrl ?? input.base.repoUrl, "").trim();
     if (input.workspace.mode === "shared_workspace") {
-      const cwdIsGitCheckout = await isGitCheckout(cwd);
+      const cwdGitProbe = await probeGitCheckout(cwd);
+      const cwdIsGitCheckout = cwdGitProbe.state === "checkout";
       const projectId = asString(input.workspace.projectId ?? input.base.projectId, "").trim();
       const companyId = asString(input.agent.companyId, "").trim();
       const managedCwd = repoUrl && projectId && companyId
@@ -4754,8 +4811,18 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       if (cwdIsGitCheckout) {
         await validateProjectPrimaryRepoOrigin({ cwd, expectedRepoUrl: repoUrl });
       } else if (repoUrl && projectId && companyId) {
+        // PEN-3633: this branch never read `repoUrl` — it is reached solely
+        // because the git probe did not return a checkout — so the refusal
+        // states the condition it actually tested instead of describing a
+        // repo-identity mismatch it never evaluated. The error type is
+        // deliberately unchanged: heartbeat.ts routes on
+        // `WorkspaceRepoMismatchError`, and re-classifying it here would move
+        // this failure's wake policy as a side effect.
+        const probeReason = cwdGitProbe.reason ?? "no diagnostic available";
         throw new WorkspaceRepoMismatchError(
-          `No verified managed checkout exists for expected repository "${repoUrl}"; refusing to start from "${cwd}".`,
+          cwdGitProbe.state === "not_a_checkout"
+            ? `git rev-parse --git-dir found no git repository in "${cwd}" (${probeReason}); refusing to start a managed run from a directory that is not a checkout.`
+            : `git rev-parse --git-dir could not verify a checkout in "${cwd}" (${probeReason}); refusing to start because the probe did not reach a verdict, so the directory's state is unknown.`,
         );
       }
     }
