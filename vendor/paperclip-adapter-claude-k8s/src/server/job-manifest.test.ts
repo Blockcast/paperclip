@@ -2339,10 +2339,11 @@ describe("buildJobManifest", () => {
     // while BLO-37287 was being fixed in this same file.
     //
     // This drives an oversize value through EVERY SAFE_LITERAL in the table
-    // rather than a hand-listed few, via adapterConfig.env (layer 4 of the
-    // merge), which lands any name in `merged` and therefore at the choke
-    // point. Adding a SAFE_LITERAL to ENV_NAME_CLASSIFICATION enrolls it here
-    // automatically — no per-variable source mapping to keep in sync.
+    // rather than a hand-listed few, via the inherited literal-env path. The
+    // operator `adapterConfig.env` path is Secret-backed and intentionally
+    // cannot reach this choke point. Adding a SAFE_LITERAL to
+    // ENV_NAME_CLASSIFICATION enrolls it here automatically — no per-variable
+    // source mapping to keep in sync.
     describe("no SAFE_LITERAL can exceed the kernel ceiling (BLO-37868 AC4)", () => {
       const safeLiteralNames = ENV_NAME_CLASSIFICATION.filter(
         (e) => e.classification === "SAFE_LITERAL" && !e.prefix,
@@ -2363,11 +2364,23 @@ describe("buildJobManifest", () => {
         Array.from({ length: 4 }, (_, i) => ({ workspaceId: `w${i}`, cwd: "/x".repeat(40 * 1024) })),
       );
 
+      /**
+       * Layer-4 adapterConfig.env is deliberately Secret-backed (BLO-22546),
+       * so it cannot reach the literal-size guard. Use the Deployment
+       * inherited-env path here instead: it is a real literal-producing input
+       * and keeps these tests from weakening the operator-env security
+       * contract just to make the ceiling test non-vacuous.
+       */
+      const literalEnvFixture = (name: string, value: string) => ({
+        ctx: makeCtx(),
+        selfPod: makeSelfPod({ inheritedEnv: { [name]: value } }),
+      });
+
       let shedAtLeastOne = false;
       for (const name of safeLiteralNames) {
         it(`bounds ${name}`, () => {
-          const ctxOversize = makeCtx({ config: { env: { [name]: oversizeArray } } });
-          const { job } = buildJobManifest({ ctx: ctxOversize, selfPod: makeSelfPod() });
+          const { ctx, selfPod } = literalEnvFixture(name, oversizeArray);
+          const { job } = buildJobManifest({ ctx, selfPod });
           expectNoOversizeEnv(job);
           if (
             job.spec?.template?.spec?.containers?.[0]?.env?.some((e) => e.name === "PAPERCLIP_ENV_SHED_JSON")
@@ -2379,16 +2392,14 @@ describe("buildJobManifest", () => {
 
       it("actually drove a value over the ceiling (non-vacuity)", () => {
         // Without this the cases above would pass if `oversizeArray` stopped
-        // being oversize, or if adapterConfig.env stopped reaching `merged` —
-        // each would assert "nothing is oversize" about nothing. Rebuilt here
+        // being oversize, or if the fixture stopped reaching `merged` — each
+        // would assert "nothing is oversize" about nothing. Rebuilt here
         // rather than read from a flag the loop sets, so it does not depend on
         // the order vitest happens to run the cases in.
         expect(Buffer.byteLength(oversizeArray, "utf-8")).toBeGreaterThan(131_072);
         const shedCount = safeLiteralNames.filter((name) => {
-          const { job } = buildJobManifest({
-            ctx: makeCtx({ config: { env: { [name]: oversizeArray } } }),
-            selfPod: makeSelfPod(),
-          });
+          const { ctx, selfPod } = literalEnvFixture(name, oversizeArray);
+          const { job } = buildJobManifest({ ctx, selfPod });
           return job.spec?.template?.spec?.containers?.[0]?.env?.some(
             (e) => e.name === "PAPERCLIP_ENV_SHED_JSON",
           );
@@ -2407,10 +2418,8 @@ describe("buildJobManifest", () => {
         // (unparseable) slice would red here while still passing the ceiling
         // assertion above — which is the point, since both are "safe" and wrong.
         const elements = Array.from({ length: 200 }, (_, i) => ({ workspaceId: `w${i}`, cwd: "/p".repeat(512) }));
-        const ctxArray = makeCtx({
-          config: { env: { PAPERCLIP_WORKSPACES_JSON: JSON.stringify(elements) } },
-        });
-        const { job } = buildJobManifest({ ctx: ctxArray, selfPod: makeSelfPod() });
+        const { ctx, selfPod } = literalEnvFixture("PAPERCLIP_WORKSPACES_JSON", JSON.stringify(elements));
+        const { job } = buildJobManifest({ ctx, selfPod });
         expectNoOversizeEnv(job);
         const value = job.spec?.template?.spec?.containers?.[0]?.env?.find(
           (e) => e.name === "PAPERCLIP_WORKSPACES_JSON",
@@ -2424,8 +2433,8 @@ describe("buildJobManifest", () => {
 
       it("marks what it shed instead of dropping it silently (AC3)", () => {
         const oversize = JSON.stringify([{ cwd: "/x".repeat(80 * 1024) }]);
-        const ctxMarked = makeCtx({ config: { env: { PAPERCLIP_WORKSPACES_JSON: oversize } } });
-        const { job } = buildJobManifest({ ctx: ctxMarked, selfPod: makeSelfPod() });
+        const { ctx, selfPod } = literalEnvFixture("PAPERCLIP_WORKSPACES_JSON", oversize);
+        const { job } = buildJobManifest({ ctx, selfPod });
         const marker = job.spec?.template?.spec?.containers?.[0]?.env?.find(
           (e) => e.name === "PAPERCLIP_ENV_SHED_JSON",
         )?.value;
@@ -2453,10 +2462,8 @@ describe("buildJobManifest", () => {
         // variable goes — the only outcome here that costs the variable
         // itself, which is why it still has to appear in the marker.
         const absurdName = `PAPERCLIP_${"N".repeat(140 * 1024)}`;
-        const { job } = buildJobManifest({
-          ctx: makeCtx({ config: { env: { [absurdName]: "x" } } }),
-          selfPod: makeSelfPod(),
-        });
+        const { ctx, selfPod } = literalEnvFixture(absurdName, "x");
+        const { job } = buildJobManifest({ ctx, selfPod });
         expectNoOversizeEnv(job);
         const env = job.spec?.template?.spec?.containers?.[0]?.env ?? [];
         expect(env.find((e) => e.name === absurdName)).toBeUndefined();
@@ -2470,10 +2477,8 @@ describe("buildJobManifest", () => {
         // leaves a 1-byte value budget, so `NAME=[]` is 131_072 B -- over the
         // ceiling. The last resort must fall through to "", which fits.
         const edgeName = `PAPERCLIP_${"N".repeat(131_069 - "PAPERCLIP_".length)}`;
-        const { job } = buildJobManifest({
-          ctx: makeCtx({ config: { env: { [edgeName]: JSON.stringify([{ cwd: "/x" }]) } } }),
-          selfPod: makeSelfPod(),
-        });
+        const { ctx, selfPod } = literalEnvFixture(edgeName, JSON.stringify([{ cwd: "/x" }]));
+        const { job } = buildJobManifest({ ctx, selfPod });
         expectNoOversizeEnv(job);
         const env = job.spec?.template?.spec?.containers?.[0]?.env ?? [];
         expect(env.find((e) => e.name === edgeName)?.value).toBe("");
