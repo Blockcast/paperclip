@@ -1151,7 +1151,7 @@ function bodyReRaisesPriorFinding(body: string | null | undefined): boolean {
 // is worth keeping: in the reviewer's own template the ledger sits in the
 // OPENING section, above the counted findings buckets, so any body whose ledger
 // is clamped has already had its findings clamped — and that case is caught
-// first by the older raw read for reviewHasActionableFeedback. That ordering is
+// first by the older raw read inside `reviewActionability`. That ordering is
 // enforced only by the reviewer's template, not by this module, which is why the
 // raw read stays and why both guards are now pinned by a synthetic body rather
 // than by that accident.
@@ -4354,8 +4354,12 @@ function isActionableReviewFeedbackContext(context: ResolvedEventContext): boole
 // non-actionable variant rather than widened to `string`. This is the boundary
 // where the value becomes a published contract (log field, response field,
 // `contextSnapshot` key), so it is the boundary that has to hold the taxonomy:
-// a reason added to the classifier, or a typo in a hand-built decision, must
-// fail to compile here rather than ship a name nothing documents.
+// a typo, or a name invented in a hand-built decision, must fail to compile
+// here rather than ship something nothing documents. It does NOT catch a reason
+// legitimately ADDED to `PrReviewNonActionableReason` — that widens the `Pick`
+// and compiles clean, and nothing downstream switches on the reason
+// exhaustively (the heartbeat reader takes it as `readNonEmptyString`). Keeping
+// the union and its JSDoc taxonomy adjacent is what covers that case.
 type PrReviewFeedbackSuppression = Pick<
   Extract<PrReviewActionabilityDecision, { actionable: false }>,
   "reason" | "predicate"
