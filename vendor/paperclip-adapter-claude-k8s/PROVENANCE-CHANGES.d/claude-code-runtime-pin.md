@@ -3,8 +3,7 @@
 **Files:** `src/server/runtime-pin.ts` (new), `src/server/runtime-pin.test.ts` (new),
 `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts`, `src/server/config-schema.ts`,
 `src/server/config-schema.test.ts`, `src/server/models.ts`, `src/server/models.test.ts`,
-`src/index.ts`, `src/server/execute.ts`, `README.md`, `CLAUDE.md`, `package.json`
-(`0.2.6-blockcast.12`).
+`src/index.ts`, `src/server/execute.ts`, `README.md`, `CLAUDE.md`.
 
 **Why.** Job pods inherit this image, whose Dockerfile installs
 `@anthropic-ai/claude-code@latest` into a root-owned, layer-cached
@@ -30,4 +29,5 @@ Opus 5.
 **Upstream.** Same change as kkroo/paperclip-adapter-claude-k8s#34 (merged `73ee6853`)
 plus the Fable 5.1 catalog rows from #33 (`4f3b0bc3`), ported onto the diverged
 vendored tree (which carries the pod-log redactor and the external launchers in the
-same command; the bootstrap sits after both setups and before ccrotate).
+same command; the bootstrap sits after the env guard and before ccrotate, and the
+pod-log redactor setup follows the log-directory `mkdir`).

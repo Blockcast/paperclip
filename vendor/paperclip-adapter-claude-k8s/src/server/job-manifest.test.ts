@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME } from "./pod-log-redactor.js";
+import { POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME, POD_LOG_UNREDACTED_SUFFIX } from "./pod-log-redactor.js";
 import {
   buildJobManifest,
   buildPodLogPath,
@@ -476,11 +476,76 @@ describe("buildJobManifest", () => {
     });
 
     it("rejects workspaceMountPath colliding with the DinD socket mount", () => {
-      // /var/run is appended AFTER the targeted workspace check, so only the
-      // per-container backstop catches this one.
+      // The socket dir is appended AFTER the targeted workspace check, so only
+      // the per-container backstop catches this one.
       ctx.config.enableDocker = true;
-      ctx.config.workspaceMountPath = "/var/run";
-      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/duplicate volumeMounts at \/var\/run/);
+      ctx.config.workspaceMountPath = "/var/run/dind";
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/duplicate volumeMounts at \/var\/run\/dind/);
+    });
+
+    // BLO-40401. The DinD socket used to mount at /var/run — over the whole
+    // directory, after the inherited secret mounts — so any Secret the
+    // Deployment mounts beneath /var/run vanished from the agent container.
+    // `gbrain-authbot-service-key` at /var/run/authbot is the live one:
+    // PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE then pointed into an empty
+    // tmpfs. Kubernetes admits that Pod and `kubectl describe` still lists the
+    // mount, so nothing short of a read inside the container notices.
+    const authbotSecretVolume = {
+      volumeName: "gbrain-authbot-service-key",
+      secretName: "authbot-mcp-consumer-service-keys",
+      mountPath: "/var/run/authbot",
+      defaultMode: 0o400,
+    };
+
+    it("the DinD socket does not shadow an inherited Secret mounted under /var/run (BLO-40401)", () => {
+      selfPod.secretVolumes = [authbotSecretVolume];
+      ctx.config.enableDocker = true;
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const spec = job.spec?.template?.spec;
+      const containers = [...(spec?.initContainers ?? []), ...(spec?.containers ?? [])];
+
+      for (const container of containers) {
+        const paths = (container.volumeMounts ?? []).map((m) => m.mountPath);
+        for (const [i, parent] of paths.entries()) {
+          for (const [j, child] of paths.entries()) {
+            if (i === j) continue;
+            // Only a parent declared AFTER its child hides anything; the
+            // reverse order is legal and is used (/runtime-cache first).
+            const hides = j < i && child.startsWith(`${parent}/`);
+            expect(hides, `${container.name}: ${parent} (#${i}) hides ${child} (#${j})`).toBe(false);
+          }
+        }
+      }
+
+      // Anti-vacuity: the loop above passes trivially if the mounts it is
+      // about are not there at all.
+      const mainMounts = spec?.containers?.[0]?.volumeMounts ?? [];
+      expect(mainMounts.map((m) => m.mountPath)).toEqual(
+        expect.arrayContaining(["/var/run/authbot", "/var/run/dind"]),
+      );
+    });
+
+    it("DOCKER_HOST points at the relocated socket, and the wait preamble polls the same path", () => {
+      ctx.config.enableDocker = true;
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const spec = job.spec?.template?.spec;
+      const main = spec?.containers?.[0];
+      const sidecar = spec?.initContainers?.find((c) => c.name === "dind");
+
+      expect(main?.env?.find((e) => e.name === "DOCKER_HOST")?.value).toBe("unix:///var/run/dind/docker.sock");
+      expect(main?.command?.[2]).toContain("-S /var/run/dind/docker.sock");
+      // The sidecar must publish the socket where the agent is told to look.
+      expect(sidecar?.args).toContain("--host=unix:///var/run/dind/docker.sock");
+      expect(sidecar?.volumeMounts).toContainEqual({ name: "docker-sock", mountPath: "/var/run/dind" });
+    });
+
+    it("rejects a mount that would hide an earlier one, whoever declares it", () => {
+      // Reachable from operator config alone: `data` is appended after
+      // /tmp/prompt, so a workspace mount at /tmp swallows the prompt volume.
+      ctx.config.workspaceMountPath = "/tmp";
+      expect(() => buildJobManifest({ ctx, selfPod })).toThrow(
+        /would mount "data" at \/tmp, hiding the earlier "prompt" mount at \/tmp\/prompt/,
+      );
     });
 
     it("still allows a NESTED workspace mount path — only exact duplicates are illegal", () => {
@@ -2105,18 +2170,22 @@ describe("buildJobManifest", () => {
       expect(command).toContain(`__pcver='${DEFAULT_CLAUDE_CODE_VERSION}'`);
       expect(command).toContain("__pcroot='/paperclip/.local/lib/paperclip-k8s-runtimes/claude-code'");
       expect(command).toContain('export PATH="$__pcdir/node_modules/.bin:$PATH"');
-      // Vendored tree: the env guard and the pod-log redactor are set up first;
-      // the runtime bootstrap must come after both and before ccrotate.
+      // Vendored tree: the env guard is set up first; the runtime bootstrap
+      // comes after it and before ccrotate. The pod-log redactor follows
+      // `preparePodLog` (its fall-open sentinel needs the log directory), so it
+      // sits between ccrotate and `claude`.
       const pipefailIdx = command.indexOf("set -o pipefail;");
-      const redactorIdx = command.indexOf("POD_LOG_FILTER");
+      const guardIdx = command.indexOf('GUARD_DIR="');
       const runtimeIdx = command.indexOf("__pcver=");
       const ccrotateIdx = command.indexOf("ccrotate next");
+      const redactorIdx = command.indexOf("PAPERCLIP_POD_LOG_FILTER");
       const claudeIdx = command.indexOf("cat /tmp/prompt/prompt.txt | claude");
       expect(pipefailIdx).toBe(0);
-      expect(redactorIdx).toBeGreaterThan(-1);
-      expect(runtimeIdx).toBeGreaterThan(redactorIdx);
+      expect(guardIdx).toBeGreaterThan(pipefailIdx);
+      expect(runtimeIdx).toBeGreaterThan(guardIdx);
       expect(ccrotateIdx).toBeGreaterThan(runtimeIdx);
-      expect(claudeIdx).toBeGreaterThan(ccrotateIdx);
+      expect(redactorIdx).toBeGreaterThan(ccrotateIdx);
+      expect(claudeIdx).toBeGreaterThan(redactorIdx);
     });
 
     it("honours an explicit exact version", () => {
@@ -2179,7 +2248,7 @@ describe("buildJobManifest", () => {
     // downstream scrubs a copy that already landed on the shared PVC — the same
     // objection that ruled out retroactive scrubbing on that ticket.
     it("pipes claude through the pod-log redactor BEFORE tee (BLO-29553)", () => {
-      const { job } = buildJobManifest({ ctx, selfPod });
+      const { job, podLogPath } = buildJobManifest({ ctx, selfPod });
       const command = job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
 
       const filter = command.indexOf(
@@ -2206,6 +2275,13 @@ describe("buildJobManifest", () => {
       // degrades to `cat` rather than failing every run in the fleet through
       // `set -o pipefail`.
       expect(command).toContain(`${POD_LOG_FILTER_VAR}=cat`);
+
+      // ...and leaves `<podLogPath>.unredacted` beside the pod log, which needs
+      // the pod log's directory to exist by then.
+      const sentinel = command.indexOf(`true > '${podLogPath}${POD_LOG_UNREDACTED_SUFFIX}'`);
+      expect(sentinel).toBeGreaterThan(-1);
+      expect(command.indexOf("mkdir -p '/paperclip/instances/default/data/run-logs")).toBeGreaterThan(-1);
+      expect(command.indexOf("mkdir -p '/paperclip/instances/default/data/run-logs")).toBeLessThan(sentinel);
 
       // $GUARD_DIR derives from the operator-configurable CLAUDE_CONFIG_DIR, so
       // the script path can contain a space. An unquoted single `$VAR` holding

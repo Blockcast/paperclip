@@ -20,6 +20,12 @@ function getTool(name: string, client = makeClient()) {
   return tool;
 }
 
+// `execute` returns the MCP content envelope; the payload is the JSON text.
+function payloadOf(result: unknown): unknown {
+  const text = (result as { content: Array<{ text: string }> }).content[0]!.text;
+  return JSON.parse(text);
+}
+
 function mockJsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -30,6 +36,58 @@ function mockJsonResponse(body: unknown, status = 200) {
 describe("paperclip MCP tools", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+  });
+
+  // BLO-39015: inbox-lite is capped and priority-ordered, so a deep lane's whole
+  // tail — on one measured lane all 44 `low` rows — was absent from a response
+  // the agent could not tell apart from a complete one. The body is a bare array
+  // with nowhere to hang a flag, so the server signals on headers; this tool has
+  // to turn that into something the agent cannot read past, and expose `offset`
+  // so the tail is actually reachable rather than merely flagged.
+  it("passes an untruncated inbox-lite page through as the bare array", async () => {
+    const rows = [{ id: "issue-1", priority: "low" }];
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse(rows));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = payloadOf(await getTool("paperclipInboxLite").execute({}));
+
+    expect(result).toEqual(rows);
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("/agents/me/inbox-lite");
+    expect(String(fetchMock.mock.calls[0]![0])).not.toContain("offset");
+  });
+
+  it("wraps a truncated inbox-lite page in an envelope naming the applied limit", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([{ id: "issue-1" }]), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Result-Truncated": "true",
+          "X-Applied-Limit": "500",
+        },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = payloadOf(await getTool("paperclipInboxLite").execute({})) as Record<
+      string,
+      unknown
+    >;
+
+    // An object, not an array: a caller that assumed `.length` or `.map` now
+    // fails loudly instead of silently reporting a prefix as the population.
+    expect(Array.isArray(result)).toBe(false);
+    expect(result).toMatchObject({ truncated: true, appliedLimit: 500, returnedCount: 1 });
+    expect(result.issues).toEqual([{ id: "issue-1" }]);
+  });
+
+  it("forwards offset so the truncated tail is reachable", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse([]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getTool("paperclipInboxLite").execute({ offset: 500 });
+
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("/agents/me/inbox-lite?offset=500");
   });
 
   it("adds auth headers and run id to mutating requests", async () => {

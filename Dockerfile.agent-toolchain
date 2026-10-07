@@ -6,8 +6,9 @@
 # (scripts/05-languages.sh + 03-k8s-tools.sh + 02-docker.sh).
 #
 # Pair with a `docker:dind` sidecar in the agent Job spec — the docker CLI
-# below talks to that sidecar over /var/run/docker.sock (shared via
-# emptyDir). `kind` then spins up nested k8s clusters on top of dind for
+# below talks to that sidecar over the socket named by DOCKER_HOST
+# (/var/run/dind/docker.sock, shared via emptyDir). `kind` then spins up
+# nested k8s clusters on top of dind for
 # any agent workflow that uses magma/cdn/fab/k8s_ops.py (which detects
 # `kind-kind` context out of the box).
 #

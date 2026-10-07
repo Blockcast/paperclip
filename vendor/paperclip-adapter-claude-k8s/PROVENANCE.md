@@ -192,7 +192,7 @@ after the first Blockcast change that ships, the version alone could no longer
 tell you which code was running — provenance had to be established by grepping
 `dist/` for a token.
 
-This directory therefore versions itself: **`0.2.6-blockcast.11`**, set in
+This directory therefore versions itself: **`0.2.6-blockcast.12`**, set in
 `package.json` and `package-lock.json`. The `-blockcast.` prerelease channel
 says plainly that this is our tree, not an upstream release.
 

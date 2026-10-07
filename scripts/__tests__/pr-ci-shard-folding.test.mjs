@@ -12,20 +12,25 @@ function jobBlock(name, nextName) {
   return workflow.slice(start, end);
 }
 
-test("server shards run general and serialized suites in the same four jobs", () => {
+test("server shards run general and serialized suites in the same jobs", () => {
   const general = jobBlock("general_tests", "verify");
   const serverEntries = general.match(
     /          - group: general-server\n(?:            [^\n]*\n)*/g,
   ) ?? [];
-  assert.equal(serverEntries.length, 4, "general_tests must retain four isolated server shards");
+  assert.ok(serverEntries.length >= 2, "general_tests must retain isolated server shards");
+  const shardCount = serverEntries.length;
   for (const [index, entry] of serverEntries.entries()) {
     assert.match(
       entry,
-      new RegExp(`group_label: server ${index + 1}/4`),
+      new RegExp(`group_label: server ${index + 1}/${shardCount}`),
       `server shard ${index} must retain its matching label`,
     );
-    assert.match(entry, new RegExp(`shard_index: ${index}`));
-    assert.match(entry, /shard_count: 4/);
+    assert.match(entry, new RegExp(`shard_index: ${index}\\b`));
+    assert.match(
+      entry,
+      new RegExp(`shard_count: ${shardCount}\\b`),
+      `server shard ${index} must declare the real shard count`,
+    );
   }
   assert.match(general, /pnpm test:run:general -- "\$\{args\[@\]\}"/);
   assert.match(
@@ -36,6 +41,21 @@ test("server shards run general and serialized suites in the same four jobs", ()
   assert.ok(
     general.indexOf("pnpm test:run:general") < general.indexOf("pnpm test:run:serialized"),
     "each server shard must run general suites before serialized suites",
+  );
+});
+
+// BLO-36439: the one way resharding loses. `max-parallel` below the matrix size
+// holds shards back behind a full shard duration, so a split meant to shorten
+// the critical path lengthens it instead -- silently, with every job green.
+test("max-parallel covers the whole general_tests matrix", () => {
+  const general = jobBlock("general_tests", "verify");
+  const entries = general.match(/\n          - group: general-[a-z0-9-]+\n/g) ?? [];
+  const maxParallel = Number(general.match(/\n      max-parallel: (\d+)\n/)?.[1]);
+  assert.ok(Number.isInteger(maxParallel), "general_tests must declare max-parallel");
+  assert.ok(
+    maxParallel >= entries.length,
+    `max-parallel (${maxParallel}) must be >= matrix size (${entries.length}); ` +
+      "a lower value serializes shards and lengthens the critical path",
   );
 });
 

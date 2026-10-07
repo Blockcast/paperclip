@@ -5,6 +5,7 @@ import {
   ISSUE_LIST_APPLIED_LIMIT_HEADER,
   ISSUE_LIST_TRUNCATED_HEADER,
   issueListProbeLimit,
+  parseOffsetParam,
   resolveIssueListTruncation,
 } from "../lib/issue-list-query.ts";
 import { ISSUE_LIST_MAX_LIMIT } from "../services/issues.ts";
@@ -180,6 +181,41 @@ describe("BLO-33741 issue-list truncation signal", () => {
       const { rows, truncated } = resolveIssueListTruncation(probed, CAP);
       expect(truncated).toBe(false);
       expect(rows).toHaveLength(CAP - 1);
+    });
+  });
+
+  /**
+   * BLO-39015 / Ally review (#2176): `parseOffsetParam` is shared by
+   * `routes/issues.ts:8349` and `routes/agents.ts:2897`, but its only coverage
+   * was indirect, through the agents route suite. Pin the branches on the
+   * function itself so the second call site is covered too, and so a future
+   * editor harmonising this guard with the `Number.isFinite` gate the services
+   * apply downstream gets a red suite rather than a green one.
+   *
+   * `"9".repeat(308)` is the load-bearing row: it is finite AND an integer but
+   * NOT safe, so it is the only input that separates the shipped
+   * `Number.isSafeInteger` from either weakening. 309 nines parses to
+   * `Infinity`, which fails all three, so it pins "parses" vs "matches the
+   * regex" and cannot pin guard strength.
+   */
+  describe("parseOffsetParam", () => {
+    it.each([
+      ["undefined — an absent offset means window 0, not a rejection", undefined, 0],
+      ["a plain integer", "25", 25],
+      ["zero", "0", 0],
+      ["leading zeroes", "007", 7],
+      ["the largest exactly representable integer", String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER],
+      ["one past MAX_SAFE_INTEGER — not exactly representable", String(2 ** 53), null],
+      ["308 nines — finite and an integer, but not safe", "9".repeat(308), null],
+      ["309 nines — parses to Infinity", "9".repeat(309), null],
+      ["negative", "-1", null],
+      ["fractional", "1.5", null],
+      ["exponent notation", "1e3", null],
+      ["non-numeric", "abc", null],
+      ["empty string", "", null],
+      ["a repeated query param, which Express gives as an array", ["1"], null],
+    ])("%s", (_label, raw, expected) => {
+      expect(parseOffsetParam(raw)).toBe(expected);
     });
   });
 

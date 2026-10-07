@@ -174,14 +174,15 @@ export function getConfigSchema(): AdapterConfigSchema {
     },
     // Docker-in-Docker sidecar — opt-in. When enabled, a docker:dind
     // sidecar runs alongside the agent container and exposes
-    // /var/run/docker.sock to it. Required for `docker build`,
+    // /var/run/dind/docker.sock to it (NOT /var/run/docker.sock: mounting the
+    // shared emptyDir over /var/run hid every sibling mount, BLO-40401). Required for `docker build`,
     // `kind create cluster`, and similar tooling. Pod becomes privileged.
     {
       type: "toggle",
       key: "enableDocker",
       label: "Enable Docker (DinD sidecar)",
       default: false,
-      hint: "Add a docker:dind sidecar that exposes /var/run/docker.sock to the agent. Required for `docker build` and `kind create cluster`. Pod becomes privileged.",
+      hint: "Add a docker:dind sidecar that exposes /var/run/dind/docker.sock to the agent (read DOCKER_HOST, not the legacy path). Required for `docker build` and `kind create cluster`. Pod becomes privileged.",
     },
     {
       type: "text",

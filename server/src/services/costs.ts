@@ -14,7 +14,14 @@ export interface CostDateRange {
 const METERED_BILLING_TYPE = "metered_api";
 const SUBSCRIPTION_BILLING_TYPES = ["subscription_included", "subscription_overage"] as const;
 
-function sumAsNumber(column: typeof costEvents.costCents | typeof costEvents.inputTokens | typeof costEvents.cachedInputTokens | typeof costEvents.outputTokens) {
+function sumAsNumber(
+  column:
+    | typeof costEvents.costCents
+    | typeof costEvents.inputTokens
+    | typeof costEvents.cachedInputTokens
+    | typeof costEvents.cacheCreationInputTokens
+    | typeof costEvents.outputTokens,
+) {
   return sql<number>`coalesce(sum(${column}), 0)::double precision`;
 }
 
@@ -72,6 +79,9 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           biller: data.biller ?? data.provider,
           billingType: data.billingType ?? "unknown",
           cachedInputTokens: data.cachedInputTokens ?? 0,
+          // BLO-29842: cache WRITE. Adapters that report no cache-creation field
+          // omit it and land on 0, which is the same value pre-migration rows carry.
+          cacheCreationInputTokens: data.cacheCreationInputTokens ?? 0,
         })
         .returning()
         .then((rows) => rows[0]);
@@ -239,6 +249,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             costCents: sumAsNumber(costEvents.costCents),
             inputTokens: sumAsNumber(costEvents.inputTokens),
             cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
+            cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
             outputTokens: sumAsNumber(costEvents.outputTokens),
           })
           .from(issues)
@@ -271,6 +282,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         costCents: Number(costRow?.costCents ?? 0),
         inputTokens: Number(costRow?.inputTokens ?? 0),
         cachedInputTokens: Number(costRow?.cachedInputTokens ?? 0),
+        cacheCreationInputTokens: Number(costRow?.cacheCreationInputTokens ?? 0),
         outputTokens: Number(costRow?.outputTokens ?? 0),
         runCount: Number(runRow?.runCount ?? 0),
         runtimeMs: Number(runRow?.runtimeMs ?? 0),
@@ -290,6 +302,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           costCents: sumAsNumber(costEvents.costCents),
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
+          cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
           apiRunCount:
             sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
@@ -297,6 +310,10 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
+          // BLO-29842: cache writes used to be folded into inputTokens, so without this
+          // twin `subscriptionInputTokens` silently shrinks by the whole cache-write volume.
+          subscriptionCacheCreationInputTokens:
+            sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cacheCreationInputTokens} else 0 end), 0)::double precision`,
           subscriptionInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.inputTokens} else 0 end), 0)::double precision`,
           subscriptionOutputTokens:
@@ -323,6 +340,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           costCents: sumAsNumber(costEvents.costCents),
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
+          cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
           apiRunCount:
             sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
@@ -330,6 +348,10 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
+          // BLO-29842: cache writes used to be folded into inputTokens, so without this
+          // twin `subscriptionInputTokens` silently shrinks by the whole cache-write volume.
+          subscriptionCacheCreationInputTokens:
+            sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cacheCreationInputTokens} else 0 end), 0)::double precision`,
           subscriptionInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.inputTokens} else 0 end), 0)::double precision`,
           subscriptionOutputTokens:
@@ -352,6 +374,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           costCents: sumAsNumber(costEvents.costCents),
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
+          cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
           apiRunCount:
             sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
@@ -359,6 +382,10 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
+          // BLO-29842: cache writes used to be folded into inputTokens, so without this
+          // twin `subscriptionInputTokens` silently shrinks by the whole cache-write volume.
+          subscriptionCacheCreationInputTokens:
+            sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cacheCreationInputTokens} else 0 end), 0)::double precision`,
           subscriptionInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.inputTokens} else 0 end), 0)::double precision`,
           subscriptionOutputTokens:
@@ -394,6 +421,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
               costCents: sumAsNumber(costEvents.costCents),
               inputTokens: sumAsNumber(costEvents.inputTokens),
               cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
+              cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
               outputTokens: sumAsNumber(costEvents.outputTokens),
             })
             .from(costEvents)
@@ -414,6 +442,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             costCents: row.costCents,
             inputTokens: row.inputTokens,
             cachedInputTokens: row.cachedInputTokens,
+            cacheCreationInputTokens: row.cacheCreationInputTokens,
             outputTokens: row.outputTokens,
           }));
         }),
@@ -442,6 +471,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           costCents: sumAsNumber(costEvents.costCents),
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
+          cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
         })
         .from(costEvents)
@@ -498,6 +528,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           costCents: costCentsExpr,
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
+          cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
         })
         .from(costEvents)

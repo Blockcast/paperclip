@@ -1071,6 +1071,61 @@ spec:
           # recovered, the exact false-page class PEN-3328 exists to remove.
           # prometheus-rule.test.mjs floors it for that reason.
           #
+          # A FOURTH path into that gap, and the only one CORRELATED with the
+          # fault being handled: TICK LATENESS (PEN-3686). The three named
+          # above are scrape-level and independent of the wedge, but the abort
+          # is requested from the `LOCK_HELD_WARN_MS` 30s `setInterval` in
+          # agent-start-lock.ts, so a stalled event loop delays the abort while
+          # this gauge keeps ageing. Arithmetic: the tick quantises the request
+          # by up to 30s BY DESIGN, so tick lateness alone exhausts the window
+          # only at a stall > 300 - 30 = 270s (4m30s). That is the duration
+          # which would spuriously page `critical` on a section that then
+          # recovers -- written down here rather than left implied.
+          #
+          # Measured, not asserted. `event loop stalled` warn lines from
+          # server/src/event-loop-stall-log.ts, namespace `paperclip`, the 14
+          # days to 2026-10-06 -- the whole of Loki's retention, since the
+          # oldest such line is 2026-09-22T18:34:25Z and a 21d lookback returns
+          # that same date. n=4344 across 7 pods: p50 1310ms, p90 3020ms, p99
+          # 6908ms, p99.9 10972ms, MAX 48620ms (48.6s, on an api pod at
+          # 2026-09-28T19:59:05Z). 140 >= 5s, 5 >= 10s, 2 >= 30s, ZERO >= 60s,
+          # zero >= 300s. Worker tier (`paperclip-0`, the only tier that holds
+          # a start lock) MAX 30568ms (30.6s, 2026-09-28T21:32:02Z) -- already
+          # past one whole 30s tick period, so a SKIPPED TICK is observed
+          # behaviour and not a hypothetical. 270s is 5.6x the worst stall on
+          # any pod and 8.8x the worst on the worker.
+          #
+          # Bound it with the fleet-wide 48.6s, not the worker's own 30.6s: the
+          # api and worker pods stalled within ONE SECOND of each other on
+          # 2026-09-28 (21:32:01Z, 21:32:02Z), so the cause is shared /
+          # node-level and the worker is not structurally immune to the larger
+          # figure.
+          #
+          # Both caveats on those numbers run in the conservative direction.
+          # The sampler only logs stalls >= 1000ms, so this is the tail -- which
+          # is the part that matters here -- and it can lose one to the
+          # histogram-reset race its own comment documents (0 misses in 26
+          # blocks at the 1000ms sample period). Read them as LOWER bounds. Note
+          # a 7d window understates the tail by 4.4x (max 10972ms): measure the
+          # full retention or do not quote a max. Independently corroborated by
+          # `max_over_time(nodejs_eventloop_lag_max_seconds[7d])` = 10.96s over
+          # that same 7d sub-window, matching the log's 10972ms from a separate
+          # code path.
+          #
+          # Why 5m is nonetheless not the binding constraint here: the worker
+          # liveness probe is periodSeconds 30 / timeoutSeconds 10 /
+          # failureThreshold 6, which values.yaml itself puts at ~180s to a
+          # kubelet kill -- BELOW the 270s a stall would have to reach. A killed
+          # pod takes this in-process gauge with it, so the window cannot
+          # complete and the page does not fire. Tick lateness therefore cannot
+          # be the SOLE cause of a spurious `critical` on this tier; the pod
+          # dies first. That is a bound, not a reassurance -- losing the
+          # singleton worker is its own incident, and in that regime it is the
+          # probe rather than this budget deciding the outcome. What remains is
+          # a stall in the 30-180s band contributing ADDITIVELY alongside the
+          # three scrape-level paths, where the worst worker observation (30.6s)
+          # consumes ~10% of the window.
+          #
           # The consequence of a hold is separately visible the whole time via
           # PaperclipQueuedRunStranded -- but visible is not paged: that alert
           # is `severity: warning` at 1440s + `for: 5m` (~29m), and it is gated
