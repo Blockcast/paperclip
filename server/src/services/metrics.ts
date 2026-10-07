@@ -1217,16 +1217,22 @@ export const DB_POOL_WAITING_QUERIES_METRIC = "paperclip_db_pool_waiting_queries
  * missing measurement.
  *
  * ⚠️ INHERITED, NOT EFFECTIVE — and for one of the three settings those differ.
- * `createDb` ships `idle_in_transaction_session_timeout: 120_000` in the pool's
- * startup packet (`POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS`, #1921), and the
+ * `createDb` ships `idle_in_transaction_session_timeout` in the pool's startup
+ * packet (`POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS`, #1921), and the
  * probe behind this gauge deliberately reads on a `createUtilitySql`
  * connection that carries none of those overrides — otherwise it would report
  * our own value back to us and destroy the evidence it exists to collect. So
- * `{setting="idle_in_transaction_session_timeout"}` is expected to read `0`
- * `source="default"` while the pool is in fact bounded at 120 s. Do NOT read
- * that series as "idle-in-transaction is unbounded"; for the pool's effective
- * value, read `POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS`. `statement_timeout`
- * and `lock_timeout` are not set pool-side, so for those two inherited *is*
+ * `{setting="idle_in_transaction_session_timeout"}` reports what the server
+ * imposes (`0` `source="default"` if nothing does), never the pool's own
+ * bound. Do NOT read a `0` there as "idle-in-transaction is unbounded". The
+ * pool's value is published beside it as
+ * `{setting="idle_in_transaction_session_timeout_pool", source="startup_packet"}`,
+ * and because the startup packet overrides the server value rather than
+ * stacking with it, a pool series above a non-zero inherited one is the
+ * PEN-3365 loosening — answerable by query, not only by the startup log
+ * line's `LOOSENED:` marker. No number is restated here, so this comment
+ * cannot drift from the constant again. `statement_timeout` and
+ * `lock_timeout` are not set pool-side, so for those two inherited *is*
  * effective — which is what makes `statement_timeout` here the reading that
  * gates PEN-3365 step 3. The metric is named `_inherited_` rather than
  * `_effective_` precisely because the name is what lands in PromQL, dashboards
@@ -1247,7 +1253,7 @@ export const DB_POOL_WAITING_QUERIES_METRIC = "paperclip_db_pool_waiting_queries
  * `Blockcast/paperclip` or `Blockcast/onprem-k8s`; `source=default` means
  * nothing sets it and the assertion is false, while `database`/`user` means we
  * genuinely inherit a bound. Cardinality is bounded: 3 settings x the small
- * fixed set of `pg_settings.source` values.
+ * fixed set of `pg_settings.source` values, plus the one pool series.
  *
  * ⚠️ Do NOT substitute `postgres_exporter`'s `pg_settings_statement_timeout_seconds`
  * for this. That series reflects the *exporter's own session* (its labels carry
@@ -1267,6 +1273,15 @@ export const DB_INHERITED_TIMEOUT_METRIC = "paperclip_db_inherited_timeout_secon
  * measurement that motivated it and for the cardinality bounds.
  */
 export const PROCESS_OPEN_FDS_BY_CLASS_METRIC = "paperclip_process_open_fds_by_class";
+
+/**
+ * `setting` label of the series carrying the pool's OWN idle-in-transaction
+ * bound (PEN-3365), published beside the inherited reading so a loosening is a
+ * one-series comparison. Named once here so the help text, the startup wiring
+ * ({@link dbInheritedTimeoutSeries} in `db-inherited-timeouts.ts`) and the tests
+ * cannot drift apart.
+ */
+export const POOL_IDLE_IN_TRANSACTION_SERIES = "idle_in_transaction_session_timeout_pool";
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
@@ -3931,10 +3946,12 @@ function ensureRegistry(): {
         + "setting and by the pg_settings source that set it (PEN-3365). 0 means disabled, as "
         + "Postgres encodes it, so statement_timeout=0 is the unbounded case. source=default "
         + "means nothing sets it; database/user means a real inherited bound. NOT the effective "
-        + "value for idle_in_transaction_session_timeout: the pool sets that to 120s in its own "
-        + "startup packet, which this probe deliberately does not observe, so that series reads "
-        + "0/default while the pool is in fact bounded. statement_timeout and lock_timeout are "
-        + "not set pool-side, so for those inherited is effective. Do not read "
+        + "value for idle_in_transaction_session_timeout: the pool overrides that in its own "
+        + "startup packet, which this probe deliberately does not observe. The pool's own value "
+        + `is the setting=${POOL_IDLE_IN_TRANSACTION_SERIES},source=startup_packet series; `
+        + "it above a non-zero inherited value means the pool LOOSENS the server's bound "
+        + "(PEN-3365). statement_timeout and lock_timeout are not set pool-side, so for "
+        + "those inherited is effective. Do not read "
         + "postgres_exporter's pg_settings_* for this -- that reports the exporter's own session.",
       labelNames: ["setting", "source"],
       registers: [registry],

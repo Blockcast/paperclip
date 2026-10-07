@@ -3,8 +3,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
   POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+  POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
   createDb,
   formatInheritedTimeoutSettings,
+  inheritedTimeoutLogLevel,
+  poolIdleInTransactionTimeoutLoosens,
   readInheritedTimeoutSettings,
 } from "./client.js";
 import {
@@ -53,6 +56,114 @@ afterEach(async () => {
   }
 });
 
+/**
+ * Deliberately NOT inside `describeEmbeddedPostgres`. These are static
+ * assertions about two constants, so they must still run — and still fail — on
+ * a runner where embedded Postgres is unavailable and every test below skips.
+ * A guard that silently skips on the machine that would have caught the raise
+ * is not a guard.
+ */
+describe("createDb idle-in-transaction bound never loosens the server's (PEN-3365)", () => {
+  it("does not exceed the idle-in-transaction bound the role already imposes", () => {
+    // The regression this exists for: between #1921 and PEN-3365 the pool
+    // shipped 120_000 against a role-level 60_000, and because startup-packet
+    // parameters outrank `ALTER ROLE`, that RAISED the live bound fleet-wide.
+    // The change was made *for* PEN-3365 and loosened the exact protection
+    // PEN-3365 exists to provide. Raising this constant again fails here.
+    expect(POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS).toBeLessThanOrEqual(
+      POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+    );
+  });
+
+  it("keeps the role figure pinned so the bound above can actually fail", () => {
+    // `POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS` is a transcription of an
+    // `ALTER ROLE` that lives only as prose in another repository (PEN-3598).
+    // Nothing in this repo can re-derive it, so it must not drift silently:
+    // editing it changes what the assertion above *means*, and this pin forces
+    // that edit to be deliberate.
+    //
+    // Only the role figure is pinned. Pinning the pool constant too would make
+    // the `<=` above unable to fail independently — any edit breaking the bound
+    // breaks the pin as well — and would turn a legitimate *tightening* (say,
+    // dropping the pool to 30s to follow a tightened role) into a red test
+    // whose message reads like the regression it guards against. The pool
+    // constant is free to move downward under the role figure.
+    //
+    // Neither pin can detect the pool constant being made an *alias* of the
+    // role constant, which would render the `<=` tautological — that is
+    // guarded by the reasoning recorded on the constant itself, not from here.
+    expect(POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS).toBe(60_000);
+  });
+
+  it("reports a tighter inherited bound as a loosening, and an absent one as not", () => {
+    const at = (valueMs: number | null) => ({
+      statementTimeout: { name: "statement_timeout", valueMs: 30_000, source: "user" },
+      idleInTransactionSessionTimeout: {
+        name: "idle_in_transaction_session_timeout",
+        valueMs,
+        source: valueMs === null ? "default" : "user",
+      },
+      lockTimeout: { name: "lock_timeout", valueMs: 15_000, source: "user" },
+    });
+
+    // Tighter server bound => we would be overriding it upward.
+    const tighter = POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS - 1;
+    expect(poolIdleInTransactionTimeoutLoosens(at(tighter))).toBe(true);
+    expect(formatInheritedTimeoutSettings(at(tighter))).toContain("LOOSENED");
+
+    // Equal is the shipped state, and is not a loosening.
+    expect(
+      poolIdleInTransactionTimeoutLoosens(at(POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS)),
+    ).toBe(false);
+
+    // Disabled (Postgres spells it `0`, surfaced as null) is the case the
+    // startup parameter exists for: there is no bound to loosen, so shipping
+    // one is strictly an improvement and must not be reported as a regression.
+    expect(poolIdleInTransactionTimeoutLoosens(at(null))).toBe(false);
+    expect(formatInheritedTimeoutSettings(at(null))).not.toContain("LOOSENED");
+
+    // Negative control: the unremarkable case still renders plainly, so the
+    // marker above is attributable to the comparison and not to the format
+    // function simply always appending it.
+    expect(formatInheritedTimeoutSettings(at(60_000))).not.toContain("LOOSENED");
+  });
+
+  it("warns on a loosening even when statement_timeout is bounded", () => {
+    const at = (idleMs: number | null, statementMs: number | null) => ({
+      statementTimeout: {
+        name: "statement_timeout",
+        valueMs: statementMs,
+        source: statementMs === null ? "default" : "user",
+      },
+      idleInTransactionSessionTimeout: {
+        name: "idle_in_transaction_session_timeout",
+        valueMs: idleMs,
+        source: idleMs === null ? "default" : "user",
+      },
+      lockTimeout: { name: "lock_timeout", valueMs: 15_000, source: "user" },
+    });
+
+    // The regression this exists for. Before PEN-3365's follow-up the caller
+    // keyed the level solely on `statement_timeout`, so under this deployment's
+    // own premise — the role sets `statement_timeout = '30000'` — a loosening
+    // was announced at `info`, the same severity as the healthy line. The
+    // `LOOSENED:` marker was added because printing the two numbers had not
+    // been enough; stating the verdict at `info` left it just as unread.
+    const tighter = POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS - 1;
+    expect(inheritedTimeoutLogLevel(at(tighter, 30_000))).toBe("warn");
+    expect(formatInheritedTimeoutSettings(at(tighter, 30_000))).toContain("LOOSENED");
+
+    // The two conditions are orthogonal, so each must raise the level alone.
+    expect(inheritedTimeoutLogLevel(at(60_000, null))).toBe("warn");
+
+    // ...and the healthy state — bounded statement_timeout, no loosening —
+    // stays at `info`, so the two above are attributable to the conditions
+    // rather than to the level simply always being `warn`.
+    expect(inheritedTimeoutLogLevel(at(60_000, 30_000))).toBe("info");
+    expect(inheritedTimeoutLogLevel(at(null, 30_000))).toBe("info");
+  });
+});
+
 describeEmbeddedPostgres("createDb pool timeout bounds (PEN-3365)", () => {
   it(
     "binds idle_in_transaction_session_timeout on every pooled connection",
@@ -93,17 +204,26 @@ describeEmbeddedPostgres("createDb pool timeout bounds (PEN-3365)", () => {
       const inherited = await readInheritedTimeoutSettings(url);
 
       // The probe exists to answer "what does the server already impose?". If
-      // it ever reads over the application pool it would report our own 120s
+      // it ever reads over the application pool it would report our own bound
       // back to us — a reading that looks authoritative, is self-inflicted, and
       // destroys the only evidence the explicit-statement_timeout decision is
       // gated on. 7s here proves it read an uncontaminated connection.
+      //
+      // 7s is also deliberately TIGHTER than the pool's bound, so this doubles
+      // as the end-to-end case for the loosening check: a server value the pool
+      // would override upward is exactly the PEN-3365 regression.
       expect(inherited.idleInTransactionSessionTimeout.valueMs).toBe(7_000);
       expect(inherited.idleInTransactionSessionTimeout.valueMs).not.toBe(
         POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
       );
+      expect(poolIdleInTransactionTimeoutLoosens(inherited)).toBe(true);
+      expect(formatInheritedTimeoutSettings(inherited)).toContain("LOOSENED");
 
       // ...while the pool itself still carries the bound, confirming the
       // precedence claim above rather than merely asserting it in a comment.
+      // This is the mechanism that made the 120s regression fleet-wide: the
+      // startup packet wins over `ALTER DATABASE`/`ALTER ROLE`, so a pool value
+      // looser than the server's silently replaces it.
       await expect(readPoolSettingMs(url, "idle_in_transaction_session_timeout")).resolves.toBe(
         POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
       );
