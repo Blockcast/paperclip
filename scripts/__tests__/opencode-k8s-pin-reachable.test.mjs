@@ -4,8 +4,10 @@ import { test } from "node:test";
 
 import {
   ADAPTER_REPO,
+  SECRET_PUT_SYMBOL,
   classify,
   extractPin,
+  nonTestHits,
 } from "../check-opencode-k8s-pin-reachable.mjs";
 
 const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
@@ -123,4 +125,137 @@ test("the guard is wired into BOTH a PR gate and a schedule", () => {
   assert.match(monitor, invocation, "the drift monitor must run the reachability guard");
   assert.match(monitor, /^\s*- cron: /m, "the drift monitor must be scheduled, not only manual");
   assert.match(monitor, /ref: master/, "it must check master, not the default checkout");
+});
+
+// ---------------------------------------------------------------------------
+// BLO-34510: the pinned tree must make no Secret PUT.
+//
+// `deploy/helm/paperclip/templates/role.yaml` retired `secrets: update`
+// because the pinned adapter makes no `replaceNamespacedSecret` call. That is
+// a property of THE PIN, so a bump can revoke it with nothing to review but a
+// 40-hex number, and the resulting 403 is runtime-only and collision-timed.
+// ---------------------------------------------------------------------------
+
+// Real `git grep -n <tree-ish> -- src` output shape, captured from the live
+// adapter at the current pin against `patchNamespacedSecret` — a symbol that
+// genuinely occurs in BOTH test and non-test sources, so this fixture
+// exercises the filter in both directions rather than only the easy one.
+// Measured 2026-10-07: 7 raw hits, exactly 1 of them non-test.
+const GREP_FIXTURE = [
+  "src/server/execute.test.ts:414:    patchNamespacedSecret: vi.fn().mockResolvedValue({}),",
+  "src/server/execute.test.ts:948:      patchNamespacedSecret: vi.fn().mockResolvedValue({}),",
+  "src/server/execute.test.ts:1339:    expect(coreApi.patchNamespacedSecret).toHaveBeenCalledTimes(2);",
+  "src/server/execute.ts:1052:    await coreApi.patchNamespacedSecret({",
+];
+
+test("nonTestHits keeps real call sites and drops mocks", () => {
+  // Over-match control: without the filter a `vi.fn()` stub reads as a
+  // consumer, and the adapter's tests legitimately name the symbol while
+  // asserting it is never called. Six of seven live hits are mocks, so an
+  // unfiltered guard is a false-positive factory that blocks every pin bump.
+  assert.deepEqual(nonTestHits(GREP_FIXTURE), ["src/server/execute.ts:1052:    await coreApi.patchNamespacedSecret({"]);
+
+  // Under-match control: the filter must key on the TEST-FILE suffix, not on
+  // the word "test" appearing anywhere in the path, or a real call site under
+  // e.g. src/server/test-harness.ts is silently exempted.
+  assert.deepEqual(
+    nonTestHits(["src/server/test.ts:90:  replaceNamespacedSecret(", "src/testing/secrets.ts:4:  replaceNamespacedSecret("]),
+    ["src/server/test.ts:90:  replaceNamespacedSecret(", "src/testing/secrets.ts:4:  replaceNamespacedSecret("],
+  );
+
+  assert.deepEqual(nonTestHits([]), []);
+  assert.deepEqual(nonTestHits(["", "   "]), []);
+});
+
+test("a pin that reintroduces a Secret PUT fails the bump", () => {
+  const result = classify({
+    pin: "b".repeat(40),
+    cloneOk: true,
+    commitPresent: true,
+    srcFileCount: 17,
+    secretPutHits: ["src/server/execute.ts:1052:  await coreApi.replaceNamespacedSecret({"],
+  });
+  assert.equal(result.verdict, "secret-put");
+  assert.equal(result.exitCode, 1);
+  // The offending line must be IN the message: the reviewer is looking at a
+  // diff that changed one hex string and has no other way to see the cause.
+  assert.match(result.message, /execute\.ts:1052/);
+  assert.match(result.message, new RegExp(SECRET_PUT_SYMBOL));
+  // ...and it must name the retired verb and both exits, or the only obvious
+  // move is to re-grant the privilege quietly to make CI green.
+  assert.match(result.message, /secrets: update/);
+  assert.match(result.message, /BLO-34510/);
+  assert.match(result.message, /merge PATCH/);
+  assert.match(result.message, /role-rbac\.test\.mjs/);
+});
+
+test("a clean pin reports how many files it actually searched", () => {
+  const result = classify({
+    pin: "a".repeat(40),
+    cloneOk: true,
+    commitPresent: true,
+    srcFileCount: 17,
+    secretPutHits: [],
+  });
+  assert.equal(result.verdict, "ok");
+  assert.equal(result.exitCode, 0);
+  // A bare "no hits" is indistinguishable from a search that ran over nothing.
+  // Printing the denominator is what makes the pass readable as evidence.
+  assert.match(result.message, /17 non-test source file/);
+});
+
+test("a search that found nothing to search is inconclusive, NOT clean", () => {
+  // THE control this guard needs most. If the adapter moves its sources out of
+  // `src/`, the grep matches nothing — which is byte-identical to a clean pin
+  // and fails in the permissive direction, silently reopening the class while
+  // printing a pass. Same shape as every other empty-filter trap in this repo.
+  const result = classify({
+    pin: "a".repeat(40),
+    cloneOk: true,
+    commitPresent: true,
+    srcFileCount: 0,
+    secretPutHits: [],
+  });
+  assert.equal(result.verdict, "inconclusive");
+  assert.equal(result.exitCode, 0);
+  assert.match(result.message, /INCONCLUSIVE/);
+  assert.match(result.message, /inert/);
+});
+
+test("reachability is judged before the Secret-PUT search, and clone failure before both", () => {
+  // Ordering matters for the message, not the exit code: an orphaned pin
+  // cannot be grepped, so reporting "no Secret PUT" about a tree that was
+  // never fetched would be a claim with nothing behind it.
+  const orphan = classify({
+    pin: "c".repeat(40),
+    cloneOk: true,
+    commitPresent: false,
+    srcFileCount: 0,
+    secretPutHits: [],
+  });
+  assert.equal(orphan.verdict, "unreachable");
+
+  const unclonable = classify({
+    pin: "c".repeat(40),
+    cloneOk: false,
+    commitPresent: false,
+    srcFileCount: 0,
+    secretPutHits: [],
+  });
+  assert.equal(unclonable.verdict, "inconclusive");
+  assert.match(unclonable.message, /could not clone/);
+});
+
+test("the retirement this guard protects is actually in the chart", () => {
+  // The guard and the Role are two halves of one decision. If someone re-adds
+  // `update` without removing this guard, the guard starts failing bumps for a
+  // verb that is granted again — noise that trains people to ignore it.
+  const role = readFileSync(
+    new URL("../../deploy/helm/paperclip/templates/role.yaml", import.meta.url),
+    "utf8",
+  );
+  const verbs = role.match(/resources: \["secrets"\]\n\s*verbs: \[([^\]]*)\]/)?.[1];
+  assert.ok(verbs, "role.yaml must render a secrets rule");
+  assert.doesNotMatch(verbs, /"update"/, "secrets:update is retired (BLO-34510)");
+  assert.match(verbs, /"patch"/, "patch is what replaced it and must stay");
 });
