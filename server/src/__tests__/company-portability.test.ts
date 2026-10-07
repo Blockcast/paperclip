@@ -1502,6 +1502,19 @@ describe("company portability", () => {
      */
     const BENIGN_LONG = "https://api.example.com/v1/ingest";
 
+    /**
+     * The two binding shapes `extractPortableScopedEnvInputs` accepts, each paired with a label.
+     *
+     * Both are exercised because they are separate branches with separately-written guards, not
+     * one path with a wrapper — a regression can land in either alone. The label is what makes
+     * that readable: the two iterations assert byte-identical expectations, so an unlabelled
+     * failure names neither the shape that broke nor, from the test name, that there were two.
+     */
+    const BINDING_SHAPES = (value: string): ReadonlyArray<readonly [string, unknown]> => [
+      ["plain binding", { type: "plain", value }],
+      ["bare-string binding", value],
+    ];
+
     async function exportEnvInputs(env: Record<string, unknown>) {
       agentSvc.list.mockResolvedValue([
         {
@@ -1554,7 +1567,7 @@ describe("company portability", () => {
     it("withholds a credential-SHAPED default under a key no name list would catch", async () => {
       // The axis no key vocabulary can cover. `BOOTSTRAP` is not credential-named by any spelling,
       // so only a value test closes this. Pinning `kind` as well as `defaultValue` matters: both
-      // arms of `withholdsEnvInputDefault` emit `kind: "secret"`, and asserting only the empty
+      // arms of `withheldEnvInputDefaultReason` emit `kind: "secret"`, and asserting only the empty
       // default would not catch a regression that stopped marking the entry as one.
       const exported = await exportEnvInputs({
         BOOTSTRAP: { type: "plain", value: CREDENTIAL_SHAPED },
@@ -1611,16 +1624,19 @@ describe("company portability", () => {
       // default while the first warning claimed it was exported, then called a binary path a
       // credential. The path is the `command` fixture from the claudecoder export test above.
       const CLAUDE_BIN = "/Users/dotta/.local/bin/claude";
-      for (const binding of [{ type: "plain", value: CLAUDE_BIN }, CLAUDE_BIN]) {
+      // Labelled because both iterations assert byte-identical expectations: without the label a
+      // one-branch regression reports as an unlabelled failure of a test whose name mentions
+      // neither binding shape, and you cannot tell which arm broke from the message alone.
+      for (const [shape, binding] of BINDING_SHAPES(CLAUDE_BIN)) {
         const exported = await exportEnvInputs({ CLAUDE_BIN: binding });
 
-        expect(inputFor(exported as never, "CLAUDE_BIN")).toMatchObject({
+        expect(inputFor(exported as never, "CLAUDE_BIN"), shape).toMatchObject({
           kind: "plain",
           defaultValue: CLAUDE_BIN,
           portability: "system_dependent",
         });
         const keyWarnings = exported.warnings.filter((warning: string) => warning.includes("env CLAUDE_BIN "));
-        expect(keyWarnings).toEqual(["Agent claudecoder env CLAUDE_BIN default was exported as system-dependent."]);
+        expect(keyWarnings, shape).toEqual(["Agent claudecoder env CLAUDE_BIN default was exported as system-dependent."]);
       }
     });
 
@@ -1628,15 +1644,18 @@ describe("company portability", () => {
       // The key arm withholds `TOKEN_FILE` before the `system_dependent` check is reached, so the
       // default is emptied; the "exported as system-dependent" warning must not then claim it shipped.
       const TOKEN_FILE = "/etc/paperclip/token_file";
-      for (const binding of [{ type: "plain", value: TOKEN_FILE }, TOKEN_FILE]) {
+      for (const [shape, binding] of BINDING_SHAPES(TOKEN_FILE)) {
         const exported = await exportEnvInputs({ TOKEN_FILE: binding });
 
-        expect(inputFor(exported as never, "TOKEN_FILE")).toMatchObject({
+        expect(inputFor(exported as never, "TOKEN_FILE"), shape).toMatchObject({
           kind: "secret",
           defaultValue: "",
           portability: "system_dependent",
         });
-        expect(exported.warnings.filter((warning: string) => warning.includes("env TOKEN_FILE "))).toEqual([]);
+        expect(
+          exported.warnings.filter((warning: string) => warning.includes("env TOKEN_FILE ")),
+          shape,
+        ).toEqual([]);
       }
     });
 

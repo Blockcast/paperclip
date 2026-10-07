@@ -57,6 +57,15 @@ export interface UsageSummary {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens?: number;
+  /**
+   * BLO-29842: cache WRITE tokens, distinct from `cachedInputTokens` (cache
+   * read). Anthropic bills creation at 1.25x-2x input and reads at 0.1x, so
+   * folding creation into `inputTokens` — which is what claude-local did until
+   * this field existed — prices it at 1x and leaves the rate card
+   * unidentifiable. Adapters whose provider reports no cache-creation field
+   * leave it undefined; consumers read undefined as 0.
+   */
+  cacheCreationInputTokens?: number;
 }
 
 export type AdapterBillingType =
