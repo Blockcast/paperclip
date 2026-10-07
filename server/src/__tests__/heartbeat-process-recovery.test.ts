@@ -2422,7 +2422,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const sweep = heartbeat.reapOrphanedRunsForStartLock();
       const outcome = await Promise.race([
         sweep.then(() => "settled" as const),
-        new Promise<"deadlocked">((resolve) => setTimeout(() => resolve("deadlocked"), SHARED_SWEEP_SETTLE_BOUND_MS)),
+        new Promise<"deadlocked">((resolve) => setTimeout(() => resolve("deadlocked"), SHARED_SWEEP_SETTLE_BOUND_MS).unref()),
       ]);
 
       expect(outcome).toBe("settled");

@@ -3,7 +3,6 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { AsyncLocalStorage } from "node:async_hooks";
 import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, max, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 
@@ -534,6 +533,7 @@ import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run
 import { taskWatchdogService } from "./task-watchdogs.js";
 import {
   LOCK_HELD_WARN_MS,
+  agentStartLockSweepContext,
   markAgentStartLockPhase,
   runDetachedFromAgentStartLock,
   withAgentStartLock,
@@ -26791,8 +26791,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * section inline. That dispatch's own reap must not join or chain behind the
    * sweep it is running inside, because that sweep is waiting for it.
    */
-  const insideStartLockSweep = new AsyncLocalStorage<true>();
-
   function scheduleStartLockReap(after: Promise<unknown>) {
     const sweep = after.then(() => {
       // The sweep reads fleet state from here on, so a later arrival must not
@@ -26800,7 +26798,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // a TTL set a failing sweep backs off instead of being retried by every
       // waking agent.
       joinableStartLockReap = null;
-      const running: Promise<unknown> = insideStartLockSweep.run(true, () =>
+      const running: Promise<unknown> = agentStartLockSweepContext.run(true, () =>
         reapOrphanedRuns({ suppressDispatchAfterReap: true }),
       ).finally(() => {
         sharedStartLockReapCompletedAtMs = Date.now();
@@ -26860,11 +26858,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * A caller already inside a shared sweep (a dispatch the sweep started and is
    * awaiting) runs its own unshared sweep instead. Joining or chaining would wait
    * on the sweep that is waiting on it, and every later start-lock caller then
-   * queues behind that cycle (BLO-35940). Nesting stays bounded
-   * by `MAX_NESTED_DISPATCH_DEPTH` in `withAgentStartLock`, as before BLO-36922.
+   * queues behind that cycle (BLO-35940). `MAX_NESTED_DISPATCH_DEPTH` bounds
+   * stack depth, not total sweep count; excess dispatch work detaches with
+   * the sweep marker cleared and follows the ordinary coalescing path.
+   *
+   * Production callers must hold an agent start lock. Its cross-agent guard
+   * prevents a sweep from awaiting an independently busy agent whose reap
+   * already waits on this sweep. A lock-free caller lacks that guard; tests
+   * using this entry directly must not introduce concurrent busy dispatch.
    */
   async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh" | "nested"> {
-    if (insideStartLockSweep.getStore()) {
+    if (agentStartLockSweepContext.getStore()) {
       await reapOrphanedRuns({ suppressDispatchAfterReap: true });
       return "nested";
     }
