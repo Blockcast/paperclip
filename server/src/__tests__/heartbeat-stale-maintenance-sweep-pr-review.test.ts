@@ -23,6 +23,10 @@ describe("isStaleMaintenanceSweepCandidate", () => {
     expect(
       isStaleMaintenanceSweepCandidate({ wakeReason: "transient_failure_retry", reviewKind: "pr_review" }),
     ).toBe(false);
+    // Literal prefix, not a LIKE pattern: the SQL pre-filter escapes `_` to match.
+    expect(
+      isStaleMaintenanceSweepCandidate({ wakeReason: "transient_failure_retry", taskKey: "prXreview:Blockcast/x:1" }),
+    ).toBe(true);
   });
 
   it("keeps issue-bound and non-maintenance wakes out of the sweep", () => {

@@ -28599,10 +28599,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             sql<string>`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`,
             [...STALE_QUEUED_MAINTENANCE_WAKE_REASONS],
           ),
-          // Mirrors isPrReviewRetryContext so pr_review rows, which are never
-          // swept (BLO-35488), cannot fill the batch and starve real candidates.
+          // These two mirror isPrReviewRetryContext so pr_review rows, which are
+          // never swept (BLO-35488), cannot fill the batch and starve real
+          // candidates. `_` is a LIKE wildcard, hence the escape. (The issueId/
+          // taskId `?` clauses above test key existence, which is stricter than
+          // the JS guard's non-empty check; that also fails safe.)
           sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'reviewKind', '') <> 'pr_review'`,
-          sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'taskKey', '') not like 'pr_review:%'`,
+          sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'taskKey', '') not like 'pr\\_review:%'`,
         ),
       )
       .orderBy(asc(heartbeatRuns.updatedAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
