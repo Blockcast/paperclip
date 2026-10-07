@@ -182,6 +182,23 @@ describe("buildClaudeCodeRuntimeShell (executed)", () => {
     }
   });
 
+  it("clears a staging dir left behind by a crashed installer", () => {
+    const { res, base, root, dir } = run({
+      setup: (root) => {
+        const leftover = path.join(root, `.tmp-${VERSION}-crashed-1`, "node_modules");
+        mkdirSync(leftover, { recursive: true });
+        writeFileSync(path.join(leftover, "partial"), "x");
+      },
+    });
+    try {
+      expect(res.status).toBe(0);
+      expect(existsSync(path.join(dir, ".complete"))).toBe(true);
+      expect(readdirSync(root).filter((e) => e.startsWith(".tmp-"))).toEqual([]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it("reuses a runtime a concurrent installer published first instead of nesting into it", () => {
     const { res, base, root, dir } = run({ hook: PUBLISH_THEIRS });
     try {

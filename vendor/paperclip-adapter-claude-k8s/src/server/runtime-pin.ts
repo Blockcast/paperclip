@@ -109,7 +109,11 @@ function shellSingleQuote(value: string): string {
  *   Job's `sh -c` is PID 1 in every pod) and is released only by its owner, so
  *   an installer whose lock was reclaimed cannot free its successor's;
  * - crash-safe: a lock older than 20 min is reclaimed, a dir without `.complete`
- *   is rebuilt, and the staging dir is renamed into place only after the fresh
+ *   is rebuilt, and the lock holder clears every `.tmp-<version>-*` staging dir
+ *   before installing (only lock holders create them, so any it finds belong to
+ *   a dead or reclaimed installer; a crash always leaves the runtime incomplete,
+ *   so the next install runs this cleanup). The staging dir is renamed into
+ *   place only after the fresh
  *   binary answers `--version`, with `mv -T` so that a runtime a concurrent
  *   installer already published makes the rename fail (that runtime is reused
  *   and the staging dir removed) instead of nesting the staging dir inside it;
@@ -137,7 +141,7 @@ export function buildClaudeCodeRuntimeShell(opts: { version: string; dataMountPa
       'if mkdir "$__pclock" 2>/dev/null; then ' +
         'echo "$__pcown" > "$__pclock/owner"; ' +
         'if [ ! -f "$__pcdir/.complete" ] || [ ! -x "$__pcbin" ]; then ' +
-          '__pctmp="$__pcroot/.tmp-$__pcver-$__pcown"; rm -rf "$__pctmp" "$__pcdir"; mkdir -p "$__pctmp"; ' +
+          '__pctmp="$__pcroot/.tmp-$__pcver-$__pcown"; rm -rf "$__pcroot/.tmp-$__pcver-"* "$__pcdir"; mkdir -p "$__pctmp"; ' +
           `echo "[paperclip] installing ${spec} into $__pcdir" >&2; ` +
           `if npm install --prefix "$__pctmp" --omit=dev --no-audit --no-fund --no-package-lock --loglevel=error "${spec}" >&2 ` +
             '&& "$__pctmp/node_modules/.bin/claude" --version >/dev/null 2>&1; then ' +
