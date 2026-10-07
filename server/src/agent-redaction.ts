@@ -392,14 +392,16 @@ export function restoreRedactedAgentMetadata(incoming: unknown, existing: unknow
  * external-lifecycle settings, so a sentinel where a structured value belongs
  * is a live-agent availability fault, not only a hygiene one.
  *
- * Shares `restoreRedactedAgentMetadata`'s body deliberately: all three columns
- * are masked by the one redactor, and a rule restated per column is how a
- * column ends up guarded on one path and inert on another. The PEN-2747
- * substring case and the drop-rather-than-invent behaviour on an absent prior
- * are inherited from {@link restoreRedactedAdapterValue}; so is the positional
- * array ceiling documented on {@link restoreRedactedAgentMetadata}.
+ * Deliberately **is** {@link restoreRedactedAgentMetadata} rather than a copy of
+ * it: all three columns are masked by the one redactor, and a rule restated per
+ * column is how a column ends up guarded on one path and inert on another. An
+ * identical body re-typed here would be exactly that restatement — the aliasing
+ * makes divergence structurally impossible instead of conventionally
+ * discouraged, while keeping the per-column name and this docblock as the thing
+ * a caller reads. The PEN-2747 substring case and the drop-rather-than-invent
+ * behaviour on an absent prior are inherited from
+ * {@link restoreRedactedAdapterValue}; so is the positional array ceiling
+ * documented on {@link restoreRedactedAgentMetadata} — and that inheritance is
+ * now by identity, not by assertion.
  */
-export function restoreRedactedAgentRuntimeConfig(incoming: unknown, existing: unknown): unknown {
-  if (!containsRedactedAdapterValue(incoming)) return incoming;
-  return restoreRedactedAdapterValue(incoming, existing ?? {});
-}
+export const restoreRedactedAgentRuntimeConfig = restoreRedactedAgentMetadata;
