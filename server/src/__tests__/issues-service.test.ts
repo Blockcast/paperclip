@@ -8391,6 +8391,174 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       // Both edges survive: the unpark saw the newly-committed blocker.
       expect(await readBlockedBy(dependentId)).toEqual([doneBlockerId, liveBlockerId].sort());
     });
+
+    // BLO-26403. Everything above drives one interleaving — a blocker add that
+    // lands, or is in flight, before the unpark — and none of it asserts the
+    // absence of a deadlock. Nothing anywhere pins *why* these two transactions
+    // cannot cycle: `runUpdate` takes `lockIssueBlockerRelations` before the row
+    // `FOR UPDATE`, so both flows acquire advisory -> row and there is no order
+    // to invert. Hoist the row lock above that call and the invariant breaks
+    // silently, with every existing case still green.
+
+    /**
+     * Drizzle wraps driver errors in a `Failed query: …` error whose own `code`
+     * is `undefined`, so a deadlock check that reads the top-level `code` sees
+     * nothing and passes on a real 40P01. Walk the cause chain to PostgreSQL's
+     * actual SQLSTATE.
+     */
+    function describeError(error: unknown) {
+      const codes: string[] = [];
+      const messages: string[] = [];
+      let current: unknown = error;
+      for (let depth = 0; current && depth < 10; depth += 1) {
+        const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
+        if (typeof candidate.code === "string") codes.push(candidate.code);
+        if (typeof candidate.message === "string") messages.push(candidate.message);
+        current = candidate.cause;
+      }
+      return { codes, message: messages.join(" | ") || String(error) };
+    }
+
+    function expectNoDeadlock(result: PromiseSettledResult<unknown>) {
+      if (result.status !== "rejected") return;
+      const described = describeError(result.reason);
+      // 40P01 is PostgreSQL's deadlock_detected.
+      expect(described.codes).not.toContain("40P01");
+      expect(described.message).not.toMatch(/deadlock/i);
+    }
+
+    it("completes without deadlocking when the unpark commits before a production blocker add", async () => {
+      const { dependentId, doneBlockerId, liveBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      // Park both calls behind a row lock we hold, so start order is commit
+      // order rather than a timing coin-flip: whichever starts first takes the
+      // company and blocker-relation advisories and then waits on the row, and
+      // the other queues behind the company advisory.
+      const rowHeld = deferred<void>();
+      const releaseRow = deferred<void>();
+      const holder = db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${eq(issues.id, dependentId)} for update`,
+        );
+        rowHeld.resolve();
+        await releaseRow.promise;
+      });
+      await rowHeld.promise;
+
+      const unpark = svc.update(dependentId, { ...unparkPatch });
+      const unparkSettled = unpark.catch(() => undefined);
+
+      // Wait until the unpark is parked on the row rather than sleeping blind.
+      // A row `FOR UPDATE` wait means it already holds both advisories, so the
+      // add below must queue behind it. If the add won the company advisory
+      // instead, it would commit the live edge first and the unpark's
+      // precondition would correctly 409, failing this case for timing alone.
+      const rowWaitDeadline = Date.now() + 10_000;
+      let unparkParkedOnRow = false;
+      while (Date.now() < rowWaitDeadline && !unparkParkedOnRow) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ~* 'for update'
+          ) as waiting
+        `);
+        unparkParkedOnRow = Boolean(Array.from(waitingRows)[0]?.waiting);
+        if (!unparkParkedOnRow) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(unparkParkedOnRow).toBe(true);
+
+      // The production blocker add: svc.update -> runUpdate -> syncBlockedByIssueIds.
+      const blockerAdd = svc.update(dependentId, { blockedByIssueIds: [liveBlockerId] });
+      const blockerAddSettled = blockerAdd.catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 75));
+
+      releaseRow.resolve();
+      await holder;
+
+      const results = await Promise.allSettled([unpark, blockerAdd]);
+      await unparkSettled;
+      await blockerAddSettled;
+      results.forEach(expectNoDeadlock);
+
+      // The unpark wins the row: it clears only the stale terminal edge, and the
+      // add then applies the live edge on top of the already-unparked row.
+      expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+      expect(await readBlockedBy(dependentId)).toEqual([liveBlockerId]);
+    });
+
+    it("takes the blocker-relation advisory lock before touching the issue row", async () => {
+      const { companyId, dependentId, doneBlockerId } = await seedUnparkScenario();
+      await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId] });
+
+      const advisoryHeld = deferred<void>();
+      const releaseAdvisory = deferred<void>();
+      const lockKey = `paperclip:issue-blockers:${companyId}:${dependentId}`;
+      const holder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+        advisoryHeld.resolve();
+        await releaseAdvisory.promise;
+      });
+      await advisoryHeld.promise;
+
+      const unpark = svc.update(dependentId, { ...unparkPatch });
+      const unparkSettled = unpark.catch(() => undefined);
+
+      // Wait for the unpark to actually park on that advisory rather than
+      // sleeping blind — a probe that fired before the unpark reached any lock
+      // would pass vacuously, which is exactly the failure this case exists to
+      // rule out.
+      const lockWaitDeadline = Date.now() + 10_000;
+      let parked = false;
+      while (Date.now() < lockWaitDeadline && !parked) {
+        const waitingRows = await db.execute(sql<{ waiting: boolean }>`
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ~* 'pg_advisory_xact_lock'
+          ) as waiting
+        `);
+        parked = Boolean(Array.from(waitingRows)[0]?.waiting);
+        if (!parked) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(parked).toBe(true);
+
+      // The ordering assertion. An unpark parked on the blocker-relation
+      // advisory has not reached the row's `FOR UPDATE` yet, so this probe
+      // acquires the row. Hoist the row lock above `lockIssueBlockerRelations`
+      // and the row is already write-locked here, so PostgreSQL raises 55P03
+      // (lock_not_available) and `acquired` comes back `row-already-locked`.
+      const probe = await db
+        .transaction(async (tx) => {
+          await tx.execute(
+            sql`select ${issues.id} from ${issues} where ${eq(issues.id, dependentId)} for update nowait`,
+          );
+          return { acquired: "row-free" as const };
+        })
+        .catch((error: unknown) => {
+          const described = describeError(error);
+          return {
+            acquired: described.codes.includes("55P03")
+              ? ("row-already-locked" as const)
+              : described.codes,
+            message: described.message,
+          };
+        });
+
+      releaseAdvisory.resolve();
+      await holder;
+      await unparkSettled;
+
+      expect(probe).toEqual({ acquired: "row-free" });
+      await expect(unpark).resolves.toMatchObject({ status: "todo" });
+    });
   });
 });
 
