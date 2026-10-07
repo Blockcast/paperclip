@@ -71,15 +71,18 @@ export const ADAPTER_REPO = "kkroo/paperclip-adapter-opencode-k8s";
 export const SECRET_PUT_SYMBOL = "replaceNamespacedSecret";
 
 /**
- * Keep only real call sites: a `vi.fn()` stub in a `.test.ts` is a mock, not a
- * consumer, and the adapter's test files legitimately name the symbol while
- * asserting it is never called.
+ * Exclude conventional test/spec files and __tests__/__mocks__ directories:
+ * their stubs can legitimately name the symbol while asserting it is never
+ * called. Names such as src/testing remain production sources.
  *
  * @param {string[]} grepLines raw `git grep -n` output lines, `path:line:text`
  * @returns {string[]} lines from non-test sources
  */
 export function nonTestHits(grepLines) {
-  return grepLines.filter((line) => line.trim() !== "" && !/\.test\.[cm]?tsx?:/.test(line));
+  return grepLines.filter((line) =>
+    line.trim() !== "" &&
+    !/(?:^|\/)__(?:tests|mocks)__\/|\.(?:test|spec)\.[cm]?tsx?$/.test(line.split(":", 1)[0]),
+  );
 }
 
 /**
@@ -95,9 +98,9 @@ export function extractPin(dockerfile) {
  *
  * The asymmetry is deliberate. `unreachable` is a definite finding — the build
  * WILL fail on its next cache miss — so it fails the PR. `inconclusive` means
- * we could not clone at all (network, rate limit, repo turned private, no
- * credential in this job); that says nothing about the pin, and turning every
- * transient network fault into a blocked merge would inflict the same class of
+ * we could not complete the probe (network, rate limit, repo turned private,
+ * no credential, or a failed source search); that says nothing about the pin.
+ * Turning every transient fault into a blocked merge would inflict the same class of
  * harm this guard exists to prevent. It warns loudly instead of failing, so a
  * permanently broken probe is visible in the run rather than silently inert.
  *
@@ -107,7 +110,7 @@ export function extractPin(dockerfile) {
  * inert search to `inconclusive` rather than letting it read as clean.
  *
  * @param {{pin: string | null, cloneOk: boolean, commitPresent: boolean, detail?: string,
- *          srcFileCount?: number, secretPutHits?: string[]}} probe
+ *          srcFileCount?: number | null, secretPutHits?: string[] | null}} probe
  * @returns {{verdict: "ok" | "unreachable" | "secret-put" | "inconclusive" | "no-pin", exitCode: 0 | 1, message: string}}
  */
 export function classify(probe) {
@@ -151,6 +154,17 @@ export function classify(probe) {
         "default branch — check `git diff <old> <new>` first, since the squash of the " +
         "same PR is usually content-identical and therefore a safe, behaviour-neutral " +
         "move.",
+    };
+  }
+
+  if (srcFileCount === null || secretPutHits === null) {
+    return {
+      verdict: "inconclusive",
+      exitCode: 0,
+      message:
+        `GUARD INCONCLUSIVE: pin ${pin} is reachable, but the Secret-PUT source search failed. ` +
+        "Not failing the PR — a failed search cannot establish that the pin makes no Secret PUT. " +
+        "Fix the probe before trusting the guard.",
     };
   }
 
@@ -211,7 +225,7 @@ export function classify(probe) {
  *
  * @param {string} pin
  * @returns {{pin: string, cloneOk: boolean, commitPresent: boolean, detail?: string,
- *            srcFileCount?: number, secretPutHits?: string[]}}
+ *            srcFileCount?: number | null, secretPutHits?: string[] | null}}
  */
 function probe(pin) {
   const scratch = mkdtempSync(join(tmpdir(), "opencode-k8s-pin-"));
@@ -246,22 +260,24 @@ function probe(pin) {
         });
       } catch (error) {
         // `git grep` exits 1 on no match, which is a result, not a failure.
-        // Any other status leaves stdout empty and the control below catches
-        // it: a failed ls-tree reads as srcFileCount 0, i.e. inconclusive.
-        return error?.status === 1 ? (error.stdout ?? "") : "";
+        // Preserve all other failures, including signals/timeouts, as unknown
+        // rather than turning a failed search into a clean attestation.
+        return args[0] === "grep" && error?.status === 1 && !error.signal ? "" : null;
       }
     };
     const lines = (out) => out.split("\n").filter((l) => l.trim() !== "");
+    const sources = git(["ls-tree", "-r", "--name-only", pin, "--", "src"]);
+    const hits = git(["grep", "-n", "--fixed-strings", SECRET_PUT_SYMBOL, pin, "--", "src"]);
 
     return {
       pin,
       cloneOk: true,
       commitPresent: true,
-      srcFileCount: nonTestHits(
-        lines(git(["ls-tree", "-r", "--name-only", pin, "--", "src"])).map((f) => `${f}:`),
+      srcFileCount: sources === null ? null : nonTestHits(
+        lines(sources).filter((f) => /\.[cm]?tsx?$/.test(f)).map((f) => `${f}:`),
       ).length,
-      secretPutHits: nonTestHits(
-        lines(git(["grep", "-n", "--fixed-strings", SECRET_PUT_SYMBOL, pin, "--", "src"])).map(
+      secretPutHits: hits === null ? null : nonTestHits(
+        lines(hits).map(
           // `git grep <tree-ish>` prefixes every line with `<sha>:`; strip it so
           // the message reads as a path, and so nonTestHits sees the real path.
           (l) => (l.startsWith(`${pin}:`) ? l.slice(pin.length + 1) : l),
