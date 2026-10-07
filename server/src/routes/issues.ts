@@ -189,6 +189,7 @@ import {
   issueListProbeLimit,
   parseOffsetParam,
   parseUnsupportedPaginationParams,
+  parseUnsupportedTimeFilterParams,
   resolveIssueListTruncation,
 } from "../lib/issue-list-query.js";
 import { readAcceptedPlanConfirmationTarget } from "../services/issues.js";
@@ -8661,6 +8662,20 @@ export function issueRoutes(
       res.status(400).json({
         error: "page/perPage pagination is not supported on this endpoint; use limit and offset instead",
         unsupportedParams: unsupportedPaginationParams,
+      });
+      return;
+    }
+    // BLO-40145: this endpoint implements no time-bound filter, so `updated_after`
+    // and friends were dropped unread — identical output to passing no filter at
+    // all. Reject instead of serving an unbounded corpus that reads as a bounded
+    // census; `GET /companies/:companyId/search?updatedAfter=` is the surface that
+    // actually applies one.
+    const unsupportedTimeFilterParams = parseUnsupportedTimeFilterParams(req.query);
+    if (unsupportedTimeFilterParams.length > 0) {
+      res.status(400).json({
+        error:
+          "time-bound filtering is not supported on this endpoint; the param was previously dropped unread and returned the whole corpus. Use GET /api/companies/:companyId/search with updatedAfter or updatedWithin, or sortField=id with afterId to walk rows by key.",
+        unsupportedParams: unsupportedTimeFilterParams,
       });
       return;
     }
