@@ -41,8 +41,9 @@
 # one-way signal at best. Never write `merge-gate-read.sh … && merge`.
 #
 #   merge-gate-read.sh <owner/repo> <sha|pr-head>     # live
-#   merge-gate-read.sh --rows <DEAD> [PENDING]        # fixture mode, rows on stdin
-#   merge-gate-read.sh --dead [witnesses]             # fixture mode, runs on stdin
+#   merge-gate-read.sh --rows <DEAD> [PENDING] [WDEAD] # fixture mode, rows on stdin
+#   merge-gate-read.sh --dead [witnesses] [w]         # fixture mode, runs on stdin;
+#                                                     # any 3rd arg: witness arm only
 #   merge-gate-read.sh --pending                      # fixture mode, runs on stdin
 #   merge-gate-read.sh --extract                      # fixture mode, check-run JSON on stdin
 #   merge-gate-read.sh --status-extract               # fixture mode, status JSON on stdin
@@ -168,7 +169,7 @@ pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
   # anything looser lets a non-verdict settle a run.
   #
   # A superseded run is completed, non-success and publishes nothing HERE — its
-  # rows are stripped by the DEAD grep before `contributed` is ever set — so it
+  # rows are stripped by the DEAD filter before `contributed` is ever set — so it
   # would emit a spurious NO-VERDICT. It is excluded in the END loop of
   # verdicts(), NOT here: pending_runs() does not know DEAD, and doing it in the
   # caller would put the guard outside `--rows` fixture reach. Direction of
@@ -211,7 +212,8 @@ require_sha() { # $1 = candidate -> stdout: a STOP line + rc 1 when not 40-hex
   return 1
 }
 
-dead_runs() { # stdin: run rows; $1 = off-head witnesses -> alternation of stale ids
+dead_runs() { # stdin: run rows; $1 = off-head witnesses; $2 non-empty = print only
+              # the ids the off-head witness arm retired -> alternation of stale ids
   # $1 is newline-separated `workflow-id<SP>run-started-at<SP>status-updated-at`,
   # empty when none. A row of any other arity is dropped rather than guessed at.
   # Passed as a VALUE rather than a second input file on purpose: the two-file
@@ -448,10 +450,19 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses -> alternation of stale
   #
   #   cx[i]           the victim was CANCELLED, not FAILED. This arm is for a
   #                   head where NO verdict was ever produced, and the two cases
-  #                   are not symmetric: a cancelled victim says nothing, so the
-  #                   off-head green is the only verdict and adds information; a
-  #                   FAILED victim already produced a verdict at this head and
-  #                   it said no. The witness is by construction a run against a
+  #                   are not symmetric: a cancelled RUN publishes no run-level
+  #                   verdict, so the off-head green is the only one and adds
+  #                   information; a FAILED victim already produced a verdict at
+  #                   this head and it said no. That premise holds for the run
+  #                   CONCLUSION and is FALSE for its ROWS (Ally review at
+  #                   bc1d8a56): a job that fails before cancel-in-progress kills
+  #                   the rest leaves a real `failure` check-run under a
+  #                   `cancelled` run, and `cx[i]` cannot see it. This function
+  #                   never sees names, so the row half is fenced in verdicts():
+  #                   the live path passes this arm's ids again as WDEAD, and
+  #                   verdicts() strips only a witness-retired run's rows that
+  #                   say nothing or pass, keeping every row that would STOP.
+  #                   The witness is by construction a run against a
   #                   DIFFERENT TREE (the scheduled run's head_sha is main's), so
   #                   retiring an at-head failure with it overrules this tree's
   #                   own answer using a pass on another one. `passed_at_head`
@@ -477,7 +488,7 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses -> alternation of stale
   # later pass, so the lane demonstrably spoke and owes no verdict. Without the
   # exemption the same run would print NO-VERDICT instead of STOP: still
   # blocking, still unclearable, i.e. this whole arm bought nothing.
-  awk -F'\t' -v wits="${1:-}" '
+  awk -F'\t' -v wits="${1:-}" -v wonly="${2:+1}" '
     BEGIN { n = 0   # n MUST be seeded: implicit is "" , not 0
             k = split(wits, W, "\n")
             for (j = 1; j <= k; j++)
@@ -492,22 +503,37 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses -> alternation of stale
         cx[n] = ($4 == "cancelled"); n++ } }
     END { for (i = 0; i < n; i++) {
             if (started[i] == "") continue
-            if (newest_pass[grp[i]] >= started[i]) { print id[i]; continue }
+            if (newest_pass[grp[i]] >= started[i]) { if (!wonly) print id[i]; continue }
             if (cx[i] && !passed_at_head[wf[i]] && ext[wf[i]] >= started[i]) print id[i] } }' \
     | sort -n | paste -sd'|' -
 }
 
-verdicts() { # $1 = DEAD alternation, $2 = PENDING rows (both may be empty)
+verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be empty)
   # Normalised HERE and nowhere else — the live path pipes dead_runs() straight
   # in, and it prints nothing when no run is stale. An empty alternation is not
-  # inert: `()` is an empty sub-expression, which GNU grep reads as "matches
-  # empty" (so `-vE "\t()$"` eats every row with an empty last field) and ugrep
-  # rejects outright as a regex error, emptying the pipeline. Either way `dead`
-  # then misses the `__none__` arm below, the App-row exclusion engages, and
-  # ABSENT misreports nothing-dropped as everything-dropped.
-  local dead="${1:-}"
+  # inert: `()` is an empty sub-expression, so `^()$` matches an empty field
+  # (this stage was a grep, which read it as "matches empty" under GNU and as a
+  # regex error under ugrep). Either way `dead` then misses the `__none__` arm
+  # below, the App-row exclusion engages, and ABSENT misreports nothing-dropped
+  # as everything-dropped.
+  #
+  # WDEAD is the subset of DEAD that ONLY the off-head witness arm retired. Its
+  # rows are NOT all stale: a witness is a pass on a DIFFERENT TREE, so it may
+  # speak for rows that said nothing (`cancelled`) and drop rows that were
+  # never blocking (`success`/`skipped`/`neutral`, leaving the survivor count
+  # exactly as before), but it must not overrule a row that would STOP — a real
+  # at-head `failure` under a cancelled run (Ally review at bc1d8a56). Matched
+  # as the list to DROP, so anything else, including a state GitHub adds later,
+  # is kept and fails CLOSED. The run stays in DEAD, so it is still exempt from
+  # NO-VERDICT below.
+  # `exit !k` keeps the `grep -v` status this stage replaced — 1 when nothing
+  # survives — which the header's one-way rc contract rides on.
+  local dead="${1:-}" wdead="${3:-__none__}"
   [ -z "$dead" ] && dead=__none__
-  grep -vE "	(${dead})$" \
+  awk -F'\t' -v dead="$dead" -v wdead="$wdead" '
+      $4 !~ ("^(" dead ")$") ||
+      ($4 ~ ("^(" wdead ")$") && $2 !~ /^(cancelled|success|skipped|neutral)$/) { print; k++ }
+      END { exit !k }' \
     | sort -t$'\t' -k1,1 -k4,4 -k3,3r \
     | awk -F'\t' '!seen[$1 FS $4]++' \
     | PEND="${2:-}" awk -F'\t' -v dead="$dead" '
@@ -581,7 +607,7 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows (both may be empty)
             #
             # DEAD runs are exempt, and the exemption is not cosmetic. A
             # superseded run is completed and non-success, so pending_runs()
-            # emits it, and its rows were stripped by the grep at the top of this
+            # emits it, and its rows were stripped by the filter at the top of this
             # function before `contributed` could be set — so without this it
             # prints NO-VERDICT for a run whose lane demonstrably spoke. The
             # alternation is reused verbatim rather than restated, on the same
@@ -600,8 +626,8 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows (both may be empty)
 # `--rows` propagates the pipeline status rather than swallowing it. Hardcoding
 # `exit 0` here made the exit contract unobservable by construction, so no
 # fixture could catch the header claiming an exactness it did not have.
-if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}" "${3:-}"; exit $?; fi
-if [ "${1:-}" = "--dead" ]; then dead_runs "${2:-}"; exit 0; fi
+if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}" "${3:-}" "${4:-}"; exit $?; fi
+if [ "${1:-}" = "--dead" ]; then dead_runs "${2:-}" "${3:-}"; exit 0; fi
 if [ "${1:-}" = "--pending" ]; then pending_runs; exit 0; fi
 if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
 if [ "${1:-}" = "--status-extract" ]; then status_extract; exit 0; fi
@@ -658,6 +684,7 @@ WITNESSES=$(printf '%s' "$STATUSES" | witness_extract \
     done)
 
 DEAD=$(printf '%s\n' "$RUNS" | dead_runs "$WITNESSES")
+WDEAD=$(printf '%s\n' "$RUNS" | dead_runs "$WITNESSES" witness)
 PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
 
 # BOTH surfaces paginate. GitHub's default page size is 30, so an unpaginated
@@ -666,4 +693,4 @@ PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
 # status rows from the survivor count, so one surviving check-run keeps the guard quiet.
 { printf '%s' "$STATUSES" | status_extract
   gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract
-} | verdicts "$DEAD" "$PENDING"
+} | verdicts "$DEAD" "$PENDING" "$WDEAD"
