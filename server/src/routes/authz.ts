@@ -233,7 +233,11 @@ type RunTranscriptReadDecider = {
  * `normalizeHumanRole` folds it to `operator`, so matching the stored string
  * would make one membership row an operator for default-grant seeding and a
  * non-operator here — the same "two places naming the human set differently"
- * that migration 0251's comment exists to remove (Ally review 5381822720).
+ * that the `runs_read_transcript_grant_seed` migration's comment exists to
+ * remove (Ally review 5381822720). Named by stem rather than by number: this
+ * migration has been renumbered twice already (0248 → 0251 → 0252) to dodge
+ * migrations landing on master, and each renumber silently re-pointed a
+ * number-based reference at an unrelated real file (Ally review 5438353035).
  * Typing the set to the normalized union also makes a future role addition a
  * compile error here rather than a silent denial.
  */
