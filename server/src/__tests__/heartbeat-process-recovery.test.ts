@@ -309,6 +309,7 @@ import {
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
 } from "../services/recovery/index.ts";
 import { ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT } from "../services/recovery/service.ts";
+import { withAgentStartLock } from "../services/agent-start-lock.js";
 import type { PluginEventBus, ScopedPluginEventBus } from "../services/plugin-event-bus.js";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import {
@@ -2417,9 +2418,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // Pods observable and none belong to the run: quiescence is proven, so the
     // successor is promoted rather than held (see the BLO-21460 tests).
     mockListManagedAgentPods.mockImplementation(async () => []);
+    // The run the promoted dispatch launches reaps too, once released. It is
+    // detached and outlives the sweep, so it must coalesce like any caller.
+    let releaseLaunchedRun!: () => void;
+    const launchedRunGate = new Promise<void>((resolve) => {
+      releaseLaunchedRun = resolve;
+    });
+    let launchedRunReap: string | undefined;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await launchedRunGate;
+      launchedRunReap = await heartbeat.reapOrphanedRunsForStartLock();
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, provider: "test", model: "test-model" };
+    });
 
     try {
-      const sweep = heartbeat.reapOrphanedRunsForStartLock();
+      // Entered holding a start lock, as the reap phase of a dispatch is.
+      const sweep = withAgentStartLock(randomUUID(), () => heartbeat.reapOrphanedRunsForStartLock(), {
+        onCoalesced: () => "coalesced" as const,
+      });
       const outcome = await Promise.race([
         sweep.then(() => "settled" as const),
         new Promise<"deadlocked">((resolve) => setTimeout(() => resolve("deadlocked"), SHARED_SWEEP_SETTLE_BOUND_MS).unref()),
@@ -2436,7 +2452,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .then((rows) => rows[0]);
       expect(wake?.status).not.toBe("deferred_issue_execution");
       expect(mockListManagedAgentJobs).toHaveBeenCalledTimes(2);
+
+      releaseLaunchedRun();
+      await vi.waitFor(() => expect(launchedRunReap).toBeDefined(), { timeout: SHARED_SWEEP_SETTLE_BOUND_MS });
+      expect(launchedRunReap).not.toBe("nested");
     } finally {
+      releaseLaunchedRun();
       mockListManagedAgentJobs.mockImplementation(async () => null);
       mockReadAgentJobRunStatusByName.mockImplementation(async () => null);
       mockListManagedAgentPods.mockImplementation(async () => null);

@@ -29592,7 +29592,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         } finally {
           const reapMs = Date.now() - reapStartedAtMs;
           if (reapMs >= LOCK_HELD_WARN_MS) {
-            logger.warn(
+            // A nested sweep is unshared by design (BLO-35940), so its cost here
+            // is expected; keep the warn for the paths where it is an anomaly.
+            (reapDisposition === "nested" ? logger.info : logger.warn).call(
+              logger,
               { agentId, reapMs, reapDisposition, warnAfterMs: LOCK_HELD_WARN_MS },
               "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
             );
