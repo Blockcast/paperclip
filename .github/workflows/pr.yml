@@ -595,7 +595,15 @@ jobs:
       # escalation's stall clock. Both properties are unobservable in production
       # until a deploy is already stuck for hours, which is the wrong moment to
       # discover either of them regressed.
-      - name: Test stuck production-approval escalation (PEN-2848, BLO-33400, PEN-3315)
+      #
+      # PEN-3744 adds the delivery-gap suite. Its subject is a property of the
+      # DELIVERED text, not of the code: the Slack relay forwards `summary`
+      # whole but cuts the description to its first paragraph at 400 chars, so a
+      # gap figure that lands in paragraph 2 or overruns that bound is a gap the
+      # human reading Slack never sees — indistinguishable in CI from having
+      # fixed nothing. That bound lives in another repository's relay config and
+      # nothing here could otherwise observe it.
+      - name: Test stuck production-approval escalation (PEN-2848, BLO-33400, PEN-3315, PEN-3744)
         if: ${{ !cancelled() }}
         run: |
           node --test \
@@ -603,7 +611,8 @@ jobs:
             ./.github/scripts/tests/scheduled-production-deploy-schedule.test.mjs \
             ./.github/scripts/tests/supersede-stale-deploy.test.mjs \
             ./.github/scripts/tests/deploy-stall-record.test.mjs \
-            ./.github/scripts/tests/deploy-stall-chain.test.mjs
+            ./.github/scripts/tests/deploy-stall-chain.test.mjs \
+            ./.github/scripts/tests/deploy-delivery-gap.test.mjs
         timeout-minutes: 1
 
       # BLO-28203. The stalled-Ally-review sweep's decision suite otherwise runs

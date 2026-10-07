@@ -83,6 +83,22 @@
  * workflow holds. See deploy-stall-chain.mjs. The issue record is kept for the
  * repositories where it does work, and its 410 is reported as a configuration
  * fact rather than an hourly warning.
+ *
+ * WHAT PEN-3744 ADDED: THE DELIVERY GAP
+ * -------------------------------------
+ * Everything above measures ONE obligation — how long this approval has been
+ * pending. It is correct and it is not the whole story. The sibling that
+ * measures the other obligation, how long production has been UNDEPLOYED, is
+ * `PaperclipApiProductionDeployStalled`, and Alertmanager INHIBITS it with this
+ * alert (onprem-k8s BLO-37835). Measured 2026-10-04: that warning had read
+ * `suppressed` with `silencedBy: []` — nobody muted it — continuously since
+ * 2026-09-27T15:05:47Z, while this alert correctly reported 27.8h and
+ * production sat 612 commits / 12.5 days behind master. The notifying surface
+ * could not express the delivery gap at all.
+ *
+ * So this alert now carries it: see deploy-delivery-gap.mjs for where the
+ * number comes from and why it is derived from the Actions API rather than read
+ * from the exporter that already publishes it.
  */
 import { appendFileSync, readFileSync } from 'node:fs';
 import {
@@ -99,6 +115,7 @@ import {
   deriveStallStartFromSupersedeChain,
   fetchCancelledDispatchRuns,
 } from './deploy-stall-chain.mjs';
+import { formatDeliveryGap, resolveDeliveryGap } from './deploy-delivery-gap.mjs';
 
 const DEFAULT_ALERTMANAGER_URL = 'http://alertmanager.monitoring.svc.cluster.local:9093';
 /**
@@ -204,6 +221,8 @@ export function buildAlert({
   now,
   stallStartedAt = null,
   stallRecordUrl = null,
+  deliveryGap = null,
+  deliveryGapReason = null,
 }) {
   const hours = ageHours.toFixed(1);
   // NO PENDING-DEPLOY RUN IDENTITY GOES IN THIS ALERT — not in the call to action,
@@ -248,6 +267,35 @@ export function buildAlert({
   // precision (`16:39:45Z`), so the same instant never compares equal as text.
   const superseded = Date.parse(stallSince) !== Date.parse(oldest.createdAt);
 
+  // PEN-3744. The DELIVERY gap — how far production has fallen behind master —
+  // leads both the summary and the description's first paragraph, because those
+  // are the only two things the Slack relay forwards and the summary is the one
+  // it never truncates (onprem-k8s monitoring/alertmanager-slack-relay.yaml:
+  // `summary` whole, description cut to its first paragraph at 400 chars).
+  //
+  // It has to be HERE rather than on the sibling warning rule that already
+  // carries it, because that rule is inhibited by this very alert
+  // (BLO-37835) and so never reaches a notification. Measured 2026-10-04: the
+  // warning had read `suppressed`/`silencedBy: []` since 2026-09-27T15:05:47Z
+  // while this alert reported 27.8h and production was 612 commits / 12.5 days
+  // behind. The approval age is correct and is the SMALLER number; saying only
+  // it is what let seven days pass.
+  const gapPhrase = formatDeliveryGap(deliveryGap);
+  // Bounded: this is spliced into the 400-char Slack lead, and an error message
+  // is the one input here with no natural length limit.
+  const gapMiss = deliveryGapReason ? deliveryGapReason.slice(0, 120) : null;
+  const deployedShort = deliveryGap?.deployedSha ? deliveryGap.deployedSha.slice(0, 8) : null;
+
+  const approvalClause =
+    `A ${DEPLOY_WORKFLOW_FILE} deploy has been parked on the ${environment} reviewer gate since ` +
+    `${stallSince} (${hours}h; threshold ${alertAfterHours}h).`;
+  const lead = gapPhrase
+    ? `Production is ${gapPhrase} behind master — last successful deploy ` +
+      `${deployedShort} landed ${deliveryGap.landedAt}. The approval age below is a ` +
+      `SMALLER, different number and does not measure that gap. ${approvalClause}`
+    : `${approvalClause}` +
+      (gapMiss ? ` The delivery gap could not be measured (${gapMiss}).` : '');
+
   return {
     labels: {
       alertname: 'ProductionDeployApprovalStuck',
@@ -258,16 +306,36 @@ export function buildAlert({
       environment,
     },
     annotations: {
-      summary:
-        `${repo} production deploy has been awaiting human approval for ${hours}h — ` +
-        'the daily dispatcher is a no-op until it clears',
+      summary: gapPhrase
+        ? `${repo} production is ${gapPhrase} behind master — a deploy has been awaiting ` +
+          `human approval for ${hours}h and the daily dispatcher is a no-op until it clears`
+        : `${repo} production deploy has been awaiting human approval for ${hours}h — ` +
+          'the daily dispatcher is a no-op until it clears',
       description:
-        `A ${DEPLOY_WORKFLOW_FILE} deploy has been parked on the ${environment} reviewer gate since ` +
-        `${stallSince} (${hours}h; threshold ${alertAfterHours}h).\n\n` +
+        `${lead}\n\n` +
         "While it waits, scheduled-production-deploy.yml's anti-stacking guard skips every " +
         'daily slot, so production drift grows. Past this threshold the dispatcher run also ' +
         'fails (conclusion=failure) and this alert refreshes each slot, so the stall is ' +
         'visible — but only a reviewer approving or rejecting can clear it.\n\n' +
+        // The sentence above arrived on master and REPLACED what this branch used to
+        // say here ("each skipped run still reports conclusion=success. Nothing else
+        // escalates this."), which was false: the dispatcher reddens itself on purpose
+        // past the threshold (PEN-2848's escalation branch). Both sides are kept
+        // because they are different claims — the red run makes the STALL visible,
+        // which is strictly weaker than carrying the GAP FIGURE. Collapsing them is
+        // how the figure goes missing again, which is the whole subject of PEN-3744.
+        'PaperclipApiProductionDeployStalled, the Prometheus rule that reports the delivery ' +
+        'gap on its own, is INHIBITED by this alert while it fires (onprem-k8s BLO-37835), so ' +
+        (gapPhrase
+          ? 'this is the only notification carrying that figure. Do not read its silence as the ' +
+            'gap being small.\n\n'
+          : // The lookup failed, so the lead carries no figure. Claiming this alert
+            // carries one would contradict its own first paragraph — and the
+            // "silence is not smallness" warning matters MORE here, not less:
+            // neither surface is reporting the gap.
+            'this is the only notification that would carry that figure — and here it could ' +
+            'not be measured, so NO surface is currently reporting the gap. Do not read ' +
+            'either silence as the gap being small.\n\n') +
         (superseded
           ? 'The run on the gate has been superseded at least once so the approvable head stays ' +
             'current, so whatever is waiting there now is younger than the stall above. ' +
@@ -292,6 +360,21 @@ export function buildAlert({
         (stallRecordUrl ? `\n\nDurable record (survives this alert's TTL): ${stallRecordUrl}` : ''),
       pending_queue_url: pendingQueueUrl,
       stall_since: stallSince,
+      // Machine-readable twin of the lead. Kept even when the lookup failed, so
+      // "the gap is absent" and "the gap was never measured" stay distinct to
+      // anyone querying /api/v2/alerts after the fact.
+      ...(deliveryGap
+        ? {
+            delivery_gap_commits: String(deliveryGap.commitsBehind),
+            ...(Number.isFinite(deliveryGap.days)
+              ? { delivery_gap_days: deliveryGap.days.toFixed(1) }
+              : {}),
+            deployed_commit: deliveryGap.deployedSha,
+            last_deploy_at: deliveryGap.landedAt,
+            ...(deliveryGap.deployRunUrl ? { last_deploy_run_url: deliveryGap.deployRunUrl } : {}),
+          }
+        : {}),
+      ...(gapMiss ? { delivery_gap_unavailable: gapMiss } : {}),
       ...(stallRecordUrl ? { stall_record_url: stallRecordUrl } : {}),
       run_url: runUrl,
       runbook_url: 'https://paperclip.blockcast.net/PEN/issues/PEN-2848',
@@ -491,6 +574,26 @@ async function main() {
   if (recordState.number) setOutput('stall_issue_number', String(recordState.number));
   setOutput('stall_started_at', verdict.stallStartedAt ?? '');
 
+  // PEN-3744. Enrichment only, and deliberately NOT fatal: this alert is the
+  // path that reaches a human, so a GitHub blip here must degrade the wording
+  // back to the pre-PEN-3744 text rather than suppress the push. The resolver
+  // never throws; the reason it returns is carried on the alert so the
+  // degradation is visible instead of reading as "the gap is small".
+  const { gap: deliveryGap, reason: deliveryGapReason } = await resolveDeliveryGap({
+    client,
+    baseRef: process.env.DEPLOY_BASE_REF || 'master',
+    now,
+  });
+  if (deliveryGap) {
+    console.log(
+      `Delivery gap: ${deliveryGap.commitsBehind} commit(s) behind ` +
+        `${process.env.DEPLOY_BASE_REF || 'master'}; last successful deploy ` +
+        `${deliveryGap.deployedSha} landed ${deliveryGap.landedAt}.`,
+    );
+  } else {
+    console.log(`::warning::Delivery gap unavailable, alerting without it — ${deliveryGapReason}`);
+  }
+
   const alert = buildAlert({
     ...verdict,
     alertAfterHours,
@@ -499,6 +602,8 @@ async function main() {
     environment,
     now,
     stallRecordUrl: recordState.url,
+    deliveryGap,
+    deliveryGapReason,
   });
   const url = `${base}/api/v2/alerts`;
 
