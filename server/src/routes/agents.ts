@@ -1385,7 +1385,14 @@ export function agentRoutes(
     // (`activatePendingApproval`), which reaches the same column by a different
     // route and must not restore it by a different rule (PEN-3847). Only the
     // `modelProfiles.*.adapterConfig` half below is route-specific: it undoes
-    // the short env sentinel, which `redactEventPayload` never emits.
+    // `REDACTED_ENV_SENTINEL` ("***"), which is emitted by exactly one redactor
+    // — `redactAgentSecrets` (`agent-redaction.ts`), the `GET /agents/:id`
+    // projection — and so can only arrive on this route's read-modify-write.
+    // No approval-card redactor emits it (the card is masked by
+    // `redactAgentConfigPayload` via `redactApprovalPayloadByType`), which is
+    // why the replay path needs the generic half alone. Stated as the sole
+    // emitter on purpose: that is checkable by grepping the constant, whereas
+    // naming a redactor that does not emit it is only checkable by exhaustion.
     const restoredRuntimeConfig = restoreRedactedAgentRuntimeConfig(
       requestedRuntimeConfig,
       asRecord(existingRuntimeConfig) ?? {},
