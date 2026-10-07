@@ -1064,12 +1064,23 @@ const RUN_RESULT_JSON_MACHINE_TEXT_KEYS = new Set([
  * Project one `resultJson` value under the rule documented above. Returns
  * `{ kept }` with `undefined` meaning "withheld"; `path` is only used to name
  * the withheld field for `withheldFields`.
+ *
+ * `depth` bounds the walk at `MAX_RUN_RESULT_JSON_REDACT_DEPTH`, deliberately
+ * the SAME constant as the sibling traversal of this same column
+ * (`redactRunResultJsonValue`) — adapter output is attacker-influenced in shape
+ * as well as content, and two walks over one blob should not disagree about
+ * where that shape stops being plausible (Ally review 5438353035). Unlike the
+ * sibling, which returns `null`, this one fails closed by WITHHOLDING the
+ * over-deep subtree: on the read side the conservative answer is to disclose
+ * less, and `withheldFields` still names the path so the cut is visible rather
+ * than silent.
  */
 function projectRunResultJsonValue(
   key: string,
   value: unknown,
   path: string,
   withheldFields: string[],
+  depth: number,
 ): { kept: boolean; value?: unknown } {
   // Non-prose primitives cannot carry a transcript. This is what keeps the
   // vendor counters (`num_turns`, `duration_api_ms`, cost, `is_error`) working
@@ -1081,6 +1092,15 @@ function projectRunResultJsonValue(
   if (typeof value === "string") {
     if (RUN_RESULT_JSON_MACHINE_TEXT_KEYS.has(key)) return { kept: true, value };
     if (value.length > 0) withheldFields.push(path);
+    return { kept: false };
+  }
+
+  // Leaves are settled above, so only the recursive branches are bounded --
+  // same placement as the sibling walk, which also classifies strings before
+  // consulting `depth`. A value nested this deep is shape no adapter produces
+  // honestly, so the subtree is withheld rather than walked.
+  if (depth >= MAX_RUN_RESULT_JSON_REDACT_DEPTH) {
+    withheldFields.push(path);
     return { kept: false };
   }
 
@@ -1100,7 +1120,13 @@ function projectRunResultJsonValue(
     let droppedAny = false;
     let keptAny = false;
     for (const [index, element] of value.entries()) {
-      const result = projectRunResultJsonValue(key, element, `${path}[${index}]`, withheldFields);
+      const result = projectRunResultJsonValue(
+        key,
+        element,
+        `${path}[${index}]`,
+        withheldFields,
+        depth + 1,
+      );
       projected.push(result.kept ? result.value : null);
       if (result.kept) keptAny = true;
       else droppedAny = true;
@@ -1120,6 +1146,7 @@ function projectRunResultJsonValue(
         childValue,
         `${path}.${childKey}`,
         withheldFields,
+        depth + 1,
       );
       if (result.kept) projected[childKey] = result.value;
     }
@@ -1182,7 +1209,7 @@ export function withholdRunTranscriptStateContent<T extends Record<string, unkno
   if (isPlainObject(out.resultJson)) {
     const resultJson: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(out.resultJson)) {
-      const result = projectRunResultJsonValue(key, value, `resultJson.${key}`, withheldFields);
+      const result = projectRunResultJsonValue(key, value, `resultJson.${key}`, withheldFields, 1);
       if (result.kept) resultJson[key] = result.value;
     }
     out.resultJson = resultJson;
