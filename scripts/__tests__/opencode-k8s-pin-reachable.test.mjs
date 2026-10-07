@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   ADAPTER_REPO,
@@ -165,6 +169,66 @@ test("nonTestHits keeps real call sites and drops mocks", () => {
 
   assert.deepEqual(nonTestHits([]), []);
   assert.deepEqual(nonTestHits(["", "   "]), []);
+  assert.deepEqual(nonTestHits([
+    "src/execute.spec.ts:1: replaceNamespacedSecret(",
+    "src/__tests__/execute.ts:1: replaceNamespacedSecret(",
+    "src/__mocks__/k8s.ts:1: replaceNamespacedSecret(",
+    "src/execute.ts:1: // src/__tests__/execute.ts",
+  ]), ["src/execute.ts:1: // src/__tests__/execute.ts"]);
+});
+
+test("the CLI distinguishes empty results from failed Git subprocesses", (t) => {
+  const scratch = mkdtempSync(join(tmpdir(), "pin-guard-cli-test-"));
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+  const pin = "a".repeat(40);
+  const fixtureDockerfile = join(scratch, "Dockerfile");
+  writeFileSync(fixtureDockerfile, `ARG OPENCODE_K8S_REF=${pin}\n`);
+  // Exercise the real execFileSync catch path without network access.
+  writeFileSync(join(scratch, "git"), `#!/bin/sh
+case "$1" in clone) exit 0;; esac
+case "$3" in
+  cat-file) exit 0;;
+  ls-tree) printf '%s\\n' "$PIN_GUARD_TEST_FILES"; exit "$PIN_GUARD_TEST_TREE_STATUS";;
+  grep)
+    if [ "$PIN_GUARD_TEST_GREP_STATUS" = signal ]; then kill -TERM "$$"; fi
+    printf '%s\\n' "$PIN_GUARD_TEST_HITS"
+    exit "$PIN_GUARD_TEST_GREP_STATUS";;
+esac
+exit 128
+`, { mode: 0o755 });
+  const script = fileURLToPath(new URL("../check-opencode-k8s-pin-reachable.mjs", import.meta.url));
+  const cases = [
+    { name: "grep exit 1 means no match", verdict: "OK", env: {} },
+    { name: "a real call fails", verdict: "FAILED", env: { PIN_GUARD_TEST_GREP_STATUS: "0", PIN_GUARD_TEST_HITS: `${pin}:src/execute.ts:1: replaceNamespacedSecret(` } },
+    { name: "grep exit 128 is not clean", env: { PIN_GUARD_TEST_GREP_STATUS: "128" } },
+    { name: "a signalled grep is not clean", env: { PIN_GUARD_TEST_GREP_STATUS: "signal" } },
+    { name: "ls-tree exit 128 is not clean", env: { PIN_GUARD_TEST_TREE_STATUS: "128" } },
+    { name: "ls-tree exit 1 is not a no-match result", env: { PIN_GUARD_TEST_TREE_STATUS: "1" } },
+    { name: "assets do not establish searched sources", env: { PIN_GUARD_TEST_FILES: "src/README.md\nsrc/icon.svg" } },
+    { name: "test-only sources do not establish searched sources", env: { PIN_GUARD_TEST_FILES: "src/execute.test.ts\nsrc/execute.spec.ts\nsrc/__tests__/execute.ts\nsrc/__mocks__/k8s.ts" } },
+  ];
+  for (const { name, verdict = "inconclusive", env } of cases) {
+    const result = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        PATH: `${scratch}:${process.env.PATH}`,
+        OPENCODE_PIN_GUARD_DOCKERFILE: fixtureDockerfile,
+        PIN_GUARD_TEST_FILES: "src/execute.ts\nsrc/execute.test.ts\nsrc/README.md",
+        PIN_GUARD_TEST_TREE_STATUS: "0",
+        PIN_GUARD_TEST_GREP_STATUS: "1",
+        PIN_GUARD_TEST_HITS: "",
+        ...env,
+      },
+    });
+    assert.ifError(result.error);
+    const output = result.stdout + result.stderr;
+    assert.equal(result.status, verdict === "FAILED" ? 1 : 0, `${name}: ${output}`);
+    assert.match(output, new RegExp(`opencode_k8s pin guard ${verdict}`), name);
+    if (verdict !== "OK") assert.doesNotMatch(output, /pin guard OK/, name);
+    else assert.match(output, /1 non-test source file/, name);
+  }
 });
 
 test("a pin that reintroduces a Secret PUT fails the bump", () => {
