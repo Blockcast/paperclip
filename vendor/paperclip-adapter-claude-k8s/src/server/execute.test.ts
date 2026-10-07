@@ -3,6 +3,10 @@ import type * as k8s from "@kubernetes/client-node";
 import { ApiException } from "@kubernetes/client-node";
 import type { Writable } from "node:stream";
 import { readFile } from "node:fs/promises";
+// Default export, not the named binding above: execute.ts calls `fs.unlink(…)`
+// as a property read on this same object, so spying here patches the call it
+// actually makes.
+import fsPromises from "node:fs/promises";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 
 // This suite doesn't exercise per-agent mcp.json layering (that's covered in
@@ -752,6 +756,76 @@ describe("execute: concurrency guard", () => {
       body: { propagationPolicy: "Background" },
     });
     expect(result.errorCode).toBe("k8s_job_create_failed");
+  });
+
+  // BLO-37704: the stale-Job branch used to call cleanupJob() with no
+  // podLogPath, so it deleted the Job and left the *other* run's
+  // .pod.ndjson behind — a leak of someone else's audit record. The guard's
+  // label selector pins agent-id, so company and agent are this run's own;
+  // only the run id and the isolation segment come off the stale Job.
+  //
+  // These assert the argument reaches fs.unlink, not that cleanupJob can
+  // unlink — dropping the argument at the call site is exactly the mutation
+  // they have to catch, and cleanupJob stays green under it.
+  describe("stale-Job pod-log reaping", () => {
+    async function runStaleBranch(orphan: k8s.V1Job): Promise<string[]> {
+      const unlink = vi.spyOn(fsPromises, "unlink").mockResolvedValue(undefined);
+      try {
+        mockBatchListJobs.mockResolvedValue({ items: [orphan] });
+        mockBatchDeleteJob.mockResolvedValue({});
+        mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+        mockPrepareBundle.mockResolvedValue(makeBundle());
+        vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404 }));
+
+        await execute(makeCtx({ context: { taskId: "task-current" } } as Partial<AdapterExecutionContext>));
+
+        expect(mockBatchDeleteJob).toHaveBeenCalledWith({
+          name: "ac-job",
+          namespace: "paperclip",
+          body: { propagationPolicy: "Background" },
+        });
+        return unlink.mock.calls.map((c) => String(c[0]));
+      } finally {
+        unlink.mockRestore();
+      }
+    }
+
+    it("unlinks the stale run's pod log, not just its Job", async () => {
+      expect(await runStaleBranch(makeJob({ runId: "prior-run", agentId: "agent-abc" }))).toContain(
+        "/paperclip/instances/default/data/run-logs/co1/agent-abc/prior-run.pod.ndjson",
+      );
+    });
+
+    it("reads the isolation segment off the stale Job, not off this run", async () => {
+      expect(
+        await runStaleBranch(makeJob({
+          runId: "prior-run",
+          agentId: "agent-abc",
+          isolationMode: "workspace",
+          isolationKey: "ws-7",
+        })),
+      ).toContain(
+        "/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/ws-7/prior-run.pod.ndjson",
+      );
+    });
+
+    // buildJobManifest writes the isolation labels when `enabled || source ===
+    // "runtime"` but only puts the key in the path when `enabled` — and a
+    // runtime descriptor with isolationMode "shared" is enabled:false carrying
+    // a non-empty key. Keying off the key label would build a path that Job
+    // never wrote, leaving the real orphan behind.
+    it("ignores the isolation key on a shared-mode Job, whose log is not isolation-keyed", async () => {
+      expect(
+        await runStaleBranch(makeJob({
+          runId: "prior-run",
+          agentId: "agent-abc",
+          isolationMode: "shared",
+          isolationKey: "ws-7",
+        })),
+      ).toContain(
+        "/paperclip/instances/default/data/run-logs/co1/agent-abc/prior-run.pod.ndjson",
+      );
+    });
   });
 
   it("blocks when the run-id lookup is still active", async () => {

@@ -114,6 +114,52 @@ describe("parseClaudeStreamJson", () => {
     expect(result.usage?.cachedInputTokens).toBe(50);
   });
 
+  it("reports cache writes separately from input instead of summing them in (BLO-29842)", () => {
+    // A real Anthropic result block: three input classes billed at three
+    // prices. This adapter is the claude_k8s execution path, so a run whose
+    // cache writes land in `inputTokens` prices them at 1x instead of
+    // 1.25x-2x and leaves the rate card unidentifiable for the whole fleet.
+    const lines = JSON.stringify({
+      type: "result",
+      session_id: "sess_cachewrite",
+      result: "Done",
+      subtype: "stop",
+      total_cost_usd: 0.42,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 35,
+        cache_creation_input_tokens: 523,
+        cache_read_input_tokens: 46_295,
+      },
+    });
+    const result = parseClaudeStreamJson(lines);
+    expect(result.usage).toEqual({
+      inputTokens: 1,
+      outputTokens: 35,
+      cachedInputTokens: 46_295,
+      cacheCreationInputTokens: 523,
+    });
+    // The whole point of the split: cache writes must not ride inside the 1x
+    // input figure the rate card fits against.
+    expect(result.usage?.inputTokens).not.toBe(524);
+  });
+
+  it("reads an absent cache-creation field as 0, not undefined (BLO-29842)", () => {
+    // Providers that never cache-write must keep working unchanged, and the
+    // column must record 0 rather than a silently-missing key.
+    const lines = JSON.stringify({
+      type: "result",
+      session_id: "sess_nocache",
+      result: "Done",
+      subtype: "stop",
+      total_cost_usd: 0.001,
+      usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0 },
+    });
+    const result = parseClaudeStreamJson(lines);
+    expect(result.usage?.cacheCreationInputTokens).toBe(0);
+    expect(result.usage?.inputTokens).toBe(10);
+  });
+
   it("returns null cost for non-finite total_cost_usd", () => {
     const lines = [
       JSON.stringify({
@@ -495,6 +541,143 @@ describe("isClaudeTransientUpstreamError — transcript independence (PEN-3223)"
         },
         stdout: "upstream returned 429 rate_limit_error; throttled and temporarily unavailable",
         stderr: "",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isClaudeTransientUpstreamError — login veto transcript independence (PEN-3259)", () => {
+  // The byte-identical shape observed on the vetoed capacity refusals in the
+  // 2026-09-12 corpus: an unambiguous provider 429 on the terminal result event.
+  const capacity429 = {
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    api_error_status: 429,
+    result:
+      "API Error: Request rejected (429) · All Claude subscription capacity for this tenant is " +
+      "rate-limited; capacity may reset at 2026-09-13T10:19:59.613Z; retry in 1106s",
+  };
+
+  // A transcript that merely *mentions* auth. `CLAUDE_AUTH_REQUIRED_RE` in this
+  // copy matches the bare word `unauthorized`, so an agent reading a 401 handler,
+  // tailing a log, or working on an auth ticket trips it — as this issue's own
+  // text would. None of this is the CLI asking to be logged in.
+  const authMentioningStdout = [
+    '{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-4-6"}',
+    '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result",' +
+      '"content":"src/auth.ts:42  if (!token) return res.status(401).send(\\"unauthorized\\");"}]}}',
+    '{"type":"assistant","message":{"id":"m1","content":[{"type":"text",' +
+      '"text":"That branch returns unauthorized when the header is absent."}]}}',
+  ].join("\n");
+
+  it("keeps a genuine 429 transient when the transcript merely mentions auth", () => {
+    expect(
+      isClaudeTransientUpstreamError({ parsed: capacity429, stdout: authMentioningStdout }),
+    ).toBe(true);
+  });
+
+  it("classifies that 429 identically with and without the auth-mentioning transcript", () => {
+    const withTranscript = isClaudeTransientUpstreamError({
+      parsed: capacity429,
+      stdout: authMentioningStdout,
+    });
+    const withoutTranscript = isClaudeTransientUpstreamError({
+      parsed: capacity429,
+      stdout: "",
+    });
+    expect(withTranscript).toBe(withoutTranscript);
+    expect(withTranscript).toBe(true);
+  });
+
+  it("routes that 429 to the transient retry family end to end", () => {
+    expect(
+      classifyClaudeUpstreamFailure({
+        failed: true,
+        zeroTokenProgress: false,
+        parsed: capacity429,
+        stdout: authMentioningStdout,
+        errorMessage: describeClaudeFailure(capacity429),
+      }),
+    ).toEqual({
+      family: "transient_upstream",
+      errorCode: "claude_transient_upstream",
+      capacityCode: null,
+    });
+  });
+
+  // The narrowing must not blind the veto to a REAL auth failure. When the run is
+  // genuinely unauthenticated the result event says so on its own bounded surface,
+  // which is still read.
+  it("still vetoes when the terminal result event itself reports a login requirement", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          api_error_status: 429,
+          result: "API Error: rate limited — not logged in; please run `claude login`",
+        },
+        stdout: "",
+      }),
+    ).toBe(false);
+  });
+
+  it("still vetoes on an auth failure reported through parsed.errors[]", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: true,
+          result: "API Error: 503 service unavailable",
+          errors: [{ message: "authentication required" }],
+        },
+        stdout: "",
+      }),
+    ).toBe(false);
+  });
+
+  it("still vetoes on an auth failure reported on stderr", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: capacity429,
+        stdout: authMentioningStdout,
+        stderr: "Invalid API key · Please run `claude login`",
+      }),
+    ).toBe(false);
+  });
+
+  // The transcript read is retained where it is the only surface that can carry a
+  // login prompt: the CLI dying before it emits a result event. Unreachable from
+  // `classifyClaudeUpstreamFailure` in this copy, live in the `claude-local` twin.
+  it("still vetoes a transcript login prompt when no result event ever arrived", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: null,
+        stdout: "API Error: 429 rate_limit_error\nNot logged in. Please run `claude login`.",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
+      }),
+    ).toBe(false);
+  });
+
+  // `parsed: null` is the one input where truthiness and the result-event shape
+  // check agree, so it cannot witness the difference between the two gates. This
+  // case can. It is UNREACHABLE in this copy — `parsed` here is `resultJson` with
+  // `scanForResultEvent` recovery, both of which hard-check `type === "result"` —
+  // and is asserted anyway, because the gate is written on the shape in both
+  // copies precisely so they cannot drift, and the twin where this input IS
+  // reachable is the one that regressed. If this copy ever gains a `parseJson`
+  // fallback like the twin's, this test is what notices.
+  it("still vetoes a transcript login prompt when `parsed` is truthy but not a result event", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { type: "system", subtype: "init", session_id: "s1" },
+        stdout: "API Error: 429 rate_limit_error\nNot logged in. Please run `claude login`.",
+        stderr: "",
+        errorMessage: "Claude exited with code 1",
       }),
     ).toBe(false);
   });

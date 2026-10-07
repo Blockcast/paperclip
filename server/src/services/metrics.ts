@@ -1132,6 +1132,60 @@ export function coerceRetryScheduleReason(reason: string | null | undefined): Re
  */
 export const NO_SCHEDULED_RETRY_PARK_REASON = "none";
 /**
+ * Park-horizon-only refinements of `transient_failure` (BLO-31174, Ally C1 on
+ * onprem-k8s#4145). The raw column says `transient_failure` for THREE writer
+ * paths whose ceilings differ by more than 9x and one of which has no ceiling
+ * at all, so a single bound on that label is wrong by construction -- which is
+ * the exact defect the per-class bounds were built to remove:
+ *
+ *  - ladder (neither constant below): `BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS`
+ *    final 2h hop plus 25% jitter = **9,000s**. Keeps the bare
+ *    `transient_failure` label.
+ *  - {@link TRANSIENT_FLOOR_PARK_REASON}: an upstream `retryNotBefore` floor
+ *    won. An unclamped floor at or just under the horizon can add up to
+ *    `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` (300s), while a floor that
+ *    `clampTransientRetryHorizon` actually clamps carries no forward jitter;
+ *    the maximum is therefore `MAX_TRANSIENT_RETRY_HORIZON_MS` (86,400s) plus
+ *    300s = **86,700s**.
+ *  - {@link TRANSIENT_QUOTA_FLOOR_PARK_REASON}: a `provider_quota` floor.
+ *    `clampTransientHorizon` deliberately excludes this family -- it is a
+ *    contractual session/billing boundary carrying an authoritative reset
+ *    instant, not a capacity estimate -- so the floor is honoured verbatim and
+ *    has **no upper bound**. A multi-day park here is correct behaviour. An
+ *    alert rule must EXCLUDE this label rather than invent a bound for it;
+ *    bounding it would page on the designed path, which is the defect, not the
+ *    fix.
+ *
+ * Deliberately outside {@link KNOWN_RETRY_SCHEDULE_REASONS}: that list is the
+ * vocabulary of the raw column, which never holds either of these, and it is
+ * shared with the outcome counter. Refining it there would mint two counter
+ * series that can never be written.
+ */
+export const TRANSIENT_FLOOR_PARK_REASON = "transient_failure_floor";
+/** See {@link TRANSIENT_FLOOR_PARK_REASON}. Unbounded by design. */
+export const TRANSIENT_QUOTA_FLOOR_PARK_REASON = "transient_failure_quota_floor";
+/**
+ * Refine a coerced park reason using facts already on the parked row. Only
+ * `transient_failure` refines; every other reason passes through untouched, so
+ * this is a no-op for 13 of the 14 known reasons.
+ *
+ * `hasRetryFloor` is floor PRESENCE, not "the floor won" -- recovering the
+ * latter would mean recomputing the ladder value the park did not keep. When a
+ * present floor loses to the ladder the row is labelled floor anyway and is
+ * judged against 86,700s instead of 9,000s. That is a LOOSER bound on a park
+ * that is already provably under the tighter one, i.e. weaker monitoring of a
+ * known-good case, never a false page.
+ */
+export function refineScheduledRetryParkReason(input: {
+  reason: string | null | undefined;
+  hasRetryFloor?: boolean | null;
+  isProviderQuotaFamily?: boolean | null;
+}): string {
+  const reason = coerceRetryScheduleReason(input.reason);
+  if (reason !== "transient_failure" || !input.hasRetryFloor) return reason;
+  return input.isProviderQuotaFamily ? TRANSIENT_QUOTA_FLOOR_PARK_REASON : TRANSIENT_FLOOR_PARK_REASON;
+}
+/**
  * postgres.js connection-pool occupancy, by `state` (BLO-33243).
  *
  * There was no pool instrumentation anywhere in this fleet, which made pool
@@ -1208,6 +1262,75 @@ export const DB_INHERITED_TIMEOUT_METRIC = "paperclip_db_inherited_timeout_secon
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
 export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
+/**
+ * BLO-25024. Time-to-dispatch for EVERY heartbeat run, not just PR-review ones.
+ *
+ * The metric above has the same shape but is gated on a `pr_review:` task key,
+ * so fleet-wide dispatch latency was measurable only by hand-reading one
+ * issue's run list — which is how multi-hour queue waits went unnoticed from
+ * 2026-08-10 to 2026-10-04. Observed at the same guarded queued-to-running
+ * transition, so the two cannot disagree about when a run started.
+ *
+ * Buckets deliberately start at 10s: healthy dispatch on this fleet is
+ * sub-minute (the week of 2026-08-24 ran a median of ~36s), so buckets that
+ * begin at 60s like the PR-review set above cannot distinguish "healthy" from
+ * "a minute late" and would make the recovery target unverifiable.
+ *
+ * `invocation_source` is the only label. It is bounded by
+ * HEARTBEAT_INVOCATION_SOURCES (4 values) and normalized against it, because
+ * the remedy differs by source: a slow `timer` run costs cadence, a slow
+ * `assignment` run costs a human waiting. No agent_id/company_id label — those
+ * grow without bound and this is a histogram.
+ */
+export const RUN_DISPATCH_WAIT_METRIC = "paperclip_run_dispatch_wait_seconds";
+/**
+ * Local copy of `HEARTBEAT_INVOCATION_SOURCES` from `@paperclip/shared`.
+ *
+ * Restated here rather than imported because this module deliberately keeps no
+ * runtime dependency outside prom-client and the logger (see the type-only
+ * import note at the top), and because every other label allow-list in this
+ * file — {@link KNOWN_BLOCKED_REASONS}, KNOWN_ISOLATION_MODES — is local for
+ * the same reason. The drift this invites is pinned by a test that asserts
+ * this array equals the shared constant, so a new invocation source fails CI
+ * here instead of silently collapsing into "other" in production.
+ *
+ * ⚠ NOT {@link KNOWN_INVOCATION_SOURCES}, despite the near-identical name.
+ * That list is the *wake-reason* vocabulary (`issue_assigned`,
+ * `github_pr_opened`, …); this one is the `heartbeat_runs.invocation_source`
+ * COLUMN vocabulary (`timer`, `assignment`, `on_demand`, `automation`). The
+ * two sets are disjoint, so normalizing this column through
+ * {@link normalizeInvocationSource} would collapse EVERY sample to "other" —
+ * a fully-populated histogram with one meaningless label. Do not merge them.
+ */
+export const RUN_DISPATCH_WAIT_INVOCATION_SOURCES = [
+  "timer",
+  "assignment",
+  "on_demand",
+  "automation",
+] as const;
+/**
+ * Day-granular edges past 86400 because the regime this metric was filed for
+ * is multi-day: the worst wait measured on BLO-25024 was 28h 19m. With 86400
+ * as the top finite edge that sample lands in +Inf, and histogram_quantile()
+ * then returns +Inf for the p95 exactly while the incident is happening.
+ */
+export const RUN_DISPATCH_WAIT_BUCKETS_SECONDS = [
+  10,
+  30,
+  60,
+  120,
+  300,
+  600,
+  900,
+  1800,
+  3600,
+  7200,
+  14400,
+  28800,
+  86400,
+  172800,
+  259200,
+];
 /**
  * BLO-21460 (2026-08-03 incident follow-up). Unlike the two metrics above
  * (which count every unreleased reservation, healthy in-flight ones
@@ -2448,6 +2571,71 @@ export function normalizeHttpRoute(route: string | null | undefined): string {
   return bounded;
 }
 
+/**
+ * One increment per inbound GitHub webhook delivery, whatever the event and
+ * whatever the outcome (BLO-39378). This is the *delivery* counter, not a
+ * consumer-side one: it is incremented by the receiver itself, so its
+ * flatlining is the fault rather than a symptom of one.
+ *
+ * It exists because {@link GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC} cannot see
+ * the failure shape where the api is healthy but GitHub stops delivering —
+ * secret rotated, hook disabled, endpoint 404ing, GitHub-side incident. That
+ * counter has no denominator for deliveries that *should* have arrived, so a
+ * dead webhook and a genuinely quiet CI window emit a byte-identical flat
+ * series and no threshold on it can separate them. `absent()` is the wrong
+ * instrument there too: the series is present (zero-initialised on every
+ * replica), it just stops moving. Across *all* event types the fleet pushes
+ * continuously, so "zero deliveries of any kind in N minutes" is actionable
+ * where "zero workflow_run completions" is not.
+ *
+ * `outcome="rejected_signature"` is deliberately a first-class value rather
+ * than folded into `error`: a rotated-or-mismatched secret is one of the
+ * named shape-B causes, and it presents as healthy delivery *volume* with
+ * nothing accepted — invisible to a count that only measures arrival.
+ *
+ * Cardinality ceiling: KNOWN_GITHUB_WEBHOOK_EVENTS (8) plus the separate
+ * UNKNOWN_GITHUB_WEBHOOK_EVENT `other` bucket = 9 event values, x
+ * KNOWN_GITHUB_WEBHOOK_OUTCOMES (3) = 27 series per
+ * replica, fixed at compile time. No repo, PR number, sender or SHA label —
+ * and `event` is normalized against the allowlist precisely because it
+ * originates in the attacker-controlled `x-github-event` header on a request
+ * that is counted *before* its signature is verified.
+ */
+export const GITHUB_WEBHOOK_DELIVERY_METRIC = "paperclip_github_webhook_delivery_total";
+
+// Every event this receiver branches on today, plus `ping` — which GitHub
+// sends on hook (re)creation and is the one delivery that is literal proof
+// the hook is alive. Unrecognized values collapse into `other`; growing this
+// list is a deliberate act, which is the point.
+export const KNOWN_GITHUB_WEBHOOK_EVENTS = [
+  "check_run",
+  "check_suite",
+  "dependabot_alert",
+  "issue_comment",
+  "ping",
+  "pull_request",
+  "pull_request_review",
+  "workflow_run",
+] as const;
+
+export const UNKNOWN_GITHUB_WEBHOOK_EVENT = "other";
+
+export const KNOWN_GITHUB_WEBHOOK_OUTCOMES = [
+  "accepted",
+  "rejected_signature",
+  "error",
+] as const;
+
+export type GithubWebhookDeliveryOutcome = (typeof KNOWN_GITHUB_WEBHOOK_OUTCOMES)[number];
+
+const knownGithubWebhookEventSet: ReadonlySet<string> = new Set(KNOWN_GITHUB_WEBHOOK_EVENTS);
+
+export function normalizeGithubWebhookEvent(event: string | null | undefined): string {
+  return typeof event === "string" && knownGithubWebhookEventSet.has(event)
+    ? event
+    : UNKNOWN_GITHUB_WEBHOOK_EVENT;
+}
+
 export const KNOWN_AUTH_OPERATIONS = [
   "oidc_start",
   "oidc_callback",
@@ -3179,6 +3367,7 @@ let githubReviewCompletion: Counter<"status"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
+let githubWebhookDelivery: Counter<"event" | "outcome"> | null = null;
 let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
@@ -3252,6 +3441,7 @@ const pluginMetricCombinations = new Map<string, Set<string>>();
 const pluginMetricNames = new Map<string, Set<string>>();
 let pluginStatusCollectorLastSuccess: Gauge<"role"> | null = null;
 let prReviewQueueWait: Histogram | null = null;
+let runDispatchWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let httpRequests: Counter<"route" | "method" | "status"> | null = null;
 let httpEmptyListResponses: Counter<"route" | "method" | "status"> | null = null;
@@ -3326,6 +3516,7 @@ function ensureRegistry(): {
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
+  githubWebhookDeliveryCounter: Counter<"event" | "outcome">;
   queuedRunOldestAgeGauge: Gauge<"agent_id">;
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
@@ -3348,6 +3539,7 @@ function ensureRegistry(): {
   agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
   agentStartLockAbortedTotalCounter: Counter<"agent_id">;
   prReviewQueueWaitHistogram: Histogram;
+  runDispatchWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   httpRequestsCounter: Counter<"route" | "method" | "status">;
   httpEmptyListResponsesCounter: Counter<"route" | "method" | "status">;
@@ -3426,6 +3618,7 @@ function ensureRegistry(): {
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
+    || !githubWebhookDelivery
     || !queuedRunOldestAge
     || !overdueScheduledRetryOldestAge
     || !overdueScheduledRetryAgeMetricsRefreshSuccess
@@ -3440,6 +3633,7 @@ function ensureRegistry(): {
     || !pluginMetricDropped
     || !pluginStatusCollectorLastSuccess
     || !prReviewQueueWait
+    || !runDispatchWait
     || !authRequest
     || !httpRequests
     || !httpEmptyListResponses
@@ -3667,8 +3861,9 @@ function ensureRegistry(): {
         + "`reason` is load-bearing, not decoration: legitimate ceilings differ by class and span "
         + "at least 289x (max_turns_continuation 300s, ccrotate_capacity 1080s as a 15min clamp plus "
         + "20% forward jitter, dependency_blocked "
-        + "3600s, transient_failure 9000s on the backoff ladder but up to 86700s when it adopts an "
-        + "upstream retryNotBefore floor, 24h clamp plus 5min forward jitter, and unbounded for a "
+        + "3600s, transient_failure 9000s on the backoff ladder but up to 86700s when an unclamped "
+        + "upstream retryNotBefore floor is at or just under the 24h horizon and takes up to 5min forward "
+        + "jitter; a floor actually clamped to 24h carries no forward jitter, and it is unbounded for a "
         + "provider_quota floor, which is never clamped), so any single threshold across all of "
         + "them fires on designed backoff in one class while missing a 5x clamp breach in another. "
         + "Bound each reason against its own ceiling. reason='none' is a per-agent zero floor emitted for every "
@@ -4122,6 +4317,31 @@ function ensureRegistry(): {
         githubWorkflowRunConclusion.inc({ conclusion, supersession }, 0);
       }
     }
+    githubWebhookDelivery = new Counter({
+      name: GITHUB_WEBHOOK_DELIVERY_METRIC,
+      help:
+        "Count of inbound GitHub webhook deliveries at the receiver, labeled by bounded "
+        + "event and outcome (BLO-39378). One increment per delivery, whatever the event "
+        + "and whatever the outcome -- including signature rejections, which are counted "
+        + "because a rotated secret presents as healthy delivery volume with nothing "
+        + "accepted. Unlike " + GITHUB_WORKFLOW_RUN_CONCLUSION_METRIC + ", which counts "
+        + "only what a healthy webhook delivered, the FLATLINING of this counter is "
+        + "itself the fault: `sum(increase(...[window])) == 0` says 'we received zero "
+        + "deliveries of any kind', which is actionable because the fleet pushes "
+        + "continuously. Zero-initialized across the full event x outcome grid on every "
+        + "replica so that `== 0` evaluates rather than returning an empty vector -- do "
+        + "NOT alert on absent() here, which that zero-init deliberately defeats. "
+        + "`event` is normalized against a compile-time allowlist because it originates "
+        + "in the x-github-event header of a request counted before its signature is "
+        + "verified; cardinality is fixed at 9 x 3 regardless of fleet growth.",
+      labelNames: ["event", "outcome"],
+      registers: [registry],
+    });
+    for (const event of [...KNOWN_GITHUB_WEBHOOK_EVENTS, UNKNOWN_GITHUB_WEBHOOK_EVENT]) {
+      for (const outcome of KNOWN_GITHUB_WEBHOOK_OUTCOMES) {
+        githubWebhookDelivery.inc({ event, outcome }, 0);
+      }
+    }
     queuedRunOldestAge = new Gauge({
       name: QUEUED_RUN_OLDEST_AGE_METRIC,
       help:
@@ -4282,6 +4502,15 @@ function ensureRegistry(): {
         "Seconds from creation until start for heartbeat runs with a pr_review: task key. "
         + "Observed once at the guarded queued-to-running transition; no repo, PR, agent, or other unbounded labels.",
       buckets: PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS,
+      registers: [registry],
+    });
+    runDispatchWait = new Histogram({
+      name: RUN_DISPATCH_WAIT_METRIC,
+      help:
+        "Seconds from queue entry (queued_at, else created_at) until start for every heartbeat run (BLO-25024). "
+        + "Observed once at the guarded queued-to-running transition, labeled only by bounded invocation_source.",
+      labelNames: ["invocation_source"],
+      buckets: RUN_DISPATCH_WAIT_BUCKETS_SECONDS,
       registers: [registry],
     });
     authRequest = new Counter({
@@ -4827,6 +5056,7 @@ function ensureRegistry(): {
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
+    githubWebhookDeliveryCounter: githubWebhookDelivery,
     queuedRunOldestAgeGauge: queuedRunOldestAge,
     overdueScheduledRetryOldestAgeGauge: overdueScheduledRetryOldestAge,
     overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
@@ -4841,6 +5071,7 @@ function ensureRegistry(): {
     pluginMetricDroppedCounter: pluginMetricDropped,
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
     prReviewQueueWaitHistogram: prReviewQueueWait,
+    runDispatchWaitHistogram: runDispatchWait,
     authRequestCounter: authRequest,
     httpRequestsCounter: httpRequests,
     httpEmptyListResponsesCounter: httpEmptyListResponses,
@@ -5403,12 +5634,19 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
  * `provider_quota` floor has no ceiling) can only be thresholded at a value
  * that is simultaneously below one class's designed backoff and above
  * another's clamp.
+ *
+ * The reason is {@link refineScheduledRetryParkReason}d, not merely coerced:
+ * the raw column's `transient_failure` covers three paths with three different
+ * ceilings, so the bare column value cannot be bounded either. See that
+ * function for the split and for why the quota path carries no bound at all.
  */
 export function setScheduledRetryParkHorizonMetrics(
   entries: ReadonlyArray<{
     agentId: string | null | undefined;
     reason: string | null | undefined;
     horizonSeconds: number;
+    hasRetryFloor?: boolean | null;
+    isProviderQuotaFamily?: boolean | null;
   }>,
   knownAgentIds: ReadonlySet<string>,
 ): void {
@@ -5424,10 +5662,12 @@ export function setScheduledRetryParkHorizonMetrics(
   const maxByLabels = new Map<string, { agentId: string; reason: string; horizonSeconds: number }>();
   for (const entry of entries) {
     const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
-    const reason = coerceRetryScheduleReason(entry.reason);
+    const reason = refineScheduledRetryParkReason(entry);
     const horizonSeconds = Number.isFinite(entry.horizonSeconds) ? Math.max(0, entry.horizonSeconds) : 0;
-    // Distinct reasons can fold to the same `other` label, so re-max here
-    // rather than trusting the query's GROUP BY to have produced unique keys.
+    // Distinct reasons can fold to the same `other` label -- and the three
+    // `transient_failure` refinements above split one GROUP BY key into
+    // several while several fold back into one -- so re-max here rather than
+    // trusting the query's GROUP BY to have produced unique keys.
     const key = `${agentId}\u0000${reason}`;
     const current = maxByLabels.get(key);
     if (current === undefined || horizonSeconds > current.horizonSeconds) {
@@ -5678,6 +5918,55 @@ export function recordPrReviewQueueWait(input: {
   const waitSeconds = computePrReviewQueueWaitSeconds(input.taskKey, input.createdAt, input.startedAt);
   if (waitSeconds === null) return null;
   ensureRegistry().prReviewQueueWaitHistogram.observe(waitSeconds);
+  return waitSeconds;
+}
+
+/**
+ * Seconds a run spent queued before it started (BLO-25024).
+ *
+ * Unlike `computePrReviewQueueWaitSeconds` there is no task-key gate — every
+ * run counts. Returns null only when the interval is genuinely unmeasurable
+ * (a missing or unparseable timestamp), so an absent observation always means
+ * "no sample", never "a sample of zero". Clamped at 0 so clock skew between
+ * the inserting and claiming processes cannot emit a negative observation,
+ * which would corrupt the histogram sum and therefore any p95 derived from it.
+ */
+export function computeRunDispatchWaitSeconds(
+  queueEnteredAt: Date | string | null | undefined,
+  startedAt: Date | string | null | undefined,
+): number | null {
+  if (!queueEnteredAt || !startedAt) return null;
+  const queueEnteredMs = new Date(queueEnteredAt).getTime();
+  const startedMs = new Date(startedAt).getTime();
+  if (!Number.isFinite(queueEnteredMs) || !Number.isFinite(startedMs)) return null;
+  return Math.max(0, (startedMs - queueEnteredMs) / 1000);
+}
+
+/**
+ * The dispatch-wait clock starts at `coalesce(queuedAt, createdAt)`, the same
+ * expression `refreshQueuedRunAgeMetrics` ages off (BLO-21116). `queuedAt` is
+ * null for a fresh insert, where `createdAt` already is the queue-entry time,
+ * and is stamped by the transitions that put an existing row back into
+ * `queued` (`promoteScheduledRetryRun`, `deferRunForK8sIsolationConflict`,
+ * `deferRunForBranchClaimConflict`).
+ * Measuring from bare `createdAt` would report a promoted retry's whole
+ * `scheduled_retry` backoff, or a re-queued run's whole prior execution, as
+ * dispatch wait.
+ */
+export function recordRunDispatchWait(input: {
+  invocationSource: string | null | undefined;
+  queuedAt: Date | string | null | undefined;
+  createdAt: Date | string | null | undefined;
+  startedAt: Date | string | null | undefined;
+}): number | null {
+  const waitSeconds = computeRunDispatchWaitSeconds(input.queuedAt ?? input.createdAt, input.startedAt);
+  if (waitSeconds === null) return null;
+  const invocation_source = RUN_DISPATCH_WAIT_INVOCATION_SOURCES.includes(
+    input.invocationSource as (typeof RUN_DISPATCH_WAIT_INVOCATION_SOURCES)[number],
+  )
+    ? (input.invocationSource as string)
+    : "other";
+  ensureRegistry().runDispatchWaitHistogram.observe({ invocation_source }, waitSeconds);
   return waitSeconds;
 }
 
@@ -5980,6 +6269,28 @@ export function recordGithubWorkflowRunConclusion(
     supersession: supersessionLabel,
   });
   return conclusionLabel;
+}
+
+/**
+ * Record one inbound GitHub webhook delivery (BLO-39378). Call exactly once
+ * per delivery, on every exit path including signature rejection and
+ * unhandled error — a delivery that is counted only when it succeeds cannot
+ * distinguish "deliveries stopped" from "deliveries are all being rejected",
+ * and both are shape-B faults.
+ *
+ * `event` is normalized against the allowlist here rather than at the call
+ * site, so an untrusted `x-github-event` header can never mint a new series.
+ */
+export function recordGithubWebhookDelivery(input: {
+  event: string | null | undefined;
+  outcome: GithubWebhookDeliveryOutcome;
+}): string {
+  const eventLabel = normalizeGithubWebhookEvent(input.event);
+  ensureRegistry().githubWebhookDeliveryCounter.inc({
+    event: eventLabel,
+    outcome: input.outcome,
+  });
+  return eventLabel;
 }
 
 /**
@@ -6885,6 +7196,7 @@ export function __resetMetricsForTest(): void {
   agentWakeupTerminalFailedUnresolved = null;
   agentWakeupTerminalFailedOldestAge = null;
   githubWorkflowRunConclusion = null;
+  githubWebhookDelivery = null;
   queuedRunOldestAge = null;
   overdueScheduledRetryOldestAge = null;
   overdueScheduledRetryAgeMetricsRefreshSuccess = null;
@@ -6898,6 +7210,7 @@ export function __resetMetricsForTest(): void {
   pluginMetricNames.clear();
   pluginStatusCollectorLastSuccess = null;
   prReviewQueueWait = null;
+  runDispatchWait = null;
   authRequest = null;
   httpRequests = null;
   httpEmptyListResponses = null;

@@ -16,6 +16,7 @@ import {
   CANCEL_POLL_DELAY_MS,
   DEPLOY_REF,
   confirmSupersede,
+  parseSupersedeAfterHours,
   selectSupersedeCandidate,
   waitForCancel,
 } from '../supersede-stale-deploy.mjs';
@@ -33,7 +34,7 @@ const run = (createdAt, extra = {}) => ({
 test('selectSupersedeCandidate: a lone waiting run past the threshold is a candidate', () => {
   const selection = selectSupersedeCandidate({
     pendingRuns: [run('2026-09-01T02:00:00.000Z')],
-    alertAfterHours: 6,
+    supersedeAfterHours: 6,
     now: NOW,
   });
 
@@ -44,13 +45,11 @@ test('selectSupersedeCandidate: a lone waiting run past the threshold is a candi
 });
 
 test('selectSupersedeCandidate: a run under the threshold is NOT a candidate', () => {
-  // The supersede deliberately reuses PENDING_DEPLOY_ALERT_HOURS rather than
-  // adding a tunable, so the condition that cancels is the condition that
-  // already escalates. A young waiting run is a reviewer who has simply not got
-  // to it yet; cancelling it would be churn, not repair.
+  // A young waiting run is a reviewer who has simply not got to it yet;
+  // cancelling it would be churn, not repair.
   const selection = selectSupersedeCandidate({
     pendingRuns: [run('2026-09-01T09:00:00.000Z')],
-    alertAfterHours: 6,
+    supersedeAfterHours: 6,
     now: NOW,
   });
 
@@ -59,13 +58,19 @@ test('selectSupersedeCandidate: a run under the threshold is NOT a candidate', (
   assert.equal(selection.ageHours, 3);
 });
 
-test('selectSupersedeCandidate: exactly at the threshold counts, matching the escalation', () => {
-  // The escalation uses `>=`. If these two disagreed by a hair, a slot could
-  // alert without superseding (or the reverse) and the two signals would tell
-  // different stories about the same run.
+test('selectSupersedeCandidate: exactly at the threshold counts', () => {
+  // Boundary inclusivity on its own terms: `supersedeAfterHours` reads as "after
+  // N hours of waiting", and a run that has waited exactly N has satisfied that.
+  // Pinned because the alternative (`>`) is a silent one-character change that
+  // would defer every supersede by a whole polling interval.
+  //
+  // Deliberately NOT justified by matching the escalation. The two thresholds
+  // are separate by design (BLO-25050) and differ by 42 hours — alerting at 6h
+  // without superseding until 48h is the shipped behaviour, not a drift to
+  // guard against.
   const selection = selectSupersedeCandidate({
     pendingRuns: [run('2026-09-01T06:00:00.000Z')],
-    alertAfterHours: 6,
+    supersedeAfterHours: 6,
     now: NOW,
   });
   assert.equal(selection.eligible, true);
@@ -79,7 +84,7 @@ test('selectSupersedeCandidate: more than one waiting run is refused', () => {
       run('2026-09-01T01:00:00.000Z', { databaseId: 2 }),
       run('2026-09-01T02:00:00.000Z', { databaseId: 3 }),
     ],
-    alertAfterHours: 6,
+    supersedeAfterHours: 6,
     now: NOW,
   });
 
@@ -93,7 +98,7 @@ test('selectSupersedeCandidate: a queued or building dispatch alongside is refus
   for (const status of ['queued', 'in_progress']) {
     const selection = selectSupersedeCandidate({
       pendingRuns: [run('2026-09-01T01:00:00.000Z'), run('2026-09-01T11:00:00.000Z', { status })],
-      alertAfterHours: 6,
+      supersedeAfterHours: 6,
       now: NOW,
     });
     assert.equal(selection.eligible, false, `${status} alongside must refuse`);
@@ -104,7 +109,7 @@ test('selectSupersedeCandidate: a queued or building dispatch alongside is refus
 test('selectSupersedeCandidate: nothing waiting means nothing to supersede', () => {
   const selection = selectSupersedeCandidate({
     pendingRuns: [run('2026-09-01T01:00:00.000Z', { status: 'in_progress' })],
-    alertAfterHours: 6,
+    supersedeAfterHours: 6,
     now: NOW,
   });
   assert.equal(selection.eligible, false);
@@ -118,7 +123,7 @@ test('selectSupersedeCandidate: an unreadable createdAt declines rather than can
   // evidence. Declining is the only safe reading.
   const selection = selectSupersedeCandidate({
     pendingRuns: [run('not-a-date')],
-    alertAfterHours: 6,
+    supersedeAfterHours: 6,
     now: NOW,
   });
   assert.equal(selection.eligible, false);
@@ -176,11 +181,22 @@ test('the replacement is dispatched at master, never at the stale run head', () 
   assert.equal(DEPLOY_WORKFLOW_FILE, 'docker.yml');
 });
 
-test('replay 2026-09-14: the incident that held the lane 41.2h would have been superseded', () => {
+test('replay 2026-09-14: the 41.2h incident is NOT superseded under the shipped 48h threshold', () => {
   // Real values, read from the Actions API. docker.yml workflow_dispatch run
   // 34889856627: created 19:55:57Z, head c316ff73, cancelled by a human
   // 2026-09-16T13:12:14Z — 41.2h on the gate. `compare/c316ff73...master`
   // reports ahead_by 123, behind_by 0, status `ahead`.
+  //
+  // This test used to assert that PEN-3315 covered its own motivating incident,
+  // running the replay at the then-shipped 6h threshold. BLO-25050 moved the
+  // supersede to 48h and that coverage is DELIBERATELY GIVEN UP: 41.2h is inside
+  // the new 6h–48h survival band, so this exact incident would now run to the
+  // human cancel untouched. The trade is stated once, here — a 6h supersede
+  // destroys the gate-holder run id roughly six times per board decision cycle
+  // (measured holder lifetimes 7.04h / 6.71h / 7.40h against a 45.7h median
+  // time-to-decision), so it buys a fresh head at the cost of a gate that can
+  // never be approved through the card channel at all. A stale head that a human
+  // CAN approve beats a current head nobody can reach.
   const GATE = {
     databaseId: 34889856627,
     status: 'waiting',
@@ -189,31 +205,39 @@ test('replay 2026-09-14: the incident that held the lane 41.2h would have been s
   };
   const HUMAN_CANCELLED_AT = Date.parse('2026-09-16T13:12:14Z');
 
-  // The first hourly sampling slot at or past the 6h threshold (crossed
-  // 01:55:57Z) is 02:23Z the next morning.
-  const firstSlotPastThreshold = Date.parse('2026-09-15T02:23:00Z');
-  const selection = selectSupersedeCandidate({
+  // Control, and the record of what was traded away: at the OLD coupled 6h
+  // threshold the first hourly sampling slot past it (02:23Z the next morning)
+  // did select this run.
+  const firstSlotPastSixHours = Date.parse('2026-09-15T02:23:00Z');
+  const atSixHours = selectSupersedeCandidate({
     pendingRuns: [GATE],
-    alertAfterHours: 6,
-    now: new Date(firstSlotPastThreshold),
+    supersedeAfterHours: 6,
+    now: new Date(firstSlotPastSixHours),
   });
+  assert.equal(atSixHours.eligible, true, 'control: the old 6h threshold did select this run');
+  assert.ok(atSixHours.ageHours > 6.4 && atSixHours.ageHours < 6.5);
 
-  assert.equal(selection.eligible, true);
-  assert.ok(selection.ageHours > 6.4 && selection.ageHours < 6.5);
+  // The shipped threshold, at the latest moment it could have mattered — the
+  // instant the human gave up and cancelled. Still below 48h, so the lane was
+  // never touched by the supersede at any point during the real incident.
+  const atShippedThreshold = selectSupersedeCandidate({
+    pendingRuns: [GATE],
+    supersedeAfterHours: 48,
+    now: new Date(HUMAN_CANCELLED_AT),
+  });
+  assert.equal(atShippedThreshold.eligible, false);
+  assert.equal(atShippedThreshold.reason, 'below-threshold');
+  assert.ok(
+    atShippedThreshold.ageHours > 41.2 && atShippedThreshold.ageHours < 41.3,
+    `the run reached ${atShippedThreshold.ageHours}h, short of the 48h threshold`,
+  );
 
-  // By then master had moved on, so the compare reads `ahead` and the run is
-  // superseded — replacing a head that went on to be 123 commits stale.
+  // The selection mechanics this incident exercised are still worth pinning:
+  // had it crossed 48h, the compare reads `ahead` and the run IS superseded.
   assert.equal(
     confirmSupersede({ liveStatus: 'waiting', compareStatus: 'ahead' }).supersede,
     true,
   );
-
-  // What this buys, stated exactly: the lane would still have waited for a
-  // human — the supersede approves nothing — but the head in front of that
-  // human would have been refreshed roughly every 6h instead of decaying for
-  // 41.2h into a partial.
-  const missedHours = (HUMAN_CANCELLED_AT - firstSlotPastThreshold) / 3_600_000;
-  assert.ok(missedHours > 34, `the stall ran ${missedHours}h past the first supersede point`);
 });
 
 // ---------------------------------------------------------------------------
@@ -273,4 +297,60 @@ test('waitForCancel: a read failure counts as "not yet", never as cleared', asyn
 test('waitForCancel: polling is bounded and the bound is far inside a cancel settle', () => {
   assert.ok(CANCEL_POLL_ATTEMPTS * CANCEL_POLL_DELAY_MS >= 20_000);
   assert.ok(CANCEL_POLL_ATTEMPTS * CANCEL_POLL_DELAY_MS <= 60_000);
+});
+
+// BLO-25050. The supersede threshold was PENDING_DEPLOY_ALERT_HOURS (6h) until
+// 2026-10-04. The gate has a second consumer now — a Paperclip board card pins to
+// the waiting run id and is retired when that run terminates — and measured
+// gate-holder lifetimes of 7.04h / 6.71h / 7.40h against a 45.7h median
+// time-to-decision meant the card's handle was destroyed roughly six times per
+// decision cycle, so the ask could never be answered through that channel.
+//
+// Regression guard for the separation: a run the OLD coupled 6h threshold would
+// have cancelled must survive the new 48h one.
+test('selectSupersedeCandidate: a run past the 6h ALERT threshold survives the 48h SUPERSEDE threshold', () => {
+  const sevenHoursOld = run('2026-09-01T05:00:00.000Z');
+
+  assert.equal(
+    selectSupersedeCandidate({ pendingRuns: [sevenHoursOld], supersedeAfterHours: 6, now: NOW })
+      .eligible,
+    true,
+    'control: the old coupled threshold did cancel this run',
+  );
+
+  const selection = selectSupersedeCandidate({
+    pendingRuns: [sevenHoursOld],
+    supersedeAfterHours: 48,
+    now: NOW,
+  });
+  assert.equal(selection.eligible, false);
+  assert.equal(selection.reason, 'below-threshold');
+  assert.equal(selection.ageHours, 7);
+});
+
+// The separation must not become "never supersede". A genuinely abandoned run
+// past 48h is still cancelled and re-dispatched, which is PEN-3315's whole point.
+test('selectSupersedeCandidate: a run past the 48h threshold is still superseded', () => {
+  const selection = selectSupersedeCandidate({
+    pendingRuns: [run('2026-08-30T02:00:00.000Z')],
+    supersedeAfterHours: 48,
+    now: NOW,
+  });
+
+  assert.equal(selection.eligible, true);
+  assert.equal(selection.reason, 'stale-and-past-threshold');
+  assert.equal(selection.ageHours, 58);
+});
+
+// BLO-25050 removed the default, which makes a missing or garbled
+// SUPERSEDE_AFTER_HOURS this script's only configuration failure mode. Nothing
+// else exercises main()'s env parsing, so the rejection is pinned here rather
+// than asserted in a comment.
+test('parseSupersedeAfterHours rejects everything that is not a positive number', () => {
+  for (const bad of [undefined, null, '', '   ', 'abc', '0', '-1', 'NaN', 'Infinity']) {
+    assert.equal(parseSupersedeAfterHours(bad), null, `${JSON.stringify(bad)} must be rejected`);
+  }
+  assert.equal(parseSupersedeAfterHours('48'), 48);
+  assert.equal(parseSupersedeAfterHours('6'), 6);
+  assert.equal(parseSupersedeAfterHours(' 48 '), 48);
 });

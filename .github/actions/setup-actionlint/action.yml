@@ -49,8 +49,15 @@ runs:
       id: install
       shell: bash
       env:
-        VERSION: "1.7.7"
-        SHA256: "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
+        # 1.7.12, not 1.7.7: 1.7.7's hardcoded activity-type list for
+        # `pull_request_target` predates GitHub adding `enqueued`/`dequeued`
+        # to that event, so it rejected a workflow GitHub accepts. The two
+        # events carry identical activity-type lists upstream; 1.7.7 had
+        # `dequeued` on `pull_request` only. Verified on this tree: 1.7.7
+        # fails merge-queue-eviction-detector.yml:49, 1.7.12 validates all
+        # 37 workflow files clean. (BLO-40351)
+        VERSION: "1.7.12"
+        SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
       run: |
         set -euo pipefail
 

@@ -54,7 +54,7 @@ function assertSafePathComponent(field: string, value: string): void {
   }
 }
 
-function sanitizeForK8sPath(value: string): string {
+export function sanitizeForK8sPath(value: string): string {
   return value.replace(/[^a-zA-Z0-9-]/g, "");
 }
 
@@ -1950,6 +1950,26 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         `config.workspaceMountPath must not collide with inherited secret mount "${sv.volumeName}" at ${normalized}`,
       );
     }
+    // NOTE the asymmetry with `SelfPodSecretVolume.optional` (PEN-3705), which
+    // is decided the other way on purpose. There, an ABSENT credential Secret
+    // now wedges the Job rather than starting the agent blind, because
+    // `PAPERCLIP_GITHUB_TOKEN_FILE` points inside the mount and the path falls
+    // through to the agent-writable shared PVC underneath. Here, a COLLIDING
+    // path still silently drops the inherited volume — but a colliding path is
+    // by definition already claimed, so it keeps resolving to whatever claimed
+    // it, never to the PVC. The workspace mount is the one collision that
+    // would land on the PVC, and it throws above. What reaches this `continue`
+    // is a collision with `/tmp/prompt` or `/runtime-cache` (per-pod
+    // `emptyDir`) or with an earlier inherited volume at the same path (that
+    // earlier Secret projection). The failure is therefore a missing
+    // credential, or for the two `emptyDir` paths a per-pod writable path —
+    // not the fleet-shared substitution the `optional` change closed.
+    //
+    // That is a deliberate trade, not an oversight: a collision needs an
+    // operator to have configured one, whereas a missing Secret is ordinary
+    // platform drift that must not wedge every run in the fleet. Tracked as
+    // PEN-3808. If this is ever revisited, note it is a behaviour change with
+    // its own blast radius, not a comment fix.
     if (claimedMountPaths.has(normalized)) continue;
     claimedMountPaths.set(normalized, sv.volumeName);
     volumes.push({

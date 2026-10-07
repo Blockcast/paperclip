@@ -21,6 +21,7 @@ import {
   buildWorkspaceConfigFreshnessOperation,
   computeK8sIsolationRetryDelayMs,
   computeSessionCompactionReason,
+  sessionRotationInputTokens,
   countConsecutiveFailedOrZeroTokenResumes,
   deriveTaskKeyWithHeartbeatFallback,
   evaluatePreferredProjectWorkspaceRealization,
@@ -296,6 +297,53 @@ describe("computeSessionCompactionReason fires rotation at the k8s ceiling (BLO-
         sessionAgeHours: 0,
       }),
     ).not.toBeNull();
+  });
+
+  // BLO-29842: pins what FEEDS the ceiling, not just the comparator above. Cache
+  // creation used to be folded into `inputTokens`; once split out, a trigger that
+  // reads `inputTokens` alone silently under-counts the prompt by the entire
+  // cache-write volume and rotates far too late. These fail if
+  // sessionRotationInputTokens reverts to `.inputTokens`.
+  it("counts cache writes toward the rotation trigger's input basis", () => {
+    // Neither leg reaches the ceiling alone; together they land exactly on it.
+    expect(
+      sessionRotationInputTokens({ rawInputTokens: 90_000, rawCacheCreationInputTokens: 60_000 }),
+    ).toBe(150_000);
+    expect(
+      computeSessionCompactionReason({
+        policy: k8sPolicy("claude_k8s"),
+        runsCount: 1,
+        latestRawInputTokens: sessionRotationInputTokens({
+          rawInputTokens: 90_000,
+          rawCacheCreationInputTokens: 60_000,
+        }),
+        sessionAgeHours: 0,
+      }),
+    ).not.toBeNull();
+  });
+
+  it("excludes cache reads from the rotation trigger's input basis", () => {
+    // Cache reads bill at ~0.1x and are not prompt re-inflation, so a session
+    // that is almost entirely cache hits must NOT be rotated by this trigger.
+    expect(
+      sessionRotationInputTokens({ rawInputTokens: 1_000, rawCachedInputTokens: 400_000 }),
+    ).toBe(1_000);
+    expect(
+      computeSessionCompactionReason({
+        policy: k8sPolicy("claude_k8s"),
+        runsCount: 1,
+        latestRawInputTokens: sessionRotationInputTokens({
+          rawInputTokens: 1_000,
+          rawCachedInputTokens: 400_000,
+        }),
+        sessionAgeHours: 0,
+      }),
+    ).toBeNull();
+  });
+
+  it("reports no rotation basis for an absent or empty usage blob", () => {
+    expect(sessionRotationInputTokens(null)).toBeNull();
+    expect(sessionRotationInputTokens({})).toBeNull();
   });
 
   it("does not rotate one token below the ceiling", () => {

@@ -545,3 +545,57 @@ test("the platform dashboard datasource uid is overridable alongside the funnel'
   );
   assert.deepEqual([...uids], ["some-other-prom"]);
 });
+
+test("the uid and panel titles that onprem-k8s alerts hard-code are pinned (BLO-38862)", () => {
+  // Blockcast/onprem-k8s monitoring/prometheus-rules-2-configmap.yaml and its
+  // CRD mirror hard-code all three of these strings into the two alerts that
+  // actually fire. (This chart's own PrometheusRule is disabled on Blockcast,
+  // so the assertion above about the dead-letter annotation does NOT reach
+  // them -- it checks this repo's copy against this repo's dashboard.)
+  //
+  //   PaperclipGithubReviewRequestDeadLettered       uid, 'Unresolved dead-letters'
+  //   PaperclipGithubReviewRequestSuppressionOutage  uid, 'Terminal suppression by cause'
+  //
+  // The uid appears twice per alert -- once in the `dashboard:` annotation and
+  // again in an inline https://stats.orc8r.blockcast.net/d/<uid> URL inside the
+  // description -- so renaming it 404s four links per file, eight across the
+  // ConfigMap and the CRD mirror.
+  //
+  // The two panel titles are both named in that description prose, but they
+  // fail differently, so they get separate assertions:
+  //
+  //   'Unresolved dead-letters' is positive navigation -- it is the
+  //   discriminator for which arm of a two-armed rule fired ("the `Unresolved
+  //   dead-letters` stat tells you which arm of this two-armed rule fired").
+  //   Renaming it sends a paged operator to a panel that is not there.
+  //
+  //   'Terminal suppression by cause' is a caveat steering the operator AWAY
+  //   ("read the firing cause from the summary above, not from the `Terminal
+  //   suppression by cause` panel: it is unfiltered and also charts benign
+  //   causes such as `reviewer_lock_contended`"). Renaming it leaves a warning
+  //   about a panel nobody can find -- so the operator reads the unfiltered
+  //   panel under its new name and mistakes a benign cause for the outage.
+  //
+  // The guard belongs here rather than in onprem-k8s: the dashboard JSON is not
+  // in that repo, so an assertion there compares its own constant to itself and
+  // passes forever while reading as coverage. Renaming any of these is fine --
+  // renaming without updating onprem-k8s in the same change is not.
+  const { dashboard } = renderDashboard();
+
+  assert.equal(
+    dashboard.uid,
+    "paperclip-review-request-funnel",
+    "renaming this uid 404s the dashboard links in both onprem-k8s review-request alerts",
+  );
+
+  const titles = dashboard.panels.map((panel) => panel.title);
+
+  assert.ok(
+    titles.includes("Unresolved dead-letters"),
+    "onprem-k8s PaperclipGithubReviewRequestDeadLettered tells the operator to read this panel to decide which arm of the rule fired; renaming it sends them to a panel that is not there",
+  );
+  assert.ok(
+    titles.includes("Terminal suppression by cause"),
+    "onprem-k8s PaperclipGithubReviewRequestSuppressionOutage warns the operator off this panel by name because it is unfiltered; renaming it strands the warning and they read the unfiltered panel anyway",
+  );
+});

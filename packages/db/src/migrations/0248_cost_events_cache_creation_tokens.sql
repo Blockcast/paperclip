@@ -1,0 +1,21 @@
+-- BLO-29842: fourth token column so Anthropic's three input classes stop
+-- collapsing into two observable columns.
+--
+-- Anthropic bills fresh input at 1x, cache CREATION at 1.25x (5m TTL) / 2x
+-- (1h TTL), and cache READ at 0.1x. `cached_input_tokens` is the read leg.
+-- Creation had nowhere to go, so `claudeModelUsageTotals` summed it into
+-- `input_tokens` and the rollup priced it at 1x. Three prices against two
+-- regressors makes the rate card unidentifiable by construction, not by
+-- sample size: an unconstrained 3-parameter fit over 13 agents returned an
+-- input price of -$256/Mtok (BLO-22232 §D).
+--
+-- Defaulted to 0 and deliberately NOT backfilled. Existing rows folded cache
+-- creation into input_tokens and the split was never recorded anywhere, so any
+-- backfill would be a guess dressed as data. Rows before this migration stay
+-- unidentifiable; the fit that closes BLO-29842 must use a window that starts
+-- after deploy.
+--
+-- No index. Every consumer aggregates this column inside a query already
+-- filtered by an existing (company_id, ...) index; it is never a predicate.
+ALTER TABLE "cost_events"
+  ADD COLUMN IF NOT EXISTS "cache_creation_input_tokens" integer DEFAULT 0 NOT NULL;

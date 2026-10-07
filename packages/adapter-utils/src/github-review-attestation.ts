@@ -326,7 +326,15 @@ function parseBodyField(expression: string): ReviewBodySource | null {
 // lines in prose, and flagging those would refuse honest reviews of exactly
 // the code that does the refusing. Lines are blanked rather than removed so
 // the line anchors below keep pointing at the same text.
-const FENCE_DELIMITER_PATTERN = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+//
+// The info string is `[^\n]*`, never `.`. JS's `.` excludes `\r`, U+2028 and
+// U+2029 where Python's and CommonMark's exclude only `\n`, so a bare `.` here
+// opens no fence on an info string carrying U+2028 while the gate and the
+// sweep open one -- and the three readers of one review body then disagree
+// about which `Reviewed head:` lines are quoted. That is the BLO-32695
+// cross-reader divergence, and this file is in its mirror set (Ally, #1721 at
+// 068806d6, Important 1).
+const FENCE_DELIMITER_PATTERN = /^ {0,3}(`{3,}|~{3,})([^\n]*)$/;
 const FENCE_CLOSE_PATTERN = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
 function withoutFencedCodeBlocks(body: string): string {
@@ -390,7 +398,14 @@ const ACCEPTED_ATTESTATION_TRAILER_PATTERN = /^[*_`]{0,3}[ \t]*[*_`]{0,3}[ \t]*$
  * lowercases what it extracts.
  */
 export function inspectReviewAttestation(body: string): ReviewAttestation {
-  const emitted = withoutFencedCodeBlocks(body);
+  // CRLF first, as the two inbound readers do (reviewBody in
+  // ally-review-detection.ts, reviewText in check-ally-review-consistency.mjs).
+  // The fence opener's `[^\n]*` admits a trailing `\r` that the closer's
+  // `[ \t]*$` does not, so on an un-normalised body a fence opens, never
+  // closes, and blanks the attestation below it. This reader is the one fed
+  // from a file on disk (`--body-file`), the likeliest CRLF source of the three
+  // (Ally, #1721 at b8322735, Important 1).
+  const emitted = withoutFencedCodeBlocks(body.replace(/\r\n?/g, "\n"));
   const candidates = Array.from(emitted.matchAll(ATTESTATION_CANDIDATE_PATTERN), (match) => ({
     token: match[1] ?? "",
     trailer: match[2] ?? "",

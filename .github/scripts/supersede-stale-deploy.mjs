@@ -26,10 +26,11 @@
  *
  * WHAT THIS DOES — AND, LOUDLY, WHAT IT DOES NOT
  * ----------------------------------------------
- * When a dispatch has been `waiting` past the SAME threshold that already arms
- * the escalation (PENDING_DEPLOY_ALERT_HOURS, 6h), and the head it would deploy
- * is a STRICT ANCESTOR of `origin/master`, this cancels it and dispatches a
- * fresh one at `master`.
+ * When a dispatch has been `waiting` past PENDING_DEPLOY_SUPERSEDE_HOURS (48h),
+ * and the head it would deploy is a STRICT ANCESTOR of `origin/master`, this
+ * cancels it and dispatches a fresh one at `master`. That threshold was
+ * PENDING_DEPLOY_ALERT_HOURS (6h) until 2026-10-04; see selectSupersedeCandidate
+ * for the measurement that separated them (BLO-25050).
  *
  * It APPROVES NOTHING. The 2026-08-28 rejection of auto-approval — "three green
  * guards prove the code builds, not that a human intends to ship it" — is
@@ -58,17 +59,18 @@
  * else; that is a real, accepted limitation, it is announced in the step
  * summary, on the durable record and in the Alertmanager alert, and the remedy
  * is to re-dispatch. A rollback is approved in minutes during an incident, so
- * the >=6h precondition makes the collision unlikely rather than merely
- * survivable.
+ * the >=SUPERSEDE_AFTER_HOURS (48h) precondition makes the collision unlikely
+ * rather than merely survivable.
  *
  * THE RACE, AND WHY THE LIVE RE-CHECK IS NOT DECORATION
  * ----------------------------------------------------
  * A reviewer approving at the instant of cancellation loses the click and must
- * re-approve. Bounded by the >=6h precondition and by the replacement landing
- * within ~4 minutes, but bounded is not zero, so the run's status is re-read
- * from the API immediately before cancelling and anything other than a live
- * `waiting` aborts. The pending-runs file this step is handed was written
- * earlier in the job, and on a slow runner that is minutes of staleness.
+ * re-approve. Bounded by the >=SUPERSEDE_AFTER_HOURS (48h) precondition and by
+ * the replacement landing within ~4 minutes, but bounded is not zero, so the
+ * run's status is re-read from the API immediately before cancelling and
+ * anything other than a live `waiting` aborts. The pending-runs file this step
+ * is handed was written earlier in the job, and on a slow runner that is
+ * minutes of staleness.
  *
  * That window has a SECOND half, after the cancel. `POST .../cancel` is
  * asynchronous, so the run leaves `waiting` on its own schedule — and it can
@@ -121,8 +123,34 @@ export const DEPLOY_REF = 'master';
  * the durable record because a supersede resets the run's age by construction;
  * here the run's own age is the right input, since what is being judged is
  * whether THIS run has been sitting long enough to be worth replacing.
+ *
+ * The threshold is `SUPERSEDE_AFTER_HOURS`, NOT `ALERT_AFTER_HOURS` (BLO-25050).
+ * They were deliberately the same value until 2026-10-04 — "the condition that
+ * supersedes is the condition that already escalates" — and that reasoning was
+ * written before the gate had a second consumer. It now has one: a Paperclip
+ * board approval card pins to a specific run id via `payload.gate`, and the
+ * BLO-29359 reconciler retires the card when that run terminates. At 6h the
+ * supersede therefore destroys the card's handle before the board can reach it.
+ * Measured on this repo 2026-10-04: three consecutive gate-holder runs lived
+ * 7.04h / 6.71h / 7.40h, against a median time-to-decision of 45.7h for
+ * agent-requested cards over the trailing 30 days (n=24, p25 27.7h, p75 213h).
+ * Only 4 of those 24 were decided inside 7h, so the ask was unanswerable through
+ * the card channel by construction — a card was filed and reconciled away six
+ * times over while BLO-25050 sat 13 days and production reached 611 commits
+ * behind.
+ *
+ * Superseding buys head freshness, which is cheap here: approving a 48h-old head
+ * ships all but ~a day of the backlog and the daily 07:23 dispatch ships the
+ * rest. Not superseding buys a gate that survives long enough to be approved at
+ * all. The second is worth more, so the two thresholds now differ.
+ *
+ * 48h was picked to clear the MEDIAN decision time, not the tail — p75 is 213h,
+ * so roughly half of these cards will still outlive their gate. That is the knob
+ * to turn if they keep doing so: `PENDING_DEPLOY_SUPERSEDE_HOURS` is a repo
+ * variable, so raising it buys more of the tail at the cost of head freshness
+ * and needs no deploy.
  */
-export function selectSupersedeCandidate({ pendingRuns, alertAfterHours, now }) {
+export function selectSupersedeCandidate({ pendingRuns, supersedeAfterHours, now }) {
   const runs = pendingRuns ?? [];
   const waiting = runs.filter((run) => run?.status === 'waiting');
 
@@ -159,7 +187,7 @@ export function selectSupersedeCandidate({ pendingRuns, alertAfterHours, now }) 
   }
 
   const ageHours = (now.getTime() - createdMs) / 3_600_000;
-  if (!(ageHours >= alertAfterHours)) {
+  if (!(ageHours >= supersedeAfterHours)) {
     return { eligible: false, reason: 'below-threshold', candidate, ageHours };
   }
   return { eligible: true, reason: 'stale-and-past-threshold', candidate, ageHours };
@@ -312,11 +340,27 @@ export async function waitForCancel(client, runId, { sleep = defaultSleep } = {}
   return { cleared: false, reason: 'cancel-did-not-settle', status: lastStatus };
 }
 
+// No default and no fallback. The workflow is the only caller and always sets
+// SUPERSEDE_AFTER_HOURS (`|| '48'`, pinned by the yaml test), so anything else
+// here would be unreachable, untestable, and a second place for the real
+// default to drift. An ALERT_AFTER_HOURS fallback would be strictly worse than
+// a literal: the value it drifts to is the 6h coupling BLO-25050 exists to
+// remove. That makes a missing or garbled value this script's only
+// configuration failure mode, so it is a pure function with its own tests
+// rather than a claim in a comment.
+export function parseSupersedeAfterHours(raw) {
+  // Number('') and Number(null) are both 0 and Number(undefined) is NaN, so the
+  // positive-finite test alone rejects every unset/garbled shape.
+  const hours = Number(raw);
+  return Number.isFinite(hours) && hours > 0 ? hours : null;
+}
+
 async function main() {
-  const alertAfterHours = Number(process.env.ALERT_AFTER_HOURS ?? 6);
-  if (!Number.isFinite(alertAfterHours) || alertAfterHours <= 0) {
+  const rawThreshold = process.env.SUPERSEDE_AFTER_HOURS;
+  const supersedeAfterHours = parseSupersedeAfterHours(rawThreshold);
+  if (supersedeAfterHours === null) {
     console.error(
-      `::error::ALERT_AFTER_HOURS must be a positive number, got "${process.env.ALERT_AFTER_HOURS}".`,
+      `::error::SUPERSEDE_AFTER_HOURS must be a positive number, got "${rawThreshold}".`,
     );
     process.exit(1);
   }
@@ -340,7 +384,7 @@ async function main() {
 
   const selection = selectSupersedeCandidate({
     pendingRuns,
-    alertAfterHours,
+    supersedeAfterHours,
     now: new Date(),
   });
   if (!selection.eligible) {

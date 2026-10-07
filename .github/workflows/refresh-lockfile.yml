@@ -147,10 +147,21 @@ jobs:
           # The merge queue owns the eventual merge and rejects --delete-branch
           # because it is asynchronous. Keep the refresh branch: the next run
           # deliberately force-updates it before reusing its PR.
-          gh pr merge --squash "${{ steps.upsert-pr.outputs.pr_url }}" \
-            || gh pr merge --auto --squash "${{ steps.upsert-pr.outputs.pr_url }}"
+          #
+          # --rebase, not --squash (BLO-39467). The method flag here is mostly
+          # vestigial — master's merge-queue rule sets merge_method: REBASE and
+          # that is what actually performs the merge — but `gh pr merge`
+          # requires one, and it is validated against the repo's enabled
+          # methods before the PR is ever enqueued. BLO-39345 is disabling
+          # `allow_squash_merge` repo-wide to stop squash-merges re-stamping
+          # multi-author agent PRs with the shared App identity; the moment
+          # that box is unchecked, a `--squash` here fails both the direct call
+          # and the --auto fallback, and the lockfile refresh stops landing.
+          # So this lands first. --rebase also matches what the queue does.
+          gh pr merge --rebase "${{ steps.upsert-pr.outputs.pr_url }}" \
+            || gh pr merge --auto --rebase "${{ steps.upsert-pr.outputs.pr_url }}"
 
-      # BLO-24150: the direct squash above sometimes falls through to --auto,
+      # BLO-24150: the direct merge above sometimes falls through to --auto,
       # which then waits on this PR's own required checks. If those checks'
       # *workflow runs* are sitting in `action_required` (observed 2026-07-21
       # and 2026-08-10, ~2.5h before a human happened to notice and click

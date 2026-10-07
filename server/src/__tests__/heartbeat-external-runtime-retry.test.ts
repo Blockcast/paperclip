@@ -35,6 +35,7 @@ import {
   recordExternalRuntimeJobIdentity,
   releaseExternalRuntimeReservation,
 } from "../services/external-runtime-reservations.js";
+import { acquireBranchRunClaim, computeBranchClaimKey } from "../services/branch-run-claims.js";
 import { refreshExternalRuntimeReservationStrandMetrics } from "../services/external-runtime-reservation-strand-metrics.js";
 import { renderMetrics } from "../services/metrics.js";
 
@@ -896,6 +897,140 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(reusedReservation.id).not.toBe(contenderReservation?.id);
     expect(reusedReservation.isolationMode).toBe("workspace");
     expect(reusedReservation.isolationKey).toBe(`workspace:${sharedWorkspaceId}`);
+  }, 120_000);
+
+  it("stamps queuedAt when a branch-claim contender is deferred back to queued", async () => {
+    // BLO-25024 (Ally review, paperclip#2232): deferRunForBranchClaimConflict is
+    // the third transition that sends an already-running row back to queued,
+    // next to the K8s isolation defer above and promoteScheduledRetryRun. It
+    // once omitted queuedAt, so the dispatch-wait histogram measured this run
+    // from createdAt and counted its first execution as queue wait. Same shape
+    // as the BLO-21602 incident: one agent, two issues sharing one execution
+    // workspace and branch. The holder's claim makes the contender's
+    // pre-realization claim conflict, and the contender is deferred.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const projectId = randomUUID();
+    const sharedWorkspaceId = randomUUID();
+    const holderIssueId = randomUUID();
+    const contenderIssueId = randomUUID();
+    const holderRunId = randomUUID();
+    const contenderRunId = randomUUID();
+    const repoUrl = "https://github.com/Blockcast/paperclip.git";
+    const branchName = "blo-25024-shared-branch";
+    const sharedWorkspaceCwd = await fs.mkdtemp(path.join(os.tmpdir(), "blo-25024-workspace-"));
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Branch Claim Defer Co",
+      issuePrefix: "BCD",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Shared Branch Claude K8s",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          enabled: true,
+          wakeOnDemand: true,
+          maxConcurrentRuns: 2,
+          concurrencyEnabled: true,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Shared Branch Project",
+    });
+    // Same reuse-without-disk-I/O workspace as the isolation test above, plus
+    // the durable (repoUrl, branchName) identity the pre-realization claim keys on.
+    await db.insert(executionWorkspaces).values({
+      id: sharedWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "project_primary",
+      name: "Shared branch workspace",
+      status: "active",
+      cwd: sharedWorkspaceCwd,
+      repoUrl,
+      branchName,
+    });
+    await db.insert(issues).values([
+      {
+        id: holderIssueId,
+        companyId,
+        title: "Parent issue holding the branch",
+        identifier: "BCD-1",
+        status: "in_progress",
+        assigneeAgentId: agentId,
+      },
+      {
+        id: contenderIssueId,
+        companyId,
+        title: "Child issue on the same branch",
+        identifier: "BCD-2",
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        executionWorkspaceId: sharedWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: holderRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        startedAt: new Date(),
+        contextSnapshot: { issueId: holderIssueId },
+      },
+      {
+        id: contenderRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId: contenderIssueId },
+      },
+    ]);
+    await acquireBranchRunClaim(db, {
+      companyId,
+      branchKey: computeBranchClaimKey({ repoUrl, branchName }),
+      executionWorkspaceId: sharedWorkspaceId,
+      issueId: holderIssueId,
+      runId: holderRunId,
+      agentId,
+    });
+
+    await heartbeat.__test_executeRunForTesting(contenderRunId);
+
+    const contender = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, contenderRunId))
+      .then((rows) => rows[0]);
+
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    expect(contender.status).toBe("queued");
+    expect(contender.contextSnapshot).toMatchObject({
+      paperclipBranchClaimRetryAttempt: 1,
+    });
+    // The inserted row has queuedAt null, so this fails if the defer stops
+    // stamping it.
+    expect(contender.queuedAt).not.toBeNull();
+    expect(contender.queuedAt!.getTime()).toBeGreaterThanOrEqual(contender.createdAt.getTime());
   }, 120_000);
 
   // BLO-16269: `createNamespacedJob` happens inside the bundled k8s adapter

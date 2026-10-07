@@ -463,6 +463,26 @@ Monitor policy lives under `executionPolicy.monitor` and includes:
 - `externalRef`: optional external-service reference input; Paperclip treats it as secret-adjacent, redacts it before persistence/visibility, and omits it from activity and wake payloads
 - `timeoutAt`, `maxAttempts`, and `recoveryPolicy`: optional recovery hints for bounded waits
 
+#### Writing a monitor
+
+Use the dedicated monitor write path. It touches the monitor and nothing else:
+
+- `PATCH /api/issues/:id/monitor` with the monitor object as the body — arms or re-arms.
+- `DELETE /api/issues/:id/monitor` — clears.
+
+Both carry the same authorization as the legacy path (`assertCanManageIssueMonitor`: the assignee agent, the agent holding the current execution run, or a board user), and both are exposed as `paperclipSetIssueMonitor` / `paperclipClearIssueMonitor`.
+
+`DELETE` is also the only reliable exit for a wedged monitor. Once a monitor fires, the trigger strips it out of `executionPolicy` and it survives only in `executionState`, so the clear keys on `executionState` rather than on a policy field that is already gone. It clears a `triggered` — and even a bounds-exhausted — monitor, and nulls `monitorNotes` so the next run does not inherit a retired monitor's notes as a live gate.
+
+Recovery actions: an arm through `PATCH /api/issues/:id/monitor` revalidates the issue's active recovery action the same way an arm through `PATCH /api/issues/:id` does, so both paths agree on whether that action is still `active`. A `DELETE` deliberately skips that revalidation. Revalidation retires an action because the issue now has its own way of being re-driven, and a clear only removes one, so it is never a reason to retire an action that may be the row's remaining wake path. The legacy `{"executionPolicy": {}}` clear still revalidates and can cancel that action; that is the one place the two paths still differ.
+
+Back-compat: `PATCH /api/issues/:id` still accepts `executionPolicy.monitor` and still **replaces** `executionPolicy` wholesale. That applies to arming and re-arming as much as to clearing, so through that path you must read the current policy and re-send it complete with `monitor` swapped in — a monitor-only body is a policy with no stages, and it erases `stages`, `reviewPreset` and `authorizationPolicy`. That read-modify-write also races any concurrent writer. Prefer the monitor path above; use the policy path only when you are genuinely rewriting the policy.
+
+Two sharp edges on that legacy path, neither of which the monitor path has:
+
+- `{"executionPolicy": {}}` is still destructive. It clears the monitor, but `normalizeIssueExecutionPolicy` collapses a stage-less, monitor-less policy to `null`, so it takes `stages`, `reviewPreset` and `authorizationPolicy` with it. That has not changed — use `DELETE /api/issues/:id/monitor` for a clear that leaves the rest of the policy alone.
+- Re-sending the policy complete *without* `monitor` is how you clear a **scheduled** monitor, and only that. On an issue whose monitor has already fired, the trigger has already stripped `monitor` out of the stored policy, so such a write is an ordinary policy edit and deliberately leaves the `triggered` state alone — `tickExpiredIssueMonitors` still owes that monitor its `recoveryPolicy`. Clearing a fired monitor is `DELETE /api/issues/:id/monitor`, or the bare `{"executionPolicy": {}}` above.
+
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
 Because `serviceName` and `notes` remain visible in issue activity and wake context, operators should keep them short and non-secret. Put enough context for the assignee to know what to inspect, but do not include signed URLs, bearer tokens, customer secrets, tenant-private identifiers, or provider links with embedded credentials.

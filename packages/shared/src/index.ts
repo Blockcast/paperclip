@@ -1283,7 +1283,9 @@ export type {
   PluginWebhookDeliveryRecord,
   QuotaWindow,
   ProviderQuotaResult,
+  BilledTokenCounts,
 } from "./types/index.js";
+export { promptTokens, totalTokens } from "./types/cost.js";
 export {
   COMPANY_SEARCH_EXTRACT_KINDS,
   COMPANY_SEARCH_EXTRACT_SCOPES,
@@ -1605,6 +1607,7 @@ export {
   issueParkedDispositionSchema,
   PARKED_DISPOSITION_MAX_HORIZON_DAYS,
   PARKED_DISPOSITION_MAX_HORIZON_MS,
+  issueExecutionMonitorPolicySchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,

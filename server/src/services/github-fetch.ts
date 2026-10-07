@@ -51,11 +51,18 @@ export function _setGhFetchDeadlineMsForTest(ms: number = GITHUB_FETCH_DEADLINE_
  * untouched; the default deadline firing is reported as a timeout, so a GitHub
  * slowdown does not send on-call to check URL configuration. Returns null for
  * anything that is not an abort, which each phase then reports in its own words.
+ *
+ * The result is WRAPPED rather than returned bare (BLO-38471): a caller may
+ * abort with a falsy reason — `abort(null)`, `abort(0)`, `abort("")` — and a
+ * truthiness test on a bare return would send that straight to the "Could not
+ * connect" message, which is the exact misdiagnosis this function exists to
+ * remove. The wrapper makes "an abort whose reason is falsy" and "not an abort"
+ * two different values instead of one.
  */
-function abortFailure(url: string, err: unknown, callerSignal?: AbortSignal | null): unknown {
-  if (callerSignal?.aborted) return err;
+function abortFailure(url: string, err: unknown, callerSignal?: AbortSignal | null): { failure: unknown } | null {
+  if (callerSignal?.aborted) return { failure: err };
   if ((err as { name?: unknown } | null)?.name === "TimeoutError") {
-    return unprocessable(`GitHub request to ${new URL(url).hostname} timed out after ${deadlineMs}ms`);
+    return { failure: unprocessable(`GitHub request to ${new URL(url).hostname} timed out after ${deadlineMs}ms`) };
   }
   return null;
 }
@@ -69,7 +76,7 @@ export async function ghFetch(url: string, init?: RequestInit): Promise<Response
     return await fetch(url, { ...init, signal });
   } catch (err) {
     const aborted = abortFailure(url, err, init?.signal);
-    if (aborted) throw aborted;
+    if (aborted) throw aborted.failure;
     throw unprocessable(`Could not connect to ${new URL(url).hostname} — ensure the URL points to a GitHub or GitHub Enterprise instance`);
   }
 }
@@ -85,6 +92,7 @@ export async function ghReadBody<T>(url: string, read: () => Promise<T>): Promis
   try {
     return await read();
   } catch (err) {
-    throw abortFailure(url, err) ?? err;
+    const aborted = abortFailure(url, err);
+    throw aborted ? aborted.failure : err;
   }
 }

@@ -30,24 +30,33 @@ const CLAUDE_RELATIVE_RETRY_RE =
  * event's top-level `usage` reflects only the main-loop message chain, so it
  * undercounts output tokens whenever subagents or sidechains ran; `modelUsage`
  * is the CLI's authoritative per-model accounting (it is what backs /cost).
- * Cache-creation tokens are billed prompt tokens, so they count as input.
+ *
+ * Cache-creation tokens are billed prompt tokens, but NOT at the fresh-input
+ * price — Anthropic charges 1.25x (5m TTL) / 2x (1h TTL) for creation against
+ * 1x for fresh input and 0.1x for reads. Until BLO-29842 they were summed into
+ * `inputTokens` here, which priced them at 1x and left three prices visible
+ * only through two columns. They are now reported separately and are NOT part
+ * of `inputTokens`; callers that need "everything except cache reads" must add
+ * the two back together (see `latestRawInputTokens` in heartbeat.ts).
  */
 export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null {
   const byModel = parseObject(modelUsage);
   let inputTokens = 0;
   let outputTokens = 0;
   let cachedInputTokens = 0;
+  let cacheCreationInputTokens = 0;
   let sawEntry = false;
   for (const value of Object.values(byModel)) {
     const entry = parseObject(value);
     if (Object.keys(entry).length === 0) continue;
     sawEntry = true;
-    inputTokens += asNumber(entry.inputTokens, 0) + asNumber(entry.cacheCreationInputTokens, 0);
+    inputTokens += asNumber(entry.inputTokens, 0);
+    cacheCreationInputTokens += asNumber(entry.cacheCreationInputTokens, 0);
     outputTokens += asNumber(entry.outputTokens, 0);
     cachedInputTokens += asNumber(entry.cacheReadInputTokens, 0);
   }
   if (!sawEntry) return null;
-  return { inputTokens, outputTokens, cachedInputTokens };
+  return { inputTokens, outputTokens, cachedInputTokens, cacheCreationInputTokens };
 }
 
 export function parseClaudeStreamJson(stdout: string) {
@@ -107,6 +116,9 @@ export function parseClaudeStreamJson(stdout: string) {
   const usage: UsageSummary = modelUsageTotals ?? {
     inputTokens: asNumber(usageObj.input_tokens, 0),
     cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
+    // BLO-29842: raw Anthropic payloads spell this snake_case. Absent for any
+    // provider that does not cache-write, which reads as 0.
+    cacheCreationInputTokens: asNumber(usageObj.cache_creation_input_tokens, 0),
     outputTokens: asNumber(usageObj.output_tokens, 0),
   };
   const costRaw = finalResult.total_cost_usd;
@@ -404,7 +416,7 @@ function buildClaudeTransientHaystack(input: {
  * to distinguish the two: forgetting to is precisely how the narrowing below
  * first went wrong, and there are three call sites plus the vendored twin.
  */
-function isClaudeTerminalResultEvent(parsed: Record<string, unknown> | null): boolean {
+export function isClaudeTerminalResultEvent(parsed: Record<string, unknown> | null): boolean {
   return parsed !== null && asString(parsed.type, "") === "result";
 }
 
@@ -440,9 +452,34 @@ function isClaudeTerminalResultEvent(parsed: Record<string, unknown> | null): bo
  *
  * The transcript-reading callers below (`isClaudeImmutableThinkingBlockError`,
  * `isClaudeProviderQuotaError`, `extractClaudeRetryNotBefore`) keep the wide
- * builder on purpose: the first two can only ever SUPPRESS a transient label, and
- * the third extracts a timestamp once a family is already decided. None of them
- * grants a retry family off transcript text.
+ * builder — but NOT because they are harmless with it. The bounding happens in
+ * the CALLER, not here. This spot used to read "the first two can only ever
+ * SUPPRESS a transient label … none of them grants a retry family off transcript
+ * text"; that was false for `isClaudeProviderQuotaError` and is corrected here,
+ * because a maintainer who believed it would widen the caller back:
+ *
+ *   - `isClaudeProviderQuotaError` suppresses only in its ONE internal role,
+ *     inside `isClaudeTransientUpstreamError` (:789). At its DIRECT call sites it
+ *     GRANTS, off whatever `stdout` it is handed: `execute.ts:1293` →
+ *     `errorCode`/`errorFamily` `provider_quota` (:1327/:1331), and `:1457` →
+ *     `:1511`/`:1517`. "Can only ever suppress" described one caller and silently
+ *     generalised to the rest.
+ *   - `isClaudeImmutableThinkingBlockError` grants a session-error KIND
+ *     (`execute.ts:1592`/`:1600` → `"immutable"`), not a retry family — so the
+ *     retry-family clause was narrowly true of it, and still not a reason the
+ *     wide builder is safe.
+ *   - `extractClaudeRetryNotBefore` reads the transcript only after a family is
+ *     already decided, and prefers structured `parsed` fields (:676-681) before
+ *     falling back to this haystack.
+ *
+ * What actually bounds the granting path is that `execute.ts` narrows the
+ * `stdout` it HANDS these rules on a terminal result event
+ * (`isClaudeTerminalResultEvent(parsed) ? "" : proc.stdout`, at `:1459` and
+ * `:1472`). Those two must stay narrowed TOGETHER: the transient rule suppresses
+ * on the quota rule's verdict (:789), so handing them different stdout makes them
+ * disagree and drops a genuine 429 to no family at all. Do not widen either back
+ * on the strength of this builder being wide. Both lines are pinned by
+ * `execute.login-veto-routing.test.ts` — reverting either one alone reds a case.
  */
 function buildClaudeTerminalResultHaystack(input: {
   parsed?: Record<string, unknown> | null;
@@ -680,12 +717,60 @@ export function isClaudeTransientUpstreamError(input: {
   if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
     return false;
   }
-  // The login and quota vetoes deliberately still read the whole transcript. Both
-  // can only ever SUPPRESS the transient label, so narrowing them would widen what
-  // this function grants — the opposite of this rule's defect. See PEN-3223.
+  // The login veto reads the same bounded surfaces as the haystack below, on the
+  // same `isClaudeTerminalResultEvent` gate and for the same reason (PEN-3259).
+  // Twin of the change in `vendor/paperclip-adapter-claude-k8s/src/server/parse.ts`,
+  // which carries the full measurement. `detectClaudeLoginRequired` itself is
+  // unchanged and still reads `stdout` for its other callers, which ask whether the
+  // run needs re-authentication before any result event exists; what changes is what
+  // THIS rule passes it.
+  //
+  // The gate is the SHAPE check, not `parsed` truthiness, and in this copy that
+  // distinction is live rather than cosmetic — see the two populations enumerated
+  // below. Gating on truthiness here would hand `stdout: ""` to a run whose
+  // `parsed` is a truthy non-result object, so a CLI login prompt that only ever
+  // reached stdout would go unseen, the wide haystack would still match any
+  // transient token in the transcript, and the run would be retried as
+  // `claude_transient_upstream` instead of surfacing `claude_auth_required`. The
+  // two gates must stay the same gate.
+  //
+  // This copy is the MORE exposed of the two, not the less. Its
+  // CLAUDE_AUTH_REQUIRED_RE does not match the bare word `unauthorized` (the k8s
+  // twin's does), but it does match `failed to authenticate` — which is ordinary
+  // output from git, gh, ssh and container registries rather than anything the
+  // Claude CLI says about its own session. Evaluating both copies' regexes over
+  // the same 446 reconstructed transcripts: this one fires on 308, the k8s twin
+  // on 91, and `failed to authenticate` alone accounts for 285 of the 308.
+  // (Those transcripts are k8s pod logs, so this is an exposure comparison of the
+  // two patterns against representative agent output, not a claim about runs this
+  // adapter served.)
+  //
+  // Narrowing THIS function alone would be inert in production, and that is why
+  // the change does not stop here. Every classifier in `execute.ts` is gated on
+  // `detectClaudeLoginRequired` before this rule is consulted (`execute.ts:1235`,
+  // consumed at :1274/:1283/:1300 on the `!parsed` path and :1423-1467 on the
+  // parsed one), so a transcript-only auth token suppressed the verdict upstream
+  // of here. That call site is narrowed the same way, on the same shape gate.
+  // The `loginUrl` it reports is deliberately left on the whole transcript: it is
+  // derived independently of `requiresLogin` (:193) and is operator-facing, not a
+  // classification input.
+  //
+  // `test.ts:488` is the one remaining wide read, and it is scoped OUT rather than
+  // missed. That is the connection-test hello probe: it runs a fixed one-line
+  // prompt ("Respond with hello.") and classifies the probe's own output, so its
+  // transcript is a controlled surface a few lines long, not an agent work log
+  // carrying git/gh/ssh/registry output. The poisoning class this change fixes
+  // cannot arise there, and the probe's whole purpose includes reporting that the
+  // CLI is asking for a login — which is emitted before any result event, exactly
+  // where the transcript is the only surface that carries it.
+  //
+  // The quota suppression below reads `input` as given, so it agrees with the
+  // caller's own quota verdict only if both get the same stdout: `execute.ts`
+  // narrows both on a result event, `test.ts` passes the probe transcript to both.
+  // Handed different inputs, a tool-output quota token vetoes a genuine 429 here.
   const loginMeta = detectClaudeLoginRequired({
     parsed,
-    stdout: input.stdout ?? "",
+    stdout: isClaudeTerminalResultEvent(parsed) ? "" : (input.stdout ?? ""),
     stderr: input.stderr ?? "",
   });
   if (loginMeta.requiresLogin) return false;
@@ -695,10 +780,10 @@ export function isClaudeTransientUpstreamError(input: {
   // Two distinct populations reach this with no result event, and both need the
   // wide transcript haystack:
   //
-  //   1. `parsed: null` — `execute.ts`'s `!parsed` fallback (:1227), when the CLI
+  //   1. `parsed: null` — `execute.ts`'s `!parsed` fallback (:1271), when the CLI
   //      died without emitting one.
   //   2. `parsed` truthy but not a result event — `execute.ts`'s `parsed` is
-  //      `parsedStream.resultJson ?? parseJson(proc.stdout)` (:1163), and that
+  //      `parsedStream.resultJson ?? parseJson(proc.stdout)` (:1181), and that
   //      second arm is a bare `JSON.parse`, so any single parseable object on
   //      stdout arrives here truthy.
   //
@@ -717,6 +802,21 @@ export function isClaudeTransientUpstreamError(input: {
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }
 
+// This rule GRANTS a family at its direct call sites — it is not only the
+// suppressor it looks like from `isClaudeTransientUpstreamError` (:789). On the
+// `!parsed` path `execute.ts:1293` turns a true verdict here into `errorCode`
+// AND `errorFamily` `provider_quota` (:1327/:1331); on the result-event path
+// `:1457` does the same at `:1511`/`:1517`. So the `stdout` a caller hands it is
+// a classification input, not a hint.
+//
+// Its internal login veto reads `input.stdout` as given. On a terminal result
+// event `execute.ts` therefore narrows that input to `""` (`:1459`), and MUST
+// narrow `isClaudeTransientUpstreamError`'s to match (`:1472`) — the suppression
+// at `:789` passes `input` through unchanged, so if the two disagree a quota
+// token present only in the tool output vetoes a genuine 429's transient verdict
+// while the narrowed gate says "not quota", and the run ends with no family.
+// `test.ts` passes its probe transcript to both, which agrees by construction.
+// Pinned by `execute.login-veto-routing.test.ts`.
 export function isClaudeProviderQuotaError(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;

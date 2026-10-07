@@ -29,7 +29,8 @@ import {
  * where `created_at` already IS the queue-entry time, but gets stamped with
  * `now()` by the specific transitions that put an *existing* row back into
  * `queued` after it was something else (`promoteScheduledRetryRun`,
- * `deferRunForK8sIsolationConflict`). Without the coalesce target, a run
+ * `deferRunForK8sIsolationConflict`, `deferRunForBranchClaimConflict`).
+ * Without the coalesce target, a run
  * promoted after hours in `scheduled_retry` backoff would instantly report
  * that entire backoff as queued-dispatch wait -- the false-stranded-run alert
  * this gauge exists to prevent.
@@ -224,6 +225,55 @@ export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new D
 }
 
 /**
+ * Did the park adopt an upstream `retryNotBefore` floor? (BLO-31174.)
+ *
+ * Read off `context_snapshot`, NOT `result_json`. The parked row is INSERTED by
+ * `scheduleBoundedRetryForRun` with `contextSnapshot: retryContextSnapshot` and
+ * no `resultJson` at all, and the column has no default -- `result_json` holds
+ * the recovery metadata of the FAILED PARENT run, reachable only through
+ * `retry_of_run_id`. Classifying a `scheduled_retry` row off `result_json`
+ * therefore reads NULL for every transient park and silently labels all three
+ * paths as the ladder, which is the single-bound defect this split exists to
+ * remove, re-introduced one layer down and green on every synthetic fixture
+ * that writes `result_json` by hand. (Found by kkroo drive session cbbb9e5e on
+ * onprem-k8s#4145; the same read was wrong in the alert's triage text.)
+ *
+ * The keys below are written by the SAME statement that books `scheduled_retry_
+ * at`, which is what makes presence here exactly as authoritative as the horizon
+ * it is being used to bound:
+ *
+ *  - `transientRetryNotBefore` -- written iff the scheduler held a floor
+ *    (`heartbeat.ts`, the `...(transientRetryNotBefore ? {...} : {})` spread).
+ *    The writer has already gated this on a recognised transient recovery
+ *    contract, so no family check is needed here.
+ *  - `providerQuotaRetryNotBefore` -- written iff that floor's family is
+ *    `provider_quota`, the family `clampTransientHorizon` deliberately never
+ *    clamps.
+ *
+ * `hasRetryFloor` is floor PRESENCE, not "the floor won": the key is written
+ * whether or not the floor beat the ladder. A present floor that lost is
+ * labelled `transient_failure_floor` and judged against 86,700s instead of
+ * 9,000s -- a LOOSER bound on a park provably under the tighter one, i.e.
+ * weaker monitoring of a known-good case, never a false page.
+ */
+export const HAS_TRANSIENT_RETRY_FLOOR = sql<boolean>`(
+  ${heartbeatRuns.contextSnapshot}->>'transientRetryNotBefore' is not null
+)`;
+
+/**
+ * Is that floor a `provider_quota` floor? (BLO-31174.) See
+ * {@link HAS_TRANSIENT_RETRY_FLOOR} for why this reads `context_snapshot`.
+ *
+ * This is the label that must carry NO alert bound: the quota floor is a
+ * contractual session/billing boundary carrying an authoritative reset instant,
+ * it is honoured verbatim, and a multi-day park is the contract being kept.
+ * See `refineScheduledRetryParkReason` in `metrics.ts`.
+ */
+export const IS_PROVIDER_QUOTA_FAMILY = sql<boolean>`(
+  ${heartbeatRuns.contextSnapshot}->>'providerQuotaRetryNotBefore' is not null
+)`;
+
+/**
  * Refresh the per-agent maximum booked `scheduled_retry` park horizon
  * (BLO-25036). Unlike the overdue sibling above, this measures the selected
  * due time itself, including future due times, so it catches an implausibly
@@ -268,15 +318,33 @@ export async function refreshOverdueScheduledRetryAgeMetrics(db: Db, now = new D
  * 289x -- 300s for `max_turns_continuation` and k8s isolation, 1,080s for
  * `ccrotate_capacity` (`CCROTATE_CAPACITY_MAX_PARK_MS` plus 20% forward jitter
  * on the clamped value), 3,600s for `dependency_blocked`
- * (`Math.min(..., 3_600_000)`), 9,000s for the `transient_failure` ladder's
- * final 2h hop plus 25% jitter, and 86,700s for a `transient_failure` park that
- * adopts an upstream `retryNotBefore` floor (`MAX_TRANSIENT_RETRY_HORIZON_MS`
- * plus `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS`; a `provider_quota` floor is never
- * clamped, so it has no ceiling) -- so a single threshold aggregated over all
- * of them is wrong in both directions at once. At
- * the 5,400s bound the alert shipped with, every run reaching transient attempt
- * 4 breaches BY DESIGN (1,016 breaching samples across 12 agents in the 7 days
- * to 2026-09-28, every one inside [5590, 8978], i.e. below the transient
+ * (`Math.min(..., 3_600_000)`), and three different ceilings for
+ * `transient_failure` -- so a single threshold aggregated over all of them is
+ * wrong in both directions at once.
+ *
+ * `transient_failure` is not one class (Ally C1 on onprem-k8s#4145). The raw
+ * column holds that one value for three writer paths, so the published label
+ * is REFINED past the column before it reaches the gauge -- see
+ * `refineScheduledRetryParkReason` and the two SQL expressions above:
+ *
+ *  - `transient_failure` (no floor): the ladder's final 2h hop plus 25%
+ *    jitter, **9,000s**.
+ *  - `transient_failure_floor`: an upstream `retryNotBefore` floor, with up
+ *    to `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` of forward jitter when it is
+ *    at or just under the horizon; an actually horizon-clamped floor carries no
+ *    forward jitter. The maximum is `MAX_TRANSIENT_RETRY_HORIZON_MS` plus
+ *    300s, **86,700s**. `jitterTransientRetry
+ *    Floor`'s own docstring puts these floors "routinely 4-5h out while the
+ *    largest backoff hop is 2h", i.e. 1.6-2x over the ladder ceiling before the
+ *    clamp is even reached -- a breach guaranteed by construction if the two
+ *    share one bound.
+ *  - `transient_failure_quota_floor`: a `provider_quota` floor, which
+ *    `clampTransientHorizon` deliberately never clamps. **No ceiling exists.**
+ *    An alert rule must exclude this label, not bound it.
+ *
+ * At the 5,400s bound the alert shipped with, every run reaching transient
+ * attempt 4 breaches BY DESIGN (1,016 breaching samples across 12 agents in the
+ * 7 days to 2026-09-28, every one inside [5590, 8978], i.e. below the transient
  * ladder ceiling), while a capacity park sitting at 3.3x its own 1,080s ceiling -- the writer
  * bug BLO-28919 fixed -- stays invisible. Bound each reason against its own
  * constant instead of retuning one number.
@@ -289,11 +357,18 @@ export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<v
         .select({
           agentId: heartbeatRuns.agentId,
           reason: heartbeatRuns.scheduledRetryReason,
+          hasRetryFloor: HAS_TRANSIENT_RETRY_FLOOR,
+          isProviderQuotaFamily: IS_PROVIDER_QUOTA_FAMILY,
           horizonSeconds: sql<number | string>`max(extract(epoch from ${heartbeatRuns.scheduledRetryAt} - ${heartbeatRuns.updatedAt}))`,
         })
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.status, "scheduled_retry"), isNotNull(heartbeatRuns.scheduledRetryAt)))
-        .groupBy(heartbeatRuns.agentId, heartbeatRuns.scheduledRetryReason),
+        .groupBy(
+          heartbeatRuns.agentId,
+          heartbeatRuns.scheduledRetryReason,
+          HAS_TRANSIENT_RETRY_FLOOR,
+          IS_PROVIDER_QUOTA_FAMILY,
+        ),
     ]);
 
     const knownAgentIds = new Set(agentRows.map((row) => row.id));
@@ -301,6 +376,8 @@ export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<v
       horizonByAgent.map((row) => ({
         agentId: row.agentId,
         reason: row.reason,
+        hasRetryFloor: row.hasRetryFloor,
+        isProviderQuotaFamily: row.isProviderQuotaFamily,
         // Clamp as the overdue sibling does: a row whose due time has already
         // passed can be touched again (see the known limit above), which would
         // otherwise surface a negative horizon. Lateness is BLO-22094's gauge.

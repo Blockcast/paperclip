@@ -63,6 +63,7 @@ import {
   isClaudeMaxTurnsResult,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
+  isClaudeTerminalResultEvent,
   isClaudeTransientUpstreamError,
   isClaudeSilentFailure,
   isClaudeUnknownSessionError,
@@ -1195,6 +1196,64 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stdout: proc.stdout,
       stderr: proc.stderr,
     });
+    // PEN-3259: this file's own veto, and the one that actually decides the label.
+    // `isClaudeTransientUpstreamError` narrows its internal login veto to the
+    // terminal-result surfaces, but every classifier below is gated on
+    // `requiresLogin` FIRST (:1423-1446, :1467), so a transcript-only auth token
+    // suppressed the real verdict before the narrowed rule was ever consulted —
+    // which left the parse.ts change a no-op at every production call site. The
+    // same narrowing has to be applied here or it does not take effect.
+    //
+    // Gated on `isClaudeTerminalResultEvent`, not on `parsed` truthiness, because
+    // this file derives `parsed` as `parsedStream.resultJson ?? parseJson(stdout)`
+    // (:1181) and that second arm admits any parseable object. On the `!parsed`
+    // path the two agree by construction, so this is provably inert there and
+    // changes only the result-event population.
+    //
+    // `loginMeta` above is deliberately NOT narrowed: `detectClaudeLoginRequired`
+    // derives `loginUrl` from `[stdout, stderr]` independently of `requiresLogin`
+    // (parse.ts:193), so narrowing it wholesale would also drop the login URL
+    // surfaced to the operator in `errorMeta` — a separate regression from the one
+    // being fixed. What is narrowed is the CLASSIFICATION input only.
+    //
+    // What this admits, enumerated — `requiresLogin` gates five things below:
+    //   1. `transientUpstream` (:1446) — the intended family.
+    //   2. `quotaExhausted` (:1431) — newly reachable. `isClaudeQuotaExhausted`
+    //      reads `parsed` ONLY (no `stdout` parameter), so it cannot be
+    //      transcript-poisoned either way.
+    //   3. `providerQuota` (:1435) — narrowed the same way, as is (1)'s input: its
+    //      internal login veto on the transcript let a quota result that mentioned
+    //      auth fall through to (1), and (1)'s quota check must agree with this one.
+    //   4/5. `claudeReportedSuccess` / `failed` (:1423-1426) and
+    //      `resolvedErrorCode` (:1467). `failed` ORs in `requiresLogin`, so under
+    //      the wide read a run whose terminal event reported clean SUCCESS was
+    //      marked failed and coded `claude_auth_required` because its transcript
+    //      contained `failed to authenticate` somewhere — ordinary git/gh/ssh and
+    //      registry output. Those false positives are what this drops. The
+    //      override itself is preserved: the case the comment at :1412 describes
+    //      lives on `parsed.result`, which the narrowed read still consults.
+    //
+    // Scoped OUT, deliberately, and recorded here because it sits on the path
+    // this change narrows: the CLASSIFICATION is narrowed, the SCHEDULE derived
+    // from it is not. `extractClaudeRetryNotBefore` (:1477) is still handed the
+    // full `proc.stdout`, so a run whose family was decided from bounded surfaces
+    // can still take its `retryNotBefore` from a transcript `…resets at <t>`
+    // string that had no part in deciding that family. Before this change the two
+    // agreed by construction, because a transcript-labelled family drew its
+    // timestamp from the same text that labelled it; narrowing one side breaks
+    // that coupling. Left wide on purpose, for two reasons: the extractor prefers
+    // the structured `parsed` fields and only falls back to the haystack
+    // (`parse.ts:676-681`), and narrowing it is a behaviour change to the retry
+    // SCHEDULE that no corpus run here measures — the 114k-log run predates it and
+    // scored verdicts, not timestamps. Unmeasured, so disclosed rather than
+    // bundled in. A transcript carrying a reset-shaped string is believed rare but
+    // is NOT a measured zero; treat that as the open question if a run ever
+    // retries on a timestamp its family never saw.
+    const requiresLogin = detectClaudeLoginRequired({
+      parsed,
+      stdout: isClaudeTerminalResultEvent(parsed) ? "" : proc.stdout,
+      stderr: proc.stderr,
+    }).requiresLogin;
     const errorMeta =
       loginMeta.loginUrl != null
         ? {
@@ -1229,7 +1288,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
       const providerQuota =
-        !loginMeta.requiresLogin &&
+        !requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeProviderQuotaError({
           parsed: null,
@@ -1238,7 +1297,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
-        !loginMeta.requiresLogin &&
+        !requiresLogin &&
         !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeTransientUpstreamError({
@@ -1255,7 +1314,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             errorMessage: fallbackErrorMessage,
           })
         : null;
-      const errorCode = loginMeta.requiresLogin
+      const errorCode = requiresLogin
         ? "claude_auth_required"
         : isClaudeModelNotFoundError({
           parsed: null,
@@ -1307,6 +1366,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return {
           inputTokens: asNumber(usageObj.input_tokens, 0),
           cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
+          // BLO-29842: keep cache WRITE out of inputTokens; billed 1.25x-2x.
+          cacheCreationInputTokens: asNumber(usageObj.cache_creation_input_tokens, 0),
           outputTokens: asNumber(usageObj.output_tokens, 0),
         };
       })();
@@ -1376,40 +1437,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // retry at line ~898 below NEVER fires because errorCode isn't
     // claude_auth_required. So a stale-active-account bug masquerades
     // as an inert "adapter failed" loop and the pool never advances.
-    // Override claudeReportedSuccess when loginMeta says auth is needed.
+    // Override claudeReportedSuccess when the narrowed login veto says auth is
+    // needed (`requiresLogin`, PEN-3259 — result-event surfaces, not the transcript).
     const claudeReportedSuccess =
-      asString(parsed.subtype, "") === "success" && !parsedIsError && !loginMeta.requiresLogin;
+      asString(parsed.subtype, "") === "success" && !parsedIsError && !requiresLogin;
     const failed =
-      parsedIsError || loginMeta.requiresLogin || ((proc.exitCode ?? 0) !== 0 && !claudeReportedSuccess);
+      parsedIsError || requiresLogin || ((proc.exitCode ?? 0) !== 0 && !claudeReportedSuccess);
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
     const quotaExhausted =
-      failed && !loginMeta.requiresLogin && isClaudeQuotaExhausted(parsed);
+      failed && !requiresLogin && isClaudeQuotaExhausted(parsed);
     // Quota messages ("out of extra usage", "weekly limit reached", etc.) also
     // match the transient-upstream regex; classify quota first so the retry
     // schedule doesn't burn attempts against an already rate-limited account.
     const providerQuota =
       failed &&
-      !loginMeta.requiresLogin &&
+      !requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
       isClaudeProviderQuotaError({
         parsed,
-        stdout: proc.stdout,
+        stdout: isClaudeTerminalResultEvent(parsed) ? "" : proc.stdout,
         stderr: proc.stderr,
         errorMessage,
       });
     const transientUpstream =
       failed &&
-      !loginMeta.requiresLogin &&
+      !requiresLogin &&
       !quotaExhausted &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
       !providerQuota &&
       isClaudeTransientUpstreamError({
         parsed,
-        stdout: proc.stdout,
+        stdout: isClaudeTerminalResultEvent(parsed) ? "" : proc.stdout,
         stderr: proc.stderr,
         errorMessage,
       });
@@ -1421,7 +1483,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
-    const resolvedErrorCode = loginMeta.requiresLogin
+    // KNOWN GAP, tracked in PEN-3829 — not fixed here, so do not read the
+    // narrowing above as covering this ladder. `isClaudeModelNotFoundError` below
+    // still reads the full `proc.stdout` and ranks ABOVE both families this change
+    // bounded (`providerQuota` :1511, `transientUpstream` :1513), so a genuine 429
+    // whose TRANSCRIPT merely mentions `model not found` still codes
+    // `model_not_found`. `errorFamily` (:1517) is computed independently and does
+    // not consult it, so that run emerges with `errorCode: "model_not_found"`
+    // beside `errorFamily: "transient_upstream"`. Left alone deliberately:
+    // `model_not_found` is a PERMANENT label, so narrowing it widens what gets a
+    // retry family, and that direction needs its own corpus measurement rather
+    // than inheriting this change's.
+    const resolvedErrorCode = requiresLogin
       ? "claude_auth_required"
       : quotaExhausted
       ? "provider_quota_exhausted"

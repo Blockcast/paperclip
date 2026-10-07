@@ -222,9 +222,9 @@ test('node is set up unconditionally, so the record-closing path is not silently
 //
 // Guard (1) is correct and stays. What it never had was a way to END a wait —
 // the only exit was a human. These pin the three things that make the supersede
-// safe to leave running unattended: it is armed by the same condition as the
-// escalation, it approves nothing, and it cannot be starved by an Alertmanager
-// outage.
+// safe to leave running unattended: it is armed by its own threshold, separate
+// from the escalation (BLO-25050), it approves nothing, and it cannot be starved
+// by an Alertmanager outage.
 // ---------------------------------------------------------------------------
 
 const stepIndex = (needle) => {
@@ -260,12 +260,43 @@ test('the supersede survives a failed escalation — Alertmanager must not freez
   );
 });
 
-test('the supersede reuses PENDING_DEPLOY_ALERT_HOURS — no second tunable', () => {
-  // A separate threshold would let the two drift apart, so a slot could escalate
-  // without superseding (or supersede a run nobody was told about). One signal,
-  // one number.
+test('the supersede and the escalation read SEPARATE thresholds (BLO-25050)', () => {
+  // This test used to assert the opposite — "the supersede reuses
+  // PENDING_DEPLOY_ALERT_HOURS — no second tunable" — on the reasoning that a
+  // separate threshold would let the two drift apart, so a slot could escalate
+  // without superseding. One signal, one number.
+  //
+  // Escalating without superseding turns out to be CORRECT, because the gate
+  // acquired a second consumer after that was written: a Paperclip board card
+  // pins to the waiting run id via payload.gate and is retired by the BLO-29359
+  // reconciler when that run terminates. A 6h supersede therefore destroys the
+  // card's handle before the board can reach it. Measured 2026-10-04 on this
+  // repo: three consecutive gate-holder runs lived 7.04h / 6.71h / 7.40h against
+  // a 45.7h median time-to-decision for agent-requested cards (n=24, p25 27.7h,
+  // p75 213h; only 4 of 24 decided inside 7h). The ask was unanswerable through
+  // that channel by construction, and BLO-25050 sat 13 days while production
+  // reached 611 commits behind.
+  //
+  // Re-coupling them is a one-line edit that runs green forever while silently
+  // restoring an unanswerable gate — exactly the class this file exists to catch.
+  const escalate = code.slice(stepIndex('id: escalate'), stepIndex('id: supersede'));
   const step = code.slice(stepIndex('id: supersede'), stepIndex('supersede-stale-deploy.mjs'));
-  assert.match(step, /ALERT_AFTER_HOURS:\s*\$\{\{\s*vars\.PENDING_DEPLOY_ALERT_HOURS/);
+
+  assert.match(
+    escalate,
+    /ALERT_AFTER_HOURS:\s*\$\{\{\s*vars\.PENDING_DEPLOY_ALERT_HOURS\s*\|\|\s*'6'/,
+    'the escalation must still fire at 6h — BLO-25050 moved the supersede, not the alert',
+  );
+  assert.match(
+    step,
+    /SUPERSEDE_AFTER_HOURS:\s*\$\{\{\s*vars\.PENDING_DEPLOY_SUPERSEDE_HOURS\s*\|\|\s*'48'/,
+    'the supersede must read its own variable, defaulted above card decision latency',
+  );
+  assert.doesNotMatch(
+    step,
+    /ALERT_AFTER_HOURS/,
+    'the supersede step must not read the alert threshold — the coupling BLO-25050 removed',
+  );
   assert.match(
     step,
     /MASTER_SHA:\s*\$\{\{\s*steps\.dispatch\.outputs\.master_sha\s*\}\}/,

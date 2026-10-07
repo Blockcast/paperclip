@@ -616,17 +616,24 @@ function nextAssigneeIds(input: {
 export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | null): IssueExecutionPolicy | null {
   if (!policy) return null;
   if (!policy.monitor) return policy;
-  // BLO-39945: clearing a monitor must not take the productivity-review opt-out
-  // with it. (This function also drops `reviewPreset`/`authorizationPolicy` —
-  // pre-existing and out of scope here; tracked as BLO-18816, "monitor-only
-  // write path so re-arming can't clobber executionPolicy".)
-  if (policy.stages.length === 0 && !policy.productivityReviewDisabled) return null;
-  return {
-    mode: policy.mode,
-    commentRequired: policy.commentRequired,
-    stages: policy.stages,
-    ...(policy.productivityReviewDisabled ? { productivityReviewDisabled: true } : {}),
-  };
+  const { monitor: _monitor, ...rest } = policy;
+  // BLO-18816: mirror `normalizeIssueExecutionPolicy`'s emptiness rule exactly.
+  // This used to rebuild `{mode, commentRequired, stages}` and so silently
+  // dropped `reviewPreset`/`authorizationPolicy` from every clear path — the
+  // same class of loss the monitor write path exists to prevent, arriving via
+  // the clear instead of the arm. The rest-spread is what keeps BLO-39945's
+  // `productivityReviewDisabled` too, without this function having to name it
+  // — an allowlist is how that field came to be dropped in the first place.
+  // Only the emptiness guard still enumerates, because it has to.
+  if (
+    rest.stages.length === 0 &&
+    !rest.reviewPreset &&
+    !rest.authorizationPolicy &&
+    !rest.productivityReviewDisabled
+  ) {
+    return null;
+  }
+  return rest;
 }
 
 export function setIssueExecutionPolicyMonitorScheduledBy(
@@ -1412,7 +1419,24 @@ function applyMonitorTransition(
         }
       }
     }
-  } else if (previousPolicy?.monitor) {
+  } else if (
+    previousPolicy?.monitor ||
+    // BLO-18816 / BLO-27586 AC1: once a monitor fires,
+    // `buildIssueMonitorTriggeredPatch` strips it out of `executionPolicy`
+    // (returning null outright for a monitor-only policy), so a `triggered`
+    // monitor lives ONLY in `executionState`. Keying the clear on
+    // `previousPolicy.monitor` alone therefore made a clear a silent 200 no-op
+    // with the stale notes intact, and re-arm 422s once attempts are exhausted
+    // — no exit in either direction.
+    //
+    // Deliberately gated on `monitorExplicitlyUpdated`. Dropping that gate is
+    // the naive fix and it is worse: every incidental carry-forward transition
+    // (a status-only return, a stage auto-approval) would then destroy the
+    // `triggered` state that `tickExpiredIssueMonitors` needs to run the
+    // monitor's `recoveryPolicy`, trading a visible no-op for a silent
+    // cancellation. Only a caller who explicitly wrote the monitor clears it.
+    (input.monitorExplicitlyUpdated && currentMonitorState && currentMonitorState.status !== "cleared")
+  ) {
     clearArmedMonitorColumns(patch);
     targetMonitorState = buildClearedMonitorState({
       previous: currentMonitorState,

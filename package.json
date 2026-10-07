@@ -54,6 +54,7 @@
     "test:multer-security-override": "node --test scripts/multer-security-override.test.js",
     "test:js-yaml-security-override": "node --test scripts/js-yaml-security-override.test.js",
     "test:http-cache-semantics-security-override": "node --test scripts/http-cache-semantics-security-override.test.js",
+    "test:proxy-addr-security-override": "node --test scripts/proxy-addr-security-override.test.js",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
@@ -159,6 +160,14 @@
           "GHSA-f27v-pv5m-c5g6"
         ]
       }
+    },
+    "BLO-40607": {
+      "proxy-addr": {
+        "patchedRange": ">=2.0.8 <3",
+        "advisories": [
+          "GHSA-jqcg-44mw-7w3h"
+        ]
+      }
     }
   },
   "pnpm": {
@@ -198,6 +207,7 @@
       "browserslist": ">=4.28.7 <5",
       "http-cache-semantics": ">=4.3.0 <5",
       "source-map-js": ">=1.2.2 <2",
+      "tinypool": ">=2.1.2 <3",
       "react": "^19.2.7",
       "react-dom": "^19.2.7",
       "lexical": "0.46.0",
@@ -209,7 +219,8 @@
       "@lexical/react": "0.46.0",
       "@lexical/rich-text": "0.46.0",
       "@lexical/selection": "0.46.0",
-      "@lexical/utils": "0.46.0"
+      "@lexical/utils": "0.46.0",
+      "proxy-addr": ">=2.0.8 <3"
     }
   }
 }
