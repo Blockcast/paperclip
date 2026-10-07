@@ -2170,6 +2170,150 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
       FIRING_FENCE_ARG,
     );
   });
+
+  // The `!terminal` / `|| terminal` gates. Every other terminal test either
+  // creates (so the join gate short-circuits on `created`) or re-fires with
+  // labels that drop `team`, so `baseConfig`'s `team`-keyed ownerMap never
+  // resolves. These key the ownerMap on `alertname: Watchdog`, as operators do,
+  // so only the severity gate stands between the owner and the row.
+  const WATCHDOG_OWNER_CONFIG = () =>
+    baseConfig({ ownerMap: { alertname: { Watchdog: "agent:agent-watchdog" } } });
+  const watchdogAlert = (fingerprint: string) =>
+    baseAlert({ labels: { alertname: "Watchdog", severity: "none" }, fingerprint });
+
+  it("CONTROL — a terminal-severity re-fire never retrofits an owner onto its `done` row", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce({
+      ...refireState,
+      alertname: "Watchdog",
+      severity: "none",
+    });
+    // Not `Once`: an unguarded retrofit re-reads the row, and a `null` second
+    // read would let this control pass for the wrong reason.
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "done",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+
+    await handleWebhook(
+      ctx,
+      WATCHDOG_OWNER_CONFIG(),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({ alerts: [watchdogAlert("9a3b1e4c5f6d7890")] }),
+      }),
+    );
+
+    // BLO-24177's own unassign is the only assignee write.
+    expect(assigneePatches(mocks)).toEqual([
+      expect.objectContaining({ assigneeAgentId: null, assigneeUserId: null }),
+    ]);
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.owner.retrofitted",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("CONTROL — a terminal-severity fingerprint joining a live aggregate row never retrofits its owner", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-winner",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }));
+
+    await handleWebhook(
+      ctx,
+      WATCHDOG_OWNER_CONFIG(),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({ alerts: [watchdogAlert("watchdog-member-2")] }),
+      }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(assigneePatches(mocks)).toEqual([]);
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.owner.retrofitted",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("still records a committed retrofit in state when its metric write fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(refireState);
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+    mocks.metrics.write.mockImplementation(async (name: string) => {
+      if (name === "alertmanager.owner.retrofitted") throw new Error("metrics down");
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("agent:agent-multicast")],
+        }),
+      }),
+    );
+
+    // The row already holds the agent, so no later delivery's retrofit will
+    // see it again: this write is the state record's only chance to agree.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: "agent-multicast" }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("a failed retrofit does not abort the re-fire's state write", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce({
+      ...refireState,
+      resolvedAt: "2026-04-29T09:00:00Z",
+    });
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+    mocks.issues.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) => {
+        if ("assigneeAgentId" in patch) throw new Error("update rejected");
+        return { id: "issue-existing" };
+      },
+    );
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("agent:agent-multicast")],
+        }),
+      }),
+    );
+
+    // Routing is a nicety; clearing `resolvedAt` is what keeps the ladder live.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ resolvedAt: null, assigneeAgentId: null }),
+      FIRING_FENCE_ARG,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

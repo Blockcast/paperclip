@@ -1420,10 +1420,20 @@ async function retrofitAggregateOwner(
       patch.assigneeAgentId ? `agent:${patch.assigneeAgentId}` : patch.assigneeUserId
     } onto aggregate issue ${issueId} for ${alert.labels.alertname ?? "(unknown)"} (BLO-40764)`,
   );
-  await ctx.metrics.write("alertmanager.owner.retrofitted", 1, {
-    alertname: alert.labels.alertname ?? "unknown",
-    target: patch.assigneeAgentId ? "agent" : "user",
-  });
+  try {
+    await ctx.metrics.write("alertmanager.owner.retrofitted", 1, {
+      alertname: alert.labels.alertname ?? "unknown",
+      target: patch.assigneeAgentId ? "agent" : "user",
+    });
+  } catch (metricErr) {
+    // Best-effort, like the other metric writes in this file. The patch above
+    // has already committed; a throw here would keep the caller from folding
+    // it into state, and the next delivery's row-owned guard would then never
+    // record it — leaving the state record ownerless for the life of the row.
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: failed to record owner retrofit metric for ${alert.fingerprint}: ${String(metricErr)}`,
+    );
+  }
   return patch;
 }
 
@@ -2186,22 +2196,33 @@ export async function handleFiring(
         decisionApplied &&
         (decision.kind === "refresh" || decision.kind === "reopen")
       ) {
-        const retrofit = await retrofitAggregateOwner(
-          ctx,
-          config,
-          alert,
-          tracked.paperclipCompanyId,
-          aggregateKey,
-          firingToken,
-          tracked.paperclipIssueId,
-          null,
-        );
-        if (retrofit) {
-          tracked = {
-            ...tracked,
-            assigneeAgentId: retrofit.assigneeAgentId ?? tracked.assigneeAgentId,
-            assigneeUserId: retrofit.assigneeUserId ?? tracked.assigneeUserId,
-          };
+        // Tolerated like the re-sync above: a failed retrofit must not abort
+        // the member/state writes below — the `resolvedAt` clear and the ladder
+        // restart — any more than a failed description refresh does. Only a
+        // lost generation is fatal.
+        try {
+          const retrofit = await retrofitAggregateOwner(
+            ctx,
+            config,
+            alert,
+            tracked.paperclipCompanyId,
+            aggregateKey,
+            firingToken,
+            tracked.paperclipIssueId,
+            null,
+          );
+          if (retrofit) {
+            tracked = {
+              ...tracked,
+              assigneeAgentId: retrofit.assigneeAgentId ?? tracked.assigneeAgentId,
+              assigneeUserId: retrofit.assigneeUserId ?? tracked.assigneeUserId,
+            };
+          }
+        } catch (err) {
+          if (err instanceof AggregateGenerationLostError) throw err;
+          ctx.logger.warn(
+            `Failed to retrofit owner onto issue ${tracked.paperclipIssueId} on re-fire: ${String(err)}`,
+          );
         }
       }
 

@@ -314,8 +314,12 @@ cached too (empty string) so a missing user doesn't cause repeated lookups.
 
 #### Retrofitting an owner onto an alertname that is already firing (BLO-40764)
 
-**You do not have to close the open issue to re-route a live alertname.** Add
-the annotation (or the `ownerMap` entry) and the next delivery applies it.
+**An open issue with no agent can be re-routed without closing it.** Add the
+annotation (or the `ownerMap` entry) and the next delivery applies it. An open
+issue that already holds an agent cannot — and that includes every row the
+plugin itself assigned from `fallbackAgentName` (or an `issueRouteMap` agent)
+at creation, which is most rows created since ownerless creation was refused.
+Reassign those in Paperclip.
 
 Until BLO-40764 the chain above ran on the **creation** path only. One alertname
 owns one aggregate issue for as long as that issue is open — and "open" includes
@@ -343,11 +347,14 @@ A row an operator closed is also left alone while its close is still suppressing
 re-opens (see *Operator suppression* below) — assigning an owner there would be
 the same resurrection by a side door.
 
-Each applied retrofit logs and emits `alertmanager.owner.retrofitted`
-(`alertname`, `target=agent|user`). If you add an annotation and that counter
-never moves for its alertname, the resolution chain is not reaching your value —
-check that no earlier link (a `paperclip_assignee_email` *label*, or an
-`ownerMap` entry matching one of the alert's labels) is shadowing it.
+Each applied retrofit logs (naming the agent or user it applied) and emits
+`alertmanager.owner.retrofitted`, labelled by `alertname` only. If you add an
+annotation and that counter never moves for its alertname, check, in order:
+
+- the row already holds an agent — most often the `fallbackAgentName` agent the
+  plugin stamped at creation — which a retrofit never overwrites (see above);
+- an earlier link in the chain (a `paperclip_assignee_email` *label*, or an
+  `ownerMap` entry matching one of the alert's labels) is shadowing your value.
 
 ### Issue creation floor and rule-level opt-out
 
