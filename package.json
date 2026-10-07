@@ -55,6 +55,7 @@
     "test:js-yaml-security-override": "node --test scripts/js-yaml-security-override.test.js",
     "test:http-cache-semantics-security-override": "node --test scripts/http-cache-semantics-security-override.test.js",
     "test:proxy-addr-security-override": "node --test scripts/proxy-addr-security-override.test.js",
+    "test:hono-node-server-security-override": "node --test scripts/hono-node-server-security-override.test.js",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
