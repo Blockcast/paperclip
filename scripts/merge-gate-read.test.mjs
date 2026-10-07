@@ -12,13 +12,13 @@ const READER = fileURLToPath(new URL("./merge-gate-read.sh", import.meta.url));
  * exit is an expected outcome here and must not be read as a harness failure —
  * the VERDICT IS THE LINES. Use `read()` unless you are asserting on rc itself.
  */
-function readRc(rows, dead = "__none__", pend = "") {
+function readRc(rows, dead = "__none__", pend = "", wdead = "") {
   const stdin = rows.length ? rows.map((r) => r.join("\t")).join("\n") + "\n" : "";
   const opts = { input: stdin, encoding: "utf8" };
   let rc = 0;
   let out;
   try {
-    out = execFileSync("bash", [READER, "--rows", dead, pend], opts);
+    out = execFileSync("bash", [READER, "--rows", dead, pend, wdead], opts);
   } catch (e) {
     rc = e.status;
     out = e.stdout;
@@ -27,8 +27,8 @@ function readRc(rows, dead = "__none__", pend = "") {
 }
 
 /** Run the verdict pipeline and return only its lines. */
-function read(rows, dead = "__none__", pend = "") {
-  return readRc(rows, dead, pend).lines;
+function read(rows, dead = "__none__", pend = "", wdead = "") {
+  return readRc(rows, dead, pend, wdead).lines;
 }
 
 /** Render pend rows the way the live path hands them to verdicts(). */
@@ -40,11 +40,12 @@ const pend = (...rows) => rows.map((r) => r.join("\t")).join("\n");
  * `workflow-id<SP>run-started-at<SP>status-updated-at`. Empty is the
  * no-witness case, and every
  * pre-BLO-38577 fixture leaves it empty on purpose: the external arm must be
- * inert unless a witness was positively established.
+ * inert unless a witness was positively established. A non-empty `arm` asks for
+ * the witness arm's ids alone — the WDEAD set the live path hands verdicts().
  */
-function dead(runs, wits = "") {
+function dead(runs, wits = "", arm = "") {
   const stdin = runs.map((r) => r.join("\t")).join("\n") + "\n";
-  const out = execFileSync("bash", [READER, "--dead", wits], { input: stdin, encoding: "utf8" });
+  const out = execFileSync("bash", [READER, "--dead", wits, arm], { input: stdin, encoding: "utf8" });
   return out.trim();
 }
 
@@ -767,6 +768,43 @@ describe("merge-gate reader", () => {
         assert.equal(dead(PIM, "286646914 2026-09-30T17:30:00Z 2026-09-30T17:40:00Z"), "");
       });
 
+      // Ally review at bc1d8a56 (Important): the OTHER half of that min had no
+      // failing mutation — `e = P[2]` (run start alone) passed the suite, since
+      // the fixture above only kills `e = P[3]`. Reachable: a re-run advances
+      // run_started_at while a status published at the earlier attempt keeps
+      // its old updated_at, so P[3] < P[2]. Here the status was published at
+      // 09:50, ten minutes BEFORE the victim ran; reading the run start alone
+      // retires it on a verdict that predates it. Ally's demonstrated values.
+      it("refuses a witness whose status was published before the victim, however late its run started", () => {
+        assert.equal(
+          dead(
+            [["555", "pull_request", "111", "cancelled", "2026-10-01T10:00:00Z"]],
+            "555 2026-10-01T10:05:00Z 2026-10-01T09:50:00Z",
+          ),
+          "",
+        );
+      });
+
+      // The live path asks for this arm's ids ALONE (WDEAD) so verdicts() can
+      // keep a witness-retired run's blocking rows. A run the SIBLING arm
+      // retired must not leak into that set: its pass is same-tree, same-lane,
+      // so its `failure` rows ARE stale (BLO-34835) and keeping them is a
+      // permanent false RED.
+      it("names only the witness arm's ids when asked for them alone", () => {
+        assert.equal(dead(PIM, WITNESS, "w"), "36752366689");
+        assert.equal(
+          dead(
+            [
+              ["286646914", "pull_request", "36752366689", "failure", "2026-09-30T17:34:32Z"],
+              ["286646914", "pull_request", "36752400000", "success", "2026-09-30T17:40:00Z"],
+            ],
+            "",
+            "w",
+          ),
+          "",
+        );
+      });
+
       // Ally review 5374012593 (Important): `split(W[j], P, " ")` had no
       // failing mutation. The arity is the contract with the live path's
       // `printf '%s %s\n' "$pair" "$ts"`, and the realistic malformation is a
@@ -802,12 +840,65 @@ describe("merge-gate reader", () => {
     // live path no longer produces.
     const PEND = pend(["36752366689", "cancelled", "ci-gate-status"]);
 
+    // The corpse is retired by the WITNESS arm, so the live path also hands
+    // it over as WDEAD — and its rows are `cancelled`, i.e. they said nothing,
+    // which is the one non-pass a witness may speak for.
     it("prints no STOP once the aggregator's corpse is retired", () => {
-      assert.deepEqual(stops(read(rows, "36752366689", PEND)), []);
+      assert.deepEqual(stops(read(rows, "36752366689", PEND, "36752366689")), []);
     });
 
     it("prints both STOPs while it is not", () => {
       assert.equal(stops(read(rows, "__none__", PEND)).length, 2);
+    });
+
+    // Ally review at bc1d8a56 (Important): `cx[i]` keys on the RUN conclusion,
+    // not on what the run published. A job that fails before cancel-in-progress
+    // kills the rest leaves a real `failure` row under a `cancelled` run, and
+    // the witness — a pass on a different tree that republishes no check-run
+    // name — used to strip it with no replacement: empty output, rc 0. The
+    // unrelated surviving row keeps the BLO-34263 ABSENT guard quiet, so it
+    // cannot mask the result. Ally's demonstrated fixture.
+    it("keeps a witness-retired run's own at-head failure", () => {
+      const runs = [["555", "pull_request", "111", "cancelled", "2026-10-01T10:00:00Z"]];
+      const wit = "555 2026-10-01T10:05:00Z 2026-10-01T10:10:00Z";
+      const atHead = [
+        ["secret-scan", "failure", "2026-10-01T10:02:00Z", "111"],
+        ["ci-gate", "success", "2026-10-01T10:10:00Z", "status"],
+        ["other", "success", "2026-10-01T10:01:00Z", "999"],
+      ];
+      assert.equal(dead(runs, wit, "w"), "111", "the witness arm must still fire here");
+      assert.deepEqual(read(atHead, dead(runs, wit), pending(runs).join("\n"), dead(runs, wit, "w")), [
+        "STOP\tsecret-scan\tfailure\trun=111",
+      ]);
+    });
+
+    // WDEAD is matched anchored, like DEAD: `1113` CONTAINS the witness id
+    // `111`, so an unanchored match keeps a sibling-retired run's stale
+    // `failure` (BLO-34835) as a permanent false RED.
+    it("keeps only the rows of runs WDEAD names exactly", () => {
+      const rows = [
+        ["verify", "failure", "t1", "1113"],
+        ["x", "success", "t1", "9"],
+      ];
+      assert.deepEqual(read(rows, "111|1113", "", "111"), []);
+    });
+
+    // The keep is confined to rows that would STOP. A witness-retired run's
+    // rows that never block are dropped exactly as before, so the survivor
+    // count and its ABSENT guard are untouched: keeping `success`/`skipped`
+    // would suppress ABSENT, keeping `neutral` prints a line, and keeping
+    // `cancelled` re-opens BLO-38577. Counting a witness-retired run's passes
+    // as survivors would be a separate, GREEN-direction change; not made here.
+    it("drops a witness-retired run's non-blocking rows exactly as before", () => {
+      const quiet = [
+        ["a", "success", "t1", "111"],
+        ["b", "skipped", "t1", "111"],
+        ["c", "neutral", "t1", "111"],
+        ["d", "cancelled", "t1", "111"],
+      ];
+      assert.deepEqual(read(quiet, "111", "", "111"), [
+        "STOP\t<every check-run at this head dropped as superseded-run>\tABSENT\trun=-",
+      ]);
     });
   });
 
@@ -1064,7 +1155,7 @@ describe("merge-gate reader", () => {
     });
 
     // A superseded run is completed and non-success, so pending_runs() emits it
-    // — and the DEAD grep strips its rows before `contributed` can be set, so
+    // — and the DEAD filter strips its rows before `contributed` can be set, so
     // without the END-loop exemption it prints NO-VERDICT for a run whose lane
     // demonstrably spoke. BLO-34114s own control is this shape: penstock
     // fbdb3477, run 34542908750, cancelled with 6 dead `failure` rows superseded
@@ -1513,6 +1604,22 @@ describe("merge-gate reader", () => {
         hdr ?? "",
         /workflow-id <SP> run-started-at <SP> status-updated-at/,
         "header witness contract drifted from the 3-field shape the fence requires",
+      );
+    });
+
+    // The row half of the `cx[i]` fence lives in verdicts() and reaches the
+    // live path only through WDEAD, which no fixture can see. Dropping it from
+    // either end silently restores the stripped at-head `failure` (GREEN), so
+    // pin both ends here, as the witness resolution above is pinned.
+    it("hands the witness arm's ids to verdicts() on the live path", () => {
+      const lines = SOURCE.split("\n");
+      assert.ok(
+        lines.some((l) => /^WDEAD=\$\(.*\| dead_runs "\$WITNESSES" \S+\)$/.test(l)),
+        "WDEAD no longer computed from the witness arm alone",
+      );
+      assert.ok(
+        lines.some((l) => /^\} \| verdicts "\$DEAD" "\$PENDING" "\$WDEAD"$/.test(l)),
+        "live verdicts() call lost WDEAD",
       );
     });
 
