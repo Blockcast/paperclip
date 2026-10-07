@@ -2181,14 +2181,14 @@ test("the start-lock runbook routes its two arms on agent count, not on an alert
   // 14-day peak as a 7-day measurement while the 2h14m ceiling above silently
   // disagrees with its own source. Reviewed and declined once already (Ally,
   // 2026-10-06, PR #2059); pin the window labels so the next reader does not
-  // re-derive it, and so "reconciling" them turns the suite red instead. The
-  // 7-day row pins the window's end date, not just the word: an undated
-  // "7-day maximum" reads as the last 7 days, so the "Wedged cannot fire on
-  // this shape" inference re-dates itself forward while its evidence stays at
-  // 2026-09-25 (Ally, 2026-10-06, PR #2059 at ea2dfbf7).
+  // re-derive it, and so "reconciling" them turns the suite red instead. Both
+  // rows pin the window's end date, not just the word: an undated "7-day
+  // maximum" or "over the 14 days" reads as the last N days, so the inferences
+  // resting on these figures re-date themselves forward while their evidence
+  // stays at 2026-09-25 (Ally, 2026-10-06/07, PR #2059 at ea2dfbf7 and 6df7bb7d).
   for (const [figure, window, label] of [
     [/\b8043s\b/g, /7-day[^.]*2026-09-25/, "7-day maximum hold to 2026-09-25 (the 2026-09-24 three-agent episode)"],
-    [/\b8073s\b/g, /14 days/, "14-day peak across the 21 agents past 300s"],
+    [/\b8073s\b/g, /14 days[^.]*2026-09-25/, "14-day peak to 2026-09-25 across the 21 agents past 300s"],
   ]) {
     const hits = [...runbook.matchAll(figure)];
     assert.ok(
