@@ -29,50 +29,80 @@ import { badRequest } from "../errors.js";
 
 const NUL = "\u0000";
 
+/** An open container in the walk: the node, its keys (null for an array), and the next child. */
+type Frame =
+  | { node: readonly unknown[]; keys: null; next: number }
+  | { node: Record<string, unknown>; keys: string[]; next: number };
+
+/** Dotted/indexed path of the child most recently entered from each open frame. */
+function pathOf(frames: readonly Frame[]): string {
+  let path = "body";
+  for (const frame of frames) {
+    path += frame.keys === null ? `[${frame.next - 1}]` : `.${frame.keys[frame.next - 1]}`;
+  }
+  return path;
+}
+
 /**
  * First raw NUL reachable from `body`, as a dotted/indexed path and the UTF-8
  * byte offset within that string. Iterative so a deeply nested body cannot
  * overflow the stack — a 10 MB body of nested arrays is within the JSON limit.
+ *
+ * The walk keeps one frame per OPEN container, not one entry per node, and
+ * builds the path only on a hit. This runs pre-auth on every parsed body, so it
+ * is an availability guard too: pushing a `{node, path}` pair with its own
+ * path string for every node cost 2460-3650 ms and ~600 MB for a 9.5 MB body
+ * of five million array elements -- under the 10 MB JSON limit and ~11x the
+ * JSON.parse it follows. This walk: ~55 ms, no measurable heap growth.
+ * Re-walking for the path on a hit would not fix it: the caller decides whether
+ * the body ends in a NUL, and that second pass is the old cost again.
  */
 export function findRawNulInBody(
   body: unknown,
 ): { field: string; byteOffset: number } | null {
-  const stack: Array<{ node: unknown; path: string }> = [{ node: body, path: "body" }];
-  while (stack.length > 0) {
-    const { node, path } = stack.pop()!;
-
+  const frames: Frame[] = [];
+  let node = body;
+  for (;;) {
     if (typeof node === "string") {
       const index = node.indexOf(NUL);
       if (index >= 0) {
-        return { field: path, byteOffset: Buffer.byteLength(node.slice(0, index), "utf8") };
+        const byteOffset = Buffer.byteLength(node.slice(0, index), "utf8");
+        return { field: pathOf(frames), byteOffset };
       }
-      continue;
+    } else if (Array.isArray(node)) {
+      frames.push({ node, keys: null, next: 0 });
+    } else if (node !== null && typeof node === "object" && !ArrayBuffer.isView(node)) {
+      // A Buffer / typed array is what express.raw leaves behind for a binary
+      // content-type. Skipping it is an AVAILABILITY guard, not a correctness one:
+      // a Buffer's own entries are numbers, so the string branch above could never
+      // flag one anyway -- but Object.keys would materialize one key per byte.
+      // Measured: a 4 MB Buffer takes 0.26 ms with this clause and 7355 ms
+      // without, on the event loop, for any binary body up to the 10 MB limit.
+      const record = node as Record<string, unknown>;
+      frames.push({ node: record, keys: Object.keys(record), next: 0 });
     }
 
-    if (Array.isArray(node)) {
-      for (let i = node.length - 1; i >= 0; i -= 1) {
-        stack.push({ node: node[i], path: `${path}[${i}]` });
+    // Advance to the next unvisited child, closing exhausted containers.
+    for (;;) {
+      const top = frames.at(-1);
+      if (top === undefined) return null;
+      if (top.keys === null) {
+        if (top.next < top.node.length) {
+          node = top.node[top.next++];
+          break;
+        }
+      } else if (top.next < top.keys.length) {
+        node = top.node[top.keys[top.next++]];
+        break;
       }
-      continue;
-    }
-
-    // A Buffer / typed array is what express.raw leaves behind for a binary
-    // content-type. Skipping it is an AVAILABILITY guard, not a correctness one:
-    // a Buffer's own entries are numbers, so the string branch above could never
-    // flag one anyway -- but Object.entries would materialize one entry per
-    // byte. Measured: a 4 MB Buffer takes 0.26 ms with this clause and 7355 ms
-    // without, on the event loop, for any binary body up to the 10 MB limit.
-    if (node === null || typeof node !== "object" || ArrayBuffer.isView(node)) continue;
-
-    for (const [key, child] of Object.entries(node)) {
-      stack.push({ node: child, path: `${path}.${key}` });
+      frames.pop();
     }
   }
-  return null;
 }
 
 /**
- * Inbound provider-webhook deliveries, deliberately NOT guarded.
+ * Inbound third-party deliveries, deliberately NOT guarded: provider webhooks
+ * routed through plugins, and the GitHub webhook receiver.
  *
  * These carry third-party bytes, and a NUL in one is reachable in production:
  * `server/src/__tests__/plugin-metric-exposition.test.ts` records that
@@ -85,8 +115,18 @@ export function findRawNulInBody(
  * that path in either direction. If it turns out to 500 on insert, widening the
  * guard to cover it is a one-line change and an improvement; asserting that
  * now, and newly rejecting a delivery that currently works, is not.
+ *
+ * GitHub deliveries are the same class and equally unmeasured. GitHub
+ * normalizes most user-authored text, but nothing here shows a delivery cannot
+ * carry a NUL. A refusal there also costs more than a 400 to an agent: GitHub
+ * marks the delivery failed, repeated failures disable the hook, and this guard
+ * runs ahead of httpLogger, so the refusal would leave no request log. So that
+ * path is unchanged in both directions too.
+ *
+ * Matched case-insensitively, as Express routes are, against `req.path`: the
+ * full pathname, because the guard is mounted at the app root.
  */
-const UNGUARDED_PATHS = [/^\/api\/plugins\/[^/]+\/webhooks\//];
+const UNGUARDED_PATHS = [/^\/api\/plugins\/[^/]+\/webhooks\//i, /^\/api\/webhooks\//i];
 
 /** 400 instead of 500 when the parsed body carries a raw NUL. */
 export function rejectRawNulInBody(): express.RequestHandler {

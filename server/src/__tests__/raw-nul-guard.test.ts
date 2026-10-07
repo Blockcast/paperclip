@@ -38,6 +38,10 @@ function buildApp() {
     reached.push("webhook");
     res.json({ body: req.body });
   });
+  app.post("/api/webhooks/github", (req, res) => {
+    reached.push("webhook");
+    res.json({ body: req.body });
+  });
   app.use(errorHandler);
   return { app, reached };
 }
@@ -82,6 +86,23 @@ describe("findRawNulInBody", () => {
     const started = Date.now();
     expect(findRawNulInBody(Buffer.alloc(4 * 1024 * 1024, 1))).toBeNull();
     expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it("walks a multi-million-element plain array without a per-node allocation", () => {
+    // The Buffer case's sibling, through the branch the typed-array skip does
+    // not cover. Five million elements is ~9.5 MB of JSON, under the 10 MB
+    // parser limit, and this runs pre-auth. Measured under vitest: a walk that
+    // pushes a {node, path} pair and a path string per element took 2274-3491
+    // ms; this one 52-202 ms. The bound sits >=5x above the fix and >=2.2x
+    // below the regression.
+    // The NUL is LAST, so a walk that re-builds the path in a second pass on a
+    // hit pays the old cost too. (A visit count cannot pin this: both walks
+    // visit every element; the regression is the allocation per visit.)
+    const body: unknown[] = new Array(5_000_000).fill(0);
+    body.push(`x${NUL}`);
+    const started = Date.now();
+    expect(findRawNulInBody(body)).toEqual({ field: "body[5000000]", byteOffset: 1 });
+    expect(Date.now() - started).toBeLessThan(1000);
   });
 
   it("returns null for a clean body", () => {
@@ -151,19 +172,30 @@ describe("registerBodyParsers raw-NUL guard", () => {
     expect(reached).toEqual([]);
   });
 
-  it("leaves inbound provider-webhook deliveries unguarded", async () => {
-    // Third-party bytes, and a NUL label is reachable from Alertmanager. Whether
-    // the jsonb payload insert survives it is unmeasured, so this guard must not
-    // newly reject a delivery that works today. See UNGUARDED_PATHS.
-    const { app, reached } = buildApp();
+  // Plugin provider webhooks and the GitHub receiver, plus a case variant of
+  // each: Express routes case-insensitively, so each exemption must match the
+  // same way.
+  const unguarded = [
+    "/api/plugins/p1/webhooks/alerts",
+    "/api/webhooks/github",
+    "/API/Plugins/p1/webhooks/alerts",
+    "/API/Webhooks/github",
+  ];
+  for (const path of unguarded) {
+    it(`leaves inbound third-party deliveries unguarded: ${path}`, async () => {
+      // Third-party bytes, and a NUL label is reachable from Alertmanager. Whether
+      // the jsonb payload insert survives it is unmeasured, so this guard must not
+      // newly reject a delivery that works today. See UNGUARDED_PATHS.
+      const { app, reached } = buildApp();
 
-    const res = await request(app)
-      .post("/api/plugins/p1/webhooks/alerts")
-      .set("content-type", "application/json")
-      .send(`{"alertname":"A${NUL_ESCAPE}B"}`);
+      const res = await request(app)
+        .post(path)
+        .set("content-type", "application/json")
+        .send(`{"alertname":"A${NUL_ESCAPE}B"}`);
 
-    expect(res.status).toBe(200);
-    expect(res.body.body.alertname).toBe(`A${NUL}B`);
-    expect(reached).toEqual(["webhook"]);
-  });
+      expect(res.status).toBe(200);
+      expect(res.body.body.alertname).toBe(`A${NUL}B`);
+      expect(reached).toEqual(["webhook"]);
+    });
+  }
 });
