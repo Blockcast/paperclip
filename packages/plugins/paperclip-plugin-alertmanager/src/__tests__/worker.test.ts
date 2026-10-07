@@ -1864,6 +1864,459 @@ describe("handleWebhook — dedup on re-fire", () => {
 });
 
 // ---------------------------------------------------------------------------
+// BLO-40764 — owner resolution used to be create-only.
+//
+// `resolveAssigneeUserId` had exactly one call site, behind
+// `if (!retainedIssue && !terminal)`. Every re-fire path wrote
+// `{status, description}` and nothing else, and the aggregate-join path
+// recorded `assigneeResolutionSource = "aggregate-winner"` — so an operator who
+// added `paperclip_assignee_email` to an alertname that already owned an open
+// row had no way to route it. `findActiveAggregateIssue` counts `backlog` as
+// active, so even a row parked for alert fatigue kept absorbing the alertname.
+// The annotation was inert for the life of the row: `RelayAtsProbeBRed`/`CRed`
+// spent 6 days correctly annotated and unrouted behind BLO-30777 / BLO-30758,
+// and the only remedy was closing the row.
+//
+// Both directions are pinned here. The controls are the load-bearing half —
+// re-resolution must never silently re-route a row somebody deliberately
+// assigned, and it must not cost an extra issue read on an alertname with no
+// configured owner (which is nearly all of them).
+//
+// These drive the `paperclip_assignee_email` *annotation*, which is what
+// onprem-k8s#4697 used, so they pass `ownerMap: {}`: the resolver checks the
+// ownerMap first and `baseConfig`'s `team=platform` entry would shadow the
+// annotation under test.
+// ---------------------------------------------------------------------------
+
+const OWNER_ANNOTATION_ALERT = (value: string): AlertmanagerAlert =>
+  baseAlert({
+    annotations: { ...baseAlert().annotations, paperclip_assignee_email: value },
+  });
+
+/** Every `assigneeAgentId`/`assigneeUserId` an `issues.update` call carried. */
+const assigneePatches = (mocks: MockClients) =>
+  mocks.issues.update.mock.calls
+    .map((call) => call[1] as Record<string, unknown>)
+    .filter((patch) => "assigneeAgentId" in patch || "assigneeUserId" in patch);
+
+/**
+ * `issues.list` stub scoped to the aggregate-winner lookup only.
+ *
+ * `findActiveAggregateIssue` queries by `originFingerprint` (the aggregate key)
+ * and probes one status at a time; a blanket `mockResolvedValue` would also
+ * answer the *earlier* by-`originId` state-recovery lookup, which silently
+ * routes the delivery down the same-fingerprint re-fire path instead.
+ */
+const aggregateWinner =
+  (issue: { id: string; status: string; assigneeAgentId: string | null; assigneeUserId: string | null }) =>
+  async (query: { originFingerprint?: string; status?: string }) =>
+    query.originFingerprint && query.status === issue.status ? [issue] : [];
+
+describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null row", () => {
+  const refireState: AlertStateRecord = {
+    paperclipIssueId: "issue-existing",
+    paperclipCompanyId: "company-1",
+    assigneeUserId: null,
+    assigneeAgentId: null,
+    alertname: "CiliumPolicyDropsHigh",
+    severity: "critical",
+    firstSeenAt: "2026-04-29T08:00:00Z",
+    lastFiredAt: "2026-04-29T08:00:00Z",
+    resolvedAt: null,
+  };
+
+  it("assigns the annotated agent to a row that has none, and records it in state", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(refireState);
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "todo",
+      assigneeAgentId: null,
+      // A user-assigned but agent-null row is the worked instance: it has no
+      // wake path, which is the whole defect.
+      assigneeUserId: "user-42",
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("agent:agent-multicast")],
+        }),
+      }),
+    );
+
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-existing",
+      { assigneeAgentId: "agent-multicast" },
+      "company-1",
+      undefined,
+      FIRING_FENCE_ARG,
+    );
+    // The state record and the firing event must agree with the row, or the
+    // next resolve/escalation read would still think nobody owns it.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: "agent-multicast" }),
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.events.emit).toHaveBeenCalledWith(
+      "alertmanager.alert.firing",
+      "company-1",
+      expect.objectContaining({ assigneeAgentId: "agent-multicast", reFired: true }),
+      FIRING_EMIT_OWNERSHIP_ARG,
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.retrofitted",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", target: "agent" },
+    );
+  });
+
+  it("CONTROL — leaves a row that already has an agent byte-identical", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce({
+      ...refireState,
+      assigneeAgentId: "agent-deliberate",
+    });
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "in_progress",
+      assigneeAgentId: "agent-deliberate",
+      assigneeUserId: null,
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("agent:agent-multicast")],
+        }),
+      }),
+    );
+
+    expect(assigneePatches(mocks)).toEqual([]);
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: "agent-deliberate" }),
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.owner.retrofitted",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("CONTROL — leaves an agent-null row alone when no owner is configured, and reads the issue only once", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(refireState);
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+
+    // No `paperclip_assignee_email`, and an ownerMap that matches nothing on
+    // this alert — the create path would fall through to the named fallback
+    // agent here, which the retrofit deliberately does not consult.
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: { team: { storage: "someone@example.com" } } }),
+      true,
+      baseInput(),
+    );
+
+    expect(assigneePatches(mocks)).toEqual([]);
+    // Resolution runs before the row read, so an unconfigured alertname costs
+    // no extra RPC — only the re-fire path's own `issues.get`.
+    expect(mocks.issues.get).toHaveBeenCalledTimes(1);
+  });
+
+  it("CONTROL — does not re-route a user-assigned row to a different resolved user", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.users.findByEmail.mockResolvedValue({ id: "user-oncall" });
+    mocks.state.get.mockResolvedValueOnce({
+      ...refireState,
+      assigneeUserId: "user-deliberate",
+    });
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-deliberate",
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("oncall@example.com")],
+        }),
+      }),
+    );
+
+    expect(assigneePatches(mocks)).toEqual([]);
+  });
+
+  it("CONTROL — does not touch a row an operator closed, even with an owner annotation", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(refireState);
+    // `decideRefire` reads this as an operator close and suppresses the
+    // re-open (BLO-24234). Assigning an owner here would hand the row back to
+    // an agent by a side door, which is the same resurrection by another name.
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "cancelled",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("agent:agent-multicast")],
+        }),
+      }),
+    );
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+  });
+
+  it("assigns the annotated agent when a NEW fingerprint joins an existing aggregate row", async () => {
+    const { ctx, mocks } = mkCtx();
+    // No state for this fingerprint — it takes the creation path and finds a
+    // live aggregate winner, which used to skip owner resolution entirely.
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-winner",
+      status: "backlog",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }));
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [
+            {
+              ...OWNER_ANNOTATION_ALERT("agent:agent-multicast"),
+              fingerprint: "second-member-1",
+            },
+          ],
+        }),
+      }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-winner",
+      { assigneeAgentId: "agent-multicast" },
+      "company-1",
+      undefined,
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        paperclipIssueId: "issue-winner",
+        assigneeAgentId: "agent-multicast",
+      }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("CONTROL — a new fingerprint joining an already-owned aggregate row leaves its owner alone", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-winner",
+      status: "todo",
+      assigneeAgentId: "agent-deliberate",
+      assigneeUserId: null,
+    }));
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [
+            {
+              ...OWNER_ANNOTATION_ALERT("agent:agent-multicast"),
+              fingerprint: "second-member-2",
+            },
+          ],
+        }),
+      }),
+    );
+
+    expect(assigneePatches(mocks)).toEqual([]);
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: "agent-deliberate" }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  // The `!terminal` / `|| terminal` gates. Every other terminal test either
+  // creates (so the join gate short-circuits on `created`) or re-fires with
+  // labels that drop `team`, so `baseConfig`'s `team`-keyed ownerMap never
+  // resolves. These key the ownerMap on `alertname: Watchdog`, as operators do,
+  // so only the severity gate stands between the owner and the row.
+  const WATCHDOG_OWNER_CONFIG = () =>
+    baseConfig({ ownerMap: { alertname: { Watchdog: "agent:agent-watchdog" } } });
+  const watchdogAlert = (fingerprint: string) =>
+    baseAlert({ labels: { alertname: "Watchdog", severity: "none" }, fingerprint });
+
+  it("CONTROL — a terminal-severity re-fire never retrofits an owner onto its `done` row", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce({
+      ...refireState,
+      alertname: "Watchdog",
+      severity: "none",
+    });
+    // Not `Once`: an unguarded retrofit re-reads the row, and a `null` second
+    // read would let this control pass for the wrong reason.
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "done",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+
+    await handleWebhook(
+      ctx,
+      WATCHDOG_OWNER_CONFIG(),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({ alerts: [watchdogAlert("9a3b1e4c5f6d7890")] }),
+      }),
+    );
+
+    // BLO-24177's own unassign is the only assignee write.
+    expect(assigneePatches(mocks)).toEqual([
+      expect.objectContaining({ assigneeAgentId: null, assigneeUserId: null }),
+    ]);
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.owner.retrofitted",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("CONTROL — a terminal-severity fingerprint joining a live aggregate row never retrofits its owner", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-winner",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }));
+
+    await handleWebhook(
+      ctx,
+      WATCHDOG_OWNER_CONFIG(),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({ alerts: [watchdogAlert("watchdog-member-2")] }),
+      }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(assigneePatches(mocks)).toEqual([]);
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.owner.retrofitted",
+      expect.any(Number),
+      expect.any(Object),
+    );
+  });
+
+  it("still records a committed retrofit in state when its metric write fails", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(refireState);
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+    mocks.metrics.write.mockImplementation(async (name: string) => {
+      if (name === "alertmanager.owner.retrofitted") throw new Error("metrics down");
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("agent:agent-multicast")],
+        }),
+      }),
+    );
+
+    // The row already holds the agent, so no later delivery's retrofit will
+    // see it again: this write is the state record's only chance to agree.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: "agent-multicast" }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("a failed retrofit does not abort the re-fire's state write", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce({
+      ...refireState,
+      resolvedAt: "2026-04-29T09:00:00Z",
+    });
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+    mocks.issues.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) => {
+        if ("assigneeAgentId" in patch) throw new Error("update rejected");
+        return { id: "issue-existing" };
+      },
+    );
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("agent:agent-multicast")],
+        }),
+      }),
+    );
+
+    // Routing is a nicety; clearing `resolvedAt` is what keeps the ladder live.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ resolvedAt: null, assigneeAgentId: null }),
+      FIRING_FENCE_ARG,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BLO-31736 — multi-cycle: a deliberate close must survive fire/clear churn
 //
 // Every re-fire test above is single-shot: one delivery against a hand-written

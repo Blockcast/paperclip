@@ -312,6 +312,50 @@ Resolved emails are looked up against `ctx.users.findByEmail` and cached
 per email in plugin state (`owner-by-email:<email>`). Negative results are
 cached too (empty string) so a missing user doesn't cause repeated lookups.
 
+#### Retrofitting an owner onto an alertname that is already firing (BLO-40764)
+
+**An open issue with no agent can be re-routed without closing it.** Add the
+annotation (or the `ownerMap` entry) and the next delivery applies it. An open
+issue that already holds an agent cannot — and that includes every row the
+plugin itself assigned from `fallbackAgentName` (or an `issueRouteMap` agent)
+at creation, which is most rows created since ownerless creation was refused.
+Reassign those in Paperclip.
+
+Until BLO-40764 the chain above ran on the **creation** path only. One alertname
+owns one aggregate issue for as long as that issue is open — and "open" includes
+`backlog`, so a row parked for alert fatigue counts — which meant a correct,
+deployed `paperclip_assignee_email` was silently inert for the life of that row.
+Nothing surfaced it from either side: the rule read as configured, and the row
+read as merely stale. `RelayAtsProbeBRed`/`CRed` spent 6 days that way.
+
+Every delivery now re-reads the chain and applies the result, on **two** narrow
+conditions:
+
+- **Only an explicitly configured owner retrofits** — the label override, the
+  `ownerMap`, and the annotation override. The `issueRouteMap` and the
+  `fallbackAgentName` legs are deliberately *not* consulted on re-fire: those
+  resolve for nearly every alert, so including them would mass-reassign every
+  legacy ownerless row on its next delivery.
+- **An existing `assigneeAgentId` is never overwritten**, and a resolved *user*
+  is applied only to a row with no assignee at all. A row that is user-assigned
+  but agent-null can still gain an agent — it has no wake path, which is the
+  defect being fixed — but a deliberate reassignment, by a human or an agent, is
+  left alone. To hand a row to a different agent, reassign it in Paperclip; the
+  plugin will not fight you for it.
+
+A row an operator closed is also left alone while its close is still suppressing
+re-opens (see *Operator suppression* below) — assigning an owner there would be
+the same resurrection by a side door.
+
+Each applied retrofit logs (naming the agent or user it applied) and emits
+`alertmanager.owner.retrofitted`, labelled by `alertname` only. If you add an
+annotation and that counter never moves for its alertname, check, in order:
+
+- the row already holds an agent — most often the `fallbackAgentName` agent the
+  plugin stamped at creation — which a retrofit never overwrites (see above);
+- an earlier link in the chain (a `paperclip_assignee_email` *label*, or an
+  `ownerMap` entry matching one of the alert's labels) is shadowing your value.
+
 ### Issue creation floor and rule-level opt-out
 
 Two gates keep low-value alerts from becoming issues at all:
