@@ -8293,6 +8293,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
       await expect(svc.update(dependentId, { ...unparkPatch })).rejects.toMatchObject({
         status: 409,
+        message: expect.stringContaining("would delete live dependency edges"),
         details: {
           reason: "delegate_recovery_unresolved_blockers",
           unresolvedBlockerCount: 1,
