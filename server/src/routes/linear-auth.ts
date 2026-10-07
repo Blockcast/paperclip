@@ -15,6 +15,11 @@ import { eq, and } from "drizzle-orm";
 import type { SecretProvider } from "@paperclipai/shared";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { logActivity, secretService } from "../services/index.js";
+import {
+  linearTeamResolutionError,
+  resolveLinearTeam,
+  type LinearTeam,
+} from "../lib/linear-team.js";
 
 const LINEAR_AUTHORIZE_URL = "https://linear.app/oauth/authorize";
 const LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token";
@@ -23,6 +28,31 @@ const LINEAR_REVOKE_URL = "https://api.linear.app/oauth/revoke";
 const LINEAR_SECRET_NAME = "linear-oauth-token";
 const SCOPES = ["read", "write", "initiative:read", "initiative:write"];
 const LINEAR_OAUTH_ACTOR = "app";
+
+/**
+ * The Linear plugin's configured `teamId` for this company, when installed.
+ * Best effort: a missing plugin or unreadable config falls through to the
+ * company's existing issue prefix rather than failing the request.
+ */
+async function readConfiguredLinearTeamId(db: Db, companyId: string): Promise<string | null> {
+  try {
+    const [plugin] = await db
+      .select()
+      .from(plugins)
+      .where(eq(plugins.pluginKey, "paperclip-plugin-linear"))
+      .limit(1);
+    if (!plugin) return null;
+    const [cfg] = await db
+      .select()
+      .from(pluginConfig)
+      .where(and(eq(pluginConfig.pluginId, plugin.id), eq(pluginConfig.companyId, companyId)))
+      .limit(1);
+    const configured = (cfg?.configJson as { teamId?: unknown } | null | undefined)?.teamId;
+    return typeof configured === "string" && configured.trim() ? configured.trim() : null;
+  } catch {
+    return null;
+  }
+}
 
 // In-memory CSRF state store (short-lived, cleared on use)
 const pendingStates = new Map<string, { companyId: string; createdAt: number }>();
@@ -183,9 +213,21 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
     const secret = await svc.getByName(companyId, LINEAR_SECRET_NAME);
     const secretId = secret?.id;
 
-    // Fetch Linear teams to auto-detect team ID
+    // BLO-31227: read the configured expectation BEFORE the plugin config is
+    // rewritten below, so team selection is deterministic instead of taking
+    // the first element of an unordered list.
+    const configuredTeamId = await readConfiguredLinearTeamId(db, companyId);
+    const [companyBeforeSync] = await db
+      .select()
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .limit(1);
+    const existingIssuePrefix = companyBeforeSync?.issuePrefix ?? null;
+
+    // Fetch Linear teams so the connection can be bound to one
     let teamId = "";
     let teamKey = "";
+    let visibleTeams: LinearTeam[] | null = null;
     try {
       const teamsRes = await fetch("https://api.linear.app/graphql", {
         method: "POST",
@@ -199,15 +241,30 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
         const teamsData = (await teamsRes.json()) as {
           data?: { teams?: { nodes?: Array<{ id: string; name: string; key: string }> } };
         };
-        const teams = teamsData.data?.teams?.nodes ?? [];
-        if (teams.length > 0) {
-          teamId = teams[0].id;
-          teamKey = teams[0].key;
-          console.log(`[linear-auth] auto-detected team: ${teamKey} (${teams[0].name})`);
-        }
+        visibleTeams = teamsData.data?.teams?.nodes ?? [];
       }
     } catch {
       console.warn("[linear-auth] could not fetch Linear teams for auto-config");
+    }
+
+    if (visibleTeams) {
+      const resolution = resolveLinearTeam(visibleTeams, {
+        configuredTeamId,
+        issuePrefix: existingIssuePrefix,
+      });
+      if (resolution.team) {
+        teamId = resolution.team.id;
+        teamKey = resolution.team.key;
+        console.log(
+          `[linear-auth] resolved team ${teamKey} (${teamId}) by ${resolution.matchedBy}`,
+        );
+      } else {
+        // Fail closed. Guessing here would overwrite issuePrefix/issueCounter.
+        const message = linearTeamResolutionError(resolution);
+        console.error(`[linear-auth] ${message}`);
+        res.status(409).send(callbackPage("error", message));
+        return;
+      }
     }
 
     // Sync company issue prefix to match Linear team key (e.g., LUC)
@@ -397,6 +454,9 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
     let highestIssueNumber: number | null = null;
     let teamKey: string | null = null;
     let currentCounter: number | null = null;
+    // BLO-31227: `/status` reported `teams.nodes[0]`, which read as a real
+    // scoping of the connection and sent readers after the wrong problem.
+    let teamResolution: string | null = null;
 
     if (existing) {
       try {
@@ -429,7 +489,22 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
           if (data.errors?.length) {
             console.warn("[linear-auth] GraphQL errors:", data.errors);
           }
-          const team = data.data?.teams?.nodes?.[0];
+          const visible = data.data?.teams?.nodes ?? [];
+          const [statusCompany] = await db
+            .select()
+            .from(companies)
+            .where(eq(companies.id, companyId))
+            .limit(1);
+          const resolution = resolveLinearTeam(visible, {
+            configuredTeamId: await readConfiguredLinearTeamId(db, companyId),
+            issuePrefix: statusCompany?.issuePrefix ?? null,
+          });
+          teamResolution = resolution.team ? resolution.matchedBy : resolution.reason;
+          const resolvedTeamId = resolution.team?.id ?? null;
+          // Unresolved: omit teamKey rather than reporting an arbitrary team.
+          const team = resolvedTeamId
+            ? visible.find((candidate) => candidate.id === resolvedTeamId) ?? null
+            : null;
           openIssueCount = team?.issues?.nodes?.length ?? null;
           teamKey = team?.key ?? null;
 
@@ -486,6 +561,7 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
       highestIssueNumber,
       currentCounter,
       teamKey,
+      teamResolution,
     });
   });
 
