@@ -4016,6 +4016,10 @@ describe("scoped writable mounts (BLO-32734)", () => {
       "/paperclip/.claude/settings.json",
       "/paperclip/.claude/paperclip-env-guard.mjs",
       "/paperclip/.mcp.json",
+      // The managed Claude Code runtime every pod puts first on PATH: neither the
+      // broad-mount shared copy nor another company's copy may be writable here.
+      "/paperclip/.local/lib/paperclip-k8s-runtimes/claude-code/2.1.292",
+      "/paperclip/.local/lib/paperclip-k8s-runtimes/companies/co2/claude-code",
     ];
     for (const container of [main, init]) {
       const writable = container.filter((m) => !m.readOnly);
@@ -4083,6 +4087,42 @@ describe("scoped writable mounts (BLO-32734)", () => {
       // creates itself is root:root 0755, which is EACCES for uid 1000.
       expect(scopedWritableDirs).toContain("/paperclip/instances/default/data/k8s-isolation/pnpm/co1");
     }
+  });
+
+  // The managed Claude Code runtime (runtime-pin.ts) installs itself at Job
+  // start under the data mount. Under the narrowed mount its shared root is
+  // read-only, so the install hit EROFS and every run fell back to the image's
+  // CLI, which rejects newer models. Asserted off the command the pod runs: the
+  // `__pcroot` it installs into must be covered by a writable mount.
+  it("keeps the managed Claude Code runtime installable under the narrowed mount", () => {
+    for (const mountPath of ["/paperclip", "/srv/agent-data"]) {
+      const ctx = makeCtx();
+      ctx.config = { ...(ctx.config ?? {}), workspaceMountPath: mountPath };
+      setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, storage: isolatedStorage("persistent") });
+      const { job, scopedWritableDirs } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+      const containers = [job.spec?.template?.spec?.containers[0], job.spec?.template?.spec?.initContainers?.[0]];
+      const command = containers[0]?.command?.[2] ?? "";
+
+      const root = /__pcroot='([^']+)'/.exec(command)?.[1];
+      // Per company, not the shared root a foreign company's pod would also write.
+      expect(root).toBe(`${mountPath}/.local/lib/paperclip-k8s-runtimes/companies/co1/claude-code`);
+      for (const container of containers) {
+        const mounts = container?.volumeMounts ?? [];
+        const covering = mounts.filter(
+          (m) => m.subPath && !m.readOnly && (root === m.mountPath || root!.startsWith(`${m.mountPath}/`)),
+        );
+        expect(covering, `no writable mount covers ${root}`).not.toEqual([]);
+      }
+      expect(scopedWritableDirs).toContain("/paperclip/.local/lib/paperclip-k8s-runtimes/companies/co1/claude-code");
+    }
+
+    // "image" installs nothing, so nothing is re-opened for it.
+    const ctx = makeCtx();
+    ctx.config = { claudeCodeVersion: "image" };
+    setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, storage: isolatedStorage("persistent") });
+    const { scopedWritableDirs } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    expect(scopedWritableDirs.length).toBeGreaterThan(0);
+    expect(scopedWritableDirs.filter((d) => d.includes("paperclip-k8s-runtimes"))).toEqual([]);
   });
 
   // This leg deliberately asserts only the pnpm path, NOT `workspaceRoot`/
