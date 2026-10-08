@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -313,6 +313,28 @@ function closingParen(source: string, open: number) {
   throw new Error(`unbalanced parens from offset ${open}; the scan cannot give a verdict`);
 }
 
+// The request bound itself, not just any signal: a signal on the 30s
+// GITHUB_FETCH_DEADLINE_MS is the very 60s-for-two-hops shape above.
+const REQUEST_BOUND = /\bsignal:\s*AbortSignal\.timeout\(GITHUB_REQUEST_TIMEOUT_MS\)/y;
+
+// True only when the bound is a key of the call's OWN options object — depth 2
+// from its `(`, counting ( { [ alike. A bound inside a nested call, a nested
+// object or a callback body sits deeper and belongs to something else, so it
+// must not satisfy this hop (testing the whole span did, BLO-40593 review).
+function hasOwnRequestBound(source: string, open: number, close: number) {
+  let depth = 0;
+  for (let i = open; i <= close; i += 1) {
+    const ch = source[i];
+    if (ch === "(" || ch === "{" || ch === "[") depth += 1;
+    else if (ch === ")" || ch === "}" || ch === "]") depth -= 1;
+    else if (depth === 2 && ch === "s") {
+      REQUEST_BOUND.lastIndex = i;
+      if (REQUEST_BOUND.test(source)) return true;
+    }
+  }
+  return false;
+}
+
 function scanWebhookGithubCallSites(routesDir: string, servicesDir: string) {
   const boundable = new Set<string>();
   for (const file of readdirSync(servicesDir).filter((f) => f.startsWith("github") && f.endsWith(".ts"))) {
@@ -360,9 +382,7 @@ function scanWebhookGithubCallSites(routesDir: string, servicesDir: string) {
         file,
         line: source.slice(0, start).split("\n").length,
         helper: match[1] ?? "<unknown>",
-        // The request bound itself, not just any signal: a signal on the 30s
-        // GITHUB_FETCH_DEADLINE_MS is the very 60s-for-two-hops shape above.
-        bound: /\bsignal:\s*AbortSignal\.timeout\(GITHUB_REQUEST_TIMEOUT_MS\)/.test(source.slice(open, close + 1)),
+        bound: hasOwnRequestBound(source, open, close),
       });
     }
   }
@@ -413,6 +433,29 @@ describe("every GitHub read on a request-blocking webhook path is bounded (BLO-4
     expect(() => assertWebhookGithubCallsAreBounded(NO_WEBHOOK_DIR, SERVICES_DIR)).toThrow(
       /scan matched no signal-accepting GitHub call sites/,
     );
+  });
+
+  // A bound that belongs to something nested inside the call must not count for
+  // the call itself. Each probe leaves the OUTER hop unbounded while a bound sits
+  // somewhere in its span; a whole-span test reported all four as bound.
+  const BOUND = "signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS)";
+  const INNER = `githubFetchPrHeadSha({ repoFullName, prNumber, ${BOUND} })`;
+  it.each([
+    ["a nested GitHub call", `await githubResolveMergeHistoryShape({ repoFullName, mergeCommitSha: await ${INNER} });`],
+    ["a nested non-GitHub call", `await githubResolveBranchState({ repoFullName, branch, opts: buildOpts({ ${BOUND} }) });`],
+    ["a trailing callback's call", `await githubResolveBranchState({ repoFullName, branch }, async () => { await ${INNER}; });`],
+    ["a trailing callback's object", `await githubResolveBranchState({ repoFullName, branch }, () => { return { ${BOUND} }; });`],
+  ])("does not let a bound inside %s satisfy the outer call", (_label, probe) => {
+    const dir = mkdtempSync(join(tmpdir(), "webhook-scan-"));
+    try {
+      writeFileSync(join(dir, "probe-webhook.ts"), `${probe}\n`);
+      expect(() => assertWebhookGithubCallsAreBounded(dir, SERVICES_DIR)).toThrow(/probe-webhook\.ts:1 github(?:ResolveMergeHistoryShape|ResolveBranchState)\b/);
+      // Control: the same probe with the outer hop bound in its own options passes.
+      writeFileSync(join(dir, "probe-webhook.ts"), `${probe.replace(/\{ repoFullName, /, `{ ${BOUND}, repoFullName, `)}\n`);
+      expect(() => assertWebhookGithubCallsAreBounded(dir, SERVICES_DIR)).not.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // The classification is checked, not asserted. Widening it to "mentions a
