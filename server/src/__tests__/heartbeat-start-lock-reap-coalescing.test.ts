@@ -299,6 +299,16 @@ describeEmbeddedPostgres("start-lock orphan reap coalescing (BLO-36922)", () => 
     // and giving up on the wait must not start a replacement.
     expect(calls).toBe(1);
 
+    // Clearing the wedge releases both parked sweeps. Settle them here rather
+    // than letting them run after the test returns, where they would race
+    // teardown and land in a later test's mock counter. Unbounding the wait and
+    // reaping once more does that: the call chains behind whatever is still in
+    // flight, so it returns only after both have finished, and its "ran" shows
+    // the slot recovers once the sweep it gave up on completes.
     wedged.resolve(null);
+    await vi.waitFor(() => expect(calls).toBe(2));
+    delete process.env.AGENT_START_LOCK_REAP_WAIT_BOUND_MS;
+    expect(await heartbeat.reapOrphanedRunsForStartLock()).toBe("ran");
+    expect(calls).toBe(3);
   });
 });
