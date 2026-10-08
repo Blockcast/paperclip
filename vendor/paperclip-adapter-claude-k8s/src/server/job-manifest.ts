@@ -104,9 +104,10 @@ export type ScopedWritableMount = { subPath: string; mountPath: string };
  * sort them by. See `PROVENANCE-CHANGES.d/pr-1820.md` §4.
  *
  * The scoping is also INERT for any subtree that is itself a derived candidate:
- * the kubelet orders mounts by path depth, so a deeper derived mount (a runtime
- * descriptor placing a workspace under `/paperclip/wt/...`, say) wins and
- * re-exposes that subtree unscoped. That is correct — the data genuinely lives
+ * `resolveScopedWritableMounts` emits parents before children, so a deeper
+ * derived mount (a runtime descriptor placing a workspace under
+ * `/paperclip/wt/...`, say) is applied over the scratch mount and re-exposes
+ * that subtree unscoped. That is correct — the data genuinely lives
  * there and the descriptor is the authority — but it means these two names are
  * scoped by default, not unconditionally.
  */
@@ -340,7 +341,12 @@ export function resolveScopedWritableMounts(input: {
   for (const name of SCRATCH_DIR_NAMES) {
     mounts.push({ subPath: `${name}/${companyId}`, mountPath: `${prefix}${name}` });
   }
-  return mounts;
+  // Parents before children. Mounts apply in declaration order, and
+  // buildJobManifest's BLO-40401 backstop throws on a parent declared after a
+  // child it would hide — which a derived candidate under `work/` or `wt/`
+  // followed by its scratch mount was. A path sorts before every path it is a
+  // proper prefix of, so a plain string sort is enough.
+  return mounts.sort((a, b) => (a.mountPath < b.mountPath ? -1 : a.mountPath > b.mountPath ? 1 : 0));
 }
 
 /** The pod log lives on the shared data volume, which the server and the agent
@@ -2575,8 +2581,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   );
   // Nested rw re-mounts that restore write access to exactly the trees this run
   // needs, inside the read-only `data` mount above. Built here rather than beside
-  // that mount because the log path is only known now; mount ORDER does not
-  // matter (the kubelet sorts by path depth, so a parent never shadows a child).
+  // that mount because the log path is only known now. Pushed AFTER the read-only
+  // parent, and the list itself is parent-first, as the BLO-40401 shadowing
+  // backstop below requires.
   const scopedWritableMounts = narrowWritableSurface
     ? resolveScopedWritableMounts({
         dataMountPath,
