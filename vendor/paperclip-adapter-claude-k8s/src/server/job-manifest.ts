@@ -3085,6 +3085,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         // `broad:<reason>` when the gate fell through to the whole-PVC rw mount.
         "paperclip.io/data-mount-scope":
           broadDataMountReason === null ? "scoped" : `broad:${broadDataMountReason}`,
+        // Stamped verbatim so a *foreign* run reaping this Job can unlink the
+        // pod log without recomputing the path (BLO-39114).  Reconstructing it
+        // from labels would be cheaper but not sound: companyId, agentId and
+        // runId each reach the path via `sanitizeForK8sPath` and the label via
+        // `sanitizeLabelValue`, from the same raw value, and those disagree on
+        // `.`/`_` and above 63 chars.  (`isolationKey` is exempt — it is
+        // pre-sanitized once in `resolveJobIsolation` and both consume that.)
+        // A reconstruction that diverges computes a path that does not exist,
+        // and a missing file is indistinguishable from a successful reap — i.e.
+        // it fails silently, which is the exact leak this is meant to close.
+        "paperclip.io/pod-log-path": podLogPath,
       },
     },
     spec: {

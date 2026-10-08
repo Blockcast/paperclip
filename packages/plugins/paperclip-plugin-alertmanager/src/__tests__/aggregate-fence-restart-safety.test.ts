@@ -25,6 +25,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import {
+  AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS,
   AlertDeliveryIncompleteError,
   type AggregateFenceWaitPolicy,
   handleWebhook,
@@ -99,6 +100,8 @@ async function seedFence(row: {
   ownerInstanceId: string | null;
   ownerSlot: string | null;
   updatedAt?: string;
+  /** Defaults to AGGREGATE_KEY; set it to seed more than one fence per case. */
+  aggregateKey?: string;
 }): Promise<void> {
   await db.query(
     `INSERT INTO ${FENCES}
@@ -107,7 +110,7 @@ async function seedFence(row: {
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [
       COMPANY_ID,
-      AGGREGATE_KEY,
+      row.aggregateKey ?? AGGREGATE_KEY,
       row.phase,
       row.firingToken ?? null,
       row.resolutionToken ?? null,
@@ -572,10 +575,16 @@ describe("BLO-31036 — startup reconciliation drains fences no live process can
     });
     const { ctx, logger } = mkCtx();
 
-    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(1);
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 1, byAge: 0 });
     expect((await readFence())?.phase).toBe("active");
-    expect(logger.warn.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+    expect(logger.info.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
       "abandoned by a previous occupant",
+    );
+    // info, not warn: this is the ordinary post-rollout drain. Reserving warn
+    // for the age arm is the whole point of the split (BLO-32481) — if a
+    // restart drain pages, the page that matters stops being read.
+    expect(logger.warn.mock.calls.map((c) => String(c[0])).join("\n")).not.toContain(
+      "abandonment backstop",
     );
   });
 
@@ -592,7 +601,7 @@ describe("BLO-31036 — startup reconciliation drains fences no live process can
     });
     const { ctx } = mkCtx();
 
-    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(1);
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 1, byAge: 0 });
     expect((await readFence())?.phase).toBe("active");
   });
 
@@ -607,7 +616,7 @@ describe("BLO-31036 — startup reconciliation drains fences no live process can
     });
     const { ctx } = mkCtx();
 
-    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(0);
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 0, byAge: 0 });
     expect((await readFence())?.phase).toBe("firing");
   });
 
@@ -620,7 +629,7 @@ describe("BLO-31036 — startup reconciliation drains fences no live process can
     });
     const { ctx } = mkCtx();
 
-    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(0);
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 0, byAge: 0 });
     expect((await readFence())?.phase).toBe("cancelling");
   });
 
@@ -632,7 +641,7 @@ describe("BLO-31036 — startup reconciliation drains fences no live process can
     });
     const { ctx } = mkCtx();
 
-    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(0);
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 0, byAge: 0 });
     expect((await readFence())?.phase).toBe("active");
   });
 
@@ -642,7 +651,7 @@ describe("BLO-31036 — startup reconciliation drains fences no live process can
     const { ctx, mocks, logger } = mkCtx();
     mocks.db.execute.mockRejectedValueOnce(new Error("connection reset"));
 
-    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(0);
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 0, byAge: 0 });
     expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
       "reconciliation failed",
     );
@@ -677,7 +686,7 @@ describe("BLO-32113 — the startup sweep also reclaims on age, for aggregates t
     });
     const { ctx, logger } = mkCtx();
 
-    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(1);
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 0, byAge: 1 });
     expect((await readFence())?.phase).toBe("active");
     expect(logger.warn.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
       "abandonment backstop",
@@ -705,7 +714,7 @@ describe("BLO-32113 — the startup sweep also reclaims on age, for aggregates t
     });
     const { ctx } = mkCtx();
 
-    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(1);
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 0, byAge: 1 });
     expect((await readFence())?.phase).toBe("active");
   });
 
@@ -721,7 +730,7 @@ describe("BLO-32113 — the startup sweep also reclaims on age, for aggregates t
     });
     const { ctx } = mkCtx();
 
-    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(0);
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 0, byAge: 0 });
     expect((await readFence())?.firing_token).toBe("token-foreign-and-fresh");
   });
 
@@ -737,8 +746,183 @@ describe("BLO-32113 — the startup sweep also reclaims on age, for aggregates t
     });
     const { ctx } = mkCtx();
 
-    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toBe(0);
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 0, byAge: 0 });
     expect((await readFence())?.phase).toBe("active");
+  });
+});
+
+/**
+ * BLO-32481. The sweep released on either arm and reported one `rowCount`, so
+ * the log could not tell an ordinary rollout drain from the one state worth
+ * investigating: a fence leaked by a process that was still running. Those two
+ * get opposite responses, and a combined total reads as the harmless one.
+ */
+describe("BLO-32481 — the sweep counts its two arms separately", () => {
+  const pastBackstop = () => new Date(Date.now() - 20 * 60_000).toISOString();
+
+  it("counts a row matching BOTH arms once, as identity", async () => {
+    // The ordinary rollout shape, and the case that makes precedence matter: a
+    // dead predecessor's fence is old *and* identity-reclaimable, so it
+    // satisfies both predicates. Identity runs first and leaves it `active`,
+    // which is what stops the age statement double-counting it.
+    //
+    // Identity is the right winner, not an arbitrary tiebreak. The age count
+    // exists to mean "a live process leaked this"; a dead predecessor did not,
+    // so scoring this as age would put a routine deploy into the signal the
+    // operator is meant to investigate, every single boot.
+    await seedFence({
+      phase: "firing",
+      firingToken: "token-dead-predecessor-and-stale",
+      ownerInstanceId: DEAD_PREDECESSOR.instanceId,
+      ownerSlot: DEAD_PREDECESSOR.slot,
+      updatedAt: pastBackstop(),
+    });
+    const { ctx, logger } = mkCtx();
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({
+      byIdentity: 1,
+      byAge: 0,
+    });
+    expect((await readFence())?.phase).toBe("active");
+    // Released once, and specifically NOT escalated: a rollout must not page.
+    expect(logger.warn.mock.calls.map((c) => String(c[0])).join("\n")).not.toContain(
+      "A live process leaked these",
+    );
+  });
+
+  it("escalates the age arm to warn, because only it means a live leak", async () => {
+    // Foreign slot, past the horizon: identity declines it, so whatever holds
+    // it was alive while holding it. This is the line an operator should act on.
+    await seedFence({
+      phase: "firing",
+      firingToken: "token-foreign-stale",
+      ownerInstanceId: FOREIGN_HOST.instanceId,
+      ownerSlot: FOREIGN_HOST.slot,
+      updatedAt: pastBackstop(),
+    });
+    const { ctx, logger } = mkCtx();
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({
+      byIdentity: 0,
+      byAge: 1,
+    });
+    expect(logger.warn.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "A live process leaked these",
+    );
+  });
+
+  it("separates the two arms when both are present in one sweep", async () => {
+    // The shape production actually produces on a boot that follows a leak: the
+    // predecessor's fences drain normally while a foreign-slot leak is still
+    // held. A single total reports "3 released" and buries the one that matters.
+    await seedFence({
+      aggregateKey: "agg-dead-1",
+      phase: "firing",
+      firingToken: "t1",
+      ownerInstanceId: DEAD_PREDECESSOR.instanceId,
+      ownerSlot: DEAD_PREDECESSOR.slot,
+    });
+    await seedFence({
+      aggregateKey: "agg-dead-2",
+      phase: "cancelling",
+      resolutionToken: "t2",
+      ownerInstanceId: null,
+      ownerSlot: null,
+    });
+    await seedFence({
+      aggregateKey: "agg-leaked",
+      phase: "firing",
+      firingToken: "t3",
+      ownerInstanceId: FOREIGN_HOST.instanceId,
+      ownerSlot: FOREIGN_HOST.slot,
+      updatedAt: pastBackstop(),
+    });
+    const { ctx } = mkCtx();
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({
+      byIdentity: 2,
+      byAge: 1,
+    });
+  });
+
+  it("stays non-fatal, and reports zero on both arms, when the identity statement fails", async () => {
+    // AC4. `mocks.db.execute` is one shared mock, so "once" rejects call 1 —
+    // the identity statement. The age statement is never reached here; the
+    // case below covers it.
+    const { ctx, mocks, logger } = mkCtx();
+    mocks.db.execute.mockRejectedValueOnce(new Error("connection reset"));
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({
+      byIdentity: 0,
+      byAge: 0,
+    });
+    expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "reconciliation failed",
+    );
+  });
+
+  it("stays non-fatal, and keeps the committed identity count, when only the age statement fails", async () => {
+    // AC4 for the second statement. The two statements are separate
+    // autocommits, so the identity release is durable before the age statement
+    // runs; reporting zeros here would hide a drain that happened. Moving the
+    // age statement outside the `catch`, or returning literal zeros from it,
+    // turns this red.
+    await seedFence({
+      phase: "firing",
+      firingToken: "token-from-the-dead-process",
+      ownerInstanceId: DEAD_PREDECESSOR.instanceId,
+      ownerSlot: DEAD_PREDECESSOR.slot,
+    });
+    const { ctx, mocks, logger } = mkCtx();
+    const passthrough = mocks.db.execute.getMockImplementation()!;
+    mocks.db.execute
+      .mockImplementationOnce(passthrough)
+      .mockRejectedValueOnce(new Error("connection reset"));
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({
+      byIdentity: 1,
+      byAge: 0,
+    });
+    expect((await readFence())?.phase).toBe("active");
+    expect(logger.info.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "abandoned by a previous occupant",
+    );
+    expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "reconciliation failed",
+    );
+  });
+
+  it("keeps the backstop constant and the wedged-fence detector prose on one number", async () => {
+    // AC1, scoped to what actually exists. There is no second *code* site: the
+    // `updated_at < now() - interval '15 minutes'` detector is quoted in
+    // docstrings but is not implemented anywhere — `listAggregateFiringFences`
+    // has no age filter and lists every held fence. So the decoupling risk is
+    // not two queries drifting apart; it is the constant moving and leaving
+    // every docstring asserting a horizon the code no longer uses.
+    //
+    // That prose is load-bearing: it is the stated justification for
+    // `assertFiringGeneration` being a SELECT. Reading a stale number there
+    // sends the next editor looking for a detector tuned to a horizon nothing
+    // implements.
+    const source = await readFile(
+      path.resolve(__dirname, "../webhook-handler.ts"),
+      "utf8",
+    );
+    // Scoped by `updated_at` on the same line: the file also carries an
+    // unrelated live `claimed_at < now() - interval '5 minutes'`, which this
+    // must not drag in.
+    const quoted = [
+      ...source.matchAll(/updated_at < now\(\) - interval '(\d+) minutes'/g),
+    ].map((m) => Number(m[1]));
+
+    // Non-zero guard, and it is the point of this assertion rather than
+    // decoration: every check below is vacuously true over an empty match set,
+    // so without this, deleting or rewording the docstrings turns the test
+    // green while removing the thing it was written to protect.
+    expect(quoted.length).toBeGreaterThanOrEqual(3);
+    for (const minutes of quoted) {
+      expect(minutes * 60_000).toBe(AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS);
+    }
   });
 });
 
