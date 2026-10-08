@@ -2485,6 +2485,41 @@ describe("buildJobManifest", () => {
         expect(env.find((e) => e.name === "PAPERCLIP_ENV_SHED_JSON")).toBeDefined();
       });
     });
+
+    // The boundary pair, mirroring the PROMPT_CONTENT pair above. The fixtures
+    // above sit at ~4 MB / ~500 KiB / ~4 KB, nowhere near the edge, so an
+    // off-by-name budget (bare MAX_ENV_STRING_BYTES, 28 B too generous) or a
+    // `<` for `<=` would leave them all green while the pod died in execve.
+    const largestUnshedWake = MAX_ARG_STRLEN - "PAPERCLIP_WAKE_PAYLOAD_JSON=".length - 1;
+    /** A wake payload whose JSON is exactly `bytes` long — asserted, so a
+     *  fixture drift cannot quietly move the test off the boundary. */
+    const wakeOfSize = (bytes: number) => {
+      const base = { reason: "issue_commented", issue: { id: "i1", identifier: "BLO-37287", title: "t" }, pad: "" };
+      const wake = { ...base, pad: "p".repeat(bytes - Buffer.byteLength(JSON.stringify(base), "utf-8")) };
+      expect(Buffer.byteLength(JSON.stringify(wake), "utf-8")).toBe(bytes);
+      return wake;
+    };
+    const wakeEnvValue = (wake: Record<string, unknown>) =>
+      buildJobManifest({ ctx: makeCtx({ context: { paperclipWake: wake } }), selfPod: makeSelfPod() }).job.spec
+        ?.template?.spec?.containers?.[0]?.env?.find((e) => e.name === "PAPERCLIP_WAKE_PAYLOAD_JSON")?.value;
+
+    it("keeps a wake payload exactly at the exec limit literal", () => {
+      const wake = wakeOfSize(largestUnshedWake);
+      const value = wakeEnvValue(wake);
+      expect(value).toBe(JSON.stringify(wake));
+      expect(JSON.parse(value!).payloadShed).toBeUndefined();
+      expect(Buffer.byteLength(`PAPERCLIP_WAKE_PAYLOAD_JSON=${value}`, "utf-8") + 1).toBe(MAX_ARG_STRLEN);
+    });
+
+    it("sheds a wake payload one byte over the exec limit", () => {
+      const value = wakeEnvValue(wakeOfSize(largestUnshedWake + 1));
+      const parsed = JSON.parse(value!);
+      expect(parsed.payloadShed).toBe(true);
+      expect(parsed.fallbackFetchNeeded).toBe(true);
+      expect(Buffer.byteLength(`PAPERCLIP_WAKE_PAYLOAD_JSON=${value}`, "utf-8") + 1).toBeLessThanOrEqual(
+        MAX_ARG_STRLEN,
+      );
+    });
   });
 
   describe("pod log file tailing", () => {

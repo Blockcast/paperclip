@@ -876,7 +876,7 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     reason: "Opaque comment UUID.",
   },
   {
-    name: "PAPERCLIP_WAKE_PAYLOAD_JSON",
+    name: WAKE_PAYLOAD_ENV_NAME,
     classification: "SAFE_LITERAL",
     reason:
       "Compact issue summary plus the new-comment batch. Board content, not credential material, and already readable by this pod through its own API token — but it is the one SAFE_LITERAL here whose value is free-form text, so a credential pasted into an issue comment would appear on the pod spec. Accepted: the same text is equally readable via the API, so Secret-backing it would not close that path.",
@@ -1272,7 +1272,7 @@ function buildEnvVars(
 
   const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
   if (wakePayloadJson) {
-    paperclipEnv.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+    paperclipEnv[WAKE_PAYLOAD_ENV_NAME] = wakePayloadJson;
   }
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
