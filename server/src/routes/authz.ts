@@ -332,6 +332,11 @@ export type RunTranscriptReadOutcome = {
  * implemented by PEN-3204 — the `stdoutExcerpt` / `stderrExcerpt` captured
  * output projected onto workspace-operation rows.
  *
+ * `contextSnapshot` stays company-readable, including free-text wake/review
+ * inputs, per PEN-3149's explicit field ruling (comment 5703eb19). The list
+ * route's compact snapshot does not change that scope; withholding captured
+ * output here is separate from credential scrubbing of run inputs.
+ *
  * NOT `GET /workspace-operations/:operationId/log`. That route is deliberately
  * left on BLO-34631's `workspace_runtime:read` entitlement and is not
  * additionally gated here; the reasoning, and why stacking the two would change
