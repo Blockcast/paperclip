@@ -706,6 +706,11 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_released",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+// PEN-3743: cap on the superseded-comment id list inlined into the wake payload
+// and the task markdown. The COUNT is always exact; only the enumeration is
+// capped, so a wake that coalesced hundreds of comments still reports the true
+// size while the payload stays bounded.
+const SUPERSEDED_WAKE_COMMENT_ID_LIMIT = 20;
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
@@ -10136,6 +10141,39 @@ export async function buildPaperclipWakePayload(input: {
   // payload construction, inline only the current newest comment so an agent
   // never receives an hours-old answer while retaining a freshness anchor.
   const commentIds = latestIssueComment ? [latestIssueComment] : requestedCommentIds;
+  // PEN-3743: the override above is correct, but it is the point at which a
+  // coalesced wake stops carrying the orders it absorbed. `requestedCommentIds`
+  // IS the complete accumulated set -- `mergeCoalescedContextSnapshot` keeps it
+  // in `wakeCommentIds` and it survives deferral and promotion intact -- so the
+  // ids are not lost, only un-delivered. Name the difference here so the run is
+  // told what it does not have.
+  //
+  // Without this the loss is actively disguised rather than merely unreported:
+  // `requestedCount` below was computed from the POST-override list, so it could
+  // never exceed `includedCount` from this cause, and `fallbackFetchNeeded` was
+  // correspondingly false -- an explicit assertion of completeness aimed at the
+  // one reader who would otherwise go and check. Measured 2026-10-03 on PEN-3743
+  // itself: two comments 34s apart, `wakeCommentIds` holding both, the delivered
+  // payload holding one, and `{requestedCount: 1, missingCount: 0}` reporting it
+  // as whole.
+  //
+  // "Superseded" means the body reaches the run on NEITHER surface, so subtract
+  // both of them. The payload inlines `commentIds` (the issue's newest row); the
+  // task prompt separately renders `deriveCommentId` -- the LAST ABSORBED wake
+  // comment -- and those two are different rows whenever a later non-wake
+  // comment exists, which is exactly the coalesce this fix targets. Subtracting
+  // only the inlined id would name, as "not shown", the one comment the prompt
+  // had just rendered: the count comes out one high and the run is sent to
+  // re-read what it was handed. Do the subtraction HERE rather than at the call
+  // site because this is the only place the pre-cap set exists, and
+  // `supersededCount` is derived from it: a downstream filter sees only the
+  // capped list, so it could neither recompute an exact count nor restore an id
+  // the cap had already dropped. Subtracting the rendered id there instead would
+  // leave the count one high with no way to correct it.
+  const renderedWakeCommentId = deriveCommentId(input.contextSnapshot, null);
+  const supersededCommentIds = requestedCommentIds.filter(
+    (id) => !commentIds.includes(id) && id !== renderedWakeCommentId,
+  );
   if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
 
   const commentRows =
@@ -10396,12 +10434,34 @@ export async function buildPaperclipWakePayload(input: {
     annotationDeltas,
     planReviewContext,
     commentWindow: {
+      // Deliberately POST-override: `commentIds` has already had the freshness
+      // override applied, so on a coalesce this reads `{requestedCount: 1,
+      // includedCount: 1, missingCount: 0}` even though the wake requested
+      // more. Left as-is rather than widened to the pre-override count because
+      // other readers treat it as "what this payload carries"; the information
+      // it under-reports is now carried exactly by `supersededCount` below.
       requestedCount: commentIds.length,
       includedCount: comments.length,
       missingCount: missingCommentCount,
+      // PEN-3743: absorbed by this wake and shown on NEITHER surface the run
+      // receives -- not inlined in `comments` above (the freshness override),
+      // and not the comment the task prompt renders (see
+      // `renderedWakeCommentId`). `supersededCount` is exact; only the id list
+      // is capped, so a long coalesce still reports its true size without
+      // inflating the payload. Counting these into `fallbackFetchNeeded` is the
+      // point of that field -- a run holding only the newest comment must know
+      // to go read the rest.
+      supersededCount: supersededCommentIds.length,
+      // Keep the NEWEST ids, not the oldest: `requestedCommentIds` is
+      // append-ordered (which is why `deriveCommentId` reads `.at(-1)`), so
+      // `slice(0, N)` would list the most ancient orders and elide the ones
+      // adjacent to the comment actually rendered -- the far end of the thread
+      // from where a run reading it backward starts.
+      supersededCommentIds: supersededCommentIds.slice(-SUPERSEDED_WAKE_COMMENT_ID_LIMIT),
     },
     truncated: payloadTruncated,
-    fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    fallbackFetchNeeded:
+      payloadTruncated || missingCommentCount > 0 || supersededCommentIds.length > 0,
   };
 }
 
@@ -12324,6 +12384,13 @@ export function buildPaperclipTaskMarkdown(input: {
     id: string;
     body: string;
   } | null;
+  // PEN-3743: comment ids this wake absorbed but whose bodies are NOT inlined
+  // above, because the freshness override in `buildPaperclipWakePayload` kept
+  // only the newest. The ids survive on the run row (`wakeCommentIds`); what
+  // was missing was any route from there into the one surface the agent
+  // reliably reads, which is this prompt.
+  supersededWakeCommentIds?: string[] | null;
+  supersededWakeCommentCount?: number | null;
   interaction?: {
     kind?: string | null;
     status?: string | null;
@@ -12686,6 +12753,29 @@ export function buildPaperclipTaskMarkdown(input: {
   }
   if (wakeComment?.body.trim()) {
     lines.push("", "Latest wake comment:", fenceTaskText(wakeComment.body.trim()));
+  }
+  // PEN-3743: a coalesced wake inlines only the newest comment, so every earlier
+  // order it absorbed reaches the agent as silence. Name them. The ids are the
+  // replay path -- they are durably on the run row and readable over the issue
+  // comments API -- so the only thing that was missing is this sentence.
+  const supersededIds = (input.supersededWakeCommentIds ?? []).filter(
+    (id) => typeof id === "string" && id.trim().length > 0,
+  );
+  const supersededCount = input.supersededWakeCommentCount ?? supersededIds.length;
+  if (supersededCount > 0) {
+    const plural = supersededCount === 1 ? "comment" : "comments";
+    const shown = supersededIds.length > 0 ? ` Ids: ${supersededIds.join(", ")}.` : "";
+    const elidedCount = supersededIds.length > 0 ? supersededCount - supersededIds.length : 0;
+    const elided =
+      elidedCount > 0
+        ? ` (${elidedCount} further ${elidedCount === 1 ? "id" : "ids"} not listed.)`
+        : "";
+    lines.push(
+      "",
+      `Earlier wake ${plural} NOT shown above (${supersededCount}):`,
+      `This wake absorbed ${supersededCount} earlier ${plural} whose ${supersededCount === 1 ? "body is" : "bodies are"} not included here.${shown}${elided}`,
+      `Read ${supersededCount === 1 ? "it" : "them"} on the issue before acting -- ${supersededCount === 1 ? "it may carry an order" : "they may carry orders"} the comment above does not repeat.`,
+    );
   }
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
@@ -31628,6 +31718,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       ancestors: issueAncestors,
       wakeComment: safeWakeCommentContext,
+      // PEN-3743: carry the absorbed-but-not-inlined ids from the payload we
+      // just built into the prompt. The payload subtracts BOTH shown surfaces
+      // -- its own inlined `comments` and the `deriveCommentId` row this call
+      // site renders as `wakeComment` below -- so the list is disjoint from the
+      // body rendered here. It is computed from one `contextSnapshot` (the same
+      // `context` object `wakeCommentId` was derived from above), so the two
+      // surfaces cannot disagree about which ID was shown.
+      //
+      // They can still disagree about what was RENDERED, in the under-report
+      // direction only: a soft-deleted wake comment has its body forced to ""
+      // and `buildPaperclipTaskMarkdown` skips the block entirely, so that id
+      // is subtracted as "shown" while nothing was shown. It is then named on
+      // neither surface. Narrow and deliberate -- marking such ids is a
+      // payload-shape change, and excluding them would re-silence a retracted
+      // order, which is the defect this ticket exists to kill.
+      supersededWakeCommentIds: paperclipWakePayload?.commentWindow?.supersededCommentIds ?? null,
+      supersededWakeCommentCount: paperclipWakePayload?.commentWindow?.supersededCount ?? null,
       interaction: {
         kind: readNonEmptyString(context.interactionKind),
         status: readNonEmptyString(context.interactionStatus),

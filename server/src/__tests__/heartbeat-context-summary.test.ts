@@ -671,6 +671,90 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(commentWake).toContain("Update the plan only. Do not write code or perform implementation work.");
     expect(commentWake).not.toContain("Create child issues from the approved plan only");
   });
+
+  // PEN-3743: a coalesced wake inlines only the newest comment. The earlier
+  // orders it absorbed previously reached the agent as silence -- the ids were
+  // retained on the run row but never routed into the prompt, which is the one
+  // surface the agent reliably reads.
+  it("names the earlier comments a coalesced wake absorbed but did not inline", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PEN-3743",
+        title: "Coalesced wake",
+        workMode: "standard",
+        description: null,
+      },
+      wakeComment: {
+        id: "comment-2",
+        body: "the correction",
+      },
+      supersededWakeCommentIds: ["comment-1"],
+      supersededWakeCommentCount: 1,
+    });
+
+    expect(markdown).toContain("Latest wake comment:");
+    expect(markdown).toContain("the correction");
+    expect(markdown).toContain("Earlier wake comment NOT shown above (1):");
+    expect(markdown).toContain("comment-1");
+    expect(markdown).toContain("Read it on the issue before acting");
+  });
+
+  it("pluralizes and reports the exact count when the id list is capped", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PEN-3743",
+        title: "Coalesced wake",
+        workMode: "standard",
+        description: null,
+      },
+      wakeComment: { id: "comment-9", body: "newest" },
+      supersededWakeCommentIds: ["comment-1", "comment-2"],
+      // Exact count exceeds the enumerated ids: the cap must not understate how
+      // much was dropped.
+      supersededWakeCommentCount: 5,
+    });
+
+    expect(markdown).toContain("Earlier wake comments NOT shown above (5):");
+    expect(markdown).toContain("This wake absorbed 5 earlier comments");
+    expect(markdown).toContain("(3 further ids not listed.)");
+    expect(markdown).toContain("Read them on the issue before acting");
+  });
+
+  it("uses the singular when exactly one id is elided by the cap", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PEN-3743",
+        title: "Coalesced wake",
+        workMode: "standard",
+        description: null,
+      },
+      wakeComment: { id: "comment-9", body: "newest" },
+      supersededWakeCommentIds: ["comment-1", "comment-2"],
+      supersededWakeCommentCount: 3,
+    });
+
+    expect(markdown).toContain("(1 further id not listed.)");
+  });
+
+  it("says nothing about supersession when a wake dropped nothing", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PEN-3743",
+        title: "Coalesced wake",
+        workMode: "standard",
+        description: null,
+      },
+      wakeComment: { id: "comment-1", body: "only comment" },
+      supersededWakeCommentIds: [],
+      supersededWakeCommentCount: 0,
+    });
+
+    expect(markdown).not.toContain("NOT shown above");
+  });
 });
 
 describe("derivePaperclipPrReview", () => {
