@@ -24,7 +24,8 @@
 # It therefore FAILS CLOSED: only an explicit HTTP 404 on the ref counts as gone.
 # A 403, a rate-limit, a network error or any other failure leaves the run alone.
 # `gh api` exits non-zero for all of them alike, so the exit code is not a
-# sufficient discriminator -- `classify_ref_probe` is, and is self-tested below.
+# sufficient discriminator -- `classify_ref_probe` is, and is tested by
+# `.github/scripts/tests/sweep-orphaned-merge-group-runs.test.mjs`.
 #
 # Every cancel is logged with the run id and the branch that was missing, so this
 # canceller is attributable. BLO-35314 is an open, unexplained recurring mass
@@ -45,27 +46,10 @@ classify_ref_probe() {
   esac
 }
 
-if [ "${SELF_TEST:-}" = "1" ]; then
-  fail=0
-  check() {
-    local got; got="$(classify_ref_probe "$2" "$3")"
-    [ "$got" = "$1" ] || { echo "FAIL: $4 -> $got (want $1)"; fail=1; }
-  }
-  check alive   0 ""                                  "exit 0 is a live ref"
-  check gone    1 "gh: Not Found (HTTP 404)"           "404 is a deleted ref"
-  # Everything below MUST NOT be read as 'gone' -- that is the cancel-a-live-build bug.
-  check unknown 1 "gh: Forbidden (HTTP 403)"           "403 is not evidence of deletion"
-  check unknown 1 "gh: API rate limit exceeded (HTTP 429)" "rate limit is not evidence of deletion"
-  check unknown 1 "dial tcp: i/o timeout"              "network failure is not evidence of deletion"
-  check unknown 1 ""                                   "non-zero with no message is unknown"
-  check unknown 1 "gh: Server Error (HTTP 500)"        "5xx is not evidence of deletion"
-  [ "$fail" -eq 0 ] && echo "classify_ref_probe: ok"
-  exit "$fail"
-fi
-
+main() {
 R="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 
-runs="$(gh api "repos/$R/actions/runs?event=merge_group&per_page=100" --paginate \
+runs="$(gh api "repos/$R/actions/runs?event=merge_group&per_page=100" \
           --jq '.workflow_runs[]|select(.status!="completed")|[.id,.head_branch]|@tsv')" || {
   echo "::error::could not list merge_group runs for $R"
   exit 1
@@ -96,3 +80,8 @@ while IFS=$'\t' read -r id branch; do
 done <<< "$runs"
 
 echo "swept $R: cancelled $cancelled orphaned merge_group run(s)"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

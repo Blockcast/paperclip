@@ -22,10 +22,12 @@ name: merge-queue-orphan-sweeper
 on:
   schedule:
     # Every 10 minutes, off the round minutes and off `9` (review-gate-sweep).
-    # Cost is one list call plus one ref probe per non-completed merge_group run
-    # -- typically under 6 requests, ~36/hour against the 1,000/hour/repository
-    # `github.token` budget this repo's workflows share. Cheap enough that the
-    # cadence is set by how long an orphan may hold a runner, not by rate limit.
+    # The endpoint is newest-first, and a run is swept within one interval unless
+    # more than 100 newer merge_group runs appear in those 10 minutes. Cost is
+    # one list call plus one ref probe per non-completed run -- typically under 6
+    # requests, ~36/hour against the 1,000/hour/repository `github.token` budget
+    # this repo's workflows share. Cheap enough that the cadence is set by how
+    # long an orphan may hold a runner, not by rate limit.
     - cron: '3-59/10 * * * *'
   workflow_dispatch: {}
 
@@ -59,7 +61,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Self-test the fail-closed liveness classifier
-        run: SELF_TEST=1 bash .github/scripts/sweep-orphaned-merge-group-runs.sh
+        run: node --test .github/scripts/tests/sweep-orphaned-merge-group-runs.test.mjs
 
       - name: Sweep orphaned merge_group runs
         env:
