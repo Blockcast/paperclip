@@ -107,8 +107,48 @@ describe("startup heartbeat dispatch cannot suppress stranded-issue reconciliati
     expect(reconcileIndex).toBeGreaterThan(catchIndex);
 
     const between = region.slice(catchIndex, reconcileIndex);
-    expect(between).not.toContain("{");
+
+    // Exactly one brace closes the handler, and it closes BEFORE the reconcile
+    // call. If the call were moved inside the handler the handler's `}` would
+    // fall after it, so `between` would contain no `}` at all — which is why
+    // this is asserted explicitly rather than left to the slice below.
+    expect(between).toContain("}");
     expect(between.match(/\}/g)).toHaveLength(1);
+
+    // PEN-3810 (carried from Ally's non-blocking review 1 on PR #2234). This
+    // case previously also asserted `not.toContain("{")`. That assertion was
+    // REMOVED, not lost: PEN-3810 wraps each following recovery pass in its own
+    // `try`/`catch`, so there is now a legitimate `try {` between this handler
+    // and the reconcile call and the assertion would fail on correct code. What
+    // it was really pinning — that the reconcile call is after the handler
+    // CLOSES rather than nested inside it — is pinned more tightly below.
+    //
+    // Ally named `throw err;` specifically: adding it after the log reinstates
+    // the exact defect this file exists to pin, and it contains no brace, so
+    // every assertion above passes. "Surface this failure upstream" is the most
+    // plausible innocent edit to a catch that currently only logs.
+    //
+    // Kept as its own assertion rather than folded into the regex below: it is
+    // the single likeliest mutation, and `not.toContain` names it in the
+    // failure output where a regex mismatch would not.
+    expect(between).not.toContain("throw");
+
+    // `throw` is not the only escape, and enumerating keywords would only ever
+    // close the ones we thought of — verified by mutation: `return;` and
+    // `process.exit(1);` both reinstate the same suppression and both survive
+    // the `throw` check above. So assert the shape instead of blacklisting:
+    // between the handler's message literal and its closing brace there may be
+    // nothing but the tail of that logger call. Any added statement fails, and
+    // so does moving the reconcile call inside the handler (no `}` in
+    // `between` then, so this collapses to "" and the match fails loudly).
+    //
+    // The optional comma and loose whitespace keep an innocent multi-line
+    // reformat of the `logger.error(...)` call passing; only an added
+    // statement breaks it.
+    const handlerTail = between.slice(0, between.indexOf("}") + 1);
+    expect(handlerTail.trim()).toMatch(
+      /^"startup heartbeat dispatch resumption failed",?\s*\)\s*;\s*\}$/,
+    );
   });
 
   it("reports an unmeasured promotion count as null rather than a fabricated zero", () => {
@@ -118,5 +158,85 @@ describe("startup heartbeat dispatch cannot suppress stranded-issue reconciliati
     // fixed one block further down this file.
     expect(region).toMatch(/promotedScheduledRetries:\s*promotion\?\.promoted\s*\?\?\s*null/);
     expect(region).not.toMatch(/promotedScheduledRetries:\s*promotion\?\.promoted\s*\?\?\s*0/);
+  });
+});
+
+// PEN-3810. Bounds the whole startup recovery IIFE, not just the dispatch pair
+// above: the terminal `.catch()` message is the last thing in it.
+const IIFE_ANCHOR = "const startupHeartbeatRecovery = (async () => {";
+const TERMINAL_CATCH = '"startup heartbeat recovery failed"';
+
+describe("every startup recovery pass is isolated from its siblings (PEN-3810)", () => {
+  /**
+   * Carried from Ally's non-blocking review 2 on PR #2234. PR #2234 guarded the
+   * dispatch pair; the passes behind it were still bare `await`s under the one
+   * terminal `.catch()`, so the first rejection skipped all of the rest. Ally
+   * named five; re-measuring found eight — `reconcileResolvedBlockerDependents`,
+   * `reconcileUndeliverableIssueMonitors` and `reconcileFailedWakeDispatches`
+   * were not in the review.
+   *
+   * Asserted as a PROPERTY of the whole IIFE rather than as a list of the eight.
+   * A list would go stale the moment a ninth pass is appended — and a pass
+   * appended unguarded is exactly the regression this exists to catch, so the
+   * stale-list version would be silent on the only case that matters.
+   */
+  const iifeStart = serverSource.indexOf(IIFE_ANCHOR);
+  const iifeEnd = iifeStart > -1 ? serverSource.indexOf(TERMINAL_CATCH, iifeStart) : -1;
+
+  // Comments are stripped before the brace walk: a `{` inside a comment would
+  // shift the depth counter and silently misclassify every pass after it.
+  const body = iifeStart > -1 && iifeEnd > iifeStart
+    ? serverSource
+      .slice(iifeStart, iifeEnd)
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "")
+    : "";
+
+  it("has a locatable, unambiguous startup recovery IIFE", () => {
+    expect(iifeStart).toBeGreaterThan(-1);
+    expect(serverSource.indexOf(IIFE_ANCHOR)).toBe(serverSource.lastIndexOf(IIFE_ANCHOR));
+    expect(iifeEnd).toBeGreaterThan(iifeStart);
+  });
+
+  it("runs every heartbeat recovery pass inside a failure guard", () => {
+    // Index of the `{` that opens each `try` block, so the brace walk below can
+    // tell a try-brace from any other brace at the same depth.
+    const tryBraces = new Set<number>();
+    const tryRe = /\btry\s*\{/g;
+    for (let m = tryRe.exec(body); m !== null; m = tryRe.exec(body)) {
+      tryBraces.add(m.index + m[0].length - 1);
+    }
+
+    const passes: { index: number; name: string }[] = [];
+    const awaitRe = /await\s+(heartbeat\.[A-Za-z0-9_$]+)\(/g;
+    for (let m = awaitRe.exec(body); m !== null; m = awaitRe.exec(body)) {
+      passes.push({ index: m.index, name: m[1] });
+    }
+
+    // Positive control: if the anchors or the regex ever stop matching, this
+    // case must fail rather than pass vacuously against an empty pass list.
+    expect(passes.length).toBeGreaterThanOrEqual(16);
+
+    const unguarded: string[] = [];
+    const openTryDepths: number[] = [];
+    let depth = 0;
+    let cursor = 0;
+    for (const pass of passes) {
+      for (; cursor < pass.index; cursor += 1) {
+        const ch = body[cursor];
+        if (ch === "{") {
+          depth += 1;
+          if (tryBraces.has(cursor)) openTryDepths.push(depth);
+        } else if (ch === "}") {
+          if (openTryDepths[openTryDepths.length - 1] === depth) openTryDepths.pop();
+          depth -= 1;
+        }
+      }
+      if (openTryDepths.length === 0) unguarded.push(pass.name);
+    }
+
+    // Named rather than counted: the failure output should say WHICH pass lost
+    // its guard, not just that one did.
+    expect(unguarded).toEqual([]);
   });
 });
