@@ -594,8 +594,8 @@ describe("reconcilePluginSecretBindings", () => {
     });
 
     expect(results).toEqual([
-      { companyId: "company-a", bound: 1, declaredSecretPaths: 1 },
-      { companyId: "company-b", bound: 1, declaredSecretPaths: 1 },
+      { companyId: "company-a", bound: 1, declaredSecretPaths: 1, undeclaredUuidValues: 0 },
+      { companyId: "company-b", bound: 1, declaredSecretPaths: 1, undeclaredUuidValues: 0 },
     ]);
     expect(synced).toEqual([
       { companyId: "company-a", paths: ["slackTokenRef"] },
@@ -615,7 +615,9 @@ describe("reconcilePluginSecretBindings", () => {
       },
     });
 
-    expect(results).toEqual([{ companyId: "company-a", bound: 0, declaredSecretPaths: 0 }]);
+    expect(results).toEqual([
+      { companyId: "company-a", bound: 0, declaredSecretPaths: 0, undeclaredUuidValues: 1 },
+    ]);
     expect(calls).toEqual([]);
   });
 
@@ -633,7 +635,9 @@ describe("reconcilePluginSecretBindings", () => {
       },
     });
 
-    expect(results).toEqual([{ companyId: "company-a", bound: 0, declaredSecretPaths: 1 }]);
+    expect(results).toEqual([
+      { companyId: "company-a", bound: 0, declaredSecretPaths: 1, undeclaredUuidValues: 0 },
+    ]);
     expect(calls).toEqual([]);
   });
 
@@ -656,14 +660,56 @@ describe("reconcilePluginSecretBindings", () => {
       companyId: "foreign-company",
       bound: 0,
       declaredSecretPaths: 1,
+      undeclaredUuidValues: 0,
       error: "Secret does not belong to this company",
     });
     expect(results[1]).toEqual({
       companyId: "owning-company",
       bound: 1,
       declaredSecretPaths: 1,
+      undeclaredUuidValues: 0,
     });
     // The failure must not bind the foreign credential, nor stop the owner.
     expect(synced).toEqual(["owning-company"]);
+  });
+
+  it("counts UUID-shaped config values when the manifest declares none (BLO-32567)", async () => {
+    const calls: string[] = [];
+    const results = await reconcilePluginSecretBindings({
+      pluginId,
+      companyIds: ["company-a"],
+      // No schema, so the bare UUID can never be coerced into a ref and this
+      // install is unresolvable forever. Nothing else diagnoses it.
+      instanceConfigSchema: undefined,
+      getConfig: async () => ({
+        configJson: { nested: { slackTokenRef: secretId }, channel: "#ops" },
+      }),
+      syncBindings: async (companyId) => {
+        calls.push(companyId);
+      },
+    });
+
+    expect(results).toEqual([
+      { companyId: "company-a", bound: 0, declaredSecretPaths: 0, undeclaredUuidValues: 1 },
+    ]);
+    expect(calls).toEqual([]);
+  });
+
+  it("stays quiet for a credential-free plugin with no UUID-shaped config", async () => {
+    const results = await reconcilePluginSecretBindings({
+      pluginId,
+      companyIds: ["company-a"],
+      instanceConfigSchema: undefined,
+      getConfig: async () => ({ configJson: { channel: "#ops", enabled: true } }),
+      syncBindings: async () => {
+        throw new Error("must not sync");
+      },
+    });
+
+    // This is the benign majority. A warning here would be the noise that
+    // trains everyone to ignore the branch above.
+    expect(results).toEqual([
+      { companyId: "company-a", bound: 0, declaredSecretPaths: 0, undeclaredUuidValues: 0 },
+    ]);
   });
 });
