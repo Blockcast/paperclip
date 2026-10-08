@@ -101,3 +101,76 @@ export function shouldReopenTerminalIssueForDeferredWake(
       input.wakeReason === "issue_reopened_via_comment")
   );
 }
+
+/**
+ * PEN-3877: the strings `drainLocklessDeferredIssueWakes` stamps into
+ * `agent_wakeup_requests.error` on each of its three ACTING verbs, and the
+ * classifier that reads them back.
+ *
+ * They live here, beside the predicate the same two components share, for the
+ * same reason that predicate does: writer and reader must not hold separate
+ * copies. The writer is `recovery/service.ts`; the reader is
+ * `projectIssueWakeRequest` in `routes/issues.ts`, which is the ONLY
+ * agent-reachable surface for `agent_wakeup_requests` at all. A reword on one
+ * side that silently stopped matching the other would take the drain's evidence
+ * dark exactly where PEN-3739 done-when 2(b) reads it.
+ *
+ * ⛔ Why a classifier and not the raw string. The `error` column is NOT
+ * uniformly server-authored: `routes/github-webhook.ts` writes
+ * `err instanceof Error ? err.message : String(err)` into it on the PR-reviewer
+ * contention path, so a passthrough would put arbitrary exception text — stack
+ * fragments, upstream payload echoes — on a route an agent seat can read.
+ * `issue-wake-diagnostics-routes.test.ts` already asserts that boundary by
+ * seeding a secret marker into `error` and requiring it absent from the
+ * response. Projecting to a closed set of server-authored literals is the same
+ * discipline `ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS` applies to `reason`, and it
+ * keeps that control intact.
+ *
+ * The terminal arm interpolates the issue's status, so it is matched on its
+ * invariant prefix; the other two are exact.
+ */
+export const LOCKLESS_DEFERRED_WAKE_PROMOTED_ERROR =
+  "Deferred wake superseded by the lockless drain: re-queued because the issue holds no execution lock (PEN-3739)";
+
+export const LOCKLESS_DEFERRED_WAKE_DEPENDENCY_BLOCKED_ERROR =
+  "Deferred wake cancelled by the lockless drain: the issue has an unresolved dependency blocker (PEN-3739)";
+
+const LOCKLESS_DEFERRED_WAKE_TERMINAL_ERROR_PREFIX =
+  "Deferred wake cancelled by the lockless drain: the issue is already ";
+
+export function locklessDeferredWakeTerminalError(issueStatus: string): string {
+  return `${LOCKLESS_DEFERRED_WAKE_TERMINAL_ERROR_PREFIX}${issueStatus} and this wake cannot reopen it (PEN-3739)`;
+}
+
+export type LocklessDeferredWakeDisposition =
+  | "lockless_drain_promoted"
+  | "lockless_drain_cancelled_dependency_blocked"
+  | "lockless_drain_cancelled_terminal";
+
+/**
+ * Attribute a wake row to the lockless drain from the string it stamped, or
+ * `null` for every row the drain did not write.
+ *
+ * `null` is the answer for a finalizer promotion too, and not by omission: a
+ * finalizer promotes the SAME row IN PLACE (`status: "queued"`,
+ * `reason: "issue_execution_promoted"`, `error: null`), while the drain enqueues
+ * a NEW row and cancels the old one carrying {@link
+ * LOCKLESS_DEFERRED_WAKE_PROMOTED_ERROR}. That is what makes this a sound
+ * discriminator between the two promoters rather than a label on one of them —
+ * the ambiguity PEN-3739 done-when 2(b) exists to resolve, which `reason` alone
+ * cannot, because the drain writes `issue_execution_promoted` deliberately
+ * identically to the finalizer.
+ */
+export function locklessDeferredWakeDisposition(
+  rawError: string | null | undefined,
+): LocklessDeferredWakeDisposition | null {
+  if (!rawError) return null;
+  if (rawError === LOCKLESS_DEFERRED_WAKE_PROMOTED_ERROR) return "lockless_drain_promoted";
+  if (rawError === LOCKLESS_DEFERRED_WAKE_DEPENDENCY_BLOCKED_ERROR) {
+    return "lockless_drain_cancelled_dependency_blocked";
+  }
+  if (rawError.startsWith(LOCKLESS_DEFERRED_WAKE_TERMINAL_ERROR_PREFIX)) {
+    return "lockless_drain_cancelled_terminal";
+  }
+  return null;
+}

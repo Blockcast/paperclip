@@ -23,6 +23,12 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes, ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS } from "../routes/issues.js";
+import {
+  locklessDeferredWakeDisposition,
+  locklessDeferredWakeTerminalError,
+  LOCKLESS_DEFERRED_WAKE_DEPENDENCY_BLOCKED_ERROR,
+  LOCKLESS_DEFERRED_WAKE_PROMOTED_ERROR,
+} from "../services/deferred-wake-reopen.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -671,6 +677,191 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(serialized).not.toContain("\"error\"");
   });
 
+  it(
+    "attributes each lockless-drain verb distinctly, and distinguishes all three from a finalizer promotion",
+    async () => {
+      const company = await seedCompany(db);
+      const agent = await seedAgent(db, company.id);
+      const project = await seedProject(db, company.id, "Core");
+      const issue = await seedIssue(db, {
+        companyId: company.id,
+        projectId: project.id,
+        title: "Drained issue",
+        status: "todo",
+        assigneeAgentId: agent.id,
+      });
+      const [actorRun] = await db.insert(heartbeatRuns).values({
+        companyId: company.id,
+        agentId: agent.id,
+        status: "running",
+        contextSnapshot: { issueId: issue.id },
+      }).returning();
+
+      // Exactly what `drainLocklessDeferredIssueWakes` leaves behind on each of
+      // its three ACTING verbs: the row it selected goes `cancelled` carrying
+      // the verb's literal. The promote arm ALSO enqueues a fresh row, which is
+      // what makes it structurally distinct from the finalizer below.
+      const base = {
+        companyId: company.id,
+        agentId: agent.id,
+        source: "automation",
+        status: "cancelled",
+        payload: { issueId: issue.id },
+      };
+      await db.insert(agentWakeupRequests).values([
+        {
+          ...base,
+          reason: "issue_execution_deferred",
+          error: LOCKLESS_DEFERRED_WAKE_PROMOTED_ERROR,
+          requestedAt: new Date(Date.now() - 40_000),
+          finishedAt: new Date(Date.now() - 39_000),
+        },
+        {
+          ...base,
+          reason: "issue_execution_deferred",
+          error: LOCKLESS_DEFERRED_WAKE_DEPENDENCY_BLOCKED_ERROR,
+          requestedAt: new Date(Date.now() - 30_000),
+          finishedAt: new Date(Date.now() - 29_000),
+        },
+        {
+          ...base,
+          reason: "issue_execution_deferred",
+          error: locklessDeferredWakeTerminalError("done"),
+          requestedAt: new Date(Date.now() - 20_000),
+          finishedAt: new Date(Date.now() - 19_000),
+        },
+        // The finalizer, `releaseIssueExecutionAndPromote`: promotes the SAME
+        // row IN PLACE to `queued` with `error: null`. It writes the identical
+        // `reason`, deliberately — which is precisely why `reason` cannot
+        // attribute a promotion and `disposition` must.
+        {
+          ...base,
+          status: "queued",
+          reason: "issue_execution_promoted",
+          error: null,
+          requestedAt: new Date(Date.now() - 10_000),
+        },
+      ]);
+
+      // At the privilege level an agent seat actually has — NOT board. The
+      // `includeInternalIds` gate gives a board user `agentId`/`runId` and
+      // nothing else, so attribution has to survive without it.
+      const res = await request(createApp(db, agentActor(company, agent, actorRun!.id)))
+        .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const wakes = res.body.events.filter((event: { kind: string }) => event.kind === "wake_request");
+      expect(wakes).toHaveLength(4);
+      // Newest-first, so the finalizer row leads.
+      expect(wakes.map((event: { disposition: string | null }) => event.disposition)).toEqual([
+        null,
+        "lockless_drain_cancelled_terminal",
+        "lockless_drain_cancelled_dependency_blocked",
+        "lockless_drain_promoted",
+      ]);
+      // All three drain verbs are distinguishable from each other.
+      expect(new Set(wakes.slice(1).map((event: { disposition: string }) => event.disposition)).size)
+        .toBe(3);
+
+      // PEN-3877's second defect: the promoted row is the drain SUCCEEDING, and
+      // it reported `failed` because the drain stamps its string precisely then.
+      const promoted = wakes[3];
+      expect(promoted.disposition).toBe("lockless_drain_promoted");
+      expect(promoted.failureClass).not.toBe("failed");
+      expect(promoted.failureClass).toBe("cancelled");
+
+      // The raw column stays off the wire — it is not uniformly server-authored.
+      const serialized = JSON.stringify(res.body);
+      expect(serialized).not.toContain("\"error\"");
+      expect(serialized).not.toContain("lockless drain");
+      expect(serialized).not.toContain("PEN-3739");
+
+      // ...and again with `includeInternalIds` CLOSED. An ordinary agent seat in
+      // its own company reads internal ids, so the request above does not
+      // exercise the gate at all; a boundary-scoped seat does. `disposition` is
+      // deliberately outside that gate — it is a closed set of server-authored
+      // literals about an action taken on this issue's own wake, not an internal
+      // identifier — and asserting it here is what stops a later revision
+      // "tidying" it inside the gate and taking the evidence dark for exactly
+      // the caller least able to get it elsewhere.
+      await db.update(agents).set({
+        permissions: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          authorizationPolicy: {
+            trustBoundary: {
+              mode: LOW_TRUST_REVIEW_PRESET,
+              companyId: company.id,
+              projectIds: [project.id],
+              rootIssueId: issue.id,
+              issueIds: [issue.id],
+              allowedAgentIds: [],
+            },
+          },
+        },
+      }).where(eq(agents.id, agent.id));
+
+      const scoped = await request(createApp(db, agentActor(company, agent, actorRun!.id)))
+        .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+      expect(scoped.status, JSON.stringify(scoped.body)).toBe(200);
+      const scopedWakes = scoped.body.events
+        .filter((event: { kind: string }) => event.kind === "wake_request");
+      // The gate is genuinely closed on this request — otherwise this assertion
+      // passes for the same reason the one above did and proves nothing.
+      expect(scopedWakes.every((event: { agentId: null; runId: null }) =>
+        event.agentId === null && event.runId === null)).toBe(true);
+      expect(scopedWakes.map((event: { disposition: string | null }) => event.disposition))
+        .toEqual([
+          null,
+          "lockless_drain_cancelled_terminal",
+          "lockless_drain_cancelled_dependency_blocked",
+          "lockless_drain_promoted",
+        ]);
+    },
+  );
+
+  it("classifies a cancelled wake carrying an explanatory string as cancelled, not failed", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Explained cancellation",
+      status: "todo",
+      assigneeAgentId: agent.id,
+    });
+
+    // Predates the drain and is unrelated to it: this shape was already
+    // mis-reporting, because `rawError` truthiness outranked the status the
+    // column states outright. Keeps the fix honest as a general correction
+    // rather than a special case carved out for the drain.
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "automation",
+      reason: "issue_dependencies_blocked",
+      status: "cancelled",
+      payload: { issueId: issue.id },
+      error: "Cancelled because the dependency-blocked park exceeded its maximum age",
+      requestedAt: new Date(Date.now() - 5_000),
+      finishedAt: new Date(Date.now() - 4_000),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events[0]).toMatchObject({
+      kind: "wake_request",
+      status: "cancelled",
+      failureClass: "cancelled",
+      // Not the drain — a string the drain never writes must not be attributed
+      // to it, or the discriminator is worthless.
+      disposition: null,
+    });
+  });
+
   it("caps wake output and reports truncation", async () => {
     const company = await seedCompany(db);
     const agent = await seedAgent(db, company.id);
@@ -706,6 +897,67 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(res.body.truncatedSections).toEqual({ wakeRequests: true, activityRecords: false });
     expect(res.body.diagnosis).toContain("truncated to 50 wake requests");
     expect(res.body.caps).toEqual({ maxWakeRequests: 50, maxActivityRecords: 50, lookbackDays: 14 });
+  });
+});
+
+// PEN-3877, same discipline and the same reason as the reason-allowlist scans
+// below: outside `describeEmbeddedPostgres`, because this is a static assertion
+// against the writer and must not go silently green where embedded Postgres is
+// unavailable.
+//
+// `disposition` is the ONLY durable, attributable evidence the lockless drain
+// emits — its `logger.warn` goes to pod stdout with no central log store, and
+// `reason` is written deliberately identically to the finalizer's. So a verb
+// that gained a fourth literal, or reworded an existing one, would take that
+// evidence dark while the route kept answering `200` with `disposition: null`.
+// The constants are shared rather than restated, so a reword cannot desync; this
+// scan is what catches a NEW string the classifier has never been taught.
+describe("lockless deferred-wake drain evidence is readable from its writer", () => {
+  const recoveryUrl = new URL("../services/recovery/service.ts", import.meta.url);
+  const recoverySource = readFileSync(fileURLToPath(recoveryUrl), "utf8");
+
+  it("classifies every string the drain stamps on an acting verb", () => {
+    // `cancelWake` is the drain's single write path to `agent_wakeup_requests.error`
+    // (it sets `status`/`finishedAt`/`error`), so every acting verb goes through it.
+    const calls = [...recoverySource.matchAll(/cancelWake\(\s*candidate\.wakeId,\s*([^\n]+?),?\s*\)/g)];
+    expect(calls.length, "no `cancelWake(candidate.wakeId, ...)` call sites found").toBe(3);
+
+    for (const [, rawArg] of calls) {
+      const arg = rawArg!.trim();
+      // A bare string literal would mean the writer stopped sharing the constant,
+      // which is the desync this module exists to prevent. Fail loudly on it
+      // rather than silently classifying `null`.
+      expect(arg.startsWith("\"") || arg.startsWith("`") || arg.startsWith("'"), `inline literal at a drain cancelWake site: ${arg}`).toBe(false);
+    }
+
+    // Every literal the drain can write must classify to a non-null disposition.
+    const written = [
+      LOCKLESS_DEFERRED_WAKE_PROMOTED_ERROR,
+      LOCKLESS_DEFERRED_WAKE_DEPENDENCY_BLOCKED_ERROR,
+      locklessDeferredWakeTerminalError("done"),
+      locklessDeferredWakeTerminalError("cancelled"),
+    ];
+    for (const value of written) {
+      expect(locklessDeferredWakeDisposition(value), `unclassified drain string: ${value}`)
+        .not.toBeNull();
+    }
+    // Distinct verbs stay distinct — a classifier collapsing them would satisfy
+    // the loop above and still fail the attribution this exists for.
+    expect(new Set(written.map(locklessDeferredWakeDisposition)).size).toBe(3);
+  });
+
+  it("attributes nothing it did not write", () => {
+    // The finalizer nulls `error` on the row it promotes in place; an exception
+    // message from `github-webhook.ts` is the reason the raw column is not
+    // exposed at all. Neither may be read as drain evidence.
+    expect(locklessDeferredWakeDisposition(null)).toBeNull();
+    expect(locklessDeferredWakeDisposition("")).toBeNull();
+    expect(locklessDeferredWakeDisposition("Cancelled due to budget pause")).toBeNull();
+    expect(
+      locklessDeferredWakeDisposition(
+        "Deferred wake suppressed by persisted external-service wait",
+      ),
+    ).toBeNull();
   });
 });
 

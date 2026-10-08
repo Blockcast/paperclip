@@ -845,6 +845,7 @@ export type {
   IssueWakeDiagnosticActivityRecord,
   IssueWakeDiagnosticEvent,
   IssueWakeDiagnosticWakeFailureClass,
+  IssueWakeDiagnosticWakeDisposition,
   IssueWakeDiagnosticWakeRequest,
   IssueWakeDiagnosticsResponse,
   IssueSubtreeDiagnosticNode,
