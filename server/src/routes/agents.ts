@@ -5205,7 +5205,22 @@ export function agentRoutes(
       });
     }
 
-    res.json(run);
+    // PEN-3142 (Ally review 5449228335, late lens): on an already-terminal run
+    // `cancelRun` mutates nothing and hands back the unmodified `getRun` row —
+    // every column of `heartbeat_runs`, captured output included. Board actors
+    // skip the decision above, so without this a board actor the `GET` sibling
+    // withholds from (a `cloud_tenant` owner) reads the transcript with one POST.
+    // Same decider, same projection as `GET /heartbeat-runs/:runId`.
+    if (!run) {
+      res.json(run);
+      return;
+    }
+    const transcriptAccess = await decideRunTranscriptRead(req, access, run);
+    res.json(
+      transcriptAccess.allowed
+        ? run
+        : withholdRunTranscriptStateContent(run as unknown as Record<string, unknown>),
+    );
   });
 
   router.post("/heartbeat-runs/:runId/watchdog-decisions", async (req, res) => {
