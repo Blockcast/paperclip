@@ -152,6 +152,12 @@ part of a day, exactly as this incident did.
 A third shape emits **no signal at all**, automatic or otherwise: see
 "Silent eviction: un-stageable rebase" below.
 
+⚠ "That path needs no runbook" is a claim about the *mechanism*, not about
+the *diagnosis*. When the base itself is red, the automatic path works
+perfectly and evicts every entry in turn — each one reporting a failure that
+reads like that PR's own fault. See "The base is red" below for the one query
+that tells the two apart.
+
 ## Silent eviction: un-stageable rebase (BLO-23395)
 
 Source: [BLO-23395](/BLO/issues/BLO-23395)
@@ -388,6 +394,92 @@ A PR whose queue entry is evicted must not be left reporting a stale
 wake/comment is the correction, and it fires whether or not anyone is
 watching.
 
+## The base is red: every entry fails the same job (BLO-41267)
+
+The merge group is `master` + the entry. If `master` is red, **every** entry
+fails — one at a time, each with a failure that looks like that PR's own. This
+produces more total stall time than any other shape in this file, because it
+blocks the whole queue rather than one position, and it is the only shape where
+reading the head entry's log leads you to the wrong conclusion *by design*.
+
+**The discriminator is the failing job name grouped across entries, not the
+contents of any one log.** Group by job, count **distinct PRs**:
+
+```bash
+# $WINDOW is the suspected red period, e.g. "2026-10-07..2026-10-08".
+gh run list --repo Blockcast/paperclip --workflow pr.yml --event merge_group \
+  --status failure --created "$WINDOW" \
+  --json databaseId,headBranch --limit 100 \
+  --jq '.[]|"\(.databaseId)\t\(.headBranch)"' \
+| while IFS=$'\t' read -r id br; do
+    pr=${br##*/pr-}; pr=${pr%%-*}
+    gh api "repos/Blockcast/paperclip/actions/runs/$id/jobs?per_page=100" --paginate \
+      --jq '.jobs[]|select(.conclusion=="failure")|.name' \
+    | grep -vxF verify | sed "s|\$|\t$pr|"
+  done | sort -u \
+| awk -F'\t' '{n[$1]++; p[$1]=p[$1]" "$2} END{for(j in n) printf "%d\t%s\t%s\n", n[j], j, p[j]}' \
+| sort -rn
+```
+
+| grouping | reading | action |
+|---|---|---|
+| **one job name across most or all entries** | the base is red; the entries are innocent | fix `master`, then re-enqueue what was evicted. Do **not** dequeue entries one by one — step 4 of the policy below is the same instinct and the same answer |
+| **a different job per entry** | the entries are genuinely bad | ordinary eviction handling; each PR owns its own failure |
+
+**Three ways to read this query wrong:**
+
+- **Exclude `verify`.** It is the aggregate required check (`needs:` every
+  lane, `if: always() && !cancelled()`), so it fails on every failing entry by
+  construction and reads as "same job everywhere" on *any* bad day. Left in, it
+  is a permanent false positive. The `grep -vxF verify` above is load-bearing.
+- **Count distinct PRs, not runs.** One PR re-queued three times contributes
+  three runs and is one data point; the `sort -u` above is what makes the count
+  mean what the table says.
+- **Two entries sharing a job name is not a red base.** It is the weakest
+  reading the query can produce and a plausible coincidence — the same window
+  below contains exactly that (`Typecheck + Release Registry`, 2 PRs, hours
+  away from the real cluster). **Confirm on `master` itself before acting**:
+  the one `master-health.yml` failure in the whole of 2026-10-01→10-08 is the
+  red base here, at `73231deccc3c` `09:29:24Z`. ⚠ That workflow is **not** a
+  detector — it self-cancels on supersession (31 of 46 runs that day), so a red
+  can pass under it unobserved. A `success` there is evidence; an absence is
+  not.
+
+**Worked example — 2026-10-07, this repo.** `master` red from **08:59:36Z**
+(`f3e05fc53`, [#2263](https://github.com/Blockcast/paperclip/pull/2263)) until
+**16:31:11Z** ([#2290](https://github.com/Blockcast/paperclip/pull/2290)). The
+query above over `2026-10-07..2026-10-08` returns:
+
+```
+6  General tests (server 5/6)       1699 2041 2142 2143 2252 2267
+2  Typecheck + Release Registry     1864 2157
+2  General tests (workspaces-b)     2142 2241
+1  Canary Dry Run                   2269
+```
+
+Six distinct PRs, ten runs, **one assertion** —
+`security-audit-overrides.test.ts > has a guard wired for every ticket bucket`.
+The bottom three rows are the other side of the discriminator in the same
+output — different jobs, one or two entries each, scattered across the window
+rather than clustered in the red period. Those entries own their own failures.
+PR 2142 appears on both sides: innocent at 09:5xZ against the red base,
+genuinely bad at 18:29Z against a fixed one.
+
+**How it landed** — a semantic conflict between two individually-correct
+commits. `3c6322515` ([BLO-40607](/BLO/issues/BLO-40607)) added a
+`securityAuditRemediations` bucket plus its guard; `f3e05fc53`
+([BLO-40334](/BLO/issues/BLO-40334)) added a ticket-key pin enumerating only
+the buckets that existed in *its* tree. Neither is wrong alone. #2263 merged
+with **zero `merge_group` builds**, so the queue — the only check that
+evaluates a PR against the real `master` — never saw the pair. The pin worked
+exactly as designed; it was never shown the entry. **A PR that reaches `master`
+without a `merge_group` build is the generator of this shape**, so it is worth
+checking what merged just before the first same-job failure.
+
+Out of scope here, deliberately: how the repo admin uses their own bypass.
+That is their call. This step is diagnosis, and it is useful however the red
+arrived.
+
 ## The policy
 
 This is the "how long before it is dequeued" answer AC4 asked for. It is an
@@ -620,23 +712,59 @@ by construction. An earlier revision of this file used that gap as the
 qualifying test and classified the 2026-10-05 re-run pair as a supply
 incident; both readings were wrong.
 
-Runner wait lives at **job** level — the first job's `started_at` against the
-run's `created_at`:
+Runner wait lives at **job** level, and it is **every job, not the first**:
 
 ```
-gh api repos/Blockcast/paperclip/actions/runs/<id> --jq '.created_at'
-gh api repos/Blockcast/paperclip/actions/runs/<id>/jobs \
-  --jq '[.jobs[]|select(.started_at)|.started_at]|sort|first'
+gh api repos/Blockcast/paperclip/actions/runs/<id>/jobs?per_page=100 --paginate \
+  --jq '.jobs[]|select(.status!="queued" and .started_at)|[.created_at,.started_at]|@tsv'
 ```
 
-Measured 2026-10-06 over 40 post-change builds this is **p50 12s, p90 41s,
-max 50s** — seconds, not minutes. So a run still `queued` after **≥ 10 min**
-is far outside anything observed and is the floor for a row here. The margin
-against step 3's 150 min threshold is ~180×, not the 1.3× an earlier revision
-claimed. There is no cheap sweep for this (it is one extra API call per run),
-which is fine: the counter takes a row per *incident*, and the cheaper
-front-line signal is the one the 2026-08-26 case actually turned on — a
-`merge_group` run `queued` with **zero runner pods in its target scale set**.
+Two filters, both load-bearing, both the same defect in different clothes:
+
+- **Every job, not the first.** A `pr.yml` merge-group run has ~17 jobs, so
+  `[.started_at]|sort|first` reports the *luckiest* acquisition in the run — a
+  min-of-17 estimator, structurally blind to pool pressure in exactly the way
+  `run_started_at` is. An earlier revision of this section prescribed that and
+  measured p50 12s / p90 41s / max 50s from it. Those numbers are real and the
+  method is wrong; see the correction below.
+- **Exclude `status == "queued"`.** A job that has not acquired a runner yet
+  reports `started_at == created_at` — a placeholder, not an acquisition, the
+  same pin-to-zero shape as `run_started_at` one level down. Left in, every
+  job still waiting contributes a **zero**, so the metric is biased low
+  precisely when the pool is most saturated. Measured 2026-10-08 the dilution
+  was p50 173s → 137s with only 39 placeholder rows in 523; it scales with how
+  much is in flight when you sample.
+
+`created_at` at job level is stamped when the job is **unblocked**, not when
+the run is dispatched, so this gap contains no `needs:` time. Verified on run
+`37786264532`: the three first-wave jobs are created `13:40:49Z`, and every
+second-wave job is created `14:01:25Z` — `policy`'s `completed_at` to the
+second.
+
+Measured 2026-10-08 over 30 merge-group builds (2026-10-06 → 10-08, n=484
+jobs after filtering): **p50 173s, p90 1386s (23.1 min), max 3215s
+(53.6 min)** — minutes to tens of minutes, not seconds. The margin against
+step 3's 150 min threshold is **~2.8×**, not the ~180× an earlier revision
+claimed off the min-of-N method, and not the 1.3× the revision before that
+claimed off `run_started_at`.
+
+⚠ **The "≥ 10 min" floor below is re-derived, and it is no longer justified
+by "far outside anything observed".** p90 per-job wait is 23 min, so 10 min of
+*job* wait is ordinary. The floor still holds because it measures a different
+quantity: a whole run sitting `queued` with **no job started at all**, which
+is distinct from one job queueing behind a busy pool. Read it as "nothing has
+started", not "something is slow".
+
+☠️ **150 min is a dequeue-decision threshold and is NOT the ARC eviction
+threshold.** The two are unrelated numbers and the eviction threshold has
+never been measured here. Everything available says there is headroom — 0 of
+484 waits came near it — so this is a measurement gap, not a suspected
+problem. Do not cite 150 min as evidence about pool eviction.
+
+There is no cheap sweep for this (it is one extra API call per run), which is
+fine: the counter takes a row per *incident*, and the cheaper front-line
+signal is the one the 2026-08-26 case actually turned on — a `merge_group` run
+`queued` with **zero runner pods in its target scale set**.
 
 | date | evidence | runner wait |
 |---|---|---|
@@ -660,22 +788,85 @@ window (`pr-2214` twice, `pr-2228` once), both lanes re-formed at
 19:07:44/45Z, those attempts were cancelled too, and the pair was finally
 re-run **manually by `kkroo` at 21:00:53Z** and succeeded.
 
+☠️ **Before reading a cancellation spike as parallelism cost, rule out a red
+base.** A red base produces a cancellation spike *as a downstream symptom*:
+each entry fails on the base's defect, is evicted, the group re-forms, and the
+healthy neighbours' in-flight builds are cancelled. The cancellations are real
+and the fan-out mechanism described here is genuinely what produces them — but
+the cause is upstream and no amount of parallelism tuning touches it. This
+section is the nearest thing a reader will find, which is exactly why it has
+misled: see "The base is red" above for the one query that separates them.
+2026-10-07 is the worked case — **60% of that day's builds cancelled (54/90)**
+against 0–7% every other day in the window, entirely from one red `master`.
+([BLO-41267](/BLO/issues/BLO-41267) records 19/44 for the same day; that was a
+mid-incident snapshot taken while it was still running, and 54/90 is the
+complete day.)
+
 **This is a cost of parallelism, not a regression to back out** — and the
-measured cost is small. Cancelled share of `merge_group` `pr.yml` builds:
-**1.4% (2/140) over the 7 days before the change, 2.0% (3/148) after**, with
-the post window containing the whole 10-05 burst. That is the
-[BLO-22289](/BLO/issues/BLO-22289) cascade signature the issue asked for and
-it has not regressed. Net drain went 17.3/day → 40.0/day (`merged_at` counts
-over the 7 days before and the 2 days after) and depth 108 → 27.
+measured cost is modest once the red-base day is set aside. Cancelled share of
+`merge_group` `pr.yml` builds, per day (measured 2026-10-08T14:0xZ):
+
+| day | lanes | builds | cancelled | |
+|---|---:|---:|---:|---:|
+| 2026-09-26 → 10-02 | 1 | 140 | 2 | **1.4%** |
+| 2026-10-04 | 2 | 43 | 0 | 0.0% |
+| 2026-10-05 | 2 | 43 | 3 | 7.0% |
+| 2026-10-06 | 2 | 42 | 0 | 0.0% |
+| ~~2026-10-07~~ | 2 | 90 | 54 | *60.0% — red base, not fan-out* |
+| 2026-10-08 (partial) | 2 | 34 | 9 | 26.5% |
+
+**1-lane baseline 1.4% (2/140); 2-lane excluding the red-base day 7.4%
+(12/162)** — a ~5× rise, well short of the
+[BLO-22289](/BLO/issues/BLO-22289) cascade signature the issue asked for.
+Net drain went 17.3/day → 40.0/day and depth 108 → 27, so the trade is a good
+one at this ratio.
+
+⚠ **Two days get dropped from that figure and only one of them may be.**
+Dropping 10-07 is sound — it is a red base, a different mechanism, named above.
+Dropping 10-08 is not: its 9 cancellations are at 03:15–04:12Z, **eleven hours
+after** [#2290](https://github.com/Blockcast/paperclip/pull/2290) fixed the
+base at 16:31Z, so the red-base explanation does not reach them. They are
+ordinary fan-out around a single bad entry — `pr-2269` failed at 02:52Z, after
+which `pr-2272` re-formed across 4 bases and `pr-2297` across 3, green again by
+04:19Z. Bounded re-formation while merges continue (45 in 24h, depth 8), which
+is the shape this section describes working as intended. An earlier revision
+recorded 2.3% by quoting 10-04→10-06 only; that window ends the day before both
+of these and understates the steady state.
+
+**Cancelled builds are wasted runner-seconds, so this is a capacity cost as
+well as a latency one.** A 7.4% cancel rate is a plausible contributor to the
+p90 23-minute per-job runner wait measured in the stall counter above — the two
+sections are measuring opposite ends of the same pool. Neither figure is near a
+threshold today; they are worth watching together rather than separately.
 
 ⚠ **An earlier revision of this section reported that both lanes "waited
 113.2 min for a runner" and recommended raising `arc-merge-queue`'s minimum
-warm pool. Both are retracted.** The two runs are `run_attempt: 3`; attempt 1
-started at 19:07:44Z with `run_started_at == created_at`, i.e. **zero** wait,
-and the 113.2 min is the span from that first dispatch to the manual re-run.
-Runner supply was never implicated: measured job-level runner wait is p50 12s
-/ max 50s (see the stall counter above), so the warm pool is not the
-constraint and there is nothing for that change to fix. The real exposure
-from an N-wide re-form is **cancelled build-minutes**, bounded by the share
-above — if it ever does become expensive, the lever is reducing invalidations
-(fewer evictions, `ALLGREEN` grouping already helps), not more warm runners.
+warm pool. The 113.2 min figure is retracted.** The two runs are
+`run_attempt: 3`; attempt 1 started at 19:07:44Z with
+`run_started_at == created_at`, i.e. **zero** recorded wait, and the 113.2 min
+is the span from that first dispatch to the manual re-run. That retraction
+rests on the attempt evidence alone and is unaffected by anything below.
+
+**The warm-pool recommendation is withdrawn as unsupported, which is not the
+same as refuted.** A revision between the two cited p50 12s / max 50s against
+it; those figures came from the min-of-N method and are themselves corrected
+above to **p50 173s, p90 1386s, max 3215s**. Tens of minutes of per-job wait is
+not evidence that the pool is comfortable — it is simply not evidence either
+way, because nobody has measured the pool's eviction threshold (see the stall
+counter). Do not cite this paragraph as showing the warm pool is fine. The real
+exposure from an N-wide re-form is **cancelled build-minutes**, bounded by the
+share above; if it becomes expensive, the first lever is reducing invalidations
+(fewer evictions, `ALLGREEN` grouping already helps), and the warm pool is a
+live second option that needs the threshold measured before anyone sizes it.
+
+### Counting enqueues over a past window
+
+`mergeQueue.entries[].enqueuedAt` exists only for entries **currently** in the
+queue, so the obvious query cannot be run backwards and a 7-day enqueue rate is
+not recoverable from it after the fact. The workable method is timeline
+`added_to_merge_queue` events over (merged-in-window ∪ currently-queued), then
+a sweep of open PRs touched in-window to catch enqueue-then-ejected entries
+that neither set contains. That last sweep found 2 of 44 on one run — small,
+but it biases toward the reassuring answer (fewer enqueues than really
+happened), so it is worth the extra pass. Recorded here so the next person does
+not rediscover the dead end.
