@@ -69,13 +69,22 @@ describe("securityAuditRemediations ledger", () => {
   // leaves the ticket key set unchanged.
   //
   // BLO-40936: both levels are driven from this ONE literal, so a new ticket
-  // bucket cannot be silenced by a single edit. Listing it here to clear the
-  // ticket-key assertion immediately arms the package-set assertion for it,
-  // which is empty until its packages are listed and their guards named.
+  // bucket cannot be silenced WITHOUT NAMING ITS PACKAGES. Listing the ticket
+  // here to clear the ticket-key assertion immediately arms the package-set
+  // assertion for it, which compares against `[]` until its packages are
+  // listed and their guards named. That empty-array step is what cannot be
+  // skipped — not the edit count, since listing a ticket together with its
+  // packages is one edit and legitimately passes both assertions.
+  //
+  // A guard name here is a claim about what that guard ASSERTS, so a guard
+  // that covers only part of an entry says which part.
   const GUARDS: Record<string, string[]> = {
     // scripts/http-cache-semantics-security-override.test.js
     "BLO-39519": ["http-cache-semantics"],
-    // scripts/proxy-addr-security-override.test.js
+    // scripts/proxy-addr-security-override.test.js — patchedRange only; that
+    // guard carries no advisories assertion and neither does the
+    // "documents the advisories ..." test below, which covers PEN-1198 only.
+    // So this entry's `advisories` array is UNGUARDED.
     "BLO-40607": ["proxy-addr"],
     "PEN-1198": [
       // UNGUARDED: no advisories assertion anywhere in the repo.
@@ -101,14 +110,20 @@ describe("securityAuditRemediations ledger", () => {
   });
 
   // Adding a package entry fails here until someone lists it and says which
-  // guard covers it. Two entries are knowingly listed as UNGUARDED rather than
-  // quietly omitted — the point of this pin is that the unguarded set is
-  // explicit and cannot grow silently. Closing those two is separate work.
+  // guard covers it. Entries whose `advisories` array nothing asserts are
+  // knowingly labelled above rather than quietly omitted — the point of this
+  // pin is that the unguarded set is explicit and cannot grow silently.
+  // Closing those gaps is separate work.
   it("accounts for every package entry inside each ticket bucket", () => {
     const ledger = rootPackageJson.securityAuditRemediations;
 
     for (const [ticket, packages] of Object.entries(GUARDS)) {
-      expect(Object.keys(ledger[ticket] ?? {}).sort()).toEqual(packages);
+      // Sort BOTH sides: `packages` is read from a literal whose order is a
+      // readability choice, so comparing it raw would fail an entry appended
+      // in the wrong position on ordering rather than on membership.
+      expect(Object.keys(ledger[ticket] ?? {}).sort()).toEqual(
+        [...packages].sort(),
+      );
     }
   });
 });
