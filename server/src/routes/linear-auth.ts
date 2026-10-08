@@ -98,6 +98,64 @@ export interface LinearAuthConfig {
   }) => Promise<void>;
 }
 
+/**
+ * Point the Linear plugin at the company's OAuth token secret and team, and
+ * record the company id in plugin state for the import job.  Returns false
+ * when the plugin is not installed.
+ *
+ * Shared by the connect path and the team-refusal path (BLO-31227): the plugin
+ * reads its token only through `linearTokenRef`, so a stored token with no
+ * config write is a connection `/status` reports and nothing can use.
+ */
+export async function persistLinearPluginConfig(
+  db: Db,
+  companyId: string,
+  secretId: string,
+  teamId: string,
+): Promise<boolean> {
+  const [plugin] = await db
+    .select()
+    .from(plugins)
+    .where(eq(plugins.pluginKey, "paperclip-plugin-linear"))
+    .limit(1);
+  if (!plugin) return false;
+
+  const configJson = {
+    linearTokenRef: secretId,
+    linearOAuthActor: LINEAR_OAUTH_ACTOR,
+    teamId,
+    syncComments: true,
+    syncDirection: "bidirectional",
+  };
+  const [existingConfig] = await db
+    .select()
+    .from(pluginConfig)
+    .where(and(eq(pluginConfig.pluginId, plugin.id), eq(pluginConfig.companyId, companyId)))
+    .limit(1);
+  if (existingConfig) {
+    await db
+      .update(pluginConfig)
+      .set({ configJson, updatedAt: new Date() })
+      .where(and(eq(pluginConfig.pluginId, plugin.id), eq(pluginConfig.companyId, companyId)));
+  } else {
+    await db.insert(pluginConfig).values({ pluginId: plugin.id, companyId, configJson });
+  }
+  // Store company ID in plugin state so the import job can find it
+  const { pluginState } = await import("@paperclipai/db");
+  await db.insert(pluginState).values({
+    pluginId: plugin.id,
+    scopeKind: "instance",
+    scopeId: null,
+    namespace: "default",
+    stateKey: "company-id",
+    valueJson: JSON.stringify(companyId),
+  }).onConflictDoUpdate({
+    target: [pluginState.pluginId, pluginState.scopeKind, pluginState.scopeId, pluginState.namespace, pluginState.stateKey],
+    set: { valueJson: JSON.stringify(companyId), updatedAt: new Date() },
+  });
+  return true;
+}
+
 export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
   const router = Router();
   const svc = secretService(db);
@@ -259,9 +317,21 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
           `[linear-auth] resolved team ${teamKey} (${teamId}) by ${resolution.matchedBy}`,
         );
       } else {
-        // Fail closed. Guessing here would overwrite issuePrefix/issueCounter.
+        // Fail closed on identity: guessing here would overwrite
+        // issuePrefix/issueCounter, so neither is touched.  Do NOT also fail
+        // closed on connectivity.  The token above is already stored, and the
+        // plugin can only reach it through `linearTokenRef`, so skip the config
+        // write and `/status` reports connected while the plugin's team picker
+        // (the remedy this message names) throws "Not connected to Linear".
         const message = linearTeamResolutionError(resolution);
         console.error(`[linear-auth] ${message}`);
+        if (secretId) {
+          try {
+            await persistLinearPluginConfig(db, companyId, secretId, configuredTeamId ?? "");
+          } catch (err) {
+            console.warn("[linear-auth] could not write plugin config on team refusal:", err);
+          }
+        }
         res.status(409).send(callbackPage("error", message));
         return;
       }
@@ -319,56 +389,17 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
     // Auto-configure the Linear plugin if installed
     if (secretId) {
       try {
-        const [plugin] = await db
-          .select()
-          .from(plugins)
-          .where(eq(plugins.pluginKey, "paperclip-plugin-linear"))
-          .limit(1);
+        // A failed teams fetch leaves `teamId` blank. Keep the binding read
+        // above instead of erasing it, or the next reconnect has nothing to
+        // resolve against and can refuse (409) on every later attempt.
+        const configured = await persistLinearPluginConfig(
+          db,
+          companyId,
+          secretId,
+          teamId || configuredTeamId || "",
+        );
 
-        if (plugin) {
-          const configJson = {
-            linearTokenRef: secretId,
-            linearOAuthActor: LINEAR_OAUTH_ACTOR,
-            // A failed teams fetch leaves `teamId` blank. Keep the binding read
-            // above instead of erasing it, or the next reconnect has nothing to
-            // resolve against and can refuse (409) on every later attempt.
-            teamId: teamId || configuredTeamId || "",
-            syncComments: true,
-            syncDirection: "bidirectional",
-          };
-
-          const [existingConfig] = await db
-            .select()
-            .from(pluginConfig)
-            .where(and(eq(pluginConfig.pluginId, plugin.id), eq(pluginConfig.companyId, companyId)))
-            .limit(1);
-
-          if (existingConfig) {
-            await db
-              .update(pluginConfig)
-              .set({ configJson, updatedAt: new Date() })
-              .where(and(eq(pluginConfig.pluginId, plugin.id), eq(pluginConfig.companyId, companyId)));
-          } else {
-            await db.insert(pluginConfig).values({
-              pluginId: plugin.id,
-              companyId,
-              configJson,
-            });
-          }
-          // Store company ID in plugin state so the import job can find it
-          const { pluginState } = await import("@paperclipai/db");
-          await db.insert(pluginState).values({
-            pluginId: plugin.id,
-            scopeKind: "instance",
-            scopeId: null,
-            namespace: "default",
-            stateKey: "company-id",
-            valueJson: JSON.stringify(companyId),
-          }).onConflictDoUpdate({
-            target: [pluginState.pluginId, pluginState.scopeKind, pluginState.scopeId, pluginState.namespace, pluginState.stateKey],
-            set: { valueJson: JSON.stringify(companyId), updatedAt: new Date() },
-          });
-
+        if (configured) {
           console.log("[linear-auth] auto-configured Linear plugin");
 
           // Start or update tunnel + webhook
