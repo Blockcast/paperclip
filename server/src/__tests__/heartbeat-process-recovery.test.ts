@@ -4293,7 +4293,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // The discriminator: the orphan behind the throwing one was still reaped.
     // Unguarded, `reapOrphanedRuns` rejects and the pass never gets here.
     expect(result.runIds).toEqual(expect.arrayContaining([first.runId, second.runId]));
-    expect(result.reaped).toBe(2);
+    // PEN-3810 (carried from Ally's non-blocking review 3 on PR #2234):
+    // `toBe(2)` was unscoped against the shared embedded database while the
+    // injection hook above is deliberately scoped to `orphanAgentIds` for
+    // exactly that reason. Latent rather than broken today — prior cases reap
+    // their own orphans to terminal, so they do not recount — but it fails the
+    // day a case above seeds an orphan without reaping it, for a reason
+    // unrelated to what this assertion tests. The `arrayContaining` check above
+    // already carries the real signal (WHICH runs were reaped), so the lower
+    // bound gives up nothing this case depends on.
+    expect(result.reaped).toBeGreaterThanOrEqual(2);
 
     // ...and its dispatch was genuinely ATTEMPTED, not skipped by one of the
     // early `return []` screens. Without this, a guard that silently stopped

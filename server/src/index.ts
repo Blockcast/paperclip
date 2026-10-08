@@ -1451,84 +1451,149 @@ export async function startServer(): Promise<StartedServer> {
         } catch (err) {
           logger.error({ err }, "startup heartbeat dispatch resumption failed");
         }
-        const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-        if (
-          (promotion?.promoted ?? 0) > 0 ||
-          reconciled.assignmentDispatched > 0 ||
-          reconciled.dispatchRequeued > 0 ||
-          reconciled.continuationRequeued > 0 ||
-          reconciled.successfulRunHandoffEscalated > 0 ||
-          reconciled.reviewWaitingParked > 0 ||
-          reconciled.waitingOnReviewResolved > 0 ||
-          reconciled.escalated > 0
-        ) {
-          logger.warn(
-            {
-              // `null`, not 0, when the pair above rejected: a fabricated zero
-              // would read as "measured, nothing promoted".
-              promotedScheduledRetries: promotion?.promoted ?? null,
-              promotedScheduledRetryRunIds: promotion?.runIds ?? null,
-              ...reconciled,
-            },
-            "startup heartbeat recovery changed assigned issue state",
-          );
+        // PEN-3810 (carried from Ally's non-blocking review 2 on PR #2234).
+        // Every pass below this point was a bare `await` under the single
+        // terminal `.catch()` at the end of this IIFE, so the first one to
+        // reject skipped all of the others. PR #2234 moved that trigger off the
+        // pass that rejects BY DESIGN (`resumeQueuedRuns`); it did not remove
+        // the coupling behind it.
+        //
+        // Shape chosen, not pattern-matched from #2234:
+        //
+        //   - A single guard around the whole run would NOT fix this. The harm
+        //     is "one rejection skips every later pass", and inside one guard
+        //     that cascade is unchanged — it would only spare the collector at
+        //     the end. Per-pass isolation is the only shape that removes it.
+        //   - #2234 grouped its pair for a reason that does not generalise:
+        //     a `promoteDueScheduledRetries` rejection already skips
+        //     `resumeQueuedRuns` in the periodic chain, so grouping kept both
+        //     chains' dispatch semantics identical. These passes have no such
+        //     pairing — they are independent, and no result below is read by
+        //     any pass but its own logging block.
+        //   - It matches the six passes AHEAD of the dispatch pair, which each
+        //     already carry their own `try`/`catch` and their own named error
+        //     log. One idiom in one block.
+        //
+        // Each handler names its own pass, so a failure stays attributable
+        // rather than collapsing into the terminal "startup heartbeat recovery
+        // failed" line, which cannot say which pass died.
+        //
+        // Scoped to STARTUP deliberately. The periodic chain (see the
+        // `trackHeartbeatSchedulerWork` chain further down this file) has the
+        // same serial `.then()` cascade under one terminal `.catch()`, but it
+        // re-runs every tick, so a transient fault there costs one interval.
+        // This sequence runs exactly once: a rejection here means those passes
+        // do not run again until the process restarts.
+        try {
+          const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+          if (
+            (promotion?.promoted ?? 0) > 0 ||
+            reconciled.assignmentDispatched > 0 ||
+            reconciled.dispatchRequeued > 0 ||
+            reconciled.continuationRequeued > 0 ||
+            reconciled.successfulRunHandoffEscalated > 0 ||
+            reconciled.reviewWaitingParked > 0 ||
+            reconciled.waitingOnReviewResolved > 0 ||
+            reconciled.escalated > 0
+          ) {
+            logger.warn(
+              {
+                // `null`, not 0, when the pair above rejected: a fabricated zero
+                // would read as "measured, nothing promoted".
+                promotedScheduledRetries: promotion?.promoted ?? null,
+                promotedScheduledRetryRunIds: promotion?.runIds ?? null,
+                ...reconciled,
+              },
+              "startup heartbeat recovery changed assigned issue state",
+            );
+          }
+        } catch (err) {
+          logger.error({ err }, "startup stranded-assigned-issue reconciliation failed");
         }
 
-        const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
-        if (
-          issueGraphReconciled.escalationsCreated > 0 ||
-          issueGraphReconciled.dependencyWakesHealed > 0 ||
-          issueGraphReconciled.staleEscalationsAutoResolved > 0
-        ) {
-          logger.warn(
-            { ...issueGraphReconciled },
-            "startup issue-graph liveness reconciliation changed issue graph state",
-          );
+        try {
+          const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
+          if (
+            issueGraphReconciled.escalationsCreated > 0 ||
+            issueGraphReconciled.dependencyWakesHealed > 0 ||
+            issueGraphReconciled.staleEscalationsAutoResolved > 0
+          ) {
+            logger.warn(
+              { ...issueGraphReconciled },
+              "startup issue-graph liveness reconciliation changed issue graph state",
+            );
+          }
+        } catch (err) {
+          logger.error({ err }, "startup issue-graph liveness reconciliation failed");
         }
 
-        const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
-        if (taskWatchdogsReconciled.triggered > 0) {
-          logger.warn(
-            { ...taskWatchdogsReconciled },
-            "startup task-watchdog reconciliation triggered watchdog work",
-          );
+        try {
+          const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
+          if (taskWatchdogsReconciled.triggered > 0) {
+            logger.warn(
+              { ...taskWatchdogsReconciled },
+              "startup task-watchdog reconciliation triggered watchdog work",
+            );
+          }
+        } catch (err) {
+          logger.error({ err }, "startup task-watchdog reconciliation failed");
         }
 
-        const scanned = await heartbeat.scanSilentActiveRuns();
-        if (scanned.created > 0 || scanned.escalated > 0) {
-          logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
+        try {
+          const scanned = await heartbeat.scanSilentActiveRuns();
+          if (scanned.created > 0 || scanned.escalated > 0) {
+            logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup active-run output watchdog failed");
         }
 
-        const reviewed = await heartbeat.reconcileProductivityReviews();
-        // BLO-30303 AC4: log the funnel counters unconditionally. Gating this
-        // on `created|updated|failed > 0` discarded the one record that
-        // explains a zero — which is how a fleet-wide hard zero looked
-        // identical to a healthy fleet for 23 days. `scanned` plus the
-        // suppression breakdown is what tells those two apart.
-        logger.info({ ...reviewed }, "startup productivity reconciliation funnel");
-        if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-          logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
+        try {
+          const reviewed = await heartbeat.reconcileProductivityReviews();
+          // BLO-30303 AC4: log the funnel counters unconditionally. Gating this
+          // on `created|updated|failed > 0` discarded the one record that
+          // explains a zero — which is how a fleet-wide hard zero looked
+          // identical to a healthy fleet for 23 days. `scanned` plus the
+          // suppression breakdown is what tells those two apart.
+          logger.info({ ...reviewed }, "startup productivity reconciliation funnel");
+          if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
+            logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup productivity reconciliation failed");
         }
 
-        const blockerDependentsSwept = await heartbeat.reconcileResolvedBlockerDependents();
-        if (blockerDependentsSwept.woken > 0 || blockerDependentsSwept.failed > 0) {
-          logger.warn({ ...blockerDependentsSwept }, "startup resolved-blocker-dependents sweep enqueued wakes");
+        try {
+          const blockerDependentsSwept = await heartbeat.reconcileResolvedBlockerDependents();
+          if (blockerDependentsSwept.woken > 0 || blockerDependentsSwept.failed > 0) {
+            logger.warn({ ...blockerDependentsSwept }, "startup resolved-blocker-dependents sweep enqueued wakes");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup resolved-blocker-dependents sweep failed");
         }
 
-        const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
-        if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
-          logger.warn(
-            { ...deadMonitors },
-            "startup undeliverable-monitor reconciliation cleared monitors armed on ineligible issues (BLO-33539)",
-          );
+        try {
+          const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
+          if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
+            logger.warn(
+              { ...deadMonitors },
+              "startup undeliverable-monitor reconciliation cleared monitors armed on ineligible issues (BLO-33539)",
+            );
+          }
+        } catch (err) {
+          logger.error({ err }, "startup undeliverable-monitor reconciliation failed");
         }
 
-        const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
-        if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
-          logger.warn(
-            { ...failedWakeDispatches },
-            "startup failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
-          );
+        try {
+          const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
+          if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
+            logger.warn(
+              { ...failedWakeDispatches },
+              "startup failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
+            );
+          }
+        } catch (err) {
+          logger.error({ err }, "startup failed-wake-dispatch reconciliation failed");
         }
 
         // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
