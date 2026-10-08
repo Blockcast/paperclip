@@ -39,13 +39,23 @@ function makeTool<TSchema extends z.ZodRawShape>(
   schema: z.ZodObject<TSchema>,
   execute: (input: z.infer<typeof schema>) => Promise<unknown>,
 ): ToolDefinition {
+  // BLO-41373: `.strict()` so an argument this tool does not implement is
+  // REFUSED, naming the key, rather than dropped. Silent-ignore is undetectable
+  // by the caller and fails in the reassuring direction — a filter vanishes and
+  // the call returns a clean success over the unfiltered result.
+  //
+  // Load-bearing counterpart in `index.ts`: this object must be handed to the
+  // SDK whole (`registerTool({ inputSchema })`). Passing `.shape` makes the SDK
+  // rebuild its own non-strict object and strip the key before `execute` runs,
+  // so `.strict()` here would never see it.
+  const strict = schema.strict();
   return {
     name,
     description,
-    schema,
+    schema: strict,
     execute: async (input) => {
       try {
-        const parsed = schema.parse(input);
+        const parsed = strict.parse(input);
         return formatTextResponse(await execute(parsed));
       } catch (error) {
         return formatErrorResponse(error);
