@@ -1,0 +1,68 @@
+name: merge-queue-orphan-sweeper
+
+# BLO-41174. Cancels `pr.yml` merge_group runs whose `gh-readonly-queue/master/*`
+# branch has been deleted by a queue re-formation. Full rationale, and the
+# fail-closed liveness property this depends on, live in
+# .github/scripts/sweep-orphaned-merge-group-runs.sh -- read that first.
+#
+# DELIBERATELY NOT TRIGGERED BY `merge_group`, even though that is the event that
+# causes the orphan and would cut latency to seconds. A merge_group-triggered job
+# is itself a merge-queue check, so under ALLGREEN a failure of THIS job ejects
+# the live entry -- see the header of comment-review-gate-merge-group.yml, which
+# documents that ejection path and the queue-ref measurement behind it. Adding an
+# ejection path for every entry, to clean up after a subset of them, is the wrong
+# trade for a backstop. `push` to master was the other candidate and is rejected
+# for being too early: the push IS the merge, and re-formation follows it, so the
+# old refs are frequently still present when it would fire.
+#
+# So: schedule only. Orphans live for at most one interval, which caps the damage
+# at the handful of re-formations that fit in that window rather than the ~17 that
+# accumulated over the 2026-10-07 incident.
+
+on:
+  schedule:
+    # Every 10 minutes, off the round minutes and off `9` (review-gate-sweep).
+    # Cost is one list call plus one ref probe per non-completed merge_group run
+    # -- typically under 6 requests, ~36/hour against the 1,000/hour/repository
+    # `github.token` budget this repo's workflows share. Cheap enough that the
+    # cadence is set by how long an orphan may hold a runner, not by rate limit.
+    - cron: '3-59/10 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  # write, not read: this cancels workflow runs. It is the only write this job has.
+  actions: write
+
+# No `concurrency` block, for the reason documented at length in
+# review-gate-sweep.yml (BLO-31818): a group holds at most ONE pending run, so
+# under runner starvation it EVICTS the backlog rather than serialising it --
+# and a sweeper that is silently discarded is worse than one that runs late.
+# Overlapping runs are harmless here: the work is idempotent (a second cancel of
+# the same run is a 409 warning) and each run re-resolves liveness itself.
+
+jobs:
+  sweep:
+    name: Cancel orphaned merge_group runs
+    # NOT arc-merge-queue: that pool's runner admission hook refuses any workflow
+    # other than pr.yml before checkout, and a sweeper must not compete for the
+    # very pool it exists to free. `default` is where this repo's other scheduled
+    # guards run. RESIDUAL, stated rather than implied: `default` was measured
+    # wedged for ~5h on 2026-09-04 (BLO-31818), and while it is wedged this
+    # backstop does not run. That degrades to the status quo ante, not to
+    # something worse.
+    runs-on: default
+    # Hang detector, not a performance budget. The job is a handful of API calls.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Self-test the fail-closed liveness classifier
+        run: SELF_TEST=1 bash .github/scripts/sweep-orphaned-merge-group-runs.sh
+
+      - name: Sweep orphaned merge_group runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: bash .github/scripts/sweep-orphaned-merge-group-runs.sh
