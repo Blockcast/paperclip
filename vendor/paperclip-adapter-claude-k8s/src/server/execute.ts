@@ -32,6 +32,7 @@ import {
   DEFAULT_SWEEP_AGE_FLOOR_SEC,
   DEFAULT_SWEEP_INTERVAL_SEC,
   DEFAULT_SWEEP_TIMEOUT_MS,
+  LAUNCH_AT_ANNOTATION,
   MANAGED_BY_LABEL,
   MANAGED_BY_VALUE,
   RUN_ID_LABEL,
@@ -668,6 +669,11 @@ export async function createOrAdoptRunSecret(
         [ADAPTER_TYPE_LABEL]: ADAPTER_TYPE_VALUE,
         [RUN_ID_LABEL]: input.runId,
       },
+      // On the create AND the adopt write (the PATCH below reuses this body):
+      // a merge PATCH keeps the orphan's creationTimestamp, so without this the
+      // orphan-Secret sweep would judge an adopted Secret by its old age and
+      // could delete it before this run's Job exists (BLO-21857).
+      annotations: { [LAUNCH_AT_ANNOTATION]: new Date().toISOString() },
     },
     stringData: input.data,
   };
