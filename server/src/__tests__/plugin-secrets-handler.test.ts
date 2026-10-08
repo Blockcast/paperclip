@@ -18,6 +18,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import {
   createPluginSecretsHandler,
   extractSecretRefBindingsFromConfig,
+  reconcilePluginSecretBindings,
 } from "../services/plugin-secrets-handler.js";
 import { secretService } from "../services/secrets.js";
 
@@ -570,5 +571,76 @@ describeEmbeddedPostgres("createPluginSecretsHandler shared vault integration", 
       .from(secretAccessEvents)
       .where(eq(secretAccessEvents.secretId, foreignSecret.id));
     expect(events).toHaveLength(0);
+  });
+});
+
+describe("reconcilePluginSecretBindings", () => {
+  const schema = {
+    type: "object",
+    properties: { slackTokenRef: { type: "string", format: "secret-ref" } },
+  };
+  const secretId = "a286c20f-8c0c-40d5-a140-2a8db9041283";
+
+  it("binds legacy bare-UUID refs for each configured company (BLO-32567)", async () => {
+    const synced: Array<{ companyId: string; paths: string[] }> = [];
+    const results = await reconcilePluginSecretBindings({
+      pluginId,
+      companyIds: ["company-a", "company-b"],
+      instanceConfigSchema: schema,
+      getConfig: async () => ({ configJson: { slackTokenRef: secretId } }),
+      syncBindings: async (companyId, refs) => {
+        synced.push({ companyId, paths: refs.map((ref) => ref.configPath) });
+      },
+    });
+
+    expect(results).toEqual([
+      { companyId: "company-a", bound: 1 },
+      { companyId: "company-b", bound: 1 },
+    ]);
+    expect(synced).toEqual([
+      { companyId: "company-a", paths: ["slackTokenRef"] },
+      { companyId: "company-b", paths: ["slackTokenRef"] },
+    ]);
+  });
+
+  it("never syncs an empty ref set, so a missing schema cannot unbind a healthy install", async () => {
+    const calls: string[] = [];
+    const results = await reconcilePluginSecretBindings({
+      pluginId,
+      companyIds: ["company-a"],
+      instanceConfigSchema: undefined,
+      getConfig: async () => ({ configJson: { slackTokenRef: secretId } }),
+      syncBindings: async (companyId) => {
+        calls.push(companyId);
+      },
+    });
+
+    expect(results).toEqual([{ companyId: "company-a", bound: 0 }]);
+    expect(calls).toEqual([]);
+  });
+
+  it("isolates a company whose config points at another company's secret", async () => {
+    const synced: string[] = [];
+    const results = await reconcilePluginSecretBindings({
+      pluginId,
+      companyIds: ["foreign-company", "owning-company"],
+      instanceConfigSchema: schema,
+      getConfig: async () => ({ configJson: { slackTokenRef: secretId } }),
+      syncBindings: async (companyId) => {
+        if (companyId === "foreign-company") {
+          throw new Error("Secret does not belong to this company");
+        }
+        synced.push(companyId);
+      },
+    });
+
+    expect(results[0]).toEqual({
+      companyId: "foreign-company",
+      bound: 0,
+      error: "Secret does not belong to this company",
+    });
+    expect(results[1]).toEqual({ companyId: "owning-company", bound: 1 });
+    // The failure must not bind the foreign credential, nor stop the owner.
+    expect(synced).toEqual(["owning-company"]);
   });
 });
