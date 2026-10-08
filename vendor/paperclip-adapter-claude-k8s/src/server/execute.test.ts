@@ -2600,7 +2600,82 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
     }
   });
 
-  // Ally Suggestion on #2099 at 09154619: the retention warning was the last
+  // Ally I1 on #2099 at 746dd977: the warning sat inside `if
+  // (!adoptedExistingJob)` at both aborts, so an ADOPTED Job that aborts
+  // retained unowned Secrets with no log line — the same silent leak one
+  // branch deeper. Adoption assigns createdJobUid from the verdict, so this
+  // path reaches the ownerReference patch loop and a refusal there fills
+  // unownedSecrets exactly as on the created path.
+  it("names the unowned Secrets when an ADOPTED Job aborts on the launch ack", async () => {
+    // Probe for the deterministic Job name this ctx builds: adoption only
+    // fires when the persisted identity names the very Job the run rebuilds.
+    mockCoreDeletePod.mockImplementation(async () => {
+      mockCoreListPods.mockResolvedValue({ items: [] });
+      return {};
+    });
+    await execute(makeCtx({ config: { podStartTimeoutSec: 0 } } as Partial<AdapterExecutionContext>));
+    const jobName = mockBatchCreateJob.mock.calls[0]?.[0]?.body?.metadata?.name as string | undefined;
+    expect(jobName, "probe execute() should have reached createNamespacedJob").toBeTruthy();
+
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    try {
+      const liveUid = "live-uid-from-before-the-restart";
+      mockCoreListPods.mockResolvedValue(startingPod);
+      mockCoreDeletePod.mockResolvedValue({});
+      // A 409 corroborated by a readable Job that IS this run's own launched
+      // object: the one shape that adopts rather than failing closed.
+      mockBatchCreateJob.mockRejectedValue(
+        new ApiException(
+          409,
+          "Conflict",
+          { kind: "Status", status: "Failure", reason: "AlreadyExists", code: 409 },
+          {},
+        ) as unknown as Error,
+      );
+      mockBatchReadJob.mockResolvedValue(
+        makeJob({ name: jobName, uid: liveUid, runId: "run-test-001", agentId: "agent-abc" }),
+      );
+      // ...and the ownerReference patch is refused, so the Secrets end up
+      // unowned on a path that never created the Job.
+      mockCorePatchSecret.mockRejectedValue(
+        Object.assign(new Error("secrets is forbidden"), { code: 403 }),
+      );
+      const onLog = vi.fn().mockResolvedValue(undefined);
+
+      const promise = execute(
+        makeCtx({
+          externalRuntime: { reservationId: "reservation-1", slotId: 0, jobName, jobUid: liveUid },
+          onExternalRuntimeLaunched: vi.fn().mockRejectedValue(new Error("reservation ack failed")),
+          onLog,
+          config: { env: { MY_API_KEY: "s3cret" } },
+        } as unknown as Partial<AdapterExecutionContext>),
+      );
+      await vi.advanceTimersByTimeAsync(90_000);
+      const result = await promise;
+
+      // Guard against a vacuous pass: this must be the abort on an *adopted*
+      // Job, not the created-Job abort the case above already covers.
+      expect(result.errorCode).toBe("k8s_job_identity_unacknowledged");
+      expect(mockBatchCreateJob).toHaveBeenCalledTimes(1);
+      const log = onLog.mock.calls.map(([, m]: [string, string]) => m).join("");
+      expect(log).toContain("Reattached to existing Job");
+      expect(log).toContain("with no ownerReference, so no GC will ever collect them");
+      const created = mockCoreCreateSecret.mock.calls
+        .map(([arg]: [{ body?: { metadata?: { name?: string } } }]) => arg?.body?.metadata?.name)
+        .filter(Boolean) as string[];
+      expect(created.length).toBeGreaterThan(0);
+      for (const name of created) expect(log).toContain(name);
+      // An adopted Job is live work. Naming its Secrets is not licence to reap
+      // them, and the teardown must not run against it at all.
+      expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+      expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+      expect(mockCoreDeletePod).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // `await onLog` on the normal teardown path without a `.catch`. Its
   // `cleanupJob` call sites are all supervised, but one of them is the
   // `finally` block — and a rejecting onLog there replaces the run's actual

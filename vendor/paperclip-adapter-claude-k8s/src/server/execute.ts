@@ -2606,7 +2606,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         unownedSecrets.push(secret);
-        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on ${label} Secret: ${msg}\n`);
+        // Guarded like every other retain-path log: a throw here unwinds out of
+        // execute() through the mutex `finally`, so neither abort nor the
+        // teardown `finally` runs and the entry just pushed is discarded unread.
+        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on ${label} Secret: ${msg}\n`).catch(
+          () => undefined,
+        );
       }
     }
     if (!createdJobUid || !onExternalRuntimeLaunched) {
@@ -2614,13 +2619,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // live and its Secrets are mounted into a running pod; deleting either
       // here would destroy work that is still progressing, which is the failure
       // this whole change exists to stop.  Leaking a Job is recoverable by the
-      // existing reapers — deleting a live one is not.
-      if (!adoptedExistingJob) {
-        if (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)) {
-          await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
-        } else {
-          await warnUnownedSecrets();
-        }
+      // existing reapers — deleting a live one is not.  The short-circuit keeps
+      // cleanupJob() off the adopted path while still routing it to the warning:
+      // adoption assigns createdJobUid, so an adopted run reaches the patch loop
+      // above and can retain unowned Secrets just as a created one can.
+      if (!adoptedExistingJob && (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath))) {
+        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+      } else {
+        await warnUnownedSecrets();
       }
       return {
         exitCode: null,
@@ -2641,13 +2647,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Same reasoning as above.  Re-acking an adopted Job re-asserts an
       // identity the server already persisted, so a throw here means we could
       // not confirm ownership — which is the least safe moment to delete a
-      // live in-cluster object, not the most.
-      if (!adoptedExistingJob) {
-        if (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath)) {
-          await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
-        } else {
-          await warnUnownedSecrets();
-        }
+      // live in-cluster object, not the most.  The adopted path still reaches
+      // the warning, for the reason given at the first abort.
+      if (!adoptedExistingJob && (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath))) {
+        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+      } else {
+        await warnUnownedSecrets();
       }
       return {
         exitCode: null,
@@ -2952,11 +2957,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (podsGone) {
       await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
     } else {
-      // These carry no ownerReference, so the Job GC that eventually collects
-      // the rest will never reach them and the adapter has no Secret reaper:
-      // they leak until someone deletes them by hand.  Deleting them here is
-      // the exact hazard this change exists to stop — a pod that outlived
-      // teardown still mounts them — so name them instead of reaping them.
+      // If any Secret's ownerReference patch did not land, that Secret carries
+      // no ownerReference, so the Job GC that eventually collects the rest will
+      // never reach it and the adapter has no Secret reaper: it leaks until
+      // someone deletes it by hand.  Deleting them here is the exact hazard
+      // this change exists to stop — a pod that outlived teardown still mounts
+      // them — so name them instead of reaping them.  No-ops when none failed.
       await warnUnownedSecrets();
     }
   }
