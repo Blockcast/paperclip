@@ -111,6 +111,12 @@ const PROMPT_ENV_NAME = "PROMPT_CONTENT";
  *  var path and failed 100% of the time (BLO-35720). */
 const MAX_ARG_STRLEN_BYTES = 32 * 4096;
 const LARGE_PROMPT_THRESHOLD_BYTES = MAX_ARG_STRLEN_BYTES - PROMPT_ENV_NAME.length - "=".length - 1;
+/** Linux caps one `NAME=value` string at MAX_ARG_STRLEN, including its NUL. */
+const MAX_ENV_STRING_BYTES = MAX_ARG_STRLEN_BYTES - 1;
+
+const WAKE_PAYLOAD_ENV_NAME = "PAPERCLIP_WAKE_PAYLOAD_JSON";
+/** Budget for the value alone — the kernel bounds the whole `NAME=value`. */
+const WAKE_PAYLOAD_MAX_VALUE_BYTES = MAX_ENV_STRING_BYTES - (WAKE_PAYLOAD_ENV_NAME.length + 1);
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
@@ -429,11 +435,61 @@ function joinPromptSections(sections: string[], separator = "\n\n"): string {
   return sections.filter((s) => s.trim().length > 0).join(separator);
 }
 
+/** Shed an oversize wake payload down to something `execve` will accept.
+ *
+ *  The server caps every large term it builds (comment bodies 8 x 4_000 chars,
+ *  continuation summary 4_000, child summaries 20) — but passes each comment's
+ *  `metadata` and `presentation` through raw, and the comment-metadata schema
+ *  permits 20 sections x 50 rows x 4_000 chars (~4 MB, 30x this ceiling). So
+ *  the reachable maximum is unbounded by anything upstream even though the
+ *  measured maximum is ~10 KB (BLO-37287, AC1).
+ *
+ *  Sheds rather than truncates: a sliced JSON string is unparseable, which
+ *  would lose the whole payload instead of the largest part of it. Both tiers
+ *  set the existing `truncated`/`fallbackFetchNeeded` contract, which the agent
+ *  skill already documents as "fetch the thread from the API", so no wake
+ *  context is silently dropped (AC3). */
+function shedOversizeWakePayload(wake: Record<string, unknown>): string {
+  const flags = { truncated: true, fallbackFetchNeeded: true, payloadShed: true };
+  const comments = Array.isArray(wake.comments) ? wake.comments : [];
+
+  // Tier 1: drop only the two uncapped passthrough fields. Everything the
+  // server already bounded — including every comment body — survives.
+  const tier1 = JSON.stringify({
+    ...wake,
+    ...flags,
+    comments: comments.map((c) =>
+      c && typeof c === "object" ? { ...(c as Record<string, unknown>), metadata: null, presentation: null } : c,
+    ),
+  });
+  if (Buffer.byteLength(tier1, "utf8") <= WAKE_PAYLOAD_MAX_VALUE_BYTES) return tier1;
+
+  // Tier 2: routing identifiers only. Every string is bounded HERE rather than
+  // trusted from upstream, so this tier cannot exceed the budget no matter what
+  // the server sent — that is what makes the PodSpec invariant total.
+  const cap = (v: unknown, n: number) => (typeof v === "string" ? v.slice(0, n) : null);
+  const issue = wake.issue && typeof wake.issue === "object" ? (wake.issue as Record<string, unknown>) : null;
+  return JSON.stringify({
+    ...flags,
+    reason: cap(wake.reason, 200),
+    issue: issue
+      ? { id: cap(issue.id, 64), identifier: cap(issue.identifier, 64), title: cap(issue.title, 240) }
+      : null,
+    commentIds: (Array.isArray(wake.commentIds) ? wake.commentIds : [])
+      .filter((v): v is string => typeof v === "string")
+      .slice(0, 8)
+      .map((v) => v.slice(0, 64)),
+    latestCommentId: cap(wake.latestCommentId, 64),
+  });
+}
+
 function stringifyPaperclipWakePayload(wake: unknown): string | null {
   if (!wake || typeof wake !== "object") return null;
   try {
     const json = JSON.stringify(wake);
-    return json === "{}" ? null : json;
+    if (json === "{}") return null;
+    if (Buffer.byteLength(json, "utf8") <= WAKE_PAYLOAD_MAX_VALUE_BYTES) return json;
+    return shedOversizeWakePayload(wake as Record<string, unknown>);
   } catch {
     return null;
   }
@@ -744,7 +800,7 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     reason: "Opaque comment UUID.",
   },
   {
-    name: "PAPERCLIP_WAKE_PAYLOAD_JSON",
+    name: WAKE_PAYLOAD_ENV_NAME,
     classification: "SAFE_LITERAL",
     reason:
       "Compact issue summary plus the new-comment batch. Board content, not credential material, and already readable by this pod through its own API token — but it is the one SAFE_LITERAL here whose value is free-form text, so a credential pasted into an issue comment would appear on the pod spec. Accepted: the same text is equally readable via the API, so Secret-backing it would not close that path.",
@@ -1134,7 +1190,7 @@ function buildEnvVars(
 
   const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
   if (wakePayloadJson) {
-    paperclipEnv.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+    paperclipEnv[WAKE_PAYLOAD_ENV_NAME] = wakePayloadJson;
   }
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
