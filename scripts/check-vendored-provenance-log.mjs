@@ -46,10 +46,10 @@ export const LOG_DIR = `${VENDOR_DIR}/PROVENANCE-CHANGES.d`;
 // Blockcast additions, not vendored source. Changing one of these alone is not a
 // vendored change and needs no log row.
 //
-// The log file is deliberately NOT listed, and that is not an oversight: a
-// change touching only the log is already satisfied by the row it appends, so
-// an entry for it has no failing mutation -- i.e. it would be a comment wearing
-// a guard's clothes. Measured: removing it leaves the suite green.
+// LOG is deliberately NOT listed, and after BLO-41101 that is load-bearing
+// rather than merely harmless: a change touching LOG is rejected outright
+// before `changed` is ever computed, so listing it here would exempt the one
+// file the frozen check exists to reject. The test pins the list exactly.
 export const NOT_SOURCE = [`${VENDOR_DIR}/LICENSE`, `${VENDOR_DIR}/PROVENANCE.md`];
 
 /** An entry file under LOG_DIR. README.md documents the directory, it is not an entry. */
@@ -58,7 +58,7 @@ export function isEntryPath(path) {
 }
 
 /**
- * @returns {{ok: true, warning?: string} | {ok: false, reason: string, detail: string[]}}
+ * @returns {{ok: true} | {ok: false, reason: string, detail: string[]}}
  */
 export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   // core.quotePath defaults on, so an entry with any non-ASCII character comes
@@ -82,40 +82,110 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   // the changed-entry and added-entry paths cannot drift apart again.
   const isRegularFileAtHead = (p) => git("ls-tree", head, "--", p).split(/\s/)[0].startsWith("100");
 
-  const numstat = git("diff", "--numstat", range, "--", LOG).trim();
-  const [added, deleted] = numstat
-    ? numstat.split("\t").slice(0, 2).map(Number)
-    : [0, 0];
+  // BLO-41101. LOG is frozen, and this is the check that makes "frozen" mean
+  // something. It replaces three narrower LOG rules -- an append-only rule, a
+  // binary-blob rule, and a warn-but-pass legacy-row path -- all of which read
+  // only the NET diff and so shared one blind spot.
+  //
+  // The merge queue is REBASE: it replays this branch's commits one at a time,
+  // and GitHub's server-side replay ignores .gitattributes merge drivers. So a
+  // commit that edits LOG conflicts against any row master gained since the
+  // branch point, and the net diff cannot see that -- a later commit in the
+  // same branch can move the row back out and leave the final tree identical.
+  // Measured on #1797: the net diff for LOG was empty, the guard said ok,
+  // `merge=union` made every local rebase return clean, and the queue ejected
+  // it six times in 24 days with zero merge_group runs to point at. #1699 was
+  // ejected three times on the same shape, and BLO-38488/BLO-38489 are the
+  // hand-rebases that paid for it.
+  //
+  // Both halves of that collision are closed here by one rule. A branch may not
+  // carry a LOG-touching commit, and -- because the legacy row path is the same
+  // rule seen from the other side -- master stops gaining rows to collide with.
+  // That path was already documented as known-broken ("accepted, but concurrent
+  // appends to that one file conflict on GitHub and get ejected from the merge
+  // queue"); it landed two more rows on 2026-10-01, which is what the in-flight
+  // branches were being ejected against.
+  //
+  // `numstat !== ""` rather than parsed counts: it is total. A binary blob
+  // emits `-\t-`, which parses to NaN and makes every numeric comparison false
+  // -- the old fail-open this file carried an explicit Number.isFinite guard
+  // for. Testing for the presence of a diff line cannot have that shape at all,
+  // so do not reintroduce the counts.
+  //
+  // This is the MESSAGE discriminator only, deliberately not a second rejection
+  // arm: a non-empty net diff for LOG implies some commit in `base..head`
+  // changed LOG, so `logCommits` already covers every case it would catch.
+  // Measured -- ORing it into the condition below has no failing mutation. It
+  // is not a shallow-clone backstop either: on a shallow clone BOTH commands
+  // exit non-zero and throw, which is the safe direction and not something a
+  // second arm improves on.
+  const netTouchesLog = git("diff", "--numstat", range, "--", LOG).trim() !== "";
 
-  // `git diff --numstat` emits `-\t-` for a blob it treats as binary, so both
-  // counts parse to NaN and every comparison below is false: the guard would
-  // pass on exactly the input it exists to reject -- including a destructively
-  // rewritten log, which is the case the append-only rule is here for. Reject
-  // non-finite rather than comparing against it.
-  if (!Number.isFinite(added) || !Number.isFinite(deleted)) {
+  // Two dots, not the three-dot `range`: `base..head` is exactly the set
+  // `git rebase base` replays. For rev-list, three dots is a SYMMETRIC
+  // DIFFERENCE -- measured, it pulls in master's own commits and blames this
+  // branch for rows it did not write.
+  //
+  // --full-history because the default history simplification walks one parent
+  // of a merge and can drop a LOG-touching commit on the other side entirely:
+  // measured 0 commits without it against 1 with, on a branch that merged a
+  // LOG change and then discarded it. --no-merges because a rebase replays
+  // non-merge commits only, so naming a merge commit sends the author to a
+  // commit that is not the problem: measured 2 listed without it against 1.
+  const logCommits = git(
+    "rev-list", "--no-merges", "--full-history", `${base}..${head}`, "--", LOG,
+  )
+    .split("\n")
+    .filter(Boolean);
+
+  if (logCommits.length > 0) {
+    // Two different repairs, and conflating them is what sent three previous
+    // authors to the wrong one. A wrong net diff needs the row relocated; a
+    // clean net diff over a dirty history needs the history rewritten. A branch
+    // that has both needs both, in that order.
+    //
+    // Pin to the blob at the MERGE BASE, never at `base`. Exercised verbatim on
+    // #1797: pinning to master's tip left 1 offending commit of 6 and the
+    // driver-disabled rebase still conflicted on LOG, because the first
+    // rewritten commit's parent is the merge base -- so rewriting LOG to
+    // master's blob is itself a modification. With the merge-base blob: 0
+    // offending, all 10 commits kept, and LOG drops out of the conflict set
+    // (3 conflicting paths before, 2 after, neither of them LOG).
+    const historyRepair = [
+      "Rewrite the branch so no commit touches it, keeping every commit:",
+      `  MB=$(git merge-base ${base} HEAD)`,
+      `  git filter-branch -f --index-filter \\`,
+      `    "git update-index --cacheinfo 100644,$(git rev-parse $MB:${LOG}),${LOG}" \\`,
+      `    -- $MB..HEAD`,
+      `Offending commit(s) in ${base}..${head}:`,
+      ...logCommits.slice(0, 20).map((sha) => `  ${sha}`),
+      ...(logCommits.length > 20 ? [`  ... and ${logCommits.length - 20} more`] : []),
+    ];
+
     return {
       ok: false,
-      reason: `${LOG} is not a text file; provenance cannot be verified.`,
-      detail: [
-        "git reports it as binary, so added/removed rows cannot be counted and",
-        "the append-only rule cannot be enforced. Check for a stray NUL byte or",
-        "a non-UTF-8 encoding, and restore the file as UTF-8 text.",
-      ],
-    };
-  }
-
-  // Unconditional, because append-only is what makes `merge=union` on this file
-  // safe at all: a union resolves by keeping both sides' added lines and cannot
-  // reconcile an edit, so a rewritten row would be silently duplicated on the
-  // next concurrent append. In a diff, an edit or a reorder is a deletion.
-  if (deleted > 0) {
-    return {
-      ok: false,
-      reason: `${LOG} is append-only, but this change removes ${deleted} line(s) from it.`,
-      detail: [
-        "Append new rows at the end; never edit or reorder existing ones.",
-        "To correct an earlier row, append a row that supersedes it.",
-      ],
+      reason: netTouchesLog
+        ? `${LOG} is frozen, and this change modifies it.`
+        : `${LOG} is frozen. Your net diff leaves it alone, but ${logCommits.length} commit(s) in this branch modify it.`,
+      detail: netTouchesLog
+        ? [
+            `Record the change as a new file, '${LOG_DIR}/<issue-or-pr>.md', and drop`,
+            `the ${LOG} edit. Two distinct new files never conflict; concurrent`,
+            "appends to that one file do, under every merge implementation GitHub",
+            `uses. See ${LOG_DIR}/README.md.`,
+            "",
+            "Dropping it from the working tree is not enough on its own -- the merge",
+            "queue rebases, so it replays each commit separately.",
+            ...historyRepair,
+          ]
+        : [
+            "Your tree is already correct; your history is not. The merge queue is",
+            "REBASE, so it replays each commit onto master in turn, and GitHub's",
+            "replay ignores the `merge=union` attribute that makes your local rebase",
+            "resolve. The result is an eviction with no failing check and no",
+            "merge_group run -- which is why this is caught here instead.",
+            ...historyRepair,
+          ],
     };
   }
 
@@ -252,16 +322,16 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
       .some((line) => line.startsWith("+") && !line.startsWith("+++") && line.slice(1).trim() !== ""),
   );
 
-  // Count added *rows*, not added lines: a bare `added > 0` is satisfied by a
-  // blank line, so the cheapest way to silence the guard would be to add
-  // nothing. Row quality is still left to human review -- this only rules out
-  // the whitespace-only satisfier. The `+++ b/path` diff header cannot match,
-  // since the character after its leading `+` is neither space nor `|`.
-  const addedRows = git("diff", "--unified=0", range, "--", LOG)
-    .split("\n")
-    .filter((line) => /^\+\s*\|/.test(line));
-
-  if (substantiveEntries.length < 1 && addedRows.length < 1) {
+  // BLO-41101. This used to also accept an added *row* in LOG, and to warn
+  // rather than fail when a change recorded itself that way. Both are gone, and
+  // they are gone by subsumption rather than by choice: the frozen-file check
+  // above rejects any change that touches LOG at all, so nothing can reach this
+  // point having appended a row. Leaving the row path in would have been a
+  // branch no input can take -- a comment wearing a guard's clothes. The
+  // `/^\+\s*\|/` row-shape filter it used is preserved in spirit by
+  // `substantiveEntries` above, which rejects the same whitespace-only
+  // satisfier for an entry file.
+  if (substantiveEntries.length < 1) {
     // Distinguish "you added nothing" from "you added an empty file": the
     // second is the misleading case, where the entry the guard is asking for
     // is sitting right there in the diff.
@@ -289,20 +359,6 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
     };
   }
 
-  // A legacy row still satisfies the guard so that PRs already in the queue do
-  // not all have to be rewritten -- but say so, because appending there is what
-  // reproduces the conflict this directory exists to remove.
-  //
-  // Not when the log is the only thing that changed: there is no vendored
-  // source being recorded, so there is nothing to redirect.
-  const logOnly = changed.length === 1 && changed[0] === LOG;
-  if (substantiveEntries.length < 1 && !logOnly) {
-    return {
-      ok: true,
-      warning: `${LOG} is frozen: this change appends a row to it instead of adding ${LOG_DIR}/<issue-or-pr>.md. Accepted, but concurrent appends to that one file conflict on GitHub and get ejected from the merge queue.`,
-    };
-  }
-
   return { ok: true };
 }
 
@@ -327,8 +383,5 @@ if (isMainModule()) {
     for (const line of result.detail) console.error(line);
     process.exit(1);
   }
-  if (result.warning) console.log(`::warning::${result.warning}`);
-  // Name the surface that actually satisfied the guard. On the legacy path
-  // `${LOG_DIR}: ok` names the one surface that did *not* gain an entry.
-  console.log(result.warning ? `${LOG}: ok (legacy row)` : `${LOG_DIR}: ok`);
+  console.log(`${LOG_DIR}: ok`);
 }
