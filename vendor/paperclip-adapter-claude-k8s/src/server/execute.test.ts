@@ -1375,23 +1375,26 @@ describe("execute: job creation", () => {
     }
   });
 
-  it("carries an explicit JSON Patch Content-Type on ALL THREE ownerReference attaches", async () => {
-    // The runtime test above reaches only two of the three. `mcpConfigSecret`
-    // is unreachable in this suite by construction: line 14 pins
-    // PAPERCLIP_SHARED_MCP_BASELINE_PATH to "" so buildJobManifest() never
+  it("carries an explicit JSON Patch Content-Type on every ownerReference attach", async () => {
+    // The runtime test above reaches only two of the three Secrets.
+    // `mcpConfigSecret` is unreachable in this suite by construction: line 14
+    // pins PAPERCLIP_SHARED_MCP_BASELINE_PATH to "" so buildJobManifest() never
     // stages an mcp Secret here. Mutation-testing confirmed it — reverting the
     // prompt or env attach reddens the test above, reverting the mcp attach
     // does not. So that one needs a static pin, in the style BLO-33894 used
     // for the 2>&1-free tee pipeline.
     //
-    // Counts rather than positions, so the pin survives the call sites moving.
+    // BLO-35486 collapsed the three near-identical attaches into one loop over
+    // all three Secrets, so the count is no longer 3 — and pinning any number
+    // would just re-break on the next refactor. The invariant that actually
+    // matters is the ratio: every attach states its Content-Type explicitly.
     // `patchNamespacedSecret({` is the single-argument-object call shape the
-    // three attaches share; the adoption write opens its argument list on the
-    // next line and so is deliberately not counted.
+    // attaches use; the adoption write opens its argument list on the next line
+    // and so is deliberately not counted.
     const src = await readFile(new URL("./execute.ts", import.meta.url), "utf8");
     const attaches = src.match(/patchNamespacedSecret\(\{/g) ?? [];
     const explicit = src.match(/PatchStrategy\.JsonPatch/g) ?? [];
-    expect(attaches).toHaveLength(3);
+    expect(attaches.length).toBeGreaterThan(0);
     expect(explicit).toHaveLength(attaches.length);
   });
 
@@ -1969,14 +1972,24 @@ describe("execute: waitForPod edge cases", () => {
   // no recorded kind and gets the neutral one. Fails against the old ternary,
   // whose else-branch was "Pod scheduling failed".
   it("reports an unclassified label for a failure with no recorded kind", async () => {
-    mockCoreListPods.mockRejectedValue(new Error("connect ETIMEDOUT 10.0.0.1:443"));
+    // Fake timers: the list rejection is persistent, so BLO-35486's teardown
+    // pod-gone confirmation retries it to its 60s real-time deadline before
+    // failing closed. That wait is the point of the other suite, not this one.
+    vi.useFakeTimers();
+    try {
+      mockCoreListPods.mockRejectedValue(new Error("connect ETIMEDOUT 10.0.0.1:443"));
 
-    const result = await execute(makeCtx());
+      const promise = execute(makeCtx());
+      await vi.advanceTimersByTimeAsync(90_000);
+      const result = await promise;
 
-    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
-    expect(result.errorMessage).not.toContain("Pod scheduling failed");
-    expect(result.errorMessage).toContain("unclassified");
-    expect(result.errorMessage).toContain("ETIMEDOUT");
+      expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+      expect(result.errorMessage).not.toContain("Pod scheduling failed");
+      expect(result.errorMessage).toContain("unclassified");
+      expect(result.errorMessage).toContain("ETIMEDOUT");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("throws k8s_pod_schedule_failed when init container has ImagePullBackOff", async () => {
@@ -2838,13 +2851,17 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
       // Guard against a vacuous pass: the env Secret must exist to be retained.
       expect(created.some((name) => name.endsWith("-env"))).toBe(true);
       for (const name of created) {
+        // Two args, not one: the attach now states its Content-Type explicitly
+        // (`setHeaderOptions(..., PatchStrategy.JsonPatch)`), and a
+        // single-argument toHaveBeenCalledWith does not match a two-argument
+        // call. The header itself is pinned by its own test above.
         expect(mockCorePatchSecret).toHaveBeenCalledWith(expect.objectContaining({
           name,
           body: [expect.objectContaining({
             path: "/metadata/ownerReferences",
             value: [expect.objectContaining({ kind: "Job", uid: "uid-1" })],
           })],
-        }));
+        }), expect.anything());
       }
     } finally {
       vi.useRealTimers();

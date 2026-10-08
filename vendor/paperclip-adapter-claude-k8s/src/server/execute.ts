@@ -2582,7 +2582,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         unownedSecrets.push(secret);
         continue;
       }
-      }
       try {
         await coreApi.patchNamespacedSecret({
           name: secret.name,
