@@ -107,7 +107,13 @@ function shellSingleQuote(value: string): string {
  *   finished in between is reused rather than torn down;
  * - owned: the lock holds a random owner token (`$$` alone is useless — the
  *   Job's `sh -c` is PID 1 in every pod) and is released only by its owner, so
- *   an installer whose lock was reclaimed cannot free its successor's;
+ *   an installer whose lock was reclaimed cannot free its successor's, and the
+ *   holder re-reads its token before it deletes anything;
+ * - reclaimed atomically: a stale lock is renamed to a name only this installer
+ *   uses, so of two installers reclaiming it exactly one wins. The winner then
+ *   re-tests the age of the directory it actually renamed: if another installer
+ *   reclaimed and re-took the lock between this one's age check and its rename,
+ *   that fresh lock is put back rather than deleted, and this installer waits;
  * - crash-safe: a lock older than 20 min is reclaimed, a dir without `.complete`
  *   is rebuilt, and the lock holder clears every `.tmp-<version>-*` staging dir
  *   before installing (only lock holders create them, so any it finds belong to
@@ -137,10 +143,17 @@ export function buildClaudeCodeRuntimeShell(opts: { version: string; dataMountPa
       'mkdir -p "$__pcroot" 2>/dev/null; __pclock="$__pcroot/.lock-$__pcver"; ' +
       '__pcown="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)-$$"; ' +
       'if [ -d "$__pclock" ] && [ -n "$(find "$__pclock" -maxdepth 0 -mmin +20 2>/dev/null)" ]; then ' +
-        'echo "[paperclip] reclaiming stale claude-code install lock $__pclock" >&2; rm -rf "$__pclock"; fi; ' +
+        '__pcstale="$__pclock.stale-$__pcown"; ' +
+        'if mv "$__pclock" "$__pcstale" 2>/dev/null; then ' +
+          'if [ -n "$(find "$__pcstale" -maxdepth 0 -mmin +20 2>/dev/null)" ]; then ' +
+            'echo "[paperclip] reclaiming stale claude-code install lock $__pclock" >&2; ' +
+          'elif mv -T "$__pcstale" "$__pclock" 2>/dev/null; then __pcstale=; fi; ' +
+          '[ -z "$__pcstale" ] || rm -rf "$__pcstale"; ' +
+        'fi; ' +
+      'fi; ' +
       'if mkdir "$__pclock" 2>/dev/null; then ' +
         'echo "$__pcown" > "$__pclock/owner"; ' +
-        'if [ ! -f "$__pcdir/.complete" ] || [ ! -x "$__pcbin" ]; then ' +
+        'if { [ ! -f "$__pcdir/.complete" ] || [ ! -x "$__pcbin" ]; } && [ "$(cat "$__pclock/owner" 2>/dev/null)" = "$__pcown" ]; then ' +
           '__pctmp="$__pcroot/.tmp-$__pcver-$__pcown"; rm -rf "$__pcroot/.tmp-$__pcver-"* "$__pcdir"; mkdir -p "$__pctmp"; ' +
           `echo "[paperclip] installing ${spec} into $__pcdir" >&2; ` +
           `if npm install --prefix "$__pctmp" --omit=dev --no-audit --no-fund --no-package-lock --loglevel=error "${spec}" >&2 ` +
