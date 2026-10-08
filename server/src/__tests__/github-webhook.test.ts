@@ -10038,6 +10038,124 @@ describeEmbeddedPostgres("github-webhook route", () => {
         }),
       ).toBeNull();
     });
+
+    // BLO-34248. BLO-30420 gave the declined path a named reason; it did not
+    // separate the reasons by how much they should worry a reader. Every
+    // declined classification but the healthy one shared `info` and one
+    // message string, so finding the suspect case still required knowing its
+    // name in advance -- most of the discoverability problem BLO-30420 names.
+    //
+    // These two tests are a PAIR and the second is the load-bearing one. A
+    // blanket promotion of the whole declined path passes the first assertion
+    // while destroying the signal this split exists to create, so the routine
+    // case is pinned at its own level in the same breath.
+    describe("declined-review log level (BLO-34248)", () => {
+      const DECLINED_MESSAGE =
+        "github webhook declined PR review feedback delivery: classifier found no actionable findings";
+
+      function declinedLines(spy: ReturnType<typeof vi.spyOn>) {
+        return spy.mock.calls.filter(([, msg]) => msg === DECLINED_MESSAGE);
+      }
+
+      it("promotes ally_review_findings_unenumerable to warn so the truncated-body case is selectable without knowing the reason name", async () => {
+        // Same fixture and same clamp-then-classify sequence as the reason
+        // test above: Ally heading present, counted buckets past the clamp.
+        const fullBody = frr61ShapedBody({ priorStillPresent: false });
+        const truncatedBody = Buffer.from(fullBody, "utf8")
+          .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
+          .toString("utf8");
+
+        const { issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+        expect(issueId).toEqual(expect.any(String));
+        const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+        const warnSpy = vi.spyOn(logger, "warn");
+        const infoSpy = vi.spyOn(logger, "info");
+        try {
+          const response = await sendReviewSubmitted(
+            app,
+            reviewSubmittedFeedbackPayload({
+              prNumber: 61,
+              reviewId: 4968003839,
+              state: "commented",
+              headSha: "f78f3dcd8818ed2bf9b7550965c96c614f433987",
+              identifier: "PEN-1126",
+              body: truncatedBody,
+            }),
+            "delivery-blo-34248-unenumerable-warn",
+          );
+          expect(response.status).toBe(200);
+
+          const warned = declinedLines(warnSpy);
+          expect(warned).toHaveLength(1);
+          expect(warned[0]?.[0]).toMatchObject({
+            suppressionReason: "ally_review_findings_unenumerable",
+            suppressionPredicate:
+              "hasAllyConsolidatedReviewHeading && extractAllyReportedFindingRefs === null",
+            prNumber: 61,
+            repoFullName: "Blockcast/paperclip",
+          });
+
+          // The promotion is a MOVE, not a copy: a line emitted at both levels
+          // would leave the `info` stream exactly as unselectable as before.
+          expect(declinedLines(infoSpy)).toHaveLength(0);
+
+          // Emission only. The verdict the wake path routes on is untouched.
+          expect(response.body.reviewFeedbackSuppressed).toEqual({
+            reason: "ally_review_findings_unenumerable",
+            predicate: "hasAllyConsolidatedReviewHeading && extractAllyReportedFindingRefs === null",
+          });
+          expect(response.body.reopened).toEqual([]);
+        } finally {
+          warnSpy.mockRestore();
+          infoSpy.mockRestore();
+        }
+      });
+
+      it("leaves the routine review_body_absent case at info", async () => {
+        const { issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
+        expect(issueId).toEqual(expect.any(String));
+        const app = buildApp({ prReviewerBotLogin: "allyblockcast[bot]" });
+
+        // An approval submitted with no body at all -- routine and
+        // high-volume, which is precisely why it must not share a level with
+        // the suspect case.
+        const payload = reviewSubmittedFeedbackPayload({
+          prNumber: 62,
+          reviewId: 4968003840,
+          state: "commented",
+          headSha: "f78f3dcd8818ed2bf9b7550965c96c614f433987",
+          identifier: "PEN-1126",
+        });
+        (payload.review as { body: string | null }).body = null;
+
+        const warnSpy = vi.spyOn(logger, "warn");
+        const infoSpy = vi.spyOn(logger, "info");
+        try {
+          const response = await sendReviewSubmitted(
+            app,
+            payload,
+            "delivery-blo-34248-body-absent-info",
+          );
+          expect(response.status).toBe(200);
+          expect(response.body.reviewFeedbackSuppressed).toEqual({
+            reason: "review_body_absent",
+            predicate: "typeof body !== 'string'",
+          });
+
+          const infoed = declinedLines(infoSpy);
+          expect(infoed).toHaveLength(1);
+          expect(infoed[0]?.[0]).toMatchObject({ suppressionReason: "review_body_absent" });
+
+          // The control the AC calls load-bearing: if this ever goes `warn`,
+          // the promoted stream is high-volume again and selects nothing.
+          expect(declinedLines(warnSpy)).toHaveLength(0);
+        } finally {
+          warnSpy.mockRestore();
+          infoSpy.mockRestore();
+        }
+      });
+    });
   });
 
   // BLO-23267: real-world reproduction of the same defect via the

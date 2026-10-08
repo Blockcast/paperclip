@@ -7016,12 +7016,24 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // changes no wake, comment, dedupe or escalation behavior.
     const reviewFeedbackSuppression = resolveReviewFeedbackSuppression(context);
     if (reviewFeedbackSuppression) {
-      // `ally_review_findings_all_zero` is the healthy no-op and the
-      // overwhelmingly common one; logging it at `info` buries
-      // `ally_review_findings_unenumerable`, the suspect reason this
-      // diagnostic exists to surface.
+      // BLO-34248: three levels, because the reasons differ in how much they
+      // should worry a reader and a single level makes the one suspect case
+      // selectable only by someone who already knows its name.
+      //   `warn`  -- `ally_review_findings_unenumerable`: a body reached the
+      //              classifier with its findings already truncated away (the
+      //              frr#61 shape). Alertable on its own.
+      //   `debug` -- `ally_review_findings_all_zero`: the healthy no-op and
+      //              the overwhelmingly common one.
+      //   `info`  -- the routine remainder (`review_body_absent` and peers).
+      // Deliberately NOT a blanket promotion of the declined path: promoting
+      // `review_body_absent` too would restore exactly the burial this fixes,
+      // which is why the test carries a routine-level control alongside.
       const level =
-        reviewFeedbackSuppression.reason === "ally_review_findings_all_zero" ? "debug" : "info";
+        reviewFeedbackSuppression.reason === "ally_review_findings_unenumerable"
+          ? "warn"
+          : reviewFeedbackSuppression.reason === "ally_review_findings_all_zero"
+            ? "debug"
+            : "info";
       logger[level](
         {
           deliveryId,
