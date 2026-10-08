@@ -957,17 +957,19 @@ describe("lockless deferred-wake drain evidence is readable from its writer", ()
     // (it sets `status`/`finishedAt`/`error`), so every acting verb goes through it.
     // Matched on the callee, not the receiver expression, so a verb added outside
     // the candidate loop still counts. The definition (`const cancelWake = async (`)
-    // does not match `cancelWake(`.
+    // does not match `cancelWake(`. The optional trailing group captures the list
+    // the site records its wake into on success (`if (await cancelWake(...)) {
+    // <list>.push(`), which is what binds a site to its meaning below.
     const openers = recoverySource.match(/\bcancelWake\(/g) ?? [];
     const calls = [
       ...recoverySource.matchAll(
-        /\bcancelWake\(\s*[^,()]+,\s*((?:[^()\n]|\([^()\n]*\))+?)\s*,?\s*\)/g,
+        /\bcancelWake\(\s*[^,()]+,\s*((?:[^()\n]|\([^()\n]*\))+?)\s*,?\s*\)(?:\s*\)\s*\{\s*(\w+)\.push\()?/g,
       ),
     ];
     expect(calls.length, "a `cancelWake(` site whose argument the scan cannot read").toBe(openers.length);
     expect(calls.length, "the drain's three acting-verb `cancelWake(...)` sites").toBe(3);
 
-    const siteDispositions = calls.map(([, rawArg]) => {
+    const sites = calls.map(([, rawArg, recordedInto]) => {
       const arg = rawArg!.trim();
       // A bare string literal would mean the writer stopped sharing the constant,
       // which is the desync this module exists to prevent. Fail loudly on it
@@ -981,13 +983,27 @@ describe("lockless deferred-wake drain evidence is readable from its writer", ()
           ? locklessDeferredWakeTerminalError("done")
           : null;
       expect(stamped, `unresolvable drain cancelWake argument: ${arg}`).not.toBeNull();
-      return locklessDeferredWakeDisposition(stamped);
+      return { arg, disposition: locklessDeferredWakeDisposition(stamped), recordedInto };
     });
-    // Three sites, three distinct verbs. Every constant classifying (below) is not
-    // enough: swap one site's constant for another's and the route answers `200`
-    // with a confidently wrong `disposition`, which only this set catches.
+    const siteDispositions = sites.map((site) => site.disposition);
+    // Three sites, three distinct verbs.
     expect(siteDispositions).not.toContain(null);
     expect(new Set(siteDispositions).size).toBe(3);
+    // Distinctness binds each site to A constant, not to the RIGHT one: swap the
+    // dependency-blocked and promote sites' constants and all three still resolve,
+    // distinctly, while the route answers `200` labelling a dependency-blocked
+    // cancellation `lockless_drain_promoted` — and the route-level test seeds the
+    // literals directly, so it cannot see that either. The writer's own bookkeeping
+    // is the independent signal: only the promote arm records into
+    // `promotedWakeIds`, both cancel arms into `cancelledWakeIds`. The terminal arm
+    // is pinned by its call shape above, so dependency-blocked is bound as the
+    // remainder. Checked per site rather than as an ordered list, so a legitimate
+    // reordering of the arms stays green.
+    for (const site of sites) {
+      expect(site.recordedInto, `drain cancelWake(${site.arg}) records its wake into the wrong (or no) list`).toBe(
+        site.disposition === "lockless_drain_promoted" ? "promotedWakeIds" : "cancelledWakeIds",
+      );
+    }
 
     // Every literal the drain can write must classify to a non-null disposition.
     const written = [
@@ -1012,13 +1028,22 @@ describe("lockless deferred-wake drain evidence is readable from its writer", ()
     expect(locklessDeferredWakeDisposition(null)).toBeNull();
     expect(locklessDeferredWakeDisposition("")).toBeNull();
     expect(locklessDeferredWakeDisposition("Cancelled due to budget pause")).toBeNull();
-    // The real near-misses: sibling writers sharing the `Deferred wake ` prefix
-    // (`recovery/service.ts`, `heartbeat.ts`).
+    // The real near-misses: every sibling writer sharing the `Deferred wake ` prefix
+    // as of this writing (`recovery/service.ts`, `heartbeat.ts`). The self-authored
+    // one interpolates the issue status much as the terminal arm does.
     expect(
       locklessDeferredWakeDisposition("Deferred wake superseded by persisted external-service wait"),
     ).toBeNull();
     expect(
       locklessDeferredWakeDisposition("Deferred wake suppressed by active subtree pause hold"),
+    ).toBeNull();
+    expect(
+      locklessDeferredWakeDisposition("Deferred wake could not be promoted: agent is not invokable"),
+    ).toBeNull();
+    expect(
+      locklessDeferredWakeDisposition(
+        "Deferred wake suppressed: self-authored comment waking its own author on an issue already done",
+      ),
     ).toBeNull();
   });
 });
