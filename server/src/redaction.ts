@@ -927,6 +927,11 @@ export function liveEventCarriesTranscriptContent(payload: Record<string, unknow
  * Narrowing `/log` and `/events` while leaving these open would have been
  * decorative: the same prose exits here, in bulk, without even a per-run fetch.
  */
+// `contextSnapshot` deliberately remains company-readable run state, as the
+// PEN-3149 field ruling (comment 5703eb19) explicitly specifies. This includes
+// its free-text wake/review inputs; the list route's compact summary is not an
+// authorization boundary. This carve-out does not assert the snapshot is free
+// of sensitive text, or exempt its writers from credential scrubbing.
 const WITHHELD_RUN_STATE_CONTENT_KEYS = [
   "stdoutExcerpt",
   "stderrExcerpt",
