@@ -1252,9 +1252,11 @@ const POD_FAILURE_LABELS: Record<PodFailureKind, string> = {
  * This covers Secrets consumed through `secretKeyRef`, which is only
  * `envSecret`.  `promptSecret` and `mcpConfigSecret` are mounted as volumes
  * (`job-manifest.ts`), and a missing volume Secret produces none of these
- * reasons.  The pod stays `Pending` with its container at `ContainerCreating`,
- * and the cause shows up only as a `FailedMount` event, which `waitForPod`
- * does not read.  That case rides the full start deadline.
+ * reasons.  The pod stays `Pending` with its containers waiting at
+ * `PodInitializing` (the pod always has an init container, so the kubelet
+ * reports that rather than `ContainerCreating`), which also looks like a normal
+ * init-image pull.  The cause shows up only as a `FailedMount` event, which
+ * `waitForPod` does not read.  That case rides the full start deadline.
  */
 const UNRECOVERABLE_WAITING_REASONS = new Set([
   "CreateContainerConfigError",
@@ -1724,9 +1726,10 @@ async function reapPodLogFile(
  *                  Returned only when the pod delete was accepted, so they are
  *                  Terminating.
  * - `undeleted`  -- the list still showed pods at the deadline and at least
- *                  one pod's delete was refused (non-404) on the final poll, so
- *                  that pod is NOT Terminating and can still start a container.  A successful
- *                  list proves nothing about the delete: `list` and
+ *                  one pod's delete was refused (non-404) on the last poll
+ *                  whose list succeeded, so that pod is NOT Terminating and
+ *                  can still start a container.  A successful list proves
+ *                  nothing about the delete: `list` and
  *                  `delete` are separate verbs, and a read-only Role grants
  *                  one without the other.
  * - `unobserved` — no list call ever succeeded, so nothing was observed either
@@ -1885,7 +1888,10 @@ async function deleteJobPodsAndWait(
  * failures are logged but not thrown.
  *
  * Returns true only when every pod for the Job is confirmed gone, which is the
- * caller's licence to delete the run's mounted Secrets.
+ * caller's licence to delete the run's mounted Secrets.  The one exception is
+ * `waitForPods: false`, which skips the wait and returns true unconditionally;
+ * only the concurrency guard's foreign-Job reap passes it, and it ignores the
+ * result.
  *
  * BLO-35486: ordering here is load-bearing.  This used to delete the Job with
  * `propagationPolicy: Background` — which returns before the GC has removed the
@@ -1895,12 +1901,14 @@ async function deleteJobPodsAndWait(
  * start its container into `Error: secret "ac-…-env" not found`.  Pods first,
  * confirmed gone, then the Job, then the Secrets.
  *
- * The Job delete and the pod-log reap stay independent of each other
- * (BLO-32734); see `deleteJobOnly`.  The reap is skipped only when pods are
- * not confirmed gone, since a live pod may still be writing that log.  The
- * retained Job carries the log path in its `paperclip.io/pod-log-path`
- * annotation, so the concurrency guard that later reaps the Job as stale
- * reaps the log with it (BLO-39114).
+ * The pod-log reap runs on every path, independent of both the Job delete and
+ * the pod wait (BLO-32734); see `deleteJobOnly`.  It is not gated on pods
+ * being gone: nothing else will ever unlink this file.  The concurrency
+ * guard's annotation-driven reap (BLO-39114) only looks at non-terminal Jobs,
+ * and a retained Job is normally already Complete or Failed, so
+ * `ttlSecondsAfterFinished` deletes it, annotation and all, while the log
+ * stays on the shared PVC.  A pod still writing it keeps its open descriptor;
+ * the run that log belongs to has already ended.
  */
 export async function cleanupJob(
   namespace: string,
@@ -1911,8 +1919,10 @@ export async function cleanupJob(
   reportMissingPodLog = false,
   opts?: { waitForPods?: boolean },
 ): Promise<boolean> {
-  // The concurrency guard reaps *other* runs' stale Jobs under its own 15s
-  // budget, and never deletes this run's Secrets, so it opts out of the wait.
+  // The concurrency guard reaps *other* runs' stale Jobs in a loop with no time
+  // bound (only its Job list sits inside the 15s guard timeout), and never
+  // deletes this run's Secrets, so it opts out of the wait.  Waiting would add
+  // up to POD_TEARDOWN_TIMEOUT_MS per stale Job, serially, at every run start.
   if (opts?.waitForPods === false) {
     await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath, podLogPath, reportMissingPodLog);
     return true;
@@ -1937,6 +1947,8 @@ export async function cleanupJob(
         `leaving Job and run Secrets for K8s GC ` +
         `rather than deleting a Secret a live pod mounts${retainCost}\n`,
     );
+    // Not deferred to the Job's eventual reaper: see the docstring.
+    await reapPodLogFile(podLogPath, jobName, onLog, reportMissingPodLog);
     return false;
   }
   await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath, podLogPath, reportMissingPodLog);
@@ -2281,8 +2293,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           if (!reapable) {
             await logQuietly(onLog, "stderr", `[paperclip] Warning: Job ${jobName} has an implausible ${POD_LOG_PATH_ANNOTATION} (${annotated}); refusing to unlink it\n`);
           }
-          // `waitForPods: false`: this reaps *another* run's stale Job under the
-          // guard's own 15s budget and never deletes this run's Secrets.
+          // `waitForPods: false`: this reaps *another* run's stale Job in an
+          // unbounded loop and never deletes this run's Secrets; see cleanupJob.
           await cleanupJob(
             jobNamespace,
             jobName,
@@ -2827,16 +2839,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // BLO-35486: 600s was shorter than a cold pull of the agent image under
     // contention — 8 concurrent pods on one node measured 11m12s–12m36s from
     // schedule to container start, of which the transfer itself was 2–33s and
-    // the rest was queueing behind one uncached 3.3 GB layer set.  Every
-    // failure mode that shows in pod status (ErrImagePull/ImagePullBackOff/
-    // InvalidImageName/CrashLoopBackOff/CreateContainerConfigError/
-    // CreateContainerError/Unschedulable/phase=Failed/init-container exit) is
-    // detected and thrown above without waiting for this deadline.  A reason
+    // the rest was queueing behind one uncached 3.3 GB layer set.  The failure
+    // modes waitForPod knows (ErrImagePull/ImagePullBackOff/InvalidImageName/
+    // CrashLoopBackOff/CreateContainerConfigError/CreateContainerError/
+    // Unschedulable/phase=Failed/init-container exit) are detected and thrown
+    // above without waiting for this deadline.  That list is not every
+    // never-clearing reason (`ErrImageNeverPull`, with an operator-set
+    // `imagePullPolicy: Never`, is absent).  A reason
     // added to the kubelet's vocabulary belongs in UNRECOVERABLE_WAITING_REASONS,
     // not here.
     //
     // NOT covered: a missing *volume*-mounted run Secret (`promptSecret`,
-    // `mcpConfigSecret`).  It leaves the container at `ContainerCreating` and
+    // `mcpConfigSecret`).  It leaves the containers at `PodInitializing` and
     // reports only as a `FailedMount` event, which this path does not read, so
     // it costs the full deadline: 1800s, up from 600s.  That needs a Secret to
     // disappear between creation and mount, and the pods-before-Secrets

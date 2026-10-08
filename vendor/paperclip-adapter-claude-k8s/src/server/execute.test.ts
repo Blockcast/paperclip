@@ -847,6 +847,11 @@ describe("execute: concurrency guard", () => {
     mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
     mockPrepareBundle.mockResolvedValue(makeBundle());
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 404 }));
+    // The orphan still has a pod.  Without the opt-out, the teardown wait would
+    // list it and issue a per-pod delete; with it, nothing touches pods.  (With
+    // the reset mock, the list returned undefined, read as `gone`, and this
+    // assertion passed with the opt-out deleted.)
+    mockCoreListPods.mockResolvedValueOnce({ items: [{ metadata: { name: "ac-job-pod" } }] });
 
     const result = await execute(makeCtx({ context: { taskId: "task-current" } } as Partial<AdapterExecutionContext>));
 
@@ -3532,6 +3537,30 @@ describe("cleanupJob pod-log reaping", () => {
       "stderr",
       expect.stringContaining("failed to cleanup job job-gone"),
     );
+  });
+
+  // #2099 rebuild review: when pods are not confirmed gone, cleanupJob retains
+  // the Job and Secrets, but it must still reap the log.  Nothing else will.
+  // The stale-Job guard only reaps non-terminal Jobs, and the retained Job is
+  // normally terminal, so ttlSecondsAfterFinished deletes it and leaks the log
+  // (BLO-32734's leak, reached through the retain path).
+  it("still removes the pod log when pods outlive teardown and the Job is retained", async () => {
+    const podLogPath = await makePodLog("retained.pod.ndjson");
+    // A Terminating pod that never goes away: the delete is accepted, so the
+    // verdict at the deadline is `alive`.
+    mockCoreListPods.mockResolvedValue({
+      items: [{ metadata: { name: "job-retain-pod", deletionTimestamp: new Date() } }],
+    });
+    vi.useFakeTimers();
+    try {
+      const promise = cleanupJob("ns", "job-retain", vi.fn(), undefined, podLogPath);
+      await vi.advanceTimersByTimeAsync(90_000);
+      await expect(promise).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+    expect(await exists(podLogPath)).toBe(false);
   });
 
   it("still removes the pod log when the Job delete fails for any other reason", async () => {
