@@ -3170,7 +3170,10 @@ export function classifyGitCheckoutProbeFailure(
   error: unknown,
 ): Extract<GitCheckoutProbe, { reason: string }> {
   const reason = (error instanceof Error ? error.message : String(error ?? "")).trim();
-  if (/not a git repository/i.test(reason)) return { state: "not_a_checkout", reason };
+  // Anchored to the start of a line: git's own fatal in both forms it emits
+  // ("...(or any of the parent directories): .git" and "...: '<path>'"), never
+  // the phrase appearing inside a path carried by some other failure.
+  if (/^fatal: not a git repository/im.test(reason)) return { state: "not_a_checkout", reason };
   return {
     state: "indeterminate",
     reason: reason || "git rev-parse --git-dir failed without emitting a diagnostic",
@@ -3197,7 +3200,7 @@ export async function probeGitCheckout(cwd: string): Promise<GitCheckoutProbe> {
     // ENOENT on the spawn carries no stderr for it to surface. Mirrors the
     // `pathIsAbsent` arm of `probeGitCheckoutStateStrict`.
     if (classified.state === "indeterminate" && !await directoryExists(cwd)) {
-      return { state: "not_a_checkout", reason: `no directory exists at "${cwd}"` };
+      return { state: "not_a_checkout", reason: `no directory exists at "${cwd}" (path is absent or not a directory)` };
     }
     return classified;
   }
