@@ -86,7 +86,7 @@ function reviewerName(entry) {
 }
 
 /**
- * Stable slugs for the four things this check can find wrong.
+ * Stable slugs for the five things this check can find wrong.
  *
  * These exist so a caller can key on *which* control broke without parsing the
  * human-facing prose, which embeds reviewer logins and observed values and so
@@ -95,7 +95,15 @@ function reviewerName(entry) {
  * unchanged Alertmanager fingerprint (BLO-22329 / PEN-2863).
  */
 export const VIOLATION_KINDS = {
+  /**
+   * No rule of type `required_reviewers` exists on the environment at all.
+   * Kept on the original slug deliberately: this is the shape that was live when
+   * the two were split (PEN-3871), so the then-firing Alertmanager alert keeps
+   * its fingerprint across that change instead of resolving and re-firing.
+   */
   REQUIRED_REVIEWERS_RULE: 'required_reviewers_rule',
+  /** The rule exists, but its reviewer list is empty. */
+  REQUIRED_REVIEWERS_EMPTY: 'required_reviewers_empty',
   REQUIRED_REVIEWERS_MEMBERSHIP: 'required_reviewers_membership',
   CAN_ADMINS_BYPASS: 'can_admins_bypass',
   PROTECTED_BRANCHES: 'protected_branches',
@@ -137,13 +145,23 @@ export function evaluateEnvironmentProtection(env, options = {}) {
   // A compound clause that skips a sibling check is how a tolerated drift masks
   // an untolerated one; keep this clause about "is there a gate at all".
   //
-  // An absent rule makes `reviewers` derive to [], so a `rule == null` term
-  // would be subsumed by `reviewers.length === 0` and is not spelled out.
-  if (expected.length > 0 && reviewers.length === 0) {
+  // `expected.length > 0` is the reviewed switch that enables the gate.
+  // With an empty ratified set, an absent rule is the current ratified shape and
+  // falls through to membership comparison; otherwise keep missing and empty
+  // rule states as distinct, actionable verdicts.
+  if (expected.length > 0 && rule == null) {
     violation(
       VIOLATION_KINDS.REQUIRED_REVIEWERS_RULE,
-      'required_reviewers: rule is missing, or its reviewer list is empty — ' +
-        'there is no effective approval gate on production deploys',
+      'required_reviewers: NO rule of this type exists on the environment — ' +
+        'there is no effective approval gate on production deploys ' +
+        `(remedy: create the rule with the ratified reviewer set ${JSON.stringify(expected)})`,
+    );
+  } else if (expected.length > 0 && reviewers.length === 0) {
+    violation(
+      VIOLATION_KINDS.REQUIRED_REVIEWERS_EMPTY,
+      'required_reviewers: the rule exists but its reviewer list is EMPTY — ' +
+        'there is no effective approval gate on production deploys ' +
+        `(remedy: restore the ratified reviewer set ${JSON.stringify(expected)} on the existing rule)`,
     );
   } else {
     // Compare membership case-insensitively; GitHub logins are case-preserving
