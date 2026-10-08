@@ -53,13 +53,21 @@ const TIME_FILTER_ALIASES = [
   "updatedSince",
   "created_after",
   "createdAfter",
+  // Silently dropped before the schema generated its keys from the route
+  // regex's prefix x suffix lists. `updatedWithin` is the token the refusal
+  // message itself teaches.
+  "updatedWithin",
+  "updated_before",
+  "closedUntil",
 ];
 
 /**
  * The refusal arrives as a RESULT carrying `isError: true`, not as a thrown
- * McpError — `makeTool` catches the Zod failure and formats it. Asserting on a
- * rejection instead would fail against a perfectly good refusal, and asserting
- * only on `isError` would pass against any unrelated error, so check the text.
+ * McpError — the SDK's `validateToolInput` rejects the arguments against the
+ * registered shape before `makeTool` runs, and the SDK's CallTool handler turns
+ * that McpError into an error result. Asserting on a rejection instead would
+ * fail against a perfectly good refusal, and asserting only on `isError` would
+ * pass against any unrelated error, so check the text.
  */
 function errorText(result: Awaited<ReturnType<Client["callTool"]>>): string {
   expect(result.isError).toBe(true);
@@ -67,7 +75,7 @@ function errorText(result: Awaited<ReturnType<Client["callTool"]>>): string {
 }
 
 describe("paperclipListIssues time-bound params", () => {
-  beforeEach(() => vi.restoreAllMocks());
+  beforeEach(() => vi.unstubAllGlobals());
 
   it.each(TIME_FILTER_ALIASES)("refuses %s instead of silently dropping it", async (param) => {
     const urls: string[] = [];
