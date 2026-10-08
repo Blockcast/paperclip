@@ -90,6 +90,27 @@ describe("paperclip MCP tools", () => {
     expect(String(fetchMock.mock.calls[0]![0])).toContain("/agents/me/inbox-lite?offset=500");
   });
 
+  // BLO-39015: the envelope and `offset` ship in the server; this description
+  // ships in the MCP package, and the two reach an agent on different cadences.
+  // Against a server predating the fix, `offset` is ignored and a capped page
+  // comes back as a BARE ARRAY — so "a bare array is the proof you have every
+  // row" is not merely stale, it is backwards, and it fails OPEN. The scalar
+  // fields above already carry this caveat; THE TELL shipped without it.
+  // Measured 2026-10-08: 532 eligible rows, 494 returned bare, `offset=400`
+  // byte-identical to `offset=0`, 38 rows absent including all 23 `low`.
+  it("tells the caller how to detect a server that predates the truncation fix", () => {
+    const { description } = getTool("paperclipInboxLite");
+
+    // The caveat exists and names the fail-open direction.
+    expect(description).toContain("fails OPEN");
+    expect(description).toContain("BARE ARRAY even when the cap bit");
+
+    // And it is actionable: a runnable discriminator, not just a warning.
+    expect(description).toContain("POSITIVE CONTROL");
+    expect(description).toContain("`offset=0` and `offset=<N\u22651>` and compare the returned ids");
+    expect(description).toContain("a bare array proves NOTHING");
+  });
+
   it("adds auth headers and run id to mutating requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ ok: true }),
