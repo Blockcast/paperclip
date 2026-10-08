@@ -23,8 +23,9 @@ export function createPaperclipMcpServer(config: PaperclipMcpConfig = readConfig
     // `server.tool()` cannot be used here: it rejects a ZodObject as a third
     // positional arg ("expected a Zod schema or ToolAnnotations"). `registerTool`
     // passes `inputSchema` through `getZodSchemaObject`, which keeps our object
-    // whole, so strictness survives to `tools/call` validation and also surfaces
-    // as `additionalProperties: false` in the served `tools/list` schema.
+    // whole, so strictness survives to `tools/call` validation. The served
+    // `tools/list` schema is NOT evidence of this: it reads
+    // `additionalProperties: false` for a plain object too.
     server.registerTool(
       tool.name,
       { description: tool.description, inputSchema: tool.schema },
@@ -54,7 +55,11 @@ export async function runServer(config: PaperclipMcpConfig = readConfigFromEnv()
     // built-in `paperclip*` tools. These schemas are derived from a remote plugin
     // manifest we do not control, and the strictness blast radius was measured for
     // `paperclip*` calls only — an under-declaring manifest would start erroring
-    // with no measurement behind it. The silent-strip caveat still applies here.
+    // with no measurement behind it. The silent-strip caveat still applies here,
+    // and is worse than it looks: `tools/list` advertises these as
+    // `additionalProperties: false` too, so a client validating locally against
+    // the served schema is misled. Follow-up: measure-then-strict, or
+    // `.passthrough()` so the advertisement matches.
     server.tool(tool.name, tool.description, tool.schema.shape, tool.execute);
   }
 

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createPaperclipMcpServer } from "./index.js";
@@ -18,6 +18,8 @@ function mockJsonResponse(body: unknown, status = 200) {
   });
 }
 
+const openClients: Client[] = [];
+
 async function connectedClient() {
   const { server } = createPaperclipMcpServer(CONFIG);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -25,6 +27,7 @@ async function connectedClient() {
 
   const client = new Client({ name: "test-client", version: "1.0.0" });
   await client.connect(clientTransport);
+  openClients.push(client);
   return client;
 }
 
@@ -41,6 +44,13 @@ async function connectedClient() {
 describe("MCP undeclared tool arguments — BLO-41373", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+  });
+
+  // `restoreAllMocks` does not undo `stubGlobal`, and an unclosed linked pair
+  // outlives its test; both would leak into the next case.
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    await Promise.all(openClients.splice(0).map((client) => client.close()));
   });
 
   it("refuses an undeclared argument and names the offending key", async () => {
@@ -111,19 +121,49 @@ describe("MCP undeclared tool arguments — BLO-41373", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  // The refusal is also advertised, so a client that validates locally can see it
-  // without making the call. This reads the served `tools/list` schema the way an
-  // agent does — asserting on our Zod object instead would pass even if the SDK
-  // dropped strictness on the way out, which is exactly how the original defect
-  // stayed invisible.
-  it("serves additionalProperties: false for every built-in tool", async () => {
+  // Every built-in tool, over the transport. The served `tools/list` schema
+  // cannot carry this property: `additionalProperties: false` is emitted for a
+  // plain zod object as well as a strict one, so it read the same before the fix.
+  // The error has to NAME the junk key -- tools with required params fail
+  // pre-fix too, but on the missing params, with the junk key already stripped.
+  it("refuses an undeclared argument on every built-in tool, by name, before any request", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({}));
+    vi.stubGlobal("fetch", fetchMock);
+
     const client = await connectedClient();
     const { tools } = await client.listTools();
-
     expect(tools.length).toBeGreaterThan(40);
-    const lax = tools.filter(
-      (tool) => (tool.inputSchema as Record<string, unknown>).additionalProperties !== false,
-    );
-    expect(lax.map((tool) => tool.name)).toEqual([]);
+
+    const accepted: string[] = [];
+    for (const tool of tools) {
+      const result = await client.callTool({
+        name: tool.name,
+        arguments: { zzz_not_a_param: "x" },
+      });
+      const text = (result.content as Array<{ text?: string }>)[0]?.text ?? "";
+      if (result.isError !== true || !text.includes("zzz_not_a_param")) accepted.push(tool.name);
+    }
+    expect(accepted).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // BLO-41373 blast radius: `summary` is the one key agents send most often to
+  // paperclipAddComment. A bare "Unrecognized key" names it without saying where
+  // the text belongs, so it is declared and refused with the remedy instead.
+  it("refuses `summary` on paperclipAddComment and says the text goes in `body`", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({}));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = await connectedClient();
+    const result = await client.callTool({
+      name: "paperclipAddComment",
+      arguments: { issueId: "BLO-1", body: "done", summary: "done" },
+    });
+
+    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ text: string }>)[0]!.text;
+    expect(text).toMatch(/summary/);
+    expect(text).toMatch(/`body`/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
