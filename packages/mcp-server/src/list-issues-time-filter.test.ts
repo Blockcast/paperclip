@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { TIME_FILTER_PREFIXES, TIME_FILTER_SUFFIXES } from "@paperclipai/shared";
 import { createPaperclipMcpServer } from "./index.js";
 
 /**
@@ -46,20 +47,15 @@ async function connectedClient(onFetch: (url: string) => void) {
   return client;
 }
 
-const TIME_FILTER_ALIASES = [
-  "updated_after",
-  "updatedAfter",
-  "updated_since",
-  "updatedSince",
-  "created_after",
-  "createdAfter",
-  // Silently dropped before the schema generated its keys from the route
-  // regex's prefix x suffix lists. `updatedWithin` is the token the refusal
-  // message itself teaches.
-  "updatedWithin",
-  "updated_before",
-  "closedUntil",
-];
+// Every snake_case and camelCase alias of the shared prefix x suffix lists the
+// route regex is built from — derived here rather than hand-listed, so a list
+// entry the tool fails to declare (and so silently strips) turns this red.
+const TIME_FILTER_ALIASES = TIME_FILTER_PREFIXES.flatMap((prefix) =>
+  TIME_FILTER_SUFFIXES.flatMap((suffix) => [
+    `${prefix}_${suffix}`,
+    `${prefix}${suffix[0].toUpperCase()}${suffix.slice(1)}`,
+  ]),
+);
 
 /**
  * The refusal arrives as a RESULT carrying `isError: true`, not as a thrown

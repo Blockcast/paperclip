@@ -1,3 +1,5 @@
+import { TIME_FILTER_PREFIXES, TIME_FILTER_SUFFIXES } from "@paperclipai/shared";
+
 // BLO-24495: `GET /companies/:companyId/issues` only ever implemented
 // limit/offset pagination. `page`/`perPage` were silently dropped (never read
 // from req.query), so every page number replayed the same limit/offset-default
@@ -55,8 +57,15 @@ export function parseUnsupportedPaginationParams(query: {
 // be the fuller fix and is deliberately not taken here: this is a hot read
 // path shared with the board UI, and one missing entry turns a wrong-census
 // bug into a 400 on every list request.
-const TIME_FILTER_PARAM_PATTERN =
-  /^(updated|created|started|completed|resolved|closed|modified)_?(after|before|since|until|within|from|to)$/i;
+//
+// The prefix and suffix lists live in @paperclipai/shared because the MCP list
+// tools build their refusal keys from the same two lists: an MCP caller's
+// undeclared key is stripped before it reaches this route, so a name matched
+// here but not declared there is silently dropped again.
+const TIME_FILTER_PARAM_PATTERN = new RegExp(
+  `^(${TIME_FILTER_PREFIXES.join("|")})_?(${TIME_FILTER_SUFFIXES.join("|")})$`,
+  "i",
+);
 
 export function parseUnsupportedTimeFilterParams(query: Record<string, unknown>): string[] {
   return Object.keys(query)

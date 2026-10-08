@@ -15,6 +15,8 @@ import {
   updateMilestoneSchema,
   upsertIssueDocumentSchema,
   linkIssueApprovalSchema,
+  TIME_FILTER_PREFIXES,
+  TIME_FILTER_SUFFIXES,
 } from "@paperclipai/shared";
 import { PaperclipApiClient } from "./client.js";
 import { formatErrorResponse, formatTextResponse } from "./format.js";
@@ -98,32 +100,23 @@ const ISSUE_SEARCH_Q_DESCRIPTION =
 // backstop for an MCP caller: by the stripping above, an undeclared alias never
 // reaches it. Enumerating keys in the shape is the only lever this layer has —
 // an object-level `.superRefine`/`.passthrough()` is discarded, because only
-// `schema.shape` is registered. So the aliases are generated from the same
-// prefix x suffix lists as `TIME_FILTER_PARAM_PATTERN` in
-// server/src/lib/issue-list-query.ts — keep the two in sync — in both
-// snake_case and camelCase. Other casings that case-insensitive regex also
-// matches (`UpdatedAfter`, `updatedafter`) are still stripped here.
+// `schema.shape` is registered. So the aliases are generated, in both
+// snake_case and camelCase, from the shared prefix x suffix lists that
+// `TIME_FILTER_PARAM_PATTERN` in server/src/lib/issue-list-query.ts is also
+// built from. Other casings that case-insensitive regex also matches
+// (`UpdatedAfter`, `updatedafter`) are still stripped here.
+//
+// No `.describe()`: this schema is repeated on all 98 keys of both list tools,
+// and the explanation lives once in the tool description. A refused caller sees
+// the `.refine` message, not a description.
 const unsupportedTimeFilter = z
   .unknown()
   .optional()
   .refine((value) => value === undefined, {
     message:
       "not supported on this endpoint — it applies no time bound, and the param was previously dropped unread so the call returned the whole corpus while reading as a bounded census (BLO-40145). Use GET /api/companies/:companyId/search with updatedAfter or updatedWithin, or sortField=id with afterId to walk rows by key.",
-  })
-  .describe(
-    "NOT SUPPORTED — rejected, never applied. Declared only so the call fails loudly instead of silently returning unfiltered rows. See the time-bound paragraph in this tool's description.",
-  );
+  });
 
-const TIME_FILTER_PREFIXES = [
-  "updated",
-  "created",
-  "started",
-  "completed",
-  "resolved",
-  "closed",
-  "modified",
-] as const;
-const TIME_FILTER_SUFFIXES = ["after", "before", "since", "until", "within", "from", "to"] as const;
 type TimeFilterPrefix = (typeof TIME_FILTER_PREFIXES)[number];
 type TimeFilterSuffix = (typeof TIME_FILTER_SUFFIXES)[number];
 type TimeFilterKey =
@@ -202,6 +195,8 @@ const listIssuesSchema = z.object({
     .describe("Rows to skip. Use with `limit` to page past a truncated result."),
 });
 
+// Inherits the time-filter refusal keys on purpose: the alias hits the same
+// route, so dropping them here would reopen BLO-40145 on this tool only.
 const searchIssuesSchema = listIssuesSchema.omit({ q: true }).extend({
   query: z.string().trim().min(1).describe(ISSUE_SEARCH_Q_DESCRIPTION),
 });

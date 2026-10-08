@@ -297,6 +297,21 @@ export const ISSUE_ORIGIN_KINDS = [
 export type BuiltInIssueOriginKind = (typeof ISSUE_ORIGIN_KINDS)[number];
 export type PluginIssueOriginKind = `plugin:${string}`;
 export type IssueOriginKind = BuiltInIssueOriginKind | PluginIssueOriginKind;
+// BLO-40145: `GET /companies/:companyId/issues` implements no time bound, so it
+// refuses any `<prefix>[_]<suffix>` param built from these lists
+// (server/src/lib/issue-list-query.ts), and the MCP list tools declare the same
+// names only to refuse them (packages/mcp-server/src/tools.ts). Both are built
+// from here, so an entry added to one side cannot be missing from the other.
+export const TIME_FILTER_PREFIXES = [
+  "updated",
+  "created",
+  "started",
+  "completed",
+  "resolved",
+  "closed",
+  "modified",
+] as const;
+export const TIME_FILTER_SUFFIXES = ["after", "before", "since", "until", "within", "from", "to"] as const;
 export const ISSUE_WATCHDOG_DISCOVERY_KINDS = ["product_bug", "platform_bug"] as const;
 export type IssueWatchdogDiscoveryKind = (typeof ISSUE_WATCHDOG_DISCOVERY_KINDS)[number];
 export const ISSUE_SURFACE_VISIBILITIES = ["default", "plugin_operation"] as const;
