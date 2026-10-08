@@ -52,27 +52,53 @@ never hold two identities).
 
 States: `reserved → launching → launched → release_pending → released`.
 
-Two partial-unique indexes do the actual containment, both scoped to
-`released_at IS NULL`:
+Two partial-unique indexes do the actual containment:
 
-- **`..._active_slot_idx` on `(agent_id, slot_id)`** — the per-agent ceiling.
-  Slots are dense from 0.
-- **`..._active_isolation_writer_idx` on `isolation_key`** — one writer per
-  shared mutable resource. This is what keeps shared workspaces serialized.
+- **`..._active_slot_idx` on `(agent_id, slot_id)`**, `WHERE released_at IS
+  NULL` — the per-agent ceiling. Slots are dense from 0.
+- **`..._active_isolation_writer_idx` on `isolation_key`**, `WHERE released_at
+  IS NULL AND isolation_key IS NOT NULL` — one writer per shared mutable
+  resource. That second clause is why an unbound row does not contend.
 
-`isolation_mode` is one of `legacy | pending | shared | run | workspace`, and
-the key follows from the effective ceiling (`resolveK8sRunIsolationIdentity`):
+### Two keys, and the column stores the second one
 
-| effective ceiling | mode | key | effect |
+`resolveK8sRunIsolationIdentity` returns **two** keys that are deliberately
+allowed to diverge (BLO-31443):
+
+- `isolationKey` — the run's *private* filesystem identity. Derives `tmpRoot`,
+  is stamped into `sessionScope`, and gates saved-session resume.
+- `reservationKey` — the *shared mutable resource* this run will write. Binds
+  the writer index and nothing else.
+
+**The `isolation_key` column stores `reservationKey`** (`heartbeat.ts`:
+`isolationKey: k8sIsolationIdentity.reservationKey`). When querying lease rows,
+match the last column below, not the third.
+
+`isolation_mode` is one of `legacy | pending | shared | run | workspace`:
+
+| selected when | mode | `isolationKey` | what lands in `isolation_key` |
 |---|---|---|---|
-| `> 1` | `run` | `run:<runId>` | siblings hold independent leases and independent ephemeral workspaces |
-| `= 1` (default) | `shared` | `agent-shared:<agentId>` | the agent's warm persistent workspace, serialized |
-| explicit reused workspace | `workspace` | `workspace:<id>` | names the tree; several issues may share it, so it serializes across them |
+| stateless PR review — checked first, before any ceiling | `run` | `run:<runId>` | same |
+| ceiling `> 1`, no persisted workspace | `run` | `run:<runId>` | same |
+| ceiling `= 1` (default) | `shared` | `agent-shared:<agentId>` | `workspace-tree:<treeKey>` if a tree key resolves, else same |
+| persisted workspace, *explicitly* reused | `workspace` | `workspace:<id>` | same — it already names the tree |
+| persisted workspace, isolated (reachable at ceiling 1) | `workspace` | `workspace:<id>` | `workspace-tree:<treeKey>` if a tree key resolves |
 
-Keys are additionally **tree-scoped** (`withTreeScopedReservationKey`,
-BLO-31443/BLO-19422) so two runs resolving to the same worktree collide even
-when their run ids differ. **Shared and unknown modes therefore stay at
-concurrency 1 by construction, independent of the `concurrencyEnabled` flag.**
+`withTreeScopedReservationKey` does not narrow the key — it **replaces** it.
+Whenever a per-issue tree key resolves, `isolation_key` is
+`workspace-tree:<treeKey>` and none of `run:` / `agent-shared:` / `workspace:`
+appears, so **grepping `isolation_key` for `agent-shared:` finds nothing on the
+default path.** The two keys are equal only when the tree key is null.
+
+What the writer index guarantees **by construction** is one writer per shared
+mutable resource — the tree, or the agent home when no tree key resolves — and
+that holds across agents. It is *not* the per-agent ceiling, which is enforced
+at dispatch by `availableSlots` and therefore by `concurrencyEnabled`. Two
+shared-mode runs on different trees hold different reservation keys and do not
+serialize against each other; BLO-19422 gave that up deliberately. The
+documented hole is BLO-12990 — a silent `running` row is excluded from
+`countRunsOccupyingSlots`, so `availableSlots = 1 - 0 = 1` admits a second run
+even at effective concurrency 1.
 
 A contended lease raises `ExternalRuntimeIsolationConflictError`
 (`external_runtime_isolation_conflict`) and the run defers rather than
@@ -128,23 +154,58 @@ Three windows kill a run whose Job stopped reporting
 
 A stale kill releases the lease with `release_reason =
 'external_lifecycle_stale_killed'` and sets the run's `errorCode` to match.
-Other release reasons seen in normal operation: `succeeded`, `cancelled`,
-`timeout`, `job_missing`, `k8s_job_deleted_externally`.
+Other reasons seen at non-test call sites include `succeeded`, `completed`,
+`cancelled`, `job_missing`, `adapter_failed`, `launch_failed`,
+`terminal_prelaunch_orphan`, `legacy_drained`,
+`external_runtime_isolation_conflict`, and `run_cancelled:<errorCode>`; the
+list is not exhaustive, so treat an unfamiliar value as a prompt to grep rather
+than as an anomaly. Two traps: there is **no `timeout` reason** — the run
+*status* is `timed_out` — and an adapter error code such as
+`k8s_job_deleted_externally` is a run `errorCode`, never a bare release reason.
+It reaches this column only as `run_cancelled:k8s_job_deleted_externally`, so
+match the prefix, not the whole string.
 
 Workspace-side cleanup is separate and has its own metrics —
 `paperclip_isolation_workspace_reaper_*` for ephemeral run roots and
 `paperclip_execution_workspace_collector_*` / `..._teardown_*` for worktrees.
 A leaked *workspace* does not hold a slot; a leaked *reservation* does.
 
-Manual release, when a lease is wedged with no live Job (confirm with
-`kubectl get job <name> -o jsonpath='{.metadata.uid}'` first — the lease's
-`job_uid` must be absent, not merely different):
+Manual release, when **no live Job owns the lease**. Read the row first — you
+need a Job name to check against and `state` to know which case you are in:
+
+```sql
+SELECT state, expected_job_name, job_name, job_uid
+FROM external_runtime_reservations
+WHERE run_id = '<run-uuid>' AND released_at IS NULL;
+```
+
+Then `kubectl get job <expected_job_name|job_name> -o jsonpath='{.metadata.uid}'`.
+Release only if one of these holds:
+
+- **no Job exists under that name**, or
+- **a Job exists and its uid differs from a non-null `job_uid`** — positive
+  proof the lease's own Job is gone. This is the safe case.
+
+**A null `job_uid` does not mean no Job exists.** `createNamespacedJob` can
+succeed after the reservation gating it was released, so a `reserved` /
+`launching` row with a null `job_uid` may have a live unstamped Job. That case
+needs *more* care, not less: identify the Job by name and run/agent labels
+before releasing anything.
+
+The `name_mismatch` row from the failure signature above is the
+present-and-different case — it is raised only from `launched`, which requires
+a non-null `job_uid`.
 
 ```sql
 UPDATE external_runtime_reservations
 SET released_at = now(), release_reason = 'operator_manual', state = 'released'
 WHERE run_id = '<run-uuid>' AND released_at IS NULL;
 ```
+
+This raw `UPDATE` bypasses `recordExternalRuntimeReservationEvent("released")`,
+so `paperclip_external_runtime_reservation_events_total{…released}` will not
+move and the active/oldest gauges only correct on their next refresh. Confirm
+the release by re-reading the row, not by watching those metrics.
 
 ## Rollback
 
