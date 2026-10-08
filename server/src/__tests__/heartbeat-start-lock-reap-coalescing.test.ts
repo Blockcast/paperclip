@@ -63,6 +63,7 @@ describeEmbeddedPostgres("start-lock orphan reap coalescing (BLO-36922)", () => 
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const originalTtl = process.env.AGENT_START_LOCK_REAP_TTL_MS;
+  const originalWaitBound = process.env.AGENT_START_LOCK_REAP_WAIT_BOUND_MS;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-start-lock-reap-");
@@ -77,6 +78,8 @@ describeEmbeddedPostgres("start-lock orphan reap coalescing (BLO-36922)", () => 
   afterEach(async () => {
     if (originalTtl === undefined) delete process.env.AGENT_START_LOCK_REAP_TTL_MS;
     else process.env.AGENT_START_LOCK_REAP_TTL_MS = originalTtl;
+    if (originalWaitBound === undefined) delete process.env.AGENT_START_LOCK_REAP_WAIT_BOUND_MS;
+    else process.env.AGENT_START_LOCK_REAP_WAIT_BOUND_MS = originalWaitBound;
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -255,5 +258,47 @@ describeEmbeddedPostgres("start-lock orphan reap coalescing (BLO-36922)", () => 
       heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true }),
     ]);
     expect(listManagedAgentJobsMock).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * BLO-41036. Coalescing (every test above) is what makes this necessary: the
+   * sweep is single-flight across the fleet, so one that does not return holds
+   * EVERY agent's start lock, not just its own. Measured on `d5268bc0`
+   * 2026-10-07T00:26-00:48Z — nine agents in phase `reap`, the hold climbing
+   * +120s per 120s scrape to 1049s and still rising, 0 run starts in 22
+   * minutes, 544 runs queued, released only by `helm rollback`.
+   *
+   * The guard is that the caller STOPS WAITING, not that the sweep is
+   * cancelled: dispatch proceeds on stale orphan state (the already-supported
+   * `skipped_fresh` cost) instead of a slow section being aborted, which is the
+   * livelock documented on `LOCK_ABORT_MS`.
+   */
+  it("gives up waiting on a sweep that never returns instead of holding dispatch", async () => {
+    await seedFleet(2);
+    process.env.AGENT_START_LOCK_REAP_WAIT_BOUND_MS = "50";
+    const heartbeat = heartbeatService(db);
+    const wedged = deferred<null>();
+    let calls = 0;
+    listManagedAgentJobsMock.mockImplementation(async () => {
+      calls += 1;
+      return wedged.promise;
+    });
+
+    // The originator of the wedged sweep must not wait on it forever...
+    const first = heartbeat.reapOrphanedRunsForStartLock();
+    await vi.waitFor(() => expect(calls).toBe(1));
+    expect(await first).toBe("timed_out");
+
+    // ...and neither must an agent arriving mid-sweep, which is the fleet-wide
+    // half of the outage. Its chained sweep is queued behind the wedged one, so
+    // it inherits the wedge without ever running: one stuck sweep parks every
+    // later waker. That is what took 100% of dispatch, not the first caller.
+    expect(await heartbeat.reapOrphanedRunsForStartLock()).toBe("timed_out");
+
+    // Still exactly one sweep: the chained sweep never got to read fleet state,
+    // and giving up on the wait must not start a replacement.
+    expect(calls).toBe(1);
+
+    wedged.resolve(null);
   });
 });

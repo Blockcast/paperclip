@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, max, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 
@@ -13550,6 +13551,87 @@ export interface HeartbeatServiceOptions {
  */
 const START_LOCK_REAP_TTL_DEFAULT_MS = 0;
 
+/**
+ * How long a start-lock caller will WAIT for the shared orphan sweep (BLO-41036).
+ *
+ * ⚠️ This bounds the *wait*, not the sweep, and that distinction is the whole
+ * design. On expiry the caller stops awaiting and dispatches on slightly stale
+ * orphan state; the sweep keeps running for whoever else joined it. Nothing is
+ * cancelled, so this cannot turn a slow-but-succeeding dispatch into a failing
+ * one.
+ *
+ * ⚠️ Do NOT "simplify" this by lowering {@link LOCK_ABORT_MS} for the reap
+ * phase instead. That was this issue's own planned fix and it is refuted by the
+ * measurement recorded on `LOCK_ABORT_MS`: the section's long holds settle on
+ * their own (peak 8073 s), and PEN-3328's abort cancels the whole section, so
+ * an early abort converts a slow dispatch into a permanently retried-and-
+ * recancelled one — a livelock, strictly worse than the hold. Aborting is the
+ * wrong verb here; declining to wait is the right one.
+ *
+ * Why 120 s, derived rather than picked:
+ *
+ *  - It is the threshold BLO-41036's own post-deploy acceptance signal already
+ *    names for this phase ("no agent start lock enters phase `reap` with
+ *    `heldMs > 120s`"), so the guard and the check that validates it agree by
+ *    construction instead of being two independently-chosen numbers.
+ *  - It is 4x {@link LOCK_HELD_WARN_MS}, the budget at which this phase already
+ *    logs that it "is holding dispatch for this agent" — i.e. four times past
+ *    the point the code already calls pathological.
+ *  - It is 1/120th of {@link LOCK_ABORT_MS}, which measured 1049 s of climbing,
+ *    never-settling fleet-wide hold during the `d5268bc0` incident without
+ *    coming close to firing.
+ *
+ * Known false-cut, stated rather than discovered later: every k8s call under
+ * the sweep is bounded at `PAPERCLIP_K8S_JOB_LIVENESS_TIMEOUT_MS` (2 s in
+ * production). With a fleet of ~40-50 running runs and an apiserver degraded
+ * enough that every call hits that ceiling, a *legitimate* serial sweep can
+ * exceed 120 s and will be cut. The cost of that cut is exactly the documented
+ * {@link START_LOCK_REAP_TTL_DEFAULT_MS} cost — dispatch may cancel same-issue
+ * queued work as `duplicate_dispatch_suppressed` — on a path that already
+ * supports proceeding without a fresh sweep (`skipped_fresh`). Erring toward
+ * cutting is the cheap direction here: a false cut degrades one dispatch pass,
+ * an unbounded wait took 100% of fleet dispatch for 22 minutes.
+ *
+ * ponytail: on expiry the latches are deliberately left alone, so while a sweep
+ * is genuinely wedged every later caller chains behind it and pays this bound
+ * once per pass. That is bounded and self-correcting, not free. If a wedge ever
+ * persists long enough for that per-pass cost to matter, mark the sweep
+ * abandoned on expiry so later callers skip the wait outright.
+ */
+const START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS = 120_000;
+
+/** Resolved once per call so an incident knob takes effect without a restart. */
+function startLockReapWaitBoundMs() {
+  const configured = Number.parseInt(process.env.AGENT_START_LOCK_REAP_WAIT_BOUND_MS ?? "", 10);
+  // 0 disables the bound (restores the pre-BLO-41036 unbounded wait).
+  return Number.isFinite(configured) && configured >= 0
+    ? configured
+    : START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS;
+}
+
+const START_LOCK_REAP_WAIT_TIMED_OUT = Symbol("start_lock_reap_wait_timed_out");
+
+/**
+ * Await `sweep`, giving up after `boundMs`. Returns the sentinel on expiry.
+ *
+ * The sweep's own rejection propagates unchanged — callers that are meant to
+ * inherit a sweep failure still do. The timer is aborted in `finally` so a
+ * fast sweep does not leave a 120 s handle holding the event loop open, and the
+ * timer's abort rejection is swallowed because the race has already settled by
+ * the time it fires.
+ */
+async function awaitStartLockSweepBounded(sweep: Promise<unknown>, boundMs: number) {
+  if (boundMs <= 0) return await sweep;
+  const abort = new AbortController();
+  const timer = delay(boundMs, START_LOCK_REAP_WAIT_TIMED_OUT, { signal: abort.signal })
+    .catch(() => undefined);
+  try {
+    return await Promise.race([sweep, timer]);
+  } finally {
+    abort.abort();
+  }
+}
+
 function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
 }
@@ -27080,28 +27162,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * already waits on this sweep. A lock-free caller lacks that guard; tests
    * using this entry directly must not introduce concurrent busy dispatch.
    */
-  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh" | "nested"> {
+  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh" | "nested" | "timed_out"> {
     if (agentStartLockSweepContext.getStore()) {
       await reapOrphanedRuns({ suppressDispatchAfterReap: true });
       return "nested";
     }
+    // BLO-41036: every path below awaits a FLEET-WIDE sweep while holding this
+    // agent's start lock, and the sweep is single-flight, so one that does not
+    // return holds every agent's dispatch. Each wait is bounded; on expiry the
+    // caller proceeds on stale orphan state rather than cancelling anything.
+    // See START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS for the threshold's derivation
+    // and for why lowering the PEN-3328 section abort is the wrong fix.
+    const waitBoundMs = startLockReapWaitBoundMs();
+    const timedOut = (outcome: unknown) => outcome === START_LOCK_REAP_WAIT_TIMED_OUT;
     if (joinableStartLockReap) {
-      await joinableStartLockReap;
+      if (timedOut(await awaitStartLockSweepBounded(joinableStartLockReap, waitBoundMs))) {
+        return "timed_out";
+      }
       return "joined";
     }
     if (inFlightStartLockReap) {
       // The reading sweep's own failure belongs to its callers. This caller is
       // served by the chained sweep, so it must not inherit that rejection.
-      await scheduleStartLockReap(inFlightStartLockReap.catch(() => undefined));
-      return "ran";
+      const chained = scheduleStartLockReap(inFlightStartLockReap.catch(() => undefined));
+      return timedOut(await awaitStartLockSweepBounded(chained, waitBoundMs)) ? "timed_out" : "ran";
     }
     const configuredTtlMs = Number.parseInt(process.env.AGENT_START_LOCK_REAP_TTL_MS ?? "", 10);
     const ttlMs = Number.isFinite(configuredTtlMs) && configuredTtlMs >= 0
       ? configuredTtlMs
       : START_LOCK_REAP_TTL_DEFAULT_MS;
     if (ttlMs > 0 && Date.now() - sharedStartLockReapCompletedAtMs < ttlMs) return "skipped_fresh";
-    await scheduleStartLockReap(Promise.resolve());
-    return "ran";
+    const fresh = scheduleStartLockReap(Promise.resolve());
+    return timedOut(await awaitStartLockSweepBounded(fresh, waitBoundMs)) ? "timed_out" : "ran";
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
@@ -29802,7 +29894,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // another agent's in-flight sweep, which is still time this lock was held.
         markAgentStartLockPhase(agentId, "reap");
         const reapStartedAtMs = Date.now();
-        let reapDisposition: "ran" | "joined" | "skipped_fresh" | "nested" | undefined;
+        let reapDisposition: "ran" | "joined" | "skipped_fresh" | "nested" | "timed_out" | undefined;
         try {
           reapDisposition = await reapOrphanedRunsForStartLock();
         } finally {
@@ -29813,7 +29905,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             (reapDisposition === "nested" ? logger.info : logger.warn).call(
               logger,
               { agentId, reapMs, reapDisposition, warnAfterMs: LOCK_HELD_WARN_MS },
-              "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
+              reapDisposition === "timed_out"
+                // BLO-41036: the opposite of the message below — this agent
+                // STOPPED waiting and is dispatching on stale orphan state. Any
+                // occurrence means a fleet sweep outlived its bound; it is the
+                // signal that would have named the d5268bc0 outage in one line.
+                ? "orphan reap exceeded its wait bound; dispatching on stale reap state for this agent"
+                : "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
             );
           }
         }
