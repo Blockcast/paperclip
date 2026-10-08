@@ -182,7 +182,11 @@ test('evaluateEnvironmentProtection: flags empty reviewers as non-compliant even
   const result = evaluateEnvironmentProtection(env, { expectedReviewers: ['kkroo'] });
   assert.equal(result.compliant, false);
   assert.match(result.violations[0], /required_reviewers/);
-  assert.deepEqual(result.violationKinds, ['required_reviewers_rule']);
+  assert.deepEqual(result.violationKinds, ['required_reviewers_empty']);
+  // The remedy differs from the absent-rule case: this rule must be
+  // REPOPULATED, not created. Assert the prose says so (PEN-3871).
+  assert.match(result.violations[0], /EMPTY/);
+  assert.doesNotMatch(result.violations[0], /NO rule/);
 });
 
 test('evaluateEnvironmentProtection: flags an absent required_reviewers rule', () => {
@@ -193,6 +197,40 @@ test('evaluateEnvironmentProtection: flags an absent required_reviewers rule', (
   const result = evaluateEnvironmentProtection(env, { expectedReviewers: ['kkroo'] });
   assert.equal(result.compliant, false);
   assert.deepEqual(result.violationKinds, ['required_reviewers_rule']);
+  assert.match(result.violations[0], /NO rule/);
+  assert.doesNotMatch(result.violations[0], /list is EMPTY/);
+});
+
+test('evaluateEnvironmentProtection: absent rule and empty list are DISTINCT verdicts', () => {
+  // PEN-3871. These were one disjunct reporting one slug and one message, so
+  // the 2026-10-06 loss of the rule itself was indistinguishable in the alert
+  // from a rule whose reviewer list had been emptied. They have different
+  // causes and different remedies, and because the violation-kind set is an
+  // Alertmanager LABEL, collapsing them also made the two shapes share a
+  // fingerprint. Mutation guard: restore `rule == null || reviewers.length === 0`
+  // as a single branch and this fails on both the slug and the message.
+  const absent = evaluateEnvironmentProtection({
+    ...COMPLIANT_ENV,
+    protection_rules: [{ id: 1, type: 'branch_policy' }],
+  }, { expectedReviewers: ['kkroo'] });
+  const empty = evaluateEnvironmentProtection({
+    ...COMPLIANT_ENV,
+    protection_rules: [
+      { id: 1, type: 'branch_policy' },
+      { id: 2, type: 'required_reviewers', prevent_self_review: true, reviewers: [] },
+    ],
+  }, { expectedReviewers: ['kkroo'] });
+
+  // Both are still the dangerous "no effective gate" state...
+  assert.equal(absent.compliant, false);
+  assert.equal(empty.compliant, false);
+  for (const r of [absent, empty]) {
+    assert.match(r.violations[0], /no effective approval gate on production deploys/);
+  }
+
+  // ...but they must not be confusable with each other.
+  assert.notDeepEqual(absent.violationKinds, empty.violationKinds);
+  assert.notEqual(absent.violations[0], empty.violations[0]);
 });
 
 test('evaluateEnvironmentProtection: prevent_self_review is REPORTED but not asserted', () => {
