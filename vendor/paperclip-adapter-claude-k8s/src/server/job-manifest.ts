@@ -108,7 +108,10 @@ export type ScopedWritableMount = { subPath: string; mountPath: string };
  * `/paperclip/wt/...`, say) is applied over the scratch mount and re-exposes
  * that subtree unscoped. That is correct — the data genuinely lives
  * there and the descriptor is the authority — but it means these two names are
- * scoped by default, not unconditionally.
+ * scoped by default, not unconditionally. A linked worktree's git common dir is
+ * NOT such a candidate: its location comes from an agent-writable pointer, not
+ * the descriptor, so it is never emitted under an existing writable mount (see
+ * `resolveScopedWritableMounts`).
  */
 const SCRATCH_DIR_NAMES = ["work", "wt"] as const;
 
@@ -149,12 +152,18 @@ function assertNormalizedPath(field: string, value: string): void {
  * exists. The last rejects a registration forged inside the worktree itself,
  * whose shape would otherwise name the worktree's parent dir as `<common>`.
  *
- * Read through `serverRoot`, where THIS process reaches the volume; see
- * `buildPodLogPath` for why that differs from the pod's `dataMountPath`.
+ * Every pointer is a POD path, so each read is translated through the pod's own
+ * mount table, `writableMounts`, before landing on `serverRoot` (where THIS
+ * process reaches the volume; see `buildPodLogPath`). A plain prefix swap is
+ * wrong under the scratch remap: pod `<mount>/wt/<x>` is volume
+ * `wt/<companyId>/<x>`, not `wt/<x>`. Reading what the pod will see is also
+ * what lets the registration checks above carry the containment argument; a
+ * prefix swap read a different tree from the one the pod would mount.
  */
 export function resolveLinkedWorktreeCommonDir(
   workspaceRoot: string,
   dataMountPath: string,
+  writableMounts: ScopedWritableMount[],
   serverRoot: string = SELF_POD_DATA_MOUNT_PATH,
 ): string | null {
   const prefix = dataMountPath.endsWith("/") ? dataMountPath : `${dataMountPath}/`;
@@ -162,8 +171,12 @@ export function resolveLinkedWorktreeCommonDir(
   // `/runtime-cache` emptyDir), and not ours to scope either.
   const read = (podPath: string): string | null => {
     if (!podPath.startsWith(prefix)) return null;
+    const mount = coveringMount(writableMounts, podPath);
+    const volumePath = mount
+      ? path.posix.join(mount.subPath, podPath.slice(mount.mountPath.length))
+      : podPath.slice(prefix.length);
     try {
-      return readFileSync(path.posix.join(serverRoot, podPath.slice(prefix.length)), "utf8").trim();
+      return readFileSync(path.posix.join(serverRoot, volumePath), "utf8").trim();
     } catch {
       return null;
     }
@@ -186,18 +199,35 @@ export function resolveLinkedWorktreeCommonDir(
           : null;
   if (reason === null) return common;
   // Named rather than silent: the run proceeds narrowed, and git then fails
-  // EROFS mid-run, which is unreadable without this.
+  // EROFS mid-run, which is unreadable without this. Unless a writable mount
+  // already covers the git dir — then EROFS is not what happens, and the likely
+  // cause is a pre-narrowing repo the scratch remap hides.
+  const coveredBy = coveringMount(writableMounts, gitDir);
   console.warn(
     JSON.stringify({
       level: "warn",
       event: "claude_k8s.worktree_gitdir_rejected",
-      msg: "linked worktree git dir not made writable; git writes in this run will fail read-only",
+      msg: coveredBy
+        ? "linked worktree git dir does not verify through the writable mount covering it; this is not a read-only failure — if git cannot find its repository, a pre-narrowing unscoped work/ or wt/ repo is not visible at this path (PROVENANCE-CHANGES.d/pr-1820.md §4)"
+        : "linked worktree git dir not made writable; git writes in this run will fail read-only",
       reason,
       workspaceRoot,
       gitDir,
+      ...(coveredBy ? { coveredBy } : {}),
     }),
   );
   return null;
+}
+
+/** The mount the pod sees `podPath` through: the deepest one at or above it,
+ *  since mounts apply parent-first and a child shadows its parent. */
+function coveringMount(mounts: ScopedWritableMount[], podPath: string): ScopedWritableMount | undefined {
+  let deepest: ScopedWritableMount | undefined;
+  for (const mount of mounts) {
+    if (podPath !== mount.mountPath && !podPath.startsWith(`${mount.mountPath}/`)) continue;
+    if (!deepest || mount.mountPath.length > deepest.mountPath.length) deepest = mount;
+  }
+  return deepest;
 }
 
 /**
@@ -283,11 +313,6 @@ export function resolveScopedWritableMounts(input: {
     ["isolation.homeRoot", isolation.homeRoot],
     ["isolation.sessionRoot", isolation.sessionRoot],
     ["isolation.workspaceRoot", isolation.workspaceRoot],
-    // A linked worktree's index, refs and objects live outside `workspaceRoot`.
-    [
-      "isolation.workspaceRoot git common dir",
-      resolveLinkedWorktreeCommonDir(isolation.workspaceRoot, dataMountPath, serverDataMountPath) ?? "",
-    ],
     ["isolation.cacheRoot", isolation.cacheRoot],
     ["isolation.tmpRoot", isolation.tmpRoot],
     ["isolation.promptCacheRoot", isolation.promptCacheRoot],
@@ -312,40 +337,53 @@ export function resolveScopedWritableMounts(input: {
   ];
 
   const onVolume: string[] = [];
-  for (const [field, raw] of candidates) {
-    if (!raw) continue;
+  const accept = (field: string, raw: string) => {
+    if (!raw) return;
     assertSafeAbsolutePath(field, raw);
     assertNormalizedPath(field, raw);
     // Off-volume roots (the `/runtime-cache` emptyDir, `/tmp`) are already
     // writable and are not ours to scope.
     if (raw !== dataMountPath && !raw.startsWith(prefix)) {
       warnIfPersistentTreeIsOffVolume(field, raw, isolation, dataMountPath);
-      continue;
+      return;
     }
     if (raw === dataMountPath) {
       throw new Error(`${field} must not be the data mount root itself (${dataMountPath}); that would re-open the whole volume for writing`);
     }
     if (!onVolume.includes(raw)) onVolume.push(raw);
-  }
+  };
+  for (const [field, raw] of candidates) accept(field, raw);
 
-  // Drop any target an ancestor target already covers.
-  const minimal = onVolume.filter(
-    (candidate) => !onVolume.some((other) => other !== candidate && candidate.startsWith(`${other}/`)),
-  );
+  const toMounts = (): ScopedWritableMount[] => {
+    // Drop any target an ancestor target already covers.
+    const minimal = onVolume.filter(
+      (candidate) => !onVolume.some((other) => other !== candidate && candidate.startsWith(`${other}/`)),
+    );
+    const mounts: ScopedWritableMount[] = minimal
+      .sort()
+      .map((absolute) => ({ subPath: absolute.slice(prefix.length), mountPath: absolute }));
+    for (const name of SCRATCH_DIR_NAMES) {
+      mounts.push({ subPath: `${name}/${companyId}`, mountPath: `${prefix}${name}` });
+    }
+    // Parents before children. Mounts apply in declaration order, and
+    // buildJobManifest's BLO-40401 backstop throws on a parent declared after a
+    // child it would hide — which a derived candidate under `work/` or `wt/`
+    // followed by its scratch mount was. A path sorts before every path it is a
+    // proper prefix of, so a plain string sort is enough.
+    return mounts.sort((a, b) => (a.mountPath < b.mountPath ? -1 : a.mountPath > b.mountPath ? 1 : 0));
+  };
+  const mounts = toMounts();
 
-  const mounts: ScopedWritableMount[] = minimal
-    .sort()
-    .map((absolute) => ({ subPath: absolute.slice(prefix.length), mountPath: absolute }));
-
-  for (const name of SCRATCH_DIR_NAMES) {
-    mounts.push({ subPath: `${name}/${companyId}`, mountPath: `${prefix}${name}` });
-  }
-  // Parents before children. Mounts apply in declaration order, and
-  // buildJobManifest's BLO-40401 backstop throws on a parent declared after a
-  // child it would hide — which a derived candidate under `work/` or `wt/`
-  // followed by its scratch mount was. A path sorts before every path it is a
-  // proper prefix of, so a plain string sort is enough.
-  return mounts.sort((a, b) => (a.mountPath < b.mountPath ? -1 : a.mountPath > b.mountPath ? 1 : 0));
+  // A linked worktree's index, refs and objects live outside `workspaceRoot`.
+  // Resolved against the mounts above, so its reads see what the pod will see.
+  // Emitted only when no writable mount already covers it: its mount would be
+  // identity-mapped (`subPath` = its own path), which is right on the read-only
+  // base but, under a scratch mount, re-opens the legacy unscoped `wt/<x>` or
+  // `work/<x>` tree over the company-scoped one.
+  const common = resolveLinkedWorktreeCommonDir(isolation.workspaceRoot, dataMountPath, mounts, serverDataMountPath);
+  if (!common || coveringMount(mounts, common)) return mounts;
+  accept("isolation.workspaceRoot git common dir", common);
+  return toMounts();
 }
 
 /** The pod log lives on the shared data volume, which the server and the agent

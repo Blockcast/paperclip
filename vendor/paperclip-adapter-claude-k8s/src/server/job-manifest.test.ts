@@ -4224,7 +4224,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
       git(repo, "worktree", "add", "-q", "-b", "br", worktree);
       return { repo, worktree };
     }
-    function writableFor(workspaceRoot: string): string[] {
+    function scopedFor(workspaceRoot: string) {
       const isolationRoot = join(volume, "instances/default/data/k8s-isolation/workspaces/ws-1");
       return resolveScopedWritableMounts({
         dataMountPath: volume,
@@ -4247,15 +4247,16 @@ describe("scoped writable mounts (BLO-32734)", () => {
         instructionsFilePath: null,
         addDir: null,
         companyId: "co1",
-      }).map((m) => m.mountPath);
+      });
     }
+    const writableFor = (workspaceRoot: string) => scopedFor(workspaceRoot).map((m) => m.mountPath);
     const covered = (mounts: string[], target: string) =>
       mounts.some((m) => target === m || target.startsWith(`${m}/`));
-    const rejections = () =>
+    const rejected = () =>
       warn.mock.calls
         .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
-        .filter((entry) => entry?.event === "claude_k8s.worktree_gitdir_rejected")
-        .map((entry) => entry.reason);
+        .filter((entry) => entry?.event === "claude_k8s.worktree_gitdir_rejected");
+    const rejections = () => rejected().map((entry) => entry.reason);
 
     it("makes writable every dir a commit in the worktree writes into", () => {
       const { worktree } = repoWithWorktree("co1");
@@ -4286,6 +4287,9 @@ describe("scoped writable mounts (BLO-32734)", () => {
       const mounts = writableFor(own.worktree);
       expect(covered(mounts, join(foreign.repo, ".git")), JSON.stringify(mounts)).toBe(false);
       expect(rejections()).toEqual(["gitdir_back_pointer_mismatch"]);
+      // Uncovered, so the read-only claim is true here.
+      expect(rejected()[0].msg).toContain("will fail read-only");
+      expect(rejected()[0].coveredBy).toBeUndefined();
     });
 
     // Shape-valid and back-pointer-valid, both written from inside the run's own
@@ -4298,6 +4302,52 @@ describe("scoped writable mounts (BLO-32734)", () => {
       const mounts = writableFor(worktree);
       expect(covered(mounts, join(repo, ".paperclip/worktrees/sibling")), JSON.stringify(mounts)).toBe(false);
       expect(rejections()).toEqual(["common_dir_not_a_git_dir"]);
+    });
+
+    // Ally review on #2326 (Important): the scratch remap makes pod
+    // `<mount>/wt/<x>` volume `wt/co1/<x>`, so a pod-to-server prefix swap read
+    // the wrong tree for a repo under `wt/`. Both directions are pinned: the
+    // company's own repo must resolve (and need no mount — scratch already
+    // covers it), and a legacy unscoped `wt/<x>` repo must not come back as an
+    // unscoped rw mount stacked over the scoped scratch one. The workspace sits
+    // under `wt/` too, as a derived (unscoped) mount over scratch, so its own
+    // `.git` must be read through the deeper of the two.
+    function worktreeOfRepoAt(volumeDir: string) {
+      const repo = join(volume, volumeDir, "repo");
+      mkdirSync(repo, { recursive: true });
+      git(repo, "init", "-q");
+      git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init");
+      const worktree = join(volume, "wt/co1-ws");
+      git(repo, "worktree", "add", "-q", "-b", "br", worktree);
+      return { worktree, gitDir: git(worktree, "rev-parse", "--path-format=absolute", "--git-dir") };
+    }
+    const wtMounts = (mounts: ReturnType<typeof scopedFor>) =>
+      mounts.filter((m) => m.mountPath === join(volume, "wt") || m.mountPath.startsWith(`${join(volume, "wt")}/`));
+    const scratchAndWorkspaceOnly = () => [
+      { subPath: "wt/co1", mountPath: join(volume, "wt") },
+      { subPath: "wt/co1-ws", mountPath: join(volume, "wt/co1-ws") },
+    ];
+
+    it("resolves a common dir under the scoped wt scratch tree and adds no mount for it", () => {
+      const { worktree, gitDir } = worktreeOfRepoAt("wt/co1");
+      // Rewrite the pointer to what a pod wrote: it sees `wt/co1` at `<mount>/wt`.
+      const podGitDir = gitDir.replace(`${join(volume, "wt/co1")}/`, `${join(volume, "wt")}/`);
+      expect(podGitDir).not.toBe(gitDir);
+      writeFileSync(join(worktree, ".git"), `gitdir: ${podGitDir}\n`);
+      const mounts = scopedFor(worktree);
+      expect(rejections()).toEqual([]);
+      expect(covered(mounts.map((m) => m.mountPath), join(volume, "wt/repo/.git"))).toBe(true);
+      expect(wtMounts(mounts)).toEqual(scratchAndWorkspaceOnly());
+    });
+
+    it("emits no unscoped mount for a legacy wt repo the scoped pod cannot see", () => {
+      const { worktree } = worktreeOfRepoAt("wt");
+      const mounts = scopedFor(worktree);
+      expect(wtMounts(mounts)).toEqual(scratchAndWorkspaceOnly());
+      expect(rejections()).toEqual(["gitdir_back_pointer_mismatch"]);
+      // Scratch is rw, so a read-only claim would send the operator the wrong way.
+      expect(rejected()[0].msg).toContain("not a read-only failure");
+      expect(rejected()[0].coveredBy).toEqual({ subPath: "wt/co1", mountPath: join(volume, "wt") });
     });
   });
 });
