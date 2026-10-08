@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import request from "supertest";
@@ -924,10 +924,20 @@ function resolveConstLiteral(name: string, source: string, sourceUrl: URL): stri
     /import\s*\{([^}]*)\}\s*from\s*"(\.\.?\/[^"]+)"/g,
   )) {
     if (!new RegExp(`(^|[\\s,])${name}([\\s,]|$)`).test(imported[1])) continue;
-    const moduleSource = readFileSync(
-      fileURLToPath(new URL(imported[2].replace(/\.js$/, ".ts"), sourceUrl)),
-      "utf8",
-    );
+    let moduleSource: string;
+    try {
+      moduleSource = readFileSync(
+        fileURLToPath(new URL(imported[2].replace(/\.js$/, ".ts"), sourceUrl)),
+        "utf8",
+      );
+    } catch {
+      // A barrel or extensionless specifier this narrow resolver cannot follow
+      // (PEN-3855: the reason-allowlist scan now resolves against every writer
+      // module, not only `heartbeat.ts`). Skip the candidate rather than throwing:
+      // both callers fail loudly on a `null` -- the drain scan's `not.toBeNull()`
+      // and the allowlist scan's `unresolvedConsts` -- with the name attached.
+      continue;
+    }
     const exported = moduleSource.match(
       new RegExp(`(?:^|\\n)\\s*export\\s+const\\s+${name}\\s*(?::[^=]+)?=\\s*"([^"]+)"`),
     );
@@ -1052,8 +1062,80 @@ describe("lockless deferred-wake drain evidence is readable from its writer", ()
 // assert a static registry against its writer, need no database, and must not go
 // silently green on a host where embedded Postgres is unavailable.
 describe("issue wake diagnostic reason allowlist", () => {
-  const heartbeatUrl = new URL("../services/heartbeat.ts", import.meta.url);
-  const heartbeatSource = readFileSync(fileURLToPath(heartbeatUrl), "utf8");
+  // PEN-3855: this scan used to read `heartbeat.ts` and nothing else, which made
+  // its own title ("account for every wake writer") true by measurement rather
+  // than by construction -- and the measurement was already wrong. A writer in
+  // `services/recovery/service.ts` was writing `provider_quota_recovery` onto an
+  // issue-scoped row that this route selects and projected to "other", one file
+  // outside the scan's whole domain.
+  //
+  // So discover the writers from the repo instead of naming one file. Everything
+  // below is keyed off `WRITER_FILES`, so a writer landing in a new module joins
+  // the scan by existing rather than by someone remembering to add it.
+  const SERVER_SRC = new URL("../", import.meta.url);
+
+  // Exclusion is by `.test.ts` SUFFIX, not by `__tests__/` directory, and that is
+  // load-bearing in both directions. `services/wake-idempotency.test.ts` is a
+  // co-located test holding a real `insert(agentWakeupRequests)`, so a
+  // directory-only rule would scan it and derive expectations from fixture data.
+  // The directory is excluded as well because a non-`.test.ts` helper under
+  // `__tests__/` would otherwise slip through the suffix rule for the same reason.
+  function isProductionSource(path: string) {
+    if (!path.endsWith(".ts")) return false;
+    if (path.endsWith(".test.ts") || path.endsWith(".d.ts")) return false;
+    return !path.includes("/__tests__/");
+  }
+
+  function collectWriterFiles(dir: URL): { path: string; source: string; url: URL }[] {
+    const found: { path: string; source: string; url: URL }[] = [];
+    for (const entry of readdirSync(fileURLToPath(dir), { withFileTypes: true })) {
+      const child = new URL(entry.name + (entry.isDirectory() ? "/" : ""), dir);
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules") continue;
+        found.push(...collectWriterFiles(child));
+        continue;
+      }
+      const path = fileURLToPath(child);
+      if (!isProductionSource(path)) continue;
+      const source = readFileSync(path, "utf8");
+      if (!source.includes("insert(agentWakeupRequests)")) continue;
+      found.push({ path: path.slice(path.indexOf("server/src/")), source, url: child });
+    }
+    return found;
+  }
+
+  const WRITER_FILES = collectWriterFiles(SERVER_SRC).sort((a, b) => a.path.localeCompare(b.path));
+  const heartbeatFile = WRITER_FILES.find((file) => file.path.endsWith("services/heartbeat.ts"));
+  const heartbeatSource = heartbeatFile?.source ?? "";
+
+  // The glob is the whole control here, so prove it is live before anything reads
+  // it. A walker that silently returns [] would make every assertion below vacuous
+  // -- and vacuous is exactly the failure mode this change exists to remove.
+  it("discovers every production wake writer in the repo, not one hand-named file", () => {
+    expect(WRITER_FILES.length, "writer-file walk found nothing").toBeGreaterThan(0);
+    const paths = WRITER_FILES.map((file) => file.path);
+
+    // Anchored on the two files that carry the point: `heartbeat.ts` is the scan's
+    // historical domain, `recovery/service.ts` is the file whose writer reached
+    // "other" while invisible to it. Losing either silently is the regression.
+    expect(paths, `writer files: ${paths.join(", ")}`).toContain("server/src/services/heartbeat.ts");
+    expect(paths, `writer files: ${paths.join(", ")}`).toContain(
+      "server/src/services/recovery/service.ts",
+    );
+    // ...and the scan must reach beyond the one file it used to read.
+    expect(paths.filter((path) => !path.endsWith("services/heartbeat.ts")).length).toBeGreaterThan(0);
+
+    // No test fixture may enter the scan: those build wake rows from invented
+    // reasons, so admitting them would derive the allowlist from the tests that
+    // check it. `wake-idempotency.test.ts` is the co-located case the suffix rule
+    // exists for, so name it rather than only asserting the general shape.
+    for (const path of paths) {
+      expect(path.endsWith(".test.ts"), `${path} is a test fixture and must not be scanned`).toBe(
+        false,
+      );
+    }
+    expect(paths).not.toContain("server/src/services/wake-idempotency.test.ts");
+  });
 
   // The timer-scheduler skips this route cannot return. Hoisted so the positive scan
   // below and the negative test at the bottom carve out the SAME names: if one list
@@ -1068,12 +1150,30 @@ describe("issue wake diagnostic reason allowlist", () => {
   // would not have caught its admission either. Naming both members here makes the
   // negative test cover all three families, so this is one list rather than two plus
   // an omission.
-  const AGENT_SCOPED_UNREACHABLE = [
-    "provider_capacity_deferred",
-    "no_in_flight_work",
-    "idle_circuit_breaker",
-    "adapter_failed_circuit_breaker",
+  //
+  // PEN-3855: carries a `why` per entry now that the scan spans several files and
+  // the exclusions no longer share one justification. The list stays single-sourced:
+  // the positive scan's carve-out and the negative test below both read it, so an
+  // entry added for one and not the other contradicts rather than drifts.
+  const UNREACHABLE_BY_CONSTRUCTION: { reason: string; why: string }[] = [
+    { reason: "provider_capacity_deferred", why: "agent-scoped timer skip, payload has no issue binding" },
+    { reason: "no_in_flight_work", why: "agent-scoped timer skip, payload has no issue binding" },
+    { reason: "idle_circuit_breaker", why: "agent-scoped timer skip, payload has no issue binding" },
+    {
+      reason: "adapter_failed_circuit_breaker",
+      why: "agent-scoped timer skip, payload has no issue binding",
+    },
+    // PEN-3855. Doubly unreachable, which is why it stays out even though it sits
+    // in the same file as the reason this change admits: the insert carries no
+    // `payload` at all, AND the row is deleted unconditionally in a `finally`
+    // (`recovery/service.ts`). It is an ephemeral capacity token, not a durable
+    // wake record -- adding a payload alone would not make it a diagnostic row.
+    {
+      reason: "issue_assignment_recovery_capacity_reservation",
+      why: "ephemeral capacity token: no payload, and deleted in a finally",
+    },
   ];
+  const UNREACHABLE_REASONS = UNREACHABLE_BY_CONSTRUCTION.map((entry) => entry.reason);
 
   // `reason:` appears TWICE in most of these insert blocks -- once at the top level
   // (the `agent_wakeup_requests.reason` COLUMN) and once nested inside
@@ -1088,12 +1188,15 @@ describe("issue wake diagnostic reason allowlist", () => {
   // simply produced nothing, which made "this writer passes a runtime variable"
   // byte-identical to "this writer has no reason column" -- and to "the depth walk
   // desynced and lost the site". `unaccounted` is what tells those apart.
-  function columnReasonLiteralsFromDirectInserts() {
-    const sites: { line: number; reasons: string[] }[] = [];
+  function columnReasonLiteralsFromDirectInserts(file: { path: string; source: string; url: URL }) {
+    const source = file.source;
+    const lineOf = (index: number) => source.slice(0, index).split("\n").length;
+    const at = (index: number) => `${file.path}:${lineOf(index)}`;
+    const sites: { site: string; reasons: string[] }[] = [];
     const unresolvedConsts: string[] = [];
     // Depth-1 `reason` column present, value not statically resolvable. Named, not
     // dropped, so a site cannot hide here.
-    const dynamic: { line: number; expr: string }[] = [];
+    const dynamic: { site: string; expr: string }[] = [];
     // No depth-1 `reason` key found at all. Must stay empty — but NOT because the
     // column is NOT NULL. It is nullable: `reason: text("reason")` carries no
     // `.notNull()` (`packages/db/src/schema/agent_wakeup_requests.ts`, where `source`
@@ -1110,22 +1213,22 @@ describe("issue wake diagnostic reason allowlist", () => {
     // see the `openerCount` check in the caller), or a new writer genuinely
     // omits the key and must be classified here deliberately. The failure message
     // names both, so the next engineer checks the writer as well as the scanner.
-    const unaccounted: number[] = [];
+    const unaccounted: string[] = [];
     let openerCount = 0;
     const openers = /insert\(agentWakeupRequests\)\s*\n?\s*\.?\s*values\(\{/g;
     let opener: RegExpExecArray | null;
-    while ((opener = openers.exec(heartbeatSource))) {
+    while ((opener = openers.exec(source))) {
       openerCount++;
       const open = opener.index + opener[0].length - 1;
       let depth = 1;
       let end = open + 1;
-      while (end < heartbeatSource.length && depth > 0) {
-        const ch = heartbeatSource[end];
+      while (end < source.length && depth > 0) {
+        const ch = source[end];
         if (ch === "{") depth++;
         else if (ch === "}") depth--;
         end++;
       }
-      const block = heartbeatSource.slice(open, end);
+      const block = source.slice(open, end);
 
       let blockDepth = 0;
       let classified = false;
@@ -1172,7 +1275,7 @@ describe("issue wake diagnostic reason allowlist", () => {
         if (!block.startsWith("reason:", i) && !shorthand) continue;
         if (shorthand) {
           // A binding forwarded by shorthand is a runtime value by construction.
-          dynamic.push({ line: lineOf(opener.index), expr: "reason (ES6 shorthand)" });
+          dynamic.push({ site: at(opener.index), expr: "reason (ES6 shorthand)" });
           classified = true;
           break;
         }
@@ -1181,34 +1284,31 @@ describe("issue wake diagnostic reason allowlist", () => {
         const ternary = tail.match(/^[^,]*?\?\s*\n?\s*"([^"]+)"\s*\n?\s*:\s*\n?\s*"([^"]+)"/);
         const constIdentifier = tail.match(/^\s*([A-Z][A-Z0-9_]*)\s*,/);
         classified = true;
-        if (literal) sites.push({ line: lineOf(opener.index), reasons: [literal[1]] });
+        if (literal) sites.push({ site: at(opener.index), reasons: [literal[1]] });
         else if (ternary)
-          sites.push({ line: lineOf(opener.index), reasons: [ternary[1], ternary[2]] });
+          sites.push({ site: at(opener.index), reasons: [ternary[1], ternary[2]] });
         else if (constIdentifier) {
-          const resolved = resolveConstLiteral(constIdentifier[1], heartbeatSource, heartbeatUrl);
+          const resolved = resolveConstLiteral(constIdentifier[1], source, file.url);
           // Fail loudly rather than widening the skip: a `SCREAMING_SNAKE` const the
           // resolver cannot follow means the resolver broke, not that the site is
           // dynamic. Silently skipping it is the exact failure this revision fixes.
-          if (resolved) sites.push({ line: lineOf(opener.index), reasons: [resolved] });
-          else unresolvedConsts.push(`${constIdentifier[1]} (heartbeat.ts:${lineOf(opener.index)})`);
+          if (resolved) sites.push({ site: at(opener.index), reasons: [resolved] });
+          else unresolvedConsts.push(`${constIdentifier[1]} (${at(opener.index)})`);
         } else {
           // A lowercase/member-expression `reason:` cannot be resolved statically.
           // Named rather than dropped, so it is distinguishable from a block that
           // carries no `reason` column at all -- see `unaccounted` below.
           dynamic.push({
-            line: lineOf(opener.index),
+            site: at(opener.index),
             expr: (tail.match(/^\s*([^,\n]{0,60})/)?.[1] ?? "").trim(),
           });
         }
         break;
       }
-      if (!classified) unaccounted.push(lineOf(opener.index));
+      if (!classified) unaccounted.push(at(opener.index));
     }
-    return { sites, unresolvedConsts, dynamic, unaccounted, openerCount };
-  }
-
-  function lineOf(index: number) {
-    return heartbeatSource.slice(0, index).split("\n").length;
+    const rawOpeners = (source.match(/insert\(agentWakeupRequests\)/g) ?? []).length;
+    return { sites, unresolvedConsts, dynamic, unaccounted, openerCount, rawOpeners };
   }
 
   // The first revision of the allowlist carried bare `worktree_execution_cutoff`,
@@ -1243,9 +1343,16 @@ describe("issue wake diagnostic reason allowlist", () => {
   // instead, including the coalesce ternary that writes
   // `github_state_change_queued_coalesced` / `issue_execution_same_name`, so a rename
   // at any of those would still have reached "other" undetected.
+  //
+  // PEN-3855: runs over every discovered writer file, not `heartbeat.ts` alone.
   it("admits every statically resolvable reason a direct `insert(agentWakeupRequests)` writes to the column", () => {
-    const { sites, unresolvedConsts, dynamic, unaccounted, openerCount } =
-      columnReasonLiteralsFromDirectInserts();
+    const scans = WRITER_FILES.map((file) => columnReasonLiteralsFromDirectInserts(file));
+    const sites = scans.flatMap((scan) => scan.sites);
+    const unresolvedConsts = scans.flatMap((scan) => scan.unresolvedConsts);
+    const dynamic = scans.flatMap((scan) => scan.dynamic);
+    const unaccounted = scans.flatMap((scan) => scan.unaccounted);
+    const openerCount = scans.reduce((total, scan) => total + scan.openerCount, 0);
+    const rawOpeners = scans.reduce((total, scan) => total + scan.rawOpeners, 0);
 
     // A `SCREAMING_SNAKE` const the resolver cannot follow is a broken resolver, not a
     // dynamic site. Assert it before the floor: a resolver that silently returns null
@@ -1266,7 +1373,7 @@ describe("issue wake diagnostic reason allowlist", () => {
     // or classify the new writer here on purpose.
     expect(
       unaccounted,
-      "direct-insert openers with no depth-1 `reason` key the scan could read (heartbeat.ts lines). " +
+      "direct-insert openers with no depth-1 `reason` key the scan could read. " +
         "Two causes, opposite fixes: (a) the scan went blind — depth walk desynced by an unbalanced " +
         "brace in a string property (a writer the opener regex stops matching cannot land here; the " +
         "`openerCount` assertion below catches that); or (b) a new " +
@@ -1276,7 +1383,7 @@ describe("issue wake diagnostic reason allowlist", () => {
     expect(
       sites.length + dynamic.length,
       `every opener must classify as resolved or dynamic; resolved=${sites.length} dynamic=${dynamic.length} of ${openerCount}. Dynamic sites: ${
-        dynamic.map((site) => `heartbeat.ts:${site.line} (${site.expr})`).join(", ") || "none"
+        dynamic.map((site) => `${site.site} (${site.expr})`).join(", ") || "none"
       }`,
     ).toBe(openerCount);
     // ...and the partition must be non-vacuous: zero openers would satisfy the
@@ -1288,7 +1395,7 @@ describe("issue wake diagnostic reason allowlist", () => {
     expect(
       openerCount,
       "opener regex stopped matching a writer — `.values(<identifier>)`, or a reformatted `values({`",
-    ).toBe((heartbeatSource.match(/insert\(agentWakeupRequests\)/g) ?? []).length);
+    ).toBe(rawOpeners);
 
     const ANCHORS = [
       "github_state_change_queued_coalesced",
@@ -1300,6 +1407,12 @@ describe("issue wake diagnostic reason allowlist", () => {
       // `workspace_worktree_requires_project` survived the previous revision.
       "workspace_worktree_requires_project",
       "execution_review_participant_recovery",
+      // PEN-3855: the out-of-file anchor. This one is written by
+      // `services/recovery/service.ts`, so it is reachable by this scan ONLY while
+      // the walk spans more than `heartbeat.ts`. If the glob ever narrows back to a
+      // single hand-named file, this anchor is what goes red -- which is the whole
+      // point of keying the scan off the repo rather than off a filename.
+      "provider_quota_recovery",
     ];
     // PEN-3765: keyed off the anchors rather than the live site count, which was `17`
     // against an actual 18. At one site of slack, deleting any single writer turned a
@@ -1322,30 +1435,35 @@ describe("issue wake diagnostic reason allowlist", () => {
 
     for (const site of sites) {
       for (const reason of site.reasons) {
-        if (AGENT_SCOPED_UNREACHABLE.includes(reason)) continue;
+        if (UNREACHABLE_REASONS.includes(reason)) continue;
         expect(
           ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(reason),
-          `${reason} (heartbeat.ts:${site.line}) is written to agent_wakeup_requests.reason but projects to "other"`,
+          `${reason} (${site.site}) is written to agent_wakeup_requests.reason but projects to "other"`,
         ).toBe(true);
       }
     }
   });
 
-  // The converse, and the reason these were dropped rather than corrected: all are
-  // written only by the timer scheduler, onto agent-scoped rows whose payload
-  // carries no `issueId`, `taskId` or `_paperclipWakeContext`. `wakeRequestTargetsIssue`
-  // cannot return them, so admitting them would assert a reachability this route does
-  // not have. If any writer ever gains issue scope, re-add it with a route test.
+  // The converse, and the reason these were dropped rather than corrected. Each is
+  // unreachable on this route by construction, so admitting it would assert a
+  // reachability the route does not have. If any writer ever gains issue scope,
+  // re-add it with a route test.
   //
   // PEN-3765: `idle_circuit_breaker` / `adapter_failed_circuit_breaker` are the third
   // such family (`writeTimerCircuitBreakerSkip`). They reach the column through a
   // typed parameter, so the positive scan classifies that writer as dynamic and would
   // never have caught their admission -- this negative test is the only guard on them.
-  it("does not admit timer-scheduler skips this route cannot return", () => {
-    for (const reason of AGENT_SCOPED_UNREACHABLE) {
+  //
+  // PEN-3855: `issue_assignment_recovery_capacity_reservation` is the first entry
+  // here from outside `heartbeat.ts`. Unlike the four above, the positive scan DOES
+  // resolve it to a literal, so without the carve-out the scan would demand its
+  // admission -- making this test the thing that stops a widened glob from
+  // over-admitting.
+  it("does not admit wake reasons this route cannot return", () => {
+    for (const { reason, why } of UNREACHABLE_BY_CONSTRUCTION) {
       expect(
         ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(reason),
-        `${reason} is agent-scoped and unreachable on this route`,
+        `${reason} is unreachable on this route (${why})`,
       ).toBe(false);
     }
   });

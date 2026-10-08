@@ -1477,6 +1477,32 @@ export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set(
   // run, but it is issue-scoped and reachable here, so naming it beats "other".
   "workspace_worktree_requires_project",
   "execution_review_participant_recovery",
+  // PEN-3855: the first admitted reason written OUTSIDE `heartbeat.ts`
+  // (`services/recovery/service.ts`, the provider-quota retry). It satisfies the
+  // same criterion as `execution_review_participant_recovery` directly above --
+  // it queues a run, but it is issue-scoped and reachable here, so naming it
+  // beats "other". Reachability is measured, not assumed: the writer sets
+  // `payload: withRecoveryModelProfileHint({ issueId, ... }, "normal_model")`,
+  // `issueId` is not among `RECOVERY_MODEL_PROFILE_HINT_KEYS` so the scrub
+  // preserves it, and `wakeTargetIssueIdSql` coalesces `payload ->> 'issueId'`
+  // first under a WHERE that filters on company and time window only -- no
+  // status predicate. The row is selected unconditionally and projected to
+  // "other", which is the degradation this list exists to remove.
+  //
+  // Deliberately NOT admitted, both measured rather than assumed:
+  //   - `issue_assignment_recovery_capacity_reservation` (same file, :3647) is
+  //     doubly unreachable -- its insert carries NO `payload` at all, and the
+  //     row is deleted unconditionally in a `finally` (:3659). It is an
+  //     ephemeral capacity token, not a durable wake record, so adding a payload
+  //     alone would still not make it a diagnostic row.
+  //   - the `routes/github-webhook.ts` contended-retry row writes a dynamic
+  //     `wakeupOptions.reason`, but the reason being dynamic is moot: its payload
+  //     is built by `buildPrReviewerWakeupOptions` and carries none of the four
+  //     coalesce arms, so the row can never bind to an issue and can never reach
+  //     this projector.
+  // Admitting either would assert a reachability this route does not have --
+  // the same rule the timer-scheduler exclusions above are held to.
+  "provider_quota_recovery",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
