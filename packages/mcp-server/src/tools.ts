@@ -246,8 +246,19 @@ const setIssueMonitorToolSchema = z.object({
   issueId: issueIdSchema,
 }).merge(issueExecutionMonitorPolicySchema);
 
+// BLO-41373: `summary` is not a comment field, and refusing it under the bare
+// strict error names the key without saying where the text goes. Declared here
+// so the refusal carries the remedy -- never remapped (that would silently
+// reinterpret it). Same pattern as parkedDispositionCreateGuardShape.
 const addCommentToolSchema = z.object({
   issueId: issueIdSchema,
+  summary: z
+    .undefined({
+      errorMap: () => ({
+        message: "`summary` is not a paperclipAddComment parameter: put the comment text in `body` (markdown).",
+      }),
+    })
+    .optional(),
 }).merge(addIssueCommentSchema.innerType());
 
 const createSuggestTasksToolSchema = z.object({
