@@ -98,17 +98,36 @@ that agent. A second Job appearing *after* the config echo is confirmed is a
 real finding, not drain lag.
 
 **3. No more than one active reservation.** The slot ledger is
-`external_runtime_reservations`; active means `released_at is null`.
+`external_runtime_reservations`; active means `released_at is null`, and every
+row carries its agent (`packages/db/src/schema/external_runtime_reservations.ts:12`,
+`:25`). The per-agent count is a query against that table:
 
-```
-paperclip_external_runtime_reservations_active{agent_id="<agentId>"}
+```sql
+select count(*) from external_runtime_reservations
+ where agent_id = '<agentId>' and released_at is null;
 ```
 
-should settle at ≤ 1. If it sits above 1 with no corresponding Job, you have
-**leaked reservations**, not concurrency — rollback will not clear those, and
-they will keep blocking dispatch. Cross-check
-`paperclip_external_runtime_reservation_oldest_age_seconds`: a reservation
-older than the longest plausible run is leaked.
+Once in-flight work drains it should settle at ≤ 1. If it sits above 1 with no
+corresponding Job from step 2, read
+`paperclip_external_runtime_reservation_stranded_oldest_age_seconds{agent_id="<agentId>"}`
+(`server/src/services/metrics.ts:948-949`, labelled `agent_id` at `:4112`). It
+counts only a reservation whose run is already terminal or has gone silent, so
+it reads 0 for a healthy long run and a sustained non-zero value is a plain
+finding: you have **stranded reservations**, not concurrency — rollback will
+not clear those, and they will keep blocking dispatch. Trust its 0 only while
+`paperclip_external_runtime_reservation_strand_metrics_refresh_success` is 1
+(`metrics.ts:4115`); 0 there means the strand gauge is stale.
+
+Do not confirm this step from the fleet gauges.
+`paperclip_external_runtime_reservations_active` and
+`paperclip_external_runtime_reservation_oldest_age_seconds` have no labels
+(`metrics.ts:3897-3906`): each is one series summed across every agent. An
+`{agent_id=...}` selector on them matches nothing and returns empty, which reads
+as zero, and without one the count includes every other agent's runs. The age
+gauge also cannot separate a stranded row from a legitimately long run
+(`metrics.ts:940-947`), so an age threshold over it calls healthy long runs
+leaked. They can corroborate a fleet-wide trend; they cannot confirm a single
+agent.
 
 **4. Starts stop, blocks start.** After rollback,
 `paperclip_k8s_isolated_run_started_total` for that agent flattens and
@@ -141,15 +160,19 @@ without isolated starts replacing them — the agent is paying concurrency's
 complexity and getting none of its throughput. Read the ratio of the two, never
 either alone.
 
-**Leaked active reservations.** `paperclip_external_runtime_reservations_active`
-persistently above the configured ceiling, or
-`paperclip_external_runtime_reservation_oldest_age_seconds` beyond the longest
-plausible run. This is the failure where rollback alone is insufficient: pin the
-ceiling to 1 *and* raise the leak separately, because stale reservations keep
-occupying slots after the flag is off.
+**Stranded active reservations.**
+`paperclip_external_runtime_reservation_stranded_oldest_age_seconds{agent_id="<agentId>"}`
+sustained above 0 (with its refresh-success gauge at 1), or the step-3 per-agent
+count persistently above the configured ceiling. This is the failure where
+rollback alone is insufficient: pin the ceiling to 1 *and* raise the stranding
+separately, because stranded reservations keep occupying slots after the flag is
+off. The unlabelled `paperclip_external_runtime_reservations_active` above one
+agent's ceiling is not this signal — it sums every agent.
 
 **`process_lost` classification buckets.** `paperclip_process_lost_total` is
-labelled `adapter`, `error_bucket` and `classification` (`metrics.ts:3114`):
+labelled `adapter`, `error_bucket` and `classification` only
+(`metrics.ts:4132`). It has **no `agent_id`**, so it is a fleet-level signal.
+Its classifications (`metrics.ts:3114`):
 
 | classification | reads as |
 |---|---|
@@ -157,9 +180,25 @@ labelled `adapter`, `error_bucket` and `classification` (`metrics.ts:3114`):
 | `pre_adapter_job_unstamped` / `pre_adapter_job_stamped` / `pre_adapter_kube_unknown` | died before the adapter ran — launch-path, usually not concurrency |
 | `local` | not an external-lifecycle loss at all |
 
-A rise concentrated in `started_job_absent` on one agent after a ceiling change
-is a rollback trigger. A rise spread evenly across the `pre_adapter_*` buckets
-is a launch-path or cluster problem and rolling back will not fix it.
+A fleet-level rise concentrated in `started_job_absent` after a ceiling change
+is a rollback trigger once you have tied it to an agent, and the metric cannot
+do that. Attribute it with the agent's `job_missing` share above
+(`paperclip_heartbeat_run_failed_total` does carry `agent_id`), or read the
+durable classification off that agent's runs, which the metric's
+`classification` label is copied from
+(`server/src/services/process-loss-classification.ts:11`):
+
+```sql
+select result_json->'processLoss'->>'classification' as classification, count(*)
+  from heartbeat_runs
+ where agent_id = '<agentId>' and error_code = 'process_lost'
+   and finished_at > now() - interval '24 hours'
+ group by 1;
+```
+
+A rise spread evenly across the `pre_adapter_*` buckets is likewise fleet-level:
+a launch-path or cluster problem, not any one agent's, and rolling an agent back
+will not fix it. Run the same query before blaming a specific agent for it.
 
 > ☠️ **A low `process_lost` count is only trustworthy when
 > `rate(paperclip_process_lost_liveness_null_total[5m]) == 0`** (or
@@ -177,8 +216,9 @@ unmatched collapses to `other`.
 ## Rolling forward again
 
 Set `concurrencyEnabled: true` and raise `maxConcurrentRuns` in a separate,
-later write. Confirm the `job_missing` share and the `started_job_absent` bucket
-are back at baseline *for that agent* before raising the ceiling — the flag and
+later write. Confirm the agent's `job_missing` share and its `started_job_absent`
+count (from the per-agent query above, not the fleet-level metric) are back at
+baseline *for that agent* before raising the ceiling — the flag and
 the ceiling are independent decisions and bundling them makes the resulting
 telemetry unattributable.
 
