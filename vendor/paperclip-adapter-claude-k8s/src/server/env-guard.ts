@@ -153,6 +153,51 @@ const PROC_ENVIRON_RE = /\/proc\/(?:self|\d+)\/environ/;
  */
 const SHELL_BASENAMES = ["sh", "bash", "zsh", "ksh", "dash", "ash", "busybox"];
 
+/**
+ * BLO-40805. Utilities that put a LATER word back into command position, either
+ * by exec'ing it (`sudo env`, `timeout 5 env`, `xargs printenv`) or by
+ * re-parsing it as shell source (`eval`, `su -c`). Everything NOT on this list
+ * is an ordinary utility whose arguments are DATA, so a dump utility's name
+ * appearing after one is prose, a pattern, or a string literal — never a
+ * command.
+ *
+ * The previous design note here argued these "need no enumeration" because a
+ * flat scan over every word catches them without one. That is true, and it is
+ * also what made the guard block `echo env`, `grep -iE 'a|env'`, and writing a
+ * test fixture for this guard. The enumeration is the cost of distinguishing
+ * command position from argument position; the negative controls in
+ * env-guard.test.ts are the gate on it. Err toward adding a wrapper: a name on
+ * this list only ever makes the scan MORE conservative.
+ */
+const COMMAND_POSITION_WRAPPERS = [
+  ...SHELL_BASENAMES,
+  "eval",
+  "command",
+  "builtin",
+  "exec",
+  "nohup",
+  "setsid",
+  "time",
+  "timeout",
+  "nice",
+  "ionice",
+  "stdbuf",
+  "unbuffer",
+  "sudo",
+  "doas",
+  "su",
+  "runuser",
+  "xargs",
+  "watch",
+  "env",
+  "chroot",
+  "script",
+  "flock",
+  "strace",
+  "ltrace",
+  "parallel",
+];
+
 type LexedCommand = string[];
 
 interface LexResult {
@@ -167,6 +212,13 @@ interface LexResult {
    * still opens the file, so the target must be classified.
    */
   redirections: string[];
+  /**
+   * Bodies of heredocs whose delimiter was UNQUOTED (`<<EOF`), so the shell
+   * interpolates them. Kept apart from `commands` because the shell never
+   * executes a heredoc body's words — only its substitutions run — and apart
+   * from quoted heredocs (`<<'EOF'`), which are inert and are dropped entirely.
+   */
+  heredocs: string[];
 }
 
 function basename(word: string): string {
@@ -184,6 +236,8 @@ function lexShell(input: string): LexResult {
   const commands: LexedCommand[] = [];
   const nested: string[] = [];
   const redirections: string[] = [];
+  const heredocs: string[] = [];
+  const pendingHeredocs: { delimiter: string; expanded: boolean }[] = [];
   let words: string[] = [];
   let cur: string | null = null;
   let curQuoted = false;
@@ -197,11 +251,22 @@ function lexShell(input: string): LexResult {
     if (cur === null) return;
     // A quoted payload containing a command SEPARATOR may itself be a command
     // string (`eval "echo ok; env"`); re-analyse it rather than treating it as
-    // one opaque word. Deliberately keyed on separators and not on whitespace:
-    // recursing on whitespace alone would block ordinary prose arguments such
-    // as `git commit -m 'fix env'`, and a shell wrapper's `-c` payload is
-    // already recursed explicitly by `shellPayloadIndex` below.
-    if (curQuoted && /[;&|()\r\n]/.test(cur)) nested.push(cur);
+    // one opaque word.
+    //
+    // BLO-40805: gated on the current command actually being an evaluator.
+    // Separators alone are not evidence of a command — they are ordinary bytes
+    // in a regex alternation (`grep -iE 'a|env'`), a jq program, a sed script
+    // or a JSON blob, and re-lexing those re-created the very false positive
+    // this guard's altitude bug is about. `words` holds the command word and
+    // its preceding arguments, which is exactly the context needed to tell
+    // `eval '…; env'` from `grep '…|env'`.
+    if (
+      curQuoted
+      && /[;&|()\r\n]/.test(cur)
+      && words.some((w) => COMMAND_POSITION_WRAPPERS.indexOf(basename(w)) !== -1)
+    ) {
+      nested.push(cur);
+    }
     words.push(cur);
     cur = null;
     curQuoted = false;
@@ -272,7 +337,43 @@ function lexShell(input: string): LexResult {
    */
   const readRedirection = (start: number): number => {
     let j = start;
-    while (j < n && (input[j] === "<" || input[j] === ">" || input[j] === "&")) j += 1;
+    let operator = "";
+    while (j < n && (input[j] === "<" || input[j] === ">" || input[j] === "&")) {
+      operator += input[j] as string;
+      j += 1;
+    }
+    // BLO-40805: `<<DELIM` / `<<-DELIM` introduce a heredoc. The delimiter is
+    // not a file the shell opens, and the BODY is not argv — so neither the
+    // target scan nor the command scan applies to it. Record the delimiter and
+    // whether any part of it was quoted; the body is consumed at the newline.
+    if (operator.indexOf("<<") === 0 && operator.indexOf("<<<") !== 0) {
+      if (input[j] === "-") j += 1;
+      while (j < n && (input[j] === " " || input[j] === "\t")) j += 1;
+      let delimiter = "";
+      let expanded = true;
+      while (j < n && !/[\s;&|()<>]/.test(input[j] as string)) {
+        const c = input[j] as string;
+        if (c === "'" || c === '"') {
+          expanded = false;
+          j += 1;
+          while (j < n && input[j] !== c) {
+            delimiter += input[j] as string;
+            j += 1;
+          }
+          j += 1;
+          continue;
+        }
+        if (c === "\\") {
+          expanded = false;
+          j += 1;
+          continue;
+        }
+        delimiter += c;
+        j += 1;
+      }
+      if (delimiter) pendingHeredocs.push({ delimiter, expanded });
+      return j;
+    }
     while (j < n && (input[j] === " " || input[j] === "\t")) j += 1;
     // Capture the target word (quoted or bare) with quotes removed.
     let target = "";
@@ -294,6 +395,30 @@ function lexShell(input: string): LexResult {
     return j;
   };
 
+  /**
+   * Consumes every pending heredoc body, starting just after the newline that
+   * ended the command line. A quoted delimiter means the body is inert data and
+   * is dropped; an unquoted one is kept for substitution-only analysis.
+   */
+  const consumeHeredocBodies = (start: number): number => {
+    let j = start;
+    while (pendingHeredocs.length) {
+      const pending = pendingHeredocs.shift() as { delimiter: string; expanded: boolean };
+      let body = "";
+      while (j < n) {
+        let eol = input.indexOf("\n", j);
+        if (eol === -1) eol = n;
+        const line = input.slice(j, eol);
+        j = eol < n ? eol + 1 : n;
+        // `<<-` strips leading tabs from the terminator, so compare trimmed.
+        if (line.trim() === pending.delimiter) break;
+        body += `${line}\n`;
+      }
+      if (pending.expanded && body) heredocs.push(body);
+    }
+    return j;
+  };
+
   while (i < n) {
     const ch = input[i] as string;
 
@@ -305,6 +430,7 @@ function lexShell(input: string): LexResult {
     if (ch === "\n" || ch === "\r") {
       endCommand();
       i += 1;
+      if (ch === "\n" && pendingHeredocs.length) i = consumeHeredocBodies(i);
       continue;
     }
     if (ch === "\\") {
@@ -398,7 +524,7 @@ function lexShell(input: string): LexResult {
     i += 1;
   }
   endCommand();
-  return { commands, nested, redirections };
+  return { commands, nested, redirections, heredocs };
 }
 
 /**
@@ -483,16 +609,34 @@ function hasNameOperand(args: string[]): boolean {
   return false;
 }
 
-/** Classifies one simple command (already quote-removed and redirection-stripped). */
+/**
+ * Classifies one simple command (already quote-removed and redirection-stripped).
+ *
+ * BLO-40805: the scan stops at the first ORDINARY command word. Before that
+ * word every token is still a candidate command — assignments, flags and
+ * pass-through wrappers all keep a later word in command position — but after
+ * it, every token is an argument, i.e. data. `echo env`, `grep -iE 'a|env'` and
+ * a source file whose literals happen to be dump-shaped are not dumps, and
+ * blocking them taught agents to route around the guard.
+ *
+ * Once a wrapper is seen the scan runs to the end of the word list, because a
+ * wrapper's own operands (`timeout 5 env`) are not the command either and
+ * enumerating each wrapper's arity would be its own source of holes.
+ */
 function simpleCommandDumps(words: string[]): boolean {
   if (words.length === 0) return false;
   for (const w of words) if (PROC_ENVIRON_RE.test(w)) return true;
 
+  let sawWrapper = false;
   for (let i = 0; i < words.length; i += 1) {
-    const base = basename(words[i] as string);
+    const word = words[i] as string;
+    const base = basename(word);
     const rest = words.slice(i + 1);
     if (ENV_DUMP_UTILS.indexOf(base) !== -1) {
       if (!hasOperand(rest)) return true;
+      // An operand means this is `env FOO=bar cmd` — a launcher, so whatever
+      // it launches is still in command position.
+      sawWrapper = true;
       continue;
     }
     if (base === "set") {
@@ -500,8 +644,21 @@ function simpleCommandDumps(words: string[]): boolean {
       if (rest.length === 0) return true;
       continue;
     }
-    if (base === "export" && !hasNameOperand(rest)) return true;
-    if (base === "declare" && !hasNameOperand(rest)) return true;
+    if (base === "export") {
+      if (!hasNameOperand(rest)) return true;
+      continue;
+    }
+    if (base === "declare") {
+      if (!hasNameOperand(rest)) return true;
+      continue;
+    }
+    if (COMMAND_POSITION_WRAPPERS.indexOf(base) !== -1) {
+      sawWrapper = true;
+      continue;
+    }
+    if (word.length > 0 && word[0] === "-") continue;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) continue;
+    if (!sawWrapper) return false;
   }
   return false;
 }
@@ -521,7 +678,7 @@ function shellPayloadIndex(words: string[]): number {
 
 function containsDump(command: string, depth: number): boolean {
   if (depth > 4) return false;
-  const { commands, nested, redirections } = lexShell(command);
+  const { commands, nested, redirections, heredocs } = lexShell(command);
   // The shell opens a redirection target even though it never enters argv, so
   // `cat </proc/self/environ` is only reachable from the target word.
   for (const target of redirections) if (PROC_ENVIRON_RE.test(target)) return true;
@@ -537,6 +694,13 @@ function containsDump(command: string, depth: number): boolean {
   }
   for (const body of nested) {
     if (body.trim() && containsDump(body, depth + 1)) return true;
+  }
+  // An unquoted heredoc body is interpolated, not executed: its words never
+  // reach argv, so only its command substitutions can run anything.
+  for (const body of heredocs) {
+    for (const inner of lexShell(body).nested) {
+      if (inner.trim() && containsDump(inner, depth + 1)) return true;
+    }
   }
   return false;
 }
@@ -592,6 +756,14 @@ const BACKTICK = "\x60";
 const ENV_DUMP_UTILS = ["env", "printenv"];
 const PROC_ENVIRON_RE = /\/proc\/(?:self|\d+)\/environ/;
 const SHELL_BASENAMES = ["sh", "bash", "zsh", "ksh", "dash", "ash", "busybox"];
+// BLO-40805: utilities that put a LATER word back into command position.
+// Everything not listed is an ordinary utility whose arguments are DATA.
+const COMMAND_POSITION_WRAPPERS = SHELL_BASENAMES.concat([
+  "eval", "command", "builtin", "exec", "nohup", "setsid", "time", "timeout",
+  "nice", "ionice", "stdbuf", "unbuffer", "sudo", "doas", "su", "runuser",
+  "xargs", "watch", "env", "chroot", "script", "flock", "strace", "ltrace",
+  "parallel",
+]);
 function basename(word) {
   const cut = word.lastIndexOf("/");
   return cut === -1 ? word : word.slice(cut + 1);
@@ -600,6 +772,8 @@ function lexShell(input) {
   const commands = [];
   const nested = [];
   const redirections = [];
+  const heredocs = [];
+  const pendingHeredocs = [];
   let words = [];
   let cur = null;
   let curQuoted = false;
@@ -608,7 +782,14 @@ function lexShell(input) {
   const add = (s) => { cur = (cur === null ? "" : cur) + s; };
   const endWord = () => {
     if (cur === null) return;
-    if (curQuoted && /[;&|()\r\n]/.test(cur)) nested.push(cur);
+    // BLO-40805: a quoted word is a command string only when something
+    // re-parses it (eval, su -c). Separators alone are ordinary bytes in a
+    // regex alternation, a jq program or a JSON blob.
+    if (
+      curQuoted
+      && /[;&|()\r\n]/.test(cur)
+      && words.some((w) => COMMAND_POSITION_WRAPPERS.indexOf(basename(w)) !== -1)
+    ) nested.push(cur);
     words.push(cur);
     cur = null;
     curQuoted = false;
@@ -658,7 +839,30 @@ function lexShell(input) {
   };
   const readRedirection = (start) => {
     let j = start;
-    while (j < n && (input[j] === "<" || input[j] === ">" || input[j] === "&")) j += 1;
+    let operator = "";
+    while (j < n && (input[j] === "<" || input[j] === ">" || input[j] === "&")) { operator += input[j]; j += 1; }
+    // BLO-40805: a heredoc delimiter is not a file and its body is not argv.
+    if (operator.indexOf("<<") === 0 && operator.indexOf("<<<") !== 0) {
+      if (input[j] === "-") j += 1;
+      while (j < n && (input[j] === " " || input[j] === "\t")) j += 1;
+      let delimiter = "";
+      let expanded = true;
+      while (j < n && !/[\s;&|()<>]/.test(input[j])) {
+        const c = input[j];
+        if (c === "'" || c === '"') {
+          expanded = false;
+          j += 1;
+          while (j < n && input[j] !== c) { delimiter += input[j]; j += 1; }
+          j += 1;
+          continue;
+        }
+        if (c === "\\") { expanded = false; j += 1; continue; }
+        delimiter += c;
+        j += 1;
+      }
+      if (delimiter) pendingHeredocs.push({ delimiter: delimiter, expanded: expanded });
+      return j;
+    }
     while (j < n && (input[j] === " " || input[j] === "\t")) j += 1;
     let target = "";
     if (j < n && (input[j] === "'" || input[j] === '"')) {
@@ -672,10 +876,32 @@ function lexShell(input) {
     if (target) redirections.push(target);
     return j;
   };
+  const consumeHeredocBodies = (start) => {
+    let j = start;
+    while (pendingHeredocs.length) {
+      const pending = pendingHeredocs.shift();
+      let body = "";
+      while (j < n) {
+        let eol = input.indexOf("\n", j);
+        if (eol === -1) eol = n;
+        const line = input.slice(j, eol);
+        j = eol < n ? eol + 1 : n;
+        if (line.trim() === pending.delimiter) break;
+        body += line + "\n";
+      }
+      if (pending.expanded && body) heredocs.push(body);
+    }
+    return j;
+  };
   while (i < n) {
     const ch = input[i];
     if (ch === " " || ch === "\t") { endWord(); i += 1; continue; }
-    if (ch === "\n" || ch === "\r") { endCommand(); i += 1; continue; }
+    if (ch === "\n" || ch === "\r") {
+      endCommand();
+      i += 1;
+      if (ch === "\n" && pendingHeredocs.length) i = consumeHeredocBodies(i);
+      continue;
+    }
     if (ch === "\\") {
       if (i + 1 < n) {
         if (input[i + 1] === "\n") { i += 2; continue; }
@@ -733,7 +959,7 @@ function lexShell(input) {
     i += 1;
   }
   endCommand();
-  return { commands: commands, nested: nested, redirections: redirections };
+  return { commands: commands, nested: nested, redirections: redirections, heredocs: heredocs };
 }
 function hasNameOperand(args) {
   for (const a of args) {
@@ -782,19 +1008,34 @@ function hasOperand(args) {
 function simpleCommandDumps(words) {
   if (words.length === 0) return false;
   for (const w of words) if (PROC_ENVIRON_RE.test(w)) return true;
+  // BLO-40805: stop at the first ORDINARY command word — after it every token
+  // is an argument, i.e. data. Once a wrapper is seen, scan to the end.
+  let sawWrapper = false;
   for (let i = 0; i < words.length; i += 1) {
-    const base = basename(words[i]);
+    const word = words[i];
+    const base = basename(word);
     const rest = words.slice(i + 1);
     if (ENV_DUMP_UTILS.indexOf(base) !== -1) {
       if (!hasOperand(rest)) return true;
+      sawWrapper = true;
       continue;
     }
     if (base === "set") {
       if (rest.length === 0) return true;
       continue;
     }
-    if (base === "export" && !hasNameOperand(rest)) return true;
-    if (base === "declare" && !hasNameOperand(rest)) return true;
+    if (base === "export") {
+      if (!hasNameOperand(rest)) return true;
+      continue;
+    }
+    if (base === "declare") {
+      if (!hasNameOperand(rest)) return true;
+      continue;
+    }
+    if (COMMAND_POSITION_WRAPPERS.indexOf(base) !== -1) { sawWrapper = true; continue; }
+    if (word.length > 0 && word[0] === "-") continue;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) continue;
+    if (!sawWrapper) return false;
   }
   return false;
 }
@@ -824,6 +1065,12 @@ function containsDump(command, depth) {
   }
   for (const body of lexed.nested) {
     if (body.trim() && containsDump(body, depth + 1)) return true;
+  }
+  // An unquoted heredoc body is interpolated, not executed: only substitutions run.
+  for (const body of lexed.heredocs) {
+    for (const inner of lexShell(body).nested) {
+      if (inner.trim() && containsDump(inner, depth + 1)) return true;
+    }
   }
   return false;
 }

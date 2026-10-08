@@ -140,6 +140,19 @@ const blocked = [
   "declare -p",
   "declare",
   "export",
+  // BLO-40805 negative controls. The data-position fix must not reach an
+  // UNQUOTED heredoc: the shell interpolates that body, so its substitutions
+  // really do run and their output really does land in the transcript.
+  "cat > /tmp/f <<EOF\n$(printenv)\nEOF",
+  "cat > /tmp/f <<EOF\n`env`\nEOF",
+  "cat <<EOF\nx=$(env -0)\nEOF",
+  // ...nor a wrapper's payload, whichever side of the quote it sits on.
+  "echo $(printenv >&2)",
+  "eval 'echo ok; env'",
+  "sudo env",
+  "xargs -n1 printenv",
+  "timeout 5 printenv",
+  "su -c 'ls; env'",
 ];
 const allowed = [
   // The trailing terminator deliberately does NOT include whitespace, which is
@@ -211,6 +224,26 @@ const allowed = [
   "declare -p PATH", // one named variable, not the exported set
   "export FOO=bar", // an assignment is a name operand, so it is scoped
   "export PATH",
+  // BLO-40805 — DATA IS NOT A COMMAND POSITION. Every entry below was BLOCKED
+  // before this fix, none of them can emit an environment value, and the guard
+  // blocking them is what taught agents to reach for an encoding workaround.
+  //
+  // A single-quoted heredoc body is inert: no expansion, no word executed. The
+  // fifth reproduction was writing a vitest fixture for THIS GUARD.
+  "cat > /tmp/ac2.test.ts <<'TS'\nconst cases = ['env', 'printenv', 'set', 'declare -x'];\nTS",
+  "cat > /tmp/f.sh <<'SH'\n#!/usr/bin/env bash\nset -euo pipefail\nenv\nSH",
+  'cat > /tmp/f.sh <<"SH"\nprintenv\nSH',
+  "cat <<-'EOF' > /tmp/f\n\tenv\nEOF",
+  // A dump-shaped string in ARGUMENT position is data whatever separators it
+  // carries. The first of these is the sixth reproduction, measured live while
+  // this ticket was being worked: the word `env` inside a grep pattern.
+  "gh pr list --json title --jq '.[].title' | grep -iE 'guard|40805|env'",
+  "grep -iE 'guard|env' notes.txt",
+  "echo env",
+  "echo 'env; printenv'",
+  "jq -r '.[]|.env' package.json",
+  "sed -i 's/env/ENV/' file.txt",
+  "#!/usr/bin/env bash",
   "",
 ];
 
