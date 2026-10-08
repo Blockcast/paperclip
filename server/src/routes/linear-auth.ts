@@ -106,12 +106,21 @@ export interface LinearAuthConfig {
  * Shared by the connect path and the team-refusal path (BLO-31227): the plugin
  * reads its token only through `linearTokenRef`, so a stored token with no
  * config write is a connection `/status` reports and nothing can use.
+ *
+ * `claimInstanceCompany` also points the instance-wide `company-id` plugin
+ * state at this company. That state is a singleton: the worker skips events
+ * for every other company (`getConnectedCompanyIdForEvent`). So only a
+ * completed connect claims it. The refusal path passes `false`, because a
+ * refused connect for one company must not stop another company's sync. The
+ * token binding does not need it: the plugin resolves its token through
+ * `linearTokenRef`.
  */
 export async function persistLinearPluginConfig(
   db: Db,
   companyId: string,
   secretId: string,
   teamId: string,
+  { claimInstanceCompany = true }: { claimInstanceCompany?: boolean } = {},
 ): Promise<boolean> {
   const [plugin] = await db
     .select()
@@ -140,6 +149,7 @@ export async function persistLinearPluginConfig(
   } else {
     await db.insert(pluginConfig).values({ pluginId: plugin.id, companyId, configJson });
   }
+  if (!claimInstanceCompany) return true;
   // Store company ID in plugin state so the import job can find it
   const { pluginState } = await import("@paperclipai/db");
   await db.insert(pluginState).values({
@@ -320,14 +330,19 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
         // Fail closed on identity: guessing here would overwrite
         // issuePrefix/issueCounter, so neither is touched.  Do NOT also fail
         // closed on connectivity.  The token above is already stored, and the
-        // plugin can only reach it through `linearTokenRef`, so skip the config
-        // write and `/status` reports connected while the plugin's team picker
-        // (the remedy this message names) throws "Not connected to Linear".
+        // plugin can only reach it through `linearTokenRef`, so the config is
+        // written below before the 409.  Skipping it would leave `/status`
+        // reporting connected while the plugin's team picker (the remedy this
+        // message names) throws "Not connected to Linear".  The instance-wide
+        // `company-id` is NOT claimed: this connect did not complete, and
+        // claiming it would stop another company's sync.
         const message = linearTeamResolutionError(resolution);
         console.error(`[linear-auth] ${message}`);
         if (secretId) {
           try {
-            await persistLinearPluginConfig(db, companyId, secretId, configuredTeamId ?? "");
+            await persistLinearPluginConfig(db, companyId, secretId, configuredTeamId ?? "", {
+              claimInstanceCompany: false,
+            });
           } catch (err) {
             console.warn("[linear-auth] could not write plugin config on team refusal:", err);
           }
