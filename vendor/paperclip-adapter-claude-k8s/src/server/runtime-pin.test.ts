@@ -50,6 +50,15 @@ describe("claudeCodeRuntimeDir", () => {
     );
     expect(claudeCodeRuntimeDir("/data/", "2.1.292")).toBe("/data/.local/lib/paperclip-k8s-runtimes/claude-code/2.1.292");
   });
+
+  it("moves under a per-company root when a company id is passed (narrowed data mount)", () => {
+    expect(claudeCodeRuntimeDir("/paperclip", "2.1.292", "co1")).toBe(
+      "/paperclip/.local/lib/paperclip-k8s-runtimes/companies/co1/claude-code/2.1.292",
+    );
+    expect(buildClaudeCodeRuntimeShell({ version: "2.1.292", dataMountPath: "/paperclip", companyId: "co1" })).toContain(
+      "__pcroot='/paperclip/.local/lib/paperclip-k8s-runtimes/companies/co1/claude-code'",
+    );
+  });
 });
 
 describe("buildClaudeCodeRuntimeShell", () => {

@@ -14,7 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
-import { buildClaudeCodeRuntimeShell, resolveClaudeCodeVersion } from "./runtime-pin.js";
+import { buildClaudeCodeRuntimeShell, claudeCodeRuntimeRoot, resolveClaudeCodeVersion } from "./runtime-pin.js";
 import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
@@ -300,6 +300,9 @@ export function resolveScopedWritableMounts(input: {
   instructionsFilePath: string | null;
   addDir: string | null;
   companyId: string;
+  /** Pod path of the company-scoped managed Claude Code runtime root, or "" when
+   *  the run uses the image's CLI (`claudeCodeVersion: "image"`). */
+  claudeCodeRuntimeRoot?: string;
   /** Where this process reaches the same volume; see `resolveLinkedWorktreeCommonDir`. */
   serverDataMountPath?: string;
 }): ScopedWritableMount[] {
@@ -335,6 +338,13 @@ export function resolveScopedWritableMounts(input: {
     // which agents edit. Only FOREIGN bundles become unreachable.
     ["instructionsFilePath", instructionsFilePath ? path.posix.dirname(instructionsFilePath) : ""],
     ["promptBundle.addDir", addDir ?? ""],
+    // The managed Claude Code runtime installs itself at Job start (runtime-pin.ts).
+    // Like the pnpm store it is a sibling of the isolation root, so nothing above
+    // covers it, and it is company-scoped for the same reason: the shared
+    // unscoped root would let one company write the `claude` every other company
+    // runs. Without this entry the install hits EROFS and every run falls back to
+    // the image's CLI, which rejects models newer than it.
+    ["claudeCodeRuntimeRoot", input.claudeCodeRuntimeRoot ?? ""],
   ];
 
   const onVolume: string[] = [];
@@ -1654,15 +1664,14 @@ function buildEnvVars(
   // HOME must live on the mounted data PVC to enable session resume. Isolated
   // mode scopes Claude config/cache/session state away from shared /paperclip.
   //
-  // That is a state boundary, not a trust boundary: every Job runs as uid 1000
-  // with the whole PVC read-write, isolation roots included. The adapter relies
-  // on that once, deliberately — the managed Claude Code runtime
-  // (runtime-pin.ts) lives under the data mount, not `isolation.homeRoot`, so
-  // it is the first executable on PATH shared across isolation keys (and
-  // companies). Accepted because it grants no write the PVC does not already
-  // grant, and its content is adapter-written at an exact version; if per-key
-  // write separation ever lands, move that runtime per key with it. Full
-  // rationale in runtime-pin.ts.
+  // On its own that is a state boundary, not a trust boundary: every Job runs as
+  // uid 1000. The write boundary is the narrowed data mount (BLO-32734,
+  // `resolveScopedWritableMounts`). The managed Claude Code runtime
+  // (runtime-pin.ts) lives under the data mount, not `isolation.homeRoot`: on a
+  // broad rw mount it is one copy shared across isolation keys and companies,
+  // and on a narrowed mount it moves to a per-company root that the derived
+  // writable set covers, so no company writes a binary another company runs.
+  // Full rationale in runtime-pin.ts.
   merged.HOME = isolation.enabled ? isolation.homeRoot : "/paperclip";
   // BLO-34477: zsh sources $ZDOTDIR/.zshenv on every start, and bash sources
   // $BASH_ENV on a non-interactive start ONLY when it does not take its
@@ -2617,6 +2626,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     isolation.enabled ? isolation.key : undefined,
     normalizedDataMountPath,
   );
+  // Where the managed Claude Code runtime installs (runtime-pin.ts): the shared
+  // root on a broad rw mount, a per-company root on a narrowed one, which then
+  // has to be among the writable mounts below.
+  const claudeCodeRuntimeCompanyId = narrowWritableSurface ? logPathCompanyId : undefined;
   // Nested rw re-mounts that restore write access to exactly the trees this run
   // needs, inside the read-only `data` mount above. Built here rather than beside
   // that mount because the log path is only known now. Pushed AFTER the read-only
@@ -2630,6 +2643,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         instructionsFilePath: effectiveInstructionsFilePath,
         addDir: promptBundle?.addDir ?? null,
         companyId: logPathCompanyId,
+        claudeCodeRuntimeRoot: claudeCodeVersion ? claudeCodeRuntimeRoot(dataMountPath, logPathCompanyId) : "",
       })
     : [];
   // Absolute paths the SERVER must create before the Job exists. Without
@@ -2951,7 +2965,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // pre-pin command and `claude` resolves to the image's bundled CLI. The
   // external launchers inherit the same PATH, so they pick up the pin too.
   const claudeRuntime = claudeCodeVersion
-    ? `${buildClaudeCodeRuntimeShell({ version: claudeCodeVersion, dataMountPath })}; `
+    ? `${buildClaudeCodeRuntimeShell({ version: claudeCodeVersion, dataMountPath, companyId: claudeCodeRuntimeCompanyId })}; `
     : "";
   // BLO-29553 AC1(b): the redactor goes BEFORE `tee`, so the credential never
   // reaches the file on the shared PVC rather than being cleaned up afterwards.
