@@ -900,6 +900,42 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
   });
 });
 
+// In the reason-allowlist scan below, `reason:` is not always an inline literal.
+// Two writers pass a `SCREAMING_SNAKE` const instead -- one declared in
+// `heartbeat.ts`, one imported -- and the first revision of this scan skipped
+// both as "cannot be resolved statically". It can:
+// that shape is a module-level binding to a string literal, and skipping it is what
+// let `workspace_worktree_requires_project` reach "other" through the very suite
+// added to stop that. A lowercase identifier (`wakeReason`, `skipReason`,
+// `dailyCapBlock.reason`, `opts.reason`) is the genuinely unresolvable shape and
+// stays the documented, narrower gap.
+//
+// Lazy on purpose: only a name the scan actually meets is resolved, so this reads
+// two files rather than all 43 of `heartbeat.ts`'s relative imports. Module scope
+// because the PEN-3877 drain scan uses it too, to bind each `cancelWake` site in
+// `recovery/service.ts` to the constant it passes.
+function resolveConstLiteral(name: string, source: string, sourceUrl: URL): string | null {
+  const local = source.match(
+    new RegExp(`(?:^|\\n)\\s*(?:export\\s+)?const\\s+${name}\\s*(?::[^=]+)?=\\s*"([^"]+)"`),
+  );
+  if (local) return local[1];
+
+  for (const imported of source.matchAll(
+    /import\s*\{([^}]*)\}\s*from\s*"(\.\.?\/[^"]+)"/g,
+  )) {
+    if (!new RegExp(`(^|[\\s,])${name}([\\s,]|$)`).test(imported[1])) continue;
+    const moduleSource = readFileSync(
+      fileURLToPath(new URL(imported[2].replace(/\.js$/, ".ts"), sourceUrl)),
+      "utf8",
+    );
+    const exported = moduleSource.match(
+      new RegExp(`(?:^|\\n)\\s*export\\s+const\\s+${name}\\s*(?::[^=]+)?=\\s*"([^"]+)"`),
+    );
+    if (exported) return exported[1];
+  }
+  return null;
+}
+
 // PEN-3877, same discipline and the same reason as the reason-allowlist scans
 // below: outside `describeEmbeddedPostgres`, because this is a static assertion
 // against the writer and must not go silently green where embedded Postgres is
@@ -919,16 +955,39 @@ describe("lockless deferred-wake drain evidence is readable from its writer", ()
   it("classifies every string the drain stamps on an acting verb", () => {
     // `cancelWake` is the drain's single write path to `agent_wakeup_requests.error`
     // (it sets `status`/`finishedAt`/`error`), so every acting verb goes through it.
-    const calls = [...recoverySource.matchAll(/cancelWake\(\s*candidate\.wakeId,\s*([^\n]+?),?\s*\)/g)];
-    expect(calls.length, "no `cancelWake(candidate.wakeId, ...)` call sites found").toBe(3);
+    // Matched on the callee, not the receiver expression, so a verb added outside
+    // the candidate loop still counts. The definition (`const cancelWake = async (`)
+    // does not match `cancelWake(`.
+    const openers = recoverySource.match(/\bcancelWake\(/g) ?? [];
+    const calls = [
+      ...recoverySource.matchAll(
+        /\bcancelWake\(\s*[^,()]+,\s*((?:[^()\n]|\([^()\n]*\))+?)\s*,?\s*\)/g,
+      ),
+    ];
+    expect(calls.length, "a `cancelWake(` site whose argument the scan cannot read").toBe(openers.length);
+    expect(calls.length, "the drain's three acting-verb `cancelWake(...)` sites").toBe(3);
 
-    for (const [, rawArg] of calls) {
+    const siteDispositions = calls.map(([, rawArg]) => {
       const arg = rawArg!.trim();
       // A bare string literal would mean the writer stopped sharing the constant,
       // which is the desync this module exists to prevent. Fail loudly on it
       // rather than silently classifying `null`.
       expect(arg.startsWith("\"") || arg.startsWith("`") || arg.startsWith("'"), `inline literal at a drain cancelWake site: ${arg}`).toBe(false);
-    }
+      // Bind the site to the string it writes: a shared const resolves through the
+      // writer's own import; the terminal builder is the one call shape the drain uses.
+      const stamped = /^[A-Z][A-Z0-9_]*$/.test(arg)
+        ? resolveConstLiteral(arg, recoverySource, recoveryUrl)
+        : arg.startsWith("locklessDeferredWakeTerminalError(")
+          ? locklessDeferredWakeTerminalError("done")
+          : null;
+      expect(stamped, `unresolvable drain cancelWake argument: ${arg}`).not.toBeNull();
+      return locklessDeferredWakeDisposition(stamped);
+    });
+    // Three sites, three distinct verbs. Every constant classifying (below) is not
+    // enough: swap one site's constant for another's and the route answers `200`
+    // with a confidently wrong `disposition`, which only this set catches.
+    expect(siteDispositions).not.toContain(null);
+    expect(new Set(siteDispositions).size).toBe(3);
 
     // Every literal the drain can write must classify to a non-null disposition.
     const written = [
@@ -953,10 +1012,13 @@ describe("lockless deferred-wake drain evidence is readable from its writer", ()
     expect(locklessDeferredWakeDisposition(null)).toBeNull();
     expect(locklessDeferredWakeDisposition("")).toBeNull();
     expect(locklessDeferredWakeDisposition("Cancelled due to budget pause")).toBeNull();
+    // The real near-misses: sibling writers sharing the `Deferred wake ` prefix
+    // (`recovery/service.ts`, `heartbeat.ts`).
     expect(
-      locklessDeferredWakeDisposition(
-        "Deferred wake suppressed by persisted external-service wait",
-      ),
+      locklessDeferredWakeDisposition("Deferred wake superseded by persisted external-service wait"),
+    ).toBeNull();
+    expect(
+      locklessDeferredWakeDisposition("Deferred wake suppressed by active subtree pause hold"),
     ).toBeNull();
   });
 });
@@ -987,39 +1049,6 @@ describe("issue wake diagnostic reason allowlist", () => {
     "idle_circuit_breaker",
     "adapter_failed_circuit_breaker",
   ];
-
-  // `reason:` is not always an inline literal. Two writers pass a `SCREAMING_SNAKE`
-  // const instead -- one declared in `heartbeat.ts`, one imported -- and the first
-  // revision of this scan skipped both as "cannot be resolved statically". It can:
-  // that shape is a module-level binding to a string literal, and skipping it is what
-  // let `workspace_worktree_requires_project` reach "other" through the very suite
-  // added to stop that. A lowercase identifier (`wakeReason`, `skipReason`,
-  // `dailyCapBlock.reason`, `opts.reason`) is the genuinely unresolvable shape and
-  // stays the documented, narrower gap.
-  //
-  // Lazy on purpose: only a name the scan actually meets is resolved, so this reads
-  // two files rather than all 43 of `heartbeat.ts`'s relative imports.
-  function resolveConstLiteral(name: string): string | null {
-    const local = heartbeatSource.match(
-      new RegExp(`(?:^|\\n)\\s*(?:export\\s+)?const\\s+${name}\\s*(?::[^=]+)?=\\s*"([^"]+)"`),
-    );
-    if (local) return local[1];
-
-    for (const imported of heartbeatSource.matchAll(
-      /import\s*\{([^}]*)\}\s*from\s*"(\.\.?\/[^"]+)"/g,
-    )) {
-      if (!new RegExp(`(^|[\\s,])${name}([\\s,]|$)`).test(imported[1])) continue;
-      const moduleSource = readFileSync(
-        fileURLToPath(new URL(imported[2].replace(/\.js$/, ".ts"), heartbeatUrl)),
-        "utf8",
-      );
-      const exported = moduleSource.match(
-        new RegExp(`(?:^|\\n)\\s*export\\s+const\\s+${name}\\s*(?::[^=]+)?=\\s*"([^"]+)"`),
-      );
-      if (exported) return exported[1];
-    }
-    return null;
-  }
 
   // `reason:` appears TWICE in most of these insert blocks -- once at the top level
   // (the `agent_wakeup_requests.reason` COLUMN) and once nested inside
@@ -1131,7 +1160,7 @@ describe("issue wake diagnostic reason allowlist", () => {
         else if (ternary)
           sites.push({ line: lineOf(opener.index), reasons: [ternary[1], ternary[2]] });
         else if (constIdentifier) {
-          const resolved = resolveConstLiteral(constIdentifier[1]);
+          const resolved = resolveConstLiteral(constIdentifier[1], heartbeatSource, heartbeatUrl);
           // Fail loudly rather than widening the skip: a `SCREAMING_SNAKE` const the
           // resolver cannot follow means the resolver broke, not that the site is
           // dynamic. Silently skipping it is the exact failure this revision fixes.
