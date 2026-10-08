@@ -74,6 +74,16 @@ describe("resolveLinearTeam", () => {
     expect(resolution).toMatchObject({ reason: "ambiguous" });
   });
 
+  it("refuses a same-key team when the configured team id is not visible", () => {
+    // Key collision across workspaces: the prefix matches, the team does not.
+    const otherBlo: LinearTeam = { id: "22222222-2222-2222-2222-222222222222", key: "BLO" };
+    for (const visible of [[EGY, otherBlo], [otherBlo]] as LinearTeam[][]) {
+      const resolution = resolveLinearTeam(visible, { configuredTeamId: BLO.id, issuePrefix: "BLO" });
+      expect(resolution.team).toBeNull();
+      expect(resolution).toMatchObject({ reason: "ambiguous" });
+    }
+  });
+
   it("reports no-teams distinctly from ambiguous", () => {
     const resolution = resolveLinearTeam([], { configuredTeamId: BLO.id });
     expect(resolution).toMatchObject({ team: null, reason: "no-teams" });

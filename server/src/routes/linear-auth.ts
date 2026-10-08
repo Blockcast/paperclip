@@ -329,7 +329,10 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
           const configJson = {
             linearTokenRef: secretId,
             linearOAuthActor: LINEAR_OAUTH_ACTOR,
-            teamId,
+            // A failed teams fetch leaves `teamId` blank. Keep the binding read
+            // above instead of erasing it, or the next reconnect has nothing to
+            // resolve against and can refuse (409) on every later attempt.
+            teamId: teamId || configuredTeamId || "",
             syncComments: true,
             syncDirection: "bidirectional",
           };
