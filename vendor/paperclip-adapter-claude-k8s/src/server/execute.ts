@@ -36,6 +36,16 @@ import { PatchStrategy, setHeaderOptions } from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
 const KEEPALIVE_INTERVAL_MS = 15_000;
+// How long cleanup waits for a Job's pods to actually disappear before giving
+// up and leaving the Job + Secrets to K8s GC (BLO-35486).
+//
+// INVARIANT: this must exceed the pod's terminationGracePeriodSeconds, which is
+// what the wait is actually waiting on. `buildJobManifest` (job-manifest.ts) sets
+// none, so pods ride the K8s 30s default — 2x headroom. The two values live in
+// different files: raising the grace period past this makes *every* teardown hit
+// the timeout and fail closed, retaining Job + Secrets with no reaper to collect
+// them.
+const POD_TEARDOWN_TIMEOUT_MS = 60_000;
 const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
 const RUN_ID_LABEL = "paperclip.io/run-id";
 const MANAGED_BY_LABEL = "app.kubernetes.io/managed-by";
@@ -1217,6 +1227,27 @@ const POD_FAILURE_LABELS: Record<PodFailureKind, string> = {
 };
 
 /**
+ * Container `waiting.reason` values that never resolve on their own, so riding
+ * the (now 1800s) start deadline only delays the real error by half an hour and
+ * replaces it with a generic "Timed out waiting for pod containers to start".
+ *
+ * BLO-35486: `CreateContainerConfigError` is this ticket's own symptom — it is
+ * the state a pod enters on `secret "ac-…-env" not found`.  Such a pod stays
+ * `phase: Pending` (so the `phase === "Failed"` throw never fires) and is not
+ * `Unschedulable`, so nothing else in this loop would ever see it.
+ *
+ * Throwing on first observation is safe here for the same reason it is safe for
+ * `ErrImagePull`: all three run Secrets are created and awaited *before*
+ * `createNamespacedJob`, so there is no legitimate transient window in which a
+ * pod of ours sits in a config error and then recovers.
+ */
+const UNRECOVERABLE_WAITING_REASONS = new Set([
+  "CreateContainerConfigError",
+  "CreateContainerError",
+  "InvalidImageName",
+]);
+
+/**
  * Wait for the Job's pod to reach a terminal or running state.
  * Returns the pod name once logs can be streamed, or throws on failure.
  *
@@ -1341,6 +1372,9 @@ async function waitForPod(
       if (waiting?.reason === "CrashLoopBackOff") {
         throw new PodWaitError("init_container", `Init container "${init.name}" crash loop: ${waiting.message ?? waiting.reason}`);
       }
+      if (waiting?.reason && UNRECOVERABLE_WAITING_REASONS.has(waiting.reason)) {
+        throw new PodWaitError("init_container", `Init container "${init.name}" cannot start (${waiting.reason}): ${waiting.message ?? "no detail"}`);
+      }
     }
 
     // phase=Failed means the pod crashed before we could stream logs.
@@ -1382,6 +1416,9 @@ async function waitForPod(
       }
       if (waiting?.reason === "CrashLoopBackOff") {
         throw new PodWaitError("crash_loop", `Container "${cs.name}" crash loop: ${waiting.message ?? waiting.reason}`);
+      }
+      if (waiting?.reason && UNRECOVERABLE_WAITING_REASONS.has(waiting.reason)) {
+        throw new PodWaitError("startup", `Container "${cs.name}" cannot start (${waiting.reason}): ${waiting.message ?? "no detail"}`);
       }
     }
 
@@ -1659,8 +1696,241 @@ async function reapPodLogFile(
 }
 
 /**
+ * Outcome of `deleteJobPodsAndWait` (BLO-38096).
+ *
+ * `alive` and `unobserved` are both "not confirmed gone", but they are
+ * different facts and collapsing them into one `false` cost two things: the
+ * retention warnings claimed pods were seen when nothing had been seen, and
+ * `teardownCancelledJob` could not tell a wedged pod from an apiserver it
+ * could not reach at all.
+ *
+ * - `gone`       — the pod list came back empty, or the namespace itself 404s.
+ * - `alive`      — the list succeeded and still showed pods at the deadline.
+ *                  Returned only when the pod delete was accepted, so they are
+ *                  Terminating.
+ * - `undeleted`  -- the list still showed pods at the deadline but the pod
+ *                  delete was refused (non-404) on every poll, so they are NOT
+ *                  Terminating and can still start a container.  A successful
+ *                  list proves nothing about the delete: `list` and
+ *                  `deletecollection` are separate verbs, and a read-only Role
+ *                  grants one without the other.
+ * - `unobserved` — no list call ever succeeded, so nothing was observed either
+ *                  way.  Notably this is also the branch where the pod delete
+ *                  itself may never have been issued.
+ */
+type PodTeardownOutcome = "gone" | "alive" | "undeleted" | "unobserved";
+
+/**
+ * The clause describing a non-`gone` teardown outcome.  Split because
+ * `unobserved` must not claim pods were "still present": nothing was seen —
+ * the poll failed to look.
+ */
+function podTeardownFailureClause(
+  outcome: Exclude<PodTeardownOutcome, "gone">,
+  subject: string,
+): string {
+  const secs = Math.round(POD_TEARDOWN_TIMEOUT_MS / 1000);
+  if (outcome === "alive") return `pod(s) for ${subject} still present after ${secs}s`;
+  if (outcome === "undeleted") {
+    return `pod(s) for ${subject} still present after ${secs}s and the pod delete was refused`;
+  }
+  return `could not confirm pods for ${subject} are gone after ${secs}s (no pod list succeeded)`;
+}
+
+/**
+ * Delete the Job's pods and wait for them to actually be gone.
+ *
+ * A Pod object is only removed from the API after the kubelet has confirmed
+ * teardown, so "no pods match `job-name=<jobName>`" is a sound signal that no
+ * container can still be started for this run.
+ */
+async function deleteJobPodsAndWait(
+  namespace: string,
+  jobName: string,
+  onLog: AdapterExecutionContext["onLog"],
+  kubeconfigPath?: string,
+): Promise<PodTeardownOutcome> {
+  const coreApi = getCoreApi(kubeconfigPath);
+  const labelSelector = `job-name=${jobName}`;
+  const deadline = Date.now() + POD_TEARDOWN_TIMEOUT_MS;
+  // Whether the most recent poll marked every pod it observed for deletion.
+  // Evaluated per poll rather than latched once: the delete is re-issued every
+  // poll, so one transient fault heals into `alive`, and `undeleted` means
+  // refused right up to the deadline.
+  let deleteAccepted = false;
+  // The delete error already written to the log, and the most recent one.  They
+  // diverge when a transient fault degrades into a persistent one (503 on poll
+  // 1, then 403 to the deadline): the first explains why the retry started, the
+  // last explains why the verdict is `undeleted`.  Logging only the first left
+  // the warning naming a cause that had since been superseded.
+  let loggedDeleteError: string | null = null;
+  let lastDeleteError: string | null = null;
+  let listErrorLogged = false;
+  // Survives across polls: one late list failure after several good reads
+  // still leaves us knowing pods were there, which is `alive`, not
+  // `unobserved`.  Only a poll that never once succeeded is `unobserved`.
+  let lastObserved: number | null = null;
+  // Pods whose delete the API already accepted, so a retry poll does not
+  // re-issue it.  Keyed by name because the delete is now per pod.
+  const deletedPods = new Set<string>();
+  while (true) {
+    // List first — the delete below is per-pod, so it needs the names.
+    let observed: k8s.V1Pod[] | null = null;
+    try {
+      const podList = await coreApi.listNamespacedPod({ namespace, labelSelector });
+      observed = podList?.items ?? [];
+      lastObserved = observed.length;
+    } catch (err) {
+      // Can't observe the pods, so we can't prove they are gone — unless the
+      // namespace itself is gone, in which case they are.
+      if (isK8s404(err)) return "gone";
+      // Log the first non-404 once. A persistent RBAC/5xx failure retries
+      // silently to the deadline and then fails closed on the same path as a
+      // genuinely wedged pod, so without this the two are indistinguishable in
+      // a postmortem — and both leave the Job + Secrets behind.
+      if (!listErrorLogged) {
+        listErrorLogged = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        // `.catch`: see the delete-failure log below — a rejection here unwinds
+        // the cancel-path teardown before the Job is deleted.
+        await logQuietly(
+          onLog,
+          "stderr",
+          `[paperclip] Warning: cannot list pods for job ${jobName} to confirm teardown: ${msg}\n`,
+        );
+      }
+    }
+    if (lastObserved === 0) return "gone";
+    if (observed !== null) {
+      // Per-pod `delete` over the list result, not one `deleteCollection`:
+      // Role/paperclip-k8s-adapters does not grant `deletecollection` on pods
+      // (SelfSubjectAccessReview from `paperclip:paperclip`, 2026-10-06 —
+      // `deletecollection` false, `delete` true, against a fake-subresource
+      // control reading false).  The collection call was therefore refused on
+      // every poll: every teardown returned `undeleted`, run Secrets were never
+      // deleted, and the cancel path never deleted the Job.
+      let pollAccepted = true;
+      for (const pod of observed) {
+        const name = pod.metadata?.name;
+        if (!name) continue;
+        // Already marked, or already accepted on an earlier poll.  Re-issuing
+        // is pure API load, and skipping it is what the collection-wide
+        // `deleteAccepted` latch this replaces was doing, now per pod.
+        if (pod.metadata?.deletionTimestamp || deletedPods.has(name)) continue;
+        try {
+          await coreApi.deleteNamespacedPod({ name, namespace });
+          deletedPods.add(name);
+        } catch (err) {
+          // A 404 on a *named* pod delete means that one pod is already gone,
+          // which is not a refusal.  Unlike the `deleteCollection`
+          // 404-as-accepted branch this replaces, it cannot fail open: `gone`
+          // is still returned only by a list that observed zero pods, never by
+          // anything the delete call reports.
+          if (isK8s404(err)) continue;
+          pollAccepted = false;
+          lastDeleteError = err instanceof Error ? err.message : String(err);
+          if (loggedDeleteError === null) {
+            loggedDeleteError = lastDeleteError;
+            // `.catch`: this runs on the cancel path under the keepalive's
+            // unsupervised `void (async () => {…})()`, so a rejecting onLog
+            // would unwind past `teardownCancelledJob` before it can delete the
+            // Job — the run then never settles.  That is the hang the fail-open
+            // exists to prevent, reached by the logging of it.
+            await logQuietly(
+              onLog,
+              "stderr",
+              `[paperclip] Warning: failed to delete pods for job ${jobName}: ${lastDeleteError}\n`,
+            );
+          }
+        }
+      }
+      deleteAccepted = pollAccepted;
+    }
+    if (Date.now() >= deadline) {
+      if (lastObserved === null) return "unobserved";
+      if (deleteAccepted) return "alive";
+      // Emitted at the deadline, not per poll, so this is bounded at one extra
+      // line and only when the cause actually changed.
+      if (lastDeleteError !== null && lastDeleteError !== loggedDeleteError) {
+        await logQuietly(
+          onLog,
+          "stderr",
+          `[paperclip] Warning: pod delete for job ${jobName} still refused at the ` +
+            `teardown deadline: ${lastDeleteError}\n`,
+        );
+      }
+      return "undeleted";
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+}
+
+/**
  * Delete Job and its pods, then reap the run's pod log.  Best-effort —
  * failures are logged but not thrown.
+ *
+ * Returns true only when every pod for the Job is confirmed gone, which is the
+ * caller's licence to delete the run's mounted Secrets.
+ *
+ * BLO-35486: ordering here is load-bearing.  This used to delete the Job with
+ * `propagationPolicy: Background` — which returns before the GC has removed the
+ * pod — and every caller deleted the per-run Secrets immediately after.  A pod
+ * still mid-image-pull (a cold 3.3 GB agent image took ~12 min under 8-way
+ * contention, well past the pod-start timeout) would then finish pulling and
+ * start its container into `Error: secret "ac-…-env" not found`.  Pods first,
+ * confirmed gone, then the Job, then the Secrets.
+ *
+ * The Job delete and the pod-log reap stay independent of each other
+ * (BLO-32734); see `deleteJobOnly`.  The reap is skipped only when pods are
+ * not confirmed gone, since a live pod may still be writing that log.  The
+ * retained Job carries the log path in its `paperclip.io/pod-log-path`
+ * annotation, so the concurrency guard that later reaps the Job as stale
+ * reaps the log with it (BLO-39114).
+ */
+export async function cleanupJob(
+  namespace: string,
+  jobName: string,
+  onLog: AdapterExecutionContext["onLog"],
+  kubeconfigPath?: string,
+  podLogPath?: string,
+  reportMissingPodLog = false,
+  opts?: { waitForPods?: boolean },
+): Promise<boolean> {
+  // The concurrency guard reaps *other* runs' stale Jobs under its own 15s
+  // budget, and never deletes this run's Secrets, so it opts out of the wait.
+  if (opts?.waitForPods === false) {
+    await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath, podLogPath, reportMissingPodLog);
+    return true;
+  }
+  const outcome = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
+  if (outcome !== "gone") {
+    // On `undeleted` the pod was never marked for deletion, so "leaving … for
+    // K8s GC" would read as deferred cleanup when nothing is pending: the
+    // ownerReference GC that would have stopped the pod runs under the
+    // controller-manager's own credentials, and retaining the Job gives up that
+    // lever.  Same trade as `teardownCancelledJob`, and it is named on both
+    // paths so a postmortem is not left inferring it from one of them.
+    const retainCost =
+      outcome === "undeleted"
+        ? `; the pod is not Terminating and keeps running until a later run's ` +
+          `concurrency guard reaps the Job as stale`
+        : "";
+    await logQuietly(
+      onLog,
+      "stderr",
+      `[paperclip] Warning: ${podTeardownFailureClause(outcome, `job ${jobName}`)}; ` +
+        `leaving Job and run Secrets for K8s GC ` +
+        `rather than deleting a Secret a live pod mounts${retainCost}\n`,
+    );
+    return false;
+  }
+  await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath, podLogPath, reportMissingPodLog);
+  return true;
+}
+
+/**
+ * Delete the Job itself, cascading to any pods, then reap the run's pod log.
+ * Best-effort — failures are logged but not thrown.
  *
  * The two steps are deliberately independent (BLO-32734).  The Job delete
  * routinely fails with a 404: by the time cleanup runs the Job has often
@@ -1672,7 +1942,7 @@ async function reapPodLogFile(
  * the catch, leaking the pod log permanently.  The warning names the Job, so
  * the leaked *file* appeared in no log line and the accumulation was silent.
  */
-export async function cleanupJob(
+async function deleteJobOnly(
   namespace: string,
   jobName: string,
   onLog: AdapterExecutionContext["onLog"],
@@ -1694,6 +1964,100 @@ export async function cleanupJob(
   // Unconditional: the pod log's lifetime is not a function of whether the
   // Kubernetes Job could be deleted.  They are unrelated resources.
   await reapPodLogFile(podLogPath, jobName, onLog, reportMissingPodLog);
+}
+
+/**
+ * Tear down a Job whose Paperclip run was cancelled externally.
+ *
+ * BLO-35486: deletes the pods and waits for them to go *before* deleting the
+ * Job.  Deleting the Job reaps this run's Secrets through their
+ * `ownerReference`, so doing it while a pod is still mid-image-pull starts
+ * that container into `secret "ac-…-env" not found` — the same defect
+ * `cleanupJob` fixes, reached by a path that used to bypass `cleanupJob`
+ * entirely and call `deleteNamespacedJob` directly.
+ *
+ * Unlike `cleanupJob` this fails *open* when a pod is still there: a cancelled
+ * run only settles once `waitForJobCompletion` sees the Job 404, and
+ * `completionTimeoutMs` may be 0 (run indefinitely), so refusing to delete the
+ * Job would hang the run forever.  That trade is only sound when the pod delete
+ * actually landed, which is what `alive` means: `deleteJobPodsAndWait` returns
+ * it only when `deleteCollection` was accepted.  A successful list is not that
+ * evidence: a Role granting pods `list` but not `deletecollection` (or a 5xx
+ * on the delete alone) sees the pod and never marks it Terminating; that is
+ * `undeleted`, and it fails closed like `unobserved`.
+ *
+ * Retaining on `undeleted` has a pod-side cost the Secret-side argument does
+ * not show.  `deleteJobOnly` deletes the Job with `propagationPolicy:
+ * Background`, and that dependent deletion is done by the kube-controller-
+ * manager garbage collector under its own credentials, so it would stop the pod
+ * even though this ServiceAccount cannot.  Retaining gives up that last lever:
+ * the pod is not Terminating and the cancelled agent keeps running, with no
+ * local bound (`activeDeadlineSeconds` is unset when `timeoutSec` is 0, and
+ * `ttlSecondsAfterFinished` only starts once the Job finishes).  It clears only
+ * when a later run's concurrency guard reaps the Job as stale.  The trade taken:
+ * a cancelled pod that keeps running, rather than run Secrets reaped under a pod
+ * that can still start.  Because the delete is retried on every poll, this is
+ * paid only for a delete refused for the whole budget (a persistent RBAC
+ * denial), not for one transient fault.
+ *
+ * BLO-38096: it does NOT fail open on `unobserved`.  A non-404
+ * `deleteCollection` failure is swallowed above and falls through to the poll,
+ * so a fault denying both verbs (RBAC, 5xx) leaves the pod delete never issued
+ * *and* nothing observed.  Deleting the Job there reaps the Secrets through
+ * their `ownerReference` under a pod that can still start — BLO-35486's exact
+ * failure on the cancel path.  So `unobserved` retains the Job and accepts the
+ * hang; it needs a total read outage, where the run is already not settling.
+ * That premise is `unobserved`'s alone: on `undeleted` the list path is healthy
+ * and the run was settling normally up to this branch.
+ */
+export async function teardownCancelledJob(
+  namespace: string,
+  jobName: string,
+  onLog: AdapterExecutionContext["onLog"],
+  kubeconfigPath?: string,
+): Promise<void> {
+  const outcome = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
+  if (outcome === "unobserved" || outcome === "undeleted") {
+    const deleteStatus =
+      outcome === "unobserved" ? "the pod delete may never have been issued, so " : "";
+    await logQuietly(
+      onLog,
+      "stderr",
+      `[paperclip] Warning: ${podTeardownFailureClause(outcome, `cancelled job ${jobName}`)}; ` +
+        `${deleteStatus}leaving the Job rather than letting ` +
+        `ownerReference GC reap the run Secrets under a pod that can still start\n`,
+    );
+    return;
+  }
+  if (outcome === "alive") {
+    await logQuietly(
+      onLog,
+      "stderr",
+      `[paperclip] Warning: ${podTeardownFailureClause(outcome, `cancelled job ${jobName}`)}; ` +
+        `deleting the Job anyway so the run can settle\n`,
+    );
+  }
+  await deleteJobOnly(namespace, jobName, onLog, kubeconfigPath);
+}
+
+/**
+ * Best-effort delete of the per-run Secrets.  Only safe to call once the pod
+ * that mounts them is confirmed gone — see `cleanupJob` (BLO-35486).
+ * Failures are swallowed: TTL and the ownerReference-driven Job GC catch
+ * stragglers.
+ */
+async function deleteRunSecrets(
+  coreApi: k8s.CoreV1Api,
+  secrets: ({ name: string; namespace: string } | null)[],
+): Promise<void> {
+  for (const secret of secrets) {
+    if (!secret) continue;
+    try {
+      await coreApi.deleteNamespacedSecret({ name: secret.name, namespace: secret.namespace });
+    } catch {
+      // Best-effort cleanup — TTL or manual deletion will catch stragglers
+    }
+  }
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -1796,6 +2160,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let namespace!: string;
   // eslint-disable-next-line prefer-const
   let podLogPath!: string;
+  // Run Secrets whose ownerReference patch did not land, so the Job GC that
+  // collects the rest can never reach them.  Named on every retain path below.
+  const unownedSecrets: { name: string; namespace: string }[] = [];
+  // Shared by every path that retains the run Secrets: the teardown `finally`
+  // and both early aborts, which `return` before that `finally` is entered.
+  const warnUnownedSecrets = async (): Promise<void> => {
+    if (unownedSecrets.length === 0) return;
+    await onLog(
+      "stderr",
+      `[paperclip] Warning: retaining ${unownedSecrets.length} Secret(s) for job ${jobName} ` +
+        `with no ownerReference, so no GC will ever collect them; delete by hand once the ` +
+        `pod is gone: ${unownedSecrets.map((s) => s.name).join(", ")}\n`,
+    ).catch(() => undefined);
+  };
   let promptSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let envSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let mcpConfigSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
@@ -1889,7 +2267,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           if (!reapable) {
             await logQuietly(onLog, "stderr", `[paperclip] Warning: Job ${jobName} has an implausible ${POD_LOG_PATH_ANNOTATION} (${annotated}); refusing to unlink it\n`);
           }
-          await cleanupJob(jobNamespace, jobName, onLog, kubeconfigPath, reapable ? annotated : undefined, /* reportMissingPodLog */ reapable);
+          // `waitForPods: false`: this reaps *another* run's stale Job under the
+          // guard's own 15s budget and never deletes this run's Secrets.
+          await cleanupJob(
+            jobNamespace,
+            jobName,
+            onLog,
+            kubeconfigPath,
+            reapable ? annotated : undefined,
+            /* reportMissingPodLog */ reapable,
+            { waitForPods: false },
+          );
           await onLog("stdout", `[paperclip] Ignoring stale Job ${jobName}: run ${jobRunId} is terminal or missing in Paperclip.\n`);
           continue;
         }
@@ -2261,32 +2649,79 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
     }
+    // Attach ownerReference so K8s GC cleans up the Secret(s) if the process
+    // crashes before the finally block runs.  It must land before the two
+    // abort paths below: when cleanupJob() refuses to delete the Secrets
+    // because a pod outlived teardown (BLO-35486), this ownerReference is the
+    // only thing that will ever collect them; the adapter has no Secret reaper.
+    //
+    // The patch body is a JSON Patch array, and its Content-Type is stated
+    // explicitly rather than inherited.  The generated client picks the first
+    // entry of its accepted-media-type list via
+    // `ObjectSerializer.getPreferredMediaType`, which happens to be
+    // `application/json-patch+json` — so the default is load-bearing here, and
+    // a client-version change that reorders that list would break it silently.
+    // The adoption write at `createOrAdoptRunSecret` sets its own MergePatch
+    // header, so leaving this implicit would also make it the only unstated
+    // patch content-type in this file.
+    //
+    // A Secret whose patch did not land therefore has no collector at all, so
+    // the failures are tracked here and named on every retain path rather than
+    // logged once and forgotten.
+    for (const [label, secret] of [
+      ["prompt", promptSecret],
+      ["env", envSecret],
+      ["mcp-config", mcpConfigSecret],
+    ] as const) {
+      if (!secret) continue;
+      if (!createdJobUid) {
+        unownedSecrets.push(secret);
+        continue;
+      }
+      try {
+        await coreApi.patchNamespacedSecret({
+          name: secret.name,
+          namespace: secret.namespace,
+          body: [
+            {
+              op: "add",
+              path: "/metadata/ownerReferences",
+              value: [
+                {
+                  apiVersion: "batch/v1",
+                  kind: "Job",
+                  name: jobName,
+                  uid: createdJobUid,
+                  blockOwnerDeletion: false,
+                },
+              ],
+            },
+          ],
+        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        unownedSecrets.push(secret);
+        // Guarded like every other retain-path log: a throw here unwinds out of
+        // execute() through the mutex `finally`, so neither abort nor the
+        // teardown `finally` runs and the entry just pushed is discarded unread.
+        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on ${label} Secret: ${msg}\n`).catch(
+          () => undefined,
+        );
+      }
+    }
     if (!createdJobUid || !onExternalRuntimeLaunched) {
       // Only tear down what this execution actually created.  An adopted Job is
       // live and its Secrets are mounted into a running pod; deleting either
       // here would destroy work that is still progressing, which is the failure
       // this whole change exists to stop.  Leaking a Job is recoverable by the
-      // existing reapers — deleting a live one is not.
-      if (!adoptedExistingJob) {
-        await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
-        if (promptSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: promptSecret.name,
-            namespace: promptSecret.namespace,
-          }).catch(() => undefined);
-        }
-        if (envSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: envSecret.name,
-            namespace: envSecret.namespace,
-          }).catch(() => undefined);
-        }
-        if (mcpConfigSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: mcpConfigSecret.name,
-            namespace: mcpConfigSecret.namespace,
-          }).catch(() => undefined);
-        }
+      // existing reapers — deleting a live one is not.  The short-circuit keeps
+      // cleanupJob() off the adopted path while still routing it to the warning:
+      // adoption assigns createdJobUid, so an adopted run reaches the patch loop
+      // above and can retain unowned Secrets just as a created one can.
+      if (!adoptedExistingJob && (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath))) {
+        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+      } else {
+        await warnUnownedSecrets();
       }
       return {
         exitCode: null,
@@ -2307,27 +2742,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Same reasoning as above.  Re-acking an adopted Job re-asserts an
       // identity the server already persisted, so a throw here means we could
       // not confirm ownership — which is the least safe moment to delete a
-      // live in-cluster object, not the most.
-      if (!adoptedExistingJob) {
-        await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
-        if (promptSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: promptSecret.name,
-            namespace: promptSecret.namespace,
-          }).catch(() => undefined);
-        }
-        if (envSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: envSecret.name,
-            namespace: envSecret.namespace,
-          }).catch(() => undefined);
-        }
-        if (mcpConfigSecret) {
-          await coreApi.deleteNamespacedSecret({
-            name: mcpConfigSecret.name,
-            namespace: mcpConfigSecret.namespace,
-          }).catch(() => undefined);
-        }
+      // live in-cluster object, not the most.  The adopted path still reaches
+      // the warning, for the reason given at the first abort.
+      if (!adoptedExistingJob && (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath))) {
+        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+      } else {
+        await warnUnownedSecrets();
       }
       return {
         exitCode: null,
@@ -2340,97 +2760,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (jobIsolation.enabled) {
       await reportIsolatedRunStarted(effectiveCtx, currentGuardIdentity);
-    }
-
-    // Attach ownerReference so K8s GC cleans up the Secret(s) if the process
-    // crashes before the finally block runs.
-    //
-    // These three bodies are JSON Patch arrays, and their Content-Type is
-    // stated explicitly rather than inherited.  The generated client picks the
-    // first entry of its accepted-media-type list via
-    // `ObjectSerializer.getPreferredMediaType`, which happens to be
-    // `application/json-patch+json` — so the default is load-bearing here, and
-    // a client-version change that reorders that list would break all three
-    // silently.  The adoption write at `createOrAdoptRunSecret` sets its own
-    // MergePatch header, so leaving these implicit would also make them the
-    // only unstated patch content-type in this file.
-    if (promptSecret && createdJobUid) {
-      try {
-        await coreApi.patchNamespacedSecret({
-          name: promptSecret.name,
-          namespace: promptSecret.namespace,
-          body: [
-            {
-              op: "add",
-              path: "/metadata/ownerReferences",
-              value: [
-                {
-                  apiVersion: "batch/v1",
-                  kind: "Job",
-                  name: jobName,
-                  uid: createdJobUid,
-                  blockOwnerDeletion: false,
-                },
-              ],
-            },
-          ],
-        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on prompt Secret: ${msg}\n`);
-      }
-    }
-    if (envSecret && createdJobUid) {
-      try {
-        await coreApi.patchNamespacedSecret({
-          name: envSecret.name,
-          namespace: envSecret.namespace,
-          body: [
-            {
-              op: "add",
-              path: "/metadata/ownerReferences",
-              value: [
-                {
-                  apiVersion: "batch/v1",
-                  kind: "Job",
-                  name: jobName,
-                  uid: createdJobUid,
-                  blockOwnerDeletion: false,
-                },
-              ],
-            },
-          ],
-        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on env Secret: ${msg}\n`);
-      }
-    }
-    if (mcpConfigSecret && createdJobUid) {
-      try {
-        await coreApi.patchNamespacedSecret({
-          name: mcpConfigSecret.name,
-          namespace: mcpConfigSecret.namespace,
-          body: [
-            {
-              op: "add",
-              path: "/metadata/ownerReferences",
-              value: [
-                {
-                  apiVersion: "batch/v1",
-                  kind: "Job",
-                  name: jobName,
-                  uid: createdJobUid,
-                  blockOwnerDeletion: false,
-                },
-              ],
-            },
-          ],
-        }, setHeaderOptions("Content-Type", PatchStrategy.JsonPatch));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on mcp-config Secret: ${msg}\n`);
-      }
     }
 
     await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
@@ -2480,7 +2809,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   try {
     // Wait for pod to be ready for log streaming
     const scheduleTimeoutMs = Math.max(0, asNumber(config.podScheduleTimeoutSec, 120)) * 1000;
-    const startTimeoutMs = Math.max(0, asNumber(config.podStartTimeoutSec, 600)) * 1000;
+    // BLO-35486: 600s was shorter than a cold pull of the agent image under
+    // contention — 8 concurrent pods on one node measured 11m12s–12m36s from
+    // schedule to container start, of which the transfer itself was 2–33s and
+    // the rest was queueing behind one uncached 3.3 GB layer set.  Every real
+    // failure mode (ErrImagePull/ImagePullBackOff/InvalidImageName/
+    // CrashLoopBackOff/CreateContainerConfigError/CreateContainerError/
+    // Unschedulable/phase=Failed/init-container exit) is detected and thrown
+    // above without waiting for this deadline, so this is only the backstop for
+    // a pod that is still legitimately working — and it must outlast a cold-
+    // image wave.  See UNRECOVERABLE_WAITING_REASONS: the enumeration is what
+    // makes the longer deadline safe, so a reason added to the kubelet's
+    // vocabulary belongs there, not here.
+    const startTimeoutMs = Math.max(0, asNumber(config.podStartTimeoutSec, 1800)) * 1000;
     try {
       podName = await waitForPod(namespace, jobName, jobUid, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);
       await onLog("stdout", `[paperclip] Pod running: ${podName}\n`);
@@ -2590,13 +2931,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 void onLog("stdout", `[paperclip] Run cancelled externally — deleting Job ${jobName}\n`).catch(() => {});
                 cancelled = true;
                 logStopSignal.stopped = true;
-                try {
-                  await batchApi.deleteNamespacedJob({
-                    name: jobName,
-                    namespace,
-                    body: { propagationPolicy: "Background" },
-                  });
-                } catch { /* best-effort — completion watcher will see 404 and settle */ }
+                await teardownCancelledJob(namespace, jobName, onLog, kubeconfigPath);
                 return;
               }
             } else if (resp.status >= 500) {
@@ -2702,36 +3037,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   } finally {
     if (keepaliveTimer) clearInterval(keepaliveTimer);
     activeJobs.delete(activeJobRef);
+    let podsGone = false;
     if (skipCleanup) {
       await onLog("stdout", `[paperclip] Retaining job ${jobName} (state mismatch — UI is waiting on it)\n`);
     } else if (!retainJobs) {
-      await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
+      podsGone = await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
     } else {
       await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
     }
-    // Clean up prompt Secret if one was created
-    if (promptSecret) {
-      try {
-        await coreApi.deleteNamespacedSecret({ name: promptSecret.name, namespace: promptSecret.namespace });
-      } catch {
-        // Best-effort cleanup — TTL or manual deletion will catch stragglers
-      }
-    }
-    // Clean up env Secret if one was created (BLO-17980/BLO-17973)
-    if (envSecret) {
-      try {
-        await coreApi.deleteNamespacedSecret({ name: envSecret.name, namespace: envSecret.namespace });
-      } catch {
-        // Best-effort cleanup — TTL or manual deletion will catch stragglers
-      }
-    }
-    // Clean up mcp-config Secret if one was created (BLO-17980/BLO-17973)
-    if (mcpConfigSecret) {
-      try {
-        await coreApi.deleteNamespacedSecret({ name: mcpConfigSecret.name, namespace: mcpConfigSecret.namespace });
-      } catch {
-        // Best-effort cleanup — TTL or manual deletion will catch stragglers
-      }
+    // Clean up prompt/env/mcp-config Secrets — but only once the pod that
+    // mounts them is confirmed gone (BLO-35486).  When the Job is retained, or
+    // a pod outlived teardown, the Secrets stay too: the ownerReference-driven
+    // Job GC collects them, and a retained Job's pod must keep its mounts.
+    if (podsGone) {
+      await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+    } else {
+      // If any Secret's ownerReference patch did not land, that Secret carries
+      // no ownerReference, so the Job GC that eventually collects the rest will
+      // never reach it and the adapter has no Secret reaper: it leaks until
+      // someone deletes it by hand.  Deleting them here is the exact hazard
+      // this change exists to stop — a pod that outlived teardown still mounts
+      // them — so name them instead of reaping them.  No-ops when none failed.
+      await warnUnownedSecrets();
     }
   }
 
