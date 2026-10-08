@@ -22,20 +22,28 @@
  * the old CLI supports keeps working, and a model it does not support fails
  * with the same API error it fails with today.
  *
- * Trust assumption. The runtime root is derived from the data mount, not from
- * the isolation root, so one installed copy serves every Job on the PVC across
- * isolation keys, agents and companies. That makes the managed `claude` the
- * first executable on PATH shared across the isolation split: a file one Job
- * wrote, run by every other Job ahead of the image's CLI. It is accepted
- * because it grants no write the PVC does not already grant: every Job runs as
- * uid 1000 with the whole PVC mounted read-write, isolation roots included, so
- * any Job can already rewrite another key's CLAUDE_CONFIG_DIR (whose settings
- * hooks run commands) or HOME. Isolation keys separate state, not trust; a
- * per-key runtime would buy no boundary and cost one CLI install per key. Its
- * content is never agent-chosen either: only this snippet writes it, from the
- * registry, at an exact version. If the PVC ever gains per-key write separation
- * (distinct uids, per-key mounts), move the runtime under `isolation.homeRoot`
- * in the same change — from then on this sharing is the hole. The isolation
+ * Trust assumption. On a broad read-write data mount the runtime root is
+ * derived from the data mount, not from the isolation root, so one installed
+ * copy serves every Job on the PVC across isolation keys, agents and companies.
+ * That makes the managed `claude` the first executable on PATH shared across
+ * the isolation split: a file one Job wrote, run by every other Job ahead of the
+ * image's CLI. It is accepted there because it grants no write that mount does
+ * not already grant: such a Job can already rewrite another key's
+ * CLAUDE_CONFIG_DIR (whose settings hooks run commands) or HOME. Its content is
+ * never agent-chosen either: only this snippet writes it, from the registry, at
+ * an exact version.
+ *
+ * A Job whose data mount is narrowed (BLO-32734: read-only volume, rw `subPath`
+ * re-mounts of its own trees only) cannot write that shared root at all, and
+ * re-opening it would be exactly the hole that narrowing closes: one company's
+ * pod writing the binary every other company runs. Such a Job passes its
+ * `companyId`, which moves the root to
+ * `<RUNTIMES_DIR_RELATIVE>/companies/<id>/claude-code`;
+ * job-manifest.ts adds that root to the Job's derived writable mounts. The
+ * runtime is therefore shared per company, the same boundary the shared pnpm
+ * store and the `work`/`wt` scratch remap hold, at one install per company per
+ * version. Not per isolation key: a `run`-mode HOME is on the per-run emptyDir,
+ * so a HOME-rooted runtime would reinstall the CLI on every run. The isolation
  * contract in job-manifest.ts (where HOME is set) points back here.
  */
 
@@ -80,9 +88,16 @@ export function resolveClaudeCodeVersion(raw: unknown): string {
   return value;
 }
 
-/** Directory holding one installed CLI version on the shared data PVC. */
-export function claudeCodeRuntimeDir(dataMountPath: string, version: string): string {
-  return `${dataMountPath.replace(/\/+$/, "")}/${RUNTIMES_DIR_RELATIVE}/claude-code/${version}`;
+/** Root holding every installed CLI version on the data PVC. Pass `companyId`
+ *  when the Job's data mount is narrowed: see the trust note above. */
+export function claudeCodeRuntimeRoot(dataMountPath: string, companyId?: string): string {
+  const base = `${dataMountPath.replace(/\/+$/, "")}/${RUNTIMES_DIR_RELATIVE}`;
+  return companyId ? `${base}/companies/${companyId}/claude-code` : `${base}/claude-code`;
+}
+
+/** Directory holding one installed CLI version on the data PVC. */
+export function claudeCodeRuntimeDir(dataMountPath: string, version: string, companyId?: string): string {
+  return `${claudeCodeRuntimeRoot(dataMountPath, companyId)}/${version}`;
 }
 
 function shellSingleQuote(value: string): string {
@@ -98,6 +113,8 @@ function shellSingleQuote(value: string): string {
  *   .../<version>/.complete                                            written last
  *   .../.lock-<version>/owner                                          mkdir lock + owner token
  *   .../.tmp-<version>-<owner>                                         staging dir
+ * (under `.../paperclip-k8s-runtimes/companies/<companyId>/claude-code/` instead
+ * when `companyId` is passed.)
  *
  * Properties:
  * - idempotent: a complete install is reused by every later Job, any isolation key;
@@ -128,10 +145,10 @@ function shellSingleQuote(value: string): string {
  * - deterministic: DISABLE_AUTOUPDATER=1 keeps the managed copy at the pin
  *   unless the operator set that variable themselves.
  */
-export function buildClaudeCodeRuntimeShell(opts: { version: string; dataMountPath: string }): string {
-  const { version, dataMountPath } = opts;
+export function buildClaudeCodeRuntimeShell(opts: { version: string; dataMountPath: string; companyId?: string }): string {
+  const { version, dataMountPath, companyId } = opts;
   if (!EXACT_VERSION_RE.test(version)) throw new Error(`invalid claude-code version: ${JSON.stringify(version)}`);
-  const root = `${dataMountPath.replace(/\/+$/, "")}/${RUNTIMES_DIR_RELATIVE}/claude-code`;
+  const root = claudeCodeRuntimeRoot(dataMountPath, companyId);
   const pkg = CLAUDE_CODE_PACKAGE;
   const spec = `${pkg}@$__pcver`;
   return [
