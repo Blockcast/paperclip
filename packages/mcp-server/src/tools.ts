@@ -92,9 +92,17 @@ const ISSUE_SEARCH_Q_DESCRIPTION =
 //
 // `.refine` rather than `z.never()`: the point is that the caller learns where
 // the real time bound lives, and "Expected never, received string" does not say
-// that. Only the aliases a caller plausibly reaches for are listed — the route's
-// shape-matched regex (`parseUnsupportedTimeFilterParams`) is the backstop for
-// the rest, and it is the only layer that can match by shape.
+// that.
+//
+// The route's shape-matched regex (`parseUnsupportedTimeFilterParams`) is NOT a
+// backstop for an MCP caller: by the stripping above, an undeclared alias never
+// reaches it. Enumerating keys in the shape is the only lever this layer has —
+// an object-level `.superRefine`/`.passthrough()` is discarded, because only
+// `schema.shape` is registered. So the aliases are generated from the same
+// prefix x suffix lists as `TIME_FILTER_PARAM_PATTERN` in
+// server/src/lib/issue-list-query.ts — keep the two in sync — in both
+// snake_case and camelCase. Other casings that case-insensitive regex also
+// matches (`UpdatedAfter`, `updatedafter`) are still stripped here.
 const unsupportedTimeFilter = z
   .unknown()
   .optional()
@@ -106,16 +114,36 @@ const unsupportedTimeFilter = z
     "NOT SUPPORTED — rejected, never applied. Declared only so the call fails loudly instead of silently returning unfiltered rows. See the time-bound paragraph in this tool's description.",
   );
 
+const TIME_FILTER_PREFIXES = [
+  "updated",
+  "created",
+  "started",
+  "completed",
+  "resolved",
+  "closed",
+  "modified",
+] as const;
+const TIME_FILTER_SUFFIXES = ["after", "before", "since", "until", "within", "from", "to"] as const;
+type TimeFilterPrefix = (typeof TIME_FILTER_PREFIXES)[number];
+type TimeFilterSuffix = (typeof TIME_FILTER_SUFFIXES)[number];
+type TimeFilterKey =
+  | `${TimeFilterPrefix}_${TimeFilterSuffix}`
+  | `${TimeFilterPrefix}${Capitalize<TimeFilterSuffix>}`;
+
+const unsupportedTimeFilterShape = Object.fromEntries(
+  TIME_FILTER_PREFIXES.flatMap((prefix) =>
+    TIME_FILTER_SUFFIXES.flatMap((suffix) => [
+      `${prefix}_${suffix}`,
+      `${prefix}${suffix[0].toUpperCase()}${suffix.slice(1)}`,
+    ]),
+  ).map((key) => [key, unsupportedTimeFilter]),
+) as Record<TimeFilterKey, typeof unsupportedTimeFilter>;
+
 const listIssuesSchema = z.object({
   companyId: companyIdOptional,
   status: z.string().optional(),
   // Not real filters. See `unsupportedTimeFilter` above.
-  updated_after: unsupportedTimeFilter,
-  updatedAfter: unsupportedTimeFilter,
-  updated_since: unsupportedTimeFilter,
-  updatedSince: unsupportedTimeFilter,
-  created_after: unsupportedTimeFilter,
-  createdAfter: unsupportedTimeFilter,
+  ...unsupportedTimeFilterShape,
   projectId: z.string().uuid().optional(),
   assigneeAgentId: z.string().uuid().optional(),
   participantAgentId: z.string().uuid().optional(),
