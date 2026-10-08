@@ -223,6 +223,15 @@ test('one pull request under the cap is still readable', () => {
   assert.equal(r.status, 'compliant');
 });
 
+test('pageInfo.hasNextPage decides truncation over the page length', () => {
+  // A branch with EXACTLY OPEN_PRS_PAGE_SIZE open pull requests is a complete
+  // window; the length tell alone would page critical on it until the count
+  // moved. When the flag is present it is authoritative in both directions.
+  const full = gatedPrs(OPEN_PRS_PAGE_SIZE);
+  assert.equal(evaluateConsumer(core({ openPullRequests: full, openPullRequestsTruncated: false })).status, 'compliant');
+  assert.equal(evaluateConsumer(core({ openPullRequests: full, openPullRequestsTruncated: true })).status, 'unreadable');
+});
+
 test('a truncated page that already contains an ungated pull request is drift, not unreadable', () => {
   // Truncation says "I may not have seen everything". An ungated PR in the part
   // we DID see is a positive observation and outranks it — reporting unreadable
@@ -290,7 +299,7 @@ test('ALERT_TTL_MS outlives the longest gap between scheduled runs', () => {
   assert.equal(crons.length, 1, 'this assertion assumes a single schedule entry');
 
   const [minute, hour, dom, month, dow] = crons[0].trim().split(/\s+/);
-  assert.deepEqual([minute.includes(','), dom, month, dow], [false, '*', '*', '*'],
+  assert.deepEqual([/^\d+$/.test(minute), dom, month, dow], [true, '*', '*', '*'],
     'this assertion only understands a fixed-minute, daily, hour-list schedule');
 
   const hours = hour.split(',').map(Number).sort((a, b) => a - b);
@@ -336,6 +345,28 @@ test('the open-pull-request probe is only paid for where no pull_request rule wa
     fetchImpl,
   }).then(() => {
     assert.equal(calls.filter((p) => p === '/graphql').length, 1);
+  });
+});
+
+test('the probe passes pageInfo.hasNextPage through to the verdict', () => {
+  // A complete full page: without the flag reaching evaluateConsumer this
+  // falls back to the length tell and reads unreadable.
+  const nodes = Array.from({ length: OPEN_PRS_PAGE_SIZE }, (_, i) => ({
+    number: i + 1,
+    reviewDecision: 'REVIEW_REQUIRED',
+    latestOpinionatedReviews: { nodes: [] },
+  }));
+  const fetchImpl = async (path) =>
+    path === '/graphql'
+      ? { data: { repository: { pullRequests: { pageInfo: { hasNextPage: false }, nodes } } } }
+      : [];
+  return checkConsumers({
+    owner: 'Blockcast',
+    token: 't',
+    consumers: [{ repo: 'without-rule', branch: 'main' }],
+    fetchImpl,
+  }).then((results) => {
+    assert.equal(results[0].status, 'compliant');
   });
 });
 
