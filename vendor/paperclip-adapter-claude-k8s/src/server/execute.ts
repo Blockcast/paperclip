@@ -2193,12 +2193,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // and both early aborts, which `return` before that `finally` is entered.
   const warnUnownedSecrets = async (): Promise<void> => {
     if (unownedSecrets.length === 0) return;
-    await onLog(
+    await logQuietly(
+      onLog,
       "stderr",
       `[paperclip] Warning: retaining ${unownedSecrets.length} Secret(s) for job ${jobName} ` +
         `with no ownerReference, so no GC will ever collect them; delete by hand once the ` +
         `pod is gone: ${unownedSecrets.map((s) => s.name).join(", ")}\n`,
-    ).catch(() => undefined);
+    );
   };
   let promptSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let envSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
@@ -2731,9 +2732,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // Guarded like every other retain-path log: a throw here unwinds out of
         // execute() through the mutex `finally`, so neither abort nor the
         // teardown `finally` runs and the entry just pushed is discarded unread.
-        await onLog("stderr", `[paperclip] Warning: failed to set ownerReference on ${label} Secret: ${msg}\n`).catch(
-          () => undefined,
-        );
+        await logQuietly(onLog, "stderr", `[paperclip] Warning: failed to set ownerReference on ${label} Secret: ${msg}\n`);
       }
     }
     if (!createdJobUid || !onExternalRuntimeLaunched) {
@@ -3072,13 +3071,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   } finally {
     if (keepaliveTimer) clearInterval(keepaliveTimer);
     activeJobs.delete(activeJobRef);
+    // Both retain paths share one branch so a single test pins `podsGone`
+    // staying false for each: the state-mismatch path is not reachable from the
+    // unit harness, the retainJobs one is.
+    const retainReason = skipCleanup
+      ? "state mismatch — UI is waiting on it"
+      : retainJobs
+        ? "for debugging, retainJobs=true"
+        : null;
     let podsGone = false;
-    if (skipCleanup) {
-      await onLog("stdout", `[paperclip] Retaining job ${jobName} (state mismatch — UI is waiting on it)\n`);
-    } else if (!retainJobs) {
-      podsGone = await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
+    if (retainReason) {
+      await onLog("stdout", `[paperclip] Retaining job ${jobName} (${retainReason})\n`);
     } else {
-      await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
+      podsGone = await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath);
     }
     // Clean up prompt/env/mcp-config Secrets — but only once the pod that
     // mounts them is confirmed gone (BLO-35486).  When the Job is retained, or
