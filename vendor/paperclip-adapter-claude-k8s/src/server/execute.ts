@@ -1240,6 +1240,13 @@ const POD_FAILURE_LABELS: Record<PodFailureKind, string> = {
  * `ErrImagePull`: all three run Secrets are created and awaited *before*
  * `createNamespacedJob`, so there is no legitimate transient window in which a
  * pod of ours sits in a config error and then recovers.
+ *
+ * This covers Secrets consumed through `secretKeyRef`, which is only
+ * `envSecret`.  `promptSecret` and `mcpConfigSecret` are mounted as volumes
+ * (`job-manifest.ts`), and a missing volume Secret produces none of these
+ * reasons.  The pod stays `Pending` with its container at `ContainerCreating`,
+ * and the cause shows up only as a `FailedMount` event, which `waitForPod`
+ * does not read.  That case rides the full start deadline.
  */
 const UNRECOVERABLE_WAITING_REASONS = new Set([
   "CreateContainerConfigError",
@@ -1708,12 +1715,12 @@ async function reapPodLogFile(
  * - `alive`      — the list succeeded and still showed pods at the deadline.
  *                  Returned only when the pod delete was accepted, so they are
  *                  Terminating.
- * - `undeleted`  -- the list still showed pods at the deadline but the pod
- *                  delete was refused (non-404) on every poll, so they are NOT
- *                  Terminating and can still start a container.  A successful
+ * - `undeleted`  -- the list still showed pods at the deadline and at least
+ *                  one pod's delete was refused (non-404) on the final poll, so
+ *                  that pod is NOT Terminating and can still start a container.  A successful
  *                  list proves nothing about the delete: `list` and
- *                  `deletecollection` are separate verbs, and a read-only Role
- *                  grants one without the other.
+ *                  `delete` are separate verbs, and a read-only Role grants
+ *                  one without the other.
  * - `unobserved` — no list call ever succeeded, so nothing was observed either
  *                  way.  Notably this is also the branch where the pod delete
  *                  itself may never have been issued.
@@ -1791,7 +1798,7 @@ async function deleteJobPodsAndWait(
       if (!listErrorLogged) {
         listErrorLogged = true;
         const msg = err instanceof Error ? err.message : String(err);
-        // `.catch`: see the delete-failure log below — a rejection here unwinds
+        // logQuietly: see the delete-failure log below — a rejection here unwinds
         // the cancel-path teardown before the Job is deleted.
         await logQuietly(
           onLog,
@@ -1831,7 +1838,7 @@ async function deleteJobPodsAndWait(
           lastDeleteError = err instanceof Error ? err.message : String(err);
           if (loggedDeleteError === null) {
             loggedDeleteError = lastDeleteError;
-            // `.catch`: this runs on the cancel path under the keepalive's
+            // logQuietly: this runs on the cancel path under the keepalive's
             // unsupervised `void (async () => {…})()`, so a rejecting onLog
             // would unwind past `teardownCancelledJob` before it can delete the
             // Job — the run then never settles.  That is the hang the fail-open
@@ -1904,7 +1911,7 @@ export async function cleanupJob(
   }
   const outcome = await deleteJobPodsAndWait(namespace, jobName, onLog, kubeconfigPath);
   if (outcome !== "gone") {
-    // On `undeleted` the pod was never marked for deletion, so "leaving … for
+    // On `undeleted` at least one pod was not marked for deletion, so "leaving … for
     // K8s GC" would read as deferred cleanup when nothing is pending: the
     // ownerReference GC that would have stopped the pod runs under the
     // controller-manager's own credentials, and retaining the Job gives up that
@@ -1912,7 +1919,7 @@ export async function cleanupJob(
     // paths so a postmortem is not left inferring it from one of them.
     const retainCost =
       outcome === "undeleted"
-        ? `; the pod is not Terminating and keeps running until a later run's ` +
+        ? `; a pod whose delete was refused is not Terminating and keeps running until a later run's ` +
           `concurrency guard reaps the Job as stale`
         : "";
     await logQuietly(
@@ -1981,10 +1988,10 @@ async function deleteJobOnly(
  * `completionTimeoutMs` may be 0 (run indefinitely), so refusing to delete the
  * Job would hang the run forever.  That trade is only sound when the pod delete
  * actually landed, which is what `alive` means: `deleteJobPodsAndWait` returns
- * it only when `deleteCollection` was accepted.  A successful list is not that
- * evidence: a Role granting pods `list` but not `deletecollection` (or a 5xx
- * on the delete alone) sees the pod and never marks it Terminating; that is
- * `undeleted`, and it fails closed like `unobserved`.
+ * it only when the per-pod `delete` was accepted for every pod it observed.  A
+ * successful list is not that evidence: a Role granting pods `list` but not
+ * `delete` (or a 5xx on the delete alone) sees the pod and never marks it
+ * Terminating; that is `undeleted`, and it fails closed like `unobserved`.
  *
  * Retaining on `undeleted` has a pod-side cost the Secret-side argument does
  * not show.  `deleteJobOnly` deletes the Job with `propagationPolicy:
@@ -2000,10 +2007,9 @@ async function deleteJobOnly(
  * paid only for a delete refused for the whole budget (a persistent RBAC
  * denial), not for one transient fault.
  *
- * BLO-38096: it does NOT fail open on `unobserved`.  A non-404
- * `deleteCollection` failure is swallowed above and falls through to the poll,
- * so a fault denying both verbs (RBAC, 5xx) leaves the pod delete never issued
- * *and* nothing observed.  Deleting the Job there reaps the Secrets through
+ * BLO-38096: it does NOT fail open on `unobserved`.  The delete is issued per
+ * pod over the list result, so a fault denying `list` (RBAC, 5xx) leaves the
+ * pod delete never issued *and* nothing observed.  Deleting the Job there reaps the Secrets through
  * their `ownerReference` under a pod that can still start — BLO-35486's exact
  * failure on the cancel path.  So `unobserved` retains the Job and accepts the
  * hang; it needs a total read outage, where the run is already not settling.
@@ -2812,15 +2818,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // BLO-35486: 600s was shorter than a cold pull of the agent image under
     // contention — 8 concurrent pods on one node measured 11m12s–12m36s from
     // schedule to container start, of which the transfer itself was 2–33s and
-    // the rest was queueing behind one uncached 3.3 GB layer set.  Every real
-    // failure mode (ErrImagePull/ImagePullBackOff/InvalidImageName/
-    // CrashLoopBackOff/CreateContainerConfigError/CreateContainerError/
-    // Unschedulable/phase=Failed/init-container exit) is detected and thrown
-    // above without waiting for this deadline, so this is only the backstop for
-    // a pod that is still legitimately working — and it must outlast a cold-
-    // image wave.  See UNRECOVERABLE_WAITING_REASONS: the enumeration is what
-    // makes the longer deadline safe, so a reason added to the kubelet's
-    // vocabulary belongs there, not here.
+    // the rest was queueing behind one uncached 3.3 GB layer set.  Every
+    // failure mode that shows in pod status (ErrImagePull/ImagePullBackOff/
+    // InvalidImageName/CrashLoopBackOff/CreateContainerConfigError/
+    // CreateContainerError/Unschedulable/phase=Failed/init-container exit) is
+    // detected and thrown above without waiting for this deadline.  A reason
+    // added to the kubelet's vocabulary belongs in UNRECOVERABLE_WAITING_REASONS,
+    // not here.
+    //
+    // NOT covered: a missing *volume*-mounted run Secret (`promptSecret`,
+    // `mcpConfigSecret`).  It leaves the container at `ContainerCreating` and
+    // reports only as a `FailedMount` event, which this path does not read, so
+    // it costs the full deadline: 1800s, up from 600s.  That needs a Secret to
+    // disappear between creation and mount, and the pods-before-Secrets
+    // ordering in cleanupJob closes that race for this adapter's own teardown.
+    // Detecting it would mean reading `FailedMount` events in waitForPod.
     const startTimeoutMs = Math.max(0, asNumber(config.podStartTimeoutSec, 1800)) * 1000;
     try {
       podName = await waitForPod(namespace, jobName, jobUid, scheduleTimeoutMs, startTimeoutMs, onLog, kubeconfigPath);
