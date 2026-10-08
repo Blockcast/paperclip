@@ -32,4 +32,8 @@
 # already rejects with a message and a one-command repair, and it would change
 # nothing for any branch that does not touch this file. Net zero safety gain,
 # non-zero churn. Revisit only when no open PR carries a row here.
+# Known-stale by design: the frozen file's own header still says every PR
+# "appends a row here". It cannot be corrected, since an edit to it is itself
+# a rejected modification. PROVENANCE-CHANGES.d/README.md carries the
+# superseding statement.
 vendor/paperclip-adapter-claude-k8s/PROVENANCE-CHANGES.md merge=union
