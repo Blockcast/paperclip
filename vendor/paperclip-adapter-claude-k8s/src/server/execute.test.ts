@@ -638,6 +638,26 @@ function makeIsolatedRuntime(isolationKey: string): AdapterExecutionContext["run
   };
 }
 
+// execute() pre-creates every scoped `subPath` target with a real recursive
+// `fs.mkdir` (BLO-32734). `makeIsolatedRuntime`'s roots sit on `/paperclip`,
+// so unmocked that writes onto whatever volume the suite runs beside — on an
+// agent pod, the live shared PVC. Every describe whose tests drive execute()
+// with that runtime stubs `mkdir` (spied on the same default-export object
+// execute.ts calls through); this asserts the stub actually intercepted them.
+const ISOLATED_RUNTIME_SCOPED_DIRS = [
+  "/paperclip/workspaces/workspace-1",
+  "/paperclip/k8s-isolation/workspace-1/home",
+  "/paperclip/k8s-isolation/workspace-1/session",
+  "/paperclip/work/co1",
+  "/paperclip/wt/co1",
+];
+
+function expectScopedDirsPreCreatedThroughMock(): void {
+  for (const dir of ISOLATED_RUNTIME_SCOPED_DIRS) {
+    expect(fsPromises.mkdir).toHaveBeenCalledWith(dir, { recursive: true });
+  }
+}
+
 function makeSelfPodResult() {
   return {
     namespace: "paperclip",
@@ -687,7 +707,9 @@ describe("execute: stdout accumulator regression", () => {
 // ─── execute: concurrency guard paths ────────────────────────────────────────
 
 describe("execute: concurrency guard", () => {
+  let mkdirSpy: ReturnType<typeof vi.spyOn>;
   beforeEach(() => {
+    mkdirSpy = vi.spyOn(fsPromises, "mkdir").mockResolvedValue(undefined);
     vi.clearAllMocks();
     vi.unstubAllGlobals();
     process.env.PAPERCLIP_API_URL = "https://paperclip.test";
@@ -701,6 +723,7 @@ describe("execute: concurrency guard", () => {
   });
 
   afterEach(() => {
+    mkdirSpy.mockRestore();
     vi.unstubAllGlobals();
     delete process.env.PAPERCLIP_API_URL;
   });
@@ -927,6 +950,7 @@ describe("execute: concurrency guard", () => {
     expect(mockPrepareBundle).toHaveBeenCalledWith(expect.objectContaining({
       rootDir: expect.stringContaining("current-key/prompt-cache"),
     }));
+    expectScopedDirsPreCreatedThroughMock();
   });
 
   it("recognizes legacy isolated labels when allowing a different isolation key", async () => {
@@ -950,6 +974,7 @@ describe("execute: concurrency guard", () => {
 
     expect(result.errorCode).toBe("k8s_job_create_failed");
     expect(result.errorMessage).toContain("create reached");
+    expectScopedDirsPreCreatedThroughMock();
   });
 
   it("blocks active jobs with the same isolation key", async () => {
@@ -1251,8 +1276,14 @@ describe("execute: skill source unavailable", () => {
 // ─── execute: job creation paths ─────────────────────────────────────────────
 
 describe("execute: job creation", () => {
+  let mkdirSpy: ReturnType<typeof vi.spyOn>;
+  afterEach(() => {
+    mkdirSpy.mockRestore();
+  });
+
   beforeEach(() => {
     vi.resetAllMocks();
+    mkdirSpy = vi.spyOn(fsPromises, "mkdir").mockResolvedValue(undefined);
     mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
     mockBatchListJobs.mockResolvedValue({ items: [] }); // no concurrent jobs
@@ -1623,6 +1654,7 @@ describe("execute: job creation", () => {
         taskKey: "task-current",
         sessionId: "session-current",
       });
+      expectScopedDirsPreCreatedThroughMock();
     } finally {
       vi.unstubAllGlobals();
       delete process.env.PAPERCLIP_API_URL;
@@ -1651,6 +1683,7 @@ describe("execute: job creation", () => {
       expect(result.errorCode).toBe("k8s_pod_schedule_failed");
       expect(result.errorMessage).not.toContain("metrics route unavailable");
       expect(result.errorMessage).not.toContain("log transport unavailable");
+      expectScopedDirsPreCreatedThroughMock();
     } finally {
       vi.unstubAllGlobals();
       delete process.env.PAPERCLIP_API_URL;
