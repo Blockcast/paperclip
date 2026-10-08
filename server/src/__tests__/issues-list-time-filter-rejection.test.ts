@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
+import { TIME_FILTER_PREFIXES, TIME_FILTER_SUFFIXES } from "@paperclipai/shared";
 import { parseUnsupportedTimeFilterParams } from "../lib/issue-list-query.ts";
 
 /**
@@ -118,5 +119,34 @@ describe("issue list time-filter rejection", () => {
   it("does not reject a request with no params at all", async () => {
     const res = await get("/api/companies/c1/issues");
     expect(res.status).toBe(200);
+  });
+});
+
+// The MCP list tools must DECLARE every name this route refuses: an MCP
+// caller's undeclared key is stripped by the SDK before the request is built,
+// so the 400 above never fires for it and the call silently serves the whole
+// corpus. Both sides build from the shared prefix x suffix lists; this pins the
+// two builders to each other, in both directions, on the real tool shapes.
+describe("MCP list-tool refusal keys match the route pattern", () => {
+  it.each(["paperclipListIssues", "paperclip_search_issues"])("%s", async (toolName) => {
+    const { createToolDefinitions } = await import("../../../packages/mcp-server/src/tools.ts");
+    const tool = createToolDefinitions({} as never).find((t) => t.name === toolName)!;
+    const keys = Object.keys(tool.schema.shape);
+    // Identified by behaviour, not by name, so the route pattern is not used to
+    // pick the keys it is then checked against.
+    const refusedByTool = keys.filter((key) => {
+      const result = tool.schema.shape[key].safeParse("2026-10-04T00:00:00Z");
+      return !result.success && result.error.issues.some((i) => i.message.includes("not supported on this endpoint"));
+    });
+
+    expect(refusedByTool).toHaveLength(2 * TIME_FILTER_PREFIXES.length * TIME_FILTER_SUFFIXES.length);
+    // Every key the tool refuses is one the route refuses...
+    expect(parseUnsupportedTimeFilterParams(Object.fromEntries(refusedByTool.map((k) => [k, "x"])))).toEqual(
+      [...refusedByTool].sort(),
+    );
+    // ...and the route refuses none of the filters the tool actually serves.
+    const servedByTool = keys.filter((key) => !refusedByTool.includes(key));
+    expect(servedByTool).toContain("status");
+    expect(parseUnsupportedTimeFilterParams(Object.fromEntries(servedByTool.map((k) => [k, "x"])))).toEqual([]);
   });
 });
