@@ -67,10 +67,10 @@
  * any wedge that still answers `/api/health` inside its timeout is
  * undetectable by construction — the probe refreshes the completion clock
  * three times a minute and `/livez` cannot go red. `/api/health` is the
- * shallowest `/api` route there is, so it is the request least likely to
- * share a partial wedge's fate. This detector is scoped to the 2026-10-05
- * shape, where `/api/*` served zero bytes; a partial wedge was invisible
- * before it and still is.
+ * first route mounted in the `api` Router, ahead of the routers a partial
+ * wedge is likely to stall, so it can keep answering while they do. This
+ * detector is scoped to the 2026-10-05 shape, where `/api/*` served zero
+ * bytes; a partial wedge was invisible before it and still is.
  *
  * ## Why an idle instance stays green
  *
