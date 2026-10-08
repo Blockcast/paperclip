@@ -153,6 +153,35 @@ const blocked = [
   "xargs -n1 printenv",
   "timeout 5 printenv",
   "su -c 'ls; env'",
+  // PR #2332 review (Ally C1): a heredoc body is DATA only to a data consumer.
+  // Fed to a program that executes its stdin, the body is the program, and a
+  // quoted delimiter only stops expansion. Each was allowed before this fix.
+  "bash <<'EOF'\nenv\nEOF",
+  "bash <<EOF\nenv\nEOF",
+  "sh -s <<'EOF'\nenv\nEOF",
+  "bash -s <<EOF\nprintenv\nEOF",
+  "sudo bash <<'EOF'\nenv\nEOF",
+  "make -f - <<'EOF'\nall:\n\tenv\nEOF",
+  "ssh host <<'EOF'\nenv\nEOF",
+  "cat <<'EOF' | bash\nenv\nEOF",
+  "cat <<'EOF' | sudo sh -s\nprintenv\nEOF",
+  // ...and (Ally I1) executors that were never on the wrapper list, so the
+  // first-ordinary-word stop turned every one into a pass-through.
+  "ssh host env",
+  "ssh -t host printenv",
+  "docker run --rm alpine env",
+  "docker exec c env",
+  "kubectl exec pod -- printenv",
+  "nsenter -t 1 -m env",
+  "unshare -r env",
+  "setpriv --reuid 0 env",
+  "pkexec env",
+  "taskset -c 0 env",
+  "chrt -f 1 env",
+  "systemd-run --scope env",
+  "awk 'BEGIN{system(\"env\")}'",
+  "perl -e 'system(\"env\")'",
+  "capsh -- -c 'env'",
 ];
 const allowed = [
   // The trailing terminator deliberately does NOT include whitespace, which is
@@ -244,6 +273,18 @@ const allowed = [
   "jq -r '.[]|.env' package.json",
   "sed -i 's/env/ENV/' file.txt",
   "#!/usr/bin/env bash",
+  // Negative controls for the consumer rule: a body that only reaches a data
+  // consumer stays data, even behind sudo or next to a later shell command.
+  "tee /tmp/f <<'EOF'\nenv\nEOF",
+  "sudo tee /etc/f <<'EOF'\nenv\nEOF",
+  "cat <<'EOF' | sudo tee /etc/f\nenv\nEOF",
+  // `&&` ends the pipeline, so the shell after it does not read this body.
+  "cat > /tmp/f <<'EOF' && bash -c true\nenv\nEOF",
+  "cat <<'EOF' | grep env\nenv\nEOF",
+  // git is deliberately not a wrapper: `env` after it is a pattern or a
+  // missing subcommand, never a dump.
+  "git grep env",
+  "git log --grep env",
   "",
 ];
 
