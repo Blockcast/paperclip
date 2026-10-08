@@ -442,9 +442,19 @@ jobs:
         # without a provenance row -- off the diff, which stores nothing and so
         # cannot conflict.
         #
+        # BLO-41101: it also rejects any commit in base..head that touches the
+        # frozen PROVENANCE-CHANGES.md, not just a net diff that does. The merge
+        # queue is REBASE and replays commits one at a time, so a branch whose
+        # net diff is clean can still be un-stageable -- #1797 was ejected six
+        # times in 24 days that way, green on every surface, with no
+        # merge_group run to point at.
+        #
         # Runs in this job rather than in vendor_claude_k8s because this one
         # already checks out full history (fetch-depth: 0); the vendored job
-        # checks out at depth 1 and cannot resolve $PR_BASE_SHA.
+        # checks out at depth 1 and cannot resolve $PR_BASE_SHA. That checkout
+        # depth is now load-bearing twice over: the per-commit walk needs the
+        # branch's commits present, and on a shallow clone it exits non-zero
+        # rather than reporting an empty range.
         if: ${{ !cancelled() }}
         run: node ./scripts/check-vendored-provenance-log.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
         timeout-minutes: 1
