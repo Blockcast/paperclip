@@ -9746,6 +9746,22 @@ describeEmbeddedPostgres("github-webhook route", () => {
       ].join("\n");
     }
 
+    // The other Ally-specific decline: buckets that were read and were zero.
+    // Shared with the delegation guard below so both Ally reasons stay
+    // reachable from one place; divergent copies are what this describe exists
+    // to catch.
+    function allyAllZeroBody(): string {
+      return [
+        "## Ally — Consolidated PR Review",
+        "",
+        "Reviewed head: f78f3dcd8818ed2bf9b7550965c96c614f433987",
+        "",
+        "### Critical Issues (0)",
+        "",
+        "### Important Issues (0)",
+      ].join("\n");
+    }
+
     it("names ally_review_findings_unenumerable when the classifier sees the frr#61 body truncated before its findings buckets", async () => {
       const fullBody = frr61ShapedBody({ priorStillPresent: false });
       // Pin the property that made frr#61 undiagnosable: the buckets sit
@@ -9918,15 +9934,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       // Both decline, and collapsing them into one reason would re-create the
       // ambiguity this issue exists to remove: all-zero buckets are a healthy
       // no-op, no buckets at all is a body that lost its findings.
-      const clean = [
-        "## Ally — Consolidated PR Review",
-        "",
-        "Reviewed head: f78f3dcd8818ed2bf9b7550965c96c614f433987",
-        "",
-        "### Critical Issues (0)",
-        "",
-        "### Important Issues (0)",
-      ].join("\n");
+      const clean = allyAllZeroBody();
       expect(__test_classifyPrReviewActionability(clean, "commented")).toEqual({
         actionable: false,
         reason: "ally_review_findings_all_zero",
@@ -9972,6 +9980,14 @@ describeEmbeddedPostgres("github-webhook route", () => {
       // hasActionablePrReviewFeedback delegates to the classifier, so this
       // pins the delegation rather than re-testing the branches: a future edit
       // that reintroduces a second copy of the predicate fails here.
+      //
+      // BLO-35581: the body set has to reach every reason, not just the
+      // oldest ones. Both Ally-specific declines were unreachable from here —
+      // the clamped frr#61 entry defaults to `priorStillPresent: true` and so
+      // routes actionable on the BLO-31446 ledger clause, and nothing else
+      // carried an Ally heading with readable zero buckets. A divergent copy
+      // that differed only on those two branches passed. The two entries are
+      // additions, not swaps: the still-present route stays covered.
       const bodies: Array<[string | null, string]> = [
         [frr61ShapedBody(), "commented"],
         [
@@ -9980,17 +9996,42 @@ describeEmbeddedPostgres("github-webhook route", () => {
             .toString("utf8"),
           "commented",
         ],
+        [
+          // Same truncated-before-its-buckets shape with the blocking ledger
+          // assertion dropped -> ally_review_findings_unenumerable.
+          Buffer.from(frr61ShapedBody({ priorStillPresent: false }), "utf8")
+            .subarray(0, __test_REVIEW_BODY_MAX_BYTES)
+            .toString("utf8"),
+          "commented",
+        ],
+        [allyAllZeroBody(), "commented"],
         ["### Important Issues (2)", "commented"],
         ["nothing to see", "commented"],
         ["anything at all", "changes_requested"],
         [null, "commented"],
         ["   ", "commented"],
       ];
+      const reasons = new Set<string>();
       for (const [body, state] of bodies) {
-        expect(__test_hasActionablePrReviewFeedback(body, state)).toBe(
-          __test_classifyPrReviewActionability(body, state).actionable,
-        );
+        const decision = __test_classifyPrReviewActionability(body, state);
+        expect(__test_hasActionablePrReviewFeedback(body, state)).toBe(decision.actionable);
+        if (!decision.actionable) reasons.add(decision.reason);
       }
+
+      // The delegation assertion above cannot fail on a classifier mutation:
+      // both sides of it read the same function, so stubbing out a branch
+      // moves them together and the loop still passes. That is what left this
+      // guard with no failing mutation (BLO-34263's "a guard with no failing
+      // mutation is a comment"). The reason set is the half that does fail —
+      // deleting the hasAllyConsolidatedReviewHeading branch collapses both
+      // Ally reasons into review_no_blocking_feedback and this is what reds.
+      expect([...reasons].sort()).toEqual([
+        "ally_review_findings_all_zero",
+        "ally_review_findings_unenumerable",
+        "review_body_absent",
+        "review_body_empty",
+        "review_no_blocking_feedback",
+      ]);
     });
 
     it("reports a suppression reason only for review submissions carrying a classifier decision", () => {
