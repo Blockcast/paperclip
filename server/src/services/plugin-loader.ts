@@ -3565,10 +3565,14 @@ export function pluginLoader(
             "plugin-loader: multiple company configs; legacy bootstrap scope disabled",
           );
         }
-      } catch {
-        log.debug(
-          { pluginId, pluginKey },
-          "plugin-loader: unable to resolve legacy bootstrap company scope",
+      } catch (err) {
+        // Not just the legacy bootstrap scope: step 4b reconciles bindings for
+        // exactly these companies, so an empty list here silently disables the
+        // repair too. Warn, or a lookup failure hides the fix for the silent
+        // failure it exists to close (BLO-32567).
+        log.warn(
+          { pluginId, pluginKey, err },
+          "plugin-loader: unable to list configured companies; legacy bootstrap scope disabled and secret-ref bindings not reconciled",
         );
       }
 
@@ -3596,6 +3600,21 @@ export function pluginLoader(
           log.warn(
             { pluginId, pluginKey, companyId: result.companyId, err: result.error },
             "plugin-loader: secret-ref bindings not reconciled; this company's plugin secrets will not resolve",
+          );
+        } else if (result.declaredSecretPaths > 0 && result.bound === 0) {
+          // The BLO-32567 shape itself: the manifest declares credentials, a
+          // config row exists, and nothing bound — extraction found no ref at
+          // any declared path, so the empty-set guard correctly declined to
+          // sync and this install stays unresolvable. Silence here is what let
+          // the original outage run 38 days.
+          log.warn(
+            {
+              pluginId,
+              pluginKey,
+              companyId: result.companyId,
+              declaredSecretPaths: result.declaredSecretPaths,
+            },
+            "plugin-loader: plugin declares secret-ref config but no bindings were reconciled; this company's plugin secrets will not resolve",
           );
         } else if (result.bound > 0) {
           log.debug(

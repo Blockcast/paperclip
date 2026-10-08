@@ -175,6 +175,12 @@ export interface PluginSecretBindingReconcileResult {
   companyId: string;
   /** Refs synced for this company. 0 means nothing to bind, not an error. */
   bound: number;
+  /**
+   * `format: "secret-ref"` paths the manifest declares. Tells a benign zero
+   * (plugin has no credentials) apart from the BLO-32567 shape: the schema
+   * says this plugin has credentials and we bound none anyway.
+   */
+  declaredSecretPaths: number;
   /** Present when this company was skipped; the other companies still ran. */
   error?: string;
 }
@@ -202,6 +208,7 @@ export async function reconcilePluginSecretBindings(input: {
   getConfig: (companyId: string) => Promise<{ configJson?: unknown } | null | undefined>;
   syncBindings: (companyId: string, refs: PluginConfigSecretRefBinding[]) => Promise<unknown>;
 }): Promise<PluginSecretBindingReconcileResult[]> {
+  const declaredSecretPaths = collectSecretRefPaths(input.instanceConfigSchema).size;
   const results: PluginSecretBindingReconcileResult[] = [];
   for (const companyId of input.companyIds) {
     try {
@@ -214,7 +221,7 @@ export async function reconcilePluginSecretBindings(input: {
       // "delete every binding for this target", so an unreadable or absent
       // manifest schema would silently unbind a healthy install on restart.
       if (refs.length > 0) await input.syncBindings(companyId, refs);
-      results.push({ companyId, bound: refs.length });
+      results.push({ companyId, bound: refs.length, declaredSecretPaths });
     } catch (err) {
       // Per-company isolation is load-bearing: a config pointing at another
       // company's secret throws in `assertSecretInCompany`, and that must
@@ -223,6 +230,7 @@ export async function reconcilePluginSecretBindings(input: {
       results.push({
         companyId,
         bound: 0,
+        declaredSecretPaths,
         error: err instanceof Error ? err.message : String(err),
       });
     }

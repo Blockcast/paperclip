@@ -594,8 +594,8 @@ describe("reconcilePluginSecretBindings", () => {
     });
 
     expect(results).toEqual([
-      { companyId: "company-a", bound: 1 },
-      { companyId: "company-b", bound: 1 },
+      { companyId: "company-a", bound: 1, declaredSecretPaths: 1 },
+      { companyId: "company-b", bound: 1, declaredSecretPaths: 1 },
     ]);
     expect(synced).toEqual([
       { companyId: "company-a", paths: ["slackTokenRef"] },
@@ -615,7 +615,25 @@ describe("reconcilePluginSecretBindings", () => {
       },
     });
 
-    expect(results).toEqual([{ companyId: "company-a", bound: 0 }]);
+    expect(results).toEqual([{ companyId: "company-a", bound: 0, declaredSecretPaths: 0 }]);
+    expect(calls).toEqual([]);
+  });
+
+  it("reports declaredSecretPaths so a silent zero-bind is distinguishable (BLO-32567)", async () => {
+    const calls: string[] = [];
+    const results = await reconcilePluginSecretBindings({
+      pluginId,
+      companyIds: ["company-a"],
+      instanceConfigSchema: schema,
+      // Schema declares a credential; the stored config has no ref at it.
+      // That is the outage shape: nothing binds, nothing errors.
+      getConfig: async () => ({ configJson: { unrelated: "value" } }),
+      syncBindings: async (companyId) => {
+        calls.push(companyId);
+      },
+    });
+
+    expect(results).toEqual([{ companyId: "company-a", bound: 0, declaredSecretPaths: 1 }]);
     expect(calls).toEqual([]);
   });
 
@@ -637,9 +655,14 @@ describe("reconcilePluginSecretBindings", () => {
     expect(results[0]).toEqual({
       companyId: "foreign-company",
       bound: 0,
+      declaredSecretPaths: 1,
       error: "Secret does not belong to this company",
     });
-    expect(results[1]).toEqual({ companyId: "owning-company", bound: 1 });
+    expect(results[1]).toEqual({
+      companyId: "owning-company",
+      bound: 1,
+      declaredSecretPaths: 1,
+    });
     // The failure must not bind the foreign credential, nor stop the owner.
     expect(synced).toEqual(["owning-company"]);
   });
