@@ -91,7 +91,15 @@ outrank them whatever the ceiling is.
 Only the first two rows are genuinely `same` — both are `runUniqueIdentity` call
 sites. `resolveWorkspaceWriterTreeKey` takes no ceiling or concurrency input, so
 on the last three rows a tree key resolves whenever the runScope is the default
-`per_issue` and the run has an issue id, which is the ordinary case.
+`per_issue` and the run has an issue id, which is the ordinary case. That is one
+sufficient condition, not the only one: when the run does not resolve to its own
+tree, the key is `project-primary:<projectWorkspaceId>` for *any* run with a
+project workspace, regardless of runScope or issue id. So `isolation_key` carries
+three shapes — `workspace-tree:<pwid>:<issueId>`,
+`workspace-tree:project-primary:<pwid>`, and
+`workspace-tree:no-project-workspace:<issueId>` when there is no project
+workspace. **Grep the `workspace-tree:` prefix, not the `<pwid>:<issueId>` form**,
+or the primary-checkout rows are missed.
 
 `withTreeScopedReservationKey` does not narrow the key — it **replaces** it.
 Whenever a per-issue tree key resolves, `isolation_key` is
@@ -129,8 +137,10 @@ Exposed on `/metrics` (`server/src/services/metrics.ts`):
 | `paperclip_external_runtime_reservations_release_pending` / `..._release_pending_oldest_age_seconds` | teardown that started and did not finish |
 
 Direct reconciliation query — live Jobs with `active>0` should equal
-unreleased reservations minus `launching` (no Job yet) minus `release_pending`
-(Job already reaped). A persistent mismatch is the signal that matters:
+unreleased reservations minus `reserved` and `launching` (no Job yet) minus
+`release_pending` (Job already reaped). A persistent mismatch is the signal that
+matters — and note that a stuck `reserved` row is a leaked slot, not a missing
+Job:
 
 ```sql
 SELECT state, count(*) FROM external_runtime_reservations
@@ -256,5 +266,6 @@ Re-read the live values rather than trusting this paragraph:
 SELECT name,
        runtime_config->'heartbeat'->>'concurrencyEnabled' AS enabled,
        runtime_config->'heartbeat'->>'maxConcurrentRuns'  AS ceiling
-FROM agents WHERE adapter_type = 'claude_k8s' ORDER BY 3 DESC NULLS LAST;
+FROM agents WHERE adapter_type = 'claude_k8s'
+ORDER BY (runtime_config->'heartbeat'->>'maxConcurrentRuns')::int DESC NULLS LAST;
 ```
