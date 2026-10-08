@@ -731,14 +731,58 @@ describe("issue wake diagnostic reason allowlist", () => {
   // directory-only rule would scan it and derive expectations from fixture data.
   // The directory is excluded as well because a non-`.test.ts` helper under
   // `__tests__/` would otherwise slip through the suffix rule for the same reason.
+  //
+  // PEN-3855 review follow-up: `server/src/__fixtures__/` is excluded for exactly the
+  // same reason and is NOT covered by either rule above. It holds only `.json` today,
+  // so this is prophylaxis rather than a live fix -- but a single `.ts` helper landing
+  // there would derive the allowlist from fixture data, which is the precise harm the
+  // suffix rule was written to prevent.
   function isProductionSource(path: string) {
     if (!path.endsWith(".ts")) return false;
     if (path.endsWith(".test.ts") || path.endsWith(".d.ts")) return false;
+    if (path.includes("/__fixtures__/")) return false;
     return !path.includes("/__tests__/");
   }
 
-  function collectWriterFiles(dir: URL): { path: string; source: string; url: URL }[] {
-    const found: { path: string; source: string; url: URL }[] = [];
+  // Blank out whole-line comments, preserving every byte offset by replacing the text
+  // with spaces. Two things read this instead of the raw source, and neither can be
+  // done safely on the raw text:
+  //
+  //   - File ADMISSION. A bare `source.includes("insert(agentWakeupRequests)")` admits
+  //     a production file that merely DISCUSSES wake writers in prose. This PR is its
+  //     own near-miss: it added exactly that kind of commentary to `routes/issues.ts`,
+  //     and avoided joining `WRITER_FILES` only by not spelling the literal token.
+  //   - `rawOpeners`. Same token, same inflation -- which breaks the
+  //     `openerCount === rawOpeners` identity into a FALSE RED whose message blames
+  //     the opener regex, pointing the next engineer at the scanner instead of at the
+  //     comment.
+  //
+  // Offsets are preserved so `lineOf` still reports real line numbers, and the opener
+  // walk slices blocks from this same masked view -- so the two counts can never
+  // disagree about what a comment is. Masking inside a `.values({ ... })` block is a
+  // bonus rather than a hazard: comment braces no longer perturb the depth walk, and a
+  // `reason:` written in a comment can no longer be read as a column write.
+  //
+  // It is a heuristic, bounded on purpose: a TRAILING comment on a code line
+  // (`foo(); // insert(agentWakeupRequests)`) is not masked. That bound is safe
+  // because a mask that ever corrupted real code would desync the depth walk into
+  // `unaccounted`, which is asserted empty with the site named -- a loud failure, not
+  // a silent one.
+  function maskWholeLineComments(source: string) {
+    return source
+      .split("\n")
+      .map((line) => {
+        const trimmed = line.trimStart();
+        if (!trimmed.startsWith("//") && !trimmed.startsWith("/*") && !trimmed.startsWith("*")) {
+          return line;
+        }
+        return " ".repeat(line.length);
+      })
+      .join("\n");
+  }
+
+  function collectWriterFiles(dir: URL): { path: string; source: string; masked: string; url: URL }[] {
+    const found: { path: string; source: string; masked: string; url: URL }[] = [];
     for (const entry of readdirSync(fileURLToPath(dir), { withFileTypes: true })) {
       const child = new URL(entry.name + (entry.isDirectory() ? "/" : ""), dir);
       if (entry.isDirectory()) {
@@ -749,15 +793,18 @@ describe("issue wake diagnostic reason allowlist", () => {
       const path = fileURLToPath(child);
       if (!isProductionSource(path)) continue;
       const source = readFileSync(path, "utf8");
-      if (!source.includes("insert(agentWakeupRequests)")) continue;
-      found.push({ path: path.slice(path.indexOf("server/src/")), source, url: child });
+      const masked = maskWholeLineComments(source);
+      // Admit on the MASKED view: a file that only discusses wake writers in prose is
+      // not a writer. See `maskWholeLineComments`.
+      if (!masked.includes("insert(agentWakeupRequests)")) continue;
+      found.push({ path: path.slice(path.indexOf("server/src/")), source, masked, url: child });
     }
     return found;
   }
 
   const WRITER_FILES = collectWriterFiles(SERVER_SRC).sort((a, b) => a.path.localeCompare(b.path));
   const heartbeatFile = WRITER_FILES.find((file) => file.path.endsWith("services/heartbeat.ts"));
-  const heartbeatSource = heartbeatFile?.source ?? "";
+  const heartbeatSource = heartbeatFile?.masked ?? "";
 
   // The glob is the whole control here, so prove it is live before anything reads
   // it. A walker that silently returns [] would make every assertion below vacuous
@@ -883,8 +930,16 @@ describe("issue wake diagnostic reason allowlist", () => {
   // simply produced nothing, which made "this writer passes a runtime variable"
   // byte-identical to "this writer has no reason column" -- and to "the depth walk
   // desynced and lost the site". `unaccounted` is what tells those apart.
-  function columnReasonLiteralsFromDirectInserts(file: { path: string; source: string; url: URL }) {
-    const source = file.source;
+  function columnReasonLiteralsFromDirectInserts(file: {
+    path: string;
+    source: string;
+    masked: string;
+    url: URL;
+  }) {
+    // Masked, not raw: the opener walk, the block slices and `rawOpeners` must all
+    // agree about what is a comment, or the identity below goes red on prose. Offsets
+    // are preserved, so `lineOf` still reports real line numbers.
+    const source = file.masked;
     const lineOf = (index: number) => source.slice(0, index).split("\n").length;
     const at = (index: number) => `${file.path}:${lineOf(index)}`;
     const sites: { site: string; reasons: string[] }[] = [];
@@ -983,7 +1038,10 @@ describe("issue wake diagnostic reason allowlist", () => {
         else if (ternary)
           sites.push({ site: at(opener.index), reasons: [ternary[1], ternary[2]] });
         else if (constIdentifier) {
-          const resolved = resolveConstLiteral(constIdentifier[1], source, file.url);
+          // Raw source here, not masked: this resolves DECLARATIONS and `import`
+          // specifiers, which are code wherever they sit, and the raw text is the
+          // honest input for them.
+          const resolved = resolveConstLiteral(constIdentifier[1], file.source, file.url);
           // Fail loudly rather than widening the skip: a `SCREAMING_SNAKE` const the
           // resolver cannot follow means the resolver broke, not that the site is
           // dynamic. Silently skipping it is the exact failure this revision fixes.
@@ -1016,14 +1074,42 @@ describe("issue wake diagnostic reason allowlist", () => {
   // So derive the expected literals from the writer rather than restating them: a
   // rename or a spelling drift on either side fails here instead of quietly
   // projecting a real suppression to "other".
-  it("admits every reason `writeSkippedHeartbeatRequest` writes to the reason column", () => {
+  it("admits every reason the `writeSkippedRequest` helper family writes to the reason column", () => {
+    // PEN-3855 review follow-up. This used to match `writeSkippedHeartbeatRequest`
+    // only -- 3 call sites -- while `writeSkippedRequest`, the parent it delegates to,
+    // carried 8 further literal call sites that NO test read. That is the same defect
+    // this suite exists to catch, one helper over instead of one file over: five of
+    // those eight projected to "other", including `issue_execution_ownership_changed`,
+    // whose enclosing block runs only after the issue is loaded by
+    // `eq(issues.id, issueId)`.
+    //
+    // The direct-insert scan below cannot cover them either -- it reaches the single
+    // insert inside `writeSkippedRequest` and correctly classifies it as dynamic
+    // (`reason: skipReason`), so every caller's literal is invisible there by
+    // construction. This regex is the only thing that reads them.
+    //
+    // `writeSkippedHeartbeatRequest` does not contain `writeSkippedRequest` as a
+    // substring, so the optional group is required to cover both and cannot
+    // double-count a single call site.
+    //
+    // Single-file is correct *by construction* here, and this is the one place the
+    // file-granular argument legitimately does not apply: both helpers are closures
+    // declared inside one function in `heartbeat.ts`, so neither can acquire a call
+    // site in another module. The repo-wide glob above is what covers direct inserts;
+    // this scan is deliberately scoped to the lexical scope that defines these two.
     const written = [
-      ...heartbeatSource.matchAll(/writeSkippedHeartbeatRequest\(\s*"([^"]+)"/g),
+      ...heartbeatSource.matchAll(/writeSkipped(?:Heartbeat)?Request\(\s*"([^"]+)"/g),
     ].map((match) => match[1]);
 
-    // Guard against the scan itself going vacuous: if the helper is renamed, this
-    // fails loudly rather than passing over an empty set.
-    expect(written.length, "no writeSkippedHeartbeatRequest call sites found").toBeGreaterThan(0);
+    // Guard against the scan itself going vacuous: if either helper is renamed, this
+    // fails loudly rather than passing over an empty set. The floor is the delegate's
+    // 3 sites plus the parent's 8 -- a regex that silently reverts to matching only
+    // the delegate shrinks the set rather than erroring, so assert the count, not just
+    // non-emptiness.
+    expect(
+      written.length,
+      `no writeSkipped(Heartbeat)?Request call sites found; got ${written.join(", ") || "none"}`,
+    ).toBeGreaterThanOrEqual(11);
 
     for (const reason of written) {
       expect(
@@ -1087,6 +1173,26 @@ describe("issue wake diagnostic reason allowlist", () => {
     // ...and the denominator must be checked, not trusted. A writer the opener regex
     // misses shrinks both sides of the identity above and leaves it true, so count
     // every raw `insert(agentWakeupRequests)` and require the regex to have matched all.
+    //
+    // PEN-3855 review follow-up: name the DISAGREEING FILES. The old message asserted
+    // one cause ("opener regex stopped matching"), which is only one of two -- prose
+    // mentioning the token also inflates `rawOpeners`. Both counts now run over the
+    // comment-masked view so prose cannot cause this at all, but the per-file
+    // breakdown means that if it ever does go red the real cause is one read away
+    // instead of being mis-attributed to the scanner.
+    const openerSkew = WRITER_FILES.map((file, index) => ({
+      path: file.path,
+      openerCount: scans[index]!.openerCount,
+      rawOpeners: scans[index]!.rawOpeners,
+    })).filter((entry) => entry.openerCount !== entry.rawOpeners);
+    expect(
+      openerSkew,
+      "opener regex matched a different number of writers than the raw token count. " +
+        "Two causes, opposite fixes: (a) the opener regex stopped matching a real writer — " +
+        "`.values(<identifier>)`, or a reformatted `values({`; or (b) the token appears " +
+        "somewhere the mask did not blank (a trailing `// insert(agentWakeupRequests)` on a " +
+        "code line), inflating the raw count without being a writer. Files listed with both counts",
+    ).toEqual([]);
     expect(
       openerCount,
       "opener regex stopped matching a writer — `.values(<identifier>)`, or a reformatted `values({`",
