@@ -485,6 +485,11 @@ jobs:
         run: node --test ./scripts/check-scheduled-guard-liveness.test.mjs
         timeout-minutes: 1
 
+      - name: Test merge-group orphan sweeper classifier (BLO-41174)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/sweep-orphaned-merge-group-runs.test.mjs
+        timeout-minutes: 1
+
       - name: Reject git push in adapter/runtime code
         if: ${{ !cancelled() }}
         run: node ./scripts/check-no-git-push.mjs
