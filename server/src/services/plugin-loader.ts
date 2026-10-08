@@ -3598,7 +3598,9 @@ export function pluginLoader(
       for (const result of reconciled) {
         if (result.error) {
           log.warn(
-            { pluginId, pluginKey, companyId: result.companyId, err: result.error },
+            // `reason`, not `err`: the result carries a flattened message, not
+            // an Error, so pino's err serializer would have nothing to expand.
+            { pluginId, pluginKey, companyId: result.companyId, reason: result.error },
             "plugin-loader: secret-ref bindings not reconciled; this company's plugin secrets will not resolve",
           );
         } else if (result.declaredSecretPaths > 0 && result.bound === 0) {
@@ -3615,6 +3617,26 @@ export function pluginLoader(
               declaredSecretPaths: result.declaredSecretPaths,
             },
             "plugin-loader: plugin declares secret-ref config but no bindings were reconciled; this company's plugin secrets will not resolve",
+          );
+        } else if (
+          result.declaredSecretPaths === 0 &&
+          result.bound === 0 &&
+          result.undeclaredUuidValues > 0
+        ) {
+          // The complementary silent branch: the manifest declares no
+          // secret-ref path, so a bare UUID in the config cannot be coerced
+          // into a ref and nothing can ever bind it. Reachable by a plugin
+          // that never declared `instanceConfigSchema`, or by an upgrade that
+          // drops one. Heuristic — an ordinary UUID-valued setting trips it
+          // too — so it names the suspicion rather than asserting a credential.
+          log.warn(
+            {
+              pluginId,
+              pluginKey,
+              companyId: result.companyId,
+              undeclaredUuidValues: result.undeclaredUuidValues,
+            },
+            "plugin-loader: plugin declares no secret-ref config but its stored config holds UUID-shaped values; if one is a credential it can never bind and this company's plugin secrets will not resolve",
           );
         } else if (result.bound > 0) {
           log.debug(
