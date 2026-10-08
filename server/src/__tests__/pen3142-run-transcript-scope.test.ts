@@ -23,6 +23,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   decorateActiveRunStatus: vi.fn(),
   getRetryExhaustedReason: vi.fn(),
   getRetrySuccessor: vi.fn(),
+  cancelRun: vi.fn(),
   getRun: vi.fn(),
   getRunIssueSummary: vi.fn(),
   getActiveRunIssueSummaryForAgent: vi.fn(),
@@ -534,6 +535,32 @@ describe("run transcript scoping (PEN-3142)", () => {
       });
     });
 
+    /**
+     * REST half of the WS-vs-REST pair for Ally review 5449228335 (the socket
+     * half is in `pen3142-live-event-transcript-scope.test.ts`). The decider
+     * stub mirrors `decideSkillTestAccess`'s default-deny — pinned against the
+     * real service in `authorization-service.test.ts` — and otherwise allows
+     * the owner, so the scope is the only thing that can deny here.
+     */
+    it("denies a skill_test-scoped key its own run's transcript, because the actor carries the scope", async () => {
+      mockDecide.mockImplementation(async (input: { action?: string; actor: { keyScope?: { kind?: string } } }) =>
+        input.actor.keyScope?.kind === "skill_test"
+          ? { allowed: false, action: input.action, reason: "deny_scope", explanation: "Skill-test run token cannot use this API action." }
+          : { allowed: true, action: input.action, reason: "allow_self", explanation: "own run" });
+      const keyScope = { kind: "skill_test", issueId: "55555555-5555-4555-8555-555555555555" };
+
+      const res = await requestApp(
+        await createApp({ ...ownerAgentActor, keyId: "key-1", keyScope }),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "runs:read_transcript",
+        actor: expect.objectContaining({ keyId: "key-1", keyScope }),
+      }));
+    });
+
     it("asks the decider about the run's OWNING agent, not the caller", async () => {
       await requestApp(
         await createApp(peerAgentActor),
@@ -734,6 +761,26 @@ describe("run transcript scoping (PEN-3142)", () => {
         );
 
         expect(res.status, JSON.stringify(res.body)).toBe(403);
+      });
+
+      // Ally review 5449228335 (Important): an ABSENT status is not an active
+      // one. Every sibling check of this field is strict, and this branch is
+      // the one that skips the authorization service entirely.
+      it("does not treat an operator membership with no status as active", async () => {
+        const res = await requestApp(
+          await createApp({
+            type: "board",
+            userId: "user-1",
+            companyIds: ["company-1"],
+            source: "session",
+            isInstanceAdmin: false,
+            memberships: [{ companyId: "company-1", membershipRole: "owner" }],
+          }),
+          (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/log"),
+        );
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(mockDecide).toHaveBeenCalled();
       });
     });
   });
@@ -1364,6 +1411,71 @@ describe("run transcript scoping (PEN-3142)", () => {
       // Memoized on the owning agent. Without this a 200-run page would issue
       // 200 authorization decisions.
       expect(mockDecide).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  /**
+   * Ally review 5449228335 (late lens): `POST /heartbeat-runs/:runId/cancel`
+   * returns the run row too, and on an already-terminal run `cancelRun` hands
+   * back the unmodified `getRun` row. Board actors skip the cancel's own
+   * decision, so the response must go through the same projection as its `GET`
+   * sibling or a board actor that `GET` withholds from reads it with one POST.
+   */
+  describe("POST /heartbeat-runs/:runId/cancel projects the returned row like its GET sibling", () => {
+    beforeEach(() => {
+      // Terminal run: nothing to cancel, so the row comes back unmodified.
+      mockHeartbeatService.cancelRun.mockImplementation(async () => mockHeartbeatService.getRun());
+    });
+
+    const boardWithRole = (source: string, membershipRole: string) => ({
+      type: "board",
+      userId: "user-1",
+      companyIds: ["company-1"],
+      source,
+      isInstanceAdmin: false,
+      memberships: [{ companyId: "company-1", membershipRole, status: "active" }],
+    });
+
+    it("withholds transcript content from a cloud-tenant owner cancelling a completed run", async () => {
+      const res = await requestApp(
+        await createApp(boardWithRole("cloud_tenant", "owner")),
+        (baseUrl) => request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.stdoutExcerpt).toBeNull();
+      expect(res.body.stderrExcerpt).toBeNull();
+      expect(res.body.nextAction).toBeNull();
+      expect(res.body.resultJson).not.toHaveProperty("result");
+      expect(res.body.resultJson).not.toHaveProperty("summary");
+      expect(JSON.stringify(res.body)).not.toContain("sk-live-not-a-real-key");
+      expect(res.body).toMatchObject({ id: "run-1", status: "failed", errorCode: "rate_limit_exhausted" });
+      expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "runs:read_transcript",
+        resource: expect.objectContaining({ type: "agent", agentId: runOwnerAgentId }),
+      }));
+    });
+
+    it("refuses a viewer-role board actor before the cancel runs at all", async () => {
+      const res = await requestApp(
+        await createApp(boardWithRole("session", "viewer")),
+        (baseUrl) => request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      expect(JSON.stringify(res.body)).not.toContain("sk-live-not-a-real-key");
+    });
+
+    it("gives an operator the full row back", async () => {
+      const res = await requestApp(
+        await createApp(boardWithRole("session", "operator")),
+        (baseUrl) => request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.stdoutExcerpt).toContain("sk-live-not-a-real-key");
+      expect(res.body).not.toHaveProperty("withheldFields");
     });
   });
   /**

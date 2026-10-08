@@ -302,7 +302,7 @@ export function boardActorIsTranscriptOperator(req: Request, companyId: string):
   return (req.actor.memberships ?? []).some(
     (membership) =>
       membership.companyId === companyId &&
-      (membership.status === undefined || membership.status === "active") &&
+      membership.status === "active" &&
       typeof membership.membershipRole === "string" &&
       TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES.has(normalizedTranscriptRole(membership.membershipRole)),
   );

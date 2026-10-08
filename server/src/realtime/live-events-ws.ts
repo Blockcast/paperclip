@@ -5,7 +5,7 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import { normalizeAgentApiKeyScope, type AgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -64,6 +64,15 @@ interface UpgradeContext {
   actorSource?: "local_implicit" | "session" | "cloud_tenant";
   /** The `local_trusted` board, which has no membership row to carry. */
   trustedLocal?: boolean;
+  /**
+   * PEN-3142: the agent key's id and normalized scope, read off the same
+   * `agentApiKeys` row the upgrade already matched, exactly as the REST
+   * middleware stamps them. Without them the transcript gate decides a
+   * `skill_test` / `task_bridge` key as an unscoped one, and the socket streams
+   * what the REST twin denies it (Ally review 5449228335).
+   */
+  keyId?: string;
+  keyScope?: AgentApiKeyScope;
 }
 
 interface IncomingMessageWithContext extends IncomingMessage {
@@ -223,6 +232,8 @@ async function authorizeUpgrade(
     companyId,
     actorType: "agent",
     actorId: key.agentId,
+    keyId: key.id,
+    keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
   };
 }
 
