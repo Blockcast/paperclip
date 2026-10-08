@@ -179,48 +179,103 @@ test("a vendored source change with no log row is rejected", () => {
   );
 });
 
-test("a vendored source change with an appended log row passes", () => {
+// --------------------------------------------------------------------------
+// BLO-41101. LOG is frozen: nothing may modify it, in the net diff or in any
+// commit along the way. These replace an earlier append-only rule, a binary
+// rule, and a warn-but-pass legacy-row path -- all three read only the net
+// diff, and the net diff cannot see a row that a later commit takes back out.
+// --------------------------------------------------------------------------
+
+test("appending a row to the frozen log is rejected, and the repair relocates it", () => {
+  // Was "a vendored source change with an appended log row passes". It did
+  // pass, with a warning that described this exact failure as a known outcome
+  // -- and master gained two such rows on 2026-10-01, which is what every
+  // in-flight branch carrying a LOG commit was then ejected against.
   const { write, commit, check } = scratchRepo();
   write(SOURCE, "export const manifest = 2;\n");
   write(LOG, `${LOG_HEADER}| \`abc\` | job-manifest.ts | bumped the manifest |\n`);
-  commit("touch vendored source and log it");
-
-  // Still accepted -- transitional, see "a legacy row still passes" below.
-  assert.equal(check().ok, true);
-});
-
-test("deleting a line from the append-only log is rejected", () => {
-  // Union merge keeps both sides' added lines and cannot reconcile an edit, so
-  // an edited or reordered row would be silently duplicated on the next
-  // concurrent append. In a diff, an edit is a deletion.
-  const { write, commit, check } = scratchRepo();
-  write(SOURCE, "export const manifest = 2;\n");
-  write(LOG, "| commit | files | what |\n|---|---|---|\n| `seed` | x | EDITED |\n");
-  commit("rewrite an existing log row");
+  commit("touch vendored source and append to the frozen log");
 
   const result = check();
-  assert.equal(result.ok, false);
-  assert.match(result.reason, /append-only/);
+  assert.equal(result.ok, false, "the frozen log must not be appendable");
+  assert.match(result.reason, /frozen, and this change modifies it/);
+  assert.ok(
+    result.detail.some((line) => line.includes(`${LOG_DIR}/<issue-or-pr>.md`)),
+    "a wrong net diff must be told to relocate the row",
+  );
+  assert.ok(
+    result.detail.some((line) => line.includes("filter-branch")),
+    "and to scrub it from history too -- dropping it from the tip is not enough",
+  );
 });
 
-test("editing a log row is rejected even with no source change", () => {
-  // The append-only rule is unconditional: `merge=union` duplicates a rewritten
-  // row on the next concurrent append whether or not the same PR touched source.
-  const { write, commit, check } = scratchRepo();
-  write(LOG, "| commit | files | what |\n|---|---|---|\n| `seed` | x | EDITED |\n");
-  commit("rewrite an existing log row, nothing else");
-
-  const result = check();
-  assert.equal(result.ok, false);
-  assert.match(result.reason, /append-only/);
-});
-
-test("appending a log row on its own is not itself a change needing a row", () => {
+test("appending a row on its own, with no source change, is still rejected", () => {
+  // The rule is unconditional. A row appended by a PR that changes no vendored
+  // source is still a row master gains, and so is still what the next branch's
+  // rebase replay conflicts against.
   const { write, commit, check } = scratchRepo();
   write(LOG, `${LOG_HEADER}| \`abc\` | - | a note |\n`);
   commit("log append only");
 
-  assert.deepEqual(check(), { ok: true });
+  const result = check();
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /frozen, and this change modifies it/);
+});
+
+test("deleting or editing a line in the frozen log is rejected", () => {
+  // Previously two tests, rejected by an append-only rule for a reason that no
+  // longer applies -- "append new rows at the end" is now wrong advice. The
+  // behaviour is preserved; only the diagnosis changed.
+  for (const [name, seedSource] of [["with a source change", true], ["alone", false]]) {
+    const { write, commit, check } = scratchRepo();
+    if (seedSource) write(SOURCE, "export const manifest = 2;\n");
+    write(LOG, "| commit | files | what |\n|---|---|---|\n| `seed` | x | EDITED |\n");
+    commit(`rewrite an existing log row ${name}`);
+
+    const result = check();
+    assert.equal(result.ok, false, `a rewritten row ${name} must not pass`);
+    assert.match(result.reason, /frozen/);
+  }
+});
+
+test("a log git treats as binary is rejected, not silently passed", () => {
+  // `git diff --numstat` emits `-\t-` for a binary blob. The old guard parsed
+  // those to NaN, which made every numeric comparison false, so it needed an
+  // explicit Number.isFinite check or it passed on exactly the input it existed
+  // to reject. The frozen check tests for the PRESENCE of a diff line instead,
+  // which cannot have that shape -- this pins that the fail-open did not come
+  // back with the counts.
+  const withSource = scratchRepo();
+  withSource.write(SOURCE, "export const manifest = 2;\n");
+  withSource.write(LOG, `${LOG_HEADER}| \`abc\` | job\0manifest.ts | binary now |\n`);
+  withSource.commit("rewrite the log as a binary blob, and touch source");
+
+  const a = withSource.check();
+  assert.equal(a.ok, false);
+  assert.match(a.reason, /frozen/);
+
+  const logOnly = scratchRepo();
+  logOnly.write(LOG, "| commit | files | what |\n|---|---|---|\n| `seed` | x | \0 |\n");
+  logOnly.commit("destructively rewrite the log as a binary blob");
+
+  const b = logOnly.check();
+  assert.equal(b.ok, false, "a binary log must never verify as ok");
+  assert.match(b.reason, /frozen/);
+});
+
+test("adding only whitespace to the frozen log is still touching it", () => {
+  // Was "a blank added line does not satisfy the require-a-row guard", which
+  // pinned a `/^\+\s*\|/` row-shape filter on LOG. That filter is gone with the
+  // row path: LOG can no longer satisfy the guard at all, so the question is
+  // not whether a blank line is a row but whether the file was touched.
+  const { write, commit, check } = scratchRepo();
+  write(SOURCE, "export const manifest = 2;\n");
+  write(LOG, `${LOG_HEADER}\n   \n`);
+  commit("touch vendored source, append only whitespace to the frozen log");
+
+  const result = check();
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /frozen/);
 });
 
 test("changing only the Blockcast-added provenance files needs no row", () => {
@@ -240,48 +295,6 @@ test("changing only the Blockcast-added provenance files needs no row", () => {
   assert.deepEqual(NOT_SOURCE, [`${VENDOR_DIR}/LICENSE`, `${VENDOR_DIR}/PROVENANCE.md`]);
 });
 
-test("a log git treats as binary is rejected, not silently passed", () => {
-  // `git diff --numstat` emits `-\t-` for a binary blob, so both counts parse
-  // to NaN and every comparison against them is false. Without an explicit
-  // non-finite check the guard passes on exactly the input it exists to
-  // reject. A stray NUL from a bad editor or a pasted binary snippet is enough.
-  //
-  // Asserting the *reason* is what makes this a real mutation test: drop the
-  // non-finite check and the destructive rewrite below stops being reported as
-  // an unverifiable file, which is the defect. The no-source-change case is
-  // the pure fail-open -- with the check gone it returns ok:true outright.
-  const withSource = scratchRepo();
-  withSource.write(SOURCE, "export const manifest = 2;\n");
-  withSource.write(LOG, `${LOG_HEADER}| \`abc\` | job\0manifest.ts | binary now |\n`);
-  withSource.commit("rewrite the log as a binary blob, and touch source");
-
-  const a = withSource.check();
-  assert.equal(a.ok, false);
-  assert.match(a.reason, /not a text file/);
-
-  const logOnly = scratchRepo();
-  logOnly.write(LOG, "| commit | files | what |\n|---|---|---|\n| `seed` | x | \0 |\n");
-  logOnly.commit("destructively rewrite the log as a binary blob");
-
-  const b = logOnly.check();
-  assert.equal(b.ok, false, "a binary log must never verify as ok");
-  assert.match(b.reason, /not a text file/);
-});
-
-test("a blank added line does not satisfy the require-a-row guard", () => {
-  // `added > 0` counts lines, and a blank line is a line. Requiring an added
-  // line shaped like a table row keeps the cheapest way to silence the guard
-  // being to actually write the row.
-  const { write, commit, check } = scratchRepo();
-  write(SOURCE, "export const manifest = 2;\n");
-  write(LOG, `${LOG_HEADER}\n   \n`);
-  commit("touch vendored source, append only whitespace");
-
-  const result = check();
-  assert.equal(result.ok, false);
-  assert.match(result.reason, /gained no entry/);
-});
-
 test("a change that does not touch the vendored tree at all passes", () => {
   const { write, commit, check } = scratchRepo();
   write("README.md", "unrelated\n");
@@ -292,19 +305,24 @@ test("a change that does not touch the vendored tree at all passes", () => {
 
 test("commits that landed on the base branch are not attributed to this change", () => {
   // $PR_BASE_SHA is the base branch's *tip*, not the merge base. A two-dot diff
-  // against it reports the base's own log rows as deletions, so an unrelated
-  // append on master would fail every open vendored PR with a bogus
+  // against it reports the base's own entries as deletions, so an unrelated
+  // vendored change on master would fail every open vendored PR with a bogus
   // "append-only" violation. The three-dot range is what prevents that.
+  //
+  // BLO-41101: the vehicle is an entry file, not a LOG row. A LOG row would now
+  // be rejected as a frozen-file change before the three-dot range mattered,
+  // so this test would have passed for the wrong reason and stopped measuring
+  // what it is named for.
   const { dir, git, write, commit, base } = scratchRepo();
 
   git("checkout", "--quiet", "-b", "feature");
   write(SOURCE, "export const manifest = 2;\n");
-  write(LOG, `${LOG_HEADER}| \`fff\` | job-manifest.ts | the PR's own change |\n`);
-  commit("feature work, logged");
+  write(`${LOG_DIR}/blo-feature.md`, "The PR's own change.\n");
+  commit("feature work, recorded");
 
   git("checkout", "--quiet", "master");
-  write(LOG, `${LOG_HEADER}| \`mmm\` | - | landed on master after the branch point |\n`);
-  commit("unrelated master append");
+  write(`${LOG_DIR}/blo-master.md`, "Landed on master after the branch point.\n");
+  commit("unrelated master entry");
   const baseTip = git("rev-parse", "HEAD").trim();
 
   assert.notEqual(baseTip, base, "master must have moved for this test to mean anything");
@@ -320,20 +338,47 @@ test("commits that landed on the base branch are not attributed to this change",
 test("two concurrent realistic vendored changes rebase with no conflict (BLO-35109 AC1)", () => {
   const { dir, git, write, commit, base } = scratchRepo();
 
-  // Branch A: edits one vendored source file and appends its row.
+  // Branch A: edits one vendored source file and records it.
   git("checkout", "--quiet", "-b", "branch-a");
   write(SOURCE, "export const manifest = 2;\n");
-  write(LOG, `${LOG_HEADER}| \`aaa\` | job-manifest.ts | change A |\n`);
+  write(`${LOG_DIR}/change-a.md`, "Change A: bumped the manifest.\n");
   commit("change A");
 
-  // Branch B: edits a different vendored source file and appends its own row.
+  // Branch B: edits a different vendored source file and records its own.
   git("checkout", "--quiet", "-b", "branch-b", base);
   write(SECOND_SOURCE, "export const execute = 2;\n");
-  write(LOG, `${LOG_HEADER}| \`bbb\` | execute.ts | change B |\n`);
+  write(`${LOG_DIR}/change-b.md`, "Change B: bumped execute.\n");
   commit("change B");
 
   // Before BLO-34872 + BLO-35109 this rebase conflicted every time: on the log
   // row, on the 64-hex hash, and on the version line in three files.
+  git("rebase", "branch-a");
+
+  assert.ok(!readFileSync(join(dir, `${LOG_DIR}/change-b.md`), "utf8").includes("<<<<<<<"),
+    "the rebase left conflict markers");
+
+  // And the rebased result still satisfies the guard.
+  assert.equal(checkVendoredProvenanceLog({ base, head: "HEAD", cwd: dir }).ok, true);
+});
+
+test("the union driver still resolves a local rebase of a legacy LOG row (BLO-41101 AC5)", () => {
+  // AC5: `merge=union` is KEPT, so record what it still does. Branches that
+  // already carry a LOG row predate the frozen rule and must stay locally
+  // rebasable; CI is what now rejects them, with a message and a repair.
+  //
+  // This is also the mechanism that hid the bug for six evictions, so it is
+  // pinned deliberately rather than left to chance: the two CONTROL tests below
+  // assert the same driver does NOT save the merge GitHub actually performs.
+  const { dir, git, write, commit, base } = scratchRepo();
+
+  git("checkout", "--quiet", "-b", "branch-a");
+  write(LOG, `${LOG_HEADER}| \`aaa\` | job-manifest.ts | change A |\n`);
+  commit("change A, legacy row");
+
+  git("checkout", "--quiet", "-b", "branch-b", base);
+  write(LOG, `${LOG_HEADER}| \`bbb\` | execute.ts | change B |\n`);
+  commit("change B, legacy row");
+
   git("rebase", "branch-a");
 
   const merged = readFileSync(join(dir, LOG), "utf8");
@@ -341,8 +386,11 @@ test("two concurrent realistic vendored changes rebase with no conflict (BLO-351
   assert.ok(merged.includes("change B"), "union merge dropped branch B's row");
   assert.ok(!merged.includes("<<<<<<<"), "the rebase left conflict markers");
 
-  // And the rebased result still satisfies the guard.
-  assert.equal(checkVendoredProvenanceLog({ base, head: "HEAD", cwd: dir }).ok, true);
+  // And the guard rejects it anyway -- the local clean is exactly the false
+  // reassurance BLO-41101 is about.
+  const result = checkVendoredProvenanceLog({ base, head: "HEAD", cwd: dir });
+  assert.equal(result.ok, false, "a locally-clean rebase must not read as mergeable");
+  assert.match(result.reason, /frozen/);
 });
 
 // --------------------------------------------------------------------------
@@ -460,18 +508,142 @@ test("a vendored source change with a new entry file passes, with no warning", (
   assert.deepEqual(check(), { ok: true });
 });
 
-test("a legacy row still passes, but is warned about", () => {
-  // Transitional on purpose: PRs already in the queue appended to the old file
-  // and must not all be rewritten. The warning is what stops it being the
-  // silent default -- appending there is what reproduces the conflict.
-  const { write, commit, check } = scratchRepo();
+test("a branch whose net diff is clean but whose commits touch LOG is rejected (BLO-41101 AC1)", () => {
+  // THE HEADLINE CASE. #1797: `git diff master -- LOG` empty, the guard said
+  // ok, `merge=union` made every local rebase return clean -- and the REBASE
+  // merge queue replayed the commits one at a time, conflicted on the first one
+  // that touched LOG, and ejected the PR six times in 24 days with zero
+  // merge_group runs to point at.
+  const { dir, git, write, commit, check, base } = scratchRepo();
+
   write(SOURCE, "export const manifest = 2;\n");
-  write(LOG, `${LOG_HEADER}| \`abc\` | job-manifest.ts | bumped the manifest |\n`);
-  commit("touch vendored source, append to the frozen log");
+  write(LOG, `${LOG_HEADER}| \`abc\` | job-manifest.ts | recorded the old way |\n`);
+  commit("record it in the frozen log");
+  const offender = git("rev-parse", "HEAD").trim();
+
+  write(`${LOG_DIR}/blo-1.md`, "Moved the row here instead.\n");
+  write(LOG, LOG_HEADER); // take the row back out: net diff for LOG is now empty
+  commit("move the row to the entry directory");
+
+  // The precondition, asserted rather than assumed: without it this test would
+  // pass on the old net-diff-only guard and prove nothing.
+  assert.equal(
+    git("diff", "--numstat", `${base}...HEAD`, "--", LOG).trim(),
+    "",
+    "the net diff for LOG must be empty, or this is not the case under test",
+  );
 
   const result = check();
-  assert.equal(result.ok, true);
-  assert.match(result.warning ?? "", /frozen/);
+  assert.equal(result.ok, false, "a clean net diff over a LOG-touching history is not mergeable");
+  assert.match(result.reason, /Your net diff leaves it alone/);
+  assert.ok(
+    result.detail.some((line) => line.includes(offender)),
+    `the failure must name the offending commit ${offender}`,
+  );
+  assert.ok(
+    result.detail.some((line) => line.includes("filter-branch")),
+    "and give the one-command repair",
+  );
+  // The repair must pin LOG to the MERGE BASE's blob, not to `base`'s. Measured
+  // on #1797: a tip-pinned rewrite left 1 offending commit of 6 and still
+  // conflicted, because the first rewritten commit's parent is the merge base,
+  // so rewriting LOG to master's blob is itself a modification.
+  assert.ok(
+    result.detail.some((line) => line.includes("merge-base")),
+    "the repair must pin to the merge base's blob, or it leaves an offending commit behind",
+  );
+  // AC4: this message is the history repair, not the relocate-your-row one.
+  assert.ok(
+    !result.detail.some((line) => line.includes(`${LOG_DIR}/<issue-or-pr>.md`)),
+    "a clean net diff must not be told to relocate a row it does not have",
+  );
+});
+
+test("a commit that landed on master is not reported as this branch's offender (BLO-41101)", () => {
+  // Two dots, not three. For rev-list `base...head` is a SYMMETRIC DIFFERENCE,
+  // so it pulls in master's own LOG commits -- measured, 3 commits instead of
+  // 2 -- and blames this branch for rows it did not write. That would fail
+  // every open vendored PR the moment master gained a row.
+  const { dir, git, write, commit, base } = scratchRepo();
+
+  git("checkout", "--quiet", "-b", "feature");
+  write(SOURCE, "export const manifest = 2;\n");
+  write(`${LOG_DIR}/blo-1.md`, "Recorded properly.\n");
+  commit("feature work, recorded in the entry directory");
+
+  git("checkout", "--quiet", "master");
+  write(LOG, `${LOG_HEADER}| \`mmm\` | - | a legacy row that landed on master |\n`);
+  commit("master appends to the frozen log");
+  const baseTip = git("rev-parse", "HEAD").trim();
+  assert.notEqual(baseTip, base, "master must have moved for this test to mean anything");
+
+  git("checkout", "--quiet", "feature");
+  assert.equal(
+    checkVendoredProvenanceLog({ base: baseTip, head: "HEAD", cwd: dir }).ok,
+    true,
+    "master's own LOG commit must not be attributed to this branch",
+  );
+});
+
+test("a LOG commit hidden behind a merge that discards it is still found (BLO-41101)", () => {
+  // --full-history. Default history simplification walks ONE parent of a merge:
+  // when the merge's tree is TREESAME to the mainline parent -- which is what a
+  // merge that discards the side's LOG change produces -- the side commit is
+  // pruned and rev-list returns nothing at all. Measured: 0 commits plain, 0
+  // with --no-merges alone, 1 with --full-history. A rebase still replays that
+  // commit, so the branch is still un-stageable; without the flag the guard is
+  // a complete fail-open on this shape, and the net diff is empty too.
+  const { dir, git, write, commit, check, base } = scratchRepo();
+
+  write(SOURCE, "export const manifest = 2;\n");
+  write(`${LOG_DIR}/blo-1.md`, "Recorded properly.\n");
+  commit("feature work, recorded the supported way");
+
+  git("checkout", "--quiet", "-b", "side");
+  write(LOG, `${LOG_HEADER}| \`sss\` | - | a row added on a side branch |\n`);
+  commit("side branch touches the frozen log");
+  const offender = git("rev-parse", "HEAD").trim();
+
+  git("checkout", "--quiet", "master");
+  git("merge", "--quiet", "--no-ff", "side", "-m", "merge side");
+  // Discard the side's LOG change in the merge, so the merge tree is TREESAME
+  // to the mainline parent and the net diff for LOG comes back empty.
+  git("checkout", base, "--", LOG);
+  git("commit", "--quiet", "-a", "--amend", "--no-edit");
+  const mergeCommit = git("rev-parse", "HEAD").trim();
+
+  assert.equal(
+    git("diff", "--numstat", `${base}...HEAD`, "--", LOG).trim(),
+    "",
+    "the net diff for LOG must be empty, or this is not the case under test",
+  );
+
+  const result = check();
+  assert.equal(result.ok, false, "a LOG commit behind a discarding merge is still replayed");
+  assert.ok(
+    result.detail.some((line) => line.includes(offender)),
+    `the failure must name the pruned commit ${offender}`,
+  );
+  // --no-merges. A rebase replays non-merge commits only, so listing the merge
+  // itself sends the author to a commit that is not the problem. Measured: 2
+  // SHAs listed without the flag, 1 with. Asserting the offender is PRESENT
+  // cannot catch that -- only asserting the merge is ABSENT can.
+  assert.ok(
+    !result.detail.some((line) => line.includes(mergeCommit)),
+    "a merge commit is not replayed by a rebase and must not be named as an offender",
+  );
+});
+
+test("a change adding only an entry file passes (BLO-41101 AC3 true-negative)", () => {
+  // The control that stops the guard becoming "any vendored PR fails". Without
+  // it, a frozen check that over-matched -- on the directory, on a path prefix,
+  // on the whole vendored tree -- would look like a working guard.
+  const { write, commit, check } = scratchRepo();
+  write(SOURCE, "export const manifest = 2;\n");
+  write(`${LOG_DIR}/blo-41101.md`, "Bumped the manifest.\n");
+  commit("touch vendored source and record it the supported way");
+
+  assert.deepEqual(check(), { ok: true });
 });
 
 test("the entry directory's README does not satisfy the guard", () => {
