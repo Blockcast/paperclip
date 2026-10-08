@@ -343,7 +343,12 @@ function scanWebhookGithubCallSites(routesDir: string, servicesDir: string) {
     // spellings in the tree bind the real helper as the fallback — an inline
     // `(config.x ?? githubY)({…})`, and a named `const alias = config.x ?? githubY;`
     // called later — so accept the inline form and resolve the alias by name.
-    const aliases = [...source.matchAll(/\bconst (\w+) = (?:[\w.]+ \?\? )?(github\w+);/g)]
+    // Whitespace is \s rather than a literal space and the terminator is a
+    // lookahead rather than a required `;`, so a prettier wrap or a missing
+    // semicolon cannot silently drop an alias and take its call sites out of
+    // the scan with it. The lookahead is what keeps `const prUrl = githubPrUrl(`
+    // — a call, not an alias — from being read as one.
+    const aliases = [...source.matchAll(/\bconst (\w+) =\s*(?:[\w.]+\s*\?\?\s*)?(github\w+)(?![\w(])/g)]
       .filter((match) => boundable.has(match[2] ?? ""))
       .map((match) => match[1] ?? "");
     const callPattern = new RegExp(`\\b(${[...boundable, ...aliases].join("|")})\\)?\\s*\\(`, "g");
@@ -393,6 +398,18 @@ describe("every GitHub read on a request-blocking webhook path is bounded (BLO-4
   });
 
   it("is non-vacuous: the same scan over a directory with no webhook routes fails rather than passing", () => {
+    // The control only controls for anything while the directory stays out of
+    // scope, and it would go quietly vacuous the day a file there matched —
+    // the scan would then have routes to walk and could throw for the wrong
+    // reason, or stop throwing at all. Pinned against BOTH arms of the route
+    // rule, not just the filename: signature verification is exactly the kind
+    // of thing that lands in middleware/.
+    const inScope = readdirSync(NO_WEBHOOK_DIR).filter(
+      (f) =>
+        f.endsWith(".ts") &&
+        (f.includes("webhook") || /x-hub-signature-256/i.test(readFileSync(join(NO_WEBHOOK_DIR, f), "utf8"))),
+    );
+    expect(inScope).toEqual([]);
     expect(() => assertWebhookGithubCallsAreBounded(NO_WEBHOOK_DIR, SERVICES_DIR)).toThrow(
       /scan matched no signal-accepting GitHub call sites/,
     );
