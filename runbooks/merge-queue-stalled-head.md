@@ -748,12 +748,10 @@ step 3's 150 min threshold is **~2.8×**, not the ~180× an earlier revision
 claimed off the min-of-N method, and not the 1.3× the revision before that
 claimed off `run_started_at`.
 
-⚠ **The "≥ 10 min" floor below is re-derived, and it is no longer justified
-by "far outside anything observed".** p90 per-job wait is 23 min, so 10 min of
-*job* wait is ordinary. The floor still holds because it measures a different
-quantity: a whole run sitting `queued` with **no job started at all**, which
-is distinct from one job queueing behind a busy pool. Read it as "nothing has
-started", not "something is slow".
+⚠ **The floor for a row here is a whole run sitting `queued` ≥ 10 min with
+no job started at all.** Read it as "nothing has started", not "something is
+slow" — p90 per-job wait is 23 min, so 10 min of *job* wait is ordinary and
+the old "far outside anything observed" justification no longer applies.
 
 ☠️ **150 min is a dequeue-decision threshold and is NOT the ARC eviction
 threshold.** The two are unrelated numbers and the eviction threshold has
