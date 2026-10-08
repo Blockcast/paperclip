@@ -102,6 +102,7 @@ function multiDispositionReview(headSha: string, priorHeadSha: string, verbs: st
 describe("evaluateCommentReviewGate", () => {
   it("fails the #1022 shape: an Ally comment finding for the current head", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [allyComment(blockingReview(CURRENT_HEAD), "2026-08-04T20:09:19Z")],
     });
@@ -114,6 +115,7 @@ describe("evaluateCommentReviewGate", () => {
 
   it("lets a later clean review of the same head clear an earlier finding", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(CURRENT_HEAD), "2026-08-04T20:09:19Z"),
@@ -126,6 +128,7 @@ describe("evaluateCommentReviewGate", () => {
 
   it("carries an undispositioned finding forward across a replacement head", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
     });
@@ -153,6 +156,7 @@ describe("evaluateCommentReviewGate", () => {
 
   it("does not carry forward when the newest attestation of an earlier head is clean", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -165,6 +169,7 @@ describe("evaluateCommentReviewGate", () => {
 
   it("keeps carrying a finding when the clean review attests a different head", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -185,6 +190,7 @@ describe("evaluateCommentReviewGate", () => {
 
   it("carries the newest of several undispositioned heads", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -200,6 +206,7 @@ describe("evaluateCommentReviewGate", () => {
 
   it("still clears when every attested head was re-reviewed clean", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -259,6 +266,7 @@ describe("evaluateCommentReviewGate", () => {
     // evidence a merely-clean review of an unrelated head lacks. Without this,
     // #362 sat red on a finding its own reviewer had already closed.
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -274,6 +282,7 @@ describe("evaluateCommentReviewGate", () => {
     // guard treats it as a blocking verdict (I2c). Reading the ledger without
     // reading the verb would invert its meaning.
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -294,6 +303,7 @@ describe("evaluateCommentReviewGate", () => {
     // Fail closed on vocabulary we have not seen: a new word in Ally's ledger
     // must not silently unblock a merge before anyone decides that it should.
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -396,6 +406,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: null,
       comments: [allyComment(body, "2026-08-04T21:09:19Z")],
     });
 
@@ -408,6 +419,7 @@ describe("evaluateCommentReviewGate", () => {
     // is reported, not enforced.
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: null,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
         allyComment(
@@ -435,6 +447,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
+      prAuthorLogin: null,
       comments: [
         allyComment(twoFindings, "2026-08-04T20:09:19Z"),
         allyComment(
@@ -452,6 +465,7 @@ describe("evaluateCommentReviewGate", () => {
     // fact. A ledger entry can only speak to findings that existed when it was
     // written.
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), "2026-08-04T20:09:19Z"),
@@ -473,6 +487,7 @@ describe("evaluateCommentReviewGate", () => {
     const suffixMatchHead = `eeeeeee${"d4d4d4d"}${"f".repeat(26)}`;
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(suffixMatchHead), "2026-08-04T20:09:19Z"),
@@ -508,6 +523,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(twoFindings, "2026-08-04T20:09:19Z"),
@@ -537,6 +553,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(twoFindings, "2026-08-04T20:09:19Z"),
@@ -563,6 +580,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(uncounted, "2026-08-04T20:09:19Z"),
@@ -579,6 +597,7 @@ describe("evaluateCommentReviewGate", () => {
     // implying anything changed. Observed in Blockcast/onprem-k8s#2881,
     // Blockcast/paperclip#1126 and Blockcast/go-amt#93.
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -610,6 +629,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(twoFindings, "2026-08-04T20:09:19Z"),
@@ -630,6 +650,7 @@ describe("evaluateCommentReviewGate", () => {
     // a genuinely open finding. The missing `no-longer-applicable` verb was
     // expensive to diagnose for exactly this reason.
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -807,6 +828,7 @@ describe("evaluateCommentReviewGate", () => {
     const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
     const verdictFor = (severityKey: string) =>
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [
           allyComment(
@@ -873,6 +895,7 @@ describe("evaluateCommentReviewGate", () => {
 
     const carriedFor = (verb: string) =>
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [
           allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -947,6 +970,7 @@ describe("evaluateCommentReviewGate", () => {
 
   it("keeps the ordinary reason when no unrecognized verb is involved", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
     });
@@ -974,6 +998,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [allyComment(twoFindings, "2026-08-04T20:09:19Z"), allyComment(ledger, "2026-08-04T21:09:19Z")],
     });
@@ -988,6 +1013,7 @@ describe("evaluateCommentReviewGate", () => {
     // branch exists to fix, so pin the budget with a maximal verb.
     const longVerb = "superseded-by-a-later-architectural-decision-recorded-elsewhere";
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -1014,6 +1040,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -1046,6 +1073,7 @@ describe("evaluateCommentReviewGate", () => {
     ]);
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z"),
@@ -1060,7 +1088,7 @@ describe("evaluateCommentReviewGate", () => {
   });
 
   it("reports not_evaluated rather than clean when nothing attests the head", () => {
-    const verdict = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
+    const verdict = evaluateCommentReviewGate({ prAuthorLogin: null, headSha: CURRENT_HEAD, comments: [] });
 
     // A green status must not be mistakable for review evidence. Under a
     // review/-prefixed context that reading is false (BLO-29711).
@@ -1082,6 +1110,7 @@ describe("evaluateCommentReviewGate", () => {
 
   it("requires the configured GitHub App identity, not a same-shaped contributor comment", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         {
@@ -1097,6 +1126,7 @@ describe("evaluateCommentReviewGate", () => {
 
   it("requires one unambiguous exact-head attestation", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(
@@ -1118,6 +1148,7 @@ describe("evaluateCommentReviewGate", () => {
 
   it("uses comment chronology rather than contributor-controlled commit metadata", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [allyComment(blockingReview(CURRENT_HEAD), "2020-01-01T00:00:00Z")],
     });
@@ -1258,10 +1289,16 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
 
     expect(selfAttested).toMatchObject({ state: "failure", outcome: "carried_finding" });
     expect(commentReviewGateCheckConclusion(selfAttested)).toBe("failure");
-    expect(authorUnknown).toMatchObject({ state: "failure", outcome: "carried_finding" });
-    expect(authorUnknown.authorUnknown).toBe(true);
+    expect(authorUnknown).toMatchObject({
+      state: "failure",
+      outcome: "carried_finding",
+      authorUnknown: true,
+    });
     // The settled verdict must NOT re-request the author: it would loop.
-    expect(selfAttested.authorUnknown).toBeUndefined();
+    // `authorUnknown` is conditionally spread, so absence -- not an undefined
+    // value -- is the contract; assert absence rather than `toBeUndefined`,
+    // which would also pass on a present-but-undefined property.
+    expect(selfAttested).not.toHaveProperty("authorUnknown");
 
     // The red must not tell the author "no comment attests the current head":
     // on both these routes one does, and the action that sentence invites is
@@ -1344,9 +1381,9 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * discriminator exists yet.
  *
  * `prAuthorLogin` is INERT on the path both fixtures exercise, and that is
- * deliberate rather than an oversight: `evaluateCommentReviewGate` reads it
- * only inside the `if (forHead)` branch (`pr-comment-review-gate.ts:399`,
- * `:412`), and neither fixture attests CURRENT_HEAD, so control reaches
+ * deliberate rather than an oversight: it is read only inside the
+ * `if (forHead)` branch of `evaluateCommentReviewGate`, and neither fixture
+ * attests CURRENT_HEAD, so control reaches
  * `headsWithUndispositionedFinding(comments, reviewerBotLogin)` — which takes
  * no author argument at all. Setting it here encodes the assumption these
  * fixtures exist to fence: it becomes load-bearing only once a fix threads an
@@ -1365,9 +1402,9 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * load-bearing: the pre-existing retirement test above feeds the same two
  * comments and asserts the stronger `{ state: "success", outcome:
  * "not_evaluated" }`, so it catches an unconditional ledger exclusion — but
- * it passes no `prAuthorLogin`, so it does NOT catch the author-threaded form
- * a fix actually reaches for. Only the witness below does; see the per-mutant
- * counts next.
+ * it passes `prAuthorLogin: null`, which no comment author can equal, so it
+ * does NOT catch an author-threaded form that credits an unknown author as
+ * independent. Only the witness below does; see the per-mutant counts next.
  *
  * WHAT EACH FIXTURE ACTUALLY DETECTS, because "runtime-identical to an
  * existing test" and "detects nothing new" are NOT the same claim and the
@@ -1378,9 +1415,22 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
  * `carriedFromHeadSha` too), the witness to "lets a later review's ledger
  * disposition a finding from a head it replaced", down to the same two
  * comments and timestamps. But a mutant that READS the author is exactly
- * where they stop being identical, because those pre-existing twins pass no
- * `prAuthorLogin` at all, so an author-reading exclusion never fires on them.
- * Measured at this head (113 tests), one mutation per run:
+ * where they stop being identical, because those pre-existing twins pass
+ * `prAuthorLogin: null` while both fixtures here pass `ALLY_BOT_LOGIN`, and an
+ * author-reading exclusion can only fire on a login a comment author actually
+ * carries, never on `null`, PROVIDED the exclusion credits an unknown author as
+ * independent. That distinction, not the mere presence of the argument, is
+ * what the counts below rest on: the twins carried no argument at all when
+ * these counts were taken, and BLO-38582 later gave them the explicit `null`,
+ * which is inert at the same sites for the same reason. The fail-closed form
+ * the attestation path already uses (the `!prAuthorLogin` arm of
+ * `evaluateCommentReviewGate`, `authorUnknown: true`) treats `null` as
+ * self-attested instead, so it would fire on the twins too and a run taken
+ * under it shows the witness red alongside them. That does not make the
+ * witness redundant: the credits-unknown form still reaches it alone. The
+ * counts below are for the credits-unknown form. Measured at the BLO-34389
+ * head that wrote this block (113 tests there; vitest reports 151 for this
+ * file at BLO-38582's head), one mutation per run:
  *
  *   placement (1), always-exclude   24 fail — incl. this block's first; the
  *                                   pre-existing twin catches it too
@@ -1460,6 +1510,7 @@ describe("evaluateCommentReviewGate — quoted review bodies", () => {
 
   it("does not let a fenced paste of a clean review attest the head", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [allyComment(fenced(cleanReview(CURRENT_HEAD)), "2026-09-05T00:00:00Z")],
     });
@@ -1471,6 +1522,7 @@ describe("evaluateCommentReviewGate — quoted review bodies", () => {
 
   it("does not let a fenced paste of a finding redden a head Ally never reviewed", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [allyComment(fenced(blockingReview(CURRENT_HEAD), "markdown"), "2026-09-05T00:00:00Z")],
     });
@@ -1480,6 +1532,7 @@ describe("evaluateCommentReviewGate — quoted review bodies", () => {
 
   it("does not let a quoted ledger entry retire a live finding", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-09-05T00:00:00Z"),
@@ -1503,6 +1556,7 @@ describe("evaluateCommentReviewGate — quoted review bodies", () => {
     ]);
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [allyComment(withSuggestion, "2026-09-05T00:00:00Z")],
     });
@@ -1555,6 +1609,7 @@ describe("evaluateCommentReviewGate — quoted review bodies", () => {
     ]);
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(swallowed, "2026-09-05T00:00:00Z"),
@@ -1580,6 +1635,7 @@ describe("evaluateCommentReviewGate — quoted review bodies", () => {
     expect(extractAllyPriorFindingDispositions(quotesLedgerByIndent)).toEqual([]);
 
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: INTERMEDIATE_HEAD,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-09-05T00:00:00Z"),
@@ -1611,6 +1667,7 @@ describe("evaluateCommentReviewGate — quoted review bodies", () => {
     expect(extractAllyReviewedHeadSha(indented)).toBeNull();
     expect(
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [allyComment(indented, "2026-09-05T00:00:00Z")],
       }),
@@ -1942,17 +1999,19 @@ describe("retired context supersede", () => {
 });
 
 describe("commentReviewGateCheckConclusion", () => {
-  const notEvaluated = evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: [] });
+  const notEvaluated = evaluateCommentReviewGate({ prAuthorLogin: null, headSha: CURRENT_HEAD, comments: [] });
   const clean = evaluateCommentReviewGate({
     headSha: CURRENT_HEAD,
     prAuthorLogin: DISTINCT_PR_AUTHOR,
     comments: [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")],
   });
   const blocking = evaluateCommentReviewGate({
+    prAuthorLogin: null,
     headSha: CURRENT_HEAD,
     comments: [allyComment(blockingReview(CURRENT_HEAD), "2026-08-04T20:09:19Z")],
   });
   const carried = evaluateCommentReviewGate({
+    prAuthorLogin: null,
     headSha: CURRENT_HEAD,
     comments: [allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z")],
   });
@@ -1997,14 +2056,16 @@ describe("commentReviewGateCheckConclusion", () => {
   it("covers every not-established shape, not just the empty-comment one", () => {
     const cases = [
       // No head supplied to evaluate against.
-      evaluateCommentReviewGate({ headSha: "", comments: [] }),
+      evaluateCommentReviewGate({ prAuthorLogin: null, headSha: "", comments: [] }),
       // An Ally review that attests some other head.
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [allyComment(cleanReview(INTERMEDIATE_HEAD), "2026-08-04T21:09:19Z")],
       }),
       // A clean review of this head from someone who is not the reviewer.
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [
           { authorLogin: "someone-else", body: cleanReview(CURRENT_HEAD), createdAt: "2026-08-04T21:09:19Z" },
@@ -2304,6 +2365,7 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     // This is the assertion that would have caught the regression.
     expect(
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [allyComment(blockCarryingStillPresent(CURRENT_HEAD, "still-present"), "2026-08-04T21:09:19Z")],
       }),
@@ -2327,7 +2389,9 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
   // template mandates emitting both the block and the prose ledger, which is
   // exactly how the two come to disagree on this field. Found by Ally in
   // review of #1721 at 1d6f3785.
-  const proseLedgerAgainstBlock = (verb: string, dispositions?: unknown[]) =>
+  // `readonly unknown[]`, not `unknown[]`: the table below is `as const`, and
+  // this only reads the value into JSON.stringify.
+  const proseLedgerAgainstBlock = (verb: string, dispositions?: readonly unknown[]) =>
     [
       "## Ally — Consolidated PR Review",
       "",
@@ -2368,6 +2432,7 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     // route, which is how this family of fail-opens has escaped every time.
     expect(
       evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [allyComment(proseLedgerAgainstBlock("still-present", []), "2026-08-04T21:09:19Z")],
       }),
@@ -2451,6 +2516,7 @@ describe("clean-review precedence over the Recommended Action prose fallback", (
     // the existing still-present test in this file attests INTERMEDIATE_HEAD
     // and therefore exercises the carry-forward path instead.
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: CURRENT_HEAD,
       comments: [
         allyComment(
@@ -2638,7 +2704,7 @@ describe("equal-timestamp ties resolve to the conservative verdict", () => {
     ];
 
     for (const order of [comments, [...comments].reverse()]) {
-      expect(evaluateCommentReviewGate({ headSha: CURRENT_HEAD, comments: order })).toMatchObject({
+      expect(evaluateCommentReviewGate({ prAuthorLogin: null, headSha: CURRENT_HEAD, comments: order })).toMatchObject({
         state: "success",
         outcome: "not_evaluated",
       });
