@@ -431,13 +431,45 @@ an alert that will be dropped identically every time. A non-string
 | Severity | Priority |
 |----------|----------|
 | critical | critical |
-| warning  | high     |
+| page     | critical |
+| warning  | medium   |
 | info     | medium   |
+| ticket   | low      |
 | (other)  | medium   |
 
 `info` remains explicit for compatibility, but the firing creation floor runs
 first, so it creates no new issue. Accepted `critical`, `warning`, and custom
 severities continue through this mapping.
+
+`warning → medium` is deliberate and is the BLO-20576 change. `warning` is the
+fleet's dominant severity — 698 of 993 post-ship issues — and 84.6% of its
+aged cohort auto-cancelled when the alert cleared on its own, against 76.0%
+for `critical`. A band that is mostly self-resolving and accounts for 70% of
+volume cannot also be the second-highest priority without debasing the scale
+for every other source: at the time BLO-20576 was filed this one plugin held
+51 open `critical` and zero `medium`/`low`. `medium` keeps the issue
+dispatchable and inbox-visible; `low` would not, because a `low` row falls off
+the 500-row inbox page on a deep lane (BLO-39015).
+
+Two overrides, in precedence order:
+
+1. **`paperclip_priority` alert label** — per-rule escape hatch. A rule whose
+   warnings genuinely are not self-resolving declares that on itself, next to
+   its own `severity`, instead of dragging the whole band up:
+
+   ```yaml
+   - alert: CephFsCapacityCritical
+     labels:
+       severity: warning
+       paperclip_priority: high
+   ```
+
+   The value is validated against `critical`/`high`/`medium`/`low`
+   (case-insensitive, trimmed). Anything else is ignored and the severity map
+   applies — an unrecognised value must not reach `issues.create` and fail the
+   whole delivery, and a `PrometheusRule` is not a trusted enough surface to
+   pass straight through to the API.
+2. **`config.severityToPriority`** — operator-wide remap of a severity.
 
 ### Aggregate creation identity
 
@@ -458,12 +490,56 @@ point at an older terminal issue rebind to the current active aggregate winner.
 
 ### Channel precision policy
 
-The target is at least 70% actionable issues, measured as a 14-day cancellation
-rate at or below 30%. The pre-change baseline from
-[BLO-20576](/BLO/issues/BLO-20576) is 73.6% cancelled. If the first 14-day
-cohort remains above 36.8% cancelled, opt the noisiest rules out with
-`paperclip_issue: "false"`, recalibrate their thresholds and dedupe domains,
-and require a replay before restoring issue creation.
+**Cancellation rate is not the precision metric. Do not use it.** The resolve
+path writes `status: "cancelled"` whenever `autoCloseOnResolve` is left at its
+default `true` (`webhook-handler.ts`, `constants.ts`), so *every alert that
+fires and then clears normally produces a cancelled issue*. "Cancellation
+rate" is approximately "fraction of alerts that self-resolved", and no healthy
+channel drives it below the 73.6% baseline BLO-20576 was filed against —
+measured over the 14 days to 2026-10-08 it was **96.5% of terminal rows while
+the channel demonstrably improved**. The threshold originally written here was
+unfalsifiable; this replaces it.
+
+**Intended precision, and the three measures that can actually move:**
+
+1. **Ownership — target 100%, currently met.** Zero issues created with no
+   agent and no user owner. Last ownerless row was 2026-09-11; the fail-closed
+   fallback in `owner-resolver.ts` is what holds this. A regression here is a
+   defect, not noise: an unassigned `todo` has no wake path at all.
+2. **Priority distribution — target: `critical` + `high` below 50% of created
+   rows.** Was 100% at filing, 90.1% in September. This is the measure the
+   `warning → medium` change targets; on the September mix it moves ~70% of
+   volume out of `high`. `critical` stays reserved for `severity: critical`
+   and `severity: page`.
+3. **Creation volume per continuously-firing series — target: flat.** An alert
+   firing for a week should hold one issue, not seven. Dedupe by aggregate key
+   and fingerprint is what holds this; a rise means dedupe is leaking, which
+   is a plugin bug.
+
+**What we do when precision is missed.** Each measure has a different owner
+and a different remedy, and conflating them is what produced two years of
+"the alerting is too noisy" with nothing actionable attached:
+
+- Ownership regressions and volume-per-series regressions are **plugin bugs**.
+  File against this package.
+- A priority distribution that stays top-heavy after this change is an
+  **alert-rule labelling problem**, not a plugin problem — the plugin files
+  what the rule declares. The remedy is re-labelling the offending rules at
+  source, or opting them out with `paperclip_issue: "false"`. The eight rules
+  that produced 156 of the 302 cancelled `warning → high` rows in the
+  2026-10-04 cohort (`AlloyWedgeHealerJobFailed`, `PodPodInitializingStuck`,
+  `HeadscaleRouteStateDrift`, `HarborPinGuardJobFailed`,
+  `PodContainerCreatingStuck`, `CephFsMountUnhealthy`,
+  `PaperclipControlPlaneContainerRestarted`,
+  `PaperclipApiOldestMissingCommitAge`) are self-healing conditions; a
+  `*JobFailed` alert for a healer that retries and succeeds should not file an
+  issue at all.
+- **A self-resolving condition should auto-resolve and never become an
+  issue.** BLO-20576 named this as "legitimate and probably better" and the
+  data supports it for exactly that class. The mechanism already exists
+  (`paperclip_issue: "false"` plus the `info` floor); what is missing is its
+  application to those rules, which is rule config and lives with the owning
+  team, not here.
 
 ### Observability drill-in links
 

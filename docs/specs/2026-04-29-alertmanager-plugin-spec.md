@@ -218,6 +218,12 @@ const manifest: PaperclipPluginManifestV1 = {
       severityToPriority: {
         type: "object",
         title: "severity → priority map",
+        // Superseded. The live default is DEFAULT_SEVERITY_TO_PRIORITY in
+        // packages/plugins/paperclip-plugin-alertmanager/src/constants.ts:
+        // `page` and `ticket` were added (BLO-27018) and `warning` moved
+        // high → medium (BLO-20576). See the plugin README, "Severity →
+        // priority defaults", for the reasoning and the per-rule
+        // `paperclip_priority` escape hatch.
         default: { critical: "critical", warning: "high", info: "medium" },
         additionalProperties: {
           type: "string",
