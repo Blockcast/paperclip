@@ -196,7 +196,66 @@ const COMMAND_POSITION_WRAPPERS = [
   "strace",
   "ltrace",
   "parallel",
+  // Remote, container and namespace executors: the later word runs somewhere
+  // else, but its output still lands in this transcript (Ally I1 on PR #2332:
+  // all of these were blocked before BLO-40805 narrowed the scan).
+  "ssh",
+  "docker",
+  "podman",
+  "kubectl",
+  "nsenter",
+  "unshare",
+  "setpriv",
+  "runcon",
+  "pkexec",
+  "setarch",
+  "taskset",
+  "chrt",
+  "systemd-run",
+  "proot",
+  "capsh",
+  // Interpreters whose quoted program can shell out (`awk 'BEGIN{system("env")}'`,
+  // `perl -e 'system("env")'`). Listing them re-enables the quoted-payload
+  // re-lex for them; their unquoted arguments stay data as before.
+  "awk",
+  "gawk",
+  "mawk",
+  "perl",
+  // Deliberately NOT listed: git. `git -c x=y env` looks up a `git-env`
+  // subcommand that does not exist and dumps nothing, while listing git would
+  // re-block `git grep env` and `git log --grep env` -- the false positive
+  // BLO-40805 exists to remove.
 ];
+
+/**
+ * Programs that execute what arrives on their STDIN as a script. A heredoc
+ * body is data to `cat`/`tee`, but it is the PROGRAM to `bash <<'EOF'`,
+ * `sh -s`, `ssh host <<'EOF'` (the remote login shell reads stdin) and
+ * `make -f -`. A quoted delimiter only suppresses expansion; it does not stop
+ * the consumer executing the body (Ally C1 on PR #2332).
+ */
+const HEREDOC_SCRIPT_CONSUMERS = [...SHELL_BASENAMES, "ssh", "make", "gmake"];
+
+/**
+ * Whether a simple command executes its stdin. True when its leading program
+ * (after `NAME=value` assignments) is a script consumer, or when it is a
+ * command-position wrapper that goes on to launch one (`sudo bash`,
+ * `timeout 5 sh -s`, `docker exec -i c sh`). `sudo tee /etc/f` and
+ * `cat <<'EOF'` stay data. A later word that merely names a shell
+ * (`bash script.sh <<'EOF'`) reads as executing -- the conservative side.
+ */
+function runsStdinAsScript(words: string[]): boolean {
+  let i = 0;
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i] as string)) i += 1;
+  if (i >= words.length) return false;
+  const lead = basename(words[i] as string);
+  if (HEREDOC_SCRIPT_CONSUMERS.indexOf(lead) !== -1) return true;
+  if (COMMAND_POSITION_WRAPPERS.indexOf(lead) === -1) return false;
+  for (let j = i + 1; j < words.length; j += 1) {
+    if (HEREDOC_SCRIPT_CONSUMERS.indexOf(basename(words[j] as string)) !== -1) return true;
+  }
+  return false;
+}
 
 type LexedCommand = string[];
 
@@ -213,10 +272,13 @@ interface LexResult {
    */
   redirections: string[];
   /**
-   * Bodies of heredocs whose delimiter was UNQUOTED (`<<EOF`), so the shell
-   * interpolates them. Kept apart from `commands` because the shell never
-   * executes a heredoc body's words — only its substitutions run — and apart
-   * from quoted heredocs (`<<'EOF'`), which are inert and are dropped entirely.
+   * Bodies of heredocs whose delimiter was UNQUOTED (`<<EOF`) and whose
+   * consumer treats them as data, so only the shell's interpolation runs.
+   * Kept apart from `commands` because the shell never executes a heredoc
+   * body's words — only its substitutions run — and apart from quoted heredocs
+   * (`<<'EOF'`) fed to data consumers, which are inert and dropped entirely.
+   * A body fed to a script consumer (`bash <<'EOF'`, `cat <<'EOF' | sh`) is
+   * neither: it is a program, and goes to `nested` whatever its delimiter.
    */
   heredocs: string[];
 }
@@ -237,8 +299,12 @@ function lexShell(input: string): LexResult {
   const nested: string[] = [];
   const redirections: string[] = [];
   const heredocs: string[] = [];
-  const pendingHeredocs: { delimiter: string; expanded: boolean }[] = [];
+  const pendingHeredocs: { delimiter: string; expanded: boolean; line: string[][]; from: number }[] = [];
   let words: string[] = [];
+  // The simple commands of the pipeline being lexed, each as the SAME array
+  // `words` is filled into, so a heredoc can see the commands its body reaches:
+  // its own and every later stage of the pipe (`cat <<'EOF' | bash`).
+  let pipeline: string[][] = [words];
   let cur: string | null = null;
   let curQuoted = false;
   let i = 0;
@@ -271,10 +337,12 @@ function lexShell(input: string): LexResult {
     cur = null;
     curQuoted = false;
   };
-  const endCommand = (): void => {
+  const endCommand = (pipe = false): void => {
     endWord();
     if (words.length) commands.push(words);
     words = [];
+    if (pipe) pipeline.push(words);
+    else pipeline = [words];
   };
 
   /** Reads `$(...)`, a backtick pair, `${...}` or `$NAME`, recording bodies to re-analyse. */
@@ -371,7 +439,9 @@ function lexShell(input: string): LexResult {
         delimiter += c;
         j += 1;
       }
-      if (delimiter) pendingHeredocs.push({ delimiter, expanded });
+      // `pipeline` keeps growing while this command line's pipe continues, so
+      // the slice from the owning command on is every stage the body reaches.
+      if (delimiter) pendingHeredocs.push({ delimiter, expanded, line: pipeline, from: pipeline.length - 1 });
       return j;
     }
     while (j < n && (input[j] === " " || input[j] === "\t")) j += 1;
@@ -397,13 +467,15 @@ function lexShell(input: string): LexResult {
 
   /**
    * Consumes every pending heredoc body, starting just after the newline that
-   * ended the command line. A quoted delimiter means the body is inert data and
-   * is dropped; an unquoted one is kept for substitution-only analysis.
+   * ended the command line. A body that reaches a script consumer is a program
+   * and is scanned as commands, whatever its delimiter. Otherwise it is data:
+   * a quoted delimiter drops it, an unquoted one keeps it for
+   * substitution-only analysis.
    */
   const consumeHeredocBodies = (start: number): number => {
     let j = start;
     while (pendingHeredocs.length) {
-      const pending = pendingHeredocs.shift() as { delimiter: string; expanded: boolean };
+      const pending = pendingHeredocs.shift() as { delimiter: string; expanded: boolean; line: string[][]; from: number };
       let body = "";
       while (j < n) {
         let eol = input.indexOf("\n", j);
@@ -414,7 +486,8 @@ function lexShell(input: string): LexResult {
         if (line.trim() === pending.delimiter) break;
         body += `${line}\n`;
       }
-      if (pending.expanded && body) heredocs.push(body);
+      if (body && pending.line.slice(pending.from).some(runsStdinAsScript)) nested.push(body);
+      else if (pending.expanded && body) heredocs.push(body);
     }
     return j;
   };
@@ -511,8 +584,9 @@ function lexShell(input: string): LexResult {
       continue;
     }
     if (ch === "|") {
-      endCommand();
-      i += input[i + 1] === "|" ? 2 : 1;
+      const orOperator = input[i + 1] === "|";
+      endCommand(!orOperator);
+      i += orOperator ? 2 : 1;
       continue;
     }
     if (ch === ";" || ch === "(" || ch === ")") {
@@ -763,7 +837,27 @@ const COMMAND_POSITION_WRAPPERS = SHELL_BASENAMES.concat([
   "nice", "ionice", "stdbuf", "unbuffer", "sudo", "doas", "su", "runuser",
   "xargs", "watch", "env", "chroot", "script", "flock", "strace", "ltrace",
   "parallel",
+  // Remote/container/namespace executors, and interpreters whose quoted
+  // program can shell out. git is deliberately absent (see env-guard.ts).
+  "ssh", "docker", "podman", "kubectl", "nsenter", "unshare", "setpriv",
+  "runcon", "pkexec", "setarch", "taskset", "chrt", "systemd-run", "proot",
+  "capsh", "awk", "gawk", "mawk", "perl",
 ]);
+// Programs that execute their STDIN as a script: a heredoc body fed to one is
+// a program, not data, whatever its delimiter's quoting.
+const HEREDOC_SCRIPT_CONSUMERS = SHELL_BASENAMES.concat(["ssh", "make", "gmake"]);
+function runsStdinAsScript(words) {
+  let i = 0;
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i += 1;
+  if (i >= words.length) return false;
+  const lead = basename(words[i]);
+  if (HEREDOC_SCRIPT_CONSUMERS.indexOf(lead) !== -1) return true;
+  if (COMMAND_POSITION_WRAPPERS.indexOf(lead) === -1) return false;
+  for (let j = i + 1; j < words.length; j += 1) {
+    if (HEREDOC_SCRIPT_CONSUMERS.indexOf(basename(words[j])) !== -1) return true;
+  }
+  return false;
+}
 function basename(word) {
   const cut = word.lastIndexOf("/");
   return cut === -1 ? word : word.slice(cut + 1);
@@ -775,6 +869,8 @@ function lexShell(input) {
   const heredocs = [];
   const pendingHeredocs = [];
   let words = [];
+  // Stages of the current pipeline, as the same arrays words fills into.
+  let pipeline = [words];
   let cur = null;
   let curQuoted = false;
   let i = 0;
@@ -794,10 +890,12 @@ function lexShell(input) {
     cur = null;
     curQuoted = false;
   };
-  const endCommand = () => {
+  const endCommand = (pipe) => {
     endWord();
     if (words.length) commands.push(words);
     words = [];
+    if (pipe) pipeline.push(words);
+    else pipeline = [words];
   };
   const readExpansion = (start) => {
     if (input[start] === BACKTICK) {
@@ -860,7 +958,7 @@ function lexShell(input) {
         delimiter += c;
         j += 1;
       }
-      if (delimiter) pendingHeredocs.push({ delimiter: delimiter, expanded: expanded });
+      if (delimiter) pendingHeredocs.push({ delimiter: delimiter, expanded: expanded, line: pipeline, from: pipeline.length - 1 });
       return j;
     }
     while (j < n && (input[j] === " " || input[j] === "\t")) j += 1;
@@ -889,7 +987,8 @@ function lexShell(input) {
         if (line.trim() === pending.delimiter) break;
         body += line + "\n";
       }
-      if (pending.expanded && body) heredocs.push(body);
+      if (body && pending.line.slice(pending.from).some(runsStdinAsScript)) nested.push(body);
+      else if (pending.expanded && body) heredocs.push(body);
     }
     return j;
   };
@@ -953,7 +1052,7 @@ function lexShell(input) {
       i += input[i + 1] === "&" ? 2 : 1;
       continue;
     }
-    if (ch === "|") { endCommand(); i += input[i + 1] === "|" ? 2 : 1; continue; }
+    if (ch === "|") { const orOp = input[i + 1] === "|"; endCommand(!orOp); i += orOp ? 2 : 1; continue; }
     if (ch === ";" || ch === "(" || ch === ")") { endCommand(); i += 1; continue; }
     add(ch);
     i += 1;
