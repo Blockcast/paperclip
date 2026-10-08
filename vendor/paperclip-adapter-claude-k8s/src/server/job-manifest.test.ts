@@ -4022,6 +4022,22 @@ describe("scoped writable mounts (BLO-32734)", () => {
     expect(byPath.get("/paperclip/wt")).toBe("wt/co1");
   });
 
+  // A derived candidate under a scratch tree used to be emitted BEFORE that
+  // tree's scratch mount, which the BLO-40401 shadowing backstop rejects: every
+  // such run failed at manifest construction. Parents must come first so the
+  // derived mount is applied over the scratch one, as the docblock describes.
+  it("emits a scratch mount before a derived candidate nested under it", () => {
+    const ctx = makeCtx();
+    setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, workspaceRoot: "/paperclip/wt/co1-ws", storage: isolatedStorage() });
+    const { main, init } = mountsFor(ctx);
+    for (const container of [main, init]) {
+      const paths = container.map((m) => m.mountPath);
+      expect(paths.indexOf("/paperclip/wt")).toBeGreaterThan(paths.indexOf("/paperclip"));
+      expect(paths.indexOf("/paperclip/wt/co1-ws")).toBeGreaterThan(paths.indexOf("/paperclip/wt"));
+      expect(container.find((m) => m.mountPath === "/paperclip/wt/co1-ws")?.subPath).toBe("wt/co1-ws");
+    }
+  });
+
   // BLO-36583 landed the shared pnpm store on this volume a week before this
   // narrowing merged, and the two never touched the same lines — so the rebase
   // was clean and the store was still uncovered. Asserted as "a writable mount
