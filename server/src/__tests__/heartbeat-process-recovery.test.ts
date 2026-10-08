@@ -9375,9 +9375,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .then((rows) => rows[0] ?? null);
     }
 
-    async function seedTerminalExternalRunWithLease(
-      leaseInput: { acquiredAt?: Date; lastUsedAt?: Date } = {},
-    ) {
+    // The lease age is NOT parameterised here on purpose. Every caller wants
+    // the default ~6-month-old lease; the PEN-3674 grace tests that do care
+    // about the clock build their rows from `seedRunFixture` +
+    // `seedEnvironmentLeaseFixture` directly, because they also need to vary
+    // `acquiredAt` and `lastUsedAt` independently. A forwarding parameter here
+    // had no callers.
+    async function seedTerminalExternalRunWithLease() {
       const fixture = await seedRunFixture({
         adapterType: "claude_k8s",
         runStatus: "failed",
@@ -9394,8 +9398,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         companyId: fixture.companyId,
         runId: fixture.runId,
         issueId: fixture.issueId,
-        acquiredAt: leaseInput.acquiredAt,
-        lastUsedAt: leaseInput.lastUsedAt,
       });
       return { ...fixture, reservation, leaseId };
     }
