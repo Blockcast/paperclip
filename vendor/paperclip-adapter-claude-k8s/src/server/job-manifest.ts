@@ -80,10 +80,17 @@ function assertSafeAbsolutePath(field: string, value: string): void {
   }
 }
 
+/** Every pod log lives under here.  Named only because the literal appears
+ *  twice below; it is deliberately not exported.  The one consumer that reads
+ *  a pod-log path back off a mutable Kubernetes object checks its *shape*
+ *  (`isReapablePodLogPath`, execute.ts) rather than this root — see the
+ *  reasoning at its call site (BLO-39114). */
+const POD_LOG_ROOT = "/paperclip/instances/default/data/run-logs";
+
 export function buildPodLogPath(companyId: string, agentId: string, runId: string, isolationKey?: string): string {
   const dir = isolationKey
-    ? `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/isolated/${isolationKey}`
-    : `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}`;
+    ? `${POD_LOG_ROOT}/${companyId}/${agentId}/isolated/${isolationKey}`
+    : `${POD_LOG_ROOT}/${companyId}/${agentId}`;
   return `${dir}/${runId}.pod.ndjson`;
 }
 
@@ -2645,6 +2652,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       annotations: {
         "paperclip.io/adapter-type": "claude_k8s",
         "paperclip.io/agent-name": agent.name,
+        // Stamped verbatim so a *foreign* run reaping this Job can unlink the
+        // pod log without recomputing the path (BLO-39114).  Reconstructing it
+        // from labels would be cheaper but not sound: companyId, agentId and
+        // runId each reach the path via `sanitizeForK8sPath` and the label via
+        // `sanitizeLabelValue`, from the same raw value, and those disagree on
+        // `.`/`_` and above 63 chars.  (`isolationKey` is exempt — it is
+        // pre-sanitized once in `resolveJobIsolation` and both consume that.)
+        // A reconstruction that diverges computes a path that does not exist,
+        // and a missing file is indistinguishable from a successful reap — i.e.
+        // it fails silently, which is the exact leak this is meant to close.
+        "paperclip.io/pod-log-path": podLogPath,
       },
     },
     spec: {

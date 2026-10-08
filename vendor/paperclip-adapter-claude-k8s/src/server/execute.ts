@@ -38,9 +38,7 @@ import {
 } from "./secret-sweep.js";
 import {
   buildJobManifest,
-  buildPodLogPath,
   resolveJobIsolation,
-  sanitizeForK8sPath,
   sanitizeLabelValue,
   type JobIsolation,
 } from "./job-manifest.js";
@@ -55,6 +53,8 @@ const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
 // queries with cannot drift apart (BLO-21857).
 const ISOLATION_MODE_LABEL = "paperclip.io/isolation-mode";
 const ISOLATION_KEY_LABEL = "paperclip.io/isolation-key";
+/** Pod-log path stamped on the Job at creation (BLO-39114). Read verbatim — never recomputed. */
+const POD_LOG_PATH_ANNOTATION = "paperclip.io/pod-log-path";
 const TASK_KEY_LABEL = "paperclip.io/task-key";
 const TASK_ID_LABEL = "paperclip.io/task-id";
 const SESSION_ID_LABEL = "paperclip.io/session-id";
@@ -162,40 +162,6 @@ function readJobGuardIdentity(job: k8s.V1Job): GuardIdentity {
     sessionId: readOptionalString(labels[SESSION_ID_LABEL]),
     validIsolationMetadata: isolationMode !== null && isolationKey !== null,
   };
-}
-
-/**
- * Pod-log path of a *foreign* Job the concurrency guard found (BLO-37704).
- *
- * The guard's label selector pins `paperclip.io/agent-id`, so every Job it
- * returns belongs to this agent — and therefore this company. Only the run id
- * and the isolation segment have to be recovered from the Job's own labels,
- * and both are written by `buildJobManifest` on every Job it creates.
- *
- * The isolation segment is keyed off the *mode* label, not the presence of the
- * key label, because those two diverge. `buildJobManifest` writes both labels
- * whenever `enabled || source === "runtime"`, but `buildPodLogPath` is only
- * given the key when `enabled` — and a runtime descriptor with
- * `isolationMode: "shared"` is `enabled: false` carrying a non-empty key. On
- * that Job, keying off the key label would build a path no run ever wrote.
- */
-function podLogPathForForeignJob(
-  agent: { id: string; companyId: string },
-  job: k8s.V1Job,
-): string | undefined {
-  const labels = job.metadata?.labels ?? {};
-  const companyId = sanitizeForK8sPath(agent.companyId);
-  const agentId = sanitizeForK8sPath(agent.id);
-  const runId = sanitizeForK8sPath(readOptionalString(labels[RUN_ID_LABEL]) ?? "");
-  if (!companyId || !agentId || !runId) return undefined;
-  const isolationMode = readOptionalString(labels[ISOLATION_MODE_LABEL]);
-  const isolationKey = readOptionalString(labels[ISOLATION_KEY_LABEL]);
-  return buildPodLogPath(
-    companyId,
-    agentId,
-    runId,
-    isolationMode && isolationMode !== "shared" && isolationKey ? isolationKey : undefined,
-  );
 }
 
 function readCurrentGuardIdentity(ctx: AdapterExecutionContext, isolation: JobIsolation): GuardIdentity {
@@ -1634,14 +1600,101 @@ export function describeTruncationCause(
 }
 
 /**
- * Delete Job and its pods. Best-effort — failures are logged but not thrown.
+ * Emit a cleanup log line that can never throw.  `cleanupJob` runs inside the
+ * `finally` of the execute path, where an escaping rejection would mask the
+ * block's original outcome.  Swallows a rejecting sink *and* a sink that
+ * returns no promise at all — `.catch()` alone would TypeError on the latter.
  */
-async function cleanupJob(
+async function logQuietly(
+  onLog: AdapterExecutionContext["onLog"],
+  stream: "stdout" | "stderr",
+  message: string,
+): Promise<void> {
+  try {
+    await onLog(stream, message);
+  } catch {
+    // The log sink is gone; there is nowhere left to report that it is gone.
+  }
+}
+
+/**
+ * Is this string plausibly a pod log we are allowed to unlink?
+ *
+ * Only the foreign-reap path needs this: it reads the path off a mutable
+ * Kubernetes object, whereas the three own-run callers pass
+ * `buildJobManifest`'s own return value.  Every path `buildPodLogPath`
+ * produces satisfies all three clauses, so this rejects nothing the producer
+ * can emit — it just stops `fs.unlink` being aimed at something that is not a
+ * pod log at all, without the delete having to trust a second file.
+ */
+export function isReapablePodLogPath(podLogPath: string): boolean {
+  return podLogPath.startsWith("/")
+    && podLogPath.endsWith(".pod.ndjson")
+    && !podLogPath.split("/").includes("..");
+}
+
+/**
+ * Reap the on-disk pod log for a finished run.  Best-effort: a missing file is
+ * the normal case (the pod may never have written one), so ENOENT is silent.
+ * Any other failure is surfaced, because a log we failed to delete for a real
+ * reason accumulates on the shared PVC and nothing else reports it.
+ *
+ * `reportMissing` flips the silence off for the *foreign*-run reap (BLO-39114).
+ * There the caller is deleting another run's Job and gets the path from that
+ * Job's `paperclip.io/pod-log-path` annotation, so "no path" and "path not
+ * there" are states worth naming: the first means we knowingly leaked a file
+ * (a Job predating the annotation), the second means there was nothing to
+ * leak.  They are reported on different streams because only the first is a
+ * problem — warning on both would cry wolf on every orphan whose pod died
+ * before it ever wrote a log, which is the common case.
+ */
+async function reapPodLogFile(
+  podLogPath: string | undefined,
+  jobName: string,
+  onLog: AdapterExecutionContext["onLog"],
+  reportMissing: boolean,
+): Promise<void> {
+  if (!podLogPath) {
+    if (reportMissing) {
+      await logQuietly(onLog, "stderr", `[paperclip] Warning: cannot reap pod log for Job ${jobName} — it carries no ${POD_LOG_PATH_ANNOTATION} annotation; its log is left on the shared PVC\n`);
+    }
+    return;
+  }
+  try {
+    await fs.unlink(podLogPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      if (reportMissing) {
+        await logQuietly(onLog, "stdout", `[paperclip] Pod log ${podLogPath} for Job ${jobName} was already gone — nothing to reap.\n`);
+      }
+      return;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    await logQuietly(onLog, "stderr", `[paperclip] Warning: failed to remove pod log ${podLogPath}: ${msg}\n`);
+  }
+}
+
+/**
+ * Delete Job and its pods, then reap the run's pod log.  Best-effort —
+ * failures are logged but not thrown.
+ *
+ * The two steps are deliberately independent (BLO-32734).  The Job delete
+ * routinely fails with a 404: by the time cleanup runs the Job has often
+ * already been removed by its own `ttlSecondsAfterFinished`, deleted
+ * externally, or reaped by a prior reattach — the SIGTERM handler above
+ * documents that we *intentionally* leave Jobs alive across restarts for the
+ * orphan-reattach path to pick up.  Sequencing the unlink after the delete
+ * inside a single `try` meant every one of those threw past the unlink into
+ * the catch, leaking the pod log permanently.  The warning names the Job, so
+ * the leaked *file* appeared in no log line and the accumulation was silent.
+ */
+export async function cleanupJob(
   namespace: string,
   jobName: string,
   onLog: AdapterExecutionContext["onLog"],
   kubeconfigPath?: string,
   podLogPath?: string,
+  reportMissingPodLog = false,
 ): Promise<void> {
   try {
     const batchApi = getBatchApi(kubeconfigPath);
@@ -1650,13 +1703,13 @@ async function cleanupJob(
       namespace,
       body: { propagationPolicy: "Background" },
     });
-    if (podLogPath) {
-      try { await fs.unlink(podLogPath); } catch { /* non-fatal */ }
-    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    await onLog("stderr", `[paperclip] Warning: failed to cleanup job ${jobName}: ${msg}\n`);
+    await logQuietly(onLog, "stderr", `[paperclip] Warning: failed to cleanup job ${jobName}: ${msg}\n`);
   }
+  // Unconditional: the pod log's lifetime is not a function of whether the
+  // Kubernetes Job could be deleted.  They are unrelated resources.
+  await reapPodLogFile(podLogPath, jobName, onLog, reportMissingPodLog);
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -1846,7 +1899,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
         const priorRun = await fetchHeartbeatRunSnapshot(ctx, jobRunId);
         if (!priorRun || !isActiveHeartbeatRun(priorRun)) {
-          await cleanupJob(jobNamespace, jobName, onLog, kubeconfigPath, podLogPathForForeignJob(ctx.agent, job));
+          // Reap that run's pod log too (BLO-39114).  This run died before it
+          // could reach its own `cleanupJob` — pod OOM, node eviction,
+          // job_failed — so this is the only code path that will ever delete
+          // its log, and we are already deleting its Job.  The path is read
+          // verbatim off the Job rather than rebuilt from labels: see the
+          // annotation's comment in job-manifest.ts for why rebuilding it
+          // fails silently.  `reportMissingPodLog` is on because here a miss
+          // is information, not the routine no-op it is for the owning run.
+          //
+          // This is the one `cleanupJob` call whose path is externally
+          // sourced — the other three pass `buildJobManifest`'s own return
+          // value — so it is the one that owes a check before handing a
+          // string to `fs.unlink` on the shared multi-tenant PVC.  The check
+          // is on the *shape* rather than the run-logs root: every path
+          // `buildPodLogPath` emits ends in `.pod.ndjson`, so requiring that
+          // suffix (plus absolute, no `..`) means this unlink cannot be aimed
+          // at a kubeconfig, a secret, or anyone's source, while staying
+          // assertable from a tmpdir in the tests below.
+          const annotated = readOptionalString(job.metadata?.annotations?.[POD_LOG_PATH_ANNOTATION]) ?? undefined;
+          const reapable = annotated === undefined || isReapablePodLogPath(annotated);
+          if (!reapable) {
+            await logQuietly(onLog, "stderr", `[paperclip] Warning: Job ${jobName} has an implausible ${POD_LOG_PATH_ANNOTATION} (${annotated}); refusing to unlink it\n`);
+          }
+          await cleanupJob(jobNamespace, jobName, onLog, kubeconfigPath, reapable ? annotated : undefined, /* reportMissingPodLog */ reapable);
           await onLog("stdout", `[paperclip] Ignoring stale Job ${jobName}: run ${jobRunId} is terminal or missing in Paperclip.\n`);
           continue;
         }
