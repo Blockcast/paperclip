@@ -71,6 +71,41 @@ describeEmbeddedPostgres("persistLinearPluginConfig", () => {
     expect(company).toMatchObject({ issuePrefix: "BLO", issueCounter: 31222 });
   });
 
+  it("does not take the instance-wide company-id from a connected company on refusal", async () => {
+    const connected = await seed(true);
+    await persistLinearPluginConfig(db, connected, randomUUID(), "team-a");
+    const [other] = await db
+      .insert(companies)
+      .values({ name: `linear-config ${randomUUID()}`, issuePrefix: "OTH", issueCounter: 1 })
+      .returning();
+    const refusedSecret = randomUUID();
+
+    await expect(
+      persistLinearPluginConfig(db, other!.id, refusedSecret, "", { claimInstanceCompany: false }),
+    ).resolves.toBe(true);
+
+    const [state] = await db
+      .select()
+      .from(pluginState)
+      .where(eq(pluginState.stateKey, "company-id"));
+    expect(JSON.stringify(state!.valueJson)).toContain(connected);
+    expect(JSON.stringify(state!.valueJson)).not.toContain(other!.id);
+    const [row] = await db.select().from(pluginConfig).where(eq(pluginConfig.companyId, other!.id));
+    expect(row?.configJson).toMatchObject({ linearTokenRef: refusedSecret, teamId: "" });
+  });
+
+  it("claims the instance-wide company-id on a completed connect", async () => {
+    const companyId = await seed(true);
+
+    await persistLinearPluginConfig(db, companyId, randomUUID(), "team-a");
+
+    const [state] = await db
+      .select()
+      .from(pluginState)
+      .where(eq(pluginState.stateKey, "company-id"));
+    expect(JSON.stringify(state!.valueJson)).toContain(companyId);
+  });
+
   it("rewrites an existing config in place on reconnect", async () => {
     const companyId = await seed(true);
     await persistLinearPluginConfig(db, companyId, randomUUID(), "team-a");
