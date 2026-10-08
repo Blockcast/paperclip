@@ -19,7 +19,10 @@
  *      and carries a non-empty `paperclip.io/run-id`.
  *   2. It has zero `ownerReferences` — an owned Secret is normal GC's business.
  *   3. It is older than the age floor, which is sized so that a launch still in
- *      flight can never have its credentials collected out from under it.
+ *      flight can never have its credentials collected out from under it.  Age
+ *      is measured from the later of `creationTimestamp` and the
+ *      `paperclip.io/launch-at` annotation, because an adopted Secret keeps the
+ *      orphan's `creationTimestamp` (see `LAUNCH_AT_ANNOTATION`).
  *   4. No Job appears to own it, by *either* of two independent checks — the
  *      run-id label, or the `<jobName>-<suffix>` name convention.  Only one has
  *      to say "a Job exists" for the Secret to be left alone.  The name-derived
@@ -33,14 +36,15 @@
  * cannot close it.  3 closes it from the other side, by refusing to judge any
  * Secret young enough that a launch could still plausibly be working on it.
  *
- * The age floor does that job with nothing but the object's own
- * `creationTimestamp`, which is why this module has no lease, no renewal timer
+ * The age floor does that job with nothing but timestamps written once on the
+ * object itself, which is why this module has no lease, no renewal timer
  * and no coordination with the launching replica.  An earlier revision stamped a
  * renewable `launch-expires-at` lease on each Secret and raced the Job create
  * against its renewals; that let a cleanup path abort healthy launches and
  * delete Jobs that had already been created, which is a far worse failure than
- * the orphan it was collecting.  A creation timestamp needs no renewing, is
- * identical from every replica, and survives a crash by construction.
+ * the orphan it was collecting.  A write-once timestamp needs no renewing, is
+ * identical from every replica, and survives a crash by construction: a crash
+ * leaves it stale, which only makes the Secret *more* collectable, never less.
  *
  * Check 4 is doubled on purpose.  The Secret's run-id label is the *raw* runId
  * (execute.ts), while the Job's is `sanitizeLabelValue(runId)`, which strips
@@ -59,16 +63,26 @@ export const MANAGED_BY_LABEL = "app.kubernetes.io/managed-by";
 export const MANAGED_BY_VALUE = "paperclip";
 export const ADAPTER_TYPE_LABEL = "paperclip.io/adapter-type";
 export const ADAPTER_TYPE = "claude_k8s";
+/**
+ * ISO-8601 time of the latest launch write to a run Secret, stamped by
+ * `createOrAdoptRunSecret` (execute.ts) on both the create and the adopt
+ * write.  The age floor needs it because adoption is a merge PATCH, which
+ * resets neither `creationTimestamp` nor `ownerReferences`: a retry that adopts
+ * an hours-old orphan would otherwise present a Secret that is ownerless, past
+ * the floor, and Job-less until its own Job create lands -- every check passing
+ * in the wrong direction for a live launch (PR #2325 review).
+ */
+export const LAUNCH_AT_ANNOTATION = "paperclip.io/launch-at";
 
 /** Suffixes appended to `jobName` to name each run Secret (job-manifest.ts). */
 export const RUN_SECRET_SUFFIXES = ["-prompt", "-env", "-mcp"] as const;
 
 export const DEFAULT_SWEEP_INTERVAL_SEC = 300;
 /**
- * How long a Secret is immune from the sweep, measured from its own
- * `creationTimestamp`.  This is the only thing protecting a launch in flight, so
- * it is sized as a bound on "no longer plausibly launching" rather than on the
- * happy path: the three Secret creates and the Job create are bare awaits on the
+ * How long a Secret is immune from the sweep, measured from its latest launch
+ * write (see `LAUNCH_AT_ANNOTATION`).  This is the only thing protecting a
+ * launch in flight, so it is sized as a bound on "no longer plausibly
+ * launching" rather than on the happy path: the three Secret creates and the Job create are bare awaits on the
  * K8s API, so nothing in the code bounds the gap between them.  (An earlier
  * revision claimed the 15s concurrency-guard timeout did; that guard wraps only
  * the pre-launch Job lookup in execute.ts, not these calls.)  A launch that has
@@ -126,6 +140,7 @@ type LogFn = (stream: LogStream, message: string) => void | Promise<void>;
 export interface SecretSweepObjectMeta {
   name?: string;
   labels?: { [key: string]: string };
+  annotations?: { [key: string]: string };
   ownerReferences?: unknown[];
   creationTimestamp?: Date | string;
   deletionTimestamp?: Date | string;
@@ -204,6 +219,36 @@ function toMillis(value: Date | string | undefined): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
+/**
+ * When this Secret was last claimed by a launch: the later of its creation and
+ * its `LAUNCH_AT_ANNOTATION`.  Null -- judged "too young" -- when either is
+ * present but unreadable; we never delete something whose age we cannot
+ * establish.  An absent annotation (a Secret from an older adapter build) falls
+ * back to `creationTimestamp` alone.
+ */
+function launchBasisMillis(meta: SecretSweepObjectMeta | undefined): number | null {
+  const createdMs = toMillis(meta?.creationTimestamp);
+  if (createdMs === null) return null;
+  const launchAt = meta?.annotations?.[LAUNCH_AT_ANNOTATION];
+  if (launchAt === undefined) return createdMs;
+  const launchMs = toMillis(launchAt);
+  return launchMs === null ? null : Math.max(createdMs, launchMs);
+}
+
+/**
+ * Emit a log line that can never throw.  `onLog` streams to the control plane,
+ * so a transient rejection is plausible, and this module's contract is that
+ * cleanup never fails a run.  try/await rather than `.catch()`, because a
+ * `LogFn` may return no promise at all.
+ */
+async function logQuietly(onLog: LogFn, stream: LogStream, message: string): Promise<void> {
+  try {
+    await onLog(stream, message);
+  } catch {
+    // The log sink is gone; there is nowhere left to report that it is gone.
+  }
+}
+
 /** HTTP status carried by a rejected `@kubernetes/client-node` request, if any. */
 function errorStatusCode(err: unknown): number | null {
   if (typeof err !== "object" || err === null) return null;
@@ -280,7 +325,8 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
   // "overridden", not "raised": `!==` covers the lowering too (Infinity yields
   // the 900000 default, which went DOWN), so the verb has to cover both.
   if (opts.ageFloorMs !== undefined && opts.ageFloorMs !== ageFloorMs) {
-    await onLog(
+    await logQuietly(
+      onLog,
       "stderr",
       `[paperclip] Orphan-secret sweep age floor overridden to ${ageFloorMs}ms (requested ${opts.ageFloorMs})\n`,
     );
@@ -311,16 +357,16 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
       result.retained.push({ name, reason: "no_run_id" });
       continue;
     }
-    const createdMs = toMillis(secret.metadata?.creationTimestamp);
-    // An unreadable creation timestamp is treated as "too young": we never
-    // delete something whose age we cannot establish.  The floor is also the
-    // only thing standing between a launch still in flight and the deletion of
-    // its credentials, so it is applied before any Job lookup.
-    if (createdMs === null || now - createdMs < ageFloorMs) {
+    const launchedMs = launchBasisMillis(secret.metadata);
+    // An unreadable timestamp is treated as "too young": we never delete
+    // something whose age we cannot establish.  The floor is also the only
+    // thing standing between a launch still in flight and the deletion of its
+    // credentials, so it is applied before any Job lookup.
+    if (launchedMs === null || now - launchedMs < ageFloorMs) {
       result.retained.push({ name, reason: "too_young" });
       continue;
     }
-    candidates.push({ name, runId, ageMs: now - createdMs });
+    candidates.push({ name, runId, ageMs: now - launchedMs });
   }
 
   if (candidates.length === 0) return result;
@@ -373,14 +419,16 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
     try {
       await coreApi.deleteNamespacedSecret({ name: candidate.name, namespace });
       result.swept.push(candidate.name);
-      await onLog(
+      await logQuietly(
+        onLog,
         "stdout",
         `[paperclip] Swept ownerless Secret ${candidate.name} (run-id ${candidate.runId}, age ${Math.round(candidate.ageMs / 1000)}s, no owning Job)\n`,
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       result.failed.push({ name: candidate.name, error: message });
-      await onLog(
+      await logQuietly(
+        onLog,
         "stderr",
         `[paperclip] Failed to sweep ownerless Secret ${candidate.name}: ${message}\n`,
       );
@@ -432,7 +480,8 @@ export function createSweepGate(): (opts: SweepOptions) => Promise<SweepResult |
       ]);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await opts.onLog(
+      await logQuietly(
+        opts.onLog,
         "stderr",
         `[paperclip] Orphan-secret sweep failed (non-fatal): ${message}\n`,
       );

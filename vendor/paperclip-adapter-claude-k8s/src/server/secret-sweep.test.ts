@@ -5,6 +5,7 @@ import {
   createSweepGate,
   DEFAULT_SWEEP_AGE_FLOOR_SEC,
   deriveOwningJobName,
+  LAUNCH_AT_ANNOTATION,
   MANAGED_BY_LABEL,
   MIN_SWEEP_AGE_FLOOR_SEC,
   RUN_ID_LABEL,
@@ -23,6 +24,7 @@ function secret(
     owned?: boolean;
     deleting?: boolean;
     creationTimestamp?: Date | string;
+    launchAt?: string;
   } = {},
 ): { metadata: SecretSweepObjectMeta } {
   const labels: Record<string, string> = {
@@ -35,6 +37,7 @@ function secret(
     metadata.ownerReferences = [{ apiVersion: "batch/v1", kind: "Job", name: "ac-x", uid: "u1" }];
   }
   if (opts.deleting) metadata.deletionTimestamp = new Date(NOW);
+  if (opts.launchAt !== undefined) metadata.annotations = { [LAUNCH_AT_ANNOTATION]: opts.launchAt };
   metadata.creationTimestamp =
     "creationTimestamp" in opts
       ? opts.creationTimestamp
@@ -379,6 +382,53 @@ describe("sweepOrphanedRunSecrets", () => {
     expect(result.retained).toEqual([{ name: "ac-agent-run-badts-prompt", reason: "too_young" }]);
   });
 
+  // PR #2325 review C1. A retry that adopts an orphan merge-PATCHes it, which
+  // keeps the orphan's hours-old creationTimestamp and leaves it ownerless, and
+  // its Job does not exist yet -- so creationTimestamp alone would delete a live
+  // launch's credentials. The adopt write stamps launch-at; the floor must use it.
+  it("keeps an adopted Secret whose creationTimestamp is old but whose launch is fresh", async () => {
+    const h = harness([
+      secret("ac-agent-run-adopt-prompt", {
+        runId: "run-adopt",
+        ageSec: 3600,
+        launchAt: new Date(NOW - 5_000).toISOString(),
+      }),
+    ]);
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.retained).toEqual([{ name: "ac-agent-run-adopt-prompt", reason: "too_young" }]);
+    expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
+  });
+
+  // Positive control for the test above: a stale launch-at (the launch crashed
+  // again) must not make the Secret immune, or the annotation would trade a
+  // deleted credential for a permanent orphan.
+  it("still collects an orphan whose launch-at is itself past the floor", async () => {
+    const h = harness([
+      secret("ac-agent-run-stale-prompt", {
+        runId: "run-stale",
+        ageSec: 7200,
+        launchAt: new Date(NOW - 3_600_000).toISOString(),
+      }),
+    ]);
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.swept).toEqual(["ac-agent-run-stale-prompt"]);
+  });
+
+  it("treats an unreadable launch-at as too young", async () => {
+    const h = harness([
+      secret("ac-agent-run-badlaunch-prompt", { runId: "run-badlaunch", ageSec: 3600, launchAt: "not-a-date" }),
+    ]);
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.retained).toEqual([{ name: "ac-agent-run-badlaunch-prompt", reason: "too_young" }]);
+    expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
+  });
+
   it("skips a Secret already being deleted", async () => {
     const h = harness([
       secret("ac-agent-run-going-prompt", { runId: "run-going", ageSec: 3600, deleting: true }),
@@ -488,6 +538,30 @@ describe("createSweepGate", () => {
 
     expect(result).toBeNull();
     expect(logs.some((l) => l.stream === "stderr" && l.message.includes("sweep failed (non-fatal)"))).toBe(true);
+  });
+
+  // PR #2325 review I1. The log call inside the gate's own catch was unguarded,
+  // and execute()'s try around this await has no catch, so a rejecting onLog
+  // (it streams to the control plane) aborted a healthy run before its Job.
+  it("never throws when onLog itself rejects on the failure path", async () => {
+    const gate = createSweepGate();
+
+    const result = await gate({
+      namespace: "paperclip",
+      coreApi: {
+        listNamespacedSecret: async () => {
+          throw new Error("apiserver unreachable");
+        },
+        deleteNamespacedSecret: async () => ({}),
+      },
+      batchApi: { listNamespacedJob: async () => ({ items: [] }) },
+      onLog: async () => {
+        throw new Error("log sink gone");
+      },
+      now: NOW,
+    });
+
+    expect(result).toBeNull();
   });
 
   // A hang is not a rejection, so the catch above cannot cover this. The gate is
