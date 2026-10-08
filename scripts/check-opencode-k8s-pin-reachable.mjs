@@ -54,8 +54,10 @@
  *
  * The grep carries its own negative control. A filter that matches nothing
  * because the tree moved out of `src/` is indistinguishable from a clean pin,
- * and that failure reads as a pass — so the probe also counts the TypeScript
- * files it searched, and zero means inconclusive rather than clean.
+ * and that failure reads as a pass — so the probe also counts the JS/TS source
+ * files it searched, and zero means inconclusive rather than clean. The control
+ * only reasons about an EMPTY result: a hit proves the search ran over
+ * something, so it fails the bump whatever the count says.
  */
 
 import { execFileSync } from "node:child_process";
@@ -107,7 +109,9 @@ export function extractPin(dockerfile) {
  * `secret-put` follows the same rule and lands on the same side as
  * `unreachable`: it is a definite finding about the pinned tree, so it fails.
  * A searched-nothing grep is not — hence `srcFileCount`, which routes an
- * inert search to `inconclusive` rather than letting it read as clean.
+ * inert search to `inconclusive` rather than letting it read as clean. A hit
+ * is judged BEFORE that control: a non-empty hit set is self-evidencing, so a
+ * zero or failed file count cannot turn a real call site into a warning.
  *
  * @param {{pin: string | null, cloneOk: boolean, commitPresent: boolean, detail?: string,
  *          srcFileCount?: number | null, secretPutHits?: string[] | null}} probe
@@ -157,30 +161,6 @@ export function classify(probe) {
     };
   }
 
-  if (srcFileCount === null || secretPutHits === null) {
-    return {
-      verdict: "inconclusive",
-      exitCode: 0,
-      message:
-        `GUARD INCONCLUSIVE: pin ${pin} is reachable, but the Secret-PUT source search failed. ` +
-        "Not failing the PR — a failed search cannot establish that the pin makes no Secret PUT. " +
-        "Fix the probe before trusting the guard.",
-    };
-  }
-
-  if (srcFileCount === 0) {
-    return {
-      verdict: "inconclusive",
-      exitCode: 0,
-      message:
-        `GUARD INCONCLUSIVE: pin ${pin} is reachable, but the Secret-PUT search found no ` +
-        "TypeScript sources under `src/` to search. The adapter's layout has moved, so " +
-        "the grep is inert and matching nothing no longer means clean. Not failing the " +
-        "PR — but re-point the search before trusting it, or the BLO-34510 retirement of " +
-        "`secrets: update` is unguarded against the next pin bump.",
-    };
-  }
-
   if (secretPutHits && secretPutHits.length > 0) {
     return {
       verdict: "secret-put",
@@ -198,6 +178,30 @@ export function classify(probe) {
         "still granted), or re-add `update` to that Role naming this call site, and " +
         "update deploy/helm/paperclip/tests/role-rbac.test.mjs in the same change. " +
         "Re-granting a retired standing privilege is a stated decision, not a fix-up.",
+    };
+  }
+
+  if (srcFileCount === null || secretPutHits === null) {
+    return {
+      verdict: "inconclusive",
+      exitCode: 0,
+      message:
+        `GUARD INCONCLUSIVE: pin ${pin} is reachable, but the Secret-PUT source search failed. ` +
+        "Not failing the PR — a failed search cannot establish that the pin makes no Secret PUT. " +
+        "Fix the probe before trusting the guard.",
+    };
+  }
+
+  if (srcFileCount === 0) {
+    return {
+      verdict: "inconclusive",
+      exitCode: 0,
+      message:
+        `GUARD INCONCLUSIVE: pin ${pin} is reachable, but the Secret-PUT search found no ` +
+        "JS/TS sources under `src/` to search. The adapter's layout has moved, so " +
+        "the grep is inert and matching nothing no longer means clean. Not failing the " +
+        "PR — but re-point the search before trusting it, or the BLO-34510 retirement of " +
+        "`secrets: update` is unguarded against the next pin bump.",
     };
   }
 
@@ -274,7 +278,7 @@ function probe(pin) {
       cloneOk: true,
       commitPresent: true,
       srcFileCount: sources === null ? null : nonTestHits(
-        lines(sources).filter((f) => /\.[cm]?tsx?$/.test(f)).map((f) => `${f}:`),
+        lines(sources).filter((f) => /\.[cm]?[jt]sx?$/.test(f)).map((f) => `${f}:`),
       ).length,
       secretPutHits: hits === null ? null : nonTestHits(
         lines(hits).map(

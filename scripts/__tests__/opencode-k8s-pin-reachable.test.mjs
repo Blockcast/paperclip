@@ -200,6 +200,8 @@ exit 128
   const cases = [
     { name: "grep exit 1 means no match", verdict: "OK", env: {} },
     { name: "a real call fails", verdict: "FAILED", env: { PIN_GUARD_TEST_GREP_STATUS: "0", PIN_GUARD_TEST_HITS: `${pin}:src/execute.ts:1: replaceNamespacedSecret(` } },
+    { name: "a real call fails even when no counted source was found", verdict: "FAILED", env: { PIN_GUARD_TEST_FILES: "src/README.md", PIN_GUARD_TEST_GREP_STATUS: "0", PIN_GUARD_TEST_HITS: `${pin}:src/server/execute.go:12: replaceNamespacedSecret(` } },
+    { name: "JS sources count as searched", verdict: "OK", env: { PIN_GUARD_TEST_FILES: "src/execute.js" } },
     { name: "grep exit 128 is not clean", env: { PIN_GUARD_TEST_GREP_STATUS: "128" } },
     { name: "a signalled grep is not clean", env: { PIN_GUARD_TEST_GREP_STATUS: "signal" } },
     { name: "ls-tree exit 128 is not clean", env: { PIN_GUARD_TEST_TREE_STATUS: "128" } },
@@ -284,6 +286,25 @@ test("a search that found nothing to search is inconclusive, NOT clean", () => {
   assert.equal(result.exitCode, 0);
   assert.match(result.message, /INCONCLUSIVE/);
   assert.match(result.message, /inert/);
+});
+
+test("a real Secret PUT fails even when the file count is zero or failed", () => {
+  // A non-empty hit set is self-evidencing: it proves the grep ran over
+  // something, so the inert-search control (which reasons only about an empty
+  // result) must not downgrade it to a warning. The grep has no extension
+  // filter, so a hit can exist in a file the denominator does not count.
+  for (const srcFileCount of [0, null]) {
+    const result = classify({
+      pin: "b".repeat(40),
+      cloneOk: true,
+      commitPresent: true,
+      srcFileCount,
+      secretPutHits: ["src/server/execute.js:12: await coreApi.replaceNamespacedSecret({"],
+    });
+    assert.equal(result.verdict, "secret-put", `srcFileCount=${srcFileCount}`);
+    assert.equal(result.exitCode, 1, `srcFileCount=${srcFileCount}`);
+    assert.match(result.message, /execute\.js:12/);
+  }
 });
 
 test("reachability is judged before the Secret-PUT search, and clone failure before both", () => {
