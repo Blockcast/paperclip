@@ -36,9 +36,9 @@ export interface LinearTeamExpectation {
 /**
  * Resolve which Linear team a connection is bound to.
  *
- * Order: configured plugin `teamId`, then the company's existing
- * `issuePrefix`, then — only when nothing was configured — a sole visible
- * team. Anything else is ambiguous and returns no team.
+ * Order: configured plugin `teamId`; only when no `teamId` is configured,
+ * the company's existing `issuePrefix`, then a sole visible team. Anything
+ * else is ambiguous and returns no team.
  */
 export function resolveLinearTeam(
   teams: readonly LinearTeam[],
@@ -55,8 +55,11 @@ export function resolveLinearTeam(
     if (byId) return { team: byId, matchedBy: "configured-team-id" };
   }
 
+  // A configured `teamId` that failed to match suppresses BOTH fallbacks: a
+  // team with the same key in another workspace would otherwise be adopted
+  // here, and its issue numbers would overwrite `issueCounter`.
   const prefix = expectation.issuePrefix?.trim().toUpperCase();
-  if (prefix) {
+  if (prefix && !configuredTeamId) {
     const byPrefix = visible.find((team) => team.key.toUpperCase() === prefix);
     if (byPrefix) return { team: byPrefix, matchedBy: "issue-prefix" };
   }
@@ -87,6 +90,7 @@ export function linearTeamResolutionError(
     "Could not determine which Linear team this connection is for, so it was refused " +
     "rather than guessed — guessing would overwrite this company's issue prefix and " +
     `issue counter. Visible teams: ${list}. Set the Linear plugin's "teamId" to one of ` +
-    "those ids (or align the company's issue prefix with one of those keys), then reconnect."
+    "those ids (or, if no teamId is set, align the company's issue prefix with one of " +
+    "those keys), then reconnect."
   );
 }
