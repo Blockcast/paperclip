@@ -59,10 +59,21 @@ this directory removes.
 ## PROVENANCE-CHANGES.md is frozen
 
 It is kept, not migrated: rewriting it would conflict with every in-flight PR
-that has already appended to it — the exact failure being fixed. It remains
-append-only and `merge=union` so that those PRs still merge locally, and the
-guard still accepts a row there as a transitional allowance, with a CI warning.
-Do not add new rows to it.
+that has already appended to it — the exact failure being fixed.
+
+It is now frozen outright
+([BLO-41101](https://paperclip.blockcast.net/BLO/issues/BLO-41101)).
+`scripts/check-vendored-provenance-log.mjs` rejects **any commit** in your
+branch that touches it: no row is accepted, there is no warning-and-pass path,
+and an edit to its prose is rejected the same way. The merge queue is REBASE and
+replays each commit, so even a branch whose net diff leaves the file alone is
+ejected if one intermediate commit modified it. The guard's message prints the
+one-command history repair.
+
+**Its own header is stale by design.** It still says every PR "appends a row
+here" and that doing so is required. That text is now wrong, and it cannot be
+corrected in place, because correcting it is itself a modification. This
+section supersedes it. Record vendored changes as a new file in this directory.
 
 ## Do not put a single-valued field in an entry
 

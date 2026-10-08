@@ -154,7 +154,7 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
     const historyRepair = [
       "Rewrite the branch so no commit touches it, keeping every commit:",
       `  MB=$(git merge-base ${base} HEAD)`,
-      `  git filter-branch -f --index-filter \\`,
+      `  FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --index-filter \\`,
       `    "git update-index --cacheinfo 100644,$(git rev-parse $MB:${LOG}),${LOG}" \\`,
       `    -- $MB..HEAD`,
       `Offending commit(s) in ${base}..${head}:`,
