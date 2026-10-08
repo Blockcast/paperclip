@@ -18,8 +18,10 @@ newer is required`.
 versions only, `"image"` opts out and keeps the main command byte-identical). The Job's
 main command installs the pinned package once into
 `<data PVC>/.local/lib/paperclip-k8s-runtimes/claude-code/<version>` — atomic `mkdir`
-lock carrying a random owner token and released only by its owner, 20-minute stale
-reclaim, `.complete` re-checked once the lock is held, staged install published with
+lock carrying a random owner token, re-read before any delete and released only by
+its owner, 20-minute stale reclaim by atomic rename (the renamed lock's age is
+re-tested, so a lock another installer re-took in between is put back),
+`.complete` re-checked once the lock is held, staged install published with
 `mv -T` only after the fresh binary answers `--version` (a runtime a concurrent
 installer already published is reused rather than nested into), `.complete` marker,
 concurrent Jobs wait for the winner — prepends it to PATH ahead of the ccrotate

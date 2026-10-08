@@ -177,6 +177,56 @@ describe("buildClaudeCodeRuntimeShell (executed)", () => {
       expect(res.stderr).toContain("reclaiming stale claude-code install lock");
       expect(existsSync(path.join(dir, ".complete"))).toBe(true);
       expect(existsSync(lock)).toBe(false);
+      expect(readdirSync(path.dirname(lock)).filter((e) => e.includes(".stale-"))).toEqual([]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("puts back a lock another installer re-took between its age check and its reclaim", () => {
+    // Both installers saw the same stale lock. The other one (A) reclaims it
+    // and takes a fresh lock while this one's age check is still running (the
+    // fake `find`); this one's reclaim then renames A's fresh lock. It must
+    // re-test what it renamed, put A's lock back, and wait for A rather than
+    // delete A's lock and install alongside it.
+    const realFind = spawnSync("/bin/sh", ["-c", "command -v find"], { encoding: "utf8" }).stdout.trim();
+    const lockRel = `.lock-${VERSION}`;
+    const { res, base, root, dir } = run({
+      setup: (root, bin) => {
+        const stale = path.join(root, lockRel);
+        mkdirSync(stale);
+        writeFileSync(path.join(stale, "owner"), "dead-installer\n");
+        const old = new Date(Date.now() - 30 * 60_000);
+        utimesSync(stale, old, old);
+        writeFileSync(
+          path.join(bin, "find"),
+          [
+            "#!/bin/sh",
+            `if [ ! -e "$ROOT/a-took" ]; then : > "$ROOT/a-took"; ` +
+              `rm -rf "$ROOT/${lockRel}" && mkdir "$ROOT/${lockRel}" && echo installer-A > "$ROOT/${lockRel}/owner"; ` +
+              'echo "$1"; exit 0; fi',
+            `exec ${realFind} "$@"`,
+            "",
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        // While this installer waits, A finishes: it publishes and releases.
+        writeFileSync(
+          path.join(bin, "sleep"),
+          `#!/bin/sh\ncp "$ROOT/${lockRel}/owner" "$ROOT/owner-seen" 2>/dev/null; ${PUBLISH_THEIRS}; rm -rf "$ROOT/${lockRel}"\n`,
+          { mode: 0o755 },
+        );
+      },
+    });
+    try {
+      expect(res.status).toBe(0);
+      expect(existsSync(path.join(root, "npm-ran"))).toBe(false);
+      expect(res.stderr).not.toContain("reclaiming stale claude-code install lock");
+      expect(res.stderr).toContain("waiting for a concurrent");
+      expect(readFileSync(path.join(root, "owner-seen"), "utf8")).toBe("installer-A\n");
+      expect(readdirSync(root).filter((e) => e.includes(".stale-"))).toEqual([]);
+      expect(readdirSync(dir).sort()).toEqual([".complete", "node_modules"]);
+      expect(res.stderr).toContain("runtime theirs (Claude Code) (adapter-managed");
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
