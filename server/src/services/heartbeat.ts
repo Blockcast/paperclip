@@ -26807,10 +26807,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           //   4. `recordExpectedExternalRuntimeJobName` — sets `expectedJobName`
           //      and ends the sibling's grace.
           //
-          // Nothing writes the reservation between (1) and (4). So the
-          // sibling's clock is frozen at (1), strictly EARLIER than this arm's
-          // (2): `isolationSetupGraceActive` lapses FIRST, not last. This arm
-          // is the later-expiring of the two, not the laggard — so do not
+          // Nothing writes the reservation between (1) and (4) — but that holds
+          // by a mechanism worth naming, because a reader who checks it will
+          // otherwise conclude it is false. There are TWO
+          // `markExternalRuntimeReservationLaunching` call sites, and the second
+          // runs AFTER `realizeForRun` in execution order (its line number is
+          // misleading: `recordExpectedExternalRuntimeJobName` sits inside the
+          // `onAdapterMeta` callback, so it is written earlier than it runs).
+          // That second call is a no-op only because its SQL `WHERE` requires
+          // `state = 'reserved'`; the state is already `launching` by then, so
+          // it matches zero rows and never bumps `updatedAt`. The
+          // `k8sIsolationIdentity`-falsy path is fine for a related reason:
+          // `isolationMode` then stays `pending` and `isolationSetupGraceActive`
+          // never applies, so the comparison is vacuous rather than inverted.
+          //
+          // So the sibling's clock is frozen at (1), strictly EARLIER than this
+          // arm's (2): `isolationSetupGraceActive` lapses FIRST, not last. This
+          // arm is the later-expiring of the two, not the laggard — so do not
           // "restore parity" by shortening it.
           //
           // Taking the newer of `acquired_at`/`last_used_at` closes the (3)→(4)
@@ -26840,7 +26853,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // becomes a countable event once deployed rather than staying a
             // hypothesis. The sibling is silent, but this is the change that
             // raised the question.
-            logger.debug(
+            //
+            // `info`, not `debug`, and that is load-bearing rather than taste.
+            // `middleware/logger.ts` sets the ROOT level to `debug` but fans out
+            // to two transports, and only the FILE target is at `debug`; the
+            // stdout target (`destination: 1`) is pinned at `info`. A `debug`
+            // line therefore reaches the in-container `server.log` and nothing
+            // else — not `kubectl logs`, not any stdout aggregator. Since the
+            // whole point of this line is to make the window countable in
+            // production, emitting it where production cannot see it would
+            // defeat its own purpose. Volume is bounded: it fires only for an
+            // orphaned external lease inside a single grace window.
+            logger.info(
               {
                 runId: run.runId,
                 companyId: run.companyId,
