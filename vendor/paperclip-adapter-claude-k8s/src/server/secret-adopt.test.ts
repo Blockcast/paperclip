@@ -23,6 +23,7 @@ const RUN_ID = "f6fd03d0-4940-43ab-9c11-000000000000";
 const MANAGED_BY = "app.kubernetes.io/managed-by";
 const ADAPTER_TYPE = "paperclip.io/adapter-type";
 const RUN_ID_LABEL = "paperclip.io/run-id";
+const LAUNCH_AT = "paperclip.io/launch-at";
 
 /**
  * A real `ApiException` from the installed client, not a hand-rolled stand-in.
@@ -124,6 +125,8 @@ describe("createOrAdoptRunSecret", () => {
       [RUN_ID_LABEL]: RUN_ID,
     });
     expect(body.stringData).toEqual({ FOO: "bar" });
+    // The orphan sweep's age basis (BLO-21857); must be a readable time.
+    expect(Number.isFinite(Date.parse(body.metadata.annotations[LAUNCH_AT]))).toBe(true);
     expect(coreApi.readNamespacedSecret).not.toHaveBeenCalled();
   });
 
@@ -150,6 +153,10 @@ describe("createOrAdoptRunSecret", () => {
     expect(call.body.metadata.resourceVersion).toBe("12345");
     expect(call.body.metadata.labels[RUN_ID_LABEL]).toBe(RUN_ID);
     expect(call.body.stringData).toEqual({ FOO: "bar" });
+    // The merge PATCH keeps the orphan's old creationTimestamp, so the adopt
+    // write must re-stamp the launch time or the orphan sweep can delete this
+    // live run's Secret before its Job exists (PR #2325 review C1).
+    expect(Number.isFinite(Date.parse(call.body.metadata.annotations[LAUNCH_AT]))).toBe(true);
   });
 
   it("writes the adoption as a merge PATCH, on the verb this path already held", async () => {
