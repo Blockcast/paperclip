@@ -47,19 +47,27 @@ is a separate deliberate act (delete the Jobs — see below).
 
 | Principal | Result |
 |---|---|
+| Agent, targeting itself | `allow_self` — write applies |
 | Holds `agents:configure` (board users, company `admin`/`owner` roles, root agents) | Write applies immediately |
 | Holds only `agents:suggest-changes` | **`deny_missing_consent`** — the change is *not* applied; it needs accepted change consent first |
-| Neither | `deny_missing_grant` |
+| Neither | `deny_no_grant` |
 
-Source: `server/src/services/authorization.ts:1765-1810`, action
-`agent_config:update`. **Most agent seats hold only `agents:suggest-changes`**,
-so an agent attempting this mid-incident gets a denial, not a rollback. Route
-it to a board user. Do not read a non-200 as "the flag is already off".
+Rows are evaluated top to bottom; the first match wins.
+
+Source: `server/src/services/authorization.ts:1765-1820` (grants) and
+`:2504-2515` (self), action `agent_config:update`. A `runtimeConfig`-only PATCH
+on the caller's own agent reaches `allow_self` via `assertCanUpdateAgent`
+(`server/src/routes/agents.ts:3902-3903`, `:1050-1061`) and needs no grant or
+consent, so an agent can always roll **itself** back. For **cross-agent**
+rollback, **most agent seats hold only `agents:suggest-changes`**, so an agent
+attempting it mid-incident gets a denial, not a rollback — route a cross-agent
+rollback to a board user. Do not read a non-200 as "the flag is already off".
 
 ### Bounds the route enforces
 
-- `concurrencyEnabled` is a plain boolean, **default false**
-  (`packages/shared/src/validators/agent.ts:80`). Absent counts as false.
+- `concurrencyEnabled` is an optional boolean
+  (`packages/shared/src/validators/agent.ts:80`); absent is read as **false**
+  (`agent-concurrency.ts:70`).
 - A heartbeat **preset** (`economic`/`balanced`/`aggressive`) deliberately does
   *not* set it (`agent-concurrency.ts:67-70`). Changing preset neither enables
   nor disables concurrency.
@@ -154,10 +162,13 @@ is a rollback trigger. A rise spread evenly across the `pre_adapter_*` buckets
 is a launch-path or cluster problem and rolling back will not fix it.
 
 > ☠️ **A low `process_lost` count is only trustworthy when
-> `paperclip_process_lost_liveness_null_total` is 0.** That gauge is the
-> denominator-reliability signal (`metrics.ts:1450-1462`): non-zero means
-> liveness could not be determined, so a concurrent low `process_lost` count is
-> **unreliable, not healthy**. Read it before concluding an agent is clean.
+> `rate(paperclip_process_lost_liveness_null_total[5m]) == 0`** (or
+> `increase(...)` over the window you are judging). That counter is the
+> denominator-reliability signal (`metrics.ts:1454-1462`, `:4169`). It is
+> cumulative, so its raw value stays non-zero after any past blind reap cycle;
+> a non-zero rate means liveness could not be determined, so a concurrent low
+> `process_lost` count is **unreliable, not healthy**. Read it before
+> concluding an agent is clean.
 
 The coarser error-string buckets on the same path are `pre_adapter`,
 `child_pid`, `process_group`, `server_restart` (`metrics.ts:3101`); anything
