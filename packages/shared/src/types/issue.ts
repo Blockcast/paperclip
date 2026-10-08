@@ -259,6 +259,24 @@ export interface IssueBlockerDiagnosticsResponse {
 
 export type IssueWakeDiagnosticWakeFailureClass = "failed" | "cancelled" | "skipped";
 
+/**
+ * PEN-3877: which component acted on this wake row, where that is attributable
+ * from a server-authored marker rather than inferred.
+ *
+ * Today the only attributable actor is the lockless deferred-wake drain, whose
+ * three acting verbs each stamp a distinct literal into
+ * `agent_wakeup_requests.error`. `null` means "no attributable marker" — which
+ * includes an ordinary finalizer promotion, because that path promotes the row
+ * in place with `error: null` and so is distinguished by the absence.
+ *
+ * The raw `error` column is deliberately NOT exposed: it is not uniformly
+ * server-authored (see `locklessDeferredWakeDisposition`).
+ */
+export type IssueWakeDiagnosticWakeDisposition =
+  | "lockless_drain_promoted"
+  | "lockless_drain_cancelled_dependency_blocked"
+  | "lockless_drain_cancelled_terminal";
+
 export interface IssueWakeDiagnosticWakeRequest {
   kind: "wake_request";
   agentId: string | null;
@@ -271,6 +289,7 @@ export interface IssueWakeDiagnosticWakeRequest {
   claimedAt: string | null;
   finishedAt: string | null;
   failureClass: IssueWakeDiagnosticWakeFailureClass | null;
+  disposition: IssueWakeDiagnosticWakeDisposition | null;
 }
 
 export interface IssueWakeDiagnosticActivityRecord {
