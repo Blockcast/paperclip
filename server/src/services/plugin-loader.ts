@@ -50,6 +50,8 @@ import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
+import { reconcilePluginSecretBindings } from "./plugin-secrets-handler.js";
+import { secretService } from "./secrets.js";
 import { isIsolatedSdkPluginPackage, resolveDefaultInstallDir } from "../bootstrap/isolated-sdk-plugins.js";
 
 const execFileAsync = promisify(execFile);
@@ -3552,8 +3554,9 @@ export function pluginLoader(
       // bootstrap config and must use ctx.config.get(companyId) at runtime.
       const config: Record<string, unknown> = {};
       let bootstrapCompanyId: string | undefined;
+      let configuredCompanyIds: string[] = [];
       try {
-        const configuredCompanyIds = await registry.listConfigCompanyIds(pluginId);
+        configuredCompanyIds = await registry.listConfigCompanyIds(pluginId);
         if (configuredCompanyIds.length === 1) {
           bootstrapCompanyId = configuredCompanyIds[0];
         } else if (configuredCompanyIds.length > 1) {
@@ -3567,6 +3570,39 @@ export function pluginLoader(
           { pluginId, pluginKey },
           "plugin-loader: unable to resolve legacy bootstrap company scope",
         );
+      }
+
+      // ------------------------------------------------------------------
+      // 4b. Repair secret-ref bindings before the worker can ask for a secret
+      // ------------------------------------------------------------------
+      // Bindings were only ever minted by POST /plugins/:id/config, so a config
+      // row older than that sync resolves nothing forever and the plugin's jobs
+      // no-op in silence (BLO-32567). Rebuilding here means a restart repairs it
+      // instead of an instance admin re-saving every config by hand.
+      const reconciled = await reconcilePluginSecretBindings({
+        pluginId,
+        companyIds: configuredCompanyIds,
+        instanceConfigSchema: manifest.instanceConfigSchema,
+        getConfig: (companyId) => registry.getConfig(pluginId, companyId),
+        syncBindings: (companyId, refs) =>
+          secretService(db).syncSecretRefsForTarget(
+            companyId,
+            { targetType: "plugin", targetId: pluginId },
+            refs,
+          ),
+      });
+      for (const result of reconciled) {
+        if (result.error) {
+          log.warn(
+            { pluginId, pluginKey, companyId: result.companyId, err: result.error },
+            "plugin-loader: secret-ref bindings not reconciled; this company's plugin secrets will not resolve",
+          );
+        } else if (result.bound > 0) {
+          log.debug(
+            { pluginId, pluginKey, companyId: result.companyId, boundRefs: result.bound },
+            "plugin-loader: reconciled secret-ref bindings",
+          );
+        }
       }
 
       // ------------------------------------------------------------------

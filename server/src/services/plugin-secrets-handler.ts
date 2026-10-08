@@ -171,6 +171,65 @@ export function extractSecretRefPathsFromConfig(
   return refs;
 }
 
+export interface PluginSecretBindingReconcileResult {
+  companyId: string;
+  /** Refs synced for this company. 0 means nothing to bind, not an error. */
+  bound: number;
+  /** Present when this company was skipped; the other companies still ran. */
+  error?: string;
+}
+
+/**
+ * Rebuild `company_secret_bindings` for a plugin from its stored config.
+ *
+ * Bindings are a projection of (`plugin_config.config_json` x the plugin's
+ * `instanceConfigSchema`), but they were only ever minted by
+ * `POST /plugins/:id/config`. Any config row written before that sync existed —
+ * or by any other write path — carries no bindings at all, so every
+ * `secrets.resolve` fails `binding_missing` and the plugin's jobs no-op
+ * silently and indefinitely. BLO-32567: all Slack jobs across three companies
+ * were dead for 38 days this way, and the only recorded repair was an instance
+ * admin re-saving the config by hand.
+ *
+ * Call this where the plugin starts so a restart repairs the drift with no
+ * operator action. It is idempotent: a company whose bindings are already
+ * correct is rewritten to the same rows.
+ */
+export async function reconcilePluginSecretBindings(input: {
+  pluginId: string;
+  companyIds: readonly string[];
+  instanceConfigSchema?: Record<string, unknown> | null;
+  getConfig: (companyId: string) => Promise<{ configJson?: unknown } | null | undefined>;
+  syncBindings: (companyId: string, refs: PluginConfigSecretRefBinding[]) => Promise<unknown>;
+}): Promise<PluginSecretBindingReconcileResult[]> {
+  const results: PluginSecretBindingReconcileResult[] = [];
+  for (const companyId of input.companyIds) {
+    try {
+      const stored = await input.getConfig(companyId);
+      const refs = extractSecretRefBindingsFromConfig(
+        stored?.configJson,
+        input.instanceConfigSchema,
+      );
+      // Never sync an empty ref set. `syncSecretRefsForTarget` reads that as
+      // "delete every binding for this target", so an unreadable or absent
+      // manifest schema would silently unbind a healthy install on restart.
+      if (refs.length > 0) await input.syncBindings(companyId, refs);
+      results.push({ companyId, bound: refs.length });
+    } catch (err) {
+      // Per-company isolation is load-bearing: a config pointing at another
+      // company's secret throws in `assertSecretInCompany`, and that must
+      // neither bind the credential nor stop the remaining companies — or the
+      // worker itself — from starting.
+      results.push({
+        companyId,
+        bound: 0,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return results;
+}
+
 // ---------------------------------------------------------------------------
 // Handler factory
 // ---------------------------------------------------------------------------
