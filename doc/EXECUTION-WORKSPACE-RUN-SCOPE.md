@@ -127,6 +127,10 @@ apparent size for a single runtime-managed tree.
 - It does not change any existing default. `per_issue` remains the default and
   `shared_workspace` remains available and default-safe for agents at
   `maxConcurrentRuns: 1`. This is not a forced fleet-wide migration.
+  Returning a single already-concurrent agent to that posture is a per-agent
+  config write, not a migration — the procedure, the rollback triggers and the
+  observables that confirm it took are in
+  [K8S-CONCURRENCY-ROLLBACK.md](./K8S-CONCURRENCY-ROLLBACK.md).
 - It does not retire the 93 pre-existing hand-rolled worktrees. That cleanup is
   separate operational work.
 - It does not by itself decide *which* agents should run `per_run`. Enabling it is
