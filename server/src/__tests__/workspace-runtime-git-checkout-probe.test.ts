@@ -52,14 +52,22 @@ describe("classifyGitCheckoutProbeFailure", () => {
     }
   });
 
-  it("does not mistake a repository path that merely mentions the fatal wording", () => {
-    // "not a git repository" must be matched as git's diagnosis, not as part
-    // of an arbitrary path; this pins that a genuine lock error near such a
-    // path is still indeterminate rather than silently downgraded.
-    const probe = classifyGitCheckoutProbeFailure(
-      new Error("fatal: Unable to create '/srv/checkouts/index.lock': File exists."),
-    );
+  // "not a git repository" must be matched as git's diagnosis, not as part of
+  // an arbitrary path: each fixture carries the phrase inside a path, so an
+  // unanchored match would downgrade a genuine failure to positive absence.
+  it.each([
+    ["lock contention", "fatal: Unable to create '/srv/not a git repository/index.lock': File exists."],
+    ["dubious ownership", "fatal: detected dubious ownership in repository at '/w/not a git repository'"],
+    ["stale handle", "fatal: Unable to read current working directory: Stale file handle (/srv/Not A Git Repository/x)"],
+  ])("does not mistake %s on a path that merely mentions the fatal wording", (_label, stderr) => {
+    const probe = classifyGitCheckoutProbeFailure(new Error(stderr));
     expect(probe.state).toBe("indeterminate");
+    expect(probe.reason).toBe(stderr);
+  });
+
+  it("reads git's 'not a git repository: <path>' form as positive absence", () => {
+    const stderr = "warning: unrelated\nfatal: not a git repository: '/srv/missing/.git'";
+    expect(classifyGitCheckoutProbeFailure(new Error(stderr)).state).toBe("not_a_checkout");
   });
 });
 
