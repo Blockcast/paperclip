@@ -17,10 +17,16 @@ concurrency:
   # invisible at maximumEntriesToBuild=1 but silently defeats any raise above 1:
   # the head's build would be cancelled by the entry queued behind it (BLO-22902).
   #
-  # Superseding a destroyed generation does not depend on this key. GitHub
-  # cancels a destroyed merge group's runs itself: run 08:48:57Z
-  # (pr-1770-2ace7b68) was cancelled at 09:05:23Z, 73s before any successor run
-  # existed, so no concurrency rule could have done it (measured 2026-09-13).
+  # Superseding a destroyed generation does not depend on this key either -- but
+  # nothing else reliably does it, so do NOT read that as "handled". An earlier
+  # revision of this comment claimed GitHub cancels a destroyed merge group's
+  # runs itself, on one observation (run 08:48:57Z, pr-1770-2ace7b68, cancelled
+  # 09:05:23Z, 73s before any successor run existed, 2026-09-13). That
+  # generalisation is FALSIFIED: run 37722816166 (pr-2272-69a141cf) sat `queued`
+  # with 18 of its 19 jobs already executed for 1h34m after its branch was
+  # deleted, and 17 such orphans saturated all 12 `arc-merge-queue` runners on
+  # 2026-10-07 (BLO-41174, BLO-33021). GitHub's own cancellation is best-effort
+  # at most. The backstop is merge-queue-orphan-sweeper.yml.
   group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.run_id }}
   cancel-in-progress: true
 
