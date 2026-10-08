@@ -7,6 +7,7 @@
  * tested without spinning up a plugin context or mocking the host RPC.
  */
 
+import { ISSUE_PRIORITIES } from "@paperclipai/shared";
 import {
   DEFAULT_SEVERITY_TO_PRIORITY,
   TERMINAL_SEVERITIES,
@@ -47,6 +48,32 @@ export function severityToPriority(
     if (value !== undefined) return value;
   }
   return FALLBACK_PRIORITY;
+}
+
+/**
+ * Resolve the issue priority for one alert.
+ *
+ * Resolution order:
+ *   1. the `paperclip_priority` alert label (per-rule escape hatch, BLO-20576)
+ *   2. `severityToPriority` above (operator override map, then the default map)
+ *
+ * The label is the escape hatch for the `warning → medium` default: a rule
+ * whose warnings genuinely are not self-resolving declares that on itself,
+ * next to its own `severity`, rather than dragging the whole severity band up
+ * with it. It is validated against `ISSUE_PRIORITIES` and ignored when it is
+ * anything else — an unrecognised value must not reach `ctx.issues.create`
+ * and fail the whole delivery, and a `PrometheusRule` is not a trusted enough
+ * surface to pass straight through to the API.
+ */
+export function resolveAlertPriority(
+  alert: AlertmanagerAlert,
+  override?: Record<string, PaperclipPriority>,
+): PaperclipPriority {
+  const label = alert.labels.paperclip_priority?.trim().toLowerCase();
+  if (label && (ISSUE_PRIORITIES as readonly string[]).includes(label)) {
+    return label as PaperclipPriority;
+  }
+  return severityToPriority(alert.labels.severity, override);
 }
 
 /**

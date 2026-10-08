@@ -24,7 +24,7 @@ import {
   buildIssueTitle,
   effectiveAlertStatus,
   isTerminalSeverity,
-  severityToPriority,
+  resolveAlertPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
@@ -2763,7 +2763,7 @@ export async function handleFiring(
 
   const title = buildIssueTitle(alert);
   const description = buildIssueDescription(alert);
-  const priority = severityToPriority(severity, config.severityToPriority);
+  const priority = resolveAlertPriority(alert, config.severityToPriority);
 
   const billingCode = alert.labels.billing_code ?? null;
 

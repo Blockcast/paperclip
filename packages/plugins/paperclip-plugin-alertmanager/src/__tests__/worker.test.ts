@@ -4930,7 +4930,7 @@ describe("handleWebhook — acceptOnlyLabels filter", () => {
 });
 
 describe("handleWebhook — severity → priority", () => {
-  it("maps severity=warning to priority=high using the default map", async () => {
+  it("maps severity=warning to priority=medium using the default map (BLO-20576)", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ severityToPriority: undefined });
     const alert = baseAlert({
@@ -4940,7 +4940,36 @@ describe("handleWebhook — severity → priority", () => {
 
     await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.priority).toBe("medium");
+  });
+
+  // The unit tests in issue-mapping.test.ts cover resolveAlertPriority itself.
+  // These two pin the *call site*: that the handler reads the label at all,
+  // and that a junk value cannot reach ctx.issues.create.
+  it("honours the paperclip_priority escape hatch on the created issue", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "high" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.priority).toBe("high");
+  });
+
+  it("falls back to the severity map when paperclip_priority is junk", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "P1" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.priority).toBe("medium");
   });
 
   it("operator severity-to-priority overrides the default", async () => {

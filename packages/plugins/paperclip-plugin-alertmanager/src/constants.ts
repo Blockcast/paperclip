@@ -59,12 +59,24 @@ export function legacyInstanceAlertStateRef(fingerprint: string) {
 }
 
 /**
- * Default severity → priority map. Operators can override via
- * `config.severityToPriority`.
+ * Default severity → priority map. Operators can override globally via
+ * `config.severityToPriority`, or per rule via the `paperclip_priority`
+ * alert label (see `resolveAlertPriority`).
  */
 export const DEFAULT_SEVERITY_TO_PRIORITY: Record<string, PaperclipPriority> = {
   critical: "critical",
-  warning: "high",
+  // BLO-20576: `warning` was `high`. It is the fleet's dominant severity —
+  // 698/993 post-ship issues — and 84.6% of its aged cohort auto-cancelled
+  // when the alert cleared on its own, against 76.0% for `critical`. A
+  // severity that mostly self-resolves and accounts for 70% of volume cannot
+  // also be the fleet's second-highest priority band without debasing the
+  // band: this one source held 51 open `critical` and zero medium/low at the
+  // time the row was filed. `medium` keeps the issue dispatchable and
+  // inbox-visible (unlike `low`, which falls off the 500-row inbox page on a
+  // deep lane — BLO-39015) while leaving `high`/`critical` to mean something.
+  // A rule that genuinely needs the old behaviour sets
+  // `paperclip_priority: high` on itself.
+  warning: "medium",
   info: "medium",
   // BLO-27018: `page` and `ticket` are the severity vocabulary the Blockcast
   // Prometheus rule groups actually emit (`llm-proxy.alerts` and friends), and
