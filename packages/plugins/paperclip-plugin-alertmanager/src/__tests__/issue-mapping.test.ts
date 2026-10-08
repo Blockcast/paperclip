@@ -7,6 +7,7 @@ import {
   extractObservabilityUrls,
   isTerminalSeverity,
   renderDrillInLinks,
+  resolveAlertPriority,
   severityToPriority,
 } from "../issue-mapping.js";
 import type { AlertmanagerAlert } from "../types.js";
@@ -34,7 +35,9 @@ const baseAlert = (overrides: Partial<AlertmanagerAlert> = {}): AlertmanagerAler
 describe("severityToPriority", () => {
   it("uses default mappings when no override is supplied", () => {
     expect(severityToPriority("critical")).toBe("critical");
-    expect(severityToPriority("warning")).toBe("high");
+    // BLO-20576: `warning` is the fleet's dominant severity and 84.6% of
+    // its aged cohort auto-cancelled unattended, so it no longer mints `high`.
+    expect(severityToPriority("warning")).toBe("medium");
     expect(severityToPriority("info")).toBe("medium");
     // BLO-27018: `page` and `ticket` are part of the emitted vocabulary, not
     // unknown values. `page` previously appeared in the "unknown severities"
@@ -52,7 +55,7 @@ describe("severityToPriority", () => {
 
   it("matches case-insensitively", () => {
     expect(severityToPriority("CRITICAL")).toBe("critical");
-    expect(severityToPriority(" Warning ")).toBe("high");
+    expect(severityToPriority(" Warning ")).toBe("medium");
   });
 
   it("operator override wins over the default map", () => {
@@ -62,7 +65,55 @@ describe("severityToPriority", () => {
     // Unmapped keys fall through to the default map, not the fallback.
     expect(
       severityToPriority("warning", { critical: "high" }),
+    ).toBe("medium");
+  });
+});
+
+describe("resolveAlertPriority (BLO-20576 per-rule escape hatch)", () => {
+  const withLabels = (labels: Record<string, string>) =>
+    baseAlert({ labels: { ...baseAlert().labels, ...labels } });
+
+  it("falls through to the severity map when the label is absent", () => {
+    expect(resolveAlertPriority(withLabels({ severity: "warning" }))).toBe(
+      "medium",
+    );
+  });
+
+  it("a rule that needs the old behaviour opts itself back up", () => {
+    expect(
+      resolveAlertPriority(
+        withLabels({ severity: "warning", paperclip_priority: "high" }),
+      ),
     ).toBe("high");
+  });
+
+  it("the label outranks the operator override map too", () => {
+    expect(
+      resolveAlertPriority(
+        withLabels({ severity: "warning", paperclip_priority: "low" }),
+        { warning: "critical" },
+      ),
+    ).toBe("low");
+  });
+
+  it("matches case-insensitively and tolerates surrounding space", () => {
+    expect(
+      resolveAlertPriority(
+        withLabels({ severity: "warning", paperclip_priority: " Critical " }),
+      ),
+    ).toBe("critical");
+  });
+
+  it("ignores a value that is not a real priority rather than failing the delivery", () => {
+    // A PrometheusRule is not a trusted surface: an unrecognised value must
+    // not reach ctx.issues.create, where it would reject the whole alert.
+    for (const bad of ["urgent", "P1", "", "   ", "high;drop table"]) {
+      expect(
+        resolveAlertPriority(
+          withLabels({ severity: "warning", paperclip_priority: bad }),
+        ),
+      ).toBe("medium");
+    }
   });
 });
 
