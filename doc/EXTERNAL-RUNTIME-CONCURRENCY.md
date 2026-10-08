@@ -76,13 +76,22 @@ match the last column below, not the third.
 
 `isolation_mode` is one of `legacy | pending | shared | run | workspace`:
 
+Rows are in branch order and the first match wins — in particular the
+persisted-workspace rows are evaluated **before** either ceiling row, so they
+outrank them whatever the ceiling is.
+
 | selected when | mode | `isolationKey` | what lands in `isolation_key` |
 |---|---|---|---|
-| stateless PR review — checked first, before any ceiling | `run` | `run:<runId>` | same |
-| ceiling `> 1`, no persisted workspace | `run` | `run:<runId>` | same |
+| stateless PR review | `run` | `run:<runId>` | same |
+| persisted workspace, *explicitly* reused — and either isolated or ceiling `> 1` | `workspace` | `workspace:<id>` | same — it already names the tree |
+| persisted workspace, isolated | `workspace` | `workspace:<id>` | `workspace-tree:<treeKey>` if a tree key resolves, else same |
+| ceiling `> 1`, no persisted workspace that qualifies above | `run` | `run:<runId>` | `workspace-tree:<treeKey>` if a tree key resolves, else same |
 | ceiling `= 1` (default) | `shared` | `agent-shared:<agentId>` | `workspace-tree:<treeKey>` if a tree key resolves, else same |
-| persisted workspace, *explicitly* reused | `workspace` | `workspace:<id>` | same — it already names the tree |
-| persisted workspace, isolated (reachable at ceiling 1) | `workspace` | `workspace:<id>` | `workspace-tree:<treeKey>` if a tree key resolves |
+
+Only the first two rows are genuinely `same` — both are `runUniqueIdentity` call
+sites. `resolveWorkspaceWriterTreeKey` takes no ceiling or concurrency input, so
+on the last three rows a tree key resolves whenever the runScope is the default
+`per_issue` and the run has an issue id, which is the ordinary case.
 
 `withTreeScopedReservationKey` does not narrow the key — it **replaces** it.
 Whenever a per-issue tree key resolves, `isolation_key` is
@@ -157,13 +166,22 @@ A stale kill releases the lease with `release_reason =
 Other reasons seen at non-test call sites include `succeeded`, `completed`,
 `cancelled`, `job_missing`, `adapter_failed`, `launch_failed`,
 `terminal_prelaunch_orphan`, `legacy_drained`,
-`external_runtime_isolation_conflict`, and `run_cancelled:<errorCode>`; the
-list is not exhaustive, so treat an unfamiliar value as a prompt to grep rather
-than as an anomaly. Two traps: there is **no `timeout` reason** — the run
-*status* is `timed_out` — and an adapter error code such as
-`k8s_job_deleted_externally` is a run `errorCode`, never a bare release reason.
-It reaches this column only as `run_cancelled:k8s_job_deleted_externally`, so
-match the prefix, not the whole string.
+`external_runtime_isolation_conflict`, and `run_cancelled:<errorCode>`. This
+list **cannot** be complete: `releaseExternalRuntimeReservation` takes
+`reason: string`, and the dominant call site passes the run's own
+`errorCode ?? outcome`, so the value set is open by construction and sourced
+from the adapter. Treat an unfamiliar value as a prompt to grep rather than as
+an anomaly. (`launch_failed` and `legacy_drained` are credible but unconfirmed
+— neither appears as a literal at any call site read for this document.)
+
+Two traps. There is **no `timeout` reason** — the run *status* is `timed_out`.
+And an adapter error code such as `k8s_job_deleted_externally` reaches this
+column **both ways**: bare on the terminal-finalization path (the run's
+`errorCode` is passed straight through), and prefixed as
+`run_cancelled:k8s_job_deleted_externally` on the cancellation path. Match
+both — a prefix-only query misses every terminally-finalized row. `job_missing`
+above is exactly such a bare errorCode, stamped by the vanished-Job
+reconciler.
 
 Workspace-side cleanup is separate and has its own metrics —
 `paperclip_isolation_workspace_reaper_*` for ephemeral run roots and
@@ -192,9 +210,11 @@ succeed after the reservation gating it was released, so a `reserved` /
 needs *more* care, not less: identify the Job by name and run/agent labels
 before releasing anything.
 
-The `name_mismatch` row from the failure signature above is the
-present-and-different case — it is raised only from `launched`, which requires
-a non-null `job_uid`.
+The `name_mismatch` row from the failure signature above is raised only from
+`launched` — but `launched` does **not** imply a non-null `job_uid`
+(`recordExternalRuntimeJobIdentity` coalesces a null uid in), so it is not
+automatically the safe present-and-different case. Read `job_uid` from the
+`SELECT` above and apply the same two rules.
 
 ```sql
 UPDATE external_runtime_reservations
