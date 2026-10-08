@@ -2332,6 +2332,160 @@ describe("buildJobManifest", () => {
       expect(parsed.comments[0].metadata).toEqual({ version: 1 });
     });
 
+    // BLO-37868 / AC4 — the CLASS guard. Everything above stuffs ONE variable,
+    // so a newly-added unbounded literal is normal-sized in every fixture and
+    // passes. That is exactly how PAPERCLIP_WORKSPACES_JSON,
+    // _RUNTIME_SERVICE_INTENTS_JSON and _RUNTIME_SERVICES_JSON stayed invisible
+    // while BLO-37287 was being fixed in this same file.
+    //
+    // This drives an oversize value through EVERY SAFE_LITERAL in the table
+    // rather than a hand-listed few, via the inherited literal-env path. The
+    // operator `adapterConfig.env` path is Secret-backed and intentionally
+    // cannot reach this choke point. Adding a SAFE_LITERAL to
+    // ENV_NAME_CLASSIFICATION enrolls it here automatically — no per-variable
+    // source mapping to keep in sync.
+    describe("no SAFE_LITERAL can exceed the kernel ceiling (BLO-37868 AC4)", () => {
+      const safeLiteralNames = ENV_NAME_CLASSIFICATION.filter(
+        (e) => e.classification === "SAFE_LITERAL" && !e.prefix,
+      ).map((e) => e.name);
+
+      it("covers every non-prefix SAFE_LITERAL in the table", () => {
+        // Guards the guard: if the table is ever read wrongly (or emptied by a
+        // refactor) the per-name test below would iterate nothing and pass.
+        expect(safeLiteralNames.length).toBeGreaterThan(10);
+        expect(safeLiteralNames).toContain("PAPERCLIP_WORKSPACES_JSON");
+        expect(safeLiteralNames).toContain("PAPERCLIP_RUNTIME_SERVICE_INTENTS_JSON");
+        expect(safeLiteralNames).toContain("PAPERCLIP_RUNTIME_SERVICES_JSON");
+      });
+
+      // A JSON array of oversize elements: the real shape of all three
+      // variables this issue is about, and the shape the prefix-shed is for.
+      const oversizeArray = JSON.stringify(
+        Array.from({ length: 4 }, (_, i) => ({ workspaceId: `w${i}`, cwd: "/x".repeat(40 * 1024) })),
+      );
+
+      /**
+       * Layer-4 adapterConfig.env is deliberately Secret-backed (BLO-22546),
+       * so it cannot reach the literal-size guard. Use the Deployment
+       * inherited-env path here instead: it is a real literal-producing input
+       * and keeps these tests from weakening the operator-env security
+       * contract just to make the ceiling test non-vacuous.
+       */
+      const literalEnvFixture = (name: string, value: string) => ({
+        ctx: makeCtx(),
+        selfPod: makeSelfPod({ inheritedEnv: { [name]: value } }),
+      });
+
+      let shedAtLeastOne = false;
+      for (const name of safeLiteralNames) {
+        it(`bounds ${name}`, () => {
+          const { ctx, selfPod } = literalEnvFixture(name, oversizeArray);
+          const { job } = buildJobManifest({ ctx, selfPod });
+          expectNoOversizeEnv(job);
+          if (
+            job.spec?.template?.spec?.containers?.[0]?.env?.some((e) => e.name === "PAPERCLIP_ENV_SHED_JSON")
+          ) {
+            shedAtLeastOne = true;
+          }
+        });
+      }
+
+      it("actually drove a value over the ceiling (non-vacuity)", () => {
+        // Without this the cases above would pass if `oversizeArray` stopped
+        // being oversize, or if the fixture stopped reaching `merged` — each
+        // would assert "nothing is oversize" about nothing. Rebuilt here
+        // rather than read from a flag the loop sets, so it does not depend on
+        // the order vitest happens to run the cases in.
+        expect(Buffer.byteLength(oversizeArray, "utf-8")).toBeGreaterThan(131_072);
+        const shedCount = safeLiteralNames.filter((name) => {
+          const { ctx, selfPod } = literalEnvFixture(name, oversizeArray);
+          const { job } = buildJobManifest({ ctx, selfPod });
+          return job.spec?.template?.spec?.containers?.[0]?.env?.some(
+            (e) => e.name === "PAPERCLIP_ENV_SHED_JSON",
+          );
+        }).length;
+        // Not all of them: a few names (HOME, the isolation roots) are
+        // re-set by later merge layers, so their oversize value never reaches
+        // the choke point. Most must, or the loop is testing nothing.
+        expect(shedCount, "no SAFE_LITERAL reached the choke point oversize").toBeGreaterThan(
+          safeLiteralNames.length / 2,
+        );
+      });
+
+      it("sheds a JSON array to its longest fitting prefix, not to nothing", () => {
+        // The reduction has to keep the value USEFUL and same-shaped. Elements
+        // sized so several fit: a guard that emitted `[]` or a truncated
+        // (unparseable) slice would red here while still passing the ceiling
+        // assertion above — which is the point, since both are "safe" and wrong.
+        const elements = Array.from({ length: 200 }, (_, i) => ({ workspaceId: `w${i}`, cwd: "/p".repeat(512) }));
+        const { ctx, selfPod } = literalEnvFixture("PAPERCLIP_WORKSPACES_JSON", JSON.stringify(elements));
+        const { job } = buildJobManifest({ ctx, selfPod });
+        expectNoOversizeEnv(job);
+        const value = job.spec?.template?.spec?.containers?.[0]?.env?.find(
+          (e) => e.name === "PAPERCLIP_WORKSPACES_JSON",
+        )?.value;
+        const parsed = JSON.parse(value!); // unparseable => byte-truncated, not shed
+        expect(Array.isArray(parsed)).toBe(true);
+        expect(parsed.length).toBeGreaterThan(0); // kept real context
+        expect(parsed.length).toBeLessThan(200); // actually dropped some
+        expect(parsed[0]).toEqual(elements[0]); // prefix, and elements intact
+      });
+
+      it("marks what it shed instead of dropping it silently (AC3)", () => {
+        const oversize = JSON.stringify([{ cwd: "/x".repeat(80 * 1024) }]);
+        const { ctx, selfPod } = literalEnvFixture("PAPERCLIP_WORKSPACES_JSON", oversize);
+        const { job } = buildJobManifest({ ctx, selfPod });
+        const marker = job.spec?.template?.spec?.containers?.[0]?.env?.find(
+          (e) => e.name === "PAPERCLIP_ENV_SHED_JSON",
+        )?.value;
+        expect(marker, "value was reduced with no marker — that IS silent loss").toBeDefined();
+        const parsed = JSON.parse(marker!);
+        expect(parsed.truncated).toBe(true);
+        expect(parsed.fallbackFetchNeeded).toBe(true);
+        // The original size must be recoverable: "it was cut" without "from
+        // what" does not tell the agent whether a refetch is worth it.
+        expect(parsed.shed.PAPERCLIP_WORKSPACES_JSON).toBe(Buffer.byteLength(oversize, "utf-8"));
+      });
+
+      it("emits no marker when nothing was shed", () => {
+        // The other half of the mutation guard: a marker that is always present
+        // says nothing. Absence has to mean "complete".
+        const { job } = buildJobManifest({ ctx: makeCtx(), selfPod: makeSelfPod() });
+        expect(
+          job.spec?.template?.spec?.containers?.[0]?.env?.find((e) => e.name === "PAPERCLIP_ENV_SHED_JSON"),
+        ).toBeUndefined();
+      });
+
+      it("drops a variable whose NAME alone exceeds the ceiling, and marks it", () => {
+        // The one case where no value can rescue the string: the budget is
+        // spent before the `=`. Emitting it anyway would kill the pod, so the
+        // variable goes — the only outcome here that costs the variable
+        // itself, which is why it still has to appear in the marker.
+        const absurdName = `PAPERCLIP_${"N".repeat(140 * 1024)}`;
+        const { ctx, selfPod } = literalEnvFixture(absurdName, "x");
+        const { job } = buildJobManifest({ ctx, selfPod });
+        expectNoOversizeEnv(job);
+        const env = job.spec?.template?.spec?.containers?.[0]?.env ?? [];
+        expect(env.find((e) => e.name === absurdName)).toBeUndefined();
+        const marker = env.find((e) => e.name === "PAPERCLIP_ENV_SHED_JSON")?.value;
+        expect(marker, "variable dropped with no marker — silent loss").toBeDefined();
+        expect(JSON.parse(marker!).shedCount).toBeGreaterThan(0);
+      });
+
+      it("checks the `[]` last resort against the budget too (budget of 1 byte)", () => {
+        // The neighbour of the case above: a name of exactly 131_069 chars
+        // leaves a 1-byte value budget, so `NAME=[]` is 131_072 B -- over the
+        // ceiling. The last resort must fall through to "", which fits.
+        const edgeName = `PAPERCLIP_${"N".repeat(131_069 - "PAPERCLIP_".length)}`;
+        const { ctx, selfPod } = literalEnvFixture(edgeName, JSON.stringify([{ cwd: "/x" }]));
+        const { job } = buildJobManifest({ ctx, selfPod });
+        expectNoOversizeEnv(job);
+        const env = job.spec?.template?.spec?.containers?.[0]?.env ?? [];
+        expect(env.find((e) => e.name === edgeName)?.value).toBe("");
+        expect(env.find((e) => e.name === "PAPERCLIP_ENV_SHED_JSON")).toBeDefined();
+      });
+    });
+
     // The boundary pair, mirroring the PROMPT_CONTENT pair above. The fixtures
     // above sit at ~4 MB / ~500 KiB / ~4 KB, nowhere near the edge, so an
     // off-by-name budget (bare MAX_ENV_STRING_BYTES, 28 B too generous) or a
