@@ -2912,6 +2912,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
 
   it("negative control: retiring only the original leaves the mirroring head carried", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: UNATTESTED,
       reviewerBotLogin: ALLY_BOT_LOGIN,
       comments: history([fixed(RAISED, 1), fixed(MIRRORING, 2)]),
@@ -2926,6 +2927,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
 
   it("clears once the mirror is also dispositioned under the mirroring head", () => {
     const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
       headSha: UNATTESTED,
       reviewerBotLogin: ALLY_BOT_LOGIN,
       comments: history([fixed(RAISED, 1), fixed(MIRRORING, 2), fixed(MIRRORING, 1)]),
@@ -2964,6 +2966,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
 
     it("clears when the mirror is retired at the ordinal its own head gave it", () => {
       const verdict = evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         comments: diverged([fixed(RAISED, 1), fixed(RAISED, 2), fixed(MIRRORING, 1)]),
@@ -2974,6 +2977,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
 
     it("negative control: reusing the original's ordinal leaves the mirror carried", () => {
       const verdict = evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         // `fixed(MIRRORING, 2)` names an index MIRRORING never reported, so the
@@ -3005,6 +3009,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
 
     it("clears when the mirror keeps important 1 despite a Critical ahead of it", () => {
       const verdict = evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         comments: acrossSeverities([
@@ -3019,6 +3024,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
 
     it("negative control: counting the Critical against the Important ordinal dangles", () => {
       const verdict = evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         // `fixed(MIRRORING, 2)` names an Important index MIRRORING never
@@ -3041,6 +3047,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
     // Important mirror does not clear the head while its Critical dangles.
     it("negative control: one severity retired at a head does not clear the other", () => {
       const verdict = evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         comments: acrossSeverities([fixed(RAISED, 1), fixed(MIRRORING, 1)]),
@@ -3082,6 +3089,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
 
     it("clears when all three reporting heads are retired", () => {
       const verdict = evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         comments: chained([fixed(RAISED, 1), fixed(MIRRORING, 1), fixed(MIRRORED_AGAIN, 1)]),
@@ -3092,6 +3100,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
 
     it("negative control: skipping the INTERMEDIATE head carries it alone", () => {
       const verdict = evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         // Both ends of the chain retired, the middle link forgotten — the
@@ -3112,6 +3121,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
     // the only one that reds if the `mirroredAgain` splice regresses.
     it("negative control: skipping the NEWEST mirror carries it", () => {
       const verdict = evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         comments: chained([fixed(RAISED, 1), fixed(MIRRORING, 1)]),
@@ -3138,6 +3148,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
 
     it("clears when the mirror's entry carries the escalated severity", () => {
       const verdict = evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         comments: regraded([fixed(RAISED, 1), fixed(MIRRORING, 1, "critical")]),
@@ -3148,6 +3159,7 @@ describe("mirrored findings retire under both identities (#1707)", () => {
 
     it("negative control: carrying the original's severity over names nothing", () => {
       const verdict = evaluateCommentReviewGate({
+        prAuthorLogin: null,
         headSha: UNATTESTED,
         reviewerBotLogin: ALLY_BOT_LOGIN,
         // `important 1` is the identity it had at RAISED; MIRRORING never
