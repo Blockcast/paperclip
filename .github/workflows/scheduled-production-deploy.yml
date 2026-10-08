@@ -15,20 +15,32 @@
 # WHAT THIS DOES NOT DO
 # ---------------------
 # It does NOT approve anything. docker.yml's `deploy` job stays gated on the
-# paperclip-production environment and its ONE ratified human reviewer.
+# paperclip-production environment, whose ratified reviewer set is
+# RATIFIED_REVIEWERS in .github/scripts/check-production-environment-protection.mjs.
+# ⛔ DO NOT RESTATE THE COUNT HERE — read the symbol. Two successive counts
+# written into this line were already false when committed (see below); a count
+# in prose is a second source of truth that drifts silently, and this file is a
+# design document that readers plan against.
 #
-# Until 2026-10-04 this read "its three named human reviewers". That was never a
-# ratified shape. Approval b75f8156 (2026-08-03) ratified TWO; an unratified
-# drift on 2026-08-08 added a third and flipped can_admins_bypass; the
-# environment was narrowed to [kkroo] on 2026-08-30; and card 60e271b7
-# (2026-09-14) ruled that narrowed shape intended — "reconcile the guard, not
-# the environment". RATIFIED_REVIEWERS in
-# .github/scripts/check-production-environment-protection.mjs is the
-# authoritative list; read it rather than re-deriving a count here. The residual
-# single-approver risk is already homed on BLO-22329 and PEN-2863 is RESOLVED on
-# it — do not re-file it. This only
-# performs the mechanical step (dispatch), so there is always a build ready to approve
-# and approving means reviewing a day of commits instead of a quarter's worth.
+# That set is EMPTY as of 2026-10-07: the owner removed the required_reviewers
+# rule on 2026-10-06 and recorded the decision in Blockcast/onprem-k8s#4913
+# (merged 2026-10-07T01:13:11Z), which SUPERSEDES the reviewer clause of card
+# 60e271b7. The environment now holds a branch_policy rule only. The guard file
+# above carries the full record, the accepted risk, and the revert recipe — read
+# it there rather than re-deriving any of it here.
+#
+# Two superseded readings, kept as a quoted record so a later run does not
+# re-litigate them. Until 2026-10-04 this read "its three named human
+# reviewers"; that was never a ratified shape. A 2026-10-08 correction to "its
+# ONE ratified human reviewer" was ALSO false when written — by 16h52m — because
+# it was authored against a branch behind the 2026-10-07 removal. Both are wrong
+# about the same underlying fact, that this job is gated on named humans, which
+# is why the count is gone rather than re-corrected.
+#
+# The residual single-approver risk is homed on BLO-22329 and PEN-2863 is
+# RESOLVED on it — do not re-file it. This only performs the mechanical step
+# (dispatch), so there is always a build ready to ship and shipping means
+# reviewing a day of commits instead of a quarter's worth.
 #
 # Auto-approval was considered and rejected on 2026-08-28: three green guards prove the
 # code builds, not that a human intends to ship it. That reasoning is unchanged.

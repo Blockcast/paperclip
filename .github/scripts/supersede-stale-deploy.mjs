@@ -257,8 +257,8 @@ function declined(reason, detail) {
  * deploy-stall-chain.mjs): STALL_ISSUE_NUMBER is always empty here, because
  * the workflow binds it from the `escalate` step's `stall_issue_number` output,
  * which post-pending-deploy-alert.mjs only sets when it holds a record
- * number. So this function takes its early return below and only the step
- * outputs carry the signal.
+ * number. So this function takes its early return below, leaving the step
+ * outputs and a `::warning::` annotation (`:280`) as the signal.
  * Until 2026-10-04 this paragraph presented the record as live here.
  *
  * The signal is a LABEL, not a comment: `--resolve` already reads the issue
