@@ -2749,8 +2749,26 @@ export function agentRoutes(
     const unsupportedPaginationParams = parseUnsupportedPaginationParams(req.query);
     if (unsupportedPaginationParams.length > 0) {
       res.status(400).json({
-        error: "page/perPage pagination is not supported on this endpoint; use offset instead",
+        error: "page/perPage/per_page pagination is not supported on this endpoint; use offset instead",
         unsupportedParams: unsupportedPaginationParams,
+      });
+      return;
+    }
+    // BLO-40714: `limit` was never read here either — `?limit=10` returned the
+    // full 500-row page and a 200. Rejected rather than honoured, deliberately:
+    // honouring it would hand a caller who sent it by mistake a SHORT page,
+    // which is the silent prefix BLO-39015 exists to kill, and it would do so
+    // for callers who get the whole page today. The cap is fixed and already
+    // reported on `X-Applied-Limit`, so there is nothing a caller-supplied
+    // `limit` buys that `offset` does not. Endpoint-local and NOT in
+    // `parseUnsupportedPaginationParams`, because the sibling
+    // `GET /companies/:id/issues` genuinely implements `limit` — folding this
+    // into the shared helper would break it.
+    if (req.query.limit !== undefined) {
+      res.status(400).json({
+        error:
+          "limit is not supported on this endpoint; the page size is fixed — read it from the X-Applied-Limit header and page with offset",
+        unsupportedParams: ["limit"],
       });
       return;
     }

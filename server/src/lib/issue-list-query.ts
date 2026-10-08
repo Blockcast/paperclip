@@ -9,13 +9,24 @@
 // nine route test suites (`vi.doMock("../services/issues.js", () => ({ issueService }))`).
 // A route-hot-path import from there resolves to undefined under those mocks and
 // turns every list request into a 500. lib/ is mocked by nobody.
+//
+// BLO-40714: `per_page` is the third spelling and was the one that fell
+// through. It is what GitHub's own API uses, so it is the plausible first
+// reach for a hand-written request — and a caller who reaches for it gets the
+// pre-BLO-24495 behaviour back: a 200 over window 0 with no error. Matching
+// all three is what makes "rejected" a property of the CONCEPT rather than of
+// a spelling. Note `limit` is deliberately absent and must stay absent:
+// `GET /companies/:id/issues` genuinely implements it, so a surface that does
+// not (`/agents/me/inbox-lite`) rejects it with its own endpoint-local check.
 export function parseUnsupportedPaginationParams(query: {
   page?: unknown;
   perPage?: unknown;
+  per_page?: unknown;
 }): string[] {
   return [
     ...(query.page !== undefined ? ["page"] : []),
     ...(query.perPage !== undefined ? ["perPage"] : []),
+    ...(query.per_page !== undefined ? ["per_page"] : []),
   ];
 }
 

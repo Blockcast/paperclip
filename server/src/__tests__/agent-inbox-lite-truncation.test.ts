@@ -272,8 +272,20 @@ describe("agent inbox-lite truncation signal (BLO-39015)", () => {
  * Mutation-checked per the 2026-09-17 rule, each guard reverted ALONE:
  *   - drop `res.setHeader(ISSUE_LIST_TRUNCATED_HEADER)` -> the cap+1 case fails;
  *   - drop `res.setHeader(ISSUE_LIST_APPLIED_LIMIT_HEADER)` -> both cap cases fail;
- *   - drop the `parseUnsupportedPaginationParams` 400 -> both the `page` and
- *     `perPage` cases fail (status `200 !== 400`, and `list` is reached);
+ *   - drop the `parseUnsupportedPaginationParams` 400 -> the `page`, `perPage`
+ *     and `per_page` cases fail (status `200 !== 400`, and `list` is reached);
+ *   - drop the `per_page` arm from `parseUnsupportedPaginationParams` -> the
+ *     `per_page` case alone fails, and so does the sibling in
+ *     issues-list-page-param-rejection.test.ts (BLO-40714);
+ *   - drop the `req.query.limit !== undefined` 400 -> both `limit` cases fail
+ *     (BLO-40714);
+ *   - move that `limit` check into `parseUnsupportedPaginationParams` instead
+ *     -> these pass, and issue-list-truncation-signal.test.ts goes red: 11
+ *     cases, because the sibling endpoint is paged BY `limit` throughout. The
+ *     one added for this (`still honours a caller-supplied limit`) is not the
+ *     only case that catches a blanket harmonisation — it is the one that
+ *     catches a PARTIAL one (reject `limit` only below the cap, say, which
+ *     every pre-existing case sends) and the one that says why in its name;
  *   - drop the `parseOffsetParam === null` 400 -> both rejection cases fail;
  *   - pass a literal `0` instead of `parsedOffset` -> the paging case fails;
  *   - weaken `parseOffsetParam`'s `Number.isSafeInteger` to `Number.isFinite`
@@ -403,7 +415,7 @@ describe("REST — GET /api/agents/me/inbox-lite (BLO-39015)", () => {
   // the guard `?page=2` is a 200 serving window 0, and on a truncated lane the
   // envelope's `truncated: true` tells the caller there is more while the page
   // it asked for was silently dropped.
-  it.each(["page", "perPage"])(
+  it.each(["page", "perPage", "per_page"])(
     "rejects %s with 400 rather than silently serving window 0",
     async (param) => {
       serveRestPopulation(CAP + 1);
@@ -417,4 +429,55 @@ describe("REST — GET /api/agents/me/inbox-lite (BLO-39015)", () => {
       expect(mockIssueService.list).not.toHaveBeenCalled();
     },
   );
+
+  // BLO-40714. `limit` was the one param that reached this route and was
+  // dropped WITHOUT producing a short page: `?limit=10` served all 500 rows
+  // and a 200. Rejecting rather than honouring is the decision on that row —
+  // honouring would turn an accidental `limit` into a silent prefix, which is
+  // the defect BLO-39015 exists to kill, for callers who get the whole page
+  // today. `list` must not be reached: a guard placed after the service call
+  // would still 400 while having done the query.
+  it("rejects limit with 400 rather than silently serving the full page", async () => {
+    serveRestPopulation(CAP + 1);
+
+    const res = await request(await buildApp())
+      .get("/api/agents/me/inbox-lite")
+      .query({ limit: "10" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.unsupportedParams).toEqual(["limit"]);
+    expect(res.body.error).toMatch(/X-Applied-Limit/);
+    expect(mockIssueService.list).not.toHaveBeenCalled();
+  });
+
+  // Alongside a param this surface DOES support, so the case cannot pass by
+  // way of a guard that only fires on a lone unknown param.
+  it("rejects limit even when a valid offset rides with it", async () => {
+    serveRestPopulation(CAP + 3);
+
+    const res = await request(await buildApp())
+      .get("/api/agents/me/inbox-lite")
+      .query({ limit: "10", offset: String(CAP) });
+
+    expect(res.status).toBe(400);
+    expect(res.body.unsupportedParams).toEqual(["limit"]);
+    expect(mockIssueService.list).not.toHaveBeenCalled();
+  });
+
+  // The positive control for both guards above. Without it, "reject `limit`"
+  // and "reject `per_page`" are satisfiable by rejecting everything.
+  it("still serves a plain request and one carrying only offset", async () => {
+    serveRestPopulation(CAP + 3);
+    const app = await buildApp();
+
+    const plain = await request(app).get("/api/agents/me/inbox-lite");
+    expect(plain.status).toBe(200);
+    expect(plain.body).toHaveLength(CAP);
+
+    const paged = await request(app)
+      .get("/api/agents/me/inbox-lite")
+      .query({ offset: String(CAP) });
+    expect(paged.status).toBe(200);
+    expect(paged.body).toHaveLength(3);
+  });
 });
