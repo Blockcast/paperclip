@@ -1076,8 +1076,8 @@ not the others reproduces the blindness that got this audit rejected as a
 standalone compensating control on PEN-3140. The workspace-operation path is the
 one that had *neither* half of the control pair — no gate and no audit — until
 PEN-3204; its row is keyed `entity_type = workspace_operation` and carries the
-operation's owning run in `runId`, plus `details.ownerAgentId`, where `null`
-records the fail-closed branch (decided with no resolvable owner).
+operation's owning run in `runId` — the only owner reference it records (no
+owning-agent id is written, because this route is not owner-resolved).
 
 The audit row records the actor type/id, company id, heartbeat run id, timestamp
 (`activity_log.created_at`), access result, and the requested window (byte

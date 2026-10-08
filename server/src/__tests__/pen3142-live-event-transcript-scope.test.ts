@@ -581,3 +581,109 @@ describe("PEN-3142 live-event transcript scope — WebSocket fan-out", () => {
     expect(seqs).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
   });
 });
+
+/**
+ * Ally review 5449228335 (Critical): the socket half of the WS-vs-REST pair for
+ * scope-restricted agent keys. The REST half is in
+ * `pen3142-run-transcript-scope.test.ts`.
+ *
+ * Driven through the real upgrade, not a hand-built context, because the bug
+ * was `authorizeUpgrade` discarding `scopeConfig` from the very row it had
+ * selected — a test that supplies the context itself cannot see that.
+ *
+ * The decider stub mirrors `decideSkillTestAccess`'s default-deny (pinned
+ * against the real service in `authorization-service.test.ts`) and otherwise
+ * allows the owner, so the key's scope is the only thing that can withhold.
+ */
+describe("PEN-3142 live-event transcript scope — scoped agent keys", () => {
+  class FakeClientSocket extends EventEmitter {
+    readyState = 1;
+    sent: string[] = [];
+    send(data: string) {
+      this.sent.push(data);
+    }
+    ping() {}
+    terminate() {}
+    close() {}
+  }
+
+  class FakeUpgradeSocket extends EventEmitter {
+    destroyed = false;
+    writable = true;
+    end() {
+      return this;
+    }
+    destroy() {
+      this.destroyed = true;
+      return this;
+    }
+  }
+
+  const skillTestScope = { kind: "skill_test", issueId: "55555555-5555-4555-8555-555555555555" };
+
+  /** Thenable stand-in for the two drizzle chains `authorizeUpgrade` runs on the key. */
+  function keyDb(row: Record<string, unknown>) {
+    const chain: Record<string, unknown> = {
+      then: (resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) =>
+        Promise.resolve([row]).then(resolve, reject),
+    };
+    for (const method of ["select", "from", "where", "update", "set"]) chain[method] = () => chain;
+    return chain;
+  }
+
+  async function connectWithKey(scopeConfig: Record<string, unknown>) {
+    const { setupLiveEventsWebSocketServer } = await import("../realtime/live-events-ws.js");
+    const server = new EventEmitter();
+    const db = keyDb({ id: "key-1", agentId: runOwnerAgentId, companyId, revokedAt: null, scopeConfig });
+    const wss = setupLiveEventsWebSocketServer(server as never, db as never, { deploymentMode: "authenticated" });
+    const client = new FakeClientSocket();
+    vi.spyOn(wss as unknown as { handleUpgrade: (...args: unknown[]) => void }, "handleUpgrade")
+      .mockImplementation((...args: unknown[]) => (args[3] as (ws: unknown) => void)(client));
+    server.emit(
+      "upgrade",
+      { url: `/api/companies/${companyId}/events/ws`, headers: { authorization: "Bearer test-token" } },
+      new FakeUpgradeSocket(),
+      Buffer.alloc(0),
+    );
+    for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    return client;
+  }
+
+  async function publishCanaries(client: FakeClientSocket) {
+    const { publishLiveEvent } = await import("../services/live-events.js");
+    for (const [, build] of transcriptCanaries) {
+      const event = build();
+      publishLiveEvent({ companyId, type: event.type, payload: event.payload as never });
+    }
+    for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    return client.sent;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDecide.mockImplementation(async (input: { actor: { agentId?: string; keyScope?: { kind?: string } } }) =>
+      input.actor.keyScope?.kind === "skill_test"
+        ? { allowed: false, reason: "deny_scope", explanation: "Skill-test run token cannot use this API action." }
+        : { allowed: input.actor.agentId === runOwnerAgentId, reason: "allow_self", explanation: "test" });
+  });
+
+  it("withholds the transcript from a skill_test-scoped key, as its REST twin does", async () => {
+    const sent = await publishCanaries(await connectWithKey(skillTestScope));
+
+    expect(sent).toHaveLength(3);
+    expect(sent.join("\n")).not.toContain(CANARY);
+    // The decider is handed the key's id and scope, exactly as the REST
+    // middleware stamps them — not an actor decided as an unscoped key.
+    expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "runs:read_transcript",
+      actor: expect.objectContaining({ source: "agent_key", keyId: "key-1", keyScope: skillTestScope }),
+    }));
+  });
+
+  it("still streams the transcript to the same agent on a standard key", async () => {
+    const sent = await publishCanaries(await connectWithKey({ kind: "standard" }));
+
+    expect(sent).toHaveLength(3);
+    for (const frame of sent) expect(frame).toContain(CANARY);
+  });
+});

@@ -3639,6 +3639,32 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  // Ally review 5449228335: the decision the live-events socket must reproduce.
+  // An unscoped key reads its own run's transcript; the same key scoped to a
+  // skill test does not, so dropping `keyScope` from an actor flips the answer.
+  it("denies runs:read_transcript to a skill-test key, even on its own run", async () => {
+    const company = await createCompany(db, "SkillTestTranscript");
+    const skillTestAgent = await createAgent(db, company.id);
+    const ownIssue = await createIssue(db, company.id, { assigneeAgentId: skillTestAgent.id });
+    const actor = {
+      type: "agent" as const,
+      agentId: skillTestAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+    const input = {
+      action: "runs:read_transcript" as const,
+      resource: { type: "agent" as const, companyId: company.id, agentId: skillTestAgent.id },
+    };
+    const authz = authorizationService(db);
+
+    await expect(authz.decide({ actor, ...input })).resolves.toMatchObject({ allowed: true });
+    await expect(authz.decide({
+      actor: { ...actor, keyScope: { kind: "skill_test" as const, issueId: ownIssue.id } },
+      ...input,
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+  });
+
   it("allows responsible-user inbox management by default", async () => {
     const company = await createCompany(db, "InboxDefaultOpen");
     const actorAgent = await createAgent(db, company.id);

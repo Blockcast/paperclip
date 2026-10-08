@@ -1,6 +1,6 @@
 import type { Request } from "express";
 import type { Db } from "@paperclipai/db";
-import type { LiveEvent } from "@paperclipai/shared";
+import type { AgentApiKeyScope, LiveEvent } from "@paperclipai/shared";
 import {
   liveEventCarriesTranscriptContent,
   withholdLiveEventTranscriptContent,
@@ -47,6 +47,15 @@ export interface LiveEventSubscriberContext {
    * the same caller.
    */
   trustedLocal?: boolean;
+  /**
+   * The agent key's id and scope, as `authorizeUpgrade` read them off the
+   * matched `agentApiKeys` row. Carried for the same reason as `actorSource`:
+   * the decider keys on them (`skill_test` default-denies, `task_bridge` needs
+   * the key id), and an actor synthesized without them is decided as an
+   * unscoped key — a question the REST twin never asks (Ally review 5449228335).
+   */
+  keyId?: string;
+  keyScope?: AgentApiKeyScope;
 }
 
 type RunTranscriptDecider = Parameters<typeof decideRunTranscriptRead>[1];
@@ -88,6 +97,8 @@ function syntheticRequest(context: LiveEventSubscriberContext): Request {
           type: "agent" as const,
           agentId: context.actorId,
           companyId: context.companyId,
+          keyId: context.keyId,
+          keyScope: context.keyScope,
           source: "agent_key" as const,
         }
       : {
