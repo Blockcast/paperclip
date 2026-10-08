@@ -2435,6 +2435,51 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
     }
   });
 
+  // Ally on #2336 at e93b1b1c: the retain paths keep a pod alive on purpose, so
+  // its Secrets must stay mounted.  Both paths (retainJobs, and the
+  // state-mismatch skipCleanup) share one branch in the teardown `finally`;
+  // only retainJobs is reachable here, and it pins that branch for both.
+  it("retains the run Secrets, and never touches the pods, when retainJobs is set", async () => {
+    mockCoreDeletePod.mockImplementation(async () => {
+      mockCoreListPods.mockResolvedValue({ items: [] });
+      return {};
+    });
+
+    const result = await execute(
+      makeCtx({
+        config: { podStartTimeoutSec: 0, retainJobs: true, env: { MY_API_KEY: "s3cret" } },
+      } as Partial<AdapterExecutionContext>),
+    );
+
+    expect(result.errorMessage).toContain("Pod startup failed");
+    // Guard against a vacuous pass: there must be a Secret to retain.
+    expect(mockCoreCreateSecret).toHaveBeenCalled();
+    expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+    expect(mockCoreDeletePod).not.toHaveBeenCalled();
+    expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+  });
+
+  // Ally on #2336 at e93b1b1c: both unowned-Secret warnings run where a throw
+  // discards the run's result, so they go through `logQuietly`.  A sink that
+  // returns no promise is the case `.catch(() => undefined)` gets wrong: it
+  // TypeErrors on `undefined.catch`.  Reverting either call site reddens this.
+  it("survives a log sink that returns no promise while warning about unowned Secrets", async () => {
+    mockCorePatchSecret.mockRejectedValue(new Error("secrets is forbidden"));
+    const onLog = vi.fn();
+
+    const result = await execute(
+      makeCtx({
+        onLog,
+        config: { podStartTimeoutSec: 0, retainJobs: true, env: { MY_API_KEY: "s3cret" } },
+      } as Partial<AdapterExecutionContext>),
+    );
+
+    expect(result.errorMessage).toContain("Pod startup failed");
+    const stderr = onLog.mock.calls.filter(([s]) => s === "stderr").map(([, m]) => m).join("");
+    expect(stderr).toContain("failed to set ownerReference");
+    expect(stderr).toContain("with no ownerReference, so no GC will ever collect them");
+  });
+
   // Ally C1 on #2099 at 0dc2e567: `deleteCollectionNamespacedPod` needs the
   // `deletecollection` verb, which Role/paperclip-k8s-adapters does not grant
   // (SSAR from `paperclip:paperclip`, 2026-10-06: `deletecollection` false,
@@ -3496,6 +3541,10 @@ describe("cleanupJob pod-log reaping", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    // A list that ran and saw no pods.  Left unset, the reset mock resolves
+    // `undefined`, which `podList?.items ?? []` also reads as gone — so the
+    // `true` assertions below would pass on an unparseable response too.
+    mockCoreListPods.mockResolvedValue({ items: [] });
   });
 
   async function makePodLog(name: string): Promise<string> {
