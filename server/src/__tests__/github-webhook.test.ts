@@ -10091,11 +10091,22 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // while destroying the signal this split exists to create, so the routine
     // case is pinned at its own level in the same breath.
     describe("declined-review log level (BLO-34248)", () => {
-      const DECLINED_MESSAGE =
+      const ROUTINE_MESSAGE =
         "github webhook declined PR review feedback delivery: classifier found no actionable findings";
+      // The promoted case says what it actually means. The routine wording is
+      // the OPPOSITE of it -- the classifier could not enumerate, rather than
+      // enumerating and coming up empty -- and a WARN whose own text says
+      // nothing was found hands the operator a reason to dismiss it.
+      const UNENUMERABLE_MESSAGE =
+        "github webhook declined PR review feedback delivery: Ally review findings could not be enumerated";
 
+      // Matches EITHER wording on purpose: a test that filtered each stream by
+      // the message it expects could not see the promoted line leaking back
+      // into `info`, which is the regression the length-0 assertions catch.
       function declinedLines(spy: ReturnType<typeof vi.spyOn>) {
-        return spy.mock.calls.filter(([, msg]) => msg === DECLINED_MESSAGE);
+        return spy.mock.calls.filter(
+          ([, msg]) => msg === ROUTINE_MESSAGE || msg === UNENUMERABLE_MESSAGE,
+        );
       }
 
       it("promotes ally_review_findings_unenumerable to warn so the truncated-body case is selectable without knowing the reason name", async () => {
@@ -10129,6 +10140,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
           const warned = declinedLines(warnSpy);
           expect(warned).toHaveLength(1);
+          // Level AND wording: a promoted line still carrying the routine
+          // "found no actionable findings" text states the opposite of the
+          // reason it was promoted for.
+          expect(warned[0]?.[1]).toBe(UNENUMERABLE_MESSAGE);
           expect(warned[0]?.[0]).toMatchObject({
             suppressionReason: "ally_review_findings_unenumerable",
             suppressionPredicate:
@@ -10186,6 +10201,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
           const infoed = declinedLines(infoSpy);
           expect(infoed).toHaveLength(1);
+          expect(infoed[0]?.[1]).toBe(ROUTINE_MESSAGE);
           expect(infoed[0]?.[0]).toMatchObject({ suppressionReason: "review_body_absent" });
 
           // The control the AC calls load-bearing: if this ever goes `warn`,

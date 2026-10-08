@@ -93,6 +93,7 @@ import {
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
   type PrReviewActionabilityDecision,
+  type PrReviewNonActionableReason,
 } from "../services/ally-review-detection.js";
 import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
 import { enqueueGithubCommitStatusDelivery } from "../services/github-status-delivery-outbox.js";
@@ -4365,6 +4366,53 @@ type PrReviewFeedbackSuppression = Pick<
   "reason" | "predicate"
 >;
 
+// The routine wording, shared by every reason that really does mean "the
+// classifier enumerated the findings and none were actionable".
+const DECLINED_REVIEW_FEEDBACK_MESSAGE =
+  "github webhook declined PR review feedback delivery: classifier found no actionable findings";
+
+// BLO-34248: how each declined reason is emitted. The reasons differ in how
+// much they should worry a reader, and a single level under a single message
+// makes the one suspect case selectable only by someone who already knows its
+// name -- which is most of the discoverability problem BLO-30420 names.
+//
+//   `warn`  -- `ally_review_findings_unenumerable`: a body reached the
+//              classifier with its findings already truncated away (the frr#61
+//              shape). Alertable on its own, and it carries its OWN message:
+//              "found no actionable findings" states the opposite of what this
+//              reason means -- the classifier could not enumerate, it did not
+//              enumerate and come up empty. A WARN whose own text says nothing
+//              was found hands the operator a reason to dismiss it.
+//   `debug` -- `ally_review_findings_all_zero`: the healthy no-op, and the
+//              overwhelmingly common one.
+//   `info`  -- the routine remainder (`review_body_absent` and peers).
+//
+// Deliberately NOT a blanket promotion of the declined path: promoting
+// `review_body_absent` too would restore exactly the burial this removes,
+// which is why the test carries a routine-level control alongside.
+//
+// A `satisfies`-checked lookup rather than a fall-through ternary, because the
+// fall-through lands a reason added later on `info` under the routine wording
+// SILENTLY -- the hazard named directly above ("nothing downstream switches on
+// the reason exhaustively"), and here that reason would be a new suspect case
+// inheriting exactly the burial this exists to prevent. This is that exhaustive
+// switch: adding a member to `PrReviewNonActionableReason` now fails to compile
+// until its level and wording are a decision someone made.
+const DECLINED_REVIEW_FEEDBACK_LOG = {
+  ally_review_findings_unenumerable: {
+    level: "warn",
+    message:
+      "github webhook declined PR review feedback delivery: Ally review findings could not be enumerated",
+  },
+  ally_review_findings_all_zero: { level: "debug", message: DECLINED_REVIEW_FEEDBACK_MESSAGE },
+  review_body_absent: { level: "info", message: DECLINED_REVIEW_FEEDBACK_MESSAGE },
+  review_body_empty: { level: "info", message: DECLINED_REVIEW_FEEDBACK_MESSAGE },
+  review_no_blocking_feedback: { level: "info", message: DECLINED_REVIEW_FEEDBACK_MESSAGE },
+} as const satisfies Record<
+  PrReviewNonActionableReason,
+  { level: "warn" | "info" | "debug"; message: string }
+>;
+
 function resolveReviewFeedbackSuppression(
   context: ResolvedEventContext,
 ): PrReviewFeedbackSuppression | null {
@@ -7024,24 +7072,8 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // changes no wake, comment, dedupe or escalation behavior.
     const reviewFeedbackSuppression = resolveReviewFeedbackSuppression(context);
     if (reviewFeedbackSuppression) {
-      // BLO-34248: three levels, because the reasons differ in how much they
-      // should worry a reader and a single level makes the one suspect case
-      // selectable only by someone who already knows its name.
-      //   `warn`  -- `ally_review_findings_unenumerable`: a body reached the
-      //              classifier with its findings already truncated away (the
-      //              frr#61 shape). Alertable on its own.
-      //   `debug` -- `ally_review_findings_all_zero`: the healthy no-op and
-      //              the overwhelmingly common one.
-      //   `info`  -- the routine remainder (`review_body_absent` and peers).
-      // Deliberately NOT a blanket promotion of the declined path: promoting
-      // `review_body_absent` too would restore exactly the burial this fixes,
-      // which is why the test carries a routine-level control alongside.
-      const level =
-        reviewFeedbackSuppression.reason === "ally_review_findings_unenumerable"
-          ? "warn"
-          : reviewFeedbackSuppression.reason === "ally_review_findings_all_zero"
-            ? "debug"
-            : "info";
+      // Level and wording per reason; see DECLINED_REVIEW_FEEDBACK_LOG.
+      const { level, message } = DECLINED_REVIEW_FEEDBACK_LOG[reviewFeedbackSuppression.reason];
       logger[level](
         {
           deliveryId,
@@ -7061,7 +7093,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           suppressionReason: reviewFeedbackSuppression.reason,
           suppressionPredicate: reviewFeedbackSuppression.predicate,
         },
-        "github webhook declined PR review feedback delivery: classifier found no actionable findings",
+        message,
       );
     }
 
