@@ -5,6 +5,7 @@ import {
   activityLog,
   agents,
   agentWakeupRequests,
+  backstopSweepCursors,
   budgetPolicies,
   companies,
   companyMemberships,
@@ -100,6 +101,7 @@ import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import {
   BACKSTOP_CANDIDATES_SKIPPED_METRIC,
+  BACKSTOP_SWEEP_COMPLETED_METRIC,
   __resetMetricsForTest,
   renderMetrics,
 } from "../services/metrics.ts";
@@ -836,6 +838,161 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(metrics).not.toContain(
       `${BACKSTOP_CANDIDATES_SKIPPED_METRIC}{source="issue_graph_liveness.backstop",reason="deferred_or_failed"} 1`,
     );
+  });
+
+  describe("backstop rotation cursor survives process restart (BLO-36017)", () => {
+    /**
+     * Adds `count` extra blocked dependents, each behind its own already-`done` blocker, to a
+     * company seeded by `seedResolvedDependencyBackstopFixture`. Every one is an independent
+     * heal candidate, so a sweep that reaches it enqueues exactly one wake for it — which is
+     * what makes "was this row visited?" observable through the `enqueueWakeup` spy.
+     */
+    async function seedAdditionalBlockedDependents(
+      seeded: { companyId: string; agentId: string },
+      count: number,
+    ) {
+      const { companyId, agentId } = seeded;
+      const issuePrefix = `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      const blockedIssueIds: string[] = [];
+      for (let n = 0; n < count; n += 1) {
+        const blockedIssueId = randomUUID();
+        const blockerIssueId = randomUUID();
+        blockedIssueIds.push(blockedIssueId);
+        await db.insert(issues).values([
+          {
+            id: blockedIssueId,
+            companyId,
+            title: `Synthetic blocked dependent ${n + 3}`,
+            status: "blocked",
+            priority: "medium",
+            assigneeAgentId: agentId,
+            issueNumber: 100 + n * 2,
+            identifier: `${issuePrefix}-${100 + n * 2}`,
+          },
+          {
+            id: blockerIssueId,
+            companyId,
+            title: `Synthetic completed blocker ${n + 3}`,
+            status: "done",
+            priority: "medium",
+            issueNumber: 101 + n * 2,
+            identifier: `${issuePrefix}-${101 + n * 2}`,
+          },
+        ]);
+        await db.insert(issueRelations).values({
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: blockedIssueId,
+          type: "blocks",
+        });
+      }
+      return blockedIssueIds;
+    }
+
+    function wokenIssueIds(enqueueWakeup: ReturnType<typeof vi.fn>): string[] {
+      // `enqueueWakeup(agentId, request)` — the payload rides on the SECOND argument.
+      return enqueueWakeup.mock.calls
+        .map(([, request]) => (request as { payload?: { issueId?: string } })?.payload?.issueId)
+        .filter((id): id is string => typeof id === "string");
+    }
+
+    function completionCount(metricsBody: string): number {
+      const line = metricsBody
+        .split("\n")
+        .find((l) => l.startsWith(`${BACKSTOP_SWEEP_COMPLETED_METRIC}{source="issue_graph_liveness.backstop"}`));
+      return line ? Number(line.trim().split(/\s+/).pop()) : 0;
+    }
+
+    /**
+     * The defect: both rotation cursors were in-memory closure variables, so a process
+     * replacement reset them to null and restarted the rotation at page 1. Under churn shorter
+     * than one rotation the tail beyond page 1 was never visited, and the completion counter —
+     * which only fires on the tail tick, where `candidateLimitSkipped` reaches 0 — never
+     * incremented at all.
+     *
+     * Each tick runs on a FRESHLY CONSTRUCTED service, which is the restart. Against the
+     * in-memory cursor every tick re-reads page 1, so ticks 2 and 3 heal nothing (those rows
+     * already hold a queued wake), the tail rows are never reached, and no completion is ever
+     * recorded. That is the failing mutation this test exists to pin.
+     *
+     * Driven through the injectable `limit` rather than by seeding 501 rows: the production
+     * limit is a parameter, not a branch, so `limit: 2` over 5 candidates drives the identical
+     * multi-page rotation in milliseconds.
+     */
+    it("resumes a rotation mid-flight across a restart, visiting each candidate once per rotation", async () => {
+      const seeded = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      const extraIds = await seedAdditionalBlockedDependents(seeded, 4);
+      const allIds = [seeded.blockedIssueId, ...extraIds].sort();
+
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      // A fresh service per tick — the restart. The cursor must come back from the database,
+      // not from a closure that died with the previous "process".
+      const tick = () =>
+        recoveryService(db, { enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+          companyId: seeded.companyId,
+          limit: 2,
+        });
+
+      const first = await tick();
+      expect(first).toMatchObject({ checked: 2, healed: 2, candidateLimitSkipped: 3 });
+
+      const second = await tick();
+      expect(second).toMatchObject({ checked: 2, healed: 2, candidateLimitSkipped: 1 });
+
+      const third = await tick();
+      expect(third).toMatchObject({ checked: 1, healed: 1, candidateLimitSkipped: 0 });
+
+      // Every candidate reached exactly once across the rotation, restarts notwithstanding.
+      const woken = wokenIssueIds(enqueueWakeup);
+      expect(woken.slice().sort()).toEqual(allIds);
+      expect(new Set(woken).size).toBe(woken.length);
+
+      // The tail tick is reachable again, so the rotation records exactly one completion.
+      expect(completionCount((await renderMetrics()).body)).toBe(1);
+    });
+
+    /**
+     * The regression control, and the one that matters: the below-page-limit regime is the
+     * healthy production shape (cursor null every tick), and it feeds the `unless` arm of the
+     * live `PaperclipBackstopSweepNotDraining` rule. A fix that gated the counter on a non-null
+     * cursor — the rejected `backstopSweepCompletionPath()` swap — would stop this counter
+     * entirely and make that alert fire on a healthy system, silently and in the worst
+     * direction. This asserts the counter still advances once per tick here.
+     */
+    it("still records a completion on every tick when the population fits inside one page", async () => {
+      const seeded = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const tick = () =>
+        recoveryService(db, { enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+          companyId: seeded.companyId,
+        });
+
+      for (const expected of [1, 2, 3]) {
+        const result = await tick();
+        expect(result.candidateLimitSkipped).toBe(0);
+        expect(completionCount((await renderMetrics()).body)).toBe(expected);
+      }
+    });
+
+    it("keeps the stranded-recovery rotation's cursor across a restart too", async () => {
+      const seeded = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      await seedAdditionalBlockedDependents(seeded, 2);
+
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      await recoveryService(db, { enqueueWakeup }).reconcileResolvedDependencyWakeBackstop({
+        companyId: seeded.companyId,
+        limit: 2,
+      });
+
+      const cursor = await db
+        .select({ cursor: backstopSweepCursors.cursor, sweep: backstopSweepCursors.sweep })
+        .from(backstopSweepCursors)
+        .where(eq(backstopSweepCursors.sweep, `issue_graph_liveness.backstop:${seeded.companyId}`))
+        .then((rows) => rows[0] ?? null);
+
+      // Persisted, company-scoped, and pointing past page 1 — the state a restart must inherit.
+      expect(cursor?.cursor).toBeTruthy();
+    });
   });
 
   it("does not create recovery issues outside the configured lookback window", async () => {
