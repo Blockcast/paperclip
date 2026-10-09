@@ -97,9 +97,14 @@ function reviewerName(entry) {
 export const VIOLATION_KINDS = {
   /**
    * No rule of type `required_reviewers` exists on the environment at all.
-   * Kept on the original slug deliberately: this is the shape that was live when
-   * the two were split (PEN-3871), so the then-firing Alertmanager alert keeps
-   * its fingerprint across that change instead of resolving and re-firing.
+   * Kept on the original slug deliberately: an absent rule has always reported
+   * under this slug, so when a reviewer is restored to RATIFIED_REVIEWERS the
+   * verdict re-arms under the name consumers already key on (PEN-3871).
+   *
+   * Both this kind and REQUIRED_REVIEWERS_EMPTY sit behind `expected.length > 0`.
+   * With the ratified set empty — the state since onprem-k8s#4913 — NEITHER can
+   * emit, because an absent rule IS then the ratified shape. Do not read either
+   * slug as currently alerting.
    */
   REQUIRED_REVIEWERS_RULE: 'required_reviewers_rule',
   /** The rule exists, but its reviewer list is empty. */
@@ -145,10 +150,9 @@ export function evaluateEnvironmentProtection(env, options = {}) {
   // A compound clause that skips a sibling check is how a tolerated drift masks
   // an untolerated one; keep this clause about "is there a gate at all".
   //
-  // `expected.length > 0` is the reviewed switch that enables the gate.
-  // With an empty ratified set, an absent rule is the current ratified shape and
-  // falls through to membership comparison; otherwise keep missing and empty
-  // rule states as distinct, actionable verdicts.
+  // Split into two verdicts: an absent rule and an emptied list have different
+  // causes and different remedies. Both stay behind the `expected.length > 0`
+  // switch described above, so neither widens what this clause reports.
   if (expected.length > 0 && rule == null) {
     violation(
       VIOLATION_KINDS.REQUIRED_REVIEWERS_RULE,
