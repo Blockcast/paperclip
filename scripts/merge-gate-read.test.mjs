@@ -12,13 +12,13 @@ const READER = fileURLToPath(new URL("./merge-gate-read.sh", import.meta.url));
  * exit is an expected outcome here and must not be read as a harness failure —
  * the VERDICT IS THE LINES. Use `read()` unless you are asserting on rc itself.
  */
-function readRc(rows, dead = "__none__", pend = "") {
+function readRc(rows, dead = "__none__", pend = "", wdead = "") {
   const stdin = rows.length ? rows.map((r) => r.join("\t")).join("\n") + "\n" : "";
   const opts = { input: stdin, encoding: "utf8" };
   let rc = 0;
   let out;
   try {
-    out = execFileSync("bash", [READER, "--rows", dead, pend], opts);
+    out = execFileSync("bash", [READER, "--rows", dead, pend, wdead], opts);
   } catch (e) {
     rc = e.status;
     out = e.stdout;
@@ -27,18 +27,35 @@ function readRc(rows, dead = "__none__", pend = "") {
 }
 
 /** Run the verdict pipeline and return only its lines. */
-function read(rows, dead = "__none__", pend = "") {
-  return readRc(rows, dead, pend).lines;
+function read(rows, dead = "__none__", pend = "", wdead = "") {
+  return readRc(rows, dead, pend, wdead).lines;
 }
 
 /** Render pend rows the way the live path hands them to verdicts(). */
 const pend = (...rows) => rows.map((r) => r.join("\t")).join("\n");
 
-/** Classify workflow runs at a head into the stale-run alternation. */
-function dead(runs) {
+/**
+ * Classify workflow runs at a head into the stale-run alternation.
+ * `wits` is the BLO-38577 off-head witness list, newline-separated
+ * `workflow-id<SP>run-started-at<SP>status-updated-at`. Empty is the
+ * no-witness case, and every
+ * pre-BLO-38577 fixture leaves it empty on purpose: the external arm must be
+ * inert unless a witness was positively established. A non-empty `arm` asks for
+ * the witness arm's ids alone — the WDEAD set the live path hands verdicts().
+ */
+function dead(runs, wits = "", arm = "") {
   const stdin = runs.map((r) => r.join("\t")).join("\n") + "\n";
-  const out = execFileSync("bash", [READER, "--dead"], { input: stdin, encoding: "utf8" });
+  const out = execFileSync("bash", [READER, "--dead", wits, arm], { input: stdin, encoding: "utf8" });
   return out.trim();
+}
+
+/** Turn a commit-status API body into off-head witness candidates. */
+function witnessExtract(pages) {
+  const out = execFileSync("bash", [READER, "--witness-extract"], {
+    input: pages.map((p) => JSON.stringify(p)).join("\n"),
+    encoding: "utf8",
+  });
+  return out.split("\n").filter(Boolean);
 }
 
 /** Turn a check-runs API body into reader rows. */
@@ -619,6 +636,270 @@ describe("merge-gate reader", () => {
         "",
       );
     });
+
+    // BLO-38577. The sibling arm asks `actions/runs?head_sha=`, so a producer
+    // whose verdict run lives at ANOTHER head is unreachable by it and its
+    // victim prints a STOP nothing can clear. Measured on
+    // pim-multicast-gateway#3469 @ c494fdc5: `ci-gate-status` (workflow
+    // 286646914) runs once at the PR head as `pull_request`, is cancelled by
+    // its own by-design re-entrancy, and has ZERO siblings of ANY event there —
+    // so the failure is EMPTINESS, not the `event` key, and dropping `event`
+    // would fix nothing while re-opening BLO-34114. The green verdict comes
+    // from run 36761895861, a `schedule` run of the SAME workflow whose
+    // head_sha is main's, visible at the PR head only as the `ci-gate` status.
+    // Live values throughout.
+    describe("off-head witness", () => {
+      const PIM = [
+        ["286646914", "pull_request", "36752366689", "cancelled", "2026-09-30T17:34:32Z"],
+        ["315797104", "pull_request", "36762359479", "success", "2026-09-30T18:58:15Z"],
+      ];
+      // `wf run-started-at status-updated-at`. Live: ci-gate's green status was
+      // published 18:55:08Z by run 36761895861, which started 18:54:18Z.
+      const WITNESS = "286646914 2026-09-30T18:54:18Z 2026-09-30T18:55:08Z";
+
+      it("retires a sole cancelled run on a later off-head pass by its own workflow", () => {
+        assert.equal(dead(PIM, WITNESS), "36752366689");
+      });
+
+      // ...and the whole arm is inert without one. This is also the shape of
+      // BLO-34367's control: paperclip#1898 @ 1918adce carries ZERO legacy
+      // statuses, so no witness can be built there and its terminal `e2e`
+      // cancellation stays a STOP by construction rather than by luck.
+      it("keeps the same run when no witness was established", () => {
+        assert.equal(dead(PIM), "");
+      });
+
+      // BLO-34114 in the surface dimension. `passed_at_head` refuses the
+      // off-head witness whenever ANY run of that workflow passed at this head,
+      // because that is the multi-lane world the `event` key exists to police:
+      // one workflow file, two triggers, and the `pull_request` lane passes
+      // vacuously without secrets. Live ids from penstock-llm-proxy-core, the
+      // same pair as the sibling-arm fixture above. Without this term the
+      // vacuous lane's presence plus any green status retires the secrets lane
+      // and `secret-scan` reads green — the exact false GREEN BLO-34114 closed.
+      it("refuses an off-head witness when the workflow passed at this head", () => {
+        assert.equal(
+          dead(
+            [
+              ["286504429", "pull_request_target", "34868322890", "cancelled", "2026-09-15T16:33:00Z"],
+              ["286504429", "pull_request", "34868326080", "success", "2026-09-15T16:37:00Z"],
+            ],
+            "286504429 2026-09-15T16:59:00Z 2026-09-15T17:00:00Z",
+          ),
+          "",
+        );
+      });
+
+      // Attribution. The witness is keyed on the VICTIM'S workflow_id, so it can
+      // only ever retire its own producer's runs. Un-keying it — one global
+      // newest witness — is the "any green status clears anything" variant this
+      // arm was designed around, and it is what makes the 403 on
+      // required_status_checks.contexts survivable.
+      it("does not let one workflow's witness retire another's run", () => {
+        assert.equal(dead(PIM, "999999999 2026-09-30T18:54:18Z 2026-09-30T18:55:08Z"), "");
+      });
+
+      // Ordering, for the same reason as the sibling arm: a verdict published
+      // BEFORE the victim ran is not evidence about it. One second early.
+      it("keeps a run whose only witness predates it", () => {
+        assert.equal(dead(PIM, "286646914 2026-09-30T17:30:00Z 2026-09-30T17:34:31Z"), "");
+      });
+
+      // The two arms are independent: a witness must not be required to reach
+      // the sibling arm, and must not override a missing timestamp either.
+      it("still fails closed on a missing victim timestamp, witness or not", () => {
+        assert.equal(dead([["10", "push", "100", "cancelled", ""]], "10 2026-09-19T01:04:00Z 2026-09-19T01:05:00Z"), "");
+      });
+
+      // Ally review 5374012593 (Important). The off-head arm is for a head where
+      // NO verdict was produced. A FAILED victim produced one and it said no,
+      // and the witness is by construction a run against a DIFFERENT TREE (the
+      // scheduled run sits at main's head_sha) — so retiring it would overrule
+      // this tree's own answer with a pass on another one. Same victim, same
+      // witness, same timing as the motivating case above; only `conclusion`
+      // differs, which isolates the term. Kills the `cx[i]` guard.
+      it("refuses an off-head witness for a FAILED victim, not merely a cancelled one", () => {
+        assert.equal(
+          dead([["286646914", "pull_request", "36752366689", "failure", "2026-09-30T17:34:32Z"]], WITNESS),
+          "",
+        );
+      });
+
+      // ...while the SIBLING arm must still retire that same failed victim: a
+      // pass at THIS head is the same tree and the same lane, so it IS evidence
+      // about this code. Ally review 5375356236 measured that over-applying
+      // `cx` to the sibling arm is ALSO killed by the BLO-34619 fixture above,
+      // so this is not the only thing standing between `cx` and that
+      // regression — it is redundant cover, kept because it names the intent at
+      // the point of the narrowing, where the BLO-34619 fixture does not.
+      it("still retires a FAILED victim on an at-head pass by its own lane", () => {
+        assert.equal(
+          dead([
+            ["286646914", "pull_request", "36752366689", "failure", "2026-09-30T17:34:32Z"],
+            ["286646914", "pull_request", "36752400000", "success", "2026-09-30T17:40:00Z"],
+          ]),
+          "36752366689",
+        );
+      });
+
+      // Ally review 5374012593 (Important): `P[2] > ext[P[1]]` had no failing
+      // mutation — un-keying the max to `ext["g"]` survived the suite. Two
+      // witnesses for ONE workflow, NEWEST FIRST: the un-keyed max is never
+      // assigned, so every row beats it and the OLDER row lands last, pulling
+      // ext back before the victim and wrongly sparing it. Order matters here;
+      // oldest-first would pass under both.
+      it("keeps the newest witness per workflow when several are published", () => {
+        assert.equal(
+          dead(PIM, "286646914 2026-09-30T18:54:18Z 2026-09-30T18:55:08Z\n286646914 2026-09-30T16:59:00Z 2026-09-30T17:00:00Z"),
+          "36752366689",
+        );
+      });
+
+      // Ally review 5375356236 (Suggestion): the ordering fence read the
+      // STATUS's updated_at, which records when a verdict was PUBLISHED, never
+      // when the run that produced it looked at anything. A run publishes at
+      // the END of its own execution, so the gap between the two is the
+      // witness run's whole duration — and a long aggregator run that STARTED
+      // before the victim can publish after it and clear a tree it never saw.
+      // Here the status (17:40) is comfortably later than the victim (17:34:32)
+      // while the run itself began at 17:30. Kills the min: reverting `e` to
+      // the status field alone retires the victim and this goes red.
+      it("refuses a witness whose run started before the victim, however late it published", () => {
+        assert.equal(dead(PIM, "286646914 2026-09-30T17:30:00Z 2026-09-30T17:40:00Z"), "");
+      });
+
+      // Ally review at bc1d8a56 (Important): the OTHER half of that min had no
+      // failing mutation — `e = P[2]` (run start alone) passed the suite, since
+      // the fixture above only kills `e = P[3]`. Reachable: a re-run advances
+      // run_started_at while a status published at the earlier attempt keeps
+      // its old updated_at, so P[3] < P[2]. Here the status was published at
+      // 09:50, ten minutes BEFORE the victim ran; reading the run start alone
+      // retires it on a verdict that predates it. Ally's demonstrated values.
+      it("refuses a witness whose status was published before the victim, however late its run started", () => {
+        assert.equal(
+          dead(
+            [["555", "pull_request", "111", "cancelled", "2026-10-01T10:00:00Z"]],
+            "555 2026-10-01T10:05:00Z 2026-10-01T09:50:00Z",
+          ),
+          "",
+        );
+      });
+
+      // The live path asks for this arm's ids ALONE (WDEAD) so verdicts() can
+      // keep a witness-retired run's blocking rows. A run the SIBLING arm
+      // retired must not leak into that set: its pass is same-tree, same-lane,
+      // so its `failure` rows ARE stale (BLO-34835) and keeping them is a
+      // permanent false RED.
+      it("names only the witness arm's ids when asked for them alone", () => {
+        assert.equal(dead(PIM, WITNESS, "w"), "36752366689");
+        assert.equal(
+          dead(
+            [
+              ["286646914", "pull_request", "36752366689", "failure", "2026-09-30T17:34:32Z"],
+              ["286646914", "pull_request", "36752400000", "success", "2026-09-30T17:40:00Z"],
+            ],
+            "",
+            "w",
+          ),
+          "",
+        );
+      });
+
+      // Ally review 5374012593 (Important): `split(W[j], P, " ")` had no
+      // failing mutation. The arity is the contract with the live path's
+      // `printf '%s %s\n' "$pair" "$ts"`, and the realistic malformation is a
+      // row built by a caller still on the pre-5375356236 two-field shape:
+      // relaxing the test to `>= 1` accepts it, reads the publish time as the
+      // run start, and reinstates exactly the hazard above. Fail closed on any
+      // arity but three rather than guessing which field is which.
+      it("fails closed on a malformed witness row rather than guessing its fields", () => {
+        assert.equal(dead(PIM, "286646914 2026-09-30T18:55:08Z"), "");
+        assert.equal(dead(PIM, "286646914 2026-09-30T18:54:18Z 2026-09-30T18:55:08Z 36761895861"), "");
+      });
+    });
+  });
+
+  // BLO-38577 end to end: the measured pim rows. Both STOPs were the
+  // aggregator's own scratch jobs, from a corpse of the aggregator — never an
+  // independent CI verdict — and an unclearable veto on 100% of a repo's PRs is
+  // what trains the hand-override that defeats the reader. A surviving green
+  // check-run keeps the BLO-34263 ABSENT guard honest here.
+  describe("off-head witness, end to end", () => {
+    const rows = [
+      ["Report /test status", "cancelled", "2026-09-30T17:35:00Z", "36752366689"],
+      ["aggregate-status", "cancelled", "2026-09-30T17:35:01Z", "36752366689"],
+      ["ci-gate", "success", "2026-09-30T18:55:08Z", "status"],
+      ["Cross-deps Guard", "success", "2026-09-30T17:40:00Z", "36752366433"],
+    ];
+
+    // The corpse is `completed`+`cancelled`, so BLO-37887's pending_runs()
+    // emits it too and the live path hands it here as a pend row. Passing it is
+    // not decoration: without the END-loop DEAD exemption this prints
+    // NO-VERDICT instead of STOP — still blocking, still unclearable, i.e. this
+    // whole arm buys nothing. Omitting the pend arg would assert a shape the
+    // live path no longer produces.
+    const PEND = pend(["36752366689", "cancelled", "ci-gate-status"]);
+
+    // The corpse is retired by the WITNESS arm, so the live path also hands
+    // it over as WDEAD — and its rows are `cancelled`, i.e. they said nothing,
+    // which is the one non-pass a witness may speak for.
+    it("prints no STOP once the aggregator's corpse is retired", () => {
+      assert.deepEqual(stops(read(rows, "36752366689", PEND, "36752366689")), []);
+    });
+
+    it("prints both STOPs while it is not", () => {
+      assert.equal(stops(read(rows, "__none__", PEND)).length, 2);
+    });
+
+    // Ally review at bc1d8a56 (Important): `cx[i]` keys on the RUN conclusion,
+    // not on what the run published. A job that fails before cancel-in-progress
+    // kills the rest leaves a real `failure` row under a `cancelled` run, and
+    // the witness — a pass on a different tree that republishes no check-run
+    // name — used to strip it with no replacement: empty output, rc 0. The
+    // unrelated surviving row keeps the BLO-34263 ABSENT guard quiet, so it
+    // cannot mask the result. Ally's demonstrated fixture.
+    it("keeps a witness-retired run's own at-head failure", () => {
+      const runs = [["555", "pull_request", "111", "cancelled", "2026-10-01T10:00:00Z"]];
+      const wit = "555 2026-10-01T10:05:00Z 2026-10-01T10:10:00Z";
+      const atHead = [
+        ["secret-scan", "failure", "2026-10-01T10:02:00Z", "111"],
+        ["ci-gate", "success", "2026-10-01T10:10:00Z", "status"],
+        ["other", "success", "2026-10-01T10:01:00Z", "999"],
+      ];
+      assert.equal(dead(runs, wit, "w"), "111", "the witness arm must still fire here");
+      assert.deepEqual(read(atHead, dead(runs, wit), pending(runs).join("\n"), dead(runs, wit, "w")), [
+        "STOP\tsecret-scan\tfailure\trun=111",
+      ]);
+    });
+
+    // WDEAD is matched anchored, like DEAD: `1113` CONTAINS the witness id
+    // `111`, so an unanchored match keeps a sibling-retired run's stale
+    // `failure` (BLO-34835) as a permanent false RED.
+    it("keeps only the rows of runs WDEAD names exactly", () => {
+      const rows = [
+        ["verify", "failure", "t1", "1113"],
+        ["x", "success", "t1", "9"],
+      ];
+      assert.deepEqual(read(rows, "111|1113", "", "111"), []);
+    });
+
+    // The keep is confined to rows that would STOP. A witness-retired run's
+    // rows that never block are dropped exactly as before, so the survivor
+    // count and its ABSENT guard are untouched: keeping `success`/`skipped`
+    // would suppress ABSENT, keeping `neutral` prints a line, and keeping
+    // `cancelled` re-opens BLO-38577. Counting a witness-retired run's passes
+    // as survivors would be a separate, GREEN-direction change; not made here.
+    it("drops a witness-retired run's non-blocking rows exactly as before", () => {
+      const quiet = [
+        ["a", "success", "t1", "111"],
+        ["b", "skipped", "t1", "111"],
+        ["c", "neutral", "t1", "111"],
+        ["d", "cancelled", "t1", "111"],
+      ];
+      assert.deepEqual(read(quiet, "111", "", "111"), [
+        "STOP\t<every check-run at this head dropped as superseded-run>\tABSENT\trun=-",
+      ]);
+    });
   });
 
   // End to end on the measured shape. The BLO-34263 ABSENT guard cannot catch
@@ -874,7 +1155,7 @@ describe("merge-gate reader", () => {
     });
 
     // A superseded run is completed and non-success, so pending_runs() emits it
-    // — and the DEAD grep strips its rows before `contributed` can be set, so
+    // — and the DEAD filter strips its rows before `contributed` can be set, so
     // without the END-loop exemption it prints NO-VERDICT for a run whose lane
     // demonstrably spoke. BLO-34114s own control is this shape: penstock
     // fbdb3477, run 34542908750, cancelled with 6 dead `failure` rows superseded
@@ -1150,6 +1431,132 @@ describe("merge-gate reader", () => {
   // The ABSENT guard cannot catch it: the reader's `$4!="status"` excludes
   // status rows from the survivor count, so one surviving check-run keeps it
   // quiet. Direction: GREEN.
+  // BLO-38577. Candidate off-head witnesses, taken from the live
+  // pim-multicast-gateway#3469 @ c494fdc5 status surface. Only `ci-gate`
+  // qualifies: the two Ally statuses point at the PR rather than a run, and a
+  // status that is not green is not a verdict. This step only PROPOSES — the
+  // caller still resolves the run and confirms it passed and is the victim's
+  // workflow — but every row it wrongly proposes is a candidate for clearing a
+  // real STOP, so each fence is asserted here as well as there.
+  describe("off-head witness extraction", () => {
+    const page = (statuses) => ({ statuses });
+
+    it("proposes a green status that names a run", () => {
+      assert.deepEqual(
+        witnessExtract([
+          page([
+            {
+              context: "ci-gate",
+              state: "success",
+              updated_at: "2026-09-30T18:55:08Z",
+              target_url:
+                "https://github.com/Blockcast/pim-multicast-gateway/actions/runs/36761895861",
+            },
+          ]),
+        ]),
+        ["36761895861\t2026-09-30T18:55:08Z"],
+      );
+    });
+
+    it("drops a status that is not green", () => {
+      // `pending` is the live shape on penstock#1992's `review/ally-complete`,
+      // and an unfinished gate must never retire a STOP. Relaxing the fence to
+      // `!= "failure"` is the tempting widening; this is the fixture for it.
+      for (const state of ["pending", "failure", "error"]) {
+        assert.deepEqual(
+          witnessExtract([
+            page([
+              {
+                context: "review/ally-complete",
+                state,
+                updated_at: "2026-09-17T13:49:28Z",
+                target_url: "https://github.com/o/r/actions/runs/35229290511",
+              },
+            ]),
+          ]),
+          [],
+          state,
+        );
+      }
+    });
+
+    it("drops a green status whose target names no run", () => {
+      assert.deepEqual(
+        witnessExtract([
+          page([
+            {
+              context: "gate/ally-comment-findings",
+              state: "success",
+              updated_at: "2026-09-30T17:46:00Z",
+              target_url: "https://github.com/Blockcast/pim-multicast-gateway/pull/3469",
+            },
+          ]),
+        ]),
+        [],
+      );
+    });
+
+    // capture() RAISES on null rather than returning no match, and jq aborts
+    // mid-stream on the raise — so one nullable target_url silently truncates
+    // every status after it. Same trap, same GREEN direction, as the one
+    // extract() carries a guard for. The qualifying row is placed AFTER the
+    // null so a truncating extractor returns [] and this fixture fails.
+    it("does not truncate the stream on a null target_url", () => {
+      assert.deepEqual(
+        witnessExtract([
+          page([
+            { context: "no-url", state: "success", updated_at: "t0", target_url: null },
+            {
+              context: "ci-gate",
+              state: "success",
+              updated_at: "t1",
+              target_url: "https://github.com/o/r/actions/runs/42",
+            },
+          ]),
+        ]),
+        ["42\tt1"],
+      );
+    });
+
+    // Ally review 5374012593 (Suggestion). The run-id pattern is anchored to a
+    // GitHub Actions run URL: unanchored `runs/[0-9]+` matches ANY status
+    // target, so a third-party CI system's green status proposes a witness id
+    // it has no business proposing. Both rows are `success` with a `runs/<n>`
+    // substring and neither is a GitHub Actions URL; only the real one survives.
+    it("ignores a runs/<id> substring that is not a GitHub Actions run URL", () => {
+      assert.deepEqual(
+        witnessExtract([
+          page([
+            { context: "third-party", state: "success", updated_at: "t0", target_url: "https://ci.example.com/jobs/runs/999" },
+            { context: "docs", state: "success", updated_at: "t1", target_url: "https://example.com/runs/888" },
+            {
+              context: "ci-gate",
+              state: "success",
+              updated_at: "t2",
+              target_url: "https://github.com/o/r/actions/runs/42",
+            },
+          ]),
+        ]),
+        ["42\tt2"],
+      );
+    });
+
+    it("extracts candidates from every page", () => {
+      assert.deepEqual(
+        witnessExtract([
+          page([
+            { context: "a", state: "success", updated_at: "t1", target_url: "https://github.com/o/r/actions/runs/1" },
+            { context: "b", state: "success", updated_at: "t2", target_url: "https://github.com/o/r/actions/runs/2" },
+          ]),
+          page([
+            { context: "c", state: "success", updated_at: "t3", target_url: "https://github.com/o/r/actions/runs/3" },
+          ]),
+        ]),
+        ["1\tt1", "2\tt2", "3\tt3"],
+      );
+    });
+  });
+
   describe("legacy status surface", () => {
     // Asserted over EVERY list fetch, not just the status one: the check-run and
     // actions/runs calls carry the same silent-truncation risk, and neither had a
@@ -1169,9 +1576,65 @@ describe("merge-gate reader", () => {
       assert.deepEqual(read(appOnly, ""), read(appOnly, "__none__"));
     });
 
+    // BLO-38577. The witness RESOLUTION step lives in the live path, so no
+    // fixture can reach it — the same position the pagination assertions are
+    // in, and asserted the same way. All three terms are fences with a GREEN
+    // failure direction: without the conclusion test a run that did NOT pass
+    // becomes a witness; `.workflow_id` is what carries the attribution into
+    // dead_runs(), so projecting anything else silently un-keys it there; and
+    // `.run_started_at` is the term that stops a late-published status naming
+    // an early run (Ally 5375356236). The null test on run_started_at must stay
+    // in the `select`: interpolating a null renders the STRING "null", which
+    // beats every ISO timestamp lexically and fails the ordering fence OPEN.
+    it("resolves an off-head witness run through a passed-and-attributed fence", () => {
+      const resolve = SOURCE.split("\n").find((l) => l.includes("/actions/runs/$rid"));
+      assert.ok(resolve, "witness resolution call gone");
+      const jq = SOURCE.split("\n").find((l) => l.includes("--jq 'select(.conclusion"));
+      assert.match(jq ?? "", /select\(\.conclusion=="success"/, "witness greenness fence gone");
+      assert.match(jq ?? "", /\(\.run_started_at \/\/ ""\) != ""/, "witness null-start fence gone");
+      const proj = SOURCE.split("\n").find((l) => l.includes('"\\(.workflow_id)'));
+      assert.match(proj ?? "", /\\\(\.workflow_id\) \\\(\.run_started_at\)/, "witness projection gone");
+      // The file's own contract header is the third end of this three-field shape, and
+      // was the one end with no guard: it documented two fields while the `== 3` fence
+      // required three, so a caller building to the spec emits an arity-2 row that is
+      // silently dropped (Ally 5376184866). Direction is GREEN-to-RED-to-unclearable:
+      // the witness vanishes and the STOP this reader exists to clear comes back.
+      const hdr = SOURCE.split("\n").find((l) => l.startsWith("# Witness shape"));
+      assert.match(
+        hdr ?? "",
+        /workflow-id <SP> run-started-at <SP> status-updated-at/,
+        "header witness contract drifted from the 3-field shape the fence requires",
+      );
+    });
+
+    // The row half of the `cx[i]` fence lives in verdicts() and reaches the
+    // live path only through WDEAD, which no fixture can see. Dropping it from
+    // either end silently restores the stripped at-head `failure` (GREEN), so
+    // pin both ends here, as the witness resolution above is pinned.
+    it("hands the witness arm's ids to verdicts() on the live path", () => {
+      const lines = SOURCE.split("\n");
+      assert.ok(
+        lines.some((l) => /^WDEAD=\$\(.*\| dead_runs "\$WITNESSES" \S+\)$/.test(l)),
+        "WDEAD no longer computed from the witness arm alone",
+      );
+      assert.ok(
+        lines.some((l) => /^\} \| verdicts "\$DEAD" "\$PENDING" "\$WDEAD"$/.test(l)),
+        "live verdicts() call lost WDEAD",
+      );
+    });
+
     it("paginates every list fetch", () => {
+      // Exempt: single-OBJECT lookups, which have no pages. Enumerated rather
+      // than pattern-guessed, and counted below, so adding one is a deliberate
+      // edit to this list and never a silent widening of the exemption. The
+      // `/actions/runs/` entry must keep its trailing slash: `/actions/runs?`
+      // is the LIST fetch and exempting it would un-paginate the run surface.
+      const SINGLE_OBJECT = ["/commits/$2", "/actions/runs/$rid"];
+      const isSingle = (l) => SINGLE_OBJECT.some((p) => l.includes(p));
+      const singles = SOURCE.split("\n").filter((l) => l.includes('gh api "repos/') && isSingle(l));
+      assert.equal(singles.length, SINGLE_OBJECT.length, `single-object lookup lost or doubled?`);
       const fetches = SOURCE.split("\n").filter(
-        (l) => l.includes('gh api "repos/') && !l.includes("/commits/$2"),
+        (l) => l.includes('gh api "repos/') && !isSingle(l),
       );
       assert.equal(fetches.length, 3, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
       // The collector matches `gh api "repos/` on ONE line, so a fetch written
@@ -1199,16 +1662,16 @@ describe("merge-gate reader", () => {
       // deliberately kept as one: reverting `.replace(...)` to bare `SOURCE`
       // leaves the suite green (re-measured 61/61 at this head) because no
       // line here yet splits a `gh api` token or appends a second call. The
-      // `+ 1` and the `#` exclusion are the terms that fail when broken. Do
-      // not record this as an unkilled guard on the next sweep — it is the
-      // two shapes above being absent today, not a fixture gap.
+      // `+ singles.length` and the `#` exclusion are the terms that fail when
+      // broken. Do not record this as an unkilled guard on the next sweep — it
+      // is the two shapes above being absent today, not a fixture gap.
       const ghApi = SOURCE.replace(/\\\n\s*/g, " ")
         .split("\n")
         .filter((l) => !l.trimStart().startsWith("#"))
         .flatMap((l) => l.match(/gh\s+api/g) ?? []);
       assert.equal(
         ghApi.length,
-        fetches.length + 1,
+        fetches.length + singles.length,
         `gh api call the collector missed — variable URL or line continuation? got ${JSON.stringify(ghApi)}`,
       );
       for (const call of fetches) {

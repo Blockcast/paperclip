@@ -67,35 +67,26 @@ describe("securityAuditRemediations ledger", () => {
   // level. A ticket-level pin alone does not see a new package added inside an
   // existing ticket, which is the common case: a 7th entry under PEN-1198
   // leaves the ticket key set unchanged.
-  it("has a guard wired for every ticket bucket", () => {
-    expect(
-      Object.keys(rootPackageJson.securityAuditRemediations).sort(),
-    ).toEqual([
-      // scripts/http-cache-semantics-security-override.test.js
-      "BLO-39519",
-      // scripts/proxy-addr-security-override.test.js
-      "BLO-40607",
-      // the PEN-1198 suite below
-      "PEN-1198",
-    ]);
-  });
-
-  // Adding a package entry fails here until someone lists it and says which
-  // guard covers it. Two entries are knowingly listed as UNGUARDED rather than
-  // quietly omitted — the point of this pin is that the unguarded set is
-  // explicit and cannot grow silently. Closing those two is separate work.
-  it("accounts for every package entry inside each ticket bucket", () => {
-    const ledger = rootPackageJson.securityAuditRemediations;
-
-    expect(Object.keys(ledger["BLO-39519"]).sort()).toEqual([
-      // scripts/http-cache-semantics-security-override.test.js
-      "http-cache-semantics",
-    ]);
-    expect(Object.keys(ledger["BLO-40607"]).sort()).toEqual([
-      // scripts/proxy-addr-security-override.test.js
-      "proxy-addr",
-    ]);
-    expect(Object.keys(ledger["PEN-1198"]).sort()).toEqual([
+  //
+  // BLO-40936: both levels are driven from this ONE literal, so a new ticket
+  // bucket cannot be silenced WITHOUT NAMING ITS PACKAGES. Listing the ticket
+  // here to clear the ticket-key assertion immediately arms the package-set
+  // assertion for it, which compares against `[]` until its packages are
+  // listed and their guards named. That empty-array step is what cannot be
+  // skipped — not the edit count, since listing a ticket together with its
+  // packages is one edit and legitimately passes both assertions.
+  //
+  // A guard name here is a claim about what that guard ASSERTS, so a guard
+  // that covers only part of an entry says which part.
+  const GUARDS: Record<string, string[]> = {
+    // scripts/http-cache-semantics-security-override.test.js
+    "BLO-39519": ["http-cache-semantics"],
+    // scripts/proxy-addr-security-override.test.js — patchedRange only; that
+    // guard carries no advisories assertion and neither does the
+    // "documents the advisories ..." test below, which covers PEN-1198 only.
+    // So this entry's `advisories` array is UNGUARDED.
+    "BLO-40607": ["proxy-addr"],
+    "PEN-1198": [
       // UNGUARDED: no advisories assertion anywhere in the repo.
       "@babel/core",
       // "documents the advisories ..." below
@@ -106,9 +97,34 @@ describe("securityAuditRemediations ledger", () => {
       "js-yaml",
       // "documents the advisories ..." below
       "jsdom>undici",
-      // scripts/multer-security-override.test.js
+      // "documents the advisories ..." below, plus the narrower single-ID
+      // membership check in scripts/multer-security-override.test.js
       "multer",
-    ]);
+    ],
+  };
+
+  it("has a guard wired for every ticket bucket", () => {
+    expect(
+      Object.keys(rootPackageJson.securityAuditRemediations).sort(),
+    ).toEqual(Object.keys(GUARDS).sort());
+  });
+
+  // Adding a package entry fails here until someone lists it and says which
+  // guard covers it. Entries whose `advisories` array nothing asserts are
+  // knowingly labelled above rather than quietly omitted — the point of this
+  // pin is that the unguarded set is explicit and cannot grow silently.
+  // Closing those gaps is separate work.
+  it("accounts for every package entry inside each ticket bucket", () => {
+    const ledger = rootPackageJson.securityAuditRemediations;
+
+    for (const [ticket, packages] of Object.entries(GUARDS)) {
+      // Sort BOTH sides: `packages` is read from a literal whose order is a
+      // readability choice, so comparing it raw would fail an entry appended
+      // in the wrong position on ordering rather than on membership.
+      expect(Object.keys(ledger[ticket] ?? {}).sort()).toEqual(
+        [...packages].sort(),
+      );
+    }
   });
 });
 

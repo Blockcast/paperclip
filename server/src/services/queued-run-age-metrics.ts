@@ -1,8 +1,11 @@
-import { and, eq, isNotNull, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, heartbeatRuns } from "@paperclipai/db";
+import { agents, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "./ccrotate-capacity-retry.js";
 import {
+  setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
+  setDeferredIssueExecutionWakeOldestAgeMetrics,
   setOverdueScheduledRetryAgeMetrics,
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
@@ -74,6 +77,235 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
     setQueuedRunAgeMetricsRefreshSuccess(false);
     throw error;
   }
+}
+
+/**
+ * How old a pending deferred wake must be before the refresh names it in the
+ * log (PEN-3734). The gauge carries the age; this threshold decides when the
+ * *identity* is worth writing down.
+ *
+ * Thirty minutes is deliberately well below any alert threshold. The gauge can
+ * only ever say "agent X is waiting"; the thing a responder actually needs is
+ * WHICH issue is holding the lock, and `issue_id` cannot be a label without
+ * unbounded cardinality. Logging it from here is the bridge, and it has to be
+ * written *before* the page so the record already exists when someone goes
+ * looking — the entire defect being fixed is that this state was unobservable
+ * after the fact.
+ */
+const DEFERRED_WAKE_DETAIL_LOG_AGE_MS = 30 * 60 * 1000;
+
+/**
+ * Row cap on ONE detail emission. Bounds the width of a single record, not the
+ * rate — see {@link DEFERRED_WAKE_DETAIL_LOG_INTERVAL_MS} for that.
+ *
+ * The query asks for one row more than this so `capped` can distinguish
+ * "exactly this many matched" from "more matched than we printed". A bare
+ * `length === LIMIT` reports truncation at the exact boundary where nothing was
+ * truncated, which is the same shown-equals-matched ambiguity the field exists
+ * to remove.
+ */
+const DEFERRED_WAKE_DETAIL_LOG_LIMIT = 20;
+
+/**
+ * Minimum gap between detail emissions, process-wide.
+ *
+ * The collector ticks every 15s and the detail pass fires on every tick where
+ * anything is past 30m, so without this the motivating 10h53m case emits ~2,600
+ * near-identical `warn` records — ~840 of them before the 4h alert even fires.
+ * That buries the forensic record inside copies of itself, in exactly the log
+ * the runbook tells a responder to grep.
+ *
+ * A global throttle rather than a per-wake one, because each emission is a
+ * *snapshot* of every current offender rather than a per-row event: a wake that
+ * starts deferring between emissions appears in the next one with its true age.
+ * So the throttle delays the record by at most this interval and never drops a
+ * row from it. 15 minutes keeps a full hour of deferral to four records while
+ * still landing the first one well inside the 30m-to-4h window.
+ */
+const DEFERRED_WAKE_DETAIL_LOG_INTERVAL_MS = 15 * 60 * 1000;
+
+/** Unix ms of the last detail emission, or null if none has been written yet. */
+let lastDeferredWakeDetailLogMs: number | null = null;
+
+/** Test seam: forget the throttle so each test starts from a clean slate. */
+export function __resetDeferredWakeDetailLogThrottleForTest(): void {
+  lastDeferredWakeDetailLogMs = null;
+}
+
+/**
+ * Refresh the per-agent oldest-pending-`deferred_issue_execution`-wake-age
+ * gauge (PEN-3734).
+ *
+ * A wake is parked in `deferred_issue_execution` while another run holds the
+ * issue's execution lock. It is promoted only when a run on that issue
+ * finalizes, one per finalization, and the lock is held globally across
+ * agents, so an agent's wait is bounded below by the queue wait of every other
+ * agent's run ahead of it on that row. Measured 2026-10-02 on PEN-3164: one
+ * wake waited 10h53m, of which 10h35m was a single foreign run sitting
+ * `queued` before it ever started.
+ *
+ * Neither sibling above can see it, and not by a near miss:
+ * {@link refreshQueuedRunAgeMetrics} and
+ * {@link refreshOverdueScheduledRetryAgeMetrics} both read `heartbeatRuns`,
+ * and a deferred wake deliberately creates NO run row — that is the
+ * documented contract of the deferral, which is why `heartbeat_runs` is not
+ * the wake ledger and a seat-side search for the wake returns nothing *by
+ * design*. Every non-metric surface is blind too: the issue's
+ * `lastActivityAt` is ADVANCED by each undelivered comment, so staleness
+ * sweeps read a starving row as freshly healthy. This gauge reads the one
+ * table that knows.
+ *
+ * Ages off `requested_at`, not `updated_at`. Later wakes on the same issue
+ * MERGE into a pending request (`coalescedCount++`) rather than creating their
+ * own, and that merge bumps `updated_at` without resetting `requested_at`. So
+ * `requested_at` is the wait of the EARLIEST undelivered comment, which is the
+ * quantity that cost 10h53m; `updated_at` would reset on every new comment and
+ * report a starving row as young — the exact `lastActivityAt` failure mode one
+ * table over.
+ *
+ * No issue-status filter, and the omission is deliberate. A deferred wake
+ * whose issue has since gone terminal will never be promoted (no run will
+ * finalize on it) and is stranded forever — a real strand, correctly paged,
+ * and clearable by cancelling the row. Excluding it would make this detector
+ * quiet in a case where nothing is coming, which is the failure direction this
+ * whole class of gauge exists to avoid.
+ *
+ * Same "query every agent id, reset-then-set" shape as the siblings so an
+ * agent with nothing deferred reads back an explicit 0 rather than an absent
+ * series, and the same freshness-gauge contract on failure: the reset-then-set
+ * only runs on the success path, so a throw leaves the previous per-agent
+ * values frozen while `/metrics` still returns 200 — and the frozen value is
+ * almost always 0, the healthy reading.
+ */
+export async function refreshDeferredIssueExecutionWakeAgeMetrics(db: Db, now = new Date()): Promise<void> {
+  let oldestAgeSeconds = 0;
+  try {
+    const [agentRows, oldestByAgent] = await Promise.all([
+      db.select({ id: agents.id }).from(agents),
+      // Predicate kept in exactly the form migration 0250's partial index is
+      // built on, so this never scans the largest table in the schema.
+      db
+        .select({
+          agentId: agentWakeupRequests.agentId,
+          oldestRequestedAt: sql<Date | string | null>`min(${agentWakeupRequests.requestedAt})`,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.status, "deferred_issue_execution"))
+        .groupBy(agentWakeupRequests.agentId),
+    ]);
+
+    const knownAgentIds = new Set(agentRows.map((row) => row.id));
+    const entries = oldestByAgent
+      .filter((row) => row.agentId !== null && row.oldestRequestedAt)
+      .map((row) => ({
+        agentId: row.agentId,
+        ageSeconds: Math.max(
+          0,
+          (now.getTime() - new Date(row.oldestRequestedAt as Date | string).getTime()) / 1000,
+        ),
+      }));
+
+    setDeferredIssueExecutionWakeOldestAgeMetrics(entries, knownAgentIds);
+    setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess(true);
+    oldestAgeSeconds = entries.reduce((max, entry) => Math.max(max, entry.ageSeconds), 0);
+  } catch (error) {
+    // Do not zero the gauge here: synthetic zeros would read as "nothing
+    // deferred", the healthy state, and hide a real wait. Leave the last
+    // snapshot in place and let the freshness gauge disqualify it.
+    setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess(false);
+    throw error;
+  }
+
+  // The detail pass sits OUTSIDE the try above, and that placement is the whole
+  // point rather than a formatting choice. Inside it, any failure of this
+  // second query would reach the catch and flip the freshness gauge to 0 — on
+  // data that was fetched and published correctly one statement earlier. The
+  // alert is gated on that gauge, so a timeout here would silently hold
+  // PaperclipDeferredIssueExecutionWakeOverdue off while the value in memory
+  // was fresh and above threshold. And the correlation makes that the likely
+  // case, not a remote one: this query only ever runs when something is
+  // ALREADY overdue, so the entire extra failure surface is bolted onto the
+  // unhealthy path. A diagnostic must not be able to disable the detector it
+  // is diagnosing.
+  await logOverdueDeferredWakes(db, now, oldestAgeSeconds).catch((error: unknown) => {
+    logger.warn({ error }, "deferred-wake detail log failed; the age gauge is unaffected (PEN-3734)");
+  });
+}
+
+/**
+ * Name the overdue deferred wakes in the log (PEN-3734).
+ *
+ * The gauge can only ever say "agent X is waiting" — `issue_id` is unbounded
+ * cardinality and cannot be a label — so this is the only bridge from the alert
+ * to the row that is actually stuck. It is written at 30m, far below the alert
+ * threshold, so the record already exists by the time anyone goes looking;
+ * being unobservable after the fact is the defect being fixed.
+ *
+ * Returns without querying when nothing is overdue, so a healthy fleet costs
+ * one query per tick rather than two.
+ */
+async function logOverdueDeferredWakes(db: Db, now: Date, oldestAgeSeconds: number): Promise<void> {
+  if (oldestAgeSeconds * 1000 < DEFERRED_WAKE_DETAIL_LOG_AGE_MS) return;
+  if (
+    lastDeferredWakeDetailLogMs !== null
+    && now.getTime() - lastDeferredWakeDetailLogMs < DEFERRED_WAKE_DETAIL_LOG_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  const cutoff = new Date(now.getTime() - DEFERRED_WAKE_DETAIL_LOG_AGE_MS);
+  const matched = await db
+    .select({
+      wakeId: agentWakeupRequests.id,
+      agentId: agentWakeupRequests.agentId,
+      companyId: agentWakeupRequests.companyId,
+      issueId: sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`,
+      reason: agentWakeupRequests.reason,
+      coalescedCount: agentWakeupRequests.coalescedCount,
+      requestedAt: agentWakeupRequests.requestedAt,
+    })
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.requestedAt} < ${cutoff.toISOString()}::timestamptz`,
+      ),
+    )
+    .orderBy(asc(agentWakeupRequests.requestedAt))
+    // One over the cap, so `capped` below reports real truncation rather than
+    // firing at the exact cardinality where nothing was truncated.
+    .limit(DEFERRED_WAKE_DETAIL_LOG_LIMIT + 1);
+
+  // The aggregate and this query are separate round-trips, so a promotion
+  // between them can legitimately leave nothing to print.
+  if (matched.length === 0) return;
+  const stale = matched.slice(0, DEFERRED_WAKE_DETAIL_LOG_LIMIT);
+  lastDeferredWakeDetailLogMs = now.getTime();
+
+  logger.warn(
+    {
+      thresholdSeconds: Math.floor(DEFERRED_WAKE_DETAIL_LOG_AGE_MS / 1000),
+      oldestAgeSeconds: Math.floor(oldestAgeSeconds),
+      // Truncation is stated, not implied: `shown < matched` is impossible to
+      // distinguish from "that was all of them" otherwise, and a silent cap
+      // reads as full coverage.
+      shown: stale.length,
+      capped: matched.length > DEFERRED_WAKE_DETAIL_LOG_LIMIT,
+      wakes: stale.map((row) => ({
+        wakeId: row.wakeId,
+        agentId: row.agentId,
+        companyId: row.companyId,
+        issueId: row.issueId,
+        reason: row.reason,
+        coalescedCount: row.coalescedCount,
+        requestedAt: row.requestedAt,
+        ageSeconds: Math.floor(
+          Math.max(0, (now.getTime() - new Date(row.requestedAt).getTime()) / 1000),
+        ),
+      })),
+    },
+    "wake deferred behind an issue execution lock is overdue for promotion (PEN-3734)",
+  );
 }
 
 /**

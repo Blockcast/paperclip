@@ -207,12 +207,12 @@ export function containsRedactedAdapterValue(value: unknown): boolean {
 }
 
 /**
- * Exported for `restoreRedactedRuntimeConfigValues` in `routes/agents.ts`,
- * which restores `runtimeConfig` on the same rule. Prefer
- * {@link restoreRedactedAgentMetadata} or
+ * The shared sentinel-restore walk. Prefer {@link restoreRedactedAgentMetadata},
+ * {@link restoreRedactedAgentRuntimeConfig} or
  * {@link stripRedactedEnvBindingsFromAdapterConfig} where one fits — they pair
  * this with the `containsRedactedAdapterValue` short-circuit that keeps an
- * unmasked payload byte-identical.
+ * unmasked payload byte-identical. It stays exported for tests and for a future
+ * column that needs the walk without that pairing.
  *
  * A masked scalar with an `undefined` prior has nothing to restore from, and
  * reports that as `undefined` rather than as the private
@@ -364,3 +364,44 @@ export function restoreRedactedAgentMetadata(incoming: unknown, existing: unknow
   if (!containsRedactedAdapterValue(incoming)) return incoming;
   return restoreRedactedAdapterValue(incoming, existing ?? {});
 }
+
+/**
+ * The same restore for `runtimeConfig`, the third column replayed on the
+ * hire-approval path (PEN-3847).
+ *
+ * Two callers, reached from opposite directions, which is why this lives here
+ * rather than in either of them:
+ *
+ *  - `restoreRedactedRuntimeConfigValues` (`routes/agents.ts`) — the client
+ *    `PATCH` round-trip, which pairs it with the `modelProfiles.*.adapterConfig`
+ *    restore that only the route can do.
+ *  - `activatePendingApproval` (`services/agents.ts`) — the approval replay.
+ *
+ * The replay caller is the new one. Its verbatim branch was documented as
+ * unreachable because the only *producer* of the stored payload
+ * (`POST .../agent-hires`) sets `requestedConfigurationSnapshot`
+ * unconditionally, so `mergeApprovedRuntimeConfig` — which starts from the
+ * stored row and `continue`s on `jsonEqual` keys — always ran. There is a
+ * second producer: `PUT /approvals/:id/resubmit` **replaces** the stored payload
+ * wholesale (`services/approvals.ts`) and re-binds `agentId` from the card
+ * (`routes/approvals.ts`), so a requester that GETs its own
+ * `revision_requested` card through the redacted read path, edits a field and
+ * PUTs it back — ordinary read-modify-write — stores `REDACTED_EVENT_VALUE`
+ * wherever `redactAgentConfigPayload` masked, and can omit the snapshot
+ * entirely. `runtimeConfig` carries `heartbeat.maxConcurrentRuns` and the
+ * external-lifecycle settings, so a sentinel where a structured value belongs
+ * is a live-agent availability fault, not only a hygiene one.
+ *
+ * Deliberately **is** {@link restoreRedactedAgentMetadata} rather than a copy of
+ * it: all three columns are masked by the one redactor, and a rule restated per
+ * column is how a column ends up guarded on one path and inert on another. An
+ * identical body re-typed here would be exactly that restatement — the aliasing
+ * makes divergence structurally impossible instead of conventionally
+ * discouraged, while keeping the per-column name and this docblock as the thing
+ * a caller reads. The PEN-2747 substring case and the drop-rather-than-invent
+ * behaviour on an absent prior are inherited from
+ * {@link restoreRedactedAdapterValue}; so is the positional array ceiling
+ * documented on {@link restoreRedactedAgentMetadata} — and that inheritance is
+ * now by identity, not by assertion.
+ */
+export const restoreRedactedAgentRuntimeConfig = restoreRedactedAgentMetadata;

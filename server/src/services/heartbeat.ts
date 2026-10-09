@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, max, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 
@@ -706,6 +707,11 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_released",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+// PEN-3743: cap on the superseded-comment id list inlined into the wake payload
+// and the task markdown. The COUNT is always exact; only the enumeration is
+// capped, so a wake that coalesced hundreds of comments still reports the true
+// size while the payload stays bounded.
+const SUPERSEDED_WAKE_COMMENT_ID_LIMIT = 20;
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
@@ -1826,6 +1832,22 @@ function isPrReviewRetryContext(contextSnapshot: Record<string, unknown>) {
   return taskKey?.startsWith("pr_review:") === true;
 }
 
+// BLO-35488: the stale-maintenance sweep assumes "the current or next timer
+// wake represents latest state". A pr_review run has no such successor: the
+// GitHub webhook fires once per push or review request, so cancelling its
+// transient retry silently drops the review (2026-10-06: 22 reviews in ~2h, 15
+// never re-run). Never sweep one, however deep the queue.
+export function isStaleMaintenanceSweepCandidate(contextSnapshot: Record<string, unknown>) {
+  const wakeReason = readNonEmptyString(contextSnapshot.wakeReason);
+  return (
+    !readNonEmptyString(contextSnapshot.issueId) &&
+    !readNonEmptyString(contextSnapshot.taskId) &&
+    wakeReason !== null &&
+    (STALE_QUEUED_MAINTENANCE_WAKE_REASONS as readonly string[]).includes(wakeReason) &&
+    !isPrReviewRetryContext(contextSnapshot)
+  );
+}
+
 type PrReviewFairnessRun = Pick<
   typeof heartbeatRuns.$inferSelect,
   "id" | "createdAt" | "contextSnapshot"
@@ -2306,6 +2328,21 @@ const STARVATION_RECOVERY_ESCALATION_MS = 10 * 60 * 1000;
 // If another process has just finalized a run while its k8s Job is still
 // visible, do not immediately delete that live Job. The adapter process may
 // still be awaiting/synchronizing the Job and should be allowed to finish.
+//
+// PEN-3674: this constant now backs three call sites with related but not
+// identical semantics. Read all three before changing the value.
+//   1. Job deletion (the original case above) — a grace after finalization,
+//      protecting a Job that already EXISTS.
+//   2. `isolationSetupGraceActive` in the reservation reclaim sweep — keyed on
+//      `reservation.updatedAt`, which last moves at
+//      `markExternalRuntimeReservationLaunching`.
+//   3. The orphaned-lease reclaim sweep — keyed on the newer of the lease's
+//      `acquired_at`/`last_used_at`, which is strictly LATER than (2)'s clock.
+// (2) and (3) are the inverse of (1): they bound a runtime that is STARTING,
+// not one that has stopped, and for them the value is a floor on how long a
+// pre-Job launch may take. So SHORTENING it widens their exposure — it does not
+// merely reclaim sooner — while lengthening it slows every reclaim this sweep
+// exists for. Neither direction is free.
 const EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS = 5 * 60 * 1000;
 // PEN-3640: how long an unreleased external-runtime reservation may sit before
 // the reclaim sweep names the branch that is refusing it. Every skip in
@@ -9750,6 +9787,8 @@ const GITHUB_PR_CONTEXT_KEYS = [
   "githubPrReviewRequestAuthorLogin",
   "githubReviewFeedbackActionable",
   "githubMergeQueueEvictionBody",
+  "githubReviewFeedbackSuppressionReason",
+  "githubReviewFeedbackSuppressionPredicate",
   "prRole",
   "reviewKind",
 ] as const;
@@ -9772,6 +9811,14 @@ const GITHUB_PR_REVIEW_CONTENT_KEYS = [
   "githubPrReviewAuthorLogin",
   "githubReviewFeedbackActionable",
   "githubReviewFeedbackCommentId",
+  // BLO-30420: the declined-classification reason describes ONE review
+  // instance. Both keys are written under a conditional spread, so an
+  // actionable review re-supplies neither; without listing them here a later
+  // actionable wake coalescing onto the same run would carry
+  // `githubReviewFeedbackActionable: true` next to the earlier decline's
+  // reason, the pair the webhook test forbids for a single delivery.
+  "githubReviewFeedbackSuppressionReason",
+  "githubReviewFeedbackSuppressionPredicate",
 ] as const;
 
 // BLO-23395: the same instance-ownership rule as BLO-22229 above, for
@@ -10120,6 +10167,39 @@ export async function buildPaperclipWakePayload(input: {
   // payload construction, inline only the current newest comment so an agent
   // never receives an hours-old answer while retaining a freshness anchor.
   const commentIds = latestIssueComment ? [latestIssueComment] : requestedCommentIds;
+  // PEN-3743: the override above is correct, but it is the point at which a
+  // coalesced wake stops carrying the orders it absorbed. `requestedCommentIds`
+  // IS the complete accumulated set -- `mergeCoalescedContextSnapshot` keeps it
+  // in `wakeCommentIds` and it survives deferral and promotion intact -- so the
+  // ids are not lost, only un-delivered. Name the difference here so the run is
+  // told what it does not have.
+  //
+  // Without this the loss is actively disguised rather than merely unreported:
+  // `requestedCount` below was computed from the POST-override list, so it could
+  // never exceed `includedCount` from this cause, and `fallbackFetchNeeded` was
+  // correspondingly false -- an explicit assertion of completeness aimed at the
+  // one reader who would otherwise go and check. Measured 2026-10-03 on PEN-3743
+  // itself: two comments 34s apart, `wakeCommentIds` holding both, the delivered
+  // payload holding one, and `{requestedCount: 1, missingCount: 0}` reporting it
+  // as whole.
+  //
+  // "Superseded" means the body reaches the run on NEITHER surface, so subtract
+  // both of them. The payload inlines `commentIds` (the issue's newest row); the
+  // task prompt separately renders `deriveCommentId` -- the LAST ABSORBED wake
+  // comment -- and those two are different rows whenever a later non-wake
+  // comment exists, which is exactly the coalesce this fix targets. Subtracting
+  // only the inlined id would name, as "not shown", the one comment the prompt
+  // had just rendered: the count comes out one high and the run is sent to
+  // re-read what it was handed. Do the subtraction HERE rather than at the call
+  // site because this is the only place the pre-cap set exists, and
+  // `supersededCount` is derived from it: a downstream filter sees only the
+  // capped list, so it could neither recompute an exact count nor restore an id
+  // the cap had already dropped. Subtracting the rendered id there instead would
+  // leave the count one high with no way to correct it.
+  const renderedWakeCommentId = deriveCommentId(input.contextSnapshot, null);
+  const supersededCommentIds = requestedCommentIds.filter(
+    (id) => !commentIds.includes(id) && id !== renderedWakeCommentId,
+  );
   if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
 
   const commentRows =
@@ -10380,12 +10460,34 @@ export async function buildPaperclipWakePayload(input: {
     annotationDeltas,
     planReviewContext,
     commentWindow: {
+      // Deliberately POST-override: `commentIds` has already had the freshness
+      // override applied, so on a coalesce this reads `{requestedCount: 1,
+      // includedCount: 1, missingCount: 0}` even though the wake requested
+      // more. Left as-is rather than widened to the pre-override count because
+      // other readers treat it as "what this payload carries"; the information
+      // it under-reports is now carried exactly by `supersededCount` below.
       requestedCount: commentIds.length,
       includedCount: comments.length,
       missingCount: missingCommentCount,
+      // PEN-3743: absorbed by this wake and shown on NEITHER surface the run
+      // receives -- not inlined in `comments` above (the freshness override),
+      // and not the comment the task prompt renders (see
+      // `renderedWakeCommentId`). `supersededCount` is exact; only the id list
+      // is capped, so a long coalesce still reports its true size without
+      // inflating the payload. Counting these into `fallbackFetchNeeded` is the
+      // point of that field -- a run holding only the newest comment must know
+      // to go read the rest.
+      supersededCount: supersededCommentIds.length,
+      // Keep the NEWEST ids, not the oldest: `requestedCommentIds` is
+      // append-ordered (which is why `deriveCommentId` reads `.at(-1)`), so
+      // `slice(0, N)` would list the most ancient orders and elide the ones
+      // adjacent to the comment actually rendered -- the far end of the thread
+      // from where a run reading it backward starts.
+      supersededCommentIds: supersededCommentIds.slice(-SUPERSEDED_WAKE_COMMENT_ID_LIMIT),
     },
     truncated: payloadTruncated,
-    fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    fallbackFetchNeeded:
+      payloadTruncated || missingCommentCount > 0 || supersededCommentIds.length > 0,
   };
 }
 
@@ -10744,10 +10846,9 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     // pinned by "prefers the decline line when both classifications are
     // present"; swapping the arms previously passed every test.
     //
-    // Reader-before-writer is intentional and inert: the suppression keys are
-    // written by BLO-30420 / #1681, which has not merged. Until it does these
-    // two read null on every wake and nothing downstream changes;
-    // `reviewFeedbackActionable` is live today.
+    // The suppression keys are written by the GitHub webhook (BLO-30420 /
+    // #1681); this reader landed first and was inert until that writer
+    // merged. Both keys are now live alongside `reviewFeedbackActionable`.
     reviewFeedbackActionable:
       contextSnapshot.githubReviewFeedbackActionable === true ? (true as const) : null,
     reviewFeedbackSuppressionReason: readNonEmptyString(
@@ -12308,6 +12409,13 @@ export function buildPaperclipTaskMarkdown(input: {
     id: string;
     body: string;
   } | null;
+  // PEN-3743: comment ids this wake absorbed but whose bodies are NOT inlined
+  // above, because the freshness override in `buildPaperclipWakePayload` kept
+  // only the newest. The ids survive on the run row (`wakeCommentIds`); what
+  // was missing was any route from there into the one surface the agent
+  // reliably reads, which is this prompt.
+  supersededWakeCommentIds?: string[] | null;
+  supersededWakeCommentCount?: number | null;
   interaction?: {
     kind?: string | null;
     status?: string | null;
@@ -12670,6 +12778,29 @@ export function buildPaperclipTaskMarkdown(input: {
   }
   if (wakeComment?.body.trim()) {
     lines.push("", "Latest wake comment:", fenceTaskText(wakeComment.body.trim()));
+  }
+  // PEN-3743: a coalesced wake inlines only the newest comment, so every earlier
+  // order it absorbed reaches the agent as silence. Name them. The ids are the
+  // replay path -- they are durably on the run row and readable over the issue
+  // comments API -- so the only thing that was missing is this sentence.
+  const supersededIds = (input.supersededWakeCommentIds ?? []).filter(
+    (id) => typeof id === "string" && id.trim().length > 0,
+  );
+  const supersededCount = input.supersededWakeCommentCount ?? supersededIds.length;
+  if (supersededCount > 0) {
+    const plural = supersededCount === 1 ? "comment" : "comments";
+    const shown = supersededIds.length > 0 ? ` Ids: ${supersededIds.join(", ")}.` : "";
+    const elidedCount = supersededIds.length > 0 ? supersededCount - supersededIds.length : 0;
+    const elided =
+      elidedCount > 0
+        ? ` (${elidedCount} further ${elidedCount === 1 ? "id" : "ids"} not listed.)`
+        : "";
+    lines.push(
+      "",
+      `Earlier wake ${plural} NOT shown above (${supersededCount}):`,
+      `This wake absorbed ${supersededCount} earlier ${plural} whose ${supersededCount === 1 ? "body is" : "bodies are"} not included here.${shown}${elided}`,
+      `Read ${supersededCount === 1 ? "it" : "them"} on the issue before acting -- ${supersededCount === 1 ? "it may carry an order" : "they may carry orders"} the comment above does not repeat.`,
+    );
   }
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
@@ -13443,6 +13574,87 @@ export interface HeartbeatServiceOptions {
  * that accepts that risk.
  */
 const START_LOCK_REAP_TTL_DEFAULT_MS = 0;
+
+/**
+ * How long a start-lock caller will WAIT for the shared orphan sweep (BLO-41036).
+ *
+ * ⚠️ This bounds the *wait*, not the sweep, and that distinction is the whole
+ * design. On expiry the caller stops awaiting and dispatches on slightly stale
+ * orphan state; the sweep keeps running for whoever else joined it. Nothing is
+ * cancelled, so this cannot turn a slow-but-succeeding dispatch into a failing
+ * one.
+ *
+ * ⚠️ Do NOT "simplify" this by lowering {@link LOCK_ABORT_MS} for the reap
+ * phase instead. That was this issue's own planned fix and it is refuted by the
+ * measurement recorded on `LOCK_ABORT_MS`: the section's long holds settle on
+ * their own (peak 8073 s), and PEN-3328's abort cancels the whole section, so
+ * an early abort converts a slow dispatch into a permanently retried-and-
+ * recancelled one — a livelock, strictly worse than the hold. Aborting is the
+ * wrong verb here; declining to wait is the right one.
+ *
+ * Why 120 s, derived rather than picked:
+ *
+ *  - It is the threshold BLO-41036's own post-deploy acceptance signal already
+ *    names for this phase ("no agent start lock enters phase `reap` with
+ *    `heldMs > 120s`"), so the guard and the check that validates it agree by
+ *    construction instead of being two independently-chosen numbers.
+ *  - It is 4x {@link LOCK_HELD_WARN_MS}, the budget at which this phase already
+ *    logs that it "is holding dispatch for this agent" — i.e. four times past
+ *    the point the code already calls pathological.
+ *  - It is 1/120th of {@link LOCK_ABORT_MS}, which measured 1049 s of climbing,
+ *    never-settling fleet-wide hold during the `d5268bc0` incident without
+ *    coming close to firing.
+ *
+ * Known false-cut, stated rather than discovered later: every k8s call under
+ * the sweep is bounded at `PAPERCLIP_K8S_JOB_LIVENESS_TIMEOUT_MS` (2 s in
+ * production). With a fleet of ~40-50 running runs and an apiserver degraded
+ * enough that every call hits that ceiling, a *legitimate* serial sweep can
+ * exceed 120 s and will be cut. The cost of that cut is exactly the documented
+ * {@link START_LOCK_REAP_TTL_DEFAULT_MS} cost — dispatch may cancel same-issue
+ * queued work as `duplicate_dispatch_suppressed` — on a path that already
+ * supports proceeding without a fresh sweep (`skipped_fresh`). Erring toward
+ * cutting is the cheap direction here: a false cut degrades one dispatch pass,
+ * an unbounded wait took 100% of fleet dispatch for 22 minutes.
+ *
+ * ponytail: on expiry the latches are deliberately left alone, so while a sweep
+ * is genuinely wedged every later caller chains behind it and pays this bound
+ * once per pass. That is bounded and self-correcting, not free. If a wedge ever
+ * persists long enough for that per-pass cost to matter, mark the sweep
+ * abandoned on expiry so later callers skip the wait outright.
+ */
+const START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS = 120_000;
+
+/** Resolved once per call so an incident knob takes effect without a restart. */
+function startLockReapWaitBoundMs() {
+  const configured = Number.parseInt(process.env.AGENT_START_LOCK_REAP_WAIT_BOUND_MS ?? "", 10);
+  // 0 disables the bound (restores the pre-BLO-41036 unbounded wait).
+  return Number.isFinite(configured) && configured >= 0
+    ? configured
+    : START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS;
+}
+
+const START_LOCK_REAP_WAIT_TIMED_OUT = Symbol("start_lock_reap_wait_timed_out");
+
+/**
+ * Await `sweep`, giving up after `boundMs`. Returns the sentinel on expiry.
+ *
+ * The sweep's own rejection propagates unchanged — callers that are meant to
+ * inherit a sweep failure still do. The timer is aborted in `finally` so a
+ * fast sweep does not leave a 120 s handle holding the event loop open, and the
+ * timer's abort rejection is swallowed because the race has already settled by
+ * the time it fires.
+ */
+async function awaitStartLockSweepBounded(sweep: Promise<unknown>, boundMs: number) {
+  if (boundMs <= 0) return await sweep;
+  const abort = new AbortController();
+  const timer = delay(boundMs, START_LOCK_REAP_WAIT_TIMED_OUT, { signal: abort.signal })
+    .catch(() => undefined);
+  try {
+    return await Promise.race([sweep, timer]);
+  } finally {
+    abort.abort();
+  }
+}
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
@@ -26476,6 +26688,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterType: agents.adapterType,
         status: heartbeatRuns.status,
         error: heartbeatRuns.error,
+        leaseAcquiredAt: environmentLeases.acquiredAt,
+        leaseLastUsedAt: environmentLeases.lastUsedAt,
       })
       .from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
@@ -26487,8 +26701,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       );
 
+    // PEN-3674: the lease clock this sweep judges against is the NEWER of
+    // `acquired_at` and `last_used_at`. `acquired_at` never moves after the
+    // lease is taken; `last_used_at` is refreshed by `updateLeaseMetadata`
+    // when realization metadata is persisted mid-setup, so the pair is the
+    // closest thing the lease row has to a liveness signal. Taking the max
+    // can only ever defer a release, never hasten one.
+    const leaseClockMs = (row: { leaseAcquiredAt: Date; leaseLastUsedAt: Date }) =>
+      Math.max(new Date(row.leaseAcquiredAt).getTime(), new Date(row.leaseLastUsedAt).getTime());
+
+    // PEN-3674: keep the NEWEST lease per run, by that same expression.
+    // Release is per-run and all-or-nothing (`releaseEnvironmentLeasesForRun`
+    // below releases every active lease the run holds), so the launch-window
+    // grace has to be judged against the youngest of them: deferring a pass on
+    // an old lease costs one pass, releasing a young one cannot be undone.
     const uniqueRuns = new Map<string, (typeof orphanedRows)[number]>();
-    for (const row of orphanedRows) uniqueRuns.set(row.runId, row);
+    for (const row of orphanedRows) {
+      const seen = uniqueRuns.get(row.runId);
+      if (!seen || leaseClockMs(row) > leaseClockMs(seen)) uniqueRuns.set(row.runId, row);
+    }
 
     let releasedRunCount = 0;
     for (const run of uniqueRuns.values()) {
@@ -26532,6 +26763,90 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // across the pair, but do not rely on the Job arm being live here.
         if (!hasExternalLifecycle(run.adapterType) && activeRunExecutions.has(run.runId)) continue;
         if (hasExternalLifecycle(run.adapterType)) {
+          // PEN-3674: launch-window grace, and it has to come BEFORE the
+          // quiescence probe because the probe cannot see this hazard.
+          //
+          // `confirmStaleKilledJobQuiesced` is fail-closed against an
+          // *unobservable* runtime (a null kube read keeps the lease), but it
+          // is not fail-closed against a *not-yet-existent* one. A lease is
+          // acquired on the launch path strictly before the Job is created, so
+          // inside that window a run that is already status-terminal — a
+          // cancel racing its own launch — presents with no reservation
+          // `jobName` (so the Job arm is skipped entirely and `quiesced` stays
+          // true) and no run-labelled pods (so the pod arm reads an observable
+          // empty list). Both arms therefore report "quiesced" for a runtime
+          // that is still on its way up, and the sweep releases the lease out
+          // from under a Job that is about to start.
+          //
+          // Before BLO-32052 narrowed the guard above, the stale
+          // `activeRunExecutions` entry masked this: such a run was in the Set
+          // and skipped outright. Narrowing the guard is correct and is what
+          // unwedges the 100h+ strands this sweep exists for — but it is also
+          // what exposes this window, so the two changes belong together.
+          //
+          // ⛔ This is a bounded floor, NOT a setup-activity grace, and it does
+          // NOT cover an arbitrarily long pre-Job setup. Ally raised exactly
+          // that on #2179 and the finding is correct; what follows is the
+          // measured ordering, because the parity direction in the finding is
+          // inverted and that changes what the remaining exposure is.
+          //
+          // The four launch-path anchors are straight-line inside `executeRun`:
+          //   1. `markExternalRuntimeReservationLaunching` — the last
+          //      `reservation.updatedAt` bump before the Job.
+          //   2. `acquireForRun` — lease created, `acquired_at` =
+          //      `last_used_at` = now.
+          //   3. `realizeForRun` — realize → provision (`timeoutMs: 300_000`,
+          //      i.e. the whole of this constant), then `updateLeaseMetadata`
+          //      bumps `last_used_at`.
+          //   4. `recordExpectedExternalRuntimeJobName` — sets `expectedJobName`
+          //      and ends the sibling's grace.
+          //
+          // Nothing writes the reservation between (1) and (4). So the
+          // sibling's clock is frozen at (1), strictly EARLIER than this arm's
+          // (2): `isolationSetupGraceActive` lapses FIRST, not last. This arm
+          // is the later-expiring of the two, not the laggard — so do not
+          // "restore parity" by shortening it.
+          //
+          // Taking the newer of `acquired_at`/`last_used_at` closes the (3)→(4)
+          // tail for free, and the dedup above keys off the same expression.
+          // It does NOT rescue the cited slow-provision case: the only refresh
+          // in that span lands at the END of (3), after provision returns, so
+          // at the moment the floor lapses the clock is still `acquired_at`. A
+          // run whose provision burns the full 300 s can therefore still reach
+          // the floor with no Job. This SHRINKS the window; it does not close
+          // it. Closing it needs a positive "not yet launched" signal — the
+          // reservation's own pre-Job state — not a longer timer, and
+          // lengthening the constant here would trade this race for a slower
+          // reclaim of the strands the sweep exists for.
+          //
+          // The constant is shared with `isolationSetupGraceActive` in the
+          // sibling reservation sweep above, which declines to act on a pre-Job
+          // (`!jobName`) row this recently touched. Same defect class, same
+          // remedy, same tunable — but see the ordering above: the reference
+          // timestamps differ, so this is not a claim of equivalent coverage.
+          // Gating on age alone — rather than also re-deriving `jobName` here —
+          // needs no extra query; a Job that does exist and is still active is
+          // retained by the probe below regardless.
+          const leaseAgeMs = Date.now() - leaseClockMs(run);
+          if (leaseAgeMs < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS) {
+            // PEN-3674: the production frequency of this window is unmeasured —
+            // the row proves it reachable, not common. Log the deferral so it
+            // becomes a countable event once deployed rather than staying a
+            // hypothesis. The sibling is silent, but this is the change that
+            // raised the question.
+            logger.debug(
+              {
+                runId: run.runId,
+                companyId: run.companyId,
+                agentId: run.agentId,
+                adapterType: run.adapterType,
+                leaseAgeMs,
+                graceMs: EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS,
+              },
+              "orphaned_lease_launch_grace_deferred",
+            );
+            continue;
+          }
           // Background Job deletion does not prove that the Job or its
           // run-labelled pods have stopped. Reuse the same fail-closed probe as
           // cancellation: an active or unobservable external runtime keeps the
@@ -26974,28 +27289,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * already waits on this sweep. A lock-free caller lacks that guard; tests
    * using this entry directly must not introduce concurrent busy dispatch.
    */
-  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh" | "nested"> {
+  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh" | "nested" | "timed_out"> {
     if (agentStartLockSweepContext.getStore()) {
       await reapOrphanedRuns({ suppressDispatchAfterReap: true });
       return "nested";
     }
+    // BLO-41036: every path below awaits a FLEET-WIDE sweep while holding this
+    // agent's start lock, and the sweep is single-flight, so one that does not
+    // return holds every agent's dispatch. Each wait is bounded; on expiry the
+    // caller proceeds on stale orphan state rather than cancelling anything.
+    // See START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS for the threshold's derivation
+    // and for why lowering the PEN-3328 section abort is the wrong fix.
+    const waitBoundMs = startLockReapWaitBoundMs();
+    const timedOut = (outcome: unknown) => outcome === START_LOCK_REAP_WAIT_TIMED_OUT;
     if (joinableStartLockReap) {
-      await joinableStartLockReap;
+      if (timedOut(await awaitStartLockSweepBounded(joinableStartLockReap, waitBoundMs))) {
+        return "timed_out";
+      }
       return "joined";
     }
     if (inFlightStartLockReap) {
       // The reading sweep's own failure belongs to its callers. This caller is
       // served by the chained sweep, so it must not inherit that rejection.
-      await scheduleStartLockReap(inFlightStartLockReap.catch(() => undefined));
-      return "ran";
+      const chained = scheduleStartLockReap(inFlightStartLockReap.catch(() => undefined));
+      return timedOut(await awaitStartLockSweepBounded(chained, waitBoundMs)) ? "timed_out" : "ran";
     }
     const configuredTtlMs = Number.parseInt(process.env.AGENT_START_LOCK_REAP_TTL_MS ?? "", 10);
     const ttlMs = Number.isFinite(configuredTtlMs) && configuredTtlMs >= 0
       ? configuredTtlMs
       : START_LOCK_REAP_TTL_DEFAULT_MS;
     if (ttlMs > 0 && Date.now() - sharedStartLockReapCompletedAtMs < ttlMs) return "skipped_fresh";
-    await scheduleStartLockReap(Promise.resolve());
-    return "ran";
+    const fresh = scheduleStartLockReap(Promise.resolve());
+    return timedOut(await awaitStartLockSweepBounded(fresh, waitBoundMs)) ? "timed_out" : "ran";
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
@@ -28556,15 +28881,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   function isQueuedMaintenanceWake(run: typeof heartbeatRuns.$inferSelect) {
-    const context = parseObject(run.contextSnapshot);
-    const wakeReason = readNonEmptyString(context.wakeReason);
-    return (
-      run.status === "queued" &&
-      !issueIdFromRunContext(context) &&
-      Boolean(wakeReason && STALE_QUEUED_MAINTENANCE_WAKE_REASONS.includes(
-        wakeReason as (typeof STALE_QUEUED_MAINTENANCE_WAKE_REASONS)[number],
-      ))
-    );
+    return run.status === "queued" && isStaleMaintenanceSweepCandidate(parseObject(run.contextSnapshot));
   }
 
   async function cancelStaleQueuedMaintenanceRun(run: typeof heartbeatRuns.$inferSelect, now: Date) {
@@ -28623,6 +28940,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             sql<string>`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`,
             [...STALE_QUEUED_MAINTENANCE_WAKE_REASONS],
           ),
+          // These two mirror isPrReviewRetryContext so pr_review rows, which are
+          // never swept (BLO-35488), cannot fill the batch and starve real
+          // candidates. `_` is a LIKE wildcard, hence the escape. (The issueId/
+          // taskId `?` clauses above test key existence, which is stricter than
+          // the JS guard's non-empty check; that also fails safe.)
+          sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'reviewKind', '') <> 'pr_review'`,
+          sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'taskKey', '') not like 'pr\\_review:%'`,
         ),
       )
       .orderBy(asc(heartbeatRuns.updatedAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
@@ -29697,7 +30021,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // another agent's in-flight sweep, which is still time this lock was held.
         markAgentStartLockPhase(agentId, "reap");
         const reapStartedAtMs = Date.now();
-        let reapDisposition: "ran" | "joined" | "skipped_fresh" | "nested" | undefined;
+        let reapDisposition: "ran" | "joined" | "skipped_fresh" | "nested" | "timed_out" | undefined;
         try {
           reapDisposition = await reapOrphanedRunsForStartLock();
         } finally {
@@ -29708,7 +30032,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             (reapDisposition === "nested" ? logger.info : logger.warn).call(
               logger,
               { agentId, reapMs, reapDisposition, warnAfterMs: LOCK_HELD_WARN_MS },
-              "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
+              reapDisposition === "timed_out"
+                // BLO-41036: the opposite of the message below — this agent
+                // STOPPED waiting and is dispatching on stale orphan state. Any
+                // occurrence means a fleet sweep outlived its bound; it is the
+                // signal that would have named the d5268bc0 outage in one line.
+                ? "orphan reap exceeded its wait bound; dispatching on stale reap state for this agent"
+                : "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
             );
           }
         }
@@ -31613,6 +31943,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       ancestors: issueAncestors,
       wakeComment: safeWakeCommentContext,
+      // PEN-3743: carry the absorbed-but-not-inlined ids from the payload we
+      // just built into the prompt. The payload subtracts BOTH shown surfaces
+      // -- its own inlined `comments` and the `deriveCommentId` row this call
+      // site renders as `wakeComment` below -- so the list is disjoint from the
+      // body rendered here. It is computed from one `contextSnapshot` (the same
+      // `context` object `wakeCommentId` was derived from above), so the two
+      // surfaces cannot disagree about which ID was shown.
+      //
+      // They can still disagree about what was RENDERED, in the under-report
+      // direction only: a soft-deleted wake comment has its body forced to ""
+      // and `buildPaperclipTaskMarkdown` skips the block entirely, so that id
+      // is subtracted as "shown" while nothing was shown. It is then named on
+      // neither surface. Narrow and deliberate -- marking such ids is a
+      // payload-shape change, and excluding them would re-silence a retracted
+      // order, which is the defect this ticket exists to kill.
+      supersededWakeCommentIds: paperclipWakePayload?.commentWindow?.supersededCommentIds ?? null,
+      supersededWakeCommentCount: paperclipWakePayload?.commentWindow?.supersededCount ?? null,
       interaction: {
         kind: readNonEmptyString(context.interactionKind),
         status: readNonEmptyString(context.interactionStatus),

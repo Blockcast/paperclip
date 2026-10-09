@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
+import { buildClaudeCodeRuntimeShell, resolveClaudeCodeVersion } from "./runtime-pin.js";
 import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 
@@ -80,10 +81,17 @@ function assertSafeAbsolutePath(field: string, value: string): void {
   }
 }
 
+/** Every pod log lives under here.  Named only because the literal appears
+ *  twice below; it is deliberately not exported.  The one consumer that reads
+ *  a pod-log path back off a mutable Kubernetes object checks its *shape*
+ *  (`isReapablePodLogPath`, execute.ts) rather than this root — see the
+ *  reasoning at its call site (BLO-39114). */
+const POD_LOG_ROOT = "/paperclip/instances/default/data/run-logs";
+
 export function buildPodLogPath(companyId: string, agentId: string, runId: string, isolationKey?: string): string {
   const dir = isolationKey
-    ? `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/isolated/${isolationKey}`
-    : `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}`;
+    ? `${POD_LOG_ROOT}/${companyId}/${agentId}/isolated/${isolationKey}`
+    : `${POD_LOG_ROOT}/${companyId}/${agentId}`;
   return `${dir}/${runId}.pod.ndjson`;
 }
 
@@ -104,6 +112,12 @@ const PROMPT_ENV_NAME = "PROMPT_CONTENT";
  *  var path and failed 100% of the time (BLO-35720). */
 const MAX_ARG_STRLEN_BYTES = 32 * 4096;
 const LARGE_PROMPT_THRESHOLD_BYTES = MAX_ARG_STRLEN_BYTES - PROMPT_ENV_NAME.length - "=".length - 1;
+/** Linux caps one `NAME=value` string at MAX_ARG_STRLEN, including its NUL. */
+const MAX_ENV_STRING_BYTES = MAX_ARG_STRLEN_BYTES - 1;
+
+const WAKE_PAYLOAD_ENV_NAME = "PAPERCLIP_WAKE_PAYLOAD_JSON";
+/** Budget for the value alone — the kernel bounds the whole `NAME=value`. */
+const WAKE_PAYLOAD_MAX_VALUE_BYTES = MAX_ENV_STRING_BYTES - (WAKE_PAYLOAD_ENV_NAME.length + 1);
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
@@ -422,11 +436,61 @@ function joinPromptSections(sections: string[], separator = "\n\n"): string {
   return sections.filter((s) => s.trim().length > 0).join(separator);
 }
 
+/** Shed an oversize wake payload down to something `execve` will accept.
+ *
+ *  The server caps every large term it builds (comment bodies 8 x 4_000 chars,
+ *  continuation summary 4_000, child summaries 20) — but passes each comment's
+ *  `metadata` and `presentation` through raw, and the comment-metadata schema
+ *  permits 20 sections x 50 rows x 4_000 chars (~4 MB, 30x this ceiling). So
+ *  the reachable maximum is unbounded by anything upstream even though the
+ *  measured maximum is ~10 KB (BLO-37287, AC1).
+ *
+ *  Sheds rather than truncates: a sliced JSON string is unparseable, which
+ *  would lose the whole payload instead of the largest part of it. Both tiers
+ *  set the existing `truncated`/`fallbackFetchNeeded` contract, which the agent
+ *  skill already documents as "fetch the thread from the API", so no wake
+ *  context is silently dropped (AC3). */
+function shedOversizeWakePayload(wake: Record<string, unknown>): string {
+  const flags = { truncated: true, fallbackFetchNeeded: true, payloadShed: true };
+  const comments = Array.isArray(wake.comments) ? wake.comments : [];
+
+  // Tier 1: drop only the two uncapped passthrough fields. Everything the
+  // server already bounded — including every comment body — survives.
+  const tier1 = JSON.stringify({
+    ...wake,
+    ...flags,
+    comments: comments.map((c) =>
+      c && typeof c === "object" ? { ...(c as Record<string, unknown>), metadata: null, presentation: null } : c,
+    ),
+  });
+  if (Buffer.byteLength(tier1, "utf8") <= WAKE_PAYLOAD_MAX_VALUE_BYTES) return tier1;
+
+  // Tier 2: routing identifiers only. Every string is bounded HERE rather than
+  // trusted from upstream, so this tier cannot exceed the budget no matter what
+  // the server sent — that is what makes the PodSpec invariant total.
+  const cap = (v: unknown, n: number) => (typeof v === "string" ? v.slice(0, n) : null);
+  const issue = wake.issue && typeof wake.issue === "object" ? (wake.issue as Record<string, unknown>) : null;
+  return JSON.stringify({
+    ...flags,
+    reason: cap(wake.reason, 200),
+    issue: issue
+      ? { id: cap(issue.id, 64), identifier: cap(issue.identifier, 64), title: cap(issue.title, 240) }
+      : null,
+    commentIds: (Array.isArray(wake.commentIds) ? wake.commentIds : [])
+      .filter((v): v is string => typeof v === "string")
+      .slice(0, 8)
+      .map((v) => v.slice(0, 64)),
+    latestCommentId: cap(wake.latestCommentId, 64),
+  });
+}
+
 function stringifyPaperclipWakePayload(wake: unknown): string | null {
   if (!wake || typeof wake !== "object") return null;
   try {
     const json = JSON.stringify(wake);
-    return json === "{}" ? null : json;
+    if (json === "{}") return null;
+    if (Buffer.byteLength(json, "utf8") <= WAKE_PAYLOAD_MAX_VALUE_BYTES) return json;
+    return shedOversizeWakePayload(wake as Record<string, unknown>);
   } catch {
     return null;
   }
@@ -737,7 +801,7 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     reason: "Opaque comment UUID.",
   },
   {
-    name: "PAPERCLIP_WAKE_PAYLOAD_JSON",
+    name: WAKE_PAYLOAD_ENV_NAME,
     classification: "SAFE_LITERAL",
     reason:
       "Compact issue summary plus the new-comment batch. Board content, not credential material, and already readable by this pod through its own API token — but it is the one SAFE_LITERAL here whose value is free-form text, so a credential pasted into an issue comment would appear on the pod spec. Accepted: the same text is equally readable via the API, so Secret-backing it would not close that path.",
@@ -1058,6 +1122,9 @@ export interface JobBuildResult {
   /** Resolved ServiceAccount for the Job's pod template — echoed here so
    *  callers can log/report it without a cluster read (BLO-21812). */
   serviceAccountName: string;
+  /** Pinned Claude Code version the Job bootstraps onto the data PVC, or ""
+   *  when adapterConfig.claudeCodeVersion is "image" (use the bundled CLI). */
+  claudeCodeVersion: string;
 }
 
 function sanitizeForK8sName(value: string, maxLen = 16): string {
@@ -1127,7 +1194,7 @@ function buildEnvVars(
 
   const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
   if (wakePayloadJson) {
-    paperclipEnv.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+    paperclipEnv[WAKE_PAYLOAD_ENV_NAME] = wakePayloadJson;
   }
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
@@ -1234,6 +1301,16 @@ function buildEnvVars(
 
   // HOME must live on the mounted data PVC to enable session resume. Isolated
   // mode scopes Claude config/cache/session state away from shared /paperclip.
+  //
+  // That is a state boundary, not a trust boundary: every Job runs as uid 1000
+  // with the whole PVC read-write, isolation roots included. The adapter relies
+  // on that once, deliberately — the managed Claude Code runtime
+  // (runtime-pin.ts) lives under the data mount, not `isolation.homeRoot`, so
+  // it is the first executable on PATH shared across isolation keys (and
+  // companies). Accepted because it grants no write the PVC does not already
+  // grant, and its content is adapter-written at an exact version; if per-key
+  // write separation ever lands, move that runtime per key with it. Full
+  // rationale in runtime-pin.ts.
   merged.HOME = isolation.enabled ? isolation.homeRoot : "/paperclip";
   // BLO-34477: zsh sources $ZDOTDIR/.zshenv on every start, and bash sources
   // $BASH_ENV on a non-interactive start ONLY when it does not take its
@@ -1716,6 +1793,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const namespace = asString(config.namespace, "") || selfPod.namespace;
   const serviceAccountName = resolveServiceAccountName(config);
   const image = asString(config.image, "") || selfPod.image;
+  // Throws on anything but an exact version or "image" — the value is shell-interpolated.
+  const claudeCodeVersion = resolveClaudeCodeVersion(config.claudeCodeVersion);
   const enableDocker = asBoolean(config.enableDocker, false);
   const dockerImage = asString(config.dockerImage, "docker:28-dind");
   const dockerCpuLimit = asString(config.dockerCpuLimit, "4");
@@ -2409,6 +2488,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       ].join(" ")
     : "";
   const preparePodLog = `mkdir -p ${quoteShellArg(path.posix.dirname(podLogPath))} || exit $?`;
+  // Adapter-managed Claude Code runtime (see runtime-pin.ts). Runs after the
+  // env guard and before the ccrotate preflight, so a slow first install cannot
+  // age the freshly rotated OAuth token. The pod-log redactor setup comes later,
+  // after `preparePodLog`. Empty when
+  // claudeCodeVersion is "image": the pipeline is then byte-identical to the
+  // pre-pin command and `claude` resolves to the image's bundled CLI. The
+  // external launchers inherit the same PATH, so they pick up the pin too.
+  const claudeRuntime = claudeCodeVersion
+    ? `${buildClaudeCodeRuntimeShell({ version: claudeCodeVersion, dataMountPath })}; `
+    : "";
   // BLO-29553 AC1(b): the redactor goes BEFORE `tee`, so the credential never
   // reaches the file on the shared PVC rather than being cleaned up afterwards.
   // Anything after `tee` would be scrubbing a copy that already landed, which is
@@ -2426,7 +2515,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   //
   // The redactor setup follows `preparePodLog`: on fall-open it writes a
   // `<podLogPath>.unredacted` sentinel, which needs the directory to exist.
-  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(podLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
+  const claudeInvocation = `set -o pipefail; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(podLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(podLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
@@ -2645,6 +2734,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       annotations: {
         "paperclip.io/adapter-type": "claude_k8s",
         "paperclip.io/agent-name": agent.name,
+        // Stamped verbatim so a *foreign* run reaping this Job can unlink the
+        // pod log without recomputing the path (BLO-39114).  Reconstructing it
+        // from labels would be cheaper but not sound: companyId, agentId and
+        // runId each reach the path via `sanitizeForK8sPath` and the label via
+        // `sanitizeLabelValue`, from the same raw value, and those disagree on
+        // `.`/`_` and above 63 chars.  (`isolationKey` is exempt — it is
+        // pre-sanitized once in `resolveJobIsolation` and both consume that.)
+        // A reconstruction that diverges computes a path that does not exist,
+        // and a missing file is indistinguishable from a successful reap — i.e.
+        // it fails silently, which is the exact leak this is meant to close.
+        "paperclip.io/pod-log-path": podLogPath,
       },
     },
     spec: {
@@ -2713,5 +2813,5 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     );
   }
 
-  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, skippedLabels, podLogPath, serviceAccountName };
+  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, skippedLabels, podLogPath, serviceAccountName, claudeCodeVersion };
 }

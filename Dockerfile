@@ -393,7 +393,15 @@ WORKDIR /vendor
 # vendor layer kept passing, which is why the break looked commit-timed rather
 # than cache-timed. scripts/check-opencode-k8s-pin-reachable.mjs now fails a PR
 # for an unreachable pin instead of waiting for a cache miss to find it.
-ARG OPENCODE_K8S_REF=2075ae1ba249e97c49a77386c81a9d88b22c481d
+# Re-pinned 2026-10-07 to kkroo/paperclip-adapter-opencode-k8s master 133f4c1
+# (was 2075ae1): #64 pins the opencode-ai binary (`opencodeVersion`, default
+# 1.18.35) and bootstraps it onto the data PVC instead of running whatever the
+# cached image layer froze (1.18.11), mirroring the claude_k8s runtime pin in
+# this same change; #65 adds the GPT-6 lineup (6.1 Sol, 6 Astra, 6 Sol, 6 Luna)
+# to the model catalog, pricing fallback and context-window table; #63 moves
+# Rust build output off the shared PVC (BLO-15567). Local adapter verification:
+# typecheck clean, 664/664 (#64) and the pricing/models/execute suites (#65).
+ARG OPENCODE_K8S_REF=133f4c1a65085a6c141aab5aa8818afe51e2689c
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest

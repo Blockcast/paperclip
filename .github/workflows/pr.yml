@@ -899,6 +899,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: pnpm run test:proxy-addr-security-override
 
+      - name: Test @hono/node-server security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:hono-node-server-security-override
+
       - name: Test agent-health preflight fixtures
         if: ${{ !cancelled() }}
         run: pnpm run test:agent-health-preflight
@@ -1231,6 +1235,23 @@ jobs:
 
       - name: Test undefined-identifier guard failure modes
         run: node --test scripts/check-test-undefined-symbols.test.mjs
+
+      # BLO-38582: server's `typecheck` script runs this config, but NOTHING on
+      # pull_request or merge_group runs that script -- `typecheck:build-gaps`
+      # filters server out (its build already contains `tsc`), and the only
+      # `pnpm -r typecheck` lives in release-verify.yml, which is
+      # workflow_call-only. Without this step the allowlist is enforced solely
+      # at release, so a regression merges green. Sibling of the guard above:
+      # same file class, same job.
+      #
+      # `ensure-build-deps` is NOT redundant with `typecheck:build-gaps`: that
+      # script only runs it inside `if (buildGapPackages.length > 0)`
+      # (scripts/run-typecheck-build-gaps.mjs:178-179), so the prerequisite is
+      # contingent on an unrelated set being non-empty. It is declared inside
+      # `typecheck:tests` rather than inlined here, so the invocation has ONE
+      # definition that this step and server's own `typecheck` both reach.
+      - name: Typecheck allowlisted server tests
+        run: pnpm --filter @paperclipai/server run typecheck:tests
 
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry

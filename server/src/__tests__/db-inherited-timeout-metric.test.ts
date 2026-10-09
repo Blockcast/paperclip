@@ -17,9 +17,9 @@
  *
  * The series name is asserted for the same reason. It reports what the pool
  * INHERITS, which for `idle_in_transaction_session_timeout` is provably not
- * its effective value — `createDb` sets that to 120 s in its own startup
- * packet and the probe deliberately reads on a connection carrying none of
- * those overrides. Under an `_effective_` name that series reading `0` would
+ * its effective value — `createDb` sets its own value in the startup packet
+ * and the probe deliberately reads on a connection carrying none of those
+ * overrides. Under an `_effective_` name that series reading `0` would
  * say "unbounded" about the one setting #1921 already bounds, and the name is
  * what lands in PromQL where no doc comment is read.
  */
@@ -29,8 +29,11 @@ import {
   DB_INHERITED_TIMEOUT_METRIC,
   __resetMetricsForTest,
   renderMetrics,
+  POOL_IDLE_IN_TRANSACTION_SERIES,
   setDbInheritedTimeouts,
 } from "../services/metrics.js";
+import { POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS } from "@paperclipai/db";
+import { dbInheritedTimeoutSeries } from "../db-inherited-timeouts.js";
 
 afterEach(() => {
   __resetMetricsForTest();
@@ -57,13 +60,16 @@ async function readings(): Promise<Map<string, { value: number; source: string }
 
 describe("inherited DB timeout exposition (PEN-3365)", () => {
   it("names the series for what it measures: inherited, not effective", () => {
-    // Not cosmetic. `createDb` bounds idle-in-transaction at 120s in the pool's
+    // Not cosmetic. `createDb` bounds idle-in-transaction in the pool's
     // startup packet (#1921) and this probe deliberately does not observe that,
     // so under an `_effective_` name the resulting 0 would assert "unbounded"
     // about a setting that is bounded. The name is the part that reaches
     // PromQL, dashboards and alert rules; the help string is not read there.
     expect(DB_INHERITED_TIMEOUT_METRIC).toBe("paperclip_db_inherited_timeout_seconds");
     expect(DB_INHERITED_TIMEOUT_METRIC).not.toContain("effective");
+    // The pool series' name is a label value selected in PromQL too, so pin
+    // the literal: renaming the constant must not silently rename the series.
+    expect(POOL_IDLE_IN_TRANSACTION_SERIES).toBe("idle_in_transaction_session_timeout_pool");
   });
 
   it("publishes one series per setting, carrying the attributing source", async () => {
@@ -84,6 +90,61 @@ describe("inherited DB timeout exposition (PEN-3365)", () => {
     // asserting a role-level 30s statement_timeout.
     expect(seen.get("statement_timeout")?.source).toBe("user");
     expect(seen.get("lock_timeout")?.source).toBe("default");
+  });
+
+  it("publishes the pool's own idle-in-transaction value beside the inherited one", async () => {
+    // The startup log's `LOOSENED:` verdict is unreadable in practice (see the
+    // header), so the comparison it states must be answerable by query: a
+    // pool series above a non-zero inherited one is the PEN-3365 loosening.
+    setDbInheritedTimeouts([
+      { name: "idle_in_transaction_session_timeout", valueMs: 30_000, source: "user" },
+      {
+        name: POOL_IDLE_IN_TRANSACTION_SERIES,
+        valueMs: 60_000,
+        source: "startup_packet",
+      },
+    ]);
+
+    const seen = await readings();
+    expect(seen.get("idle_in_transaction_session_timeout")).toEqual({ value: 30, source: "user" });
+    expect(seen.get(POOL_IDLE_IN_TRANSACTION_SERIES)).toEqual({
+      value: 60,
+      source: "startup_packet",
+    });
+  });
+
+  it("startup publishes the pool series at the shipped constant, not just the inherited three", async () => {
+    // The wiring is what makes the loosening queryable, so it needs its own
+    // failing test: dropping the pool entry from `dbInheritedTimeoutSeries`
+    // leaves every other assertion here green and silently reverts the gauge
+    // to the inherited-only reading.
+    const inherited = {
+      statementTimeout: { name: "statement_timeout", valueMs: 30_000, source: "user" },
+      idleInTransactionSessionTimeout: {
+        name: "idle_in_transaction_session_timeout",
+        valueMs: null,
+        source: "default",
+      },
+      lockTimeout: { name: "lock_timeout", valueMs: null, source: "default" },
+    };
+    const series = dbInheritedTimeoutSeries(inherited);
+    expect(series.map((s) => s.name)).toEqual([
+      "statement_timeout",
+      "idle_in_transaction_session_timeout",
+      "lock_timeout",
+      POOL_IDLE_IN_TRANSACTION_SERIES,
+    ]);
+    expect(series[3]).toEqual({
+      name: POOL_IDLE_IN_TRANSACTION_SERIES,
+      valueMs: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+      source: "startup_packet",
+    });
+
+    setDbInheritedTimeouts(series);
+    expect((await readings()).get(POOL_IDLE_IN_TRANSACTION_SERIES)).toEqual({
+      value: POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS / 1000,
+      source: "startup_packet",
+    });
   });
 
   it("converts the probe's milliseconds to the seconds the metric name promises", async () => {

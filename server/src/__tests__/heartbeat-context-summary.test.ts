@@ -671,6 +671,90 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(commentWake).toContain("Update the plan only. Do not write code or perform implementation work.");
     expect(commentWake).not.toContain("Create child issues from the approved plan only");
   });
+
+  // PEN-3743: a coalesced wake inlines only the newest comment. The earlier
+  // orders it absorbed previously reached the agent as silence -- the ids were
+  // retained on the run row but never routed into the prompt, which is the one
+  // surface the agent reliably reads.
+  it("names the earlier comments a coalesced wake absorbed but did not inline", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PEN-3743",
+        title: "Coalesced wake",
+        workMode: "standard",
+        description: null,
+      },
+      wakeComment: {
+        id: "comment-2",
+        body: "the correction",
+      },
+      supersededWakeCommentIds: ["comment-1"],
+      supersededWakeCommentCount: 1,
+    });
+
+    expect(markdown).toContain("Latest wake comment:");
+    expect(markdown).toContain("the correction");
+    expect(markdown).toContain("Earlier wake comment NOT shown above (1):");
+    expect(markdown).toContain("comment-1");
+    expect(markdown).toContain("Read it on the issue before acting");
+  });
+
+  it("pluralizes and reports the exact count when the id list is capped", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PEN-3743",
+        title: "Coalesced wake",
+        workMode: "standard",
+        description: null,
+      },
+      wakeComment: { id: "comment-9", body: "newest" },
+      supersededWakeCommentIds: ["comment-1", "comment-2"],
+      // Exact count exceeds the enumerated ids: the cap must not understate how
+      // much was dropped.
+      supersededWakeCommentCount: 5,
+    });
+
+    expect(markdown).toContain("Earlier wake comments NOT shown above (5):");
+    expect(markdown).toContain("This wake absorbed 5 earlier comments");
+    expect(markdown).toContain("(3 further ids not listed.)");
+    expect(markdown).toContain("Read them on the issue before acting");
+  });
+
+  it("uses the singular when exactly one id is elided by the cap", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PEN-3743",
+        title: "Coalesced wake",
+        workMode: "standard",
+        description: null,
+      },
+      wakeComment: { id: "comment-9", body: "newest" },
+      supersededWakeCommentIds: ["comment-1", "comment-2"],
+      supersededWakeCommentCount: 3,
+    });
+
+    expect(markdown).toContain("(1 further id not listed.)");
+  });
+
+  it("says nothing about supersession when a wake dropped nothing", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PEN-3743",
+        title: "Coalesced wake",
+        workMode: "standard",
+        description: null,
+      },
+      wakeComment: { id: "comment-1", body: "only comment" },
+      supersededWakeCommentIds: [],
+      supersededWakeCommentCount: 0,
+    });
+
+    expect(markdown).not.toContain("NOT shown above");
+  });
 });
 
 describe("derivePaperclipPrReview", () => {
@@ -2290,6 +2374,56 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(merged.githubHeadSha).toBe("8555702b54179d291f3283a449eaead3c4b08bc9");
     expect(merged.githubPrReviewBody).toBe("Nit: rename the helper.");
     expect(merged.githubPrReviewAuthorLogin).toBe("ally");
+  });
+
+  // BLO-30420. The declined-classification reason is written only when a
+  // review is NOT actionable, under a conditional spread, so an actionable
+  // review re-supplies neither key. If the two keys are not on the scrub
+  // lists, a second review-instance wake coalescing onto the same run keeps
+  // the earlier decline's reason next to `githubReviewFeedbackActionable:
+  // true` -- the pair github-webhook.test.ts forbids for a single delivery --
+  // and via the different-PR scrub the same reason crosses onto another PR.
+  it("does not carry a stale suppression reason onto a later actionable review (BLO-30420)", () => {
+    const declined = {
+      issueId: "issue-1681",
+      wakeReason: "github_pr_review_submitted",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 1681,
+      githubHeadSha: "6f89faa8",
+      githubPrReviewBody: "Findings header with no enumerable items.",
+      githubPrReviewAuthorLogin: "allyblockcast[bot]",
+      githubReviewFeedbackSuppressionReason: "ally_review_findings_unenumerable",
+      githubReviewFeedbackSuppressionPredicate: "findings_header_without_items",
+      prRole: "author",
+    };
+
+    // Same PR, next review instance, actionable this time.
+    const samePr = mergeCoalescedContextSnapshot(declined, {
+      issueId: "issue-1681",
+      wakeReason: "github_pr_review_feedback",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 1681,
+      githubHeadSha: "6f89faa8",
+      githubPrReviewBody: "1 Important finding.",
+      githubPrReviewAuthorLogin: "allyblockcast[bot]",
+      githubReviewFeedbackActionable: true,
+      prRole: "author",
+    });
+    expect(samePr.githubReviewFeedbackActionable).toBe(true);
+    expect(samePr).not.toHaveProperty("githubReviewFeedbackSuppressionReason");
+    expect(samePr).not.toHaveProperty("githubReviewFeedbackSuppressionPredicate");
+
+    // Different PR routed to the same issue: the reason must not cross PRs.
+    const otherPr = mergeCoalescedContextSnapshot(declined, {
+      issueId: "issue-1681",
+      wakeReason: "github_pr_ready_for_review",
+      githubRepoFullName: "Blockcast/paperclip",
+      githubPrNumber: 1699,
+      githubHeadSha: "c9890150",
+      prRole: "author",
+    });
+    expect(otherPr).not.toHaveProperty("githubReviewFeedbackSuppressionReason");
+    expect(otherPr).not.toHaveProperty("githubReviewFeedbackSuppressionPredicate");
   });
 
   // BLO-22229. Reproduces the incident verbatim: a formal `kkroo` APPROVED

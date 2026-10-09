@@ -647,6 +647,72 @@ test("PaperclipQueuedRunAgeMetricsRefreshFailed exposes a stale snapshot instead
   );
 });
 
+test("PaperclipDeferredIssueExecutionWakeOverdue is agent-keyed, freshness-gated, and links its own runbook (PEN-3734)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipDeferredIssueExecutionWakeOverdue/);
+  const [, expr] = rendered.match(
+    /alert: PaperclipDeferredIssueExecutionWakeOverdue[\s\S]*?\n\s+expr: (.+)\n/,
+  ) ?? [];
+  assert.ok(expr, "deferred-wake alert must render an expr");
+
+  // Same per-replica freshness gate as the queued-run sibling: an `on()` join
+  // would let one healthy replica bless another replica's stale snapshot.
+  assert.match(
+    expr,
+    /^max by \(agent_id\) \(paperclip_deferred_issue_execution_wake_oldest_age_seconds and on\(instance\) \(paperclip_deferred_issue_execution_wake_age_metrics_refresh_success == 1\)\) > (\d+)$/,
+    "deferred-wake alert must gate each replica's age before taking the per-agent max",
+  );
+
+  const [, ageThreshold] = expr.match(/> (\d+)$/) ?? [];
+  // The gauge is reset-then-set to 0 for every known agent on each refresh, so
+  // a strictly positive threshold is the silent-in-steady-state guarantee.
+  assert.ok(
+    Number(ageThreshold) > 0,
+    "age threshold must be strictly positive so a zero-valued gauge is silent",
+  );
+  // Deliberately a BACKSTOP, not a fitted percentile: a deferral behind a
+  // legitimately long-running holder is correct behaviour and healthy runs in
+  // this fleet have been measured to ~9h. A threshold near the queued-run
+  // sibling's 1440s would page on ordinary work. Pinned so a later "make it
+  // consistent with its siblings" edit has to read why it is not.
+  assert.ok(
+    Number(ageThreshold) >= 3600,
+    "deferred-wake threshold must stay above the healthy long-run band; see values.yaml for why this is not fitted to a percentile",
+  );
+
+  assert.match(
+    rendered,
+    /alert: PaperclipDeferredIssueExecutionWakeOverdue[\s\S]*?runbook_url: "[^"]*runbooks\/deferred-issue-execution-wake\.md"/,
+    "the deferred-wake alert must route responders to its own runbook",
+  );
+});
+
+test("PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed exposes a stale snapshot instead of hiding it (PEN-3734)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(
+    rendered,
+    /alert: PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed[\s\S]*?\n\s+expr: paperclip_deferred_issue_execution_wake_age_metrics_refresh_success == 0\n/,
+    "a failed deferred-wake-age refresh must have its own alert",
+  );
+  assert.match(
+    rendered,
+    /alert: PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed[\s\S]*?runbook_url: "[^"]*runbooks\/deferred-issue-execution-wake\.md"/,
+    "the freshness failure alert must route responders to the deferred-wake runbook",
+  );
+});
+
 test("PaperclipPrReviewQueueWaitSaturated uses the bounded p95 histogram and runbook", () => {
   const rendered = renderChart(["--show-only", "templates/prometheusrule.yaml", "--set", "prometheusRule.enabled=true"]);
   assert.match(rendered, /alert: PaperclipPrReviewQueueWaitSaturated/);
@@ -1620,9 +1686,13 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
   // each found by re-grepping the phrase rather than by re-reading the diff --
   // so assert the class is gone instead of waiting for a sixth site. These
   // three files carry start-lock guidance as live operator/operator-adjacent
-  // instruction, never as quotation. queued-run-stranded.md and this file are
-  // excluded on purpose: both quote the claim in order to withdraw it, which
-  // is the one place it still belongs.
+  // instruction, never as quotation. This file is excluded on purpose: it
+  // quotes the claim in order to withdraw it, which is the one place it still
+  // belongs. queued-run-stranded.md does both, so only its live-instruction
+  // regions are scanned: the step-0 routing blockquote and the fleet-stall
+  // trigger, which a responder reads first. Its BLO-36522 sections stay out
+  // because they quote the claim to withdraw it, and a whole-file scan would
+  // also trip the legitimate socket/await sense further down.
   //
   // Each file is sliced to its start-lock region rather than scanned whole.
   // The phrases are ordinary English, and prometheusrule.yaml is a 909-line
@@ -1643,6 +1713,14 @@ test("the start-lock retune prose does not run ahead of the evidence (BLO-36522)
     [
       "deploy/helm/paperclip/values.yaml",
       /\n\s+# -- How long a single per-agent start lock may be held[\s\S]*?agentStartLockWedgedRunbookUrl: .*/,
+    ],
+    [
+      "runbooks/queued-run-stranded.md",
+      /\n> [^\n]*\*\*This section's Step 4 restart gate is the ONE-AGENT arm\.\*\*[\s\S]*?(?=\n(?!>)|$)/,
+    ],
+    [
+      "runbooks/queued-run-stranded.md",
+      /\n## Fleet stall: many agents in lockstep \(BLO-36922\)\n[\s\S]*?(?=\n#{2,3} |$)/,
     ],
   ]) {
     const [section] =
@@ -2016,5 +2094,230 @@ test("PaperclipIsolationWorkspaceReaperStopped is gauge-keyed, dry_run-collapsed
   assert.ok(
     existsSync(path.join(repoRoot, "runbooks/isolation-workspace-reaper.md")),
     "runbooks/isolation-workspace-reaper.md must exist for the runbook_url to resolve",
+  );
+});
+
+test("the start-lock runbook routes its two arms on agent count, not on an alert name (BLO-36922)", () => {
+  // The two arms have opposite remedies: the one-agent wedge ends in replacing
+  // the process, while a fleet stall self-clears and the restart destroys its
+  // only evidence. Each way this routing has been written wrong fails toward
+  // the restart, and nothing rendered breaks when it rots (the chart does not
+  // read the runbook), so only an assertion catches it.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/queued-run-stranded.md"),
+    "utf8",
+  );
+  // Blockquote markers and line wraps are layout, not content; match on the
+  // prose so a re-wrap cannot make an assertion pass or fail.
+  const flat = (text) => text.replace(/^> ?/gm, "").replace(/\s+/g, " ");
+  const wedgedAt = runbook.indexOf("\n## Agent start lock wedged (PEN-3305)\n");
+  const referencesAt = runbook.indexOf("\n## References\n");
+  const [fleetHeading] = runbook.match(/^#+ Fleet stall: .*$/m) ?? [];
+  assert.ok(
+    wedgedAt !== -1 && referencesAt !== -1 && fleetHeading,
+    "runbook must keep the one-agent, fleet-stall and References headings -- "
+      + "the assertions below scope themselves to them by name",
+  );
+
+  // A sibling `##`, not nested inside the section that opens by saying it is
+  // the one-agent arm only, and after that section's own liveness check,
+  // whose closing paragraph describes the Wedged rule alone.
+  assert.match(
+    fleetHeading,
+    /^## /,
+    "fleet stall must be a sibling ## of the one-agent section, not nested inside it",
+  );
+  const fleetAt = runbook.indexOf(`\n${fleetHeading}\n`);
+  assert.ok(wedgedAt < fleetAt && fleetAt < referencesAt, "fleet stall must follow the one-agent section");
+  // Bound each section at the NEXT `##`, never at the other one's offset. These
+  // two were adjacent when this test was written and are not any more: PEN-3328
+  // added `## Agent start lock aborted` as a third sibling between them.
+  // slice(wedgedAt, fleetAt) would have swallowed it into `wedged`, so a
+  // doesNotMatch guard below would have started policing prose that belongs to
+  // a different alert -- failing or passing for reasons unrelated to routing.
+  const nextH2 = (from) => {
+    const at = runbook.indexOf("\n## ", from + 1);
+    return at === -1 ? runbook.length : at;
+  };
+  const wedged = runbook.slice(wedgedAt, nextH2(wedgedAt));
+  const fleet = runbook.slice(fleetAt, nextH2(fleetAt));
+  for (const [name, text] of [["one-agent", wedged], ["fleet-stall", fleet]]) {
+    assert.ok(
+      !text.slice(1).includes("\n## "),
+      `the ${name} slice must stop at the next ## heading, not run into a sibling section`,
+    );
+  }
+  assert.match(
+    wedged,
+    /\n### Verifying the signal is live\n/,
+    "the one-agent section must close with its own liveness check before the fleet arm opens",
+  );
+
+  const routingEnd = wedged.indexOf("\n### ");
+  const fleetIntroEnd = fleet.indexOf("\n### ");
+  assert.ok(routingEnd !== -1 && fleetIntroEnd !== -1, "both arms must keep their subsections");
+  const routing = flat(wedged.slice(0, routingEnd));
+  const fleetIntro = flat(fleet.slice(0, fleetIntroEnd));
+
+  // Step 0 is the agent count, which keys on shape and so survives the alert
+  // names' semantics moving (they moved three times in two weeks). Since
+  // onprem-k8s #4036 (BLO-35571) the split is live: a fleet stall pages
+  // `PaperclipAgentStartLockFleetStall` (unlabelled count, one page per
+  // episode) and `PaperclipAgentStartLockWedged` only past 4 h, longer than any
+  // measured fleet stall. The runbook still has to say which arm wins.
+  // Scope step 0 to the routing blockquote: `routing` also spans the Trigger,
+  // which quotes FleetStall's count, so asserting on `routing` let the step-0
+  // block be deleted with the test still green.
+  const blockquoteAt = wedged.indexOf("ONE-AGENT arm");
+  assert.ok(
+    blockquoteAt !== -1 && blockquoteAt < routingEnd,
+    "the one-agent section must keep its routing blockquote before its first subsection",
+  );
+  assert.ok(
+    flat(wedged.slice(blockquoteAt, routingEnd)).includes(
+      "count(max by (agent_id) (paperclip_agent_start_lock_held_seconds) > 900)",
+    ),
+    "the one-agent section must open with the agent-count query as step 0",
+  );
+  // The Trigger is the section's entry point, read before the blockquote. It
+  // must give Wedged its own landed rule (the solo 4 h arm), not FleetStall's
+  // count, and no start-lock text may still wait on #3985: it closed unmerged
+  // and #4036 landed the split instead.
+  assert.match(
+    flat(wedged.slice(0, blockquoteAt)),
+    /\| `PaperclipAgentStartLockWedged` \| `max by \(agent_id\) \(paperclip_agent_start_lock_held_seconds\) > 14400` \| 5m \|/,
+    "the Trigger must give PaperclipAgentStartLockWedged its landed solo rule (> 14400 for 5m), not FleetStall's count",
+  );
+  assert.doesNotMatch(
+    flat(wedged + fleet),
+    /#3985(?![^.]*closed (?:unmerged|superseded))/,
+    "every #3985 mention in the start-lock runbook must say it closed without landing; the live split is onprem-k8s #4036",
+  );
+  // Pin every remedy sentence's direction, not just its words. Inverting or
+  // deleting any of the fleet-side ones tells a responder to restart during a
+  // fleet stall; inverting the below-3 row withholds the one-agent remedy.
+  for (const [text, pattern, message] of [
+    [routing, /\*\*The fleet arm takes precedence\.\*\*/, "routing must say the fleet arm wins when both alerts fire"],
+    [routing, /\| `>= 3` \|[^|]*\| do \*\*not\*\* replace the process \|/, "the `>= 3` row's remedy must say do not replace the process"],
+    [routing, /\| below 3, or no data \|[^|]*\| this section, which ends with the Step 4 restart gate \|/, "the below-3 row's remedy must be this section, whose Step 4 gate can authorise a restart"],
+    [routing, /While the count reads `>= 3`, do not apply this section's remedy to any agent/, "routing must say not to apply the one-agent remedy while the count reads >= 3"],
+    [fleetIntro, /\*\*Do NOT replace the process\.\*\*/, "the fleet-stall section must say do NOT replace the process"],
+  ]) {
+    assert.match(text, pattern, message);
+  }
+  // Pin each row's arm cell too: the remedy patterns above accept any arm
+  // text. The 2026-09-15/16 episode (6-19 h) was five agents, so it is `>= 3`
+  // evidence, and evidence in neither direction; cited on the below-3 row it
+  // reads as a solo hold that would not end and routes to the Step 4 restart.
+  // The solo hold measured cycled.
+  const [, fleetArm = ""] = routing.match(/\| `>= 3` \| ([^|]*) \|/) ?? [];
+  const [, soloArm = ""] = routing.match(/\| below 3, or no data \| ([^|]*) \|/) ?? [];
+  assert.match(fleetArm, /\*\*self-clears\*\*/, "the `>= 3` row's arm must say the fleet stall self-clears");
+  // Pin the fleet arm's observed CEILING too, not just its self-clear verdict.
+  // The four BLO-36922 episodes top out at 120 min, but the 2026-09-24 episode
+  // at :664 was "also three agents in lockstep" -- fleet-scope, 2h14m, above
+  // that ceiling. A range built from the four alone reads as a bound the
+  // record already exceeds, and understating it is the direction that matters:
+  // a responder watching a 130-minute stall against a "120 min" ceiling
+  // concludes this episode is not the measured shape and reaches for Step 4.
+  assert.match(
+    fleetArm,
+    /2h14m/,
+    "the `>= 3` row's arm must carry the 2h14m ceiling (the 2026-09-24 three-agent episode, :664), not the 120 min top of the four BLO-36922 episodes",
+  );
+  assert.match(
+    soloArm,
+    /\*\*cycled\*\*[^|]*`Wedged` pages at 4 h only if the abort fails to land/,
+    "the below-3 row's arm must give what was measured for a solo hold: it cycled, and Wedged pages at 4 h only on an unlanded abort",
+  );
+  assert.doesNotMatch(
+    soloArm,
+    /6.19 ?h|2026-09-15/,
+    "the below-3 row's arm must not cite the 2026-09-15/16 episode: it was five agents, so it is `>= 3` evidence, and evidence in neither direction",
+  );
+
+  // 8043s and 8073s are TWO MEASUREMENTS OVER TWO WINDOWS, not one figure
+  // spelled two ways: 8043s is the 7-day maximum hold (the 2026-09-24
+  // three-agent episode, which is where the `>= 3` row's 2h14m ceiling comes
+  // from) and 8073s is the 14-day peak across the 21 agents that held past
+  // 300s. 8043 <= 8073 is the expected relationship between a window and the
+  // one containing it, so agreement is not something to restore. Both round
+  // to "2h14m", which is the whole trap -- a reader comparing the rendered
+  // durations sees a typo and reconciles them, and the file then states a
+  // 14-day peak as a 7-day measurement while the 2h14m ceiling above silently
+  // disagrees with its own source. Reviewed and declined once already (Ally,
+  // 2026-10-06, PR #2059); pin the window labels so the next reader does not
+  // re-derive it, and so "reconciling" them turns the suite red instead. Both
+  // rows pin the window's end date, not just the word: an undated "7-day
+  // maximum" or "over the 14 days" reads as the last N days, so the inferences
+  // resting on these figures re-date themselves forward while their evidence
+  // stays at 2026-09-25 (Ally, 2026-10-06/07, PR #2059 at ea2dfbf7 and 6df7bb7d).
+  for (const [figure, window, label] of [
+    [/\b8043s\b/g, /7-day[^.]*2026-09-25/, "7-day maximum hold to 2026-09-25 (the 2026-09-24 three-agent episode)"],
+    [/\b8073s\b/g, /14 days[^.]*2026-09-25/, "14-day peak to 2026-09-25 across the 21 agents past 300s"],
+  ]) {
+    const hits = [...runbook.matchAll(figure)];
+    assert.ok(
+      hits.length > 0,
+      `the runbook must keep its ${label} figure; losing it makes this guard vacuous`,
+    );
+    for (const hit of hits) {
+      assert.match(
+        flat(runbook.slice(Math.max(0, hit.index - 240), hit.index)),
+        window,
+        `every ${hit[0]} in the runbook must be labelled with its measurement window -- it is the ${label}, `
+          + "and the other figure is a different window, not a typo to reconcile",
+      );
+    }
+  }
+
+  // PEN-3328 made "Wedged pages once per agent past 4h" false, and false in the
+  // direction that matters: `paperclip_agent_start_lock_held_seconds` is
+  // reset-then-set, so an abort that LANDS deletes the series inside a scrape
+  // and Wedged's `for: 5m` never completes. The normal outcome past 4h is
+  // therefore silence on Wedged and one `PaperclipAgentStartLockAborted`
+  // (`warning`) per agent. Prose that promises a Wedged page licenses the
+  // inverse inference -- "no Wedged page, so nothing is past 4h" -- in exactly
+  // the case where the system worked. templates/prometheusrule.yaml states the
+  // same mechanism beside the `for:` it depends on.
+  for (const [where, text] of [["the routing block", routing], ["the fleet-stall trigger", fleetIntro]]) {
+    assert.match(
+      text,
+      /`PaperclipAgentStartLockAborted`/,
+      `${where} must name PaperclipAgentStartLockAborted as the per-agent signal past the 4h abort boundary`,
+    );
+    assert.doesNotMatch(
+      text,
+      /would page it once per agent|pages? it once per agent/,
+      `${where} must not promise a per-agent Wedged page past 4h; a landed abort deletes the series before for: 5m completes`,
+    );
+  }
+
+  // FleetStall landed in onprem-k8s #4036 and is in the deployed rules, but
+  // not in this chart. Both texts must name it, say where to verify what is
+  // live, and not resurrect the "not deployed" wording whose premise expired
+  // when #4036 merged (2026-09-28).
+  for (const [where, text] of [["the routing block", routing], ["the fleet-stall trigger", fleetIntro]]) {
+    assert.match(
+      text,
+      /`PaperclipAgentStartLockFleetStall`[^.]*(?:once|one page) per episode/,
+      `${where} must say a fleet stall pages PaperclipAgentStartLockFleetStall, once per episode`,
+    );
+    assert.doesNotMatch(
+      text,
+      /not deployed/,
+      `${where} must not call PaperclipAgentStartLockFleetStall not deployed; it landed in onprem-k8s #4036`,
+    );
+    assert.match(text, /\/api\/v1\/rules/, `${where} must say where to verify which rules are live`);
+  }
+
+  // Both arms are one continuous hold per agent, so `heldMs` grows line over
+  // line in either (agent-start-lock.ts: one interval per acquisition,
+  // `heldMs = nowMs - startedAtMs`). It separates a continuous hold from
+  // sequential short ones, not a fleet stall from a wedge.
+  assert.doesNotMatch(
+    flat(wedged + fleet),
+    /`heldMs`[^.]*discriminat/,
+    "runbook must not offer heldMs as the discriminator between the two arms -- it grows in both",
   );
 });

@@ -82,23 +82,52 @@ export const VIOLATION_KINDS = {
 };
 
 /**
+ * GraphQL's maximum `first`. A repo past this needs real pagination, which the
+ * truncation guard in `evaluateConsumer` turns into a loud `unreadable` rather
+ * than a silent pass. The authoritative truncation signal is the connection's
+ * `pageInfo.hasNextPage`; a page of exactly this length is only the fallback
+ * tell, used when that flag is absent.
+ * Measured 2026-10-07: penstock-llm-proxy-core, the only consumer that reaches
+ * the behavioural arm, had 19 open pull requests on `main` against the then-cap
+ * of 20 — one PR from the fail-open this guard now refuses.
+ */
+export const OPEN_PRS_PAGE_SIZE = 100;
+
+/**
  * Evaluate one consumer from already-fetched data. Pure, so the whole decision
  * table is testable without the network.
  *
  * @param rules  the `rules/branches/{branch}` array, or null if it could not be read
  * @param openPullRequests  [{number, approvals, reviewDecision}], or null if not fetched
+ * @param openPullRequestsTruncated  the probe's `pageInfo.hasNextPage`; when absent,
+ *   a full page (length >= OPEN_PRS_PAGE_SIZE) is treated as truncated
  */
-export function evaluateConsumer({ repo, branch, rules, openPullRequests }) {
+export function evaluateConsumer({ repo, branch, rules, openPullRequests, openPullRequestsTruncated }) {
   const base = { repo, branch };
 
   if (rules == null) {
     return { ...base, status: 'unreadable', reason: 'rules/branches could not be read', violationKinds: [] };
   }
 
-  const rule = rules.find((r) => r?.type === 'pull_request');
+  // `rules/branches/{branch}` FLATTENS the contributions of every ruleset that
+  // applies to the branch — each entry carries its own `ruleset_id` — so two
+  // rulesets can both contribute a `pull_request` rule. `.find()` would read
+  // the first and silently ignore a second one's stricter parameters.
+  // Measured 2026-10-07: no consumer has two today (hang 1, pim 1, vault 1,
+  // core 0), so this is structural rather than currently exercised. Unioned
+  // strictest-wins anyway, matching GitHub's own cross-ruleset evaluation:
+  // a parameter is satisfied if ANY applying rule demands it.
+  const prRules = rules.filter((r) => r?.type === 'pull_request');
 
-  if (rule) {
-    const p = rule.parameters ?? {};
+  if (prRules.length > 0) {
+    const params = prRules.map((r) => r.parameters ?? {});
+    const p = {
+      required_approving_review_count: Math.max(
+        ...params.map((x) => Number(x.required_approving_review_count) || 0),
+      ),
+      require_last_push_approval: params.some((x) => x.require_last_push_approval === true),
+      dismiss_stale_reviews_on_push: params.some((x) => x.dismiss_stale_reviews_on_push === true),
+    };
     const violations = [];
     const violationKinds = [];
     const fail = (kind, message) => {
@@ -130,7 +159,7 @@ export function evaluateConsumer({ repo, branch, rules, openPullRequests }) {
       ...base,
       status: violations.length === 0 ? 'compliant' : 'drift',
       evidence: 'ruleset',
-      rulesetId: rule.ruleset_id ?? null,
+      rulesetIds: prRules.map((r) => r.ruleset_id ?? null),
       observed: {
         required_approving_review_count: p.required_approving_review_count,
         require_last_push_approval: p.require_last_push_approval,
@@ -158,19 +187,9 @@ export function evaluateConsumer({ repo, branch, rules, openPullRequests }) {
   const eligible = openPullRequests.filter(
     (pr) => (pr.approvals ?? 0) === 0 && pr.reviewDecision !== 'CHANGES_REQUESTED',
   );
-  if (eligible.length === 0) {
-    // VOID, not a pass. With no zero-approval pull request there is nothing
-    // that would read REVIEW_REQUIRED even if the control were deleted.
-    return {
-      ...base,
-      status: 'unreadable',
-      reason: `no pull_request rule, and no open zero-approval pull request on ${branch} without ` +
-        `CHANGES_REQUESTED to probe ` +
-        `(${openPullRequests.length} open) — the control is unmeasurable from here, which is not a pass`,
-      violationKinds: [],
-    };
-  }
 
+  // Drift first: an ungated pull request we DID see is a positive observation,
+  // and stays drift whether or not the window behind it was complete.
   const ungated = eligible.filter((pr) => pr.reviewDecision !== 'REVIEW_REQUIRED');
   if (ungated.length > 0) {
     return {
@@ -183,6 +202,38 @@ export function evaluateConsumer({ repo, branch, rules, openPullRequests }) {
           'reviews and do not report reviewDecision=REVIEW_REQUIRED — no review is required to merge',
       ],
       violationKinds: [VIOLATION_KINDS.NO_REVIEW_GATE],
+    };
+  }
+
+  // A truncated window (`hasNextPage`, or a full page when that flag is
+  // absent) dropped rows, and the query orders UPDATED_AT DESC — so the rows
+  // dropped are the LEAST recently touched, which is exactly where a stale
+  // ungated pull request sits. A `compliant` here would be a pass bought by
+  // not looking. Not drift: nothing ungated was observed. Raising
+  // OPEN_PRS_PAGE_SIZE only moves the cliff; this guard is what makes the
+  // cliff loud instead of silent.
+  if (openPullRequestsTruncated ?? (openPullRequests.length >= OPEN_PRS_PAGE_SIZE)) {
+    return {
+      ...base,
+      status: 'unreadable',
+      reason: `no pull_request rule, and the open-pull-request window came back full ` +
+        `(${openPullRequests.length} = the ${OPEN_PRS_PAGE_SIZE} cap) — least-recently-updated pull ` +
+        `requests were dropped unseen, so this sample cannot refute the control`,
+      observed: { probed: eligible.length, truncated: true },
+      violationKinds: [],
+    };
+  }
+
+  if (eligible.length === 0) {
+    // VOID, not a pass. With no zero-approval pull request there is nothing
+    // that would read REVIEW_REQUIRED even if the control were deleted.
+    return {
+      ...base,
+      status: 'unreadable',
+      reason: `no pull_request rule, and no open zero-approval pull request on ${branch} without ` +
+        `CHANGES_REQUESTED to probe ` +
+        `(${openPullRequests.length} open) — the control is unmeasurable from here, which is not a pass`,
+      violationKinds: [],
     };
   }
 
@@ -217,8 +268,9 @@ export function summarize(results) {
 
 const OPEN_PRS_QUERY = `query($o:String!,$r:String!,$b:String!){
   repository(owner:$o,name:$r){
-    pullRequests(states:OPEN,baseRefName:$b,first:20,orderBy:{field:UPDATED_AT,direction:DESC}){
-      nodes{ number reviewDecision latestOpinionatedReviews(first:20,writersOnly:false){nodes{state}} }
+    pullRequests(states:OPEN,baseRefName:$b,first:${OPEN_PRS_PAGE_SIZE},orderBy:{field:UPDATED_AT,direction:DESC}){
+      pageInfo{ hasNextPage }
+      nodes{ number reviewDecision latestOpinionatedReviews(first:100,writersOnly:false){nodes{state}} }
     }
   }
 }`;
@@ -243,11 +295,16 @@ async function fetchOpenPullRequests(owner, repo, branch, token, fetchImpl = ghF
     // would turn a permission failure into "zero open pull requests" — which
     // the caller cannot distinguish from a genuinely quiet repo.
     if (body?.errors?.length) throw new Error(body.errors.map((e) => e.message).join('; '));
-    return body.data.repository.pullRequests.nodes.map((pr) => ({
-      number: pr.number,
-      reviewDecision: pr.reviewDecision,
-      approvals: pr.latestOpinionatedReviews.nodes.filter((r) => r.state === 'APPROVED').length,
-    }));
+    const { nodes, pageInfo } = body.data.repository.pullRequests;
+    return {
+      nodes: nodes.map((pr) => ({
+        number: pr.number,
+        reviewDecision: pr.reviewDecision,
+        approvals: pr.latestOpinionatedReviews.nodes.filter((r) => r.state === 'APPROVED').length,
+      })),
+      // undefined when absent, so evaluateConsumer falls back to the length tell.
+      truncated: pageInfo?.hasNextPage,
+    };
   } catch (err) {
     console.warn(`::warning::could not read open pull requests for ${owner}/${repo}@${branch}: ${err.message}`);
     return null;
@@ -260,10 +317,16 @@ export async function checkConsumers({ owner, token, consumers = CONSUMERS, fetc
     const rules = await fetchRules(owner, repo, branch, token, fetchImpl);
     // Only pay for the fallback where the primary did not settle it.
     const needsProbe = rules != null && !rules.some((r) => r?.type === 'pull_request');
-    const openPullRequests = needsProbe
+    const probe = needsProbe
       ? await fetchOpenPullRequests(owner, repo, branch, token, fetchImpl)
       : null;
-    results.push(evaluateConsumer({ repo, branch, rules, openPullRequests }));
+    results.push(evaluateConsumer({
+      repo,
+      branch,
+      rules,
+      openPullRequests: probe?.nodes ?? null,
+      openPullRequestsTruncated: probe?.truncated,
+    }));
   }
   return results;
 }

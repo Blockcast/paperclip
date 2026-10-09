@@ -197,6 +197,55 @@ export const WATCHED_GUARDS = [
     staleHours: 16,
     graceUntil: "2026-10-09T00:00:00.000Z",
   },
+
+  // Twice daily (cron "13 7,19"), BLO-39345. Shares the 16h bar carried by
+  // production-environment-protection-guard.yml, and that number is ADOPTED,
+  // not measured: this guard has no run history yet, so there is no jitter
+  // distribution to place a bar inside. It is the same twice-daily cadence as
+  // that guard, so the same bar is the least-invented choice available — but
+  // it has not earned the argument that row carries, and saying so is the
+  // point. Re-derive it from this workflow's own measured
+  // gaps once ~30 cycles (about two weeks) have run; if its ordinary band
+  // tops out well below 14.6h, tighten it rather than leaving a borrowed
+  // number in place.
+  //
+  // What makes a borrowed bar tolerable in the meantime: the audit runs a 2d
+  // window on a 12h cadence, so each merged PR is examined by roughly three
+  // consecutive runs. A missed cycle loses no coverage, which is exactly the
+  // property the threshold is protecting — unlike the hourly guards, where a
+  // skipped tick is a real gap.
+  //
+  // `event: "schedule"` for the BLO-38228 reason: a non-schedule run must not
+  // satisfy this guard's newest-run query while the cron is dead. It buys two
+  // things here. It closes the `workflow_dispatch` masking window that the
+  // BLO-38228 test accepts as a stated exposure on the seven older guards — a
+  // manual dispatch can otherwise mask a dead cron for one threshold window,
+  // and that exposure was accepted there only because narrowing those seven
+  // would invalidate the gap distributions their bars were measured from. This
+  // guard has no measured distribution to protect, so it costs nothing. And it
+  // fails closed against a later edit adding an auto-firing trigger back.
+  //
+  // That second half is not hypothetical: an earlier revision of this PR DID
+  // carry a push trigger on this workflow's own file, to give the guard a
+  // completed run at merge. It was removed because this filter makes such a run
+  // inert, so the trigger bought nothing and cost a full audit job per edit.
+  //
+  // `graceUntil` is what covers that merge-day window instead. A schedule only
+  // fires from the DEFAULT branch, so at merge this workflow has zero completed
+  // `schedule` runs by construction and classifies `never-completed` — a
+  // threshold-INDEPENDENT branch the 16h above cannot cover. The date is the
+  // first cron after merge plus two full cycles of slack for GitHub's
+  // scheduled-run delay under load: it holds for a merge before
+  // 2026-10-08T07:13Z (moved from 2026-10-08T00:00Z after a queue ejection
+  // burned that runway). Rotting here is FAIL-CLOSED: when it lapses
+  // the guard gets STRICTER, so a merge that slips past it reds on day one —
+  // loud, never silently green.
+  {
+    workflow: "commit-attribution-audit.yml",
+    staleHours: 16,
+    event: "schedule",
+    graceUntil: "2026-10-09T12:00:00.000Z",
+  },
 ];
 
 /**

@@ -182,14 +182,29 @@ describe("agent inbox-lite status contract", () => {
 // which is the input to a demotion pass. These assertions are on KEY PRESENCE, not
 // truthiness: a value-only test passes on the broken payload, because every value it
 // would read is legitimately null on most rows.
-describe("agent inbox-lite wake-path projection", () => {
-  const WAKE_PATH_KEYS = [
+// BLO-39015 widened this block past wake paths: four `parked*` columns are asserted
+// here too, and a park is deliberately NOT a wake path (see `agent-inbox-lite.ts` —
+// nothing fires when a `parkedUntil` lapses). So the block and its key list are named
+// for the CONTRACT they assert — every column present, null rather than absent — not
+// for any one mechanism. Do not re-read this list as "the attendance predicate's
+// inputs"; `attendedCount` below is that, and it is deliberately narrower.
+describe("agent inbox-lite liveness-column projection", () => {
+  const PRESENT_AND_NULL_KEYS = [
     "monitorNextCheckAt",
     "scheduledRetryAt",
     "scheduledRetryReason",
     "scheduledRetryAttempt",
+    "parkedUntil",
+    "parkedReason",
+    "parkedByAgentId",
+    "parkedAt",
   ] as const;
 
+  // Every `loadInbox()` in this block pins `nowMs` to NOW. The fixtures encode
+  // relative-to-now facts (an overdue monitor, a LIVE park), so an unpinned call
+  // re-reads them against the wall clock and they rot into their own opposites —
+  // the park fixture is already expired against today's real date, which is how the
+  // anti-suppression test below survived its first mutation.
   const NOW = new Date("2026-09-17T11:14:00.000Z");
 
   function baseRow(id: string, overrides: Record<string, unknown>) {
@@ -209,12 +224,21 @@ describe("agent inbox-lite wake-path projection", () => {
       scheduledRetryAt: null,
       scheduledRetryReason: null,
       scheduledRetryAttempt: null,
+      parkedUntil: null,
+      parkedReason: null,
+      parkedByAgentId: null,
+      parkedAt: null,
       scheduledRetryParkedRuns: [],
       ...overrides,
     };
   }
 
-  // The doctrine's own predicate, applied to whatever shape it is handed.
+  // The doctrine's own predicate — and it models WAKE-PATH attendance specifically:
+  // run, scheduled retry, future monitor. A live deliberate park is deliberately
+  // OUTSIDE it, because nothing fires when a `parkedUntil` lapses; a park satisfies
+  // the strandedness sweep ("is anyone accountable?"), not dispatch ("will this wake?").
+  // So `live-park` scoring unattended here is the intended answer, not a gap to close:
+  // adding a `parkedUntil` arm would be a doctrine change, not a fixture fix.
   function attendedCount(rows: Array<Record<string, unknown>>) {
     return rows.filter((row) => {
       const monitorAt = row.monitorNextCheckAt as Date | string | null | undefined;
@@ -237,6 +261,16 @@ describe("agent inbox-lite wake-path projection", () => {
     // definition a wake that did not happen.
     baseRow("overdue-monitor", { monitorNextCheckAt: new Date("2026-09-17T10:00:00.000Z") }),
     baseRow("genuinely-idle", {}),
+    // BLO-39015: a live deliberate park. Offered like any other row — a park is a
+    // strandedness-sweep satisfier, not a dispatch gate — but its columns must be
+    // READABLE here so the caller can tell it apart from `genuinely-idle`.
+    baseRow("live-park", {
+      status: "todo",
+      parkedUntil: new Date("2026-09-18T09:00:00.000Z"),
+      parkedReason: "awaiting TC-04 G0 rerun",
+      parkedByAgentId: "agent-uuid",
+      parkedAt: new Date("2026-09-17T09:00:00.000Z"),
+    }),
   ];
 
   beforeEach(() => {
@@ -246,12 +280,12 @@ describe("agent inbox-lite wake-path projection", () => {
     mockRecoveryActionService.listActiveForIssues.mockResolvedValue(new Map());
   });
 
-  it("emits every wake-path key on every row, present-and-null rather than absent", async () => {
-    const items = await loadInbox();
+  it("emits every liveness-column key on every row, present-and-null rather than absent", async () => {
+    const items = await loadInbox({ nowMs: NOW.getTime() });
 
     expect(items).toHaveLength(sourceRows.length);
     for (const item of items) {
-      for (const key of WAKE_PATH_KEYS) {
+      for (const key of PRESENT_AND_NULL_KEYS) {
         // `in`, not a value check: absent and always-null are both failures here,
         // and only `in` can tell them apart.
         expect(Object.keys(item)).toContain(key);
@@ -263,20 +297,78 @@ describe("agent inbox-lite wake-path projection", () => {
     expect(idle.scheduledRetryAt).toBeNull();
     expect(idle.scheduledRetryReason).toBeNull();
     expect(idle.scheduledRetryAttempt).toBeNull();
+    expect(idle.parkedUntil).toBeNull();
+    expect(idle.parkedReason).toBeNull();
+    expect(idle.parkedByAgentId).toBeNull();
+    expect(idle.parkedAt).toBeNull();
+  });
+
+  // BLO-39015: measured on two lanes — `inbox-lite` neither honoured nor exposed the
+  // park, and the second half is the defect. `issues.ts` selects all four columns so a
+  // park can be shown "by whom, why, and until when"; this projection dropped them, so
+  // a parked row and an idle row were byte-identical to the one surface agents reach
+  // for first. Key presence, not truthiness — every value here is null on most rows.
+  it("carries the deliberate-park columns, so a parked row is distinguishable from an idle one", async () => {
+    // `nowMs` pinned to NOW: the fixture's park is only LIVE relative to a fixed clock,
+    // and `loadInbox()` otherwise defaults to `Date.now()`. Without this the row is an
+    // EXPIRED park and both park assertions below pass vacuously — caught by mutation
+    // test, where adding a suppression filter left all 15 tests green.
+    const items = await loadInbox({ nowMs: NOW.getTime() });
+    const parked = items.find((item) => item.id === "live-park")!;
+    const idle = items.find((item) => item.id === "genuinely-idle")!;
+
+    expect(parked.parkedUntil).toEqual(new Date("2026-09-18T09:00:00.000Z"));
+    expect(parked.parkedReason).toBe("awaiting TC-04 G0 rerun");
+    expect(parked.parkedByAgentId).toBe("agent-uuid");
+    expect(parked.parkedAt).toEqual(new Date("2026-09-17T09:00:00.000Z"));
+
+    // The whole point: these two rows used to be indistinguishable here.
+    expect(parked.parkedUntil).not.toEqual(idle.parkedUntil);
+  });
+
+  // The OTHER direction, pinned on purpose. Exposing the park must not become
+  // filtering on it: `parkedUntil` is compared to now in exactly one place in the
+  // codebase — the strandedness sweep's `hasActiveParkedDisposition` — and selection
+  // has never keyed on it. Withholding a parked row here would remove it from the only
+  // surface BLO-27553 disposition 2 leaves it reachable on, turning a deliberate park
+  // into a strand. If a future author wants suppression, that is an owner-level change
+  // to selection semantics and this assertion is the thing they must argue with.
+  it("still OFFERS a live-parked row — exposure, never suppression", async () => {
+    // Clock pinned so the fixture park is genuinely in force; see the note above.
+    const items = await loadInbox({ nowMs: NOW.getTime() });
+
+    expect(items).toHaveLength(sourceRows.length);
+    expect(items.map((item) => item.id)).toContain("live-park");
+    // ...and offered INTACT. A filter is one way to lose a parked row; a projection
+    // that nulls the columns while the park is live is another, and would leave this
+    // test green on the id check alone.
+    expect(items.find((item) => item.id === "live-park")!.parkedUntil).not.toBeNull();
   });
 
   it("agrees with the source rows on the attendance count", async () => {
-    const items = await loadInbox();
+    const items = await loadInbox({ nowMs: NOW.getTime() });
 
     // live-monitor + parked-retry. Before the fix this read 0.
     expect(attendedCount(sourceRows)).toBe(2);
     expect(attendedCount(items as unknown as Array<Record<string, unknown>>)).toBe(
       attendedCount(sourceRows),
     );
+
+    // The boundary, made executable rather than nominal: a LIVE park is exposed by
+    // this endpoint and is still not attendance. Without this, a future author who
+    // adds a `parkedUntil` arm sees only `2` -> `3` and reads it as fixture drift to
+    // update. With it, they have to argue with the claim instead.
+    expect(
+      attendedCount(
+        (items as unknown as Array<Record<string, unknown>>).filter(
+          (row) => row.id === "live-park",
+        ),
+      ),
+    ).toBe(0);
   });
 
   it("carries the retry reason and attempt, not just the timestamp", async () => {
-    const items = await loadInbox();
+    const items = await loadInbox({ nowMs: NOW.getTime() });
     const parked = items.find((item) => item.id === "parked-retry")!;
 
     expect(parked.scheduledRetryReason).toBe("ccrotate_capacity");
