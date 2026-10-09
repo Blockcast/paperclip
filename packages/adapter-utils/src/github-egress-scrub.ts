@@ -183,17 +183,34 @@ const LEXICAL_SEGMENT_RE = /^(?:[A-Za-z]+|[0-9]+)$/;
 /** Longest segment an identifier may carry and still be exonerated. This is
  *  identifier HEADROOM, not a security bound: 16 random lowercase letters is
  *  already ~75 bits, so a segment at the limit is a usable secret on its own.
- *  What keeps the rule closed is the aggregate bound below. Chosen with room
- *  over the longest segment real identifiers use — `multicast` and `transport`
- *  are 9, `authentication` is 14. */
+ *  Chosen with room over the longest segment real identifiers use —
+ *  `multicast` and `transport` are 9, `authentication` is 14.
+ *
+ *  None of the length bounds here closes the rule; see isLexicalIdentifier for
+ *  what actually keeps random tokens out. */
 const LEXICAL_SEGMENT_MAX_LENGTH = 16;
 
 /** Segments longer than this count as "long", and an exonerated value may hold
  *  at most one. Without it the per-segment cap admits any NUMBER of ~75-bit
  *  segments — two random 16-letter words joined by a hyphen (~150 bits) passed.
  *  Real identifiers carry at most one long word: the longest segment of
- *  `draft-ramadan-moq-multicast-00` and `draft-ietf-moq-transport-14` is 9. */
+ *  `draft-ramadan-moq-multicast-00` and `draft-ietf-moq-transport-14` is 9.
+ *
+ *  This bounds LONG segments only. It says nothing about how many segments of
+ *  this length or less a value carries, so on its own it left exonerated
+ *  entropy unbounded: 16 × 10 random letters (~750 bits) passed. The total is
+ *  capped separately, by LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH. */
 const LEXICAL_LONG_SEGMENT_LENGTH = 10;
+
+/** Ceiling on the summed length of an exonerated value's segments, separators
+ *  excluded. Derived from the regression set, not from an entropy budget: the
+ *  longest real identifier there, `draft-ramadan-moq-multicast-00`, sums to 26
+ *  (`draft-ietf-moq-transport-14` to 23, the `-fec-`/`-mmt-` drafts to 20), and
+ *  this is 26 rounded up to the next whole LEXICAL_LONG_SEGMENT_LENGTH — three
+ *  long-segment widths, 30. So 4 × 10 random letters and above go back to
+ *  refused. It narrows the rule rather than closing it: 3 × 10 sums to exactly
+ *  30 (~141 bits) and is still exonerated. */
+const LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH = 3 * LEXICAL_LONG_SEGMENT_LENGTH;
 
 /**
  * BLO-41262: a separator-delimited run of short words is an identifier, not a
@@ -205,21 +222,29 @@ const LEXICAL_LONG_SEGMENT_LENGTH = 10;
  *
  * The discriminator is structure, not vocabulary (no word list to drift): a
  * credential is ONE opaque run, so a value is exonerated only when every
- * separator-delimited segment is itself a plain word or number, none is long
- * enough to be a token on its own, AND at most one is long at all. Each
- * conjunct carries weight — `release-Candidate-<20 letters>` has lexical
- * segments and is still refused on the length of its tail, and two 16-letter
- * words are refused on the count.
+ * separator-delimited segment is itself a plain word or number, none exceeds
+ * LEXICAL_SEGMENT_MAX_LENGTH, at most one exceeds LEXICAL_LONG_SEGMENT_LENGTH,
+ * AND the segments sum to at most LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH. Each
+ * conjunct carries weight — `release-Candidate-<20 letters>` is refused on the
+ * length of its tail, two 11-letter words on the long-segment count, and four
+ * 10-letter words on the summed length.
  *
- * Measured against 20k random values per shape: 0/20000 base64url-43,
- * 0/20000 alnum-40 and 0/20000 hex-40 are exonerated by this rule. A UUID
- * stays opaque, because `386c81e8` is neither a word nor a number.
+ * These are bounds on SHAPE, not on entropy, and they do not close the rule:
+ * 3 × 10 random letters (~141 bits) is still exonerated. What keeps random
+ * tokens out is that generators do not emit homogeneous letter-or-digit runs.
+ * Measured through the whole of isOpaqueSecretValue over 20k random values per
+ * shape (Ally, review 5476147384): 0/20000 alnum-40, 1/20000 base64url-43 and
+ * 1/20000 alnum-24 pass, and each of those passes is the entropy floor, not
+ * this rule; re-measured with the summed-length cap in place, 0/20000 of each.
+ * A UUID stays opaque, because `386c81e8` is neither a word nor a number.
  */
 function isLexicalIdentifier(value: string): boolean {
   const segments = value.split(/[-._]/);
   if (segments.length < 2) return false;
   const longSegments = segments.filter((s) => s.length > LEXICAL_LONG_SEGMENT_LENGTH).length;
   if (longSegments > 1) return false;
+  const contentLength = segments.reduce((sum, s) => sum + s.length, 0);
+  if (contentLength > LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH) return false;
   return segments.every(
     (segment) =>
       segment.length <= LEXICAL_SEGMENT_MAX_LENGTH && LEXICAL_SEGMENT_RE.test(segment),

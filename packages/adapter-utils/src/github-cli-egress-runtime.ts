@@ -97,8 +97,14 @@ export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOption
           .join("");
         // A region class never has line attribution (see
         // locateGitHubEgressMatches), so say so rather than print nothing.
+        // Keyed on the class, not on `locations.length === 0`: in an --input
+        // body one key can trip a region class while another prints a line,
+        // and the region key still needs explaining. The lines that do print
+        // come from other keys, so say that too rather than read as a
+        // contradiction.
         const unlocated = refusal.classes.some((cls) => GITHUB_EGRESS_REGION_CLASSES.includes(cls))
-          ? " (spans lines; no per-line location is reported for environment-dump or private-key-block)"
+          ? " (spans lines; no per-line location is reported for environment-dump or private-key-block;" +
+            " any lines listed are other, single-line matches)"
           : "";
         return `\`${refusal.field}\`${where} matched ${refusal.classes.join(", ")}${unlocated}${lines}`;
       })

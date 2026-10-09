@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   ENVIRONMENT_DUMP_MIN_RUN,
+  GITHUB_EGRESS_REGION_CLASSES,
+  type GitHubEgressScrubClass,
   locateGitHubEgressMatches,
   redactionMarker,
   scrubGitHubEgressText,
@@ -360,14 +362,58 @@ describe("scrubGitHubEgressText", () => {
       expect(result.classes).toEqual([]);
     });
 
-    it("refuses two long word-shaped segments: the aggregate bound", () => {
+    // Random-looking letter runs for the bound cases below. Derived, not
+    // embedded, like LONG_LEXICAL_TAIL: as literals they are credential-shaped.
+    const LETTERS = "QwrtypsdfghjklzxmnbvcXZLKJHGFDSAPOIUYTREWQ";
+    const letterRun = (offset: number, length: number) =>
+      LETTERS.slice(offset, offset + length);
+
+    it("refuses two 16-letter segments (long-segment count and summed length)", () => {
       // Each segment is within the per-segment cap, but two ~75-bit segments
-      // are ~150 bits — a usable secret, and the per-segment cap alone admits
-      // any number of them. Derived, not embedded, like the tail above.
-      const token = ["Qwrtypsdfghjklzx", "mnbvcxzlkjhgfdsa"].join("-");
+      // are ~150 bits. Two checks refuse this independently: both segments
+      // are long, and 32 letters exceeds the summed-length cap — so deleting
+      // either check alone leaves it refused. The 2 × 11 and 4 × 10 cases
+      // below are the ones that pin each check.
+      const token = [letterRun(0, 16), letterRun(16, 16)].join("-");
       const result = scrubGitHubEgressText(`sessionkey=${token}`);
       expect(result.classes).toContain("high-entropy-assignment");
       expect(result.text).not.toContain(token);
+    });
+
+    it("refuses two 11-letter segments: pins LEXICAL_LONG_SEGMENT_LENGTH", () => {
+      // 11 is one over the long-segment length, and 11 + 11 + 2 is under the
+      // summed-length cap, so only the long-segment count refuses this. The
+      // `00` tail lifts it over the 24-character entropy floor (2 × 11 alone
+      // is 23 characters and would pass without reaching any rule here), and
+      // must itself be lexical: a mixed tail like `v2` is refused on shape and
+      // would let this case pass with the constant deleted.
+      const token = [letterRun(0, 11), letterRun(11, 11), "00"].join("-");
+      const result = scrubGitHubEgressText(`sessionkey=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("refuses four 10-letter segments: pins the summed-length cap", () => {
+      // No segment is long, so only LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH (30)
+      // refuses 40 letters (~188 bits). Before it, any number of 10-letter
+      // segments was exonerated.
+      const token = [0, 10, 20, 30].map((o) => letterRun(o, 10)).join("-");
+      const result = scrubGitHubEgressText(`sessionkey=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("still exonerates three 10-letter segments: the cap narrows, it does not close", () => {
+      // Documents a known gap rather than a desired property. 3 × 10 sums to
+      // exactly the cap (30, ~141 bits) and passes. No length or count rule
+      // separates it from a real draft name of 26; what keeps random tokens
+      // out of this shape is that generators do not emit homogeneous letter
+      // runs, not this rule. If the cap is ever tightened, flip this case.
+      const token = [0, 10, 20].map((o) => letterRun(o, 10)).join("-");
+      const text = `sessionkey=${token}`;
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.classes).toEqual([]);
     });
 
     it("still refuses a random token in the same assignment position", () => {
@@ -460,6 +506,35 @@ describe("scrubGitHubEgressText", () => {
       expect(located).toEqual([]);
       expect(JSON.stringify(located)).not.toContain(shortSecret);
     });
+
+    // Region-ness is derived, not trusted to the hand-kept list: a class is a
+    // region class exactly when a per-line re-scan cannot reproduce the
+    // whole-text scrub. The Record makes tsc demand a probe for every class,
+    // so a new multi-line detector cannot silently escape
+    // GITHUB_EGRESS_REGION_CLASSES and re-open per-line excerpts under it.
+    const regionProbes: Record<GitHubEgressScrubClass, string> = {
+      "private-key-block": `before\n${SYNTHETIC_PEM}\nafter`,
+      "credentialed-uri": `a\npostgres://dbuser:${SYNTHETIC_OPAQUE_VALUE}@db.internal:5432/app\nb`,
+      jwt: `a\nBearer ${SYNTHETIC_JWT}\nb`,
+      "vendor-key": `a\ntoken is ${["ghp", "S7kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0TgAbCd"].join("_")} ok\nb`,
+      "environment-dump": Array.from({ length: ENVIRONMENT_DUMP_MIN_RUN }, (_, i) => `VAR_${i}=v`).join("\n"),
+      "high-entropy-assignment": `a\nKEY=${SYNTHETIC_OPAQUE_VALUE}\nb`,
+    };
+
+    it.each(Object.entries(regionProbes))(
+      "lists %s as a region class iff a per-line re-scan cannot reproduce it",
+      (cls, input) => {
+        const whole = scrubGitHubEgressText(input);
+        expect(whole.classes).toContain(cls);
+        const perLine = input
+          .split("\n")
+          .map((line) => scrubGitHubEgressText(line).text)
+          .join("\n");
+        expect(GITHUB_EGRESS_REGION_CLASSES.includes(cls as GitHubEgressScrubClass)).toBe(
+          perLine !== whole.text,
+        );
+      },
+    );
 
     it("does not leave a carriage return on a CRLF excerpt", () => {
       const located = locateGitHubEgressMatches(`clean\r\napikey=${token}\r\nclean`);
