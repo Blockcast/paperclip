@@ -167,6 +167,32 @@ describe("paperclip MCP tools", () => {
     expect(description).toContain("for a seat without company-scope read neither is a shorter one");
   });
 
+  // paperclipListIssues' own tool description is the surface a caller reads
+  // first, and the inbox-lite fallback routes there. It must not state the
+  // bare-array completeness proof unconditionally (fails open pre-BLO-39015).
+  it("paperclipListIssues does not state the bare-array proof unqualified", () => {
+    const { description } = getTool("paperclipListIssues");
+    expect(description).not.toMatch(/positive proof/);
+    expect(description).toContain(
+      "on a server with the fix a bare array back is proof you have every matching row — but see the `limit` parameter for the deploy-skew caveat",
+    );
+  });
+
+  // The shared `offset` hint (paperclipListIssues, paperclip_search_issues) is
+  // read in isolation by a caller paging; on an older server a truncated result
+  // is never observable, and the window is raw (pre-ACL), so the increment is
+  // the applied limit, never returnedCount.
+  it.each(["paperclipListIssues", "paperclip_search_issues"])(
+    "%s's offset hint carries the increment rule and the deploy-skew caveat",
+    (name) => {
+      const offset = getTool(name).schema.shape.offset as { description?: string } | undefined;
+      expect(offset).toBeDefined();
+      expect(offset!.description).toContain("advance by the applied limit, not by the number of rows returned");
+      expect(offset!.description).toContain("deploy-skew caveat");
+      expect(offset!.description).toContain("on an older server you will never see a truncated result to page past");
+    },
+  );
+
   it("adds auth headers and run id to mutating requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ ok: true }),
