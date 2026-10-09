@@ -858,6 +858,62 @@ describe("run transcript scoping (PEN-3142)", () => {
       });
     });
 
+    /**
+     * PEN-3895 item 3 (Ally suggestion on #2324), mirroring BLO-34738 on `/log`:
+     * an ALLOWED read that disclosed nothing is not a read. `/events` is a
+     * cursor-paged feed, so a live tailer parks on the empty tail of a finished
+     * run and re-polls it; auditing each of those cost a row plus a write on the
+     * response path and made "who read this run's events" over-report by however
+     * often the client polled.
+     *
+     * The two directions are asserted on the SAME empty page, deliberately. A
+     * suppression-only assertion still passes if the write were suppressed for
+     * everyone — which would retire the denied-path audit PEN-3142 exists to add
+     * to this route.
+     */
+    it("suppresses the allowed audit write when the page disclosed nothing", async () => {
+      mockDecide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_self",
+        explanation: "Allowed because the actor owns the run.",
+      }));
+      mockHeartbeatService.listEvents.mockResolvedValue([]);
+
+      const res = await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/events?afterSeq=99&limit=50"),
+      );
+
+      // Still a normal empty page — only the audit write is skipped.
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toEqual([]);
+      expect(auditCallsFor("heartbeat.run_events_accessed")).toHaveLength(0);
+    });
+
+    it("still audits the DENIED read on an empty page", async () => {
+      // Default decider for this suite denies the peer; the page is empty.
+      mockHeartbeatService.listEvents.mockResolvedValue([]);
+
+      const res = await requestApp(
+        await createApp(peerAgentActor),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/events?afterSeq=99&limit=50"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toEqual([]);
+
+      // A denial records an ATTEMPT, which happened whatever the page held.
+      const audits = auditCallsFor("heartbeat.run_events_accessed");
+      expect(audits).toHaveLength(1);
+      expect(audits[0]?.[1]?.details).toMatchObject({
+        result: "denied",
+        afterSeq: 99,
+        limit: 50,
+        eventCount: 0,
+      });
+    });
+
     // Fail-closed proof. Adapters choose their own `eventType` string and the
     // server only length-clamps it, so a type allowlist would leak the first
     // time an adapter emitted an unrecognized (or a deliberately state-looking)
