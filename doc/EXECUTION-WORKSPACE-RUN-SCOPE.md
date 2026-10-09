@@ -2,6 +2,10 @@
 
 Status: shipped behind opt-in configuration. Tracking issue: BLO-19063.
 
+Companion: [`EXTERNAL-RUNTIME-CONCURRENCY.md`](./EXTERNAL-RUNTIME-CONCURRENCY.md)
+covers the concurrency slot and lease a run occupies; this document covers the
+worktree it lands in.
+
 ## The defect this addresses
 
 Execution worktrees are keyed by **branch name**, and the branch name is derived
