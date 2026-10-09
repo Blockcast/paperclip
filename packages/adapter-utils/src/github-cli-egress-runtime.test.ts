@@ -162,6 +162,36 @@ describe("github-cli-egress-runtime", () => {
     expect(() => readFileSync(fixture.record, "utf8")).toThrow();
   });
 
+  it("names no line inside a refused environment dump, and says why", () => {
+    // A region class has no line attribution: re-scanning a line inside the
+    // dump on its own would echo the short assignment the dump rule exists to
+    // catch into stderr and from there into run logs.
+    const fixture = makeFixture();
+    const shortSecret = "s3cretpw";
+    const dump = [
+      "HOME=/root",
+      `TOKEN=${syntheticCredential} DB_PASS=${shortSecret}`,
+      "PATH=/usr/bin",
+      "LANG=C",
+      "SHELL=/bin/sh",
+    ].join("\n");
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--import", "tsx", runtimeEntryPoint, fixture.target,
+        "api", "repos/acme/widget/git/blobs", "-f", `content=${dump}`,
+      ],
+      { cwd: repositoryRoot, encoding: "utf8" },
+    );
+
+    expect(result.status).toBe(64);
+    expect(result.stderr).toContain("environment-dump");
+    expect(result.stderr).toContain("no per-line location is reported");
+    expect(result.stderr).not.toContain(shortSecret);
+    expect(() => readFileSync(fixture.record, "utf8")).toThrow();
+  });
+
   it("passes a clean repository blob through to the target byte-exact", () => {
     const fixture = makeFixture();
     const source = 'export const VERSION = "1.2.3";\n';

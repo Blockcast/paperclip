@@ -17,6 +17,7 @@ import {
   hasGitHubCliStdinTextFile,
   scrubGitHubCliInvocation,
 } from "./github-cli-egress-shim.js";
+import { GITHUB_EGRESS_REGION_CLASSES } from "./github-egress-scrub.js";
 import {
   type CommitReachability,
   evaluateReviewSubmission,
@@ -94,7 +95,12 @@ export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOption
             return `\n    ${key}${location.line}: ${location.excerpt}`;
           })
           .join("");
-        return `\`${refusal.field}\`${where} matched ${refusal.classes.join(", ")}${lines}`;
+        // A region class never has line attribution (see
+        // locateGitHubEgressMatches), so say so rather than print nothing.
+        const unlocated = refusal.classes.some((cls) => GITHUB_EGRESS_REGION_CLASSES.includes(cls))
+          ? " (spans lines; no per-line location is reported for environment-dump or private-key-block)"
+          : "";
+        return `\`${refusal.field}\`${where} matched ${refusal.classes.join(", ")}${unlocated}${lines}`;
       })
       .join("; ");
     throw new GitHubCliEgressRuntimeError(
