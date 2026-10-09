@@ -334,16 +334,30 @@ export function nextCronTickInTimeZone(expression: string, timeZone: string, aft
 // in-flight work is protected by the separate started-and-young waiver rather
 // than by this number.
 const ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS = 6;
-export function deriveRoutineFireAgeHorizonMs(
+
+/**
+ * The trigger's raw cadence in milliseconds, or null when it has none.
+ *
+ * BLO-32638 split this out of {@link deriveRoutineFireAgeHorizonMs} so the
+ * dispatch bound and the fire-gap alert gauge read ONE derivation. They
+ * answer different questions off the same number -- dispatch asks "may this
+ * fire still hold the lock?" and shaves a jitter margin, the gauge asks "how
+ * often should a measurement land?" and must not -- and if each sampled the
+ * cron itself they would silently drift apart on the next edit to either.
+ *
+ * Returns null rather than a fallback because the two callers want opposite
+ * things from "no cadence": dispatch keeps gating on a flat horizon, while the
+ * gauge must emit no interval series at all so the alert's vector match drops
+ * the routine. A number here cannot express the second.
+ */
+export function deriveRoutineFireIntervalMs(
   trigger: Pick<RoutineTriggerRow, "kind" | "cronExpression" | "timezone"> | null | undefined,
   now: Date,
-) {
-  if (trigger?.kind !== "schedule" || !trigger.cronExpression || !trigger.timezone) {
-    return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
-  }
+): number | null {
+  if (trigger?.kind !== "schedule" || !trigger.cronExpression || !trigger.timezone) return null;
   try {
     let cursor = nextCronTickInTimeZone(trigger.cronExpression, trigger.timezone, now);
-    if (!cursor) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
+    if (!cursor) return null;
     let intervalMs: number | null = null;
     for (let i = 0; i < ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS; i += 1) {
       const next = nextCronTickInTimeZone(trigger.cronExpression, trigger.timezone, cursor);
@@ -353,19 +367,30 @@ export function deriveRoutineFireAgeHorizonMs(
       if (!Number.isFinite(gapMs) || gapMs <= 0) continue;
       if (intervalMs === null || gapMs < intervalMs) intervalMs = gapMs;
     }
-    // No usable gap at all (a cron that fires once and never again) means there
-    // is no cadence to bound against, so keep the flat fallback.
-    if (intervalMs === null) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
-    return Math.max(
-      ROUTINE_FIRE_AGE_HORIZON_FLOOR_MS,
-      intervalMs - ROUTINE_FIRE_AGE_HORIZON_JITTER_MS,
-    );
+    // No usable gap at all (a cron that fires once and never again) means
+    // there is no cadence.
+    return intervalMs;
   } catch (err) {
-    // A cron that no longer validates must not take routine dispatch down with
-    // it; fall back to the flat horizon and keep gating.
-    logger.warn({ err, cronExpression: trigger.cronExpression }, "failed to derive routine fire-age horizon");
-    return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
+    // A cron that no longer validates must not take routine dispatch (or the
+    // metrics refresh) down with it.
+    logger.warn({ err, cronExpression: trigger.cronExpression }, "failed to derive routine fire interval");
+    return null;
   }
+}
+
+export function deriveRoutineFireAgeHorizonMs(
+  trigger: Pick<RoutineTriggerRow, "kind" | "cronExpression" | "timezone"> | null | undefined,
+  now: Date,
+) {
+  const intervalMs = deriveRoutineFireIntervalMs(trigger, now);
+  // No cadence to bound against -- a webhook/api trigger, an unparseable cron,
+  // or a cron that fires once and never again -- so keep the flat fallback and
+  // keep gating.
+  if (intervalMs === null) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
+  return Math.max(
+    ROUTINE_FIRE_AGE_HORIZON_FLOOR_MS,
+    intervalMs - ROUTINE_FIRE_AGE_HORIZON_JITTER_MS,
+  );
 }
 
 function isSubHourlyCronExpression(expression: string, timeZone: string, after: Date) {
