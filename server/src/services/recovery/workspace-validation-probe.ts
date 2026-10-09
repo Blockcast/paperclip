@@ -62,6 +62,15 @@
  *   - determinis -> the attempts exhaust and the action escalates where someone
  *                   can see it, instead of latching silently forever.
  *
+ * On that escalation the source issue stays `blocked`, as the confirmed class
+ * does. `resolveStrandedEscalationStatus` cannot learn "manual repair" from the
+ * cause any more, so it reads the run's `workspace_validation_failed` error code
+ * instead; without that it wrote `todo`, and dispatch refused and re-parked the
+ * row on every pass. What this does NOT close: the BLO-21523 reconciler does not
+ * suppress on an `escalated` action, so it can still drain such a row to `todo`.
+ * That is shared with the confirmed class, whose unbounded action BLO-40297
+ * retires on the same horizon, so it is not widened here.
+ *
  * Measured 2026-10-05 on BLO-19924: of 99 blocked rows carrying
  * `k8s_agent_home_git_bootstrap_unsupported`, 99/99 recorded
  * `gitProbeState: "indeterminate"` and 0/99 recorded "checkout" — i.e. no stray

@@ -1057,6 +1057,7 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
         isProviderQuotaWait: false,
         blockerIssueIds: [],
         recoveryCause: "stranded_assigned_issue",
+        latestRunErrorCode: null,
       });
     }
 
@@ -1126,6 +1127,7 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
         isProviderQuotaWait: false,
         blockerIssueIds: [blocker],
         recoveryCause: "stranded_assigned_issue",
+        latestRunErrorCode: null,
       })).toEqual({ status: "blocked", hasNoRecoveryPath: false });
     });
   });

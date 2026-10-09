@@ -8026,6 +8026,9 @@ export function recoveryService(
         isProviderQuotaWait,
         blockerIssueIds: blockerIds,
         recoveryCause,
+        // BLO-19924: the run, not just the cause — a re-routed workspace park carries
+        // `stranded_assigned_issue` but must not be released to `todo` on exhaustion.
+        latestRunErrorCode: latestRunForReceipt?.errorCode ?? null,
       });
 
       const escalatedAssigneeAgentId = action.ownerAgentId ?? fresh.assigneeAgentId;
