@@ -230,9 +230,11 @@ route:
   # example recommended `[alertname, severity]`, which has the same defect for any
   # alert whose rule emits more than one severity.
   #
-  # Set this on the CHILD route that targets this plugin rather than at the root,
-  # so other receivers keep whatever grouping suits them — a Slack receiver
-  # generally wants `namespace` so the message can name it.
+  # This example has a single receiver, so `group_by` sits on the root route. If
+  # you have other receivers, move it onto a child route that matches this plugin
+  # (and match the other receivers off first), so they keep whatever grouping
+  # suits them — a Slack receiver generally wants `namespace` so the message can
+  # name it.
   group_by: [alertname]
   repeat_interval: 4h
 ```

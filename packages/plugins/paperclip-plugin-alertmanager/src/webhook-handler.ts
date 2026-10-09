@@ -702,11 +702,15 @@ const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
  * against: the loser cannot wait its way to the claim, because the holder is a
  * sibling delivery, not an earlier alert in its own batch.
  *
- * Enforced sender-side in `monitoring/alertmanager-configmap.yaml` in
- * Blockcast/onprem-k8s, pinned by `scripts/check-alertmanager-routes.sh`. Treat
- * it as an assumption that can lapse without anything here changing: when it
- * does, this memo stays correct but stops being sufficient, and the residual is
- * the delivery's own disposition for a lost fence (BLO-38643).
+ * The sender-side fix is pending, not in force: Blockcast/onprem-k8s#5110
+ * moves this receiver to `group_by: [alertname]` in
+ * `monitoring/alertmanager-configmap.yaml` and pins it in
+ * `scripts/check-alertmanager-routes.sh`. Until that merges, the Blockcast root
+ * route still groups by `[alertname, namespace]` and this memo is not
+ * sufficient. Even after it lands, treat it as an assumption that can lapse
+ * without anything here changing: when it does, this memo stays correct but
+ * stops being sufficient, and the residual is the delivery's own disposition
+ * for a lost fence (BLO-38643).
  *
  * Alerts 2..N gain nothing by waiting: the first already established that this
  * key is not becoming claimable on this delivery's timescale, and none of them
