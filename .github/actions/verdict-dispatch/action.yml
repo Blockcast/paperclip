@@ -1,0 +1,135 @@
+name: Ally verdict dispatch eligibility
+description: >-
+  Schedule-only predicate for Ally-gated heavy CI. Decides whether heavy lanes
+  may start at a pull request head now, from typed head-bound Ally signals.
+  Never merge authority and never a required context. Consume this pinned by
+  full 40-character commit SHA, never by tag or branch.
+author: Blockcast
+
+# WHAT THIS IS, AND IS NOT
+#
+# eligible(PR, H) = preconditions(PR, H)
+#                   AND NOT (A in {failure, error} OR B == failure)
+#                   AND (A == success OR B == success OR S == success)
+#
+# A is the review/ally-complete commit status written by github-actions[bot];
+# B and S are the gate/ally-comment-findings and ci/ally-head-attested
+# check-runs of the Ally App (app.id 3966421). Each is the newest by id among
+# its bound identity's entries at the exact 40-hex head. B's same-named commit
+# status is fail-open and is never read. See eligible.mjs for the binding.
+#
+# It decides WHEN a consumer's heavy lanes start, never WHETHER they are
+# required: that stays with the consumer's own fail-closed aggregator. So it
+# must not be added to required status checks, and `eligible=true` is not
+# review evidence.
+#
+# Exit status: 0 whenever a decision was reached, including every refusal.
+# Non-zero, with `eligible=false` and a reason starting `error:`, when the
+# predicate could not be evaluated (bad input, an unreadable signal, a git
+# failure during carry-forward). Both forms leave heavy CI waiting.
+inputs:
+  github-token:
+    description: >-
+      Token for the reads: `pull-requests: read`, `statuses: read` and
+      `checks: read`. Carry-forward additionally fetches git objects through the
+      caller's checkout, which uses that checkout's own credentials.
+    required: true
+  pull-number:
+    description: Pull request to evaluate.
+    required: true
+  head-sha:
+    description: >-
+      Full 40-character head SHA the triggering event named (for example
+      `github.event.check_run.head_sha`). Refused as a head race when the PR's
+      live head differs. Empty evaluates the live head, which the `head` output
+      then reports.
+    required: false
+    default: ""
+  bypass:
+    description: >-
+      Kill switch. Wire it to the repository variable
+      `vars.ALLY_GATED_CI_BYPASS` (an expression in the caller's `with:`); a
+      composite action cannot read repository variables itself. `true` (compared
+      case-insensitively, as an Actions expression compares) replaces the
+      verdict with eligible, basis `bypass`; the preconditions still apply.
+      Anything else, including unset, means gated.
+    required: false
+    default: ""
+  carry-forward:
+    description: >-
+      `true` lets a two-parent merge of default-branch history inherit its
+      first parent's clean verdict when the PR targets the default branch,
+      the net PR diff hashes identically (`git patch-id --verbatim`) and the
+      head is git's own clean merge of its parents (`git merge-tree
+      --write-tree`). Needs a non-shallow checkout of the repository at
+      `working-directory` (`fetch-depth: 0`) whose `origin` can fetch the head.
+    required: false
+    default: "false"
+  working-directory:
+    description: >-
+      The caller's checkout, used only by carry-forward. Objects are fetched
+      into it; nothing from the pull request is checked out or executed.
+    required: false
+    default: ${{ github.workspace }}
+  github-api-url:
+    description: GitHub API base URL.
+    required: false
+    default: ${{ github.api_url }}
+  request-max-attempts:
+    description: Max attempts per API read (transient 5xx and rate limits are retried).
+    required: false
+    default: "3"
+  request-timeout-seconds:
+    description: Per-request timeout in seconds.
+    required: false
+    default: "20"
+  request-backoff-seconds:
+    description: Base backoff in seconds between attempts of a transient read.
+    required: false
+    default: "1"
+  node-version:
+    description: Node version used to run the predicate.
+    required: false
+    default: "22"
+
+outputs:
+  eligible:
+    description: "`true` when heavy CI may start at `head` now, else `false`."
+    value: ${{ steps.eligible.outputs.eligible }}
+  basis:
+    description: >-
+      What admitted it: `ally-complete`, `comment-findings-clean`,
+      `head-attested`, `carry-forward` or `bypass`. Empty when not eligible.
+    value: ${{ steps.eligible.outputs.basis }}
+  head:
+    description: The full 40-character head SHA that was evaluated.
+    value: ${{ steps.eligible.outputs.head }}
+  reason:
+    description: One human-readable line. Log it; never parse it.
+    value: ${{ steps.eligible.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    # Inputs reach the script through env only, never interpolated into the
+    # shell, and the script needs no dependencies, so nothing is installed.
+    - name: Evaluate Ally verdict eligibility
+      id: eligible
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_API_URL: ${{ inputs.github-api-url }}
+        VERDICT_DISPATCH_PULL_NUMBER: ${{ inputs.pull-number }}
+        VERDICT_DISPATCH_HEAD_SHA: ${{ inputs.head-sha }}
+        VERDICT_DISPATCH_CARRY_FORWARD: ${{ inputs.carry-forward }}
+        ALLY_GATED_CI_BYPASS: ${{ inputs.bypass }}
+        REQUEST_MAX_ATTEMPTS: ${{ inputs.request-max-attempts }}
+        REQUEST_TIMEOUT_SECONDS: ${{ inputs.request-timeout-seconds }}
+        REQUEST_BACKOFF_SECONDS: ${{ inputs.request-backoff-seconds }}
+      run: node "${{ github.action_path }}/eligible.mjs"

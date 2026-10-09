@@ -150,6 +150,66 @@ pnpm build
 
 If anything cannot be run, explicitly report what was not run and why.
 
+### Heavy CI waits for Ally
+
+Owner directive 2026-10-07 (~01:55Z): "also actively work to reduce and isolate
+CPU waste from CI. CI is suboptimal across the org as you saw in this
+conversation, with jobs running without new signal on each PR, or before ally
+approved resulting in CI runs that are unecessary."
+
+On a pull request, `pr.yml` runs its heavy (Tier 1) jobs only once Ally has a
+typed verdict at the exact head. Tier 1 is every job on `arc-paperclip-general`
+or `arc-e2e`: Typecheck + Release Registry, Worktree install, OpenCode Responses
+replay, k8s-ro seed transport cold start, General tests, Build, Canary Dry Run
+and the Playwright e2e job. `policy`, Helm chart and Vendored claude_k8s adapter
+still run on every push.
+
+- The heavy jobs `needs:` the `ally-verdict` job. It passes when the Ally App's
+  `gate/ally-comment-findings` check-run (the newest one at the head) is
+  `success`, or its `ci/ally-head-attested` check-run is, and the findings
+  check-run is not `failure`. Until then it fails, the heavy jobs are skipped,
+  and `verify` is red with `verify: awaiting-ally-verdict`.
+- **That red is a schedule state, not a finding.** Do not push a fix for it, and
+  do not report it in a review. Do not wait for a green `verify` before you
+  request a review: request it first, because the review is what releases the
+  heavy jobs.
+- **The release is automatic.** When a clean verdict check-run lands,
+  `dispatch-ally-verdict-ci.yml` re-runs the held run's failed jobs
+  (`ally-verdict`, the heavy jobs and `verify`) as attempt 2 of the same run. The
+  hourly `ally_verdict_backstop` job in `review-gate-sweep.yml` re-fires a lost
+  event, and also covers a draft that was reviewed before it was marked ready.
+  `gh workflow run dispatch-ally-verdict-ci.yml -f pr_number=<n>` re-fires it by
+  hand; it releases only a head that has the verdict, unless the bypass below
+  is on.
+- **Do not re-run the held run yourself before the verdict.** The automatic
+  release re-runs attempt 1 only, once. If a run was already re-run by hand, its
+  annotations say so; re-run its failed jobs yourself after the verdict lands.
+- A non-blocking verdict that is not clean also waits: a finding Ally accepted
+  onto a follow-up, or an unreadable verdict block, leaves the findings
+  check-run `neutral`, and no automatic release comes at that head. Push the fix
+  (a clean review of the new head releases it), or ask the owner for the bypass.
+- A draft is held until it is ready for review. A fork PR is not held: no
+  release path acts on a head outside this repository, so it runs its heavy
+  jobs on every push, as before this gate.
+- **A PR its own reviewer opened is not held.** The server never reports the
+  findings check-run `success` on a PR opened by `allyblockcast[bot]` (or the
+  `allyblockcast` seat): it withholds a self-attested clean (BLO-34316), and
+  nothing publishes `ci/ally-head-attested` yet. Such a PR runs its heavy jobs on
+  every push, as before this gate. Once `ci/ally-head-attested` is seen `success`
+  on one, the owner sets the repository variable
+  `ALLY_GATED_CI_HOLD_SELF_AUTHORED=true` to gate them too.
+- `ALLY_GATED_CI_BYPASS=true` (a repository variable; owner or admin sets it) is
+  the outage lever for Ally, the Paperclip server, or a missing signal. With it,
+  `ally-verdict` passes at once and the heavy jobs run on every push again,
+  drafts included. A non-draft head already held at attempt 1 is released
+  without a verdict too: by the hourly backstop sweep (up to 10 a sweep), or at
+  once by the manual dispatch above. Unset means gated. `verify` needs every
+  heavy job either way, so merge enforcement is identical in both modes.
+- The merge queue is unchanged: a `merge_group` run always builds in full (its
+  `ally-verdict` exits 0 on `arc-merge-queue`), `verify` is still the only
+  required check, and the queue still rebases. Bring a PR up to date by rebasing
+  it, never with a merge commit.
+
 ## 8. API and Auth Expectations
 
 - Base path: `/api`

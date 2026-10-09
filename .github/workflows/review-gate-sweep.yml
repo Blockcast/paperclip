@@ -275,3 +275,65 @@ jobs:
           # constant for why the User, not the App, login is used here).
           ALLY_REQUEST_REVIEWER_LOGIN: allyblockcast
         run: python3 .github/scripts/sweep-stalled-ally-reviews.py
+
+  # Ally-gated heavy CI backstop (design ally-gated-ci.md §3.4, §4.2). Owner
+  # directive 2026-10-07 (~01:55Z): "also actively work to reduce and isolate
+  # CPU waste from CI. CI is suboptimal across the org as you saw in this
+  # conversation, with jobs running without new signal on each PR, or before
+  # ally approved resulting in CI runs that are unecessary."
+  #
+  # pr.yml holds its heavy lanes until an Ally verdict, and
+  # dispatch-ally-verdict-ci.yml releases them on the verdict's check_run
+  # event. Events can be lost, and a head that turns non-draft after a clean
+  # draft verdict gets no new event, so once per sweep this job reads every open
+  # PR in ONE GraphQL batch (up to 4 pages of 50; ~25 points a page against the
+  # 1,000/hour GraphQL budget, separate from the REST budget the job above
+  # spends) and re-fires the dispatcher's manual arm for each head that has a
+  # positive Ally signal but a still-held attempt-1 run -- at most 10 per sweep.
+  # That pre-filter is cost only: the dispatcher re-evaluates the shared
+  # predicate and the exactly-once rule before re-running anything.
+  #
+  # With ALLY_GATED_CI_BYPASS=true it re-fires the manual arm for every held
+  # attempt-1 head instead, whatever the Ally signals say: the dispatcher's
+  # predicate treats each as eligible (bypass), so heads held before the switch
+  # was thrown are released within the hour instead of staying red until
+  # someone pushes or re-runs them by hand.
+  #
+  # Its own job, on arc-light rather than `default`, so a starved default pool
+  # (see the header) cannot hold it, and so its write scope (`actions: write`,
+  # to dispatch) is not granted to the sweep above. Trusted code only (design
+  # I4): a SHA-pinned checkout of the default branch, nothing from a pull
+  # request, and every dispatch targets the default branch
+  # (ally-verdict-gate.test.mjs enforces all of it).
+  ally_verdict_backstop:
+    name: Ally verdict backstop (held heavy CI)
+    runs-on: arc-light
+    # A hang detector: up to 4 GraphQL pages and 10 dispatches.
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      checks: read
+      contents: read
+      pull-requests: read
+    steps:
+      # GitHub documents the `schedule` payload as "not applicable", so there
+      # `ref` can evaluate empty and checkout falls back to the triggering ref,
+      # which for `schedule` is the default branch. On `workflow_dispatch` it
+      # names the default branch outright, whichever ref was dispatched.
+      - name: Check out the default branch (trusted code only)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Re-fire the dispatcher for held heads with a positive Ally signal
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # The kill switch: under it every held head qualifies (see above).
+          ALLY_GATED_CI_BYPASS: ${{ vars.ALLY_GATED_CI_BYPASS }}
+        run: node scripts/ally-verdict-ci.mjs backstop

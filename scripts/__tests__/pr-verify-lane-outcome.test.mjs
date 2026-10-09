@@ -66,6 +66,10 @@ function laneEnv(results) {
     OPENCODE_K8S_SEED_COLD_START_RESULT: results.opencode_k8s_seed_cold_start ?? "success",
     BUILD_RESULT: results.build ?? "success",
     VENDOR_CLAUDE_K8S_RESULT: results.vendor_claude_k8s ?? "success",
+    // Not a lane: the Ally-gated schedule hold (pr.yml `ally_verdict`). Its
+    // cases live in ally-verdict-gate.test.mjs; default it to released so every
+    // scenario here keeps testing the lanes alone.
+    ALLY_VERDICT_RESULT: results.ally_verdict ?? "success",
   };
 }
 
