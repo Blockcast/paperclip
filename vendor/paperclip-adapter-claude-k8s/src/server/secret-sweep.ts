@@ -28,6 +28,9 @@
  *      to say "a Job exists" for the Secret to be left alone.  The name-derived
  *      Job is then re-read directly from the API server immediately before the
  *      delete, so a Job created after the list snapshot still saves its Secret.
+ *   5. It is unchanged since it was listed.  The delete carries the listed
+ *      `resourceVersion` as a precondition, so the API server refuses it (409)
+ *      if anything has written the Secret since the snapshot.
  *
  * Checks 3 and 4 are what make this safe under concurrency, and they are
  * deliberately of different kinds.  4 asks "is there a Job?", which is only ever
@@ -35,6 +38,16 @@
  * can create the Job we just failed to see.  Re-reading narrows that window but
  * cannot close it.  3 closes it from the other side, by refusing to judge any
  * Secret young enough that a launch could still plausibly be working on it.
+ *
+ * Neither covers adoption, because 3 judges age from the list snapshot.  A
+ * different agent's `execute()` can adopt the Secret (merge-PATCH it, refreshing
+ * `launch-at`) after the sweep has listed it as old and before the sweep's
+ * delete; its Job does not exist yet, so the re-read in 4 still 404s.  The
+ * per-agent creation mutex does not serialise the two, since the sweep gate is
+ * module-level.  5 closes that at no API cost: any write since the snapshot,
+ * the adopt PATCH included, turns the delete into a 409.  That fails in the
+ * right direction: the Secret is retained, and the next sweep re-judges it on
+ * fresh data.
  *
  * The age floor does that job with nothing but timestamps written once on the
  * object itself, which is why this module has no lease, no renewal timer
@@ -144,13 +157,19 @@ export interface SecretSweepObjectMeta {
   ownerReferences?: unknown[];
   creationTimestamp?: Date | string;
   deletionTimestamp?: Date | string;
+  /** Opaque write version; the delete's precondition (check 5). */
+  resourceVersion?: string;
 }
 
 export interface SecretSweepCoreApi {
   listNamespacedSecret(req: { namespace: string; labelSelector?: string }): Promise<{
     items: { metadata?: SecretSweepObjectMeta }[];
   }>;
-  deleteNamespacedSecret(req: { name: string; namespace: string }): Promise<unknown>;
+  deleteNamespacedSecret(req: {
+    name: string;
+    namespace: string;
+    body?: { preconditions?: { resourceVersion?: string } };
+  }): Promise<unknown>;
 }
 
 export interface SecretSweepBatchApi {
@@ -193,7 +212,7 @@ export interface SweepResult {
   /** Names of Secrets examined but deliberately left alone, with the reason. */
   retained: {
     name: string;
-    reason: "owned" | "too_young" | "job_exists" | "no_run_id" | "unverifiable";
+    reason: "owned" | "too_young" | "job_exists" | "no_run_id" | "unnamed" | "unverifiable" | "changed";
   }[];
   /** Names of Secrets we tried and failed to delete (non-fatal). */
   failed: { name: string; error: string }[];
@@ -341,7 +360,7 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
 
   // Candidates first, so the Job list is only fetched when there is something
   // to judge — the common case is zero orphans and zero extra API calls.
-  const candidates: { name: string; runId: string; ageMs: number }[] = [];
+  const candidates: { name: string; runId: string; ageMs: number; resourceVersion?: string }[] = [];
   for (const secret of secrets.items) {
     const name = secret.metadata?.name;
     if (!name) continue;
@@ -366,7 +385,12 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
       result.retained.push({ name, reason: "too_young" });
       continue;
     }
-    candidates.push({ name, runId, ageMs: now - launchedMs });
+    candidates.push({
+      name,
+      runId,
+      ageMs: now - launchedMs,
+      resourceVersion: secret.metadata?.resourceVersion,
+    });
   }
 
   if (candidates.length === 0) return result;
@@ -403,7 +427,16 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
     // the Secret alone — absence has to be proven, not assumed.  A name we
     // cannot map to a Job at all is unprovable by construction, so it is
     // retained and left to the dashboard rather than deleted on the snapshot.
+    // That is naming-convention drift, not API trouble, so it has its own
+    // reason: the two want different operator responses.
     if (owningJobName === null) {
+      result.retained.push({ name: candidate.name, reason: "unnamed" });
+      continue;
+    }
+    // Check 5 needs the snapshot's write version.  Every real list item carries
+    // one; a delete that cannot be made conditional is a delete on the
+    // snapshot alone, so a listing without it retains.
+    if (!candidate.resourceVersion) {
       result.retained.push({ name: candidate.name, reason: "unverifiable" });
       continue;
     }
@@ -417,7 +450,11 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
       continue;
     }
     try {
-      await coreApi.deleteNamespacedSecret({ name: candidate.name, namespace });
+      await coreApi.deleteNamespacedSecret({
+        name: candidate.name,
+        namespace,
+        body: { preconditions: { resourceVersion: candidate.resourceVersion } },
+      });
       result.swept.push(candidate.name);
       await logQuietly(
         onLog,
@@ -426,6 +463,17 @@ export async function sweepOrphanedRunSecrets(opts: SweepOptions): Promise<Sweep
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (errorStatusCode(err) === 409) {
+        // The precondition held: something wrote this Secret after the list,
+        // most likely an adopting launch.  Retain, not fail.
+        result.retained.push({ name: candidate.name, reason: "changed" });
+        await logQuietly(
+          onLog,
+          "stdout",
+          `[paperclip] Kept Secret ${candidate.name}: it changed after the sweep listed it (delete precondition failed); the next sweep re-judges it\n`,
+        );
+        continue;
+      }
       result.failed.push({ name: candidate.name, error: message });
       await logQuietly(
         onLog,
@@ -480,7 +528,13 @@ export function createSweepGate(): (opts: SweepOptions) => Promise<SweepResult |
       ]);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await logQuietly(
+      // Deliberately not awaited.  This line is outside the race above, and
+      // `onLog` streams to the control plane: a sink that never settles is the
+      // same hang the timeout exists for, and awaiting it here would hold the
+      // per-agent mutex for the process lifetime all the same.  `logQuietly`
+      // never rejects, so nothing is left unhandled; a hung sink leaks one
+      // pending promise per failed sweep, bounded by the interval gate.
+      void logQuietly(
         opts.onLog,
         "stderr",
         `[paperclip] Orphan-secret sweep failed (non-fatal): ${message}\n`,
