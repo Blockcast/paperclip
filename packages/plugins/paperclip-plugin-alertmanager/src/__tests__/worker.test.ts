@@ -1586,6 +1586,50 @@ describe("handleWebhook — firing first time", () => {
     expect(mocks.agents.get).toHaveBeenCalledWith("agent-paused", "company-1");
   });
 
+  it.each([
+    [
+      "an owner-map human owner",
+      { assigneeAgentId: "agent-paused" },
+      { class: { physical_infra_disk: "carol@example.com" } },
+    ],
+    [
+      "the route's own human fallback",
+      { assigneeAgentId: "agent-paused", assigneeUserId: "user-carol" },
+      {},
+    ],
+  ])(
+    "keeps %s when the guard drops a paused route agent (BLO-26613)",
+    async (_label, route, ownerMap) => {
+      const { ctx, mocks } = mkCtx();
+      mocks.agents.get.mockImplementation(async (id: string) =>
+        id === "agent-paused" ? { id, status: "paused" } : { id, status: "active" },
+      );
+      mocks.users.findByEmail.mockResolvedValueOnce({
+        id: "user-carol",
+        email: "carol@example.com",
+        name: "Carol",
+      });
+      const config = baseConfig({
+        issueRouteMap: { class: { physical_infra_disk: route } },
+        ownerMap,
+      });
+      const alert = baseAlert({
+        labels: {
+          alertname: "PhysicalInfraDiskReallocatedSectorsHigh",
+          severity: "warning",
+          class: "physical_infra_disk",
+        },
+        fingerprint: "physical-disk-paused-human",
+      });
+
+      await handleWebhook(ctx, config, true, baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }));
+
+      const createArgs = mocks.issues.create.mock.calls[0][0];
+      expect(createArgs.assigneeUserId).toBe("user-carol");
+      expect(createArgs.assigneeAgentId).toBeUndefined();
+    },
+  );
+
   it("lets explicit assignee overrides win over route assignees", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({
