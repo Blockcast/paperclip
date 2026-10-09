@@ -192,9 +192,23 @@ durable classification off that agent's runs, which the metric's
 select result_json->'processLoss'->>'classification' as classification, count(*)
   from heartbeat_runs
  where agent_id = '<agentId>' and error_code = 'process_lost'
+   and result_json->>'pipelineStageExitCancellationRequestedAt' is null
    and finished_at > now() - interval '24 hours'
  group by 1;
 ```
+
+The `pipelineStageExitCancellationRequestedAt` clause is what keeps this query
+aligned with the metric. On the process-loss reap path the row write
+`setRunStatusIfRunning(run.id, "failed", { errorCode: "process_lost" })` is
+unconditional (`server/src/services/heartbeat.ts:28192`), while the
+`recordProcessLost(...)` that feeds the metric is gated on the run not being a
+pipeline-stage exit (`:28234-28240`) — so a stage-exit run lands in the table as
+`error_code = 'process_lost'` but was never counted. Without the clause the
+query returns a superset of the metric and over-reports the agent. It mirrors
+one of the two arms of `isPersistedPipelineStageExitRun` (`:12989-12995`); the
+other arm keys on `error_code = PIPELINE_STAGE_EXIT_ERROR_CODE`, which is
+mutually exclusive with the `error_code = 'process_lost'` already in this
+`WHERE`, so mirroring it too would be a dead predicate.
 
 A rise spread evenly across the `pre_adapter_*` buckets is likewise fleet-level:
 a launch-path or cluster problem, not any one agent's, and rolling an agent back
