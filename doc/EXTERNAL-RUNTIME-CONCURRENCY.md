@@ -90,16 +90,24 @@ outrank them whatever the ceiling is.
 
 Only the first two rows are genuinely `same` — both are `runUniqueIdentity` call
 sites. `resolveWorkspaceWriterTreeKey` takes no ceiling or concurrency input, so
-on the last three rows a tree key resolves whenever the runScope is the default
-`per_issue` and the run has an issue id, which is the ordinary case. That is one
-sufficient condition, not the only one: when the run does not resolve to its own
-tree, the key is `project-primary:<projectWorkspaceId>` for *any* run with a
-project workspace, regardless of runScope or issue id. So `isolation_key` carries
-three shapes — `workspace-tree:<pwid>:<issueId>`,
-`workspace-tree:project-primary:<pwid>`, and
-`workspace-tree:no-project-workspace:<issueId>` when there is no project
-workspace. **Grep the `workspace-tree:` prefix, not the `<pwid>:<issueId>` form**,
-or the primary-checkout rows are missed.
+on the last three rows whether a tree key resolves turns on
+`runResolvesToOwnTree`, and each branch carries its own condition:
+
+- **resolves to its own tree** — keys on `<pwid>:<issueId>` when the runScope is
+  the default `per_issue` and the run has an issue id (the ordinary case),
+  substituting `no-project-workspace` for a null `<pwid>`;
+- **does not** — keys on `project-primary:<pwid>` for *any* run with a project
+  workspace, regardless of runScope or issue id, and **null** when there is no
+  project workspace.
+
+So `per_issue` plus an issue id is not on its own sufficient: outside the
+own-tree branch it buys nothing, and `agent_default` mode — where
+`resolveWorkspaceForRun` runs with `useProjectWorkspace: false` and lands in the
+agent home — reaches exactly that null. Those are three `workspace-tree:` shapes,
+not three shapes of the column: wherever the tree key is null the column keeps
+the `run:` / `agent-shared:` / `workspace:` form from the table.
+**Grep the `workspace-tree:` prefix, not the `<pwid>:<issueId>` form**, or the
+primary-checkout rows are missed.
 
 `withTreeScopedReservationKey` does not narrow the key — it **replaces** it.
 Whenever a per-issue tree key resolves, `isolation_key` is
@@ -137,7 +145,8 @@ Exposed on `/metrics` (`server/src/services/metrics.ts`):
 | `paperclip_external_runtime_reservations_release_pending` / `..._release_pending_oldest_age_seconds` | teardown that started and did not finish |
 
 Direct reconciliation query — live Jobs with `active>0` should equal
-unreleased reservations minus `reserved` and `launching` (no Job yet) minus
+unreleased reservations minus `reserved` and `launching` (no Job yet on the
+normal path) minus
 `release_pending` (Job already reaped). A persistent mismatch is the signal that
 matters — and note that a stuck `reserved` row is a leaked slot, not a missing
 Job:
