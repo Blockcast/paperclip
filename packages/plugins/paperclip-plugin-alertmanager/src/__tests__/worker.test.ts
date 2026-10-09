@@ -4987,10 +4987,12 @@ describe("handleWebhook — severity → priority", () => {
     expect(mocks.logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('ignoring paperclip_priority "hgih"'),
     );
+    // `label` keeps this non-lossy case apart from a malformed
+    // `paperclip_issue`, which counts on the same metric but drops the alert.
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.malformed",
       1,
-      { alertname: "X" },
+      { alertname: "X", label: "paperclip_priority" },
     );
     // Still filed — only the override is dropped, unlike a malformed
     // `paperclip_issue`, which drops the alert.
@@ -5010,6 +5012,93 @@ describe("handleWebhook — severity → priority", () => {
     expect(mocks.logger.warn).not.toHaveBeenCalledWith(
       expect.stringContaining("ignoring paperclip_priority"),
     );
+  });
+
+  it("honours paperclip_priority set as an annotation on the created issue", async () => {
+    // Same label-or-annotation surface as `paperclip_issue` and
+    // `paperclip_dedupe_domain`; an annotation used to be silently absent.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+      annotations: { summary: "s", paperclip_priority: "high" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.create.mock.calls[0][0].priority).toBe("high");
+  });
+
+  // The escape hatch only prices a *new* issue. A firing alert that joins an
+  // already-open aggregate issue for its alertname — the usual case for the
+  // chronically-firing rule the label targets, since adding the label mints a
+  // new fingerprint — leaves that issue's priority alone (rewriting it would
+  // also overwrite an operator's manual re-prioritization). These pin that
+  // contract so changing it is a decision, not a side effect.
+  it("does not re-price an already-open aggregate issue the alert joins", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-open",
+      status: "todo",
+      assigneeAgentId: "agent-deliberate",
+      assigneeUserId: null,
+    }));
+    const alert = baseAlert({
+      fingerprint: "relabelled-member",
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "high" },
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ severityToPriority: undefined }),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(
+      mocks.issues.update.mock.calls.filter(
+        (call) => "priority" in (call[1] as Record<string, unknown>),
+      ),
+    ).toEqual([]);
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:relabelled-member" }),
+      expect.objectContaining({ paperclipIssueId: "issue-open" }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("an ignored value joining an open aggregate issue does not claim a priority was filed", async () => {
+    // The warn used to end `falling back to the severity map, priority=medium`,
+    // which reads as a statement about the issue — but on this path no
+    // priority is written at all.
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-open",
+      status: "todo",
+      assigneeAgentId: "agent-deliberate",
+      assigneeUserId: null,
+    }));
+    const alert = baseAlert({
+      fingerprint: "relabelled-member",
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "hgih" },
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ severityToPriority: undefined }),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    const warning = mocks.logger.warn.mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes('ignoring paperclip_priority "hgih"'));
+    expect(warning).toBeDefined();
+    expect(warning).toContain("if this files a new issue");
+    expect(warning).toContain("an already-open aggregate issue keeps its own priority");
   });
 
   it("a non-string paperclip_priority does not fail the delivery", async () => {
@@ -5363,7 +5452,7 @@ describe("handleWebhook — creation policy", () => {
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.malformed",
       1,
-      { alertname: "MalformedPolicyAlert" },
+      { alertname: "MalformedPolicyAlert", label: "paperclip_issue" },
     );
   });
 

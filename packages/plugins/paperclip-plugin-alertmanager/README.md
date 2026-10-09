@@ -424,7 +424,10 @@ Both are permanent policy decisions, so a failure to write their telemetry is
 logged but does not fail the delivery — otherwise Alertmanager would redeliver
 an alert that will be dropped identically every time. A non-string
 `paperclip_issue` is refused rather than coerced
-(`alertmanager.alert.malformed`).
+(`alertmanager.alert.malformed` with `label: paperclip_issue`). The same metric
+also counts an ignored `paperclip_priority` under `label: paperclip_priority`,
+which drops nothing — filter on `label` before reading the series as lost
+alerts.
 
 ### Severity → priority defaults
 
@@ -453,7 +456,9 @@ the 500-row inbox page on a deep lane (BLO-39015).
 
 Two overrides, in precedence order:
 
-1. **`paperclip_priority` alert label** — per-rule escape hatch. A rule whose
+1. **`paperclip_priority` alert label or annotation** — per-rule escape
+   hatch, read from the same surfaces as `paperclip_issue` and
+   `paperclip_dedupe_domain` (the label wins when both are set). A rule whose
    warnings genuinely are not self-resolving declares that on itself, next to
    its own `severity`, instead of dragging the whole band up:
 
@@ -475,11 +480,19 @@ Two overrides, in precedence order:
    Alertmanager redeliver into the same crash.
 
    An ignored value is **not silent**: it logs a `warn` naming the value and
-   the resolved fallback, and counts `alertmanager.alert.malformed`. A typo
+   the resolved fallback, and counts `alertmanager.alert.malformed` with
+   `label: paperclip_priority`. A typo
    like `paperclip_priority: hgih` would otherwise be indistinguishable from
    an absent label, on the one surface whose entire purpose is overriding a
    default. The alert is still filed — unlike a malformed `paperclip_issue`,
    which drops it, because that label decides whether an issue exists at all.
+
+   The value prices a **newly created** issue only. An alert that joins an
+   already-open aggregate issue for its alertname leaves that issue's priority
+   alone — rewriting it would also overwrite an operator's manual
+   re-prioritization. Adding the label to a rule that is firing right now
+   therefore takes effect on the next issue filed for that alertname, once the
+   open one closes; re-prioritize the open issue by hand if it cannot wait.
 
    An alert with **no** `severity` label resolves under the key `unknown`, so
    an operator's `severityToPriority: { unknown: … }` entry applies to it.
