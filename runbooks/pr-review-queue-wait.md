@@ -24,6 +24,16 @@ sum(rate(paperclip_pr_review_queue_wait_seconds_sum[6h]))
   / sum(rate(paperclip_pr_review_queue_wait_seconds_count[6h]))
 ```
 
+**Read the two together before triaging the queue.** Every run that breached
+waited more than 3600s, so a real breach always has a mean above query 1 ×
+3600s. Once `onprem-k8s#5124` is live, a firing alert that reports a mean at
+or below that bound (0s is the extreme case), or a query above that returns
+empty, points at the instrument, not the queue: check that `_bucket`, `_sum`
+and `_count` are all still being reported. That rule puts `or vector(0)` on
+its bucket and `_sum` arms on purpose, so a drifted `le` label or a missing
+`_sum` series pages instead of going dark, and this is what such a page looks
+like.
+
 **(a) Compare Ally's running count against its configured concurrency cap.**
 This is the comparison that identified the 2026-10-08 cause, and it is the
 first thing to check:
