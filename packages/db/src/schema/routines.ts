@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
   boolean,
@@ -172,5 +173,11 @@ export const routineRuns = pgTable(
     dispatchFingerprintIdx: index("routine_runs_dispatch_fingerprint_idx").on(table.routineId, table.dispatchFingerprint),
     linkedIssueIdx: index("routine_runs_linked_issue_idx").on(table.linkedIssueId),
     idempotencyIdx: index("routine_runs_trigger_idempotency_idx").on(table.triggerId, table.idempotencyKey),
+    // BLO-32638 (paperclip#2352): backs the routine fire-gap gauge's
+    // per-routine max(completed_at) probe (migration 0254). Partial so it
+    // holds only the receipts that probe reads.
+    routineCompletedIdx: index("routine_runs_routine_completed_idx")
+      .on(table.routineId, table.completedAt)
+      .where(sql`${table.status} = 'completed'`),
   }),
 );
