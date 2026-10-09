@@ -8,6 +8,7 @@ import {
   DEFAULT_CLAUDE_CODE_VERSION,
   buildClaudeCodeRuntimeShell,
   claudeCodeRuntimeDir,
+  IMAGE_WRAPPER_BIN_DIR,
   resolveClaudeCodeVersion,
 } from "./runtime-pin.js";
 
@@ -88,7 +89,7 @@ describe("buildClaudeCodeRuntimeShell", () => {
   });
 
   it("puts the managed CLI first on PATH and pins it against self-update, else falls back to the image CLI", () => {
-    expect(shell).toContain('export PATH="$__pcdir/node_modules/.bin:$PATH"');
+    expect(shell).toContain('PATH="$__pcdir/node_modules/.bin:$PATH"');
     expect(shell).toContain('[ -n "${DISABLE_AUTOUPDATER+x}" ] || export DISABLE_AUTOUPDATER=1');
     expect(shell).toContain("falling back to the image claude");
     expect(shell).not.toMatch(/exit \d/);
@@ -292,5 +293,98 @@ describe("buildClaudeCodeRuntimeShell (executed)", () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
+  });
+});
+
+describe("buildClaudeCodeRuntimeShell PATH precedence (PEN-3714)", () => {
+  const VERSION = "2.1.292";
+
+  // job-manifest.ts guarantees IMAGE_WRAPPER_BIN_DIR is PATH[0] on the Job env.
+  // This snippet runs afterwards, in the Job's own shell, so it is the last
+  // writer and the only place that ordering can be lost.
+  const JOB_PATH = `${IMAGE_WRAPPER_BIN_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+  const LEGACY_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+  /**
+   * Executes the emitted snippet with the runtime ALREADY published, so the
+   * install branch short-circuits and what runs is the PATH logic itself, then
+   * reports the PATH the Job would really go on to use.
+   */
+  function runWith(startPath: string) {
+    const base = mkdtempSync(path.join(tmpdir(), "pen3714-"));
+    const data = path.join(base, "data");
+    const dir = path.join(data, `.local/lib/paperclip-k8s-runtimes/claude-code/${VERSION}`);
+    const runtimeBin = path.join(dir, "node_modules/.bin");
+    mkdirSync(runtimeBin, { recursive: true });
+    writeFileSync(path.join(runtimeBin, "claude"), '#!/bin/sh\necho "managed (Claude Code)"\n', { mode: 0o755 });
+    writeFileSync(path.join(dir, ".complete"), "");
+    const shell = buildClaudeCodeRuntimeShell({ version: VERSION, dataMountPath: data });
+    const res = spawnSync("/bin/sh", ["-c", `${shell}; printf '%s\n' "$PATH"; command -v claude`], {
+      encoding: "utf8",
+      timeout: 20_000,
+      env: { PATH: startPath },
+    });
+    const lines = res.stdout.trim().split("\n");
+    return { base, res, runtimeBin, resultPath: lines[0] ?? "", claudeAt: lines[1] ?? "" };
+  }
+
+  it("keeps the root-owned wrapper directory ahead of the agent-writable runtime root", () => {
+    const { base, res, runtimeBin, resultPath } = runWith(JOB_PATH);
+    try {
+      expect(res.status).toBe(0);
+      const entries = resultPath.split(":");
+      // The property that decides resolution: a `gh`/`git`/`github-mcp-server`
+      // CREATED in the runtime root must not outrank the image's wrapper. The
+      // runtime root is agent-writable, the wrapper directory is not.
+      expect(entries.indexOf(IMAGE_WRAPPER_BIN_DIR)).toBeGreaterThanOrEqual(0);
+      expect(entries.indexOf(runtimeBin)).toBeGreaterThanOrEqual(0);
+      expect(entries.indexOf(IMAGE_WRAPPER_BIN_DIR)).toBeLessThan(entries.indexOf(runtimeBin));
+      expect(entries[0]).toBe(IMAGE_WRAPPER_BIN_DIR);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("still pins `claude` to the managed runtime, ahead of the image CLI", () => {
+    const { base, res, runtimeBin, resultPath, claudeAt } = runWith(JOB_PATH);
+    try {
+      expect(res.status).toBe(0);
+      // The wrapper directory carries no `claude`, so giving it precedence must
+      // not cost the pin — that is the whole reason this ordering is safe.
+      expect(claudeAt).toBe(path.join(runtimeBin, "claude"));
+      const entries = resultPath.split(":");
+      expect(entries.indexOf(runtimeBin)).toBeLessThan(entries.indexOf("/usr/local/bin"));
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("introduces no phantom entry on an image whose PATH never carried the wrappers", () => {
+    const { base, res, runtimeBin, resultPath } = runWith(LEGACY_PATH);
+    try {
+      expect(res.status).toBe(0);
+      // Keyed off $PATH, not the filesystem: absent there, it stays absent, and
+      // the pre-PEN-3714 behaviour is preserved exactly.
+      expect(resultPath.split(":")).not.toContain(IMAGE_WRAPPER_BIN_DIR);
+      expect(resultPath.split(":")[0]).toBe(runtimeBin);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("matches the wrapper directory as a whole PATH entry, not a substring", () => {
+    // A lookalike entry must not satisfy the `case`, or a Job could suppress the
+    // re-prepend by carrying a near-miss directory.
+    const { base, res, resultPath } = runWith(`${IMAGE_WRAPPER_BIN_DIR}-decoy:/usr/bin:/bin`);
+    try {
+      expect(res.status).toBe(0);
+      expect(resultPath.split(":")).not.toContain(IMAGE_WRAPPER_BIN_DIR);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("pins the literal that job-manifest.ts and the chart both carry", () => {
+    expect(IMAGE_WRAPPER_BIN_DIR).toBe("/usr/local/libexec/paperclip/bin");
   });
 });
