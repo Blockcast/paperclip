@@ -3635,6 +3635,7 @@ describe("execute: orphan-secret sweep wire-up (BLO-21857)", () => {
               "paperclip.io/run-id": "run-orphan",
             },
             creationTimestamp: new Date(Date.now() - 3_600_000),
+            resourceVersion: "4242",
           },
         },
       ],
@@ -3655,9 +3656,11 @@ describe("execute: orphan-secret sweep wire-up (BLO-21857)", () => {
       name: "ac-agent-run-orphan",
       namespace: "paperclip",
     });
+    // Conditional on the version the sweep judged (PR #2370 review I1).
     expect(mockCoreDeleteSecret).toHaveBeenCalledWith({
       name: "ac-agent-run-orphan-prompt",
       namespace: "paperclip",
+      body: { preconditions: { resourceVersion: "4242" } },
     });
   });
 
@@ -3677,6 +3680,7 @@ describe("execute: orphan-secret sweep wire-up (BLO-21857)", () => {
               "paperclip.io/run-id": "run-orphan",
             },
             creationTimestamp: new Date(Date.now() - 3_600_000),
+            resourceVersion: "4242",
           },
         },
       ],
@@ -3686,8 +3690,14 @@ describe("execute: orphan-secret sweep wire-up (BLO-21857)", () => {
     const { execute: freshExecute } = await import("./execute.js");
     await freshExecute(makeCtx()).catch(() => {});
 
-    expect(mockCoreDeleteSecret).not.toHaveBeenCalledWith({
-      name: "ac-agent-run-orphan-prompt",
+    // Keyed on the name alone: an exact-shape negative would pass vacuously
+    // once the delete carries a body.
+    expect(mockCoreDeleteSecret).not.toHaveBeenCalledWith(
+      expect.objectContaining({ name: "ac-agent-run-orphan-prompt" }),
+    );
+    // And it was the point read that saved it, not an earlier retain.
+    expect(mockBatchReadJob).toHaveBeenCalledWith({
+      name: "ac-agent-run-orphan",
       namespace: "paperclip",
     });
   });
