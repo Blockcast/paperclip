@@ -148,9 +148,16 @@ describe("inherited execution workspace reuse failure — the cause survives sum
   it("states the condition when restore reported no workspace and no cause", async () => {
     const message = await composeReuseFailure({ restoreReturnsNull: true });
 
-    const summary = summarizeOnRecoveryPath(asRun(message))!;
-    expect(summary).toContain("could not be restored, and no cause was reported");
-    expect(summary).not.toContain("intentionally clear the issue's reuse_existing");
+    for (const summary of [
+      summarizeOnRecoveryPath(asRun(message))!,
+      summarizeOnHeartbeatPath(asRun(message))!,
+    ]) {
+      expect(summary).toContain("could not be restored, and no cause was reported");
+      expect(summary).not.toContain("intentionally clear the issue's reuse_existing");
+      // With no cause competing for the 240-char budget, the workspace id is the
+      // one actionable datum behind "repair the referenced execution workspace".
+      expect(summary).toContain(WORKSPACE_ID);
+    }
   });
 
   it("keeps the layout the guarantee rests on: cause line, context line, remediation line", async () => {
