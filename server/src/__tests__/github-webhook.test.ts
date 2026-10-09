@@ -84,6 +84,7 @@ import {
   resolveOwningPaperclipIdentifiers,
 } from "../services/paperclip-identifiers.js";
 import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID } from "../services/pull-request-work-products.js";
+import { PR_REVIEW_NON_ACTIONABLE_REASONS } from "../services/ally-review-detection.js";
 import { issueService } from "../services/issues.js";
 import { errorHandler } from "../middleware/index.js";
 
@@ -10025,13 +10026,13 @@ describeEmbeddedPostgres("github-webhook route", () => {
       // mutation is a comment"). The reason set is the half that does fail —
       // deleting the hasAllyConsolidatedReviewHeading branch collapses both
       // Ally reasons into review_no_blocking_feedback and this is what reds.
-      expect([...reasons].sort()).toEqual([
-        "ally_review_findings_all_zero",
-        "ally_review_findings_unenumerable",
-        "review_body_absent",
-        "review_body_empty",
-        "review_no_blocking_feedback",
-      ]);
+      //
+      // BLO-41777: compared against the exported const, not a copied literal.
+      // A hand-copied five-element list equalled the taxonomy by coincidence,
+      // so a sixth reason landed uncovered and green — the same no-failing-
+      // mutation shape one level up. Sorted on both sides: the const's order
+      // is the declaration's, not lexicographic, and neither is the contract.
+      expect([...reasons].sort()).toEqual([...PR_REVIEW_NON_ACTIONABLE_REASONS].sort());
     });
 
     it("reports a suppression reason only for review submissions carrying a classifier decision", () => {
