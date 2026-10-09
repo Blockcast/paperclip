@@ -446,7 +446,13 @@ describe("parsePrePushInput", () => {
 describe("commitsForRefUpdate", () => {
   const zero = "0".repeat(40);
 
-  it("uses a two-dot range when the remote already has the ref", () => {
+  it("excludes the remote tip AND everything already published when the remote has the ref", () => {
+    // PEN-3907. This was a bare `old..new` two-dot range, which re-reported
+    // every commit a rebase pulled in from upstream: measured 43 commits in
+    // range on one force-push, 4 flagged and all 4 already on `origin/master`.
+    // `remoteSha` stays in the exclusion set because the pre-push hook's view
+    // of the remote is authoritative and can be AHEAD of the local
+    // remote-tracking ref; `--remotes` is what removes the upstream commits.
     const seen: string[][] = [];
     const runGit: GitReader = (args) => {
       seen.push(args);
@@ -456,8 +462,29 @@ describe("commitsForRefUpdate", () => {
       { localRef: "r", localSha: "new", remoteRef: "r", remoteSha: "old" },
       runGit,
     );
-    expect(seen[0]).toEqual(["rev-list", "old..new"]);
+    expect(seen[0]).toEqual(["rev-list", "new", "--not", "old", "--remotes"]);
     expect(commits).toEqual(["c1", "c2"]);
+  });
+
+  it("narrows both arms the same way, so a fresh branch name is not a softer path", () => {
+    // The asymmetry this removes was not enforcing anything: an author refused
+    // by the strict arm could push the identical commits under a branch name
+    // the remote does not have and take the lenient one. Pinning both arms to
+    // the same exclusion keeps that from silently coming back.
+    const armFor = (remoteSha: string): string[] => {
+      const seen: string[][] = [];
+      commitsForRefUpdate(
+        { localRef: "r", localSha: "new", remoteRef: "r", remoteSha },
+        (args) => {
+          seen.push(args);
+          return "";
+        },
+      );
+      return seen[0];
+    };
+
+    expect(armFor(zero)).toContain("--remotes");
+    expect(armFor("old")).toContain("--remotes");
   });
 
   it("excludes everything already published when the ref is new", () => {

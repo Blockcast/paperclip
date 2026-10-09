@@ -18,7 +18,7 @@ import {
   runGitEgressRuntime,
   runPrePushHook,
 } from "./github-git-egress-runtime.js";
-import type { GitReader } from "./github-git-egress-shim.js";
+import { commitsForRefUpdate, type GitReader } from "./github-git-egress-shim.js";
 
 const HOOKS = "/hooks";
 
@@ -1014,4 +1014,72 @@ describe.skipIf(!SPAWNED_GIT)("pre-push hook bootstrap, spawned as git spawns it
     expect(stderr).toBe("");
     expect(status).toBe(0);
   });
+});
+
+describe("PEN-3907: a force-push after a rebase reports only the author's own commits", () => {
+  // The unit test beside this one pins the ARGV. This one pins what the argv
+  // MEANS: that `--not <remoteSha> --remotes` actually excludes upstream
+  // commits in real git, which a fake GitReader cannot establish. Without it a
+  // flag combination that silently matched nothing would look identical to a
+  // correct one.
+  const git = (repo: string, ...args: string[]): string =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+
+  it.skipIf(!GIT)("excludes commits already published upstream", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "git-egress-rebase-"));
+    const upstream = path.join(root, "up.git");
+    const work = path.join(root, "work");
+
+    execFileSync("git", ["init", "-q", "--bare", "-b", "master", upstream]);
+    execFileSync("git", ["clone", "-q", upstream, work]);
+    git(work, "config", "user.name", "t");
+    git(work, "config", "user.email", "t@t.invalid");
+
+    writeFileSync(path.join(work, "f"), "base\n");
+    git(work, "add", "-A");
+    git(work, "commit", "-qm", "base");
+    git(work, "push", "-q", "origin", "HEAD:master");
+
+    // The author's branch, pushed once. This sha is what the remote holds.
+    git(work, "checkout", "-qb", "feat");
+    writeFileSync(path.join(work, "g"), "mine\n");
+    git(work, "add", "-A");
+    git(work, "commit", "-qm", "my work");
+    git(work, "push", "-q", "origin", "feat");
+    const remoteSha = git(work, "rev-parse", "feat");
+
+    // Upstream moves on. These commits are PUBLIC; the author cannot amend them.
+    git(work, "checkout", "-q", "master");
+    for (const n of ["1", "2", "3"]) {
+      writeFileSync(path.join(work, "f"), `base\nm${n}\n`);
+      git(work, "commit", "-qam", `master ${n}`);
+    }
+    git(work, "push", "-q", "origin", "master");
+    git(work, "fetch", "-q", "origin");
+
+    // Rebase onto the new upstream — the force-push scenario.
+    git(work, "checkout", "-q", "feat");
+    git(work, "rebase", "-q", "origin/master");
+    const localSha = git(work, "rev-parse", "feat");
+
+    const commits = commitsForRefUpdate(
+      { localRef: "refs/heads/feat", localSha, remoteRef: "refs/heads/feat", remoteSha },
+      makeGitReader("git", work),
+    );
+
+    // Exactly the author's own rebased commit. The three upstream commits are
+    // excluded, so the refusal's `git rebase -i <oldest>~1` suggestion can no
+    // longer name a commit that is already published — the remedy is made safe
+    // structurally rather than by editing the message.
+    expect(commits).toEqual([localSha]);
+
+    // The control: the old two-dot range over the same repository DID carry
+    // them, so this asserts a behaviour change rather than an empty scenario.
+    const twoDot = git(work, "rev-list", `${remoteSha}..${localSha}`).split("\n");
+    expect(twoDot).toHaveLength(4);
+    expect(twoDot).toContain(git(work, "rev-parse", "origin/master"));
+    // Builds a two-remote-ref repository and rebases it, so it runs well over a
+    // dozen git invocations. On an agent seat `git` on PATH is a node wrapper,
+    // which puts this comfortably past the 5s default.
+  }, 60_000);
 });

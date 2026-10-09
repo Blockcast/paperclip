@@ -111,6 +111,57 @@ const ENVIRONMENT_DUMP_RE = new RegExp(
 // still a secret. Structural — it tests the value, not the name.
 const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([^\s"'`\r\n]{16,})\2/g;
 
+// PEN-3907: a cryptographic content digest bound to a name that says so.
+//
+// A lowercase-hex digest is indistinguishable from a hex-encoded secret by
+// entropy alone — both saturate the 4.0 bits/char ceiling that a 16-symbol
+// alphabet allows, and `isOpaqueSecretValue` therefore fires on every one.
+// Measured: 200/200 random sha256 digests redact. That makes every digest
+// REPIN unpushable from an agent seat, and the refusal's advice — derive the
+// value at runtime — is unavailable when the literal lives inside a PromQL
+// matcher in a `PrometheusRule`, which is exactly where the admission-drift
+// detector keeps its expectation pin.
+//
+// The exemption is deliberately a CONJUNCTION of name and shape, and the name
+// half is why this does not contradict the structural-detection rule at the
+// top of this file. That rule governs DETECTION: firing on a name is unsound
+// because material hides under names nobody enumerated, and the default must
+// be to fire. Here the default is unchanged — an unrecognised name still
+// fires. The name only narrows an exemption, so the failure mode of a name we
+// did not anticipate is a false positive, not a leak.
+//
+// Shape alone would not be safe: `SECRET_KEY=<64 hex>` is a real credential
+// shape (hex-encoded HMAC and framework signing keys are routinely 32 or 64
+// hex), and exempting bare hex would pass it. Name alone would not be safe
+// either, so both are required.
+//
+// Note the OCI form `name="sha256:<64hex>"` is already exempt for an unrelated
+// reason — `:` is outside the token alphabet in `isOpaqueSecretValue` — and
+// `digestExemptionApplies` does not cover it. A test pins that so the two
+// paths cannot silently diverge.
+
+/** Lengths of the hex digests this exemption recognises, in characters:
+ *  md5/sha1/sha224/sha256/sha384/sha512. Anchored, lowercase only — an
+ *  uppercase or mixed-case value is not the canonical form any of the tools
+ *  that consume these pins emit, so it stays subject to the entropy test. */
+const HEX_DIGEST_RE = /^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{56}|[0-9a-f]{64}|[0-9a-f]{96}|[0-9a-f]{128})$/;
+
+/** A binding name that declares its value to be a digest rather than a secret:
+ *  `sha256`, `image_digest`, `expected-checksum`, `manifest.sha512`.
+ *
+ *  Anchored at the END so `sha256_signing_key` — a name that merely mentions a
+ *  hash — does not qualify. The leading `[_.-]` alternative is mostly belt and
+ *  braces: `ASSIGNMENT_RE` captures a name from `[A-Za-z0-9_]` only, so `-`
+ *  and `.` already terminate the capture and arrive here pre-trimmed
+ *  (`expected-checksum=` captures `checksum`). It is kept so the predicate
+ *  stays correct if that capture ever widens. */
+const DIGEST_NAME_RE = /(?:^|[_.\-])(?:sha(?:1|224|256|384|512)|md5|digest|checksum)$/i;
+
+/** True when a NAME=VALUE pair is a content digest pin rather than a secret. */
+function isContentDigestAssignment(name: string, value: string): boolean {
+  return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
+}
+
 function shannonEntropyBitsPerChar(value: string): number {
   if (value.length === 0) return 0;
   const counts = new Map<string, number>();
@@ -216,6 +267,7 @@ export function scrubGitHubEgressText(input: string): GitHubEgressScrubResult {
   // Redact only the value; the name is often the point of the sentence and is
   // not itself sensitive.
   text = text.replace(ASSIGNMENT_RE, (match, name: string, quote: string, value: string) => {
+    if (isContentDigestAssignment(name, value)) return match;
     if (!isOpaqueSecretValue(value)) return match;
     fired.add("high-entropy-assignment");
     return `${name}=${quote}${redactionMarker("high-entropy-assignment")}${quote}`;
