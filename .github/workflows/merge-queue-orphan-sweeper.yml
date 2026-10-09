@@ -1,6 +1,6 @@
 name: merge-queue-orphan-sweeper
 
-# BLO-41174. Cancels `pr.yml` merge_group runs whose `gh-readonly-queue/master/*`
+# BLO-41174. Cancels merge_group workflow runs whose `gh-readonly-queue/master/*`
 # branch has been deleted by a queue re-formation. Full rationale, and the
 # fail-closed liveness property this depends on, live in
 # .github/scripts/sweep-orphaned-merge-group-runs.sh -- read that first.
@@ -61,6 +61,8 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Self-test the fail-closed liveness classifier
+        # A hung self-test must not eat the 10-minute job cap and silently skip the sweep.
+        timeout-minutes: 1
         run: node --test .github/scripts/tests/sweep-orphaned-merge-group-runs.test.mjs
 
       - name: Sweep orphaned merge_group runs
