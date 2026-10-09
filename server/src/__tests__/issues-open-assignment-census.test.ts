@@ -640,6 +640,22 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/open-assignment-censu
     expect(res.body.error).toMatch(/status must be a subset/);
   });
 
+  // BLO-41592: this surface is named "census" and implements no time bound, so
+  // `?updated_after=T` was dropped unread and the whole-corpus totals came back as a
+  // success. The first case above is the non-vacuity control: an unfiltered census
+  // still answers 200 with real totals.
+  it("rejects a time-bound param instead of returning a whole-corpus census", async () => {
+    const res = await request(appAs(boardActorFor([companyId])))
+      .get(`/api/companies/${companyId}/issues/open-assignment-census`)
+      // A floor no row can satisfy: honoured it is an empty census, dropped it is all 3.
+      .query({ updated_after: "2099-01-01T00:00:00Z" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.totals).toBeUndefined();
+    expect(res.body.unsupportedParams).toEqual(["updated_after"]);
+    expect(res.body.error).toMatch(/\/search with updatedAfter/);
+  });
+
   it("keeps company isolation: an agent key from another company is refused", async () => {
     // A `local_implicit` board actor is the trusted local-dev bypass and is
     // exempt from company scoping by design, so it would assert nothing here.
