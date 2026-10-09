@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { IncomingMessage } from "node:http";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { logger } from "../middleware/logger.js";
 
 /**
  * PEN-3142 — the live-event PUSH channel, closed alongside the two REST pull
@@ -583,21 +584,26 @@ describe("PEN-3142 live-event transcript scope — WebSocket fan-out", () => {
 });
 
 /**
- * Ally review 5449228335 (Critical): the socket half of the WS-vs-REST pair for
- * scope-restricted agent keys. The REST half is in
- * `pen3142-run-transcript-scope.test.ts`.
+ * PEN-3895 item 2 (Ally suggestion on #2324). The ordering guarantee pinned by
+ * "preserves event order across the async gate" above is implemented by chaining
+ * each event's send onto the previous one, which makes `sendChain` per-socket
+ * state with two properties nothing asserted:
  *
- * Driven through the real upgrade, not a hand-built context, because the bug
- * was `authorizeUpgrade` discarding `scopeConfig` from the very row it had
- * selected — a test that supplies the context itself cannot see that.
+ *  - it was not released on close, so the tail promise — and every event payload
+ *    a queued continuation closed over — stayed reachable for as long as the
+ *    socket's closure did; and
+ *  - it had no depth bound, so a stalled authorization decision accrued one
+ *    continuation per company-wide event, per socket, for the length of the
+ *    stall.
  *
- * The decider stub mirrors `decideSkillTestAccess`'s default-deny (pinned
- * against the real service in `authorization-service.test.ts`) and otherwise
- * allows the owner, so the key's scope is the only thing that can withhold.
+ * Both are load shapes THIS gate introduced: before it the send was synchronous
+ * and nothing could queue. Driven with a decider that never resolves, which is
+ * the stall these exist for — a fast decider drains the chain between events and
+ * can never reach either condition.
  */
-describe("PEN-3142 live-event transcript scope — scoped agent keys", () => {
+describe("PEN-3895 live-event send chain is released and bounded", () => {
   class FakeClientSocket extends EventEmitter {
-    readyState = 1;
+    readyState = 1; // WebSocket.OPEN
     sent: string[] = [];
     send(data: string) {
       this.sent.push(data);
@@ -607,83 +613,146 @@ describe("PEN-3142 live-event transcript scope — scoped agent keys", () => {
     close() {}
   }
 
-  class FakeUpgradeSocket extends EventEmitter {
-    destroyed = false;
-    writable = true;
-    end() {
-      return this;
-    }
-    destroy() {
-      this.destroyed = true;
-      return this;
-    }
+  async function flush() {
+    for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
   }
 
-  const skillTestScope = { kind: "skill_test", issueId: "55555555-5555-4555-8555-555555555555" };
-
-  /** Thenable stand-in for the two drizzle chains `authorizeUpgrade` runs on the key. */
-  function keyDb(row: Record<string, unknown>) {
-    const chain: Record<string, unknown> = {
-      then: (resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) =>
-        Promise.resolve([row]).then(resolve, reject),
-    };
-    for (const method of ["select", "from", "where", "update", "set"]) chain[method] = () => chain;
-    return chain;
+  /**
+   * Each test gets its OWN company channel.
+   *
+   * `subscribeCompanyLiveEvents` is backed by a process-global `EventEmitter`
+   * keyed on company id, and no describe in this file closes the sockets it
+   * opens — so a socket from an earlier test stays subscribed for the rest of
+   * the run. Sharing `companyId` would therefore fan these publishes out to
+   * those sockets too, and since they are subject to the same depth bound they
+   * would contribute their own shed-warnings to the count asserted below. A
+   * per-test channel makes the drop count exactly this socket's.
+   */
+  let channelSeq = 0;
+  function nextChannel() {
+    channelSeq += 1;
+    return `99999999-9999-4999-8999-${String(channelSeq).padStart(12, "0")}`;
   }
 
-  async function connectWithKey(scopeConfig: Record<string, unknown>) {
+  async function connectSubscriber(channelCompanyId: string, actorId: string) {
     const { setupLiveEventsWebSocketServer } = await import("../realtime/live-events-ws.js");
     const server = new EventEmitter();
-    const db = keyDb({ id: "key-1", agentId: runOwnerAgentId, companyId, revokedAt: null, scopeConfig });
-    const wss = setupLiveEventsWebSocketServer(server as never, db as never, { deploymentMode: "authenticated" });
-    const client = new FakeClientSocket();
-    vi.spyOn(wss as unknown as { handleUpgrade: (...args: unknown[]) => void }, "handleUpgrade")
-      .mockImplementation((...args: unknown[]) => (args[3] as (ws: unknown) => void)(client));
-    server.emit(
-      "upgrade",
-      { url: `/api/companies/${companyId}/events/ws`, headers: { authorization: "Bearer test-token" } },
-      new FakeUpgradeSocket(),
-      Buffer.alloc(0),
-    );
-    for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
-    return client;
+    const wss = setupLiveEventsWebSocketServer(server as never, {} as never, {
+      deploymentMode: "authenticated",
+    });
+    const socket = new FakeClientSocket();
+    const req = {
+      headers: {},
+      paperclipUpgradeContext: { companyId: channelCompanyId, actorType: "agent", actorId },
+    } as unknown as IncomingMessage;
+    wss.emit("connection", socket as never, req);
+    return socket;
   }
 
-  async function publishCanaries(client: FakeClientSocket) {
+  /** A decision that never settles, plus the handle that releases it. */
+  function stallTheDecider() {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockDecide.mockImplementation(async () => {
+      await gate;
+      return { allowed: true, reason: "allow_self", explanation: "test" };
+    });
+    return () => release();
+  }
+
+  async function publishChunk(channelCompanyId: string, seq: number) {
     const { publishLiveEvent } = await import("../services/live-events.js");
-    for (const [, build] of transcriptCanaries) {
-      const event = build();
-      publishLiveEvent({ companyId, type: event.type, payload: event.payload as never });
-    }
-    for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
-    return client.sent;
+    publishLiveEvent({
+      companyId: channelCompanyId,
+      type: "heartbeat.run.log",
+      payload: { runId: "run-1", agentId: runOwnerAgentId, seq, stream: "stdout", chunk: `chunk-${seq}` } as never,
+    });
+  }
+
+  function dropWarnings() {
+    return vi.mocked(logger.warn).mock.calls.filter(
+      (call) => call[1] === "live event dropped: per-socket send queue is saturated",
+    );
   }
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockDecide.mockImplementation(async (input: { actor: { agentId?: string; keyScope?: { kind?: string } } }) =>
-      input.actor.keyScope?.kind === "skill_test"
-        ? { allowed: false, reason: "deny_scope", explanation: "Skill-test run token cannot use this API action." }
-        : { allowed: input.actor.agentId === runOwnerAgentId, reason: "allow_self", explanation: "test" });
+    allowOnlyOwner();
   });
 
-  it("withholds the transcript from a skill_test-scoped key, as its REST twin does", async () => {
-    const sent = await publishCanaries(await connectWithKey(skillTestScope));
+  it("does not send an event whose decision resolved after the socket closed", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
 
-    expect(sent).toHaveLength(3);
-    expect(sent.join("\n")).not.toContain(CANARY);
-    // The decider is handed the key's id and scope, exactly as the REST
-    // middleware stamps them — not an actor decided as an unscoped key.
-    expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
-      action: "runs:read_transcript",
-      actor: expect.objectContaining({ source: "agent_key", keyId: "key-1", keyScope: skillTestScope }),
-    }));
+    await publishChunk(channel, 1);
+    await flush();
+    // Parked on the decider, so nothing has been sent yet — this is the state
+    // the close has to be safe in.
+    expect(socket.sent).toEqual([]);
+
+    socket.emit("close");
+    release();
+    await flush();
+
+    // An in-flight continuation cannot be cancelled, so the guard — not the
+    // absence of a continuation — is what has to stop the send.
+    expect(socket.sent).toEqual([]);
   });
 
-  it("still streams the transcript to the same agent on a standard key", async () => {
-    const sent = await publishCanaries(await connectWithKey({ kind: "standard" }));
+  it("stops queueing once the socket is closed", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
 
-    expect(sent).toHaveLength(3);
-    for (const frame of sent) expect(frame).toContain(CANARY);
+    socket.emit("close");
+    await publishChunk(channel, 1);
+    await publishChunk(channel, 2);
+    release();
+    await flush();
+
+    expect(socket.sent).toEqual([]);
+  });
+
+  it("sheds events beyond the per-socket depth bound instead of queueing without limit", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
+
+    // 520 against a cap of 512: the first 512 queue behind the stalled decider,
+    // the last 8 are shed. Without the bound all 520 would be retained.
+    for (let seq = 0; seq < 520; seq += 1) await publishChunk(channel, seq);
+    await flush();
+
+    expect(dropWarnings()).toHaveLength(8);
+
+    release();
+    await flush();
+
+    // The bound caps what may be held, so it caps what is delivered.
+    expect(socket.sent).toHaveLength(512);
+  });
+
+  it("keeps delivering after a saturating burst drains", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
+
+    for (let seq = 0; seq < 520; seq += 1) await publishChunk(channel, seq);
+    release();
+    await flush();
+    const delivered = socket.sent.length;
+    expect(delivered).toBeGreaterThan(0);
+
+    // Drained, so the counter is back at zero and a later event is not shed.
+    allowOnlyOwner();
+    await publishChunk(channel, 999);
+    await flush();
+
+    expect(socket.sent).toHaveLength(delivered + 1);
+    expect(socket.sent[socket.sent.length - 1]).toContain("chunk-999");
+    expect(dropWarnings()).toHaveLength(8);
   });
 });
