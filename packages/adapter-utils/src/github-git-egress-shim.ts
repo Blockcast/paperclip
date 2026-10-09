@@ -214,6 +214,11 @@ export function isKnownPublishingGitVerb(verb: string): boolean {
  * status --recursive` through this wrapper, treating a refusal as an unusable
  * checkout. Only `-q`/`--quiet` may precede it. A bare `git submodule` also
  * means `status`, but nothing runs it that way, so it stays refused.
+ *
+ * Residual: an uninitialised submodule still needs `sync` / `update --init`,
+ * which stay refused, so such a workspace fails one step later with the same
+ * `workspace_git_submodule_unavailable`. The remedy is an attended repair run
+ * with /usr/bin/git directly, not a wider allowlist.
  */
 export function isReadOnlySubmoduleInvocation(verb: string, args: readonly string[]): boolean {
   return verb === "submodule" && args.find((arg) => arg !== "-q" && arg !== "--quiet") === "status";

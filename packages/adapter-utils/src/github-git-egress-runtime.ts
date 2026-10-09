@@ -236,6 +236,15 @@ function publishVerbRefusal(publishVerb: GitPublishVerb): GitEgressRuntimeError 
     ? ` It was reached through the alias \`${alias}\` (\`${(chain ?? [alias]).join("` → `")}\`), so the definition is where the fix goes.`
     : "";
 
+  // Partially admitted, so neither generic wording fits: "add it to
+  // NON_PUBLISHING_GIT_VERBS" is the widening that reopens the `subtree` hole,
+  // and "use \`push\`" is no advice for \`submodule update\`.
+  if (verb === "submodule") {
+    return new GitEgressRuntimeError(
+      `paperclip-github-egress: refusing to run \`git submodule\` — only \`git submodule status\` passes this guard (isReadOnlySubmoduleInvocation in github-git-egress-shim.ts). Its other forms can publish without the pre-push hook: \`foreach\` runs an arbitrary command and \`update\` runs a configured \`!\` update command, both with git's exec-path ahead of PATH, so a push run inside them reaches the real binary instead of this wrapper. Do NOT add \`submodule\` to NON_PUBLISHING_GIT_VERBS — that reopens the hole \`subtree\` is held back for. Initialising or updating submodules is an attended operator step: run it with /usr/bin/git directly.${via}`,
+    );
+  }
+
   if (known) {
     return new GitEgressRuntimeError(
       `paperclip-github-egress: refusing to run \`git ${verb}\` — it publishes to a remote but does NOT run the pre-push hook, so the check for credential-shaped material would never see the objects it sends. Measured against git 2.47.3: \`send-pack\` landed a new ref on the remote with the hook silent, and with this guard's own \`core.hooksPath\` present — injecting the hook does not help, because the command never reads it. Publish with the \`push\` subcommand, which is guarded.${via}`,

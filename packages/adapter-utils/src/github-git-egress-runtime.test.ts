@@ -428,8 +428,11 @@ describe("`git submodule` (BLO-41987)", () => {
       ["submodule", "--cached", "foreach", "status"],
     ]) {
       expect(() => buildGitArgv(argv, { ...PRESENT }), argv.join(" ")).toThrow(
-        /refusing to run `git submodule`/,
+        /refusing to run `git submodule` — only `git submodule status` passes/,
       );
+      // Pin the dedicated wording: the generic one tells the operator to add
+      // `submodule` to the allowlist, which is the widening this refuses.
+      expect(() => buildGitArgv(argv, { ...PRESENT })).not.toThrow(/add it to NON_PUBLISHING_GIT_VERBS/);
     }
   });
 
