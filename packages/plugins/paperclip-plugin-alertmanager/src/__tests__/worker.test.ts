@@ -181,7 +181,7 @@ const baseInput = (
 interface MockClients {
   state: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
   users: { get: ReturnType<typeof vi.fn>; findByEmail: ReturnType<typeof vi.fn> };
-  agents: { list: ReturnType<typeof vi.fn> };
+  agents: { list: ReturnType<typeof vi.fn>; get: ReturnType<typeof vi.fn> };
   issues: {
     list: ReturnType<typeof vi.fn>;
     get: ReturnType<typeof vi.fn>;
@@ -224,6 +224,10 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       list: vi.fn(async () => [
         { id: "agent-fallback", name: "Alert Fallback", status: "idle" },
       ]),
+      // Default every resolved agentId to invokable so tests written before
+      // BLO-26613's guard keep exercising the assignment path they intend to;
+      // tests for the guard itself override this.
+      get: vi.fn(async () => ({ status: "active" })),
     },
     issues: {
       list: vi.fn(async () => []),
@@ -1552,6 +1556,34 @@ describe("handleWebhook — firing first time", () => {
     expect(createArgs.goalId).toBe("goal-override");
     expect(createArgs.status).toBe("todo");
     expect(createArgs.assigneeAgentId).toBe("agent-override");
+  });
+
+  it("does not file a new issue on a paused route assignee (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.get.mockImplementation(async (id: string) =>
+      id === "agent-paused" ? { id, status: "paused" } : { id, status: "active" },
+    );
+    const config = baseConfig({
+      issueRouteMap: {
+        class: { physical_infra_disk: { assigneeAgentId: "agent-paused" } },
+      },
+      ownerMap: {},
+    });
+    const alert = baseAlert({
+      labels: {
+        alertname: "PhysicalInfraDiskReallocatedSectorsHigh",
+        severity: "warning",
+        class: "physical_infra_disk",
+      },
+      fingerprint: "physical-disk-paused",
+    });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }));
+
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    // Falls through to the (invokable) named fallback agent instead.
+    expect(createArgs.assigneeAgentId).toBe("agent-fallback");
+    expect(mocks.agents.get).toHaveBeenCalledWith("agent-paused", "company-1");
   });
 
   it("lets explicit assignee overrides win over route assignees", async () => {

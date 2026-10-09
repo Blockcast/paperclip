@@ -6,7 +6,7 @@
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { getAgentWorkEligibility } from "@paperclipai/shared";
+import { getAgentWorkEligibility, isAgentStatusInvokable } from "@paperclipai/shared";
 import type { AgentEligibilityLifecycleReason } from "@paperclipai/shared";
 import {
   ASSIGNEE_OVERRIDE_ANNOTATION,
@@ -352,6 +352,35 @@ export async function resolveFallbackAgentId(
   }
   const agentId = invokable[0]?.agent.id;
   return agentId ? { agentId } : { refusal: "permanent" };
+}
+
+/**
+ * BLO-26613: drop a resolved assignee agent that cannot be woken.
+ *
+ * A label-override, owner-map, or issue-route resolution names an agentId
+ * unconditionally. If that agent is paused, terminated, or otherwise
+ * uninvokable, the issue used to be assigned to it anyway, and — unlike an
+ * inert `todo` row — the alert keeps re-firing against a dead run path while
+ * looking handled. Same guard as the Dependabot path's
+ * `resolveDependabotIssueAssigneeId` (`server/src/services/dependabot-alert-issues.ts`).
+ *
+ * Returning `undefined` hands the caller's owner chain the next step: the named
+ * fallback agent (itself invokability-checked by `resolveFallbackAgentId`),
+ * else a refused creation that keeps Alertmanager's retry window. It never
+ * files a silent assignment.
+ */
+export async function resolveInvokableAssigneeAgentId(
+  ctx: Pick<PluginContext, "agents" | "logger">,
+  companyId: string,
+  agentId: string | undefined,
+): Promise<string | undefined> {
+  if (!agentId) return undefined;
+  const agent = await ctx.agents.get(agentId, companyId);
+  if (agent && isAgentStatusInvokable(agent.status)) return agentId;
+  ctx.logger.warn(
+    `alertmanager: resolved assignee ${agentId} is not invokable (status=${agent?.status ?? "not-found"}); not assigning it, falling through the owner chain`,
+  );
+  return undefined;
 }
 
 function normalizeEmail(email: string): string {

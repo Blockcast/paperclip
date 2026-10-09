@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   resolveAssigneeUserId,
   resolveFallbackAgentId,
+  resolveInvokableAssigneeAgentId,
   resolveOwnerEmail,
   resolveOwnerUserId,
 } from "../owner-resolver.js";
@@ -756,4 +757,52 @@ describe("resolveFallbackAgentId", () => {
       expect.stringContaining("none are invokable"),
     );
   });
+});
+
+describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () => {
+  const mkAgentsCtx = (agent: { status: string } | null) => {
+    const agents = { get: vi.fn(async () => agent) };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    return {
+      ctx: { agents, logger } as unknown as Parameters<
+        typeof resolveInvokableAssigneeAgentId
+      >[0],
+      agents,
+      logger,
+    };
+  };
+
+  it("returns undefined immediately when no agentId was resolved", async () => {
+    const { ctx, agents } = mkAgentsCtx(null);
+    expect(await resolveInvokableAssigneeAgentId(ctx, "company-1", undefined)).toBeUndefined();
+    expect(agents.get).not.toHaveBeenCalled();
+  });
+
+  it("passes through an invokable agent unchanged", async () => {
+    const { ctx } = mkAgentsCtx({ status: "idle" });
+    expect(await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-active")).toBe(
+      "agent-active",
+    );
+  });
+
+  it("drops a paused agent and logs it", async () => {
+    const { ctx, agents, logger } = mkAgentsCtx({ status: "paused" });
+    expect(await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-paused")).toBeUndefined();
+    expect(agents.get).toHaveBeenCalledWith("agent-paused", "company-1");
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("status=paused"));
+  });
+
+  it("drops an agent that no longer exists", async () => {
+    const { ctx, logger } = mkAgentsCtx(null);
+    expect(await resolveInvokableAssigneeAgentId(ctx, "company-1", "deleted-agent")).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("status=not-found"));
+  });
+
+  it.each(["terminated", "pending_approval"])(
+    "drops an agent with non-invokable status %s",
+    async (status) => {
+      const { ctx } = mkAgentsCtx({ status });
+      expect(await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x")).toBeUndefined();
+    },
+  );
 });

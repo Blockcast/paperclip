@@ -27,7 +27,11 @@ import {
   severityToPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
-import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
+import {
+  resolveAssigneeUserId,
+  resolveFallbackAgentId,
+  resolveInvokableAssigneeAgentId,
+} from "./owner-resolver.js";
 import type { FallbackOwnerResolution } from "./owner-resolver.js";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
@@ -2668,16 +2672,23 @@ export async function handleFiring(
     const ownerOverride =
       resolution.source === "label-override" ||
       resolution.source === "annotation-override";
-    createAssigneeAgentId = ownerOverride
+    const resolvedAssigneeAgentId = ownerOverride
       ? assigneeAgentId
       : routeAssigneeAgentId ?? assigneeAgentId;
-    createAssigneeUserId = createAssigneeAgentId
+    createAssigneeUserId = resolvedAssigneeAgentId
       ? undefined
       : ownerOverride
         ? assigneeUserId
         : routeHasAssigneeUserId
           ? routeAssigneeUserId
           : assigneeUserId;
+    // BLO-26613: never hand a new issue to an agent that can't act on it —
+    // see resolveInvokableAssigneeAgentId.
+    createAssigneeAgentId = await resolveInvokableAssigneeAgentId(
+      ctx,
+      companyId,
+      resolvedAssigneeAgentId,
+    );
     assigneeResolutionSource = resolution.source;
     resolvedTarget =
       resolution.agentId
