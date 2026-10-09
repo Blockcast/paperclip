@@ -608,27 +608,33 @@ export function buildPluginInstallArgs(
 }
 
 /**
- * Run a plugin install, falling back to the pre-BLO-34795 invocation if the
- * peer-resolving one fails.
+ * Run a plugin install, optionally falling back to the pre-BLO-34795 invocation
+ * if the peer-resolving one fails.
  *
- * The fallback is what makes dropping `--legacy-peer-deps` strictly
- * non-regressive: three of the four `ISOLATED_SDK_PLUGIN_PACKAGES` are healthy
- * today, and if resolving one of their peer trees turns out to ERESOLVE we
- * retry exactly the argv that shipped before, so the worst case is today's
- * behaviour rather than taking a working plugin offline. A tree that installs
- * but still has no SDK is caught downstream by the consistency guard, as it is
- * now.
+ * ⚠ BLO-34794: the fallback was introduced on the claim that it made dropping
+ * `--legacy-peer-deps` "strictly non-regressive … the worst case is today's
+ * behaviour rather than taking a working plugin offline". **That claim was
+ * wrong, and taking a working plugin offline is exactly what it did.** On an
+ * isolated tree the retry cannot place the peer, and the `--save` it carries
+ * PRUNES an SDK that is already installed. Measured in production 2026-10-09 on
+ * `lucitra.plugin-secrets`: `removed 5 packages`, `node_modules/@paperclipai`
+ * left an empty directory, the lockfile rewritten without the SDK entry — one
+ * transient failure of the peer-resolving attempt turned a healthy tree into
+ * the permanent `SDK_NOT_INSTALLED` latch.
  *
- * `fallbackToLegacyPeerDeps: false` opts out, and the SDK-tree repair path is
- * the one caller that does. There the retry cannot help *by construction* — it
- * is exactly the argv that can never place `node_modules/@paperclipai/plugin-sdk`
- * in the tree — so both of its outcomes are failure: either it throws, or it
- * "succeeds" and the `requireInstalledInTree` re-probe rejects the tree anyway.
- * What it does buy is a second 120s timeout and a second `--save` write over the
- * tree, inside the serial boot loop that `loadAll()` awaits *before* selecting
- * ready rows. With the four `ISOLATED_SDK_PLUGIN_PACKAGES` latched and a slow or
- * unreachable registry, that is every plugin — healthy ones included — waiting
- * ~16 minutes instead of ~8.
+ * Both production callers therefore opt out for an isolated tree, so the retry
+ * below is now unreachable in production: the install path passes
+ * `fallbackToLegacyPeerDeps: !isolatedTree`, and the shared store never reaches
+ * the branch at all because it installs with `installPeers: false`. It is kept
+ * only so the opt-out is explicit at each call site rather than implicit in the
+ * helper. **Do not re-enable it for a self-contained SDK tree.**
+ *
+ * The repair path's reason for opting out is unchanged and still holds: there
+ * the retry cannot help *by construction* — it is exactly the argv that can
+ * never place `node_modules/@paperclipai/plugin-sdk` in the tree — so both of
+ * its outcomes are failure, while it buys a second 120s timeout and a second
+ * `--save` write over the tree, inside the serial boot loop that `loadAll()`
+ * awaits *before* selecting ready rows.
  */
 export async function npmInstallPlugin(
   spec: string,
@@ -2116,8 +2122,20 @@ export function pluginLoader(
         // "potentially broken" peer-dep tree at install time is bounded — we'd
         // reject a bad manifest before loading it, rather than letting npm
         // refuse to install at all.
+        const isolatedTree = requiresSelfContainedSdkTree(targetInstallDir, localPluginDir);
         await npmInstallPlugin(spec, targetInstallDir, {
-          installPeers: requiresSelfContainedSdkTree(targetInstallDir, localPluginDir),
+          installPeers: isolatedTree,
+          // BLO-34794: on an isolated tree the legacy retry is not a safe
+          // fallback, it is destructive. `--legacy-peer-deps` cannot place the
+          // peer, and `--save` PRUNES an SDK that is already installed — so one
+          // transient failure of the peer-resolving attempt converts a healthy
+          // tree into the permanent SDK_NOT_INSTALLED latch. Measured
+          // 2026-10-09: `removed 5 packages`, `node_modules/@paperclipai`
+          // emptied, lockfile rewritten without the SDK entry. Leaving the tree
+          // untouched on failure is strictly better — the next boot retries,
+          // and the SDK that is already there keeps working meanwhile. This
+          // matches the repair path, which already opts out for the same tree.
+          fallbackToLegacyPeerDeps: !isolatedTree,
         });
       } catch (err) {
         throw new Error(`npm install failed for ${spec}: ${String(err)}`);
