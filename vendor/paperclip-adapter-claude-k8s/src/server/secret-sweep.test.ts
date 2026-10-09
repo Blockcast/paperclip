@@ -25,6 +25,8 @@ function secret(
     deleting?: boolean;
     creationTimestamp?: Date | string;
     launchAt?: string;
+    /** `null` lists the Secret without one, which no real API server does. */
+    resourceVersion?: string | null;
   } = {},
 ): { metadata: SecretSweepObjectMeta } {
   const labels: Record<string, string> = {
@@ -33,6 +35,7 @@ function secret(
   };
   if (opts.runId !== null) labels[RUN_ID_LABEL] = opts.runId ?? "run-abc";
   const metadata: SecretSweepObjectMeta = { name, labels };
+  if (opts.resourceVersion !== null) metadata.resourceVersion = opts.resourceVersion ?? "1001";
   if (opts.owned) {
     metadata.ownerReferences = [{ apiVersion: "batch/v1", kind: "Job", name: "ac-x", uid: "u1" }];
   }
@@ -59,10 +62,24 @@ function notFound(): Error & { code: number } {
   return Object.assign(new Error("jobs.batch \"x\" not found"), { code: 404 });
 }
 
+/** What the API server returns when a delete's resourceVersion precondition fails. */
+function conflict(): Error & { code: number } {
+  return Object.assign(
+    new Error("Operation cannot be fulfilled on secrets: the object has been modified"),
+    { code: 409 },
+  );
+}
+
+type DeleteReq = {
+  name: string;
+  namespace: string;
+  body?: { preconditions?: { resourceVersion?: string } };
+};
+
 function harness(
   secrets: { metadata: SecretSweepObjectMeta }[],
   jobs: { metadata: SecretSweepObjectMeta }[] = [],
-  deleteImpl?: (req: { name: string; namespace: string }) => Promise<unknown>,
+  deleteImpl?: (req: DeleteReq) => Promise<unknown>,
   readImpl?: (req: { name: string; namespace: string }) => Promise<unknown>,
 ) {
   const deleted: string[] = [];
@@ -76,7 +93,7 @@ function harness(
     if (jobs.some((j) => j.metadata.name === req.name)) return {};
     throw notFound();
   });
-  const deleteNamespacedSecret = vi.fn(async (req: { name: string; namespace: string }) => {
+  const deleteNamespacedSecret = vi.fn(async (req: DeleteReq) => {
     if (deleteImpl) return deleteImpl(req);
     deleted.push(req.name);
     return {};
@@ -117,6 +134,7 @@ describe("sweepOrphanedRunSecrets", () => {
     expect(h.deleteNamespacedSecret).toHaveBeenCalledWith({
       name: "ac-agent-run-abc123-prompt",
       namespace: "paperclip",
+      body: { preconditions: { resourceVersion: "1001" } },
     });
     expect(h.logs.some((l) => l.stream === "stdout" && l.message.includes("Swept ownerless Secret"))).toBe(true);
   });
@@ -317,7 +335,7 @@ describe("sweepOrphanedRunSecrets", () => {
     const result = await sweepOrphanedRunSecrets(h.opts);
 
     expect(result.swept).toEqual([]);
-    expect(result.retained).toEqual([{ name: "ac-agent-run-oddname", reason: "unverifiable" }]);
+    expect(result.retained).toEqual([{ name: "ac-agent-run-oddname", reason: "unnamed" }]);
     expect(h.readNamespacedJob).not.toHaveBeenCalled();
   });
 
@@ -453,6 +471,56 @@ describe("sweepOrphanedRunSecrets", () => {
     expect(result.swept).toHaveLength(3);
     // A cleanup path must not multiply load on the API server.
     expect(h.listNamespacedJob).toHaveBeenCalledTimes(1);
+  });
+
+  // PR #2370 review I1. Check 3 judges age from the list snapshot, so a
+  // Secret adopted (merge-PATCHed, launch-at refreshed) by another agent's
+  // execute() between the list and the delete looks old, and its Job does not
+  // exist yet. The delete must be conditional on the snapshot it was judged on.
+  it("makes the delete conditional on the resourceVersion it was judged on", async () => {
+    const h = harness([
+      secret("ac-agent-run-a-prompt", { runId: "run-a", ageSec: 3600, resourceVersion: "7731" }),
+    ]);
+
+    await sweepOrphanedRunSecrets(h.opts);
+
+    expect(h.deleteNamespacedSecret).toHaveBeenCalledTimes(1);
+    expect(h.deleteNamespacedSecret.mock.calls[0][0].body).toEqual({
+      preconditions: { resourceVersion: "7731" },
+    });
+  });
+
+  it("keeps a Secret adopted between the list and the delete (precondition 409)", async () => {
+    const h = harness(
+      [
+        secret("ac-agent-run-a-prompt", { runId: "run-a", ageSec: 3600 }),
+        secret("ac-agent-run-b-prompt", { runId: "run-b", ageSec: 3600 }),
+      ],
+      [],
+      async (req) => {
+        if (req.name === "ac-agent-run-a-prompt") throw conflict();
+        return {};
+      },
+    );
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.retained).toEqual([{ name: "ac-agent-run-a-prompt", reason: "changed" }]);
+    expect(result.failed).toEqual([]);
+    expect(result.swept).toEqual(["ac-agent-run-b-prompt"]);
+    expect(h.logs.some((l) => l.message.includes("changed after the sweep listed it"))).toBe(true);
+  });
+
+  it("retains a listed Secret that carries no resourceVersion rather than deleting unconditionally", async () => {
+    const h = harness([
+      secret("ac-agent-run-a-prompt", { runId: "run-a", ageSec: 3600, resourceVersion: null }),
+    ]);
+
+    const result = await sweepOrphanedRunSecrets(h.opts);
+
+    expect(result.swept).toEqual([]);
+    expect(result.retained).toEqual([{ name: "ac-agent-run-a-prompt", reason: "unverifiable" }]);
+    expect(h.deleteNamespacedSecret).not.toHaveBeenCalled();
   });
 
   it("records a failed delete without throwing or aborting the sweep", async () => {
@@ -593,6 +661,54 @@ describe("createSweepGate", () => {
     expect(
       logs.some((l) => l.stream === "stderr" && l.message.includes("timed out after 50ms")),
     ).toBe(true);
+  });
+
+  // PR #2370 review I2. The gate's own failure-path log sat outside the race,
+  // so a log sink that never settles held execute()'s per-agent mutex exactly
+  // as a hung listing would. Rejection alone is covered above; this is the hang.
+  it("does not wait on a log sink that never settles after a failed listing", async () => {
+    const gate = createSweepGate();
+    let logCalls = 0;
+
+    const result = await gate({
+      namespace: "paperclip",
+      coreApi: {
+        listNamespacedSecret: async () => {
+          throw new Error("apiserver unreachable");
+        },
+        deleteNamespacedSecret: async () => ({}),
+      },
+      batchApi: { listNamespacedJob: async () => ({ items: [] }) },
+      onLog: () => {
+        logCalls += 1;
+        return new Promise<void>(() => {});
+      },
+      timeoutMs: 60_000,
+      now: NOW,
+    });
+
+    // Resolving at all is the assertion: awaiting the sink would never return,
+    // and vitest's per-test timeout would fail this instead.
+    expect(result).toBeNull();
+    expect(logCalls).toBe(1);
+  });
+
+  it("does not wait on a log sink that never settles after the sweep times out", async () => {
+    const gate = createSweepGate();
+
+    const result = await gate({
+      namespace: "paperclip",
+      coreApi: {
+        listNamespacedSecret: () => new Promise(() => {}),
+        deleteNamespacedSecret: async () => ({}),
+      },
+      batchApi: { listNamespacedJob: async () => ({ items: [] }) },
+      onLog: () => new Promise<void>(() => {}),
+      timeoutMs: 50,
+      now: NOW,
+    });
+
+    expect(result).toBeNull();
   });
 
   it("falls back to the default bound rather than disabling it on a non-positive timeout", async () => {
