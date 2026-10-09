@@ -210,7 +210,7 @@ export const AGENT_ENV_ALLOWED_PREFIXES: readonly string[] = [
  *
  *   - the `gh` wrapper resolves its credential from
  *     PAPERCLIP_GITHUB_TOKEN_FILE, which values.blockcast.yaml pins to the App
- *     token at /paperclip/.secrets/github-token/token — never the seat path;
+ *     token at /etc/paperclip/secrets/github-token/token — never the seat path;
  *   - `GH_TOKEN=` / `gh auth` / `--with-token` overrides silently do nothing in
  *     these pods, because that wrapper re-reads the token file per invocation;
  *   - shipped skills are forbidden from naming the seat path at all — see

@@ -2157,15 +2157,22 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         //   optional: true,
         //
         // which silently downgraded a Secret the chart declares as required.
-        // For a credential mount that is not graceful degradation, because the
-        // env var pointing into the mount keeps resolving after the mount is
-        // gone: PAPERCLIP_GITHUB_TOKEN_FILE is /paperclip/.secrets/github-token
-        // /token, and without the mount that is the bare shared-PVC directory —
-        // mode 2775, writable by uid 1000, the uid every agent runs as, on a
-        // CephFS volume shared by the whole fleet. So failing open did not give
-        // the agent "no credential"; it moved the credential path somewhere any
-        // agent can write. Fail closed: a missing GitHub token must stop the
-        // Job loudly, not start an agent pointed at a writable token path.
+        // For a credential mount that is not graceful degradation: the env var
+        // keeps pointing into the mount after the mount is gone, so the Job
+        // starts with PAPERCLIP_GITHUB_TOKEN_FILE naming a path that does not
+        // resolve, and every `gh`/git call fails at use time instead of at
+        // start. Fail closed: a missing GitHub token must stop the Job loudly.
+        //
+        // Historically (pre-BLO-40279) the stakes were worse, which is why this
+        // comment exists at all. The token then mounted at /paperclip/.secrets/
+        // github-token/, *underneath* the shared CephFS volume, so losing the
+        // mount did not make the path unreadable — it exposed the bare PVC
+        // directory beneath it: mode 2775, writable by uid 1000, the uid every
+        // agent runs as, fleet-shared. Failing open there did not give the agent
+        // "no credential", it pointed the agent at a path any agent could write.
+        // BLO-40279 moved the mount to /etc/paperclip/secrets/, outside the
+        // shared volume, so that specific hazard is gone; fail-closed stands on
+        // the plain-unreadable argument above.
         //
         // `undefined` is left as-is rather than coerced: upstream reads an
         // absent `optional` as `false`, so omitting it preserves the source's

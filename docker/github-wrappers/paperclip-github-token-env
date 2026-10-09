@@ -24,7 +24,7 @@ if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
   export GITHUB_PERSONAL_ACCESS_TOKEN="${TOKEN}"
   exec "$@"
 fi
-TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
+TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/etc/paperclip/secrets/github-token/token}"
 if [ ! -r "${TOKEN_FILE}" ]; then
   echo "paperclip github token file not readable: ${TOKEN_FILE}" >&2
   exit 1

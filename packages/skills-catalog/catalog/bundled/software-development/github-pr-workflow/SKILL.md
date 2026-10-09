@@ -286,7 +286,7 @@ receive the formal reviews branch protection needs:
   gate-authorizing Bot/App reviews. That means a PR authored by this App cannot
   receive the App's own formal review; clean App comments on an App-authored PR
   are useful triage, not merge-gate evidence.
-- **User-seat token** — mounted at `/paperclip/.secrets/github-merge-token/token`
+- **User-seat token** — mounted at `/etc/paperclip/secrets/github-merge-token/token`
   when provisioned. This is the **`allyblockcast` user** account, a *distinct*
   GitHub identity from the `app/allyblockcast[bot]` App. A dedicated reviewer
   service may use this identity for singleton Ally-team approval evidence on the

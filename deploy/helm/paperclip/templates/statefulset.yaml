@@ -352,7 +352,7 @@ spec:
               # override was silently ignored here, because .local/bin precedes
               # /usr/bin on PATH and this file is the one every agent pod
               # actually runs. That gap is why the fleet-wide merge-token PAT
-              # mounted at /paperclip/.secrets/github-merge-token/token (covers
+              # mounted at /etc/paperclip/secrets/github-merge-token/token (covers
               # repos outside the allyblockcast[bot] App installation, e.g.
               # user-owned allyblockcast/*) had no wired-in way to reach `gh`
               # or `git` except a bare 403. Do not make this override the
@@ -405,7 +405,7 @@ spec:
                 export GITHUB_PERSONAL_ACCESS_TOKEN="${TOKEN}"
                 exec "$@"
               fi
-              TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
+              TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/etc/paperclip/secrets/github-token/token}"
               if [ ! -r "${TOKEN_FILE}" ]; then
                 echo "paperclip github token file not readable: ${TOKEN_FILE}" >&2
                 exit 1
@@ -460,7 +460,7 @@ spec:
                 printf 'username=x-access-token\npassword=%s\n\n' "${TOKEN}"
                 exit 0
               fi
-              TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
+              TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/etc/paperclip/secrets/github-token/token}"
               [ -r "${TOKEN_FILE}" ] || exit 0
               TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}")"
               [ -n "${TOKEN}" ] || exit 0

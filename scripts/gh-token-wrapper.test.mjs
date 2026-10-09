@@ -21,7 +21,7 @@ echo "ARGS=$*"
 // inside an agent pod it holds the live bot token, and the stub gh below prints
 // GH_TOKEN to stdout, so running there would both break hermeticity and print a
 // live credential into the test log.
-const COMPILED_IN_DEFAULT_TOKEN_FILE = "/paperclip/.secrets/github-token/token";
+const COMPILED_IN_DEFAULT_TOKEN_FILE = "/etc/paperclip/secrets/github-token/token";
 
 function withTempDir(fn) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "gh-token-wrapper-test-"));
@@ -157,6 +157,41 @@ test("refuses when PAPERCLIP_GITHUB_TOKEN_FILE names an absent file (BLO-37977)"
     assert.match(proc.stderr, /is absent; refusing to run with ambient auth/);
     // Must not have reached the real binary at all.
     assert.equal(proc.stdout, "");
+  });
+});
+
+// BLO-40279: both token Secrets used to mount under /paperclip/.secrets, and an
+// absolute path pinned in prose (a runbook, an agent instruction bundle) cannot
+// be swept the way an in-repo one can. The refusal stays a refusal — resolving a
+// named merge-seat path to the compiled-in App default would run as a different
+// GitHub identity than the caller asked for — but it names where the path went,
+// so a stale pin costs one read instead of a silent dead end.
+test("names the BLO-40279 move when the stale /paperclip/.secrets path is pinned", (t) => {
+  // Deliberately a name nothing mounts: a readable file here would exec the stub
+  // gh, which echoes GH_TOKEN. Same hermeticity rule as the compiled-in default.
+  const stale = "/paperclip/.secrets/gh-token-wrapper-test-absent/token";
+  if (existsSync(stale)) return t.skip(`${stale} unexpectedly exists`);
+
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, {
+      setTokenFileVar: false,
+      extraEnv: { PAPERCLIP_GITHUB_TOKEN_FILE: stale },
+      args: ["auth", "status"],
+    });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /is absent; refusing to run with ambient auth/);
+    assert.match(proc.stderr, /moved to \/etc\/paperclip\/secrets\/<name>\/token in BLO-40279/);
+    assert.equal(proc.stdout, "");
+  });
+});
+
+test("does not mention the BLO-40279 move for a path that was never under it", () => {
+  // Anti-vacuity for the test above: the hint must be conditional on the stale
+  // prefix, not unconditional boilerplate every refusal happens to carry.
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, { args: ["auth", "status"] });
+    assert.equal(proc.status, 64);
+    assert.doesNotMatch(proc.stderr, /BLO-40279/);
   });
 });
 
