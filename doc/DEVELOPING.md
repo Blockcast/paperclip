@@ -953,7 +953,7 @@ either.
 |---|---|
 | `phase`, `status`, `exitCode`, `command`, `cwd`, `metadata`, the ids, the timestamps, and the log volume/location/digest (`logStore`, `logRef`, `logBytes`, `logSha256`, `logCompressed`) | **state** — company-readable |
 | `stdoutExcerpt`, `stderrExcerpt` | **transcript** — scoped on `runs:read_transcript` as above |
-| `GET /api/workspace-operations/:operationId/log` body | **transcript** — scoped, but on `workspace_runtime:read`, NOT on the run-transcript gate. See below. |
+| `GET /api/workspace-operations/:operationId/log` body | **transcript** — scoped on `workspace_runtime:read` **and** the run-transcript gate, ANDed. See below. |
 
 The excerpts are withheld on **both list routes**, or the boundary is not
 closed: `GET /api/heartbeat-runs/:runId/workspace-operations` and
@@ -965,54 +965,91 @@ entitled" from "this operation captured no output"; every state field survives
 beside them, because hiding the operator's text is the point and hiding that an
 operation ran is not.
 
-**The per-operation `/log` body is scoped by a different control, and the
-difference is deliberate.** BLO-34631 landed a `workspace_runtime:read`
-entitlement on that route while PEN-3204 was open, so it is **not** additionally
-gated on `decideRunTranscriptRead`. That entitlement is *strictly tighter* than
-the run-transcript gate for the population this section protects:
-`workspace_runtime:read` is unmapped in `permissionForAction` and deliberately
-absent from the same-company agent allow-list (PEN-2852,
-`services/authorization.ts`), so **no agent actor resolves it** — the body is
-withheld from every agent, owner or not. Reaching for a grant row is a dead end
-for two *independent* reasons: the action is unmapped, so the generic
-`permissionKey` fallback at the bottom of `decideBase` never fires for it — and
+**The per-operation `/log` body is gated by two controls, ANDed, and both are
+deliberate.** BLO-34631 landed a `workspace_runtime:read` entitlement on that
+route while PEN-3204 was open; PEN-3204 then ANDed `decideRunTranscriptRead`
+onto it (through `runTranscriptReadGate`, against the operation's owning agent).
+The body is disclosed only to a reader who clears **both**; a reader refused by
+either gets the masked 200 described below, never a 403. The rationale is on the
+route in `routes/agents.ts`.
+
+The entitlement alone was kept for a time, on the reasoning that it is *strictly
+tighter* than the run-transcript gate. **That reasoning is sound for agents and
+unsound for humans**, which is why the second gate is now there.
+
+For agents it holds: `workspace_runtime:read` is unmapped in
+`permissionForAction` and deliberately absent from the same-company agent
+allow-list (PEN-2852, `services/authorization.ts`), so **no agent actor resolves
+it** — the body is withheld from every agent, owner or not. Reaching for a grant row is a dead end for two
+*independent* reasons: the action is unmapped, so the generic `permissionKey`
+fallback at the bottom of `decideBase` never fires for it — and
 `workspace_runtime:read` is not a `PermissionKey` at all, so there is no row to
 insert in the first place. The second reason is compiler-held (it is absent
 from `PERMISSION_KEYS`, `packages/shared/src/constants.ts`) and is therefore
 the one a future implementer cannot accidentally undo; widening the allow-list
-is the only lever that works. Stacking the transcript gate on top would convert
-a withheld 200 into a 403 and change no bytes.
+is the only lever that works.
+
+For humans it does not hold. The two gates read the same unconstrained
+`company_memberships.membership_role` text column in opposite failure
+directions:
+
+- the transcript gate **normalizes** it (`normalizeHumanRole(value, "viewer")`,
+  union `[owner, admin, operator, viewer]` plus `member → operator`) and so
+  fails **closed** on an unrecognized role — deliberate, see
+  `boardActorIsTranscriptOperator`;
+- `workspace_runtime:read` tests the **raw** column (`membershipRole !== "viewer"`,
+  `allow_simple_company_member`) and so fails **open** on one.
+
+A non-union role really is written: `middleware/auth.ts` persists the Cloud
+stack role verbatim for anything that is not owner/admin, and
+`stackMembershipRole` admits `support`. Such a member had the excerpts withheld
+on both list routes and was served the whole log body here, one URL over — a
+gate on one sibling and not the other, which is the failure this whole section
+exists to prevent. The AND is strictly narrowing: operator-grade humans and the
+local board clear the transcript gate anyway, viewers and agents are already
+withheld by the entitlement, and the only decision that changes is the
+divergent one. If you are tempted to drop one of the two gates, that is the
+case to re-check first.
+
+⚠️ The underlying divergence is **not** fixed by this route — every other
+`workspace_runtime:read` consumer still reads the raw column. Narrowing that is
+tracked separately; do not assume an unrecognized role is handled safely
+elsewhere.
 
 Two consequences follow, and neither is an oversight:
 
-- **`runs:read_transcript` does not reach this route.** A holder of the grant
-  gets a withheld body here, unlike on the run-transcript routes. That is a real
-  narrowing of the PEN-3140 escape hatch, decided on PEN-3204 rather than
-  inherited: the grant was sized from an audit of *run* transcript reads, no
-  demand for workspace-operation log reads was measured, and human operators
-  (active non-viewer board members) retain the read, which is the principal
-  incident response actually uses. Widening it back is a product decision that
-  needs its own evidence, not a default.
+- **`runs:read_transcript` does not reach this route on its own.** The gate is
+  an AND, not an OR, so a holder of the grant who lacks `workspace_runtime:read`
+  — every agent, and every viewer — gets a withheld body here, unlike on the
+  run-transcript routes. That is a real narrowing of the PEN-3140 escape hatch,
+  decided on PEN-3204 rather than inherited: the grant was sized from an audit
+  of *run* transcript reads, no demand for workspace-operation log reads was
+  measured, and human operators (active non-viewer board members) retain the
+  read, which is the principal incident response actually uses. Widening it
+  back is a product decision that needs its own evidence, not a default.
 - **Withheld here means masked, not emptied.** The body returns 200 with
   `content` replaced wholesale by the redaction sentinel
   (`maskWorkspaceRuntimeTextForRead`), so a reader can still tell "this operation
   logged nothing" from "the log was withheld". It is a total replacement, not a
   heuristic scrub.
 
-Because the transcript bytes on that route now ride on an entitlement whose
-charter is *operator-authored runtime config* rather than transcript content,
-adding `workspace_runtime:read` to the agent allow-list for a runtime-config
-workflow would open the captured output as a silent side effect. That coupling
+For agents, the transcript bytes on that route still ride first on an
+entitlement whose charter is *operator-authored runtime config* rather than
+transcript content. Adding `workspace_runtime:read` to the agent allow-list for
+a runtime-config workflow would leave the transcript gate as the only gate an
+agent meets here, so `runs:read_transcript` would reach this route as a side
+effect and undo the narrowing above without anyone deciding to. That coupling
 is pinned by a test in `authorization-service.test.ts` (PEN-3204) which fails if
 a `runs:read_transcript` holder ever resolves `workspace_runtime:read`.
 
 The route carries the same rationale beside the code (`routes/agents.ts`, the
 `/workspace-operations/:operationId/log` handler). It is stated here as well
 because this is the paragraph a maintainer reads to answer "is the operation log
-gated?", and the answer is yes, by a different gate than the one above it. The
+gated?", and the answer is yes, by the gate above it **and** a second one. The
 two gates agree on viewers by default — neither admits one — and differ in what
 can widen them: a viewer can be granted `runs:read_transcript`, while
-`workspace_runtime:read` has no grant to issue.
+`workspace_runtime:read` has no grant to issue, so under the AND a viewer stays
+withheld even with the grant.
 
 `command` / `cwd` / `metadata` are separately masked by an **orthogonal** gate,
 `workspace_runtime:read` (`routes/workspace-response.ts`). The two compose and
@@ -1113,8 +1150,8 @@ standalone compensating control on PEN-3140. The workspace-operation path is the
 one that had *neither* half of the control pair — no gate and no audit — until
 BLO-34631 gave it both; its row is keyed `entity_type = workspace_operation` and
 carries the operation's owning run in `runId` — the only owner reference it
-records (no owning-agent id is written, because this route is not
-owner-resolved). That `runId` is **`null`** for a workspace-scoped operation
+records (no owning-agent id is written: the route resolves the owner only to
+decide the transcript gate, and does not record it). That `runId` is **`null`** for a workspace-scoped operation
 that has no owning run, so a run pivot alone never sees those. See the sweep
 below.
 
@@ -1154,7 +1191,8 @@ workspace-operation `/log` route it is not: that caller clears both company
 checks and receives a 200 whose `content` is masked, and the row books
 `result: "allowed"` with **`details.withheld: true`**
 (BLO-34631 added that flag for exactly this reason — there, the access check
-decides reachability and the entitlement decides the bytes). `details.withheld`
+decides reachability and the entitlement ANDed with the transcript decision
+decides the bytes). `details.withheld`
 is present *only* on the workspace-operation rows. An incident query that
 enumerates unentitled transcript access as `details.result = "denied"` therefore
 returns every run-route attempt and **zero** workspace-operation attempts. Read
