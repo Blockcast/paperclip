@@ -4358,16 +4358,24 @@ function isActionableReviewFeedbackContext(context: ResolvedEventContext): boole
 // a typo, or a name invented in a hand-built decision, must fail to compile
 // here rather than ship something nothing documents. It does NOT catch a reason
 // legitimately ADDED to `PrReviewNonActionableReason` — that widens the `Pick`
-// and compiles clean, and nothing downstream switches on the reason
-// exhaustively (the heartbeat reader takes it as `readNonEmptyString`). Keeping
-// the union and its JSDoc taxonomy adjacent is what covers that case.
+// and compiles clean. `DECLINED_REVIEW_FEEDBACK_LOG` below is what catches an
+// added reason; the `Pick` itself does not. Keeping the union and its JSDoc
+// taxonomy adjacent is what documents what each reason MEANS, which no
+// exhaustiveness check can supply.
 type PrReviewFeedbackSuppression = Pick<
   Extract<PrReviewActionabilityDecision, { actionable: false }>,
   "reason" | "predicate"
 >;
 
-// The routine wording, shared by every reason that really does mean "the
-// classifier enumerated the findings and none were actionable".
+// The default wording, for every reason that needs no alerting. Two of its
+// users did enumerate and come up empty (`ally_review_findings_all_zero`
+// parses the buckets and reads every count as zero; `review_no_blocking_
+// feedback` reads the body and finds nothing blocking). Two never enumerated
+// anything: `review_body_absent` is a non-string body, `review_body_empty` a
+// blank one. That looseness costs nothing at `debug`/`info`, which is why
+// these share one string -- unlike the `warn` case, where a dismissive
+// sentence destroys the signal. The map makes per-reason wording free if a
+// reader ever needs them split.
 const DECLINED_REVIEW_FEEDBACK_MESSAGE =
   "github webhook declined PR review feedback delivery: classifier found no actionable findings";
 
@@ -4393,11 +4401,11 @@ const DECLINED_REVIEW_FEEDBACK_MESSAGE =
 //
 // A `satisfies`-checked lookup rather than a fall-through ternary, because the
 // fall-through lands a reason added later on `info` under the routine wording
-// SILENTLY -- the hazard named directly above ("nothing downstream switches on
-// the reason exhaustively"), and here that reason would be a new suspect case
-// inheriting exactly the burial this exists to prevent. This is that exhaustive
-// switch: adding a member to `PrReviewNonActionableReason` now fails to compile
-// until its level and wording are a decision someone made.
+// SILENTLY -- the hazard named directly above (the `Pick` widens and compiles
+// clean on an ADDED reason), and here that reason would be a new suspect case
+// inheriting exactly the burial this exists to prevent. This is the exhaustive
+// switch that closes it: adding a member to `PrReviewNonActionableReason` now
+// fails to compile until its level and wording are a decision someone made.
 const DECLINED_REVIEW_FEEDBACK_LOG = {
   ally_review_findings_unenumerable: {
     level: "warn",
