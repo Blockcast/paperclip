@@ -201,6 +201,19 @@ test('evaluateEnvironmentProtection: flags an absent required_reviewers rule', (
   assert.doesNotMatch(result.violations[0], /list is EMPTY/);
 });
 
+test('evaluateEnvironmentProtection: an empty ratified set leaves the EMPTY-list verdict dormant too', () => {
+  // The absent-rule half of that claim is locked by 'passes the owner-ratified shape'
+  // (COMPLIANT_ENV carries no required_reviewers rule). This is the other half.
+  // Mutation guard: narrow the EMPTY branch to `rule != null && reviewers.length === 0`
+  // and this fails; the suite otherwise stays green with #2313 silently regressed.
+  const result = evaluateEnvironmentProtection({
+    ...COMPLIANT_ENV,
+    protection_rules: [{ id: 61677470, type: 'branch_policy' }, reviewersRule([])],
+  });
+  assert.equal(result.compliant, true);
+  assert.deepEqual(result.violationKinds, []);
+});
+
 test('evaluateEnvironmentProtection: absent rule and empty list are DISTINCT verdicts', () => {
   // PEN-3871. These were one disjunct reporting one slug and one message, so
   // the 2026-10-06 loss of the rule itself was indistinguishable in the alert
