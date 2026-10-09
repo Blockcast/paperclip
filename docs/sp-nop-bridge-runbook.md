@@ -182,7 +182,17 @@ Registration MUST use this order:
    normalized `gateway_hwid`. Both indexes are partial, and the
    two compose: a same-wallet retry matches the conflict target and takes the
    update path, while a different-wallet insert raises on the hardware
-   constraint. A same-wallet registration against a `retired` row matches
+   constraint. The update path raises too when the matched row is not already
+   in the hardware index and another wallet's intent holds the `gateway_hwid`
+   there. That is the rejected wallet trying again: `registration_failed` is
+   non-`retired`, so the rejected `(H, B)` intent stays in the arbiter index,
+   and B's next attempt matches it and updates it to `pending_orc8r` — into
+   the hardware index, where `(H, A)` already sits. `ON CONFLICT` arbitrates
+   only on its own index, so that `unique_violation` propagates exactly like
+   the insert's, and every attempt after the first is rejected by the update.
+   Either raise aborts this transaction, so the `registration_failed` record
+   (or, on a repeat attempt, its refreshed `last_error`) is written in a
+   separate one. A same-wallet registration against a `retired` row matches
    neither and inserts. That falls out of the arbiter-index choice, so both
    indexes are part of the contract, not an implementation detail.
 2. Call `MintMember` with the same derived identity and bridge mTLS
@@ -251,7 +261,10 @@ tenant is rejected; and the sweep reports and quarantines an orphan/duplicate
 without silently reassigning it. It MUST also prove that a second registration
 of an already-bound `gateway_hwid` under a different `wallet` is rejected as
 non-retryable, leaves the intent `registration_failed`, and mints no second
-member, both serially and when the two registrations run concurrently; and that
+member, both serially and when the two registrations run concurrently, and
+again when the rejected wallet repeats its registration: that attempt matches
+its `registration_failed` intent, is rejected on the hardware constraint by the
+update path, leaves the intent `registration_failed`, and mints nothing; and that
 the `gateway_hwid`-only sweep grouping surfaces such a pair when one is seeded
 directly. It MUST also prove the retirement round-trip: with the prior member
 disabled and its intent `retired`, the same `gateway_hwid` registers
