@@ -136,8 +136,11 @@ The correct manual intervention is the same thing the fix automates: make the
 **run** terminal (`cancelRun`), which deletes the Job by its still-correct old
 name and lets the reaper release the reservation.
 
-Also note `release_pending` is never written by any code in `server/src` (all
-three references are reads), so do not expect to reach it or set it by hand.
+Also note `release_pending` is never written by any code in `server/src` (every
+reference there is a read). The database writes it: the
+`heartbeat_runs_release_external_runtime_reservation` trigger (migration
+`0128`) moves a `launching`/`launched` lease to `release_pending` when its run
+goes terminal. So expect to see it after `cancelRun`, but never set it by hand.
 
 ## Related
 
@@ -145,3 +148,5 @@ three references are reads), so do not expect to reach it or set it by hand.
   That one covers a run that never got dispatched; this one covers an agent
   that cannot dispatch anything at all.
 - `runbooks/k8s-live-job-block-guard.md` — live-Job-vs-run-state disagreement.
+- `doc/EXTERNAL-RUNTIME-CONCURRENCY.md` — the lease model, its metrics, and
+  the raw-`UPDATE` fallback for a lease whose run is already terminal.
