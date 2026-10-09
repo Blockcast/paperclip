@@ -401,6 +401,14 @@ WORKDIR /vendor
 # to the model catalog, pricing fallback and context-window table; #63 moves
 # Rust build output off the shared PVC (BLO-15567). Local adapter verification:
 # typecheck clean, 664/664 (#64) and the pricing/models/execute suites (#65).
+# PEN-3732: this pin does NOT carry the GitHub-egress PATH prepend that
+# PEN-3713 added to the claude_k8s adapter, so an opencode_k8s Job resolves
+# `git`/`gh` through the agent-writable PVC wrappers. Latent, not live — there
+# are no opencode_k8s workloads — and closing it needs a merge in a fork no
+# agent seat can push to. The ready-to-apply mirror, verified green against
+# THIS SHA, is vendor/opencode-k8s-patches/. Read that README before bumping:
+# scripts/check-opencode-k8s-pin-reachable.mjs fails the bump if a new pin
+# still lacks the prepend, because re-accepting the gap is a stated decision.
 ARG OPENCODE_K8S_REF=133f4c1a65085a6c141aab5aa8818afe51e2689c
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
