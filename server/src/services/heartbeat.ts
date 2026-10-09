@@ -3785,10 +3785,13 @@ async function ensureManagedProjectWorkspace(input: {
   const partialClone = await ensureManagedCheckoutCanServeClones({ cwd: realized.cwd });
   if (partialClone.state === "partial_cannot_serve") {
     // Raised as a workspace validation failure rather than a bare Error so the
-    // recovery machinery treats it as the manual-repair, budget-exempt cause it
-    // is. A partial mirror missing objects cannot be fixed by retrying the same
-    // agent against the same path, and `workspace_validation_failed` is the one
-    // cause that neither wakes an owner nor spends a wake attempt.
+    // park keeps the diagnostics and the run carries `workspace_validation_failed`.
+    // It does NOT keep that no-wake recovery cause: the payload has no
+    // `gitProbeState` or `provenance`, so `workspaceValidationRecoveryCause`
+    // (recovery/workspace-validation-probe.ts) returns undefined and the park
+    // takes the ordinary stranded cause -- bounded wake attempts, then a visible
+    // escalation to `blocked`. That is deliberate (BLO-19924): a mirror only a
+    // human can repair is the case where a permanent silent strand costs most.
     throw new WorkspaceValidationFailure(partialClone.fatalMessage ?? "Managed checkout cannot serve clones.", {
       workspaceValidation: {
         reason: "managed_checkout_partial_clone_unservable",
