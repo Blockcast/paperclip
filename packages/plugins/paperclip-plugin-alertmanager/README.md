@@ -468,7 +468,21 @@ Two overrides, in precedence order:
    (case-insensitive, trimmed). Anything else is ignored and the severity map
    applies — an unrecognised value must not reach `issues.create` and fail the
    whole delivery, and a `PrometheusRule` is not a trusted enough surface to
-   pass straight through to the API.
+   pass straight through to the API. A non-string value (an unquoted YAML
+   number or bool) is ignored on the same path rather than thrown on; the
+   envelope type-guard deliberately does not validate label entries, so
+   calling a string method on one would fail the whole batch and make
+   Alertmanager redeliver into the same crash.
+
+   An ignored value is **not silent**: it logs a `warn` naming the value and
+   the resolved fallback, and counts `alertmanager.alert.malformed`. A typo
+   like `paperclip_priority: hgih` would otherwise be indistinguishable from
+   an absent label, on the one surface whose entire purpose is overriding a
+   default. The alert is still filed — unlike a malformed `paperclip_issue`,
+   which drops it, because that label decides whether an issue exists at all.
+
+   An alert with **no** `severity` label resolves under the key `unknown`, so
+   an operator's `severityToPriority: { unknown: … }` entry applies to it.
 2. **`config.severityToPriority`** — operator-wide remap of a severity.
 
 ### Aggregate creation identity

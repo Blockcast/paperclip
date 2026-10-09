@@ -4972,6 +4972,90 @@ describe("handleWebhook — severity → priority", () => {
     expect(createArgs.priority).toBe("medium");
   });
 
+  it("warns and counts an ignored paperclip_priority instead of dropping it silently", async () => {
+    // The label exists to override a default this plugin lowered, so a typo
+    // must not be indistinguishable from an absent label.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "hgih" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('ignoring paperclip_priority "hgih"'),
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.malformed",
+      1,
+      { alertname: "X" },
+    );
+    // Still filed — only the override is dropped, unlike a malformed
+    // `paperclip_issue`, which drops the alert.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("an honoured paperclip_priority does not warn", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "high" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("ignoring paperclip_priority"),
+    );
+  });
+
+  it("a non-string paperclip_priority does not fail the delivery", async () => {
+    // `isAlertmanagerPayload` does not validate label entries, so a YAML
+    // `paperclip_priority: 5` reaches this path as a number. Throwing here
+    // raises a TypeError, not a PermanentAlertError, which fails the whole
+    // batch and makes Alertmanager redeliver into the same crash.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+    });
+    (alert.labels as Record<string, unknown>).paperclip_priority = 5;
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    const result = await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+
+    // Without the guard this rejects with AlertDeliveryIncompleteError rather
+    // than returning, so `accepted: 1` is the assertion that carries the fix.
+    expect(result.accepted).toBe(1);
+    expect(result.rejected).toBeUndefined();
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create.mock.calls[0][0].priority).toBe("medium");
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('ignoring paperclip_priority "<non-string number>"'),
+    );
+  });
+
+  it("an absent severity still resolves under the operator's `unknown` key", async () => {
+    // Pre-BLO-20576 the call site passed `alert.labels.severity ?? "unknown"`.
+    // Passing the raw label instead short-circuits on `!severity`, so an
+    // operator's `unknown` entry would silently stop applying.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: { unknown: "low" } });
+    const alert = baseAlert({ labels: { alertname: "X" } });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    expect(mocks.issues.create.mock.calls[0][0].priority).toBe("low");
+  });
+
   it("operator severity-to-priority overrides the default", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({

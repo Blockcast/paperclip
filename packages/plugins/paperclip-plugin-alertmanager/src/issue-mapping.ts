@@ -51,6 +51,21 @@ export function severityToPriority(
 }
 
 /**
+ * Outcome of resolving one alert's issue priority.
+ *
+ * `ignoredLabel` is set when a `paperclip_priority` label was present but
+ * unusable, so the caller — which holds `ctx`, unlike this module — can warn
+ * and emit a metric. Without it a typo (`hgih`) is indistinguishable from an
+ * absent label: the rule author believes they opted back up and nothing
+ * anywhere records that they did not.
+ */
+export interface ResolvedAlertPriority {
+  priority: PaperclipPriority;
+  /** Raw label value when present but unusable; `undefined` when honoured or absent. */
+  ignoredLabel?: string;
+}
+
+/**
  * Resolve the issue priority for one alert.
  *
  * Resolution order:
@@ -64,16 +79,40 @@ export function severityToPriority(
  * anything else — an unrecognised value must not reach `ctx.issues.create`
  * and fail the whole delivery, and a `PrometheusRule` is not a trusted enough
  * surface to pass straight through to the API.
+ *
+ * The label is read as `unknown`: `isAlertmanagerPayload` deliberately does
+ * not validate label entries (see its docstring), so a YAML `paperclip_priority: 5`
+ * arrives as a number at runtime despite the declared `Record<string, string>`.
+ * Calling a string method on it would throw a `TypeError` — not a
+ * `PermanentAlertError` — which fails the whole batch and makes Alertmanager
+ * redeliver into the same deterministic crash until the alert is lost. Mirrors
+ * the `paperclip_issue` guard in `webhook-handler.ts`.
+ *
+ * A whitespace-only label is treated as absent, not as a typo: Prometheus drops
+ * empty labels, so warning on one would be noise about a value nobody set.
  */
 export function resolveAlertPriority(
   alert: AlertmanagerAlert,
   override?: Record<string, PaperclipPriority>,
-): PaperclipPriority {
-  const label = alert.labels.paperclip_priority?.trim().toLowerCase();
-  if (label && (ISSUE_PRIORITIES as readonly string[]).includes(label)) {
-    return label as PaperclipPriority;
+): ResolvedAlertPriority {
+  // `?? "unknown"` is load-bearing: it is the key `severityToPriority` matches
+  // an operator's `severityToPriority: { unknown: … }` entry against. Passing
+  // the raw label would short-circuit on `!severity` and never consult it.
+  const priority = severityToPriority(
+    alert.labels.severity ?? "unknown",
+    override,
+  );
+  const raw: unknown = alert.labels.paperclip_priority;
+  if (raw === undefined) return { priority };
+  if (typeof raw !== "string") {
+    return { priority, ignoredLabel: `<non-string ${typeof raw}>` };
   }
-  return severityToPriority(alert.labels.severity, override);
+  const key = raw.trim().toLowerCase();
+  if (!key) return { priority };
+  if ((ISSUE_PRIORITIES as readonly string[]).includes(key)) {
+    return { priority: key as PaperclipPriority };
+  }
+  return { priority, ignoredLabel: raw };
 }
 
 /**
