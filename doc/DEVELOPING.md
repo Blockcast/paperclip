@@ -953,7 +953,7 @@ either.
 |---|---|
 | `phase`, `status`, `exitCode`, `command`, `cwd`, `metadata`, the ids, the timestamps, and the log volume/location/digest (`logStore`, `logRef`, `logBytes`, `logSha256`, `logCompressed`) | **state** — company-readable |
 | `stdoutExcerpt`, `stderrExcerpt` | **transcript** — scoped as above |
-| `GET /api/workspace-operations/:operationId/log` body | **transcript** — but gated by `workspace_runtime:read`, *not* by the transcript decider (see below) |
+| `GET /api/workspace-operations/:operationId/log` body | **transcript** — gated by `workspace_runtime:read` **and** the transcript decider (see below) |
 
 The excerpts are withheld on **all three** read routes, or the boundary is not
 closed: `GET /api/heartbeat-runs/:runId/workspace-operations`,
@@ -965,18 +965,43 @@ entitled" from "this operation captured no output"; every state field survives
 beside them, because hiding the operator's text is the point and hiding that an
 operation ran is not.
 
-**Which gate covers the per-operation `/log` body.** That route is deliberately
-left on BLO-34631's `workspace_runtime:read` entitlement and is *not*
-additionally gated on `decideRunTranscriptRead` (the rationale is on the route
-in `routes/agents.ts`). The entitlement answers the transcript question there
-and answers it more tightly: `workspace_runtime:read` is unmapped in
-`permissionForAction` and absent from the same-company agent allow-list, so no
-agent actor resolves it at all. Stacking the transcript gate on top would turn a
-withheld 200 into a 403 for non-owners and change nothing about which bytes
-leave. The two entitlements agree on viewers — neither admits one without a
-grant. Stated explicitly because this is the paragraph a maintainer reads to
-answer "is the operation log gated?", and the answer is yes, by a different gate
-than the one above it.
+**Which gate covers the per-operation `/log` body — both of them, ANDed.** That
+route carries BLO-34631's `workspace_runtime:read` entitlement *and*
+`decideRunTranscriptRead`; the body is disclosed only to a reader who clears
+both (the rationale is on the route in `routes/agents.ts`).
+
+It did not always. The entitlement alone was kept for a time, on the reasoning
+that it is tighter: `workspace_runtime:read` is unmapped in `permissionForAction`
+and absent from the same-company agent allow-list, so no agent actor resolves it
+at all. **That reasoning is sound for agents and unsound for humans**, which is
+why the second gate is now there. The two gates read the same unconstrained
+`company_memberships.membership_role` text column in opposite failure
+directions:
+
+- the transcript gate **normalizes** it (`normalizeHumanRole(value, "viewer")`,
+  union `[owner, admin, operator, viewer]` plus `member → operator`) and so
+  fails **closed** on an unrecognized role — deliberate, see
+  `boardActorIsTranscriptOperator`;
+- `workspace_runtime:read` tests the **raw** column (`membershipRole !== "viewer"`,
+  `allow_simple_company_member`) and so fails **open** on one.
+
+A non-union role really is written: `middleware/auth.ts` persists the Cloud
+stack role verbatim for anything that is not owner/admin, and
+`stackMembershipRole` admits `support`. Such a member had the excerpts withheld
+on both list routes and was served the whole log body here, one URL over — a
+gate on one sibling and not the other, which is the failure this whole section
+exists to prevent. If you are tempted to drop one of the two gates, that is the
+case to re-check first.
+
+The AND is deliberate and is **not** an OR: a `runs:read_transcript` grant
+holder who lacks `workspace_runtime:read` still gets the masked body. Whether
+that grant should reach this route is an open product question, not an
+oversight.
+
+⚠️ The underlying divergence is **not** fixed by this route — every other
+`workspace_runtime:read` consumer still reads the raw column. Narrowing that is
+tracked separately; do not assume an unrecognized role is handled safely
+elsewhere.
 
 `command` / `cwd` / `metadata` are separately masked by an **orthogonal** gate,
 `workspace_runtime:read` (`routes/workspace-response.ts`). The two compose and
