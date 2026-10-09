@@ -238,7 +238,10 @@ const COMMAND_POSITION_WRAPPERS = [
  * (Ally I1 at a36d40f5): `python3 <<'EOF'` runs the body as Python, and an
  * `at`/`crontab` body is shell that runs later. A heredoc fed to an
  * interpreter is a program, and listing them cost no false positive on
- * `python3 -m venv env` or `node env.js`, which have no heredoc.
+ * `python3 -m venv env` or `node env.js`, which have no heredoc. `perl` and
+ * `awk -f -` read their program from stdin the same way, and `batch` is
+ * `at`'s sibling (Ally I2 at 67d7b0a1); `perl -ne 'print' env.log` and
+ * `batch -l` have no heredoc and are unaffected.
  */
 const HEREDOC_SCRIPT_CONSUMERS = [
   ...SHELL_BASENAMES,
@@ -250,7 +253,12 @@ const HEREDOC_SCRIPT_CONSUMERS = [
   "node",
   "ruby",
   "php",
+  "perl",
+  "awk",
+  "gawk",
+  "mawk",
   "at",
+  "batch",
   "crontab",
 ];
 
@@ -312,9 +320,20 @@ interface LexResult {
   heredocs: string[];
 }
 
+/**
+ * A versioned or distro-aliased interpreter name (`python3.11`, `python2.7`,
+ * `nodejs`, `ruby3.1`, `php8.2`, `perl5.36`) and the bare name it resolves to.
+ * Every table is keyed on that bare name, and an exact-string lookup let the
+ * versioned binaries RHEL, Debian and most CI images ship miss all three
+ * (Ally I1 at 67d7b0a1). `python3` stays distinct from `python`.
+ */
+const VERSIONED_INTERPRETER_RE = /^(python3|python|node|ruby|php|perl)(?:js)?[0-9]*(?:\.[0-9]+)*$/;
+
 function basename(word: string): string {
   const cut = word.lastIndexOf("/");
-  return cut === -1 ? word : word.slice(cut + 1);
+  const base = cut === -1 ? word : word.slice(cut + 1);
+  const m = VERSIONED_INTERPRETER_RE.exec(base);
+  return m ? (m[1] as string) : base;
 }
 
 /**
@@ -793,15 +812,33 @@ const INLINE_PROGRAM_FLAGS = new Map<string, RegExp>([
   ["php", /^-r$/],
 ]);
 
+/**
+ * The interpreters' flags that take their value as the NEXT word
+ * (`python3 -W ignore -c …`, `node -r dotenv/config -e …`). That value is a
+ * bare word but not a script, so the flag scan steps over it as a pair instead
+ * of stopping there (Ally I3 at 67d7b0a1). Listing a flag that takes no value
+ * only scans further, i.e. fails toward blocking.
+ */
+const VALUE_TAKING_FLAGS = new Map<string, RegExp>([
+  ["python", /^-[A-Za-z]*[WX]$/],
+  ["python3", /^-[A-Za-z]*[WX]$/],
+  ["node", /^(?:-[rC]|--require|--import|--loader|--experimental-loader|--conditions|--env-file|--input-type)$/],
+  ["ruby", /^(?:-[A-Za-z]*[ICrE]|--encoding)$/],
+  ["php", /^-[cdz]$/],
+]);
+
 /** Index of an inline program's payload word (`sh -c PAYLOAD`, `node -e PAYLOAD`), or -1. */
 function inlineProgramIndex(words: string[]): number {
   for (let i = 0; i < words.length; i += 1) {
-    const flag = INLINE_PROGRAM_FLAGS.get(basename(words[i] as string));
+    const name = basename(words[i] as string);
+    const flag = INLINE_PROGRAM_FLAGS.get(name);
     if (!flag) continue;
+    const valueFlag = VALUE_TAKING_FLAGS.get(name);
     for (let j = i + 1; j < words.length; j += 1) {
       const w = words[j] as string;
       if (flag.test(w)) return j + 1 < words.length ? j + 1 : -1;
       if (w[0] !== "-") break;
+      if (valueFlag && valueFlag.test(w)) j += 1;
     }
   }
   return -1;
@@ -902,9 +939,11 @@ const COMMAND_POSITION_WRAPPERS = SHELL_BASENAMES.concat([
 ]);
 // Programs that execute their STDIN as a script: a heredoc body fed to one is
 // a program, not data, whatever its delimiter's quoting. Includes the language
-// interpreters and the at/crontab schedulers, whose bodies are shell.
+// interpreters (perl and awk -f - included) and the at/batch/crontab
+// schedulers, whose bodies are shell.
 const HEREDOC_SCRIPT_CONSUMERS = SHELL_BASENAMES.concat([
-  "ssh", "make", "gmake", "python", "python3", "node", "ruby", "php", "at", "crontab",
+  "ssh", "make", "gmake", "python", "python3", "node", "ruby", "php",
+  "perl", "awk", "gawk", "mawk", "at", "batch", "crontab",
 ]);
 // The script consumer a simple command feeds its stdin to, or null.
 function stdinScriptConsumer(words) {
@@ -925,9 +964,14 @@ function stdinScriptConsumer(words) {
 function cronCommands(body) {
   return body.replace(/^[ \t]*(?:@\S+|(?:\S+[ \t]+){5})/gm, "");
 }
+// A versioned or aliased interpreter (python3.11, nodejs, ruby3.1, php8.2,
+// perl5.36) resolves to the bare name every table is keyed on.
+const VERSIONED_INTERPRETER_RE = /^(python3|python|node|ruby|php|perl)(?:js)?[0-9]*(?:\.[0-9]+)*$/;
 function basename(word) {
   const cut = word.lastIndexOf("/");
-  return cut === -1 ? word : word.slice(cut + 1);
+  const base = cut === -1 ? word : word.slice(cut + 1);
+  const m = VERSIONED_INTERPRETER_RE.exec(base);
+  return m ? m[1] : base;
 }
 function lexShell(input) {
   const commands = [];
@@ -1225,14 +1269,26 @@ const INLINE_PROGRAM_FLAGS = new Map(
     ["php", /^-r$/],
   ]),
 );
+// Interpreter flags whose value is the NEXT word (python3 -W ignore -c ...):
+// stepped over as a pair, since the value is not a script.
+const VALUE_TAKING_FLAGS = new Map([
+  ["python", /^-[A-Za-z]*[WX]$/],
+  ["python3", /^-[A-Za-z]*[WX]$/],
+  ["node", /^(?:-[rC]|--require|--import|--loader|--experimental-loader|--conditions|--env-file|--input-type)$/],
+  ["ruby", /^(?:-[A-Za-z]*[ICrE]|--encoding)$/],
+  ["php", /^-[cdz]$/],
+]);
 function inlineProgramIndex(words) {
   for (let i = 0; i < words.length; i += 1) {
-    const flag = INLINE_PROGRAM_FLAGS.get(basename(words[i]));
+    const name = basename(words[i]);
+    const flag = INLINE_PROGRAM_FLAGS.get(name);
     if (!flag) continue;
+    const valueFlag = VALUE_TAKING_FLAGS.get(name);
     for (let j = i + 1; j < words.length; j += 1) {
       const w = words[j];
       if (flag.test(w)) return j + 1 < words.length ? j + 1 : -1;
       if (w[0] !== "-") break;
+      if (valueFlag && valueFlag.test(w)) j += 1;
     }
   }
   return -1;

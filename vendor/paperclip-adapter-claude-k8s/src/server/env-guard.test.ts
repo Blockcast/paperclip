@@ -219,6 +219,44 @@ const blocked = [
   "python3 <<'EOF'\n# it's fine\nimport os\nos.system(\"env\")\nEOF",
   "echo hi # <<EOF\nenv\nEOF",
   "env # note",
+  // Ally I1 at 67d7b0a1: the tables match a RESOLVED basename. A versioned or
+  // distro-aliased interpreter (`python3.11` on RHEL/CI images, `nodejs` on
+  // Debian) missed all three tables by exact-string lookup and was allowed.
+  "python3.11 -c 'import os; os.system(\"env\")'",
+  "python3.12 -c 'import os; os.system(\"env\")'",
+  "python3.9 -c 'import os; os.system(\"env\")'",
+  "python2 -c 'import os; os.system(\"env\")'",
+  "python2.7 -c 'import os; os.system(\"env\")'",
+  "/usr/bin/python3.11 -c 'import os; os.system(\"env\")'",
+  "nodejs -e 'require(\"child_process\").execSync(\"env\")'",
+  "ruby3.1 -e 'system(\"env\")'",
+  "ruby2.7 -e 'system(\"env\")'",
+  "php8.2 -r 'system(\"env\");'",
+  "php7.4 -r 'system(\"env\");'",
+  "perl5.36 -e 'system(\"env\")'",
+  "python3.11 <<'EOF'\nimport os\nos.system(\"env\")\nEOF",
+  "python2.7 <<'EOF'\nimport os\nos.system(\"env\")\nEOF",
+  "nodejs <<'EOF'\nrequire(\"child_process\").execSync(\"env\")\nEOF",
+  "ruby3.1 <<'EOF'\nsystem(\"env\")\nEOF",
+  "php8.2 <<'EOF'\n<?php system(\"env\");\nEOF",
+  // Ally I2 at 67d7b0a1: perl and awk read a program from stdin too, and
+  // `batch` is `at`'s sibling whose body is shell that runs later.
+  "perl <<'EOF'\nsystem(\"env\")\nEOF",
+  "cat <<'EOF' | perl\nsystem(\"env\")\nEOF",
+  "sudo perl <<'EOF'\nsystem(\"env\")\nEOF",
+  "awk -f - <<'EOF'\nBEGIN{system(\"env\")}\nEOF",
+  "gawk -f - <<'EOF'\nBEGIN{system(\"env\")}\nEOF",
+  "mawk -f - <<'EOF'\nBEGIN{system(\"env\")}\nEOF",
+  "batch <<'EOF'\nenv\nEOF",
+  // Ally I3 at 67d7b0a1: a flag that takes its value as the NEXT word. The
+  // value is a bare word but not a script, so it must not end the flag scan.
+  "python3 -W ignore -c 'import os; os.system(\"env\")'",
+  "python3 -X dev -c 'import os; os.system(\"env\")'",
+  "node -r dotenv/config -e 'require(\"child_process\").execSync(\"env\")'",
+  "node --require dotenv/config -e 'require(\"child_process\").execSync(\"env\")'",
+  "ruby -I lib -e 'system(\"env\")'",
+  "ruby -r json -e 'system(\"env\")'",
+  "php -d memory_limit=1G -r 'system(\"env\");'",
 ];
 const allowed = [
   // The trailing terminator deliberately does NOT include whitespace, which is
@@ -337,6 +375,15 @@ const allowed = [
   "crontab -l",
   "python3 <<'EOF'\nprint('hello')\nEOF",
   "crontab - <<'EOF'\nMAILTO=\"\"\n0 3 * * * /usr/local/bin/backup.sh\nEOF",
+  // Negative controls for the versioned-name, stdin-program and value-flag
+  // rules above: none of these runs a program the guard can see.
+  "python3.11 -m venv env",
+  "nodejs env.js",
+  "perl -ne 'print' env.log",
+  "awk '{print}' /var/log/x",
+  "batch -l",
+  "python3 x.py -c foo", // a script argument, not the inline-program flag
+  "python3 -W ignore x.py -c env", // the value is skipped, the script still ends the scan
   "ls # env", // a comment is not an argument, let alone a command
   "",
 ];
