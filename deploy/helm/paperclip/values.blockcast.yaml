@@ -359,13 +359,30 @@ env:
     # decision with its own audit, not a knob to turn while enabling.
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_AGE_DAYS
       value: "30"
-    # 200 — also the code default, made explicit so it stays inert on purpose
-    # rather than by luck. It does not bind today (4 eligible << 200). It becomes
-    # load-bearing the moment MAX_AGE_DAYS drops: unlink here is MDS-metadata
-    # bound, measured at 145 files/s serial, and the tree averages ~6.9k entries
-    # per directory — so a capped 200-directory tick is ~1.4M entries, ~2.7h of
-    # MDS pressure borne by every other CephFS consumer on the cluster. The four
-    # directories eligible today total 42,892 entries, ~5 min.
+    # 200 — also the code default, made explicit. It was recorded here as
+    # "inert on purpose … does not bind today (4 eligible << 200)". That is no
+    # longer true and the cap is now load-bearing without MAX_AGE_DAYS having
+    # moved: the first deployed dry run (2026-10-09T08:07:57Z) stopped with
+    # stop_reason="capped" at exactly 200 eligible, because the cohort the
+    # 2026-09-26 sweep counted as retainedFresh=798 has simply aged past 30d.
+    # So treat an eligible count of 200 as a floor, never a total.
+    #
+    # Re-measured against the live tree the same day: the match set is 503
+    # directories / 141.6 GiB / 3,467,038 entries, of which the nested-checkout
+    # guard excludes 13 (23.7 GiB), leaving 490 / 117.9 GiB / 2,916,346 entries.
+    # Unlink is MDS-metadata bound at 145 files/s serial, so the whole backlog
+    # is ~5.6h of MDS pressure, a typical 200-directory tick ~2.3h, and a
+    # worst-case tick (the 200 largest) ~5.2h — entries per directory are highly
+    # skewed, median 1,712 against a max of 93,966, so the ~6.9k mean this
+    # comment previously reasoned from describes almost no actual directory.
+    #
+    # Deliberately NOT raised. Total MDS work is a property of the backlog, not
+    # of the cap; the cap only decides how it is spread. At 200/tick on the
+    # default 1440-minute interval the backlog drains in ~3 daily ticks and
+    # steady state is then ~0.5h/day. The tree gained ~35-64 directories/day
+    # over 2026-09-26..10-09, and eligible arrivals lag that by MAX_AGE_DAYS at
+    # a lower historical rate, so 200/tick keeps up with room to spare. Raising
+    # it buys nothing but a bigger burst.
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_DELETES_PER_TICK
       value: "200"
 
