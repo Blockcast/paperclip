@@ -95,8 +95,8 @@ type OpenPullRequest = {
  * `number` here is ADDITIVE across repos and every `boolean` is "happened in at
  * least one repo this tick". A field added here that breaks it (a ratio, an
  * echoed-back ceiling, an epoch timestamp, an AND-shaped flag) is summed or
- * OR'd into nonsense with no type error and no test failure. All seven below
- * obey it. Add fields that obey it, or change the merge first.
+ * OR'd into nonsense with no type error and no test failure. Every field below
+ * obeys it. Add fields that obey it, or change the merge first.
  *
  * @see GateRedriveResult for the full statement of the invariant.
  */
@@ -593,7 +593,7 @@ export async function prReviewStateReconcilerTick(
       // Keys-driven for the WHOLE result, nested `gateRedrive` included. The
       // six fields this used to accumulate by hand carried the same defect as
       // the nested one: `totals` is initialised with every field zeroed above,
-      // so a seventh added to `ReviewStateReconcileResult` and forgotten here
+      // so any field added to `ReviewStateReconcileResult` and forgotten here
       // compiles clean and reports zero fleet-wide. Specialising the helper to
       // the nested type closed half the class and left this half open.
       mergeSweepCounters(totals, result);
