@@ -3112,7 +3112,9 @@ async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
 // the subprocess twice — once by path, once by branch — is pure overhead on the
 // common `sameHead` path that repairs without ever reading the branch lookup.
 async function listRegisteredGitWorktrees(repoRoot: string): Promise<GitWorktreeListEntry[] | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
+  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot, {
+    timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+  }).catch(() => null);
   if (!raw) return null;
   return parseGitWorktreeListPorcelain(raw);
 }
@@ -3834,11 +3836,12 @@ async function stampGitWorktreeOwnership(input: {
  * from the registration itself rather than from `git worktree list`: the
  * worktree's `.git` file names an admin dir under `<repoRoot>/.git/worktrees/`,
  * and that dir's `gitdir` file points back at the same `.git`. That pair is
- * what the list enumerates. Used only when the list failed (BLO-42089), and
- * every doubt, including a read that outlives the reclaim deadline, resolves
- * to "not registered", the verdict a failed list already gave.
+ * what the list enumerates. Used only when the list failed (BLO-42089). A
+ * missing or mismatched file resolves to "not registered", the verdict a failed
+ * list already gave. A read that outlives the reclaim deadline answers nothing,
+ * so it returns `null` and the caller decides.
  */
-async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: string): Promise<boolean> {
+async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: string): Promise<boolean | null> {
   const dotGit = path.join(worktreePath, ".git");
   const read = async () => {
     const adminRef = /^gitdir:\s*(.+)$/m.exec(await fs.readFile(dotGit, "utf8"))?.[1]?.trim();
@@ -3851,7 +3854,8 @@ async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: 
     return await resolvePathForWorktreeComparison(path.resolve(adminDir, backRef))
       === await resolvePathForWorktreeComparison(dotGit);
   };
-  return withReclaimFsDeadline(read(), dotGit).catch(() => false);
+  return withReclaimFsDeadline(read(), dotGit).catch((error: unknown) =>
+    (error as { code?: unknown } | null)?.code === "ETIMEDOUT" ? null : false);
 }
 
 export async function inspectManagedGitWorktreeBranch(input: {
@@ -3897,10 +3901,18 @@ export async function inspectManagedGitWorktreeBranch(input: {
   // with the worktree listed both times. Reporting that as `not_registered`
   // blocked healthy issues for manual repair, so read this one registration
   // directly instead.
-  const listedWorktrees = await listLinkedGitWorktreePaths(repoRoot).catch(() => null);
-  const registered = listedWorktrees
-    ? listedWorktrees.has(worktreePath)
+  const listed = await listLinkedGitWorktreePaths(repoRoot).then(
+    (paths) => ({ paths, error: null as unknown }),
+    (error: unknown) => ({ paths: null, error }),
+  );
+  const registered = listed.paths
+    ? listed.paths.has(worktreePath)
     : await hasLinkedGitWorktreeRegistration(repoRoot, worktreePath);
+  // The list stalled and the direct read stalled too, so there is no answer.
+  // `not_registered` would become a workspace-validation failure, which recovery
+  // parks for manual repair. Rethrow the stall instead: the run fails as a
+  // retryable setup/adapter failure and the next attempt re-checks.
+  if (registered === null && listed.error instanceof GitCommandTimeoutError) throw listed.error;
   if (!registered) {
     return {
       ...base,
