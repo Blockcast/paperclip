@@ -112,7 +112,7 @@ describe("resolveAlertPriority (BLO-20576 per-rule escape hatch)", () => {
         resolveAlertPriority(
           withLabels({ severity: "warning", paperclip_priority: bad }),
         ),
-      ).toEqual({ priority: "medium", ignoredLabel: bad });
+      ).toEqual({ priority: "medium", ignoredValue: bad });
     }
   });
 
@@ -120,13 +120,13 @@ describe("resolveAlertPriority (BLO-20576 per-rule escape hatch)", () => {
     expect(
       resolveAlertPriority(
         withLabels({ severity: "warning", paperclip_priority: "hgih" }),
-      ).ignoredLabel,
+      ).ignoredValue,
     ).toBe("hgih");
     // An honoured label is not a finding.
     expect(
       resolveAlertPriority(
         withLabels({ severity: "warning", paperclip_priority: "high" }),
-      ).ignoredLabel,
+      ).ignoredValue,
     ).toBeUndefined();
   });
 
@@ -159,9 +159,49 @@ describe("resolveAlertPriority (BLO-20576 per-rule escape hatch)", () => {
       expect(() => resolveAlertPriority(alert)).not.toThrow();
       expect(resolveAlertPriority(alert)).toEqual({
         priority: "medium",
-        ignoredLabel: `<non-string ${kind}>`,
+        ignoredValue: `<non-string ${kind}>`,
       });
     }
+  });
+
+  // `paperclip_issue` and `paperclip_dedupe_domain` both accept a label or an
+  // annotation. An annotation-only `paperclip_priority` used to fall through as
+  // "absent" — no effect, no warn, no metric — on the one surface whose whole
+  // point is overriding a default.
+  const withAnnotations = (
+    labels: Record<string, string>,
+    annotations: Record<string, string>,
+  ) =>
+    baseAlert({
+      labels: { ...baseAlert().labels, ...labels },
+      annotations: { ...baseAlert().annotations, ...annotations },
+    });
+
+  it("honours paperclip_priority set as an annotation, like its sibling escape hatches", () => {
+    expect(
+      resolveAlertPriority(
+        withAnnotations({ severity: "warning" }, { paperclip_priority: "high" }),
+      ),
+    ).toEqual({ priority: "high" });
+  });
+
+  it("reports a junk annotation value instead of treating it as absent", () => {
+    expect(
+      resolveAlertPriority(
+        withAnnotations({ severity: "warning" }, { paperclip_priority: "hgih" }),
+      ),
+    ).toEqual({ priority: "medium", ignoredValue: "hgih" });
+  });
+
+  it("the label wins over the annotation when both are set", () => {
+    expect(
+      resolveAlertPriority(
+        withAnnotations(
+          { severity: "warning", paperclip_priority: "low" },
+          { paperclip_priority: "critical" },
+        ),
+      ).priority,
+    ).toBe("low");
   });
 
   it("an absent severity still resolves under the operator's `unknown` key", () => {

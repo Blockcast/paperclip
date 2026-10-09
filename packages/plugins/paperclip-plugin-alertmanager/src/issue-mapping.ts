@@ -53,23 +53,26 @@ export function severityToPriority(
 /**
  * Outcome of resolving one alert's issue priority.
  *
- * `ignoredLabel` is set when a `paperclip_priority` label was present but
- * unusable, so the caller — which holds `ctx`, unlike this module — can warn
- * and emit a metric. Without it a typo (`hgih`) is indistinguishable from an
- * absent label: the rule author believes they opted back up and nothing
- * anywhere records that they did not.
+ * `ignoredValue` is set when a `paperclip_priority` label or annotation was
+ * present but unusable, so the caller — which holds `ctx`, unlike this module —
+ * can warn and emit a metric. Without it a typo (`hgih`) is indistinguishable
+ * from an absent value: the rule author believes they opted back up and
+ * nothing anywhere records that they did not.
  */
 export interface ResolvedAlertPriority {
   priority: PaperclipPriority;
-  /** Raw label value when present but unusable; `undefined` when honoured or absent. */
-  ignoredLabel?: string;
+  /** Raw value when present but unusable; `undefined` when honoured or absent. */
+  ignoredValue?: string;
 }
 
 /**
  * Resolve the issue priority for one alert.
  *
  * Resolution order:
- *   1. the `paperclip_priority` alert label (per-rule escape hatch, BLO-20576)
+ *   1. `paperclip_priority` (per-rule escape hatch, BLO-20576) — the alert
+ *      label, else the alert annotation, matching the sibling rule-level
+ *      escape hatches `paperclip_issue` and `paperclip_dedupe_domain`. When
+ *      both are present the label wins, as with `paperclip_dedupe_domain`.
  *   2. `severityToPriority` above (operator override map, then the default map)
  *
  * The label is the escape hatch for the `warning → medium` default: a rule
@@ -80,15 +83,21 @@ export interface ResolvedAlertPriority {
  * and fail the whole delivery, and a `PrometheusRule` is not a trusted enough
  * surface to pass straight through to the API.
  *
- * The label is read as `unknown`: `isAlertmanagerPayload` deliberately does
- * not validate label entries (see its docstring), so a YAML `paperclip_priority: 5`
+ * The result is only ever used as the priority of a *newly created* issue. An
+ * alert that joins an already-open aggregate issue for its alertname leaves
+ * that issue's priority as it is — rewriting it would also overwrite an
+ * operator's manual re-prioritization — so the escape hatch takes effect on
+ * the next issue filed for the rule, not on one already open.
+ *
+ * The value is read as `unknown`: `isAlertmanagerPayload` deliberately does
+ * not validate label or annotation entries (see its docstring), so a YAML `paperclip_priority: 5`
  * arrives as a number at runtime despite the declared `Record<string, string>`.
  * Calling a string method on it would throw a `TypeError` — not a
  * `PermanentAlertError` — which fails the whole batch and makes Alertmanager
  * redeliver into the same deterministic crash until the alert is lost. Mirrors
  * the `paperclip_issue` guard in `webhook-handler.ts`.
  *
- * A whitespace-only label is treated as absent, not as a typo: Prometheus drops
+ * A whitespace-only value is treated as absent, not as a typo: Prometheus drops
  * empty labels, so warning on one would be noise about a value nobody set.
  */
 export function resolveAlertPriority(
@@ -102,17 +111,18 @@ export function resolveAlertPriority(
     alert.labels.severity ?? "unknown",
     override,
   );
-  const raw: unknown = alert.labels.paperclip_priority;
+  const raw: unknown =
+    alert.labels.paperclip_priority ?? alert.annotations.paperclip_priority;
   if (raw === undefined) return { priority };
   if (typeof raw !== "string") {
-    return { priority, ignoredLabel: `<non-string ${typeof raw}>` };
+    return { priority, ignoredValue: `<non-string ${typeof raw}>` };
   }
   const key = raw.trim().toLowerCase();
   if (!key) return { priority };
   if ((ISSUE_PRIORITIES as readonly string[]).includes(key)) {
     return { priority: key as PaperclipPriority };
   }
-  return { priority, ignoredLabel: raw };
+  return { priority, ignoredValue: raw };
 }
 
 /**
