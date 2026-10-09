@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -195,7 +195,14 @@ describe("ghReadBody: the deadline stays armed through the body read (BLO-38257)
     const offenders: string[] = [];
     let bodyReads = 0;
 
-    for (const file of readdirSync(dir).filter((f) => f.endsWith(".ts"))) {
+    // Recursive: `server/src/services/recovery/` is a real subdirectory, and a
+    // non-recursive scan certifies the top level while a service one directory
+    // down escapes silently — the same rot this guard replaced a file list to
+    // delete. Entries come back relative to `dir`, so `join` below is unchanged
+    // and the offender label gains the subdirectory for free.
+    for (const file of readdirSync(dir, { recursive: true, encoding: "utf8" }).filter((f) =>
+      f.endsWith(".ts"),
+    )) {
       const source = readFileSync(join(dir, file), "utf8");
       if (!source.includes("ghFetch(") || !source.includes("unprocessable(")) continue;
       scanned.push(file);
@@ -223,12 +230,39 @@ describe("ghReadBody: the deadline stays armed through the body read (BLO-38257)
     expect(offenders).toEqual([]);
   });
 
-  it("the guard counts real matches: an empty directory yields no body reads", () => {
-    const empty = mkdtempSync(join(tmpdir(), "ghfetch-scan-"));
+  /**
+   * Depth, with a control in the same scan. The nested probe is the assertion;
+   * the top-level one is found with or without recursion, so a red here reads
+   * "the scan lost its recursion" rather than "the probe stopped matching the
+   * membership rule" — the two failures are otherwise indistinguishable.
+   *
+   * This replaces an empty-directory test that asserted the zero shape on zero
+   * input: true of every implementation, including every broken one, so it had
+   * no failing mutation (CEO 2026-09-17). Non-vacuity against the real tree is
+   * `expect(bodyReads).toBeGreaterThan(0)` above, which does have one.
+   */
+  it("reaches a service in a subdirectory and labels it with that subdirectory", () => {
+    const root = mkdtempSync(join(tmpdir(), "ghfetch-scan-"));
+    const nested = join("recovery", "probe.ts");
+    const probe = [
+      "const res = await ghFetch(url);",
+      'if (!res.ok) throw unprocessable("github said no");',
+      "const body = await res.json();",
+    ].join("\n");
     try {
-      expect(scanGhFetchBodyReads(empty)).toEqual({ scanned: [], bodyReads: 0, offenders: [] });
+      mkdirSync(join(root, "recovery"));
+      writeFileSync(join(root, nested), `${probe}\n`);
+      writeFileSync(join(root, "top.ts"), `${probe}\n`);
+
+      const { scanned, offenders } = scanGhFetchBodyReads(root);
+
+      expect(scanned).toContain(nested);
+      expect(offenders).toContain(`${nested}: const body = await res.json();`);
+      // Control: reachable at either depth, so it stays green under the
+      // recursion mutation and keeps the assertions above honest.
+      expect(scanned).toContain("top.ts");
     } finally {
-      rmSync(empty, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
