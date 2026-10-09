@@ -5532,12 +5532,14 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
   // and a contended walk has run past its 30s bound while the worktree stayed
   // registered. A failed list must not become `not_registered`. The shim fails
   // only `worktree`, so every other git call in the inspection is real.
-  async function withFailingWorktreeList<T>(run: () => Promise<T>): Promise<T> {
+  // `exit` fails the list with exit 128; `stall` hangs it so the 30s bound fires.
+  async function withFailingWorktreeList<T>(run: () => Promise<T>, mode: "exit" | "stall" = "exit"): Promise<T> {
     const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
     const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-list-fails-"));
+    const failList = mode === "stall" ? "exec sleep 300" : `echo "simulated failure" >&2; exit 128`;
     await fs.writeFile(
       path.join(fakeBin, "git"),
-      `#!/bin/sh\nfor arg in "$@"; do [ "$arg" = worktree ] && { echo "simulated stall" >&2; exit 128; }; done\nexec "${realGit}" "$@"\n`,
+      `#!/bin/sh\nfor arg in "$@"; do [ "$arg" = worktree ] && { ${failList}; }; done\nexec "${realGit}" "$@"\n`,
       { mode: 0o755 },
     );
     const previousPath = process.env.PATH;
@@ -5546,6 +5548,7 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
       return await run();
     } finally {
       process.env.PATH = previousPath;
+      await fs.rm(fakeBin, { recursive: true, force: true });
     }
   }
 
@@ -5582,6 +5585,42 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
 
     expect(inspection).toMatchObject({ valid: false, reasonCode: "not_registered" });
   });
+
+  it("rethrows the list's stall when the direct read stalls too, instead of reporting not_registered", async () => {
+    // Neither source answered. `not_registered` would park the issue for manual
+    // repair on a guess, so the stall must surface as an error the run treats as
+    // retryable.
+    const { worktreePath } = await createLinkedWorktree("BLO-42089-stalled");
+    const dotGit = path.join(worktreePath, ".git");
+    const realReadFile = fs.readFile.bind(fs);
+    const realSetTimeout = globalThis.setTimeout;
+    let releaseRead: (value: string) => void = () => {};
+    const readSpy = vi.spyOn(fs, "readFile").mockImplementation(((file: unknown, ...rest: unknown[]) =>
+      file === dotGit
+        ? new Promise<string>((resolve) => { releaseRead = resolve; })
+        : (realReadFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest)) as never);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const outcome = await withFailingWorktreeList(async () => {
+        const settled = inspectManagedGitWorktreeBranch({ worktreePath, expectedBranchName: "BLO-42089-stalled" })
+          .then((value) => ({ value }), (error: unknown) => ({ error }));
+        // Each 30s bound is armed only when its call starts, so step fake time
+        // while giving the real subprocesses a moment between steps.
+        for (let step = 0; step < 300; step += 1) {
+          const done = await Promise.race([settled, new Promise<null>((resolve) => realSetTimeout(() => resolve(null), 20))]);
+          if (done) return done;
+          await vi.advanceTimersByTimeAsync(5_000);
+        }
+        throw new Error("inspection never settled");
+      }, "stall");
+      expect(outcome).toMatchObject({ error: { name: "GitCommandTimeoutError" } });
+    } finally {
+      vi.useRealTimers();
+      // Settle the abandoned read so its reclaim-deadline hold is released.
+      releaseRead("");
+      readSpy.mockRestore();
+    }
+  }, 30_000);
 });
 
 describe("ensureRuntimeServicesForRun", () => {
