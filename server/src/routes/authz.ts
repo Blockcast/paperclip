@@ -337,15 +337,20 @@ export type RunTranscriptReadOutcome = {
  * route's compact snapshot does not change that scope; withholding captured
  * output here is separate from credential scrubbing of run inputs.
  *
- * NOT `GET /workspace-operations/:operationId/log`. That route is deliberately
- * left on BLO-34631's `workspace_runtime:read` entitlement and is not
- * additionally gated here; the reasoning, and why stacking the two would change
- * no bytes, is on the route itself (`routes/agents.ts`, the
- * `workspace-operations/:operationId/log` handler). Said explicitly because
- * this docblock is where a maintainer asks "is the operation log gated?", and
- * it previously answered yes about a gate that is not this one (Ally review
- * 5375217878). Note the two entitlements do agree on viewers: neither admits
- * one without a grant.
+ * AND `GET /workspace-operations/:operationId/log`, as of PEN-3204. That route
+ * reveals the log body only when BLO-34631's `workspace_runtime:read`
+ * entitlement AND this decision both admit the reader — an AND, so it does not
+ * widen `runs:read_transcript` into the route (a grant holder without the
+ * entitlement still gets the masked body). The earlier rationale for leaving it
+ * on the entitlement alone still holds for AGENT actors (`workspace_runtime:read`
+ * is absent from the same-company agent allow-list, so none resolves it) but
+ * not for humans: the entitlement tests the raw membership role and fails OPEN
+ * on a role outside the union (e.g. a cloud-tenant `support` member), where
+ * this decision fails closed. The full reasoning is on the route itself
+ * (`routes/agents.ts`, the `workspace-operations/:operationId/log` handler).
+ * Said explicitly because this docblock is where a maintainer asks "is the
+ * operation log gated?" — it has answered that wrongly twice before (Ally
+ * reviews 5375217878 and 5473959448).
  *
  * A workspace operation is a MIX rather than a counterexample: the operation
  * ROW stays company-readable — `phase`, `status`, `exitCode`, `command`, `cwd`,
