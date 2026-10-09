@@ -381,6 +381,33 @@ for (const [name, mutate] of [
   });
 }
 
+// A lift that SUCCEEDS but yields a program jq cannot run is a shape the cases
+// above cannot catch: the markers are intact, so every lifting seam passes, and
+// only jq's exit status (1 = false, 3/5 = could not evaluate) separates a false
+// predicate from a broken one. Folding the two read a runtime-broken serving
+// predicate as `false` and reported this BLO-41478 lock -- stranded when the
+// predicate runs -- as `landing`, exit 0, with nothing on stderr.
+test("refuses to conclude when a lifted predicate cannot be evaluated", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "stranded-mutate-"));
+  const mutated = path.join(dir, "approve.sh");
+  const before = readFileSync(approvePath, "utf8");
+  const after = before.replace(
+    "# BEGIN ROLLOUT_SERVING_JQ\n",
+    "# BEGIN ROLLOUT_SERVING_JQ\n(null | keys | length) >= 0 and\n",
+  );
+  assert.notEqual(after, before, "body mutation matched nothing -- it tests nothing");
+  writeFileSync(mutated, after);
+
+  const run = runChecker({
+    cm: configmap({ generation: 590, writtenAt: minutesAgo(300) }),
+    deploy: deployment({ digest: OTHER_DIGEST, marker: OTHER_MARKER, generation: 594, observedGeneration: 594 }),
+    approveScriptOverride: mutated,
+  });
+  assert.equal(run.status, 2, `expected exit 2, got ${run.status}:\n${run.stdout}${run.stderr}`);
+  assert.doesNotMatch(run.stdout, /verdict=/);
+  assert.match(run.stderr, /jq could not evaluate a lifted predicate/);
+});
+
 test("a missing approval script is refused, not treated as no lock", () => {
   const run = runChecker({
     cm: configmap(null),
