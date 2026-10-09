@@ -52,11 +52,19 @@ never hold two identities).
 
 States: `reserved → launching → launched → release_pending → released`.
 
+`release_pending` is written by the database, not by `server/src`: the
+`heartbeat_runs_release_external_runtime_reservation` trigger (migration
+`0128`) moves a `launching` or `launched` lease there when its run goes
+terminal, and a `reserved` lease (no Job yet) straight to `released`. Server
+code only reads the state, to finish the release once the Job is gone.
+`external-runtime-reservations.test.ts` asserts the cancelled-run case. So the
+release-pending gauges below are live signals, not structurally zero.
+
 Two partial-unique indexes do the actual containment:
 
-- **`..._active_slot_idx` on `(agent_id, slot_id)`**, `WHERE released_at IS
+- **`external_runtime_reservations_active_slot_idx` on `(agent_id, slot_id)`**, `WHERE released_at IS
   NULL` — the per-agent ceiling. Slots are dense from 0.
-- **`..._active_isolation_writer_idx` on `isolation_key`**, `WHERE released_at
+- **`external_runtime_reservations_active_isolation_writer_idx` on `isolation_key`**, `WHERE released_at
   IS NULL AND isolation_key IS NOT NULL` — one writer per shared mutable
   resource. That second clause is why an unbound row does not contend.
 
@@ -142,7 +150,7 @@ Exposed on `/metrics` (`server/src/services/metrics.ts`):
 | `paperclip_external_runtime_reservations_active` | live leases |
 | `paperclip_external_runtime_reservation_oldest_age_seconds` | oldest live lease — a lease that never releases shows up here first |
 | `paperclip_external_runtime_reservation_stranded_oldest_age_seconds` | stranded leases specifically (labelled; prefer this for alerting over the unlabelled gauge above) |
-| `paperclip_external_runtime_reservations_release_pending` / `..._release_pending_oldest_age_seconds` | teardown that started and did not finish |
+| `paperclip_external_runtime_reservations_release_pending` / `paperclip_external_runtime_reservation_release_pending_oldest_age_seconds` (note: singular `reservation`) | teardown that started and did not finish |
 
 Direct reconciliation query — live Jobs with `active>0` should equal
 unreleased reservations minus `reserved` and `launching` (no Job yet on the
@@ -204,10 +212,20 @@ reconciler.
 
 Workspace-side cleanup is separate and has its own metrics —
 `paperclip_isolation_workspace_reaper_*` for ephemeral run roots and
-`paperclip_execution_workspace_collector_*` / `..._teardown_*` for worktrees.
+`paperclip_execution_workspace_collector_*` / `paperclip_execution_workspace_teardown_*` for worktrees.
 A leaked *workspace* does not hold a slot; a leaked *reservation* does.
 
-Manual release, when **no live Job owns the lease**. Read the row first — you
+**First-line remedy: make the run terminal, not the lease.** `cancelRun`
+deletes the Job by its recorded name and lets the reaper release the
+reservation — the same path the code automates. For the `name_mismatch` /
+adapter-type strand, BLO-28865 self-heals that way and
+[`runbooks/external-runtime-reservation-stranded.md`](../runbooks/external-runtime-reservation-stranded.md)
+is the procedure, including what not to clear (`job_name` / `job_uid` are the
+only handle on an orphaned Job). Start there.
+
+The raw `UPDATE` below is the **fallback** for a lease whose run is already
+terminal, so there is no run left to cancel, and that still holds a slot. Use it
+only when **no live Job owns the lease**. Read the row first — you
 need a Job name to check against and `state` to know which case you are in:
 
 ```sql
@@ -229,7 +247,8 @@ succeed after the reservation gating it was released, so a `reserved` /
 needs *more* care, not less: identify the Job by name and run/agent labels
 before releasing anything.
 
-The `name_mismatch` row from the failure signature above is raised only from
+If you reached this fallback from a `name_mismatch` row, the run was already
+terminal; otherwise go back to `cancelRun` above. The row is raised only from
 `launched` — but `launched` does **not** imply a non-null `job_uid`
 (`recordExternalRuntimeJobIdentity` coalesces a null uid in), so it is not
 automatically the safe present-and-different case. Read `job_uid` from the
