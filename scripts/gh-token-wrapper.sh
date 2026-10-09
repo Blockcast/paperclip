@@ -155,8 +155,13 @@ if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
   # or to the real binary: a malformed binding is a misconfiguration, and
   # continuing would run `gh` under whatever ambient GH_TOKEN/GITHUB_TOKEN the
   # caller happened to inherit — an unintended identity, silently.
+  #
+  # The empty case also names the BLO-40279 move: the documented recipe fills
+  # this from `$(cat <token file>)`, and a stale /paperclip/.secrets path makes
+  # that cat fail and leave the variable set-but-empty, so the refusal fires
+  # here and never reaches reject_token_file()'s path-specific hint below.
   if [ -z "${TOKEN}" ]; then
-    echo "gh-token-wrapper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+    echo "gh-token-wrapper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth. If it was filled by cat-ing a token file, that read failed: a path under /paperclip/.secrets is stale since BLO-40279, and the token Secrets now mount at /etc/paperclip/secrets/<name>/token" >&2
     exit 64
   fi
   case "${TOKEN}" in

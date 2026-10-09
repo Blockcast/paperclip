@@ -10,7 +10,7 @@ if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
     esac
   done
   if [ -z "${TOKEN}" ]; then
-    echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+    echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth. If it was filled by cat-ing a token file, that read failed: a path under /paperclip/.secrets is stale since BLO-40279, and the token Secrets now mount at /etc/paperclip/secrets/<name>/token" >&2
     exit 64
   fi
   case "${TOKEN}" in
@@ -25,13 +25,19 @@ if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
   exec "$@"
 fi
 TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/etc/paperclip/secrets/github-token/token}"
+MOVED=""
+case "${TOKEN_FILE}" in
+  /paperclip/.secrets/*)
+    MOVED=" (stale path: the token Secrets moved to /etc/paperclip/secrets/<name>/token in BLO-40279; point PAPERCLIP_GITHUB_TOKEN_FILE at the new path)"
+    ;;
+esac
 if [ ! -r "${TOKEN_FILE}" ]; then
-  echo "paperclip github token file not readable: ${TOKEN_FILE}" >&2
+  echo "paperclip github token file not readable: ${TOKEN_FILE}${MOVED}" >&2
   exit 1
 fi
 TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}")"
 if [ -z "${TOKEN}" ]; then
-  echo "paperclip github token file is empty: ${TOKEN_FILE}" >&2
+  echo "paperclip github token file is empty: ${TOKEN_FILE}${MOVED}" >&2
   exit 1
 fi
 export GH_TOKEN="${TOKEN}"
