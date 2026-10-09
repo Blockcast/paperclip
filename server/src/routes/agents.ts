@@ -5450,7 +5450,10 @@ export function agentRoutes(
     // returns run-less workspace-scoped cleanup rows, so the rows in this one
     // response do not all share this run's owner, and `run.agentId` is the wrong
     // answer for the cleanup ones.
-    const owners = await workspaceOperations.owningAgentIdsByRunId(operations.map((op) => op.heartbeatRunId));
+    const owners = await workspaceOperations.owningAgentIdsByRunId(
+      operations.map((op) => op.heartbeatRunId),
+      run.companyId,
+    );
     const projected = await withholdUnentitledWorkspaceOperationOutput(
       publicWorkspaceOperations(operations, viewer),
       owners,
@@ -5550,7 +5553,10 @@ export function agentRoutes(
     // Owner resolution mirrors `withholdUnentitledWorkspaceOperationOutput` rather than
     // re-deriving it: a run-less operation has no owner to decide about, so it falls back to the
     // same human-operator test that helper uses, and withholds for everyone else.
-    const owners = await workspaceOperations.owningAgentIdsByRunId([operation.heartbeatRunId]);
+    const owners = await workspaceOperations.owningAgentIdsByRunId(
+      [operation.heartbeatRunId],
+      operation.companyId,
+    );
     const ownerAgentId = operation.heartbeatRunId ? owners.get(operation.heartbeatRunId) : undefined;
     const transcriptEntitled = ownerAgentId
       ? await runTranscriptReadGate(req, access, operation.companyId)(ownerAgentId)
