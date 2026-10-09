@@ -120,6 +120,20 @@ export interface AlertmanagerPluginConfig {
   operatorSuppressionHours?: number;
   escalationDeadlineMinutes?: Record<string, number>;
   /**
+   * Base URL of the Alertmanager this instance receives webhooks from, e.g.
+   * `http://alertmanager.monitoring.svc.cluster.local:9093` (BLO-40739).
+   *
+   * Used by the escalation sweep to PULL alert state before a ladder rung
+   * posts or reassigns. The push path cannot answer that question on its own:
+   * `resolvedAt` is written only when Alertmanager DELIVERS a resolve webhook,
+   * and that delivery is at-most-once. When it is lost, `resolvedAt: null`
+   * silently means "we never heard" rather than "still firing".
+   *
+   * Unset is a supported state, not a broken one — the ladder then says it did
+   * not verify liveness instead of asserting it.
+   */
+  alertmanagerApiUrl?: string;
+  /**
    * Width (minutes) of the board-cover dedup window (BLO-15982). Concurrent
    * same-alertname escalation ladders that reach the cover rung within the
    * same window bucket share one retained cover instead of each opening
