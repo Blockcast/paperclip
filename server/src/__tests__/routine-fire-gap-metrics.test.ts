@@ -282,6 +282,42 @@ describeEmbeddedPostgres("refreshRoutineFireGapMetrics (BLO-32638)", () => {
     expect(await gaugeValue(ROUTINE_FIRE_INTERVAL_METRIC, routineId)).toBe(String(15 * 60));
   });
 
+  it("publishes an irregular cron's LONGEST gap, so a healthy weekend cannot page (Ally on #2352)", async () => {
+    // `0 15 * * 1-5`, live in this fleet (routine 55bad102, "Triage residual
+    // assigned-elsewhere drift"). Its shortest gap is 24h; its legitimate
+    // Fri 15:00 -> Mon 15:00 gap is 72h. Publishing the shortest made the
+    // threshold 2 * 24h = 48h, so every weekend paged from Sun 15:00 until
+    // Monday's fire landed.
+    const companyId = await insertCompany();
+    const routineId = await insertRoutine({
+      companyId,
+      triggers: [{ cronExpression: "0 15 * * 1-5" }],
+    });
+    // Friday's fire completed on time; it is Sunday 16:00, 49h later, and
+    // nothing is wrong -- the next fire is not due until Monday 15:00.
+    const sunday = new Date("2026-10-11T16:00:00.000Z");
+    await insertRun({
+      companyId,
+      routineId,
+      status: "completed",
+      completedAt: new Date("2026-10-09T15:00:00.000Z"),
+    });
+
+    await refreshRoutineFireGapMetrics(db, sunday);
+
+    const age = Number(await gaugeValue(ROUTINE_LAST_DONE_FIRE_AGE_METRIC, routineId));
+    const interval = Number(await gaugeValue(ROUTINE_FIRE_INTERVAL_METRIC, routineId));
+    expect(age).toBe(49 * HOUR_S);
+    expect(interval).toBe(72 * HOUR_S);
+    // The rule, evaluated: silent. With the shortest gap (86400) this is
+    // 176400 > 172800 and pages.
+    expect(age).toBeLessThanOrEqual(2 * interval);
+
+    // And the trade, pinned so nobody is surprised by it: a weekday routine
+    // that genuinely died still pages, but only past 2 * 72h, not 2 * 24h.
+    expect(7 * 24 * HOUR_S).toBeGreaterThan(2 * interval);
+  });
+
   it("drops a routine out of the interval gauge once it is paused, rather than latching", async () => {
     const companyId = await insertCompany();
     const routineId = await insertRoutine({ companyId });

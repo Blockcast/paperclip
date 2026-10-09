@@ -744,9 +744,22 @@ spec:
           # permanently firing on a daily one -- and a hand-maintained
           # per-routine threshold list is the thing that rots silently the
           # next time someone edits a cron. The right-hand side is derived
-          # from the trigger's cron by the SAME function routine dispatch
-          # bounds its lock with, so the alert and the dispatch bound cannot
-          # drift apart.
+          # from the trigger's cron by the SAME sample routine dispatch
+          # bounds its lock with (deriveRoutineFireGapsMs), so the alert and
+          # the dispatch bound cannot drift apart. Dispatch takes the
+          # sample's SHORTEST gap; this takes its LONGEST, because on an
+          # irregular cron (`0 15 * * 1-5`) the shortest would page on every
+          # healthy Fri -> Mon gap. The cost is detection latency on such a
+          # cron (a dead weekday routine pages after 2 x 72h, not 2 x 24h).
+          #
+          # ⚠ This chart copy is the in-repo SPEC, not the deploy path:
+          # values.blockcast.yaml keeps prometheusRule.enabled false
+          # (BLO-14556 / BLO-20171 -- paperclip-ci-deploy cannot write
+          # monitoring.coreos.com). The rules that actually load live in
+          # Blockcast/onprem-k8s: paperclip/paperclip-runtime-alerts-prometheusrule.yaml
+          # and its lockstep ConfigMap key in
+          # monitoring/prometheus-rules-2-configmap.yaml. Change both repos
+          # together.
           #
           # The vector match is load-bearing in both directions. A paused
           # routine and a webhook/api-only routine emit no interval series, so
@@ -780,7 +793,7 @@ spec:
             severity: warning
           annotations:
             summary: "Paperclip routine {{`{{ $labels.routine_id }}`}} has not completed a fire in {{ .Values.prometheusRule.routineFireGapIntervalMultiplier }}x its own cadence"
-            description: "Routine {{`{{ $labels.routine_id }}`}} last completed a fire {{`{{ $value }}`}}s ago, more than {{ .Values.prometheusRule.routineFireGapIntervalMultiplier }}x the cadence its own cron implies (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+            description: "Routine {{`{{ $labels.routine_id }}`}} last completed a fire {{`{{ $value }}`}}s ago, more than {{ .Values.prometheusRule.routineFireGapIntervalMultiplier }}x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
             runbook_url: {{ .Values.prometheusRule.routineFireGapRunbookUrl | quote }}
         - alert: PaperclipRoutineFireGapMetricsRefreshFailed
           # Separate from the gap alert for the same reason as the queued-run

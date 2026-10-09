@@ -39,7 +39,7 @@ tests:
               routine_id: bridge-watchdog
             exp_annotations:
               summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
-              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the cadence its own cron implies (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
               runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
       # The smallest of the 11 measured gaps, 12h, also fires -- so the rule
       # covers the whole measured cohort and not just its worst member.
@@ -51,7 +51,7 @@ tests:
               routine_id: bridge-watchdog
             exp_annotations:
               summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
-              description: "Routine bridge-watchdog last completed a fire 43200s ago, more than 2x the cadence its own cron implies (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              description: "Routine bridge-watchdog last completed a fire 43200s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
               runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
 
   # ── Negative control: the healthy intervals in that same history. ─────────
@@ -112,6 +112,67 @@ tests:
       - eval_time: 30h42m
         alertname: PaperclipRoutineFireGap
         exp_alerts: []
+
+  # ── Irregular cron: a weekday routine's weekend is not an outage. ────────
+  # Ally on #2352. `0 15 * * 1-5` is live in this fleet (routine 55bad102).
+  # Its gauge publishes the LONGEST gap the cron schedules, Fri 15:00 -> Mon
+  # 15:00 = 259200s. The age below is that exact healthy history: Friday's
+  # fire lands at t=0, nothing until Monday's at 72h, then a normal 24h day.
+  #
+  # Mutation control: set the interval series to 86400 -- what the gauge
+  # published when it took the SHORTEST gap -- and the Sun and Mon eval_times
+  # below go red (age crosses 2 x 86400 at Sun 15:00, firing after `for: 10m`).
+  # That is the ~24h weekly false page this scenario exists to keep out.
+  - interval: 1m
+    name: "a weekday cron's healthy Fri->Mon gap stays silent"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="weekday-triage", instance="pod-a", job="paperclip-control-plane"}'
+        values: "0+60x4319 0+60x1439"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="weekday-triage", instance="pod-a", job="paperclip-control-plane"}'
+        values: "259200+0x5759"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x5759"
+    alert_rule_test:
+      # Sun 15:15 -- where the shortest-gap denominator was already firing.
+      - eval_time: 48h15m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+      # Mon 14:59, the very end of the legitimate gap.
+      - eval_time: 71h59m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+      # Tue 14:59, an ordinary weekday after Monday's fire.
+      - eval_time: 95h59m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+
+  # ── The price of the longest-gap denominator, pinned. ─────────────────────
+  # A weekday routine that genuinely died still pages -- after 2 x 72h = 144h
+  # (+ `for: 10m`), not after 2 x 24h. Pinned in both directions so the trade
+  # cannot silently move: silent at 143h, firing at 145h.
+  - interval: 1m
+    name: "a dead weekday routine pages past 2x its longest gap, not before"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="weekday-triage", instance="pod-a", job="paperclip-control-plane"}'
+        values: "0+60x8760"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="weekday-triage", instance="pod-a", job="paperclip-control-plane"}'
+        values: "259200+0x8760"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x8760"
+    alert_rule_test:
+      - eval_time: 143h
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+      - eval_time: 145h
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: weekday-triage
+            exp_annotations:
+              summary: "Paperclip routine weekday-triage has not completed a fire in 2x its own cadence"
+              description: "Routine weekday-triage last completed a fire 522000s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
 
   # ── A paused / webhook-only routine has no interval and cannot page. ──────
   # Not a special case in the rule: with no right-hand side the vector match
@@ -189,7 +250,7 @@ tests:
               routine_id: bridge-watchdog
             exp_annotations:
               summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
-              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the cadence its own cron implies (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
               runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
 
   # ── One replica's stale snapshot must not bless or suppress the others. ───
@@ -224,7 +285,7 @@ tests:
               routine_id: bridge-watchdog
             exp_annotations:
               summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
-              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the cadence its own cron implies (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
               runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
 
   # ── The age-side gate, pinned. A stale replica must not MANUFACTURE a page. ─

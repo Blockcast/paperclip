@@ -37,6 +37,11 @@ test("the measured incident replay passes against the rendered rule (BLO-32638)"
       "template",
       "paperclip",
       "deploy/helm/paperclip",
+      // Same values the sibling prometheus-rule.test.mjs renders with, so the
+      // replay is pinned to what deploys. That file keeps the flag false
+      // (BLO-14556), hence the explicit override.
+      "-f",
+      "deploy/helm/paperclip/values.blockcast.yaml",
       "--set",
       "prometheusRule.enabled=true",
       "--show-only",

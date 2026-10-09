@@ -4482,17 +4482,19 @@ function ensureRegistry(): {
     routineFireInterval = new Gauge({
       name: ROUTINE_FIRE_INTERVAL_METRIC,
       help:
-        "The cadence in seconds an active, schedule-triggered routine is expected to fire at "
-        + "(BLO-32638), derived from the trigger's own cron by deriveRoutineFireIntervalMs -- the "
-        + "SAME derivation routine dispatch bounds its lock with, so the alert threshold and the "
-        + "dispatch bound cannot drift apart when a cron is edited. The raw interval, not the "
-        + "jitter-shaved dispatch horizon. Exists so one relative rule ("
+        "The LONGEST gap in seconds between consecutive scheduled fires of an active, "
+        + "schedule-triggered routine (BLO-32638), sampled from the trigger's own cron by "
+        + "deriveRoutineFireGapsMs -- the SAME sample routine dispatch bounds its lock with, so "
+        + "the alert threshold and the dispatch bound cannot drift apart when a cron is edited. "
+        + "Dispatch takes that sample's shortest gap; this takes its longest, because on an "
+        + "irregular cron (`0 15 * * 1-5`) the shortest gap would page on every healthy weekend "
+        + "gap. The raw gap, not the jitter-shaved dispatch horizon. Exists so one relative rule ("
         + ROUTINE_LAST_DONE_FIRE_AGE_METRIC + " > 2 * this) covers every routine instead of a "
         + "hand-maintained per-routine threshold. A paused routine, and a routine whose only "
         + "triggers are webhook/api, emit NO series here: with no right-hand side the alert's "
         + "vector match drops them, which is the correct behaviour rather than a special case. "
-        + "Where several enabled schedule triggers exist the MINIMUM interval wins, since that "
-        + "is the cadence fires should actually be arriving at.",
+        + "Where several enabled schedule triggers exist the MINIMUM of their longest gaps wins: "
+        + "fires arrive from all of them, so that is still an upper bound on any healthy gap.",
       labelNames: ["routine_id"],
       registers: [registry],
     });
