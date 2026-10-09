@@ -2672,23 +2672,22 @@ export async function handleFiring(
     const ownerOverride =
       resolution.source === "label-override" ||
       resolution.source === "annotation-override";
-    const resolvedAssigneeAgentId = ownerOverride
-      ? assigneeAgentId
-      : routeAssigneeAgentId ?? assigneeAgentId;
-    createAssigneeUserId = resolvedAssigneeAgentId
+    // BLO-26613: never hand a new issue to an agent that can't act on it —
+    // see resolveInvokableAssigneeAgentId.
+    createAssigneeAgentId = await resolveInvokableAssigneeAgentId(
+      ctx,
+      companyId,
+      ownerOverride ? assigneeAgentId : routeAssigneeAgentId ?? assigneeAgentId,
+    );
+    // Keyed off the post-guard id, so a dropped agent does not also discard a
+    // resolvable human owner.
+    createAssigneeUserId = createAssigneeAgentId
       ? undefined
       : ownerOverride
         ? assigneeUserId
         : routeHasAssigneeUserId
           ? routeAssigneeUserId
           : assigneeUserId;
-    // BLO-26613: never hand a new issue to an agent that can't act on it —
-    // see resolveInvokableAssigneeAgentId.
-    createAssigneeAgentId = await resolveInvokableAssigneeAgentId(
-      ctx,
-      companyId,
-      resolvedAssigneeAgentId,
-    );
     assigneeResolutionSource = resolution.source;
     resolvedTarget =
       resolution.agentId
