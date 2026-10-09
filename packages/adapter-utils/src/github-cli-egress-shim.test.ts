@@ -255,6 +255,15 @@ describe("scrubGitHubCliInvocation", () => {
       "];",
     ].join("\n");
 
+    // BLO-41262: the refusal names the line. The excerpt is the SCRUBBED line,
+    // so the message cannot carry the material it refused back out to stderr.
+    const fixtureLocation = (key: string | null) => ({
+      key,
+      line: 2,
+      classes: ["vendor-key"],
+      excerpt: `  "${redactionMarker("vendor-key")}",`,
+    });
+
     it("passes clean content through byte-exact", () => {
       const argv = ["api", "repos/o/r/git/blobs", "-f", "content=export const x = 1;\n"];
       const result = scrubGitHubCliInvocation(argv, makeIo());
@@ -275,7 +284,12 @@ describe("scrubGitHubCliInvocation", () => {
       expect(io.written).toEqual([]);
       // ...but the invocation is not allowed to run.
       expect(result.refusals).toEqual([
-        { field: "content", path: null, classes: ["vendor-key"] },
+        {
+          field: "content",
+          path: null,
+          classes: ["vendor-key"],
+          locations: [fixtureLocation(null)],
+        },
       ]);
     });
 
@@ -301,7 +315,12 @@ describe("scrubGitHubCliInvocation", () => {
       expect(result.argv[3]).toBe("content=@/tmp/src.ts");
       expect(io.written).toEqual([]); // no scrubbed temp copy for gh to send
       expect(result.refusals).toEqual([
-        { field: "content", path: "/tmp/src.ts", classes: ["vendor-key"] },
+        {
+          field: "content",
+          path: "/tmp/src.ts",
+          classes: ["vendor-key"],
+          locations: [fixtureLocation(null)],
+        },
       ]);
     });
 
@@ -316,8 +335,37 @@ describe("scrubGitHubCliInvocation", () => {
       expect(result.argv[3]).toBe("/tmp/blob.json");
       expect(io.written).toEqual([]);
       expect(result.refusals).toEqual([
-        { field: "--input", path: "/tmp/blob.json", classes: ["vendor-key"] },
+        {
+          field: "--input",
+          path: "/tmp/blob.json",
+          classes: ["vendor-key"],
+          locations: [fixtureLocation("content")],
+        },
       ]);
+    });
+
+    it("passes an RFC-XML draft through a --input blob write (BLO-41262)", () => {
+      // The regression. A `seriesInfo` draft name in a quoted `value` scores above
+      // the entropy floor, so every .md draft in Blockcast/moqcast-draft was
+      // unwritable through the REST fallback while git push was down.
+      const draft = [
+        "# draft-ramadan-moq-fec",
+        "<reference anchor='MOQ-MULTICAST'>",
+        // Derived — see github-egress-scrub.test.ts on why.
+        `  <seriesInfo name='Internet-Draft' value='${["draft", "ramadan", "moq", "multicast", "00"].join("-")}'/>`,
+        "</reference>",
+      ].join("\n");
+      const body = JSON.stringify({ content: draft, encoding: "utf-8" });
+      const io = makeIo({ "/tmp/draft.json": body });
+      const result = scrubGitHubCliInvocation(
+        ["api", "repos/o/r/git/blobs", "--input", "/tmp/draft.json"],
+        io,
+      );
+
+      expect(result.refusals).toEqual([]);
+      expect(result.argv[3]).toBe("/tmp/draft.json"); // no rewritten temp copy
+      expect(io.written).toEqual([]);
+      expect(result.redacted).toBe(false);
     });
 
     it("refuses content nested in a git/trees request body", () => {
@@ -404,7 +452,7 @@ describe("scrubGitHubCliInvocation", () => {
 
       expect(io.written).toEqual([]);
       expect(result.refusals).toEqual([
-        { field: "--input", path: "/tmp/put.json", classes: ["vendor-key"] },
+        { field: "--input", path: "/tmp/put.json", classes: ["vendor-key"], locations: [fixtureLocation("content")] },
       ]);
     });
 

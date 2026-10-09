@@ -610,6 +610,23 @@ describe("scanCommit", () => {
     expect(findings[0]!.subject).toContain("fix: drop");
   });
 
+  it("passes a commit that adds an RFC-XML draft reference (BLO-41262)", () => {
+    // The same predicate gates both doors, so the gh-side false positive was
+    // also a pre-push refusal: bumping a `<seriesInfo value='draft-…'/>`
+    // reference is an ordinary edit and must push.
+    const findings = scanCommit(
+      sha,
+      fakeGit({
+        [`log -1 --format=%s ${sha}`]: "docs: bump the multicast reference",
+        [`log -1 --format=%B ${sha}`]: "docs: bump the multicast reference\n",
+        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]:
+          // Derived — see github-egress-scrub.test.ts on why.
+          `+  <seriesInfo name='Internet-Draft' value='${["draft", "ramadan", "moq", "multicast", "00"].join("-")}'/>\n`,
+      }),
+    );
+    expect(findings).toEqual([]);
+  });
+
   it("passes a clean commit", () => {
     const findings = scanCommit(
       sha,

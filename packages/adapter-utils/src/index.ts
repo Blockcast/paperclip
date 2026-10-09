@@ -73,10 +73,12 @@ export {
 // only by the two sandbox wrappers. A control nobody can locate is a control
 // nobody applies.
 export {
+  locateGitHubEgressMatches,
   redactionMarker,
   scrubGitHubEgressText,
 } from "./github-egress-scrub.js";
 export type {
+  GitHubEgressMatchLocation,
   GitHubEgressScrubClass,
   GitHubEgressScrubResult,
 } from "./github-egress-scrub.js";
