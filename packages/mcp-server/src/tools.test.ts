@@ -133,9 +133,25 @@ describe("paperclip MCP tools", () => {
       const limitDescription = (tool.schema.shape.limit as { description?: string }).description ?? "";
       expect(limitDescription).toContain("fails OPEN");
       expect(limitDescription).toMatch(/bare array whose length equals the limit actually applied[^.]*NOT proof of completeness/);
-      expect(limitDescription).not.toMatch(/so a plain array back is itself the proof/);
+      // Keyed on the hazard, not on retired wording: the only completeness
+      // "proof" the description may state is the one conditioned on the fix.
+      expect(limitDescription.match(/the proof/g)).toHaveLength(1);
+      expect(limitDescription).toMatch(/with the BLO-39015 fix a plain array back is the proof/);
+      // The default path (no `limit` sent) is a named case of the tell.
+      expect(limitDescription).toContain("500 if you sent none");
     },
   );
+
+  // The `offset` field hint is the surface a caller who suspects truncation
+  // reads in isolation; "repeat until a bare array returns" terminates on the
+  // first call against a pre-BLO-39015 server, so it must carry the caveat.
+  it("paperclipInboxLite's offset hint carries the deploy-skew caveat", () => {
+    const tool = getTool("paperclipInboxLite");
+    const offsetDescription =
+      (tool.schema.shape.offset as { description?: string }).description ?? "";
+    expect(offsetDescription).toContain("deploy-skew caveat");
+    expect(offsetDescription).toMatch(/predating BLO-39015 a bare array returns immediately and proves nothing/);
+  });
 
   it("paperclip_search_issues does not restate the bare-array proof unqualified", () => {
     const { description } = getTool("paperclip_search_issues");
