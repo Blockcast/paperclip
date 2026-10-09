@@ -34,6 +34,7 @@ import {
   ensureRuntimeServicesForRun,
   executeProcessForTests,
   GIT_INDEX_LOCK_STALE_MS,
+  inspectManagedGitWorktreeBranch,
   isProcessGroupAliveForTests,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
@@ -5523,6 +5524,63 @@ describe("realizeExecutionWorkspace", () => {
     expect(operations[2]?.metadata).toMatchObject({
       cleanupAction: "branch_delete",
     });
+  });
+});
+
+describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42089)", () => {
+  // On the shared CephFS checkouts `git worktree list` walks every registration,
+  // and a contended walk has run past its 30s bound while the worktree stayed
+  // registered. A failed list must not become `not_registered`. The shim fails
+  // only `worktree`, so every other git call in the inspection is real.
+  async function withFailingWorktreeList<T>(run: () => Promise<T>): Promise<T> {
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-list-fails-"));
+    await fs.writeFile(
+      path.join(fakeBin, "git"),
+      `#!/bin/sh\nfor arg in "$@"; do [ "$arg" = worktree ] && { echo "simulated stall" >&2; exit 128; }; done\nexec "${realGit}" "$@"\n`,
+      { mode: 0o755 },
+    );
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}${path.delimiter}${previousPath ?? ""}`;
+    try {
+      return await run();
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  }
+
+  async function createLinkedWorktree(branchName: string) {
+    const repoRoot = await createTempRepo();
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath]);
+    return { repoRoot, worktreePath };
+  }
+
+  it("reads the worktree's own registration and keeps a registered worktree valid", async () => {
+    const { worktreePath } = await createLinkedWorktree("BLO-42089-registered");
+
+    const inspection = await withFailingWorktreeList(() =>
+      inspectManagedGitWorktreeBranch({ worktreePath, expectedBranchName: "BLO-42089-registered" }),
+    );
+
+    expect(inspection).toMatchObject({ valid: true, reasonCode: null, actualBranchName: "BLO-42089-registered" });
+  });
+
+  it("still reports not_registered when the admin dir does not point back at the worktree", async () => {
+    // The control: the fallback must not turn every failed list into a pass. A
+    // `gitdir` naming some other checkout is exactly what an unregistered path
+    // looks like from the inside.
+    const { repoRoot, worktreePath } = await createLinkedWorktree("BLO-42089-dangling");
+    await fs.writeFile(
+      path.join(repoRoot, ".git", "worktrees", "BLO-42089-dangling", "gitdir"),
+      `${path.join(repoRoot, ".paperclip", "worktrees", "somewhere-else", ".git")}\n`,
+    );
+
+    const inspection = await withFailingWorktreeList(() =>
+      inspectManagedGitWorktreeBranch({ worktreePath, expectedBranchName: "BLO-42089-dangling" }),
+    );
+
+    expect(inspection).toMatchObject({ valid: false, reasonCode: "not_registered" });
   });
 });
 

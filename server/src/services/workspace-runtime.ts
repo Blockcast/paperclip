@@ -3829,6 +3829,31 @@ async function stampGitWorktreeOwnership(input: {
   return result.warnings;
 }
 
+/**
+ * Whether `worktreePath` is a linked worktree registered with `repoRoot`, read
+ * from the registration itself rather than from `git worktree list`: the
+ * worktree's `.git` file names an admin dir under `<repoRoot>/.git/worktrees/`,
+ * and that dir's `gitdir` file points back at the same `.git`. That pair is
+ * what the list enumerates. Used only when the list failed (BLO-42089), and
+ * every doubt, including a read that outlives the reclaim deadline, resolves
+ * to "not registered", the verdict a failed list already gave.
+ */
+async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: string): Promise<boolean> {
+  const dotGit = path.join(worktreePath, ".git");
+  const read = async () => {
+    const adminRef = /^gitdir:\s*(.+)$/m.exec(await fs.readFile(dotGit, "utf8"))?.[1]?.trim();
+    if (!adminRef) return false;
+    const adminDir = await resolvePathForWorktreeComparison(path.resolve(worktreePath, adminRef));
+    if (path.dirname(adminDir) !== await resolvePathForWorktreeComparison(path.join(repoRoot, ".git", "worktrees"))) {
+      return false;
+    }
+    const backRef = (await fs.readFile(path.join(adminDir, "gitdir"), "utf8")).trim();
+    return await resolvePathForWorktreeComparison(path.resolve(adminDir, backRef))
+      === await resolvePathForWorktreeComparison(dotGit);
+  };
+  return withReclaimFsDeadline(read(), dotGit).catch(() => false);
+}
+
 export async function inspectManagedGitWorktreeBranch(input: {
   worktreePath: string;
   expectedBranchName: string | null | undefined;
@@ -3865,8 +3890,18 @@ export async function inspectManagedGitWorktreeBranch(input: {
     };
   }
 
+  // BLO-42089: a failed `git worktree list` is not evidence this path is
+  // unregistered. The list touches every registration (340-453 on the shared
+  // CephFS checkouts), so one contended `getattr` can push it past its 30s
+  // bound. Measured on 2026-10-09: 33s and 50s, then 0.1-1.5s minutes later,
+  // with the worktree listed both times. Reporting that as `not_registered`
+  // blocked healthy issues for manual repair, so read this one registration
+  // directly instead.
   const listedWorktrees = await listLinkedGitWorktreePaths(repoRoot).catch(() => null);
-  if (!listedWorktrees?.has(worktreePath)) {
+  const registered = listedWorktrees
+    ? listedWorktrees.has(worktreePath)
+    : await hasLinkedGitWorktreeRegistration(repoRoot, worktreePath);
+  if (!registered) {
     return {
       ...base,
       valid: false,
