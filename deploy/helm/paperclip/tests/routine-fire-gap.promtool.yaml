@@ -1,0 +1,263 @@
+# BLO-32638 — replay the measured incident against PaperclipRoutineFireGap.
+#
+# The issue's binding verifying signal: take the alert-delivery bridge
+# watchdog's actual fire history (BLO-31881 — 11 gaps > 12h, largest 47.5h,
+# and one 30.7h window during which a real bridge outage destroyed 22 of 42
+# alerts undetected) and confirm the rule lights up in the blind window and
+# stays silent across the healthy intervals in that same history. A rule that
+# does not fire on the 30.7h window is not the rule this row asked for; one
+# that fires on normal cadence is a noise generator.
+#
+# Run:  promtool test rules deploy/helm/paperclip/tests/routine-fire-gap.promtool.yaml
+# (the rule_files path is the rendered chart output; see the mjs harness that
+# renders it next to this file).
+rule_files:
+  - rendered-rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ── The incident. 1h-cadence watchdog, silent for 30.7h. ──────────────────
+  - interval: 1m
+    name: "30.7h blind window on a 1h-cadence routine fires"
+    input_series:
+      # Age climbing from 0 across the whole window, one sample per minute.
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "0+60x1842"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "3600+0x1842"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x1842"
+    alert_rule_test:
+      # 30.7h in. 2 * 3600 = 7200s is crossed at 2h, so by 30.7h the alert has
+      # long been firing -- the window that hid a real outage is 15x the bar.
+      - eval_time: 30h42m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: bridge-watchdog
+            exp_annotations:
+              summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
+              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the cadence its own cron implies (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+      # The smallest of the 11 measured gaps, 12h, also fires -- so the rule
+      # covers the whole measured cohort and not just its worst member.
+      - eval_time: 12h
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: bridge-watchdog
+            exp_annotations:
+              summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
+              description: "Routine bridge-watchdog last completed a fire 43200s ago, more than 2x the cadence its own cron implies (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+
+  # ── Negative control: the healthy intervals in that same history. ─────────
+  # The sawtooth a working 1h routine actually produces: age climbs to ~1h,
+  # a fire lands, it resets. If the rule fires anywhere in here it is a noise
+  # generator and -- per the platform charter -- should not exist.
+  - interval: 1m
+    name: "healthy 1h cadence never fires (negative control)"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "0+60x59 0+60x59 0+60x59 0+60x59 0+60x59 0+60x59"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "3600+0x359"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x359"
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+      - eval_time: 3h30m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+      - eval_time: 5h59m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+
+  # ── One late-but-delivered fire must not page. ────────────────────────────
+  # This is why the multiplier is 2 and not 1: a fire's own dispatch horizon
+  # is already interval-minus-jitter, so ordinary lateness lands inside 1x.
+  - interval: 1m
+    name: "a single late fire at 1.5x cadence stays silent"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "0+60x90"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "3600+0x90"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x90"
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+
+  # ── Relative, not absolute: a DAILY routine at 30.7h must stay silent. ────
+  # The same age that is a 15x emergency above is normal lateness here. This
+  # is the whole reason the threshold is a multiple of the routine's own
+  # cadence rather than a seconds value.
+  - interval: 1m
+    name: "a daily routine is not paged by an age that pages an hourly one"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="daily-report", instance="pod-a", job="paperclip-control-plane"}'
+        values: "0+60x1842"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="daily-report", instance="pod-a", job="paperclip-control-plane"}'
+        values: "86400+0x1842"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x1842"
+    alert_rule_test:
+      - eval_time: 30h42m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+
+  # ── A paused / webhook-only routine has no interval and cannot page. ──────
+  # Not a special case in the rule: with no right-hand side the vector match
+  # drops it. Pinned because the day someone "helpfully" adds an `or vector(0)`
+  # default to the interval side, every paused routine pages forever.
+  - interval: 1m
+    name: "an age with no interval series cannot fire"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="paused-thing", instance="pod-a", job="paperclip-control-plane"}'
+        values: "0+60x1842"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x1842"
+    alert_rule_test:
+      - eval_time: 30h42m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+
+  # ── A stale snapshot must not page, and must page its own alert instead. ──
+  - interval: 1m
+    name: "a failed refresh gates the gap alert off and fires the freshness alert"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "110520+0x60"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "3600+0x60"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: PaperclipRoutineFireGapMetricsRefreshFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: pod-a
+              job: paperclip-control-plane
+            exp_annotations:
+              summary: "Paperclip routine fire-gap metric refresh is failing"
+              description: "The most recent routine-fire-gap database refresh failed (BLO-32638), so routine fire ages may be stale and PaperclipRoutineFireGap is intentionally gated off. The refresh deliberately leaves the previous snapshot in place rather than publishing zeros -- a 0 age reads as `fired just now`, the healthy state -- so do not interpret the retained values as current. Check Paperclip logs and database connectivity."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+
+  # ── Multi-replica. BLO-23413's second defect, which fails at RUNTIME only. ─
+  # Three replicas each export both gauges. A bare `on(routine_id)` join is
+  # many-to-many here and errors with HTTP 422 rather than firing. One alert,
+  # not three, and no `instance` label on it.
+  - interval: 1m
+    name: "three replicas produce exactly one alert, not one per replica"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "110520+0x60"
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-b", job="paperclip-control-plane"}'
+        values: "110520+0x60"
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-c", job="paperclip-control-plane"}'
+        values: "110520+0x60"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "3600+0x60"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-b", job="paperclip-control-plane"}'
+        values: "3600+0x60"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-c", job="paperclip-control-plane"}'
+        values: "3600+0x60"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x60"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-b", job="paperclip-control-plane"}'
+        values: "1+0x60"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-c", job="paperclip-control-plane"}'
+        values: "1+0x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: bridge-watchdog
+            exp_annotations:
+              summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
+              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the cadence its own cron implies (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+
+  # ── One replica's stale snapshot must not bless or suppress the others. ───
+  # pod-b's refresh has failed, so its (stale, low) age is excluded from the
+  # max rather than dragging the aggregate down. The gate is INSIDE each
+  # aggregate for exactly this reason.
+  #
+  # ⚠ This scenario alone does NOT pin the age-side gate: with the gate
+  # removed, max(110520, 60) is still 110520 and it still fires. Mutation
+  # testing caught that. The scenario below is the one that binds it.
+  - interval: 1m
+    name: "a stale replica is excluded rather than suppressing a live gap"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "110520+0x60"
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-b", job="paperclip-control-plane"}'
+        values: "60+0x60"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "3600+0x60"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-b", job="paperclip-control-plane"}'
+        values: "3600+0x60"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x60"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-b", job="paperclip-control-plane"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: bridge-watchdog
+            exp_annotations:
+              summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
+              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the cadence its own cron implies (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+
+  # ── The age-side gate, pinned. A stale replica must not MANUFACTURE a page. ─
+  # pod-a is live and the routine is healthy (60s into a 1h cadence). pod-b's
+  # refresh died an hour ago holding a frozen 110520s age. With the gate
+  # inside `max by`, pod-b is excluded and the max is pod-a's healthy 60s --
+  # silent. Without it, max(60, 110520) pages for a routine that is fine.
+  #
+  # This is the scenario the sibling test above was supposed to be and was
+  # not: there, removing the gate left the answer unchanged, so the test
+  # passed against broken code. Found by reverting the gate and watching the
+  # suite stay green.
+  #
+  # Note the interval side must stay reachable for the alert to be
+  # *evaluable* at all -- pod-a supplies it. A scenario where every replica
+  # is stale proves nothing about the age-side gate, because the empty
+  # right-hand side suppresses the alert on its own.
+  - interval: 1m
+    name: "a stale replica cannot manufacture a page against a healthy routine"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "60+0x60"
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-b", job="paperclip-control-plane"}'
+        values: "110520+0x60"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+        values: "3600+0x60"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-b", job="paperclip-control-plane"}'
+        values: "3600+0x60"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x60"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-b", job="paperclip-control-plane"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
