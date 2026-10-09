@@ -8501,11 +8501,16 @@ export function resolveExecutionWorkspaceReuseProvisioningPolicy(input: {
 // path prefix. That shape and this one want opposite biases, so no truncation
 // mode satisfies both and only the producer can resolve it.
 //
-// The issue and workspace ids move to line 2, which costs the summary its
-// workspace id. That is the deliberate trade: the comment is already attached
-// to the issue it concerns, and spending a 240-char diagnostic budget on
-// identifiers the reader already has is precisely what produced an
-// unattributable failure class.
+// On the cause-bearing branch the issue and workspace ids move to line 2, which
+// costs the summary its workspace id. That is the deliberate trade: the comment
+// is already attached to the issue it concerns, and spending a 240-char
+// diagnostic budget on identifiers the reader already has is precisely what
+// produced an unattributable failure class.
+//
+// The no-cause branch keeps the workspace id in its headline. No cause competes
+// for the budget there (the line stays under 200 chars), and the remediation
+// says "the referenced execution workspace", so without the id the surface
+// would name nothing the operator can act on.
 function formatInheritedExecutionWorkspaceReuseFailure(input: {
   reason: "inherited_workspace_reuse_failed" | "inherited_workspace_reuse_unavailable";
   issueRef: WorkspaceReuseIssueRef;
@@ -8532,7 +8537,7 @@ function formatInheritedExecutionWorkspaceReuseFailure(input: {
     : "Repair or unarchive the referenced execution workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying.";
   const headline = causeMessage
     ? `Inherited execution workspace reuse failed because ${causeMessage}.`
-    : "Inherited execution workspace reuse failed: the referenced execution workspace could not be restored, and no cause was reported.";
+    : `Inherited execution workspace reuse failed: the referenced execution workspace could not be restored, and no cause was reported (execution workspace ${workspaceLabel}).`;
   const context = `Issue ${issueLabel} requested reuse of execution workspace ${workspaceLabel}.`;
 
   return `${headline}\n${context}\n${remediation}`;
