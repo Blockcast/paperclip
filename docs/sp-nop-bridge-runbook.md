@@ -138,13 +138,16 @@ and never by a failure path, which is why `registration_failed` is not reused
 here: the binding did not fail, it was superseded. The hardware constraint is
 partial over `pending_orc8r` and `registered` only, so a `retired` row coexists
 with a fresh intent for the same `gateway_hwid`. The `(gateway_hwid, wallet)`
-idempotency index is partial too, over non-`retired` intents, and the
-registration upsert's conflict target MUST carry that predicate so it infers
-the partial index. Without it a retired `(H, A)` row sits in the arbiter index,
-and the original wallet re-registering the same hardware later — H bound to A,
+idempotency index is partial too, over non-`retired` intents, and it MUST be:
+a total index keeps a retired `(H, A)` row in the arbiter index, and the
+original wallet re-registering the same hardware later — H bound to A,
 retired, rebound to B, sold back to A — would match that row and update it to
-`pending_orc8r`, the one path that silently destroys the record. With it, that
-re-registration inserts a fresh row. The retired row is retained rather
+`pending_orc8r`, the one path that silently destroys the record. Partial, it
+excludes that row, and the re-registration inserts a fresh one. The
+registration upsert's conflict target MUST carry the same predicate so it
+infers the partial index; without it PostgreSQL finds no arbiter and every
+registration fails at statement time (SQLSTATE `42P10`) — an error, not a
+data hazard. The retired row is retained rather
 than deleted: it is the record of who held the hardware and when, which the
 sweep and any later dispute both need. Until that operation exists it is an
 operator action, not a registration outcome. Rejecting here does not strand
@@ -238,15 +241,15 @@ operator-triggered repair:
   same-hardware / different-wallet pair falls into two groups and the bullet
   above cannot see it. Treat the pair as a duplicate — keep the earliest
   authoritative `mb_uuid`, quarantine the later row, and require explicit repair
-  before deletion or reassignment. Count it separately from a same-wallet
-  duplicate: it means the rebind rejection in "MintMember identity and
-  idempotency" did not hold.
-- Emit counts for pending, orphaned, duplicate, repaired, quarantined, and
-  malformed-subject rows. Query failure is an unhealthy sweep, not a clean
-  zero-count result. A persistently nonzero quarantined count is expected, not
-  a sweep failing to converge: quarantine does not clear liveness, so a
-  quarantined pair stays live and the hwid-only grouping re-surfaces it on
-  every run until explicit repair.
+  before deletion or reassignment. Count it as cross-wallet-duplicate in the
+  counts below, not as duplicate: it means the rebind rejection in "MintMember
+  identity and idempotency" did not hold.
+- Emit counts for pending, orphaned, duplicate, cross-wallet-duplicate,
+  repaired, quarantined, and malformed-subject rows. Query failure is an
+  unhealthy sweep, not a clean zero-count result. A persistently nonzero
+  quarantined count is expected, not a sweep failing to converge: quarantine
+  does not clear liveness, so a quarantined pair stays live and the hwid-only
+  grouping re-surfaces it on every run until explicit repair.
 
 The sweep must be safe to run concurrently with registration. It must use
 the same unique constraint/idempotency path as the registration call and must
