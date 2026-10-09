@@ -15,24 +15,39 @@ the value (see *Where the rule lives*).
 ## Triage
 
 ```promql
-# 1. The firing condition -- the exact fraction of runs that breached the SLO.
+# 1. The firing condition once #5124 is live -- the exact fraction of runs that
+#    breached the SLO.
 1 - sum(rate(paperclip_pr_review_queue_wait_seconds_bucket{le="3600.0"}[6h]))
   / sum(rate(paperclip_pr_review_queue_wait_seconds_count[6h]))
 
-# 2. The magnitude -- the true mean. This is the figure the alert reports.
+# 2. The magnitude -- the true mean. The figure the alert reports once #5124 is live.
 sum(rate(paperclip_pr_review_queue_wait_seconds_sum[6h]))
   / sum(rate(paperclip_pr_review_queue_wait_seconds_count[6h]))
 ```
 
 **Read the two together before triaging the queue.** Every run that breached
-waited more than 3600s, so a real breach always has a mean above query 1 ×
-3600s. Once `onprem-k8s#5124` is live, a firing alert that reports a mean at
-or below that bound (0s is the extreme case), or a query above that returns
-empty, points at the instrument, not the queue: check that `_bucket`, `_sum`
-and `_count` are all still being reported. That rule puts `or vector(0)` on
-its bucket and `_sum` arms on purpose, so a drifted `le` label or a missing
-`_sum` series pages instead of going dark, and this is what such a page looks
-like.
+waited more than 3600s, so with all three series intact the mean is always
+above query 1 × 3600s. Once `onprem-k8s#5124` is live, that rule puts
+`or vector(0)` on its bucket and `_sum` arms on purpose, so a drifted `le`
+label or a missing `_sum` series pages instead of going dark. The two failures
+carry opposite verdicts on the queue, so tell them apart before standing down:
+
+- **Query 1 returns empty.** The `le="3600.0"` bucket is no longer reported
+  (see the `.0` warning below). The rule's bucket arm fell to `vector(0)`, so
+  its fraction read `1 - 0/N = 1.0` whatever the queue was doing: the firing
+  decision itself is an artefact. This points at the instrument, not the queue.
+- **Query 1 returns a number, but query 2 returns empty or the alert reports a
+  0s mean.** `_sum` is no longer reported, so only the magnitude readout is
+  broken. The firing decision is computed from `_bucket` and `_count` alone and
+  never reads `_sum`, so **the breach is real: file the instrument bug and
+  triage the queue below as well.** Do not stand down on the 0s.
+- **Both return numbers, but the mean is at or below query 1 × 3600s.** One arm
+  is reported by only some pods (the series carry a `pod` label). Find which
+  before deciding: a short `_bucket` overstates the fraction, so the page may be
+  an artefact; a short `_sum` only understates the mean, so the breach is real.
+
+In every case, check that `_bucket`, `_sum` and `_count` are all still being
+reported.
 
 **(a) Compare Ally's running count against its configured concurrency cap.**
 This is the comparison that identified the 2026-10-08 cause, and it is the
@@ -46,9 +61,9 @@ Read it against the agent's configured cap, which lives at
 `runtimeConfig.heartbeat.maxConcurrentRuns` on the agent (16 for Ally, read
 2026-10-09). It is **not** in `adapterConfig`. That object has no
 `maxConcurrentRuns` key, so an empty or absent value there does not mean no cap
-is configured. Pinned at the cap
-with work still queued is consumer starvation — the alert is correct and the
-answer is capacity, not a bug.
+is configured. A running count pinned at the cap, with work still queued, is
+consumer starvation — the alert is correct and the answer is capacity, not a
+bug.
 
 > **Do not reach for park depth first.** Provider-capacity deferrals and
 > `scheduled_retry` parks read **healthy** in this failure mode: the consumer
