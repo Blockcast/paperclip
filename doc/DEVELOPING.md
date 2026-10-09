@@ -1215,9 +1215,10 @@ and on one action even both together fall short, so a third source is needed:
   responsible-user-unavailable whatever the source says. On
   `heartbeat.run_log_accessed` both legs are reachable and `actorSource` does
   **not** separate them. An agent actor books `agent_jwt` or `agent_key` and
-  nothing else (`routes/authz.ts`), and both values are ambiguous: `agent_key`
-  always carries a responsible user, `agent_jwt` carries one whenever the claim
-  is signed, and either can fail either way. So a same-company `denied` on that
+  nothing else (`getRunLogAuditActor`, `routes/agents.ts`), and both values are
+  ambiguous: `agent_key` always carries a responsible user, `agent_jwt` carries
+  one whenever the claim is signed (and, for an unsigned legacy token, whenever
+  the run records one — `middleware/auth.ts`), and either can fail either way. So a same-company `denied` on that
   action is **not** decomposable from the row alone. Filtering it to
   `actorSource != 'agent_jwt'` and reporting the result as unentitled
   transcript reads promotes a responsible-user **availability** failure — an
