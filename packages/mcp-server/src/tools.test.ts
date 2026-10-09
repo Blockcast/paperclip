@@ -139,6 +139,13 @@ describe("paperclip MCP tools", () => {
       expect(limitDescription).toMatch(/with the BLO-39015 fix a plain array back is the proof/);
       // The default path (no `limit` sent) is a named case of the tell.
       expect(limitDescription).toContain("500 if you sent none");
+      // The short-page stop is sound only for a company-scope reader: the
+      // server ACL-filters the raw `offset`/`limit` window AFTER the cap
+      // (server/src/routes/issues.ts), so a restricted seat's page can come
+      // back short, or even empty, with readable rows still behind it.
+      expect(limitDescription).toMatch(/advancing `offset` by that limit/);
+      expect(limitDescription).toMatch(/sound only for a seat with company-scope read/);
+      expect(limitDescription).toMatch(/no page length, short or even empty, proves completeness/);
     },
   );
 
@@ -157,6 +164,7 @@ describe("paperclip MCP tools", () => {
     const { description } = getTool("paperclip_search_issues");
     expect(description).not.toContain("a bare array means you have every match, an object");
     expect(description).toContain("deploy-skew caveat");
+    expect(description).toContain("for a seat without company-scope read neither is a shorter one");
   });
 
   it("adds auth headers and run id to mutating requests", async () => {
