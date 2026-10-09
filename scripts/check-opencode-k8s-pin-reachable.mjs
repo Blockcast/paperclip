@@ -316,7 +316,10 @@ export function classify(probe) {
         ? "."
         : ` and makes no ${SECRET_PUT_SYMBOL} call in ${srcFileCount} non-test source file(s)` +
           (wrapperPathHits && wrapperPathHits.length > 0
-            ? `, and prepends ${WRAPPER_BIN_DIR} to the agent Job PATH.`
+            ? `, and references ${WRAPPER_BIN_DIR} in non-test source. That is a ` +
+              "presence check only: it does not attest that the directory is PREPENDED " +
+              "to the agent Job PATH, which is what PEN-3732 needs; the ordering is " +
+              "pinned by the adapter's own tests (vendor/opencode-k8s-patches)."
             : ".")),
   };
 }
@@ -384,6 +387,11 @@ function probe(pin) {
     // actually pins. A test file naming it proves nothing, so the same
     // non-test filter applies — a pin whose only mention is in a spec has the
     // assertion without the behaviour.
+    //
+    // This is PRESENCE, not ordering, and the `ok` message says so. Requiring
+    // `PATH` on the hit line would not narrow it to the prepend: the mirrored
+    // implementation names the directory only on its constant's definition
+    // line (`const GITHUB_WRAPPER_BIN_DIR = "..."`), which has no `PATH`.
     const wrapperHits = git(["grep", "-n", "--fixed-strings", WRAPPER_BIN_DIR, pin, "--", "src"]);
 
     return {
