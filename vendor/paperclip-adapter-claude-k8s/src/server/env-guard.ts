@@ -233,28 +233,57 @@ const COMMAND_POSITION_WRAPPERS = [
  * `sh -s`, `ssh host <<'EOF'` (the remote login shell reads stdin) and
  * `make -f -`. A quoted delimiter only suppresses expansion; it does not stop
  * the consumer executing the body (Ally C1 on PR #2332).
+ *
+ * The language interpreters and the `at`/`crontab` schedulers belong here too
+ * (Ally I1 at a36d40f5): `python3 <<'EOF'` runs the body as Python, and an
+ * `at`/`crontab` body is shell that runs later. A heredoc fed to an
+ * interpreter is a program, and listing them cost no false positive on
+ * `python3 -m venv env` or `node env.js`, which have no heredoc.
  */
-const HEREDOC_SCRIPT_CONSUMERS = [...SHELL_BASENAMES, "ssh", "make", "gmake"];
+const HEREDOC_SCRIPT_CONSUMERS = [
+  ...SHELL_BASENAMES,
+  "ssh",
+  "make",
+  "gmake",
+  "python",
+  "python3",
+  "node",
+  "ruby",
+  "php",
+  "at",
+  "crontab",
+];
 
 /**
- * Whether a simple command executes its stdin. True when its leading program
- * (after `NAME=value` assignments) is a script consumer, or when it is a
- * command-position wrapper that goes on to launch one (`sudo bash`,
- * `timeout 5 sh -s`, `docker exec -i c sh`). `sudo tee /etc/f` and
- * `cat <<'EOF'` stay data. A later word that merely names a shell
+ * The script consumer a simple command feeds its stdin to, or null. Found when
+ * its leading program (after `NAME=value` assignments) is a script consumer,
+ * or when it is a command-position wrapper that goes on to launch one
+ * (`sudo bash`, `timeout 5 sh -s`, `docker exec -i c sh`). `sudo tee /etc/f`
+ * and `cat <<'EOF'` stay data. A later word that merely names a shell
  * (`bash script.sh <<'EOF'`) reads as executing -- the conservative side.
  */
-function runsStdinAsScript(words: string[]): boolean {
+function stdinScriptConsumer(words: string[]): string | null {
   let i = 0;
   while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i] as string)) i += 1;
-  if (i >= words.length) return false;
+  if (i >= words.length) return null;
   const lead = basename(words[i] as string);
-  if (HEREDOC_SCRIPT_CONSUMERS.indexOf(lead) !== -1) return true;
-  if (COMMAND_POSITION_WRAPPERS.indexOf(lead) === -1) return false;
+  if (HEREDOC_SCRIPT_CONSUMERS.indexOf(lead) !== -1) return lead;
+  if (COMMAND_POSITION_WRAPPERS.indexOf(lead) === -1) return null;
   for (let j = i + 1; j < words.length; j += 1) {
-    if (HEREDOC_SCRIPT_CONSUMERS.indexOf(basename(words[j] as string)) !== -1) return true;
+    const word = basename(words[j] as string);
+    if (HEREDOC_SCRIPT_CONSUMERS.indexOf(word) !== -1) return word;
   }
-  return false;
+  return null;
+}
+
+/**
+ * A crontab body's command fields, one per line. Each entry's five schedule
+ * fields (or one `@reboot`-style macro) precede the command, and read as an
+ * ordinary first word they stop the command scan before it reaches `env` in
+ * `* * * * * env`.
+ */
+function cronCommands(body: string): string {
+  return body.replace(/^[ \t]*(?:@\S+|(?:\S+[ \t]+){5})/gm, "");
 }
 
 type LexedCommand = string[];
@@ -486,7 +515,8 @@ function lexShell(input: string): LexResult {
         if (line.trim() === pending.delimiter) break;
         body += `${line}\n`;
       }
-      if (body && pending.line.slice(pending.from).some(runsStdinAsScript)) nested.push(body);
+      const consumer = pending.line.slice(pending.from).map(stdinScriptConsumer).find((c) => c !== null);
+      if (body && consumer) nested.push(consumer === "crontab" ? cronCommands(body) : body);
       else if (pending.expanded && body) heredocs.push(body);
     }
     return j;
@@ -586,12 +616,21 @@ function lexShell(input: string): LexResult {
     if (ch === "|") {
       const orOperator = input[i + 1] === "|";
       endCommand(!orOperator);
-      i += orOperator ? 2 : 1;
+      // `|&` pipes stderr too; it is still a pipe, so the next stage is reached.
+      i += orOperator || input[i + 1] === "&" ? 2 : 1;
       continue;
     }
     if (ch === ";" || ch === "(" || ch === ")") {
       endCommand();
       i += 1;
+      continue;
+    }
+    // A `#` starting a word comments out the rest of the line. Lexing it as a
+    // word instead let an apostrophe in a comment (`# it's`) open a quote that
+    // swallowed the commands after it, in a heredoc body fed to `bash` or
+    // `python3` as much as on the command line.
+    if (ch === "#" && cur === null) {
+      while (i < n && input[i] !== "\n" && input[i] !== "\r") i += 1;
       continue;
     }
     add(ch);
@@ -737,13 +776,31 @@ function simpleCommandDumps(words: string[]): boolean {
   return false;
 }
 
-/** Index of a shell wrapper's `-c` payload word, or -1. */
-function shellPayloadIndex(words: string[]): number {
+/**
+ * Programs whose flag argument is itself a program, keyed by basename, with the
+ * flag that introduces it: a shell's `-c`, and the language interpreters'
+ * inline-program flags (`python3 -c`, `node -e`, `ruby -e`, `php -r`). Only the
+ * payload word is scanned, which is why the interpreters live here and not in
+ * COMMAND_POSITION_WRAPPERS: listing them there would scan every argument and
+ * re-block `python3 -m venv env` (Ally I1 at a36d40f5, measured).
+ */
+const INLINE_PROGRAM_FLAGS = new Map<string, RegExp>([
+  ...SHELL_BASENAMES.map((name): [string, RegExp] => [name, /^-[a-z]*c$/]),
+  ["python", /^-[A-Za-z]*c$/],
+  ["python3", /^-[A-Za-z]*c$/],
+  ["node", /^(?:-[a-z]*[ep]|--eval|--print)$/],
+  ["ruby", /^-[A-Za-z]*e$/],
+  ["php", /^-r$/],
+]);
+
+/** Index of an inline program's payload word (`sh -c PAYLOAD`, `node -e PAYLOAD`), or -1. */
+function inlineProgramIndex(words: string[]): number {
   for (let i = 0; i < words.length; i += 1) {
-    if (SHELL_BASENAMES.indexOf(basename(words[i] as string)) === -1) continue;
+    const flag = INLINE_PROGRAM_FLAGS.get(basename(words[i] as string));
+    if (!flag) continue;
     for (let j = i + 1; j < words.length; j += 1) {
       const w = words[j] as string;
-      if (/^-[a-z]*c$/.test(w)) return j + 1 < words.length ? j + 1 : -1;
+      if (flag.test(w)) return j + 1 < words.length ? j + 1 : -1;
       if (w[0] !== "-") break;
     }
   }
@@ -757,9 +814,9 @@ function containsDump(command: string, depth: number): boolean {
   // `cat </proc/self/environ` is only reachable from the target word.
   for (const target of redirections) if (PROC_ENVIRON_RE.test(target)) return true;
   for (const words of commands) {
-    const payload = shellPayloadIndex(words);
+    const payload = inlineProgramIndex(words);
     if (payload !== -1) {
-      // Everything after a shell's `-c` payload is `$0`/`$1`, not an operand.
+      // Everything after an inline program is `$0`/`$1`/`sys.argv`, not an operand.
       if (containsDump(words[payload] as string, depth + 1)) return true;
       if (simpleCommandDumps(words.slice(0, payload))) return true;
       continue;
@@ -844,19 +901,29 @@ const COMMAND_POSITION_WRAPPERS = SHELL_BASENAMES.concat([
   "capsh", "awk", "gawk", "mawk", "perl",
 ]);
 // Programs that execute their STDIN as a script: a heredoc body fed to one is
-// a program, not data, whatever its delimiter's quoting.
-const HEREDOC_SCRIPT_CONSUMERS = SHELL_BASENAMES.concat(["ssh", "make", "gmake"]);
-function runsStdinAsScript(words) {
+// a program, not data, whatever its delimiter's quoting. Includes the language
+// interpreters and the at/crontab schedulers, whose bodies are shell.
+const HEREDOC_SCRIPT_CONSUMERS = SHELL_BASENAMES.concat([
+  "ssh", "make", "gmake", "python", "python3", "node", "ruby", "php", "at", "crontab",
+]);
+// The script consumer a simple command feeds its stdin to, or null.
+function stdinScriptConsumer(words) {
   let i = 0;
   while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i += 1;
-  if (i >= words.length) return false;
+  if (i >= words.length) return null;
   const lead = basename(words[i]);
-  if (HEREDOC_SCRIPT_CONSUMERS.indexOf(lead) !== -1) return true;
-  if (COMMAND_POSITION_WRAPPERS.indexOf(lead) === -1) return false;
+  if (HEREDOC_SCRIPT_CONSUMERS.indexOf(lead) !== -1) return lead;
+  if (COMMAND_POSITION_WRAPPERS.indexOf(lead) === -1) return null;
   for (let j = i + 1; j < words.length; j += 1) {
-    if (HEREDOC_SCRIPT_CONSUMERS.indexOf(basename(words[j])) !== -1) return true;
+    const word = basename(words[j]);
+    if (HEREDOC_SCRIPT_CONSUMERS.indexOf(word) !== -1) return word;
   }
-  return false;
+  return null;
+}
+// A crontab body's command fields: the five schedule fields (or one @reboot
+// style macro) before each command would otherwise stop the command scan.
+function cronCommands(body) {
+  return body.replace(/^[ \t]*(?:@\S+|(?:\S+[ \t]+){5})/gm, "");
 }
 function basename(word) {
   const cut = word.lastIndexOf("/");
@@ -987,7 +1054,8 @@ function lexShell(input) {
         if (line.trim() === pending.delimiter) break;
         body += line + "\n";
       }
-      if (body && pending.line.slice(pending.from).some(runsStdinAsScript)) nested.push(body);
+      const consumer = pending.line.slice(pending.from).map(stdinScriptConsumer).find((c) => c !== null);
+      if (body && consumer) nested.push(consumer === "crontab" ? cronCommands(body) : body);
       else if (pending.expanded && body) heredocs.push(body);
     }
     return j;
@@ -1052,8 +1120,15 @@ function lexShell(input) {
       i += input[i + 1] === "&" ? 2 : 1;
       continue;
     }
-    if (ch === "|") { const orOp = input[i + 1] === "|"; endCommand(!orOp); i += orOp ? 2 : 1; continue; }
+    // A pipe written with a trailing ampersand (stderr too) still reaches the next stage.
+    if (ch === "|") { const orOp = input[i + 1] === "|"; endCommand(!orOp); i += orOp || input[i + 1] === "&" ? 2 : 1; continue; }
     if (ch === ";" || ch === "(" || ch === ")") { endCommand(); i += 1; continue; }
+    // A word-initial # comments out the rest of the line, so an apostrophe in it
+    // cannot open a quote that hides the commands after it.
+    if (ch === "#" && cur === null) {
+      while (i < n && input[i] !== "\n" && input[i] !== "\r") i += 1;
+      continue;
+    }
     add(ch);
     i += 1;
   }
@@ -1138,12 +1213,25 @@ function simpleCommandDumps(words) {
   }
   return false;
 }
-function shellPayloadIndex(words) {
+// Programs whose flag argument is itself a program: a shell's -c and the
+// interpreters' inline-program flags. Only the payload word is scanned, so
+// python3 -m venv env stays allowed.
+const INLINE_PROGRAM_FLAGS = new Map(
+  SHELL_BASENAMES.map((name) => [name, /^-[a-z]*c$/]).concat([
+    ["python", /^-[A-Za-z]*c$/],
+    ["python3", /^-[A-Za-z]*c$/],
+    ["node", /^(?:-[a-z]*[ep]|--eval|--print)$/],
+    ["ruby", /^-[A-Za-z]*e$/],
+    ["php", /^-r$/],
+  ]),
+);
+function inlineProgramIndex(words) {
   for (let i = 0; i < words.length; i += 1) {
-    if (SHELL_BASENAMES.indexOf(basename(words[i])) === -1) continue;
+    const flag = INLINE_PROGRAM_FLAGS.get(basename(words[i]));
+    if (!flag) continue;
     for (let j = i + 1; j < words.length; j += 1) {
       const w = words[j];
-      if (/^-[a-z]*c$/.test(w)) return j + 1 < words.length ? j + 1 : -1;
+      if (flag.test(w)) return j + 1 < words.length ? j + 1 : -1;
       if (w[0] !== "-") break;
     }
   }
@@ -1154,7 +1242,7 @@ function containsDump(command, depth) {
   const lexed = lexShell(command);
   for (const target of lexed.redirections) if (PROC_ENVIRON_RE.test(target)) return true;
   for (const words of lexed.commands) {
-    const payload = shellPayloadIndex(words);
+    const payload = inlineProgramIndex(words);
     if (payload !== -1) {
       if (containsDump(words[payload], depth + 1)) return true;
       if (simpleCommandDumps(words.slice(0, payload))) return true;
