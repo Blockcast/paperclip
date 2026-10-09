@@ -129,7 +129,9 @@ const ALIAS_KEY_PREFIX = "alias.";
  *   publishing    `push` (guarded, not listed here), `send-pack`, `http-push`,
  *                 and `subtree`, whose `push` mode shells out to a bare `git`
  *                 that resolves to git's own exec-path rather than back through
- *                 this wrapper.
+ *                 this wrapper. `submodule` is held back for the same reason
+ *                 (`foreach`, and `update` with a `!` update command); only its
+ *                 read-only `status` passes, see {@link isReadOnlySubmoduleInvocation}.
  *   transport     `remote-http{,s}`, `remote-ext`, `remote-fd`, `remote-ftp{,s}`.
  *                 Invoked directly these speak the transport protocol on stdin,
  *                 which includes push.
@@ -197,6 +199,24 @@ export function isNonPublishingGitVerb(verb: string): boolean {
 /** True when `verb` is a verb this guard knows publishes to a remote. */
 export function isKnownPublishingGitVerb(verb: string): boolean {
   return KNOWN_PUBLISHING_GIT_VERBS.has(verb);
+}
+
+/**
+ * True for `git submodule status`, the one `submodule` form admitted (BLO-41987).
+ *
+ * `submodule` as a whole stays off {@link NON_PUBLISHING_GIT_VERBS}: `git
+ * submodule foreach <cmd>` runs an arbitrary command, and `submodule update`
+ * runs a configured `submodule.<name>.update = !<cmd>`. Git puts its own
+ * exec-path ahead of PATH for both, so a `push` run inside resolves to the real
+ * binary and reaches neither this wrapper nor the hook — the `subtree` hole.
+ *
+ * `status` only reads, and the server's workspace setup runs `git submodule
+ * status --recursive` through this wrapper, treating a refusal as an unusable
+ * checkout. Only `-q`/`--quiet` may precede it. A bare `git submodule` also
+ * means `status`, but nothing runs it that way, so it stays refused.
+ */
+export function isReadOnlySubmoduleInvocation(verb: string, args: readonly string[]): boolean {
+  return verb === "submodule" && args.find((arg) => arg !== "-q" && arg !== "--quiet") === "status";
 }
 
 /**
@@ -615,6 +635,9 @@ export function classifyGitInvocation(
   // The verb git will actually run, when it is neither `push` nor cleared as
   // non-publishing. Set at the one place the walk learns what that verb is.
   let publishVerb: GitPublishVerb | null = null;
+  // The arguments git will hand that verb: an alias's own arguments come first,
+  // then the caller's. Only `submodule` reads them, to admit `status` alone.
+  let verbArgs: readonly string[] = rest;
 
   if (!isPush) {
     const definitions = new Map(globals.aliasDefinitions);
@@ -638,7 +661,7 @@ export function classifyGitInvocation(
       // drift, and the four bypasses already closed on this path were all
       // drift of exactly that kind.
       if (!expansion) {
-        if (!isNonPublishingGitVerb(name)) {
+        if (!isNonPublishingGitVerb(name) && !isReadOnlySubmoduleInvocation(name, verbArgs)) {
           publishVerb = {
             verb: name,
             known: isKnownPublishingGitVerb(name),
@@ -703,6 +726,7 @@ export function classifyGitInvocation(
         isPush = true;
         break;
       }
+      verbArgs = [...expandedRest, ...verbArgs];
       name = expanded;
     }
 

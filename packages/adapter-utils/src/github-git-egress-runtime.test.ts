@@ -391,6 +391,59 @@ describe("publishing verbs other than `push` (PEN-3156)", () => {
   });
 });
 
+describe("`git submodule` (BLO-41987)", () => {
+  // The server's workspace setup runs `git submodule status --recursive`
+  // through this wrapper. Refusing it failed every run in a workspace with
+  // submodules as `workspace_git_submodule_unavailable`, which is how this
+  // regression showed up after the PEN-3156 allowlist deployed.
+
+  it("passes the server's exact `submodule status --recursive` through untouched", () => {
+    const argv = ["submodule", "status", "--recursive"];
+    expect(buildGitArgv(argv, { ...PRESENT })).toEqual(argv);
+  });
+
+  it("passes `status` after a leading `--quiet`, and through an alias", () => {
+    expect(buildGitArgv(["submodule", "--quiet", "status"], { ...PRESENT })).toEqual([
+      "submodule",
+      "--quiet",
+      "status",
+    ]);
+    const viaAlias = ["ss", "--recursive"];
+    expect(
+      buildGitArgv(viaAlias, {
+        ...PRESENT,
+        resolveAlias: (name) => (name === "ss" ? "submodule status" : null),
+      }),
+    ).toEqual(viaAlias);
+  });
+
+  it("still refuses every other `submodule` form, because foreach and update can publish unguarded", () => {
+    // `foreach` runs a command with git's exec-path first, so a `git push`
+    // inside it reaches the real binary; `update` does the same for a `!`
+    // update command. A bare `git submodule` means `status` but has no caller.
+    for (const argv of [
+      ["submodule", "foreach", "true"],
+      ["submodule", "update", "--init", "--recursive"],
+      ["submodule"],
+      ["submodule", "--cached", "foreach", "status"],
+    ]) {
+      expect(() => buildGitArgv(argv, { ...PRESENT }), argv.join(" ")).toThrow(
+        /refusing to run `git submodule`/,
+      );
+    }
+  });
+
+  it("refuses `foreach` reached through an alias whose own argument names `status`", () => {
+    // The alias leg must test the verb's real first argument, not any token.
+    expect(() =>
+      buildGitArgv(["fe", "status"], {
+        ...PRESENT,
+        resolveAlias: (name) => (name === "fe" ? "submodule foreach" : null),
+      }),
+    ).toThrow(/refusing to run `git submodule`[\s\S]*alias `fe`/);
+  });
+});
+
 describe("shell aliases", () => {
   // Measured against git 2.47.3: git PREPENDS its exec-path to PATH for the
   // shell it spawns, and /usr/lib/git-core ships a complete `git`. So a bare
