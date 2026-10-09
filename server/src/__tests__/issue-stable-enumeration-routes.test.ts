@@ -275,6 +275,49 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     expect(res.body.count).toBe(2);
   });
 
+  /**
+   * BLO-41592. The A/B from the ticket, against the real route: `A` is the control that
+   * makes `B` meaningful. The count route implements no time bound and Express hands
+   * unknown params through unread, so pre-fix `B === A` — a whole-corpus count returned
+   * as a success. Worse than the BLO-40145 list case it mirrors: a list hands you rows
+   * whose updatedAt you can eyeball (that is how BLO-40145 was caught), a count hands you
+   * one integer with no tell. `A` doubles as the non-vacuity case: the guard must not
+   * reject an ordinary count, and the two exact-count tests above are the wider control.
+   */
+  it("rejects a time-bound param instead of returning a whole-corpus count", async () => {
+    const companyId = await seedCompany();
+    await db.insert(issues).values([
+      { companyId, title: "Row A", status: "todo", priority: "medium" },
+      { companyId, title: "Row B", status: "todo", priority: "low" },
+    ]);
+
+    const unbounded = await request(createApp(companyId)).get(`/api/companies/${companyId}/issues/count`);
+    expect(unbounded.status, JSON.stringify(unbounded.body)).toBe(200);
+    expect(unbounded.body.count).toBe(2);
+
+    // A floor no row can satisfy, so a honoured bound counts 0 and a dropped one counts 2.
+    const bounded = await request(createApp(companyId))
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ updated_after: "2099-01-01T00:00:00Z" });
+    expect(bounded.status, JSON.stringify(bounded.body)).toBe(400);
+    expect(bounded.body.count).toBeUndefined();
+    expect(bounded.body.unsupportedParams).toEqual(["updated_after"]);
+    // Names where a real time bound lives, as the list route's refusal does.
+    expect(bounded.body.error).toMatch(/\/search with updatedAfter/);
+  });
+
+  // The COUNT_UNSUPPORTED_FILTERS guard one block below only runs when attention is
+  // undefined, so a guard placed inside it would leave the blocked path counting the
+  // corpus. This pins the time-bound refusal ahead of that branch.
+  it("rejects a time-bound param on the attention=blocked count path too", async () => {
+    const companyId = await seedCompany();
+    const res = await request(createApp(companyId))
+      .get(`/api/companies/${companyId}/issues/count`)
+      .query({ attention: "blocked", createdSince: "2099-01-01T00:00:00Z" });
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.unsupportedParams).toEqual(["createdSince"]);
+  });
+
   /** A key scoped to a single issue: denied company_scope:read, so the count route walks. */
   function skillTestActor(companyId: string, agentId: string, issueId: string) {
     return { type: "agent", agentId, companyId, source: "agent_key", keyScope: { kind: "skill_test", issueId } };

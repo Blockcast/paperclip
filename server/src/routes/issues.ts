@@ -9041,6 +9041,22 @@ export function issueRoutes(
       res.status(403).json({ error: "Task bridge keys cannot use company-wide issue count APIs" });
       return;
     }
+    // BLO-41592: same defect as BLO-40145 one endpoint over, and worse here. This route
+    // implements no time bound either, so `?updated_after=T` was dropped unread and the
+    // whole-corpus count came back as a success. A list at least hands you rows whose
+    // updatedAt you can eyeball — that is how BLO-40145 was caught; a count hands you a
+    // single integer with no such tell. Reuses the list route's helper rather than a
+    // second copy of the pattern: the drift this family keeps producing is one surface
+    // getting the guard and its neighbour not.
+    const unsupportedTimeFilterParams = parseUnsupportedTimeFilterParams(req.query);
+    if (unsupportedTimeFilterParams.length > 0) {
+      res.status(400).json({
+        error:
+          "time-bound filtering is not supported on this endpoint; the param was previously dropped unread and returned a count of the whole corpus. Use GET /api/companies/:companyId/search with updatedAfter or updatedWithin.",
+        unsupportedParams: unsupportedTimeFilterParams,
+      });
+      return;
+    }
     const attention = req.query.attention as string | undefined;
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
     if (attention !== undefined && attention !== "blocked") {
@@ -9174,6 +9190,19 @@ export function issueRoutes(
     if (req.query.limit !== undefined || req.query.offset !== undefined) {
       res.status(400).json({
         error: "open-assignment-census is not paginated and does not accept limit or offset",
+      });
+      return;
+    }
+    // BLO-41592: same hole as issues/count above, and this surface is literally named
+    // "census" — the exact read the defect description describes going silently
+    // corpus-wide. Guarded here in the same change because fixing one aggregate and
+    // leaving its neighbour is how this family keeps regressing.
+    const unsupportedCensusTimeFilterParams = parseUnsupportedTimeFilterParams(req.query);
+    if (unsupportedCensusTimeFilterParams.length > 0) {
+      res.status(400).json({
+        error:
+          "time-bound filtering is not supported on this endpoint; the param was previously dropped unread and returned a census of the whole corpus. Use GET /api/companies/:companyId/search with updatedAfter or updatedWithin.",
+        unsupportedParams: unsupportedCensusTimeFilterParams,
       });
       return;
     }
