@@ -12,7 +12,7 @@
  * protects is gated on the paperclip-production reviewer set (RATIFIED_REVIEWERS
  * in check-production-environment-protection.mjs — read the symbol, do not
  * restate the count here; two successive counts written into this comment were
- * already false when committed, see scheduled-production-deploy.yml's header)
+ * false by the time they landed, see scheduled-production-deploy.yml's header)
  * — so while any deploy sits
  * `waiting`, the daily dispatcher is a permanent no-op — and every skipped run
  * reported `conclusion: success`. On 2026-09-01 that took production to 45
