@@ -142,7 +142,7 @@ const LEXICAL_SEGMENT_MAX_LENGTH = 16;
  * `draft-ramadan-moq-multicast-00` scores 3.74 bits/char — above the floor —
  * so an RFC-XML `<seriesInfo … value='draft-…'/>` element read as
  * credential-shaped, and every `.md` IETF draft in Blockcast/moqcast-draft
- * became unwritable through `gh api .../git/blobs` while git push was down.
+ * became unwritable through `gh api .../git/blobs` while the push path was down.
  *
  * The discriminator is structure, not vocabulary (no word list to drift): a
  * credential is ONE opaque run, so a value is exonerated only when every
