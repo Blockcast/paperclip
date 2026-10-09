@@ -361,6 +361,12 @@ export async function resolveFallbackAgentId(
 }
 
 /**
+ * `agentId` is set only for an invokable agent. `degraded` means the roster
+ * could not be read, so the missing `agentId` says nothing about the agent.
+ */
+export type InvokableAssigneeResolution = { agentId?: string; degraded?: true };
+
+/**
  * BLO-26613: drop a resolved assignee agent that cannot be woken.
  *
  * A label-override, owner-map, or issue-route resolution names an agentId
@@ -379,15 +385,19 @@ export async function resolveFallbackAgentId(
  * reads as `not_found` and a terminated manager as `missing_manager` — both
  * still refused.
  *
- * Returning `undefined` hands the caller's owner chain the next step: the named
- * fallback agent (itself invokability-checked by `resolveFallbackAgentId`),
- * else a refused creation that keeps Alertmanager's retry window. It never
- * files a silent assignment.
+ * A result without `agentId` hands the caller's owner chain the next step: a
+ * resolvable human owner, else the named fallback agent (itself
+ * invokability-checked by `resolveFallbackAgentId`), else a refused creation.
+ * It never files a silent assignment.
  *
- * A failed roster read degrades the same way, matching `resolveOwnerUserId`
- * above: an agents-RPC outage must not fail the delivery outright, because if
- * it outlasts Alertmanager's retry budget the alert is lost with no issue row
- * at all — worse than the paused-assignee bug this guard exists for.
+ * A failed roster read (`lookup_failed`) or an empty one (`roster_empty`) also
+ * drops the agent, matching `resolveOwnerUserId` above — an agents-RPC outage
+ * must not fail a delivery that still has a human owner to land on — but is
+ * flagged `degraded`: it is no evidence the agent is bad, so the caller must
+ * not turn an ownerless refusal on that read into a permanent drop. Without the
+ * flag, a default config (`fallbackAgentName: ""`) answered a transient
+ * `agents.list` fault with `PermanentAlertError` — a 200 and a lost alert, for
+ * a route agent that was most likely fine (Ally review 5475541309).
  *
  * Every drop writes `alertmanager.owner.assignee_dropped`, labelled by reason,
  * so a route or owner-map entry that is being dropped on every alert can back
@@ -399,8 +409,8 @@ export async function resolveInvokableAssigneeAgentId(
   agentId: string | undefined,
   alert: { alertname: string; severity: string },
   loadRoster: () => Promise<CompanyAgentRoster> = () => ctx.agents.list({ companyId }),
-): Promise<string | undefined> {
-  if (!agentId) return undefined;
+): Promise<InvokableAssigneeResolution> {
+  if (!agentId) return {};
   // `reason` is the bounded metric label; `detail` carries the free-form part.
   let reason: string;
   let detail = "";
@@ -409,7 +419,7 @@ export async function resolveInvokableAssigneeAgentId(
     const agent = agents.find((candidate) => candidate.id === agentId);
     if (agent) {
       const eligibility = getAgentWorkEligibility({ agent, agents });
-      if (eligibility.invokable) return agentId;
+      if (eligibility.invokable) return { agentId };
       reason = eligibility.invokabilityReason;
       detail = ` status=${agent.status} chain=${eligibility.orgChainHealth.reason}`;
     } else {
@@ -436,7 +446,7 @@ export async function resolveInvokableAssigneeAgentId(
       `paperclip-plugin-alertmanager: failed to record dropped-assignee metric for ${agentId}: ${String(metricErr)}`,
     );
   }
-  return undefined;
+  return reason === "roster_empty" || reason === "lookup_failed" ? { degraded: true } : {};
 }
 
 function normalizeEmail(email: string): string {

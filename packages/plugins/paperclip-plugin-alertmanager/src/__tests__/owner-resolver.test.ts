@@ -788,7 +788,7 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
     const { ctx, agents, metrics } = mkAgentsCtx([]);
     expect(
       await resolveInvokableAssigneeAgentId(ctx, "company-1", undefined, ALERT),
-    ).toBeUndefined();
+    ).toEqual({});
     expect(agents.list).not.toHaveBeenCalled();
     expect(metrics.write).not.toHaveBeenCalled();
   });
@@ -797,7 +797,7 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
     const { ctx, agents, metrics } = mkAgentsCtx([mkAgent("agent-active", "idle")]);
     expect(
       await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-active", ALERT),
-    ).toBe("agent-active");
+    ).toEqual({ agentId: "agent-active" });
     expect(agents.list).toHaveBeenCalledWith({ companyId: "company-1" });
     expect(metrics.write).not.toHaveBeenCalled();
   });
@@ -806,7 +806,7 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
     const { ctx, logger, metrics } = mkAgentsCtx([mkAgent("agent-paused", "paused")]);
     expect(
       await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-paused", ALERT),
-    ).toBeUndefined();
+    ).toEqual({});
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("reason=paused"));
     expect(metrics.write).toHaveBeenCalledWith("alertmanager.owner.assignee_dropped", 1, {
       alertname: "DiskFull",
@@ -833,7 +833,7 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
     const { ctx, metrics } = mkAgentsCtx(roster);
     expect(
       await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x", ALERT),
-    ).toBeUndefined();
+    ).toEqual({});
     expect(metrics.write).toHaveBeenCalledWith(
       "alertmanager.owner.assignee_dropped",
       1,
@@ -845,7 +845,7 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
     const { ctx, logger } = mkAgentsCtx([mkAgent("someone-else", "idle")]);
     expect(
       await resolveInvokableAssigneeAgentId(ctx, "company-1", "deleted-agent", ALERT),
-    ).toBeUndefined();
+    ).toEqual({});
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("reason=not_found"));
   });
 
@@ -853,7 +853,7 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
     const { ctx, metrics } = mkAgentsCtx([]);
     expect(
       await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x", ALERT),
-    ).toBeUndefined();
+    ).toEqual({ degraded: true });
     expect(metrics.write).toHaveBeenCalledWith(
       "alertmanager.owner.assignee_dropped",
       1,
@@ -861,14 +861,15 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
     );
   });
 
-  it("degrades to undefined, not a throw, when the roster read rejects", async () => {
+  it("degrades to a flagged drop, not a throw, when the roster read rejects", async () => {
     // Same failure semantics as resolveOwnerUserId: an agents-RPC outage must
-    // fall through the owner chain rather than fail the whole delivery.
+    // fall through the owner chain rather than fail the whole delivery — but
+    // flagged, so the caller does not mistake it for a bad agent.
     const { ctx, agents, logger, metrics } = mkAgentsCtx([]);
     agents.list.mockRejectedValueOnce(new Error("agents rpc unavailable"));
     await expect(
       resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x", ALERT),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ degraded: true });
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("reason=lookup_failed Error: agents rpc unavailable"),
     );
@@ -885,7 +886,7 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
     metrics.write.mockRejectedValueOnce(new Error("metrics down"));
     await expect(
       resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-paused", ALERT),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({});
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("metrics down"));
   });
 
@@ -896,7 +897,7 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
     );
     expect(
       await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-active", ALERT, loadRoster),
-    ).toBe("agent-active");
+    ).toEqual({ agentId: "agent-active" });
     expect(loadRoster).toHaveBeenCalledTimes(1);
     expect(agents.list).not.toHaveBeenCalled();
   });
@@ -907,7 +908,7 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
       const { ctx } = mkAgentsCtx([mkAgent("agent-x", status)]);
       expect(
         await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x", ALERT),
-      ).toBeUndefined();
+      ).toEqual({});
     },
   );
 });
