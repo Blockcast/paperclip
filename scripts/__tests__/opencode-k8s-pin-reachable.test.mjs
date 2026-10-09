@@ -9,6 +9,9 @@ import { fileURLToPath } from "node:url";
 import {
   ADAPTER_REPO,
   SECRET_PUT_SYMBOL,
+  WRAPPER_BIN_DIR,
+  WRAPPER_PATCH_PATH,
+  WRAPPER_PATH_GAP_ACCEPTED_PINS,
   classify,
   extractPin,
   nonTestHits,
@@ -190,6 +193,16 @@ case "$3" in
   cat-file) exit 0;;
   ls-tree) printf '%s\\n' "$PIN_GUARD_TEST_FILES"; exit "$PIN_GUARD_TEST_TREE_STATUS";;
   grep)
+    # Two greps run over the same tree now (PEN-3732), and they are judged in
+    # OPPOSITE directions — a Secret-PUT hit is the finding, a wrapper-PATH
+    # MISS is. Dispatch on the search pattern ($6) so a stub answering both
+    # with one fixture cannot make an empty Secret-PUT search read as a
+    # missing prepend.
+    if [ "$6" = "${WRAPPER_BIN_DIR}" ]; then
+      if [ "$PIN_GUARD_TEST_WRAPPER_STATUS" = signal ]; then kill -TERM "$$"; fi
+      printf '%s\\n' "$PIN_GUARD_TEST_WRAPPER_HITS"
+      exit "$PIN_GUARD_TEST_WRAPPER_STATUS"
+    fi
     if [ "$PIN_GUARD_TEST_GREP_STATUS" = signal ]; then kill -TERM "$$"; fi
     printf '%s\\n' "$PIN_GUARD_TEST_HITS"
     exit "$PIN_GUARD_TEST_GREP_STATUS";;
@@ -208,6 +221,12 @@ exit 128
     { name: "ls-tree exit 1 is not a no-match result", env: { PIN_GUARD_TEST_TREE_STATUS: "1" } },
     { name: "assets do not establish searched sources", env: { PIN_GUARD_TEST_FILES: "src/README.md\nsrc/icon.svg" } },
     { name: "test-only sources do not establish searched sources", env: { PIN_GUARD_TEST_FILES: "src/execute.test.ts\nsrc/execute.spec.ts\nsrc/__tests__/execute.ts\nsrc/__mocks__/k8s.ts" } },
+    // PEN-3732. An unaccepted pin with no prepend is a definite finding; a
+    // wrapper grep that could not run is not, and must not fail the bump.
+    { name: "an unaccepted pin missing the prepend fails", verdict: "FAILED", env: { PIN_GUARD_TEST_WRAPPER_STATUS: "1", PIN_GUARD_TEST_WRAPPER_HITS: "" } },
+    { name: "a failed wrapper grep is not a missing prepend", env: { PIN_GUARD_TEST_WRAPPER_STATUS: "128", PIN_GUARD_TEST_WRAPPER_HITS: "" } },
+    { name: "a signalled wrapper grep is not a missing prepend", env: { PIN_GUARD_TEST_WRAPPER_STATUS: "signal", PIN_GUARD_TEST_WRAPPER_HITS: "" } },
+    { name: "a test-only mention of the wrapper dir is not the prepend", verdict: "FAILED", env: { PIN_GUARD_TEST_WRAPPER_STATUS: "0", PIN_GUARD_TEST_WRAPPER_HITS: `${pin}:src/server/job-manifest.test.ts:9:${WRAPPER_BIN_DIR}` } },
   ];
   for (const { name, verdict = "inconclusive", env } of cases) {
     const result = spawnSync(process.execPath, [script], {
@@ -221,6 +240,10 @@ exit 128
         PIN_GUARD_TEST_TREE_STATUS: "0",
         PIN_GUARD_TEST_GREP_STATUS: "1",
         PIN_GUARD_TEST_HITS: "",
+        // Default: the pinned tree DOES carry the prepend, so these cases keep
+        // exercising the Secret-PUT semantics they were written for.
+        PIN_GUARD_TEST_WRAPPER_STATUS: "0",
+        PIN_GUARD_TEST_WRAPPER_HITS: `${pin}:src/server/job-manifest.ts:130:${WRAPPER_BIN_DIR}`,
         ...env,
       },
     });
@@ -343,4 +366,84 @@ test("the retirement this guard protects is actually in the chart", () => {
   assert.ok(verbs, "role.yaml must render a secrets rule");
   assert.doesNotMatch(verbs, /"update"/, "secrets:update is retired (BLO-34510)");
   assert.match(verbs, /"patch"/, "patch is what replaced it and must stay");
+});
+
+// PEN-3732 — the wrapper-PATH property. Its control runs the OPPOSITE way round
+// from the Secret-PUT one above: there a HIT is the finding, here an EMPTY
+// result is, so an unrun or inert search must never be read as a finding.
+const WRAPPED = { cloneOk: true, commitPresent: true, srcFileCount: 5, secretPutHits: [] };
+const ACCEPTED_PIN = [...WRAPPER_PATH_GAP_ACCEPTED_PINS][0];
+
+test("a pin that prepends the wrapper directory passes, and says so", () => {
+  const result = classify({
+    ...WRAPPED,
+    pin: "b".repeat(40),
+    wrapperPathHits: ["src/server/job-manifest.ts:120:const X = ..."],
+  });
+  assert.equal(result.verdict, "ok");
+  assert.equal(result.exitCode, 0);
+  assert.match(result.message, /prepends .*libexec\/paperclip\/bin/);
+});
+
+test("the measured, accepted gap warns at its own SHA without failing the PR", () => {
+  const result = classify({ ...WRAPPED, pin: ACCEPTED_PIN, wrapperPathHits: [] });
+  assert.equal(result.verdict, "wrapper-path-accepted-gap");
+  assert.equal(result.exitCode, 0);
+  // The remedy must be reachable from the message; a gap nobody can act on is
+  // one that stays open.
+  assert.ok(result.message.includes(WRAPPER_PATCH_PATH));
+});
+
+test("carrying that gap to a NEW pin fails the bump", () => {
+  // This is the whole point of keying the acceptance to a SHA: the gap was
+  // accepted on evidence about one tree, and a bump re-opens that decision.
+  const result = classify({ ...WRAPPED, pin: "c".repeat(40), wrapperPathHits: [] });
+  assert.equal(result.verdict, "wrapper-path-missing");
+  assert.equal(result.exitCode, 1);
+  assert.ok(result.message.includes(WRAPPER_BIN_DIR));
+  assert.ok(result.message.includes(WRAPPER_PATCH_PATH));
+});
+
+test("a FAILED wrapper search is inconclusive, never a missing prepend", () => {
+  // Without this, a probe that cannot run manufactures the finding it is
+  // supposed to detect — and would fail every bump on a network blip.
+  const result = classify({ ...WRAPPED, pin: "c".repeat(40), wrapperPathHits: null });
+  assert.equal(result.verdict, "inconclusive");
+  assert.equal(result.exitCode, 0);
+});
+
+test("an inert search over an empty tree is inconclusive, never a missing prepend", () => {
+  // Same failure, different cause: the adapter's layout moving out of src/
+  // makes the grep match nothing, which is indistinguishable from a real gap.
+  const result = classify({
+    ...WRAPPED,
+    srcFileCount: 0,
+    pin: "c".repeat(40),
+    wrapperPathHits: [],
+  });
+  assert.equal(result.verdict, "inconclusive");
+  assert.equal(result.exitCode, 0);
+});
+
+test("a Secret PUT still outranks the wrapper-PATH verdict", () => {
+  // Ordering matters: secret-put is self-evidencing (a hit), so it must not be
+  // masked by an empty wrapper search on the same tree.
+  const result = classify({
+    ...WRAPPED,
+    pin: "c".repeat(40),
+    secretPutHits: ["src/server/x.ts:9:replaceNamespacedSecret"],
+    wrapperPathHits: [],
+  });
+  assert.equal(result.verdict, "secret-put");
+  assert.equal(result.exitCode, 1);
+});
+
+test("the accepted-gap SHA is the pin the Dockerfile actually carries", () => {
+  // An acceptance keyed to a SHA nobody builds is inert, and would let the
+  // live pin fail the guard for a reason that reads as a stale allowlist.
+  assert.ok(
+    WRAPPER_PATH_GAP_ACCEPTED_PINS.has(extractPin(dockerfile)) ||
+      WRAPPER_PATH_GAP_ACCEPTED_PINS.size === 0,
+    "live pin is neither fixed upstream nor in the accepted set — update one of them",
+  );
 });
