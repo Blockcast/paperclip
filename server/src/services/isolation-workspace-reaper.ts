@@ -25,6 +25,14 @@
  *    allowlist costs ~0.2% of the reclaim and removes the entire class,
  *    including on future passes whose composition nobody has looked at.
  *
+ *    The top level is not the whole story, and the first deployed dry run said
+ *    so: a worktree also lives *one level down*, as `home/<name>/.git`, under a
+ *    top level that reads as a flawless `{home, session}`. `hasNestedCheckout`
+ *    extends the same allowlist discipline one level into `home` and `session`
+ *    for exactly the directories that are about to be unlinked — 13 of 503 on
+ *    the live tree, six of them worktrees registered in a *shared* project repo
+ *    outside this root. See that function for the measurement.
+ *
  * 2. **Opt-in, following `strandedRecoveryHandBack`.** This deletes files
  *    irreversibly. Defaulting it on would make "deploy the code" and "perform
  *    the deletion" the same act, with no run in between to inspect what the
@@ -109,6 +117,9 @@ export const DEFAULT_ISOLATION_WORKSPACE_ROOT =
 
 /** Per-tick unlink ceiling. Keeps MDS pressure bounded on a shared filesystem. */
 export const DEFAULT_MAX_DELETES_PER_TICK = 200;
+
+/** Parent directory the worktree helper materializes checkouts under. */
+export const WORKTREE_PARENT_DIR = ".paperclip-worktrees";
 
 /** Directory names are `execution_workspaces.id`; anything else cannot resolve. */
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -240,6 +251,65 @@ function isReapableLayout(entries: string[]): boolean {
 }
 
 /**
+ * Property 1 inspects the workspace's own top level and nothing below it. A git
+ * worktree lives one level below: `home/<name>/.git` is a *file* holding
+ * `gitdir: …/<shared project repo>/.git/worktrees/<name>`. So a directory whose
+ * top level is exactly `{home, session}` — fully compliant, indistinguishable
+ * from an orphan — can still hold live checkouts, and removing it reaches
+ * **outside this root**: the working tree is destroyed, and the shared repo is
+ * left carrying a dangling registration that makes `git worktree list` report a
+ * path that no longer exists and `git worktree add <same name>` fail until
+ * someone runs `git worktree prune`.
+ *
+ * Measured on the live tree 2026-10-09 (BLO-36735), against the first deployed
+ * dry-run tick: **13 of the 503 directories in the match set** hold a checkout
+ * or a non-empty `WORKTREE_PARENT_DIR`. Six are worktrees of one live
+ * `pim-multicast-gateway` checkout and are registered in its `worktree list`;
+ * one carries an uncommitted change. Nothing unpushed was found, so the loss is
+ * bounded — but it is silent, and it lands on a repo this module does not own.
+ *
+ * 2.6% of the reclaim buys the whole class, which is the same trade property 1
+ * already makes at ~0.2%. Both `home` and `session` are probed: a registered
+ * worktree was found under each.
+ *
+ * Cost is bounded by construction — this runs only for a directory that has
+ * already passed the age gate *and* the top-level allowlist, i.e. one about to
+ * be unlinked, which is far more metadata work than the probe. That keeps
+ * property 4 intact.
+ *
+ * Unreadable is not evidence of absence, so every fault here retains.
+ */
+async function hasNestedCheckout(dir: string): Promise<boolean> {
+  for (const side of REAPABLE_LAYOUT) {
+    const base = path.join(dir, side);
+    let children: string[];
+    try {
+      children = await fs.readdir(base);
+    } catch {
+      return true;
+    }
+    for (const child of children) {
+      if (child === WORKTREE_PARENT_DIR) {
+        try {
+          if ((await fs.readdir(path.join(base, child))).length > 0) return true;
+        } catch {
+          return true;
+        }
+        continue;
+      }
+      try {
+        await fs.stat(path.join(base, child, ".git"));
+        return true;
+      } catch {
+        // No `.git` under this child. ENOENT and ENOTDIR both mean "not a
+        // checkout"; keep looking rather than condemning the directory.
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * One sweep. Never throws for a per-directory fault: a single unreadable or
  * concurrently-removed workspace must not abort the pass.
  */
@@ -342,7 +412,11 @@ export async function reapIsolationWorkspaces(
       continue;
     }
 
-    if (!isReapableLayout(children)) {
+    const layoutOk = isReapableLayout(children);
+    // Only probed when the top level already qualifies: a directory the
+    // allowlist rejects is skipped unexamined, which is property 1.
+    const nestedCheckout = layoutOk && (await hasNestedCheckout(dir));
+    if (!layoutOk || nestedCheckout) {
       result.skippedLayout += 1;
       // Logged individually and on purpose: a skip count above the historical
       // baseline of 1 means the tree is more heterogeneous than the allowlist
@@ -363,6 +437,10 @@ export async function reapIsolationWorkspaces(
         {
           dir,
           layout: [...children].sort(),
+          // The two skips need telling apart in the log: on a nested-checkout
+          // skip `layout` reads as a compliant `[home, session]`, so without
+          // this the line looks like a contradiction.
+          reason: nestedCheckout ? "nested_checkout" : "top_level_layout",
           ageDays: (now() - idleSinceMs) / 86_400_000,
           ageSource: owner ? "lastUsedAt" : "mtime",
         },
