@@ -3777,6 +3777,8 @@ async function stampGitWorktreeOwnership(input: {
  */
 async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: string): Promise<boolean | null> {
   const dotGit = path.join(worktreePath, ".git");
+  // A read already abandoned under this dir holds a pool thread; don't spend another.
+  if (isReclaimFsWedgedDir(path.dirname(path.resolve(dotGit)))) return null;
   const read = async () => {
     const adminRef = /^gitdir:\s*(.+)$/m.exec(await fs.readFile(dotGit, "utf8"))?.[1]?.trim();
     if (!adminRef) return false;
@@ -3796,6 +3798,13 @@ export async function inspectManagedGitWorktreeBranch(input: {
   worktreePath: string;
   expectedBranchName: string | null | undefined;
   repoRoot?: string | null;
+  /**
+   * Whether a stalled registration check is rethrown (default) so the run
+   * fails retryably. Finalize passes `false`: it runs after the adapter
+   * returned, where a retry could replay finished work, so it keeps the
+   * non-replaying `not_registered` verdict.
+   */
+  rethrowListStall?: boolean;
 }): Promise<ManagedGitWorktreeBranchInspection> {
   const worktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
   const expectedBranchName = asString(input.expectedBranchName, "").trim() || null;
@@ -3845,8 +3854,11 @@ export async function inspectManagedGitWorktreeBranch(input: {
   // The list stalled and the direct read stalled too, so there is no answer.
   // `not_registered` would become a workspace-validation failure, which recovery
   // parks for manual repair. Rethrow the stall instead: the run fails as a
-  // retryable setup/adapter failure and the next attempt re-checks.
-  if (registered === null && listed.error instanceof GitCommandTimeoutError) throw listed.error;
+  // retryable setup/adapter failure and the next attempt re-checks. Only before
+  // dispatch: see `rethrowListStall`.
+  if (registered === null && input.rethrowListStall !== false && listed.error instanceof GitCommandTimeoutError) {
+    throw listed.error;
+  }
   if (!registered) {
     return {
       ...base,

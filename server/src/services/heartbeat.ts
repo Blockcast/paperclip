@@ -34027,6 +34027,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const inspection = await inspectManagedGitWorktreeBranch({
           worktreePath,
           expectedBranchName,
+          rethrowListStall: false,
         });
         return { workspaceRecord, inspection };
       };
@@ -34125,6 +34126,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 worktreePath: inspection.worktreePath,
                 expectedBranchName: repairedExpectedBranchName,
                 repoRoot: inspection.repoRoot,
+                rethrowListStall: false,
               });
               finalizeBranchRepairMetadata = {
                 attempted: true,

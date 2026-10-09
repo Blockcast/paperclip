@@ -5586,11 +5586,10 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
     expect(inspection).toMatchObject({ valid: false, reasonCode: "not_registered" });
   });
 
-  it("rethrows the list's stall when the direct read stalls too, instead of reporting not_registered", async () => {
-    // Neither source answered. `not_registered` would park the issue for manual
-    // repair on a guess, so the stall must surface as an error the run treats as
-    // retryable.
-    const { worktreePath } = await createLinkedWorktree("BLO-42089-stalled");
+  // Stalls `git worktree list` (30s bound) and the direct `.git` read (reclaim
+  // deadline), then steps fake time until the inspection settles.
+  async function inspectWithListAndReadStalled(branchName: string, rethrowListStall?: boolean) {
+    const { worktreePath } = await createLinkedWorktree(branchName);
     const dotGit = path.join(worktreePath, ".git");
     const realReadFile = fs.readFile.bind(fs);
     const realSetTimeout = globalThis.setTimeout;
@@ -5601,8 +5600,8 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
         : (realReadFile as (...args: unknown[]) => Promise<unknown>)(file, ...rest)) as never);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
-      const outcome = await withFailingWorktreeList(async () => {
-        const settled = inspectManagedGitWorktreeBranch({ worktreePath, expectedBranchName: "BLO-42089-stalled" })
+      return await withFailingWorktreeList(async () => {
+        const settled = inspectManagedGitWorktreeBranch({ worktreePath, expectedBranchName: branchName, rethrowListStall })
           .then((value) => ({ value }), (error: unknown) => ({ error }));
         // Each 30s bound is armed only when its call starts, so step fake time
         // while giving the real subprocesses a moment between steps.
@@ -5613,13 +5612,27 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
         }
         throw new Error("inspection never settled");
       }, "stall");
-      expect(outcome).toMatchObject({ error: { name: "GitCommandTimeoutError" } });
     } finally {
       vi.useRealTimers();
       // Settle the abandoned read so its reclaim-deadline hold is released.
       releaseRead("");
       readSpy.mockRestore();
     }
+  }
+
+  it("rethrows the list's stall when the direct read stalls too, instead of reporting not_registered", async () => {
+    // Neither source answered. `not_registered` would park the issue for manual
+    // repair on a guess, so the stall must surface as an error the run treats as
+    // retryable.
+    const outcome = await inspectWithListAndReadStalled("BLO-42089-stalled");
+    expect(outcome).toMatchObject({
+      error: { name: "GitCommandTimeoutError", message: expect.stringContaining("worktree list") },
+    });
+  }, 30_000);
+
+  it("keeps not_registered for finalize, which must not turn a finished run into a retry", async () => {
+    const outcome = await inspectWithListAndReadStalled("BLO-42089-finalize", false);
+    expect(outcome).toMatchObject({ value: { valid: false, reasonCode: "not_registered" } });
   }, 30_000);
 });
 
