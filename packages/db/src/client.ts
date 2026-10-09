@@ -6,11 +6,115 @@ import { fileURLToPath } from "node:url";
 import postgres, { type Sql } from "postgres";
 import * as schema from "./schema/index.js";
 import { registerTrackedClient } from "./embedded-test-client-registry.js";
-import { ensureConcurrentIndexesForMigration } from "./concurrent-index-guard.js";
+import {
+  acquireSerializingLock,
+  DEFAULT_LOCK_WAIT_TIMEOUT_MS,
+  DEFAULT_STATEMENT_TIMEOUT_MS,
+  ensureConcurrentIndexesForMigration,
+} from "./concurrent-index-guard.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
+
+/**
+ * `lock_timeout` for transactional migration DDL (BLO-42005).
+ *
+ * The role this deployment connects as carries `lock_timeout = 15s` and
+ * `statement_timeout = 30s` — transcribed in
+ * {@link POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS}'s doc block, which is
+ * the single place those values are recorded. 15s is the bound the rev-795
+ * rollout lost, and neither value is the right one for a migration: the first
+ * is too long to fail fast and the second too short to finish an index build.
+ *
+ * SHORT ON PURPOSE, and raising it makes things worse rather than better. A
+ * pending ACCESS EXCLUSIVE request — what `ALTER TABLE cost_events ADD COLUMN`
+ * and `DROP INDEX`/`CREATE UNIQUE INDEX` need — queues every later lock request
+ * on that table behind it, so a patient DDL statement converts a lock conflict
+ * into a live outage of the table. Fail fast and retry instead: during a
+ * rolling deploy the old pods' traffic releases its AccessShareLocks in gaps,
+ * and an attempt landing in a gap wins immediately.
+ *
+ * This is deliberately shorter than `concurrent-index-guard`'s 2 minutes:
+ * `CREATE INDEX CONCURRENTLY` takes only ShareUpdateExclusive, which blocks
+ * neither readers nor writers, so patience there is free. Here it is not.
+ */
+const MIGRATION_DDL_LOCK_TIMEOUT_MS = 3_000;
+/**
+ * Attempts per migration file before a lock race is reported as a failure.
+ *
+ * 12 attempts against a 3s lock_timeout and a 1s..8s backoff is a ceiling of
+ * roughly 100s per file — bounded, and well under the 2-minute single wait
+ * `concurrent-index-guard` already tolerates on the same startup path, so this
+ * adds no new worst case to pod startup.
+ */
+const MIGRATION_LOCK_RETRY_ATTEMPTS = 12;
+const MIGRATION_LOCK_RETRY_BASE_DELAY_MS = 1_000;
+const MIGRATION_LOCK_RETRY_MAX_DELAY_MS = 8_000;
+
+/**
+ * SQLSTATEs worth replaying a whole migration file for.
+ *
+ * `55P03` (lock_not_available) is `MIGRATION_DDL_LOCK_TIMEOUT_MS` firing while
+ * waiting for the lock, and `40P01` (deadlock_detected) is two sessions
+ * crossing. Both abort before the statement touches a row, and
+ * `runInTransaction` has already rolled the file back, so a replay cannot
+ * observe a partial write.
+ *
+ * `57014` (statement_timeout) is deliberately NOT here. With a 10-minute
+ * statement_timeout it means the work itself ran that long, so replaying would
+ * double an outage rather than dodge a race.
+ */
+const MIGRATION_LOCK_RETRY_SQLSTATES = new Set(["55P03", "40P01"]);
+
+function isMigrationLockContention(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  return typeof code === "string" && MIGRATION_LOCK_RETRY_SQLSTATES.has(code);
+}
+
+/** Run `apply`, replaying it with backoff while it keeps losing a lock race. */
+async function withMigrationLockRetry(
+  migrationFile: string,
+  apply: () => Promise<void>,
+  log?: (message: string) => void,
+): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await apply();
+      return;
+    } catch (error) {
+      if (attempt >= MIGRATION_LOCK_RETRY_ATTEMPTS || !isMigrationLockContention(error)) throw error;
+      const delayMs = Math.min(
+        MIGRATION_LOCK_RETRY_BASE_DELAY_MS * attempt,
+        MIGRATION_LOCK_RETRY_MAX_DELAY_MS,
+      );
+      log?.(
+        `${migrationFile}: lost the lock race on attempt ${attempt}/${MIGRATION_LOCK_RETRY_ATTEMPTS} `
+        + `(${(error as { code?: string }).code}); retrying in ${delayMs}ms`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+/**
+ * Put this session into migration posture: owner of the cross-process
+ * serializing lock, with the sequence's statement and DDL lock timeouts.
+ *
+ * Idempotent, and called again at the start of every attempt on purpose.
+ * postgres.js reconnects transparently, and a reconnect drops both the `SET`s
+ * and the session-scoped advisory lock with no error — leaving a retry running
+ * under the role's own 15s `lock_timeout` with no serialization at all, which
+ * is precisely the state BLO-42005 is about. `pg_try_advisory_lock` on a
+ * session that already holds the key just increments its nesting count, so
+ * re-asserting costs three round-trips on a path that runs a handful of times
+ * per deploy.
+ */
+async function prepareMigrationSession(sql: ReturnType<typeof createUtilitySql>): Promise<void> {
+  await acquireSerializingLock(sql, DEFAULT_LOCK_WAIT_TIMEOUT_MS);
+  await sql.unsafe(`SET statement_timeout = '${DEFAULT_STATEMENT_TIMEOUT_MS}ms'`);
+  await sql.unsafe(`SET lock_timeout = '${MIGRATION_DDL_LOCK_TIMEOUT_MS}ms'`);
+}
 
 function createUtilitySql(url: string) {
   return postgres(url, { max: 1, onnotice: () => {} });
@@ -683,6 +787,18 @@ async function applyPendingMigrationsManually(
 
   const sql = createUtilitySql(url);
   try {
+    // Serialise the whole sequence across processes, then bound every statement
+    // in it (BLO-42005). Without this a rolling deploy's two new pods raced
+    // each other and the old pods' live traffic for the same ACCESS EXCLUSIVE
+    // locks, lost the role's 15s lock_timeout, and crash-looped the pod —
+    // taking the single-replica worker StatefulSet out for ~10 minutes.
+    //
+    // The lock is session-scoped, so `sql.end()` below releases it on every
+    // path including a killed pod; an explicit unlock here could throw and
+    // mask the migration error that matters (see BLO-34039 in
+    // concurrent-index-guard.ts).
+    await prepareMigrationSession(sql);
+
     const { migrationTableSchema, columnNames } = await ensureMigrationJournalTable(sql);
     const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
 
@@ -698,44 +814,54 @@ async function applyPendingMigrationsManually(
       );
       if (existingEntry) continue;
 
-      if (options.prepareOnlineIndexes) {
-        await ensureConcurrentIndexesForMigration(url, migrationFile, {
-          log: options.log,
-        });
-      }
+      await withMigrationLockRetry(migrationFile, async () => {
+        await prepareMigrationSession(sql);
 
-      await runInTransaction(sql, async () => {
-        for (const statement of splitMigrationStatements(migrationContent)) {
-          // Use savepoints so a single "already exists" error doesn't abort the transaction.
-          const savepointName = `sp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-          await sql.unsafe(`SAVEPOINT ${savepointName}`);
-          try {
-            await sql.unsafe(statement);
-            await sql.unsafe(`RELEASE SAVEPOINT ${savepointName}`);
-          } catch (error: unknown) {
-            const pgError = error as { code?: string };
-            // PostgreSQL error codes for "already applied" scenarios:
-            // 42P07 = duplicate_table, 42701 = duplicate_column, 42710 = duplicate_object,
-            // 42703 = undefined_column (DROP COLUMN on already-dropped column),
-            // 42P01 = undefined_table (operations on already-dropped table)
-            if (pgError.code === "42P07" || pgError.code === "42701" || pgError.code === "42710" || pgError.code === "42703" || pgError.code === "42P01") {
-              await sql.unsafe(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-              await sql.unsafe(`RELEASE SAVEPOINT ${savepointName}`);
-              continue;
-            }
-            throw error;
-          }
+        // Inside the retry because `CREATE INDEX CONCURRENTLY` can lose a lock
+        // race too, and every outcome it has is idempotent (already-valid /
+        // created / rebuilt, all `IF NOT EXISTS`-guarded). A wrong-definition
+        // or missing-prerequisite failure throws a plain Error with no
+        // SQLSTATE, so it still fails on the first attempt.
+        if (options.prepareOnlineIndexes) {
+          await ensureConcurrentIndexesForMigration(url, migrationFile, {
+            log: options.log,
+            callerHoldsSerializingLock: true,
+          });
         }
 
-        await recordMigrationHistoryEntry(
-          sql,
-          qualifiedTable,
-          columnNames,
-          migrationFile,
-          hash,
-          folderMillisByFileName.get(migrationFile) ?? Date.now(),
-        );
-      });
+        await runInTransaction(sql, async () => {
+          for (const statement of splitMigrationStatements(migrationContent)) {
+            // Use savepoints so a single "already exists" error doesn't abort the transaction.
+            const savepointName = `sp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            await sql.unsafe(`SAVEPOINT ${savepointName}`);
+            try {
+              await sql.unsafe(statement);
+              await sql.unsafe(`RELEASE SAVEPOINT ${savepointName}`);
+            } catch (error: unknown) {
+              const pgError = error as { code?: string };
+              // PostgreSQL error codes for "already applied" scenarios:
+              // 42P07 = duplicate_table, 42701 = duplicate_column, 42710 = duplicate_object,
+              // 42703 = undefined_column (DROP COLUMN on already-dropped column),
+              // 42P01 = undefined_table (operations on already-dropped table)
+              if (pgError.code === "42P07" || pgError.code === "42701" || pgError.code === "42710" || pgError.code === "42703" || pgError.code === "42P01") {
+                await sql.unsafe(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+                await sql.unsafe(`RELEASE SAVEPOINT ${savepointName}`);
+                continue;
+              }
+              throw error;
+            }
+          }
+
+          await recordMigrationHistoryEntry(
+            sql,
+            qualifiedTable,
+            columnNames,
+            migrationFile,
+            hash,
+            folderMillisByFileName.get(migrationFile) ?? Date.now(),
+          );
+        });
+      }, options.log);
     }
   } finally {
     await sql.end();
