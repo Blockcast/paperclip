@@ -38,6 +38,23 @@
 # that this job is gated on named humans, which is why the count is gone rather
 # than re-corrected.
 #
+# That 2026-10-04 is the author date of the commit the correction landed in,
+# "docs: strike two false claims in the deploy-gate design document (PEN-2918)".
+# The plan doc (docs/superpowers/plans/2026-09-04-in-review-truth-gate-and-
+# landing-routines.md) records the same supersession against 2026-10-06, because
+# ITS correction is a different commit, "docs: strike the last two survivors of
+# the deploy-gate premises" — so the two-day gap between the records is two
+# commits, not a contradiction. Both landed via Blockcast/paperclip#2331; resolve
+# either with `git log --format='%h %ad %s' --date=iso-strict --grep=<subject>`.
+#
+# Name the commit by SUBJECT, not by SHA, whenever you date a correction. The
+# merge queue rebases, so the SHA a commit carries before it lands is not the one
+# it carries on master, and a SHA read off an open branch resolves afterwards
+# only through the PR refs — a second record to reconcile rather than one to
+# check, which is the exact failure this header exists to record. A bare date is
+# the other failure: it leaves the next reader reconciling two records instead of
+# checking either one.
+#
 # The residual single-approver risk is homed on BLO-22329 and PEN-2863 is
 # RESOLVED on it — do not re-file it. This only performs the mechanical step
 # (dispatch), so there is always a build ready to ship and shipping means
