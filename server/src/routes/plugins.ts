@@ -2897,6 +2897,80 @@ export function pluginRoutes(
   });
 
   /**
+   * DELETE /api/plugins/:pluginId/config?companyId=...
+   *
+   * Remove one company's configuration row for a plugin — the inverse of the
+   * POST above, and the only way to un-configure a single company without
+   * uninstalling the plugin for every company.
+   *
+   * Why this exists (BLO-19568, BLO-42285): `listConfigCompanyIds()` counts
+   * `plugin_config` ROWS, not installs. A row copied onto a company that never
+   * really installed the plugin therefore makes the install permanently
+   * "multi-company" — public webhook URLs 400 because a sender such as Slack
+   * cannot append `?companyId=`, and the job scheduler fans every tick out onto
+   * a company whose secrets can never bind. `registry.deleteConfig()` has
+   * existed since the company-scoping work but had no caller, so the only
+   * available repair was raw SQL against the production database.
+   *
+   * Response: `{ deleted: true }`
+   * Errors:
+   * - 400 if `companyId` is missing
+   * - 404 if the plugin, or that company's config row, does not exist
+   */
+  router.delete("/plugins/:pluginId/config", async (req, res) => {
+    assertInstanceAdmin(req);
+    const { pluginId } = req.params;
+    const companyId = requirePluginConfigCompanyId(req, req.query.companyId);
+
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+
+    // Same advisory lock, and the same key, as the POST (BLO-26529). Without
+    // it a concurrent save can interleave: the save writes its secret-ref
+    // bindings, this transaction deletes the row, and the bindings outlive the
+    // config they belong to.
+    const deleted = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:plugin-config:${plugin.id}:${companyId}`}, 0))`,
+      );
+
+      // Drop this company's bindings first: `syncSecretRefsForTarget` with an
+      // empty set and `replaceAll` is the same call the POST makes, so the
+      // delete leaves exactly the state a save of an empty config would.
+      await secretService(txDb).syncSecretRefsForTarget(
+        companyId,
+        { targetType: "plugin", targetId: plugin.id },
+        [],
+        { replaceAll: true },
+      );
+
+      return pluginRegistryService(txDb).deleteConfig(plugin.id, companyId);
+    });
+
+    if (!deleted) {
+      res.status(404).json({ error: "Plugin config not found" });
+      return;
+    }
+
+    await logPluginMutationActivity(req, "plugin.config.deleted", plugin.id, {
+      pluginId: plugin.id,
+      pluginKey: plugin.pluginKey,
+      companyId,
+    });
+
+    // Deliberately no worker RPC. The two readers that matter — this file's
+    // webhook company resolution and the job scheduler's fan-out — both call
+    // `listConfigCompanyIds()` against the database per request and per tick,
+    // so they observe the delete immediately. A worker still holding config in
+    // memory for a company nothing dispatches to any more is inert.
+    res.json({ deleted: true });
+  });
+
+  /**
    * POST /api/plugins/:pluginId/config/test
    *
    * Test a plugin configuration without persisting it by calling the plugin
