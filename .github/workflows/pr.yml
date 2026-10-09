@@ -414,7 +414,15 @@ jobs:
       # break look intermittent and commit-specific. Needs network (the adapter
       # repo is public, no token required); it fails the PR only on a definite
       # orphan and warns rather than blocking when the probe itself cannot run.
-      - name: Validate opencode_k8s adapter pin is reachable (BLO-33204)
+      #
+      # It now asserts two further properties of the pinned TREE, for the same
+      # reason and off the same clone: there is nothing in our diff to review
+      # but a 40-hex number. BLO-34510 — no `replaceNamespacedSecret`, since the
+      # release-namespace Role no longer grants `secrets: update`. PEN-3732 —
+      # the agent Job PATH leads with the root-owned GitHub egress wrappers.
+      # That last one is accepted at today's SHA and fails a bump that carries
+      # the gap to a new pin; see vendor/opencode-k8s-patches/README.md.
+      - name: Validate opencode_k8s adapter pin (reachable, no Secret PUT, wrapper PATH)
         if: ${{ !cancelled() }}
         run: |
           node --test ./scripts/__tests__/opencode-k8s-pin-reachable.test.mjs
