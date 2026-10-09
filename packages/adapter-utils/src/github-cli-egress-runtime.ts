@@ -85,11 +85,20 @@ export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOption
     const detail = result.refusals
       .map((refusal) => {
         const where = refusal.path ? ` (${refusal.path})` : "";
-        return `\`${refusal.field}\`${where} matched ${refusal.classes.join(", ")}`;
+        // BLO-41262: name the lines. Without them, finding the match in a
+        // 3000-line draft took ~12 bisecting API calls. The excerpt is the
+        // SCRUBBED line, so the refusal cannot carry the material it refused.
+        const lines = refusal.locations
+          .map((location) => {
+            const key = location.key ? `${location.key}:` : "";
+            return `\n    ${key}${location.line}: ${location.excerpt}`;
+          })
+          .join("");
+        return `\`${refusal.field}\`${where} matched ${refusal.classes.join(", ")}${lines}`;
       })
       .join("; ");
     throw new GitHubCliEgressRuntimeError(
-      `refusing to rewrite GitHub repository content: ${detail}. ` +
+      `refusing to rewrite GitHub repository content: ${detail}\n` +
         "Content fields are never scrubbed in place — a silent rewrite would corrupt the committed bytes. " +
         "Remove the credential-shaped material; if it is a test fixture, derive the value at runtime " +
         "rather than embedding a literal.",

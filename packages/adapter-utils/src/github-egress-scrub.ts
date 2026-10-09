@@ -174,16 +174,59 @@ function shannonEntropyBitsPerChar(value: string): number {
   return bits;
 }
 
-/** A value is "opaque" when it is long, drawn from a token alphabet, and has
- *  high per-character entropy. Deliberately narrow: applied only to assignment
- *  values, never to bare words. A 40-char git SHA scores ~4.0 bits/char and
- *  would be redacted out of ordinary review prose if this ran unbound. */
+/** A segment is "lexical" when it is a plain word or a plain number — the
+ *  shape hyphenated identifiers are built from, and the shape a random token's
+ *  segments essentially never take, because a token mixes letters with digits
+ *  inside each run. */
+const LEXICAL_SEGMENT_RE = /^(?:[A-Za-z]+|[0-9]+)$/;
+
+/** Longest segment an identifier may carry and still be exonerated. Above
+ *  this a single segment is long enough to be a credential on its own: 16
+ *  random lowercase letters is ~75 bits. Chosen with room over the longest
+ *  segment real identifiers use — `multicast` and `transport` are 9,
+ *  `authentication` is 14. */
+const LEXICAL_SEGMENT_MAX_LENGTH = 16;
+
+/**
+ * BLO-41262: a separator-delimited run of short words is an identifier, not a
+ * credential, and per-character entropy cannot tell the two apart.
+ * `draft-ramadan-moq-multicast-00` scores 3.74 bits/char — above the floor —
+ * so an RFC-XML `<seriesInfo … value='draft-…'/>` element read as
+ * credential-shaped, and every `.md` IETF draft in Blockcast/moqcast-draft
+ * became unwritable through `gh api .../git/blobs` while git push was down.
+ *
+ * The discriminator is structure, not vocabulary (no word list to drift): a
+ * credential is ONE opaque run, so a value is exonerated only when every
+ * separator-delimited segment is itself a plain word or number AND none is
+ * long enough to be a token on its own. Both conjuncts carry weight —
+ * `release-Candidate-<20 letters>` has lexical segments and is still refused
+ * on the length of its tail.
+ *
+ * Measured against 20k random values per shape: 0/20000 base64url-43,
+ * 0/20000 alnum-40 and 0/20000 hex-40 are exonerated by this rule. A UUID
+ * stays opaque, because `386c81e8` is neither a word nor a number.
+ */
+function isLexicalIdentifier(value: string): boolean {
+  const segments = value.split(/[-._]/);
+  if (segments.length < 2) return false;
+  return segments.every(
+    (segment) =>
+      segment.length <= LEXICAL_SEGMENT_MAX_LENGTH && LEXICAL_SEGMENT_RE.test(segment),
+  );
+}
+
+/** A value is "opaque" when it is long, drawn from a token alphabet, is not a
+ *  hyphenated identifier, and has high per-character entropy. Deliberately
+ *  narrow: applied only to assignment values, never to bare words. A 40-char
+ *  git SHA scores ~4.0 bits/char and would be redacted out of ordinary review
+ *  prose if this ran unbound. */
 function isOpaqueSecretValue(value: string): boolean {
   if (value.length < HIGH_ENTROPY_MIN_LENGTH) return false;
   if (!/^[A-Za-z0-9+/=_.\-]+$/.test(value)) return false;
   // Needs mixed classes; `----------------------------` and `aaaa...` are not secrets.
   const classes = [/[a-z]/, /[A-Z0-9]/].filter((re) => re.test(value)).length;
   if (classes < 2) return false;
+  if (isLexicalIdentifier(value)) return false;
   return shannonEntropyBitsPerChar(value) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR;
 }
 
@@ -287,4 +330,61 @@ export function scrubGitHubEgressText(input: string): GitHubEgressScrubResult {
     redacted: fired.size > 0,
     classes: order.filter((cls) => fired.has(cls)),
   };
+}
+
+/** One line of a refused value, and what fired on it. */
+export interface GitHubEgressMatchLocation {
+  /** 1-based line number within the value that was scanned. */
+  line: number;
+  classes: GitHubEgressScrubClass[];
+  /**
+   * The line AS SCRUBBED, truncated.
+   *
+   * Safe to print by construction, and that is the whole reason it is the
+   * scrubbed line rather than the matched substring BLO-41262's acceptance
+   * criterion asked for: echoing the raw match sends the material into agent
+   * stderr and from there into run logs and whatever the agent pastes when it
+   * reports the refusal — PEN-2526's shape, reached from inside the control
+   * built to prevent it. The marker sits where the material was, so the
+   * surrounding bytes still identify the line unambiguously.
+   */
+  excerpt: string;
+}
+
+/** Longest excerpt reported. Long enough to carry an XML element or an
+ *  assignment with its context, short enough that a minified line cannot turn
+ *  a refusal into a page of output. */
+const EXCERPT_MAX_LENGTH = 200;
+
+/**
+ * Locate, per line, what `scrubGitHubEgressText` fired on.
+ *
+ * BLO-41262: a content refusal named only the field and the class, so finding
+ * the offending line in a 3000-line draft took ~12 API calls of manual
+ * bisection. This runs the same detectors line by line, so the refusal can say
+ * where.
+ *
+ * Only called on the refusal path, which is already failing, so the per-line
+ * re-scan costs nothing in the common case.
+ *
+ * A class that only fires ACROSS lines — `environment-dump` needs a run of
+ * five — has no single line and is absent here. The caller reports those
+ * classes without a location rather than attributing them to a line.
+ */
+export function locateGitHubEgressMatches(input: string): GitHubEgressMatchLocation[] {
+  if (typeof input !== "string" || input.length === 0) return [];
+
+  const located: GitHubEgressMatchLocation[] = [];
+  const lines = input.split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] as string;
+    const scrubbed = scrubGitHubEgressText(line);
+    if (!scrubbed.redacted) continue;
+    const excerpt =
+      scrubbed.text.length > EXCERPT_MAX_LENGTH
+        ? `${scrubbed.text.slice(0, EXCERPT_MAX_LENGTH)}…`
+        : scrubbed.text;
+    located.push({ line: i + 1, classes: scrubbed.classes, excerpt });
+  }
+  return located;
 }

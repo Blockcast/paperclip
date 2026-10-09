@@ -14,9 +14,16 @@
 // stays a few lines and every rule below is unit-testable without a sandbox.
 
 import {
+  type GitHubEgressMatchLocation,
   type GitHubEgressScrubClass,
+  locateGitHubEgressMatches,
   scrubGitHubEgressText,
 } from "./github-egress-scrub.js";
+
+/** Attribute every line that fired in one content value to its JSON key. */
+function locateContent(key: string | null, value: string): GitHubCliContentLocation[] {
+  return locateGitHubEgressMatches(value).map((location) => ({ ...location, key }));
+}
 
 /** Flags whose value is agent-authored text carried inline in argv. */
 const INLINE_TEXT_FLAGS = new Set([
@@ -92,6 +99,14 @@ export interface GitHubCliScrubIo {
   writeTempText(contents: string): string;
 }
 
+/** Where inside a refused content value a detector fired. `key` is the JSON
+ *  key the bytes sat under, so a body carrying several content fields stays
+ *  unambiguous. */
+export interface GitHubCliContentLocation extends GitHubEgressMatchLocation {
+  /** The content-role JSON key, or null when the bytes were the whole value. */
+  key: string | null;
+}
+
 /** A content-bearing field that tripped a detector. The caller refuses the
  *  invocation; this carries what the operator needs to fix it. */
 export interface GitHubCliContentRefusal {
@@ -100,6 +115,14 @@ export interface GitHubCliContentRefusal {
   /** Path, when the bytes came from a file rather than inline argv. */
   path: string | null;
   classes: GitHubEgressScrubClass[];
+  /**
+   * Lines that fired, so the author does not have to bisect the file.
+   *
+   * May be empty even though `classes` is not: a class that only fires across
+   * lines has no single line. Report `classes` regardless; this narrows, it
+   * does not replace.
+   */
+  locations: GitHubCliContentLocation[];
 }
 
 export interface GitHubCliScrubResult {
@@ -265,7 +288,12 @@ function scrubTextFile(
     const split = splitRequestBody(contents);
     if (split) {
       if (split.contentClasses.length > 0) {
-        refuse({ field, path, classes: split.contentClasses });
+        refuse({
+          field,
+          path,
+          classes: split.contentClasses,
+          locations: split.contentLocations,
+        });
         return null;
       }
       if (split.proseClasses.length === 0) return null;
@@ -301,6 +329,7 @@ function scrubTextFile(
 function splitRequestBody(body: string): {
   body: string;
   contentClasses: GitHubEgressScrubClass[];
+  contentLocations: GitHubCliContentLocation[];
   proseClasses: GitHubEgressScrubClass[];
 } | null {
   let parsed: unknown;
@@ -312,6 +341,7 @@ function splitRequestBody(body: string): {
 
   let sawContent = false;
   const contentFired = new Set<GitHubEgressScrubClass>();
+  const contentLocations: GitHubCliContentLocation[] = [];
   const proseFired = new Set<GitHubEgressScrubClass>();
 
   const walk = (node: unknown): unknown => {
@@ -337,6 +367,7 @@ function splitRequestBody(body: string): {
       if (CONTENT_FIELD_KEYS.has(key)) {
         sawContent = true;
         for (const cls of scrubbed.classes) contentFired.add(cls);
+        if (scrubbed.redacted) contentLocations.push(...locateContent(key, value));
         out[key] = value; // byte-exact, always — refuse instead of rewriting
         continue;
       }
@@ -352,6 +383,7 @@ function splitRequestBody(body: string): {
   return {
     body: JSON.stringify(rewritten),
     contentClasses: orderedClasses(contentFired),
+    contentLocations,
     proseClasses: orderedClasses(proseFired),
   };
 }
@@ -407,8 +439,16 @@ function scrubField(
     const filePath = value.slice(1);
     if (isContent) {
       // The whole file IS the committed bytes.
-      const scrubbed = scrubGitHubEgressText(io.readText(filePath));
-      if (scrubbed.redacted) refuse({ field: key, path: filePath, classes: scrubbed.classes });
+      const contents = io.readText(filePath);
+      const scrubbed = scrubGitHubEgressText(contents);
+      if (scrubbed.redacted) {
+        refuse({
+          field: key,
+          path: filePath,
+          classes: scrubbed.classes,
+          locations: locateContent(null, contents),
+        });
+      }
       return expression;
     }
     const rewritten = scrubTextFile(filePath, key, io, record, refuse);
@@ -419,7 +459,12 @@ function scrubField(
   const scrubbed = scrubGitHubEgressText(value);
   if (!scrubbed.redacted) return expression;
   if (isContent) {
-    refuse({ field: key, path: null, classes: scrubbed.classes });
+    refuse({
+      field: key,
+      path: null,
+      classes: scrubbed.classes,
+      locations: locateContent(null, value),
+    });
     return expression;
   }
   record(scrubbed.classes);
