@@ -65,16 +65,9 @@ export function legacyInstanceAlertStateRef(fingerprint: string) {
  */
 export const DEFAULT_SEVERITY_TO_PRIORITY: Record<string, PaperclipPriority> = {
   critical: "critical",
-  // BLO-20576: `warning` was `high`. It is the fleet's dominant severity —
-  // 698/993 post-ship issues — and 84.6% of its aged cohort auto-cancelled
-  // when the alert cleared on its own, against 76.0% for `critical`. A
-  // severity that mostly self-resolves and accounts for 70% of volume cannot
-  // also be the fleet's second-highest priority band without debasing the
-  // band: this one source held 51 open `critical` and zero medium/low at the
-  // time the row was filed. `medium` keeps the issue dispatchable and
-  // inbox-visible (unlike `low`, which falls off the 500-row inbox page on a
-  // deep lane — BLO-39015) while leaving `high`/`critical` to mean something.
-  // A rule that genuinely needs the old behaviour sets
+  // BLO-20576: `warning` was `high`. Rationale and the numbers behind it live
+  // in README.md § "Severity → priority defaults" — one copy, so the two
+  // cannot drift. A rule that needs the old behaviour sets
   // `paperclip_priority: high` on itself.
   warning: "medium",
   info: "medium",
