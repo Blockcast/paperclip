@@ -241,9 +241,12 @@ operator-triggered repair:
   same-hardware / different-wallet pair falls into two groups and the bullet
   above cannot see it. Treat the pair as a duplicate — keep the earliest
   authoritative `mb_uuid`, quarantine the later row, and require explicit repair
-  before deletion or reassignment. Count it as cross-wallet-duplicate in the
-  counts below, not as duplicate: it means the rebind rejection in "MintMember
-  identity and idempotency" did not hold.
+  before deletion or reassignment. This grouping also surfaces same-wallet
+  pairs, so compare the two members' parsed wallets before counting. Where they
+  differ, count the pair as cross-wallet-duplicate in the counts below: it means
+  the rebind rejection in "MintMember identity and idempotency" did not hold.
+  Where they match, the pair is the bullet above's finding and is counted once,
+  there, as duplicate.
 - Emit counts for pending, orphaned, duplicate, cross-wallet-duplicate,
   repaired, quarantined, and malformed-subject rows. Query failure is an
   unhealthy sweep, not a clean zero-count result. A persistently nonzero
