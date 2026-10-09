@@ -1490,9 +1490,9 @@ export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set(
   // "other", which is the degradation this list exists to remove.
   //
   // Deliberately NOT admitted, both measured rather than assumed:
-  //   - `issue_assignment_recovery_capacity_reservation` (same file, :3647) is
+  //   - `issue_assignment_recovery_capacity_reservation` (same file) is
   //     doubly unreachable -- its insert carries NO `payload` at all, and the
-  //     row is deleted unconditionally in a `finally` (:3659). It is an
+  //     row is deleted unconditionally in a `finally`. It is an
   //     ephemeral capacity token, not a durable wake record, so adding a payload
   //     alone would still not make it a diagnostic row.
   //   - the `routes/github-webhook.ts` contended-retry row writes a dynamic
@@ -1514,30 +1514,36 @@ export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set(
   // Reachability is measured, not assumed, and it is the SAME measurement for all
   // five. `writeSkippedRequest` writes the enclosing `payload` verbatim, and `payload`
   // is `opts.payload` from the caller (`enqueueWakeup`) -- so the row binds here iff
-  // the originating wake was issue-scoped. It routinely is: `issue_commented`
-  // (`routes/issues.ts:2505`) wakes the assignee with `source: "automation"` and
+  // the originating wake was issue-scoped. It routinely is: every `issue_commented`
+  // wake in this file wakes the assignee with `source: "automation"` and
   // `payload: { issueId, ... }`, which makes coalesce arm 1 (`payload ->> 'issueId'`)
   // bind under a WHERE carrying no status predicate. Each gate below then fires on
-  // that same request, writes that same payload, and projects to "other" today.
+  // such a request, writes that same payload, and projects to "other" today.
   //
-  // The internal control is decisive: `heartbeat.disabled` (`:37322`) and
-  // `heartbeat.wakeOnDemand.disabled` (`:37326`) are already admitted and sit INSIDE
+  // The internal control is decisive: `heartbeat.disabled` and
+  // `heartbeat.wakeOnDemand.disabled` are already admitted and sit INSIDE
   // this run of gates -- same helper, same payload, same function. There is no reading
   // on which those two are reachable and `heartbeat.cooldown.active` 19 lines later is
-  // not. Per-gate specifics, all on the issue-scoped request above:
-  //   - `company.inactive` (`:37168`) and `agent.not_invokable` (`:37307`) write only
-  //     when `requestedByActorType !== "user"`, which is the automation path that
-  //     `issue_commented` takes.
-  //   - `budget.blocked` (`:37297`) is the sharpest case: the gate immediately above it
+  // not. Per-gate specifics, all on an issue-scoped request:
+  //   - `company.inactive` and `agent.not_invokable` write only when
+  //     `requestedByActorType !== "user"`. An `issue_commented` wake stamps the
+  //     triggering actor's `actorType` (the commenter, or the resolver on an
+  //     interaction-continuation wake), so an agent actor takes this path (a
+  //     user's throws without writing).
+  //   - `budget.blocked` is the sharpest case: the gate immediately above it
   //     passes `issueId` into `budgets.getInvocationBlock`, so the issue binding is not
   //     merely present on the row, it is what the block was computed against.
-  //   - `heartbeat.cooldown.active` (`:37345`) fires on the `source !== "timer"`
-  //     on-demand path -- the one issue-scoped wakes use.
-  //   - `issue_execution_ownership_changed` (`:37752`) is strictly MORE issue-scoped
-  //     than the already-admitted `issue_tree_hold_active` (`:37654`): its enclosing
+  //   - `heartbeat.cooldown.active` does NOT fire on `issue_commented`:
+  //     `isHeartbeatCooldownActive` is inert unless `source === "timer"`, and the
+  //     gate then exempts only `schedulerTimerTick` (the scheduler's own ticks). It
+  //     fires on a `source: "timer"` wake from `POST /agents/:id/wakeup`, whose
+  //     schema admits that source and passes the caller's `payload` through -- the
+  //     same `source === "timer"` condition `heartbeat.disabled` writes under.
+  //   - `issue_execution_ownership_changed` is strictly MORE issue-scoped
+  //     than the already-admitted `issue_tree_hold_active`: its enclosing
   //     block only runs after the issue is loaded by `eq(issues.id, issueId)` and it
   //     reads `issue.executionRunId` / `checkoutRunId` / `assigneeAgentId`. The
-  //     `worktree_execution_cutoff` path five lines later (`:37757`) is a direct insert
+  //     `worktree_execution_cutoff` path five lines later is a direct insert
   //     and was already admitted; the two differed only by which helper they routed
   //     through, which is precisely the hand-maintenance failure this list is meant to
   //     have stopped.
