@@ -237,6 +237,26 @@ async function authorizeUpgrade(
   };
 }
 
+/**
+ * PEN-3895: cap on the per-socket send queue.
+ *
+ * Every event now awaits an authorization decision before it is sent
+ * (`createLiveEventTranscriptGate`), so each queued event holds a continuation
+ * AND the event payload it closed over alive until that decision resolves. With
+ * no bound, a subscriber whose decider stalls — a slow or wedged authorization
+ * query — accrues one of those per event published company-wide, for as long as
+ * the stall lasts. That is a load shape this gate introduced; before it, the
+ * send was synchronous and nothing could queue.
+ *
+ * Sized well above any healthy burst rather than tuned: live events are
+ * published one at a time from independent request handlers, so a drained
+ * socket sits at a queue depth of ~1 and only a genuinely stuck decider walks
+ * this far. Shedding is the right failure here — dropping an event on an
+ * overloaded socket matches the existing fail-closed drop on a projection
+ * error, and both are strictly better than unbounded retention.
+ */
+const MAX_PENDING_SENDS_PER_SOCKET = 512;
+
 export function setupLiveEventsWebSocketServer(
   server: HttpServer,
   db: Db,
@@ -268,18 +288,35 @@ export function setupLiveEventsWebSocketServer(
     }
 
     let sendChain: Promise<void> = Promise.resolve();
+    // PEN-3895: in-flight depth, and a closed latch. `readyState` alone is not
+    // enough to stop work after close — a continuation that is already queued
+    // behind a stalled decider will run later, and it should not project or
+    // send once the socket is gone.
+    let pendingSends = 0;
+    let closed = false;
 
     const projectForSubscriber = createLiveEventTranscriptGate(db, context);
 
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
-      if (socket.readyState !== WebSocket.OPEN) return;
+      if (closed || socket.readyState !== WebSocket.OPEN) return;
+      if (pendingSends >= MAX_PENDING_SENDS_PER_SOCKET) {
+        // Shed rather than grow. Logged per drop so a saturated subscriber is
+        // visible as itself instead of as unexplained memory growth.
+        logger.warn(
+          { companyId: context.companyId, pendingSends },
+          "live event dropped: per-socket send queue is saturated",
+        );
+        return;
+      }
+      pendingSends += 1;
       // The transcript decision is async, so ordering is preserved explicitly:
       // each event is chained onto the previous one rather than racing it. A
       // live log stream that arrived out of order would be worse than useless.
       sendChain = sendChain
         .then(async () => {
+          if (closed || socket.readyState !== WebSocket.OPEN) return;
           const projected = await projectForSubscriber(event);
-          if (socket.readyState !== WebSocket.OPEN) return;
+          if (closed || socket.readyState !== WebSocket.OPEN) return;
           socket.send(JSON.stringify(projected));
         })
         .catch((err) => {
@@ -288,6 +325,9 @@ export function setupLiveEventsWebSocketServer(
           // authorization error, so reaching here means send/serialization
           // failed, and the socket's own error handler will take it from there.
           logger.warn({ err, companyId: context.companyId }, "failed to deliver live event");
+        })
+        .finally(() => {
+          pendingSends -= 1;
         });
     });
 
@@ -299,6 +339,20 @@ export function setupLiveEventsWebSocketServer(
     });
 
     socket.on("close", () => {
+      // PEN-3895: release the send chain with the subscription, not after it.
+      // `sendChain` is per-socket state and was the one piece of it that
+      // outlived the socket: the tail promise keeps the whole resolved chain,
+      // and every event payload still referenced by a queued continuation,
+      // reachable for as long as this closure is. An in-flight continuation
+      // cannot be cancelled, but the `closed` latch makes the survivor a no-op
+      // instead of a projection and a send on a dead socket.
+      //
+      // `pendingSends` is deliberately NOT reset: the queued `.finally` handlers
+      // still run and decrement it, and zeroing it here would drive the counter
+      // negative. After `cleanup()` no new events can enter, so its value no
+      // longer gates anything.
+      closed = true;
+      sendChain = Promise.resolve();
       const cleanup = cleanupByClient.get(socket);
       if (cleanup) cleanup();
       cleanupByClient.delete(socket);
