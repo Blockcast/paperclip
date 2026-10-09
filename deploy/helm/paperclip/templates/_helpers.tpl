@@ -248,24 +248,36 @@ it from a value would let an operator point PATH at a directory no image has.
 The directories holding the GitHub egress wrappers, in the order they must
 appear on PATH.
 
-First the root-owned image directory (PEN-3713), which is where the wrappers
-now actually come from. Then the two PVC directories the seed init container
-still publishes into, derived from persistence.mountPath because the seed
-derives them the same way (`BASE={{ .Values.persistence.mountPath }}`); a
-hardcoded /paperclip would silently miss every deployment that relocates the
-PVC.
+Exactly one entry since PEN-3840: the root-owned image directory, which is
+where the wrappers come from (docker/github-wrappers/, their single source of
+truth). The two PVC directories this list used to carry behind it —
+`<base>/.local/bin` and `<base>/bin` — were a PEN-3713 rollout fallback for
+agent pods on images predating the move. They are gone now that every agent
+Job pod is measured onto a post-`bb62073a` image.
 
-Both generations are listed deliberately, and the ordering is the whole
-migration plan. A chart that rolls before the images would otherwise resolve
-`gh` past an image directory that does not exist yet and land on the
-unscrubbed /usr/bin/gh — a silent PEN-2527 regression. With the PVC entries
-retained behind it, an old image falls back to the copies it already has and
-a new image wins outright, so neither rollout order has a window. Dropping the
-PVC entries is the follow-up, once the fleet is known to be on new images.
+This is a SECURITY-ORDERED list, and it is NOT "the directories that belong on
+PATH". `<base>/bin` still belongs on PATH as ordinary tooling (kubectl, helm,
+yq, kyverno, google-chrome) and is added by `paperclip.runtimePath` from
+`paperclip.toolingBinDir` instead. Conflating the two is the trap: the render
+guard only validates directories this list *declares*, so folding tooling in
+here means dropping a wrapper directory silently takes unrelated tooling off
+PATH with it, and nothing fails.
 */}}
 {{- define "paperclip.wrapperBinDirs" -}}
-{{- $base := .Values.persistence.mountPath | trimSuffix "/" -}}
-{{- printf "%s,%s/.local/bin,%s/bin" (include "paperclip.imageWrapperBinDir" .) $base $base -}}
+{{- include "paperclip.imageWrapperBinDir" . -}}
+{{- end }}
+
+{{/*
+The PVC directory carrying general agent tooling (kubectl, helm, yq, kyverno,
+google-chrome).
+
+Deliberately not a wrapper directory: it is agent-writable, so it must never
+carry anything security-relevant, and it sits *behind* the wrapper directory on
+PATH so it cannot shadow one. Derived from persistence.mountPath, like the seed
+that populates it, so a relocated PVC does not drop it off PATH.
+*/}}
+{{- define "paperclip.toolingBinDir" -}}
+{{- printf "%s/bin" (.Values.persistence.mountPath | trimSuffix "/") -}}
 {{- end }}
 
 {{/*
@@ -274,23 +286,16 @@ PATH for containers that run agent tooling.
 PEN-2527/PEN-2526: agent-authored GitHub content is scrubbed of credential-shaped
 material by wrapper binaries in `paperclip.wrapperBinDirs`. The scrubber only sits
 on the traffic path if those directories precede /usr/bin, where the unscrubbed
-image `gh` lives. The PVC's `.local/bin` is prepended by its `.profile`/`.bashrc`,
-which only a *login* shell sources; agent tool harnesses spawn non-login shells. So
-the PATH the container itself carries is the only thing that reaches the scrubber,
-which makes it a chart-level invariant rather than one operator's values file.
+image `gh` lives. So the PATH the container itself carries is the only thing that
+reaches the scrubber, which makes it a chart-level invariant rather than one
+operator's values file.
 
 PEN-3713: the root-owned image directory leads, so the wrappers that execute are
 the ones uid 1000 cannot rewrite.
 
-Override with `env.path`. The override is validated rather than trusted: it must
-keep every wrapper directory ahead of /usr/bin, and must keep them in the order
-this chart declares them, or the render fails. Both halves matter, and the
-second is not implied by the first: an override that lists the agent-writable
-PVC directories ahead of the root-owned image directory satisfies every
-per-directory check — each one is present, each one precedes /usr/bin — while
-resolving `gh` to exactly the copy uid 1000 can rewrite. The failure mode being
-prevented is an agent that looks healthy while publishing unscrubbed, so a
-reordering that reinstates it must fail as loudly as an omission.
+PEN-3840: it now leads *absolutely* — see the leading-entry check below.
+
+Override with `env.path`. The override is validated rather than trusted.
 */}}
 {{- define "paperclip.runtimePath" -}}
 {{- $wrapperDirs := splitList "," (include "paperclip.wrapperBinDirs" .) -}}
@@ -299,7 +304,7 @@ reordering that reinstates it must fail as loudly as an omission.
 {{- fail "env.extra must not define PATH: a duplicate env var would silently override the chart-managed PATH that keeps the GitHub egress scrubber (PEN-2527) ahead of /usr/bin. Set env.path instead, which is validated." -}}
 {{- end -}}
 {{- end -}}
-{{- $path := .Values.env.path | default (printf "%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" (join ":" $wrapperDirs)) -}}
+{{- $path := .Values.env.path | default (printf "%s:%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" (join ":" $wrapperDirs) (include "paperclip.toolingBinDir" .)) -}}
 {{- $entries := splitList ":" $path -}}
 {{- $systemIdx := -1 -}}
 {{- range $i, $entry := $entries -}}
@@ -307,13 +312,25 @@ reordering that reinstates it must fail as loudly as an omission.
 {{- $systemIdx = $i -}}
 {{- end -}}
 {{- end -}}
-{{- /* `paperclip.wrapperBinDirs` is an ordered list, not a set: it names the
-       root-owned image directory first and the agent-writable PVC directories
-       behind it, and that order IS the PEN-3713 fix. So the override is checked
-       for relative order as well as presence — `$prevIdx` carries the previous
-       declared directory's position and each one must land after it. Without
-       this the two checks below pass per-directory on a PATH that resolves `gh`
-       to the PVC copy. */ -}}
+{{- /* PEN-3840: `paperclip.wrapperBinDirs` is down to a single entry, which
+       silently retired the control the relative-order check used to provide.
+       With two generations listed, "keep them in declared order" was what
+       stopped an override from putting the agent-writable PVC copy ahead of
+       the root-owned one. With one entry there is nothing to reorder, so that
+       check passes vacuously and an override reading
+       "/paperclip/.local/bin:/usr/local/libexec/paperclip/bin:...:/usr/bin"
+       would satisfy every per-directory check while resolving `gh` to a
+       directory uid 1000 can write.
+
+       So the invariant is restated in the stronger form the security model
+       actually wants, and which does not weaken as the list shrinks: NOTHING
+       may precede the lead wrapper directory. The per-directory presence and
+       before-/usr/bin checks below are retained unchanged for any further
+       entries. */ -}}
+{{- $leadDir := first $wrapperDirs -}}
+{{- if ne (index $entries 0) $leadDir -}}
+{{- fail (printf "env.path must BEGIN with the Paperclip GitHub egress wrapper directory %q, but begins with %q. Anything ahead of it resolves `gh`/`git`/`github-mcp-server` before the root-owned copies — including an agent-writable directory such as the retired PVC wrapper path, which is the defect PEN-3713/PEN-3840 removed (PEN-2527 egress scrubbing is then off the traffic path)." $leadDir (index $entries 0)) -}}
+{{- end -}}
 {{- $prevIdx := -1 -}}
 {{- $prevDir := "" -}}
 {{- range $dir := $wrapperDirs -}}
@@ -330,10 +347,23 @@ reordering that reinstates it must fail as loudly as an omission.
 {{- fail (printf "env.path must place the Paperclip GitHub egress wrapper directory %q before /usr/bin, or agent `gh` resolves to the unscrubbed image CLI (PEN-2527)" $dir) -}}
 {{- end -}}
 {{- if and (ge $prevIdx 0) (lt $idx $prevIdx) -}}
-{{- fail (printf "env.path must keep the Paperclip GitHub egress wrapper directories in the order this chart declares them: %q must precede %q. Both are ahead of /usr/bin, so every per-directory check passes, but `gh` resolves to the first match — and %q is the agent-writable PVC copy that uid 1000 can rewrite, which is the defect PEN-3713 fixed." $prevDir $dir $dir) -}}
+{{- fail (printf "env.path must keep the Paperclip GitHub egress wrapper directories in the order this chart declares them: %q must precede %q." $prevDir $dir) -}}
 {{- end -}}
 {{- $prevIdx = $idx -}}
 {{- $prevDir = $dir -}}
+{{- end -}}
+{{- /* PEN-3840: the tooling directory is not security-ordered, but it must not
+       fall off PATH — kubectl/helm/yq/kyverno/google-chrome live there and the
+       render guard above cannot notice a directory nobody declares. */ -}}
+{{- $toolingDir := include "paperclip.toolingBinDir" . -}}
+{{- $toolingIdx := -1 -}}
+{{- range $i, $entry := $entries -}}
+{{- if and (eq $entry $toolingDir) (lt $toolingIdx 0) -}}
+{{- $toolingIdx = $i -}}
+{{- end -}}
+{{- end -}}
+{{- if lt $toolingIdx 0 -}}
+{{- fail (printf "env.path must include the Paperclip tooling directory %q, or kubectl/helm/yq/kyverno/google-chrome stop resolving in the server pod (PEN-3840)" $toolingDir) -}}
 {{- end -}}
 {{- $path -}}
 {{- end }}
