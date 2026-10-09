@@ -1511,20 +1511,24 @@ export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set(
   // delegate, so the parent's reasons were invisible to the control that is supposed
   // to hold this list honest. The scan now reads both.
   //
-  // Reachability is measured, not assumed, and it is the SAME measurement for all
+  // Reachability is measured, not assumed, and it rests on the SAME mechanism for all
   // five. `writeSkippedRequest` writes the enclosing `payload` verbatim, and `payload`
   // is `opts.payload` from the caller (`enqueueWakeup`) -- so the row binds here iff
   // the originating wake was issue-scoped. It routinely is: every `issue_commented`
   // wake in this file wakes the assignee with `source: "automation"` and
   // `payload: { issueId, ... }`, which makes coalesce arm 1 (`payload ->> 'issueId'`)
-  // bind under a WHERE carrying no status predicate. Each gate below then fires on
-  // such a request, writes that same payload, and projects to "other" today.
+  // bind under a WHERE carrying no status predicate. Four of the five gates below
+  // fire on such a request, write that same payload, and project to "other" today;
+  // `heartbeat.cooldown.active` has a different entry point, given below.
   //
-  // The internal control is decisive: `heartbeat.disabled` and
-  // `heartbeat.wakeOnDemand.disabled` are already admitted and sit INSIDE
-  // this run of gates -- same helper, same payload, same function. There is no reading
-  // on which those two are reachable and `heartbeat.cooldown.active` 19 lines later is
-  // not. Per-gate specifics, all on an issue-scoped request:
+  // The internal controls are decisive, one per entry point. Both are already
+  // admitted and sit INSIDE this run of gates -- same helper, same payload, same
+  // function. `heartbeat.wakeOnDemand.disabled` writes under `source !== "timer"`,
+  // the `issue_commented` path the four take. `heartbeat.disabled` writes under
+  // `source === "timer"`, the precondition `heartbeat.cooldown.active` shares
+  // further down the function. There is no reading on which either control is
+  // reachable and the gates on its path are not. Per-gate specifics, all on an
+  // issue-scoped request:
   //   - `company.inactive` and `agent.not_invokable` write only when
   //     `requestedByActorType !== "user"`. An `issue_commented` wake stamps the
   //     triggering actor's `actorType` (the commenter, or the resolver on an
