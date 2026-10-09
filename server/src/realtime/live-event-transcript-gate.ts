@@ -73,8 +73,8 @@ type MembershipReader = () => Promise<{ membershipRole: string | null; status: s
 export interface LiveEventTranscriptAuditEntry {
   ownerAgentId: string | null;
   result: "allowed" | "denied";
-  /** The decider's named boundary vocabulary, or a gate-local reason. */
-  reason: string | null;
+  /** The decider's named boundary vocabulary, or a gate-local reason. Never null. */
+  reason: string;
 }
 
 type TranscriptStreamAuditor = (entry: LiveEventTranscriptAuditEntry) => Promise<void>;
@@ -96,6 +96,17 @@ export const LIVE_EVENT_TRANSCRIPT_AUDIT_ACTION = "heartbeat.run_events_streamed
 const UNRESOLVED_OWNER_ENTITY_ID = "unresolved-owner";
 
 /**
+ * One transcript decision as the gate records it: the decider's outcome, plus a
+ * slot for the reasons the gate reaches on its own without consulting the
+ * decider at all.
+ */
+type GateOutcome = {
+  allowed: boolean;
+  decision: { reason: string } | null;
+  gateReason: string | null;
+};
+
+/**
  * The named reason for one `decideRunTranscriptRead` outcome, including the two
  * branches that return before the decider runs and so carry no
  * `AuthorizationDecision` to read a reason off.
@@ -107,17 +118,6 @@ const UNRESOLVED_OWNER_ENTITY_ID = "unresolved-owner";
  * vocabulary the way its REST twins' do; re-check against `routes/authz.ts` if
  * a third early return is ever added.
  */
-/**
- * One transcript decision as the gate records it: the decider's outcome, plus a
- * slot for the reasons the gate reaches on its own without consulting the
- * decider at all.
- */
-type GateOutcome = {
-  allowed: boolean;
-  decision: { reason: string } | null;
-  gateReason: string | null;
-};
-
 function decisionReason(outcome: { allowed: boolean; decision: { reason: string } | null }): string {
   if (outcome.decision) return outcome.decision.reason;
   return outcome.allowed ? "allow_board_transcript_operator" : "deny_company_scope";
@@ -134,7 +134,16 @@ function decisionReason(outcome: { allowed: boolean; decision: { reason: string 
  * deliveries carrying nothing a subscriber asked for. It terminates rather than
  * looping — `activity.logged` carries none of the four withheld keys, so the
  * gate returns before deciding and no second row is written — but the
- * amplification is real and it would also flood the board activity feed.
+ * amplification is real.
+ *
+ * What declining to publish buys is exactly that, and no more: no live
+ * `activity.logged` fan-out, and no plugin-outbox enqueue (this action is not a
+ * plugin event, so there is none to lose). It does NOT keep these rows out of
+ * the activity FEED — the stored rows are the feed, read back by
+ * `GET /companies/:companyId/activity`. That is handled where the feed is read:
+ * a page that does not ask for an `action` leaves this one out
+ * (`FEED_EXCLUDED_ACTIONS` in `routes/activity.ts`), and `?action=` with this
+ * name still returns every row.
  *
  * `deferPublish: true` returns the publisher to the caller instead of firing it
  * inline; dropping that function is how this site declines to publish. Said
@@ -326,7 +335,7 @@ export function createLiveEventTranscriptGate(
     const cached = cache.get(key);
     if (cached && startedAt - cached.decidedAt < ttlMs) return cached.allowed;
     const { readAt, req } = actorAt(startedAt);
-    const pending = req
+    const pending: Promise<boolean> = req
       .then(async (request): Promise<GateOutcome> => {
         // An unresolvable owner never reaches the decider. The grant arm is
         // company-wide, so `decideRunTranscriptRead` would admit a grant holder
@@ -342,28 +351,10 @@ export function createLiveEventTranscriptGate(
         });
         return { allowed: outcome.allowed, decision: outcome.decision, gateReason: null };
       })
-      // Audited HERE, inside the memoized decision, so there is exactly one
-      // record per DECISION and not one per event: a socket streaming a busy
-      // run would otherwise write thousands of identical rows for one answer.
-      // Read the row count as decisions reused for up to `ttlMs`, never as a
-      // count of transcript events delivered.
-      //
-      // Awaited rather than fired and forgotten, so an audit that cannot be
-      // written cannot become an unrecorded read — the `.catch` below turns the
-      // failure into a withhold. That is the same posture as the REST twins,
-      // where `await logRunLogAccessAudit(...)` is unguarded and a failed write
-      // fails the response instead of serving unaudited bytes.
-      .then(async (outcome) => {
-        await audit({
-          ownerAgentId: agentId,
-          result: outcome.allowed ? "allowed" : "denied",
-          reason: outcome.gateReason ?? decisionReason(outcome),
-        });
-        return outcome.allowed;
-      })
       // Fail closed. An authorization error — or a failed membership re-read —
       // must not become a transcript read; the subscriber still receives the
-      // event, just without the content.
+      // event, just without the content. Memoized like any other answer: a
+      // broken authorizer is asked again once the window expires, not per event.
       //
       // Logged for the reason the REST twin gives at `routes/authz.ts`: a
       // broken authorizer that failed silently would be indistinguishable from
@@ -371,12 +362,50 @@ export function createLiveEventTranscriptGate(
       // transcript access decidable. Fail closed AND say so — and say so here
       // too, so the posture really is local to both gates rather than inferable
       // only from the REST one.
-      .catch((error) => {
+      .catch((error): null => {
         logger.error(
           { err: error, companyId: context.companyId, agentId },
-          "live-event transcript read decision or audit failed; withholding",
+          "live-event transcript read decision failed; withholding",
         );
-        return false;
+        return null;
+      })
+      // Audited HERE, inside the memoized decision, so there is exactly one
+      // record per DECISION and not one per event: a socket streaming a busy
+      // run would otherwise write thousands of identical rows for one answer.
+      // Read the row count as decisions reused for up to `ttlMs`, never as a
+      // count of transcript events delivered. A decision that failed above has
+      // no outcome to record, so it is withheld without a row.
+      .then(async (outcome) => {
+        if (outcome === null) return false;
+        try {
+          await audit({
+            ownerAgentId: agentId,
+            result: outcome.allowed ? "allowed" : "denied",
+            reason: outcome.gateReason ?? decisionReason(outcome),
+          });
+        } catch (error) {
+          // Awaited rather than fired and forgotten, so an audit that cannot
+          // be written cannot become an unrecorded read: this read is withheld.
+          // That is the REST twins' posture, where an unguarded
+          // `await logRunLogAccessAudit(...)` fails that one response.
+          //
+          // And like the REST twins the failure is per-attempt, not sticky.
+          // The withhold is NOT memoized — memoizing it would keep an entitled
+          // reader's content withheld for the rest of the window after the
+          // audit backend recovers, indistinguishable from a real denial. The
+          // entry is dropped (only if it is still this attempt's, so a newer
+          // decision is never evicted) and the next event re-attempts the
+          // write. Concurrent events still share this one in-flight attempt.
+          if (cache.get(key)?.allowed === pending) cache.delete(key);
+          // Its own message, so an operator can tell a broken auditor from a
+          // broken authorizer (logged above) on this path.
+          logger.error(
+            { err: error, companyId: context.companyId, agentId, result: outcome.allowed ? "allowed" : "denied" },
+            "live-event transcript read audit write failed; withholding this read and retrying on the next event",
+          );
+          return false;
+        }
+        return outcome.allowed;
       });
     // A board decision is no fresher than the role it was made from: stamping
     // it with `startedAt` would let a decision started late in a role window

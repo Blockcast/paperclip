@@ -667,6 +667,55 @@ describe("PEN-3142 live-event transcript gate", () => {
 
       expect(JSON.stringify(projected)).not.toContain(CANARY);
     });
+
+    // Ally review 5473258762 (Important): the failed write used to be memoized
+    // as a denial for the whole window, so an ENTITLED reader stayed withheld
+    // for up to the TTL after the audit backend recovered. The REST twins fail
+    // only the one request; the next one re-attempts. So must this.
+    it("re-attempts the audit on the next event after a failed write, inside the same window", async () => {
+      mockLogActivity.mockRejectedValueOnce(new Error("activity log unavailable"));
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate(
+        {} as never,
+        { companyId, actorType: "agent", actorId: runOwnerAgentId },
+        // A frozen clock: the second event is well inside the decision window.
+        { now: () => 0, ttlMs: 30_000 },
+      );
+
+      const first = await project(logEvent() as never);
+      const second = await project(logEvent() as never);
+
+      expect(JSON.stringify(first)).not.toContain(CANARY);
+      expect(JSON.stringify(second)).toContain(CANARY);
+      expect(auditCalls()).toHaveLength(2);
+      // ...and the recovered decision IS memoized: a third event writes no row.
+      await project(logEvent() as never);
+      expect(auditCalls()).toHaveLength(2);
+    });
+
+    it("logs a failed audit write apart from a failed decision", async () => {
+      const { logger } = await import("../middleware/logger.js");
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const errorMessages = () => vi.mocked(logger.error).mock.calls.map((call) => String(call[1]));
+
+      mockLogActivity.mockRejectedValueOnce(new Error("activity log unavailable"));
+      await createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "agent",
+        actorId: runOwnerAgentId,
+      })(logEvent() as never);
+      expect(errorMessages()).toEqual([expect.stringMatching(/audit write failed/)]);
+
+      vi.mocked(logger.error).mockClear();
+      mockDecide.mockRejectedValueOnce(new Error("authz unavailable"));
+      await createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "agent",
+        actorId: runOwnerAgentId,
+      })(logEvent() as never);
+      expect(errorMessages()).toEqual([expect.stringMatching(/decision failed/)]);
+      expect(errorMessages()[0]).not.toMatch(/audit/);
+    });
   });
 });
 
