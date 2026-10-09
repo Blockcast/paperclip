@@ -224,7 +224,7 @@ function runRecovery(scenario: string): { status: number; stderr: string; ghCall
         ...process.env,
         // The pods export this by default pointing at the App token, so the
         // recipe must not key off its mere presence.
-        PAPERCLIP_GITHUB_TOKEN_FILE: "/paperclip/.secrets/github-token/token",
+        PAPERCLIP_GITHUB_TOKEN_FILE: "/etc/paperclip/secrets/github-token/token",
         PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
         GH_LOG: logPath,
         GH_SCENARIO: scenario,
