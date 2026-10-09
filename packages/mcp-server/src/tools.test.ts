@@ -105,10 +105,42 @@ describe("paperclip MCP tools", () => {
     expect(description).toContain("fails OPEN");
     expect(description).toContain("BARE ARRAY even when the cap bit");
 
-    // And it is actionable: a runnable discriminator, not just a warning.
+    // And it is actionable: a runnable discriminator, not just a warning. Keyed
+    // on the guarantee rather than the prose: the discriminator must be the
+    // content-independent empty-page test. Comparing the ids of two pages is
+    // churn-sensitive (the page re-orders by last activity between calls), so
+    // on a server that ignores `offset` it can fake "the fix is live".
     expect(description).toContain("POSITIVE CONTROL");
-    expect(description).toContain("`offset=0` and `offset=<N\u22651>` and compare the returned ids");
+    expect(description).toContain("an `offset` larger than the lane could plausibly hold");
+    expect(description).toContain("test for an EMPTY array");
+    expect(description).toMatch(/NON-EMPTY \u21d2 `offset` is being ignored/);
+    expect(description).not.toMatch(/DIFFERENT ids \u21d2/);
     expect(description).toContain("a bare array proves NOTHING");
+
+    // The prescribed fallback must not route the caller onto a surface that
+    // carries the same uncaveated claim.
+    expect(description).toMatch(/paperclipListIssues\(assigneeAgentId=me\) per status \u2014 whose own `limit` description carries the same deploy-skew caveat/);
+  });
+
+  // The shared issue-list `limit` schema (paperclipListIssues, paperclip_search_issues)
+  // made the same claim with no caveat, and it is independently measured false:
+  // `limit: 1000` returned exactly 1000 rows as a bare array, `offset: 1000` a
+  // disjoint second 1000 (true population 2083).
+  it.each(["paperclipListIssues", "paperclip_search_issues"])(
+    "%s's limit carries the deploy-skew caveat instead of an unconditional bare-array proof",
+    (name) => {
+      const tool = getTool(name);
+      const limitDescription = (tool.schema.shape.limit as { description?: string }).description ?? "";
+      expect(limitDescription).toContain("fails OPEN");
+      expect(limitDescription).toMatch(/bare array whose length equals the limit actually applied[^.]*NOT proof of completeness/);
+      expect(limitDescription).not.toMatch(/so a plain array back is itself the proof/);
+    },
+  );
+
+  it("paperclip_search_issues does not restate the bare-array proof unqualified", () => {
+    const { description } = getTool("paperclip_search_issues");
+    expect(description).not.toContain("a bare array means you have every match, an object");
+    expect(description).toContain("deploy-skew caveat");
   });
 
   it("adds auth headers and run id to mutating requests", async () => {
