@@ -851,7 +851,7 @@ describe("issue wake diagnostic reason allowlist", () => {
   //
   // PEN-3855: carries a `why` per entry now that the scan spans several files and
   // the exclusions no longer share one justification. The list stays single-sourced:
-  // the positive scan's carve-out and the negative test below both read it, so an
+  // both positive scans' carve-outs and the negative test below read it, so an
   // entry added for one and not the other contradicts rather than drifts.
   const UNREACHABLE_BY_CONSTRUCTION: { reason: string; why: string }[] = [
     { reason: "provider_capacity_deferred", why: "agent-scoped timer skip, payload has no issue binding" },
@@ -1111,10 +1111,14 @@ describe("issue wake diagnostic reason allowlist", () => {
       `no writeSkipped(Heartbeat)?Request call sites found; got ${written.join(", ") || "none"}`,
     ).toBeGreaterThanOrEqual(11);
 
+    // Same carve-out as the direct-insert scan below. Without it this scan could only
+    // push the list toward admission, and measuring a reason unreachable (adding it to
+    // UNREACHABLE_BY_CONSTRUCTION) would make it contradict the negative test outright.
     for (const reason of written) {
+      if (UNREACHABLE_REASONS.includes(reason)) continue;
       expect(
         ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(reason),
-        `${reason} is written to agent_wakeup_requests.reason on an issue-scoped skip path but projects to "other"`,
+        `${reason} is written to agent_wakeup_requests.reason by a writeSkipped(Heartbeat)?Request call but projects to "other"`,
       ).toBe(true);
     }
   });
