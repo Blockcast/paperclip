@@ -6469,7 +6469,11 @@ export function summarizeHeartbeatRunListResultJson(input: {
   return Object.keys(summary).length > 0 ? summary : null;
 }
 
-function summarizeRunFailureForIssueComment(
+// Exported for test only. PEN-3633 turns on there being TWO summarizers with
+// the same first-line + middle-ellipsis reduction (the other is in
+// `recovery/service.ts`), and a fix verified against only one of them would
+// leave the other still eliding causes. Exporting lets both be pinned.
+export function summarizeRunFailureForIssueComment(
   run: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined,
 ) {
   if (!run) return null;
@@ -8473,6 +8477,35 @@ export function resolveExecutionWorkspaceReuseProvisioningPolicy(input: {
   };
 }
 
+// PEN-3633. The composed message is three lines, cause first, and that layout
+// is load-bearing rather than cosmetic.
+//
+// Both issue-comment summarizers — `summarizeRunFailureForIssueComment` in
+// `recovery/service.ts` and its twin in this file — reduce a run error to its
+// first non-empty line and then middle-ellipse it at 240 chars. Composed as one
+// sentence, this message read `<151 chars of context> because <cause>. <186
+// chars of remediation>`, which put the cause in the middle: the truncator
+// deleted it *by construction* and kept the generic remediation tail, for every
+// cause length including short ones. That is what made a measured 8.6 h,
+// 33-run failure episode unattributable from the surface operators actually
+// read.
+//
+// Keeping the cause on line 1 keeps the remediation out of the summary source
+// entirely, so a cause under ~190 chars now reaches the issue comment intact
+// and a longer one is ellipsed within itself rather than replaced by boilerplate.
+//
+// Deliberately NOT fixed by changing `truncateText`'s shape. It has 12 callers,
+// and the sibling guarantee "keeps the causal tail of a long plain failure"
+// (`recovery/strand-comment-provider-capacity.test.ts`) relies on the
+// middle-ellipsis preserving the *tail* for errors whose cause trails a long
+// path prefix. That shape and this one want opposite biases, so no truncation
+// mode satisfies both and only the producer can resolve it.
+//
+// The issue and workspace ids move to line 2, which costs the summary its
+// workspace id. That is the deliberate trade: the comment is already attached
+// to the issue it concerns, and spending a 240-char diagnostic budget on
+// identifiers the reader already has is precisely what produced an
+// unattributable failure class.
 function formatInheritedExecutionWorkspaceReuseFailure(input: {
   reason: "inherited_workspace_reuse_failed" | "inherited_workspace_reuse_unavailable";
   issueRef: WorkspaceReuseIssueRef;
@@ -8483,19 +8516,26 @@ function formatInheritedExecutionWorkspaceReuseFailure(input: {
 }) {
   const issueLabel = input.issueRef?.identifier ?? input.issueRef?.id ?? input.runId;
   const workspaceLabel = input.executionWorkspaceId ?? "unknown workspace";
-  const causeMessage = input.cause instanceof Error
+  const rawCauseMessage = input.cause instanceof Error
     ? input.cause.message
     : input.cause != null
       ? String(input.cause)
       : null;
+  // Collapse the cause onto one physical line. git writes multi-line stderr, and
+  // the summarizers take only the FIRST line — so an uncollapsed multi-line cause
+  // would silently reduce the summary to its opening clause and drop the rest,
+  // reintroducing the elision this layout exists to prevent. Collapsing keeps
+  // every character and lets the 240-char ellipsis fall inside the cause itself.
+  const causeMessage = rawCauseMessage?.replace(/\s+/g, " ").trim() || null;
   const remediation = input.reason === "inherited_workspace_reuse_failed"
     ? "Inspect the referenced execution workspace restore/provision logs, repair or unarchive the workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying."
     : "Repair or unarchive the referenced execution workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying.";
-  const message = causeMessage
-    ? `Issue ${issueLabel} requested inherited execution workspace reuse for ${workspaceLabel}, but the workspace could not be restored because ${causeMessage}.`
-    : `Issue ${issueLabel} requested inherited execution workspace reuse for ${workspaceLabel}, but the workspace could not be restored.`;
+  const headline = causeMessage
+    ? `Inherited execution workspace reuse failed because ${causeMessage}.`
+    : "Inherited execution workspace reuse failed: the referenced execution workspace could not be restored, and no cause was reported.";
+  const context = `Issue ${issueLabel} requested reuse of execution workspace ${workspaceLabel}.`;
 
-  return `${message} ${remediation}`;
+  return `${headline}\n${context}\n${remediation}`;
 }
 
 export async function provisionExecutionWorkspaceForFreshnessDecision<T extends { warnings?: string[] }>(input: {
