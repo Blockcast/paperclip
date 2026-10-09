@@ -4359,9 +4359,12 @@ function isActionableReviewFeedbackContext(context: ResolvedEventContext): boole
 // here rather than ship something nothing documents. It does NOT catch a reason
 // legitimately ADDED to `PrReviewNonActionableReason` — that widens the `Pick`
 // and compiles clean. `DECLINED_REVIEW_FEEDBACK_LOG` below is what catches an
-// added reason; the `Pick` itself does not. Keeping the union and its JSDoc
-// taxonomy adjacent is what documents what each reason MEANS, which no
-// exhaustiveness check can supply.
+// added reason at compile time; the `Pick` itself does not. The delegation
+// guard in github-webhook.test.ts also asserts its body set against
+// `PR_REVIEW_NON_ACTIONABLE_REASONS` itself (BLO-41777), so an added reason
+// no body reaches reds that test. Keeping the union and its JSDoc taxonomy
+// adjacent is what documents what each reason MEANS, which no exhaustiveness
+// check can supply.
 type PrReviewFeedbackSuppression = Pick<
   Extract<PrReviewActionabilityDecision, { actionable: false }>,
   "reason" | "predicate"

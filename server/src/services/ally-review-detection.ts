@@ -1489,8 +1489,7 @@ function carriesBlockingFeedback(text: string, options?: ActionableFeedbackOptio
  *     routes as actionable before reaching this branch. The reason stays for
  *     the same truncation carrying no such assertion — the shape above with
  *     every prior finding retired.
- */
-/**
+ *
  * The runtime value is the source of truth and the type is derived from it, so
  * a test can enumerate the taxonomy instead of hand-copying it.
  *
@@ -1513,6 +1512,7 @@ export const PR_REVIEW_NON_ACTIONABLE_REASONS = [
   "review_no_blocking_feedback",
 ] as const;
 
+/** See {@link PR_REVIEW_NON_ACTIONABLE_REASONS} for the taxonomy. */
 export type PrReviewNonActionableReason = (typeof PR_REVIEW_NON_ACTIONABLE_REASONS)[number];
 
 /**
