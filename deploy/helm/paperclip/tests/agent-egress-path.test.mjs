@@ -36,7 +36,7 @@ const chartDir = "deploy/helm/paperclip";
 // PEN-3713: the root-owned image directory the wrappers now ship in. Restated
 // here on purpose — it is the one value in this file that MUST agree with
 // three places outside the chart (the Dockerfile COPY target, Dockerfile.agent's
-// COPY --from=server, and GITHUB_WRAPPER_BIN_DIR in the claude_k8s adapter), and
+// COPY --from=server, and IMAGE_WRAPPER_BIN_DIR in the claude_k8s adapter), and
 // a test that derived it from the chart could not catch the chart drifting away
 // from the image. The agreement is asserted explicitly further down.
 const IMAGE_WRAPPER_BIN = "/usr/local/libexec/paperclip/bin";
@@ -568,17 +568,25 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
   );
 
   // The adapter prepends this same directory to every agent Job's PATH, on a
-  // surface the Helm render guard above cannot reach.
-  const adapter = fs.readFileSync(
-    path.join(
-      repoRoot,
-      "vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts",
-    ),
-    "utf8",
-  );
+  // surface the Helm render guard above cannot reach. It is declared once, in
+  // runtime-pin.ts: the runtime-pin bootstrap keys its PATH ordering off it
+  // (PEN-3714), and job-manifest.ts imports it rather than restating it, so a
+  // directory move cannot leave one of the two on a stale literal.
+  const adapterSource = (file) =>
+    fs.readFileSync(
+      path.join(repoRoot, "vendor/paperclip-adapter-claude-k8s/src/server", file),
+      "utf8",
+    );
   assert.ok(
-    adapter.includes(`const GITHUB_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`),
+    adapterSource("runtime-pin.ts").includes(
+      `export const IMAGE_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`,
+    ),
     "the claude_k8s adapter must prepend the same directory the chart names",
+  );
+  assert.match(
+    adapterSource("job-manifest.ts"),
+    /import \{[^}]*\bIMAGE_WRAPPER_BIN_DIR\b[^}]*\} from "\.\/runtime-pin\.js";/,
+    "job-manifest.ts must take the wrapper directory from runtime-pin.ts, the one place it is declared",
   );
 
   // The third place the directory is named: inside the wrapper scripts

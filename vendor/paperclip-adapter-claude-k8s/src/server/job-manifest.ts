@@ -14,7 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
-import { buildClaudeCodeRuntimeShell, claudeCodeRuntimeRoot, resolveClaudeCodeVersion } from "./runtime-pin.js";
+import { buildClaudeCodeRuntimeShell, claudeCodeRuntimeRoot, IMAGE_WRAPPER_BIN_DIR, resolveClaudeCodeVersion } from "./runtime-pin.js";
 import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
@@ -446,12 +446,6 @@ const WAKE_PAYLOAD_MAX_VALUE_BYTES = MAX_ENV_STRING_BYTES - (WAKE_PAYLOAD_ENV_NA
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
-// PEN-3713. Where the image installs the root-owned GitHub egress wrappers
-// (Dockerfile `COPY docker/github-wrappers/`). Must match
-// `paperclip.imageWrapperBinDir` in the chart; the pair is pinned by
-// deploy/helm/paperclip/tests/agent-egress-path.test.mjs so the two cannot
-// drift into a PATH entry no image carries.
-const GITHUB_WRAPPER_BIN_DIR = "/usr/local/libexec/paperclip/bin";
 // Only used when the merged env carries no PATH at all; see the prepend below.
 const GITHUB_WRAPPER_FALLBACK_PATH =
   "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -1784,10 +1778,10 @@ function buildEnvVars(
   // `inheritedEnv` carries the server pod's PATH — so the cost is theoretical
   // and the exposure is not.
   const pathEntries = (existingPath || GITHUB_WRAPPER_FALLBACK_PATH).split(":");
-  if (pathEntries[0] !== GITHUB_WRAPPER_BIN_DIR) {
+  if (pathEntries[0] !== IMAGE_WRAPPER_BIN_DIR) {
     merged.PATH = [
-      GITHUB_WRAPPER_BIN_DIR,
-      ...pathEntries.filter((entry) => entry !== GITHUB_WRAPPER_BIN_DIR),
+      IMAGE_WRAPPER_BIN_DIR,
+      ...pathEntries.filter((entry) => entry !== IMAGE_WRAPPER_BIN_DIR),
     ].join(":");
   }
 
