@@ -93,6 +93,16 @@ export interface CommentReviewGateComment {
   authorLogin: string | null | undefined;
   body: string | null | undefined;
   createdAt: string | Date;
+  /**
+   * Which GitHub artifact carried this body (BLO-42525).
+   *
+   * Optional, and absence means `issue_comment` — the restrictive side. Only
+   * `pull_request_review` is exempted from the self-attestation withholding
+   * below, so a call site that forgets this field publishes a false red, never
+   * a false green. That is the opposite trade from `prAuthorLogin`, which is
+   * required precisely because ITS omission failed open (BLO-34316).
+   */
+  source?: "issue_comment" | "pull_request_review";
 }
 
 /**
@@ -620,7 +630,9 @@ export function evaluateCommentReviewGate(input: {
   headSha: string;
   reviewerBotLogin?: string | null;
   /**
-   * The login that opened the PR. Required to reach `clean` (BLO-34316).
+   * The login that opened the PR. Required to reach `clean` from an issue
+   * comment (BLO-34316); a formal `pull_request_review` is exempt (BLO-42525,
+   * see the branch that reads `source`).
    *
    * Every attesting comment has already been established to come from the
    * reviewer identity, so "this attestation is the author's own" reduces to
@@ -756,26 +768,68 @@ export function evaluateCommentReviewGate(input: {
     // branch above stays author-blind on purpose: a finding is a finding
     // whoever wrote it, and failing closed there is the direction this module
     // must not get wrong.
+    //
+    // BLO-42525: a SUBMITTED `pull_request_review` is exempt from the
+    // independence test. On an App-authored PR the author IS the reviewer
+    // identity by construction — both are `allyblockcast[bot]` — so
+    // independence is unsatisfiable there and BLO-34316's withholding made
+    // `clean` unreachable for the whole population, however many times Ally
+    // re-reviewed. Measured 2026-10-09 on Blockcast/moq#4 (a2578771) and
+    // Blockcast/Network-Operator-Portal#1269 (6ed113f0): both carried a formal
+    // 0/0 review at the exact head and both published `carried_finding`.
+    //
+    // This does NOT reopen BLO-34316, whose hole was an author-written ISSUE
+    // COMMENT reaching `clean`. Three things keep the exemption narrow:
+    //   - It is keyed on the artifact carrying THIS verdict — `forHead`, the
+    //     comment whose body was just read — not on "some formal review also
+    //     attests this head". Keying it on the set would let a newer
+    //     self-authored issue comment launder an older formal review's finding
+    //     at the same head, which is exactly the laundering being prevented.
+    //   - The review must have been SUBMITTED: `githubListPrReviewsWithTimestamps`
+    //     drops `PENDING`, so an unsubmitted draft visible only to its author
+    //     cannot self-attest.
+    //   - Every other control is unchanged — reviewer-identity match, the
+    //     `Reviewed head:` attestation of this exact SHA, and the author-blind
+    //     blocking branch above.
+    //
+    // What it does NOT establish is cryptographic independence: any pod holding
+    // the App installation token can submit a review. The claim this gate makes
+    // on an App-authored PR is therefore "a submitted review object examined
+    // this exact tree and reported nothing unresolved", not "someone other than
+    // the author did". That is the strongest claim available on this
+    // population, and the owner's landing bar keeps a human reading the review.
     const prAuthorLogin = input.prAuthorLogin?.trim();
-    if (!prAuthorLogin) {
-      withheldPositive = {
-        state: "success",
-        outcome: "not_evaluated",
-        authorUnknown: true,
-        reason: "The PR author is unknown, so this head's attestation cannot be shown to be independent.",
-      };
-      // `githubSharesReviewerIdentity`, not `githubReviewerIdentityMatches`: the
-      // strict predicate exists to keep the bare `<slug>` user seat from being
-      // CREDITED as the reviewer, and that fail direction is inverted here. The
-      // seat and the App are one agent wearing two hats, so a PR opened by the
-      // seat and attested by the App is still a self-attestation.
-    } else if (githubSharesReviewerIdentity(prAuthorLogin, reviewerBotLogin)) {
-      withheldPositive = {
-        state: "success",
-        outcome: "not_evaluated",
-        reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
-      };
-    } else {
+    const attestedByFormalReview = forHead.comment.source === "pull_request_review";
+    // Nested rather than `&&`-ed into each arm, and the positive branch below
+    // keys on `!withheldPositive` rather than on `else`. Both are about the
+    // same hazard: an `else if (!exempt && shares(prAuthorLogin!, …))` arm
+    // needs a non-null assertion whose justification is the ARM ORDER above it,
+    // so reordering the chain silently hands `undefined` to the predicate — and
+    // that predicate returns false on an empty login, which falls through to
+    // `clean`. Fail-open, with the assertion as its only warning.
+    if (!attestedByFormalReview) {
+      if (!prAuthorLogin) {
+        withheldPositive = {
+          state: "success",
+          outcome: "not_evaluated",
+          authorUnknown: true,
+          reason: "The PR author is unknown, so this head's attestation cannot be shown to be independent.",
+        };
+        // `githubSharesReviewerIdentity`, not `githubReviewerIdentityMatches`: the
+        // strict predicate exists to keep the bare `<slug>` user seat from being
+        // CREDITED as the reviewer, and that fail direction is inverted here. The
+        // seat and the App are one agent wearing two hats, so a PR opened by the
+        // seat and attested by the App is still a self-attestation.
+      } else if (githubSharesReviewerIdentity(prAuthorLogin, reviewerBotLogin)) {
+        withheldPositive = {
+          state: "success",
+          outcome: "not_evaluated",
+          reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
+        };
+      }
+    }
+
+    if (!withheldPositive) {
       // Non-blocking, but not clean. A `tracked` ledger entry says the reviewer
       // looked at a real defect and accepted it onto a follow-up, so reporting
       // "no unresolved findings" here would state the opposite of what happened
@@ -1279,11 +1333,23 @@ async function executeCommentReviewGateCheck(
     ]);
     if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
 
-    const comments = [...issueComments, ...prReviews].map((comment) => ({
-      authorLogin: comment.login,
-      body: comment.body,
-      createdAt: comment.createdAt,
-    }));
+    // `source` is carried, not inferred: the independence exemption at the
+    // `clean` branch is keyed on which artifact the body came from, and this is
+    // the only place that still knows (BLO-42525).
+    const comments: CommentReviewGateComment[] = [
+      ...issueComments.map((comment) => ({
+        authorLogin: comment.login,
+        body: comment.body,
+        createdAt: comment.createdAt,
+        source: "issue_comment" as const,
+      })),
+      ...prReviews.map((review) => ({
+        authorLogin: review.login,
+        body: review.body,
+        createdAt: review.createdAt,
+        source: "pull_request_review" as const,
+      })),
+    ];
 
     // Evaluate author-blind FIRST. Only `clean` reads the author, and both red
     // outcomes stand on the comment surfaces alone — so fetching the author up
