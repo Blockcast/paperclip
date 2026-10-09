@@ -866,6 +866,11 @@ jobs:
         run: node --test ./scripts/__tests__/pr-verify-lane-outcome.test.mjs
         timeout-minutes: 1
 
+      - name: Test Ally-gated heavy CI wiring (ally-verdict, dispatcher, backstop)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/ally-verdict-gate.test.mjs
+        timeout-minutes: 1
+
       - name: Test Playwright install-deps retry/backoff
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/playwright-install-deps-retry.test.mjs
@@ -1158,7 +1163,7 @@ jobs:
 
   typecheck_release_registry:
     name: Typecheck + Release Registry
-    needs: [policy]
+    needs: [policy, ally_verdict]
     # BLO-22428: merge_group traffic on this heavy label starves behind a
     # pull_request backlog on the shared `default` pool (merge-queue check
     # concurrency is 1, so a deep PR queue blocks the one queue that lands
@@ -1268,7 +1273,7 @@ jobs:
 
   worktree_install:
     name: Worktree install (NODE_ENV=production)
-    needs: [policy]
+    needs: [policy, ally_verdict]
     # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
     # pool so pull_request and merge_group traffic cannot starve each other.
     # See typecheck_release_registry above.
@@ -1356,7 +1361,7 @@ jobs:
 
   opencode_responses_replay:
     name: OpenCode Responses replay
-    needs: [policy]
+    needs: [policy, ally_verdict]
     # Keep this merge_group dependency off the shared default pool too; leaving
     # even one required lane there would preserve the starvation path.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}
@@ -1390,7 +1395,7 @@ jobs:
 
   opencode_k8s_seed_cold_start:
     name: k8s-ro seed transport cold start
-    needs: [policy]
+    needs: [policy, ally_verdict]
     # BLO-23422: the general-server shard already runs this suite once. This lane
     # exists to prove the cold-start property specifically — OpenCode migrates its
     # SQLite store once per state home, and the suite creates a fresh one per run,
@@ -1457,7 +1462,7 @@ jobs:
 
   general_tests:
     name: General tests (${{ matrix.group_label }})
-    needs: [policy]
+    needs: [policy, ally_verdict]
     # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
     # pool so pull_request and merge_group traffic cannot starve each other.
     # See typecheck_release_registry above.
@@ -1790,6 +1795,166 @@ jobs:
             exit 1
           fi
 
+  # ALLY-GATED HEAVY CI (R1). Owner directive 2026-10-07 (~01:55Z): "also
+  # actively work to reduce and isolate CPU waste from CI. CI is suboptimal
+  # across the org as you saw in this conversation, with jobs running without
+  # new signal on each PR, or before ally approved resulting in CI runs that
+  # are unecessary." Rolled out at once per the owner, 2026-10-09 (~11:34Z).
+  #
+  # The heavy lanes (every job on arc-paperclip-general or arc-e2e) `needs:`
+  # this job, so on a pull_request they wait for a typed, head-bound Ally
+  # verdict at the exact head. This job decides WHEN they run, never WHETHER
+  # they are required: `verify` still needs every lane and turns a failed or
+  # skipped one into a red, so a missing, late or forged verdict can only cost
+  # CPU or latency, never let a PR merge without its heavy lanes.
+  #
+  # Red here is a SCHEDULE STATE, not a finding (AGENTS.md "Heavy CI waits for
+  # Ally"). Once Ally posts a clean verdict at this head,
+  # dispatch-ally-verdict-ci.yml re-runs this run's failed jobs (this job, the
+  # heavy lanes and `verify`) as attempt 2 on the same check suite; the hourly
+  # backstop in review-gate-sweep.yml re-tries a lost event.
+  #
+  # Fail closed, deliberately: it never skips (a skipped job would pass
+  # `verify`'s needs), and a missing signal is "not eligible". In this repo
+  # only B (gate/ally-comment-findings) and S (ci/ally-head-attested) can
+  # admit a head; there is no review/ally-complete producer here.
+  #
+  # Not held: a PR its own reviewer opened. The server never reports B
+  # `success` on one (BLO-34316 withholds a self-attested clean, so B is
+  # `neutral`), and nothing publishes S yet, so holding it would hold it for
+  # good: no heavy lanes, `verify` red, no way into the merge queue. Such a PR
+  # runs heavy CI on every push, as before this gate, until the owner sets
+  # ALLY_GATED_CI_HOLD_SELF_AUTHORED=true -- after S is seen `success` on one.
+  # Not held either: a fork head. The shared predicate refuses a head outside
+  # this repository and both release paths skip one, so it could never be
+  # released; it runs heavy CI on every push, as before this gate.
+  # ALLY_GATED_CI_BYPASS is the lever for any Ally or Paperclip outage.
+  ally_verdict:
+    name: ally-verdict
+    # BLO-22428: merge_group traffic must not wait behind the pull_request
+    # backlog that saturates arc-light; same routing as `policy` and `verify`.
+    # The merge_group path is a bare `exit 0`.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
+    # Measured nowhere yet (new job); a hang detector, not a budget. The work
+    # is a Node setup plus three paginated reads, each bounded by the action's
+    # own 20s timeout and 3 attempts.
+    timeout-minutes: 6
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+      checks: read
+    steps:
+      - name: Decide whether this run waits for an Ally verdict
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BYPASS: ${{ vars.ALLY_GATED_CI_BYPASS }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HOLD_SELF_AUTHORED: ${{ vars.ALLY_GATED_CI_HOLD_SELF_AUTHORED }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+          # The merge queue's landing candidate always builds in full: it is
+          # unchanged by this gate (ALLGREEN, `verify` required).
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "merge_group: heavy lanes run in full; no Ally wait."
+            echo "evaluate=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Kill switch. Compared case-insensitively, as an Actions expression
+          # and the shared predicate compare it. It restores per-push heavy CI
+          # outright (drafts included, as before this gate); enforcement is
+          # unchanged because `verify` still needs every lane.
+          if [ "$(lower "${BYPASS:-}")" = "true" ]; then
+            echo "::notice title=ally-verdict bypassed::ALLY_GATED_CI_BYPASS=true: heavy CI runs per push; enforcement is unchanged."
+            echo "evaluate=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "::error title=ally-verdict::Unexpected event '$EVENT_NAME'; refusing to release heavy lanes."
+            exit 1
+          fi
+          # A fork head can never be released: the shared predicate refuses a
+          # head outside this repository, and both release paths (the
+          # dispatcher's check_run arm and the hourly backstop) skip one before
+          # deciding. Holding it would hold it for good, so it is not held: it
+          # runs heavy CI on every push, as before this gate, and `verify` still
+          # needs every lane. HEAD_REPO comes from GitHub's event payload; a
+          # deleted fork reads empty and is treated as a fork.
+          if [ "$(lower "${HEAD_REPO:-}")" != "$(lower "${REPOSITORY:-}")" ]; then
+            echo "::notice title=ally-verdict: fork PR::The head is in ${HEAD_REPO:-a deleted fork}, not $REPOSITORY, and no Ally release path acts on a fork head: heavy CI runs per push."
+            echo "evaluate=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # BLO-34316: the server withholds B's `clean` whenever the PR author
+          # shares the reviewer identity (githubSharesReviewerIdentity against
+          # its default reviewer allyblockcast[bot]: the `allyblockcast` seat,
+          # `allyblockcast[bot]` or `app/allyblockcast`, lowercased). Until S
+          # (ci/ally-head-attested) is published, no signal can release such a
+          # PR, so it is not held. The login comes from GitHub's event payload,
+          # not from the PR's content; the exemption only restores per-push
+          # heavy CI, and `verify` still needs every lane.
+          case "$(lower "${PR_AUTHOR:-}")" in
+            allyblockcast|allyblockcast\[bot\]|app/allyblockcast)
+              if [ "$(lower "${HOLD_SELF_AUTHORED:-}")" != "true" ]; then
+                echo "::notice title=ally-verdict: self-authored PR::$PR_AUTHOR opened this PR, so Ally's verdict cannot be B success here (BLO-34316) and ci/ally-head-attested is not published yet: heavy CI runs per push. The owner sets ALLY_GATED_CI_HOLD_SELF_AUTHORED=true once it is."
+                echo "evaluate=false" >>"$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+          esac
+          echo "evaluate=true" >>"$GITHUB_OUTPUT"
+
+      # The shared predicate, vendored byte-for-byte from
+      # Blockcast/review-gate-action (see its PROVENANCE.json): that repository
+      # is private and this one is public, so it cannot be pinned by `uses:`.
+      - name: Check out the vendored predicate
+        if: ${{ steps.mode.outputs.evaluate == 'true' }}
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/actions/verdict-dispatch
+          persist-credentials: false
+
+      - name: Evaluate the Ally verdict at this head
+        id: verdict
+        if: ${{ steps.mode.outputs.evaluate == 'true' }}
+        # Same predicate the dispatcher evaluates, so the job that holds the
+        # lanes and the job that releases them agree. No carry-forward input:
+        # it stays off with this copy (PROVENANCE.json).
+        uses: ./.github/actions/verdict-dispatch
+        with:
+          github-token: ${{ github.token }}
+          pull-number: ${{ github.event.pull_request.number }}
+          head-sha: ${{ github.event.pull_request.head.sha }}
+          bypass: ${{ vars.ALLY_GATED_CI_BYPASS }}
+
+      - name: Hold heavy lanes until Ally's verdict
+        # Runs after an evaluation ERROR too, so the red always carries the
+        # annotation; anything but eligible=true holds the lanes.
+        if: ${{ !cancelled() && steps.mode.outputs.evaluate == 'true' }}
+        env:
+          ELIGIBLE: ${{ steps.verdict.outputs.eligible }}
+          BASIS: ${{ steps.verdict.outputs.basis }}
+          REASON: ${{ steps.verdict.outputs.reason }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          if [ "$ELIGIBLE" = "true" ]; then
+            echo "Heavy lanes released at $HEAD_SHA ($BASIS): $REASON"
+            exit 0
+          fi
+          # The automatic release re-runs attempt 1 only (exactly once per
+          # head), so a run someone re-ran by hand must not promise it.
+          if [ "${RUN_ATTEMPT:-}" = "1" ]; then
+            release="it then reruns automatically."
+          else
+            release="this run is attempt ${RUN_ATTEMPT:-?}, re-run by hand, so it will not rerun automatically: once that verdict lands, re-run its failed jobs by hand."
+          fi
+          echo "::error title=awaiting-ally-verdict::Heavy CI waits for a clean Ally verdict at $HEAD_SHA (gate/ally-comment-findings or ci/ally-head-attested success); $release This is a schedule state, not a finding: do not push a fix for it. (${REASON:-no reason reported})"
+          exit 1
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     # Serialized server suites run inside the general-server matrix jobs,
@@ -1806,6 +1971,7 @@ jobs:
         opencode_k8s_seed_cold_start,
         build,
         vendor_claude_k8s,
+        ally_verdict,
       ]
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
     # BLO-28999: the failure path below adds checkout + Node setup + up to N+1
@@ -1853,21 +2019,26 @@ jobs:
       # overwhelmingly common all-green run pays nothing: no checkout, no
       # toolchain setup, no API calls. That also keeps `verify` light enough
       # not to become a victim of the same pool saturation it now reports on.
+      #
+      # Not while `ally_verdict` failed: then the heavy lanes did not run, so
+      # there is nothing to classify, and a held run is the common pre-verdict
+      # state -- these three steps would otherwise cost a checkout and a Node
+      # setup on every push. Wording only: the gate below decides either way.
       - name: Checkout repository
-        if: ${{ contains(needs.*.result, 'failure') }}
+        if: ${{ contains(needs.*.result, 'failure') && needs.ally_verdict.result != 'failure' }}
         uses: actions/checkout@v6
 
       # `arc-light` does not ship a usable Node by default — the `policy` job
       # on the same pool sets one up explicitly before its `node --test` steps.
       - name: Setup Node
-        if: ${{ contains(needs.*.result, 'failure') }}
+        if: ${{ contains(needs.*.result, 'failure') && needs.ally_verdict.result != 'failure' }}
         uses: actions/setup-node@v6
         with:
           node-version: 24
 
       - name: Classify failed lanes as infrastructure kills or real failures
         id: classify_lanes
-        if: ${{ contains(needs.*.result, 'failure') }}
+        if: ${{ contains(needs.*.result, 'failure') && needs.ally_verdict.result != 'failure' }}
         # This step decides only which WORDING explains the failure, never
         # whether `verify` passes. If it errors, the aggregation step below
         # still runs (`if: always()`) and falls back to the pre-existing
@@ -1989,6 +2160,11 @@ jobs:
         if: always()
         env:
           INFRA_LANES: ${{ steps.classify_lanes.outputs.infra_lanes }}
+          # Not a lane: the Ally-gated schedule hold (see `ally_verdict`). Kept
+          # out of the lane arrays so the classifier never reads it as a kill.
+          ALLY_VERDICT_RESULT: ${{ needs.ally_verdict.result }}
+          # Wording only: the automatic release re-runs attempt 1 only.
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           HELM_CHART_RESULT: ${{ needs.helm_chart.result }}
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
@@ -2021,8 +2197,17 @@ jobs:
 
           cancelled_lanes=()
           skipped_lanes=()
+          deferred_lanes=()
           failed_lanes=()
           infra_lanes=()
+          # Ally-gated heavy CI: anything but success means the heavy lanes were
+          # held (or the hold itself errored). Either way this gate fails; a
+          # lane skipped under that hold is reported as deferred, not as a
+          # broken dependency, and the hold names itself below.
+          ally_held=0
+          if [ "$ALLY_VERDICT_RESULT" != "success" ]; then
+            ally_held=1
+          fi
           for i in "${!lane_names[@]}"; do
             lane="${lane_names[$i]}"
             case "${lane_results[$i]}" in
@@ -2052,7 +2237,27 @@ jobs:
             esac
           done
 
+          # Under the hold, a skipped lane was deferred, not broken: report it
+          # with the hold below instead of as an unmet dependency. Still not a
+          # pass -- the hold itself sets any_non_success.
+          if [ "$ally_held" -eq 1 ]; then
+            deferred_lanes=("${skipped_lanes[@]}")
+            skipped_lanes=()
+          fi
+
           any_non_success=0
+
+          if [ "$ally_held" -eq 1 ]; then
+            # The automatic release re-runs attempt 1 only (exactly once per
+            # head), so a run someone re-ran by hand must not promise it.
+            if [ "${RUN_ATTEMPT:-}" = "1" ]; then
+              release="once Ally posts a clean verdict, dispatch-ally-verdict-ci.yml re-runs this run's failed jobs automatically."
+            else
+              release="this run is attempt ${RUN_ATTEMPT:-?}, re-run by hand, so it is not released automatically: once Ally posts a clean verdict, re-run its failed jobs by hand."
+            fi
+            echo "::error title=verify: awaiting-ally-verdict::ally-verdict is '${ALLY_VERDICT_RESULT:-unset}', so the heavy lanes wait for an Ally verdict at this head (deferred: ${deferred_lanes[*]:-none}). This is a schedule state, not a finding: $release A lane can also be skipped because 'policy' failed -- check 'policy' if it is red. See AGENTS.md \"Heavy CI waits for Ally\"."
+            any_non_success=1
+          fi
 
           if [ "${#failed_lanes[@]}" -gt 0 ]; then
             echo "::error title=verify: lane failure::Upstream lane(s) reported failure: ${failed_lanes[*]}. This may reflect a real problem with the PR diff, but a lane can also fail due to its own setup or runner trouble — check that lane's own logs before assuming the diff is at fault."
@@ -2080,7 +2285,7 @@ jobs:
 
   build:
     name: Build
-    needs: [policy]
+    needs: [policy, ally_verdict]
     # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
     # pool so pull_request and merge_group traffic cannot starve each other.
     # See typecheck_release_registry above.
@@ -2123,7 +2328,7 @@ jobs:
 
   canary_dry_run:
     name: Canary Dry Run
-    needs: [policy]
+    needs: [policy, ally_verdict]
     # Path-scoped (scripts/select-ci-suites.mjs). Only the literal 'false' skips;
     # an empty/missing output runs the job. Neither this job nor its check name is
     # in `verify`'s needs, so a skip cannot read as a failed or absent lane.
@@ -2192,7 +2397,7 @@ jobs:
           ./scripts/release.sh canary --skip-verify --dry-run
 
   e2e:
-    needs: [policy]
+    needs: [policy, ally_verdict]
     # Path-scoped (scripts/select-ci-suites.mjs). Only the literal 'false' skips;
     # an empty/missing output runs the job. Neither this job nor its check name is
     # in `verify`'s needs, so a skip cannot read as a failed or absent lane.

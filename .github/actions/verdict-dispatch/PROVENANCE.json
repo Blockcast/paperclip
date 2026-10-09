@@ -1,0 +1,18 @@
+{
+  "why": "Blockcast/review-gate-action is private (Actions access: organization) and this repository is public. GitHub shares actions from a private repository only with other private or internal repositories, so a uses: pin to it cannot resolve here. These two files are byte-identical copies of the pinned commit; ally-verdict-gate.test.mjs fails if either drifts. Re-vendor (never hand-edit) to move the pin.",
+  "source_repository": "Blockcast/review-gate-action",
+  "source_commit": "7e3259a0bca593c92d63ca053c3c2711071a61c7",
+  "source_branch": "main",
+  "source_pull_request": "Blockcast/review-gate-action#25, merged 2026-10-09T22:23:55Z as a merge commit; source_commit is that merge commit, the tip of main when vendored. verdict-dispatch/ is byte-identical to #23's squash commit 199033b6c39823fc8abb663382602e54dad5a5ed, the code Ally cleared (same git blobs below); #25 changes only the consumer-wiring checker, its fixture and the README.",
+  "source_note": "Carry-forward stays off in this repository: neither pr.yml nor dispatch-ally-verdict-ci.yml passes a carry-forward input. Move the pin only to a commit on review-gate-action main, never to a pull request head.",
+  "files": {
+    "action.yml": {
+      "source_path": "verdict-dispatch/action.yml",
+      "git_blob": "cfff15616ffabf1a2a350e2acdb01c788fb8c657"
+    },
+    "eligible.mjs": {
+      "source_path": "verdict-dispatch/eligible.mjs",
+      "git_blob": "2c6a77709356d3e7ec19b5864c9ae5150de6e16a"
+    }
+  }
+}
