@@ -142,9 +142,9 @@ export const PENDING_CONCURRENT_INDEXES: readonly ConcurrentIndexSpec[] = [
   },
 ];
 
-const DEFAULT_STATEMENT_TIMEOUT_MS = 10 * 60 * 1000;
+export const DEFAULT_STATEMENT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_DDL_LOCK_TIMEOUT_MS = 2 * 60 * 1000;
-const DEFAULT_LOCK_WAIT_TIMEOUT_MS = 20 * 60 * 1000;
+export const DEFAULT_LOCK_WAIT_TIMEOUT_MS = 20 * 60 * 1000;
 const LOCK_POLL_INTERVAL_MS = 250;
 
 export const SERIALIZING_LOCK_KEY = "paperclip:concurrent-index-guard";
@@ -155,6 +155,14 @@ export type EnsurePendingConcurrentIndexesOptions = {
   readonly lockWaitTimeoutMs?: number;
   readonly specs?: readonly ConcurrentIndexSpec[];
   readonly skipUnavailable?: boolean;
+  /**
+   * The caller already holds `SERIALIZING_LOCK_KEY` on a different session, so
+   * do not try to take it again (BLO-42005). `applyPendingMigrationsManually`
+   * holds it for the whole migration sequence and calls in here per file; a
+   * nested acquire is a different session on the same key, which would spin
+   * until `lockWaitTimeoutMs` and then throw. Session timeouts are still set.
+   */
+  readonly callerHoldsSerializingLock?: boolean;
   readonly log?: (message: string) => void;
 };
 
@@ -262,7 +270,18 @@ async function indexValidity(
   return structurallyValid ? "valid" : "wrong-definition";
 }
 
-async function acquireSerializingLock(sql: ReturnType<typeof postgres>, timeoutMs: number): Promise<void> {
+/**
+ * Block until this session owns `SERIALIZING_LOCK_KEY`, or `timeoutMs` elapses.
+ *
+ * Exported because the transactional migration runner holds the same lock for
+ * the whole migration sequence (BLO-42005), so that a rolling deploy's two new
+ * pods apply migrations one after the other instead of racing each other for
+ * the same ACCESS EXCLUSIVE locks.
+ */
+export async function acquireSerializingLock(
+  sql: ReturnType<typeof postgres>,
+  timeoutMs: number,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const [{ locked }] = await sql<{ locked: boolean }[]>`
@@ -302,10 +321,14 @@ export async function ensurePendingConcurrentIndexes(
   const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
   const results: ConcurrentIndexEnsureResult[] = [];
   let lockAcquired = false;
+  let sessionConfigured = false;
 
   try {
-    await acquireSerializingLock(sql, lockWaitTimeoutMs);
-    lockAcquired = true;
+    if (!options.callerHoldsSerializingLock) {
+      await acquireSerializingLock(sql, lockWaitTimeoutMs);
+      lockAcquired = true;
+    }
+    sessionConfigured = true;
     await sql.unsafe(`SET statement_timeout = '${statementTimeoutMs}ms'`);
     await sql.unsafe(`SET lock_timeout = '${ddlLockTimeoutMs}ms'`);
 
@@ -382,9 +405,11 @@ export async function ensurePendingConcurrentIndexes(
         }
       }
     };
-    if (lockAcquired) {
+    if (sessionConfigured) {
       await bestEffort("resetting statement_timeout", () => sql.unsafe("SET statement_timeout = 0"));
       await bestEffort("resetting lock_timeout", () => sql.unsafe("SET lock_timeout = 0"));
+    }
+    if (lockAcquired) {
       await bestEffort(`releasing advisory lock "${SERIALIZING_LOCK_KEY}"`, () => releaseSerializingLock(sql));
     }
     await bestEffort("closing the connection pool", () => sql.end());
