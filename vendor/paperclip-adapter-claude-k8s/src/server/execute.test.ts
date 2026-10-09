@@ -2122,6 +2122,59 @@ describe("execute: waitForPod edge cases", () => {
     expect(result.errorMessage).not.toContain("pod containers to start");
   });
 
+  // Ally I1 on #2336 at 861428d0: the other two members of the early-throw
+  // group had no test, and one of them did not belong there.
+  const waitingPod = (reason: string, message: string) => ({
+    items: [{
+      metadata: { name: "pod-x", ownerReferences: [jobOwnerRef("uid-1")] },
+      status: {
+        phase: "Pending",
+        conditions: [{ type: "PodScheduled", status: "True" }],
+        initContainerStatuses: [],
+        containerStatuses: [{ name: "claude", state: { waiting: { reason, message } } }],
+      },
+    }],
+  });
+
+  it("throws immediately when the main container is in InvalidImageName", async () => {
+    mockCoreListPods.mockResolvedValue(
+      waitingPod("InvalidImageName", 'couldn\'t parse image reference "registry/agent:"'),
+    );
+
+    const result = await execute(makeCtx());
+
+    expect(result.errorCode).toBe("k8s_pod_schedule_failed");
+    expect(result.errorMessage).toContain("InvalidImageName");
+    expect(result.errorMessage).not.toContain("pod containers to start");
+  });
+
+  // `CreateContainerError` is transient-capable (`name is reserved`, a CRI
+  // deadline), so one observation must not end the run.  The pod reports it on
+  // the first poll and a permanent reason on the next; the run must fail on the
+  // second, not the first.  Throwing on the first reports "(CreateContainerError)".
+  it("does not fail the run on a single CreateContainerError observation", async () => {
+    vi.useFakeTimers();
+    try {
+      let polls = 0;
+      mockCoreListPods.mockImplementation(async () =>
+        ++polls === 1
+          ? waitingPod("CreateContainerError", 'failed to reserve container name "claude": name is reserved')
+          : waitingPod("CreateContainerConfigError", 'secret "ac-e0a5011d-run-env" not found'),
+      );
+
+      const promise = execute(makeCtx());
+      await vi.advanceTimersByTimeAsync(10_000);
+      const result = await promise;
+
+      // Guard against a vacuous pass: the transient reason must have been seen.
+      expect(polls).toBeGreaterThanOrEqual(2);
+      expect(result.errorMessage).toContain("CreateContainerConfigError");
+      expect(result.errorMessage).not.toContain("(CreateContainerError)");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // ── BLO-34577: a same-name pod from an EARLIER attempt is not this attempt ──
   //
   // The Job name is deterministic per (agentId, runId) and the server's in-run

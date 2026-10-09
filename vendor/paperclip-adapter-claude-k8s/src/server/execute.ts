@@ -1247,7 +1247,16 @@ const POD_FAILURE_LABELS: Record<PodFailureKind, string> = {
  * Throwing on first observation is safe here for the same reason it is safe for
  * `ErrImagePull`: all three run Secrets are created and awaited *before*
  * `createNamespacedJob`, so there is no legitimate transient window in which a
- * pod of ours sits in a config error and then recovers.
+ * pod of ours sits in a config error and then recovers.  `InvalidImageName` is
+ * a malformed reference, which no retry can fix.
+ *
+ * `CreateContainerError` is deliberately absent.  Its common causes are
+ * node-local and transient — `failed to reserve container name …: name is
+ * reserved`, a CRI `context deadline exceeded` — and the kubelet clears them on
+ * its next sync, most often under exactly the image-pull contention the 1800s
+ * deadline exists for.  Throwing on one observation would fail a run (no
+ * `backoffLimit`, `restartPolicy: Never`) that the next 2s poll sees Running, so
+ * it rides the deadline as it did before BLO-35486.
  *
  * This covers Secrets consumed through `secretKeyRef`, which is only
  * `envSecret`.  `promptSecret` and `mcpConfigSecret` are mounted as volumes
@@ -1260,7 +1269,6 @@ const POD_FAILURE_LABELS: Record<PodFailureKind, string> = {
  */
 const UNRECOVERABLE_WAITING_REASONS = new Set([
   "CreateContainerConfigError",
-  "CreateContainerError",
   "InvalidImageName",
 ]);
 
@@ -2840,9 +2848,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // schedule to container start, of which the transfer itself was 2–33s and
     // the rest was queueing behind one uncached 3.3 GB layer set.  The failure
     // modes waitForPod knows (ErrImagePull/ImagePullBackOff/InvalidImageName/
-    // CrashLoopBackOff/CreateContainerConfigError/CreateContainerError/
-    // Unschedulable/phase=Failed/init-container exit) are detected and thrown
-    // above without waiting for this deadline.  That list is not every
+    // CrashLoopBackOff/CreateContainerConfigError/Unschedulable/phase=Failed/
+    // init-container exit) are detected and thrown above without waiting for
+    // this deadline.  `CreateContainerError` is transient-capable and rides it.  That list is not every
     // never-clearing reason (`ErrImageNeverPull`, with an operator-set
     // `imagePullPolicy: Never`, is absent).  A reason
     // added to the kubelet's vocabulary belongs in UNRECOVERABLE_WAITING_REASONS,
