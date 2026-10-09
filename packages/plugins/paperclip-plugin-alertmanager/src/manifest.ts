@@ -42,6 +42,12 @@ const manifest: PaperclipPluginManifestV1 = {
     "secrets.verify-ref",
     // Webhook entrypoint (the plugin is webhook-driven)
     "webhooks.receive",
+    // BLO-40739: the escalation sweep PULLS alert state from Alertmanager
+    // before a ladder rung posts or reassigns. Webhook delivery of a resolve is
+    // at-most-once, so push alone cannot tell "still firing" from "the resolve
+    // was never delivered" — and the outage that fires an alert about the
+    // Paperclip API is the same outage that eats its resolve.
+    "http.outbound",
     "instance.settings.register",
     "jobs.schedule",
     // Durable, race-safe storm-cover membership + resolution state (BLO-16120)
@@ -171,6 +177,12 @@ const manifest: PaperclipPluginManifestV1 = {
           "Delay before an unresolved alert climbs the reportsTo chain. Defaults: critical=30, warning=240.",
         default: DEFAULT_ESCALATION_DEADLINE_MINUTES,
         additionalProperties: { type: "number", minimum: 1 },
+      },
+      alertmanagerApiUrl: {
+        type: "string",
+        title: "Alertmanager base URL (for escalation liveness reads)",
+        description:
+          "e.g. http://alertmanager.monitoring.svc.cluster.local:9093. The escalation sweep reads /api/v2/alerts here before a rung posts or reassigns, so it can tell 'still firing' from 'the resolve webhook was never delivered'. Leave unset to keep the ladder running without a liveness claim — rung comments then say liveness was not verified instead of asserting it.",
       },
     },
     // No fields are schema-required: the bootstrap auto-config endpoint
