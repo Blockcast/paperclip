@@ -1330,7 +1330,7 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
   });
 
   for (const order of ["approval first", "blocker first"]) {
-    it(`fires I2e when a clean App APPROVED coexists with a different blocking App review (${order})`, () => {
+    it(`fires I2f when a clean App APPROVED coexists with a different blocking App review (${order})`, () => {
       // The BLO-19778 shape across two reviews with DIFFERENT states: the
       // approval's own body is clean, so I2a cannot see the blocker, and the
       // I1 supersession exemption lets both stand.
@@ -1341,17 +1341,17 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
       assert.deepEqual(violations.filter((v) => v.startsWith("I1")), []);
       assert.deepEqual(violations.filter((v) => v.startsWith("I2a")), []);
       assert.match(
-        violations.find((v) => v.startsWith("I2e")) ?? "",
-        new RegExp(`^I2e PR #1220 @ff1c72db: Ally App APPROVED \\(${DUPLICATE_IDS[0]}\\) coexists with a different blocking Ally App review \\(${DUPLICATE_IDS[1]}\\)`),
+        violations.find((v) => v.startsWith("I2f")) ?? "",
+        new RegExp(`^I2f PR #1220 @ff1c72db: Ally App APPROVED \\(${DUPLICATE_IDS[0]}\\) coexists with a different blocking Ally App review \\(${DUPLICATE_IDS[1]}\\)`),
       );
     });
   }
 
-  it("does not fire I2e once the stale approval is dismissed", () => {
+  it("does not fire I2f once the stale approval is dismissed", () => {
     const approval = appReview({ id: DUPLICATE_IDS[0], state: "DISMISSED", body: canonicalBody(HEAD, "clean") });
     const blocker = appReview({ id: DUPLICATE_IDS[1], state: "COMMENTED", body: canonicalBody(HEAD, "### Critical Issues (1)\n- boom") });
     const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [approval, blocker] });
-    assert.deepEqual(violations.filter((v) => v.startsWith("I2e")), []);
+    assert.deepEqual(violations.filter((v) => v.startsWith("I2f")), []);
   });
 
   // The other order: a COMMENTED blocker cannot be dismissed, so a clean
@@ -1366,7 +1366,7 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
       body: canonicalBody(HEAD, `### Prior Findings Dispositioned (1)\n${ledger}\n### Critical Issues (0)\n### Important Issues (0)`),
     });
 
-  it("does not fire I2e when the approval retires, by name, the finding raised at this head", () => {
+  it("does not fire I2f when the approval retires, by name, the finding raised at this head", () => {
     const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — description corrected`);
     const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approval] });
     assert.deepEqual(violations, []);
@@ -1378,21 +1378,21 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     ["names this head with an unrecognized verb", `- **prior:${HEAD.slice(0, 7)} important 1** — superseded — gone`],
     ["quotes a same-head entry as indented code", `    - **prior:${HEAD.slice(0, 7)} important 1** — fixed — gone`],
   ]) {
-    it(`still fires I2e when the approval only ${why}`, () => {
+    it(`still fires I2f when the approval only ${why}`, () => {
       const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approvalWithLedger(ledger)] });
-      assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+      assert.match(violations.find((v) => v.startsWith("I2f")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
     });
   }
 
-  it("still fires I2e for a blocker submitted after the approval that retired its predecessor", () => {
+  it("still fires I2f for a blocker submitted after the approval that retired its predecessor", () => {
     // Dismissing the approval is the exit in this order, so the ledger buys nothing.
     const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — description corrected`);
     const laterBlocker = appReview({ id: 5124950999, state: "COMMENTED", submitted_at: "2026-09-23T13:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (1)\n- new") });
     const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approval, laterBlocker] });
-    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+    assert.match(violations.find((v) => v.startsWith("I2f")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
   });
 
-  it("still fires I2e for a later blocker whose findings the approval's ledger happens to name", () => {
+  it("still fires I2f for a later blocker whose findings the approval's ledger happens to name", () => {
     // Coverage alone would exempt this: the approval retired `important 1`
     // against the EARLIER blocker, and the later one raises `important 1` too.
     // An approval cannot have read a blocker submitted after it, so order —
@@ -1400,7 +1400,7 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — description corrected`);
     const laterBlocker = appReview({ id: 5124950999, state: "COMMENTED", submitted_at: "2026-09-23T13:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (1)\n- raised after the approval") });
     const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approval, laterBlocker] });
-    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+    assert.match(violations.find((v) => v.startsWith("I2f")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
   });
 
   // The exemption is coverage, not presence: an approval retiring 1 of the N
@@ -1408,13 +1408,13 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
   const multiFindingBlocker = () =>
     appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (2)\n- one\n- two") });
 
-  it("still fires I2e when the approval retires only some of the findings raised at this head", () => {
+  it("still fires I2f when the approval retires only some of the findings raised at this head", () => {
     const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — one done`);
     const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [multiFindingBlocker(), approval] });
-    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+    assert.match(violations.find((v) => v.startsWith("I2f")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
   });
 
-  it("does not fire I2e when the approval retires every finding raised at this head", () => {
+  it("does not fire I2f when the approval retires every finding raised at this head", () => {
     const approval = approvalWithLedger(
       `- **prior:${HEAD.slice(0, 7)} important 1** — fixed — one done\n- **prior:${HEAD.slice(0, 7)} important 2** — no-longer-applicable — two moot`,
     );
@@ -1433,7 +1433,7 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     ]) {
       const approval = { ...approvalWithLedger(""), body };
       const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blocker, approval] });
-      assert.equal(violations.some((v) => /^I2e /.test(v)), blocked, label);
+      assert.equal(violations.some((v) => /^I2f /.test(v)), blocked, label);
     }
   });
 
@@ -1444,24 +1444,24 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     const blocker = appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (2), was (1)\n- one\n- two") });
     const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** - fixed - one done`);
     const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blocker, approval] });
-    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+    assert.match(violations.find((v) => v.startsWith("I2f")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
   });
 
-  it("still fires I2e when a second, emphasised bucket raises more than the heading", () => {
+  it("still fires I2f when a second, emphasised bucket raises more than the heading", () => {
     // The merge gate reads `**Important Issues (3)**` as a bucket too and keeps
     // the higher count, so this blocker raised three findings, not one.
     const blocker = appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, "### Critical Issues (0)\n### Important Issues (1)\n- one\n**Important Issues (3)**\n- two\n- three") });
     const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — one done`);
     const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blocker, approval] });
-    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+    assert.match(violations.find((v) => v.startsWith("I2f")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
   });
 
-  it("still fires I2e when the blocker blocks only on a still-present entry", () => {
+  it("still fires I2f when the blocker blocks only on a still-present entry", () => {
     // No counted bucket at this head, so no (severity, index) a ledger can name.
     const blocker = appReview({ id: DUPLICATE_IDS[0], state: "COMMENTED", submitted_at: "2026-09-23T10:00:00Z", body: canonicalBody(HEAD, `- **prior:${OTHER.slice(0, 7)} important 1** — still-present — stands`) });
     const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — done`);
     const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blocker, approval] });
-    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+    assert.match(violations.find((v) => v.startsWith("I2f")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
   });
 
   // The contract mirrors a still-standing finding into the counted bucket under
@@ -1480,16 +1480,16 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
       ),
     });
 
-  it("still fires I2e when the approval retires a mirrored finding only by its earlier-head name", () => {
+  it("still fires I2f when the approval retires a mirrored finding only by its earlier-head name", () => {
     const approval = approvalWithLedger(`- **prior:${OTHER.slice(0, 7)} important 1** — fixed — gone`);
     const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [mirroredBlocker(), approval] });
-    assert.match(violations.find((v) => v.startsWith("I2e")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
+    assert.match(violations.find((v) => v.startsWith("I2f")) ?? "", new RegExp(`APPROVED \\(${DUPLICATE_IDS[1]}\\)`));
   });
 
-  it("does not fire I2e when the approval retires a mirrored finding by its position at this head", () => {
+  it("does not fire I2f when the approval retires a mirrored finding by its position at this head", () => {
     const approval = approvalWithLedger(`- **prior:${HEAD.slice(0, 7)} important 1** — fixed — gone`);
     const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [mirroredBlocker(), approval] });
-    assert.deepEqual(violations.filter((v) => v.startsWith("I2e")), []);
+    assert.deepEqual(violations.filter((v) => v.startsWith("I2f")), []);
   });
 
   // Shapes the merge gate's PRIOR_FINDING_DISPOSITION_PATTERN accepts. Reading
@@ -1498,7 +1498,7 @@ describe("I1 names the mechanism a same-lane duplicate implies", () => {
     ["an en dash separator", `- **prior:${HEAD.slice(0, 7)} important 1** – fixed – description corrected`],
     ["a space after the opening `**`", `- **  prior:${HEAD.slice(0, 7)} important 1** — fixed — description corrected`],
   ]) {
-    it(`does not fire I2e when the retiring entry uses ${shape}`, () => {
+    it(`does not fire I2f when the retiring entry uses ${shape}`, () => {
       const violations = findPrViolations({ number: 1220, headSha: HEAD, reviews: [blockerAtHead(), approvalWithLedger(ledger)] });
       assert.deepEqual(violations, []);
     });
@@ -2872,6 +2872,14 @@ describe("main — reporting on the branch that actually runs", () => {
     // prints "guard passed" is exactly the untrustworthy output PEN-2847 set
     // out to remove.
     assert.doesNotMatch(out, /guard passed/);
+  });
+
+  it("routes the supersession notice through the injected log", () => {
+    // It used to go straight to console.log, so `main({ log })` could neither
+    // see nor silence it, and every test run leaked real `::notice` workflow
+    // commands into the PR CI step that runs this suite.
+    const { out } = run([conflicted(1962, daysAgo(1), "UNKNOWN")]);
+    assert.match(out, /::notice title=Superseded Ally review at one head::PR #1962 @/);
   });
 
   it("prints it on a PASSING run too", () => {

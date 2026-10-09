@@ -53,7 +53,7 @@
  *       Important finding, no User-seat APPROVED review coexisting with a
  *       blocking App review, no App APPROVED coexisting with a different
  *       blocking App review at one head unless it follows every such blocker
- *       and retires, by name, a finding raised against that head (I2e), and no
+ *       and retires, by name, a finding raised against that head (I2f), and no
  *       App approval without a `Reviewed head:` attestation.
  *   I3  An operative App review has exactly one canonical body and its
  *       body-attested `Reviewed head:` matches the commit GitHub recorded it
@@ -772,7 +772,7 @@ export function retiredFindingKeys(body, head) {
  *
  * Coverage rather than presence: a blocker may raise several findings at one
  * head, and an approval retiring 1 of N would otherwise stand green over the
- * N-1 nobody dispositioned — I2e's own harm class, reached through its exemption.
+ * N-1 nobody dispositioned — I2f's own harm class, reached through its exemption.
  *
  * A blocker with no counted findings is never superseded. That is a blocker
  * blocking solely on a `still-present` entry, which asserts a finding raised at
@@ -938,7 +938,7 @@ export function findPrNotices(pr) {
   const latest = [...reviews].sort(bySubmission).at(-1);
   return [
     `PR #${pr.number} @${short}: ${reviews.length} operative Ally App reviews (${reviewDetails(reviews)}) with distinct bodies — ` +
-      `treating the latest (${latest?.id}, ${latest?.submitted_at}) as the standing verdict. Legitimate for a re-review of an ` +
+      `treating the latest (${latest?.id}, ${latest?.submitted_at ?? "no submission time"}) as the standing verdict. Legitimate for a re-review of an ` +
       `unchanged head; also the signature of two concurrent runs, which review data cannot distinguish (BLO-25764). ` +
       `Exclusion belongs at dispatch — see BLO-20074.`,
   ];
@@ -1091,7 +1091,7 @@ export function findPrViolations(pr) {
       `I2b PR #${pr.number} @${short}: User-seat APPROVED (${seatApprovals.map((review) => review.id).join(", ")}) coexists with a blocking Ally App review (${appBlockers.map((review) => review.id).join(", ")}) — the User seat cannot mask the App blocker`,
     );
   }
-  // I2e: the I1 supersession exemption lets differing App bodies at one head
+  // I2f: the I1 supersession exemption lets differing App bodies at one head
   // stand as a re-review, so I1 no longer catches the BLO-19778 shape: a clean
   // App APPROVED beside a DIFFERENT App review that blocks. I2a sees a blocker
   // only inside the approving body itself. An undismissed APPROVED counts
@@ -1124,7 +1124,7 @@ export function findPrViolations(pr) {
 
   if (unsupersedingApprovals.length > 0 && otherAppBlockers.length > 0) {
     violations.push(
-      `I2e PR #${pr.number} @${short}: Ally App APPROVED (${unsupersedingApprovals.map((review) => review.id).join(", ")}) coexists with a different blocking Ally App review (${otherAppBlockers.map((review) => review.id).join(", ")}) at one head; the standing approval outranks the blocker`,
+      `I2f PR #${pr.number} @${short}: Ally App APPROVED (${unsupersedingApprovals.map((review) => review.id).join(", ")}) coexists with a different blocking Ally App review (${otherAppBlockers.map((review) => review.id).join(", ")}) at one head; the standing approval outranks the blocker`,
     );
   }
   return violations;
@@ -1730,7 +1730,7 @@ export function main({
 
   for (const pr of prs) {
     for (const notice of findPrNotices(pr)) {
-      console.log(`::notice title=Superseded Ally review at one head::${notice}`);
+      log(`::notice title=Superseded Ally review at one head::${notice}`);
     }
   }
 
