@@ -5,7 +5,56 @@ import {
   setRoutineFireGapMetrics,
   setRoutineFireGapMetricsRefreshSuccess,
 } from "./metrics.js";
-import { deriveRoutineFireIntervalMs } from "./routines.js";
+import { deriveRoutineFireGapsMs } from "./routines.js";
+
+/**
+ * One row per enabled schedule trigger on an active routine, carrying that
+ * routine's most recent COMPLETED fire.
+ *
+ * `status = 'active'` is the whole paused-routine carve-out: a routine an
+ * operator deliberately paused is not a fault, and must emit no series at all
+ * rather than an ever-growing age. Several triggers per routine are reduced in
+ * the caller -- SQL cannot derive the cron cadence.
+ *
+ * `status = 'completed'` and not `completed_at is not null`: the `skipped`,
+ * `coalesced` and `failed` paths all stamp `completed_at` too, and a coalesced
+ * fire took no measurement of its own. `completed` is written in exactly one
+ * place -- syncRunStatusForIssue, when the execution issue reaches `done` --
+ * which is precisely the receipt this gauge is reporting the age of.
+ *
+ * A correlated `max()` per routine, not a `group by` over the whole table:
+ * with the partial index `routine_runs_routine_completed_idx` (migration 0254,
+ * its own PR so this branch's migration journal cannot collide with master's)
+ * each probe is a one-row backward index scan, so a refresh costs
+ * O(scheduled routines) rather than a scan of every completed fire ever
+ * recorded -- a set that only grows, four times a minute on every replica
+ * (Ally on #2352). That migration's test EXPLAINs this probe by hand. The
+ * status is a LITERAL, not a bind parameter, so a cached generic plan can
+ * still prove the partial index's predicate.
+ */
+function selectScheduledRoutinesWithLastCompletedFire(db: Db) {
+  return db
+    .select({
+      routineId: routines.id,
+      createdAt: routines.createdAt,
+      triggerKind: routineTriggers.kind,
+      cronExpression: routineTriggers.cronExpression,
+      timezone: routineTriggers.timezone,
+      lastCompletedAt: sql<Date | string | null>`(
+        select max(${routineRuns.completedAt}) from ${routineRuns}
+        where ${routineRuns.routineId} = ${routines.id} and ${routineRuns.status} = 'completed'
+      )`,
+    })
+    .from(routines)
+    .innerJoin(routineTriggers, eq(routineTriggers.routineId, routines.id))
+    .where(
+      and(
+        eq(routines.status, "active"),
+        eq(routineTriggers.kind, "schedule"),
+        eq(routineTriggers.enabled, true),
+      ),
+    );
+}
 
 /**
  * Refresh the routine fire-gap gauge pair (BLO-32638).
@@ -34,64 +83,25 @@ import { deriveRoutineFireIntervalMs } from "./routines.js";
  */
 export async function refreshRoutineFireGapMetrics(db: Db, now = new Date()): Promise<void> {
   try {
-    const [scheduledRoutines, lastCompletedByRoutine] = await Promise.all([
-      // One row per enabled schedule trigger on an active routine, so a
-      // routine with several triggers is reduced below rather than here --
-      // SQL cannot derive the cron cadence.
-      //
-      // `status = 'active'` is the whole paused-routine carve-out: a routine
-      // an operator deliberately paused is not a fault, and must emit no
-      // series at all rather than an ever-growing age.
-      db
-        .select({
-          routineId: routines.id,
-          createdAt: routines.createdAt,
-          triggerKind: routineTriggers.kind,
-          cronExpression: routineTriggers.cronExpression,
-          timezone: routineTriggers.timezone,
-        })
-        .from(routines)
-        .innerJoin(routineTriggers, eq(routineTriggers.routineId, routines.id))
-        .where(
-          and(
-            eq(routines.status, "active"),
-            eq(routineTriggers.kind, "schedule"),
-            eq(routineTriggers.enabled, true),
-          ),
-        ),
-      // `status = 'completed'` and not `completed_at is not null`: the
-      // `skipped`, `coalesced` and `failed` paths all stamp `completed_at`
-      // too, and a coalesced fire took no measurement of its own. `completed`
-      // is written in exactly one place -- syncRunStatusForIssue, when the
-      // execution issue reaches `done` -- which is precisely the receipt this
-      // gauge is reporting the age of.
-      db
-        .select({
-          routineId: routineRuns.routineId,
-          lastCompletedAt: sql<Date | string | null>`max(${routineRuns.completedAt})`,
-        })
-        .from(routineRuns)
-        .where(eq(routineRuns.status, "completed"))
-        .groupBy(routineRuns.routineId),
-    ]);
+    const scheduledRoutines = await selectScheduledRoutinesWithLastCompletedFire(db);
 
-    const lastCompletedAtByRoutineId = new Map<string, Date>();
-    for (const row of lastCompletedByRoutine) {
-      if (!row.lastCompletedAt) continue;
-      lastCompletedAtByRoutineId.set(row.routineId, new Date(row.lastCompletedAt));
-    }
-
-    // Reduce the per-trigger rows to one entry per routine, taking the
-    // TIGHTEST cadence across its enabled schedule triggers: fires arrive from
-    // all of them, so the shortest interval is the one a healthy routine
-    // should be meeting.
+    // Per trigger, the interval is the LONGEST gap its cron legitimately
+    // schedules (maxMs, not the dispatch horizon's minMs): the alert is
+    // `age > 2 * interval`, and a minimum pages on every healthy long gap of
+    // an irregular cron -- `0 15 * * 1-5` would page each weekend.
+    //
+    // Across a routine's enabled schedule triggers take the TIGHTEST of those:
+    // fires arrive from all of them, so no healthy gap between fires can exceed
+    // any single trigger's longest gap. The minimum over triggers is therefore
+    // still an upper bound on the true gap (never a false page), and the
+    // tightest one available.
     const byRoutineId = new Map<string, { routineId: string; ageSeconds: number; intervalSeconds: number | null }>();
     for (const row of scheduledRoutines) {
-      const intervalMs = deriveRoutineFireIntervalMs(
+      const gaps = deriveRoutineFireGapsMs(
         { kind: row.triggerKind, cronExpression: row.cronExpression, timezone: row.timezone },
         now,
       );
-      const intervalSeconds = intervalMs === null ? null : intervalMs / 1000;
+      const intervalSeconds = gaps === null ? null : gaps.maxMs / 1000;
       const existing = byRoutineId.get(row.routineId);
       if (existing) {
         if (
@@ -107,7 +117,7 @@ export async function refreshRoutineFireGapMetrics(db: Db, now = new Date()): Pr
       // wrong" render identically on a dashboard, and a routine that was
       // broken from the day it was created is exactly the case worth
       // catching. BLO-21092 already named this for a sibling gauge.
-      const since = lastCompletedAtByRoutineId.get(row.routineId) ?? row.createdAt;
+      const since = row.lastCompletedAt ?? row.createdAt;
       byRoutineId.set(row.routineId, {
         routineId: row.routineId,
         ageSeconds: Math.max(0, (now.getTime() - new Date(since).getTime()) / 1000),

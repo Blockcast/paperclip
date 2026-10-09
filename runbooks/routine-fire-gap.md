@@ -9,7 +9,8 @@ Triggers:
 
 - `PaperclipRoutineFireGap` — an active, schedule-triggered routine has not
   completed a fire in more than `routineFireGapIntervalMultiplier` (2) times
-  the cadence its own cron implies, and the snapshot refreshed successfully.
+  the longest gap its own cron schedules, and the snapshot refreshed
+  successfully.
 - `PaperclipRoutineFireGapMetricsRefreshFailed` — the most recent database
   refresh failed, so fire ages are stale and intentionally do not qualify the
   gap alert.
@@ -111,14 +112,34 @@ The fleet's scheduled routines span minutes to days. Any single seconds
 threshold either never fires for a 5-minute watchdog or pages constantly on a
 daily one, and a hand-maintained per-routine threshold list rots silently the
 next time someone edits a cron. The right-hand side is derived from the
-trigger's own cron by `deriveRoutineFireIntervalMs` — the **same** function
+trigger's own cron by `deriveRoutineFireGapsMs` — the **same** sample
 routine dispatch bounds its lock with (`deriveRoutineFireAgeHorizonMs` is a
 jitter-shaved wrapper of it), so the alert and the dispatch bound cannot drift
 apart.
 
+The two read **opposite ends** of that sample. Dispatch takes the shortest gap
+(erring short only ever releases a fire); the gauge publishes the **longest**,
+because on an irregular cron the shortest pages on healthy behaviour:
+`0 15 * * 1-5` has a 24h shortest gap but a legitimate 72h Fri → Mon gap, so a
+shortest-gap denominator paged from Sunday 15:00 until Monday's fire, every
+week. The price is detection latency on such a cron — a dead weekday routine
+pages after 2 × 72h, not 2 × 24h. Regular crons (the measured 1h incident
+included) are unaffected: their shortest and longest gaps are equal.
+
 `2` is the smallest multiplier that cannot fire on one missed fire's worth of
 ordinary lateness, because a fire's own dispatch horizon is already
 interval-minus-jitter.
+
+## Where the rule actually loads
+
+The chart's `templates/prometheusrule.yaml` is the in-repo **spec**, not the
+deploy path: `values.blockcast.yaml` keeps `prometheusRule.enabled: false`
+(BLO-14556 / BLO-20171 — `paperclip-ci-deploy` cannot write
+`monitoring.coreos.com`). The copy Prometheus loads lives in
+`Blockcast/onprem-k8s`: `paperclip/paperclip-runtime-alerts-prometheusrule.yaml`
+and its lockstep key in `monitoring/prometheus-rules-2-configmap.yaml`, with a
+replay fixture in `monitoring/paperclip-routine-fire-gap/`. Change both repos
+together, or the edit never pages.
 
 ## Verifying a change to the rule
 
@@ -133,11 +154,15 @@ helm template paperclip . --set prometheusRule.enabled=true \
 promtool test rules tests/routine-fire-gap.promtool.yaml
 ```
 
-Eight scenarios: the 30.7h window fires, the smallest measured 12h gap fires,
-the healthy 1h sawtooth never does, a single 1.5x-late fire never does, a
-*daily* routine at the same 30.7h age never does, an age with no interval
-series cannot fire, a stale snapshot gates the alert off and pages its own,
-and three replicas produce exactly one alert.
+Eleven scenarios (one `name:` block each): the 30.7h window fires (and the
+smallest measured 12h gap fires, in the same block), the healthy 1h sawtooth
+never does, a single 1.5x-late fire never does, a *daily* routine at the same
+30.7h age never does, a weekday cron's healthy Fri → Mon gap never does, a dead
+weekday routine pages past 2 × its longest gap and not before, an age with no
+interval series cannot fire, a stale snapshot gates the alert off and pages its
+own, three replicas produce exactly one alert, a stale replica is excluded
+rather than suppressing a live gap, and a stale replica cannot manufacture a
+page against a healthy routine.
 
 Every one of those was mutation-tested: each guard reverted alone turns the
 suite red. If you change the rule and the suite stays green, check that it
