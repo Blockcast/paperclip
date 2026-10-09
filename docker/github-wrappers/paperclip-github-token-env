@@ -35,6 +35,22 @@ if [ ! -r "${TOKEN_FILE}" ]; then
   echo "paperclip github token file not readable: ${TOKEN_FILE}${MOVED}" >&2
   exit 1
 fi
+# BLO-40279: never read a credential off the fleet-shared data volume. Every
+# agent uid can write there, so a readable file on it proves nothing about who
+# put it there — a vacated /paperclip/.secrets/<name>/ is a bare, group-writable
+# directory, and a token planted in it would authenticate the caller as an
+# identity it never chose. A Secret mounted *under* the volume is its own tmpfs
+# with its own device, so it still passes. Compared by device, not by path
+# prefix, because symlinks and other pinned paths reach the same filesystem.
+SHARED="${PAPERCLIP_HOME:-/paperclip}"
+if [ -d "${SHARED}" ]; then
+  SHARED_DEV="$(stat -L -c %d -- "${SHARED}" 2>/dev/null || :)"
+  FILE_DEV="$(stat -L -c %d -- "${TOKEN_FILE}" 2>/dev/null || :)"
+  if [ -z "${SHARED_DEV}" ] || [ -z "${FILE_DEV}" ] || [ "${FILE_DEV}" = "${SHARED_DEV}" ]; then
+    echo "paperclip github token file is on the shared ${SHARED} volume, which every agent can write; refusing to read a credential from it: ${TOKEN_FILE}${MOVED}" >&2
+    exit 1
+  fi
+fi
 TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}")"
 if [ -z "${TOKEN}" ]; then
   echo "paperclip github token file is empty: ${TOKEN_FILE}${MOVED}" >&2

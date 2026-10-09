@@ -869,6 +869,24 @@ extraVolumes:
 # CSI/CephFS and was; an emptyDir cannot be. /run is still the wrong home for a
 # credential, because it is a shared runtime directory several parties mount
 # into, while /etc/paperclip is a root we own and already allowlist.
+#
+# The vacated /paperclip/.secrets/<name>/ directories are deliberately LEFT in
+# place, and that is not what keeps a stale pin safe. Deleting them closes
+# nothing: /paperclip itself is `drwxrwsr-x root:node` and writable by uid 1000
+# (measured in paperclip-0, 2026-10-09), so any agent can recreate the tree and
+# plant a token in it. Deleting them during a rollout is actively harmful: every
+# pod using this PVC on a node bind-mounts one staged CephFS superblock, and
+# since Linux 3.18 an rmdir of a directory that is a mountpoint in ANOTHER mount
+# namespace succeeds and lazily detaches that mount (a network fs invalidating
+# the dentry on other nodes does the same). So the seed would unmount the token
+# Secret out from under not-yet-replaced pods and Jobs — recreating this outage
+# in the mixed-version window. The closure is at the readers instead:
+# paperclip-github-token-env, github-token-credential-helper and the `gh`
+# wrapper refuse any token file on the same device as ${PAPERCLIP_HOME} (this
+# volume), so a planted file is never read, while a Secret genuinely mounted
+# under it — its own tmpfs — still is. What no reader can see is a value
+# already read by the caller (`GH_SEAT_TOKEN_VALUE="$(cat <path>)"`); the
+# in-repo recipes name /etc/paperclip, which agents cannot write.
 extraVolumeMounts:
   - name: gbrain-authbot-service-key
     mountPath: /var/run/authbot

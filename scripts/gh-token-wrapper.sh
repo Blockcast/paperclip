@@ -256,7 +256,28 @@ reject_token_file() {
   exit 64
 }
 
-if [ -r "${TOKEN_FILE}" ]; then
+# BLO-40279: never read a credential off the fleet-shared data volume. Every
+# agent uid can write there, so a readable file on it proves nothing about who
+# put it there — a vacated /paperclip/.secrets/<name>/ is a bare, group-writable
+# directory, and a token planted in it would run `gh` as an identity the caller
+# never chose. A Secret mounted *under* the volume is its own tmpfs with its own
+# device, so it still passes. Compared by device rather than by path prefix,
+# because a symlink or any other pinned path reaches the same filesystem. Fails
+# closed when either side cannot be stat'ed.
+SHARED_VOLUME="${PAPERCLIP_HOME:-/paperclip}"
+token_file_on_shared_volume() {
+  [ -d "${SHARED_VOLUME}" ] || return 1
+  shared_dev="$(stat -L -c %d -- "${SHARED_VOLUME}" 2>/dev/null)" || return 0
+  file_dev="$(stat -L -c %d -- "${TOKEN_FILE}" 2>/dev/null)" || return 0
+  [ "${file_dev}" = "${shared_dev}" ]
+}
+
+if [ -r "${TOKEN_FILE}" ] && token_file_on_shared_volume; then
+  if require_token_file; then
+    reject_token_file "is on the shared ${SHARED_VOLUME} volume, which every agent can write"
+  fi
+  echo "gh-token-wrapper: ${TOKEN_FILE} is on the shared ${SHARED_VOLUME} volume, which every agent can write; not reading a credential from it, falling back to unwrapped auth" >&2
+elif [ -r "${TOKEN_FILE}" ]; then
   TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}" 2>/dev/null || true)"
   # `tr -d '\r\n'` strips line terminators but leaves spaces/tabs, so a
   # whitespace-only file would otherwise export a whitespace GH_TOKEN and

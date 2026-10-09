@@ -48,11 +48,19 @@ const WRAPPER_CREDENTIAL_ENV_VARS = [
 // The single way any test in this file builds an environment. Starts from a
 // copy of process.env with every credential input stripped, then applies only
 // what the caller asked for, so each test states its full credential premise.
+//
+// PAPERCLIP_HOME is pinned too (BLO-40279): the wrapper refuses a token file on
+// the shared data volume `${PAPERCLIP_HOME:-/paperclip}`, compared by device,
+// and agent Jobs run this file with TMPDIR on that same CephFS — so every temp
+// token file here would otherwise read as "on the shared volume". /proc is
+// always present and never the device of a regular file, so the check stays
+// live and each token-file test is also its distinct-device positive control.
 function sanitizedEnv(overrides = {}) {
   const env = { ...process.env };
   for (const name of WRAPPER_CREDENTIAL_ENV_VARS) {
     delete env[name];
   }
+  env.PAPERCLIP_HOME = "/proc";
   return Object.assign(env, overrides);
 }
 
@@ -192,6 +200,23 @@ test("does not mention the BLO-40279 move for a path that was never under it", (
     const proc = spawnWrapper(dir, { args: ["auth", "status"] });
     assert.equal(proc.status, 64);
     assert.doesNotMatch(proc.stderr, /BLO-40279/);
+  });
+});
+
+// BLO-40279: the vacated /paperclip/.secrets/<name>/ is a bare, group-writable
+// directory on the shared volume, so a readable token there may be one any agent
+// planted. A named path on that volume is refused, not read — the token never
+// reaches the stub gh, which would echo it.
+test("refuses a named token file on the shared data volume instead of reading it", () => {
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, {
+      tokenFileContent: "planted-token\n",
+      extraEnv: { PAPERCLIP_HOME: dir },
+    });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /is on the shared .* volume, which every agent can write; refusing to run with ambient auth/);
+    assert.equal(proc.stdout, "");
+    assert.doesNotMatch(proc.stderr, /planted-token/);
   });
 });
 
