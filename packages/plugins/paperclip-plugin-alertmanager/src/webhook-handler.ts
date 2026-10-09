@@ -10,6 +10,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { hostname as osHostname } from "node:os";
 import type { PluginContext, PluginFencingPrecondition, PluginWebhookInput, PluginWebhookResult } from "@paperclipai/plugin-sdk";
+import { ISSUE_PRIORITIES } from "@paperclipai/shared";
 import {
   ACCEPTED_SCHEMA_VERSIONS,
   DEFAULT_OPERATOR_SUPPRESSION_HOURS,
@@ -2763,7 +2764,29 @@ export async function handleFiring(
 
   const title = buildIssueTitle(alert);
   const description = buildIssueDescription(alert);
-  const priority = resolveAlertPriority(alert, config.severityToPriority);
+  const { priority, ignoredLabel } = resolveAlertPriority(
+    alert,
+    config.severityToPriority,
+  );
+  if (ignoredLabel !== undefined) {
+    // BLO-20576: the label exists to override a default this plugin lowered, so
+    // "I set paperclip_priority and nothing happened" is a likely support path.
+    // Silently ignoring it makes a typo indistinguishable from an absent label.
+    // Same handling as a malformed `paperclip_issue`, except the alert is still
+    // filed — only the override is dropped.
+    ctx.logger.warn(
+      `paperclip-plugin-alertmanager: ignoring paperclip_priority "${ignoredLabel}" on ${alertname} (${alert.fingerprint}); must be one of ${ISSUE_PRIORITIES.join(", ")} — falling back to the severity map, priority=${priority}`,
+    );
+    try {
+      await ctx.metrics.write("alertmanager.alert.malformed", 1, {
+        alertname,
+      });
+    } catch (metricErr) {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record malformed paperclip_priority metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+  }
 
   const billingCode = alert.labels.billing_code ?? null;
 
