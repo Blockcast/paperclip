@@ -42,12 +42,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "secrets.verify-ref",
     // Webhook entrypoint (the plugin is webhook-driven)
     "webhooks.receive",
-    // BLO-40739: the escalation sweep PULLS alert state from Alertmanager
-    // before a ladder rung posts or reassigns. Webhook delivery of a resolve is
-    // at-most-once, so push alone cannot tell "still firing" from "the resolve
-    // was never delivered" — and the outage that fires an alert about the
-    // Paperclip API is the same outage that eats its resolve.
-    "http.outbound",
+    // No `http.outbound`: the BLO-40739 liveness read uses Node's own `fetch`,
+    // because the host's `ctx.http` refuses the cluster-internal Alertmanager
+    // address it has to reach (see `readAlertLiveness` in escalation.ts).
     "instance.settings.register",
     "jobs.schedule",
     // Durable, race-safe storm-cover membership + resolution state (BLO-16120)
