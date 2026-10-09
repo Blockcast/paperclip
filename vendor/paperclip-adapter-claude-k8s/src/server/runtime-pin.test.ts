@@ -292,7 +292,9 @@ describe("buildClaudeCodeRuntimeShell PATH precedence (PEN-3714)", () => {
 
   // job-manifest.ts guarantees IMAGE_WRAPPER_BIN_DIR is PATH[0] on the Job env.
   // This snippet runs afterwards, in the Job's own shell, so it is the last
-  // writer and the only place that ordering can be lost.
+  // writer of PATH in this bootstrap pipeline. Not overall: tool shells later
+  // source `$HOME` rc files via BASH_ENV/ZDOTDIR, and HOME is on the
+  // agent-writable shared PVC - a later writer these tests do not cover.
   const JOB_PATH = `${IMAGE_WRAPPER_BIN_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
   const LEGACY_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -373,9 +375,5 @@ describe("buildClaudeCodeRuntimeShell PATH precedence (PEN-3714)", () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
-  });
-
-  it("pins the literal that job-manifest.ts and the chart both carry", () => {
-    expect(IMAGE_WRAPPER_BIN_DIR).toBe("/usr/local/libexec/paperclip/bin");
   });
 });

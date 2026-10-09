@@ -87,11 +87,11 @@ export function claudeCodeRuntimeDir(dataMountPath: string, version: string): st
 
 /**
  * Where the image installs the root-owned GitHub egress wrappers
- * (`Dockerfile`: `COPY docker/github-wrappers/`). Mirrors the constant of the
- * same value in job-manifest.ts, which guarantees it is `PATH[0]` on the Job
- * env; the chart's `paperclip.imageWrapperBinDir` is pinned to the same literal
- * by deploy/helm/paperclip/tests/agent-egress-path.test.mjs. Declared here rather
- * than imported because job-manifest.ts imports this module, not the reverse.
+ * (`Dockerfile`: `COPY docker/github-wrappers/`). The single declaration site:
+ * job-manifest.ts imports it from here to make it `PATH[0]` on the Job env.
+ * deploy/helm/paperclip/tests/agent-egress-path.test.mjs pins this literal to
+ * the chart's `paperclip.imageWrapperBinDir`, the Dockerfiles and the wrapper
+ * scripts, and asserts that job-manifest.ts imports it rather than restating it.
  *
  * Contains no shell metacharacter, which is what lets the `case` pattern above
  * interpolate it unquoted; `shellSingleQuote` still guards the assignment.
