@@ -2444,7 +2444,15 @@ describe("buildJobManifest", () => {
       expect(built.claudeCodeVersion).toBe(DEFAULT_CLAUDE_CODE_VERSION);
       expect(command).toContain(`__pcver='${DEFAULT_CLAUDE_CODE_VERSION}'`);
       expect(command).toContain("__pcroot='/paperclip/.local/lib/paperclip-k8s-runtimes/claude-code'");
-      expect(command).toContain('export PATH="$__pcdir/node_modules/.bin:$PATH"');
+      // PEN-3714. The bootstrap runs in the Job's own shell, AFTER this manifest
+      // has made the wrapper directory `PATH[0]`, so it is the last writer of
+      // PATH and the only place that ordering can be lost. It must put the
+      // pinned CLI ahead of the image's `claude` without overtaking the
+      // root-owned wrapper directory - the one control over `gh`/`git`/
+      // `github-mcp-server` that a write to the agent-writable PVC cannot reach.
+      expect(command).toContain(`PATH='/usr/local/libexec/paperclip/bin'":$__pcdir/node_modules/.bin:$PATH"`);
+      // The fallback arm, for an image whose PATH never carried the wrappers.
+      expect(command).toContain('PATH="$__pcdir/node_modules/.bin:$PATH"');
       // Vendored tree: the env guard is set up first; the runtime bootstrap
       // comes after it and before ccrotate. The pod-log redactor follows
       // `preparePodLog` (its fall-open sentinel needs the log directory), so it

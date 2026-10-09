@@ -100,6 +100,19 @@ export function claudeCodeRuntimeDir(dataMountPath: string, version: string, com
   return `${claudeCodeRuntimeRoot(dataMountPath, companyId)}/${version}`;
 }
 
+/**
+ * Where the image installs the root-owned GitHub egress wrappers
+ * (`Dockerfile`: `COPY docker/github-wrappers/`). Mirrors the constant of the
+ * same value in job-manifest.ts, which guarantees it is `PATH[0]` on the Job
+ * env; the chart's `paperclip.imageWrapperBinDir` is pinned to the same literal
+ * by deploy/helm/paperclip/tests/agent-egress-path.test.mjs. Declared here rather
+ * than imported because job-manifest.ts imports this module, not the reverse.
+ *
+ * Contains no shell metacharacter, which is what lets the `case` pattern above
+ * interpolate it unquoted; `shellSingleQuote` still guards the assignment.
+ */
+export const IMAGE_WRAPPER_BIN_DIR = "/usr/local/libexec/paperclip/bin";
+
 function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
@@ -186,7 +199,27 @@ export function buildClaudeCodeRuntimeShell(opts: { version: string; dataMountPa
       'fi; ' +
     'fi',
     'if [ -f "$__pcdir/.complete" ] && [ -x "$__pcbin" ]; then ' +
-      'export PATH="$__pcdir/node_modules/.bin:$PATH"; ' +
+      // PEN-3714. The managed CLI goes ahead of the image's `claude` - but NOT
+      // ahead of the root-owned GitHub egress wrappers. job-manifest.ts makes
+      // IMAGE_WRAPPER_BIN_DIR `PATH[0]` on the Job env; this snippet runs later,
+      // in the Job's own shell, so a bare prepend here silently demoted it.
+      //
+      // That matters because the wrapper directory is the one control over
+      // `gh`/`git`/`github-mcp-server` that a PVC write cannot reach: it lives in
+      // the image, root-owned, precisely so the shared-PVC trust assumption above
+      // does NOT extend to it. The runtime root IS agent-writable by construction,
+      // and its directory mode means a Job shadows a wrapper by CREATING a file,
+      // not only by replacing one - reopening exactly what that directory closed.
+      //
+      // Keyed off $PATH rather than the filesystem so the branch is a pure
+      // function of the env this snippet inherits: an image that predates the
+      // wrappers has the directory on neither, and gains no phantom PATH entry.
+      // Re-prepending one already-present entry is a no-op for resolution.
+      'case ":$PATH:" in ' +
+        '*":' + IMAGE_WRAPPER_BIN_DIR + ':"*) ' +
+          'PATH=' + shellSingleQuote(IMAGE_WRAPPER_BIN_DIR) + '":$__pcdir/node_modules/.bin:$PATH" ;; ' +
+        '*) PATH="$__pcdir/node_modules/.bin:$PATH" ;; ' +
+      'esac; export PATH; ' +
       '[ -n "${DISABLE_AUTOUPDATER+x}" ] || export DISABLE_AUTOUPDATER=1; ' +
       'echo "[paperclip] claude-code runtime $(claude --version 2>/dev/null) (adapter-managed, pinned $__pcver)" >&2; ' +
     'else ' +
