@@ -215,7 +215,25 @@ receivers:
             credentials_file: /etc/alertmanager/secrets/paperclip-token
 route:
   receiver: paperclip
-  group_by: [alertname, severity]
+  # Group by alertname ALONE for a route whose receiver is this plugin.
+  #
+  # This plugin fences aggregate creation on `[alertname, paperclip_dedupe_domain]`
+  # (`src/aggregate-key.ts`), and most rules set no dedupe domain, so for those the
+  # fence key is alertname-only. Every label you add here splits one fence's worth
+  # of alerts across several Alertmanager groups, which are dispatched
+  # CONCURRENTLY — they then race that one fence, the losers exhaust the 3s
+  # fence-wait budget, and the webhook answers 502. Alertmanager retries and no
+  # alert is lost, but the delivery-error rate is permanently red.
+  #
+  # Measured on Blockcast's cluster with `group_by: [alertname, namespace]`:
+  # ~115 such responses in a 6h window (BLO-41683). An earlier revision of this
+  # example recommended `[alertname, severity]`, which has the same defect for any
+  # alert whose rule emits more than one severity.
+  #
+  # Set this on the CHILD route that targets this plugin rather than at the root,
+  # so other receivers keep whatever grouping suits them — a Slack receiver
+  # generally wants `namespace` so the message can name it.
+  group_by: [alertname]
   repeat_interval: 4h
 ```
 
