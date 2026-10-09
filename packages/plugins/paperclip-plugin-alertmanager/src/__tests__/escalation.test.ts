@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it, vi } from "vitest";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
 import { COVER_ORIGIN, escalationDeadlineMs, recordSourceResolvedAndCloseCovers, runAlertEscalationSweep } from "../escalation.js";
 import { handleFiring, handleResolved } from "../webhook-handler.js";
@@ -1029,6 +1031,15 @@ describe("BLO-20650 concurrent webhook + sweep on one alert-state record", () =>
  *   - restore the old liveness assertion wording     -> "states what it measured ..."
  *   - drop the local alertname re-filter             -> "ignores an Alertmanager response ..."
  *   - treat `suppressed` as not firing               -> "treats a suppressed alert as firing"
+ *   - read through `ctx.http` instead of `fetch`     -> "reads Alertmanager over a real request ..."
+ *   - post the hold notice before the CAS            -> "posts no hold notice when a re-fire wins ..."
+ *   - drop the per-sweep memo                        -> "reads each alertname once per sweep ..."
+ *   - drop the transport short-circuit or timeout    -> "costs a sweep one timeout ..."
+ *
+ * Every Alertmanager below is a real HTTP server on loopback, read with real
+ * `fetch`. The first cut of this fix injected a mock `ctx.http` into every
+ * test, so none of them could see the host refuse the private address the read
+ * has to reach — and the feature shipped inert with the whole suite green.
  */
 describe("BLO-40739 alert-escalation liveness claims", () => {
   const LIVENESS_ASSERTION = /\b(is|remains|still)\s+firing\b/i;
@@ -1040,11 +1051,60 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
     nextEscalationAt: "2026-07-11T00:30:00Z", escalationAttempt: 0, ...overrides,
   });
 
-  const withAlertmanager = (payload: unknown, ok = true) => ({
-    fetch: vi.fn(async () => ({ ok, status: ok ? 200 : 503, json: async () => payload })),
+  const NOW = new Date("2026-07-11T01:00:00Z");
+  const servers: Server[] = [];
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await Promise.all(servers.splice(0).map((server) => {
+      server.closeAllConnections();
+      return new Promise((resolve) => server.close(resolve));
+    }));
   });
 
-  const amConfig = () => config({ alertmanagerApiUrl: "http://am.invalid:9093/" });
+  const listen = async (server: Server) => {
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+  };
+
+  /** A loopback Alertmanager answering every `/api/v2/alerts` read with `payload`. */
+  const startAlertmanager = async (payload: unknown, status = 200) => {
+    const requests: URL[] = [];
+    const url = await listen(createServer((req, res) => {
+      requests.push(new URL(req.url ?? "/", "http://alertmanager"));
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload));
+    }));
+    return { config: config({ alertmanagerApiUrl: url }), requests };
+  };
+
+  /** An Alertmanager address that refuses connections (listened on, then closed). */
+  const refusedAlertmanager = async () => {
+    const server = createServer();
+    const url = await listen(server);
+    await new Promise((resolve) => server.close(resolve));
+    return config({ alertmanagerApiUrl: url });
+  };
+
+  /** What the host does to `ctx.http.fetch` for a private target (plugin-host-services.ts, `isPrivateIP`). */
+  const hostRefusesPrivateTargets = () => ({
+    fetch: vi.fn(async (url: string) => {
+      throw new Error(`All resolved IPs for ${new URL(url).hostname} are in private/reserved ranges`);
+    }),
+  });
+
+  /** Several due ladders in one sweep, one state record per issue. */
+  const sweepOf = (states: AlertStateRecord[]) => {
+    const { ctx, mocks } = sweepContext(states[0]);
+    const issues = states.map((_, i) => ({
+      id: `issue-${i + 1}`, identifier: `BLO-${i + 1}`, title: "Alert", status: "todo", priority: "critical",
+      originId: `fp-${i + 1}`, assigneeAgentId: "engineer", projectId: null, goalId: null,
+    }));
+    mocks.issues.list = vi.fn(async (input: { originKind?: string }) => input.originKind?.endsWith(":escalation") ? [] : issues);
+    mocks.state.get = vi.fn(async (ref: { stateKey: string }) => states[Number(/fp-(\d+)$/.exec(ref.stateKey)![1]) - 1]);
+    return { ctx, mocks };
+  };
+
   const bodies = (mocks: { issues: { createComment: ReturnType<typeof vi.fn> } }) =>
     mocks.issues.createComment.mock.calls.map((call) => String(call[1]));
 
@@ -1055,7 +1115,7 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
   it("states what it measured instead of asserting the alert is firing, when liveness was not read", async () => {
     const state = due();
     const { ctx, mocks } = sweepContext(state);
-    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    await runAlertEscalationSweep(ctx, config(), NOW);
 
     const [body] = bodies(mocks);
     expect(body).toContain("[alert-escalation 1/3]");
@@ -1063,12 +1123,43 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
     expect(body).toContain("Alert liveness NOT verified");
     // The measurement, not an adjective: the reader can judge staleness.
     expect(body).toContain("last firing notification received 2026-07-11T00:10:00Z (50m ago)");
+    // Unset URL is the fail-open direction: the ladder still climbs.
+    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1 }), casArg(state));
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads Alertmanager over a real request, not ctx.http — the host refuses the cluster-internal address", async () => {
+    // Production shape: Alertmanager is a ClusterIP (10.x) and the host's
+    // plugin fetch refuses every all-private target, so a read routed through
+    // `ctx.http` can never succeed there. Loopback is private too.
+    const am = await startAlertmanager([]);
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
+    const http = hostRefusesPrivateTargets();
+    (ctx as unknown as { http: unknown }).http = http;
+    await runAlertEscalationSweep(ctx, am.config, NOW);
+
+    expect(http.fetch).not.toHaveBeenCalled();
+    expect(am.requests).toHaveLength(1);
+    const [request] = am.requests;
+    expect(request.pathname).toBe("/api/v2/alerts");
+    expect(request.searchParams.get("filter")).toBe('alertname="SyntheticAlert"');
+    for (const flag of ["active", "silenced", "inhibited"]) expect(request.searchParams.get(flag)).toBe("true");
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(bodies(mocks)[0]).toContain("[alert-escalation] Source alert is not firing");
+  });
+
+  it("escapes quotes and backslashes in the alertname matcher", async () => {
+    const am = await startAlertmanager([]);
+    const { ctx } = sweepContext(due({ alertname: 'Has"Quote\\Slash' }));
+    await runAlertEscalationSweep(ctx, am.config, NOW);
+
+    expect(am.requests[0].searchParams.get("filter")).toBe('alertname="Has\\"Quote\\\\Slash"');
   });
 
   it("asserts firing only from a live read, and cites when that read happened", async () => {
+    const am = await startAlertmanager([amAlert("active")]);
     const { ctx, mocks } = sweepContext(due());
-    (ctx as unknown as { http: unknown }).http = withAlertmanager([amAlert("active")]);
-    await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+    await runAlertEscalationSweep(ctx, am.config, NOW);
 
     const [body] = bodies(mocks);
     expect(body).toContain("read live from Alertmanager at 2026-07-11T01:00:00.000Z");
@@ -1078,10 +1169,10 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
 
   it("holds the ladder — no reassignment, no liveness claim — when Alertmanager says the alert is not firing", async () => {
     // attempt 1 is the expensive rung: it reassigns a critical to a manager.
+    const am = await startAlertmanager([]);
     const state = due({ escalationAttempt: 1 });
     const { ctx, mocks } = sweepContext(state);
-    (ctx as unknown as { http: unknown }).http = withAlertmanager([]);
-    await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+    await runAlertEscalationSweep(ctx, am.config, NOW);
 
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.issues.requestWakeup).not.toHaveBeenCalled();
@@ -1100,22 +1191,41 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
     expect(written).not.toHaveProperty("escalationComplete", true);
   });
 
-  it("posts the hold notice once, not once per minute-sweep", async () => {
+  it("posts no hold notice when a re-fire wins the alert record mid-read", async () => {
+    // The notice says the alert is clear, so it must sit behind the swap like
+    // every rung effect. Posted first, it would assert "clear" about an alert
+    // a webhook just re-fired — and, since the marker dedups for the life of
+    // the issue, suppress every correct hold notice after it.
+    const am = await startAlertmanager([]);
     const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
-    (ctx as unknown as { http: unknown }).http = withAlertmanager([]);
+    mocks.state.set = vi.fn(async () => {
+      throw Object.assign(new Error("Plugin state changed since it was read; refusing the write"), {
+        data: { code: PLUGIN_STATE_PRECONDITION_FAILED_CODE },
+      });
+    });
+    await runAlertEscalationSweep(ctx, am.config, NOW);
+
+    expect(mocks.state.set).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+  });
+
+  it("posts the hold notice once, not once per minute-sweep", async () => {
+    const am = await startAlertmanager([]);
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
     mocks.issues.listComments = vi.fn(async () => [
       { body: "[alert-escalation] Source alert is not firing — escalation held.\n\nRead from Alertmanager at ..." },
     ]);
-    await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+    await runAlertEscalationSweep(ctx, am.config, NOW);
 
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
     expect(mocks.issues.update).not.toHaveBeenCalled();
   });
 
   it("treats a suppressed alert as firing — inhibited or silenced is firing and merely not paging", async () => {
+    const am = await startAlertmanager([amAlert("suppressed")]);
     const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
-    (ctx as unknown as { http: unknown }).http = withAlertmanager([amAlert("suppressed")]);
-    await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+    await runAlertEscalationSweep(ctx, am.config, NOW);
 
     expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
     expect(bodies(mocks)[0]).toContain("state=suppressed");
@@ -1125,23 +1235,22 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
     // An AM that drops the filter returns the whole alert set, which would read
     // as "firing" for every alertname on the cluster — a fail-open that
     // silently restores the behaviour this guard removes.
+    const am = await startAlertmanager([amAlert("active", "SomeOtherAlert")]);
     const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
-    (ctx as unknown as { http: unknown }).http = withAlertmanager([amAlert("active", "SomeOtherAlert")]);
-    await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+    await runAlertEscalationSweep(ctx, am.config, NOW);
 
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(bodies(mocks)[0]).toContain("Source alert is not firing");
   });
 
   it("fails open when the Alertmanager read errors — an unreachable AM must not silence the ladder", async () => {
-    for (const http of [
-      { fetch: vi.fn(async () => { throw new Error("ECONNREFUSED"); }) },
-      withAlertmanager([], false),
-      withAlertmanager({ not: "an array" }),
+    for (const amConfig of [
+      await refusedAlertmanager(),
+      (await startAlertmanager([], 503)).config,
+      (await startAlertmanager({ not: "an array" })).config,
     ]) {
       const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
-      (ctx as unknown as { http: unknown }).http = http;
-      await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+      await runAlertEscalationSweep(ctx, amConfig, NOW);
 
       expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
       const [body] = bodies(mocks);
@@ -1150,11 +1259,38 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
     }
   });
 
+  it("reads each alertname once per sweep, however many due issues share it", async () => {
+    const am = await startAlertmanager([]);
+    const { ctx, mocks } = sweepOf([due(), due(), due()]);
+    await runAlertEscalationSweep(ctx, am.config, NOW);
+
+    expect(am.requests).toHaveLength(1);
+    expect(bodies(mocks).filter((body) => body.startsWith("[alert-escalation] Source alert is not firing"))).toHaveLength(3);
+  });
+
+  it("costs a sweep one timeout, not one per due issue, when Alertmanager hangs", async () => {
+    // Reachable but never answering: the NetworkPolicy-drop / partition shape,
+    // not the ECONNREFUSED one. Two different alertnames, so the memo alone
+    // cannot help — the transport short-circuit has to.
+    const requests: string[] = [];
+    const url = await listen(createServer((req) => { requests.push(req.url ?? ""); }));
+    const { ctx, mocks } = sweepOf([due({ alertname: "AlertA" }), due({ alertname: "AlertB" })]);
+    const started = Date.now();
+    await runAlertEscalationSweep(ctx, config({ alertmanagerApiUrl: url }), NOW);
+    const elapsed = Date.now() - started;
+
+    expect(requests).toHaveLength(1);
+    // One per-call cap (5s) — well under two of them, and far under the host's 30s.
+    expect(elapsed).toBeLessThan(9_000);
+    // Fail-open still holds for both: neither ladder is silenced.
+    expect(bodies(mocks).filter((body) => body.includes("Alert liveness NOT verified"))).toHaveLength(2);
+  }, 20_000);
+
   it("never reassigns, comments, or covers for a known-resolved alert", async () => {
     // The pre-existing `state.resolvedAt` guard. AC2 of BLO-40739 depends on
     // it and nothing pinned it before.
     const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, resolvedAt: "2026-07-11T00:20:00Z" }));
-    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    await runAlertEscalationSweep(ctx, config(), NOW);
 
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
@@ -1164,7 +1300,7 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
 
   it("carries the measurement onto the board cover too — title, description, and announcement", async () => {
     const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }), null);
-    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    await runAlertEscalationSweep(ctx, config(), NOW);
 
     const [[created]] = mocks.issues.create.mock.calls as unknown as [[{ description: string }]];
     expect(created.description).not.toMatch(LIVENESS_ASSERTION);
@@ -1175,9 +1311,9 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
   it("does not auto-close, cancel, or reassign the alert issue in any liveness branch", async () => {
     // AC3: the row count of non-terminal alert issues is unchanged by this fix.
     for (const payload of [[], [amAlert("active")]]) {
+      const am = await startAlertmanager(payload);
       const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
-      (ctx as unknown as { http: unknown }).http = withAlertmanager(payload);
-      await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+      await runAlertEscalationSweep(ctx, am.config, NOW);
 
       const updates = mocks.issues.update.mock.calls as unknown as Array<[string, { status?: string }]>;
       for (const [, patch] of updates) expect(["done", "cancelled"]).not.toContain(patch.status);
