@@ -191,6 +191,9 @@ test("paperclip-github-token-env: rejects a whitespace-only override instead of 
 
   assert.equal(result.status, 64);
   assert.match(result.stderr, /holds only whitespace/);
+  // BLO-40279: `GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/...)"` leaves it
+  // set-but-empty, so this refusal is where a stale pin through `git` surfaces.
+  assert.match(result.stderr, /stale since BLO-40279/);
 });
 
 test("paperclip-github-token-env: rejects an override with embedded whitespace", () => {
@@ -238,6 +241,30 @@ test("paperclip-github-token-env: fails loudly when the fallback token file is u
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /not readable/);
+  // Anti-vacuity for the stale-path test below: the hint is conditional.
+  assert.doesNotMatch(result.stderr, /BLO-40279/);
+});
+
+// BLO-40279: `git` and `github-mcp-server` exec this wrapper, not the `gh`
+// wrapper, so a stale /paperclip/.secrets pin reaching them must get the same
+// pointer to the new mount instead of a bare "not readable".
+test("paperclip-github-token-env: names the BLO-40279 move for a stale /paperclip/.secrets path", (t) => {
+  const stale = "/paperclip/.secrets/gh-seat-token-test-absent/token";
+  if (fs.existsSync(stale)) return t.skip(`${stale} unexpectedly exists`);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-seat-token-"));
+  const script = writeExecutable(dir, "paperclip-github-token-env", envScriptBody);
+
+  const env = { ...process.env, PAPERCLIP_GITHUB_TOKEN_FILE: stale };
+  delete env.GH_SEAT_TOKEN_VALUE;
+
+  const result = spawnSync("sh", [script, "true"], { encoding: "utf8", env });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /not readable/);
+  assert.match(
+    result.stderr,
+    /moved to \/etc\/paperclip\/secrets\/<name>\/token in BLO-40279/,
+  );
 });
 
 function runCredHelper(

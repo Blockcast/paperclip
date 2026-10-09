@@ -446,6 +446,9 @@ for (const [label, tokenValue] of [
       const proc = runMalformedValue(dir, tokenValue);
       assert.equal(proc.status, 64);
       assert.match(proc.stderr, /GH_SEAT_TOKEN_VALUE is set but holds only whitespace/);
+      // BLO-40279: the documented `$(cat <token file>)` recipe against a stale
+      // /paperclip/.secrets path lands here, not in reject_token_file().
+      assert.match(proc.stderr, /stale since BLO-40279/);
       assert.equal(proc.stdout, "");
     });
   });
