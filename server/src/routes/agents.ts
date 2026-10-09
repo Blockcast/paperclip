@@ -5553,15 +5553,22 @@ export function agentRoutes(
     // Owner resolution mirrors `withholdUnentitledWorkspaceOperationOutput` rather than
     // re-deriving it: a run-less operation has no owner to decide about, so it falls back to the
     // same human-operator test that helper uses, and withholds for everyone else.
-    const owners = await workspaceOperations.owningAgentIdsByRunId(
-      [operation.heartbeatRunId],
-      operation.companyId,
-    );
-    const ownerAgentId = operation.heartbeatRunId ? owners.get(operation.heartbeatRunId) : undefined;
-    const transcriptEntitled = ownerAgentId
-      ? await runTranscriptReadGate(req, access, operation.companyId)(ownerAgentId)
-      : boardActorIsTranscriptOperator(req, operation.companyId);
-    const revealLogContent = viewer.revealRuntimeConfig && transcriptEntitled;
+    //
+    // Only asked once the entitlement admits the reader: an AND cannot be turned true by its
+    // second half, and the entitlement withholds every agent actor, so resolving the owner first
+    // cost a `heartbeat_runs` SELECT on each `paperclip run workspace-log` poll that could never
+    // disclose anything (Ally review 5473959448). The decision and the audit flag are unchanged.
+    let revealLogContent = viewer.revealRuntimeConfig;
+    if (revealLogContent) {
+      const owners = await workspaceOperations.owningAgentIdsByRunId(
+        [operation.heartbeatRunId],
+        operation.companyId,
+      );
+      const ownerAgentId = operation.heartbeatRunId ? owners.get(operation.heartbeatRunId) : undefined;
+      revealLogContent = ownerAgentId
+        ? await runTranscriptReadGate(req, access, operation.companyId)(ownerAgentId)
+        : boardActorIsTranscriptOperator(req, operation.companyId);
+    }
     // BLO-34738: then `readLog`, and only then the audit. It throws
     // `notFound("Workspace operation log not found")` when the operation stored no log
     // (`services/workspace-operations.ts`), so auditing first booked `result: "allowed",

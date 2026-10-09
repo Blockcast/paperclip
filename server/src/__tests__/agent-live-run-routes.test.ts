@@ -40,6 +40,10 @@ const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockWorkspaceOperationService = vi.hoisted(() => ({
   getById: vi.fn(),
   readLog: vi.fn(),
+  // PEN-3204: the route resolves the operation's owning agent for the transcript gate it ANDs
+  // onto the entitlement. A mock without it throws `TypeError` before `readLog`, which is how
+  // five cases below broke unnoticed (Ally review 5473959448).
+  owningAgentIdsByRunId: vi.fn(),
 }));
 
 /**
@@ -351,6 +355,12 @@ describe("agent live run routes", () => {
     mockLogActivity.mockResolvedValue(undefined);
     allowEveryAction();
     mockWorkspaceOperationService.getById.mockResolvedValue(workspaceOperationLogFixture());
+    // Owner set, so an entitled reader takes the transcript-gate path rather than the run-less
+    // operator fallback — the two agree for the local board, and only the former is the shape
+    // a run-attached operation actually has.
+    mockWorkspaceOperationService.owningAgentIdsByRunId.mockResolvedValue(
+      new Map([["run-1", routeAgentId]]),
+    );
     mockWorkspaceOperationService.readLog.mockResolvedValue({
       operationId: "operation-1",
       store: "local_file",
@@ -676,6 +686,9 @@ describe("agent live run routes", () => {
     expect(res.body.content).toBe("***REDACTED***");
     // The opaque handles stay — the route they point at is the one that now withholds.
     expect(res.body.logRef).toBe("logs/operation-1.ndjson");
+    // The entitlement already withholds, so the transcript gate cannot change the answer and the
+    // owner lookup (one `heartbeat_runs` SELECT per poll) is skipped.
+    expect(mockWorkspaceOperationService.owningAgentIdsByRunId).not.toHaveBeenCalled();
     // AC 2 + review: the access check passed, so this is `result: "allowed"` — but nothing was
     // disclosed. Without `withheld` the record is indistinguishable from a real disclosure, and
     // "who read this log" over-reports.
@@ -693,6 +706,12 @@ describe("agent live run routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.content).toBe(WORKSPACE_OPERATION_LOG_SENTINEL);
+    // The gate path, company-scoped (PEN-3895): the owner is resolved inside the operation's
+    // own company, never across tenants.
+    expect(mockWorkspaceOperationService.owningAgentIdsByRunId).toHaveBeenCalledWith(
+      ["run-1"],
+      "company-1",
+    );
     expect(mockWorkspaceOperationService.readLog).toHaveBeenCalledWith("operation-1", {
       offset: 7,
       limitBytes: 64,
