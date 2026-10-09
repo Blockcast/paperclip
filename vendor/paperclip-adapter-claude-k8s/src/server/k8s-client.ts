@@ -222,8 +222,13 @@ export async function getSelfPodInfo(kubeconfigPath?: string): Promise<SelfPodIn
   // Discover secret volumes mounted on the main container.
   //
   // Allowlisted (BLO-22514): everything collected here is re-mounted onto every
-  // agent Job pod by job-manifest.ts, so an un-allowlisted server mount would
-  // hand its key material to every agent under /paperclip/.secrets/...
+  // agent Job pod by job-manifest.ts, at `mountPath: sv.mountPath` — the server
+  // pod's own path, verbatim — so an un-allowlisted server mount would hand its
+  // key material to every agent at whatever path the server mounted it on.
+  // Deliberately not naming a directory here: the hazard is the verbatim
+  // propagation, which is path-independent, and the last spelling of it
+  // (`/paperclip/.secrets/...`) rotted when BLO-40279 moved the GitHub token
+  // mount out from under the shared CephFS volume.
   const secretVolumes: SelfPodSecretVolume[] = [];
   for (const vm of mainContainer.volumeMounts ?? []) {
     const vol = spec.volumes?.find((v) => v.name === vm.name);
