@@ -24,15 +24,16 @@
  * then a visible escalation.
  *
  * That last clause holds ONLY when an invokable owner resolves. When the owner
- * ladder returns none (service.ts:5534), `wakesOwner` is false (:6073), so
- * `maxAttempts`/`timeoutAt` are written null (:6186-6187), `wakePolicy` is the
- * unbounded `board_escalation`/`no_invokable_recovery_owner` shape (:6176-6177),
- * and `enqueueSourceScopedStrandedRecoveryWake` returns before enqueueing
- * anything (:6210 — note :6208 is the `provider_quota` guard and :6209 the
- * cause return; three adjacent returns, only :6210 is the ownerless one). The
- * backstop sweep skips it too, and ORDERING is why this change is inert there:
- * the `!ownerAgentId` test (:13761-13764) runs BEFORE the cause test
- * (:13765-13771) this change was aimed at, so an ownerless row only moves from
+ * ladder (`resolveStrandedRecoveryRouting`) returns none, `wakesOwner` is false,
+ * so `recoveryActionBoundsAtCreation` is skipped and `maxAttempts`/`timeoutAt`
+ * are written null, `wakePolicy` takes the unbounded
+ * `board_escalation`/`no_invokable_recovery_owner` shape, and
+ * `enqueueSourceScopedStrandedRecoveryWake` returns before enqueueing anything
+ * (its `!input.action.ownerAgentId` return — the third of three adjacent early
+ * returns, after the `provider_quota` guard and the cause return). The backstop
+ * sweep skips it too, and ORDERING is why this change is inert there: in
+ * `reconcileStrandedRecoveryWakeBackstopImpl` the `!ownerAgentId` skip runs
+ * BEFORE the cause test this change was aimed at, so an ownerless row only moves from
  * "skipped by cause" to "skipped by no owner" — same zero wakes, same null
  * budget.
  *
@@ -70,16 +71,18 @@
  *
  * One downstream effect of the cause change is not obvious from here: for the
  * parks that lose the cause, the action's `kind` moves "workspace_validation" ->
- * "stranded_assigned_issue" (service.ts:6115, `strandedRecoveryActionKind`), so
+ * "stranded_assigned_issue" (`strandedRecoveryActionKind` in service.ts), so
  * anything filtering or alerting on that kind stops seeing those rows — the
  * diagnostics survive on the issue comment.
  *
  * ⚠ An earlier revision of this file also claimed the
- * `git_worktree_branch_incoherence` arm of the `nextAction` text (service.ts:6148)
+ * `git_worktree_branch_incoherence` arm of the `nextAction` text in service.ts
  * "became unreachable and was deleted". That was wrong, and deleting the arm broke
  * two master tests in `heartbeat-workspace-branch-containment.test.ts`. The claim
- * rested on reading only the finalize-path producer (heartbeat.ts:33463) and
- * missing BLO-32628's branch-containment producer (heartbeat.ts:3800), which
+ * rested on reading only the finalize-path producer (in `heartbeatService`,
+ * fingerprinted by `fingerprintFinalizeWorkspaceBranchValidation`) and missing
+ * BLO-32628's branch-containment producer (`inspectGitWorktreeBranchIncoherence`
+ * in workspace-runtime.ts), which
  * reaches a positively confirmed divergence. The arm is reachable, is restored,
  * and the containment tests are its positive control.
  */
@@ -88,7 +91,7 @@
  * True only when a probe positively confirmed the hazard.
  *
  * `probeGitCheckoutStateStrict` is the only producer of `gitProbeState`
- * (heartbeat.ts:4132), and "checkout" is its only affirmative verdict: a real
+ * (heartbeat.ts), and "checkout" is its only affirmative verdict: a real
  * repository under the fallback cwd, whose removal is a repair only a
  * human/agent can perform. That is the one park that has earned the no-wake
  * shape.
@@ -96,7 +99,7 @@
  * The second affirmative verdict is BLO-32628's
  * `provenance.ancestryVerdict: "diverged"`. That is the same answered/unanswered
  * shape one level down: `getGitWorktreeBranchAncestryVerdict`
- * (workspace-runtime.ts:1811) runs `git merge-base --is-ancestor` and maps exit
+ * (workspace-runtime.ts) runs `git merge-base --is-ancestor` and maps exit
  * 0 -> "ancestor", exit 1 -> "diverged", and EVERY failure mode — missing
  * expected/actual SHA, `.catch(() => null)` on the exec, any other exit code —
  * to "unknown". So "diverged" means git answered and the recorded branch is
@@ -108,12 +111,12 @@
  * Keying on `reason === "git_worktree_branch_incoherence"` instead would be
  * wrong in the fail-open direction this file exists to close, because that
  * reason has TWO producers and only one of them carries provenance:
- *   - BLO-32628 branch containment (workspace-runtime.ts, via heartbeat.ts:3800)
+ *   - BLO-32628 branch containment (`inspectGitWorktreeBranchIncoherence`)
  *     — carries `provenance.ancestryVerdict`, so it can be judged. A park at
  *     `ancestryVerdict: "unknown"` is a dead probe and must stay unlatched.
- *   - the finalize-path check (heartbeat.ts:33463) — carries
+ *   - the finalize-path check in `heartbeatService` — carries
  *     `managedGitWorktreeBranch` and NO provenance, from
- *     `inspectManagedGitWorktreeBranch` (workspace-runtime.ts:3765), whose four
+ *     `inspectManagedGitWorktreeBranch` (workspace-runtime.ts), whose four
  *     `.catch(() => null)` arms each turn a git exec failure into a
  *     confirmed-sounding reasonCode; its own throw message concedes it,
  *     reporting that "the checked-out branch could not be verified". Nothing on
@@ -121,15 +124,17 @@
  *     stays unlatched.
  *
  * `git_worktree_base_not_git_checkout` stays unlatched for the same reason: it
- * comes from `isGitCheckout` (heartbeat.ts:3832), which is `.catch(() => false)`
+ * comes from `isGitCheckout` (heartbeat.ts), which is `.catch(() => false)`
  * with no timeout, so any probe error reads as a confirmed "not a checkout".
  * This very file already refuses to use that helper for the dispatch guard for
- * exactly that reason (heartbeat.ts:4127-4131).
+ * exactly that reason (the comment above its `probeGitCheckoutStateStrict` call
+ * in `assertGitSensitiveAdapterWorkspaceValid`).
  *
  * So the predicate is an allowlist of verdicts, not a denylist of reasons. It
  * governs only the two heartbeat.ts park sites that call
  * `workspaceValidationRecoveryCause` below, not the BLO-31351 git-transport
- * producer (service.ts:9322), which writes the cause directly. At those two park
+ * producer (the `workspace_git_transport` branch in `recoveryService`), which
+ * writes the cause directly. At those two park
  * sites, a reason code added later is unlatched by default, and the worst case
  * for a genuine configuration fault is a bounded set of wake attempts followed
  * by a visible escalation — against a worst case of a permanent silent strand on
@@ -156,9 +161,10 @@ export const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed"
  * then a visible escalation).
  *
  * Both heartbeat.ts park sites call this rather than repeating the decision:
- * service.ts:6069 already records that writing this kind of rule as parallel
- * expressions is what made the downstream wake-suppression sites drift apart
- * once, and the two sites here are ~600 lines apart.
+ * the comment above `wakesOwner` in service.ts already records that writing
+ * this kind of rule as parallel expressions is what made the downstream
+ * wake-suppression sites drift apart once, and the two sites here are far
+ * apart in heartbeat.ts.
  */
 export function workspaceValidationRecoveryCause(
   workspaceValidationPayload: Record<string, unknown> | null | undefined,
