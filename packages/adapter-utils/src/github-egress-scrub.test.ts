@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -27,6 +29,15 @@ const SYNTHETIC_JWT =
 
 // High per-character entropy, obviously fake, mixed case + digits.
 const SYNTHETIC_OPAQUE_VALUE = "s7Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0Tg";
+
+// PEN-3907 fixtures. DERIVED, not pasted: a 64-hex literal in `name="value"`
+// form is exactly what the pre-push guard refuses, so a hardcoded digest here
+// would make this very file unpushable from an agent seat until the fix it
+// tests has already shipped. Deriving it also makes the fixture self-evidently
+// a content digest rather than a value someone chose.
+const SYNTHETIC_SHA256 = createHash("sha256").update("pen-3907 fixture").digest("hex");
+const SYNTHETIC_SHA1 = createHash("sha1").update("pen-3907 fixture").digest("hex");
+const SYNTHETIC_SHA512 = createHash("sha512").update("pen-3907 fixture").digest("hex");
 
 describe("scrubGitHubEgressText", () => {
   describe("byte-exact pass-through", () => {
@@ -186,6 +197,94 @@ describe("scrubGitHubEgressText", () => {
       const result = scrubGitHubEgressText(text);
       expect(result.text).toBe(text);
       expect(result.redacted).toBe(false);
+    });
+  });
+
+  describe("PEN-3907: content digests are not credentials", () => {
+    // A lowercase-hex digest saturates the 4.0 bits/char ceiling a 16-symbol
+    // alphabet allows, so entropy alone cannot separate it from a hex-encoded
+    // secret. The exemption is therefore a conjunction of NAME and SHAPE, and
+    // both halves are pinned below, each with the opposite case as its control.
+
+    it("passes a sha256 pin bound to a digest-named key through byte-exact", () => {
+      // The blocking case from PEN-3896: a promtool series fixture carrying the
+      // admission-drift expectation pin. The refusal's advice — derive it at
+      // runtime — is unavailable, because the sibling copy of this literal lives
+      // in a PromQL matcher inside a PrometheusRule and a gate asserts it there.
+      const text = `paperclip_admission_policy_drift_expectation_info{job="drift",sha256="${SYNTHETIC_SHA256}"}`;
+      const result = scrubGitHubEgressText(text);
+
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+      expect(result.classes).toEqual([]);
+    });
+
+    it.each([
+      ["sha256", SYNTHETIC_SHA256],
+      ["IMAGE_DIGEST", SYNTHETIC_SHA256],
+      ["expected_checksum", SYNTHETIC_SHA256],
+      ["manifest_sha512", SYNTHETIC_SHA512],
+      ["commit_sha1", SYNTHETIC_SHA1],
+    ])("exempts %s bound to a hex digest", (name, digest) => {
+      const text = `${name}="${digest}"`;
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+    });
+
+    // -- controls: the exemption must not have widened past its conjunction --
+
+    it("still redacts a 64-hex value under a name that does not claim a digest", () => {
+      // THE control for the shape half. Hex-encoded signing keys are routinely
+      // 32 or 64 hex, so exempting bare hex would pass a real credential. This
+      // value is byte-identical to the exempt one above; only the name differs.
+      const result = scrubGitHubEgressText(`SECRET_KEY="${SYNTHETIC_SHA256}"`);
+
+      expect(result.redacted).toBe(true);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_SHA256);
+    });
+
+    it("still redacts when the name only mentions a hash rather than ending in one", () => {
+      const result = scrubGitHubEgressText(`sha256_signing_key="${SYNTHETIC_SHA256}"`);
+      expect(result.redacted).toBe(true);
+      expect(result.text).not.toContain(SYNTHETIC_SHA256);
+    });
+
+    it("still redacts a digest-named key whose value is not a hex digest", () => {
+      // THE control for the name half: naming a value `sha256` does not make an
+      // opaque token a digest. Mixed case and the wrong length both disqualify.
+      const result = scrubGitHubEgressText(`sha256="${SYNTHETIC_OPAQUE_VALUE}"`);
+      expect(result.redacted).toBe(true);
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+
+    it("still redacts a digest-named key whose hex value is the wrong length", () => {
+      const notADigestLength = SYNTHETIC_SHA256.slice(0, 48);
+      const result = scrubGitHubEgressText(`sha256="${notADigestLength}"`);
+      expect(result.redacted).toBe(true);
+    });
+
+    it("leaves every other detector intact on the same call", () => {
+      // The done-when's positive control: a real-shaped PEM in the same text as
+      // an exempt digest must still refuse, so the exemption cannot be read as
+      // "digest present ⇒ text is clean".
+      const result = scrubGitHubEgressText(
+        `sha256="${SYNTHETIC_SHA256}"\n${SYNTHETIC_PEM}`,
+      );
+
+      expect(result.classes).toContain("private-key-block");
+      expect(result.text).toContain(SYNTHETIC_SHA256);
+      expect(result.text).not.toContain(SYNTHETIC_PEM_BODY);
+    });
+
+    it("pins the OCI prefixed form, which is exempt for a different reason", () => {
+      // `sha256:<hex>` never reached the entropy test at all: `:` is outside the
+      // token alphabet in `isOpaqueSecretValue`. That is incidental rather than
+      // intended, so it is pinned here — if the alphabet ever gains `:`, this
+      // fails and points at `isContentDigestAssignment` as the deliberate home
+      // for the behaviour, instead of image-digest pins silently starting to
+      // refuse.
+      const text = `DIGEST="sha256:${SYNTHETIC_SHA256}"`;
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
     });
   });
 
