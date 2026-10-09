@@ -175,8 +175,23 @@ if ! deployment_json="$("${PAPERCLIP_DEPLOY_KUBECTL:-kubectl}" -n "$DEPLOY_NAMES
   exit 2
 fi
 
+# Branch on jq's exit status, not its truthiness: 1 is a predicate that
+# evaluated false, while 3 (compile) and 5 (runtime) are a predicate that could
+# not be evaluated. Folding those into `false` reads a broken serving predicate
+# as "not serving" and reports a stranded lock as landing, exit 0. Fail closed
+# like every other seam here. `exit 2` leaves the command substitution, and
+# `set -e` carries it out of the assignment, as script_const's already does.
 jq_bool() {
-  if jq -e "$@" >/dev/null 2>&1; then printf 'true'; else printf 'false'; fi
+  local out status=0
+  out="$(jq -e "$@" 2>&1)" || status=$?
+  case "$status" in
+    0) printf 'true' ;;
+    1) printf 'false' ;;
+    *)
+      echo "jq could not evaluate a lifted predicate (exit ${status}): ${out}" >&2
+      exit 2
+      ;;
+  esac
 }
 
 image="${IMAGE_REPOSITORY}@${lock_digest}"
