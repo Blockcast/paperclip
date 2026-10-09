@@ -20,4 +20,20 @@
 # BLO-35109 deleted the 64-hex integrity hash rather than relocating it.
 # `provenance-union-merge.test.mjs` pins all of this, including a
 # driver-disabled merge that reproduces GitHub's behaviour.
+#
+# BLO-41101 AC5 — DECISION: KEEP, and the guard is what makes that safe.
+# This attribute is the mechanism that HID the bug it was meant to fix: because
+# a local rebase resolves, #1797's author reproduced "clean" locally while the
+# queue ejected the PR six times in 24 days. Removing it was considered and
+# rejected. `check-vendored-provenance-log.mjs` now rejects ANY commit in
+# base..head that touches this file, so the hiding mechanism has nothing left
+# to hide — CI, not the merge driver, is the authority. Removing it would only
+# add a second, harder-to-read failure (a local conflict) to branches the guard
+# already rejects with a message and a one-command repair, and it would change
+# nothing for any branch that does not touch this file. Net zero safety gain,
+# non-zero churn. Revisit only when no open PR carries a row here.
+# Known-stale by design: the frozen file's own header still says every PR
+# "appends a row here". It cannot be corrected, since an edit to it is itself
+# a rejected modification. PROVENANCE-CHANGES.d/README.md carries the
+# superseding statement.
 vendor/paperclip-adapter-claude-k8s/PROVENANCE-CHANGES.md merge=union

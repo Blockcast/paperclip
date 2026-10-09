@@ -6,7 +6,7 @@ const dockerfile = readFileSync(new URL("../Dockerfile", import.meta.url), "utf8
 const opencodeRefMatch = dockerfile.match(/^ARG OPENCODE_K8S_REF=([0-9a-f]{40})$/m);
 
 test("Dockerfile pins opencode_k8s and runs its security and execution regressions", () => {
-  assert.equal(opencodeRefMatch?.[1], "2075ae1ba249e97c49a77386c81a9d88b22c481d");
+  assert.equal(opencodeRefMatch?.[1], "133f4c1a65085a6c141aab5aa8818afe51e2689c");
   assert.match(dockerfile, /add anthropic\/claude-opus-5/);
   assert.match(
     dockerfile,
@@ -19,7 +19,7 @@ test("Dockerfile pins opencode_k8s and runs its security and execution regressio
   assert.doesNotMatch(dockerfile, /OPENCODE_K8S_REF=861227d3d0726b43bf7e4a5421d076e3ab8de0af/);
   assert.doesNotMatch(dockerfile, /OPENCODE_K8S_REF=cac7d0b53fa420beb756919561004f1b5b709fa2/);
   assert.doesNotMatch(dockerfile, /OPENCODE_K8S_REF=42d2d995a2f966e134f1b62a637497f9fe98c101/);
-  // 2075ae1ba249e97c49a77386c81a9d88b22c481d retains the lifecycle recovery and
+  // 133f4c1a65085a6c141aab5aa8818afe51e2689c retains the lifecycle recovery and
   // timeout fixes, adds optional Caveman/Penstock and Ponytail launchers, and
   // constrains server-pod credential inheritance. This pin must never regress
   // to a pre-fix commit that reports exitCode:0 runs as timed_out.

@@ -819,6 +819,42 @@ describe("classifyGuard — stop-modes a run-state scan cannot see", () => {
     assert.ok(grace < Date.parse("2026-10-05T00:00:00Z"), "an open-ended grace is a permanently muted guard");
   });
 
+  // Same bounds discipline for the second schedule-filtered guard (BLO-39345).
+  // Asserted per row rather than as a blanket "every schedule-filtered guard
+  // has a grace", because the bound that matters is each guard's OWN first
+  // cron, and a blanket rule would also wrongly demand one of a guard whose
+  // grace has legitimately been retired after it started enforcing.
+  it("sets commit-attribution-audit's grace past its first cron after merge", () => {
+    const row = WATCHED_GUARDS.find((guard) => guard.workflow === "commit-attribution-audit.yml");
+    const grace = Date.parse(row.graceUntil);
+
+    // Both fields asserted together because they are coupled, not merely
+    // adjacent: the grace is only needed BECAUSE the event filter makes the
+    // merge-day schedule-run count zero. Drop the filter and the grace becomes
+    // a window that mutes a guard for no reason.
+    //
+    // The filter needs its own assertion here rather than leaning on the
+    // auto-firing-trigger test above, which does not reach this row: that test
+    // demands the filter only for a guard whose workflow carries an auto-firing
+    // non-schedule trigger, and this workflow deliberately carries none. The
+    // filter is still doing work — it closes the `workflow_dispatch` masking
+    // window that the test above accepts as a stated exposure on the seven
+    // older guards. Mutation-tested: without this line, deleting
+    // `event: "schedule"` from the row leaves the whole suite green.
+    assert.equal(
+      row.event,
+      "schedule",
+      "the event filter was dropped — a manual dispatch can now mask a dead cron for a " +
+        "threshold window, and the graceUntil below is covering a window that no longer exists",
+    );
+
+    // Cron "13 7,19". The earliest tick this guard can have after the merge it
+    // ships in; a grace expiring before it means the guard reds on day one for
+    // a reason that is not its own failure.
+    assert.ok(grace > Date.parse("2026-10-06T07:13:00Z"), "expires before the first cron can fire");
+    assert.ok(grace < Date.parse("2026-10-10T00:00:00Z"), "an open-ended grace is a permanently muted guard");
+  });
+
   // Silently dropping a guard from the watched set is this row's whole defect,
   // so an unreadable workflow must fail loudly rather than skip.
   it("reds an unreadable workflow rather than skipping it", () => {
@@ -1467,6 +1503,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         "adapter-pin-drift-monitor.yml",
         "ally-review-consistency.yml",
         "codeowners-guard.yml",
+        "commit-attribution-audit.yml",
         "lockfile-drift-monitor.yml",
         "master-health.yml",
         "production-environment-protection-guard.yml",
@@ -1477,14 +1514,44 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     );
   });
 
-  it("gives the twice-daily guard a threshold its own cadence justifies", () => {
+  it("gives the twice-daily guards a threshold their own cadence justifies", () => {
     const byWorkflow = new Map(WATCHED_GUARDS.map((g) => [g.workflow, g.staleHours]));
+
+    // Keyed on CADENCE, not on one hardcoded filename. The original form
+    // excluded production-environment-protection-guard.yml by name and put
+    // every other guard on the hourly bar, so adding a second twice-daily
+    // guard (commit-attribution-audit.yml, BLO-39345) red-flagged it as
+    // mis-barred rather than recognising its cadence.
+    const TWICE_DAILY = new Set([
+      "production-environment-protection-guard.yml",
+      "commit-attribution-audit.yml",
+      // BLO-26736. Landed on master while this branch was open, with its own
+      // name-keyed assertion below. Folded into the set instead, which is the
+      // whole point of keying on cadence: a third twice-daily guard should not
+      // need a third bespoke assertion.
+      "review-gate-consumer-protection-guard.yml",
+    ]);
 
     // Measured 39 gaps: ordinary band tops out at 14.60h, the two outage
     // outliers are 17.71h and 22.21h. The bar must sit strictly between.
-    const twiceDaily = byWorkflow.get("production-environment-protection-guard.yml");
-    assert.ok(twiceDaily > 14.6, "would red on ordinary twice-daily jitter");
-    assert.ok(twiceDaily < 17.71, "would sail over the 2026-09-15 outage it must catch");
+    // commit-attribution-audit.yml ADOPTS this band rather than having
+    // measured its own — see the note on its WATCHED_GUARDS entry.
+    //
+    // Each bar is also asserted EQUAL to the measured one (BLO-26736), not just
+    // in the band, so that if the 14.60h/17.71h band is ever re-derived they
+    // all move together — the alternative is a copy that rots out of the band
+    // silently, or bars that quietly diverge inside it.
+    const measured = byWorkflow.get("production-environment-protection-guard.yml");
+    for (const workflow of TWICE_DAILY) {
+      const bar = byWorkflow.get(workflow);
+      assert.ok(bar > 14.6, `${workflow} would red on ordinary twice-daily jitter`);
+      assert.ok(bar < 17.71, `${workflow} would sail over the 2026-09-15 outage it must catch`);
+      assert.equal(
+        bar,
+        measured,
+        `${workflow}: the twice-daily guards must share one bar until each has gaps of its own`,
+      );
+    }
 
     // BLO-38228: the daily clock-rot guard is on 48h, deliberately loose because
     // its schedule is new and has no measured gap distribution yet. Asserted
@@ -1494,26 +1561,13 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(dailyClockRot > 24, "a daily cron must clear one full cycle plus GitHub's delay");
     assert.ok(dailyClockRot <= 48, "looser than two missed cycles stops being a backstop at all");
 
-    // BLO-26736: the consumer merge-control guard shares the twice-daily
-    // cadence and INHERITS the same bar. Asserted equal to the measured one
-    // rather than to a second literal, so that if the 14.60h/17.71h band is
-    // ever re-derived both move together — the alternative is a copy that rots
-    // out of the band silently.
-    assert.equal(
-      byWorkflow.get("review-gate-consumer-protection-guard.yml"),
-      twiceDaily,
-      "the twice-daily guards must share one bar until this one has gaps of its own",
-    );
-
     // The hourly six share one bar; a shared GLOBAL threshold across cadences is
     // the bug this replaced. Asserted against DEFAULT_STALE_HOURS rather than a
     // literal so moving the bar stays a one-line change with a reason attached
     // (PEN-3379 moved it 4h -> 2.75h).
-    const notHourly = new Set([
-      "production-environment-protection-guard.yml",
-      "review-gate-consumer-protection-guard.yml",
-      "master-health.yml",
-    ]);
+    // Derived from TWICE_DAILY rather than re-listed, so adding a twice-daily
+    // guard above cannot leave it wrongly asserted against the hourly bar here.
+    const notHourly = new Set([...TWICE_DAILY, "master-health.yml"]);
     for (const workflow of WATCHED_WORKFLOWS) {
       if (notHourly.has(workflow)) continue;
       assert.equal(

@@ -76,36 +76,39 @@ test("paperclip-k8s-adapters Role retains pods:get + pods:list (adapter log pref
   );
 });
 
-test("paperclip-k8s-adapters Role still grants secrets:update pending the BLO-34510 decision", () => {
-  // ORIGINAL REASON, NOW STALE — kept because it is the measurement, not the
-  // rationale: createOrAdoptRunSecret recovered from a create 409 by calling
-  // replaceNamespacedSecret, a PUT, which the RBAC authorizer maps to `update`
-  // and NOT to the `patch` this Role already grants. Measured in prod
-  // 2026-09-13: 7 runs, 4 agents, one 7h window, all failing on
-  // `cannot update resource "secrets"`.
+test("paperclip-k8s-adapters Role does NOT grant secrets:update (retired, BLO-34510)", () => {
+  // WHY IT EXISTED, kept because the measurement is what makes the removal
+  // safe rather than merely tidy: createOrAdoptRunSecret recovered from a
+  // create 409 by calling replaceNamespacedSecret, a PUT, which the RBAC
+  // authorizer maps to `update` and NOT to the `patch` this Role already
+  // grants. Measured in prod 2026-09-13: 7 runs, 4 agents, one 7h window, all
+  // failing on `cannot update resource "secrets"`.
   //
-  // BLO-32424 converted that call site to a merge PATCH, so it no longer needs
-  // `update` and this test no longer pins what its name used to say. Do NOT
-  // read it as asserting that some caller still requires the verb — as of that
-  // change no in-release-namespace consumer of `update` is known to remain (see
-  // the justification block in templates/role.yaml for what was checked).
+  // WHY IT IS GONE: BLO-32424 (#1873, merged 2026-10-06) converted that call
+  // site to a merge PATCH, removing the verb's only in-release-namespace
+  // consumer. Enumerated at master 73231dec — claude-k8s adopt path (PATCH, no
+  // PUT), both adapters' SSAR self-tests (probe create/delete/get, never
+  // update), opencode-k8s at the current pin (zero PUT in non-test src/), and
+  // an in-tree sweep of server//packages//scripts/ whose one hit is the
+  // sandbox-provider plugin's PUT in a TENANT namespace this Role does not
+  // cover. See the justification block in templates/role.yaml.
   //
-  // What it pins now is narrower and still worth pinning: the verb set does not
-  // drift as a side effect of an unrelated edit. Retiring `update` is a stated
-  // decision tracked as BLO-34510, and that decision updates THIS test in the
-  // same change. Until then, an incidental "tidy the verb list" edit should
-  // still fail here rather than land unreviewed.
+  // This assertion is the inverse of the one it replaces, deliberately: a
+  // standing grant is retired by a stated decision, so re-adding `update` must
+  // fail here and be argued, not drift back in beside an unrelated edit.
   const verbs = secretsVerbs(renderRole());
   assert.ok(
-    verbs.includes("update"),
-    `secrets verbs must include "update" until BLO-34510 records the retirement decision (got: [${verbs.join(", ")}])`,
+    !verbs.includes("update"),
+    `secrets:update was retired by BLO-34510; re-adding it needs a named in-release-namespace consumer and an update to this test (got: [${verbs.join(", ")}])`,
   );
 });
 
 test("paperclip-k8s-adapters Role retains secrets:create + secrets:patch", () => {
-  // update is additive: create still mints the per-run Secret, and patch is
-  // still the verb used for the mid-run updates at claude-k8s execute.js:884 /
-  // opencode-k8s execute.js:1052.
+  // These are what survive the BLO-34510 retirement and they carry the whole
+  // Secret lifecycle: create mints the per-run Secret, patch covers both the
+  // mid-run updates (claude-k8s execute.js:884 / opencode-k8s execute.js:1052)
+  // and the adopt-on-collision path that used to need `update`. Losing either
+  // breaks every agent run, so pin them alongside the removal.
   const verbs = secretsVerbs(renderRole());
   assert.ok(
     verbs.includes("create") && verbs.includes("patch"),

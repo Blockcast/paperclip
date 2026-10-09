@@ -15,6 +15,8 @@ import {
   updateMilestoneSchema,
   upsertIssueDocumentSchema,
   linkIssueApprovalSchema,
+  TIME_FILTER_PREFIXES,
+  TIME_FILTER_SUFFIXES,
 } from "@paperclipai/shared";
 import { PaperclipApiClient } from "./client.js";
 import { formatErrorResponse, formatTextResponse } from "./format.js";
@@ -76,9 +78,65 @@ const documentKeySchema = z.string().trim().min(1).max(64);
 const ISSUE_SEARCH_Q_DESCRIPTION =
   "Literal contiguous substring match (case-insensitive), NOT tokenized: no AND-of-terms, no stemming, no fuzzy matching. Matched against title, identifier, description, and comment bodies; results are bucketed title > identifier > comment > description, which is a coarse field precedence and not a relevance score.\n\nMULTI-WORD INPUT IS UNRELIABLE — the whole string must appear verbatim and contiguously, so word order and every interior word matter. `dependency-waits provider` does NOT match a title reading `dependency-waits and provider-capacity`; deleting one interior word turns a hit into a miss.\n\nThis matters most when you are using this call as a duplicate check before filing. An empty result for a multi-word phrase is NOT evidence that no such issue exists, and the more precisely you describe your finding the more certain the false clear. Query ONE distinctive token (an error code, a ticket identifier, a rare noun, a symbol name) and read the results yourself; run several single-token queries rather than one descriptive phrase. `%` and `_` are matched literally, not as wildcards.";
 
+// BLO-40145: `GET /companies/:id/issues` implements NO time bound. These params
+// are DECLARED only so they can be REFUSED — they are not supported and never
+// reach the server.
+//
+// Declaring them is load-bearing, not decoration. `index.ts` registers every
+// tool as `server.tool(name, desc, schema.shape, execute)`, and the SDK rebuilds
+// its own non-strict object from that raw shape — so an UNDECLARED key is
+// stripped before `execute` ever runs. Measured on the real client/server
+// transport: `paperclipListIssues(q, limit, updated_after)` issued
+// `?q=Cilium&limit=3` with no `updated_after` at all, and returned `isError:
+// undefined`. The route's own 400 therefore cannot fire for an MCP caller, and
+// the caller gets a clean 200 over the WHOLE corpus with nothing to read as a
+// warning. Declared, Zod refuses the call instead.
+//
+// `.refine` rather than `z.never()`: the point is that the caller learns where
+// the real time bound lives, and "Expected never, received string" does not say
+// that.
+//
+// The route's shape-matched regex (`parseUnsupportedTimeFilterParams`) is NOT a
+// backstop for an MCP caller: by the stripping above, an undeclared alias never
+// reaches it. Enumerating keys in the shape is the only lever this layer has —
+// an object-level `.superRefine`/`.passthrough()` is discarded, because only
+// `schema.shape` is registered. So the aliases are generated, in both
+// snake_case and camelCase, from the shared prefix x suffix lists that
+// `TIME_FILTER_PARAM_PATTERN` in server/src/lib/issue-list-query.ts is also
+// built from. Other casings that case-insensitive regex also matches
+// (`UpdatedAfter`, `updatedafter`) are still stripped here.
+//
+// No `.describe()`: this schema is repeated on all 98 keys of both list tools,
+// and the explanation lives once in the tool description. A refused caller sees
+// the `.refine` message, not a description.
+const unsupportedTimeFilter = z
+  .unknown()
+  .optional()
+  .refine((value) => value === undefined, {
+    message:
+      "not supported on this endpoint — it applies no time bound, and the param was previously dropped unread so the call returned the whole corpus while reading as a bounded census (BLO-40145). Use GET /api/companies/:companyId/search with updatedAfter or updatedWithin, or sortField=id with afterId to walk rows by key.",
+  });
+
+type TimeFilterPrefix = (typeof TIME_FILTER_PREFIXES)[number];
+type TimeFilterSuffix = (typeof TIME_FILTER_SUFFIXES)[number];
+type TimeFilterKey =
+  | `${TimeFilterPrefix}_${TimeFilterSuffix}`
+  | `${TimeFilterPrefix}${Capitalize<TimeFilterSuffix>}`;
+
+const unsupportedTimeFilterShape = Object.fromEntries(
+  TIME_FILTER_PREFIXES.flatMap((prefix) =>
+    TIME_FILTER_SUFFIXES.flatMap((suffix) => [
+      `${prefix}_${suffix}`,
+      `${prefix}${suffix[0].toUpperCase()}${suffix.slice(1)}`,
+    ]),
+  ).map((key) => [key, unsupportedTimeFilter]),
+) as Record<TimeFilterKey, typeof unsupportedTimeFilter>;
+
 const listIssuesSchema = z.object({
   companyId: companyIdOptional,
   status: z.string().optional(),
+  // Not real filters. See `unsupportedTimeFilter` above.
+  ...unsupportedTimeFilterShape,
   projectId: z.string().uuid().optional(),
   assigneeAgentId: z.string().uuid().optional(),
   participantAgentId: z.string().uuid().optional(),
@@ -137,6 +195,8 @@ const listIssuesSchema = z.object({
     .describe("Rows to skip. Use with `limit` to page past a truncated result."),
 });
 
+// Inherits the time-filter refusal keys on purpose: the alias hits the same
+// route, so dropping them here would reopen BLO-40145 on this tool only.
 const searchIssuesSchema = listIssuesSchema.omit({ q: true }).extend({
   query: z.string().trim().min(1).describe(ISSUE_SEARCH_Q_DESCRIPTION),
 });
@@ -446,7 +506,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListIssues",
-      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.\n\nTHIS CALL IS CAPPED AT 500 ROWS BY DEFAULT AND 1000 MAXIMUM. Pass `limit` to raise it up to 1000; a larger value is clamped to 1000, not rejected. When the cap bites you get an OBJECT — `{truncated: true, appliedLimit, returnedCount, note, issues: [...]}` — instead of the usual bare array, so a bare array back is positive proof you have every matching row and an object means you are holding a PREFIX. Never report a population count off a truncated page; page the rest with `limit`/`offset` or narrow the filters.\n\nRELATIONAL FIELDS ARE NOT HYDRATED HERE. `blockedBy` is absent unless you pass includeBlockedBy=true; `blocks` and `children` are NEVER present at any setting. An absent key is not an empty relation — never conclude 'this issue has no blockers' or 'this epic has no children' from a list row. To enumerate children pass parentId (direct) or descendantOf (subtree); to read `blocks`, call paperclipGetIssue.\n\nLIVENESS IS THREE PATHS, AND EVERY ROW CARRIES ALL THREE. An issue is *attended* by a live run (`activeRun`), an armed monitor (`monitorNextCheckAt` + peers), or a scheduled retry (`scheduledRetryAt`, `scheduledRetryReason`, `scheduledRetryAttempt`). The retry scalars are always **present**, explicitly `null` when the issue has no parked run — so `scheduledRetryAt === null` genuinely means 'no retry', and a row is unattended only when all three paths are empty. Auditing on `activeRun` alone systematically over-reports unattended, because a run parked on a concrete `scheduledRetryAt` is not abandoned; that is the defect BLO-28843 fixed, after it produced a >20× lane-capacity error. The scalars mirror `paperclipGetIssue`'s `scheduledRetry` object and agree with `paperclipListParkedAgents` for the same run.\n\nATTENDED IS NOT THE SAME AS ABLE — a fourth, orthogonal axis. `activeRun.writeContainment` (PEN-3275) is `\"status_only\"`, `\"planning_only\"`, or `null` for an unconstrained run, and it answers 'can the attending run perform this row's remedy?' rather than 'is one attending?'. A contained run satisfies the `activeRun` path above while the approval writes the row needs are refused 403 by the route guards: `status_only` may create ONLY a `request_board_approval` and is refused every other approval create/modify/comment/resubmit/withdraw/apply/link; `planning_only` is refused approval create/modify outright, with no escalation exit. Auditing attendance alone therefore scores a structurally stuck row as fine. ⚠ ABSENT IS NOT `null`: a deployment predating PEN-3275 omits the key, `null` means positively unconstrained, and a truthiness test reads both as 'not contained' — the fail-open direction. Gate on key presence.\n\n`blockerAttention` is a coarse triage signal, NOT a summary of `blockedBy`, and reading it as one is wrong in three ways: (1) it is computed for non-terminal rows whose status is `blocked` or whose dependency readiness has unresolved explicit blockers; all-zeros means the row is not an attention root, but open child issues do NOT make a row a root, so all-zeros still tells you nothing about children — enumerate them with parentId; (2) `unresolvedBlockerCount` counts explicit blockers UNION open child issues, so it legitimately exceeds `blockedBy.length`; (3) `sampleBlockerIdentifier` is drawn from the transitive closure and often names an issue absent from `blockedBy`. Use it to rank attention, never to decide a specific issue is unblocked.",
+      "List issues for a company with optional filters (status, projectId, assigneeAgentId, labelId, q, ...). Omitting a filter does not scope it — pass status explicitly if you only want open work; unfiltered can return the full company backlog.\n\nTHERE IS NO TIME BOUND ON THIS CALL, AND ASKING FOR ONE NOW FAILS INSTEAD OF BEING IGNORED. `updated_after` and its aliases were never implemented here — they were dropped unread, so the call returned the WHOLE corpus while reading as a bounded census (BLO-40145). They are now rejected: an alias is refused by this tool, and the route 400s any param of that shape. ⚠ THE OLD FAILURE PASSED ITS OWN SPOT CHECK, which is why it survived: the default sort is priority band then recency, so a recent floor with a small `limit` returned rows that genuinely were recent and the bound looked honoured. Adding a second filter (`q`, `originKind`) moved the window off that recency-hot prefix and surfaced old rows — which reads as 'the time bound composes badly' rather than 'there is no time bound'. The direction is the expensive one: a census written as 'rows in class C since the fix' silently becomes 'the first N rows of the corpus', and since the fix is recent almost nothing in that prefix post-dates it, so the read returns a small number or zero and that reads as the fix holding. For a real time-bounded read use `GET /api/companies/:companyId/search` with `updatedAfter` / `updatedWithin`, or walk rows by key with `sortField=id` + `afterId`. Every other filter here (`status`, `assigneeAgentId`, `projectId`, `labelId`, `q`, `originKind`) IS read and composes normally — the defect was the absence of a time filter, not composition.\n\nTHIS CALL IS CAPPED AT 500 ROWS BY DEFAULT AND 1000 MAXIMUM. Pass `limit` to raise it up to 1000; a larger value is clamped to 1000, not rejected. When the cap bites you get an OBJECT — `{truncated: true, appliedLimit, returnedCount, note, issues: [...]}` — instead of the usual bare array, so a bare array back is positive proof you have every matching row and an object means you are holding a PREFIX. Never report a population count off a truncated page; page the rest with `limit`/`offset` or narrow the filters.\n\nRELATIONAL FIELDS ARE NOT HYDRATED HERE. `blockedBy` is absent unless you pass includeBlockedBy=true; `blocks` and `children` are NEVER present at any setting. An absent key is not an empty relation — never conclude 'this issue has no blockers' or 'this epic has no children' from a list row. To enumerate children pass parentId (direct) or descendantOf (subtree); to read `blocks`, call paperclipGetIssue.\n\nLIVENESS IS THREE PATHS, AND EVERY ROW CARRIES ALL THREE. An issue is *attended* by a live run (`activeRun`), an armed monitor (`monitorNextCheckAt` + peers), or a scheduled retry (`scheduledRetryAt`, `scheduledRetryReason`, `scheduledRetryAttempt`). The retry scalars are always **present**, explicitly `null` when the issue has no parked run — so `scheduledRetryAt === null` genuinely means 'no retry', and a row is unattended only when all three paths are empty. Auditing on `activeRun` alone systematically over-reports unattended, because a run parked on a concrete `scheduledRetryAt` is not abandoned; that is the defect BLO-28843 fixed, after it produced a >20× lane-capacity error. The scalars mirror `paperclipGetIssue`'s `scheduledRetry` object and agree with `paperclipListParkedAgents` for the same run.\n\nATTENDED IS NOT THE SAME AS ABLE — a fourth, orthogonal axis. `activeRun.writeContainment` (PEN-3275) is `\"status_only\"`, `\"planning_only\"`, or `null` for an unconstrained run, and it answers 'can the attending run perform this row's remedy?' rather than 'is one attending?'. A contained run satisfies the `activeRun` path above while the approval writes the row needs are refused 403 by the route guards: `status_only` may create ONLY a `request_board_approval` and is refused every other approval create/modify/comment/resubmit/withdraw/apply/link; `planning_only` is refused approval create/modify outright, with no escalation exit. Auditing attendance alone therefore scores a structurally stuck row as fine. ⚠ ABSENT IS NOT `null`: a deployment predating PEN-3275 omits the key, `null` means positively unconstrained, and a truthiness test reads both as 'not contained' — the fail-open direction. Gate on key presence.\n\n`blockerAttention` is a coarse triage signal, NOT a summary of `blockedBy`, and reading it as one is wrong in three ways: (1) it is computed for non-terminal rows whose status is `blocked` or whose dependency readiness has unresolved explicit blockers; all-zeros means the row is not an attention root, but open child issues do NOT make a row a root, so all-zeros still tells you nothing about children — enumerate them with parentId; (2) `unresolvedBlockerCount` counts explicit blockers UNION open child issues, so it legitimately exceeds `blockedBy.length`; (3) `sampleBlockerIdentifier` is drawn from the transitive closure and often names an issue absent from `blockedBy`. Use it to rank attention, never to decide a specific issue is unblocked.",
       listIssuesSchema,
       async (input) => listIssues(client, input),
     ),

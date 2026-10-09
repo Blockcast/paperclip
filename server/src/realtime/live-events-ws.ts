@@ -5,10 +5,11 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import { normalizeAgentApiKeyScope, type AgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { createLiveEventTranscriptGate } from "./live-event-transcript-gate.js";
 
 interface WsSocket {
   readyState: number;
@@ -44,6 +45,34 @@ interface UpgradeContext {
   companyId: string;
   actorType: "board" | "agent";
   actorId: string;
+  /**
+   * PEN-3142: the board subscriber's role in the subscribed company. The
+   * transcript gate's human short-circuit is operator-grade only, so the role
+   * has to travel with the connection — resolving it later would mean a second
+   * membership lookup per socket, and defaulting it would silently decide every
+   * board watcher as a viewer.
+   */
+  membershipRole?: string | null;
+  /**
+   * PEN-3142: the actor source the upgrade authenticated with, in the REST
+   * vocabulary, so the transcript gate asks the same question the REST twin
+   * does (it refuses the operator short-circuit to `cloud_tenant`). Set
+   * explicitly rather than defaulted in the gate — no upgrade path produces
+   * `cloud_tenant` today, and this is what makes that a property of this file
+   * rather than an assumption downstream.
+   */
+  actorSource?: "local_implicit" | "session" | "cloud_tenant";
+  /** The `local_trusted` board, which has no membership row to carry. */
+  trustedLocal?: boolean;
+  /**
+   * PEN-3142: the agent key's id and normalized scope, read off the same
+   * `agentApiKeys` row the upgrade already matched, exactly as the REST
+   * middleware stamps them. Without them the transcript gate decides a
+   * `skill_test` / `task_bridge` key as an unscoped one, and the socket streams
+   * what the REST twin denies it (Ally review 5449228335).
+   */
+  keyId?: string;
+  keyScope?: AgentApiKeyScope;
 }
 
 interface IncomingMessageWithContext extends IncomingMessage {
@@ -135,6 +164,7 @@ async function authorizeUpgrade(
         companyId,
         actorType: "board",
         actorId: "board",
+        trustedLocal: true,
       };
     }
 
@@ -153,7 +183,10 @@ async function authorizeUpgrade(
         .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
         .then((rows) => rows[0] ?? null),
       db
-        .select({ companyId: companyMemberships.companyId })
+        .select({
+          companyId: companyMemberships.companyId,
+          membershipRole: companyMemberships.membershipRole,
+        })
         .from(companyMemberships)
         .where(
           and(
@@ -164,13 +197,18 @@ async function authorizeUpgrade(
         ),
     ]);
 
-    const hasCompanyMembership = memberships.some((row) => row.companyId === companyId);
-    if (!roleRow && !hasCompanyMembership) return null;
+    const membership = memberships.find((row) => row.companyId === companyId) ?? null;
+    if (!roleRow && !membership) return null;
 
     return {
       companyId,
       actorType: "board",
       actorId: userId,
+      actorSource: "session",
+      // Null for an instance admin with no membership in this company: the
+      // transcript gate then falls through to the authorization service, which
+      // answers that case on `allow_instance_admin` rather than on a role.
+      membershipRole: membership?.membershipRole ?? null,
     };
   }
 
@@ -194,6 +232,8 @@ async function authorizeUpgrade(
     companyId,
     actorType: "agent",
     actorId: key.agentId,
+    keyId: key.id,
+    keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
   };
 }
 
@@ -227,9 +267,28 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
+    let sendChain: Promise<void> = Promise.resolve();
+
+    const projectForSubscriber = createLiveEventTranscriptGate(db, context);
+
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
       if (socket.readyState !== WebSocket.OPEN) return;
-      socket.send(JSON.stringify(event));
+      // The transcript decision is async, so ordering is preserved explicitly:
+      // each event is chained onto the previous one rather than racing it. A
+      // live log stream that arrived out of order would be worse than useless.
+      sendChain = sendChain
+        .then(async () => {
+          const projected = await projectForSubscriber(event);
+          if (socket.readyState !== WebSocket.OPEN) return;
+          socket.send(JSON.stringify(projected));
+        })
+        .catch((err) => {
+          // Fail closed: drop this event rather than fall back to the
+          // unprojected one. The gate itself already fails closed on an
+          // authorization error, so reaching here means send/serialization
+          // failed, and the socket's own error handler will take it from there.
+          logger.warn({ err, companyId: context.companyId }, "failed to deliver live event");
+        });
     });
 
     cleanupByClient.set(socket, unsubscribe);

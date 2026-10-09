@@ -62,6 +62,16 @@
  * window reads as a wedge and restarts the worker. The same test file pins
  * the 20s floor.
  *
+ * The same guarantee is this detector's sharpest blind spot, and it is the
+ * other half of the same sentence: `wedged` requires *zero* completions, so
+ * any wedge that still answers `/api/health` inside its timeout is
+ * undetectable by construction — the probe refreshes the completion clock
+ * three times a minute and `/livez` cannot go red. `/api/health` is the
+ * first route mounted in the `api` Router, ahead of the routers a partial
+ * wedge is likely to stall, so it can keep answering while they do. This
+ * detector is scoped to the 2026-10-05 shape, where `/api/*` served zero
+ * bytes; a partial wedge was invisible before it and still is.
+ *
  * ## Why an idle instance stays green
  *
  * The arrival timestamp only advances past the completion timestamp while a

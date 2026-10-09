@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { and, asc, desc, eq, exists, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, max, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 
@@ -2327,6 +2328,21 @@ const STARVATION_RECOVERY_ESCALATION_MS = 10 * 60 * 1000;
 // If another process has just finalized a run while its k8s Job is still
 // visible, do not immediately delete that live Job. The adapter process may
 // still be awaiting/synchronizing the Job and should be allowed to finish.
+//
+// PEN-3674: this constant now backs three call sites with related but not
+// identical semantics. Read all three before changing the value.
+//   1. Job deletion (the original case above) — a grace after finalization,
+//      protecting a Job that already EXISTS.
+//   2. `isolationSetupGraceActive` in the reservation reclaim sweep — keyed on
+//      `reservation.updatedAt`, which last moves at
+//      `markExternalRuntimeReservationLaunching`.
+//   3. The orphaned-lease reclaim sweep — keyed on the newer of the lease's
+//      `acquired_at`/`last_used_at`, which is strictly LATER than (2)'s clock.
+// (2) and (3) are the inverse of (1): they bound a runtime that is STARTING,
+// not one that has stopped, and for them the value is a floor on how long a
+// pre-Job launch may take. So SHORTENING it widens their exposure — it does not
+// merely reclaim sooner — while lengthening it slows every reclaim this sweep
+// exists for. Neither direction is free.
 const EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS = 5 * 60 * 1000;
 // PEN-3640: how long an unreleased external-runtime reservation may sit before
 // the reclaim sweep names the branch that is refusing it. Every skip in
@@ -4536,6 +4552,12 @@ const heartbeatRunSqlAsciiSafeColumns = {
 const heartbeatRunLogAccessColumns = {
   id: heartbeatRuns.id,
   companyId: heartbeatRuns.companyId,
+  // PEN-3142: the transcript decision is scoped to the run's OWNING AGENT
+  // (own-run / manager chain), so the log-access lookup has to carry it. Still
+  // a narrow projection — deliberately not `heartbeatRunSafeColumns`, which
+  // would pull `stdoutExcerpt` / `resultJson` into a path that only needs
+  // enough to authorize and locate the log.
+  agentId: heartbeatRuns.agentId,
   logStore: heartbeatRuns.logStore,
   logRef: heartbeatRuns.logRef,
 } as const;
@@ -13558,6 +13580,87 @@ export interface HeartbeatServiceOptions {
  * that accepts that risk.
  */
 const START_LOCK_REAP_TTL_DEFAULT_MS = 0;
+
+/**
+ * How long a start-lock caller will WAIT for the shared orphan sweep (BLO-41036).
+ *
+ * ⚠️ This bounds the *wait*, not the sweep, and that distinction is the whole
+ * design. On expiry the caller stops awaiting and dispatches on slightly stale
+ * orphan state; the sweep keeps running for whoever else joined it. Nothing is
+ * cancelled, so this cannot turn a slow-but-succeeding dispatch into a failing
+ * one.
+ *
+ * ⚠️ Do NOT "simplify" this by lowering {@link LOCK_ABORT_MS} for the reap
+ * phase instead. That was this issue's own planned fix and it is refuted by the
+ * measurement recorded on `LOCK_ABORT_MS`: the section's long holds settle on
+ * their own (peak 8073 s), and PEN-3328's abort cancels the whole section, so
+ * an early abort converts a slow dispatch into a permanently retried-and-
+ * recancelled one — a livelock, strictly worse than the hold. Aborting is the
+ * wrong verb here; declining to wait is the right one.
+ *
+ * Why 120 s, derived rather than picked:
+ *
+ *  - It is the threshold BLO-41036's own post-deploy acceptance signal already
+ *    names for this phase ("no agent start lock enters phase `reap` with
+ *    `heldMs > 120s`"), so the guard and the check that validates it agree by
+ *    construction instead of being two independently-chosen numbers.
+ *  - It is 4x {@link LOCK_HELD_WARN_MS}, the budget at which this phase already
+ *    logs that it "is holding dispatch for this agent" — i.e. four times past
+ *    the point the code already calls pathological.
+ *  - It is 1/120th of {@link LOCK_ABORT_MS}, which measured 1049 s of climbing,
+ *    never-settling fleet-wide hold during the `d5268bc0` incident without
+ *    coming close to firing.
+ *
+ * Known false-cut, stated rather than discovered later: every k8s call under
+ * the sweep is bounded at `PAPERCLIP_K8S_JOB_LIVENESS_TIMEOUT_MS` (2 s in
+ * production). With a fleet of ~40-50 running runs and an apiserver degraded
+ * enough that every call hits that ceiling, a *legitimate* serial sweep can
+ * exceed 120 s and will be cut. The cost of that cut is exactly the documented
+ * {@link START_LOCK_REAP_TTL_DEFAULT_MS} cost — dispatch may cancel same-issue
+ * queued work as `duplicate_dispatch_suppressed` — on a path that already
+ * supports proceeding without a fresh sweep (`skipped_fresh`). Erring toward
+ * cutting is the cheap direction here: a false cut degrades one dispatch pass,
+ * an unbounded wait took 100% of fleet dispatch for 22 minutes.
+ *
+ * ponytail: on expiry the latches are deliberately left alone, so while a sweep
+ * is genuinely wedged every later caller chains behind it and pays this bound
+ * once per pass. That is bounded and self-correcting, not free. If a wedge ever
+ * persists long enough for that per-pass cost to matter, mark the sweep
+ * abandoned on expiry so later callers skip the wait outright.
+ */
+const START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS = 120_000;
+
+/** Resolved once per call so an incident knob takes effect without a restart. */
+function startLockReapWaitBoundMs() {
+  const configured = Number.parseInt(process.env.AGENT_START_LOCK_REAP_WAIT_BOUND_MS ?? "", 10);
+  // 0 disables the bound (restores the pre-BLO-41036 unbounded wait).
+  return Number.isFinite(configured) && configured >= 0
+    ? configured
+    : START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS;
+}
+
+const START_LOCK_REAP_WAIT_TIMED_OUT = Symbol("start_lock_reap_wait_timed_out");
+
+/**
+ * Await `sweep`, giving up after `boundMs`. Returns the sentinel on expiry.
+ *
+ * The sweep's own rejection propagates unchanged — callers that are meant to
+ * inherit a sweep failure still do. The timer is aborted in `finally` so a
+ * fast sweep does not leave a 120 s handle holding the event loop open, and the
+ * timer's abort rejection is swallowed because the race has already settled by
+ * the time it fires.
+ */
+async function awaitStartLockSweepBounded(sweep: Promise<unknown>, boundMs: number) {
+  if (boundMs <= 0) return await sweep;
+  const abort = new AbortController();
+  const timer = delay(boundMs, START_LOCK_REAP_WAIT_TIMED_OUT, { signal: abort.signal })
+    .catch(() => undefined);
+  try {
+    return await Promise.race([sweep, timer]);
+  } finally {
+    abort.abort();
+  }
+}
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
@@ -26591,6 +26694,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterType: agents.adapterType,
         status: heartbeatRuns.status,
         error: heartbeatRuns.error,
+        leaseAcquiredAt: environmentLeases.acquiredAt,
+        leaseLastUsedAt: environmentLeases.lastUsedAt,
       })
       .from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
@@ -26602,8 +26707,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ),
       );
 
+    // PEN-3674: the lease clock this sweep judges against is the NEWER of
+    // `acquired_at` and `last_used_at`. `acquired_at` never moves after the
+    // lease is taken; `last_used_at` is refreshed by `updateLeaseMetadata`
+    // when realization metadata is persisted mid-setup, so the pair is the
+    // closest thing the lease row has to a liveness signal. Taking the max
+    // can only ever defer a release, never hasten one.
+    const leaseClockMs = (row: { leaseAcquiredAt: Date; leaseLastUsedAt: Date }) =>
+      Math.max(new Date(row.leaseAcquiredAt).getTime(), new Date(row.leaseLastUsedAt).getTime());
+
+    // PEN-3674: keep the NEWEST lease per run, by that same expression.
+    // Release is per-run and all-or-nothing (`releaseEnvironmentLeasesForRun`
+    // below releases every active lease the run holds), so the launch-window
+    // grace has to be judged against the youngest of them: deferring a pass on
+    // an old lease costs one pass, releasing a young one cannot be undone.
     const uniqueRuns = new Map<string, (typeof orphanedRows)[number]>();
-    for (const row of orphanedRows) uniqueRuns.set(row.runId, row);
+    for (const row of orphanedRows) {
+      const seen = uniqueRuns.get(row.runId);
+      if (!seen || leaseClockMs(row) > leaseClockMs(seen)) uniqueRuns.set(row.runId, row);
+    }
 
     let releasedRunCount = 0;
     for (const run of uniqueRuns.values()) {
@@ -26647,6 +26769,90 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // across the pair, but do not rely on the Job arm being live here.
         if (!hasExternalLifecycle(run.adapterType) && activeRunExecutions.has(run.runId)) continue;
         if (hasExternalLifecycle(run.adapterType)) {
+          // PEN-3674: launch-window grace, and it has to come BEFORE the
+          // quiescence probe because the probe cannot see this hazard.
+          //
+          // `confirmStaleKilledJobQuiesced` is fail-closed against an
+          // *unobservable* runtime (a null kube read keeps the lease), but it
+          // is not fail-closed against a *not-yet-existent* one. A lease is
+          // acquired on the launch path strictly before the Job is created, so
+          // inside that window a run that is already status-terminal — a
+          // cancel racing its own launch — presents with no reservation
+          // `jobName` (so the Job arm is skipped entirely and `quiesced` stays
+          // true) and no run-labelled pods (so the pod arm reads an observable
+          // empty list). Both arms therefore report "quiesced" for a runtime
+          // that is still on its way up, and the sweep releases the lease out
+          // from under a Job that is about to start.
+          //
+          // Before BLO-32052 narrowed the guard above, the stale
+          // `activeRunExecutions` entry masked this: such a run was in the Set
+          // and skipped outright. Narrowing the guard is correct and is what
+          // unwedges the 100h+ strands this sweep exists for — but it is also
+          // what exposes this window, so the two changes belong together.
+          //
+          // ⛔ This is a bounded floor, NOT a setup-activity grace, and it does
+          // NOT cover an arbitrarily long pre-Job setup. Ally raised exactly
+          // that on #2179 and the finding is correct; what follows is the
+          // measured ordering, because the parity direction in the finding is
+          // inverted and that changes what the remaining exposure is.
+          //
+          // The four launch-path anchors are straight-line inside `executeRun`:
+          //   1. `markExternalRuntimeReservationLaunching` — the last
+          //      `reservation.updatedAt` bump before the Job.
+          //   2. `acquireForRun` — lease created, `acquired_at` =
+          //      `last_used_at` = now.
+          //   3. `realizeForRun` — realize → provision (`timeoutMs: 300_000`,
+          //      i.e. the whole of this constant), then `updateLeaseMetadata`
+          //      bumps `last_used_at`.
+          //   4. `recordExpectedExternalRuntimeJobName` — sets `expectedJobName`
+          //      and ends the sibling's grace.
+          //
+          // Nothing writes the reservation between (1) and (4). So the
+          // sibling's clock is frozen at (1), strictly EARLIER than this arm's
+          // (2): `isolationSetupGraceActive` lapses FIRST, not last. This arm
+          // is the later-expiring of the two, not the laggard — so do not
+          // "restore parity" by shortening it.
+          //
+          // Taking the newer of `acquired_at`/`last_used_at` closes the (3)→(4)
+          // tail for free, and the dedup above keys off the same expression.
+          // It does NOT rescue the cited slow-provision case: the only refresh
+          // in that span lands at the END of (3), after provision returns, so
+          // at the moment the floor lapses the clock is still `acquired_at`. A
+          // run whose provision burns the full 300 s can therefore still reach
+          // the floor with no Job. This SHRINKS the window; it does not close
+          // it. Closing it needs a positive "not yet launched" signal — the
+          // reservation's own pre-Job state — not a longer timer, and
+          // lengthening the constant here would trade this race for a slower
+          // reclaim of the strands the sweep exists for.
+          //
+          // The constant is shared with `isolationSetupGraceActive` in the
+          // sibling reservation sweep above, which declines to act on a pre-Job
+          // (`!jobName`) row this recently touched. Same defect class, same
+          // remedy, same tunable — but see the ordering above: the reference
+          // timestamps differ, so this is not a claim of equivalent coverage.
+          // Gating on age alone — rather than also re-deriving `jobName` here —
+          // needs no extra query; a Job that does exist and is still active is
+          // retained by the probe below regardless.
+          const leaseAgeMs = Date.now() - leaseClockMs(run);
+          if (leaseAgeMs < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS) {
+            // PEN-3674: the production frequency of this window is unmeasured —
+            // the row proves it reachable, not common. Log the deferral so it
+            // becomes a countable event once deployed rather than staying a
+            // hypothesis. The sibling is silent, but this is the change that
+            // raised the question.
+            logger.debug(
+              {
+                runId: run.runId,
+                companyId: run.companyId,
+                agentId: run.agentId,
+                adapterType: run.adapterType,
+                leaseAgeMs,
+                graceMs: EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS,
+              },
+              "orphaned_lease_launch_grace_deferred",
+            );
+            continue;
+          }
           // Background Job deletion does not prove that the Job or its
           // run-labelled pods have stopped. Reuse the same fail-closed probe as
           // cancellation: an active or unobservable external runtime keeps the
@@ -27089,28 +27295,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * already waits on this sweep. A lock-free caller lacks that guard; tests
    * using this entry directly must not introduce concurrent busy dispatch.
    */
-  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh" | "nested"> {
+  async function reapOrphanedRunsForStartLock(): Promise<"ran" | "joined" | "skipped_fresh" | "nested" | "timed_out"> {
     if (agentStartLockSweepContext.getStore()) {
       await reapOrphanedRuns({ suppressDispatchAfterReap: true });
       return "nested";
     }
+    // BLO-41036: every path below awaits a FLEET-WIDE sweep while holding this
+    // agent's start lock, and the sweep is single-flight, so one that does not
+    // return holds every agent's dispatch. Each wait is bounded; on expiry the
+    // caller proceeds on stale orphan state rather than cancelling anything.
+    // See START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS for the threshold's derivation
+    // and for why lowering the PEN-3328 section abort is the wrong fix.
+    const waitBoundMs = startLockReapWaitBoundMs();
+    const timedOut = (outcome: unknown) => outcome === START_LOCK_REAP_WAIT_TIMED_OUT;
     if (joinableStartLockReap) {
-      await joinableStartLockReap;
+      if (timedOut(await awaitStartLockSweepBounded(joinableStartLockReap, waitBoundMs))) {
+        return "timed_out";
+      }
       return "joined";
     }
     if (inFlightStartLockReap) {
       // The reading sweep's own failure belongs to its callers. This caller is
       // served by the chained sweep, so it must not inherit that rejection.
-      await scheduleStartLockReap(inFlightStartLockReap.catch(() => undefined));
-      return "ran";
+      const chained = scheduleStartLockReap(inFlightStartLockReap.catch(() => undefined));
+      return timedOut(await awaitStartLockSweepBounded(chained, waitBoundMs)) ? "timed_out" : "ran";
     }
     const configuredTtlMs = Number.parseInt(process.env.AGENT_START_LOCK_REAP_TTL_MS ?? "", 10);
     const ttlMs = Number.isFinite(configuredTtlMs) && configuredTtlMs >= 0
       ? configuredTtlMs
       : START_LOCK_REAP_TTL_DEFAULT_MS;
     if (ttlMs > 0 && Date.now() - sharedStartLockReapCompletedAtMs < ttlMs) return "skipped_fresh";
-    await scheduleStartLockReap(Promise.resolve());
-    return "ran";
+    const fresh = scheduleStartLockReap(Promise.resolve());
+    return timedOut(await awaitStartLockSweepBounded(fresh, waitBoundMs)) ? "timed_out" : "ran";
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
@@ -29811,7 +30027,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // another agent's in-flight sweep, which is still time this lock was held.
         markAgentStartLockPhase(agentId, "reap");
         const reapStartedAtMs = Date.now();
-        let reapDisposition: "ran" | "joined" | "skipped_fresh" | "nested" | undefined;
+        let reapDisposition: "ran" | "joined" | "skipped_fresh" | "nested" | "timed_out" | undefined;
         try {
           reapDisposition = await reapOrphanedRunsForStartLock();
         } finally {
@@ -29822,7 +30038,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             (reapDisposition === "nested" ? logger.info : logger.warn).call(
               logger,
               { agentId, reapMs, reapDisposition, warnAfterMs: LOCK_HELD_WARN_MS },
-              "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
+              reapDisposition === "timed_out"
+                // BLO-41036: the opposite of the message below — this agent
+                // STOPPED waiting and is dispatching on stale orphan state. Any
+                // occurrence means a fleet sweep outlived its bound; it is the
+                // signal that would have named the d5268bc0 outage in one line.
+                ? "orphan reap exceeded its wait bound; dispatching on stale reap state for this agent"
+                : "orphan reap alone exceeded the agent start lock budget; it is holding dispatch for this agent",
             );
           }
         }
@@ -33873,8 +34095,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     ...metadata,
                     managedGitWorktreeBranch: finalizeBranchMetadata,
                     managedGitWorktreeBranchRepair: finalizeBranchRepairMetadata,
+                    // PEN-3204: write the named payload or nothing — never the raw
+                    // `resultJson` blob. `metadata` on a workspace operation is
+                    // company-readable by the PEN-3202 ruling, while `resultJson` is
+                    // transcript that the run row projects; the `?? resultJson` fallback
+                    // that used to sit here would have spread the unprojected blob into
+                    // the readable key, routing around that projection one table over.
+                    //
+                    // It is unreachable from today's six `WorkspaceValidationFailure`
+                    // constructions, which all set `.workspaceValidation` — but
+                    // `isWorkspaceValidationFailure` is a STRUCTURAL guard that also
+                    // admits any duck-typed `{ code, resultJson }`, and nothing requires
+                    // that shape to carry the key. So this was one thrower away from
+                    // live, not one refactor away.
                     ...(workspaceValidationFailure?.resultJson
-                      ? { workspaceValidation: workspaceValidationFailure.resultJson.workspaceValidation ?? workspaceValidationFailure.resultJson }
+                      ? { workspaceValidation: workspaceValidationFailure.resultJson.workspaceValidation ?? null }
                       : {}),
                   },
                   run: async () => ({

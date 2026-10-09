@@ -1,12 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   CONSUMERS,
+  OPEN_PRS_PAGE_SIZE,
   VIOLATION_KINDS,
   evaluateConsumer,
   summarize,
   checkConsumers,
 } from '../check-review-gate-consumer-protection.mjs';
+import { ALERT_TTL_MS } from '../post-review-gate-consumer-protection-alert.mjs';
 
 /**
  * The EXACT live shape read from
@@ -196,6 +199,119 @@ test('one ungated pull request is drift even when others require review', () => 
   assert.equal(r.status, 'drift');
 });
 
+// ── a truncated probe window is unreadable, never compliant (BLO-41080) ──────
+
+const gatedPrs = (n, from = 1) =>
+  Array.from({ length: n }, (_, i) => ({ number: from + i, approvals: 0, reviewDecision: 'REVIEW_REQUIRED' }));
+
+test('a full open-pull-request page is unreadable, not compliant', () => {
+  // The query caps at OPEN_PRS_PAGE_SIZE and orders UPDATED_AT DESC, so a full
+  // page is indistinguishable from one that dropped the least-recently-updated
+  // rows — which is exactly where a stale ungated pull request sits. Measured
+  // 2026-10-07: core sat at 19 open PRs against a cap of 20, one PR from this
+  // reading `compliant` off a sample it never saw.
+  const r = evaluateConsumer(core({ openPullRequests: gatedPrs(OPEN_PRS_PAGE_SIZE) }));
+  assert.equal(r.status, 'unreadable');
+  assert.equal(r.observed.truncated, true);
+  assert.match(r.reason, /came back full/);
+});
+
+test('one pull request under the cap is still readable', () => {
+  // The boundary matters in both directions: a guard that reds one short of the
+  // cap would make the common case unreadable and train people to ignore it.
+  const r = evaluateConsumer(core({ openPullRequests: gatedPrs(OPEN_PRS_PAGE_SIZE - 1) }));
+  assert.equal(r.status, 'compliant');
+});
+
+test('pageInfo.hasNextPage decides truncation over the page length', () => {
+  // A branch with EXACTLY OPEN_PRS_PAGE_SIZE open pull requests is a complete
+  // window; the length tell alone would page critical on it until the count
+  // moved. When the flag is present it is authoritative in both directions.
+  const full = gatedPrs(OPEN_PRS_PAGE_SIZE);
+  assert.equal(evaluateConsumer(core({ openPullRequests: full, openPullRequestsTruncated: false })).status, 'compliant');
+  assert.equal(evaluateConsumer(core({ openPullRequests: full, openPullRequestsTruncated: true })).status, 'unreadable');
+});
+
+test('a truncated page that already contains an ungated pull request is drift, not unreadable', () => {
+  // Truncation says "I may not have seen everything". An ungated PR in the part
+  // we DID see is a positive observation and outranks it — reporting unreadable
+  // here would downgrade a live finding to "could not check".
+  const r = evaluateConsumer(
+    core({
+      openPullRequests: [
+        ...gatedPrs(OPEN_PRS_PAGE_SIZE - 1),
+        { number: 9999, approvals: 0, reviewDecision: null },
+      ],
+    }),
+  );
+  assert.equal(r.status, 'drift');
+  assert.deepEqual(r.violationKinds, [VIOLATION_KINDS.NO_REVIEW_GATE]);
+});
+
+test('a truncated page exits 2, so the scheduled caller cannot read it as a pass', () => {
+  const s = summarize([evaluateConsumer(core({ openPullRequests: gatedPrs(OPEN_PRS_PAGE_SIZE) }))]);
+  assert.equal(s.exitCode, 2);
+  assert.equal(s.compliant, false);
+  assert.deepEqual(s.unreadable, ['penstock-llm-proxy-core']);
+});
+
+// ── several rulesets both contributing a pull_request rule (BLO-41080) ───────
+
+test('a second ruleset supplying the strict parameters is honoured, not ignored', () => {
+  // `rules/branches` flattens every applying ruleset, so `.find()` reading only
+  // the first would report drift against a branch that is in fact protected by
+  // the second. Order is reversed here on purpose: the weak rule comes first.
+  const r = evaluateConsumer(
+    consumer({
+      rules: [
+        { ...withParams({ required_approving_review_count: 0, require_last_push_approval: false }), ruleset_id: 1 },
+        { ...RATIFIED_PR_RULE, ruleset_id: 2 },
+      ],
+    }),
+  );
+  assert.equal(r.status, 'compliant');
+  assert.deepEqual(r.rulesetIds, [1, 2]);
+});
+
+test('two rules that are each individually weak are still drift', () => {
+  // The union is strictest-wins, not best-effort: if NO applying rule demands a
+  // parameter, nothing enforces it.
+  const r = evaluateConsumer(
+    consumer({
+      rules: [
+        withParams({ require_last_push_approval: false }),
+        withParams({ require_last_push_approval: false, dismiss_stale_reviews_on_push: false }),
+      ],
+    }),
+  );
+  assert.equal(r.status, 'drift');
+  assert.deepEqual(r.violationKinds, [VIOLATION_KINDS.LAST_PUSH_APPROVAL]);
+});
+
+// ── the alert TTL must outlive the schedule gap (BLO-41080) ──────────────────
+
+test('ALERT_TTL_MS outlives the longest gap between scheduled runs', () => {
+  // The TTL and the cron are edited independently. A TTL shorter than the gap
+  // lets a drift alert expire between fires, so the incident silently resolves
+  // itself in Alertmanager while the control is still gone.
+  const wf = readFileSync(new URL('../../workflows/review-gate-consumer-protection-guard.yml', import.meta.url), 'utf8');
+  const crons = [...wf.matchAll(/^\s*-\s*cron:\s*["']([^"']+)["']/gm)].map((m) => m[1]);
+  assert.equal(crons.length, 1, 'this assertion assumes a single schedule entry');
+
+  const [minute, hour, dom, month, dow] = crons[0].trim().split(/\s+/);
+  assert.deepEqual([/^\d+$/.test(minute), dom, month, dow], [true, '*', '*', '*'],
+    'this assertion only understands a fixed-minute, daily, hour-list schedule');
+
+  const hours = hour.split(',').map(Number).sort((a, b) => a - b);
+  const gapsHours = hours.map((h, i) => (i === 0 ? h + 24 - hours[hours.length - 1] : h - hours[i - 1]));
+  const longestGapMs = Math.max(...gapsHours) * 60 * 60 * 1000;
+
+  assert.ok(
+    ALERT_TTL_MS > longestGapMs,
+    `ALERT_TTL_MS (${ALERT_TTL_MS}ms) must exceed the longest schedule gap (${longestGapMs}ms)`,
+  );
+});
+
 // ── the consumer list and the fetch plan ─────────────────────────────────────
 
 test('all four review-gate consumers are watched', () => {
@@ -229,6 +345,28 @@ test('the open-pull-request probe is only paid for where no pull_request rule wa
     fetchImpl,
   }).then(() => {
     assert.equal(calls.filter((p) => p === '/graphql').length, 1);
+  });
+});
+
+test('the probe passes pageInfo.hasNextPage through to the verdict', () => {
+  // A complete full page: without the flag reaching evaluateConsumer this
+  // falls back to the length tell and reads unreadable.
+  const nodes = Array.from({ length: OPEN_PRS_PAGE_SIZE }, (_, i) => ({
+    number: i + 1,
+    reviewDecision: 'REVIEW_REQUIRED',
+    latestOpinionatedReviews: { nodes: [] },
+  }));
+  const fetchImpl = async (path) =>
+    path === '/graphql'
+      ? { data: { repository: { pullRequests: { pageInfo: { hasNextPage: false }, nodes } } } }
+      : [];
+  return checkConsumers({
+    owner: 'Blockcast',
+    token: 't',
+    consumers: [{ repo: 'without-rule', branch: 'main' }],
+    fetchImpl,
+  }).then((results) => {
+    assert.equal(results[0].status, 'compliant');
   });
 });
 

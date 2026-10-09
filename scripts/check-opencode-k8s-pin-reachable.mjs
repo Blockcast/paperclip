@@ -34,6 +34,30 @@
  * blocked that pin. The property the build actually depends on is "reachable
  * from some ref a clone fetches", so this asserts precisely that, by doing the
  * same clone the build does and asking git whether the object arrived.
+ *
+ * SECOND PROPERTY, BLO-34510 — the pinned source must make no Secret PUT.
+ *
+ * `deploy/helm/paperclip/templates/role.yaml` retired `secrets: update` from
+ * the release-namespace Role once BLO-32424 converted the claude-k8s adopt
+ * path to a merge PATCH. The opencode-k8s half of that evidence is a property
+ * of THE PIN, not of the adapter: it holds because the pinned tree contains no
+ * `replaceNamespacedSecret`. A pin bump that reintroduces one would 403 at
+ * runtime, on a collision path, for every opencode-k8s agent — and would do it
+ * with nothing in this repo's diff to review but a 40-hex number.
+ *
+ * So the same bump that could break it is the moment to check, and the clone is
+ * already paid for here. Scope, stated rather than implied: this greps the
+ * client-node symbol in non-test `src/`. It is not a proof that no PUT exists —
+ * a hand-rolled request or a renamed wrapper slips past it — so it is a guard
+ * against the realistic regression (someone re-adds the call), not a soundness
+ * argument. The soundness argument is the enumeration in role.yaml.
+ *
+ * The grep carries its own negative control. A filter that matches nothing
+ * because the tree moved out of `src/` is indistinguishable from a clean pin,
+ * and that failure reads as a pass — so the probe also counts the JS/TS source
+ * files it searched, and zero means inconclusive rather than clean. The control
+ * only reasons about an EMPTY result: a hit proves the search ran over
+ * something, so it fails the bump whatever the count says.
  */
 
 import { execFileSync } from "node:child_process";
@@ -43,6 +67,25 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const ADAPTER_REPO = "kkroo/paperclip-adapter-opencode-k8s";
+
+// The @kubernetes/client-node call whose HTTP verb is PUT, which the RBAC
+// authorizer maps to `secrets: update` — the verb BLO-34510 retired.
+export const SECRET_PUT_SYMBOL = "replaceNamespacedSecret";
+
+/**
+ * Exclude conventional test/spec files and __tests__/__mocks__ directories:
+ * their stubs can legitimately name the symbol while asserting it is never
+ * called. Names such as src/testing remain production sources.
+ *
+ * @param {string[]} grepLines raw `git grep -n` output lines, `path:line:text`
+ * @returns {string[]} lines from non-test sources
+ */
+export function nonTestHits(grepLines) {
+  return grepLines.filter((line) =>
+    line.trim() !== "" &&
+    !/(?:^|\/)__(?:tests|mocks)__\/|\.(?:test|spec)\.[cm]?tsx?$/.test(line.split(":", 1)[0]),
+  );
+}
 
 /**
  * @param {string} dockerfile raw Dockerfile text
@@ -57,17 +100,25 @@ export function extractPin(dockerfile) {
  *
  * The asymmetry is deliberate. `unreachable` is a definite finding — the build
  * WILL fail on its next cache miss — so it fails the PR. `inconclusive` means
- * we could not clone at all (network, rate limit, repo turned private, no
- * credential in this job); that says nothing about the pin, and turning every
- * transient network fault into a blocked merge would inflict the same class of
+ * we could not complete the probe (network, rate limit, repo turned private,
+ * no credential, or a failed source search); that says nothing about the pin.
+ * Turning every transient fault into a blocked merge would inflict the same class of
  * harm this guard exists to prevent. It warns loudly instead of failing, so a
- * permanently-broken probe is visible in the run rather than silently inert.
+ * permanently broken probe is visible in the run rather than silently inert.
  *
- * @param {{pin: string | null, cloneOk: boolean, commitPresent: boolean, detail?: string}} probe
- * @returns {{verdict: "ok" | "unreachable" | "inconclusive" | "no-pin", exitCode: 0 | 1, message: string}}
+ * `secret-put` follows the same rule and lands on the same side as
+ * `unreachable`: it is a definite finding about the pinned tree, so it fails.
+ * A searched-nothing grep is not — hence `srcFileCount`, which routes an
+ * inert search to `inconclusive` rather than letting it read as clean. A hit
+ * is judged BEFORE that control: a non-empty hit set is self-evidencing, so a
+ * zero or failed file count cannot turn a real call site into a warning.
+ *
+ * @param {{pin: string | null, cloneOk: boolean, commitPresent: boolean, detail?: string,
+ *          srcFileCount?: number | null, secretPutHits?: string[] | null}} probe
+ * @returns {{verdict: "ok" | "unreachable" | "secret-put" | "inconclusive" | "no-pin", exitCode: 0 | 1, message: string}}
  */
 export function classify(probe) {
-  const { pin, cloneOk, commitPresent, detail } = probe;
+  const { pin, cloneOk, commitPresent, detail, srcFileCount, secretPutHits } = probe;
 
   if (!pin) {
     return {
@@ -110,10 +161,58 @@ export function classify(probe) {
     };
   }
 
+  if (secretPutHits && secretPutHits.length > 0) {
+    return {
+      verdict: "secret-put",
+      exitCode: 1,
+      message:
+        `PIN REINTRODUCES A SECRET PUT: ${pin} calls ${SECRET_PUT_SYMBOL} in non-test ` +
+        `source.\n\n${secretPutHits.map((h) => `  ${h}`).join("\n")}\n\n` +
+        "A PUT maps to the `secrets: update` RBAC verb, which BLO-34510 RETIRED from " +
+        "`deploy/helm/paperclip/templates/role.yaml` — precisely because the previous " +
+        "pin made no such call. With this pin, that call 403s at runtime for every " +
+        "opencode-k8s agent, on a Secret-collision path, which is intermittent and will " +
+        "not show up in any build or test here.\n\n" +
+        "Two ways out, and they are a real choice, not a formality: change the adapter " +
+        "to a merge PATCH (what the claude-k8s adapter did in BLO-32424 — `patch` is " +
+        "still granted), or re-add `update` to that Role naming this call site, and " +
+        "update deploy/helm/paperclip/tests/role-rbac.test.mjs in the same change. " +
+        "Re-granting a retired standing privilege is a stated decision, not a fix-up.",
+    };
+  }
+
+  if (srcFileCount === null || secretPutHits === null) {
+    return {
+      verdict: "inconclusive",
+      exitCode: 0,
+      message:
+        `GUARD INCONCLUSIVE: pin ${pin} is reachable, but the Secret-PUT source search failed. ` +
+        "Not failing the PR — a failed search cannot establish that the pin makes no Secret PUT. " +
+        "Fix the probe before trusting the guard.",
+    };
+  }
+
+  if (srcFileCount === 0) {
+    return {
+      verdict: "inconclusive",
+      exitCode: 0,
+      message:
+        `GUARD INCONCLUSIVE: pin ${pin} is reachable, but the Secret-PUT search found no ` +
+        "JS/TS sources under `src/` to search. The adapter's layout has moved, so " +
+        "the grep is inert and matching nothing no longer means clean. Not failing the " +
+        "PR — but re-point the search before trusting it, or the BLO-34510 retirement of " +
+        "`secrets: update` is unguarded against the next pin bump.",
+    };
+  }
+
   return {
     verdict: "ok",
     exitCode: 0,
-    message: `Pin ${pin} is reachable from a ref in ${ADAPTER_REPO}.`,
+    message:
+      `Pin ${pin} is reachable from a ref in ${ADAPTER_REPO}` +
+      (srcFileCount === undefined
+        ? "."
+        : ` and makes no ${SECRET_PUT_SYMBOL} call in ${srcFileCount} non-test source file(s).`),
   };
 }
 
@@ -124,8 +223,13 @@ export function classify(probe) {
  * on GitHub, so it is not a reachability test and would pass the very pin that
  * broke the build.
  *
+ * The same clone then answers the BLO-34510 question — does the pinned tree
+ * make a Secret PUT — because a second clone would double the slowest step for
+ * one grep.
+ *
  * @param {string} pin
- * @returns {{pin: string, cloneOk: boolean, commitPresent: boolean, detail?: string}}
+ * @returns {{pin: string, cloneOk: boolean, commitPresent: boolean, detail?: string,
+ *            srcFileCount?: number | null, secretPutHits?: string[] | null}}
  */
 function probe(pin) {
   const scratch = mkdtempSync(join(tmpdir(), "opencode-k8s-pin-"));
@@ -147,10 +251,43 @@ function probe(pin) {
         stdio: "ignore",
         timeout: 30_000,
       });
-      return { pin, cloneOk: true, commitPresent: true };
     } catch {
       return { pin, cloneOk: true, commitPresent: false };
     }
+
+    const git = (args) => {
+      try {
+        return execFileSync("git", ["-C", repoDir, ...args], {
+          stdio: ["ignore", "pipe", "ignore"],
+          encoding: "utf8",
+          timeout: 60_000,
+        });
+      } catch (error) {
+        // `git grep` exits 1 on no match, which is a result, not a failure.
+        // Preserve all other failures, including signals/timeouts, as unknown
+        // rather than turning a failed search into a clean attestation.
+        return args[0] === "grep" && error?.status === 1 && !error.signal ? "" : null;
+      }
+    };
+    const lines = (out) => out.split("\n").filter((l) => l.trim() !== "");
+    const sources = git(["ls-tree", "-r", "--name-only", pin, "--", "src"]);
+    const hits = git(["grep", "-n", "--fixed-strings", SECRET_PUT_SYMBOL, pin, "--", "src"]);
+
+    return {
+      pin,
+      cloneOk: true,
+      commitPresent: true,
+      srcFileCount: sources === null ? null : nonTestHits(
+        lines(sources).filter((f) => /\.[cm]?[jt]sx?$/.test(f)).map((f) => `${f}:`),
+      ).length,
+      secretPutHits: hits === null ? null : nonTestHits(
+        lines(hits).map(
+          // `git grep <tree-ish>` prefixes every line with `<sha>:`; strip it so
+          // the message reads as a path, and so nonTestHits sees the real path.
+          (l) => (l.startsWith(`${pin}:`) ? l.slice(pin.length + 1) : l),
+        ),
+      ),
+    };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

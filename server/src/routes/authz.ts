@@ -1,6 +1,8 @@
 import type { Request, Response } from "express";
+import type { HumanCompanyMembershipRole } from "@paperclipai/shared";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { normalizeHumanRole } from "../services/company-member-roles.js";
 import { responsibleUserAuthzShadowMode, type AuthorizationDecision } from "../services/authorization.js";
 
 function throwOrShadowResponsibleUserCompanyAccessDeny(
@@ -197,6 +199,245 @@ export async function actorCanReadAgentConfig(
     resource: { type: "company", companyId },
   });
   return decision.allowed;
+}
+
+type RunTranscriptReadDecider = {
+  decide: (input: {
+    actor: Request["actor"];
+    action: "runs:read_transcript";
+    resource: { type: "agent"; companyId: string; agentId: string | null };
+  }) => Promise<AuthorizationDecision>;
+};
+
+/**
+ * The human membership roles that read a transcript without holding a grant —
+ * the "human operators" of the PEN-3140 decision.
+ *
+ * `viewer` is deliberately absent. The codebase already draws this line one
+ * notch LOWER, for material that is less sensitive than a transcript:
+ * `workspace_runtime:read` is behind `requiresNonViewer` in
+ * `services/authorization.ts` and answers a viewer with `deny_missing_grant`.
+ * A run log that has carried vendor credential material across three incidents
+ * (PEN-2328 → PEN-2370 → PEN-3139) cannot be looser than operator-authored
+ * runtime config, so the gate matches that precedent rather than admitting
+ * every board membership role.
+ *
+ * Exclusion is not a lockout: a viewer falls through to the decider below, so
+ * an explicit `runs:read_transcript` grant still admits one. That is the same
+ * escape hatch the agent side gets, which is why the seed migration can name
+ * the agent roles and stay silent about humans — this set is the only place
+ * the human operator set is written down (Ally review 5375217878).
+ *
+ * Stated in the NORMALIZED vocabulary (`HumanCompanyMembershipRole`), not in
+ * raw stored strings. `member` is storable (`COMPANY_MEMBERSHIP_ROLES`) and
+ * `normalizeHumanRole` folds it to `operator`, so matching the stored string
+ * would make one membership row an operator for default-grant seeding and a
+ * non-operator here — the same "two places naming the human set differently"
+ * that the `runs_read_transcript_grant_seed` migration's comment exists to
+ * remove (Ally review 5381822720). Named by stem rather than by number: this
+ * migration has been renumbered twice already (0248 → 0251 → 0252) to dodge
+ * migrations landing on master, and each renumber silently re-pointed a
+ * number-based reference at an unrelated real file (Ally review 5438353035).
+ * Typing the set to the normalized union also makes a future role addition a
+ * compile error here rather than a silent denial.
+ */
+const TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES: ReadonlySet<HumanCompanyMembershipRole> = new Set([
+  "owner",
+  "admin",
+  "operator",
+]);
+
+/**
+ * Normalize a stored membership role for the operator test, failing CLOSED on
+ * anything unrecognized.
+ *
+ * `normalizeHumanRole`'s own default fallback is `operator`, which is right for
+ * its callers (label rendering, default-grant seeding) and wrong here:
+ * `company_memberships.membership_role` is a plain `text` column with no DB
+ * constraint, and the cloud-tenant path can write `support` into it
+ * (`middleware/auth.ts`, `stackMembershipRole`). Taking the default would turn
+ * every unknown or legacy role string into a transcript operator. `viewer` is
+ * the least-privileged member of the union, so an unrecognized role falls
+ * through to the decider and needs an explicit grant — the same place a viewer
+ * lands. `member` still folds to `operator`, which is the agreement with
+ * `normalizeHumanRole` this exists to keep.
+ */
+function normalizedTranscriptRole(value: unknown): HumanCompanyMembershipRole {
+  return normalizeHumanRole(value, "viewer");
+}
+
+/**
+ * Whether a board actor holds an operator-grade membership in this company.
+ *
+ * `local_implicit` is allowed for the same reason `hasCompanyAccess` allows it:
+ * it is the trusted local board / internal bootstrap, which carries no
+ * membership row to inspect. Keeping the two in step matters — a divergence
+ * here would make the local board's transcript reads depend on which of the two
+ * functions a route happened to call.
+ *
+ * `cloud_tenant` is refused outright, ahead of any role test. Those actors are
+ * company-scoped BY CONTRACT and the decider is where that contract lives:
+ * `services/authorization.ts` refuses to elevate them "not even via stale
+ * instance_admin rows" and enumerates exactly four readable actions
+ * (`agent:read`, `company_scope:read`, `issue:read`, `project:read`).
+ * `runs:read_transcript` is not among them and `grantsForHumanRole` seeds it
+ * for no role, so a cloud-tenant owner is `deny_missing_grant` through the
+ * decider. The short-circuit must not answer the opposite — and it would,
+ * because a cloud-tenant user is stamped `membershipRole: "owner"` whenever
+ * their stack role is owner OR admin (`middleware/auth.ts`) and carries
+ * `companyIds: [companyId]`, so they clear `hasCompanyAccess` and then match
+ * the operator set. Falling through costs them nothing a grant cannot restore
+ * (Ally review 5381822720).
+ *
+ * Exported, and false for any non-board actor, so a caller that must answer
+ * without the decider — an operation with no resolvable owner, see
+ * `withholdUnentitledWorkspaceOperationOutput` — asks this same question
+ * instead of re-deriving "is this human an operator?" from `req.actor.type`
+ * (Ally review 5386746244).
+ */
+export function boardActorIsTranscriptOperator(req: Request, companyId: string): boolean {
+  if (req.actor.type !== "board") return false;
+  if (req.actor.source === "cloud_tenant") return false;
+  if (req.actor.source === "local_implicit") return true;
+  return (req.actor.memberships ?? []).some(
+    (membership) =>
+      membership.companyId === companyId &&
+      membership.status === "active" &&
+      typeof membership.membershipRole === "string" &&
+      TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES.has(normalizedTranscriptRole(membership.membershipRole)),
+  );
+}
+
+/**
+ * `decision` is present whenever the authorization service actually ran, so a
+ * route can render the named boundary vocabulary. It is absent for the two
+ * cases decided without it: a human operator (allowed), and the fail-closed
+ * company-boundary case, which callers are expected to have already turned into
+ * a 404 (see `hasCompanyAccess`) — the check is repeated here so a future
+ * caller that forgets cannot fall open.
+ */
+export type RunTranscriptReadOutcome = {
+  allowed: boolean;
+  decision: AuthorizationDecision | null;
+};
+
+/**
+ * Shared "may this actor see a run's TRANSCRIPT?" test (PEN-3142).
+ *
+ * Run *state* — status, exit/park reason, the retry edge, watchdog decisions,
+ * `lastActivityAt`, error text — stays company-readable and must not be routed
+ * through here. This gate covers transcript *content* only: the
+ * `GET /heartbeat-runs/:runId/log` body, the `message` / `payload` of
+ * `GET /heartbeat-runs/:runId/events`, and — per the PEN-3202 ruling
+ * implemented by PEN-3204 — the `stdoutExcerpt` / `stderrExcerpt` captured
+ * output projected onto workspace-operation rows.
+ *
+ * `contextSnapshot` stays company-readable, including free-text wake/review
+ * inputs, per PEN-3149's explicit field ruling (comment 5703eb19). The list
+ * route's compact snapshot does not change that scope; withholding captured
+ * output here is separate from credential scrubbing of run inputs.
+ *
+ * NOT `GET /workspace-operations/:operationId/log`. That route is deliberately
+ * left on BLO-34631's `workspace_runtime:read` entitlement and is not
+ * additionally gated here; the reasoning, and why stacking the two would change
+ * no bytes, is on the route itself (`routes/agents.ts`, the
+ * `workspace-operations/:operationId/log` handler). Said explicitly because
+ * this docblock is where a maintainer asks "is the operation log gated?", and
+ * it previously answered yes about a gate that is not this one (Ally review
+ * 5375217878). Note the two entitlements do agree on viewers: neither admits
+ * one without a grant.
+ *
+ * A workspace operation is a MIX rather than a counterexample: the operation
+ * ROW stays company-readable — `phase`, `status`, `exitCode`, `command`, `cwd`,
+ * `metadata`, the log digest and the timestamps — and only the captured output
+ * narrows. Operations carry no owning-agent column, so callers resolve the
+ * owner through `heartbeatRunId → heartbeat_runs.agentId` and withhold when
+ * that cannot be resolved; see `withholdUnentitledWorkspaceOperationOutput`
+ * (`routes/workspace-response.ts`), which is deliberately tighter than this
+ * function on a null agent id, because the grant fallback below would otherwise
+ * admit a grant holder for an operation with no owner to decide about.
+ *
+ * Same shape as `actorCanReadAgentConfig` above, with one deliberate
+ * difference: the human short-circuit is scoped to operator-grade memberships
+ * (see `TRANSCRIPT_OPERATOR_MEMBERSHIP_ROLES`) rather than to every board
+ * actor. Agent actors get own-run plus manager chain from the decider; everyone
+ * else — peer agents and viewer humans alike — needs an explicit
+ * `runs:read_transcript` grant. The run log has carried vendor credential
+ * material across several incidents (PEN-2328 → PEN-2370 → PEN-3139) and the
+ * scrub protecting it is write-time only, which is why standing company-wide
+ * peer read was withdrawn.
+ *
+ * It lives here, taking the run's owning agent rather than a whole run row, so
+ * BOTH transcript routes call one definition. `/log` and `/events` carry the
+ * same material with opposite halves of the control pair — `/log` had the
+ * audit and no projection, `/events` the projection and no audit — and PEN-2777
+ * (see `actorCanReadAgentConfig`) was exactly this gate existing on one sibling
+ * path and not the other.
+ */
+export async function decideRunTranscriptRead(
+  req: Request,
+  access: RunTranscriptReadDecider,
+  run: { companyId: string; agentId: string | null },
+): Promise<RunTranscriptReadOutcome> {
+  if (!hasCompanyAccess(req, run.companyId)) return { allowed: false, decision: null };
+  // Operator-grade humans only. A viewer — or a cloud-tenant actor of any role
+  // — falls THROUGH to the decider rather than being denied here, so an
+  // explicitly granted one is still admitted and the denial still carries the
+  // named boundary vocabulary.
+  if (req.actor.type === "board" && boardActorIsTranscriptOperator(req, run.companyId)) {
+    return { allowed: true, decision: null };
+  }
+  const decision = await access.decide({
+    actor: req.actor,
+    action: "runs:read_transcript",
+    resource: { type: "agent", companyId: run.companyId, agentId: run.agentId },
+  });
+  return { allowed: decision.allowed, decision };
+}
+
+/**
+ * List-route form of {@link decideRunTranscriptRead} (PEN-3149 ruling, folded
+ * into PEN-3142).
+ *
+ * A run list spans many owning agents, and the decision is scoped to the
+ * OWNING AGENT rather than the run — so the answer is per distinct agent, not
+ * per row. This memoizes on that key: a 200-run page owned by 6 agents costs 6
+ * decisions, not 200. The cache is per call, so it cannot outlive the request
+ * and go stale against a grant or reporting-line change.
+ *
+ * Returns a predicate rather than a filtered list because the caller must keep
+ * every row — run STATE stays company-readable, and only the transcript-bearing
+ * fields are projected out of the rows that fail the check.
+ */
+export function runTranscriptReadGate(
+  req: Request,
+  access: RunTranscriptReadDecider,
+  companyId: string,
+): (agentId: string | null) => Promise<boolean> {
+  const cache = new Map<string, Promise<boolean>>();
+  return (agentId: string | null) => {
+    const key = agentId ?? "";
+    const cached = cache.get(key);
+    if (cached) return cached;
+    const pending = decideRunTranscriptRead(req, access, { companyId, agentId })
+      .then((outcome) => outcome.allowed)
+      // Ally review (1ad0e938), adopted with one deliberate addition. Fail closed
+      // here as well as on the push-path twin
+      // (`realtime/live-event-transcript-gate.ts`), so the posture is local to
+      // both gates rather than inferable only from the route that calls this one.
+      //
+      // The addition is the log line. Swallowing the rejection silently would
+      // trade a loud 500 for a normal-looking 200 whose transcript fields are
+      // withheld — safe in content terms, but a broken authorizer would then be
+      // indistinguishable from an ordinary unentitled read, on the one path that
+      // exists to make transcript access decidable. Fail closed AND say so.
+      .catch((error) => {
+        logger.error({ err: error, companyId, agentId }, "run transcript read decision failed; withholding");
+        return false;
+      });
+    cache.set(key, pending);
+    return pending;
+  };
 }
 
 /**

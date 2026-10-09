@@ -171,6 +171,113 @@ export function extractSecretRefPathsFromConfig(
   return refs;
 }
 
+/**
+ * Count UUID-shaped strings anywhere in a config.
+ *
+ * Only meaningful when the manifest declares no `format: "secret-ref"` path. A
+ * bare UUID is coerced into a ref *only* at a declared path (see the loop in
+ * `extractSecretRefBindingsFromConfig`), so one sitting at an undeclared path
+ * can never bind, and the install is unresolvable with no other trace — the
+ * BLO-32567 shape one layer over, reachable by a plugin that never declared
+ * `instanceConfigSchema` or by an upgrade that drops a secret-ref property
+ * while the config row keeps the value.
+ *
+ * Heuristic by nature: an ordinary UUID-valued setting counts too. That is why
+ * it only ever raises a warning, and why the warning says "if one is a
+ * credential" rather than asserting one is.
+ */
+function countUuidValues(value: unknown): number {
+  // `.trim()` to match `coerceLegacySecretRef`, so this counts exactly the
+  // values that *would* have been coerced had the path been declared.
+  if (typeof value === "string") return isUuidSecretRef(value.trim()) ? 1 : 0;
+  if (Array.isArray(value)) return value.reduce<number>((n, item) => n + countUuidValues(item), 0);
+  if (!isPlainRecord(value)) return 0;
+  return Object.values(value).reduce<number>((n, child) => n + countUuidValues(child), 0);
+}
+
+export interface PluginSecretBindingReconcileResult {
+  companyId: string;
+  /** Refs synced for this company. 0 means nothing to bind, not an error. */
+  bound: number;
+  /**
+   * `format: "secret-ref"` paths the manifest declares. Tells a benign zero
+   * (plugin has no credentials) apart from the BLO-32567 shape: the schema
+   * says this plugin has credentials and we bound none anyway.
+   */
+  declaredSecretPaths: number;
+  /**
+   * UUID-shaped strings in the stored config, counted *only* when nothing bound
+   * and the manifest declared nothing — the one case where no other signal
+   * exists. 0 everywhere else means "not counted", not "none found".
+   */
+  undeclaredUuidValues: number;
+  /** Present when this company was skipped; the other companies still ran. */
+  error?: string;
+}
+
+/**
+ * Rebuild `company_secret_bindings` for a plugin from its stored config.
+ *
+ * Bindings are a projection of (`plugin_config.config_json` x the plugin's
+ * `instanceConfigSchema`), but they were only ever minted by
+ * `POST /plugins/:id/config`. Any config row written before that sync existed —
+ * or by any other write path — carries no bindings at all, so every
+ * `secrets.resolve` fails `binding_missing` and the plugin's jobs no-op
+ * silently and indefinitely. BLO-32567: all Slack jobs across three companies
+ * were dead for 38 days this way, and the only recorded repair was an instance
+ * admin re-saving the config by hand.
+ *
+ * Call this where the plugin starts so a restart repairs the drift with no
+ * operator action. It is idempotent: a company whose bindings are already
+ * correct is rewritten to an equivalent set — `syncSecretRefsForTarget` deletes
+ * and re-inserts, so the rows carry new ids and `created_at` on every boot.
+ */
+export async function reconcilePluginSecretBindings(input: {
+  pluginId: string;
+  companyIds: readonly string[];
+  instanceConfigSchema?: Record<string, unknown> | null;
+  getConfig: (companyId: string) => Promise<{ configJson?: unknown } | null | undefined>;
+  syncBindings: (companyId: string, refs: PluginConfigSecretRefBinding[]) => Promise<unknown>;
+}): Promise<PluginSecretBindingReconcileResult[]> {
+  const declaredSecretPaths = collectSecretRefPaths(input.instanceConfigSchema).size;
+  const results: PluginSecretBindingReconcileResult[] = [];
+  for (const companyId of input.companyIds) {
+    try {
+      const stored = await input.getConfig(companyId);
+      const refs = extractSecretRefBindingsFromConfig(
+        stored?.configJson,
+        input.instanceConfigSchema,
+      );
+      // Never sync an empty ref set. `syncSecretRefsForTarget` reads that as
+      // "delete every binding for this target", so an unreadable or absent
+      // manifest schema would silently unbind a healthy install on restart.
+      if (refs.length > 0) await input.syncBindings(companyId, refs);
+      results.push({
+        companyId,
+        bound: refs.length,
+        declaredSecretPaths,
+        undeclaredUuidValues:
+          refs.length === 0 && declaredSecretPaths === 0
+            ? countUuidValues(stored?.configJson)
+            : 0,
+      });
+    } catch (err) {
+      // Per-company isolation is load-bearing: a config pointing at another
+      // company's secret throws in `assertSecretInCompany`, and that must
+      // neither bind the credential nor stop the remaining companies — or the
+      // worker itself — from starting.
+      results.push({
+        companyId,
+        bound: 0,
+        declaredSecretPaths,
+        undeclaredUuidValues: 0,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return results;
+}
+
 // ---------------------------------------------------------------------------
 // Handler factory
 // ---------------------------------------------------------------------------

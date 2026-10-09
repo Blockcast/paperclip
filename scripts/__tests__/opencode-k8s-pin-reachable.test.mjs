@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   ADAPTER_REPO,
+  SECRET_PUT_SYMBOL,
   classify,
   extractPin,
+  nonTestHits,
 } from "../check-opencode-k8s-pin-reachable.mjs";
 
 const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
@@ -123,4 +129,218 @@ test("the guard is wired into BOTH a PR gate and a schedule", () => {
   assert.match(monitor, invocation, "the drift monitor must run the reachability guard");
   assert.match(monitor, /^\s*- cron: /m, "the drift monitor must be scheduled, not only manual");
   assert.match(monitor, /ref: master/, "it must check master, not the default checkout");
+});
+
+// ---------------------------------------------------------------------------
+// BLO-34510: the pinned tree must make no Secret PUT.
+//
+// `deploy/helm/paperclip/templates/role.yaml` retired `secrets: update`
+// because the pinned adapter makes no `replaceNamespacedSecret` call. That is
+// a property of THE PIN, so a bump can revoke it with nothing to review but a
+// 40-hex number, and the resulting 403 is runtime-only and collision-timed.
+// ---------------------------------------------------------------------------
+
+// Real `git grep -n <tree-ish> -- src` output shape, captured from the live
+// adapter at the current pin against `patchNamespacedSecret` — a symbol that
+// genuinely occurs in BOTH test and non-test sources, so this fixture
+// exercises the filter in both directions rather than only the easy one.
+// Measured 2026-10-07: 7 raw hits, exactly 1 of them non-test.
+const GREP_FIXTURE = [
+  "src/server/execute.test.ts:414:    patchNamespacedSecret: vi.fn().mockResolvedValue({}),",
+  "src/server/execute.test.ts:948:      patchNamespacedSecret: vi.fn().mockResolvedValue({}),",
+  "src/server/execute.test.ts:1339:    expect(coreApi.patchNamespacedSecret).toHaveBeenCalledTimes(2);",
+  "src/server/execute.ts:1052:    await coreApi.patchNamespacedSecret({",
+];
+
+test("nonTestHits keeps real call sites and drops mocks", () => {
+  // Over-match control: without the filter a `vi.fn()` stub reads as a
+  // consumer, and the adapter's tests legitimately name the symbol while
+  // asserting it is never called. Six of seven live hits are mocks, so an
+  // unfiltered guard is a false-positive factory that blocks every pin bump.
+  assert.deepEqual(nonTestHits(GREP_FIXTURE), ["src/server/execute.ts:1052:    await coreApi.patchNamespacedSecret({"]);
+
+  // Under-match control: the filter must key on the TEST-FILE suffix, not on
+  // the word "test" appearing anywhere in the path, or a real call site under
+  // e.g. src/server/test-harness.ts is silently exempted.
+  assert.deepEqual(
+    nonTestHits(["src/server/test.ts:90:  replaceNamespacedSecret(", "src/testing/secrets.ts:4:  replaceNamespacedSecret("]),
+    ["src/server/test.ts:90:  replaceNamespacedSecret(", "src/testing/secrets.ts:4:  replaceNamespacedSecret("],
+  );
+
+  assert.deepEqual(nonTestHits([]), []);
+  assert.deepEqual(nonTestHits(["", "   "]), []);
+  assert.deepEqual(nonTestHits([
+    "src/execute.spec.ts:1: replaceNamespacedSecret(",
+    "src/__tests__/execute.ts:1: replaceNamespacedSecret(",
+    "src/__mocks__/k8s.ts:1: replaceNamespacedSecret(",
+    "src/execute.ts:1: // src/__tests__/execute.ts",
+  ]), ["src/execute.ts:1: // src/__tests__/execute.ts"]);
+});
+
+test("the CLI distinguishes empty results from failed Git subprocesses", (t) => {
+  const scratch = mkdtempSync(join(tmpdir(), "pin-guard-cli-test-"));
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+  const pin = "a".repeat(40);
+  const fixtureDockerfile = join(scratch, "Dockerfile");
+  writeFileSync(fixtureDockerfile, `ARG OPENCODE_K8S_REF=${pin}\n`);
+  // Exercise the real execFileSync catch path without network access.
+  writeFileSync(join(scratch, "git"), `#!/bin/sh
+case "$1" in clone) exit 0;; esac
+case "$3" in
+  cat-file) exit 0;;
+  ls-tree) printf '%s\\n' "$PIN_GUARD_TEST_FILES"; exit "$PIN_GUARD_TEST_TREE_STATUS";;
+  grep)
+    if [ "$PIN_GUARD_TEST_GREP_STATUS" = signal ]; then kill -TERM "$$"; fi
+    printf '%s\\n' "$PIN_GUARD_TEST_HITS"
+    exit "$PIN_GUARD_TEST_GREP_STATUS";;
+esac
+exit 128
+`, { mode: 0o755 });
+  const script = fileURLToPath(new URL("../check-opencode-k8s-pin-reachable.mjs", import.meta.url));
+  const cases = [
+    { name: "grep exit 1 means no match", verdict: "OK", env: {} },
+    { name: "a real call fails", verdict: "FAILED", env: { PIN_GUARD_TEST_GREP_STATUS: "0", PIN_GUARD_TEST_HITS: `${pin}:src/execute.ts:1: replaceNamespacedSecret(` } },
+    { name: "a real call fails even when no counted source was found", verdict: "FAILED", env: { PIN_GUARD_TEST_FILES: "src/README.md", PIN_GUARD_TEST_GREP_STATUS: "0", PIN_GUARD_TEST_HITS: `${pin}:src/server/execute.go:12: replaceNamespacedSecret(` } },
+    { name: "JS sources count as searched", verdict: "OK", env: { PIN_GUARD_TEST_FILES: "src/execute.js" } },
+    { name: "grep exit 128 is not clean", env: { PIN_GUARD_TEST_GREP_STATUS: "128" } },
+    { name: "a signalled grep is not clean", env: { PIN_GUARD_TEST_GREP_STATUS: "signal" } },
+    { name: "ls-tree exit 128 is not clean", env: { PIN_GUARD_TEST_TREE_STATUS: "128" } },
+    { name: "ls-tree exit 1 is not a no-match result", env: { PIN_GUARD_TEST_TREE_STATUS: "1" } },
+    { name: "assets do not establish searched sources", env: { PIN_GUARD_TEST_FILES: "src/README.md\nsrc/icon.svg" } },
+    { name: "test-only sources do not establish searched sources", env: { PIN_GUARD_TEST_FILES: "src/execute.test.ts\nsrc/execute.spec.ts\nsrc/__tests__/execute.ts\nsrc/__mocks__/k8s.ts" } },
+  ];
+  for (const { name, verdict = "inconclusive", env } of cases) {
+    const result = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        PATH: `${scratch}:${process.env.PATH}`,
+        OPENCODE_PIN_GUARD_DOCKERFILE: fixtureDockerfile,
+        PIN_GUARD_TEST_FILES: "src/execute.ts\nsrc/execute.test.ts\nsrc/README.md",
+        PIN_GUARD_TEST_TREE_STATUS: "0",
+        PIN_GUARD_TEST_GREP_STATUS: "1",
+        PIN_GUARD_TEST_HITS: "",
+        ...env,
+      },
+    });
+    assert.ifError(result.error);
+    const output = result.stdout + result.stderr;
+    assert.equal(result.status, verdict === "FAILED" ? 1 : 0, `${name}: ${output}`);
+    assert.match(output, new RegExp(`opencode_k8s pin guard ${verdict}`), name);
+    if (verdict !== "OK") assert.doesNotMatch(output, /pin guard OK/, name);
+    else assert.match(output, /1 non-test source file/, name);
+  }
+});
+
+test("a pin that reintroduces a Secret PUT fails the bump", () => {
+  const result = classify({
+    pin: "b".repeat(40),
+    cloneOk: true,
+    commitPresent: true,
+    srcFileCount: 17,
+    secretPutHits: ["src/server/execute.ts:1052:  await coreApi.replaceNamespacedSecret({"],
+  });
+  assert.equal(result.verdict, "secret-put");
+  assert.equal(result.exitCode, 1);
+  // The offending line must be IN the message: the reviewer is looking at a
+  // diff that changed one hex string and has no other way to see the cause.
+  assert.match(result.message, /execute\.ts:1052/);
+  assert.match(result.message, new RegExp(SECRET_PUT_SYMBOL));
+  // ...and it must name the retired verb and both exits, or the only obvious
+  // move is to re-grant the privilege quietly to make CI green.
+  assert.match(result.message, /secrets: update/);
+  assert.match(result.message, /BLO-34510/);
+  assert.match(result.message, /merge PATCH/);
+  assert.match(result.message, /role-rbac\.test\.mjs/);
+});
+
+test("a clean pin reports how many files it actually searched", () => {
+  const result = classify({
+    pin: "a".repeat(40),
+    cloneOk: true,
+    commitPresent: true,
+    srcFileCount: 17,
+    secretPutHits: [],
+  });
+  assert.equal(result.verdict, "ok");
+  assert.equal(result.exitCode, 0);
+  // A bare "no hits" is indistinguishable from a search that ran over nothing.
+  // Printing the denominator is what makes the pass readable as evidence.
+  assert.match(result.message, /17 non-test source file/);
+});
+
+test("a search that found nothing to search is inconclusive, NOT clean", () => {
+  // THE control this guard needs most. If the adapter moves its sources out of
+  // `src/`, the grep matches nothing — which is byte-identical to a clean pin
+  // and fails in the permissive direction, silently reopening the class while
+  // printing a pass. Same shape as every other empty-filter trap in this repo.
+  const result = classify({
+    pin: "a".repeat(40),
+    cloneOk: true,
+    commitPresent: true,
+    srcFileCount: 0,
+    secretPutHits: [],
+  });
+  assert.equal(result.verdict, "inconclusive");
+  assert.equal(result.exitCode, 0);
+  assert.match(result.message, /INCONCLUSIVE/);
+  assert.match(result.message, /inert/);
+});
+
+test("a real Secret PUT fails even when the file count is zero or failed", () => {
+  // A non-empty hit set is self-evidencing: it proves the grep ran over
+  // something, so the inert-search control (which reasons only about an empty
+  // result) must not downgrade it to a warning. The grep has no extension
+  // filter, so a hit can exist in a file the denominator does not count.
+  for (const srcFileCount of [0, null]) {
+    const result = classify({
+      pin: "b".repeat(40),
+      cloneOk: true,
+      commitPresent: true,
+      srcFileCount,
+      secretPutHits: ["src/server/execute.js:12: await coreApi.replaceNamespacedSecret({"],
+    });
+    assert.equal(result.verdict, "secret-put", `srcFileCount=${srcFileCount}`);
+    assert.equal(result.exitCode, 1, `srcFileCount=${srcFileCount}`);
+    assert.match(result.message, /execute\.js:12/);
+  }
+});
+
+test("reachability is judged before the Secret-PUT search, and clone failure before both", () => {
+  // Ordering matters for the message, not the exit code: an orphaned pin
+  // cannot be grepped, so reporting "no Secret PUT" about a tree that was
+  // never fetched would be a claim with nothing behind it.
+  const orphan = classify({
+    pin: "c".repeat(40),
+    cloneOk: true,
+    commitPresent: false,
+    srcFileCount: 0,
+    secretPutHits: [],
+  });
+  assert.equal(orphan.verdict, "unreachable");
+
+  const unclonable = classify({
+    pin: "c".repeat(40),
+    cloneOk: false,
+    commitPresent: false,
+    srcFileCount: 0,
+    secretPutHits: [],
+  });
+  assert.equal(unclonable.verdict, "inconclusive");
+  assert.match(unclonable.message, /could not clone/);
+});
+
+test("the retirement this guard protects is actually in the chart", () => {
+  // The guard and the Role are two halves of one decision. If someone re-adds
+  // `update` without removing this guard, the guard starts failing bumps for a
+  // verb that is granted again — noise that trains people to ignore it.
+  const role = readFileSync(
+    new URL("../../deploy/helm/paperclip/templates/role.yaml", import.meta.url),
+    "utf8",
+  );
+  const verbs = role.match(/resources: \["secrets"\]\n\s*verbs: \[([^\]]*)\]/)?.[1];
+  assert.ok(verbs, "role.yaml must render a secrets rule");
+  assert.doesNotMatch(verbs, /"update"/, "secrets:update is retired (BLO-34510)");
+  assert.match(verbs, /"patch"/, "patch is what replaced it and must stay");
 });

@@ -442,9 +442,19 @@ jobs:
         # without a provenance row -- off the diff, which stores nothing and so
         # cannot conflict.
         #
+        # BLO-41101: it also rejects any commit in base..head that touches the
+        # frozen PROVENANCE-CHANGES.md, not just a net diff that does. The merge
+        # queue is REBASE and replays commits one at a time, so a branch whose
+        # net diff is clean can still be un-stageable -- #1797 was ejected six
+        # times in 24 days that way, green on every surface, with no
+        # merge_group run to point at.
+        #
         # Runs in this job rather than in vendor_claude_k8s because this one
         # already checks out full history (fetch-depth: 0); the vendored job
-        # checks out at depth 1 and cannot resolve $PR_BASE_SHA.
+        # checks out at depth 1 and cannot resolve $PR_BASE_SHA. That checkout
+        # depth is now load-bearing twice over: the per-commit walk needs the
+        # branch's commits present, and on a shallow clone it exits non-zero
+        # rather than reporting an empty range.
         if: ${{ !cancelled() }}
         run: node ./scripts/check-vendored-provenance-log.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
         timeout-minutes: 1
@@ -1235,6 +1245,23 @@ jobs:
 
       - name: Test undefined-identifier guard failure modes
         run: node --test scripts/check-test-undefined-symbols.test.mjs
+
+      # BLO-38582: server's `typecheck` script runs this config, but NOTHING on
+      # pull_request or merge_group runs that script -- `typecheck:build-gaps`
+      # filters server out (its build already contains `tsc`), and the only
+      # `pnpm -r typecheck` lives in release-verify.yml, which is
+      # workflow_call-only. Without this step the allowlist is enforced solely
+      # at release, so a regression merges green. Sibling of the guard above:
+      # same file class, same job.
+      #
+      # `ensure-build-deps` is NOT redundant with `typecheck:build-gaps`: that
+      # script only runs it inside `if (buildGapPackages.length > 0)`
+      # (scripts/run-typecheck-build-gaps.mjs:178-179), so the prerequisite is
+      # contingent on an unrelated set being non-empty. It is declared inside
+      # `typecheck:tests` rather than inlined here, so the invocation has ONE
+      # definition that this step and server's own `typecheck` both reach.
+      - name: Typecheck allowlisted server tests
+        run: pnpm --filter @paperclipai/server run typecheck:tests
 
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry

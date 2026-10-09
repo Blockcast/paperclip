@@ -50,6 +50,8 @@ import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
+import { reconcilePluginSecretBindings } from "./plugin-secrets-handler.js";
+import { secretService } from "./secrets.js";
 import { isIsolatedSdkPluginPackage, resolveDefaultInstallDir } from "../bootstrap/isolated-sdk-plugins.js";
 
 const execFileAsync = promisify(execFile);
@@ -3552,8 +3554,9 @@ export function pluginLoader(
       // bootstrap config and must use ctx.config.get(companyId) at runtime.
       const config: Record<string, unknown> = {};
       let bootstrapCompanyId: string | undefined;
+      let configuredCompanyIds: string[] = [];
       try {
-        const configuredCompanyIds = await registry.listConfigCompanyIds(pluginId);
+        configuredCompanyIds = await registry.listConfigCompanyIds(pluginId);
         if (configuredCompanyIds.length === 1) {
           bootstrapCompanyId = configuredCompanyIds[0];
         } else if (configuredCompanyIds.length > 1) {
@@ -3562,11 +3565,85 @@ export function pluginLoader(
             "plugin-loader: multiple company configs; legacy bootstrap scope disabled",
           );
         }
-      } catch {
-        log.debug(
-          { pluginId, pluginKey },
-          "plugin-loader: unable to resolve legacy bootstrap company scope",
+      } catch (err) {
+        // Not just the legacy bootstrap scope: step 4b reconciles bindings for
+        // exactly these companies, so an empty list here silently disables the
+        // repair too. Warn, or a lookup failure hides the fix for the silent
+        // failure it exists to close (BLO-32567).
+        log.warn(
+          { pluginId, pluginKey, err },
+          "plugin-loader: unable to list configured companies; legacy bootstrap scope disabled and secret-ref bindings not reconciled",
         );
+      }
+
+      // ------------------------------------------------------------------
+      // 4b. Repair secret-ref bindings before the worker can ask for a secret
+      // ------------------------------------------------------------------
+      // Bindings were only ever minted by POST /plugins/:id/config, so a config
+      // row older than that sync resolves nothing forever and the plugin's jobs
+      // no-op in silence (BLO-32567). Rebuilding here means a restart repairs it
+      // instead of an instance admin re-saving every config by hand.
+      const reconciled = await reconcilePluginSecretBindings({
+        pluginId,
+        companyIds: configuredCompanyIds,
+        instanceConfigSchema: manifest.instanceConfigSchema,
+        getConfig: (companyId) => registry.getConfig(pluginId, companyId),
+        syncBindings: (companyId, refs) =>
+          secretService(db).syncSecretRefsForTarget(
+            companyId,
+            { targetType: "plugin", targetId: pluginId },
+            refs,
+          ),
+      });
+      for (const result of reconciled) {
+        if (result.error) {
+          log.warn(
+            // `reason`, not `err`: the result carries a flattened message, not
+            // an Error, so pino's err serializer would have nothing to expand.
+            { pluginId, pluginKey, companyId: result.companyId, reason: result.error },
+            "plugin-loader: secret-ref bindings not reconciled; this company's plugin secrets will not resolve",
+          );
+        } else if (result.declaredSecretPaths > 0 && result.bound === 0) {
+          // The BLO-32567 shape itself: the manifest declares credentials, a
+          // config row exists, and nothing bound — extraction found no ref at
+          // any declared path, so the empty-set guard correctly declined to
+          // sync and this install stays unresolvable. Silence here is what let
+          // the original outage run 38 days.
+          log.warn(
+            {
+              pluginId,
+              pluginKey,
+              companyId: result.companyId,
+              declaredSecretPaths: result.declaredSecretPaths,
+            },
+            "plugin-loader: plugin declares secret-ref config but no bindings were reconciled; this company's plugin secrets will not resolve",
+          );
+        } else if (
+          result.declaredSecretPaths === 0 &&
+          result.bound === 0 &&
+          result.undeclaredUuidValues > 0
+        ) {
+          // The complementary silent branch: the manifest declares no
+          // secret-ref path, so a bare UUID in the config cannot be coerced
+          // into a ref and nothing can ever bind it. Reachable by a plugin
+          // that never declared `instanceConfigSchema`, or by an upgrade that
+          // drops one. Heuristic — an ordinary UUID-valued setting trips it
+          // too — so it names the suspicion rather than asserting a credential.
+          log.warn(
+            {
+              pluginId,
+              pluginKey,
+              companyId: result.companyId,
+              undeclaredUuidValues: result.undeclaredUuidValues,
+            },
+            "plugin-loader: plugin declares no secret-ref config but its stored config holds UUID-shaped values; if one is a credential it can never bind and this company's plugin secrets will not resolve",
+          );
+        } else if (result.bound > 0) {
+          log.debug(
+            { pluginId, pluginKey, companyId: result.companyId, boundRefs: result.bound },
+            "plugin-loader: reconciled secret-ref bindings",
+          );
+        }
       }
 
       // ------------------------------------------------------------------

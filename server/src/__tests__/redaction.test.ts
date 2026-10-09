@@ -10,6 +10,7 @@ import {
   sanitizeRecord,
   withholdAgentConfigFromApprovalPayload,
   withholdAgentConfigKeys,
+  withholdRunTranscriptStateContent,
 } from "../redaction.js";
 
 describe("redaction", () => {
@@ -1040,3 +1041,109 @@ describe("maskWorkspaceRuntimeForRead (PEN-2846)", () => {
     expect(maskWorkspaceRuntimeForRead(undefined)).toBeUndefined();
   });
 });
+
+/**
+ * PEN-3142 — the `resultJson` projection on the run-state route. The gate
+ * decides WHETHER a reader sees transcript content; this decides what is left
+ * of the blob when they do not.
+ */
+describe("withholdRunTranscriptStateContent resultJson arrays (PEN-3142)", () => {
+  const SECRET = "SUPER-SECRET-TRANSCRIPT-CANARY-a1b2c3";
+
+  it("nulls a withheld array element IN PLACE rather than compacting the array", () => {
+    const projected = withholdRunTranscriptStateContent({
+      resultJson: { errors: [SECRET, 42, true] },
+    }) as any;
+
+    // Splicing the prose out would shift every later element down, so a
+    // consumer reading `errors[1]` positionally would silently get `errors[2]`
+    // — a wrong answer where a null is a visibly missing one.
+    expect(projected.resultJson.errors).toEqual([null, 42, true]);
+    expect(JSON.stringify(projected)).not.toContain(SECRET);
+    // Distinguishable from an element that was genuinely null.
+    expect(projected.withheldFields).toContain("resultJson.errors[0]");
+  });
+
+  it("withholds the field entirely when every element was transcript", () => {
+    const projected = withholdRunTranscriptStateContent({
+      resultJson: { errors: [SECRET, `${SECRET}-2`] },
+    }) as any;
+
+    // An array of nulls would disclose how many prose elements there were.
+    expect(projected.resultJson).not.toHaveProperty("errors");
+    expect(JSON.stringify(projected)).not.toContain(SECRET);
+  });
+
+  it("keeps an array whose elements are all machine values untouched", () => {
+    const projected = withholdRunTranscriptStateContent({
+      resultJson: { permission_denials: [{ num_turns: 2, summary: SECRET }], counts: [1, 2, 3] },
+    }) as any;
+
+    expect(projected.resultJson.counts).toEqual([1, 2, 3]);
+    // Elements inherit the array's key, so an object element still recurses.
+    expect(projected.resultJson.permission_denials).toEqual([{ num_turns: 2 }]);
+    expect(JSON.stringify(projected)).not.toContain(SECRET);
+  });
+});
+
+/**
+ * PEN-3142 (Ally review 5438353035): the read-side projection walks the SAME
+ * `resultJson` column as `redactRunResultJsonValue`, which has been bounded at
+ * `MAX_RUN_RESULT_JSON_REDACT_DEPTH` since PEN-3153 on the stated grounds that
+ * "adapter output is attacker-influenced in SHAPE as well as content". The two
+ * walks now agree on that cap.
+ *
+ * The cut fails CLOSED — the over-deep subtree is withheld, not emitted — so
+ * the only way to be wrong here is to disclose less, never more.
+ */
+describe("withholdRunTranscriptStateContent resultJson depth bound (PEN-3142)", () => {
+  const SECRET = "SUPER-SECRET-TRANSCRIPT-CANARY-a1b2c3";
+
+  /** Wrap `leaf` in `depth` nested `{ child: … }` objects. */
+  const nest = (depth: number, leaf: unknown): unknown => {
+    let node: unknown = leaf;
+    for (let index = 0; index < depth; index += 1) node = { child: node };
+    return node;
+  };
+
+  it("still recurses to a machine value nested within the cap", () => {
+    // Guards the opposite error: a cap set too shallow would silently start
+    // withholding the ordinary nesting this projection exists to serve.
+    const projected = withholdRunTranscriptStateContent({
+      resultJson: { root: nest(10, { num_turns: 7, summary: SECRET }) },
+    }) as any;
+
+    let node = projected.resultJson.root;
+    for (let index = 0; index < 10; index += 1) node = node.child;
+    expect(node).toEqual({ num_turns: 7 });
+    expect(JSON.stringify(projected)).not.toContain(SECRET);
+  });
+
+  it("withholds the subtree past the cap instead of walking it", () => {
+    const projected = withholdRunTranscriptStateContent({
+      resultJson: { root: nest(40, { num_turns: 7, summary: SECRET }) },
+    }) as any;
+
+    // The machine value is genuinely reachable — it is withheld because of
+    // where it sits, not because of what it is. Failing closed is the point.
+    expect(JSON.stringify(projected)).not.toContain("num_turns");
+    expect(JSON.stringify(projected)).not.toContain(SECRET);
+    // The cut is named rather than silent.
+    expect(
+      projected.withheldFields.some((field: string) => field.startsWith("resultJson.root")),
+    ).toBe(true);
+  });
+
+  it("does not blow the stack on a pathologically deep tree", () => {
+    // The unbounded walk would recurse once per level. An entitled reader
+    // skips this projection entirely, so a RangeError here would 500 only
+    // UNENTITLED readers — denial of the gate, by the party the gate exists
+    // to stop.
+    const projected = withholdRunTranscriptStateContent({
+      resultJson: { root: nest(50_000, { summary: SECRET }) },
+    }) as any;
+
+    expect(JSON.stringify(projected)).not.toContain(SECRET);
+  });
+});
+

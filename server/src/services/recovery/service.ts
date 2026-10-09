@@ -107,7 +107,10 @@ import {
 import {
   extractWakeCommentIds,
   isTerminalIssueStatus,
+  locklessDeferredWakeTerminalError,
   shouldReopenTerminalIssueForDeferredWake,
+  LOCKLESS_DEFERRED_WAKE_DEPENDENCY_BLOCKED_ERROR,
+  LOCKLESS_DEFERRED_WAKE_PROMOTED_ERROR,
 } from "../deferred-wake-reopen.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
@@ -14874,7 +14877,7 @@ export function recoveryService(
         // this arm, so it belongs in a row of its own rather than here.
         if (await cancelWake(
           candidate.wakeId,
-          "Deferred wake cancelled by the lockless drain: the issue has an unresolved dependency blocker (PEN-3739)",
+          LOCKLESS_DEFERRED_WAKE_DEPENDENCY_BLOCKED_ERROR,
         )) {
           cancelledWakeIds.push(candidate.wakeId);
         }
@@ -14964,7 +14967,7 @@ export function recoveryService(
         if (!canReopenClosedIssue) {
           if (await cancelWake(
             candidate.wakeId,
-            `Deferred wake cancelled by the lockless drain: the issue is already ${candidate.issueStatus} and this wake cannot reopen it (PEN-3739)`,
+            locklessDeferredWakeTerminalError(candidate.issueStatus),
           )) {
             cancelledWakeIds.push(candidate.wakeId);
           }
@@ -15097,7 +15100,7 @@ export function recoveryService(
 
       if (await cancelWake(
         candidate.wakeId,
-        "Deferred wake superseded by the lockless drain: re-queued because the issue holds no execution lock (PEN-3739)",
+        LOCKLESS_DEFERRED_WAKE_PROMOTED_ERROR,
       )) {
         promotedWakeIds.push(candidate.wakeId);
       }

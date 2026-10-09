@@ -178,6 +178,7 @@ import {
   buildIssueBlockersResolvedWakeIdempotencyKey,
   findExistingIssueBlockersResolvedWake,
 } from "../services/issue-dependency-wakeups.js";
+import { locklessDeferredWakeDisposition } from "../services/deferred-wake-reopen.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { decisionTrainingService } from "../services/decision-training.js";
@@ -189,6 +190,7 @@ import {
   issueListProbeLimit,
   parseOffsetParam,
   parseUnsupportedPaginationParams,
+  parseUnsupportedTimeFilterParams,
   resolveIssueListTruncation,
 } from "../lib/issue-list-query.js";
 import { readAcceptedPlanConfirmationTarget } from "../services/issues.js";
@@ -1576,14 +1578,32 @@ function projectWakeDiagnosticStatus(value: string) {
   return ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES.has(value) ? value : "other";
 }
 
+/**
+ * PEN-3877: status outranks `rawError`.
+ *
+ * This read the other way round — `if (status === "failed" || rawError)` — and
+ * the consequence was not confined to the drain. EVERY cancelled or skipped row
+ * carrying an explanatory string reported `failed`, including rows predating the
+ * lockless drain entirely: a `2026-09-27` `issue_dependencies_blocked`
+ * cancellation on PEN-3568 reads `cancelled` in the column and reported `failed`
+ * here. A status the column states outright is strictly better evidence than the
+ * truthiness of a field written on both success and failure paths.
+ *
+ * `rawError` keeps its say in the one place it adds information the status does
+ * not already carry: a row that finished `queued`/`completed`/`coalesced` and
+ * nonetheless recorded an error. The drain's promoted row is the sharpest case
+ * of the inversion this fixes — the drain stamps its string precisely BECAUSE it
+ * succeeded, so a correct promotion rendered as a failure, and the predictable
+ * next filing was "the deferred-wake drain is failing".
+ */
 function wakeFailureClass(
   status: string,
   rawError: string | null,
 ): IssueWakeDiagnosticWakeFailureClass | null {
-  if (status === "failed" || rawError) return "failed";
+  if (status === "failed") return "failed";
   if (status === "cancelled") return "cancelled";
   if (status === "skipped") return "skipped";
-  return null;
+  return rawError ? "failed" : null;
 }
 
 function projectIssueWakeRequest(row: {
@@ -1611,6 +1631,19 @@ function projectIssueWakeRequest(row: {
     claimedAt: dateToIso(row.claimedAt),
     finishedAt: dateToIso(row.finishedAt),
     failureClass: wakeFailureClass(status, row.error),
+    // PEN-3877: `error` is the drain's only durable evidence and this route is
+    // the only surface that can read `agent_wakeup_requests` at all, so the
+    // column was being read and then discarded. Projected through the writer's
+    // own classifier rather than emitted raw — the column is not uniformly
+    // server-authored, and the raw-blob redaction asserted in
+    // `issue-wake-diagnostics-routes.test.ts` has to survive this.
+    //
+    // NOT gated on `includeInternalIds`: that gate exists for the internal
+    // IDENTIFIERS (`agentId`, `runId`) a boundary-scoped agent must not see.
+    // This is a closed set of server-authored literals about an action the
+    // platform took on this issue's own wake, which is exactly what a
+    // lower-privilege caller reaches this route to find out.
+    disposition: locklessDeferredWakeDisposition(row.error),
   };
 }
 
@@ -8732,6 +8765,20 @@ export function issueRoutes(
       res.status(400).json({
         error: "page/perPage/per_page pagination is not supported on this endpoint; use limit and offset instead",
         unsupportedParams: unsupportedPaginationParams,
+      });
+      return;
+    }
+    // BLO-40145: this endpoint implements no time-bound filter, so `updated_after`
+    // and friends were dropped unread — identical output to passing no filter at
+    // all. Reject instead of serving an unbounded corpus that reads as a bounded
+    // census; `GET /companies/:companyId/search?updatedAfter=` is the surface that
+    // actually applies one.
+    const unsupportedTimeFilterParams = parseUnsupportedTimeFilterParams(req.query);
+    if (unsupportedTimeFilterParams.length > 0) {
+      res.status(400).json({
+        error:
+          "time-bound filtering is not supported on this endpoint; the param was previously dropped unread and returned the whole corpus. Use GET /api/companies/:companyId/search with updatedAfter or updatedWithin, or sortField=id with afterId to walk rows by key.",
+        unsupportedParams: unsupportedTimeFilterParams,
       });
       return;
     }
