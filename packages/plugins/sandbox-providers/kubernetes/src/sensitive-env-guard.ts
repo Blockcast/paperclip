@@ -73,7 +73,7 @@ const SAFE_LITERAL_ENV_VALUES = new Map<string, ReadonlySet<string>>([
 
 /**
  * `*_FILE` vars hold a *path* to a mounted secret (e.g.
- * PAPERCLIP_GITHUB_TOKEN_FILE=/paperclip/.secrets/github-token/token). That is
+ * PAPERCLIP_GITHUB_TOKEN_FILE=/etc/paperclip/secrets/github-token/token). That is
  * the pattern we want people reaching for, so the guard must not push them off
  * it — but it must confirm the value really is a path, or the suffix becomes a
  * trivial bypass.
@@ -85,11 +85,16 @@ const PATH_POINTER_ENV_NAME = /_FILE$/;
  * these is refused: not because a path elsewhere is necessarily a credential,
  * but because the entire value of this check is that it stays narrow.
  *
- * `/paperclip/.secrets/` rather than `/paperclip/`: the latter is the whole
- * persistent data volume (`persistence.mountPath`), so it would admit every
- * workspace path under `/paperclip/instances/…`. The mounted-secret convention
- * is the `.secrets` subtree — see the `PAPERCLIP_GITHUB_TOKEN_FILE` default in
- * deploy/helm/paperclip/templates/statefulset.yaml.
+ * The convention is `/etc/paperclip/` — see the `PAPERCLIP_GITHUB_TOKEN_FILE`
+ * default in deploy/helm/paperclip/templates/statefulset.yaml. `/paperclip/.secrets/`
+ * is the location that convention replaced (BLO-40279: nesting the mount under
+ * `persistence.mountPath` let a CephFS re-mount hide it, leaving the pointer
+ * resolving to a fleet-writable directory). It stays in this list because the
+ * guard refuses an unrecognised root, and an out-of-repo pod spec may still pin
+ * a `*_FILE` value there; removing it would reject those outright. Note it is
+ * `/paperclip/.secrets/` and not `/paperclip/`: the latter is the whole
+ * persistent data volume, so it would admit every workspace path under
+ * `/paperclip/instances/…`.
  */
 const SECRET_MOUNT_ROOTS = [
   "/paperclip/.secrets/",

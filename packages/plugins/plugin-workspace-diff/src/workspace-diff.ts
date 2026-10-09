@@ -112,11 +112,24 @@ async function resolveWorkspacePaths(workspace: WorkspaceDiffTarget) {
   let repoRoot: string;
   try {
     repoRoot = (await runGit(cwd, ["rev-parse", "--show-toplevel"])).stdout.trim();
-  } catch {
+  } catch (error: unknown) {
+    // Quote git's own stderr: this message asserts something about the repo,
+    // and it is wrong whenever the probe itself was what failed (BLO-40279 —
+    // a hidden secret mount made the `git` wrapper exit 1 before git ran).
+    // Unlike heartbeat.ts's probe, runGit() above overrides no env, so the
+    // credential shim is still on this caller's PATH and that cause is live.
+    // Read `.message`, not `.stderr`: runGit() has already caught the exec
+    // failure and folded stderr into the message of a workspaceDiffError, so
+    // no raw `.stderr` property survives to reach this catch.
+    const raw = (error as Error)?.message ?? String(error);
+    // Truthiness, not `??`: for an empty message (runGit folds a whitespace-only
+    // stderr down to one), `"".split(/\r?\n/)[0]` is `""` — not `undefined` — so
+    // `??` never fires and the caller renders a bare "(git: )".
+    const gitError = raw.trim().split(/\r?\n/)[0]?.slice(0, 300) || "unknown git failure";
     throw workspaceDiffError(
       "non_git_workspace",
-      "Execution workspace path is not inside a git repository",
-      { workspaceId: workspace.id, cwd },
+      `Execution workspace path is not inside a git repository (git: ${gitError})`,
+      { workspaceId: workspace.id, cwd, gitError },
     );
   }
 

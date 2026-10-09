@@ -167,7 +167,7 @@ When adding endpoints:
 ## 9. GitHub Access From Agent Workspaces
 
 Agent pods authenticate to GitHub as the `allyblockcast[bot]` GitHub App
-installation. The token is mounted at `/paperclip/.secrets/github-token/token`
+installation. The token is mounted at `/etc/paperclip/secrets/github-token/token`
 and injected by the `gh` wrapper (`scripts/gh-token-wrapper.sh`) on every
 invocation. It is deliberately **not** exported into the shell environment, so
 `$GH_TOKEN` is empty in your terminal even though `gh` is fully authenticated.
@@ -211,7 +211,7 @@ shows up as a bare `remote: Permission ... denied to allyblockcast[bot]` /
 `403` on push, which reads like a missing grant but usually isn't one.
 
 A second credential is mounted fleet-wide at
-`/paperclip/.secrets/github-merge-token/token`: a classic PAT for the
+`/etc/paperclip/secrets/github-merge-token/token`: a classic PAT for the
 `allyblockcast` **user** account (scopes `repo, write:packages,
 delete:packages, admin:public_key`). It reaches 31 repos — 29 `Blockcast/*`
 plus 2 `allyblockcast/*` — with push access on 11 of them, including repos
@@ -226,16 +226,16 @@ already honor:
 
 ```bash
 # gh
-GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/github-merge-token/token)" \
+GH_SEAT_TOKEN_VALUE="$(cat /etc/paperclip/secrets/github-merge-token/token)" \
   gh pr create --repo allyblockcast/paperclip-adapter-claude-k8s --title "..." --body "..."
 
 # git push (same variable — the git credential helper reads it too)
-GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/github-merge-token/token)" \
+GH_SEAT_TOKEN_VALUE="$(cat /etc/paperclip/secrets/github-merge-token/token)" \
   git push https://github.com/allyblockcast/paperclip-adapter-claude-k8s.git HEAD:refs/heads/<branch>
 ```
 
 Confirm the target repo is actually in this token's reach before relying on
-it — e.g. `GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/github-merge-token/token)" gh api /user/repos --paginate --jq '.[].full_name'`
+it — e.g. `GH_SEAT_TOKEN_VALUE="$(cat /etc/paperclip/secrets/github-merge-token/token)" gh api /user/repos --paginate --jq '.[].full_name'`
 — rather than assuming every out-of-installation repo is covered. If it
 isn't, that's a real access gap: escalate rather than widening this PAT's
 use further.
