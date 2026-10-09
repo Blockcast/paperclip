@@ -226,10 +226,6 @@ defaultCompanyId: 11111111-1111-1111-1111-111111111111
 webhookTokenRef: "<secret reference for the bearer token Alertmanager sends>"
 acceptOnlyLabels:
   paperclip: "true"
-severityToPriority:
-  critical: critical
-  warning:  high
-  info:     medium
 autoCloseOnResolve: true
 ownerMap:
   class:
