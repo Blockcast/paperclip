@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import ts from "typescript";
 
 /**
  * PEN-3582 (carried from Ally's non-blocking review 1 on PR #2003).
@@ -161,82 +162,199 @@ describe("startup heartbeat dispatch cannot suppress stranded-issue reconciliati
   });
 });
 
-// PEN-3810. Bounds the whole startup recovery IIFE, not just the dispatch pair
-// above: the terminal `.catch()` message is the last thing in it.
-const IIFE_ANCHOR = "const startupHeartbeatRecovery = (async () => {";
-const TERMINAL_CATCH = '"startup heartbeat recovery failed"';
+/**
+ * PEN-3810. Bounds the whole startup recovery IIFE, not just the dispatch pair
+ * above.
+ *
+ * Asserted as a PROPERTY of the whole IIFE rather than as a list of the passes.
+ * A list would go stale the moment another pass is appended — and a pass
+ * appended unguarded is exactly the regression this exists to catch, so the
+ * stale-list version would be silent on the only case that matters.
+ *
+ * PEN-3897 (carried from Ally's non-blocking review on PR #2339). That review
+ * left three suggestions on this block, and all three were artefacts of
+ * matching source TEXT. They are answered by one mechanism rather than three
+ * patches: parse `index.ts` and assert the property against the syntax tree.
+ * The precedent for reaching for the compiler API in a guard test is
+ * `approval-payload-title-guard.test.ts`.
+ *
+ * What that buys, suggestion by suggestion:
+ *
+ *   - A `try` is only a guard if it CATCHES, and only if its handler does not
+ *     re-raise. The previous brace walk's entire guard test was
+ *     `openTryDepths.length === 0`; it never looked at the handler. So
+ *     `catch (err) { logger.error(...); throw err; }` read as guarded while
+ *     reinstating the exact cascade this file exists to pin — Ally confirmed
+ *     that by mutation on `reconcileTaskWatchdogs`, and it is re-confirmed by
+ *     mutation against THIS implementation. A handler is now checked for the
+ *     closed set of ways control leaves a function body — `throw` and `return`
+ *     — plus the one runtime escape that is neither (`process.exit`). That is a
+ *     closed set, not a keyword blacklist: there is no third syntactic way out
+ *     of a function. A `try`/`finally` carrying no `catch` does not contain a
+ *     rejection either, and is now rejected as well.
+ *   - Awaited passes are found by SHAPE, not by name, so a pass that is not a
+ *     `heartbeat.*` method is covered the moment one is added. Measured at
+ *     8bcb44c1: the previous `heartbeat.`-anchored regex, Ally's tolerant
+ *     variant of it, and an unanchored widening all match the identical 16
+ *     calls, and none of the 16 is a non-`heartbeat` call. So this closes a
+ *     PROSPECTIVE hole, and needs no allowlist — there is nothing to allow.
+ *   - The `>= 16` positive control can no longer be tripped by reformatting.
+ *     Splitting `await heartbeat.reconcileFailedWakeDispatches()` across lines
+ *     dropped the old regex's count to 15 and fired a control whose message
+ *     blamed the anchors; it does not change the tree.
+ *
+ * Out of scope deliberately: a promise that is TRACKED rather than awaited
+ * (`trackHeartbeatSchedulerWork(executionWorkspaceCleanup...)` at the tail of
+ * this IIFE) is not part of the serial flow and so cannot cascade into it, and
+ * it already carries its own `.catch()`. It is the correct pattern here, not an
+ * unguarded pass — which is why it is absent from the 16 above rather than an
+ * exception to them.
+ */
+const RECOVERY_IIFE_BINDING = "startupHeartbeatRecovery";
+
+// The closed set of ways a catch handler ends the startup sequence without
+// re-raising syntactically. `throw`/`return` are handled structurally below.
+const ESCAPE_CALLS = new Set(["process.exit", "process.abort"]);
 
 describe("every startup recovery pass is isolated from its siblings (PEN-3810)", () => {
-  /**
-   * Carried from Ally's non-blocking review 2 on PR #2234. PR #2234 guarded the
-   * dispatch pair; the passes behind it were still bare `await`s under the one
-   * terminal `.catch()`, so the first rejection skipped all of the rest. Ally
-   * named five; re-measuring found eight — `reconcileResolvedBlockerDependents`,
-   * `reconcileUndeliverableIssueMonitors` and `reconcileFailedWakeDispatches`
-   * were not in the review.
-   *
-   * Asserted as a PROPERTY of the whole IIFE rather than as a list of the eight.
-   * A list would go stale the moment a ninth pass is appended — and a pass
-   * appended unguarded is exactly the regression this exists to catch, so the
-   * stale-list version would be silent on the only case that matters.
-   */
-  const iifeStart = serverSource.indexOf(IIFE_ANCHOR);
-  const iifeEnd = iifeStart > -1 ? serverSource.indexOf(TERMINAL_CATCH, iifeStart) : -1;
+  const sourceFile = ts.createSourceFile(
+    "index.ts",
+    serverSource,
+    ts.ScriptTarget.Latest,
+    /* setParentNodes */ true,
+    ts.ScriptKind.TS,
+  );
 
-  // Comments are stripped before the brace walk: a `{` inside a comment would
-  // shift the depth counter and silently misclassify every pass after it.
-  const body = iifeStart > -1 && iifeEnd > iifeStart
-    ? serverSource
-      .slice(iifeStart, iifeEnd)
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/\/\/[^\n]*/g, "")
-    : "";
+  function collect<T extends ts.Node>(root: ts.Node, pred: (node: ts.Node) => node is T): T[] {
+    const out: T[] = [];
+    const visit = (node: ts.Node): void => {
+      if (pred(node)) out.push(node);
+      ts.forEachChild(node, visit);
+    };
+    visit(root);
+    return out;
+  }
 
-  it("has a locatable, unambiguous startup recovery IIFE", () => {
-    expect(iifeStart).toBeGreaterThan(-1);
-    expect(serverSource.indexOf(IIFE_ANCHOR)).toBe(serverSource.lastIndexOf(IIFE_ANCHOR));
-    expect(iifeEnd).toBeGreaterThan(iifeStart);
+  const isAsyncArrow = (node: ts.Node): node is ts.ArrowFunction =>
+    ts.isArrowFunction(node)
+    && node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) === true;
+
+  const bindings = collect(
+    sourceFile,
+    (node): node is ts.VariableDeclaration =>
+      ts.isVariableDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.name.text === RECOVERY_IIFE_BINDING,
+  );
+
+  // The async arrow inside that declaration's initializer. The initializer also
+  // contains the terminal `.catch((err) => ...)` arrow, but that one is not
+  // async — which is what makes this selection unambiguous rather than
+  // positional.
+  const asyncArrows = bindings.length === 1 ? collect(bindings[0], isAsyncArrow) : [];
+  const iife = asyncArrows.length === 1 ? asyncArrows[0] : null;
+
+  const normalize = (node: ts.Node): string => node.getText(sourceFile).replace(/\s+/g, "");
+
+  const enclosingFunction = (node: ts.Node): ts.Node | null => {
+    for (let p: ts.Node | undefined = node.parent; p; p = p.parent) {
+      if (
+        ts.isArrowFunction(p) || ts.isFunctionExpression(p)
+        || ts.isFunctionDeclaration(p) || ts.isMethodDeclaration(p)
+      ) return p;
+    }
+    return null;
+  };
+
+  // Only awaits whose nearest enclosing function IS the IIFE are part of its
+  // serial flow; one inside a nested callback rejects somewhere else entirely.
+  const passes = iife === null
+    ? []
+    : collect(iife, ts.isAwaitExpression)
+      .filter((await_) => enclosingFunction(await_) === iife)
+      .filter((await_) => ts.isCallExpression(await_.expression))
+      .map((await_) => ({
+        node: await_ as ts.Node,
+        name: normalize((await_.expression as ts.CallExpression).expression),
+      }));
+
+  // Nearest enclosing `try` whose TRY BLOCK contains the pass — a pass sitting
+  // in a `catch` or `finally` is not guarded by that statement.
+  const guardFor = (node: ts.Node): ts.TryStatement | null => {
+    for (let p: ts.Node | undefined = node.parent; p && p !== iife; p = p.parent) {
+      if (
+        ts.isTryStatement(p)
+        && node.getStart(sourceFile) >= p.tryBlock.getStart(sourceFile)
+        && node.getEnd() <= p.tryBlock.getEnd()
+      ) return p;
+    }
+    return null;
+  };
+
+  const escapesOf = (clause: ts.CatchClause): string[] => {
+    const found: string[] = [];
+    const visit = (node: ts.Node): void => {
+      // A `return` inside a nested callback returns from THAT callback, so a
+      // nested function body is not this handler's control flow. Documented
+      // limit: an escape hidden inside a synchronously-invoked callback is not
+      // seen. Every handler in this IIFE is a bare `logger` call, and the three
+      // measured mutations (`throw err;`, `return;`, `process.exit(1);`) are
+      // all direct statements, so this costs nothing today.
+      if (
+        ts.isArrowFunction(node) || ts.isFunctionExpression(node)
+        || ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)
+      ) return;
+      if (ts.isThrowStatement(node)) found.push("throw");
+      else if (ts.isReturnStatement(node)) found.push("return");
+      else if (ts.isCallExpression(node) && ESCAPE_CALLS.has(normalize(node.expression))) {
+        found.push(`${normalize(node.expression)}()`);
+      }
+      ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(clause.block, visit);
+    return found;
+  };
+
+  it("has exactly one locatable startup recovery IIFE", () => {
+    expect(bindings).toHaveLength(1);
+    expect(asyncArrows).toHaveLength(1);
+    expect(iife).not.toBeNull();
   });
 
-  it("runs every heartbeat recovery pass inside a failure guard", () => {
-    // Index of the `{` that opens each `try` block, so the brace walk below can
-    // tell a try-brace from any other brace at the same depth.
-    const tryBraces = new Set<number>();
-    const tryRe = /\btry\s*\{/g;
-    for (let m = tryRe.exec(body); m !== null; m = tryRe.exec(body)) {
-      tryBraces.add(m.index + m[0].length - 1);
-    }
-
-    const passes: { index: number; name: string }[] = [];
-    const awaitRe = /await\s+(heartbeat\.[A-Za-z0-9_$]+)\(/g;
-    for (let m = awaitRe.exec(body); m !== null; m = awaitRe.exec(body)) {
-      passes.push({ index: m.index, name: m[1] });
-    }
-
-    // Positive control: if the anchors or the regex ever stop matching, this
+  it("runs every awaited startup recovery pass inside a failure guard", () => {
+    // Positive control: if the binding or the walk ever stops matching, this
     // case must fail rather than pass vacuously against an empty pass list.
+    // Unlike the regex this replaced, the floor cannot be tripped by
+    // reformatting a call across lines — only by losing the IIFE or by
+    // deleting passes.
     expect(passes.length).toBeGreaterThanOrEqual(16);
-
-    const unguarded: string[] = [];
-    const openTryDepths: number[] = [];
-    let depth = 0;
-    let cursor = 0;
-    for (const pass of passes) {
-      for (; cursor < pass.index; cursor += 1) {
-        const ch = body[cursor];
-        if (ch === "{") {
-          depth += 1;
-          if (tryBraces.has(cursor)) openTryDepths.push(depth);
-        } else if (ch === "}") {
-          if (openTryDepths[openTryDepths.length - 1] === depth) openTryDepths.pop();
-          depth -= 1;
-        }
-      }
-      if (openTryDepths.length === 0) unguarded.push(pass.name);
-    }
 
     // Named rather than counted: the failure output should say WHICH pass lost
     // its guard, not just that one did.
+    const unguarded = passes.filter((pass) => guardFor(pass.node) === null).map((pass) => pass.name);
     expect(unguarded).toEqual([]);
+  });
+
+  it("lets no guard re-raise the failure it just caught", () => {
+    expect(passes.length).toBeGreaterThanOrEqual(16);
+
+    // Reported as two lists, not one: a handler that escapes and a `try` with
+    // no handler at all are different edits with different fixes, and the
+    // failure output should not conflate them.
+    const uncaught: string[] = [];
+    const escaping: string[] = [];
+    for (const pass of passes) {
+      const guard = guardFor(pass.node);
+      if (guard === null) continue; // already reported by the case above
+      if (guard.catchClause === undefined) {
+        uncaught.push(pass.name);
+        continue;
+      }
+      const escapes = escapesOf(guard.catchClause);
+      if (escapes.length > 0) escaping.push(`${pass.name} -> ${escapes.join(", ")}`);
+    }
+
+    expect(uncaught).toEqual([]);
+    expect(escaping).toEqual([]);
   });
 });
