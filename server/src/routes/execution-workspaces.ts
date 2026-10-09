@@ -179,7 +179,10 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     // leaves at all, the censoring decides what the surviving text may say. Composed in the
     // same order as the sibling route on `routes/agents.ts` — withhold first, censor the
     // projected result — so the censoring never runs over bytes the gate already removed.
-    const owners = await workspaceOperationsSvc.owningAgentIdsByRunId(operations.map((op) => op.heartbeatRunId));
+    const owners = await workspaceOperationsSvc.owningAgentIdsByRunId(
+      operations.map((op) => op.heartbeatRunId),
+      workspace.companyId,
+    );
     const projected = await withholdUnentitledWorkspaceOperationOutput(
       publicWorkspaceOperations(operations, viewer),
       owners,
