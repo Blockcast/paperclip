@@ -157,12 +157,14 @@ import {
   externalRuntimeReservations,
   issueApprovals,
   issueComments,
+  issueLabels,
   issuePlanDecompositions,
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
   issues,
   issueWorkProducts,
+  labels,
   projects,
   routineTriggers,
   projectWorkspaces,
@@ -372,7 +374,7 @@ import {
 } from "./issue-tree-control.js";
 import { RUN_STALE_SILENCE_MS } from "./issue-run-holding.js";
 import { describeSharedCheckoutOccupancy } from "./shared-checkout-occupancy.js";
-import { resolveProjectIdNeedingWorkspaceFallback, resolveWorkspaceWriterTreeKey } from "./workspace-writer-key.js";
+import { resolveProjectIdNeedingWorkspaceFallback, resolveWorkspaceWriterTreeKey, runUsesStatelessReviewWorkspace } from "./workspace-writer-key.js";
 import {
   countRunsOccupyingSlots,
   resolveAgentConcurrencyPolicy,
@@ -31961,6 +31963,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delete context[PAPERCLIP_WAKE_PAYLOAD_KEY];
     }
     const paperclipPrReview = derivePaperclipPrReview(context);
+    // BLO-42212: isolation asks a NARROWER question than `paperclipPrReview`
+    // answers -- "does this run write a shared tree", not "is this wake trusted
+    // webhook data about a PR". A hand-filed review row wakes `issue_assigned`,
+    // so `paperclipPrReview` is null for it and it serialized behind the shared
+    // `project_primary` writer with every other review on that tree. Widen the
+    // isolation predicate only; `paperclipPrReview` itself stays untouched
+    // because the reviewer-output gate trusts its `prAuthorLogin` as signed
+    // webhook data (BLO-9293).
+    //
+    // Read here rather than in `getIssueExecutionContext`: three other callers
+    // of that helper pass a full `issues` row positionally and none of them
+    // reads labels, so widening its row type breaks them for nothing. One
+    // indexed lookup (`issue_labels_issue_idx`), only when there is an issue.
+    const issueLabelNames = issueRef
+      ? await db
+          .select({ name: labels.name })
+          .from(issueLabels)
+          .innerJoin(labels, eq(labels.id, issueLabels.labelId))
+          .where(eq(issueLabels.issueId, issueRef.id))
+          .then((rows) => rows.map((row) => row.name))
+      : null;
+    const statelessPrReview = runUsesStatelessReviewWorkspace({
+      webhookPrReview: paperclipPrReview !== null,
+      issueLabelNames,
+    });
     const taskMarkdown = buildPaperclipTaskMarkdown({
       issue: issueRef
         ? {
@@ -32113,7 +32140,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // project tree it never touches would serialize unrelated agents for nothing.
     const useProjectWorkspace = requestedExecutionWorkspaceMode !== "agent_default";
     const projectIdNeedingWorkspaceFallback = resolveProjectIdNeedingWorkspaceFallback({
-      statelessPrReview: paperclipPrReview !== null,
+      statelessPrReview,
       issueProjectWorkspaceId: issueRef?.projectWorkspaceId ?? null,
       useProjectWorkspace,
       executionProjectId,
@@ -32124,7 +32151,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         )
       : null;
     const perIssueWorkspaceTreeKey = resolveWorkspaceWriterTreeKey({
-      statelessPrReview: paperclipPrReview !== null,
+      statelessPrReview,
       runResolvesToOwnTree,
       usesPerRunScope: executionWorkspaceUsesPerRunScopeForIssue,
       issue: issueRef
@@ -32136,7 +32163,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       adapterType: agent.adapterType,
       runId: run.id,
       agentId: agent.id,
-      statelessPrReview: paperclipPrReview !== null,
+      statelessPrReview,
       isWorkspaceIsolated: workspaceIsolationRequested,
       persistedExecutionWorkspaceId: plannedExecutionWorkspaceId,
       persistedWorkspaceExplicitlySelected: workspaceReuseRequest.existingExecutionWorkspaceAvailable,
@@ -33194,7 +33221,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       companyId: agent.companyId,
       agentId: agent.id,
       taskKey,
-      statelessPrReview: paperclipPrReview !== null,
+      statelessPrReview,
       executionWorkspace,
       persistedExecutionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
       isolationIdentity: k8sIsolationIdentity,
