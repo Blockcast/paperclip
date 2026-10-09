@@ -1490,12 +1490,30 @@ function carriesBlockingFeedback(text: string, options?: ActionableFeedbackOptio
  *     the same truncation carrying no such assertion — the shape above with
  *     every prior finding retired.
  */
-export type PrReviewNonActionableReason =
-  | "review_body_absent"
-  | "review_body_empty"
-  | "ally_review_findings_unenumerable"
-  | "ally_review_findings_all_zero"
-  | "review_no_blocking_feedback";
+/**
+ * The runtime value is the source of truth and the type is derived from it, so
+ * a test can enumerate the taxonomy instead of hand-copying it.
+ *
+ * Spelled this way rather than as a hand-written union because the delegation
+ * guard in github-webhook.test.ts asserts that its body set reaches every
+ * reason. Against a copied five-element literal that assertion matched the
+ * union by coincidence: adding a sixth member left it green with the new
+ * reason unreachable from any body — the "guard with no failing mutation"
+ * shape (BLO-34263) the guard itself exists to remove, recurring one level up.
+ * Derived from the const, a new member reds that test until a body selects it.
+ *
+ * So do not collapse this back into a bare union. Order is irrelevant (the
+ * assertion sorts); membership is the contract.
+ */
+export const PR_REVIEW_NON_ACTIONABLE_REASONS = [
+  "review_body_absent",
+  "review_body_empty",
+  "ally_review_findings_unenumerable",
+  "ally_review_findings_all_zero",
+  "review_no_blocking_feedback",
+] as const;
+
+export type PrReviewNonActionableReason = (typeof PR_REVIEW_NON_ACTIONABLE_REASONS)[number];
 
 /**
  * The actionability verdict plus the exact predicate that selected it.
