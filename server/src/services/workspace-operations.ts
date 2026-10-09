@@ -104,15 +104,32 @@ export function workspaceOperationService(db: Db) {
      * Returns only the ids it could resolve; a run whose row is gone, or whose
      * `agentId` is null, is simply absent, so there is one fail-closed shape
      * for the caller to handle instead of two.
+     *
+     * PEN-3895: `companyId` is a REQUIRED predicate, not an optional narrowing.
+     * This is the sole owner resolution feeding the transcript gate on all
+     * three workspace-operation read routes, so without it the gate's
+     * correctness rests on every caller having scoped its run ids beforehand
+     * rather than on the query itself. That discipline does hold at each call
+     * site today — the ids come from company-scoped lookups, and a foreign
+     * `agentId` would fail both `allow_self` and `isManagerOf` — so this is
+     * defence in depth rather than a live hole. It is required rather than
+     * optional so that the compiler, not review, is what stops a future caller
+     * from omitting it. Sibling run lookups such as `getRetrySuccessor` already
+     * carry the predicate explicitly; this was the outlier.
+     *
+     * A run belonging to another company is simply absent from the result,
+     * which the contract above already defines as withhold — so the added
+     * predicate fails closed in the same single shape, and adds no new branch
+     * for callers to handle.
      */
-    owningAgentIdsByRunId: async (runIds: (string | null)[]) => {
+    owningAgentIdsByRunId: async (runIds: (string | null)[], companyId: string) => {
       const unique = [...new Set(runIds.filter((id): id is string => typeof id === "string" && id.length > 0))];
       const owners = new Map<string, string>();
       if (unique.length === 0) return owners;
       const rows = await db
         .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId })
         .from(heartbeatRuns)
-        .where(inArray(heartbeatRuns.id, unique));
+        .where(and(inArray(heartbeatRuns.id, unique), eq(heartbeatRuns.companyId, companyId)));
       for (const row of rows) {
         if (row.agentId) owners.set(row.id, row.agentId);
       }
