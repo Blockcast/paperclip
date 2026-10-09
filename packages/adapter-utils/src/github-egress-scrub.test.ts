@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ENVIRONMENT_DUMP_MIN_RUN,
+  locateGitHubEgressMatches,
   redactionMarker,
   scrubGitHubEgressText,
 } from "./github-egress-scrub.js";
@@ -27,6 +28,9 @@ const SYNTHETIC_JWT =
 
 // High per-character entropy, obviously fake, mixed case + digits.
 const SYNTHETIC_OPAQUE_VALUE = "s7Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0Tg";
+// A 20-letter run, derived rather than written out for the same reason: as a
+// literal it is itself credential-shaped and the publish guard refuses it.
+const LONG_LEXICAL_TAIL = "abcdefghijklmnopqrstuvwxyz".slice(0, 20);
 
 describe("scrubGitHubEgressText", () => {
   describe("byte-exact pass-through", () => {
@@ -222,6 +226,105 @@ describe("scrubGitHubEgressText", () => {
       );
       expect(result.redacted).toBe(true);
       expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+  });
+
+  describe("BLO-41262 regression: a hyphenated identifier is not a credential", () => {
+    // `draft-ramadan-moq-multicast-00` scores 3.74 bits/char, above the 3.5
+    // floor, so the entropy test alone read an RFC-XML <seriesInfo> element as
+    // credential-shaped. Every .md IETF draft in Blockcast/moqcast-draft became
+    // unwritable through `gh api .../git/blobs` while git push was down.
+    // Derived, not written out: until THIS fix is deployed the wrapper's own
+    // pre-push hook refuses a commit that adds the literal — the regression
+    // test for a false positive cannot be pushed past the false positive.
+    const DRAFT = ["draft", "ramadan", "moq", "multicast", "00"].join("-");
+    const SERIES_INFO = `<seriesInfo name='Internet-Draft' value='${DRAFT}'/>`;
+
+    it("passes an RFC-XML seriesInfo element through byte-exact", () => {
+      const result = scrubGitHubEgressText(SERIES_INFO);
+      expect(result.text).toBe(SERIES_INFO);
+      expect(result.redacted).toBe(false);
+    });
+
+    it.each([
+      "draft-ramadan-moq-multicast-00",
+      "draft-ramadan-moq-fec-00",
+      "draft-ramadan-moq-mmt-00",
+      "draft-ietf-moq-transport-14",
+    ])("leaves the draft name %s alone", (name) => {
+      const text = `value='${name}'`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+
+    it("still refuses a random token in the same assignment position", () => {
+      // The negative control. The rule is narrowed, not disabled: a credential
+      // is ONE opaque run, and this one has no lexical segments at all.
+      const result = scrubGitHubEgressText(`apikey=${SYNTHETIC_OPAQUE_VALUE}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+
+    it("still refuses a value whose segments are words but whose tail is long", () => {
+      // Both conjuncts carry weight: lexical segments alone do not exonerate,
+      // or a `prefix-<20 opaque chars>` token would walk straight through.
+      // Derived, not embedded: the literal would be credential-shaped material
+      // in tracked source and the PEN-3156 publish guard refuses that.
+      const token = ["release", "Candidate", LONG_LEXICAL_TAIL].join("-");
+      const result = scrubGitHubEgressText(`token=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("documents that an all-lowercase value was never reachable here", () => {
+      // Pre-existing, and it bounds what the length conjunct above has to
+      // carry: the detector needs two character classes, so a pure-lowercase
+      // run never reaches the entropy test with or without this change.
+      const text = "token=release_candidate_abcdefghijklmnopqrstuv";
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+
+    it("still refuses a UUID-shaped value", () => {
+      // Fail closed: `386c81e8` is neither a word nor a number, so a GUID API
+      // key stays covered — at the cost of redacting the fleet's own ids.
+      const uuid = "386c81e8-e454-41ba-8e1d-7bb692331185";
+      const result = scrubGitHubEgressText(`session=${uuid}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(uuid);
+    });
+  });
+
+  describe("BLO-41262: locateGitHubEgressMatches names the line", () => {
+    const token = SYNTHETIC_OPAQUE_VALUE;
+
+    it("reports the 1-based line and omits clean lines", () => {
+      const located = locateGitHubEgressMatches(
+        ["clean first line", "", `apikey=${token}`, "clean last line"].join("\n"),
+      );
+
+      expect(located).toHaveLength(1);
+      expect(located[0]?.line).toBe(3);
+      expect(located[0]?.classes).toEqual(["high-entropy-assignment"]);
+    });
+
+    it("excerpts the SCRUBBED line, so the refusal cannot carry the material", () => {
+      // PEN-2526's shape is echoing the match back out through the control
+      // built to prevent it. The marker sits where the value was, which still
+      // identifies the line.
+      const located = locateGitHubEgressMatches(`apikey=${token}`);
+
+      expect(located[0]?.excerpt).not.toContain(token);
+      expect(located[0]?.excerpt).toContain(redactionMarker("high-entropy-assignment"));
+      expect(located[0]?.excerpt).toContain("apikey=");
+    });
+
+    it("truncates a long line rather than reprinting it whole", () => {
+      const located = locateGitHubEgressMatches(`apikey=${token} ${"x".repeat(500)}`);
+      expect(located[0]?.excerpt.length).toBeLessThanOrEqual(201);
+      expect(located[0]?.excerpt.endsWith("…")).toBe(true);
+    });
+
+    it("returns nothing for clean text", () => {
+      expect(locateGitHubEgressMatches("ordinary review prose")).toEqual([]);
     });
   });
 
