@@ -203,6 +203,22 @@ alert's last sample was 23:08Z, Alertmanager logged ~339 failed webhook
 notifications between 22:50Z and 23:30Z, and the ladder then claimed "Alert is
 still firing" at 23:42Z and reassigned a `critical` to the CTO at 00:12Z.
 
+The read uses Node's own `fetch`, not the host's `ctx.http`: the host's plugin
+fetch refuses any target that resolves only to private addresses (an SSRF
+guard), and the Alertmanager it must reach is a cluster-internal ClusterIP, so
+through `ctx.http` every read failed and the ladder silently fell back to
+"not verified". Each read is capped at 5s, memoised per alertname within one
+sweep pass, and the first transport failure (refused, timed out) is reused for
+the rest of that pass — so a hanging Alertmanager costs a sweep one timeout,
+not one per due issue.
+
+The Paperclip pods must also be allowed to reach that address. As read on
+2026-10-09 they are not: `monitoring` runs `default-deny-all` and admits
+ingress only from `gateway-system` and from inside the namespace, so a
+NetworkPolicy admitting the Paperclip namespace to `alertmanager:9093` is a
+deploy prerequisite (onprem-k8s). Without it the read times out and the ladder
+fails open as described above, at the cost of one 5s timeout per sweep.
+
 Leaving `alertmanagerApiUrl` unset is supported; the ladder then never claims
 liveness it did not read. The hold branch deliberately does **not** close or
 cancel the issue — an alert row is often the work ticket for the underlying fix
@@ -751,9 +767,15 @@ sibling that is still firing keeps the cover open. The "chain exhausted"
 comment sits behind the swap, so a **refused** swap posts no announcement for
 an alert that has already cleared. A swap that **succeeds** in that same window
 still can: the resolve is mid-delivery and has not stored `resolvedAt` yet, so
-the rung reads the alert as firing and posts "while alert remains firing" on
-the source issue. The cover is still closed by the resolve's post-commit
-cascade below, so the announcement is the only residue.
+the rung posts "Agent chain exhausted with this issue still open" on the source
+issue. Since BLO-40739 that announcement asserts nothing about the alert: it
+carries the liveness line — a timestamped live read, or an explicit "liveness
+NOT verified". And with `alertmanagerApiUrl` set, the liveness read runs before
+the cover is created, so an alert Alertmanager already reports clear *holds*
+the ladder instead of reaching this rung at all; what is left is a resolve that
+clears between that read and the swap, or an instance with no URL configured.
+The cover is still closed by the resolve's post-commit cascade below, so the
+announcement is the only residue.
 
 That compensation only fires when the swap is **refused**, which left one more
 interleaving open (BLO-33497). The webhook's cover cascade ran *before* it
