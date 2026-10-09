@@ -1014,3 +1014,173 @@ describe("BLO-20650 concurrent webhook + sweep on one alert-state record", () =>
     expect(store.read().escalationAttempt).toBe(0);
   });
 });
+
+/**
+ * BLO-40739 — the ladder used to assert "Alert is still firing" / "Alert
+ * remains firing" on every rung without ever reading alert state. Its only
+ * resolution signal is `state.resolvedAt`, written solely when Alertmanager
+ * DELIVERS a resolve webhook; that delivery is at-most-once, so a webhook
+ * outage turns `resolvedAt: null` from "still firing" into "we never heard".
+ *
+ * MUTATION GUARDS (2026-09-17 CEO ruling on guard tests). Each of these must go
+ * red when its guard alone is reverted — verified one mutation at a time:
+ *   - drop `state.resolvedAt` from the early-return  -> "never reassigns ... known-resolved"
+ *   - drop the `not-firing` early return             -> "holds the ladder ... no reassignment"
+ *   - restore the old liveness assertion wording     -> "states what it measured ..."
+ *   - drop the local alertname re-filter             -> "ignores an Alertmanager response ..."
+ *   - treat `suppressed` as not firing               -> "treats a suppressed alert as firing"
+ */
+describe("BLO-40739 alert-escalation liveness claims", () => {
+  const LIVENESS_ASSERTION = /\b(is|remains|still)\s+firing\b/i;
+
+  const due = (overrides: Partial<AlertStateRecord> = {}): AlertStateRecord => ({
+    paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null,
+    assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical",
+    firstSeenAt: "2026-07-11T00:00:00Z", lastFiredAt: "2026-07-11T00:10:00Z", resolvedAt: null,
+    nextEscalationAt: "2026-07-11T00:30:00Z", escalationAttempt: 0, ...overrides,
+  });
+
+  const withAlertmanager = (payload: unknown, ok = true) => ({
+    fetch: vi.fn(async () => ({ ok, status: ok ? 200 : 503, json: async () => payload })),
+  });
+
+  const amConfig = () => config({ alertmanagerApiUrl: "http://am.invalid:9093/" });
+  const bodies = (mocks: { issues: { createComment: ReturnType<typeof vi.fn> } }) =>
+    mocks.issues.createComment.mock.calls.map((call) => String(call[1]));
+
+  const amAlert = (state: string, alertname = "SyntheticAlert") => ({
+    labels: { alertname, severity: "critical" }, status: { state },
+  });
+
+  it("states what it measured instead of asserting the alert is firing, when liveness was not read", async () => {
+    const state = due();
+    const { ctx, mocks } = sweepContext(state);
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    const [body] = bodies(mocks);
+    expect(body).toContain("[alert-escalation 1/3]");
+    expect(body).not.toMatch(LIVENESS_ASSERTION);
+    expect(body).toContain("Alert liveness NOT verified");
+    // The measurement, not an adjective: the reader can judge staleness.
+    expect(body).toContain("last firing notification received 2026-07-11T00:10:00Z (50m ago)");
+  });
+
+  it("asserts firing only from a live read, and cites when that read happened", async () => {
+    const { ctx, mocks } = sweepContext(due());
+    (ctx as unknown as { http: unknown }).http = withAlertmanager([amAlert("active")]);
+    await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+
+    const [body] = bodies(mocks);
+    expect(body).toContain("read live from Alertmanager at 2026-07-11T01:00:00.000Z");
+    expect(body).toContain("state=active");
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds the ladder — no reassignment, no liveness claim — when Alertmanager says the alert is not firing", async () => {
+    // attempt 1 is the expensive rung: it reassigns a critical to a manager.
+    const state = due({ escalationAttempt: 1 });
+    const { ctx, mocks } = sweepContext(state);
+    (ctx as unknown as { http: unknown }).http = withAlertmanager([]);
+    await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.issues.requestWakeup).not.toHaveBeenCalled();
+    const [body] = bodies(mocks);
+    expect(body).toContain("[alert-escalation] Source alert is not firing");
+    expect(body).not.toMatch(LIVENESS_ASSERTION);
+    // Re-armed at the SAME rung, never completed: a ladder that completed here
+    // would stay dead for an alert that re-fires, because the lost resolve
+    // means `resolvedAt` is still null and a re-fire arrives as a dedup hit.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ escalationAttempt: 1, nextEscalationAt: "2026-07-11T01:30:00.000Z" }),
+      casArg(state),
+    );
+    const [[, written]] = mocks.state.set.mock.calls as unknown as [[unknown, AlertStateRecord]];
+    expect(written).not.toHaveProperty("escalationComplete", true);
+  });
+
+  it("posts the hold notice once, not once per minute-sweep", async () => {
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
+    (ctx as unknown as { http: unknown }).http = withAlertmanager([]);
+    mocks.issues.listComments = vi.fn(async () => [
+      { body: "[alert-escalation] Source alert is not firing — escalation held.\n\nRead from Alertmanager at ..." },
+    ]);
+    await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+  });
+
+  it("treats a suppressed alert as firing — inhibited or silenced is firing and merely not paging", async () => {
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
+    (ctx as unknown as { http: unknown }).http = withAlertmanager([amAlert("suppressed")]);
+    await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+    expect(bodies(mocks)[0]).toContain("state=suppressed");
+  });
+
+  it("ignores an Alertmanager response that did not honour the alertname filter", async () => {
+    // An AM that drops the filter returns the whole alert set, which would read
+    // as "firing" for every alertname on the cluster — a fail-open that
+    // silently restores the behaviour this guard removes.
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
+    (ctx as unknown as { http: unknown }).http = withAlertmanager([amAlert("active", "SomeOtherAlert")]);
+    await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(bodies(mocks)[0]).toContain("Source alert is not firing");
+  });
+
+  it("fails open when the Alertmanager read errors — an unreachable AM must not silence the ladder", async () => {
+    for (const http of [
+      { fetch: vi.fn(async () => { throw new Error("ECONNREFUSED"); }) },
+      withAlertmanager([], false),
+      withAlertmanager({ not: "an array" }),
+    ]) {
+      const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
+      (ctx as unknown as { http: unknown }).http = http;
+      await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+
+      expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+      const [body] = bodies(mocks);
+      expect(body).toContain("Alert liveness NOT verified");
+      expect(body).not.toMatch(LIVENESS_ASSERTION);
+    }
+  });
+
+  it("never reassigns, comments, or covers for a known-resolved alert", async () => {
+    // The pre-existing `state.resolvedAt` guard. AC2 of BLO-40739 depends on
+    // it and nothing pinned it before.
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, resolvedAt: "2026-07-11T00:20:00Z" }));
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it("carries the measurement onto the board cover too — title, description, and announcement", async () => {
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }), null);
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+
+    const [[created]] = mocks.issues.create.mock.calls as unknown as [[{ description: string }]];
+    expect(created.description).not.toMatch(LIVENESS_ASSERTION);
+    expect(created.description).toContain("Alert liveness NOT verified");
+    expect(bodies(mocks)[0]).not.toMatch(LIVENESS_ASSERTION);
+  });
+
+  it("does not auto-close, cancel, or reassign the alert issue in any liveness branch", async () => {
+    // AC3: the row count of non-terminal alert issues is unchanged by this fix.
+    for (const payload of [[], [amAlert("active")]]) {
+      const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
+      (ctx as unknown as { http: unknown }).http = withAlertmanager(payload);
+      await runAlertEscalationSweep(ctx, amConfig(), new Date("2026-07-11T01:00:00Z"));
+
+      const updates = mocks.issues.update.mock.calls as unknown as Array<[string, { status?: string }]>;
+      for (const [, patch] of updates) expect(["done", "cancelled"]).not.toContain(patch.status);
+    }
+  });
+});
