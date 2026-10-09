@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
 import { COVER_ORIGIN, escalationDeadlineMs, recordSourceResolvedAndCloseCovers, runAlertEscalationSweep } from "../escalation.js";
 import { handleFiring, handleResolved } from "../webhook-handler.js";
-import { DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
+import { BLOCKCAST_PHYSICAL_INFRA_AGENT_ID, DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
 import { ORIGIN_KIND } from "../types.js";
 import type { AlertmanagerAlert, AlertmanagerPluginConfig, AlertStateRecord } from "../types.js";
 
@@ -707,7 +707,12 @@ describe("BLO-15982 pod_pending route: 240-minute escalation deadline end-to-end
         // (BLO-20467 retry idempotency); empty = "no prior attempt".
         list: vi.fn(async () => []),
       },
-      agents: { get: vi.fn(async () => ({ status: "active" })) },
+      // BLO-26613: the route's agent must be invokable on the roster to be assigned.
+      agents: {
+        list: vi.fn(async () => [
+          { id: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID, companyId: "company-1", name: "Physical Infra", status: "active" },
+        ]),
+      },
       events: { emit: vi.fn() },
       activity: { log: vi.fn() },
       metrics: { write: vi.fn() },

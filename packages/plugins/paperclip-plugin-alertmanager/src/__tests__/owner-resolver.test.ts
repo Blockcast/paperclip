@@ -6,6 +6,7 @@ import {
   resolveOwnerEmail,
   resolveOwnerUserId,
 } from "../owner-resolver.js";
+import type { CompanyAgentRoster } from "../owner-resolver.js";
 import { DEFAULT_OWNER_MAP, BLOCKCAST_PLATFORM_SRE_AGENT_ID, STATE_KEYS } from "../constants.js";
 import type { AlertmanagerAlert, OwnerMap } from "../types.js";
 
@@ -760,62 +761,153 @@ describe("resolveFallbackAgentId", () => {
 });
 
 describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () => {
-  const mkAgentsCtx = (agent: { status: string } | null) => {
-    const agents = { get: vi.fn(async () => agent) };
+  type RosterAgent = { id: string; companyId: string; name: string; status: string; reportsTo?: string | null };
+  const mkAgent = (id: string, status: string, reportsTo?: string): RosterAgent => ({
+    id,
+    companyId: "company-1",
+    name: id,
+    status,
+    reportsTo: reportsTo ?? null,
+  });
+  const ALERT = { alertname: "DiskFull", severity: "critical" };
+  const mkAgentsCtx = (roster: RosterAgent[]) => {
+    const agents = { list: vi.fn(async () => roster) };
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const metrics = { write: vi.fn(async () => undefined) };
     return {
-      ctx: { agents, logger } as unknown as Parameters<
+      ctx: { agents, logger, metrics } as unknown as Parameters<
         typeof resolveInvokableAssigneeAgentId
       >[0],
       agents,
       logger,
+      metrics,
     };
   };
 
   it("returns undefined immediately when no agentId was resolved", async () => {
-    const { ctx, agents } = mkAgentsCtx(null);
-    expect(await resolveInvokableAssigneeAgentId(ctx, "company-1", undefined)).toBeUndefined();
-    expect(agents.get).not.toHaveBeenCalled();
+    const { ctx, agents, metrics } = mkAgentsCtx([]);
+    expect(
+      await resolveInvokableAssigneeAgentId(ctx, "company-1", undefined, ALERT),
+    ).toBeUndefined();
+    expect(agents.list).not.toHaveBeenCalled();
+    expect(metrics.write).not.toHaveBeenCalled();
   });
 
   it("passes through an invokable agent unchanged", async () => {
-    const { ctx } = mkAgentsCtx({ status: "idle" });
-    expect(await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-active")).toBe(
-      "agent-active",
+    const { ctx, agents, metrics } = mkAgentsCtx([mkAgent("agent-active", "idle")]);
+    expect(
+      await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-active", ALERT),
+    ).toBe("agent-active");
+    expect(agents.list).toHaveBeenCalledWith({ companyId: "company-1" });
+    expect(metrics.write).not.toHaveBeenCalled();
+  });
+
+  it("drops a paused agent, logs it, and counts the drop by reason", async () => {
+    const { ctx, logger, metrics } = mkAgentsCtx([mkAgent("agent-paused", "paused")]);
+    expect(
+      await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-paused", ALERT),
+    ).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("reason=paused"));
+    expect(metrics.write).toHaveBeenCalledWith("alertmanager.owner.assignee_dropped", 1, {
+      alertname: "DiskFull",
+      severity: "critical",
+      reason: "paused",
+    });
+  });
+
+  // Ally review 5471368783 I1: a status-only check passes these, and the wake
+  // path rejects them (`invalidOrgChain`), so they must be dropped here too.
+  it.each([
+    [
+      "a terminated manager",
+      [mkAgent("agent-x", "idle", "mgr"), mkAgent("mgr", "terminated")],
+    ],
+    // Production shape: the host's `agents.list` omits terminated agents, so a
+    // terminated manager arrives as a missing one.
+    ["a manager missing from the roster", [mkAgent("agent-x", "idle", "mgr-gone")]],
+    [
+      "a reporting cycle",
+      [mkAgent("agent-x", "idle", "agent-y"), mkAgent("agent-y", "active", "agent-x")],
+    ],
+  ])("drops an idle agent with an invalid org chain: %s", async (_label, roster) => {
+    const { ctx, metrics } = mkAgentsCtx(roster);
+    expect(
+      await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x", ALERT),
+    ).toBeUndefined();
+    expect(metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.assignee_dropped",
+      1,
+      expect.objectContaining({ reason: "invalid_org_chain" }),
     );
   });
 
-  it("drops a paused agent and logs it", async () => {
-    const { ctx, agents, logger } = mkAgentsCtx({ status: "paused" });
-    expect(await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-paused")).toBeUndefined();
-    expect(agents.get).toHaveBeenCalledWith("agent-paused", "company-1");
-    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("status=paused"));
+  it("drops an agent that is not on the roster (terminated agents are omitted)", async () => {
+    const { ctx, logger } = mkAgentsCtx([mkAgent("someone-else", "idle")]);
+    expect(
+      await resolveInvokableAssigneeAgentId(ctx, "company-1", "deleted-agent", ALERT),
+    ).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("reason=not_found"));
   });
 
-  it("drops an agent that no longer exists", async () => {
-    const { ctx, logger } = mkAgentsCtx(null);
-    expect(await resolveInvokableAssigneeAgentId(ctx, "company-1", "deleted-agent")).toBeUndefined();
-    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("status=not-found"));
+  it("labels an empty roster as a degraded read, not a wrong id", async () => {
+    const { ctx, metrics } = mkAgentsCtx([]);
+    expect(
+      await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x", ALERT),
+    ).toBeUndefined();
+    expect(metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.assignee_dropped",
+      1,
+      expect.objectContaining({ reason: "roster_empty" }),
+    );
   });
 
-  it("degrades to undefined, not a throw, when agents.get rejects", async () => {
+  it("degrades to undefined, not a throw, when the roster read rejects", async () => {
     // Same failure semantics as resolveOwnerUserId: an agents-RPC outage must
     // fall through the owner chain rather than fail the whole delivery.
-    const { ctx, agents, logger } = mkAgentsCtx(null);
-    agents.get.mockRejectedValueOnce(new Error("agents rpc unavailable"));
+    const { ctx, agents, logger, metrics } = mkAgentsCtx([]);
+    agents.list.mockRejectedValueOnce(new Error("agents rpc unavailable"));
     await expect(
-      resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x"),
+      resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x", ALERT),
     ).resolves.toBeUndefined();
     expect(logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("lookup-failed: Error: agents rpc unavailable"),
+      expect.stringContaining("reason=lookup_failed Error: agents rpc unavailable"),
+    );
+    // The free-form error stays in the log; the metric label stays bounded.
+    expect(metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.assignee_dropped",
+      1,
+      expect.objectContaining({ reason: "lookup_failed" }),
     );
   });
 
-  it.each(["terminated", "pending_approval"])(
+  it("still drops the agent when the drop metric itself fails to write", async () => {
+    const { ctx, metrics, logger } = mkAgentsCtx([mkAgent("agent-paused", "paused")]);
+    metrics.write.mockRejectedValueOnce(new Error("metrics down"));
+    await expect(
+      resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-paused", ALERT),
+    ).resolves.toBeUndefined();
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("metrics down"));
+  });
+
+  it("reads the roster through an injected loader when one is given", async () => {
+    const { ctx, agents } = mkAgentsCtx([]);
+    const loadRoster = vi.fn(
+      async () => [mkAgent("agent-active", "active")] as unknown as CompanyAgentRoster,
+    );
+    expect(
+      await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-active", ALERT, loadRoster),
+    ).toBe("agent-active");
+    expect(loadRoster).toHaveBeenCalledTimes(1);
+    expect(agents.list).not.toHaveBeenCalled();
+  });
+
+  it.each(["pending_approval", "unknown-status"])(
     "drops an agent with non-invokable status %s",
     async (status) => {
-      const { ctx } = mkAgentsCtx({ status });
-      expect(await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x")).toBeUndefined();
+      const { ctx } = mkAgentsCtx([mkAgent("agent-x", status)]);
+      expect(
+        await resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x", ALERT),
+      ).toBeUndefined();
     },
   );
 });
