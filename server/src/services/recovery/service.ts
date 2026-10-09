@@ -2579,7 +2579,7 @@ export function recoveryService(
     companyId: string,
     issueId: string,
   ): Promise<Date | null> {
-    const [row] = await db
+    const [row] = await timePassPhase("candidate.getLatestUnblockedAt", () => db
       .select({ createdAt: activityLog.createdAt })
       .from(activityLog)
       .where(
@@ -2592,7 +2592,7 @@ export function recoveryService(
         ),
       )
       .orderBy(desc(activityLog.createdAt))
-      .limit(1);
+      .limit(1));
     return row?.createdAt ?? null;
   }
 
@@ -3664,10 +3664,13 @@ export function recoveryService(
   }
 
   async function isInvocationBudgetBlocked(issue: typeof issues.$inferSelect, agentId: string) {
-    const budgetBlock = await budgets.getInvocationBlock(issue.companyId, agentId, {
-      issueId: issue.id,
-      projectId: issue.projectId,
-    });
+    const budgetBlock = await timePassPhase(
+      "candidate.invocationBudgetBlock",
+      () => budgets.getInvocationBlock(issue.companyId, agentId, {
+        issueId: issue.id,
+        projectId: issue.projectId,
+      }),
+    );
     return Boolean(budgetBlock);
   }
 
@@ -7657,6 +7660,43 @@ export function recoveryService(
   // totals stop being merely indicative.
   let activePassTimer: PassTimer | null = null;
 
+  /**
+   * Time one per-candidate round-trip against whichever pass is in flight, if any.
+   *
+   * PEN-3636. #2128 instrumented the sweep's PROLOGUE, and the 2026-10-09 post-deploy
+   * reading showed why that is not enough: across 8 production passes the named phases
+   * summed to only 36-65% of `elapsedMs`, and **the share FELL as the pass got slower**
+   * (64.6% on a 265 s pass, 35.8% on a 1,266 s one). Nearly all pass time is inside
+   * candidate spans (`candidates.totalMs` is within 0.3% of `elapsedMs`), so the
+   * unattributed remainder is real per-candidate work - ~350 ms/candidate on the slow
+   * passes, larger than every named phase combined - and it was invisible.
+   *
+   * The round-trips wrapped through this helper are each reachable from MANY branches
+   * (`getLatestUnblockedAt` from 13 via `latestRunPredatesLatestUnblock`), so wrapping
+   * the DEFINITION rather than the call sites is both the smaller diff and the only
+   * form that cannot silently miss a branch. That is the same shape
+   * `escalateStrandedAssignedIssue` already uses for its three lock/row phases, through
+   * this same `activePassTimer` handle.
+   *
+   * Two reading caveats, both consequences of attributing to a pass-scoped handle rather
+   * than to a per-call context:
+   *
+   * - `activePassTimer` is null outside a sweep and this is then a pass-through, so the
+   *   later chain passes cost nothing and record nothing. A phase appearing with FEWER
+   *   calls than `candidatesScanned` is expected on any branch-gated site - that is a
+   *   branch frequency, not a dropped sample. Only `candidate.getLatestUnblockedAt` and
+   *   `candidate.invocationBudgetBlock` are reached from more than one branch.
+   * - WARNING, and this is the direction that misleads: attribution is by WALL CLOCK, not
+   *   by caller. None of these four helpers is exported, but any future caller that
+   *   reaches one while a sweep is in flight is billed to that sweep. The inflation is
+   *   silent and reads as the sweep getting slower. If a phase's `calls` ever exceeds
+   *   `candidatesScanned`, that has happened - treat the excess as the signal, not as a
+   *   counting bug.
+   */
+  function timePassPhase<T>(phase: string, fn: () => Promise<T>): Promise<T> {
+    return activePassTimer ? activePassTimer.time(phase, fn) : fn();
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -9184,7 +9224,10 @@ export function recoveryService(
       // had just written to it.
       let adoptionHandover: AdoptionHandoverNeutralRecovery | null = null;
       if (isCheckoutAdoptionCancelledRun(newestIssueRun)) {
-        adoptionHandover = await resolveCheckoutAdoptionHandover(issue, newestIssueRun);
+        adoptionHandover = await timePassPhase(
+          "candidate.resolveCheckoutAdoptionHandover",
+          () => resolveCheckoutAdoptionHandover(issue, newestIssueRun),
+        );
         // Continuity (a live same-assignee adopter holds the lock) or the issue
         // vanished mid-sweep. Either way there is nothing to recover.
         if (!adoptionHandover) {
@@ -9679,7 +9722,10 @@ export function recoveryService(
         // sweep whatever error code it carries.
         const participantDependencyRefusalExpired =
           participantContinuationClassification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE &&
-          (dependencyReadiness ??= await issuesSvc.getDependencyReadiness(issue.id)).isDependencyReady;
+          (dependencyReadiness ??= await timePassPhase(
+            "candidate.getDependencyReadiness",
+            () => issuesSvc.getDependencyReadiness(issue.id),
+          )).isDependencyReady;
         const queuedParticipantRecovery = agentInvokable
           ? await hasQueuedExecutionReviewParticipantRecoveryWake(
               issue.companyId,
@@ -9986,9 +10032,12 @@ export function recoveryService(
           // would buy a fresher timestamp for a label and nothing else. Do not "fix" this
           // to `=` — that reinstates exactly the per-candidate query this change removed.
           if (assignmentContinuationClassification.errorCode === DEPENDENCY_BLOCKED_ERROR_CODE) {
-            dependencyReadiness ??= await issuesSvc
-              .listDependencyReadiness(issue.companyId, [issue.id])
-              .then((rows) => rows.get(issue.id) ?? null);
+            dependencyReadiness ??= await timePassPhase(
+              "candidate.listDependencyReadiness",
+              () => issuesSvc
+                .listDependencyReadiness(issue.companyId, [issue.id])
+                .then((rows) => rows.get(issue.id) ?? null),
+            );
           }
           const updated = await escalateStrandedAssignedIssue({
             issue,
@@ -10496,7 +10545,10 @@ export function recoveryService(
           // dependency-wait gate in `escalateStrandedAssignedIssue` can classify its
           // suppression from this read instead of repeating the same query for the same
           // issue under the per-issue advisory lock.
-          const readinessMap = await issuesSvc.listDependencyReadiness(issue.companyId, [issue.id]);
+          const readinessMap = await timePassPhase(
+            "candidate.listDependencyReadiness",
+            () => issuesSvc.listDependencyReadiness(issue.companyId, [issue.id]),
+          );
           const readiness = readinessMap.get(issue.id) ?? null;
           dependencyReadiness = readiness;
           if (readiness && !readiness.isDependencyReady) {
