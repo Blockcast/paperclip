@@ -980,7 +980,9 @@ unsound for humans**, which is why the second gate is now there.
 For agents it holds: `workspace_runtime:read` is unmapped in
 `permissionForAction` and deliberately absent from the same-company agent
 allow-list (PEN-2852, `services/authorization.ts`), so **no agent actor resolves
-it** — the body is withheld from every agent, owner or not. Reaching for a grant row is a dead end for two
+it** — the body is withheld from every agent, owner or not, before the
+transcript gate is even asked (the route resolves the owner only once the
+entitlement admits the reader). Reaching for a grant row is a dead end for two
 *independent* reasons: the action is unmapped, so the generic `permissionKey`
 fallback at the bottom of `decideBase` never fires for it — and
 `workspace_runtime:read` is not a `PermissionKey` at all, so there is no row to
@@ -1151,7 +1153,8 @@ one that had *neither* half of the control pair — no gate and no audit — unt
 BLO-34631 gave it both; its row is keyed `entity_type = workspace_operation` and
 carries the operation's owning run in `runId` — the only owner reference it
 records (no owning-agent id is written: the route resolves the owner only to
-decide the transcript gate, and does not record it). That `runId` is **`null`** for a workspace-scoped operation
+decide the transcript gate, and only once `workspace_runtime:read` admits the
+reader, and does not record it). That `runId` is **`null`** for a workspace-scoped operation
 that has no owning run, so a run pivot alone never sees those. See the sweep
 below.
 
