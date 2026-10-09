@@ -2446,10 +2446,16 @@ describe("buildJobManifest", () => {
       expect(command).toContain("__pcroot='/paperclip/.local/lib/paperclip-k8s-runtimes/claude-code'");
       // PEN-3714. The bootstrap runs in the Job's own shell, AFTER this manifest
       // has made the wrapper directory `PATH[0]`, so it is the last writer of
-      // PATH and the only place that ordering can be lost. It must put the
-      // pinned CLI ahead of the image's `claude` without overtaking the
-      // root-owned wrapper directory - the one control over `gh`/`git`/
-      // `github-mcp-server` that a write to the agent-writable PVC cannot reach.
+      // PATH in this bootstrap pipeline. It must put the pinned CLI ahead of
+      // the image's `claude` without overtaking the root-owned wrapper
+      // directory - the one control over `gh`/`git`/`github-mcp-server` whose
+      // contents a write to the agent-writable PVC cannot reach.
+      //
+      // It is not the last writer overall: the tool shells `claude` spawns
+      // source `$HOME/.bashrc` (BASH_ENV stub) and the `$HOME` zsh dotfiles
+      // (ZDOTDIR stubs), and HOME is on the agent-writable shared PVC, so a
+      // PATH prepend written there demotes the wrapper directory again. This
+      // change does not cover that later writer.
       expect(command).toContain(`PATH='/usr/local/libexec/paperclip/bin'":$__pcdir/node_modules/.bin:$PATH"`);
       // The fallback arm, for an image whose PATH never carried the wrappers.
       expect(command).toContain('PATH="$__pcdir/node_modules/.bin:$PATH"');
