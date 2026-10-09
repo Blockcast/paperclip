@@ -56,9 +56,11 @@ States: `reserved → launching → launched → release_pending → released`.
 `heartbeat_runs_release_external_runtime_reservation` trigger (migration
 `0128`) moves a `launching` or `launched` lease there when its run goes
 terminal, and a `reserved` lease (no Job yet) straight to `released`. Server
-code only reads the state, to finish the release once the Job is gone.
+code only reads `release_pending`, to finish the release once the Job is gone.
 `external-runtime-reservations.test.ts` asserts the cancelled-run case. So the
-release-pending gauges below are live signals, not structurally zero.
+release-pending gauges below are live signals, not structurally zero. The
+trigger knows nothing about the Job, so a `release_pending` lease may still own
+one that is terminating.
 
 Two partial-unique indexes do the actual containment:
 
@@ -66,7 +68,11 @@ Two partial-unique indexes do the actual containment:
   NULL` — the per-agent ceiling. Slots are dense from 0.
 - **`external_runtime_reservations_active_isolation_writer_idx` on `isolation_key`**, `WHERE released_at
   IS NULL AND isolation_key IS NOT NULL` — one writer per shared mutable
-  resource. That second clause is why an unbound row does not contend.
+  resource. The `IS NOT NULL` clause dates from `0130`, when a lease was
+  inserted with a NULL key and bound later. Since `0131` every unreleased lease
+  carries a key (the `pending` / `legacy` placeholders below), so today the
+  clause excludes nothing: an unreleased lease with no key is not a state you
+  will see.
 
 ### Two keys, and the column stores the second one
 
@@ -80,13 +86,39 @@ allowed to diverge (BLO-31443):
 
 **The `isolation_key` column stores `reservationKey`** (`heartbeat.ts`:
 `isolationKey: k8sIsolationIdentity.reservationKey`). When querying lease rows,
-match the last column below, not the third.
+match the last column of the table below — or one of the two placeholders —
+not the third.
 
-`isolation_mode` is one of `legacy | pending | shared | run | workspace`:
+`isolation_mode` is one of `legacy | pending | shared | run | workspace`. Two
+are placeholders that no branch of `resolveK8sRunIsolationIdentity` selects.
+Both key on the run, so neither can collide with a resource key:
 
-Rows are in branch order and the first match wins — in particular the
-persisted-workspace rows are evaluated **before** either ceiling row, so they
-outrank them whatever the ceiling is.
+- **`pending` / `pending:<runId>`** — every lease is born with it. Both claim
+  paths in `external-runtime-reservations.ts` (a fresh insert and the reuse of
+  a released row) write it, and `bindExternalRuntimeReservationIsolation`
+  replaces it with a value from the table. Binding happens before the lease
+  moves to `launching`, so a `reserved` row is where you will see it — and the
+  table will not match it.
+- **`legacy` / `legacy:<run_id>`** — the rolling-upgrade default. Migration
+  `0131` backfilled every unreleased NULL-mode lease to it, and its
+  `external_runtime_reservations_default_legacy_isolation` trigger does the
+  same for any lease a pre-`0131` server inserts without a mode. A legacy
+  lease names no resource, so the writer index cannot see what it writes; it
+  is fenced wholesale instead, in both directions (`run` mode is exempt from
+  both). The trigger refuses a new legacy lease while any unreleased `shared`
+  or `workspace` lease exists, raising `ERRCODE 23505` with
+  `CONSTRAINT = 'external_runtime_reservations_active_isolation_writer_idx'`;
+  and binding a lease to `shared` or `workspace` raises
+  `ExternalRuntimeIsolationConflictError` while any unreleased legacy lease
+  exists. **That 23505 is not a duplicate key** — there are no two rows
+  sharing an `isolation_key` to find. Look for the active `shared` /
+  `workspace` lease instead, and expect the error only while a pre-`0131`
+  server is still dispatching.
+
+The other three modes are what a lease holds after binding. Rows are in branch
+order and the first match wins — in particular the persisted-workspace rows are
+evaluated **before** either ceiling row, so they outrank them whatever the
+ceiling is:
 
 | selected when | mode | `isolationKey` | what lands in `isolation_key` |
 |---|---|---|---|
@@ -152,12 +184,17 @@ Exposed on `/metrics` (`server/src/services/metrics.ts`):
 | `paperclip_external_runtime_reservation_stranded_oldest_age_seconds` | stranded leases specifically (labelled; prefer this for alerting over the unlabelled gauge above) |
 | `paperclip_external_runtime_reservations_release_pending` / `paperclip_external_runtime_reservation_release_pending_oldest_age_seconds` (note: singular `reservation`) | teardown that started and did not finish |
 
-Direct reconciliation query — live Jobs with `active>0` should equal
-unreleased reservations minus `reserved` and `launching` (no Job yet on the
-normal path) minus
-`release_pending` (Job already reaped). A persistent mismatch is the signal that
-matters — and note that a stuck `reserved` row is a leaked slot, not a missing
-Job:
+Direct reconciliation query — compare live Jobs with `active>0` against
+unreleased reservations by state. Leave out only `reserved` and `launching` (no
+Job yet on the normal path); each `launched` lease should own a live Job.
+`release_pending` sits on **either side**, because the trigger writes it when
+the *run* goes terminal, with no knowledge of the Job: a lease whose Job is
+still terminating counts toward live Jobs, and one whose Job is gone but the
+reclaim sweep has not cleared it yet does not — that second case is the
+release-pending gauges above. So live Jobs should fall between the `launched`
+count and `launched + release_pending`. A persistent mismatch is the signal
+that matters — a `release_pending` lease whose Job stays `active` is a stuck
+teardown, and a stuck `reserved` row is a leaked slot, not a missing Job:
 
 ```sql
 SELECT state, count(*) FROM external_runtime_reservations
@@ -197,11 +234,17 @@ Other reasons seen at non-test call sites include `succeeded`, `completed`,
 list **cannot** be complete: `releaseExternalRuntimeReservation` takes
 `reason: string`, and the dominant call site passes the run's own
 `errorCode ?? outcome`, so the value set is open by construction and sourced
-from the adapter. Treat an unfamiliar value as a prompt to grep rather than as
-an anomaly. (`launch_failed` and `legacy_drained` are credible but unconfirmed
-— neither appears as a literal at any call site read for this document.)
+from the adapter. The `0128` trigger writes the column too: when a run goes
+terminal it sets `release_reason = COALESCE(release_reason, error_code,
+status)` on the run's unreleased lease, and the later release coalesces rather
+than overwrites, so for those leases the run's own `errorCode`, else its bare
+status, is the value that sticks. Treat an unfamiliar value as a prompt to grep
+rather than as an anomaly. (`launch_failed` and `legacy_drained` are credible
+but unconfirmed — neither appears as a literal at any call site read for this
+document.)
 
-Two traps. There is **no `timeout` reason** — the run *status* is `timed_out`.
+Two traps. There is **no `timeout` reason** — the run *status* is `timed_out`,
+and the trigger can write that status here verbatim.
 And an adapter error code such as `k8s_job_deleted_externally` reaches this
 column **both ways**: bare on the terminal-finalization path (the run's
 `errorCode` is passed straight through), and prefixed as
