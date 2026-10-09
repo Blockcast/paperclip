@@ -440,6 +440,7 @@ import {
   recordProcessLost,
   recordProcessLostLivenessNull,
   recordGithubReviewRequestDelivery,
+  recordWakeRedeliverySuppressed,
   recordGithubReviewRequestSuppressed,
   recordGithubReviewCompletion,
   GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
@@ -39985,6 +39986,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Tell the caller this was NOT a new queue, so it does not count a second
       // `queued` for a delivery already counted (see WakeSuppressionOutcome).
       if (suppression) suppression.alreadyDelivered = true;
+      recordWakeRedeliverySuppressed("already_delivered");
       // No new run was committed, so there is no post-commit dispatch work to
       // do here: whichever wake first delivered under this key owns that run's
       // lifecycle, and `resumeQueuedRuns` re-drives it if it is still queued.
@@ -40440,6 +40442,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         )
         .returning({ id: agentWakeupRequests.id });
       if (claimed.length === 0) {
+        recordWakeRedeliverySuppressed("claim_contended");
         logger.debug(
           { wakeupRequestId: row.id, agentId: row.agentId },
           "wake dispatch row was claimed by a concurrent reconciler pass; skipping (BLO-25726)",
@@ -40480,6 +40483,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
           .returning({ id: agentWakeupRequests.id });
         if (updated.length === 0) {
+          recordWakeRedeliverySuppressed("fence_lost");
           logger.warn(
             { wakeupRequestId: row.id, agentId: row.agentId },
             "wake dispatch claim expired and was reclaimed before this pass finished; discarding "
@@ -40615,6 +40619,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       } catch (err) {
         if (err instanceof WakeDispatchClaimLostError) {
+          recordWakeRedeliverySuppressed("claim_lost");
           logger.info(
             { wakeupRequestId: row.id, agentId: row.agentId },
             "wake dispatch lease was reclaimed before enqueue could commit; skipping stale redelivery (BLO-25726)",
