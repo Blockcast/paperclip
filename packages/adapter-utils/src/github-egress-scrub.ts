@@ -129,12 +129,20 @@ function shannonEntropyBitsPerChar(value: string): number {
  *  inside each run. */
 const LEXICAL_SEGMENT_RE = /^(?:[A-Za-z]+|[0-9]+)$/;
 
-/** Longest segment an identifier may carry and still be exonerated. Above
- *  this a single segment is long enough to be a credential on its own: 16
- *  random lowercase letters is ~75 bits. Chosen with room over the longest
- *  segment real identifiers use — `multicast` and `transport` are 9,
- *  `authentication` is 14. */
+/** Longest segment an identifier may carry and still be exonerated. This is
+ *  identifier HEADROOM, not a security bound: 16 random lowercase letters is
+ *  already ~75 bits, so a segment at the limit is a usable secret on its own.
+ *  What keeps the rule closed is the aggregate bound below. Chosen with room
+ *  over the longest segment real identifiers use — `multicast` and `transport`
+ *  are 9, `authentication` is 14. */
 const LEXICAL_SEGMENT_MAX_LENGTH = 16;
+
+/** Segments longer than this count as "long", and an exonerated value may hold
+ *  at most one. Without it the per-segment cap admits any NUMBER of ~75-bit
+ *  segments — two random 16-letter words joined by a hyphen (~150 bits) passed.
+ *  Real identifiers carry at most one long word: the longest segment of
+ *  `draft-ramadan-moq-multicast-00` and `draft-ietf-moq-transport-14` is 9. */
+const LEXICAL_LONG_SEGMENT_LENGTH = 10;
 
 /**
  * BLO-41262: a separator-delimited run of short words is an identifier, not a
@@ -146,10 +154,11 @@ const LEXICAL_SEGMENT_MAX_LENGTH = 16;
  *
  * The discriminator is structure, not vocabulary (no word list to drift): a
  * credential is ONE opaque run, so a value is exonerated only when every
- * separator-delimited segment is itself a plain word or number AND none is
- * long enough to be a token on its own. Both conjuncts carry weight —
- * `release-Candidate-<20 letters>` has lexical segments and is still refused
- * on the length of its tail.
+ * separator-delimited segment is itself a plain word or number, none is long
+ * enough to be a token on its own, AND at most one is long at all. Each
+ * conjunct carries weight — `release-Candidate-<20 letters>` has lexical
+ * segments and is still refused on the length of its tail, and two 16-letter
+ * words are refused on the count.
  *
  * Measured against 20k random values per shape: 0/20000 base64url-43,
  * 0/20000 alnum-40 and 0/20000 hex-40 are exonerated by this rule. A UUID
@@ -158,6 +167,8 @@ const LEXICAL_SEGMENT_MAX_LENGTH = 16;
 function isLexicalIdentifier(value: string): boolean {
   const segments = value.split(/[-._]/);
   if (segments.length < 2) return false;
+  const longSegments = segments.filter((s) => s.length > LEXICAL_LONG_SEGMENT_LENGTH).length;
+  if (longSegments > 1) return false;
   return segments.every(
     (segment) =>
       segment.length <= LEXICAL_SEGMENT_MAX_LENGTH && LEXICAL_SEGMENT_RE.test(segment),
@@ -288,7 +299,7 @@ export interface GitHubEgressMatchLocation {
   /**
    * The line AS SCRUBBED, truncated.
    *
-   * Safe to print by construction, and that is the whole reason it is the
+   * Safe to print for SINGLE-LINE classes, and that is the whole reason it is the
    * scrubbed line rather than the matched substring BLO-41262's acceptance
    * criterion asked for: echoing the raw match sends the material into agent
    * stderr and from there into run logs and whatever the agent pastes when it
@@ -298,6 +309,16 @@ export interface GitHubEgressMatchLocation {
    */
   excerpt: string;
 }
+
+/** Classes that suppress a REGION of the text rather than a match: a run of
+ *  environment assignments, or a PEM envelope (an unterminated one takes
+ *  everything to end of input). A per-line re-scan cannot reproduce that, so
+ *  when one fires no line is attributed at all — see
+ *  `locateGitHubEgressMatches`. */
+export const GITHUB_EGRESS_REGION_CLASSES: readonly GitHubEgressScrubClass[] = [
+  "private-key-block",
+  "environment-dump",
+];
 
 /** Longest excerpt reported. Long enough to carry an XML element or an
  *  assignment with its context, short enough that a minified line cannot turn
@@ -315,15 +336,22 @@ const EXCERPT_MAX_LENGTH = 200;
  * Only called on the refusal path, which is already failing, so the per-line
  * re-scan costs nothing in the common case.
  *
- * A class that only fires ACROSS lines — `environment-dump` needs a run of
- * five — has no single line and is absent here. The caller reports those
- * classes without a location rather than attributing them to a line.
+ * A class that suppresses a REGION — `environment-dump` (a run of five
+ * assignments) or `private-key-block` — has no single line, and worse, the
+ * lines underneath it are only protected by the whole-text pass: re-scanned
+ * one at a time, a line inside a dump that fires for its own reason would be
+ * echoed with only its own match removed, carrying the short assignments the
+ * dump rule exists to catch. So when any region class fires on the whole
+ * value this returns no locations at all, and the caller reports the classes
+ * without line attribution.
  */
 export function locateGitHubEgressMatches(input: string): GitHubEgressMatchLocation[] {
   if (typeof input !== "string" || input.length === 0) return [];
+  const whole = scrubGitHubEgressText(input);
+  if (whole.classes.some((cls) => GITHUB_EGRESS_REGION_CLASSES.includes(cls))) return [];
 
   const located: GitHubEgressMatchLocation[] = [];
-  const lines = input.split("\n");
+  const lines = input.split(/\r?\n/);
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i] as string;
     const scrubbed = scrubGitHubEgressText(line);

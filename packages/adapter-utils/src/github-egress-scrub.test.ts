@@ -253,7 +253,22 @@ describe("scrubGitHubEgressText", () => {
       "draft-ietf-moq-transport-14",
     ])("leaves the draft name %s alone", (name) => {
       const text = `value='${name}'`;
-      expect(scrubGitHubEgressText(text).text).toBe(text);
+      const result = scrubGitHubEgressText(text);
+      // `.text` alone would still pass if some other detector fired and left
+      // the bytes unchanged.
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+      expect(result.classes).toEqual([]);
+    });
+
+    it("refuses two long word-shaped segments: the aggregate bound", () => {
+      // Each segment is within the per-segment cap, but two ~75-bit segments
+      // are ~150 bits — a usable secret, and the per-segment cap alone admits
+      // any number of them. Derived, not embedded, like the tail above.
+      const token = ["Qwrtypsdfghjklzx", "mnbvcxzlkjhgfdsa"].join("-");
+      const result = scrubGitHubEgressText(`sessionkey=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
     });
 
     it("still refuses a random token in the same assignment position", () => {
@@ -325,6 +340,33 @@ describe("scrubGitHubEgressText", () => {
 
     it("returns nothing for clean text", () => {
       expect(locateGitHubEgressMatches("ordinary review prose")).toEqual([]);
+    });
+
+    it("attributes no line when a region class fires, so nothing inside the region is echoed", () => {
+      // A line inside an environment dump that also fires for its own reason
+      // used to be re-scanned alone and printed with only that match removed,
+      // carrying the short assignment the dump rule exists to catch.
+      const vendorKey = ["gh", "p_", "S7kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0TgAbCd"].join("");
+      const shortSecret = "s3cretpw";
+      const dump = [
+        "HOME=/root",
+        `TOKEN=${vendorKey} DB_PASS=${shortSecret}`,
+        "PATH=/usr/bin",
+        "LANG=C",
+        "SHELL=/bin/sh",
+      ].join("\n");
+      expect(scrubGitHubEgressText(dump).classes).toContain("environment-dump");
+
+      const located = locateGitHubEgressMatches(dump);
+      expect(located).toEqual([]);
+      expect(JSON.stringify(located)).not.toContain(shortSecret);
+    });
+
+    it("does not leave a carriage return on a CRLF excerpt", () => {
+      const located = locateGitHubEgressMatches(`clean\r\napikey=${token}\r\nclean`);
+      expect(located).toHaveLength(1);
+      expect(located[0]?.line).toBe(2);
+      expect(located[0]?.excerpt.endsWith("\r")).toBe(false);
     });
   });
 
