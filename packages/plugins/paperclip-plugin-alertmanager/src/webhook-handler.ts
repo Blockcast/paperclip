@@ -32,7 +32,7 @@ import {
   resolveFallbackAgentId,
   resolveInvokableAssigneeAgentId,
 } from "./owner-resolver.js";
-import type { FallbackOwnerResolution } from "./owner-resolver.js";
+import type { CompanyAgentRoster } from "./owner-resolver.js";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
 import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
 import {
@@ -683,7 +683,7 @@ const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
 
 /**
  * Aggregate keys this delivery has already spent a full wait budget on without
- * winning the claim. Scoped to one webhook delivery, like {@link FallbackOwnerMemo}
+ * winning the claim. Scoped to one webhook delivery, like {@link CompanyRosterMemo}
  * and for the same reason: a storm is the case that matters.
  *
  * The budget is per *call*, so without this a batch of N alerts costs N budgets
@@ -1442,6 +1442,7 @@ async function retrofitAggregateOwner(
   // the common case costs no extra RPC. `null` on the same-fingerprint re-fire
   // path, where a rebind can move the target out from under the row we read.
   known: IssueReference | null,
+  rosterMemo: CompanyRosterMemo | undefined,
 ): Promise<{ assigneeAgentId?: string; assigneeUserId?: string } | null> {
   // Resolution first: it is pure over labels/annotations/ownerMap, and the email
   // leg is a cached lookup. Gating the issue read behind it keeps an alertname
@@ -1457,8 +1458,24 @@ async function retrofitAggregateOwner(
   // Read the *row*, not the alert state record: a human may have assigned this
   // issue by hand, and the state record would not know.
   if (!issue || nonEmptyString(issue.assigneeAgentId ?? undefined)) return null;
-  const patch = assigneeAgentId
-    ? { assigneeAgentId }
+  // BLO-26613: the same invokability guard as creation. Without it, a row the
+  // creation guard deliberately left agent-less (an uninvokable owner-map agent
+  // dropped in favour of the route's human) is exactly the row this function
+  // fills in, so the very next re-fire would assign the dropped agent anyway.
+  // Checked only once the row is known to be agent-less, so a row that already
+  // has an agent costs no roster read.
+  const invokableAgentId = await resolveInvokableAssigneeAgentId(
+    ctx,
+    companyId,
+    assigneeAgentId,
+    {
+      alertname: alert.labels.alertname ?? "UnnamedAlert",
+      severity: alert.labels.severity ?? "unknown",
+    },
+    companyRosterLoader(ctx, companyId, rosterMemo),
+  );
+  const patch = invokableAgentId
+    ? { assigneeAgentId: invokableAgentId }
     : assigneeUserId && !nonEmptyString(issue.assigneeUserId ?? undefined)
       ? { assigneeUserId }
       : null;
@@ -1777,54 +1794,47 @@ function suppressionExpiryLabel(
 }
 
 /**
- * Per-delivery memo for the named-fallback owner lookup.
+ * Per-delivery memo for the company roster that owner resolution reads.
  *
- * `resolveFallbackAgentId` is one unwindowed `ctx.agents.list({ companyId })`,
- * and that call is not cheap on the host side: `server/src/services/agents.ts`
- * issues two full-table selects for the company (the filtered rows plus the org
- * chain) and then `hydrateAgentSpend`, which aggregates `costEvents` for the
- * current month. The fallback rung is also the *common* path — by BLO-20576's
- * own numbers most firing alerts resolve to no owner — so without a memo every
- * alert in a batch pays it, and a storm is exactly when the batch is largest
- * and the host is busiest.
+ * Both owner-chain checks need it: `resolveFallbackAgentId` for the named
+ * fallback, and `resolveInvokableAssigneeAgentId` (BLO-26613) to vet a
+ * route / owner-map / override agent before it is assigned. It is one
+ * unwindowed `ctx.agents.list({ companyId })`, and that call is not cheap on
+ * the host side: `server/src/services/agents.ts` issues two full-table selects
+ * for the company (the filtered rows plus the org chain) and then
+ * `hydrateAgentSpend`, which aggregates `costEvents` for the current month.
+ * Nearly every creation reaches one of the two checks, and a storm is exactly
+ * when the batch is largest and the host is busiest.
  *
- * The resolution is constant for a given `(companyId, fallbackAgentName)`
- * within a single `handleWebhook` call, so caching it there collapses N host
- * round-trips to one without changing any semantics. Scoping the memo to the
- * delivery (rather than the module) is what keeps it correct: a config edit or
- * an agent being paused takes effect on the very next delivery.
+ * The roster is constant for a given company within a single `handleWebhook`
+ * call, so caching it there collapses N host round-trips to one without
+ * changing any semantics. Scoping the memo to the delivery (rather than the
+ * module) is what keeps it correct: a config edit or an agent being paused
+ * takes effect on the very next delivery.
  */
-export type FallbackOwnerMemo = Map<string, Promise<FallbackOwnerResolution>>;
+export type CompanyRosterMemo = Map<string, Promise<CompanyAgentRoster>>;
 
-function resolveFallbackAgentIdMemoized(
-  ctx: Pick<PluginContext, "agents" | "logger">,
+function companyRosterLoader(
+  ctx: Pick<PluginContext, "agents">,
   companyId: string,
-  fallbackAgentName: string | undefined,
-  memo: FallbackOwnerMemo | undefined,
-): Promise<FallbackOwnerResolution> {
-  if (!memo) return resolveFallbackAgentId(ctx, companyId, fallbackAgentName);
-  // JSON-encoded pair rather than a naive `a + sep + b`: agent names are
-  // operator-supplied config, so any single-character separator could be
-  // embedded in a name to collide with another company's key.
-  const key = JSON.stringify([companyId, fallbackAgentName ?? ""]);
-  const cached = memo.get(key);
-  if (cached) return cached;
-  const pending = resolveFallbackAgentId(
-    ctx,
-    companyId,
-    fallbackAgentName,
-  ).catch((err: unknown) => {
-    // Evict on failure. A refusal (bad name / paused / ambiguous) resolves to a
-    // `refusal` value and IS cached — the underlying condition is stable for the
-    // delivery, whether or not it is permanent beyond it. A *throw* is a
-    // transient host fault, and caching it would let one failed `agents.list`
-    // poison every remaining alert in the batch, converting a blip that
-    // previously cost one alert into a whole-delivery failure.
-    memo.delete(key);
-    throw err;
-  });
-  memo.set(key, pending);
-  return pending;
+  memo: CompanyRosterMemo | undefined,
+): () => Promise<CompanyAgentRoster> {
+  return () => {
+    if (!memo) return ctx.agents.list({ companyId });
+    const cached = memo.get(companyId);
+    if (cached) return cached;
+    const pending = ctx.agents.list({ companyId }).catch((err: unknown) => {
+      // Evict on failure. A *throw* is a transient host fault, and caching it
+      // would let one failed `agents.list` poison every remaining alert in the
+      // batch, converting a blip that previously cost one alert into a
+      // whole-delivery failure. A resolved roster — even an empty one — is
+      // cached: it is what the host said for this delivery.
+      memo.delete(companyId);
+      throw err;
+    });
+    memo.set(companyId, pending);
+    return pending;
+  };
 }
 
 /**
@@ -1977,7 +1987,7 @@ export async function handleFiring(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
-  fallbackOwnerMemo?: FallbackOwnerMemo,
+  rosterMemo?: CompanyRosterMemo,
   fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
   fenceWedgedMemo?: AggregateFenceWedgedMemo,
 ): Promise<void> {
@@ -2438,6 +2448,7 @@ export async function handleFiring(
             firingToken,
             tracked.paperclipIssueId,
             null,
+            rosterMemo,
           );
           if (retrofit) {
             tracked = {
@@ -2664,6 +2675,8 @@ export async function handleFiring(
     : undefined;
   let createAssigneeAgentId: string | undefined;
   let createAssigneeUserId: string | undefined;
+  // One roster read shared by the assignee guard and the named-fallback leg.
+  const loadRoster = companyRosterLoader(ctx, companyId, rosterMemo);
   let assigneeResolutionSource = "aggregate-winner";
   let resolvedTarget = "(aggregate-winner)";
   if (!retainedIssue && !terminal) {
@@ -2673,11 +2686,17 @@ export async function handleFiring(
       resolution.source === "label-override" ||
       resolution.source === "annotation-override";
     // BLO-26613: never hand a new issue to an agent that can't act on it —
-    // see resolveInvokableAssigneeAgentId.
+    // see resolveInvokableAssigneeAgentId. Applied to the already-chosen agent,
+    // so precedence is decided first: a dropped *route* agent does not fall
+    // back to the owner-map agent — the route wins, and resolution goes
+    // straight to the human / named-fallback legs below (the fallback is
+    // invokability-checked in its own right).
     createAssigneeAgentId = await resolveInvokableAssigneeAgentId(
       ctx,
       companyId,
       ownerOverride ? assigneeAgentId : routeAssigneeAgentId ?? assigneeAgentId,
+      { alertname, severity },
+      loadRoster,
     );
     // Keyed off the post-guard id, so a dropped agent does not also discard a
     // resolvable human owner.
@@ -2697,11 +2716,11 @@ export async function handleFiring(
   const fallbackResolution =
     terminal || retainedIssue || createAssigneeAgentId || createAssigneeUserId
       ? undefined
-      : await resolveFallbackAgentIdMemoized(
+      : await resolveFallbackAgentId(
           ctx,
           companyId,
           config.fallbackAgentName,
-          fallbackOwnerMemo,
+          loadRoster,
         );
   const fallbackAssigneeAgentId = fallbackResolution?.agentId;
   const finalAssigneeAgentId = createAssigneeAgentId ?? fallbackAssigneeAgentId;
@@ -2867,6 +2886,7 @@ export async function handleFiring(
           firingToken,
           issue.id,
           issue,
+          rosterMemo,
         );
   const effectiveAssigneeUserId = created
     ? createAssigneeUserId ?? null
@@ -3591,10 +3611,10 @@ export async function handleWebhook(
   // payload was understood and routed. Claiming more than that is the exact
   // defect being fixed here, so it is stated rather than implied.
   let accepted = 0;
-  // Scoped to this delivery — see FallbackOwnerMemo. A storm is the case that
-  // matters: without it, every ownerless alert in the batch repeats the same
+  // Scoped to this delivery — see CompanyRosterMemo. A storm is the case that
+  // matters: without it, every alert in the batch repeats the same
   // company-wide agent lookup.
-  const fallbackOwnerMemo: FallbackOwnerMemo = new Map();
+  const rosterMemo: CompanyRosterMemo = new Map();
   // Same scope, same reason — see AggregateFenceWedgedMemo. Bounds the fence
   // wait at one budget per aggregate key per delivery instead of one per alert,
   // so a wedged fence stays O(1) in batch size on the failure path.
@@ -3716,7 +3736,7 @@ export async function handleWebhook(
           ctx,
           config,
           alert,
-          fallbackOwnerMemo,
+          rosterMemo,
           fenceWaitPolicy,
           fenceWedgedMemo,
         );

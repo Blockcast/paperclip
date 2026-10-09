@@ -181,7 +181,7 @@ const baseInput = (
 interface MockClients {
   state: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
   users: { get: ReturnType<typeof vi.fn>; findByEmail: ReturnType<typeof vi.fn> };
-  agents: { list: ReturnType<typeof vi.fn>; get: ReturnType<typeof vi.fn> };
+  agents: { list: ReturnType<typeof vi.fn> };
   issues: {
     list: ReturnType<typeof vi.fn>;
     get: ReturnType<typeof vi.fn>;
@@ -221,13 +221,16 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       findByEmail: vi.fn(async () => null),
     },
     agents: {
+      // BLO-26613: the assignee guard vets every resolved route / owner-map /
+      // override agent against this roster, so each agent a test expects to be
+      // assigned is on it, invokable and with a healthy (root) reporting chain.
+      // Tests for the guard itself override this.
       list: vi.fn(async () => [
-        { id: "agent-fallback", name: "Alert Fallback", status: "idle" },
+        { id: "agent-fallback", companyId: "company-1", name: "Alert Fallback", status: "idle" },
+        ...[BLOCKCAST_PHYSICAL_INFRA_AGENT_ID, "agent-override", "agent-multicast"].map(
+          (id) => ({ id, companyId: "company-1", name: id, status: "idle" }),
+        ),
       ]),
-      // Default every resolved agentId to invokable so tests written before
-      // BLO-26613's guard keep exercising the assignment path they intend to;
-      // tests for the guard itself override this.
-      get: vi.fn(async () => ({ status: "active" })),
     },
     issues: {
       list: vi.fn(async () => []),
@@ -1558,77 +1561,155 @@ describe("handleWebhook — firing first time", () => {
     expect(createArgs.assigneeAgentId).toBe("agent-override");
   });
 
+  // BLO-26613 guard roster: the named fallback, plus whichever route agent a
+  // test needs in a given state.
+  const guardRoster = (...extra: Array<{ id: string; status: string; reportsTo?: string }>) => [
+    { id: "agent-fallback", companyId: "company-1", name: "Alert Fallback", status: "idle" },
+    ...extra.map((agent) => ({ companyId: "company-1", name: agent.id, ...agent })),
+  ];
+  const physicalDiskAlert = (fingerprint: string) =>
+    baseAlert({
+      labels: {
+        alertname: "PhysicalInfraDiskReallocatedSectorsHigh",
+        severity: "warning",
+        class: "physical_infra_disk",
+      },
+      fingerprint,
+    });
+
   it("does not file a new issue on a paused route assignee (BLO-26613)", async () => {
     const { ctx, mocks } = mkCtx();
-    mocks.agents.get.mockImplementation(async (id: string) =>
-      id === "agent-paused" ? { id, status: "paused" } : { id, status: "active" },
-    );
+    mocks.agents.list.mockResolvedValue(guardRoster({ id: "agent-paused", status: "paused" }));
     const config = baseConfig({
       issueRouteMap: {
         class: { physical_infra_disk: { assigneeAgentId: "agent-paused" } },
       },
       ownerMap: {},
     });
-    const alert = baseAlert({
-      labels: {
-        alertname: "PhysicalInfraDiskReallocatedSectorsHigh",
-        severity: "warning",
-        class: "physical_infra_disk",
-      },
-      fingerprint: "physical-disk-paused",
-    });
 
-    await handleWebhook(ctx, config, true, baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }));
+    await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [physicalDiskAlert("physical-disk-paused")] }) }),
+    );
 
     const createArgs = mocks.issues.create.mock.calls[0][0];
     // Falls through to the (invokable) named fallback agent instead.
     expect(createArgs.assigneeAgentId).toBe("agent-fallback");
-    expect(mocks.agents.get).toHaveBeenCalledWith("agent-paused", "company-1");
+    expect(mocks.metrics.write).toHaveBeenCalledWith("alertmanager.owner.assignee_dropped", 1, {
+      alertname: "PhysicalInfraDiskReallocatedSectorsHigh",
+      severity: "warning",
+      reason: "paused",
+    });
+    // The guard and the fallback leg share one roster read per delivery.
+    expect(mocks.agents.list).toHaveBeenCalledTimes(1);
   });
 
+  // Ally review 5471368783 I1: `idle` passes a status-only check, but the wake
+  // path rejects an agent whose reporting chain is broken (`invalidOrgChain`).
   it.each([
-    [
-      "an owner-map human owner",
-      { assigneeAgentId: "agent-paused" },
-      { class: { physical_infra_disk: "carol@example.com" } },
-    ],
-    [
-      "the route's own human fallback",
-      { assigneeAgentId: "agent-paused", assigneeUserId: "user-carol" },
-      {},
-    ],
+    ["is terminated", [{ id: "agent-orphan", status: "idle", reportsTo: "mgr" }, { id: "mgr", status: "terminated" }]],
+    // Production shape: `agents.list` omits terminated agents entirely.
+    ["is missing from the roster", [{ id: "agent-orphan", status: "idle", reportsTo: "mgr-gone" }]],
   ])(
-    "keeps %s when the guard drops a paused route agent (BLO-26613)",
-    async (_label, route, ownerMap) => {
+    "does not assign an idle route agent whose manager %s (BLO-26613)",
+    async (_label, extra) => {
       const { ctx, mocks } = mkCtx();
-      mocks.agents.get.mockImplementation(async (id: string) =>
-        id === "agent-paused" ? { id, status: "paused" } : { id, status: "active" },
-      );
-      mocks.users.findByEmail.mockResolvedValueOnce({
-        id: "user-carol",
-        email: "carol@example.com",
-        name: "Carol",
-      });
+      mocks.agents.list.mockResolvedValue(guardRoster(...extra));
       const config = baseConfig({
-        issueRouteMap: { class: { physical_infra_disk: route } },
-        ownerMap,
-      });
-      const alert = baseAlert({
-        labels: {
-          alertname: "PhysicalInfraDiskReallocatedSectorsHigh",
-          severity: "warning",
-          class: "physical_infra_disk",
+        issueRouteMap: {
+          class: { physical_infra_disk: { assigneeAgentId: "agent-orphan" } },
         },
-        fingerprint: "physical-disk-paused-human",
+        ownerMap: {},
       });
 
-      await handleWebhook(ctx, config, true, baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }));
+      await handleWebhook(
+        ctx,
+        config,
+        true,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [physicalDiskAlert("physical-disk-orphan")] }) }),
+      );
 
-      const createArgs = mocks.issues.create.mock.calls[0][0];
-      expect(createArgs.assigneeUserId).toBe("user-carol");
-      expect(createArgs.assigneeAgentId).toBeUndefined();
+      expect(mocks.issues.create.mock.calls[0][0].assigneeAgentId).toBe("agent-fallback");
+      expect(mocks.metrics.write).toHaveBeenCalledWith(
+        "alertmanager.owner.assignee_dropped",
+        1,
+        expect.objectContaining({ reason: "invalid_org_chain" }),
+      );
     },
   );
+
+  it("CONTROL — assigns an idle route agent whose manager is healthy (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(
+      guardRoster({ id: "agent-managed", status: "idle", reportsTo: "mgr" }, { id: "mgr", status: "active" }),
+    );
+    const config = baseConfig({
+      issueRouteMap: {
+        class: { physical_infra_disk: { assigneeAgentId: "agent-managed" } },
+      },
+      ownerMap: {},
+    });
+
+    await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [physicalDiskAlert("physical-disk-managed")] }) }),
+    );
+
+    expect(mocks.issues.create.mock.calls[0][0].assigneeAgentId).toBe("agent-managed");
+  });
+
+  it("keeps an owner-map human owner when the guard drops a paused route agent (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(guardRoster({ id: "agent-paused", status: "paused" }));
+    mocks.users.findByEmail.mockResolvedValueOnce({
+      id: "user-carol",
+      email: "carol@example.com",
+      name: "Carol",
+    });
+    const config = baseConfig({
+      issueRouteMap: { class: { physical_infra_disk: { assigneeAgentId: "agent-paused" } } },
+      ownerMap: { class: { physical_infra_disk: "carol@example.com" } },
+    });
+
+    await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [physicalDiskAlert("physical-disk-paused-human")] }) }),
+    );
+
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.assigneeUserId).toBe("user-carol");
+    expect(createArgs.assigneeAgentId).toBeUndefined();
+  });
+
+  it("keeps the route's own human fallback when the guard drops a paused route agent (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(guardRoster({ id: "agent-paused", status: "paused" }));
+    const config = baseConfig({
+      issueRouteMap: {
+        class: {
+          physical_infra_disk: { assigneeAgentId: "agent-paused", assigneeUserId: "user-carol" },
+        },
+      },
+      ownerMap: {},
+    });
+
+    await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [physicalDiskAlert("physical-disk-paused-route-human")] }) }),
+    );
+
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.assigneeUserId).toBe("user-carol");
+    expect(createArgs.assigneeAgentId).toBeUndefined();
+  });
 
   it("lets explicit assignee overrides win over route assignees", async () => {
     const { ctx, mocks } = mkCtx();
@@ -2212,6 +2293,80 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
       }),
       FIRING_FENCE_ARG,
     );
+  });
+
+  // Ally review 5471368783 I2. The creation guard leaves exactly this row
+  // behind: `ownerMap` names an uninvokable agent, the route supplies a human,
+  // so the row is created human-owned and agent-null. Without the same guard
+  // here, the very next re-fire / aggregate join patches the dropped agent
+  // straight back in.
+  const uninvokableOwnerMapAlert = (fingerprint?: string) =>
+    baseAlert({
+      labels: { ...baseAlert().labels, class: "physical_infra_disk" },
+      ...(fingerprint ? { fingerprint } : {}),
+    });
+  const uninvokableOwnerMapConfig = () =>
+    baseConfig({
+      issueRouteMap: { class: { physical_infra_disk: { assigneeUserId: "user-carol" } } },
+      ownerMap: { class: { physical_infra_disk: "agent:agent-paused" } },
+    });
+  const pausedRoster = [
+    { id: "agent-fallback", companyId: "company-1", name: "Alert Fallback", status: "idle" },
+    { id: "agent-paused", companyId: "company-1", name: "agent-paused", status: "paused" },
+  ];
+
+  it("does not retrofit an uninvokable owner-map agent onto a re-fired row (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(pausedRoster);
+    mocks.state.get.mockResolvedValueOnce({ ...refireState, assigneeUserId: "user-carol" });
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-carol",
+    });
+
+    await handleWebhook(
+      ctx,
+      uninvokableOwnerMapConfig(),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [uninvokableOwnerMapAlert()] }) }),
+    );
+
+    expect(assigneePatches(mocks)).toEqual([]);
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.assignee_dropped",
+      1,
+      expect.objectContaining({ reason: "paused" }),
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: null, assigneeUserId: "user-carol" }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("does not retrofit an uninvokable owner-map agent when a new fingerprint joins the row (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(pausedRoster);
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-winner",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-carol",
+    }));
+
+    await handleWebhook(
+      ctx,
+      uninvokableOwnerMapConfig(),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({ alerts: [uninvokableOwnerMapAlert("second-member-paused")] }),
+      }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(assigneePatches(mocks)).toEqual([]);
   });
 
   it("CONTROL — a new fingerprint joining an already-owned aggregate row leaves its owner alone", async () => {
