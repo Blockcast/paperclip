@@ -144,38 +144,54 @@ function writeExecutable(dir, name, body) {
   return file;
 }
 
-function assertWrappersPrecedeSystemBin(pathValue, base) {
+function assertWrapperOrdering(pathValue, base) {
   const entries = pathValue.split(":");
   const systemIdx = entries.indexOf("/usr/bin");
   assert.notEqual(systemIdx, -1, "expected /usr/bin on PATH");
-  for (const dir of [IMAGE_WRAPPER_BIN, `${base}/.local/bin`, `${base}/bin`]) {
-    const idx = entries.indexOf(dir);
-    assert.notEqual(idx, -1, `expected ${dir} on PATH, got ${pathValue}`);
-    assert.ok(
-      idx < systemIdx,
-      `${dir} must precede /usr/bin, got ${pathValue}`,
-    );
-  }
-  // PEN-3713: the root-owned copy must win over the agent-writable PVC copies,
-  // not merely be present somewhere ahead of /usr/bin. Both generations are on
-  // PATH during the migration precisely so neither rollout order has a window,
-  // which makes their relative order the thing that decides which file runs.
-  for (const pvcDir of [`${base}/.local/bin`, `${base}/bin`]) {
-    assert.ok(
-      entries.indexOf(IMAGE_WRAPPER_BIN) < entries.indexOf(pvcDir),
-      `the root-owned ${IMAGE_WRAPPER_BIN} must precede the agent-writable ${pvcDir}, got ${pathValue}`,
-    );
-  }
+
+  // PEN-3840: the root-owned image directory is now the ONLY wrapper directory,
+  // so the invariant is absolute rather than relative. "Ahead of /usr/bin" was
+  // sufficient while a second, lower-priority wrapper generation existed to be
+  // ordered against; with one generation, anything in front of it resolves
+  // gh/git/github-mcp-server first. The property is that NOTHING precedes it.
+  assert.equal(
+    entries[0],
+    IMAGE_WRAPPER_BIN,
+    `the root-owned ${IMAGE_WRAPPER_BIN} must be first on PATH, got ${pathValue}`,
+  );
+
+  // The retired generation must be gone, not merely outranked: a PATH still
+  // carrying it would keep executing agent-writable copies wherever the files
+  // survive on the PVC.
+  assert.ok(
+    !entries.includes(`${base}/.local/bin`),
+    `the retired agent-writable ${base}/.local/bin must no longer be on PATH, got ${pathValue}`,
+  );
+
+  // ...and the tooling directory must survive the removal. Not a wrapper
+  // directory and not security-ordered, but kubectl/helm/yq/kyverno/chrome live
+  // there: dropping it alongside the wrapper entries is the silent collateral
+  // the wrapperBinDirs/toolingBinDir split exists to prevent.
+  const toolingIdx = entries.indexOf(`${base}/bin`);
+  assert.notEqual(
+    toolingIdx,
+    -1,
+    `the tooling directory ${base}/bin must stay on PATH, got ${pathValue}`,
+  );
+  assert.ok(
+    toolingIdx > 0 && toolingIdx < systemIdx,
+    `${base}/bin must sit behind the wrapper directory and ahead of /usr/bin, got ${pathValue}`,
+  );
 }
 
 // --- The invariant, under the chart's own defaults ------------------------
 
-test("default values put the seeded egress wrappers ahead of /usr/bin (workers)", () => {
+test("default values put the root-owned image wrappers first on PATH (workers)", () => {
   const rendered = render("templates/statefulset.yaml");
-  assertWrappersPrecedeSystemBin(containerPath(rendered), "/paperclip");
+  assertWrapperOrdering(containerPath(rendered), "/paperclip");
 });
 
-test("default values put the seeded egress wrappers ahead of /usr/bin (api tier)", () => {
+test("default values put the root-owned image wrappers first on PATH (api tier)", () => {
   // The API tier mounts the same RWX PVC, so it sees the same wrappers and
   // needs the same ordering.
   const rendered = render("templates/deployment-api.yaml", {
@@ -184,7 +200,7 @@ test("default values put the seeded egress wrappers ahead of /usr/bin (api tier)
       "persistence.existingClaim=paperclip-shared",
     ],
   });
-  assertWrappersPrecedeSystemBin(containerPath(rendered), "/paperclip");
+  assertWrapperOrdering(containerPath(rendered), "/paperclip");
 });
 
 test("the PATH follows persistence.mountPath rather than a hardcoded /paperclip", () => {
@@ -192,7 +208,7 @@ test("the PATH follows persistence.mountPath rather than a hardcoded /paperclip"
     set: ["persistence.mountPath=/data"],
   });
   const value = containerPath(rendered);
-  assertWrappersPrecedeSystemBin(value, "/data");
+  assertWrapperOrdering(value, "/data");
   // The image wrapper directory is a path inside the image and does not follow
   // the PVC; everything else must. Removing it before the check keeps this
   // assertion about relocation rather than about the substring "paperclip".
@@ -208,122 +224,70 @@ test("the PATH follows persistence.mountPath rather than a hardcoded /paperclip"
 
 // --- The end-to-end resolution the invariant exists to produce -------------
 
-test("a non-login shell resolves gh to the scrubbing wrapper under the default-values PATH", () => {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "gh-path-reach-"));
-  const localBin = path.join(base, ".local", "bin");
+// PEN-3840: these used to execute the seed's own publish step, so the test
+// failed if the seed stopped publishing onto the PATH-visible bin. The seed is
+// gone and there is nothing left to publish — the wrapper simply IS the file in
+// the image directory. So the substitution moves: the image wrapper directory
+// and /usr/bin are each redirected at a temp dir this test can populate, and
+// the ordering under test still comes from the render rather than being
+// restated here.
+function resolvesTo(tool) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), `${tool}-path-reach-`));
+  const wrapperBin = path.join(base, "image-wrapper-bin");
   const imageBin = path.join(base, "usr-bin");
-  for (const dir of [localBin, imageBin]) fs.mkdirSync(dir, { recursive: true });
+  for (const dir of [wrapperBin, imageBin]) fs.mkdirSync(dir, { recursive: true });
 
-  // Render the chart's defaults with the PVC relocated onto the temp dir, so the
-  // PATH and the publish step under test both address paths this test can
-  // actually create. Nothing about the ordering is restated here.
   const rendered = render("templates/statefulset.yaml", {
     set: [`persistence.mountPath=${base}`],
   });
 
-  // The scrubbing wrapper as the seed installs it, and the image CLI it must win
-  // against. Each announces itself so the winner is unambiguous.
-  writeExecutable(localBin, "gh", "#!/bin/sh\necho scrubbing-wrapper\n");
-  writeExecutable(imageBin, "gh", "#!/bin/sh\necho image-cli\n");
+  // Each announces itself, so the winner is unambiguous.
+  writeExecutable(wrapperBin, tool, "#!/bin/sh\necho scrubbing-wrapper\n");
+  writeExecutable(imageBin, tool, "#!/bin/sh\necho image-cli\n");
 
-  // Run the seed's own publish step rather than symlinking here, so this test
-  // fails if the seed stops publishing onto the PATH-visible bin.
-  const seeded = spawnSync(
-    "sh",
-    [
-      "-c",
-      [
-        "set -eu",
-        `BASE=${JSON.stringify(base)}`,
-        `LOCAL_BIN=${JSON.stringify(localBin)}`,
-        extractPathPublishFragment(rendered),
-      ].join("\n"),
-    ],
-    { encoding: "utf8" },
-  );
-  assert.equal(seeded.status, 0, seeded.stderr);
-
-  // The container PATH exactly as the chart renders it, with only the location
-  // of the image CLI substituted — /usr/bin on the test host holds no `gh`, and
-  // substituting in place preserves the ordering that is the thing under test.
   const containerPathValue = containerPath(rendered);
   assert.ok(
     containerPathValue.split(":").includes("/usr/bin"),
     "expected /usr/bin on the rendered PATH to substitute",
   );
+  assert.ok(
+    containerPathValue.split(":").includes(IMAGE_WRAPPER_BIN),
+    "expected the image wrapper directory on the rendered PATH to substitute",
+  );
   const testPath = containerPathValue
     .split(":")
-    .map((entry) => (entry === "/usr/bin" ? imageBin : entry))
+    .map((entry) => {
+      if (entry === "/usr/bin") return imageBin;
+      if (entry === IMAGE_WRAPPER_BIN) return wrapperBin;
+      return entry;
+    })
     .join(":");
 
   // /bin/sh by absolute path so the shell itself does not depend on the PATH
-  // under test — only the `gh` lookup inside it does.
-  const result = spawnSync("/bin/sh", ["-c", "gh"], {
+  // under test — only the lookup inside it does.
+  const result = spawnSync("/bin/sh", ["-c", tool], {
     encoding: "utf8",
     env: { PATH: testPath },
   });
-
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), "scrubbing-wrapper");
+  return result.stdout.trim();
+}
+
+test("a non-login shell resolves gh to the root-owned wrapper under the default-values PATH", () => {
+  assert.equal(resolvesTo("gh"), "scrubbing-wrapper");
 });
 
-// --- The publish guard on the `git` door (PEN-3156) -------------------------
-
+// PEN-3156: the publish guard on the `git` door needs the same reachability.
+// The regression this pins, measured in a live agent Job pod on 2026-09-10: a
+// `git` wrapper existed and was byte-identical to the chart, but nothing put it
+// on the PATH the pod actually carried, so `command -v git` gave /usr/bin/git
+// and the guard was a choke point nothing traversed.
 test("a non-login shell resolves git to the publish-guarding wrapper", () => {
-  // The regression this pins, measured in a live agent Job pod on 2026-09-10:
-  // ${LOCAL_BIN}/git existed and was byte-identical to the chart, but the pod's
-  // PATH carried /paperclip/bin without /paperclip/.local/bin and nothing
-  // published git into the former — so `command -v git` gave /usr/bin/git and
-  // any guard in the wrapper was a choke point nothing traversed. `gh` had the
-  // same defect and PEN-2527 fixed it with a symlink; git never got one.
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "git-path-reach-"));
-  const localBin = path.join(base, ".local", "bin");
-  const imageBin = path.join(base, "usr-bin");
-  for (const dir of [localBin, imageBin]) fs.mkdirSync(dir, { recursive: true });
-
-  const rendered = render("templates/statefulset.yaml", {
-    set: [`persistence.mountPath=${base}`],
-  });
-
-  writeExecutable(localBin, "git", "#!/bin/sh\necho guarding-wrapper\n");
-  writeExecutable(imageBin, "git", "#!/bin/sh\necho image-git\n");
-
-  // Run the seed's own publish step, so this fails if the seed stops publishing
-  // git rather than merely if a symlink is missing.
-  const seeded = spawnSync(
-    "sh",
-    [
-      "-c",
-      [
-        "set -eu",
-        `BASE=${JSON.stringify(base)}`,
-        `LOCAL_BIN=${JSON.stringify(localBin)}`,
-        extractPathPublishFragmentThroughGit(rendered),
-      ].join("\n"),
-    ],
-    { encoding: "utf8" },
-  );
-  assert.equal(seeded.status, 0, seeded.stderr);
-
-  const containerPathValue = containerPath(rendered);
-  const testPath = containerPathValue
-    .split(":")
-    .map((entry) => (entry === "/usr/bin" ? imageBin : entry))
-    .join(":");
-
-  const result = spawnSync("/bin/sh", ["-c", "git"], {
-    encoding: "utf8",
-    env: { PATH: testPath },
-  });
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), "guarding-wrapper");
+  assert.equal(resolvesTo("git"), "scrubbing-wrapper");
 });
 
-test("the seeded git wrapper routes through the egress runtime, inside the token wrapper", () => {
-  const rendered = render("templates/statefulset.yaml", {});
-  const match = /cat > "\$\{LOCAL_BIN\}\/git" <<'EOF'\n([\s\S]*?)\n[ \t]*EOF/.exec(rendered);
-  assert.notEqual(match, null, "the seed no longer writes a git wrapper");
-  const body = match[1];
+test("the git wrapper routes through the egress runtime, inside the token wrapper", () => {
+  const body = wrapperBody("git");
 
   assert.match(
     body,
@@ -397,58 +361,62 @@ test("a PATH entry in env.extra is rejected rather than silently overriding the 
   assert.match(stderr, /env\.extra must not define PATH/);
 });
 
-test("an env.path override that drops a wrapper directory is rejected", () => {
-  const stderr = renderExpectingFailure([
-    "env.path=/usr/local/bin:/usr/bin:/bin",
-  ]);
-  assert.match(stderr, /must include the Paperclip GitHub egress wrapper/);
-});
-
-test("an env.path override that orders a wrapper directory after /usr/bin is rejected", () => {
-  const stderr = renderExpectingFailure([
-    `env.path=/usr/bin:${IMAGE_WRAPPER_BIN}:/paperclip/.local/bin:/paperclip/bin`,
-  ]);
-  assert.match(stderr, /must place the Paperclip GitHub egress wrapper/);
-});
-
-// PEN-3713. The override that would silently reinstate the defect: every
-// directory the guard knew about before this change is present and correctly
-// ordered, and only the root-owned one is missing — so `gh` resolves to a
-// wrapper uid 1000 can rewrite while every pre-PEN-3713 assertion stays green.
-test("an env.path override that drops the root-owned image wrapper directory is rejected", () => {
-  const stderr = renderExpectingFailure([
-    "env.path=/paperclip/.local/bin:/paperclip/bin:/usr/bin:/bin",
-  ]);
-  assert.match(stderr, /must include the Paperclip GitHub egress wrapper/);
+test("an env.path override that drops the wrapper directory is rejected", () => {
+  const stderr = renderExpectingFailure(["env.path=/usr/local/bin:/usr/bin:/bin"]);
+  assert.match(stderr, /must BEGIN with the Paperclip GitHub egress wrapper/);
   assert.match(stderr, /\/usr\/local\/libexec\/paperclip\/bin/);
 });
 
-// PEN-3713, the same silent reinstatement reached by reordering rather than
-// omission. Every directory is present and every one precedes /usr/bin, so each
-// per-directory check passes — but `gh` resolves to the first match, and that is
-// the PVC copy uid 1000 can rewrite. This rendered green until the order check
-// landed; the assertion at the top of this file stating that relative order is
-// "the thing that decides which file runs" was only ever exercised against
-// correctly-ordered inputs.
-test("an env.path override that puts the PVC wrapper directories ahead of the root-owned one is rejected", () => {
+test("an env.path override that orders the wrapper directory after /usr/bin is rejected", () => {
   const stderr = renderExpectingFailure([
-    `env.path=/paperclip/.local/bin:/paperclip/bin:${IMAGE_WRAPPER_BIN}:/usr/bin:/bin`,
+    `env.path=/paperclip/bin:/usr/bin:${IMAGE_WRAPPER_BIN}`,
   ]);
-  assert.match(stderr, /must keep the Paperclip GitHub egress wrapper/);
-  assert.match(stderr, /\/usr\/local\/libexec\/paperclip\/bin/);
+  assert.match(stderr, /must BEGIN with the Paperclip GitHub egress wrapper/);
 });
 
-// A positive control for the four rejections above: the validation has to
-// discriminate, not refuse everything. Without this, a helper that failed
+// PEN-3840, the override this change had to grow a new guard to reject.
+//
+// Reducing wrapperBinDirs to a single entry silently retired the relative-order
+// check: with two generations listed, "keep them in declared order" was what
+// stopped an override from putting the agent-writable copy first, and with one
+// entry that check passes vacuously. So this PATH — which names the image
+// directory, keeps it ahead of /usr/bin, and keeps the tooling directory —
+// satisfied every per-directory check the chart had, while resolving `gh` to a
+// directory uid 1000 can rewrite. It is the exact defect PEN-3713 fixed,
+// reachable again through configuration alone.
+test("an env.path override that prepends an agent-writable directory is rejected", () => {
+  const stderr = renderExpectingFailure([
+    `env.path=/paperclip/.local/bin:${IMAGE_WRAPPER_BIN}:/paperclip/bin:/usr/bin:/bin`,
+  ]);
+  assert.match(stderr, /must BEGIN with the Paperclip GitHub egress wrapper/);
+  assert.match(stderr, /\/paperclip\/\.local\/bin/);
+});
+
+// PEN-3840's other new guard, and the landmine the card warned about: dropping
+// /paperclip/bin from wrapperBinDirs takes it off PATH entirely unless the
+// chart adds it back deliberately, and the wrapper guard cannot notice — it
+// only validates directories something still declares. Without this check the
+// render succeeds and the server pod silently loses kubectl, helm, yq, kyverno
+// and google-chrome.
+test("an env.path override that drops the tooling directory is rejected", () => {
+  const stderr = renderExpectingFailure([
+    `env.path=${IMAGE_WRAPPER_BIN}:/usr/local/bin:/usr/bin:/bin`,
+  ]);
+  assert.match(stderr, /must include the Paperclip tooling directory/);
+  assert.match(stderr, /\/paperclip\/bin/);
+});
+
+// A positive control for the rejections above: the validation has to
+// discriminate, not refuse everything. Without this, a guard that failed
 // unconditionally would pass all four.
-test("an env.path override that keeps the wrappers first is accepted", () => {
+test("an env.path override that keeps the wrapper directory first is accepted", () => {
   const rendered = render("templates/statefulset.yaml", {
     set: [
-      `env.path=${IMAGE_WRAPPER_BIN}:/paperclip/.local/bin:/paperclip/bin:/opt/custom/bin:/usr/bin:/bin`,
+      `env.path=${IMAGE_WRAPPER_BIN}:/paperclip/bin:/opt/custom/bin:/usr/bin:/bin`,
     ],
   });
   const value = containerPath(rendered);
-  assertWrappersPrecedeSystemBin(value, "/paperclip");
+  assertWrapperOrdering(value, "/paperclip");
   assert.ok(value.includes("/opt/custom/bin"), "override must be honored");
 });
 
@@ -463,7 +431,7 @@ test("the Blockcast overlay renders the PATH the chart now derives", () => {
   });
   assert.equal(
     containerPath(rendered),
-    `${IMAGE_WRAPPER_BIN}:/paperclip/.local/bin:/paperclip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
+    `${IMAGE_WRAPPER_BIN}:/paperclip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
   );
 });
 
@@ -479,28 +447,21 @@ test("the Blockcast overlay renders the PATH the chart now derives", () => {
 // Same discipline as above: read both halves out of the render, and never
 // restate the value under test.
 //
-// One asymmetry worth naming rather than fixing here: the `gh` door's
-// reachability follows `persistence.mountPath` (see the test above), whereas
-// both the MCP wrapper's inner exec and the seeded command hardcode
-// `/paperclip/.local/bin`. That coupling predates PEN-3152 — the wrapper it
-// replaced hardcoded the same path — and the two halves hardcode it
-// consistently, so it holds at the default mountPath. The assertions below pin
-// the current reality; they are not an endorsement of the hardcode.
+// PEN-3840 resolved an asymmetry that used to live here: the MCP wrapper's
+// inner exec and the seeded command both hardcoded `/paperclip/.local/bin`,
+// which held only at the default mountPath, while the `gh` door's reachability
+// followed persistence.mountPath. Both now name the image directory, which is a
+// path inside the image and correctly does NOT follow the PVC.
 
-// One wrapper's heredoc body, lifted from the rendered seed script. Asserts
-// rather than returning empty, so deleting a wrapper fails loudly.
-function extractWrapperBody(rendered, name) {
-  const lines = rendered.split("\n");
-  const startIdx = lines.findIndex(
-    (line) => line.trim() === `cat > "\${LOCAL_BIN}/${name}" <<'EOF'`,
-  );
-  assert.notEqual(startIdx, -1, `seed script no longer writes a ${name} wrapper`);
-  const body = [];
-  for (let i = startIdx + 1; i < lines.length; i += 1) {
-    if (lines[i].trim() === "EOF") return body.join("\n");
-    body.push(lines[i].trim());
-  }
-  throw new Error(`${name} wrapper heredoc is not terminated`);
+// PEN-3840: one wrapper's body, read from docker/github-wrappers/ — which is
+// now the ONLY generation, and the thing the Dockerfile COPYs into the image.
+// This used to lift the body out of the rendered seed heredoc; with the seed
+// deleted there is no rendered copy, and reading the shipped file is strictly
+// closer to what executes.
+function wrapperBody(name) {
+  return fs
+    .readFileSync(path.join(repoRoot, "docker/github-wrappers", name), "utf8")
+    .trimEnd();
 }
 
 // The `github` upstream's command as the seeded .mcp.json carries it.
@@ -510,35 +471,38 @@ function seededMcpGitHubCommand(rendered) {
   return match[1];
 }
 
-// PEN-3713 deliberately does NOT move this one wrapper, and the test exists to
-// keep the next editor from "finishing the job" and taking the fleet down.
+// PEN-3713 deliberately did NOT move this one wrapper, and PEN-3840 is the
+// change that discharges that deferral. Both directions matter, so read why
+// before flipping it back.
 //
-// The seed runs in the SERVER pod. The .mcp.json it writes is consumed by agent
-// Job pods running a different image, pinned by `adapterConfig.image` — a
-// database value that moves on an image bump, not on a chart deploy. So the
-// server carrying the root-owned wrapper is no evidence that the agent does,
-// and an absolute command cannot fall back the way a PATH lookup can: pointing
-// this at the image directory the moment the server has it breaks the github
-// MCP server on every agent pod still on an older image.
+// The seed runs in the SERVER pod; the .mcp.json it writes is consumed by agent
+// Job pods on a different image, pinned by `adapterConfig.image` — a database
+// value that moves on an image bump, not on a chart deploy. An ABSOLUTE command
+// cannot fall back the way a PATH lookup can, so naming the image directory
+// while any agent pod still lacked it would have broken the github MCP server
+// fleet-wide, with no reachable second copy.
 //
-// The flip belongs in the follow-up that deletes the seed install outright,
-// which is already gated on the whole fleet carrying the directory — at which
-// point there is no second copy and no skew window.
-test("the seeded github MCP upstream stays on the PVC wrapper until the seed install is deleted (PEN-3713)", () => {
+// That skew window is what PEN-3840's entry gate measured shut: every agent Job
+// pod observed from 2026-10-06T10:00Z onward runs an image descended from
+// bb62073a, so every consumer of this file now carries the directory. This is
+// also the first point at which all five wrappers are root-owned on the traffic
+// path — PEN-3713 reached four of five, and this absolute path was the fifth.
+test("the seeded github MCP upstream names the root-owned image wrapper (PEN-3840)", () => {
   const rendered = render("templates/statefulset.yaml");
 
   assert.equal(
     seededMcpGitHubCommand(rendered),
-    "${LOCAL_BIN}/github-mcp-server",
-    "the seeded github MCP command must reach LOCAL_BIN, so the fallback tracks wherever the seed installs",
+    `${IMAGE_WRAPPER_BIN}/github-mcp-server`,
+    "the seeded github MCP command must name the root-owned image wrapper",
   );
 
-  // The actual regression guard. A chart that names the image directory in an
-  // absolute MCP command is deciding, from the server pod, a question only the
-  // agent pod can answer.
+  // The regression guard, now pointing the other way: this command must not go
+  // back to a PVC path. It is an absolute path, so it gets none of the
+  // PATH-ordering protection the rest of the wrappers rest on — a PVC target
+  // here is executed by every agent pod and is writable by all of them.
   assert.ok(
-    !seededMcpGitHubCommand(rendered).includes(IMAGE_WRAPPER_BIN),
-    `the seeded github MCP command must not hardcode ${IMAGE_WRAPPER_BIN}: this seed runs in the server pod, but the file is consumed by agent pods on an independently pinned image`,
+    !seededMcpGitHubCommand(rendered).includes("/.local/bin"),
+    "the seeded github MCP command must not name an agent-writable PVC path",
   );
 });
 
@@ -606,19 +570,15 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
   }
 });
 
-// While both generations exist, the repo files and the seed heredocs are two
-// copies of one rule and can drift. They are compared after rewriting the PVC
-// directory to the image directory, which is the only difference either copy is
-// allowed to have.
+// PEN-3840: this used to compare the repo wrapper files against the seed
+// heredocs, because while both generations existed they were two copies of one
+// rule and could drift. There is one copy now, so that comparison is retired —
+// and what replaces it is the assertion that there is still only one.
 //
-// Scope this test does NOT cover, so the next person to debug it does not have
-// to infer it: both sides are compared line-by-line AFTER trimming each line, so
-// indentation drift is invisible here. That is deliberate — the seed copy is a
-// heredoc nested inside YAML and carries the block's indentation, which the repo
-// copy cannot have — but it means a wrapper reindented on one side only will
-// pass. Shell is whitespace-insensitive at this granularity, so the behaviour
-// under test is unaffected; the limit is on what a green result proves.
-test("the repo wrapper files and the seed heredocs are the same scripts", () => {
+// This is the guard against a future edit quietly reintroducing a PVC copy "as
+// a fallback": PATH ordering cannot protect a file the consumer can rewrite in
+// place, which is the whole of PEN-3713.
+test("the chart writes no GitHub wrapper onto the PVC", () => {
   const rendered = render("templates/statefulset.yaml");
   for (const name of [
     "paperclip-github-token-env",
@@ -627,26 +587,39 @@ test("the repo wrapper files and the seed heredocs are the same scripts", () => 
     "github-mcp-server",
     "git",
   ]) {
-    const seeded = extractWrapperBody(rendered, name)
-      .split("\n")
-      .map((line) => line.replaceAll("/paperclip/.local/bin", IMAGE_WRAPPER_BIN))
-      .join("\n");
-    const baked = fs
-      .readFileSync(path.join(repoRoot, "docker/github-wrappers", name), "utf8")
-      .split("\n")
-      .map((line) => line.trim())
-      .join("\n")
-      .trimEnd();
-    assert.equal(
-      baked,
-      seeded.trimEnd(),
-      `docker/github-wrappers/${name} has drifted from the seed heredoc`,
+    assert.ok(
+      !new RegExp(`cat > "[^"]*/${name}" <<`).test(rendered),
+      `the seed writes a ${name} wrapper onto the PVC again: it would be owned by uid 1000, the same uid every agent runs as, so the writer is the consumer (PEN-3713/PEN-3840)`,
     );
   }
+
+  // Narrow on purpose: ${BASE}/.local/bin itself is NOT retired and this must
+  // not assert that it is. The seed legitimately keeps recreating `claude` and
+  // `codex` symlinks there, because the chat plugin hard-spawns
+  // ${HOME}/.local/bin/<binary> by absolute path and the PVC mount hides the
+  // image's baked copies under ${BASE}. What PEN-3840 retired is that
+  // directory's place ON PATH and the GitHub wrappers that lived in it — which
+  // is also why dropping it from PATH is safe for those two binaries: the
+  // hard-spawn does not consult PATH, and a lookup by name still resolves them
+  // at /usr/local/bin, which is not under ${BASE} and stays on PATH.
+  assert.ok(
+    !/\$\{LOCAL_BIN\}/.test(rendered),
+    "the seed reintroduced a LOCAL_BIN GitHub wrapper directory (PEN-3840)",
+  );
+
+  // Positive control: the seed still runs and still writes the one PVC file
+  // this change deliberately KEEPS — the PEN-3156 pre-push hook, which is not a
+  // wrapper and not on PATH. Without this, a seed that stopped doing anything
+  // at all would pass every assertion above.
+  assert.match(
+    rendered,
+    /cat > "\$\{GIT_HOOKS_DIR\}\/pre-push" <<'EOF'/,
+    "the seed no longer writes the pre-push hook; the assertions above would pass vacuously",
+  );
 });
 
 test("the rendered github-mcp-server wrapper execs the scrub runtime inside the token wrapper", () => {
-  const body = extractWrapperBody(render("templates/statefulset.yaml"), "github-mcp-server");
+  const body = wrapperBody("github-mcp-server");
 
   const tokenAt = body.indexOf("paperclip-github-token-env");
   const runtimeAt = body.indexOf("github-mcp-egress-runtime.js");
@@ -678,7 +651,7 @@ test("the rendered MCP wrapper hands the real server to the scrub runtime as its
   const stubs = path.join(base, "stubs");
   fs.mkdirSync(stubs, { recursive: true });
 
-  const body = extractWrapperBody(render("templates/statefulset.yaml"), "github-mcp-server");
+  const body = wrapperBody("github-mcp-server");
   const execLine = body.split("\n").find((line) => line.startsWith("exec "));
   assert.ok(execLine, `no exec line in the MCP wrapper: ${body}`);
 
@@ -693,7 +666,7 @@ test("the rendered MCP wrapper hands the real server to the scrub runtime as its
   );
 
   const rewritten = execLine
-    .replace("/paperclip/.local/bin/paperclip-github-token-env", tokenEnv)
+    .replace("/usr/local/libexec/paperclip/bin/paperclip-github-token-env", tokenEnv)
     .replace("/usr/local/bin/node", node)
     .replace(/\S*github-mcp-egress-runtime\.js/, runtime);
 
@@ -701,7 +674,7 @@ test("the rendered MCP wrapper hands the real server to the scrub runtime as its
   // assertions below would be testing a line that cannot run for the wrong
   // reason.
   assert.ok(
-    !rewritten.includes("/paperclip/.local/bin/paperclip-github-token-env"),
+    !rewritten.includes("/usr/local/libexec/paperclip/bin/paperclip-github-token-env"),
     `token-env path not substituted: ${rewritten}`,
   );
   assert.ok(

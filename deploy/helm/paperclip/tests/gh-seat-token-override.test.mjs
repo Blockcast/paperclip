@@ -38,36 +38,14 @@ function renderStatefulSet() {
   );
 }
 
-// The rendered init container command is a single `sh -c` heredoc-of-heredocs:
-// the seed script `cat`s each wrapper script's body into the shared PVC via
-// `<<'EOF' ... EOF`. Extract one wrapper's body as it will actually run,
-// de-indenting by whatever the YAML block scalar's common indent happens to be.
-function extractHeredoc(rendered, scriptName) {
-  const lines = rendered.split("\n");
-  const startRe = new RegExp(
-    `^(\\s*)cat > "\\$\\{LOCAL_BIN\\}/${scriptName}" <<'EOF'$`,
-  );
-  let startIdx = -1;
-  let indent = "";
-  for (let i = 0; i < lines.length; i += 1) {
-    const match = lines[i].match(startRe);
-    if (match) {
-      startIdx = i;
-      indent = match[1];
-      break;
-    }
-  }
-  assert.notEqual(startIdx, -1, `did not find heredoc start for ${scriptName}`);
-
-  const body = [];
-  for (let i = startIdx + 1; i < lines.length; i += 1) {
-    const line = lines[i];
-    if (line.slice(0, indent.length) === indent && line.slice(indent.length) === "EOF") {
-      return body.join("\n");
-    }
-    body.push(line.slice(indent.length));
-  }
-  throw new Error(`did not find heredoc terminator for ${scriptName}`);
+// PEN-3840: these bodies used to be lifted out of the rendered seed script,
+// which `cat`ed each wrapper onto the shared PVC. That generation is retired —
+// the wrappers ship root-owned in the image — so read the shipped file, which
+// is both the single source of truth and strictly closer to what executes.
+function wrapperScript(scriptName) {
+  return fs
+    .readFileSync(path.join(repoRoot, "docker/github-wrappers", scriptName), "utf8")
+    .trimEnd();
 }
 
 function writeExecutable(dir, name, body) {
@@ -76,24 +54,36 @@ function writeExecutable(dir, name, body) {
   return file;
 }
 
-const rendered = renderStatefulSet();
-const envScriptBody = extractHeredoc(rendered, "paperclip-github-token-env");
-const credHelperBody = extractHeredoc(rendered, "github-token-credential-helper");
-const ghScriptBody = extractHeredoc(rendered, "gh");
+const envScriptBody = wrapperScript("paperclip-github-token-env");
+const credHelperBody = wrapperScript("github-token-credential-helper");
+const ghScriptBody = wrapperScript("gh");
 
-test("rendered statefulset still installs both GitHub credential wrapper scripts", () => {
+test("the image ships both GitHub credential wrapper scripts", () => {
   assert.match(envScriptBody, /^#!\/bin\/sh/);
   assert.match(credHelperBody, /^#!\/bin\/sh/);
 });
 
-test("rendered gh wrapper executes the egress runtime before the image gh wrapper", () => {
+// PEN-3840: the chart used to install these onto the PVC as well. It must not
+// start again — a PVC copy is owned by uid 1000, the same uid every agent runs
+// as, so the writer would be the consumer (PEN-3713).
+test("the chart does not reinstall the credential wrappers onto the PVC", () => {
+  const rendered = renderStatefulSet();
+  for (const name of ["paperclip-github-token-env", "github-token-credential-helper", "gh"]) {
+    assert.ok(
+      !new RegExp(`cat > "[^"]*/${name}" <<`).test(rendered),
+      `the seed writes ${name} onto the PVC again (PEN-3840)`,
+    );
+  }
+});
+
+test("the image gh wrapper executes the egress runtime before the image gh wrapper", () => {
   assert.match(
     ghScriptBody,
     /exec \/usr\/local\/bin\/node \/opt\/paperclip-bundled-adapters\/node_modules\/@paperclipai\/adapter-utils\/dist\/github-cli-egress-runtime\.js \/usr\/bin\/gh \"\$@\"/,
   );
 });
 
-test("rendered gh wrapper exercises the generated runtime command path", () => {
+test("the image gh wrapper exercises the generated runtime command path", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-egress-wrapper-"));
   const runtimePath = path.join(dir, "github-cli-egress-runtime.mjs");
   const targetPath = path.join(dir, "gh.real");
