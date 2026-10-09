@@ -36,6 +36,7 @@ import {
   BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
   BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
   BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
+  DEFAULT_CONFIG,
   DEFAULT_ISSUE_ROUTE_MAP,
   MAX_OPERATOR_SUPPRESSION_HOURS,
 } from "../constants.js";
@@ -1709,6 +1710,91 @@ describe("handleWebhook — firing first time", () => {
     const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.assigneeUserId).toBe("user-carol");
     expect(createArgs.assigneeAgentId).toBeUndefined();
+  });
+
+  // Ally review 5475541309: on the shipped default config the route-map agent
+  // has no human owner behind it (support@ does not resolve here) and
+  // `fallbackAgentName` is "", so the owner chain ends in a refusal. A roster
+  // read that *failed* is no evidence the route agent is bad, so that refusal
+  // must keep Alertmanager's retry window instead of a 200 PermanentAlertError.
+  const defaultShapedConfig = (): AlertmanagerPluginConfig => ({
+    ...DEFAULT_CONFIG,
+    defaultCompanyId: "company-1",
+    webhookToken: TOKEN,
+  });
+  const physicalProxmoxAlert = (fingerprint: string) =>
+    baseAlert({
+      labels: {
+        alertname: "PhysicalInfraProxmoxApiDown",
+        severity: "critical",
+        class: "physical_infra_proxmox",
+      },
+      fingerprint,
+    });
+
+  it.each([
+    ["rejects (lookup_failed)", (list: ReturnType<typeof vi.fn>) =>
+      list.mockRejectedValue(new Error("agents rpc unavailable"))],
+    ["comes back empty (roster_empty)", (list: ReturnType<typeof vi.fn>) =>
+      list.mockResolvedValue([])],
+  ])(
+    "keeps the retry window on the default config when the roster read %s (BLO-26613)",
+    async (_label, failRoster) => {
+      const { ctx, mocks } = mkCtx();
+      failRoster(mocks.agents.list);
+
+      await expect(
+        handleWebhook(
+          ctx,
+          defaultShapedConfig(),
+          true,
+          baseInput({ parsedBody: baseEnvelope({ alerts: [physicalProxmoxAlert("proxmox-degraded")] }) }),
+        ),
+      ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+
+      expect(mocks.issues.create).not.toHaveBeenCalled();
+      expect(mocks.metrics.write).toHaveBeenCalledWith("alertmanager.owner.fallback_failed", 1, {
+        alertname: "PhysicalInfraProxmoxApiDown",
+        severity: "critical",
+        refusal: "transient",
+      });
+      expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+        "alertmanager.alert.permanent_error",
+        1,
+        expect.anything(),
+      );
+    },
+  );
+
+  it("CONTROL — still drops a paused route agent permanently on the default config (BLO-26613)", async () => {
+    // Same config and alert as above, but the roster read succeeds and shows
+    // the route agent paused — a real verdict on the agent, so the
+    // empty-fallback refusal stays permanent. The fix must not regress this.
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(
+      guardRoster({ id: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID, status: "paused" }),
+    );
+
+    await expect(
+      handleWebhook(
+        ctx,
+        defaultShapedConfig(),
+        true,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [physicalProxmoxAlert("proxmox-gone")] }) }),
+      ),
+    ).resolves.toEqual({ accepted: 0 });
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.assignee_dropped",
+      1,
+      expect.objectContaining({ reason: "paused" }),
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      { alertname: "PhysicalInfraProxmoxApiDown", severity: "critical" },
+    );
   });
 
   it("lets explicit assignee overrides win over route assignees", async () => {

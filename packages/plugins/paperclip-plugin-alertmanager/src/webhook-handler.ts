@@ -1464,7 +1464,8 @@ async function retrofitAggregateOwner(
   // fills in, so the very next re-fire would assign the dropped agent anyway.
   // Checked only once the row is known to be agent-less, so a row that already
   // has an agent costs no roster read.
-  const invokableAgentId = await resolveInvokableAssigneeAgentId(
+  // A degraded roster read drops the agent here too; the next re-fire re-vets it.
+  const { agentId: invokableAgentId } = await resolveInvokableAssigneeAgentId(
     ctx,
     companyId,
     assigneeAgentId,
@@ -2675,6 +2676,8 @@ export async function handleFiring(
     : undefined;
   let createAssigneeAgentId: string | undefined;
   let createAssigneeUserId: string | undefined;
+  // The guard could not read the roster, so a dropped agent may be fine.
+  let assigneeRosterDegraded = false;
   // One roster read shared by the assignee guard and the named-fallback leg.
   const loadRoster = companyRosterLoader(ctx, companyId, rosterMemo);
   let assigneeResolutionSource = "aggregate-winner";
@@ -2691,13 +2694,15 @@ export async function handleFiring(
     // back to the owner-map agent — the route wins, and resolution goes
     // straight to the human / named-fallback legs below (the fallback is
     // invokability-checked in its own right).
-    createAssigneeAgentId = await resolveInvokableAssigneeAgentId(
+    const assigneeGuard = await resolveInvokableAssigneeAgentId(
       ctx,
       companyId,
       ownerOverride ? assigneeAgentId : routeAssigneeAgentId ?? assigneeAgentId,
       { alertname, severity },
       loadRoster,
     );
+    createAssigneeAgentId = assigneeGuard.agentId;
+    assigneeRosterDegraded = assigneeGuard.degraded === true;
     // Keyed off the post-guard id, so a dropped agent does not also discard a
     // resolvable human owner.
     createAssigneeUserId = createAssigneeAgentId
@@ -2737,7 +2742,14 @@ export async function handleFiring(
     // than waiting out a whole `repeat_interval`. Absent a classification we
     // take the transient branch: a needless retry burst is survivable, a
     // wrongly-dropped alert is not.
-    const isPermanent = fallbackResolution?.refusal === "permanent";
+    //
+    // A degraded assignee-guard read overrides a permanent fallback refusal: the
+    // dropped agent was never shown to be bad, so a retry may well assign it.
+    // Without this, the default config (`fallbackAgentName: ""`) turned a
+    // transient `agents.list` fault on a route-map agent into a 200 drop
+    // (Ally review 5475541309).
+    const isPermanent =
+      fallbackResolution?.refusal === "permanent" && !assigneeRosterDegraded;
     ctx.logger.warn(
       `Cannot create issue for ${alertname}: fallbackAgentName is missing, invalid, or ambiguous (${
         isPermanent ? "permanent" : "transient"
