@@ -11753,7 +11753,32 @@ export function issueService(db: Db) {
         return enriched;
       };
 
-      const updateResult = dbOrTx === db ? await db.transaction(runUpdate) : await runUpdate(dbOrTx);
+      // BLO-40673: reviving a terminal alertmanager row (`done`/`cancelled` -> any
+      // active status) re-enters `issues_active_alertmanager_aggregate_creation_uq`,
+      // whose predicate is `status NOT IN ('done','cancelled')`. When a *different*
+      // row already holds that aggregate slot the UPDATE raises 23505. `create`
+      // already translates exactly this constraint into a typed 409 (see
+      // `isAlertmanagerAggregateCreationConflict`'s other call site), but this path
+      // did not — so every re-fire of an alert whose own row had been closed, while
+      // a sibling held the aggregate, surfaced as a raw 500. Measured on BLO-37470:
+      // ~3 failures/minute for 11 days, each costing ~2.9s of the alertmanager
+      // delivery budget and trending toward whole-batch abandonment.
+      //
+      // The 409 is the semantically correct answer, not merely a tidier error: the
+      // aggregate winner is already open, so there is nothing to reopen, and the
+      // plugin can attach to the winner instead of retrying forever.
+      const execUpdate = async () => {
+        try {
+          return dbOrTx === db ? await db.transaction(runUpdate) : await runUpdate(dbOrTx);
+        } catch (err) {
+          if (!isAlertmanagerAggregateCreationConflict(err)) throw err;
+          throw conflict("Alertmanager aggregate creation conflict", {
+            companyId: existing.companyId,
+            originFingerprint: existing.originFingerprint,
+          });
+        }
+      };
+      const updateResult = await execUpdate();
 
       // BLO-27572: deliberately after the write, on `db` rather than `dbOrTx`, and
       // last — mirroring the strand-time call site in `recovery/service.ts`. This
