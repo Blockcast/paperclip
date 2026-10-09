@@ -368,6 +368,11 @@ export async function resolveFallbackAgentId(
  * fallback agent (itself invokability-checked by `resolveFallbackAgentId`),
  * else a refused creation that keeps Alertmanager's retry window. It never
  * files a silent assignment.
+ *
+ * A failed `agents.get` degrades the same way, matching `resolveOwnerUserId`
+ * above: an agents-RPC outage must not fail the delivery outright, because if
+ * it outlasts Alertmanager's retry budget the alert is lost with no issue row
+ * at all — worse than the paused-assignee bug this guard exists for.
  */
 export async function resolveInvokableAssigneeAgentId(
   ctx: Pick<PluginContext, "agents" | "logger">,
@@ -375,10 +380,16 @@ export async function resolveInvokableAssigneeAgentId(
   agentId: string | undefined,
 ): Promise<string | undefined> {
   if (!agentId) return undefined;
-  const agent = await ctx.agents.get(agentId, companyId);
-  if (agent && isAgentStatusInvokable(agent.status)) return agentId;
+  let status: string;
+  try {
+    const agent = await ctx.agents.get(agentId, companyId);
+    if (agent && isAgentStatusInvokable(agent.status)) return agentId;
+    status = agent?.status ?? "not-found";
+  } catch (err) {
+    status = `lookup-failed: ${String(err)}`;
+  }
   ctx.logger.warn(
-    `alertmanager: resolved assignee ${agentId} is not invokable (status=${agent?.status ?? "not-found"}); not assigning it, falling through the owner chain`,
+    `alertmanager: resolved assignee ${agentId} is not invokable (status=${status}); not assigning it, falling through the owner chain`,
   );
   return undefined;
 }

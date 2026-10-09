@@ -798,6 +798,19 @@ describe("resolveInvokableAssigneeAgentId — BLO-26613 invokability guard", () 
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("status=not-found"));
   });
 
+  it("degrades to undefined, not a throw, when agents.get rejects", async () => {
+    // Same failure semantics as resolveOwnerUserId: an agents-RPC outage must
+    // fall through the owner chain rather than fail the whole delivery.
+    const { ctx, agents, logger } = mkAgentsCtx(null);
+    agents.get.mockRejectedValueOnce(new Error("agents rpc unavailable"));
+    await expect(
+      resolveInvokableAssigneeAgentId(ctx, "company-1", "agent-x"),
+    ).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("lookup-failed: Error: agents rpc unavailable"),
+    );
+  });
+
   it.each(["terminated", "pending_approval"])(
     "drops an agent with non-invokable status %s",
     async (status) => {
