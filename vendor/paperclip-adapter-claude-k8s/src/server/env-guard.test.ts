@@ -182,6 +182,43 @@ const blocked = [
   "awk 'BEGIN{system(\"env\")}'",
   "perl -e 'system(\"env\")'",
   "capsh -- -c 'env'",
+  // Ally I1 at a36d40f5: the language interpreters and the at/crontab
+  // schedulers. Every row was blocked at the merge base and allowed at
+  // a36d40f5. A heredoc fed to an interpreter is its program, and an
+  // at/crontab body is shell that runs later.
+  "python3 <<'EOF'\nimport os\nos.system(\"env\")\nEOF",
+  "python <<'EOF'\nimport os\nos.system(\"env\")\nEOF",
+  "ruby <<'EOF'\nsystem(\"env\")\nEOF",
+  "php <<'EOF'\n<?php system(\"env\");\nEOF",
+  "node <<'EOF'\nrequire(\"child_process\").execSync(\"env\")\nEOF",
+  "cat <<'EOF' | node\nrequire(\"child_process\").execSync(\"env\")\nEOF",
+  "cat <<'EOF' | python3\nimport os\nos.system(\"env\")\nEOF",
+  "sudo python3 <<'EOF'\nimport os\nos.system(\"env\")\nEOF",
+  "at now + 1 minute <<'EOF'\nenv\nEOF",
+  // A crontab line's five schedule fields precede its command; read as an
+  // ordinary first word they stopped the scan before `env`.
+  "crontab - <<'EOF'\n* * * * * env\nEOF",
+  "cat <<'EOF' | crontab -\n* * * * * env\nEOF",
+  "crontab <<'EOF'\n@reboot printenv\nEOF",
+  "sudo -u app crontab - <<'EOF'\n*/5 * * * * printenv\nEOF",
+  // ...and their inline-program flags, whose payload word is the program.
+  "python3 -c 'import os; os.system(\"env\")'",
+  "python -c 'import os; os.system(\"env\")'",
+  "python3 -Ic 'import os; os.system(\"env\")'",
+  "node -e 'require(\"child_process\").execSync(\"env\")'",
+  "node --eval 'require(\"child_process\").execSync(\"env\")'",
+  "ruby -e 'system(\"env\")'",
+  "php -r 'system(\"env\");'",
+  // `|&` is a pipe (stderr too), so the body still reaches the next stage.
+  "cat <<'EOF' |& bash\nenv\nEOF",
+  "cat <<'EOF' |& python3\nimport os\nos.system(\"env\")\nEOF",
+  // A word-initial `#` is a comment. Lexed as a word, an apostrophe in it
+  // opened a quote that hid the rest of the body, `# <<EOF` opened a heredoc
+  // that swallowed the next line, and in `env # note` it read as an operand.
+  "bash <<'EOF'\n# it's fine\nenv\nEOF",
+  "python3 <<'EOF'\n# it's fine\nimport os\nos.system(\"env\")\nEOF",
+  "echo hi # <<EOF\nenv\nEOF",
+  "env # note",
 ];
 const allowed = [
   // The trailing terminator deliberately does NOT include whitespace, which is
@@ -285,6 +322,22 @@ const allowed = [
   // missing subcommand, never a dump.
   "git grep env",
   "git log --grep env",
+  // The interpreters are NOT command-position wrappers: only an inline
+  // program's payload word is scanned, so their ordinary arguments stay data.
+  // Each of these blocked at the merge base, and listing the interpreters as
+  // wrappers would re-block the first.
+  "python3 -m venv env",
+  "python -m venv .env",
+  "node env.js",
+  "python3 train.py --env prod",
+  "ruby -S rake db:migrate",
+  "node /usr/bin/npm ci",
+  "python3 -c 'import sys; print(sys.argv)' env", // argv after the program
+  "python3 -c 'print(1)'",
+  "crontab -l",
+  "python3 <<'EOF'\nprint('hello')\nEOF",
+  "crontab - <<'EOF'\nMAILTO=\"\"\n0 3 * * * /usr/local/bin/backup.sh\nEOF",
+  "ls # env", // a comment is not an argument, let alone a command
   "",
 ];
 
