@@ -5,8 +5,12 @@ creation and start of heartbeat runs whose task key begins with `pr_review:`.
 The histogram is observed at the guarded queued-to-running transition, so each
 run is counted once and never-started runs are intentionally excluded.
 
-It fires when **more than 5% of runs in the rolling 6h window waited longer
-than 3600s**, and it reports the **true mean** of that window as its value.
+Once `Blockcast/onprem-k8s#5124` merges and Argo syncs it, the alert fires when
+**more than 5% of runs in the rolling 6h window waited longer than 3600s**, and
+it reports the **true mean** of that window as its value. **Until then the
+deployed rule still evaluates the p95 below, and its reported value is that
+p95**, pinned inside a 4h-wide bucket. Check which rule is live before reading
+the value (see *Where the rule lives*).
 
 ## Triage
 
@@ -28,7 +32,11 @@ first thing to check:
 pg_heartbeat_run_queue_backlog_by_agent_running_count{agent_name="Ally"}
 ```
 
-Read it against the agent's configured `maxConcurrentRuns`. Pinned at the cap
+Read it against the agent's configured cap, which lives at
+`runtimeConfig.heartbeat.maxConcurrentRuns` on the agent (16 for Ally, read
+2026-10-09). It is **not** in `adapterConfig`. That object has no
+`maxConcurrentRuns` key, so an empty or absent value there does not mean no cap
+is configured. Pinned at the cap
 with work still queued is consumer starvation — the alert is correct and the
 answer is capacity, not a bug.
 
@@ -55,9 +63,10 @@ fleet-wide (BLO-34726).
 The metric has no repo, PR, agent, or delivery labels; use the durable
 `heartbeat_runs.context_task_key` and logs for per-request detail.
 
-## This alert does not report a percentile (BLO-41442)
+## This alert stops reporting a percentile once onprem-k8s#5124 syncs (BLO-41442)
 
-It used to. Until 2026-10-09 the rule evaluated
+Until `Blockcast/onprem-k8s#5124` merges and Argo syncs it, the deployed rule
+still evaluates the expression below. Before that change it always did:
 
 ```promql
 histogram_quantile(0.95, sum by (le) (rate(paperclip_pr_review_queue_wait_seconds_bucket[6h]))) > 3600
