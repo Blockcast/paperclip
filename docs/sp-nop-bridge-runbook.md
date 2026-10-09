@@ -110,9 +110,10 @@ the existing binding (its `mb_uuid`, or the pending intent if not yet minted)
 and the conflicting wallet in `last_error`. NOP MUST NOT retry and MUST NOT
 mint. That detail is operator-visible only: the caller-facing rejection says the
 hardware is unavailable and nothing more. It therefore does not reveal which
-member holds the hardware, which wallet it is bound to, or that any binding
-exists at all. It does tell the caller that this `gateway_hwid` cannot be
-registered right now, which is irreducible given that we reject at all; size
+member holds the hardware or which wallet it is bound to. It does tell the
+caller that this `gateway_hwid` cannot be registered right now — and, if that
+rejection is distinguishable from the other non-retryable causes, that some
+binding exists — which is irreducible given that we reject at all; size
 rate-limiting and caller verification against that, not against a secrecy
 property registration does not have.
 
@@ -123,13 +124,27 @@ rule"): registration is driven by an untrusted client, so an implicit rebind let
 any wallet claim hardware already in service and redirect its earnings. Rebind
 requires an authorized transfer operation that evidences the change and retires
 the prior `mb_uuid` explicitly: it disables the prior orc8r member
-(`disabled_at`) and moves its intent to `retired`, since either half left in
-place keeps the hardware bound. `retired` is a fourth terminal state, set only
+(`disabled_at`) and then moves its intent to `retired`. That order is a MUST,
+because the two halves are not symmetric. Enforcement lives on the intent, not
+on the orc8r row: leaving the intent in a live state is what keeps a new wallet
+rejected, while the live orc8r member is what a second mint would duplicate.
+Retiring the intent first therefore releases the hardware constraint while the
+prior member is still live, so a new wallet's registration commits and mints a
+second live member inside that window — caught only by the `gateway_hwid`-only
+sweep grouping, after the fact. Disabling the orc8r member first leaves the
+hardware rejected throughout. `retired` is a fourth terminal state, set only
 by that operation or by the Wave 1 operator procedure — never by registration,
 and never by a failure path, which is why `registration_failed` is not reused
 here: the binding did not fail, it was superseded. The hardware constraint is
 partial over `pending_orc8r` and `registered` only, so a `retired` row coexists
-with a fresh intent for the same `gateway_hwid`. The row is retained rather
+with a fresh intent for the same `gateway_hwid`. The `(gateway_hwid, wallet)`
+idempotency index is partial too, over non-`retired` intents, and the
+registration upsert's conflict target MUST carry that predicate so it infers
+the partial index. Without it a retired `(H, A)` row sits in the arbiter index,
+and the original wallet re-registering the same hardware later — H bound to A,
+retired, rebound to B, sold back to A — would match that row and update it to
+`pending_orc8r`, the one path that silently destroys the record. With it, that
+re-registration inserts a fresh row. The retired row is retained rather
 than deleted: it is the record of who held the hardware and when, which the
 sweep and any later dispute both need. Until that operation exists it is an
 operator action, not a registration outcome. Rejecting here does not strand
@@ -159,14 +174,17 @@ Registration MUST use this order:
 
 1. In one local transaction, upsert the registration intent and its
    `(gateway_hwid, wallet)` idempotency key, with that key as the upsert's
-   conflict target. The row starts in explicit `pending_orc8r` state; no local
-   success state is written yet. The store also carries the hardware
-   constraint from "MintMember identity and idempotency" — at most one
-   `pending_orc8r` or `registered` intent per normalized `gateway_hwid`. The
+   conflict target, carrying the non-`retired` predicate from "MintMember
+   identity and idempotency" so it infers the partial index. The row starts in
+   explicit `pending_orc8r` state; no local success state is written yet. The
+   store also carries the hardware constraint from "MintMember identity and
+   idempotency" — at most one `pending_orc8r` or `registered` intent per
+   normalized `gateway_hwid`. Both indexes are partial, and the
    two compose: a same-wallet retry matches the conflict target and takes the
    update path, while a different-wallet insert raises on the hardware
-   constraint. That falls out of the arbiter-index choice, so both indexes are
-   part of the contract, not an implementation detail.
+   constraint. A same-wallet registration against a `retired` row matches
+   neither and inserts. That falls out of the arbiter-index choice, so both
+   indexes are part of the contract, not an implementation detail.
 2. Call `MintMember` with the same derived identity and bridge mTLS
    credential.
 3. In a second local transaction, validate the returned `mb_uuid`, bind it
@@ -200,7 +218,10 @@ operator-triggered repair:
   local store cannot see, so a join would make the backstop circular. A member
   under this `st_uuid`/issuer whose subject does not parse is itself surfaced,
   as a malformed member needing repair — never skipped, since a bypass-minted
-  row is the likeliest thing to carry a non-conforming subject.
+  row is the likeliest thing to carry a non-conforming subject. The rule is
+  this broad because in Wave 1 this issuer mints no other subject kind; if one
+  is added, narrow it to `individual_beacon:`-prefixed subjects so the detector
+  does not age into noise.
 - Group orc8r members by `(st_uuid, normalized gateway_hwid)` alone and surface
   any hardware carrying more than one live member. This grouping is deliberately
   coarser than the idempotency key: the key includes `wallet`, so a
@@ -234,8 +255,14 @@ member, both serially and when the two registrations run concurrently; and that
 the `gateway_hwid`-only sweep grouping surfaces such a pair when one is seeded
 directly. It MUST also prove the retirement round-trip: with the prior member
 disabled and its intent `retired`, the same `gateway_hwid` registers
-successfully under the new wallet, while retiring only one of the two halves
-still rejects. Finally it MUST prove that the sweep recovers `gateway_hwid` and
+successfully under the new wallet; that retiring only the orc8r half — member
+disabled, intent still `registered` — still rejects; that retiring only the
+NOP half — intent `retired`, member still live — is the ordering the transfer
+operation forbids, and that when it is forced a second live member is created
+and the `gateway_hwid`-only grouping surfaces the pair; and that
+re-registering the same hardware under the *original* wallet after retirement
+inserts a fresh intent and leaves the retired row intact. Finally it MUST
+prove that the sweep recovers `gateway_hwid` and
 `wallet` from `oidc_subject` alone, with no NOP-side registration row present,
 and surfaces a member whose subject does not parse rather than skipping it.
 Manual verification must inspect persisted registration state and orchestrator
@@ -544,10 +571,16 @@ The failure modes you're most likely to hit:
   change out of band, then retire the prior `mb_uuid` in both places, in this
   order: set `disabled_at` on its orc8r member (`psql` on the orc8r pool), then
   set its registration intent to `retired` in the NOP-side registration store,
-  which is a separate database — see Prerequisites. Quarantining it does not
+  which is a separate database — see Prerequisites. This document deliberately
+  does not carry that store's schema, so unlike every other procedure here it
+  ships no statement to run for that half: get the exact update from the
+  NOP registration-store owner. Quarantining it does not
   free the hardware, and doing only the orc8r half does not either: the
   hardware constraint is over the intent, so the final step below fails against
-  a constraint that still holds. Then have the new wallet register again.
+  a constraint that still holds. Do not invert the order to work around that —
+  retiring the intent first releases the constraint while the prior member is
+  still live, which is how a second live member gets minted (see "MintMember
+  identity and idempotency"). Then have the new wallet register again.
 
 ## Related
 
