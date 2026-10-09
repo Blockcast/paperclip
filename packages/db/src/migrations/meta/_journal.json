@@ -1730,6 +1730,13 @@
       "when": 1791584286173,
       "tag": "0254_routine_runs_completed_partial_index",
       "breakpoints": true
+    },
+    {
+      "idx": 255,
+      "version": "7",
+      "when": 1791584386173,
+      "tag": "0255_backstop_sweep_cursors",
+      "breakpoints": true
     }
   ]
 }
