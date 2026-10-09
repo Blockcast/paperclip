@@ -92,6 +92,18 @@ export type StrandedEscalationStatusInput = {
   blockerIssueIds: readonly string[];
   /** Manual-repair causes have no autonomous path and must remain parked. */
   recoveryCause: string;
+  /**
+   * `errorCode` of the run this escalation is for, or `null` when there is none.
+   *
+   * BLO-19924: a `workspace_validation_failed` run no longer always carries the
+   * manual-repair cause. An unconfirmed probe takes `stranded_assigned_issue` so its owner
+   * gets bounded wakes, but the fault is still a workspace binding that re-dispatch cannot
+   * change — dispatch refuses it pre-adapter (`assertGitSensitiveAdapterWorkspaceValid`)
+   * and it re-parks. So once no live owner is left it must stay parked exactly like the
+   * confirmed class. Writing `todo` here instead turns the wake budget's exhaustion into a
+   * dispatch -> refuse -> re-park cycle, which is the opposite of what bounding it was for.
+   */
+  latestRunErrorCode: string | null;
 };
 
 export type StrandedEscalationStatusDecision = {
@@ -125,14 +137,15 @@ export type StrandedEscalationStatusDecision = {
 export function resolveStrandedEscalationStatus(
   input: StrandedEscalationStatusInput,
 ): StrandedEscalationStatusDecision {
-  const isManualRepairCause = input.recoveryCause === "workspace_validation_failed" ||
-    input.recoveryCause === "configuration_incomplete";
+  const awaitsManualRepair = input.recoveryCause === "workspace_validation_failed" ||
+    input.recoveryCause === "configuration_incomplete" ||
+    input.latestRunErrorCode === "workspace_validation_failed";
   // A named owner only counts as a path while it can still be woken. The provider-quota
   // park is checked separately below because its wake path is the post-commit monitor
   // armed for `returnOwnerAgentId`, not an owner wake, so exhaustion does not apply to it.
   const hasLiveRecoveryOwner = Boolean(input.recoveryOwnerAgentId) &&
     !input.isWakeExhaustedEscalation;
-  const hasNoRecoveryPath = !isManualRepairCause &&
+  const hasNoRecoveryPath = !awaitsManualRepair &&
     !hasLiveRecoveryOwner &&
     !input.isProviderQuotaWait &&
     input.blockerIssueIds.length === 0;

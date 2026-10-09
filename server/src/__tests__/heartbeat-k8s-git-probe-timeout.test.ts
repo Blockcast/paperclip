@@ -235,6 +235,8 @@ describeEmbeddedPostgres("claude_k8s agent-home git probe timeout", () => {
       }
       expect(recoveryAction, "no recovery action was written for the parked issue").toBeDefined();
       expect(recoveryAction).toMatchObject({
+        // `kind` is what the re-home drain's predicate reads, and the field this change moves.
+        kind: "stranded_assigned_issue",
         cause: "stranded_assigned_issue",
         wakePolicy: expect.objectContaining({ type: "wake_owner" }),
       });
