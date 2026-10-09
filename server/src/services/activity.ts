@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -25,6 +25,8 @@ export interface ActivityFilters {
   entityType?: string;
   entityId?: string;
   action?: string;
+  /** Actions left off the page. The route sets this; see `FEED_EXCLUDED_ACTIONS`. */
+  excludeActions?: readonly string[];
   limit?: number;
 }
 
@@ -352,6 +354,9 @@ export function activityService(db: Db) {
       }
       if (filters.action !== undefined) {
         conditions.push(eq(activityLog.action, filters.action));
+      }
+      if (filters.excludeActions?.length) {
+        conditions.push(notInArray(activityLog.action, [...filters.excludeActions]));
       }
 
       return db

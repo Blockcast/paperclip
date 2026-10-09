@@ -119,6 +119,7 @@ describe.sequential("activity routes", () => {
       entityType: undefined,
       entityId: undefined,
       action: undefined,
+      excludeActions: ["heartbeat.run_events_streamed"],
       limit: 100,
     });
     expect(JSON.parse(decodeURIComponent(res.headers["x-applied-filters"]))).toEqual({
@@ -126,6 +127,7 @@ describe.sequential("activity routes", () => {
       entityType: null,
       entityId: null,
       action: null,
+      excludeActions: ["heartbeat.run_events_streamed"],
       limit: 100,
     });
   });
@@ -145,6 +147,7 @@ describe.sequential("activity routes", () => {
       entityType: "issue",
       entityId: undefined,
       action: undefined,
+      excludeActions: ["heartbeat.run_events_streamed"],
       limit: 500,
     });
   });
@@ -166,12 +169,46 @@ describe.sequential("activity routes", () => {
       entityType: undefined,
       entityId: undefined,
       action: "issue_write_denied",
+      excludeActions: [],
       limit: 5,
     });
     expect(res.body).toEqual([
       { id: "evt-1", action: "issue_write_denied", entityType: "issue", entityId: "issue-1" },
     ]);
     expect(JSON.parse(decodeURIComponent(res.headers["x-applied-filters"])).action).toBe("issue_write_denied");
+  });
+
+  // PEN-3148 (Ally review 5473258762): the live-event transcript audit writes S*A rows per 30s
+  // window and is not a feed item, so a page that does not ask for an action leaves it out — but
+  // asking for it by name must still return every row, or the audit becomes unreadable.
+  it("leaves the live-event transcript audit off a page that does not ask for it, and says so", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?entityType=agent&entityId=agent-1"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith(
+      expect.objectContaining({ entityType: "agent", entityId: "agent-1", excludeActions: ["heartbeat.run_events_streamed"] }),
+    );
+    expect(JSON.parse(decodeURIComponent(res.headers["x-applied-filters"])).excludeActions).toEqual(["heartbeat.run_events_streamed"]);
+  });
+
+  it("returns the live-event transcript audit when it is asked for by action", async () => {
+    mockActivityService.list.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/activity?action=heartbeat.run_events_streamed"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "heartbeat.run_events_streamed", excludeActions: [] }),
+    );
+    expect(JSON.parse(decodeURIComponent(res.headers["x-applied-filters"])).excludeActions).toEqual([]);
   });
 
   it("rejects an empty ?action= instead of silently returning the unfiltered feed", async () => {

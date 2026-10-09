@@ -1067,9 +1067,11 @@ has no single run to key on, because one decision covers every run that agent
 produces. `details.ownerAgentId` is `null`, and `entity_id` the sentinel
 `unresolved-owner`, on the fail-closed branch where a payload cannot name an
 owner; that mirrors the `workspace_operation.log_accessed` convention.
-`details.reason` carries the decider's named boundary vocabulary, plus two
-gate-local values for the branches that return before the decider runs:
-`allow_board_transcript_operator` and `withhold_unresolved_owner`.
+`details.reason` carries the decider's named boundary vocabulary, plus three
+gate-local values for the branches that carry no `AuthorizationDecision` to read
+a reason off: `allow_board_transcript_operator` (the operator short-circuit),
+`deny_company_scope` (the company-scope miss), and `withhold_unresolved_owner`
+(a payload that cannot name its owner, which never reaches the decider).
 
 **This audit deliberately does not publish its own `activity.logged` live
 event.** It is the one audit site that sits *on* the live-event fan-out, so
@@ -1079,9 +1081,28 @@ delivered to every socket in the company. It terminates rather than looping —
 before deciding — but the amplification is real. `logActivity` is called with
 `{ deferPublish: true }` and the returned publisher is dropped.
 
+Declining to publish buys exactly that — no live `activity.logged` fan-out, and
+no plugin-outbox enqueue (the action is not a plugin event, so nothing is lost)
+— and nothing more. It does **not** keep the rows out of the activity feed: the
+stored rows *are* the feed. At one row per (socket × owning agent) per 30s
+window, S open sockets watching A agents stream write S×A rows every 30s, which
+would be most of every recency-ordered page the board reads. So
+`GET /api/companies/:companyId/activity` leaves `heartbeat.run_events_streamed`
+off any page that does not ask for an `action` (`FEED_EXCLUDED_ACTIONS` in
+`routes/activity.ts`, echoed as `excludeActions` in `X-Applied-Filters`);
+`?action=heartbeat.run_events_streamed` returns every row. There is no retention
+carve-out because there is no time-based retention to carve out of:
+`activity_log` rows are deleted only with their company, or with the agent that
+was their actor. Size any future retention policy against this action first —
+it is the highest-volume writer on the table.
+
 A write that fails withholds the content rather than serving unaudited bytes,
 matching the REST twins where an unguarded `await logRunLogAccessAudit(...)`
-fails the response.
+fails the response. Like theirs, the failure is per attempt: the withhold is not
+memoized, so the next event re-attempts the write instead of an entitled reader
+staying withheld for the rest of the window. A failed write is logged apart from
+a failed decision, so a broken auditor is distinguishable from a broken
+authorizer.
 
 ### Access auditing
 
