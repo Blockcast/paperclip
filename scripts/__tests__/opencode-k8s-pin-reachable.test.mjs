@@ -368,13 +368,28 @@ test("the retirement this guard protects is actually in the chart", () => {
   assert.match(verbs, /"patch"/, "patch is what replaced it and must stay");
 });
 
+test("the wrapper directory this guard greps is the one the chart pins", () => {
+  // The patch names one directory in three places; a value that drifts becomes
+  // a PATH entry no image carries. If the chart's directory moves, the guard
+  // would grep a stale literal and find 0 hits forever.
+  const helpers = readFileSync(
+    new URL("../../deploy/helm/paperclip/templates/_helpers.tpl", import.meta.url),
+    "utf8",
+  );
+  const body = helpers.match(
+    /\{\{-? define "paperclip\.imageWrapperBinDir" -?\}\}\n([^\n]*)\n\{\{-? end -?\}\}/,
+  )?.[1];
+  assert.ok(body, "_helpers.tpl must define paperclip.imageWrapperBinDir");
+  assert.equal(body.trim(), WRAPPER_BIN_DIR);
+});
+
 // PEN-3732 — the wrapper-PATH property. Its control runs the OPPOSITE way round
 // from the Secret-PUT one above: there a HIT is the finding, here an EMPTY
 // result is, so an unrun or inert search must never be read as a finding.
 const WRAPPED = { cloneOk: true, commitPresent: true, srcFileCount: 5, secretPutHits: [] };
 const ACCEPTED_PIN = [...WRAPPER_PATH_GAP_ACCEPTED_PINS][0];
 
-test("a pin that prepends the wrapper directory passes, and says so", () => {
+test("a pin that names the wrapper directory passes, and says only that", () => {
   const result = classify({
     ...WRAPPED,
     pin: "b".repeat(40),
@@ -382,7 +397,9 @@ test("a pin that prepends the wrapper directory passes, and says so", () => {
   });
   assert.equal(result.verdict, "ok");
   assert.equal(result.exitCode, 0);
-  assert.match(result.message, /prepends .*libexec\/paperclip\/bin/);
+  assert.match(result.message, /references .*libexec\/paperclip\/bin/);
+  // A presence hit must not read as an ordering attestation (Ally, #2392).
+  assert.match(result.message, /does not attest that the directory is PREPENDED/);
 });
 
 test("the measured, accepted gap warns at its own SHA without failing the PR", () => {
