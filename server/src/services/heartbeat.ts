@@ -385,7 +385,7 @@ import {
 } from "./issue-continuation-summary.js";
 import { buildPlanReviewContext } from "./plan-review-context.js";
 import { truncateText } from "./truncate-text.js";
-import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { describeGitFailure, executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import {
   applyAgentGitIdentityToRuntimeConfig,
   ensureCheckoutGitIdentity,
@@ -3884,12 +3884,42 @@ async function hasGitMetadata(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
-async function isGitCheckout(cwd: string | null | undefined) {
+// Carries git's own first stderr line out with the verdict (BLO-40279). This
+// helper fails open-to-"not a checkout" on ANY probe error, so the message it
+// feeds — "is not a git checkout" — is a claim about the repo that is wrong
+// whenever the probe itself was what broke. The modes that still reach the
+// catch below say nothing about .git and are mutually indistinguishable once
+// the stderr is dropped: EACCES on the directory or on .git, a stale or
+// severed handle on the shared network filesystem, ENOTDIR, a cwd that was
+// removed mid-run, and a failure to spawn `git` at all under the filtered
+// PATH. Quoting stderr is what separates those from a genuinely non-git path.
+//
+// Historically (pre-BLO-40317) one further mode reached it, and that is the
+// one this change was written for: a hidden secret mount made the credential
+// shim at <paperclip-home>/.local/bin/git exit 1 with "paperclip github token
+// file not readable", and 32 validations across 16 issues were reported as bad
+// checkouts whose .git was entirely intact. That route is closed *here*, by
+// strictGitCheckoutProbeEnv() below — it drops the agent-home bin dirs from
+// PATH and names this function as one of the three readers it protects, and a
+// false git_worktree_base_not_git_checkout as one of the failures it fixed. So
+// do not reintroduce the shim as a live cause at this call site. It remains a
+// live cause wherever the shim is still on PATH: see the same argument, still
+// correctly in present tense, around runGit()/resolveWorkspacePaths() in
+// packages/plugins/plugin-workspace-diff/src/workspace-diff.ts, which
+// overrides no env.
+async function probeGitCheckout(cwd: string | null | undefined): Promise<{ ok: boolean; detail: string }> {
   const normalized = readNonEmptyString(cwd);
-  if (!normalized) return false;
-  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized, env: strictGitCheckoutProbeEnv() })
-    .then((result) => Boolean(readNonEmptyString(result.stdout)))
-    .catch(() => false);
+  if (!normalized) return { ok: false, detail: "no workspace path" };
+  try {
+    const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
+      cwd: normalized,
+      env: strictGitCheckoutProbeEnv(),
+    });
+    if (readNonEmptyString(result.stdout)) return { ok: true, detail: "" };
+    return { ok: false, detail: "git rev-parse --show-toplevel printed nothing" };
+  } catch (error: unknown) {
+    return { ok: false, detail: describeGitFailure(error) };
+  }
 }
 
 async function pathIsAbsent(cwd: string): Promise<boolean> {
@@ -3902,7 +3932,7 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
 }
 
 // BLO-40317: resolve `git` for local-only reads (the strict probe below,
-// isGitCheckout() and hasGitPushRemote(), none of which contacts a remote)
+// probeGitCheckout() and hasGitPushRemote(), none of which contacts a remote)
 // WITHOUT the Paperclip home bin dirs on PATH. `/paperclip/.local/bin/git` is a
 // credential shim that execs the real git through a token wrapper and exits 1
 // when its token file is unreadable. That stderr is neither ENOENT nor "not a
@@ -3926,7 +3956,7 @@ function strictGitCheckoutProbeEnv(): NodeJS.ProcessEnv {
   return { ...process.env, PATH: entries.join(path.delimiter) };
 }
 
-// Unlike isGitCheckout(), this does not fail open: a probe error that isn't
+// Unlike probeGitCheckout(), this does not fail open: a probe error that isn't
 // positively identifiable as "cwd is not a git checkout" (missing directory,
 // or git's own "not a git repository" fatal) is treated as "could be a
 // checkout". That covers the storage-layer failures (permission denied,
@@ -4116,10 +4146,12 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
     );
   }
 
-  if (!await isGitCheckout(input.base.baseCwd)) {
+  const baseProbe = await probeGitCheckout(input.base.baseCwd);
+  if (!baseProbe.ok) {
     fail(
       "git_worktree_base_not_git_checkout",
-      `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but base workspace "${input.base.baseCwd}" is not a git checkout. ${remediation}`,
+      `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but base workspace "${input.base.baseCwd}" is not a git checkout (git: ${baseProbe.detail}). ${remediation}`,
+      { gitProbeDetail: baseProbe.detail },
     );
   }
 }
@@ -4206,7 +4238,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     effectiveCwd !== null &&
     (cwdIsWorkspaceLessFallback || input.resolvedWorkspace.source === "agent_home")
   ) {
-    // Deliberately not isGitCheckout(): that helper fails open (any probe
+    // Deliberately not probeGitCheckout(): that helper fails open (any probe
     // error -> false), which would wave a storage-layer probe failure
     // straight through to dispatch and reproduce the exact exit-128 this
     // guard exists to prevent. Reject dispatch unless the probe positively

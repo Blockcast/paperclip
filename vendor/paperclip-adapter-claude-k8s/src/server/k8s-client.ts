@@ -46,21 +46,26 @@ export interface SelfPodSecretVolume {
    *
    * PEN-3705: this used to be dropped and replaced with an unconditional
    * `optional: true` on the agent Job. For a credential mount that is not a
-   * graceful degradation. `PAPERCLIP_GITHUB_TOKEN_FILE` points *inside* the
-   * mount, so an absent mount does not leave the agent with "no token" — it
-   * leaves the path resolving to the bare shared-PVC directory underneath,
-   * which is mode 2775 and writable by uid 1000, the uid every agent runs as.
-   * Failing open on a credential mount whose path is PVC-backed hands that path
-   * to the agent.
+   * graceful degradation — `PAPERCLIP_GITHUB_TOKEN_FILE` points *inside* the
+   * mount, so an absent mount starts the Job with the env var naming a path
+   * that does not resolve, and every `gh`/git call fails at use time rather
+   * than at start.
    *
-   * The PVC-backed qualifier is load-bearing, not hedging: the allowlist
-   * currently covers one mount of each kind. `paperclip-github-mcp-token`
-   * mounts under `/paperclip`, so its fallback is fleet-shared and writable —
-   * that is the case this field exists for. `authbot-mcp-consumer-service-keys`
-   * mounts at `/var/run/authbot`, outside the PVC, so its fallback is the
-   * container's own ephemeral filesystem and reaches no other agent. Both are
-   * chart-declared required and both should stay that way, but only the first
-   * degrades into a credential-substitution path.
+   * The PVC-backed qualifier is load-bearing, not hedging, even though no
+   * allowlisted mount is PVC-backed today. It describes a strictly worse
+   * failure: if the mount sits *under* `persistence.mountPath`, an absent
+   * mount does not make the path unreadable, it uncovers the bare shared-PVC
+   * directory beneath — mode 2775, writable by uid 1000, the uid every agent
+   * runs as — so failing open hands every agent a writable token path rather
+   * than no token. `paperclip-github-mcp-token` was exactly that case until
+   * BLO-40279 moved it to `/etc/paperclip/secrets/`; `authbot-mcp-consumer-
+   * service-keys` at `/var/run/authbot` never was. (That is the chart's
+   * spelling, values.blockcast.yaml; /var/run is a symlink to /run, so the
+   * mount reads back as /run/authbot in-pod. Naming the resolved path alone
+   * made it look exempt from the /var/run/* note in that file — it is not.)
+   * Both are chart-declared required and must stay that way; the qualifier is
+   * what stops the next
+   * PVC-nested credential mount from being quietly downgraded.
    */
   optional?: boolean;
 }

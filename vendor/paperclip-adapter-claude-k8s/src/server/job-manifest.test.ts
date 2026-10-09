@@ -939,11 +939,14 @@ describe("buildJobManifest", () => {
     // PEN-3705. The agent Job used to force `optional: true` on every
     // propagated Secret regardless of what the source said. For a credential
     // mount that is not graceful degradation: PAPERCLIP_GITHUB_TOKEN_FILE
-    // points *inside* the github-token mount, so an absent mount leaves the
-    // path resolving to the bare shared-PVC directory underneath — mode 2775,
-    // writable by uid 1000, the uid every agent runs as, on a CephFS volume
-    // shared fleet-wide. Failing open moved the credential path somewhere any
-    // agent could write it.
+    // points *inside* the github-token mount, so an absent mount starts the
+    // Job with the env var naming a path that does not resolve. When PEN-3705
+    // was written it was worse than that — the mount then sat under the shared
+    // CephFS volume, so losing it uncovered the bare PVC directory beneath
+    // (mode 2775, writable by uid 1000, fleet-shared) and failing open moved
+    // the credential path somewhere any agent could write. BLO-40279 moved the
+    // mount outside the volume; the passthrough this asserts is what keeps the
+    // next PVC-nested credential mount from reintroducing it.
     it("does not mark a source-required Secret optional on the agent Job", () => {
       selfPod.secretVolumes = [{
         volumeName: "github-mcp-token",

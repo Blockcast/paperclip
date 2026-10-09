@@ -19,7 +19,7 @@
 # rather than mounted fleet-wide: see GH_SEAT_TOKEN_VALUE below.
 set -eu
 
-TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
+TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/etc/paperclip/secrets/github-token/token}"
 REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
 GH_SELF="${GH_TOKEN_WRAPPER_SELF:-/usr/bin/gh}"
 # Absolute, not `git` via PATH: some pods reorder PATH ahead of this image's
@@ -229,8 +229,25 @@ fi
 # the path printed is the compiled-in default and the variable named nothing.
 # Keeping the `+x` guard is the point — `-n` would let a set-but-empty value
 # fall through to ambient auth, which is the fail-open this file exists to kill.
+#
+# A caller naming a path under /paperclip/.secrets gets the move named for it
+# (BLO-40279): that was where both token Secrets mounted until they moved out
+# from under the shared CephFS volume, and an absolute path pinned in prose —
+# a runbook, an agent instruction bundle, muscle memory — cannot be swept the
+# way an in-repo one can. Deliberately a HINT and not a fallback: the two
+# Secrets are two *different principals* (the App installation vs the
+# `allyblockcast` user seat), whose approvals GitHub counts differently, so
+# silently resolving a named merge-seat path to the compiled-in App default
+# would run as an identity the caller did not ask for — the exact silent
+# downgrade BLO-37977 made this branch refuse.
 reject_token_file() {
-  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set, so a token file is required, but ${TOKEN_FILE} ${1}; refusing to run with ambient auth. GH_TOKEN/GITHUB_TOKEN are not used as a fallback; to run under a specific token, set GH_SEAT_TOKEN_VALUE" >&2
+  moved=""
+  case "${TOKEN_FILE}" in
+    /paperclip/.secrets/*)
+      moved=". That path is stale: the token Secrets moved to /etc/paperclip/secrets/<name>/token in BLO-40279, out from under the shared /paperclip volume. Point PAPERCLIP_GITHUB_TOKEN_FILE at the new path — this wrapper will not pick a credential for you, because the App token and the merge seat are different identities"
+      ;;
+  esac
+  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set, so a token file is required, but ${TOKEN_FILE} ${1}; refusing to run with ambient auth. GH_TOKEN/GITHUB_TOKEN are not used as a fallback; to run under a specific token, set GH_SEAT_TOKEN_VALUE${moved}" >&2
   exit 64
 }
 

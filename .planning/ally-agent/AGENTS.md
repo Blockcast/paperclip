@@ -289,7 +289,7 @@ review. Dismiss exactly the ids it lists, with the merge-token — a dismissal i
 not a verdict, so this is the one seat operation R4 (BLO-24056) still permits:
 
 ```bash
-PAPERCLIP_GITHUB_TOKEN_FILE=/paperclip/.secrets/github-merge-token/token \
+PAPERCLIP_GITHUB_TOKEN_FILE=/etc/paperclip/secrets/github-merge-token/token \
   gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$ID/dismissals" \
     -f event=DISMISS \
     -f message="Duplicate exact-head Ally submission superseded by the newer verdict at $HEAD_SHA."
