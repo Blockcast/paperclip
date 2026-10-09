@@ -251,6 +251,82 @@ describe("reapIsolationWorkspaces", () => {
     expect(silentLogger!.warn).toHaveBeenCalledTimes(1);
   });
 
+  it("skips an aged, layout-compliant directory holding a git worktree one level down", async () => {
+    // The shape property 1 cannot see: top level is exactly {home, session},
+    // and `home/<name>/.git` is the worktree pointer file. Measured on 13 of
+    // 503 live match-set directories (BLO-36735).
+    await makeWorkspace("ws-nested-wt", [...REAPABLE_LAYOUT], 60, {
+      "home/blo-32797-wt/.git": "gitdir: /paperclip/.../pim-multicast-gateway/.git/worktrees/blo-32797-wt\n",
+      "home/blo-32797-wt/Makefile": "real work",
+    });
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ scanned: 1, eligible: 0, deleted: 0, skippedLayout: 1 });
+    await expect(
+      fs.readFile(path.join(root, "ws-nested-wt", "home", "blo-32797-wt", "Makefile"), "utf8"),
+    ).resolves.toBe("real work");
+  });
+
+  it("probes session/ for a nested checkout, not only home/", async () => {
+    // A registered worktree was found under each side on the live tree, so
+    // probing one of them is not enough.
+    await makeWorkspace("ws-nested-session", [...REAPABLE_LAYOUT], 60, {
+      "session/pmg-34906-wt/.git": "gitdir: /paperclip/.../.git/worktrees/pmg-34906-wt\n",
+    });
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, skippedLayout: 1 });
+    await expect(fs.stat(path.join(root, "ws-nested-session"))).resolves.toBeDefined();
+  });
+
+  it("skips on a non-empty worktree parent dir, and reaps when it is empty", async () => {
+    await makeWorkspace("ws-wt-parent", [...REAPABLE_LAYOUT], 60, {
+      "home/.paperclip-worktrees/instances/worktree/go.mod": "module x",
+    });
+    // Negative control: the same directory name, empty, must NOT retain —
+    // otherwise the guard is a constant on anyone who ever ran the helper.
+    await makeWorkspace("ws-wt-parent-empty", [...REAPABLE_LAYOUT], 60);
+    await fs.mkdir(path.join(root, "ws-wt-parent-empty", "home", ".paperclip-worktrees"), { recursive: true });
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ scanned: 2, eligible: 1, deleted: 1, skippedLayout: 1 });
+    await expect(fs.stat(path.join(root, "ws-wt-parent"))).resolves.toBeDefined();
+    await expect(fs.stat(path.join(root, "ws-wt-parent-empty"))).rejects.toThrow();
+  });
+
+  it("still reaps a layout-compliant orphan whose home/ holds only tool caches", async () => {
+    // The guard must cost ~2.6% of the reclaim, not all of it. `.config` and
+    // `.local` are on every workspace in the tree.
+    await makeWorkspace("ws-plain-orphan", [...REAPABLE_LAYOUT], 60, {
+      "home/.config/gh/hosts.yml": "x",
+      "home/.local/share/pnpm/store": "y",
+      "session/history.jsonl": "z",
+    });
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ eligible: 1, deleted: 1, skippedLayout: 0 });
+  });
+
+  it("retains rather than deletes when the nested probe cannot read a side", async () => {
+    // Fail-closed branch. `home` is made a plain file so `readdir` raises
+    // ENOTDIR for every uid — a chmod 0 would not block a root-run CI, and
+    // would then pass by deleting the thing it is meant to protect.
+    const dir = path.join(root, "ws-unreadable");
+    await fs.mkdir(path.join(dir, "session"), { recursive: true });
+    await fs.writeFile(path.join(dir, "home"), "not a directory");
+    const stamp = new Date(NOW - 60 * DAY);
+    await fs.utimes(dir, stamp, stamp);
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, skippedLayout: 1 });
+    await expect(fs.stat(dir)).resolves.toBeDefined();
+  });
+
   it("skips a partial layout rather than treating a missing member as inert", async () => {
     await makeWorkspace("ws-home-only", ["home"], 60);
 
