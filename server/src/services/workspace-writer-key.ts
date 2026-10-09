@@ -65,7 +65,12 @@
  * Two exclusions, and note the asymmetry between them:
  * - a stateless PR review is run-unique by construction (and is filtered in
  *   `resolveK8sRunIsolationIdentity` ahead of every other branch), so it never
- *   keys.
+ *   keys. BLO-42212: `statelessPrReview` is now TWO populations, not one -- a
+ *   webhook-born review and a hand-filed review row carrying
+ *   `STATELESS_REVIEW_WORKSPACE_LABEL`. Both are run-unique for the same
+ *   reason (neither lands in the shared checkout at all); see
+ *   `runUsesStatelessReviewWorkspace` for why the label does not instead feed
+ *   `derivePaperclipPrReview`.
  * - `per_run` runScope excludes ONLY on the own-tree branch, where it appends a
  *   run token to the branch and hence to the directory. Under `project_primary`
  *   no branch or directory is derived at all, so `runScope: "per_run"` sitting
@@ -126,6 +131,74 @@
  * tree, and keying it on one would serialize unrelated agents against each
  * other for nothing. `resolveProjectIdNeedingWorkspaceFallback` is that gate.
  */
+/**
+ * BLO-42212: the issue label that marks a HAND-FILED PR-review row as one that
+ * needs no durable checkout, so it is isolated exactly like a webhook-born
+ * review -- `run:<runId>`, ephemeral workspace, null writer key.
+ *
+ * THE MEASURED DEFECT. A review row filed by hand (not by the GitHub webhook)
+ * wakes as `issue_assigned`, so `derivePaperclipPrReview` returns null for it:
+ * that function keys on `wakeReason` starting `github_pr_` or `reviewKind:
+ * "pr_review"`, both of which only the signed-webhook path writes. The row then
+ * falls through to the `project_primary` branch below. Onprem review rows are
+ * bound to one project workspace (a workaround for BLO-40317, which otherwise
+ * refuses them dispatch), so EVERY such review collides on
+ * `project-primary:b194eb56...` and the lane runs one review at a time behind a
+ * single isolation writer -- measured 2026-10-09 at ~3-4 reviews/hour against
+ * ~40 waiting heads, with deferral retries reaching attempt 25 (~2h).
+ *
+ * WHY THIS WIDENS THE ISOLATION PREDICATE AND NOT `derivePaperclipPrReview`.
+ * The obvious fix -- make a hand-filed row look like a webhook review by
+ * injecting `reviewKind`/`githubPrNumber` into its context -- is NOT available.
+ * `derivePaperclipPrReview` also projects `prAuthorLogin`, which the
+ * reviewer-output gate trusts as signed-webhook data to anchor a self-review
+ * skip (BLO-9293). Forging the wake context to buy isolation would hand that
+ * gate unsigned input. So the two facts are separated here: `statelessPrReview`
+ * answers "does this run write a shared tree", and it is isolation-only -- grep
+ * it, every consumer is a key/root derivation, none grants trust.
+ *
+ * WHY A LABEL IS SAFE TO LET AGENTS SET. Marking a row does not un-exclude a
+ * run from a tree it still touches; it moves the run OFF that tree.
+ * `buildK8sRunIsolationDescriptor` forces `hasProvisionedWorktree` false for a
+ * stateless review, so `workspaceRoot` becomes
+ * `/runtime-cache/paperclip-runs/<runId>/workspace` on EPHEMERAL storage. The
+ * run cannot reach the shared checkout, which is why dropping its writer key is
+ * correct rather than merely cheap -- it satisfies this module's contract
+ * literally: null means "nothing shared to exclude on". A self-applied label
+ * therefore costs the applier a warm checkout and can corrupt nothing.
+ *
+ * THE ONE HAZARD, and it is the loud kind: label a row that genuinely needs the
+ * project checkout and its run starts in an empty directory. That fails
+ * immediately and visibly on the first path that is not there. It does not
+ * silently tear a shared tree, which is the failure this module exists to
+ * prevent.
+ *
+ * WHY NOT A PER-RUN WORKTREE instead (the other option on BLO-42212): a
+ * worktree per concurrent run costs persistent volume on a filesystem measured
+ * at 88% with BLO-41473 (Thanos compactor sharing the control-plane Ceph quota)
+ * still open. Ephemeral run storage costs none of it, and is the profile
+ * webhook reviews have run on all along -- so this is the already-proven path,
+ * not a new one.
+ */
+export const STATELESS_REVIEW_WORKSPACE_LABEL = "stateless-review";
+
+/**
+ * Does this run get a run-unique ephemeral workspace instead of a shared tree?
+ *
+ * Two populations, and they are deliberately derived from different sources: a
+ * webhook-born PR review (trusted signed context) and a hand-filed review row
+ * carrying `STATELESS_REVIEW_WORKSPACE_LABEL` (operator-applied issue label).
+ * See that constant for why the label may not simply feed
+ * `derivePaperclipPrReview` instead.
+ */
+export function runUsesStatelessReviewWorkspace(input: {
+  webhookPrReview: boolean;
+  issueLabelNames?: readonly string[] | null;
+}): boolean {
+  return input.webhookPrReview
+    || (input.issueLabelNames ?? []).includes(STATELESS_REVIEW_WORKSPACE_LABEL);
+}
+
 export function resolveWorkspaceWriterTreeKey(input: {
   statelessPrReview: boolean;
   runResolvesToOwnTree: boolean;
