@@ -356,6 +356,55 @@ describe("comment-review gate lost-trigger re-drive", () => {
     expect(warn.mock.calls.some(([f]) => "errs" in (f as object))).toBe(false);
   });
 
+  it("passes a NON-Error cause through untouched, one line each", async () => {
+    // The test above only ever rejects with `Error`, the one shape pino
+    // serialises richly — so it cannot see what happens to anything else.
+    // `outcome.reason` from `Promise.allSettled` is unconstrained and
+    // `pino-std-serializers`' `errSerializer` returns a non-Error value AS IS,
+    // so the per-line split is the whole of the protection here: it is what
+    // keeps a plain object's non-enumerable fields from being erased silently
+    // inside a batched `errs` array, the way `[{},{}]` erased them. This pins
+    // pass-through rather than asserting enrichment that does not happen —
+    // a coercion or a wrapper added later must fail here and be argued for.
+    const warn = vi.fn();
+    const BARE_STRING = "outbox unavailable (no Error)";
+    // The exact hazard Ally named: enumerable-free, so `JSON.stringify` empties
+    // it. Distinct from the string so the two causes cannot be one repeated.
+    const OPAQUE: Record<string, never> = {};
+    Object.defineProperty(OPAQUE, "detail", { value: "erased on stringify", enumerable: false });
+    let attempt = 0;
+    const enqueueDelivery = vi.fn(async () => {
+      attempt += 1;
+      throw attempt === 1 ? BARE_STRING : OPAQUE;
+    });
+    await run(
+      { logger: { info: () => {}, warn } },
+      { runGateCheck: gateRunner(false, "retirement_failed"), enqueueDelivery },
+    );
+
+    const unarmedLines = warn.mock.calls.filter(([, msg]) =>
+      String(msg).startsWith("comment-review gate retired-context retry enqueue failed"),
+    );
+    // One line per cause here too — a non-Error cause must not be batched.
+    expect(unarmedLines).toHaveLength(2);
+    const causes = unarmedLines.map(([f]) => (f as { err: unknown }).err);
+    // Pass-through, by identity: neither value is wrapped, stringified, or
+    // replaced with an Error on its way to the log line.
+    expect(causes).toContain(BARE_STRING);
+    expect(causes).toContain(OPAQUE);
+    // …and this is why one line each matters: serialised, the object is empty.
+    // Batched under `errs`, that `{}` is indistinguishable from the defect this
+    // module was fixed for; alone under `err`, its own line still names the
+    // context that produced it.
+    expect(JSON.stringify(OPAQUE)).toBe("{}");
+    for (const [fields] of unarmedLines) {
+      const line = fields as { context: string; contexts: string[] };
+      expect(line.contexts).toContain(line.context);
+    }
+    expect(new Set(unarmedLines.map(([f]) => (f as { context: string }).context)).size).toBe(2);
+    expect(warn.mock.calls.some(([f]) => "errs" in (f as object))).toBe(false);
+  });
+
   it("leaves retirementRetryFailed at zero when the retries are armed", async () => {
     // The negative control: without it, a counter incremented unconditionally
     // passes the positive test above on its own.
