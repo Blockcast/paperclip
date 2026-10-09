@@ -18,7 +18,7 @@
 # paperclip-production environment, whose ratified reviewer set is
 # RATIFIED_REVIEWERS in .github/scripts/check-production-environment-protection.mjs.
 # ⛔ DO NOT RESTATE THE COUNT HERE — read the symbol. Two successive counts
-# written into this line were already false when committed (see below); a count
+# written into this line were false by the time they landed (see below); a count
 # in prose is a second source of truth that drifts silently, and this file is a
 # design document that readers plan against.
 #
@@ -31,11 +31,12 @@
 #
 # Two superseded readings, kept as a quoted record so a later run does not
 # re-litigate them. Until 2026-10-04 this read "its three named human
-# reviewers"; that was never a ratified shape. A 2026-10-08 correction to "its
-# ONE ratified human reviewer" was ALSO false when written — by 16h52m — because
-# it was authored against a branch behind the 2026-10-07 removal. Both are wrong
-# about the same underlying fact, that this job is gated on named humans, which
-# is why the count is gone rather than re-corrected.
+# reviewers"; that was never a ratified shape. A correction to "its ONE ratified
+# human reviewer" was TRUE when authored on 2026-10-04, while the environment
+# still required kkroo, and went stale before it landed on 2026-10-08: the owner
+# removed the rule on 2026-10-06 in between. Both rest on the same drifting fact,
+# that this job is gated on named humans, which is why the count is gone rather
+# than re-corrected.
 #
 # The residual single-approver risk is homed on BLO-22329 and PEN-2863 is
 # RESOLVED on it — do not re-file it. This only performs the mechanical step
