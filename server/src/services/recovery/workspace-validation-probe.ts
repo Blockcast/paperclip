@@ -139,6 +139,18 @@
  * exactly that reason (the comment above its `probeGitCheckoutStateStrict` call
  * in `assertGitSensitiveAdapterWorkspaceValid`).
  *
+ * `managed_checkout_partial_clone_unservable` is the one reason excluded on
+ * purpose rather than for want of a verdict. Its producer,
+ * `ensureManagedCheckoutCanServeClones` (managed-checkout-partial-clone.ts), is
+ * not fail-open: an unreadable config and a failed object scan each return
+ * `indeterminate`, and `partial_cannot_serve` requires a counted missing
+ * object, so that park is confirmed by construction. It still takes the
+ * ordinary stranded cause. The no-wake shape is a permanent silent strand, and
+ * a mirror only a human can repair is where silence costs most; bounded wakes
+ * and then a visible escalation are the better end state. Its payload carries
+ * neither key this predicate reads, and workspace-validation-probe.test.ts pins
+ * that against the producer's own evidence.
+ *
  * So the predicate is an allowlist of verdicts, not a denylist of reasons. It
  * governs only the two heartbeat.ts park sites that call
  * `workspaceValidationRecoveryCause` below, not the BLO-31351 git-transport

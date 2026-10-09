@@ -1,4 +1,12 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
+import {
+  ensureManagedCheckoutCanServeClones,
+  REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY,
+  REMOTE_ORIGIN_PROMISOR_KEY,
+} from "../managed-checkout-partial-clone.js";
 import {
   isConfirmedWorkspaceGitHazard,
   WORKSPACE_VALIDATION_RECOVERY_CAUSE,
@@ -121,5 +129,45 @@ describe("workspaceValidationRecoveryCause", () => {
       provenance: { ancestryVerdict: "unknown" },
     })).toBeUndefined();
     expect(workspaceValidationRecoveryCause(null)).toBeUndefined();
+  });
+});
+
+describe("managed_checkout_partial_clone_unservable", () => {
+  it("is excluded from the no-wake cause on purpose, pinned against the real producer", async () => {
+    // A confirmed hazard by construction (`partial_cannot_serve` only when
+    // `missing.count > 0`), but excluded deliberately: the no-wake shape is a
+    // permanent silent strand, the worst outcome for a mirror a human must
+    // repair. It takes the ordinary stranded cause instead. The payload is built
+    // from the producer's own evidence, assembled as the throw in
+    // `ensureManagedProjectWorkspace` (heartbeat.ts) assembles it, so a producer
+    // change that adds `gitProbeState` or `provenance` turns this red.
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "wvp-partial-clone-"));
+    try {
+      await fs.mkdir(path.join(cwd, ".git"));
+      const result = await ensureManagedCheckoutCanServeClones({
+        cwd,
+        runGit: async (args) => {
+          if (args.join(" ") === `config --get ${REMOTE_ORIGIN_PARTIAL_CLONE_FILTER_KEY}`) return "blob:none\n";
+          if (args.join(" ") === `config --get ${REMOTE_ORIGIN_PROMISOR_KEY}`) return "true\n";
+          throw new Error(`unexpected git ${args.join(" ")}`);
+        },
+        countMissing: async () => ({ count: 3, truncated: false }),
+      });
+      expect(result.state).toBe("partial_cannot_serve");
+
+      const payload = {
+        reason: "managed_checkout_partial_clone_unservable",
+        companyId: "company-1",
+        projectId: "project-1",
+        repoUrl: "https://example.com/repo.git",
+        ...result.evidence,
+      };
+      expect(payload).not.toHaveProperty("gitProbeState");
+      expect(payload).not.toHaveProperty("provenance");
+      expect(isConfirmedWorkspaceGitHazard(payload)).toBe(false);
+      expect(workspaceValidationRecoveryCause(payload)).toBeUndefined();
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
   });
 });
