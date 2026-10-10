@@ -622,12 +622,12 @@ export function buildPluginInstallArgs(
  * transient failure of the peer-resolving attempt turned a healthy tree into
  * the permanent `SDK_NOT_INSTALLED` latch.
  *
- * Both production callers therefore opt out for an isolated tree, so the retry
- * below is now unreachable in production: the install path passes
- * `fallbackToLegacyPeerDeps: !isolatedTree`, and the shared store never reaches
- * the branch at all because it installs with `installPeers: false`. It is kept
- * only so the opt-out is explicit at each call site rather than implicit in the
- * helper. **Do not re-enable it for a self-contained SDK tree.**
+ * The retry is therefore opt-IN: it runs only when a caller passes
+ * `fallbackToLegacyPeerDeps: true`, so forgetting the keyword gets the safe
+ * behaviour (fail, leave the tree alone) rather than the destructive one. No
+ * production caller opts in — both pass `false` — and the shared store never
+ * reaches the branch at all because it installs with `installPeers: false`.
+ * **Do not opt in for a self-contained SDK tree.**
  *
  * The repair path's reason for opting out is unchanged and still holds: there
  * the retry cannot help *by construction* — it is exactly the argv that can
@@ -655,7 +655,7 @@ export async function npmInstallPlugin(
   } catch (err) {
     // Only a peer-resolving attempt has a different argv left to try.
     if (!options.installPeers) throw err;
-    if (options.fallbackToLegacyPeerDeps === false) throw err;
+    if (options.fallbackToLegacyPeerDeps !== true) throw err;
     logger.child({ service: "plugin-loader" }).warn(
       { spec, installDir: targetInstallDir, err: err instanceof Error ? err.message : String(err) },
       "plugin-loader: peer-resolving install failed; retrying with --legacy-peer-deps",
@@ -2125,17 +2125,9 @@ export function pluginLoader(
         const isolatedTree = requiresSelfContainedSdkTree(targetInstallDir, localPluginDir);
         await npmInstallPlugin(spec, targetInstallDir, {
           installPeers: isolatedTree,
-          // BLO-34794: on an isolated tree the legacy retry is not a safe
-          // fallback, it is destructive. `--legacy-peer-deps` cannot place the
-          // peer, and `--save` PRUNES an SDK that is already installed — so one
-          // transient failure of the peer-resolving attempt converts a healthy
-          // tree into the permanent SDK_NOT_INSTALLED latch. Measured
-          // 2026-10-09: `removed 5 packages`, `node_modules/@paperclipai`
-          // emptied, lockfile rewritten without the SDK entry. Leaving the tree
-          // untouched on failure is strictly better — the next boot retries,
-          // and the SDK that is already there keeps working meanwhile. This
-          // matches the repair path, which already opts out for the same tree.
-          fallbackToLegacyPeerDeps: !isolatedTree,
+          // BLO-34794: the legacy retry prunes an installed SDK on an isolated
+          // tree. See npmInstallPlugin.
+          fallbackToLegacyPeerDeps: false,
         });
       } catch (err) {
         throw new Error(`npm install failed for ${spec}: ${String(err)}`);
