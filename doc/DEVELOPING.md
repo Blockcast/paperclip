@@ -1065,12 +1065,21 @@ above is async, each event's send is chained onto the previous one so the gate
 cannot reorder a live log stream — which means a socket whose decision stalls
 accrues one continuation, and one retained event payload, per company-wide event
 for the length of the stall. Past 512 pending sends the socket sheds further
-events and logs one warning per drop; the chain is also released, and a `closed`
-latch set, in the socket's `close` handler, so an in-flight continuation that
-resolves after the socket is gone neither projects nor sends. Shedding matches
-the existing fail-closed drop on a projection error. A draining socket sits at a
-depth of ~1, so reaching the bound means the authorizer is stuck, not that the
-fleet is busy — treat the warning as a signal about the decider.
+events. The bound is the only thing that caps that retention: queued
+continuations stay reachable from the stalled decider's own pending promise, so
+closing the socket does not reclaim them. What close adds is a `closed` latch,
+so a continuation that resolves after the socket is gone neither projects nor
+sends. Shedding matches the existing fail-closed drop on a projection error.
+
+Shedding is logged per episode, not per drop — a per-drop warning would turn the
+memory bound into an unbounded log-write rate for the length of the stall. A
+socket logs `live event send queue saturated` once on entering saturation, at
+most one `still saturated` summary per minute carrying the accumulated
+`droppedEvents`, and one closing line with the final count: `recovered from
+saturation` when its decider unsticks, or `closed while its send queue was
+saturated` if the socket goes first. A draining socket sits at a depth of ~1, so
+reaching the bound means the authorizer is stuck, not that the fleet is busy —
+treat these lines as a signal about the decider.
 
 ### Access auditing
 
