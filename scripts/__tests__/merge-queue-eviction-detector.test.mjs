@@ -9,6 +9,7 @@ import {
   classifyMergeQueueEviction,
   extractPaperclipIdentifiers,
   filterMergeGroupRunsForPr,
+  isQueueInitiatedRemoval,
   mergeQueueHeadBranchPrefix,
   selectLatestQueueAttemptWindow,
 } from "../merge-queue-eviction-detector.mjs";
@@ -19,6 +20,111 @@ test("classifies zero merge_group runs as conflict_unstageable, not check_failur
   const classification = classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [] });
   assert.equal(classification, "conflict_unstageable");
   assert.notEqual(classification, "check_failure");
+});
+
+// --- PEN-3926: zero runs has two causes; the removal actor separates them ---
+//
+// Measured on `Blockcast/paperclip` 2026-10-10 over 74 `removed_from_merge_queue`
+// events across 56 PRs: 53 attributed to `github-merge-queue[bot]`, 21 to a
+// human, zero with an absent actor, and no actor on both sides. Pairing each
+// detector notice to the removal that triggered it found 13 notices claiming
+// `conflict / un-stageable rebase` for a human-initiated dequeue, across 8 PRs
+// -- and 8 of the 13 PRs carrying a human removal went on to MERGE, which an
+// un-stageable branch cannot do. The same split was measured independently
+// from the webhook side over 108 runs (BLO-40351).
+
+test("PEN-3926: zero runs + queue-bot actor stays conflict_unstageable (the genuine eviction)", () => {
+  // PR #1092's removals are all `github-merge-queue[bot]`; this is the
+  // positive control that the fix does not make a real eviction quieter.
+  const classification = classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [],
+    dequeueActor: "github-merge-queue[bot]",
+  });
+  assert.equal(classification, "conflict_unstageable");
+});
+
+test("PEN-3926: zero runs + human actor is a manual dequeue, not a conflict", () => {
+  // #2331's four false notices: `kkroo` dequeued a branch reading
+  // `mergeable: MERGEABLE`/`CLEAN`, each within minutes of announcing the
+  // hold on the thread, and each notice told the reader to rebase it.
+  const classification = classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [],
+    dequeueActor: "kkroo",
+  });
+  assert.equal(classification, "manual");
+  assert.notEqual(classification, "conflict_unstageable");
+});
+
+test("PEN-3926: an App dequeue is manual too -- the test is 'not the queue', not 'is a human'", () => {
+  const classification = classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [],
+    dequeueActor: "allyblockcast[bot]",
+  });
+  assert.equal(classification, "manual");
+});
+
+test("PEN-3926: an absent or unusable actor keeps the pre-PEN-3926 verdict (fails toward status quo)", () => {
+  // The whole fix is gated on positively identifying a non-queue actor. If
+  // the timeline stops carrying `actor`, or a caller does not thread it, the
+  // classifier must behave exactly as it did before -- a genuine eviction
+  // must never be downgraded to `manual` by a missing field.
+  for (const dequeueActor of [null, undefined, "", "   ", 42, {}]) {
+    assert.equal(
+      classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [], dequeueActor }),
+      "conflict_unstageable",
+      `actor ${JSON.stringify(dequeueActor)} must not change the verdict`,
+    );
+  }
+});
+
+test("PEN-3926: isQueueInitiatedRemoval fails toward 'queue initiated' for anything unusable", () => {
+  assert.equal(isQueueInitiatedRemoval("github-merge-queue[bot]"), true);
+  assert.equal(isQueueInitiatedRemoval("GitHub-Merge-Queue[bot]"), true, "actor match is case-insensitive");
+  assert.equal(isQueueInitiatedRemoval(" github-merge-queue[bot] "), true, "surrounding whitespace is ignored");
+  assert.equal(isQueueInitiatedRemoval(null), true);
+  assert.equal(isQueueInitiatedRemoval(undefined), true);
+  assert.equal(isQueueInitiatedRemoval(""), true);
+  assert.equal(isQueueInitiatedRemoval("kkroo"), false);
+  assert.equal(isQueueInitiatedRemoval("allyblockcast[bot]"), false);
+});
+
+test("PEN-3926: the actor never overrides a failing check, and never un-merges a merge", () => {
+  // Deliberately narrow: the actor only arbitrates the ZERO-run branch,
+  // where run count genuinely cannot tell the two causes apart. A human who
+  // dequeues a PR whose merge_group run already failed is still reported as
+  // `check_failure` -- 2 such removals are in the 2026-10-10 sample.
+  assert.equal(
+    classifyMergeQueueEviction({
+      merged: false,
+      mergeGroupRuns: [{ conclusion: "failure" }],
+      dequeueActor: "kkroo",
+    }),
+    "check_failure",
+  );
+  assert.equal(
+    classifyMergeQueueEviction({ merged: true, mergeGroupRuns: [], dequeueActor: "kkroo" }),
+    "merged",
+  );
+});
+
+test("PEN-3926: a truncated empty sample stays `unknown` even with a human actor", () => {
+  // Truncation is a statement about the evidence, not the cause: an
+  // incomplete sample cannot rule out a failing run that the actor says
+  // nothing about. `unknown` already declines to prescribe a rebase, so
+  // there is nothing to fix here -- assert the ordering so a later change
+  // cannot quietly promote a truncated sample to a confident verdict.
+  assert.equal(
+    classifyMergeQueueEviction({
+      merged: false,
+      mergeGroupRuns: [],
+      truncated: true,
+      dequeueActor: "kkroo",
+    }),
+    "unknown",
+  );
 });
 
 test("classifies a failing merge_group run as check_failure", () => {
@@ -116,27 +222,34 @@ test("selectLatestQueueAttemptWindow picks the most recent enqueue/dequeue pair 
   const events = [
     { event: "added_to_merge_queue", created_at: "2026-08-08T09:00:00Z" },
     { event: "removed_from_merge_queue", created_at: "2026-08-08T09:10:00Z" },
-    { event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z" },
-    { event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z" },
+    { event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z", actor: "allyblockcast[bot]" },
+    { event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z", actor: "github-merge-queue[bot]" },
   ];
   const window = selectLatestQueueAttemptWindow(events, { now: Date.parse("2026-08-08T14:00:00Z") });
   assert.deepEqual(window, {
     enqueuedAt: "2026-08-08T09:24:35.000Z",
     dequeuedAt: "2026-08-08T13:55:45.000Z",
+    // PEN-3926: the remover, not the enqueuer -- #1092's real shape, where
+    // the App enqueued and the queue itself evicted.
+    dequeuedBy: "github-merge-queue[bot]",
   });
 });
 
 test("selectLatestQueueAttemptWindow is unaffected by event order in the input array", () => {
   const events = [
-    { event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z" },
-    { event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z" },
-    { event: "removed_from_merge_queue", created_at: "2026-08-08T09:10:00Z" },
-    { event: "added_to_merge_queue", created_at: "2026-08-08T09:00:00Z" },
+    { event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z", actor: "github-merge-queue[bot]" },
+    { event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z", actor: "allyblockcast[bot]" },
+    // PEN-3926: the earlier attempt's removal carries a DIFFERENT actor, so
+    // this fixture also fails if the actor is read off the wrong removal --
+    // which would invert the verdict, not just mislabel it.
+    { event: "removed_from_merge_queue", created_at: "2026-08-08T09:10:00Z", actor: "kkroo" },
+    { event: "added_to_merge_queue", created_at: "2026-08-08T09:00:00Z", actor: "kkroo" },
   ];
   const window = selectLatestQueueAttemptWindow(events, { now: Date.parse("2026-08-08T14:00:00Z") });
   assert.deepEqual(window, {
     enqueuedAt: "2026-08-08T09:24:35.000Z",
     dequeuedAt: "2026-08-08T13:55:45.000Z",
+    dequeuedBy: "github-merge-queue[bot]",
   });
 });
 
@@ -147,7 +260,12 @@ test("selectLatestQueueAttemptWindow reports dequeuedAt: null when still enqueue
   const events = [{ event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z" }];
   const now = Date.parse("2026-08-08T09:30:00Z");
   const window = selectLatestQueueAttemptWindow(events, { now });
-  assert.deepEqual(window, { enqueuedAt: "2026-08-08T09:24:35.000Z", dequeuedAt: null });
+  assert.deepEqual(window, {
+    enqueuedAt: "2026-08-08T09:24:35.000Z",
+    dequeuedAt: null,
+    // PEN-3926: no removal observed means no remover. Never the enqueuer.
+    dequeuedBy: null,
+  });
 });
 
 test("selectLatestQueueAttemptWindow ignores a re-enqueue that lands after `now` (Ally review #1220, grace-period race)", () => {
@@ -157,15 +275,16 @@ test("selectLatestQueueAttemptWindow ignores a re-enqueue that lands after `now`
   // The window must still classify the dequeue that triggered this run, not
   // jump onto the brand-new attempt that has no runs yet.
   const events = [
-    { event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z" },
-    { event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z" },
-    { event: "added_to_merge_queue", created_at: "2026-08-08T13:56:10Z" },
+    { event: "added_to_merge_queue", created_at: "2026-08-08T09:24:35Z", actor: "allyblockcast[bot]" },
+    { event: "removed_from_merge_queue", created_at: "2026-08-08T13:55:45Z", actor: "github-merge-queue[bot]" },
+    { event: "added_to_merge_queue", created_at: "2026-08-08T13:56:10Z", actor: "kkroo" },
   ];
   const now = Date.parse("2026-08-08T13:55:50Z");
   const window = selectLatestQueueAttemptWindow(events, { now });
   assert.deepEqual(window, {
     enqueuedAt: "2026-08-08T09:24:35.000Z",
     dequeuedAt: "2026-08-08T13:55:45.000Z",
+    dequeuedBy: "github-merge-queue[bot]",
   });
 });
 
@@ -367,4 +486,121 @@ test("detector workflow has no half-migrated `pull_request` event_name guard (BL
     "the notify step must pass --comment true on the real trigger; without it the detector " +
       "classifies the eviction and tells nobody, which is indistinguishable from no eviction.",
   );
+});
+
+
+test("PEN-3926: selectLatestQueueAttemptWindow reports the actor of the removal it anchored to", () => {
+  // #2331's shape: a bot eviction, then three human holds. The window must
+  // carry the actor of the removal belonging to THIS attempt -- taking the
+  // last removal overall (or the webhook's sender) would attribute an
+  // earlier attempt's bot eviction to a later deliberate hold.
+  const events = [
+    { event: "added_to_merge_queue", created_at: "2026-10-08T17:47:34Z", actor: "kkroo" },
+    { event: "removed_from_merge_queue", created_at: "2026-10-08T22:34:32Z", actor: "github-merge-queue[bot]" },
+    { event: "added_to_merge_queue", created_at: "2026-10-09T22:36:34Z", actor: "kkroo" },
+    { event: "removed_from_merge_queue", created_at: "2026-10-09T22:42:12Z", actor: "kkroo" },
+  ];
+
+  const latest = selectLatestQueueAttemptWindow(events, { now: Date.parse("2026-10-09T22:43:00Z") });
+  assert.equal(latest.dequeuedBy, "kkroo");
+  assert.equal(classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [],
+    dequeueActor: latest.dequeuedBy,
+  }), "manual");
+
+  // The earlier attempt, classified on its own window, is still the genuine
+  // eviction it always was.
+  const earlier = selectLatestQueueAttemptWindow(events, { now: Date.parse("2026-10-08T22:35:00Z") });
+  assert.equal(earlier.dequeuedBy, "github-merge-queue[bot]");
+  assert.equal(classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [],
+    dequeueActor: earlier.dequeuedBy,
+  }), "conflict_unstageable");
+});
+
+test("PEN-3926: a timeline event with no actor yields dequeuedBy: null, never a fabricated login", () => {
+  const window = selectLatestQueueAttemptWindow(
+    [
+      { event: "added_to_merge_queue", created_at: "2026-10-09T22:36:34Z" },
+      { event: "removed_from_merge_queue", created_at: "2026-10-09T22:42:12Z" },
+    ],
+    { now: Date.parse("2026-10-09T22:43:00Z") },
+  );
+  assert.equal(window.dequeuedBy, null);
+  // ...and a null actor keeps the pre-PEN-3926 verdict.
+  assert.equal(
+    classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [], dequeueActor: window.dequeuedBy }),
+    "conflict_unstageable",
+  );
+});
+
+test("PEN-3926: still-enqueued windows carry dequeuedBy: null alongside dequeuedAt: null", () => {
+  const window = selectLatestQueueAttemptWindow(
+    [{ event: "added_to_merge_queue", created_at: "2026-10-09T22:36:34Z", actor: "kkroo" }],
+    { now: Date.parse("2026-10-09T22:43:00Z") },
+  );
+  assert.equal(window.dequeuedAt, null);
+  assert.equal(window.dequeuedBy, null, "no removal observed means no remover, not the enqueuer");
+});
+
+test("PEN-3926: a manual notice names the actor and never prescribes a rebase", () => {
+  const body = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 2331,
+    classification: "manual",
+    mergeGroupRunCount: 0,
+    base: "master",
+    identifiers: ["PEN-2918"],
+    dequeueActor: "kkroo",
+  });
+
+  assert.ok(body.includes("kkroo"), "a manual notice must name who dequeued it");
+  assert.ok(
+    !body.includes("rebase onto the current base"),
+    "a manual dequeue notice must not instruct anyone to rebase: the branch is typically clean and under a " +
+      "deliberate hold, and both a human reader and an automated lander can act on that instruction. This is " +
+      "the concrete harm PEN-3926 was filed for.",
+  );
+  assert.ok(
+    !body.includes("un-stageable"),
+    "a manual dequeue notice must not assert an un-stageable rebase as the cause",
+  );
+  assert.ok(
+    !body.includes("a `merge_group` run was created"),
+    "the actor-attributed manual notice must not claim a run was created -- it is reachable at zero runs",
+  );
+});
+
+test("PEN-3926: a manual notice without an attributable actor keeps the original run-based wording", () => {
+  // The pre-PEN-3926 path into `manual` (a run existed and did not fail) has
+  // no actor to name and its original wording is still exactly right. Pin it
+  // so the new branch cannot silently rewrite the old one.
+  const body = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 1092,
+    classification: "manual",
+    mergeGroupRunCount: 1,
+    base: "master",
+    identifiers: [],
+  });
+  assert.ok(body.includes("a `merge_group` run was created for this PR's head and did not"));
+});
+
+test("PEN-3926: a conflict_unstageable notice still prescribes the rebase", () => {
+  // The remediation line is keyed on classification now; assert the genuine
+  // eviction kept its actionable instruction rather than losing it to the
+  // `manual` branch.
+  const body = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 1092,
+    classification: "conflict_unstageable",
+    mergeGroupRunCount: 0,
+    base: "master",
+    identifiers: ["BLO-23395"],
+    dequeueActor: "github-merge-queue[bot]",
+  });
+  assert.ok(body.includes("rebase onto the current base"));
+  assert.ok(body.includes("un-stageable"));
 });
