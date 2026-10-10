@@ -12,15 +12,37 @@
 # The gap was never the gate or the tooling — both work every time they are used. It
 # was that a manual step had no owner and no schedule.
 #
-# WHAT THIS DOES NOT DO
-# ---------------------
-# It does NOT approve anything. docker.yml's `deploy` job stays gated on the
-# paperclip-production environment and its three named human reviewers. This only
-# performs the mechanical step (dispatch), so there is always a build ready to approve
-# and approving means reviewing a day of commits instead of a quarter's worth.
+# WHAT THIS DOES NOT DO — AND WHAT NO LONGER GATES IT
+# ---------------------------------------------------
+# This workflow only dispatches. It does NOT approve anything, and its logic is
+# unchanged by the note below.
+#
+# ⛔ BUT SINCE 2026-10-06 A DISPATCH FROM HERE REACHES PRODUCTION WITH NO SECOND
+# PERSON, so dispatching IS deploying. This section used to claim the deploy job stays
+# gated on the paperclip-production environment and a named set of human reviewers. That
+# is false: the repo owner removed that rule on 2026-10-06 and recorded the decision
+# in Blockcast/onprem-k8s#4913 (merged 2026-10-07 as 641271378) —
+#   "The background security review flagged this commit as a security-control
+#    regression. That is correct, and it is intended."
+# The environment now carries a branch_policy rule only. Measured 2026-10-10, six
+# consecutive production deployments went waiting -> queued in 1-2s: nothing holds.
+# The risk accepted in #4913 is that anyone with write access to Blockcast/paperclip
+# can dispatch docker.yml and deploy any master commit, with no second person.
+#
+# WHAT STILL CONSTRAINS A DEPLOY — the whole list; there is no reviewer backstop:
+#   - deployment_branch_policy.protected_branches = true
+#   - can_admins_bypass = false
+#   - this workflow's reachable-from-master check on `target_sha`
+#   - master's own merge rules, plus the audit trail
+# The first two are asserted twice daily by production-environment-protection-guard.yml
+# via check-production-environment-protection.mjs, which is the authoritative record of
+# the ratified shape (RATIFIED_REVIEWERS is deliberately empty, which is why that guard
+# is green rather than broken). BLO-22329 homes the residual risk — do not re-argue it
+# here, and do not "restore" a reviewer without changing that file first.
 #
 # Auto-approval was considered and rejected on 2026-08-28: three green guards prove the
-# code builds, not that a human intends to ship it. That reasoning is unchanged.
+# code builds, not that a human intends to ship it. That reasoning is unchanged, but it
+# no longer has a reviewer gate to defend — #4913 removed the gate, not the reasoning.
 #
 # THE FOUR EXITS ARE DISTINGUISHABLE (PEN-2848, BLO-33400)
 # --------------------------------------------------------
