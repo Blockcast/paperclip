@@ -25,8 +25,8 @@
 //      head (or master), so base..head is this PR's change set and nothing else;
 //   3. the PR is open against that base branch and its head SHA is readable;
 //   4. the change set touches no CI-control path (pr.yml, .github/actions/,
-//      this script): a PR that changes how CI runs proves itself on the full
-//      suite;
+//      this script, master-health.yml): a PR that changes how CI runs, or the
+//      post-merge backstop the trim relies on, proves itself on the full suite;
 //   5. the queue applied exactly the change set PR CI tested, proven twice on
 //      git objects: `git patch-id --verbatim` (the stable algorithm, with
 //      whitespace kept) of base..head equals that of the PR head's diff
@@ -102,6 +102,7 @@ export const CI_CONTROL_PATHS = [
   /^\.github\/workflows\/pr\.yml$/,
   /^\.github\/actions\//,
   /^scripts\/merge-group-trim\.mjs$/,
+  /^\.github\/workflows\/master-health\.yml$/,
 ];
 
 const SHA = /^[0-9a-f]{40}$/;
