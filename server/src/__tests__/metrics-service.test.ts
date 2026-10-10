@@ -141,8 +141,17 @@ describe("PR-review queue-wait metrics (BLO-30623)", () => {
     expect(body).toContain(`${PR_REVIEW_QUEUE_WAIT_METRIC}_bucket{le="3600"} 0`);
     expect(body).toContain(`${PR_REVIEW_QUEUE_WAIT_METRIC}_bucket{le="7200"} 1`);
     expect(body).toContain(`${PR_REVIEW_QUEUE_WAIT_METRIC}_count 1`);
-    expect(PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS).toEqual([60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800]);
+    expect(PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS).toEqual([
+      60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 43200, 86400, 172800, 259200,
+    ]);
     expect(body).not.toContain("Blockcast");
+  });
+
+  it("keeps the saturated regime measured on BLO-31298 in a finite bucket", () => {
+    // 2026-10-10T11:44Z: 100% of samples past the then-top edge of 28800, mean
+    // 48941s. Past the top finite edge histogram_quantile() returns that edge
+    // verbatim, so the p95 panel flatlines at 8h while the wait keeps growing.
+    expect(PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS.at(-1)).toBeGreaterThan(48941);
   });
 });
 
