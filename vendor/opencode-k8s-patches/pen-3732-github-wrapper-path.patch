@@ -1,0 +1,149 @@
+diff --git a/src/server/job-manifest.test.ts b/src/server/job-manifest.test.ts
+index 38417d2..f816aba 100644
+--- a/src/server/job-manifest.test.ts
++++ b/src/server/job-manifest.test.ts
+@@ -2103 +2103,83 @@ describe("buildJobManifest — adapter-managed OpenCode runtime (opencodeVersion
+ });
++
++describe("buildJobManifest — GitHub egress wrapper PATH ordering (PEN-3732)", () => {
++  // PEN-3713/PEN-2527. The chart's render guard keeps the GitHub egress
++  // wrappers ahead of /usr/bin on the StatefulSet and the api Deployment — and
++  // only there. An agent Job's PATH is whatever layer 3 inherited or layer 4
++  // overwrote, with no shape check on any key, so the invariant was enforced
++  // everywhere except the containers that run agents. Measured on a live pod:
++  // PATH led with an agent-writable PVC directory and did not contain the
++  // wrapper directory at all.
++  //
++  // Read these five together; each kills a mutant the others survive. Drop the
++  // operator case and an implementation that only fixes the inherited path
++  // passes; drop the idempotence case and one that prepends without
++  // de-duplicating passes, growing PATH on every build; drop the no-PATH case
++  // and one that emits a lone directory passes, which clobbers the image's own
++  // ENV PATH and leaves nothing else resolvable; drop the present-but-late
++  // case and one that checks only for PRESENCE passes, which is the whole bug
++  // — a PVC directory ahead of the wrappers resolves `git` to the writable
++  // copy whether or not the wrapper directory appears later in the value.
++  //
++  // Verified by mutation, not assumed: with the prepend removed, four of the
++  // five fail; with the guard and the de-dup filter removed, the idempotence
++  // and present-but-late cases fail.
++  const WRAPPER_BIN = "/usr/local/libexec/paperclip/bin";
++
++  function pathOf(result: ReturnType<typeof buildJobManifest>): string {
++    const entry = (result.job.spec?.template?.spec?.containers[0]?.env ?? []).find(
++      (e) => e.name === "PATH",
++    );
++    // PATH is not sensitive-shaped so it stays a literal, but read the Secret
++    // too rather than depending on that classification staying put.
++    return entry?.value ?? result.envSecret?.data.PATH ?? "";
++  }
++
++  it("prepends the root-owned wrapper directory to an inherited PATH", () => {
++    const selfPod = { ...mockSelfPod, inheritedEnv: { PATH: "/usr/local/bin:/usr/bin:/bin" } };
++    const value = pathOf(buildJobManifest({ ctx: mockCtx, selfPod }));
++    expect(value).toBe(`${WRAPPER_BIN}:/usr/local/bin:/usr/bin:/bin`);
++  });
++
++  it("prepends it to an operator-set PATH too, which the merge does not validate", () => {
++    // The live shape: an adapterConfig.env PATH leading with an
++    // agent-writable PVC directory and omitting the wrappers entirely.
++    const ctx = {
++      ...mockCtx,
++      config: {
++        ...(mockCtx.config as Record<string, unknown>),
++        env: { PATH: "/paperclip/opencode-api-key-bin:/paperclip/bin:/usr/bin:/bin" },
++      },
++    };
++    const value = pathOf(buildJobManifest({ ctx, selfPod: mockSelfPod }));
++    expect(value.split(":")[0]).toBe(WRAPPER_BIN);
++    // The operator's own entries survive; this pins ordering, not content.
++    expect(value).toContain("/paperclip/opencode-api-key-bin");
++    expect(value).toContain("/usr/bin");
++  });
++
++  it("is idempotent when the wrapper directory already leads", () => {
++    const already = `${WRAPPER_BIN}:/usr/bin:/bin`;
++    const selfPod = { ...mockSelfPod, inheritedEnv: { PATH: already } };
++    expect(pathOf(buildJobManifest({ ctx: mockCtx, selfPod }))).toBe(already);
++  });
++
++  it("falls back to the system PATH rather than emitting a lone directory", () => {
++    const selfPod = { ...mockSelfPod, inheritedEnv: {} };
++    const value = pathOf(buildJobManifest({ ctx: mockCtx, selfPod }));
++    expect(value.split(":")[0]).toBe(WRAPPER_BIN);
++    expect(value.split(":").length).toBeGreaterThan(1);
++    expect(value).toContain("/usr/bin");
++  });
++
++  it("moves the wrapper directory to the front when it is present but late", () => {
++    // The ordering is the control, not mere presence: a PVC directory ahead of
++    // the wrappers resolves `git` to the agent-writable copy either way.
++    const selfPod = {
++      ...mockSelfPod,
++      inheritedEnv: { PATH: `/paperclip/.local/bin:${WRAPPER_BIN}:/usr/bin` },
++    };
++    const value = pathOf(buildJobManifest({ ctx: mockCtx, selfPod }));
++    expect(value).toBe(`${WRAPPER_BIN}:/paperclip/.local/bin:/usr/bin`);
++  });
++});
+diff --git a/src/server/job-manifest.ts b/src/server/job-manifest.ts
+index 2a79c5c..d605e13 100644
+--- a/src/server/job-manifest.ts
++++ b/src/server/job-manifest.ts
+@@ -111,2 +111,12 @@ const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
+ const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
++
++// PEN-3713/PEN-3732. Where the paperclip agent image installs the root-owned
++// GitHub egress wrappers (Dockerfile `COPY docker/github-wrappers/`). Must
++// match `paperclip.imageWrapperBinDir` in the chart and the identical constant
++// in the claude_k8s adapter — the three name one directory, and a value that
++// drifts becomes a PATH entry no image carries.
++const GITHUB_WRAPPER_BIN_DIR = "/usr/local/libexec/paperclip/bin";
++// Only used when the merged env carries no PATH at all; see the prepend below.
++const GITHUB_WRAPPER_FALLBACK_PATH =
++  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+ const RUNTIME_CACHE_SIZE_LIMIT = "20Gi";
+@@ -693,2 +703,43 @@ function buildEnvVars(
+ 
++
++  // PEN-3713/PEN-2527/PEN-3732: keep the root-owned GitHub egress wrappers
++  // ahead of the image CLIs on the agent's PATH, whatever PATH it ended up
++  // with. This mirrors the identical block in the claude_k8s adapter; the two
++  // adapters are the only K8s execution targets, so a fix in one leaves the
++  // other resolving the agent-writable PVC wrappers.
++  //
++  // The chart validates this invariant at render time ("paperclip.runtimePath"
++  // fails the render if a wrapper directory is missing or lands after
++  // /usr/bin), but that guard only reaches the long-lived server and api
++  // containers. An agent Job's PATH is whatever layer 3 inherited or layer 4
++  // (`adapterConfig.env.PATH`, an operator-set database value) overwrote — see
++  // the merge above, which applies no shape check to any key. Measured
++  // 2026-10-02 on a live agent pod: PATH began with an agent-writable PVC
++  // directory and did not contain the wrapper directory at all, so `git`
++  // resolved straight to /usr/bin/git and PEN-3156's wrapper was off the
++  // traffic path entirely while the chart's render guard reported healthy.
++  //
++  // Prepending rather than rejecting: a bad PATH here is an operator
++  // misconfiguration that would otherwise fail a Job that has nothing to do
++  // with GitHub, and the thing worth guaranteeing is the ordering, not the
++  // rest of the value. Idempotent, so a PATH that already leads with the
++  // directory is left exactly as it is.
++  const existingPath = merged.PATH;
++  // With no PATH to prepend to, emitting a bare wrapper directory would
++  // CLOBBER the image's own `ENV PATH` — an explicit container env entry wins
++  // outright — and leave the agent unable to resolve any other binary. Fall
++  // back to the system default in that case rather than to one directory.
++  // Leaving PATH unset instead is rejected for the reason the whole block
++  // exists: no env entry means no chart guard and no inherited value either,
++  // so the wrapper directory would be absent rather than merely late. This
++  // branch is in practice unreachable — layer 3 `inheritedEnv` carries the
++  // server pod's PATH, which the inherit allowlist admits by name.
++  const pathEntries = (existingPath || GITHUB_WRAPPER_FALLBACK_PATH).split(":");
++  if (pathEntries[0] !== GITHUB_WRAPPER_BIN_DIR) {
++    merged.PATH = [
++      GITHUB_WRAPPER_BIN_DIR,
++      ...pathEntries.filter((entry) => entry !== GITHUB_WRAPPER_BIN_DIR),
++    ].join(":");
++  }
++
+   // Keep credential-shaped values out of the Job spec. A Secret-backed
