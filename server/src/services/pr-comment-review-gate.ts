@@ -907,9 +907,9 @@ export function evaluateCommentReviewGate(input: {
     // Tails measure 38 / 54 / 55. That 55 bounds the LAST branch below to 131
     // (its 76-character lead plus the tail), inside the 140 cap. It does not
     // bound the two list branches: each budgets its list against whatever the
-    // tail leaves, so either lands on exactly 140 whenever the list fills its
-    // allowance — which is what the exact-fit tests pin. 131 is that one
-    // branch's ceiling, not the file's.
+    // tail leaves and cuts between entries, so neither can exceed 140 however
+    // long the list — the cap the list-branch tests pin with `<= 140`. 131 is
+    // that one branch's ceiling, not the file's.
     const carriedTail = !withheldPositive
       ? "; no comment attests the current head."
       : withheldPositive.authorUnknown
@@ -954,12 +954,15 @@ export function evaluateCommentReviewGate(input: {
       carried.unrecognizedVerbs.map((verb) => `"${verb}"`),
       Math.max(0, MAX_COMMIT_STATUS_DESCRIPTION - verbLead.length - carriedTail.length),
     );
-    // Names the ledger entries Ally still owes for this head, in the exact
-    // `prior:<sha> <severity> <index>` token an entry is written with, so the
-    // reader can copy it rather than reverse-engineer it from the review. It is
-    // deliberately terser than the no-verb lead below (36 characters against
-    // 76) because the identities are the payload here, not the prose: 36 plus
-    // the longest tail at 55 leaves 49, enough for two identities whole.
+    // Names the ledger entries Ally still owes for this head by the same
+    // `prior:<sha>` and `<severity> <index>` an entry is written with, so the
+    // reader can transcribe them rather than reverse-engineer them from the
+    // review. Each `<severity> <index>` is quoted so a multi-entry list stays
+    // legible, which means the rendered text is not a literal copy of an entry
+    // bullet. It is deliberately terser than the no-verb lead below (36
+    // characters against 76) because the identities are the payload here, not
+    // the prose: 36 plus the longest tail at 55 leaves 49, enough for two
+    // identities whole.
     //
     // Message only. The red is already correct under #1707 and nothing here
     // reads back into the verdict — crediting a mirror relation as a ledger
