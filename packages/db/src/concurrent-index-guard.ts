@@ -143,7 +143,7 @@ export const PENDING_CONCURRENT_INDEXES: readonly ConcurrentIndexSpec[] = [
 ];
 
 export const DEFAULT_STATEMENT_TIMEOUT_MS = 10 * 60 * 1000;
-const DEFAULT_DDL_LOCK_TIMEOUT_MS = 2 * 60 * 1000;
+export const DEFAULT_DDL_LOCK_TIMEOUT_MS = 2 * 60 * 1000;
 export const DEFAULT_LOCK_WAIT_TIMEOUT_MS = 20 * 60 * 1000;
 const LOCK_POLL_INTERVAL_MS = 250;
 
