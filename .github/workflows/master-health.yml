@@ -115,8 +115,24 @@ concurrency:
   # Keyed on event_name too: `github.ref` is `refs/heads/master` for both push
   # and workflow_dispatch, so without it an operator's "has master recovered?"
   # dispatch could be cancelled by an unrelated push, or cancel one.
+  #
+  # A PUSH run is never cancelled in flight. Since the merge-group heavy-lane
+  # trim (scripts/merge-group-trim.mjs) this workflow is the post-merge backstop
+  # for every landing whose general-server shards were carried forward, which
+  # is most of them, and landings arrive faster than one 54-69 min server run.
+  # With cancel-in-progress the next landing killed the run in flight: in the
+  # 2026-10-03..10-09 replay only 25 of 164 such runs would have finished, and
+  # the other 139 burned arc-paperclip-general CPU and reported nothing.
+  # Without it, GitHub keeps at most ONE pending run per concurrency group and
+  # replaces it with each newer push (the superseded pending run is cancelled
+  # before it takes a runner). So the run in flight always reports, the next one
+  # tests the newest master head, and a burst of N landings still costs at most
+  # two runs (the 2026-08-16 drain: one in flight plus the newest pending).
+  # Every master head contains all earlier ones, so a superseded landing is
+  # covered by the newer head's run. Dispatch and schedule keep cancelling: each
+  # is a single explicit request whose newest instance is the one wanted.
   group: master-health-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 permissions:
   contents: read
@@ -137,6 +153,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       pretested: ${{ steps.check.outputs.pretested }}
+      pretested_workspaces: ${{ steps.check.outputs.pretested_workspaces }}
     steps:
       - name: Look for a successful merge_group build at this exact SHA
         id: check
@@ -162,6 +179,18 @@ jobs:
             and ([.steps[]? | select(.name == "Run grouped general test suites"
             or .name == "Run serialized server test shard") | .conclusion]
             == ["success", "success"]))
+          # The trim never carries workspaces-a/-b forward, so a merge_group
+          # build that ran them proved them on this exact tree: proof is per
+          # group, and a landing whose server shards were carried forward
+          # re-runs only the server legs (`pretested_workspaces` gates
+          # workspaces_tests). Same positive-evidence rule as above: both jobs
+          # succeeded AND ran their suite step; a path-selector skip is not proof.
+          WORKSPACES_SUITES_RAN: >-
+            [.jobs[] | select(.name == "General tests (workspaces-a)"
+            or .name == "General tests (workspaces-b)")]
+            | length == 2 and all(.[]; .conclusion == "success"
+            and ([.steps[]? | select(.name == "Run grouped general test suites")
+            | .conclusion] == ["success"]))
         run: |
           set -uo pipefail
 
@@ -175,8 +204,10 @@ jobs:
           # suites (SERVER_SUITES_RAN above) means this exact tree has already
           # been through them, and re-running them would be pure duplicated
           # cost. A run that carried them forward from the PR head proves
-          # nothing about this tree: the suite runs here instead, once per
-          # landed head (cancel-in-progress coalesces a burst of landings).
+          # nothing about this tree: the suite runs here instead. Push runs
+          # coalesce without cancellation (see `concurrency:` above), so each
+          # run that starts finishes and reports. The workspaces groups are
+          # proven separately (WORKSPACES_SUITES_RAN above).
           #
           # Filter on the workflow PATH, not merely on a successful merge_group
           # run: `commitperclip-review.yml` also fires on merge_group, so
@@ -194,29 +225,38 @@ jobs:
             # workflow exists to prevent.
             echo "Could not query merge_group runs; running the suite anyway."
             echo "pretested=0" >> "$GITHUB_OUTPUT"
+            echo "pretested_workspaces=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if [ -z "$runs" ]; then
             echo "No successful pr.yml merge_group build for ${HEAD_SHA} (landed outside the queue); running the suite."
             echo "pretested=0" >> "$GITHUB_OUTPUT"
+            echo "pretested_workspaces=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          server=0 workspaces=0
           for run_id in $runs; do
-            # Fail closed per build as well: a job list that cannot be read is
-            # not proof that the server suites ran.
-            if ran="$(gh api \
-              "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100" \
-              --jq "$SERVER_SUITES_RAN")" && [ "$ran" = "true" ]; then
-              echo "Commit ${HEAD_SHA} has successful pr.yml merge_group build ${run_id}, which ran every general-server shard; skipping."
-              echo "pretested=1" >> "$GITHUB_OUTPUT"
-              exit 0
+            # Fail closed per build and per group as well: a job list that
+            # cannot be read is not proof that any suite ran.
+            jobs_url="repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100"
+            if [ "$server" = 0 ] && ran="$(gh api "$jobs_url" --jq "$SERVER_SUITES_RAN")" \
+              && [ "$ran" = "true" ]; then
+              echo "Commit ${HEAD_SHA} has successful pr.yml merge_group build ${run_id}, which ran every general-server shard; skipping the server legs."
+              server=1
+            fi
+            if [ "$workspaces" = 0 ] && ran="$(gh api "$jobs_url" --jq "$WORKSPACES_SUITES_RAN")" \
+              && [ "$ran" = "true" ]; then
+              echo "Commit ${HEAD_SHA} has successful pr.yml merge_group build ${run_id}, which ran workspaces-a and workspaces-b; skipping the workspaces legs."
+              workspaces=1
             fi
           done
 
-          echo "Commit ${HEAD_SHA} has a successful pr.yml merge_group build, but none ran the general-server suites (merge-group trim or path selector), or its jobs were unreadable; running the suite."
-          echo "pretested=0" >> "$GITHUB_OUTPUT"
+          [ "$server" = 1 ] || echo "Commit ${HEAD_SHA} has a successful pr.yml merge_group build, but none ran the general-server suites (merge-group trim or path selector), or its jobs were unreadable; running the server legs."
+          [ "$workspaces" = 1 ] || echo "Commit ${HEAD_SHA} has a successful pr.yml merge_group build, but none ran workspaces-a and workspaces-b, or its jobs were unreadable; running the workspaces legs."
+          echo "pretested=${server}" >> "$GITHUB_OUTPUT"
+          echo "pretested_workspaces=${workspaces}" >> "$GITHUB_OUTPUT"
 
   general_tests:
     name: Master tests (${{ matrix.group_label }})
@@ -229,7 +269,7 @@ jobs:
     # non-zero inside a step that is actually running. With the gate failed,
     # `needs.gate.outputs.pretested` is empty, `'' != '1'` is true, and the
     # suite runs — the fail-closed behaviour this workflow promises. Nothing
-    # retries a skipped run: the next push supersedes it via cancel-in-progress.
+    # retries a skipped run; the next push's run tests a head that contains it.
     #
     # It is `!cancelled()` and NOT `always()`, which is a real distinction here
     # rather than style. `always()` is true even when the run has been
@@ -271,9 +311,10 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 6
-      # Mirrors pr.yml's general_tests matrix. The 2026-08-16 regression
-      # surfaced in `general-server` shard 1/4's serialized suite.
+      max-parallel: 4
+      # Mirrors pr.yml's general_tests matrix (its server legs; workspaces-a/-b
+      # are workspaces_tests below, gated on their own proof). The 2026-08-16
+      # regression surfaced in `general-server` shard 1/4's serialized suite.
       matrix:
         include:
           - group: general-server
@@ -292,14 +333,6 @@ jobs:
             group_label: server 4/4
             shard_index: 3
             shard_count: 4
-          - group: general-workspaces-a
-            group_label: workspaces-a
-            shard_index: ''
-            shard_count: ''
-          - group: general-workspaces-b
-            group_label: workspaces-b
-            shard_index: ''
-            shard_count: ''
 
     steps:
       - name: Checkout repository
@@ -328,3 +361,47 @@ jobs:
       - name: Run serialized server test shard
         if: matrix.group == 'general-server'
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
+
+  workspaces_tests:
+    name: Master tests (${{ matrix.group_label }})
+    needs: [gate]
+    # general_tests' workspaces-a/-b legs, split out so they are gated on their
+    # own proof (`pretested_workspaces`): the merge-group trim carries only the
+    # general-server shards forward, so a landing whose workspaces groups ran in
+    # its merge_group build need not re-run them here. The `if:` keeps every
+    # property argued at general_tests' `if:` above: `!cancelled()` (fail
+    # closed on a gate failure, no resurrected superseded runs), the
+    # workflow_dispatch bypass, and the load-bearing `schedule` bypass (held by
+    # the same scan in scripts/check-scheduled-guard-liveness.test.mjs, which
+    # audits every `if:` naming `needs.gate.outputs.pretested`).
+    if: ${{ !cancelled() && (needs.gate.outputs.pretested_workspaces != '1' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    runs-on: arc-paperclip-general
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - group: general-workspaces-a
+            group_label: workspaces-a
+          - group: general-workspaces-b
+            group_label: workspaces-b
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run grouped general test suites
+        run: pnpm test:run:general -- --group '${{ matrix.group }}'

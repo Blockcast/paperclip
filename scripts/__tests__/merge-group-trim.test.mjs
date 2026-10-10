@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,7 @@ import {
   gatherFacts,
   parseQueueRef,
   patchId,
+  repoRoot,
 } from "../merge-group-trim.mjs";
 
 // Contract for the merge-group heavy-lane trim (owner directives 2026-10-07 /
@@ -282,6 +283,72 @@ for (const [label, env] of [
   });
 }
 
+// The decision is made by the merge group BASE's copy of the script (design
+// §3.3: trusted code), never the queued PR's copy: a PR that edits the script
+// must not decide its own trim. The step's shell runs here as written.
+function runDecideStep(t, { baseHasScript }) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "mg-trim-decide-")));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repo = join(root, "repo");
+  const temp = join(root, "runner-temp");
+  mkdirSync(join(repo, "scripts"), { recursive: true });
+  mkdirSync(temp);
+  const g = (...args) => execFileSync("git", ["-c", "commit.gpgsign=false", ...args], { cwd: repo, env: GIT_ENV }).toString().trim();
+  const stub = (who) =>
+    `import { appendFileSync } from "node:fs";\nappendFileSync(process.env.GITHUB_OUTPUT, "copy=${who}\\nroot=" + process.env.MERGE_GROUP_TRIM_REPO_ROOT + "\\n");\n`;
+  g("init", "-q", "-b", "master");
+  writeFileSync(join(repo, "README"), "base\n");
+  if (baseHasScript) writeFileSync(join(repo, "scripts", "merge-group-trim.mjs"), stub("base"));
+  g("add", "-A");
+  g("commit", "-q", "-m", "base");
+  const base = g("rev-parse", "HEAD");
+  writeFileSync(join(repo, "scripts", "merge-group-trim.mjs"), stub("queued-pr"));
+  g("add", "-A");
+  g("commit", "-q", "-m", "queued PR edits the trim script");
+  const out = join(root, "output");
+  writeFileSync(out, "");
+  const decide = jobRegion("policy").slice(jobRegion("policy").indexOf("- name: Decide merge-group heavy-lane trim\n"));
+  const r = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", stepRun(decide, "Decide merge-group heavy-lane trim")], {
+    cwd: repo,
+    env: { PATH: process.env.PATH, GITHUB_OUTPUT: out, RUNNER_TEMP: temp, MERGE_GROUP_BASE_SHA: base, ...GIT_ENV },
+    encoding: "utf8",
+  });
+  return { status: r.status, stdout: r.stdout, output: readFileSync(out, "utf8"), repo };
+}
+
+test("the decide step runs the merge group base's copy of the script, not the queued PR's", (t) => {
+  const r = runDecideStep(t, { baseHasScript: true });
+  assert.equal(r.status, 0, r.stdout);
+  assert.equal(r.output, `copy=base\nroot=${r.repo}\n`);
+});
+
+test("with no script at the merge group base the decide step trims nothing and stays green", (t) => {
+  const r = runDecideStep(t, { baseHasScript: false });
+  assert.equal(r.status, 0, r.stdout);
+  assert.equal(r.output, "", "no outputs: every consumer reads a missing output as run");
+  assert.match(r.stdout, /::warning title=merge-group trim fell back to the full suite::/);
+});
+
+test("the repo root is MERGE_GROUP_TRIM_REPO_ROOT when set, else the script's parent directory", () => {
+  assert.equal(repoRoot({ MERGE_GROUP_TRIM_REPO_ROOT: "/work/checkout" }), "/work/checkout");
+  assert.equal(repoRoot({}), fileURLToPath(new URL("../..", import.meta.url)).replace(/\/$/, ""));
+  assert.equal(repoRoot({}, "file:///runner/_temp/merge-group-trim.base.mjs"), "/runner");
+});
+
+test("the real script still decides when run from a copy outside the checkout", (t) => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "mg-trim-copy-")));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const copy = join(dir, "merge-group-trim.base.mjs");
+  copyFileSync(script, copy);
+  const out = join(dir, "output");
+  const r = spawnSync(process.execPath, [copy], {
+    env: { PATH: process.env.PATH, GITHUB_OUTPUT: out, GITHUB_EVENT_NAME: "pull_request", MERGE_GROUP_TRIM_REPO_ROOT: dir },
+    encoding: "utf8",
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readFileSync(out, "utf8"), allOutputs("false"), "the main guard must fire for a copied script");
+});
+
 // ---------------------------------------------------------------------------
 // Fact gathering on real git objects. A bare "origin" carries the PR head at
 // refs/pull/7/head; the work tree is checked out at the merge-group head G,
@@ -362,9 +429,9 @@ async function withApi(t, H, jobs) {
   return { url: `http://127.0.0.1:${server.address().port}`, seen };
 }
 
-async function gather(t, fx, G) {
+async function gather(t, fx, G, apiHead = fx.H) {
   const fresh = greenJobs(new Date(Date.now() - 3_600_000).toISOString());
-  const api = await withApi(t, fx.H, fresh);
+  const api = await withApi(t, apiHead, fresh);
   const env = {
     GITHUB_EVENT_NAME: "merge_group",
     MERGE_GROUP_HEAD_REF: `refs/heads/gh-readonly-queue/master/pr-7-${fx.P}`,
@@ -430,6 +497,25 @@ test("base drift inside the PR's hunk context merges cleanly but still refuses t
   assert.deepEqual(trimmed(decideTrim(f)), []);
 });
 
+test("an API head that is not the fetched refs/pull/N/head refuses the trim, even when its change is identical", async (t) => {
+  const fx = fixture(t);
+  // X carries H's exact tree and patch under a different message, so every git
+  // identity check would pass on X: only the ref/API consistency check refuses.
+  fx.g("checkout", "-q", "-b", "amended", fx.H);
+  fx.g("commit", "-q", "--amend", "-m", "pr: add c (amended)");
+  const X = fx.g("rev-parse", "HEAD");
+  assert.notEqual(X, fx.H);
+  const G = queueHead(fx);
+  const { facts: f } = await gather(t, fx, G, X);
+  assert.ok(
+    f.notes.some((n) => n === `refs/pull/7/head is ${fx.H}, API says ${X}`),
+    `expected the ref/API mismatch note, got ${JSON.stringify(f.notes)}`,
+  );
+  assert.notEqual(f.patchIdMatch, true);
+  assert.notEqual(f.treeMatch, true);
+  assert.deepEqual(trimmed(decideTrim(f)), []);
+});
+
 test("patch-id is whitespace-sensitive (--verbatim): an indentation-only change is a different patch", (t) => {
   const fx = fixture(t);
   fx.g("checkout", "-q", "-b", "ws", fx.B);
@@ -487,7 +573,8 @@ test("policy decides the trim once, fails open, and reads the kill switch and th
   );
   assert.match(decide, /MERGE_GROUP_FULL_SUITE: \$\{\{ vars\.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE \}\}/);
   assert.match(decide, /MERGE_GROUP_DEFAULT_BRANCH: \$\{\{ github\.event\.repository\.default_branch \}\}/);
-  assert.match(decide, /run: node \.\/scripts\/merge-group-trim\.mjs\n        timeout-minutes: \d+\n/);
+  assert.match(decide, /\n        run: \|\n[\s\S]*git show "\$\{MERGE_GROUP_BASE_SHA\}:scripts\/merge-group-trim\.mjs"[\s\S]*\n        timeout-minutes: \d+\n/);
+  assert.doesNotMatch(decide.slice(0, decide.indexOf("timeout-minutes:")), /node \.\/scripts\/merge-group-trim\.mjs/, "never the merge group's own copy");
   assert.ok(
     policy.indexOf("- name: Decide merge-group heavy-lane trim\n") > policy.indexOf("- name: Checkout repository\n"),
     "the decision needs policy's full-depth checkout",
@@ -638,6 +725,7 @@ function foldedEnv(region, name) {
 
 const GATE = jobRegion("gate", masterHealth);
 const SERVER_SUITES_RAN = foldedEnv(GATE, "SERVER_SUITES_RAN");
+const WORKSPACES_SUITES_RAN = foldedEnv(GATE, "WORKSPACES_SUITES_RAN");
 const GATE_RUN = stepRun(GATE, "Look for a successful merge_group build at this exact SHA");
 const hasJq = spawnSync("jq", ["--version"]).status === 0;
 
@@ -676,6 +764,7 @@ function runGate(t, fixtures) {
       HEAD_SHA: GROUP_HEAD,
       REPO: "o/r",
       SERVER_SUITES_RAN,
+      WORKSPACES_SUITES_RAN,
     },
     encoding: "utf8",
   });
@@ -685,10 +774,15 @@ function runGate(t, fixtures) {
 
 const prRun = (id) => ({ id, path: ".github/workflows/pr.yml", conclusion: "success" });
 const reviewRun = { id: 12, path: ".github/workflows/commitperclip-review.yml", conclusion: "success" };
-const serverJobs = (proof) => ({
+const wsJob = (name, stepConclusion = "success") => ({
+  ...job(name),
+  steps: [...SETUP, step("Run grouped general test suites", stepConclusion)],
+});
+const WS = [wsJob("General tests (workspaces-a)"), wsJob("General tests (workspaces-b)")];
+const serverJobs = (proof, ws = WS) => ({
   jobs: [
     ...Array.from({ length: 6 }, (_, i) => job(`General tests (server ${i + 1}/6)`, "success", DONE, proof)),
-    job("General tests (workspaces-a)"),
+    ...ws,
     job("verify"),
   ],
 });
@@ -701,21 +795,55 @@ const CARRIED = {
   ),
 };
 
-for (const [label, fixtures, expected] of [
-  ["a merge group that RAN every server shard is proof", { "runs.json": { workflow_runs: [prRun(11)] }, "jobs-11.json": RAN }, "pretested=1"],
-  ["a merge group that CARRIED the server shards forward is not", { "runs.json": { workflow_runs: [prRun(11)] }, "jobs-11.json": CARRIED }, "pretested=0"],
-  ["a shard missing one suite step is not", { "runs.json": { workflow_runs: [prRun(11)] }, "jobs-11.json": serverJobs(["Run grouped general test suites"]) }, "pretested=0"],
-  ["a build with no server jobs is not", { "runs.json": { workflow_runs: [prRun(11)] }, "jobs-11.json": { jobs: [job("verify")] } }, "pretested=0"],
-  ["any one proving build among several is enough", { "runs.json": { workflow_runs: [prRun(11), prRun(13)] }, "jobs-11.json": CARRIED, "jobs-13.json": RAN }, "pretested=1"],
-  ["a green review workflow is never proof", { "runs.json": { workflow_runs: [reviewRun] }, "jobs-12.json": RAN }, "pretested=0"],
-  ["no merge_group build at all (landed outside the queue)", { "runs.json": { workflow_runs: [] } }, "pretested=0"],
-  ["an unreadable run list fails closed", {}, "pretested=0"],
-  ["an unreadable job list fails closed", { "runs.json": { workflow_runs: [prRun(11)] } }, "pretested=0"],
+const one = (jobs) => ({ "runs.json": { workflow_runs: [prRun(11)] }, "jobs-11.json": jobs });
+const serverFailedStepsGreen = {
+  jobs: RAN.jobs.map((j) => (j.name === "General tests (server 3/6)" ? { ...j, conclusion: "failure" } : j)),
+};
+const ONLY_WS = { jobs: [...WS, job("verify")] };
+
+// [server legs proven, workspaces legs proven]: each group is gated on its own
+// proof, so a landing whose server shards were carried forward re-runs only
+// the server legs here.
+for (const [label, fixtures, [server, workspaces]] of [
+  ["a merge group that RAN every shard proves both groups", one(RAN), [1, 1]],
+  ["a merge group that CARRIED the server shards forward re-runs only the server legs", one(CARRIED), [0, 1]],
+  ["a shard missing one suite step is not server proof", one(serverJobs(["Run grouped general test suites"])), [0, 1]],
+  ["a server job that concluded failure is not proof, even with both suite steps green", one(serverFailedStepsGreen), [0, 1]],
+  ["a build with no server jobs proves only what it ran", one(ONLY_WS), [0, 1]],
+  ["a path-skipped workspaces suite step is not workspaces proof", one(serverJobs(undefined, [WS[0], wsJob("General tests (workspaces-b)", "skipped")])), [1, 0]],
+  ["one workspaces group alone is not workspaces proof", one(serverJobs(undefined, [WS[0]])), [1, 0]],
+  ["a build with neither group is no proof", one({ jobs: [job("verify")] }), [0, 0]],
+  ["any one proving build among several is enough", { "runs.json": { workflow_runs: [prRun(11), prRun(13)] }, "jobs-11.json": CARRIED, "jobs-13.json": RAN }, [1, 1]],
+  ["each group may be proven by a different build of this exact SHA", { "runs.json": { workflow_runs: [prRun(11), prRun(13)] }, "jobs-11.json": serverJobs(undefined, []), "jobs-13.json": ONLY_WS }, [1, 1]],
+  ["a green review workflow is never proof", { "runs.json": { workflow_runs: [reviewRun] }, "jobs-12.json": RAN }, [0, 0]],
+  ["no merge_group build at all (landed outside the queue)", { "runs.json": { workflow_runs: [] } }, [0, 0]],
+  ["an unreadable run list fails closed", {}, [0, 0]],
+  ["an unreadable job list fails closed", { "runs.json": { workflow_runs: [prRun(11)] } }, [0, 0]],
 ]) {
   test(`master-health gate: ${label}`, { skip: hasJq ? false : "jq is not installed" }, (t) => {
-    assert.equal(runGate(t, fixtures), expected);
+    assert.equal(runGate(t, fixtures), `pretested=${server}\npretested_workspaces=${workspaces}`);
   });
 }
+
+test("master-health never cancels a push run in flight; dispatch and schedule still supersede", () => {
+  const block = masterHealth.slice(masterHealth.indexOf("\nconcurrency:\n"), masterHealth.indexOf("\npermissions:\n"));
+  assert.match(block, /\n  group: master-health-\$\{\{ github\.ref \}\}-\$\{\{ github\.event_name \}\}\n/);
+  assert.match(block, /\n  cancel-in-progress: \$\{\{ github\.event_name != 'push' \}\}\n/);
+});
+
+test("master-health gates its server and workspaces legs on separate proofs", () => {
+  const server = jobRegion("general_tests", masterHealth);
+  const ws = jobRegion("workspaces_tests", masterHealth);
+  const bypass = " || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}\n";
+  assert.ok(server.includes(`    if: \${{ !cancelled() && (needs.gate.outputs.pretested != '1'${bypass}`));
+  assert.ok(ws.includes(`    if: \${{ !cancelled() && (needs.gate.outputs.pretested_workspaces != '1'${bypass}`));
+  const groups = (region) => [...region.matchAll(/- group: (\S+)/g)].map((m) => m[1]);
+  assert.deepEqual(groups(server), Array(4).fill("general-server"));
+  assert.deepEqual(groups(ws), ["general-workspaces-a", "general-workspaces-b"]);
+  assert.ok(GATE.includes("      pretested_workspaces: ${{ steps.check.outputs.pretested_workspaces }}\n"));
+  for (const region of [server, ws]) assert.match(region, /\n    needs: \[gate\]\n/);
+  assert.match(ws, /- name: Run grouped general test suites\n        run: pnpm test:run:general -- --group '\$\{\{ matrix\.group \}\}'\n/);
+});
 
 test("master-health's proof filter names exactly the general-server lane's proof steps", () => {
   assert.ok(SERVER_SUITES_RAN.includes('startswith("General tests (server ")'));
@@ -723,5 +851,10 @@ test("master-health's proof filter names exactly the general-server lane's proof
   const named = [...SERVER_SUITES_RAN.matchAll(/\.name == "([^"]+)"/g)].map((m) => m[1]);
   assert.deepEqual(named, TRIM_LANES.general_server.proofSteps);
   assert.match(GATE_RUN, /--jq "\$SERVER_SUITES_RAN"/);
+  assert.match(GATE_RUN, /--jq "\$WORKSPACES_SUITES_RAN"/);
+  const wsNamed = [...WORKSPACES_SUITES_RAN.matchAll(/\.name == "([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(wsNamed, ["General tests (workspaces-a)", "General tests (workspaces-b)", "Run grouped general test suites"]);
+  assert.ok(!Object.values(TRIM_LANES).some((l) => (l.matrix ? l.matrix.test("General tests (workspaces-a)") || l.matrix.test("General tests (workspaces-b)") : /workspaces/.test(l.name))),
+    "a trimmed workspaces lane would make WORKSPACES_SUITES_RAN accept carried-forward results");
   assert.match(GATE_RUN, /select\(\.path == "\.github\/workflows\/pr\.yml"\n\s+and \.conclusion == "success"\)/);
 });

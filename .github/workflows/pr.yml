@@ -226,7 +226,8 @@ jobs:
       # repository variable PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true and the next
       # merge-group run is the full suite (runbooks/merge-group-heavy-lane-trim.md).
       # master-health.yml re-runs the server suites post-merge on any landed head
-      # whose merge-group build did not run them.
+      # whose merge-group build did not run them. e2e and Canary Dry Run have no
+      # post-merge backstop (runbooks/merge-group-heavy-lane-trim.md).
       - name: Decide merge-group heavy-lane trim
         id: merge_group_trim
         if: ${{ !cancelled() && github.event_name == 'merge_group' }}
@@ -239,7 +240,21 @@ jobs:
           MERGE_GROUP_BASE_REF: ${{ github.event.merge_group.base_ref }}
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           MERGE_GROUP_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: node ./scripts/merge-group-trim.mjs
+        # The merge group BASE's copy of the script decides (design section 3.3:
+        # identity checks run as trusted code), never the queued PR's copy: a PR
+        # that edits scripts/merge-group-trim.mjs, by mistake or on purpose,
+        # must not ship its own CI_CONTROL_PATHS / decideTrim and decide its own
+        # trim. No copy at the base (this file's first landing) emits no outputs,
+        # which every consumer reads as "run the lane". The PR can still edit
+        # this step itself, but pr.yml is a CI-control path, so the base copy
+        # refuses to trim that landing.
+        run: |
+          trusted="${RUNNER_TEMP}/merge-group-trim.base.mjs"
+          if ! git show "${MERGE_GROUP_BASE_SHA}:scripts/merge-group-trim.mjs" > "$trusted"; then
+            echo "::warning title=merge-group trim fell back to the full suite::no scripts/merge-group-trim.mjs at merge group base ${MERGE_GROUP_BASE_SHA}"
+            exit 0
+          fi
+          MERGE_GROUP_TRIM_REPO_ROOT="$PWD" node "$trusted"
         timeout-minutes: 3
 
       - name: Setup actionlint

@@ -42,6 +42,14 @@ A lane is trimmed only if **all** of these hold (otherwise it runs):
 
 Any error, missing permission or unreadable fact fails **open**: the lane runs.
 
+The decision is made by the **merge group base's** copy of
+`scripts/merge-group-trim.mjs` (`git show <base_sha>:scripts/merge-group-trim.mjs`,
+run from `RUNNER_TEMP`), never the queued PR's copy, so a PR that edits the
+script cannot decide its own trim. No copy at the base (the script's first
+landing) means no trim. A PR can still edit the `pr.yml` step itself, since
+`merge_group` reads the workflow from the group head; that exposure is the same
+as any PR editing `pr.yml`, and rule 4 makes the base copy refuse to trim it.
+
 ## Reading a decision
 
 Open the merge-group run, then the `policy` job, then the step **Decide
@@ -54,11 +62,22 @@ could not be read (API error, fetch failure). That only costs CPU.
 
 - **Server suites.** `master-health.yml` counts a merge-group build as proof
   only when its server shards ran their suites. A trimmed landing therefore
-  runs the server suites post-merge on the landed `master` head (once per
-  head; a newer push cancels an older run). The daily 00:37 UTC schedule runs
-  them regardless.
-- **e2e, Canary Dry Run, worktree install, the OpenCode lanes.** The next PR's
-  `pull_request` CI runs them against `master` merged with that PR.
+  runs the server suites post-merge on the landed `master` head. Push runs are
+  **not** cancelled in flight: GitHub keeps one pending run and replaces it
+  with each newer push, so every run that starts finishes and reports, and the
+  next one tests the newest head (which contains every superseded landing).
+  Proof is per group: workspaces-a/-b re-run only when the merge-group build
+  did not run them (they are never trimmed). The daily 00:37 UTC schedule runs
+  everything regardless.
+- **Worktree install, the OpenCode lanes.** The next PR's `pull_request` CI
+  runs them against `master` merged with that PR.
+- **e2e and Canary Dry Run have no post-merge backstop.** Nothing runs them on
+  `master`: `e2e.yml` is `workflow_dispatch` only, and `master-health.yml` has
+  no e2e or canary leg. A trimmed landing's merged tree is never tested by
+  them, before or after the merge, until a later PR's own `pull_request` e2e
+  (not a required check) happens to cover it. In the 2026-10-03..10-09 replay
+  e2e would have been skipped in 216 of 280 final-head merge groups (77.1%).
+  To test a suspect `master` head, dispatch `e2e.yml` on it.
 
 ## Residual risk
 
@@ -66,8 +85,9 @@ A semantic conflict between a PR and work that landed after its PR CI ran
 (including an earlier entry of the same queue batch) that only a trimmed lane
 would catch now lands, and is caught after the merge. Build, typecheck and the
 workspaces unit tests still run on the merged tree first. `master-health.yml`
-catches server-suite breaks; the other lanes surface as red `pull_request` CI
-on unrelated PRs. While `master` is red that way, a queued PR whose own CI
+catches server-suite breaks; worktree install and the OpenCode lanes surface as
+red `pull_request` CI on unrelated PRs; e2e and Canary Dry Run breaks surface
+only in a later PR's own `pull_request` e2e, which is not required (see above). While `master` is red that way, a queued PR whose own CI
 passed before the bad landing can still be trimmed and land, until its PR-head
 result passes the 72 h limit.
 
