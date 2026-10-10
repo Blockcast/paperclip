@@ -55,12 +55,25 @@ test("API deployment keeps HTTP health probes", () => {
 // failures before the only Service endpoint is removed. See BLO-31945.
 const MIN_READINESS_FAILURE_THRESHOLD = 3;
 
-function probeSettings(rendered, probeName) {
+function probeBlock(rendered, probeName) {
   const match = rendered.match(
     new RegExp(`^(\\s*)${probeName}:\\n((?:\\1\\s+.*\\n)+)`, "m"),
   );
   assert.ok(match, `${probeName} not found in rendered template`);
-  const block = match[2];
+  return match[2];
+}
+
+// Path only, for probes whose tolerances this file does not constrain. The API
+// startup probe declares no `timeoutSeconds` (its 30 x 10s budget absorbs an
+// individual slow probe), and probeSettings below deliberately *requires* every
+// numeric key rather than defaulting a missing one to zero — so asking it for
+// that probe would fail on a key nobody needs.
+function probePath(rendered, probeName) {
+  return probeBlock(rendered, probeName).match(/\bpath:\s*(\S+)/)?.[1];
+}
+
+function probeSettings(rendered, probeName) {
+  const block = probeBlock(rendered, probeName);
   const read = (key) => {
     const found = block.match(new RegExp(`\\b${key}:\\s*(\\d+)`));
     assert.ok(found, `${probeName} is missing ${key}`);
@@ -149,6 +162,24 @@ test("worker readiness probe cannot be re-tightened into the BLO-31945 outage", 
 // on `/api/health` starts KILLING the singleton worker for pool saturation —
 // measured 2026-09-10 `/api/health` took 13.19s while `/healthz` answered in
 // 6ms in the same second.
+// `/api/health` has its own, much longer tail than `/healthz` — 13.19s
+// measured under pool saturation on 2026-09-10 — so BLO-31945's "never set
+// the timeout below the endpoint's own tail" rule yields a different floor for
+// this endpoint than the 10s that was right for `/healthz`. Below this, a
+// merely saturated pool drops a Service endpoint instead of a genuinely dead
+// one. Shared by the worker (BLO-35948) and the API tier (BLO-28615), which
+// probe the same route against the same pool.
+const API_HEALTH_SATURATION_TAIL_SECONDS = 15;
+
+// The `/livez` wedge detector counts completed `/api` responses, and readiness
+// probes `/api/health`, so readiness `timeoutSeconds` — not the detector's own
+// 180s window — is its saturation margin: kubelet abandons a probe at its
+// timeout, which the detector sees as an arrival with no completion. 20s is
+// ~1.5x the 13.19s worst non-wedge sample. Shared by both tiers since
+// BLO-28615 put API liveness on `/livez` as well, and not scoped to a replica
+// count either way: the detector is per-pod.
+const LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS = 20;
+
 test("worker probes keep the BLO-35948 split: readiness checks the DB, liveness and startup do not", () => {
   const rendered = renderTemplate("templates/statefulset.yaml");
 
@@ -177,19 +208,116 @@ test("worker probes keep the BLO-35948 split: readiness checks the DB, liveness 
     "worker startup must stay on the dependency-free /healthz. See BLO-35948.",
   );
 
-  // `/api/health` has its own, much longer tail than `/healthz` — 13.19s
-  // measured under pool saturation on 2026-09-10 — so BLO-31945's "never set
-  // the timeout below the endpoint's own tail" rule yields a different floor
-  // for this endpoint than the 10s that was right for `/healthz`. Below this,
-  // a merely saturated pool drops the only Service endpoint instead of a
-  // genuinely dead one.
-  const API_HEALTH_SATURATION_TAIL_SECONDS = 15;
   assert.ok(
     readiness.timeoutSeconds >= API_HEALTH_SATURATION_TAIL_SECONDS,
     `readiness timeoutSeconds (${readiness.timeoutSeconds}s) must be at least ` +
       `${API_HEALTH_SATURATION_TAIL_SECONDS}s while it targets /api/health, measured at 13.19s ` +
       `under pool saturation on 2026-09-10. A shorter timeout fails on a slow pool rather than ` +
       `a dead one and 502s all plugin traffic. See BLO-35948.`,
+  );
+});
+
+// BLO-28615. All three API-tier probes used to target `/healthz`, which
+// answers "can the event loop service a request" from upstream of the hostname
+// guard, actorMiddleware and the whole `/api` router — and, before BLO-32164
+// declared a handler for it, was answered by the SPA catch-all. A replica with
+// a dead connection pool stayed Ready and kept receiving traffic it could not
+// serve, and an `/api` pipeline completing nothing never triggered a restart.
+// This applies the same split the worker already carries.
+//
+// Each of the three paths is asserted, because each regresses differently:
+// readiness back on `/healthz` restores the silent dead-pool case, liveness
+// back on `/healthz` restores the unbounded `/api` wedge, and either of them
+// on `/api/health`... see the kill-decision assertion below.
+test("API probes keep the BLO-28615 split: readiness checks the DB, liveness and startup do not", () => {
+  const rendered = renderTemplate("templates/deployment-api.yaml", [
+    "--set",
+    "api.enabled=true",
+  ]);
+
+  const readiness = probeSettings(rendered, "readinessProbe");
+
+  assert.equal(
+    readiness.path,
+    "/api/health",
+    "API readiness must exercise the database path, or a replica with a dead " +
+      "connection pool stays in the Service endpoint list and keeps receiving " +
+      "traffic it cannot serve. See BLO-28615.",
+  );
+
+  assert.equal(
+    probePath(rendered, "livenessProbe"),
+    "/livez",
+    "API liveness must target /livez: on /healthz it answers from upstream of the " +
+      "/api pipeline and stays green through a total API outage — measured at 29 " +
+      "minutes with restartCount 0 on 2026-10-05. See BLO-28615 / BLO-40591.",
+  );
+
+  // The database is SHARED, so this failure is correlated across replicas: a
+  // query on a kill path restarts every replica at once for one pool problem,
+  // which is a rolling crash loop rather than a repair. Restarting a pod
+  // cannot fix a downstream outage.
+  for (const name of ["livenessProbe", "startupProbe"]) {
+    assert.notEqual(
+      probePath(rendered, name),
+      "/api/health",
+      `API ${name} must not query the database: the pool is shared across replicas, ` +
+        `so a query on a kill path turns one DB blip into a simultaneous restart of ` +
+        `every replica. See BLO-28615.`,
+    );
+  }
+
+  assert.equal(
+    probePath(rendered, "startupProbe"),
+    "/healthz",
+    "API startup must stay on the dependency-free /healthz: it gates when readiness " +
+      "and liveness begin, so a DB check here makes a still-migrating pod fail to " +
+      "start rather than start NotReady. See BLO-28615.",
+  );
+
+  // Same BLO-31945 rule, same endpoint, same measured tail as the worker
+  // assertion above. This is the knob that separates "pool is dead" from "pool
+  // is slow", and only the first should empty the Service.
+  assert.ok(
+    readiness.timeoutSeconds >= API_HEALTH_SATURATION_TAIL_SECONDS,
+    `API readiness timeoutSeconds (${readiness.timeoutSeconds}s) must be at least ` +
+      `${API_HEALTH_SATURATION_TAIL_SECONDS}s while it targets /api/health, measured at 13.19s ` +
+      `under pool saturation on 2026-09-10. Below that, a saturated pool takes every ` +
+      `replica NotReady at once. See BLO-28615.`,
+  );
+
+  // The stricter of the two floors, and it only binds because liveness moved
+  // to /livez in the same change: the wedge detector counts completed `/api`
+  // responses, and this probe is now `/api` traffic. kubelet abandons a probe
+  // at its timeout, so an /api/health slower than this counts as an arrival
+  // with no completion — and once readiness has dropped the endpoints, the
+  // probe is the only /api traffic left. Saturation above this value for the
+  // detector's 180s window therefore reads as a wedge and restarts the pod.
+  // Identical to the worker's margin; see services/api-pipeline-liveness.ts.
+  assert.ok(
+    readiness.timeoutSeconds >= LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS,
+    `API readiness timeoutSeconds (${readiness.timeoutSeconds}s) must be at least ` +
+      `${LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS}s: it is the /livez wedge detector's ` +
+      `saturation margin on this tier too, now that API liveness targets /livez. Below it, ` +
+      `pool saturation reads as a wedge and restarts every replica. See BLO-28615.`,
+  );
+
+  // Not scoped to a replica count, unlike the worker's guard. Readiness here
+  // sheds to a peer only for UNCORRELATED failures; for the shared pool it
+  // empties the Service however many replicas there are, so requiring
+  // consecutive failures matters at every scale.
+  assert.ok(
+    readiness.failureThreshold >= MIN_READINESS_FAILURE_THRESHOLD,
+    `API readiness failureThreshold (${readiness.failureThreshold}) must be at least ` +
+      `${MIN_READINESS_FAILURE_THRESHOLD}: the database is shared, so a single blip below ` +
+      `this threshold takes every replica out of the Service simultaneously. See BLO-28615.`,
+  );
+
+  assert.ok(
+    readiness.timeoutSeconds <= readiness.periodSeconds,
+    `API readiness timeoutSeconds (${readiness.timeoutSeconds}s) must not exceed ` +
+      `periodSeconds (${readiness.periodSeconds}s), or one probe can outlast its own ` +
+      `period. See BLO-31945.`,
   );
 });
 
@@ -234,10 +362,7 @@ test("worker liveness can detect an API wedge without acquiring the database", (
   // probe at its timeout, and once readiness drops the only endpoint the probe
   // is the only `/api` traffic left. So an `/api/health` slower than this
   // timeout for the 180s window reads as a wedge and restarts the worker.
-  // 20s is ~1.5x the 13.19s worst non-wedge sample; tightening it toward that
-  // tail turns pool saturation into a restart. Not scoped to replicas === 1:
-  // the detector is per-pod.
-  const LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS = 20;
+  // Tightening it toward the 13.19s tail turns pool saturation into a restart.
   const readiness = probeSettings(rendered, "readinessProbe");
   assert.ok(
     readiness.timeoutSeconds >= LIVENESS_DETECTOR_SATURATION_MARGIN_SECONDS,

@@ -47,20 +47,29 @@
  * `/api` does serve long-lived streams (board chat, plugin and MCP transports),
  * so "any other traffic" has to be guaranteed, not assumed: a lone open stream
  * on an otherwise silent instance is the one shape that could trip this
- * wrongly. Worker *readiness* targets `/api/health` every 20s (BLO-35948), so a
- * healthy instance completes an `/api` response three times a minute no matter
- * how quiet it is, and only an instance that cannot answer that either can
- * reach the window. Point readiness back at `/healthz` and that guarantee is
- * gone — `deploy/helm/paperclip/tests/probes.test.mjs` pins it.
+ * wrongly. *Readiness* targets `/api/health` every 20s on both tiers — the
+ * worker since BLO-35948, the API Deployment since BLO-28615 — so a healthy
+ * instance completes an `/api` response three times a minute no matter how
+ * quiet it is, and only an instance that cannot answer that either can reach
+ * the window. Point readiness back at `/healthz` and that guarantee is gone —
+ * `deploy/helm/paperclip/tests/probes.test.mjs` pins it for each tier
+ * separately.
  *
  * It also makes readiness `timeoutSeconds` (20s), not `stallMs`, this
  * detector's real saturation margin: about 1.5x the 13.19s worst non-wedge
  * sample. kubelet abandons a probe at its timeout, so an `/api/health` slower
  * than that counts as an arrival without a completion. Three of those (~60s)
- * remove the only Service endpoint, the probe is then the only `/api` traffic
+ * remove the Service endpoint, the probe is then the only `/api` traffic
  * left, and a saturation episode that keeps `/api/health` above 20s for the
- * window reads as a wedge and restarts the worker. The same test file pins
- * the 20s floor.
+ * window reads as a wedge and restarts the pod. The same test file pins
+ * the 20s floor on both tiers.
+ *
+ * That margin does not weaken with replica count, which is why BLO-28615
+ * carried it over to the API tier unchanged rather than relaxing it there.
+ * The pool is shared, so saturation arrives at every replica at once: the
+ * endpoints drain together and each pod then reaches this window on its own
+ * probe traffic, at the same time. More replicas make that failure wider, not
+ * softer.
  *
  * The same guarantee is this detector's sharpest blind spot, and it is the
  * other half of the same sentence: `wedged` requires *zero* completions, so
