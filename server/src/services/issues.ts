@@ -10360,10 +10360,20 @@ export function issueService(db: Db) {
           if (issueData.projectId == null && workspaceSource.projectId) {
             issueData.projectId = workspaceSource.projectId;
           }
-          if (projectWorkspaceId == null && workspaceSource.projectWorkspaceId) {
+          // An explicit `projectId` that disagrees with the inheritance source wins
+          // over the source's workspaces. Inheriting them anyway can only reach the
+          // assertions below as "… must belong to the selected project", and that 422
+          // is what pushes callers into omitting `projectId` altogether (BLO-19924).
+          // Evaluated after the backfill above, so a projectless create still inherits.
+          const sourceProjectMatchesIssue =
+            issueData.projectId == null ||
+            workspaceSource.projectId == null ||
+            workspaceSource.projectId === issueData.projectId;
+          if (sourceProjectMatchesIssue && projectWorkspaceId == null && workspaceSource.projectWorkspaceId) {
             projectWorkspaceId = workspaceSource.projectWorkspaceId;
           }
           if (
+            sourceProjectMatchesIssue &&
             isolatedWorkspacesEnabled &&
             !hasExplicitWorkspaceOverride &&
             workspaceSource.executionWorkspaceId
