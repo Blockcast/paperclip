@@ -12801,9 +12801,9 @@ export function issueRoutes(
     const isExecutionWorkspaceDetach =
       !!closedExecutionWorkspace &&
       isExecutionWorkspaceDetachPatch({
-        updateFields,
-        hasComment: !!commentBody,
-        hasReviewRequest: reviewRequest !== undefined,
+        // The whole body, not `updateFields`: the keys destructured out above (hiddenAt is
+        // written unconditionally below) must count against the exemption too.
+        body: req.body,
         closedExecutionWorkspaceId: closedExecutionWorkspace.id,
       });
 
