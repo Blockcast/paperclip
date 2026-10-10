@@ -1045,7 +1045,9 @@ describe("evaluateCommentReviewGate", () => {
         allyComment(dispositioningReview(CURRENT_HEAD, INTERMEDIATE_HEAD, "fixed"), "2026-08-04T22:09:19Z"),
       ],
     });
-    expect(mirrorRetired.carriedFromHeadSha).not.toBe(INTERMEDIATE_HEAD);
+    expect(
+      mirrorRetired.outcome === "carried_finding" ? mirrorRetired.carriedFromHeadSha : null,
+    ).not.toBe(INTERMEDIATE_HEAD);
   });
 
   it("does not claim ledger silence about a finding the ledger explicitly names", () => {
