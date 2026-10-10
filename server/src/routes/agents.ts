@@ -5011,6 +5011,15 @@ export function agentRoutes(
         // it is present only while the run is *parked*, and it is not a
         // historical census.
         penstockReason: typeof result.penstockReason === "string" ? result.penstockReason : null,
+        // BLO-42916: which gate probe produced the denial — "capacity" (the
+        // cheap cached `GET /v1/pools/default/capacity`) or "messages_fallback"
+        // (a real `POST /v1/messages` against the exhausted provider). Both
+        // persist the same `penstockReason`, so without this a parked row
+        // cannot say whether its re-probe spent provider inference quota —
+        // which is the cost the 15m re-probe cadence assumes it is not paying.
+        //
+        // Same two limits as `penstockReason`: parked rows only, not a census.
+        penstockProbePath: typeof result.penstockProbePath === "string" ? result.penstockProbePath : null,
         penstockRetryAfterSeconds:
           typeof result.penstockRetryAfterSeconds === "number" ? result.penstockRetryAfterSeconds : null,
         penstockAdvertisedResumeAt: typeof advertisedResumeAt === "string" ? advertisedResumeAt : null,
