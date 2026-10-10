@@ -1755,7 +1755,10 @@ async function reapPodLogFile(
  *                  one without the other.
  * - `unobserved` — no list call ever succeeded, so nothing was observed either
  *                  way.  Notably this is also the branch where the pod delete
- *                  itself may never have been issued.
+ *                  itself may never have been issued.  A list whose body has no
+ *                  `items` array counts as not having succeeded: an
+ *                  unparseable read is a third input to this outcome, not zero
+ *                  pods (see the `Array.isArray` guard below).
  */
 type PodTeardownOutcome = "gone" | "alive" | "undeleted" | "unobserved";
 
@@ -1817,7 +1820,19 @@ async function deleteJobPodsAndWait(
     let observed: k8s.V1Pod[] | null = null;
     try {
       const podList = await coreApi.listNamespacedPod({ namespace, labelSelector });
-      observed = podList?.items ?? [];
+      // A response we cannot parse is not "zero pods".  `?? []` collapsed the
+      // two, and `lastObserved === 0` below is the caller's licence to delete
+      // the run's mounted Secrets — so an unparseable read authorised deleting
+      // them under a pod that may still be alive, the exact BLO-35486 failure
+      // by another route.  Throw into the catch below rather than branching
+      // here: that is the "could not observe" path, and it already logs once,
+      // retries to the deadline, and fails closed into `unobserved` (or
+      // `alive`/`undeleted` if an earlier poll did see pods).  The message must
+      // not look like a 404 to `isK8s404`, which would return "gone".
+      if (!Array.isArray(podList?.items)) {
+        throw new Error(`pod list for ${labelSelector} returned no items array`);
+      }
+      observed = podList.items;
       lastObserved = observed.length;
     } catch (err) {
       // Can't observe the pods, so we can't prove they are gone — unless the
