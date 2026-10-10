@@ -9,6 +9,7 @@ import {
   createRunRedactionCanaryValue,
   createRunSecretBoundaryCarry,
   isRedactableSecretValue,
+  redactRunSecretValues,
 } from "./run-secret-redaction.js";
 
 /**
@@ -479,25 +480,39 @@ describe("per-run redaction canary", () => {
       { env: { [RUN_REDACTION_CANARY_ENV_KEY]: value } },
       [RUN_REDACTION_CANARY_ENV_KEY],
     );
-    const cases = [
-      // (a) echoed from an env var, with no secret-shaped carrier beside it.
+    // (a) echoed from an env var, with no secret-shaped carrier beside it, and
+    // (b) read out of a projected Secret volume — bare file contents. Neither has a
+    // `name=` carrier, so the needle pass is the ONLY thing that can cover them and
+    // `RUN_SECRET_MASK` is the correct assertion.
+    for (const text of [
       `${value}\n`,
-      // (b) read out of a projected Secret volume — bare file contents.
       `+ cat /var/run/secrets/envdir/CANARY\n${value}\n`,
-      // (c) embedded mid-string inside a libpq DSN. Written in the `key=value` form the
-      // fixtures above use rather than as a credentialed connection URI: the egress
-      // scanner refuses to publish that shape even when the credential is a template
-      // expression, and a suppression would be a worse answer than the shape change.
-      `psql "host=db.internal port=5432 user=traffic_ops password=${value} dbname=to"\n`,
-    ];
-    for (const text of cases) {
-      const sanitized = sanitizeRunLogChunkForStorage(
-        text,
-        NO_CURRENT_USER_REDACTION,
-        plan.needles,
-      );
+    ]) {
+      const sanitized = sanitizeRunLogChunkForStorage(text, NO_CURRENT_USER_REDACTION, plan.needles);
       expect(sanitized).not.toContain(value);
       expect(sanitized).toContain(RUN_SECRET_MASK);
     }
+
+    // (c) embedded mid-string inside a libpq DSN. Written in the `key=value` form the
+    // fixtures above use rather than as a credentialed connection URI: the egress
+    // scanner refuses to publish that shape even when the credential is a template
+    // expression, and a suppression would be a worse answer than the shape change.
+    //
+    // Asserted in TWO parts, deliberately. Through the full sanitizer the pre-existing
+    // NAME-ANCHORED scrub fires first on `password=` and wins the replacement, so the
+    // mask here is `***REDACTED***` and not ours — asserting `RUN_SECRET_MASK` would
+    // fail on a value that is in fact fully protected. What matters at this level is
+    // only that the value does not survive.
+    const dsn = `psql "host=db.internal port=5432 user=traffic_ops password=${value} dbname=to"\n`;
+    expect(sanitizeRunLogChunkForStorage(dsn, NO_CURRENT_USER_REDACTION, plan.needles))
+      .not.toContain(value);
+
+    // Then the claim that actually belongs to THIS change: the needle pass covers the
+    // mid-string DSN shape on its own, independent of the carrier. Checked directly so
+    // the coverage survives the carrier being renamed, narrowed, or removed — which the
+    // combined assertion above cannot distinguish from a silent loss of coverage.
+    const needleOnly = redactRunSecretValues(dsn, plan.needles);
+    expect(needleOnly).not.toContain(value);
+    expect(needleOnly).toContain(RUN_SECRET_MASK);
   });
 });
