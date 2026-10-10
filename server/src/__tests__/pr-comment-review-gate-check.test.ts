@@ -43,7 +43,19 @@ vi.mock("../services/github-status-delivery-outbox.js", () => ({
 }));
 
 import { admitsNothingEvaluated } from "../../../scripts/check-comment-review-gate-census.mjs";
-import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
+import { gitHubIdentityFieldRedaction, scrubOutboundGitHubText } from "../services/github-app-auth.js";
+import {
+  ALLY_HEAD_ATTESTED_CHECK_NAME,
+  allyHeadAttestedCheckConclusion,
+  allyHeadAttestedCheckSummary,
+  allyHeadAttestedCheckTitle,
+  commentReviewGateCheckConclusion,
+  commentReviewGateCheckTitle,
+  commentReviewGateRetirementStatus,
+  evaluateCommentReviewGate,
+  runPrCommentReviewGateCheck,
+  type CommentReviewGateVerdict,
+} from "../services/pr-comment-review-gate.js";
 
 // `db` is required on the input: the gate takes the shared delivery lock
 // unconditionally, so every caller — including these tests — must supply a
@@ -535,14 +547,24 @@ describe("check-run mirror (BLO-33657)", () => {
     createdAt: "2026-09-13T05:00:00Z",
   };
 
+  // The mirror is the check-run NAMED FOR THE GATE CONTEXT. The gate also
+  // publishes a second, differently named check-run (the `ci/ally-head-attested`
+  // schedule signal, covered below), so counting every check-run would pin the
+  // wrong thing: it would go red the day a third one is added, and stay green if
+  // the mirror itself were published twice.
+  function mirrorRuns(context: string) {
+    return mockPostCheckRun.mock.calls.map(([arg]) => arg).filter((arg) => arg.name === context);
+  }
+
   it("mirrors the verdict as a check-run alongside the commit status", async () => {
     mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
     mockListComments.mockResolvedValue([clean]);
 
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
 
-    expect(mockPostCheckRun).toHaveBeenCalledTimes(1);
-    expect(mockPostCheckRun.mock.calls[0][0]).toMatchObject({
+    const mirrors = mirrorRuns("review/ally-comment-gate");
+    expect(mirrors).toHaveLength(1);
+    expect(mirrors[0]).toMatchObject({
       sha: TARGET.headSha,
       name: "review/ally-comment-gate",
       conclusion: "success",
@@ -558,7 +580,7 @@ describe("check-run mirror (BLO-33657)", () => {
     // on absence deadlocks formally-reviewed PRs (BLO-29711). The check-run is
     // what carries the distinction.
     expect(mockPostStatus.mock.calls[0][0]).toMatchObject({ state: "success" });
-    expect(mockPostCheckRun.mock.calls[0][0]).toMatchObject({ conclusion: "neutral" });
+    expect(mirrorRuns("review/ally-comment-gate")[0]).toMatchObject({ conclusion: "neutral" });
   });
 
   it("does not fail the check when the check-run write is refused", async () => {
@@ -579,5 +601,703 @@ describe("check-run mirror (BLO-33657)", () => {
     // commit status that was already published.
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
     expect(mockPostStatus).toHaveBeenCalled();
+  });
+});
+
+// Ally-gated heavy CI, design 4.0b. `ci/ally-head-attested` is a SCHEDULE
+// signal: it says WHEN a heavy-CI dispatcher may run a lane at this head, never
+// WHETHER the change may merge. It exists because the gate's own check-run is
+// `success` only for `clean`, and `clean` is withheld for every PR the App
+// authors (BLO-34316) — so a dispatcher reading that check-run alone would
+// starve on the whole App-authored population. Everything below is a property of
+// what is PUBLISHED, because the signal has no other surface.
+describe("ci/ally-head-attested schedule signal", () => {
+  const SIGNAL = "ci/ally-head-attested";
+  const GATE = "gate/ally-comment-findings";
+  const ALLY = "allyblockcast[bot]";
+  const HEAD = TARGET.headSha;
+  const OLD_HEAD = "0".repeat(40);
+  const OK = { ok: true, statusCode: 201 };
+
+  beforeEach(() => {
+    // The live Blockcast context, so the gate's check-run and the signal are
+    // told apart by name exactly as they are in production.
+    h.cfg.prCommentReviewGateStatusContext = GATE;
+    mockPostStatus.mockResolvedValue(OK);
+  });
+
+  const reviewOf = (headSha: string, lines: string[], createdAt: string) => ({
+    login: ALLY,
+    body: ["## Ally — Consolidated PR Review", `Reviewed head: ${headSha}`, ...lines].join("\n"),
+    createdAt,
+  });
+  const cleanAt = (headSha: string, createdAt = "2026-10-08T10:00:00Z") =>
+    reviewOf(headSha, ["### Critical Issues (0)", "### Important Issues (0)"], createdAt);
+  const blockingAt = (headSha: string, createdAt = "2026-10-08T09:00:00Z") =>
+    reviewOf(
+      headSha,
+      [
+        "### Critical Issues (0)",
+        "### Important Issues (1)",
+        "- The queue can merge this head before its review finding is resolved.",
+        "### Recommended Action",
+        "Fix the gate before merge.",
+      ],
+      createdAt,
+    );
+  const trackedAt = (headSha: string, priorHeadSha: string, createdAt = "2026-10-08T10:00:00Z") =>
+    reviewOf(
+      headSha,
+      [
+        "### Prior Findings Dispositioned (1)",
+        `- **prior:${priorHeadSha.slice(0, 7)} important 1** — tracked — accepted onto a follow-up.`,
+        "### Critical Issues (0)",
+        "### Important Issues (0)",
+      ],
+      createdAt,
+    );
+  const unreadableAt = (headSha: string, createdAt = "2026-10-08T10:00:00Z") => ({
+    login: ALLY,
+    body: [
+      "## Ally — Consolidated PR Review",
+      "<!-- ally-verdict:1",
+      "{ this is not json",
+      "-->",
+      `Reviewed head: ${headSha}`,
+    ].join("\n"),
+    createdAt,
+  });
+
+  /** Every check-run written under `name`, in call order. */
+  function runsNamed(name: string) {
+    return mockPostCheckRun.mock.calls.map(([arg]) => arg).filter((arg) => arg.name === name);
+  }
+  /** The one check-run written under `name`: an evaluation writes each exactly once. */
+  function onlyRunNamed(name: string) {
+    const runs = runsNamed(name);
+    expect(runs, `exactly one "${name}" check-run per evaluation`).toHaveLength(1);
+    return runs[0];
+  }
+
+  it("App-authored PR, self-attested clean: the signal is success while the gate check-run stays neutral", async () => {
+    // The population the signal exists for. The review is Ally's, the PR is the
+    // App's, so BLO-34316 withholds `clean` and the gate publishes `neutral`.
+    mockFetchPrAuthor.mockResolvedValue(ALLY);
+    mockListComments.mockResolvedValue([cleanAt(HEAD)]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated", headAttested: true },
+    });
+
+    expect(onlyRunNamed(GATE)).toMatchObject({ sha: HEAD, conclusion: "neutral" });
+    expect(onlyRunNamed(SIGNAL)).toMatchObject({
+      repoFullName: TARGET.repoFullName,
+      sha: HEAD,
+      conclusion: "success",
+      detailsUrl: TARGET.prUrl,
+      title: expect.stringMatching(/^Schedule signal:/),
+    });
+    // The signal is a check-run and only a check-run. A commit status under its
+    // name would be a second, differently-shaped thing for a rule to require.
+    expect(mockPostStatus.mock.calls.map(([arg]) => arg.context)).toEqual([GATE]);
+  });
+
+  it("bare-slug seat author, self-attested clean: the same branch, the same signal", async () => {
+    // `githubSharesReviewerIdentity`, not the strict predicate: the user seat and
+    // the App are one agent, so a PR opened by the seat is still self-attested.
+    mockFetchPrAuthor.mockResolvedValue("allyblockcast");
+    mockListComments.mockResolvedValue([cleanAt(HEAD)]);
+
+    await runPrCommentReviewGateCheck(TARGET);
+
+    expect(onlyRunNamed(GATE)).toMatchObject({ conclusion: "neutral" });
+    expect(onlyRunNamed(SIGNAL)).toMatchObject({ conclusion: "success" });
+  });
+
+  it("unattested head: the signal is neutral", async () => {
+    mockListComments.mockResolvedValue([]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated" },
+    });
+
+    expect(onlyRunNamed(SIGNAL)).toMatchObject({ sha: HEAD, conclusion: "neutral" });
+    expect(onlyRunNamed(GATE)).toMatchObject({ conclusion: "neutral" });
+    expect(mockFetchPrAuthor).not.toHaveBeenCalled();
+  });
+
+  it("an attestation of a DIFFERENT head does not attest this one", async () => {
+    // Head-bound. Ally cleared an earlier tree; nothing says anything about this
+    // one, and a signal that carried over would schedule heavy CI at a head no
+    // reviewer has seen.
+    mockFetchPrAuthor.mockResolvedValue(ALLY);
+    mockListComments.mockResolvedValue([cleanAt(OLD_HEAD)]);
+
+    await runPrCommentReviewGateCheck(TARGET);
+
+    expect(onlyRunNamed(SIGNAL)).toMatchObject({ sha: HEAD, conclusion: "neutral" });
+  });
+
+  it("blocking finding: the signal is neutral, never failure, while the gate check-run is failure", async () => {
+    mockListComments.mockResolvedValue([blockingAt(HEAD)]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "blocking_finding" },
+    });
+
+    // The gate's own check-run carries the finding. A second red here would be a
+    // duplicate nobody can clear separately.
+    expect(onlyRunNamed(GATE)).toMatchObject({ conclusion: "failure" });
+    expect(onlyRunNamed(SIGNAL)).toMatchObject({ conclusion: "neutral" });
+    expect(mockPostStatus).toHaveBeenCalledWith(expect.objectContaining({ context: GATE, state: "failure" }));
+  });
+
+  // The whole truth table, so "never failure" and "head-bound" are properties of
+  // every outcome rather than of the three above.
+  const AUTHOR = "some-contributor";
+  it.each([
+    {
+      name: "independent clean",
+      author: AUTHOR,
+      comments: [cleanAt(HEAD)],
+      outcome: "clean",
+      gate: "success",
+      signal: "success",
+    },
+    {
+      name: "independent, tracked residual (deferred)",
+      author: AUTHOR,
+      comments: [blockingAt(OLD_HEAD), trackedAt(HEAD, OLD_HEAD)],
+      outcome: "deferred_finding",
+      gate: "neutral",
+      signal: "success",
+    },
+    {
+      name: "App-authored, self-attested clean",
+      author: ALLY,
+      comments: [cleanAt(HEAD)],
+      outcome: "not_evaluated",
+      gate: "neutral",
+      signal: "success",
+    },
+    {
+      name: "no comment at all",
+      author: AUTHOR,
+      comments: [],
+      outcome: "not_evaluated",
+      gate: "neutral",
+      signal: "neutral",
+    },
+    {
+      name: "clean review of an earlier head only",
+      author: ALLY,
+      comments: [cleanAt(OLD_HEAD)],
+      outcome: "not_evaluated",
+      gate: "neutral",
+      signal: "neutral",
+    },
+    {
+      name: "blocking finding at this head",
+      author: AUTHOR,
+      comments: [blockingAt(HEAD)],
+      outcome: "blocking_finding",
+      gate: "failure",
+      signal: "neutral",
+    },
+    {
+      name: "blocking finding at this head, App-authored PR",
+      author: ALLY,
+      comments: [blockingAt(HEAD)],
+      outcome: "blocking_finding",
+      gate: "failure",
+      signal: "neutral",
+    },
+    {
+      name: "finding carried from an earlier head, nothing attests this one",
+      author: AUTHOR,
+      comments: [blockingAt(OLD_HEAD)],
+      outcome: "carried_finding",
+      gate: "failure",
+      signal: "neutral",
+    },
+    {
+      // The one row where a comment DOES attest the head non-blockingly and the
+      // signal is still neutral: an earlier head's finding is undispositioned, so
+      // the gate is red, and the red is the gate's to carry.
+      name: "self-attested clean at this head over a carried finding",
+      author: ALLY,
+      comments: [blockingAt(OLD_HEAD), cleanAt(HEAD)],
+      outcome: "carried_finding",
+      gate: "failure",
+      signal: "neutral",
+    },
+    {
+      name: "unreadable verdict block at this head",
+      author: AUTHOR,
+      comments: [unreadableAt(HEAD)],
+      outcome: "unreadable_verdict",
+      gate: "failure",
+      signal: "neutral",
+    },
+    // What counts as an attestation at all. The signal asks the same two
+    // questions the gate does and no looser ones: WHO wrote it (the App
+    // identity) and WHAT it names (one standalone, complete `Reviewed head:`
+    // line, which is `extractAllyReviewedHeadSha`'s to decide). A signal that
+    // answered either more loosely would schedule heavy CI off text a PR author
+    // can post.
+    {
+      name: "App exposed as app/<slug> attests this head",
+      author: ALLY,
+      comments: [{ ...cleanAt(HEAD), login: "app/allyblockcast" }],
+      outcome: "not_evaluated",
+      gate: "neutral",
+      signal: "success",
+    },
+    {
+      name: "Ally's format, written by a human account",
+      author: AUTHOR,
+      comments: [{ ...cleanAt(HEAD), login: "some-contributor" }],
+      outcome: "not_evaluated",
+      gate: "neutral",
+      signal: "neutral",
+    },
+    {
+      name: "Ally's format, written by the bare-slug user seat and not the App",
+      author: AUTHOR,
+      comments: [{ ...cleanAt(HEAD), login: "allyblockcast" }],
+      outcome: "not_evaluated",
+      gate: "neutral",
+      signal: "neutral",
+    },
+    {
+      name: "head named in prose only, no attestation line",
+      author: ALLY,
+      comments: [
+        {
+          login: ALLY,
+          body: [
+            "## Ally — Consolidated PR Review",
+            `I looked at ${HEAD} and found nothing.`,
+            "### Critical Issues (0)",
+            "### Important Issues (0)",
+          ].join("\n"),
+          createdAt: "2026-10-08T10:00:00Z",
+        },
+      ],
+      outcome: "not_evaluated",
+      gate: "neutral",
+      signal: "neutral",
+    },
+    {
+      name: "abbreviated head in the attestation line",
+      author: ALLY,
+      comments: [
+        reviewOf(HEAD.slice(0, 7), ["### Critical Issues (0)", "### Important Issues (0)"], "2026-10-08T10:00:00Z"),
+      ],
+      outcome: "not_evaluated",
+      gate: "neutral",
+      signal: "neutral",
+    },
+  ])("truth table: $name -> gate $gate, signal $signal", async ({ author, comments, outcome, gate, signal }) => {
+    mockFetchPrAuthor.mockResolvedValue(author);
+    mockListComments.mockResolvedValue(comments);
+
+    // `outcome` is asserted too, so a fixture that stops reaching the branch it
+    // names fails here instead of passing on the wrong one.
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { outcome },
+    });
+
+    expect(onlyRunNamed(GATE).conclusion).toBe(gate);
+    expect(onlyRunNamed(SIGNAL).conclusion).toBe(signal);
+    // Never failure, whatever the verdict.
+    expect(["success", "neutral"]).toContain(onlyRunNamed(SIGNAL).conclusion);
+    expect(mockPostStatus.mock.calls.map(([arg]) => arg.context)).not.toContain(SIGNAL);
+  });
+
+  it("is published after the commit status, the gate check-run and every retirement write", async () => {
+    // The signal's `success` is an event a dispatcher wakes on, and the
+    // dispatcher then reads the gate's check-run at this head. Written first, it
+    // could wake the dispatcher while that check-run still showed an earlier
+    // evaluation's `failure`; the dispatcher would read "blocked" and nothing
+    // would wake it again, because a `neutral` gate check-run (the App-authored
+    // population) is not a wake event.
+    //
+    // And AFTER retirement, last of all. The retirement write is merge-facing: it
+    // mirrors a blocking verdict onto a legacy context that may still be a
+    // required check, so a stale green cannot satisfy it. The signal is a
+    // best-effort schedule hint. A degraded Checks API must cost the hint its
+    // latency, never delay or lose the merge-facing write that sits behind it
+    // inside the delivery lock's 120s hold cap.
+    h.cfg.prCommentReviewGateRetiredStatusContexts = ["review/ally-comment"];
+    const order: string[] = [];
+    mockPostStatus.mockImplementation(async ({ context }: { context: string }) => {
+      order.push(`status:${context}`);
+      return OK;
+    });
+    mockPostCheckRun.mockImplementation(async ({ name }: { name: string }) => {
+      order.push(`check-run:${name}`);
+      return OK;
+    });
+    mockFetchPrAuthor.mockResolvedValue(ALLY);
+    mockListComments.mockResolvedValue([cleanAt(HEAD)]);
+
+    await runPrCommentReviewGateCheck(TARGET);
+
+    expect(order).toEqual([
+      `status:${GATE}`,
+      `check-run:${GATE}`,
+      "status:review/ally-comment",
+      `check-run:${SIGNAL}`,
+    ]);
+  });
+
+  it("writes the retirement status before a hung signal write completes, and gives the signal one attempt", async () => {
+    // The degraded Checks API: every check-run call hangs to the 30s fetch
+    // deadline and then returns the retryable failure shape the real client
+    // returns. A blocking verdict is mirrored onto the retired context, and that
+    // mirror is merge-facing. With the signal ahead of it (and retried), the
+    // mirror landed at t=182.5s against a 120s lock hold cap; it must not wait
+    // on the signal at all.
+    vi.useFakeTimers();
+    let run: Promise<unknown> | undefined;
+    try {
+      h.cfg.prCommentReviewGateRetiredStatusContexts = ["review/ally-comment"];
+      const log: string[] = [];
+      let signalAttempts = 0;
+      mockPostStatus.mockImplementation(async ({ context }: { context: string }) => {
+        log.push(`status:${context}`);
+        return OK;
+      });
+      mockPostCheckRun.mockImplementation(async ({ name }: { name: string }) => {
+        if (name !== SIGNAL) return OK;
+        signalAttempts += 1;
+        await new Promise((resolve) => setTimeout(resolve, 30_000));
+        log.push("signal:gave-up");
+        return { ok: false, retryable: true, reason: "check_run_write_fetch_failed" };
+      });
+      mockFetchPrAuthor.mockResolvedValue(ALLY);
+      mockListComments.mockResolvedValue([blockingAt(HEAD)]);
+
+      run = runPrCommentReviewGateCheck(TARGET);
+      // Nothing has timed out yet: the signal write is still in flight.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(signalAttempts).toBe(1);
+      expect(log).toEqual([`status:${GATE}`, "status:review/ally-comment"]);
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      await expect(run).resolves.toMatchObject({ posted: true });
+      // One attempt: the 250ms and 1s backoffs and two more 30s hangs would have
+      // spent another 61s of the lock's 120s cap on a best-effort hint.
+      expect(signalAttempts).toBe(1);
+      expect(log).toEqual([`status:${GATE}`, "status:review/ally-comment", "signal:gave-up"]);
+    } finally {
+      // Settle the evaluation before the real timers come back. A failed
+      // assertion above would otherwise leave it pending on a fake timer that
+      // never fires, and the per-PR evaluation chain would then hold every later
+      // test in this file behind it until each one timed out.
+      await vi.advanceTimersByTimeAsync(400_000);
+      await run?.catch(() => undefined);
+      vi.useRealTimers();
+    }
+  });
+
+  it("still publishes the signal when the retirement write throws", async () => {
+    // Unconditional, not "unless retirement failed": a retirement that throws
+    // rejects the publish, and the signal still has to have been written.
+    h.cfg.prCommentReviewGateRetiredStatusContexts = ["review/ally-comment"];
+    mockPostStatus.mockImplementation(async ({ context }: { context: string }) => {
+      if (context === "review/ally-comment") throw new Error("retirement write blew up");
+      return OK;
+    });
+    mockFetchPrAuthor.mockResolvedValue(ALLY);
+    mockListComments.mockResolvedValue([cleanAt(HEAD)]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).rejects.toThrow("retirement write blew up");
+
+    expect(onlyRunNamed(SIGNAL)).toMatchObject({ conclusion: "success" });
+  });
+
+  it("still publishes when a retirement write fails, because the signal does not depend on it", async () => {
+    h.cfg.prCommentReviewGateRetiredStatusContexts = ["review/ally-comment"];
+    mockPostStatus.mockImplementation(async ({ context }: { context: string }) =>
+      context === "review/ally-comment"
+        ? { ok: false, retryable: false, reason: "commit_status_write_http_403" }
+        : OK,
+    );
+    mockFetchPrAuthor.mockResolvedValue(ALLY);
+    mockListComments.mockResolvedValue([cleanAt(HEAD)]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: false,
+      reason: "retirement_failed",
+    });
+
+    expect(onlyRunNamed(SIGNAL)).toMatchObject({ conclusion: "success" });
+  });
+
+  it("republishes neutral when a later evaluation of the same head no longer attests it", async () => {
+    // Written on EVERY evaluation, not only when it is `success`. Check-runs are
+    // read newest-first, so a review that was dismissed after it attested the
+    // head has to be able to supersede the earlier `success`; staying silent
+    // would leave it standing for a dispatcher to act on.
+    mockFetchPrAuthor.mockResolvedValue(ALLY);
+    mockListComments.mockResolvedValueOnce([cleanAt(HEAD)]).mockResolvedValueOnce([]);
+
+    await runPrCommentReviewGateCheck(TARGET);
+    await runPrCommentReviewGateCheck(TARGET);
+
+    expect(runsNamed(SIGNAL).map((run) => run.conclusion)).toEqual(["success", "neutral"]);
+  });
+
+  it("publishes nothing, the signal included, while the PR author cannot be read", async () => {
+    // The signal follows the gate's own evidence rules. Here the gate withholds
+    // its whole publish rather than overwrite a correct earlier verdict on a
+    // transient 5xx, and the signal must not run ahead of it.
+    mockFetchPrAuthor.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([cleanAt(HEAD)]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toEqual({
+      posted: false,
+      reason: "fetch_failed",
+    });
+
+    expect(mockPostCheckRun).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it("publishes no signal when the commit status itself could not be written", async () => {
+    mockPostStatus.mockResolvedValue({ ok: false, retryable: false, reason: "commit_status_write_http_403" });
+    mockFetchPrAuthor.mockResolvedValue(ALLY);
+    mockListComments.mockResolvedValue([cleanAt(HEAD)]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: false,
+      reason: "post_failed",
+    });
+
+    // The status is the authoritative surface and its durable retry re-runs the
+    // whole evaluation, which publishes the signal then. Publishing it now would
+    // run ahead of a gate that has not spoken.
+    expect(mockPostCheckRun).not.toHaveBeenCalled();
+  });
+
+  it("a refused signal write leaves the commit status and the gate check-run published", async () => {
+    mockPostCheckRun.mockImplementation(async ({ name }: { name: string }) =>
+      name === SIGNAL ? { ok: false, retryable: false, reason: "check_run_write_http_403" } : OK,
+    );
+    mockFetchPrAuthor.mockResolvedValue(ALLY);
+    mockListComments.mockResolvedValue([cleanAt(HEAD)]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
+
+    expect(mockPostStatus).toHaveBeenCalledWith(expect.objectContaining({ context: GATE }));
+    expect(onlyRunNamed(GATE)).toMatchObject({ conclusion: "neutral" });
+    expect(runsNamed(SIGNAL)).toHaveLength(1);
+  });
+
+  it("a thrown signal write is contained the same way", async () => {
+    mockPostCheckRun.mockImplementation(async ({ name }: { name: string }) => {
+      if (name === SIGNAL) throw new Error("githubPostCheckRun is not a function");
+      return OK;
+    });
+    mockFetchPrAuthor.mockResolvedValue(ALLY);
+    mockListComments.mockResolvedValue([cleanAt(HEAD)]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
+    expect(mockPostStatus).toHaveBeenCalledWith(expect.objectContaining({ context: GATE }));
+    expect(onlyRunNamed(GATE)).toMatchObject({ conclusion: "neutral" });
+  });
+
+  it("does not retry a transient signal write: it is one best-effort attempt", async () => {
+    // Unlike the status and the gate's own check-run, the signal is not retried.
+    // It runs inside the delivery lock's 120s hold cap, a retried hung write can
+    // spend 91s of it, and the next evaluation of the head republishes the hint.
+    let signalAttempts = 0;
+    mockPostCheckRun.mockImplementation(async ({ name }: { name: string }) => {
+      if (name !== SIGNAL) return OK;
+      signalAttempts += 1;
+      return { ok: false, retryable: true, reason: "check_run_write_http_502" };
+    });
+    mockFetchPrAuthor.mockResolvedValue(ALLY);
+    mockListComments.mockResolvedValue([cleanAt(HEAD)]);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
+
+    expect(signalAttempts).toBe(1);
+  });
+
+  it("names a refused signal write once per repo, and says what it costs", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockPostCheckRun.mockImplementation(async ({ name }: { name: string }) =>
+      name === SIGNAL ? { ok: false, retryable: false, reason: "check_run_write_http_403" } : OK,
+    );
+    // A repo no other test in this file writes to: the once-per-repo memory is
+    // module state, so sharing a repo would make this order-dependent.
+    const target = { ...TARGET, repoFullName: "Blockcast/signal-warn-probe" };
+
+    await runPrCommentReviewGateCheck(target);
+    await runPrCommentReviewGateCheck(target);
+
+    const messages = warn.mock.calls.map(([message]) => String(message)).filter((m) => m.includes(SIGNAL));
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain("Blockcast/signal-warn-probe");
+    expect(messages[0]).toContain("check_run_write_http_403");
+    expect(messages[0]).toContain("checks: write");
+  });
+
+  describe("what is published", () => {
+    it("says in the summary that it is a schedule signal and never a required context", async () => {
+      mockFetchPrAuthor.mockResolvedValue(ALLY);
+
+      for (const comments of [[cleanAt(HEAD)], [], [blockingAt(HEAD)]]) {
+        mockPostCheckRun.mockClear();
+        mockListComments.mockResolvedValue(comments);
+        await runPrCommentReviewGateCheck(TARGET);
+
+        const { summary } = onlyRunNamed(SIGNAL);
+        // The sentence the deployment test also pins, from the other side: this
+        // is the text a reader sees on the check, in every conclusion.
+        expect(summary).toContain("Schedule signal only");
+        expect(summary).toContain("must never be added to required contexts");
+        expect(summary).toContain(`"${GATE}"`);
+        // A different artifact from the gate's own check-run, not a copy of it:
+        // the gate's reason ("nothing independent reviewed it") would contradict
+        // a `success` here.
+        expect(summary).not.toBe(onlyRunNamed(GATE).summary);
+      }
+    });
+
+    it("tells the two conclusions apart by title, and both are labelled a schedule signal", () => {
+      const success = allyHeadAttestedCheckTitle("success");
+      const neutral = allyHeadAttestedCheckTitle("neutral");
+
+      expect(success).not.toBe(neutral);
+      expect(success).toMatch(/^Schedule signal:/);
+      expect(neutral).toMatch(/^Schedule signal:/);
+      // "Findings" is the gate's vocabulary: this title must not read as a verdict.
+      expect(`${success} ${neutral}`).not.toMatch(/finding|review(ed)? (clean|passed)/i);
+    });
+
+    it("is published under a name the egress boundary leaves untouched", () => {
+      // `githubPostCheckRun` REFUSES an identity field the scrub would change
+      // (PEN-3391) and redacts prose that it would. Either would silently drop
+      // the signal, or the sentence that says it is never required.
+      const verdicts: CommentReviewGateVerdict[] = [
+        { state: "success", outcome: "clean", reason: "r" },
+        { state: "success", outcome: "not_evaluated", reason: "r", headAttested: true },
+        { state: "success", outcome: "not_evaluated", reason: "r" },
+        { state: "failure", outcome: "blocking_finding", reason: "r", commentCreatedAt: "2026-10-08T10:00:00Z" },
+      ];
+
+      expect(gitHubIdentityFieldRedaction(ALLY_HEAD_ATTESTED_CHECK_NAME, "check-run name")).toBeNull();
+      for (const verdict of verdicts) {
+        const summary = allyHeadAttestedCheckSummary(verdict, GATE);
+        expect(scrubOutboundGitHubText(summary, "check-run summary")).toBe(summary);
+      }
+    });
+  });
+
+  describe("the conclusion, from the typed verdict", () => {
+    // Every outcome the gate can return, built by hand so this does not depend on
+    // the evaluator reaching it. `Record<Outcome, ...>` makes a new outcome a
+    // compile error here too, not only in the function under test.
+    const SAMPLE_VERDICTS: Record<CommentReviewGateVerdict["outcome"], CommentReviewGateVerdict> = {
+      clean: { state: "success", outcome: "clean", reason: "r" },
+      deferred_finding: { state: "success", outcome: "deferred_finding", reason: "r" },
+      not_evaluated: { state: "success", outcome: "not_evaluated", reason: "r" },
+      blocking_finding: { state: "failure", outcome: "blocking_finding", reason: "r", commentCreatedAt: "t" },
+      carried_finding: {
+        state: "failure",
+        outcome: "carried_finding",
+        reason: "r",
+        commentCreatedAt: "t",
+        carriedFromHeadSha: OLD_HEAD,
+      },
+      unreadable_verdict: { state: "failure", outcome: "unreadable_verdict", reason: "r", commentCreatedAt: "t" },
+    };
+
+    it("is success only where a comment attests the head and nothing at it blocks", () => {
+      const conclusions = Object.fromEntries(
+        Object.entries(SAMPLE_VERDICTS).map(([outcome, verdict]) => [outcome, allyHeadAttestedCheckConclusion(verdict)]),
+      );
+      expect(conclusions).toEqual({
+        clean: "success",
+        deferred_finding: "success",
+        not_evaluated: "neutral",
+        blocking_finding: "neutral",
+        carried_finding: "neutral",
+        unreadable_verdict: "neutral",
+      });
+    });
+
+    it("reads a not_evaluated as attested only through the typed marker", () => {
+      const attested: CommentReviewGateVerdict = {
+        state: "success",
+        outcome: "not_evaluated",
+        // Wording that says nothing is attested: the conclusion must follow the
+        // marker, not the prose.
+        reason: "No Ally consolidated-review comment attests to reviewing this head.",
+        headAttested: true,
+      };
+      const unattested: CommentReviewGateVerdict = {
+        state: "success",
+        outcome: "not_evaluated",
+        // Wording that says something IS attested: and the conclusion must not
+        // follow that either.
+        reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
+      };
+
+      expect(allyHeadAttestedCheckConclusion(attested)).toBe("success");
+      expect(allyHeadAttestedCheckConclusion(unattested)).toBe("neutral");
+    });
+
+    it("the marker changes nothing a merge surface publishes", () => {
+      // `headAttested` says a comment EXISTS that attests the head. It does not
+      // say anyone independent of the PR author examined it, which is the claim
+      // the gate's own check-run and commit status exist to make (BLO-34316). So
+      // the marker may move the schedule signal and nothing else: the two verdicts
+      // below differ ONLY in it, and every merge-facing rendering of them must be
+      // identical.
+      const plain: CommentReviewGateVerdict = { state: "success", outcome: "not_evaluated", reason: "r" };
+      const attested: CommentReviewGateVerdict = { ...plain, headAttested: true };
+
+      expect(commentReviewGateCheckConclusion(attested)).toBe("neutral");
+      expect(commentReviewGateCheckConclusion(attested)).toBe(commentReviewGateCheckConclusion(plain));
+      expect(commentReviewGateCheckTitle(attested)).toBe(commentReviewGateCheckTitle(plain));
+      expect(commentReviewGateRetirementStatus(GATE, attested)).toEqual(commentReviewGateRetirementStatus(GATE, plain));
+      // ...while the schedule signal is the one thing it does move.
+      expect(allyHeadAttestedCheckConclusion(attested)).not.toBe(allyHeadAttestedCheckConclusion(plain));
+    });
+
+    it("the evaluator sets the marker on exactly the withheld-positive branches", () => {
+      const run = (prAuthorLogin: string | null, comments: ReturnType<typeof cleanAt>[]) =>
+        evaluateCommentReviewGate({
+          headSha: HEAD,
+          prAuthorLogin,
+          comments: comments.map((c) => ({ authorLogin: c.login, body: c.body, createdAt: c.createdAt })),
+        });
+
+      // The two withheld routes: shared identity, and an author nobody could read.
+      expect(run(ALLY, [cleanAt(HEAD)])).toMatchObject({ outcome: "not_evaluated", headAttested: true });
+      expect(run("allyblockcast", [cleanAt(HEAD)])).toMatchObject({ outcome: "not_evaluated", headAttested: true });
+      expect(run(null, [cleanAt(HEAD)])).toMatchObject({
+        outcome: "not_evaluated",
+        headAttested: true,
+        authorUnknown: true,
+      });
+
+      // Everything else that is `not_evaluated` must NOT carry it.
+      expect(run(AUTHOR, [])).not.toHaveProperty("headAttested");
+      expect(run(ALLY, [cleanAt(OLD_HEAD)])).not.toHaveProperty("headAttested");
+      expect(run(null, [])).not.toHaveProperty("headAttested");
+
+      // And the verdicts that are attested on their own terms do not need it.
+      expect(run(AUTHOR, [cleanAt(HEAD)])).toMatchObject({ outcome: "clean" });
+      expect(run(AUTHOR, [cleanAt(HEAD)])).not.toHaveProperty("headAttested");
+    });
   });
 });

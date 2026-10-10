@@ -154,6 +154,21 @@ export type CommentReviewGateVerdict =
        * anything — see executeCommentReviewGateCheck.
        */
       authorUnknown?: true;
+      /**
+       * Set on exactly the two branches that WITHHOLD a positive claim, and on
+       * no other `not_evaluated`: an Ally consolidated-review comment DOES
+       * attest this exact head and reports no finding blocking it, and only its
+       * independence from the PR author is unestablished (BLO-34316).
+       *
+       * It is what separates that verdict from "no comment attests this head" —
+       * two `not_evaluated` outcomes that share a `state`, an `outcome` and a
+       * `neutral` check-run — without anyone pattern-matching on `reason`. The
+       * schedule signal `ci/ally-head-attested` reads it (see
+       * `allyHeadAttestedCheckConclusion`). Nothing that decides a MERGE may
+       * read it: it asserts that a comment exists, not that anyone independent
+       * of the author examined the head.
+       */
+      headAttested?: true;
     }
   | { state: "failure"; outcome: "blocking_finding"; reason: string; commentCreatedAt: string }
   | { state: "failure"; outcome: "unreadable_verdict"; reason: string; commentCreatedAt: string }
@@ -762,6 +777,10 @@ export function evaluateCommentReviewGate(input: {
         state: "success",
         outcome: "not_evaluated",
         authorUnknown: true,
+        // `forHead` exists, so a comment attests this head; only the author is
+        // unknown. Typed rather than inferred from `reason`, because the
+        // schedule signal reads it (see `headAttested` on the verdict type).
+        headAttested: true,
         reason: "The PR author is unknown, so this head's attestation cannot be shown to be independent.",
       };
       // `githubSharesReviewerIdentity`, not `githubReviewerIdentityMatches`: the
@@ -773,6 +792,14 @@ export function evaluateCommentReviewGate(input: {
       withheldPositive = {
         state: "success",
         outcome: "not_evaluated",
+        // The App-authored population: the review is attested, the merge-facing
+        // positive is withheld, and the schedule signal `ci/ally-head-attested`
+        // is the one surface that still says "an Ally comment attests this
+        // head" for it. Without this marker that signal would read the same as
+        // "nothing attests", and heavy CI would starve on every PR the App
+        // authors, because `gate/ally-comment-findings` is `neutral` for all of
+        // them.
+        headAttested: true,
         reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
       };
     } else {
@@ -994,6 +1021,134 @@ export function commentReviewGateCheckTitle(
       // summary (`verdict.reason`) names which of the two it was.
       return "Not evaluated — no independent comment-shaped review attests this head";
   }
+}
+
+/**
+ * Name of the schedule-signal check-run (ally-gated heavy CI, design 4.0b).
+ *
+ * A literal and not configuration, on purpose. The dispatchers that read this
+ * signal key on this exact string and on this App's id, so a chart value that
+ * could rename it would let an operator point the signal at a name some branch
+ * rule already requires. The deployment test pins that no env var and no chart
+ * value reaches it.
+ */
+export const ALLY_HEAD_ATTESTED_CHECK_NAME = "ci/ally-head-attested";
+
+/**
+ * Conclusions the schedule signal may carry. `failure` is excluded by the TYPE
+ * rather than by a branch someone could edit: this signal has no way to block
+ * anything, because the gate's own check-run already carries every finding.
+ */
+export type AllyHeadAttestedConclusion = Exclude<GitHubCheckRunConclusion, "failure">;
+
+/**
+ * Conclusion of the `ci/ally-head-attested` schedule signal.
+ *
+ * `success` iff an Ally consolidated-review comment attests THIS exact head and
+ * nothing at that head blocks it: the verdict is `clean`, `deferred_finding`, or
+ * the withheld positive of a self-attestation (the branches that set
+ * `withheldPositive` in evaluateCommentReviewGate). Otherwise `neutral`. Never
+ * `failure`.
+ *
+ * Why this exists. The gate's own check-run is `success` only for `clean`, and
+ * BLO-34316 withholds `clean` whenever the PR author shares the reviewer's
+ * identity, which is every PR the App opens. A heavy-CI dispatcher that waits
+ * for "Ally attested this head" would starve on that whole population, and this
+ * is the typed surface that still says it. It deliberately does NOT ask for
+ * independence from the author, which is exactly why it is a schedule signal
+ * and never review evidence: it decides WHEN heavy CI may run, never WHETHER a
+ * change may merge.
+ *
+ * "Attests this exact head" needs no separate lookup here. Every verdict that
+ * can reach `success` is built inside the `forHead` branch of
+ * evaluateCommentReviewGate, whose comment was matched on
+ * `extractAllyReviewedHeadSha` equal to the evaluated head, and the one
+ * `not_evaluated` that is NOT built there (no comment attests the head) does not
+ * carry `headAttested`.
+ *
+ * A finding at this head, a finding carried from an earlier head and an
+ * unreadable verdict are all `neutral`, not `failure`. They are blocking states,
+ * but the gate's own check-run reports them; this one carries no findings of its
+ * own, so a second red here would be a duplicate nobody can clear separately.
+ *
+ * The switch is exhaustive on purpose: a new outcome fails to compile until
+ * someone decides what it means for scheduling.
+ */
+export function allyHeadAttestedCheckConclusion(
+  verdict: CommentReviewGateVerdict,
+): AllyHeadAttestedConclusion {
+  switch (verdict.outcome) {
+    case "clean":
+    case "deferred_finding":
+      return "success";
+    case "not_evaluated":
+      return verdict.headAttested === true ? "success" : "neutral";
+    case "blocking_finding":
+    case "carried_finding":
+    case "unreadable_verdict":
+      return "neutral";
+  }
+}
+
+/** Short title for the schedule signal, so its meaning is legible before it is opened. */
+export function allyHeadAttestedCheckTitle(conclusion: AllyHeadAttestedConclusion): string {
+  return conclusion === "success"
+    ? "Schedule signal: Ally attested this head, nothing blocking"
+    : "Schedule signal: no non-blocking Ally attestation of this head";
+}
+
+/**
+ * Why the schedule signal landed where it did. Written from the typed verdict,
+ * never by re-reading `verdict.reason`: that string describes the MERGE gate's
+ * reading ("nothing independent reviewed it") and would contradict a `success`
+ * here.
+ */
+function allyHeadAttestedWhy(verdict: CommentReviewGateVerdict): string {
+  switch (verdict.outcome) {
+    case "clean":
+      return "An Ally consolidated-review comment attests this exact head and reports no unresolved finding.";
+    case "deferred_finding":
+      return (
+        "An Ally consolidated-review comment attests this exact head; the findings it leaves open " +
+        "were accepted as tracked on a follow-up, not fixed."
+      );
+    case "not_evaluated":
+      return verdict.headAttested === true
+        ? "An Ally consolidated-review comment attests this exact head and reports no unresolved finding. " +
+            "Its independence from the PR author is not established, so the review gate withholds its " +
+            "clean claim; this signal does not depend on authorship."
+        : "No Ally consolidated-review comment attests this exact head.";
+    case "blocking_finding":
+      return "Ally's review of this exact head carries an unresolved finding.";
+    case "carried_finding":
+      return "A finding from an earlier head is still undispositioned.";
+    case "unreadable_verdict":
+      return "Ally's newest review of this head carries a verdict block that could not be read.";
+  }
+}
+
+/**
+ * Check-run summary for the schedule signal.
+ *
+ * Says in so many words that the check is never a required context. That
+ * sentence is not decoration: this check is `success` for a PR the review gate
+ * deliberately reports `neutral`, and `neutral` or absent on a head that is
+ * perfectly mergeable, so requiring it would either authorize a merge the gate
+ * withheld or block one it allowed. The deployment test pins the sentence for
+ * every verdict, and the check test pins that the egress scrub leaves it
+ * intact, so neither a reword nor a redaction can quietly drop it.
+ */
+export function allyHeadAttestedCheckSummary(
+  verdict: CommentReviewGateVerdict,
+  gateContext: string,
+): string {
+  return (
+    `${allyHeadAttestedWhy(verdict)}\n\n` +
+    "Schedule signal only. It says WHEN heavy CI may run at this head, never WHETHER the change may " +
+    "merge, and it is not review evidence. It must never be added to required contexts (branch " +
+    "protection, rulesets or the merge queue): a success here authorizes nothing, and a neutral or " +
+    `missing result must block nothing. Findings are reported by "${gateContext.trim()}".`
+  );
 }
 
 /**
@@ -1332,7 +1487,33 @@ async function executeCommentReviewGateCheck(
 
     await publishCheckRunMirror(input, headSha, context, verdict);
 
-    const retirementFailures = await supersedeRetiredContexts(input, headSha, context, config, verdict);
+    // The retirement write is merge-facing and the signal is not, so retirement
+    // goes first and the signal is written LAST, after every write that decides
+    // anything. A retired context mirrors a blocking verdict onto a legacy
+    // context that may still be a required check (BLO-26602), and all of this
+    // runs under the delivery lock's 120s hold cap, which a degraded Checks API
+    // can spend: three 30s hangs and their backoff cost the mirror 91s, and a
+    // signal written ahead of retirement cost it another 91s, so the retirement
+    // landed at 182s, after Postgres had already ended the lock's holder.
+    //
+    // The signal also stays AFTER the mirror. Its `success` is an event a
+    // dispatcher wakes on, and the dispatcher then reads the gate's own
+    // check-run at this head. Written first, a `success` here could wake it
+    // while that check-run still showed an earlier evaluation's `failure`; the
+    // dispatcher would read "blocked", and nothing would wake it again, because
+    // its verdict arm wakes only on a `success` conclusion (ally-gated CI design
+    // 3.4) and a `neutral` mirror, the self-attested population's, is not one.
+    //
+    // `finally`, so the signal is unconditional: a retirement that throws
+    // rejects the publish, and the signal has still been written. It cannot
+    // throw itself (it contains its own failures), so it never masks the
+    // retirement's. Pinned by test.
+    let retirementFailures: Awaited<ReturnType<typeof supersedeRetiredContexts>>;
+    try {
+      retirementFailures = await supersedeRetiredContexts(input, headSha, context, config, verdict);
+    } finally {
+      await publishAllyHeadAttestedCheckRun(input, headSha, context, verdict);
+    }
     if (retirementFailures.length > 0) {
       // NOT "post_failed": the live status published successfully at line 643
       // above, and only the retired-context cleanup did not. Reporting this as
@@ -1423,6 +1604,82 @@ async function publishCheckRunMirror(
       `${reason}. The commit status is still authoritative, but "not evaluated" and ` +
       `"reviewed clean" both render green there — the check-run is what separates them. ` +
       "A 403 here means the installation is missing `checks: write` (BLO-33657).",
+  );
+}
+
+/**
+ * Publish the `ci/ally-head-attested` schedule signal for one head.
+ *
+ * Written on EVERY evaluation, `neutral` included, and not only when it is
+ * `success`. A consumer takes the newest check-run of a name, so a later
+ * evaluation that no longer attests the head (a review dismissed after it
+ * attested, a blocking review landing at the same head) has to be able to
+ * supersede an earlier `success`; staying silent would leave the earlier one
+ * standing for a dispatcher to act on.
+ *
+ * Best-effort, for the reason `publishCheckRunMirror` is, with a weaker
+ * consequence still: this signal is never a required context and never merge
+ * authority, so a refused or thrown write costs heavy CI some latency, not
+ * safety. Failing the check over it would let the schedule signal take out the
+ * commit status that does gate.
+ *
+ * ONE attempt, unlike the status and the mirror, which are retried. It runs
+ * inside the delivery lock, whose 120s hold cap a degraded Checks API can spend
+ * (a retried hung write costs 91s of it), it is written after every write that
+ * decides anything, and it is rewritten by the next evaluation of the head.
+ *
+ * What a lost write costs is NOT recovered by anything yet. The outbox backstop
+ * (`processGateReevaluation`) and the redrive sweep both key on the gate's
+ * commit STATUS, which this evaluation did publish, so neither re-drives a head
+ * whose only missing write is this check-run, and Ally's review is normally the
+ * last event at a head, so no later webhook re-evaluates it either. For the
+ * App-authored population this is the only positive signal, so one lost write
+ * leaves that head waiting on a human (a rerun, or the bypass lever). No
+ * consumer reads this signal in this change, so nothing waits on it yet; making
+ * the write durable (a distinct result the redrive sweep and the outbox
+ * freshness guard honour) is a prerequisite of the first consumer, not of this
+ * change.
+ *
+ * Logged once per repo so a missing `checks: write` grant is diagnosable
+ * without a log flood. A separate set from the mirror's, because the two writes
+ * can fail independently and each failure names a different consequence.
+ */
+const allyHeadAttestedWriteWarnings = new Set<string>();
+
+async function publishAllyHeadAttestedCheckRun(
+  input: PrCommentReviewGateCheckInput,
+  headSha: string,
+  gateContext: string,
+  verdict: CommentReviewGateVerdict,
+): Promise<void> {
+  let reason: string;
+  try {
+    const conclusion = allyHeadAttestedCheckConclusion(verdict);
+    const result = await githubPostCheckRun({
+      repoFullName: input.repoFullName,
+      sha: headSha,
+      name: ALLY_HEAD_ATTESTED_CHECK_NAME,
+      conclusion,
+      title: allyHeadAttestedCheckTitle(conclusion),
+      summary: allyHeadAttestedCheckSummary(verdict, gateContext),
+      detailsUrl: input.prUrl ?? null,
+    });
+    if (result.ok) return;
+    reason = result.reason;
+  } catch (error) {
+    // Same reasoning as the mirror's catch: a classified failure comes back as a
+    // result, but an unmocked export or a module that failed to load throws, and
+    // letting that escape would reject the publish and lose the commit status
+    // that was already written.
+    reason = error instanceof Error ? error.message : String(error);
+  }
+  if (allyHeadAttestedWriteWarnings.has(input.repoFullName)) return;
+  allyHeadAttestedWriteWarnings.add(input.repoFullName);
+  console.warn(
+    `[pr-comment-review-gate] Could not publish the "${ALLY_HEAD_ATTESTED_CHECK_NAME}" schedule-signal ` +
+      `check-run on ${input.repoFullName}: ${reason}. Heavy CI that waits on it stays queued until a ` +
+      `later evaluation of this head republishes it (nothing re-drives it on its own); "${gateContext}" ` +
+      "and the commit status are unaffected. A 403 here means the installation is missing `checks: write`.",
   );
 }
 

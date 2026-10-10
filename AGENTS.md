@@ -390,6 +390,8 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 - **Model Used** — the AI model that produced or assisted with the change (provider, exact model ID, context window, capabilities). Write "None — human-authored" if no AI was used.
 - **Checklist** — all items checked
 
+The review gate also publishes a `ci/ally-head-attested` check-run on every PR. It is a schedule signal for heavy CI (`success` when an Ally comment attests this exact head and nothing blocks it, even where `gate/ally-comment-findings` is deliberately `neutral`), not review evidence and not a finding when `neutral`. Never add it to required contexts.
+
 ## 12. Definition of Done
 
 A change is done when all are true:
