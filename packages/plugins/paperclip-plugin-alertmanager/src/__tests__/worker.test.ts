@@ -2191,9 +2191,14 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
       }),
     );
 
+    // BLO-42811: `assigneeUserId: null` is load-bearing, not cosmetic. The host
+    // merges this patch over the row and then refuses a row holding both
+    // assignees, so the one-field form this used to assert is rejected
+    // `422 Issue can only have one assignee` against a user-assigned row —
+    // permanently, on every retry, destroying the whole delivery batch.
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-existing",
-      { assigneeAgentId: "agent-multicast" },
+      { assigneeAgentId: "agent-multicast", assigneeUserId: null },
       "company-1",
       undefined,
       FIRING_FENCE_ARG,
@@ -2202,7 +2207,11 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
     // next resolve/escalation read would still think nobody owns it.
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.any(Object),
-      expect.objectContaining({ assigneeAgentId: "agent-multicast" }),
+      expect.objectContaining({
+        assigneeAgentId: "agent-multicast",
+        // The displaced user must not survive in state either.
+        assigneeUserId: null,
+      }),
       FIRING_FENCE_ARG,
     );
     expect(mocks.events.emit).toHaveBeenCalledWith(
@@ -2340,11 +2349,14 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
     const { ctx, mocks } = mkCtx();
     // No state for this fingerprint — it takes the creation path and finds a
     // live aggregate winner, which used to skip owner resolution entirely.
+    // BLO-42811: the winner is USER-assigned, which is the production shape —
+    // an agent-null row is agent-null precisely because a human owns it. A
+    // winner with no owner at all cannot exercise the displacement.
     mocks.issues.list.mockImplementation(aggregateWinner({
       id: "issue-winner",
       status: "backlog",
       assigneeAgentId: null,
-      assigneeUserId: null,
+      assigneeUserId: "user-42",
     }));
 
     await handleWebhook(
@@ -2364,9 +2376,11 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
     );
 
     expect(mocks.issues.create).not.toHaveBeenCalled();
+    // BLO-42811: the agent branch always clears the user, on this path too —
+    // the aggregate-join path reaches the same patch builder as the re-fire one.
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-winner",
-      { assigneeAgentId: "agent-multicast" },
+      { assigneeAgentId: "agent-multicast", assigneeUserId: null },
       "company-1",
       undefined,
       FIRING_FENCE_ARG,
@@ -2376,6 +2390,10 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
       expect.objectContaining({
         paperclipIssueId: "issue-winner",
         assigneeAgentId: "agent-multicast",
+        // BLO-42811: the displaced user must not survive into state via the
+        // caller's coalescing either — `retrofit.assigneeUserId ?? issue.
+        // assigneeUserId` would put `user-42` straight back.
+        assigneeUserId: null,
       }),
       FIRING_FENCE_ARG,
     );
@@ -2628,6 +2646,73 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.any(Object),
       expect.objectContaining({ resolvedAt: null, assigneeAgentId: null }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  // BLO-42811 — the production failure, pinned by BEHAVIOUR rather than by
+  // payload shape. The assertions above check which fields we send; this one
+  // enforces the rule the host actually applies, so it still fails if the patch
+  // is later rewritten into some other form that reintroduces the collision.
+  //
+  // Measured 2026-10-10: against a user-assigned, agent-null row the one-field
+  // patch was rejected `422 Issue can only have one assignee` on every attempt.
+  // Alertmanager retried 13-17x and then destroyed the whole delivery batch —
+  // 512 failed attempts and 30 terminal give-ups in one 6h window, taking
+  // unrelated alerts batched alongside down with them.
+  it("survives a host that enforces the single-assignee rule on a user-assigned row", async () => {
+    const { ctx, mocks } = mkCtx();
+    // The state record carries the human too — that is how the row got written
+    // at creation. Without it the caller's `?? tracked.assigneeUserId` has
+    // nothing to resurrect, and the coalescing guard goes untested.
+    mocks.state.get.mockResolvedValueOnce({ ...refireState, assigneeUserId: "user-42" });
+    const row = {
+      id: "issue-existing",
+      status: "todo",
+      assigneeAgentId: null as string | null,
+      // The poisoned shape seen in production: a human owns the row, so it has
+      // no agent and therefore no wake path.
+      assigneeUserId: "user-42" as string | null,
+    };
+    mocks.issues.get.mockResolvedValue(row);
+    mocks.issues.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) => {
+        // The host MERGES the patch over the row: a field absent from the patch
+        // keeps its existing value (server/src/services/issues.ts).
+        const nextAgent =
+          "assigneeAgentId" in patch ? patch.assigneeAgentId : row.assigneeAgentId;
+        const nextUser =
+          "assigneeUserId" in patch ? patch.assigneeUserId : row.assigneeUserId;
+        if (nextAgent && nextUser) {
+          throw new Error("Issue can only have one assignee");
+        }
+        return { id: "issue-existing" };
+      },
+    );
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("agent:agent-multicast")],
+        }),
+      }),
+    );
+
+    // The retrofit must have committed, not been swallowed as a failed write.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.retrofitted",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", target: "agent" },
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        assigneeAgentId: "agent-multicast",
+        assigneeUserId: null,
+      }),
       FIRING_FENCE_ARG,
     );
   });
