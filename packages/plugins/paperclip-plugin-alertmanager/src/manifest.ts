@@ -42,9 +42,13 @@ const manifest: PaperclipPluginManifestV1 = {
     "secrets.verify-ref",
     // Webhook entrypoint (the plugin is webhook-driven)
     "webhooks.receive",
-    // No `http.outbound`: the BLO-40739 liveness read uses Node's own `fetch`,
-    // because the host's `ctx.http` refuses the cluster-internal Alertmanager
-    // address it has to reach (see `readAlertLiveness` in escalation.ts).
+    // Outbound network reach: the BLO-40739 liveness read GETs the operator-set
+    // `alertmanagerApiUrl`. It uses Node's own `fetch`, not `ctx.http` (whose
+    // SSRF guard refuses the cluster-internal Alertmanager; see
+    // `readAlertLiveness` in escalation.ts), so the host does not enforce this
+    // for it — but this list is what the host diffs on upgrade and shows an
+    // operator, so the reach is declared where it is reviewed.
+    "http.outbound",
     "instance.settings.register",
     "jobs.schedule",
     // Durable, race-safe storm-cover membership + resolution state (BLO-16120)
