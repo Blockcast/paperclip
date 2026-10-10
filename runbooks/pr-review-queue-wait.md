@@ -49,9 +49,12 @@ carry opposite verdicts on the page, so tell them apart before standing down:
   triage the queue below as well.** Do not stand down on the 0s.
 - **Both return numbers, but the mean is at or below query 1 × 3600s.** One arm
   is incomplete relative to the others, most often because only some pods
-  report it (the series carry a `pod` label). Find which
-  before deciding: a short `_bucket` overstates the fraction, so the page may be
-  an artefact; a short `_sum` only understates the mean, so the breach is real.
+  report it (the series carry a `pod` label). Find which before deciding. A
+  short `_bucket` overstates the fraction, so the page may be an artefact, but
+  the queue can still be saturated: re-run query 1 over only the pods that
+  report all three series and judge the queue on that fraction. A short `_sum`
+  only understates the mean, so the breach is real: file the instrument bug and
+  triage the queue below as well.
 
 In every case, check that `_bucket`, `_sum` and `_count` are all still being
 reported.
