@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Express } from "express";
 import request from "supertest";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createApp } from "../app.js";
 
 /**
@@ -199,5 +199,111 @@ describe("/healthz probe route", () => {
       "/healthz",
       "/livez",
     ]);
+  });
+});
+
+/**
+ * BLO-28615. `/api/health` is now the readiness probe path on BOTH tiers — the
+ * worker since BLO-35948, the API Deployment since this issue. The tests above
+ * cover the two dependency-free probe routes; these cover the one that is
+ * deliberately NOT dependency-free, through the real `createApp` stack rather
+ * than against a router mounted on a bare Express app.
+ *
+ * That distinction is the whole point of putting them here. `health.test.ts`
+ * mounts `healthRoutes` directly, so it can prove the handler's logic but not
+ * that a probe reaching this path is answered by the handler at all — which is
+ * exactly the class of defect BLO-32164 was: a probe path resolving through the
+ * SPA catch-all and reporting 200/text/html for a process that attested
+ * nothing.
+ */
+describe("/api/health as a readiness probe path", () => {
+  let app: Express;
+  // Separate boot from the suite above, which deliberately passes a bare `{}`
+  // db so that any dependency creeping onto `/healthz` or `/livez` throws
+  // loudly. Giving that app a working `execute` would silence that control, so
+  // the readiness path gets its own instance instead.
+  //
+  // Seeded healthy at declaration rather than in a test: `createApp` runs
+  // before the first `it`, and a bare `vi.fn()` would hand boot-time callers
+  // `undefined`.
+  const execute = vi.fn().mockResolvedValue([{ "?column?": 1 }]);
+
+  beforeAll(async () => {
+    app = await createApp({ execute } as never, {
+      uiMode: "none",
+      serverPort: 0,
+      storageService: {} as never,
+      deploymentMode: "local_trusted",
+      deploymentExposure: "private",
+      allowedHostnames: [],
+      bindHost: "127.0.0.1",
+      authReady: false,
+      companyDeletionEnabled: false,
+    } as never);
+  }, 120_000);
+
+  afterAll(async () => {
+    await (app?.locals?.paperclipShutdown as undefined | (() => Promise<void>))?.();
+  });
+
+  it("answers 2xx as JSON — not the catch-all's text/html — when the pool is reachable", async () => {
+    execute.mockResolvedValue([{ "?column?": 1 }]);
+
+    const res = await request(app).get("/api/health").set("Host", "127.0.0.1:3100");
+
+    expect(res.status).toBe(200);
+    expect(res.body?.status).toBe("ok");
+    // The content-type assertion is the one that pins the catch-all
+    // specifically: that regression was also a 200, and differed only in
+    // answering `text/html` with the UI shell. A status check alone would not
+    // have caught it.
+    expect(res.headers["content-type"]).toMatch(/^application\/json\b/);
+    expect(res.headers["content-type"]).not.toMatch(/text\/html/);
+    // Control: the probe's verdict came from the pool, not from a route that
+    // happens to answer 200 regardless. Without this the test passes just as
+    // happily against an endpoint that never queries anything.
+    expect(execute).toHaveBeenCalled();
+  });
+
+  it("answers 503 when the pool is unreachable, so the pod leaves the Service", async () => {
+    execute.mockRejectedValue(new Error("connect ECONNREFUSED"));
+
+    const res = await request(app).get("/api/health").set("Host", "127.0.0.1:3100");
+
+    // Non-2xx is the entire point: on `/healthz` this same failure answered
+    // 200 and the replica stayed in the endpoint list serving traffic it could
+    // not fulfil.
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ status: "unhealthy", error: "database_unreachable" });
+    expect(res.headers["content-type"]).toMatch(/^application\/json\b/);
+  });
+
+  it("cannot be impersonated by an undeclared /api path falling through to the SPA", async () => {
+    execute.mockResolvedValue([{ "?column?": 1 }]);
+
+    // `app.use("/api", …)` terminates every unmatched /api request with a JSON
+    // 404 before the SPA catch-all is reached, so moving the probe under /api
+    // does not move the BLO-32164 problem to a new path: a typo'd or retired
+    // probe path fails loudly instead of inheriting a 200 from the UI shell.
+    const res = await request(app)
+      .get("/api/health/ready")
+      .set("Host", "127.0.0.1:3100");
+
+    expect(res.status).toBe(404);
+    expect(res.headers["content-type"]).toMatch(/^application\/json\b/);
+    // toMatchObject, not toEqual: the response carries a `publicUrl` field
+    // added downstream of this handler. What matters here is the shape a probe
+    // would see — a JSON error, not the UI shell.
+    expect(res.body).toMatchObject({ error: "API route not found" });
+  });
+
+  it("declares the /api 404 terminator ahead of the SPA catch-all", () => {
+    // The live assertion above runs with `uiMode: "none"`, where no catch-all
+    // is mounted at all — so on its own it cannot distinguish "the terminator
+    // answered" from "nothing else was there to answer". This pins the
+    // ordering that makes it true in a UI-serving build too.
+    expect(indexOfOrFail(appSource, 'app.use("/api", (_req, res) => {')).toBeLessThan(
+      indexOfOrFail(appSource, "app.get(/.*/"),
+    );
   });
 });
