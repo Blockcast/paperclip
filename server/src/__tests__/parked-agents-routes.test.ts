@@ -264,6 +264,79 @@ describeEmbeddedPostgres("parked agents route", () => {
     expect(unlabelled.penstockReason).toBeNull();
   });
 
+  it("names which probe denied the run, so a park says whether it spent inference quota", async () => {
+    const companyId = await seedCompany();
+    const cheapAgent = await seedAgent(companyId, "PlatformSREEngineer");
+    const paidAgent = await seedAgent(companyId, "BackendEngineer");
+    const unlabelledAgent = await seedAgent(companyId, "FrontendEngineer");
+
+    // A 429 off the cached capacity read and a 429 off the real
+    // `POST /v1/messages` fallback persist the SAME `penstockReason`, so that
+    // key cannot separate them (BLO-42916). Only the probe path says whether
+    // the re-probe paid for a provider call — the cost the 15m re-probe
+    // cadence assumes it is not paying.
+    await seedRun({
+      companyId,
+      agentId: cheapAgent,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 5 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAttempt: 1,
+      resultJson: {
+        penstockReason: "penstock.model_capacity_unavailable",
+        penstockProbePath: "capacity",
+      },
+    });
+    await seedRun({
+      companyId,
+      agentId: paidAgent,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 10 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAttempt: 1,
+      resultJson: {
+        penstockReason: "penstock.model_capacity_unavailable",
+        penstockProbePath: "messages_fallback",
+      },
+    });
+    // A park written before this key existed must read as null, not be absent:
+    // a caller has to tell "probe path unknown on this row" from "field not
+    // deployed", and an absent key is indistinguishable from the latter.
+    await seedRun({
+      companyId,
+      agentId: unlabelledAgent,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 15 * 60_000),
+      scheduledRetryReason: "ccrotate_capacity",
+      scheduledRetryAttempt: 1,
+      resultJson: { penstockReason: "penstock.model_capacity_unavailable" },
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .get(`/api/companies/${companyId}/parked-agents`)
+      .expect(200);
+
+    const [cheap, paid, unlabelled] = res.body.agents;
+    expect(res.body.parkedRunCount).toBe(3);
+
+    // The control: `penstockReason` is identical on all three, so the field
+    // that already exists cannot answer "did this park cost a provider call".
+    expect(
+      res.body.agents.map((entry: { penstockReason: string }) => entry.penstockReason),
+    ).toEqual([
+      "penstock.model_capacity_unavailable",
+      "penstock.model_capacity_unavailable",
+      "penstock.model_capacity_unavailable",
+    ]);
+
+    expect(cheap.penstockProbePath).toBe("capacity");
+    expect(paid.penstockProbePath).toBe("messages_fallback");
+    // `toBeNull` over `toBeUndefined`: null is the projected "not recorded",
+    // and a dropped projection line would yield undefined here.
+    expect(unlabelled.penstockProbePath).toBeNull();
+    expect(unlabelled).toHaveProperty("penstockProbePath");
+  });
+
   it("surfaces the advertised resume instant under the writer's key, so a rename cannot null it", async () => {
     // The alert runbook sends on-call here to see a capacity park's advertised
     // resume instant (BLO-35263). Seeding through the writer's binding rather

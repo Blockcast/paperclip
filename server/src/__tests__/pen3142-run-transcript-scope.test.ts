@@ -344,6 +344,9 @@ describe("run transcript scoping (PEN-3142)", () => {
         stopReason: "max_turns",
         errorFamily: "provider_capacity",
         penstockReason: "throttled",
+        // A bounded enum that is nonetheless a string, so the value-shape rule
+        // withholds it unless the key is allowlisted (BLO-42916).
+        penstockProbePath: "capacity",
         retryNotBefore: "2026-09-10T04:00:00.000Z",
         error: "provider returned 429",
         totalCostUsd: 0.42,
@@ -1474,6 +1477,10 @@ describe("run transcript scoping (PEN-3142)", () => {
         stopReason: "max_turns",
         errorFamily: "provider_capacity",
         penstockReason: "throttled",
+        // Withheld unless the key is allowlisted, because it is a string
+        // (BLO-42916). `toEqual` is the guard: drop the allowlist entry and
+        // this key vanishes from the projection and this assertion goes red.
+        penstockProbePath: "capacity",
         retryNotBefore: "2026-09-10T04:00:00.000Z",
         error: "provider returned 429",
         totalCostUsd: 0.42,
