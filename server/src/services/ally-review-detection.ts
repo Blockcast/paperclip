@@ -386,6 +386,23 @@ export interface AllyStructuredVerdict {
   /** Per-severity finding counts, lowercased keys. */
   findings: Map<string, number>;
   dispositions: AllyStructuredDisposition[];
+  /**
+   * The lane that wrote this review, as the review declares itself, or `null`
+   * when it declares nothing. Lowercased and trimmed; otherwise opaque.
+   *
+   * A SELF-DECLARATION, NOT A TRUST BOUNDARY (BLO-34389). It disambiguates
+   * which lane authored a review-shaped comment on a fleet where every lane
+   * posts under one shared `allyblockcast[bot]` login, so the GitHub author is
+   * useless for telling the reviewer apart from the PR author. It buys nothing
+   * against a lane that sets out to retire its own finding: such a lane writes
+   * the whole block, counts included, and can simply omit this field or spell
+   * it wrong. What it discriminates is the honest case, which is the one
+   * actually measured.
+   *
+   * `null` therefore means "today's behaviour", not "refused" — see the
+   * exclusion in pr-comment-review-gate.ts.
+   */
+  reviewer: string | null;
 }
 
 /**
@@ -580,7 +597,7 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
     return { kind: "unreadable", reason: "ally-verdict payload is not a JSON object" };
   }
 
-  const { head, findings, dispositions } = parsed as Record<string, unknown>;
+  const { head, findings, dispositions, reviewer } = parsed as Record<string, unknown>;
   if (typeof head !== "string" || !/^[0-9a-f]{40}$/i.test(head.trim())) {
     return { kind: "unreadable", reason: "ally-verdict block attests no complete head SHA" };
   }
@@ -591,6 +608,29 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
   if (typeof counts === "string") return { kind: "unreadable", reason: counts };
   const ledger = asDispositions(dispositions);
   if (!ledger) return { kind: "unreadable", reason: "ally-verdict dispositions are malformed" };
+
+  // Optional, and its ABSENCE is the permissive direction — the one shape the
+  // other optional field does not have. `asDispositions(undefined)` is `[]`,
+  // which retires nothing; an absent `reviewer` instead leaves every retirement
+  // credited, exactly as before this field existed (BLO-34389).
+  //
+  // That is deliberate and it is the anti-deadlock constraint, not an
+  // oversight: every review ever posted carries no `reviewer`, so refusing
+  // those retirements would wedge the whole open-PR population red with no
+  // route out. The honest invariant is therefore NOT "every optional field
+  // fails closed" — it is the weaker one that still holds: an absent optional
+  // field can never make a head *more* retired than the pre-field code made it.
+  //
+  // PRESENT-but-malformed is a different fact and does fail closed. A field
+  // Ally tried to state and we could not read is not the same as a review that
+  // predates it, which is the same asymmetry the opener check above draws.
+  let reviewerLane: string | null = null;
+  if (reviewer !== undefined) {
+    if (typeof reviewer !== "string" || !reviewer.trim()) {
+      return { kind: "unreadable", reason: "ally-verdict reviewer is not a lane identifier" };
+    }
+    reviewerLane = reviewer.trim().toLowerCase();
+  }
 
   // A readable prose attestation naming a *different* head is two claims about
   // which tree was examined. Fail closed instead of silently picking one.
@@ -641,8 +681,24 @@ export function parseAllyVerdictBlock(body: string | null | undefined): AllyVerd
 
   return {
     kind: "ok",
-    verdict: { head: attestedHead, findings: counts, dispositions: ledger },
+    verdict: { head: attestedHead, findings: counts, dispositions: ledger, reviewer: reviewerLane },
   };
+}
+
+/**
+ * The lane a review declares as its author, or `null` when it declares none.
+ *
+ * `null` for a body with no block, an unreadable one, or a readable one that
+ * omits the field — three different facts that are alike for every caller
+ * here, because all three mean "this review says nothing about which lane
+ * wrote it" and the only consumer treats that as today's behaviour.
+ *
+ * See `AllyStructuredVerdict.reviewer`: a self-declaration, not a trust
+ * boundary.
+ */
+export function allyVerdictReviewerLane(body: string | null | undefined): string | null {
+  const block = parseAllyVerdictBlock(body);
+  return block.kind === "ok" ? block.verdict.reviewer : null;
 }
 
 /**
