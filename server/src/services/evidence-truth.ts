@@ -278,6 +278,13 @@ async function probeOne(
       ],
       headSha: normalizedHead,
       reviewerBotLogin: deps.reviewerBotLogin,
+      // Mirrors the gate's own `null` (BLO-34389), and for the same two
+      // reasons spelled out at its call site in `pr-comment-review-gate.ts`:
+      // no producer emits `reviewer` yet, and the token space is unagreed. This
+      // probe must not diverge from the gate it exists to predict — a lane the
+      // gate does not supply would make this surface vouch differently from the
+      // status it is checking.
+      prAuthorLane: null,
     };
     let commentVerdict = evaluateCommentReviewGate({ ...commentInput, prAuthorLogin: null });
     // `authorUnknown` marks every outcome the author could still change. Gating

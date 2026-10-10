@@ -20,6 +20,7 @@ import {
   extractAllyReportedFindingRefs,
   extractAllyReviewedHeadSha,
   allyClaimedReviewHead,
+  allyVerdictReviewerLane,
   hasActionablePrReviewFeedback,
   hasAllyConsolidatedReviewHeading,
   asPublishableToken,
@@ -274,6 +275,14 @@ interface CarriedFinding extends AttestingComment {
    * the red is explainable by vocabulary drift rather than by an open finding.
    */
   unrecognizedVerbs: string[];
+  /**
+   * True when this head would have been retired but for a ledger entry refused
+   * because the review retiring it declared the PR author's own lane
+   * (BLO-34389). Reported so the commit-status description can say *why* the
+   * red stands: a reader who sees only the string must not be told a reviewer
+   * looked at this tree when one did not.
+   */
+  selfRetiredByAuthorLane: boolean;
 }
 
 /**
@@ -342,9 +351,15 @@ function latestAttestingAllyComment(
 function headsWithUndispositionedFinding(
   comments: CommentReviewGateComment[],
   reviewerBotLogin: string,
+  prAuthorLane: string | null,
 ): CarriedFinding[] {
   const byHead = new Map<string, { attesting: AttestingComment; timeMs: number; attested: boolean }[]>();
   const ledger: { entry: AllyPriorFindingDisposition; timeMs: number; attestedHeadSha: string }[] = [];
+  // Entries refused by the author-lane exclusion, kept rather than dropped so
+  // the red can name its own cause. Same shape, same `namesFinding` predicate,
+  // so an explanation can only ever cite an entry that would otherwise have
+  // retired the finding — the discipline `unrecognizedVerbs` already follows.
+  const refusedByAuthorLane: typeof ledger = [];
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
@@ -371,6 +386,13 @@ function headsWithUndispositionedFinding(
     const commentTime = toEpochMs(comment.createdAt);
     if (!Number.isFinite(commentTime)) continue;
 
+    // Computed out here, one scope above the only place it is READ, so that
+    // moving the refusal up to the `continue` is a one-line mutation that
+    // compiles. A mutant that fails to build is not a measurement — it reads as
+    // "the fixture did not fire" while the suite never ran at all (BLO-34263).
+    const declaredLane = allyVerdictReviewerLane(comment.body);
+    const refusedByLane = Boolean(prAuthorLane && declaredLane && declaredLane === prAuthorLane);
+
     // Ledger authority requires a real attestation, which is the asymmetry this
     // whole path turns on: an unreadable verdict may carry a finding forward
     // and may not dispose of one. Retiring is the direction that loses
@@ -383,8 +405,33 @@ function headsWithUndispositionedFinding(
     // conferred ledger authority — which it must not, and which would become
     // true the moment that extractor grew a prose fallback of its own.
     if (attestedHeadSha) {
+      // The author-lane exclusion sits HERE, on the ledger push, and nowhere
+      // else (BLO-34389). Two neighbouring placements are both wrong, in
+      // opposite directions, and both look right at the call site:
+      //
+      //   - inside `isAllyConsolidatedReviewComment`: that filter also feeds
+      //     `byHead`, so on an agent PR no head is ever carried and the whole
+      //     red path disappears — fail-OPEN.
+      //   - on the `continue` above: same, it drops the CARRY as well as the
+      //     retirement.
+      //
+      // Refusing only the retirement keeps raising author-blind: a finding is
+      // a finding whoever wrote it, so the comment still reaches `byHead`
+      // below and can still turn this gate red.
+      //
+      // The discriminator is the declared LANE, never the login. On this fleet
+      // author and reviewer are both `allyblockcast[bot]`, so a login-equality
+      // test matches every comment and empties the ledger outright — no
+      // retirement by anyone ever lands and the head goes permanently red,
+      // which is the deadlock BLO-29711's anti-deadlock constraint forbids.
+      //
+      // Both sides must be known for the exclusion to fire. An undeclared lane
+      // or an unknown author is today's behaviour — credited — because every
+      // review posted before this field existed declares nothing, and refusing
+      // those would wedge the open-PR population on arrival.
+      const target = refusedByLane ? refusedByAuthorLane : ledger;
       for (const entry of extractAllyPriorFindingDispositions(comment.body)) {
-        ledger.push({ entry, timeMs: commentTime, attestedHeadSha });
+        target.push({ entry, timeMs: commentTime, attestedHeadSha });
       }
     }
 
@@ -489,6 +536,34 @@ function headsWithUndispositionedFinding(
     return [...verbs];
   };
 
+  // True when this head is red *because* a retirement was refused for naming
+  // the PR author's own lane — i.e. every finding it still carries would have
+  // been disposed had the refused entries been credited. Used only to explain
+  // the red; it changes no verdict.
+  //
+  // "Every finding", not "any": with a second finding genuinely open, the
+  // honest cause is that open finding, and naming the refusal instead would
+  // route the author at the wrong thing. Same discipline as the
+  // `still-present` exclusion directly above.
+  const retiredOnlyByAuthorLane = (entry: {
+    attesting: AttestingComment;
+    timeMs: number;
+  }): boolean => {
+    if (refusedByAuthorLane.length === 0) return false;
+    const headSha = entry.attesting.attestedHeadSha;
+    const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
+    if (!reported || reported.length === 0) return false;
+    return reported.every(
+      (finding) =>
+        isDisposed(headSha, entry.timeMs, finding) ||
+        refusedByAuthorLane.some(
+          (prior) =>
+            (prior.entry.kind === "retires" || prior.entry.kind === "defers") &&
+            namesFinding(prior, headSha, entry.timeMs, finding),
+        ),
+    );
+  };
+
   // Newest statement per head wins, with one precedence above recency: an
   // unreadable review may not *displace* an attested one, however much newer it
   // is, because displacing is retiring by another name. "Newest per head" means
@@ -564,7 +639,11 @@ function headsWithUndispositionedFinding(
             ? 1
             : 0),
     )
-    .map((entry) => ({ ...entry.attesting, unrecognizedVerbs: unrecognizedVerbsBlocking(entry) }));
+    .map((entry) => ({
+      ...entry.attesting,
+      unrecognizedVerbs: unrecognizedVerbsBlocking(entry),
+      selfRetiredByAuthorLane: retiredOnlyByAuthorLane(entry),
+    }));
 }
 
 /**
@@ -632,6 +711,23 @@ export function evaluateCommentReviewGate(input: {
    * which it means instead of silently downgrading every `clean` to `neutral`.
    */
   prAuthorLogin: string | null;
+  /**
+   * The lane that opened the PR, in the same token space a review declares in
+   * its `ally-verdict` `reviewer` field. Refuses a retirement written by the
+   * PR author's own lane (BLO-34389).
+   *
+   * Explicitly nullable rather than optional, for the reason `prAuthorLogin`
+   * is: a new call site has to say which it means. `null` is "unknown", and
+   * unknown is CREDITED here — the opposite of the `prAuthorLogin` arm above,
+   * which treats null as self-attested. The asymmetry is the anti-deadlock
+   * constraint: withholding a positive on an unknown author is recoverable,
+   * whereas refusing every retirement wedges the head red with no route out.
+   *
+   * A SELF-DECLARATION, NOT A TRUST BOUNDARY. It disambiguates which lane
+   * authored a review-shaped comment; it does not stop a determined author
+   * retiring its own finding, who need only omit the field.
+   */
+  prAuthorLane: string | null;
 }): CommentReviewGateVerdict {
   const reviewerBotLogin = input.reviewerBotLogin?.trim() || DEFAULT_PR_REVIEWER_BOT_LOGIN;
   const headSha = input.headSha?.trim();
@@ -848,7 +944,11 @@ export function evaluateCommentReviewGate(input: {
   // which is why `withheldPositive` falls through to here rather than returning.
   // Note that none of those routes exists while the reviewer itself is failing
   // to run, which is the state that strands a PR here.
-  const [carried] = headsWithUndispositionedFinding(comments, reviewerBotLogin);
+  const [carried] = headsWithUndispositionedFinding(
+    comments,
+    reviewerBotLogin,
+    input.prAuthorLane?.trim().toLowerCase() || null,
+  );
   if (carried) {
     const shortHead = carried.attestedHeadSha.slice(0, 7);
     // The tail is conditional because `withheldPositive` is exactly the state
@@ -857,17 +957,28 @@ export function evaluateCommentReviewGate(input: {
     // they just did, and which cannot clear a carried finding. Naming why the
     // attestation did not count is the difference between a red that routes
     // the author to the reviewer and a red that routes them into a loop.
-    // Tails measure 38 / 54 / 55. That 55 bounds the NO-VERB branch below to
-    // 131 (its 76-character lead plus the tail), inside the 140 cap. It does
+    // Tails measure 38 / 52 / 54 / 55. That 55 bounds the NO-VERB branch below
+    // to 131 (its 76-character lead plus the tail), inside the 140 cap. It does
     // not bound the verb branch directly beneath this comment: that one
     // budgets the verb list against whatever the tail leaves, so it lands on
     // exactly 140 whenever the list fills its allowance — which is what the
-    // exact-fit test pins. 131 is this branch's ceiling, not the file's.
-    const carriedTail = !withheldPositive
-      ? "; no comment attests the current head."
-      : withheldPositive.authorUnknown
-        ? "; its only attestation is not known to be independent."
-        : "; the only comment attesting it is the PR author's own.";
+    // exact-fit test pins. 131 is this branch's ceiling, not the file's, and
+    // the 52-character refusal tail added below does not move it.
+    //
+    // The refusal is checked FIRST because it is the most specific cause and
+    // the only one the author cannot guess: the other three tails all describe
+    // a missing attestation, whereas this one describes an attestation that
+    // exists, retires the finding on its face, and was refused. Saying "no
+    // comment attests the current head" there is true of the head and false
+    // about the cause, and it routes the author to post another comment — the
+    // exact loop the conditional tail exists to avoid.
+    const carriedTail = carried.selfRetiredByAuthorLane
+      ? "; its retirement came from the PR author's own lane."
+      : !withheldPositive
+        ? "; no comment attests the current head."
+        : withheldPositive.authorUnknown
+          ? "; its only attestation is not known to be independent."
+          : "; the only comment attesting it is the PR author's own.";
     // Both clauses have to reach the author, and GitHub caps a commit-status
     // description at 140 characters. The tail is the one an author is least
     // likely to guess — it is the only thing that says why the attestation
@@ -1291,7 +1402,30 @@ async function executeCommentReviewGateCheck(
     // or `carried_finding` that was already fully justified, leaving the merge
     // surface showing that finding as absent rather than red. A red going
     // silent is the direction this module must not get wrong.
-    let verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin: null });
+    // `prAuthorLane: null` is the honest value here, not a stub awaiting a
+    // fetch (BLO-34389). Two things have to land before a non-null one would
+    // mean anything, and neither is this module's:
+    //
+    //   1. Ally's producer has to EMIT `reviewer` in its verdict block. Nothing
+    //      in the current corpus carries it, so every value this gate could
+    //      supply today compares against `null` and credits.
+    //   2. The token space has to be AGREED. BLO-32695's ruling names an agent
+    //      uuid, and the only PR-author lane signal this gate can cheaply read
+    //      — the head commit's git author, `Staff Engineer
+    //      <staff-engineer@paperclip.blockcast.net>` — is not a uuid. Wiring a
+    //      fetch across that mismatch would cost a GitHub call per evaluation
+    //      and could never match, which reads as a working control. Open
+    //      question for BLO-32695's owner; see BLO-34389.
+    //
+    // So the exclusion ships exercised by tests and inert in production, the
+    // same way `prAuthorLogin` shipped here before its fetch landed below.
+    let verdict = evaluateCommentReviewGate({
+      comments,
+      headSha,
+      reviewerBotLogin,
+      prAuthorLogin: null,
+      prAuthorLane: null,
+    });
 
     // `authorUnknown` marks every outcome the author could still change, which
     // is both the withheld positive and the carried finding that consumed it —
@@ -1303,7 +1437,13 @@ async function executeCommentReviewGateCheck(
         (login) => login == null,
       );
       if (prAuthorLogin) {
-        verdict = evaluateCommentReviewGate({ comments, headSha, reviewerBotLogin, prAuthorLogin });
+        verdict = evaluateCommentReviewGate({
+          comments,
+          headSha,
+          reviewerBotLogin,
+          prAuthorLogin,
+          prAuthorLane: null,
+        });
       } else if (verdict.state === "success") {
         // Publishing `neutral` on incomplete evidence would overwrite a correct
         // earlier verdict with a weaker one on a transient 5xx. Not publishing
