@@ -393,6 +393,7 @@ describe("openapi routes", () => {
     for (const [routePath, method] of [
       ["/api/plugins/{pluginId}/config", "get"],
       ["/api/plugins/{pluginId}/config", "post"],
+      ["/api/plugins/{pluginId}/config", "delete"],
       ["/api/plugins/{pluginId}/config/test", "post"],
     ] as const) {
       expect(spec.paths[routePath][method]["x-paperclip-authorization"]).toEqual({
