@@ -15,6 +15,8 @@ const DASHBOARD_KEY = "runtime-run-queue-health.json";
 
 const QUEUED = "paperclip_queued_run_oldest_age_seconds";
 const OVERDUE = "paperclip_overdue_scheduled_retry_oldest_age_seconds";
+const PARK_HORIZON = "paperclip_scheduled_retry_park_horizon_seconds";
+const PARK_HORIZON_REFRESH = "paperclip_scheduled_retry_park_horizon_refresh_success";
 
 // Split a kubectl jsonpath into its field list. `.` separates fields unless
 // escaped; a bracketed segment (`['a.json']`) is normalised to the escaped-dot
@@ -554,5 +556,129 @@ test("no two rendered dashboards claim the same uid", () => {
     byUid.size,
     shipped.length,
     `scanned ${byUid.size} dashboard(s) out of the rendered chart but ${shipped.length} exist on disk (${shipped.join(", ")}); an unscanned dashboard is not checked for uid collisions`,
+  );
+});
+
+test("the booked park horizon is charted at all (BLO-25036 acceptance criterion)", () => {
+  // Third gauge on this dashboard and a THIRD failure mode, not a variation on
+  // the two above. QUEUED measures time waiting to start; OVERDUE measures how
+  // late a parked row is against its own due time; this measures how far out
+  // that due time was BOOKED in the first place. The overdue gauge is silent by
+  // design while a due time is still in the future, so a six-day park on a
+  // healthy agent is invisible to every other panel here for as long as it
+  // lasts -- which is the 22h incident that opened BLO-25036.
+  const { dashboard } = renderDashboard();
+  const exprs = allTargets(dashboard).map(({ target }) => target.expr ?? "");
+
+  assert.ok(
+    exprs.some((expr) => expr.includes(PARK_HORIZON)),
+    `dashboard must chart ${PARK_HORIZON}`,
+  );
+});
+
+test("the park-horizon panel groups by reason, never fleet-wide or by agent alone", () => {
+  // `reason` is load-bearing, not decoration. Designed ceilings differ by park
+  // class and span at least 289x -- max_turns_continuation 300s through a
+  // floored transient_failure park at 86,700s, and a provider_quota floor has
+  // no ceiling at all. Collapsed to one line, a 1,000s max_turns_continuation
+  // park (3.3x its clamp, a real fault) is indistinguishable from a 1,000s
+  // ccrotate_capacity park (inside its 1,080s clamp, designed backoff), and
+  // both hide under a legitimate 3,600s dependency_blocked line. That
+  // aggregation was the second defect fixed in BLO-31174; charting it
+  // re-aggregated would put the defect back on the operator's screen.
+  //
+  // MUTATION TEST: change the expr to `max by (agent_id)`. If this still
+  // passes it is no longer checking the grouping that makes the panel readable.
+  const { dashboard } = renderDashboard();
+
+  const target = allTargets(dashboard).find(({ target }) =>
+    target.expr?.includes(PARK_HORIZON),
+  );
+  assert.ok(target, "expected a panel backed by the park-horizon gauge");
+  assert.match(
+    target.target.expr,
+    /max by \(reason\)/,
+    "the park-horizon panel must group by reason; one line across all park classes cannot separate designed backoff from a clamp breach",
+  );
+});
+
+test("the park-horizon panel draws NO absolute threshold, because the alert's bound is per-reason", () => {
+  // The obvious panel design -- colour the line red above the chart's
+  // `scheduledRetryParkHorizonSeconds` -- is wrong in BOTH directions, and it
+  // looks right, which is why this guard exists rather than a comment.
+  //
+  // Measured against the DEPLOYED rule on 2026-10-10, not against this chart:
+  // PaperclipScheduledRetryParkHorizonImplausible in production compares
+  // `max by (agent_id, reason)` against a per-reason ceiling vector
+  // (max_turns_continuation 300, ccrotate_capacity 1080, dependency_blocked
+  // 3600, transient_failure 9000, transient_failure_floor 86700, none 0, ...).
+  // There is no 5,400 anywhere in it. A flat 5,400 line on this panel would
+  // therefore redden a 6,000s transient_failure park the page correctly
+  // ignores, and stay green on a 1,000s max_turns_continuation park the page
+  // correctly fires on -- a panel that disagrees with the alert beside it in
+  // both directions at once.
+  //
+  // Re-deriving the ceiling table here instead is the other wrong answer: it is
+  // a sixteen-entry copy that drifts the moment a park reason is added, and the
+  // alert already evaluates it. The panel's job is trend and class context,
+  // which the alert cannot give; the verdict stays with the alert.
+  //
+  // NOTE this chart's own templates/prometheusrule.yaml still carries the old
+  // flat `> {{ .Values.prometheusRule.scheduledRetryParkHorizonSeconds }}`
+  // form. It renders only under --set prometheusRule.enabled=true and is NOT
+  // what runs in production, so do not reach for that value here on the
+  // strength of finding it in the chart.
+  //
+  // MUTATION TEST: add `{ "color": "red", "value": 5400 }` to the panel's
+  // threshold steps. If this still passes, the guard is decorative.
+  const { dashboard } = renderDashboard();
+
+  const panel = dashboard.panels.find((p) =>
+    (p.targets ?? []).some((t) => t.expr?.includes(PARK_HORIZON)),
+  );
+  assert.ok(panel, "expected a panel backed by the park-horizon gauge");
+
+  const steps = panel.fieldConfig?.defaults?.thresholds?.steps ?? [];
+  const bounded = steps.filter((step) => typeof step.value === "number");
+  assert.deepEqual(
+    bounded,
+    [],
+    `the park-horizon panel carries absolute threshold(s) ${JSON.stringify(bounded)}; the deployed alert bounds this gauge PER REASON, so any single line on this panel contradicts it for every class it does not happen to match`,
+  );
+});
+
+test("the park-horizon gauge has its OWN freshness tile, not the overdue refresher's", () => {
+  // These are two refreshes against two different aggregates behind two
+  // different indexes, and metrics.ts says in as many words that they fail
+  // independently. The existing "Retry-age refresher healthy" tile reads
+  // paperclip_overdue_scheduled_retry_age_metrics_refresh_success and does NOT
+  // vouch for this gauge -- so shipping the park-horizon panel without its own
+  // signal leaves a frozen gauge rendering pixel-identical to a live one, on a
+  // panel added specifically to make an invisible failure visible.
+  //
+  // The frozen value is also usually the healthy-looking one: a drained fleet
+  // reads reason="none" at 0 on every agent, so a dead refresh looks like a
+  // quiet cluster.
+  //
+  // MUTATION TEST: delete the "Park-horizon refresher healthy" panel. If this
+  // still passes it is matching the sibling tile, not this one.
+  const { dashboard } = renderDashboard();
+
+  const target = allTargets(dashboard).find(({ target }) =>
+    target.expr?.includes(PARK_HORIZON_REFRESH),
+  );
+  assert.ok(
+    target,
+    `dashboard must chart ${PARK_HORIZON_REFRESH}; the overdue refresher is a different gauge and can be green while this one is dead`,
+  );
+  assert.match(
+    target.target.expr,
+    /^min\(/,
+    "park-horizon freshness must be min() across replicas; one failing replica is already a stale gauge",
+  );
+  assert.match(
+    target.target.expr,
+    /or vector\(0\)/,
+    "an absent refresh series must read as 0/STALE, not render No data",
   );
 });

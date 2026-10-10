@@ -7,7 +7,8 @@
     "queues",
     "blo-21116",
     "blo-22094",
-    "blo-23450"
+    "blo-23450",
+    "blo-25036"
   ],
   "schemaVersion": 39,
   "editable": false,
@@ -195,6 +196,81 @@
           "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
           "expr": "max by (agent_id) (paperclip_overdue_scheduled_retry_oldest_age_seconds)",
           "legendFormat": "{{agent_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 0 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Park-horizon refresher healthy",
+      "description": "min() across control-plane replicas of paperclip_scheduled_retry_park_horizon_refresh_success. A SECOND tile rather than a clause on the refresher above because these are two refreshes against two different aggregates and they fail independently — a healthy paperclip_overdue_scheduled_retry_age_metrics_refresh_success does not vouch for this one, so folding them into one signal would let a live sibling cover a dead gauge. 0 means the park-horizon gauge beside it is FROZEN at its last snapshot, which is almost always the healthy-looking reading, and PaperclipScheduledRetryParkHorizonImplausible is gated off while it is. Falls back to 0 so total absence of the series reads as the worst case rather than as No data.",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "expr": "min(paperclip_scheduled_retry_park_horizon_refresh_success) or vector(0)",
+          "legendFormat": "refresh ok",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "STALE", "color": "red", "index": 0 },
+                "1": { "text": "OK", "color": "green", "index": 1 }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Booked park horizon by reason",
+      "description": "paperclip_scheduled_retry_park_horizon_seconds, max by reason (BLO-25036; split by reason in BLO-31174). A DIFFERENT failure mode from the two panels above: this is the interval a live scheduled_retry row has BOOKED, from its park decision (heartbeat_runs.updated_at) to a due time still in the future. The BLO-22094 gauge is silent by design until a row is already late, so a due time set implausibly far out is invisible to it for as long as the booking lasts.\n\nCHARTED BY PARK CLASS, NOT BY AGENT, and that is the point. Designed ceilings differ by class and span at least 289x — max_turns_continuation 300s, ccrotate_capacity 1080s, dependency_blocked 3600s, the transient_failure ladder 9000s, a floored transient_failure park 86700s, a provider_quota floor unbounded — so a single fleet-wide line cannot tell designed backoff in one class from a multiple-x clamp breach in another, and a flat horizontal threshold would be wrong in both directions at once. Judge each line against its own class ceiling: the table is in runbooks/queued-run-stranded.md, linked from the alert.\n\nNO THRESHOLD IS DRAWN HERE DELIBERATELY. PaperclipScheduledRetryParkHorizonImplausible already evaluates the per-class ceilings and is the authority on whether a reading is a breach; a second copy of that table in a panel would be a copy to keep current, and a flat line would disagree with the page. This panel is for trend and class context — what the alert cannot give you — not for a verdict.\n\nThe agent is named in the alert annotation and the two panels above chart the sibling gauges per agent, so a third per-agent chart would bury the one distinction this gauge adds. reason=\"none\" is the per-agent zero floor emitted for every known agent, including agents with live parks: it is always 0, is not a park class, carries no bound, and its presence is what tells you the producer is alive — if every line including \"none\" disappears, the gauge is not being emitted at all.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "__PAPERCLIP_DS_UID__" },
+          "expr": "max by (reason) (paperclip_scheduled_retry_park_horizon_seconds)",
+          "legendFormat": "{{reason}}"
         }
       ],
       "fieldConfig": {
