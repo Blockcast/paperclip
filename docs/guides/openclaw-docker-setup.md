@@ -105,7 +105,7 @@ Docker Sandbox provides better isolation (microVM-based) and simpler setup than 
 
 ```bash
 # 1. Clone the OpenClaw repo and build the image
-git clone https://github.com/openclaw/openclaw.git /tmp/openclaw-docker
+git clone --filter=blob:none https://github.com/openclaw/openclaw.git /tmp/openclaw-docker
 cd /tmp/openclaw-docker
 docker build -t openclaw:local -f Dockerfile .
 
@@ -188,7 +188,7 @@ Use this if Docker Sandbox is not available (Docker Desktop < v29).
 
 ```bash
 # 1. Clone the OpenClaw repo
-git clone https://github.com/openclaw/openclaw.git /tmp/openclaw-docker
+git clone --filter=blob:none https://github.com/openclaw/openclaw.git /tmp/openclaw-docker
 cd /tmp/openclaw-docker
 
 # 2. Build the Docker image (~5-10 min on first run)
