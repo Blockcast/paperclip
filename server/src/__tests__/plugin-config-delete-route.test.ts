@@ -67,7 +67,9 @@ const fakeDb = {
     }),
 };
 
-async function createApp() {
+type ActorOverrides = { isInstanceAdmin?: boolean; companyIds?: string[] };
+
+async function createApp(overrides: ActorOverrides = {}) {
   const [{ pluginRoutes }, { errorHandler }] = await Promise.all([
     import("../routes/plugins.js"),
     import("../middleware/index.js"),
@@ -82,6 +84,7 @@ async function createApp() {
       source: "session",
       isInstanceAdmin: true,
       companyIds: [companyA, companyNoConfig],
+      ...overrides,
     } as typeof req.actor;
     next();
   });
@@ -158,6 +161,34 @@ describe("DELETE /api/plugins/:pluginId/config (BLO-19568)", () => {
     // `{ deleted: true }` for a row that was never there.
     expect(res.status).toBe(404);
     expect(res.body).not.toEqual({ deleted: true });
+    // The binding sync is an unconditional delete; on the 404 path it must not
+    // run, or a probe that reports "nothing here" has already wiped that
+    // company's plugin secret-ref bindings in a committed transaction.
+    expect(mockSecretService.syncSecretRefsForTarget).not.toHaveBeenCalled();
+  });
+
+  it("403s a board user who is not an instance admin, before touching anything", async () => {
+    const res = await request(await createApp({ isInstanceAdmin: false }))
+      .delete(`/api/plugins/${pluginId}/config`)
+      .query({ companyId: companyA });
+
+    // Same company, same row as the happy path: only the instance-admin bit
+    // differs, so this fails if `assertInstanceAdmin` is removed.
+    expect(res.status).toBe(403);
+    expect(store.deleteCalls).toEqual([]);
+    expect(mockSecretService.syncSecretRefsForTarget).not.toHaveBeenCalled();
+    expect([...store.configs.keys()]).toEqual([companyA]);
+  });
+
+  it("403s an instance admin for a company outside their access set", async () => {
+    const res = await request(await createApp({ companyIds: [companyNoConfig] }))
+      .delete(`/api/plugins/${pluginId}/config`)
+      .query({ companyId: companyA });
+
+    // `companyA` has a row, so without the company-access check this would 200.
+    expect(res.status).toBe(403);
+    expect(store.deleteCalls).toEqual([]);
+    expect(mockSecretService.syncSecretRefsForTarget).not.toHaveBeenCalled();
   });
 
   it("refuses a request with no companyId rather than guessing one", async () => {
