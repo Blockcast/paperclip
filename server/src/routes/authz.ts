@@ -344,9 +344,16 @@ export type RunTranscriptReadOutcome = {
  * entitlement still gets the masked body). The earlier rationale for leaving it
  * on the entitlement alone still holds for AGENT actors (`workspace_runtime:read`
  * is absent from the same-company agent allow-list, so none resolves it) but
- * not for humans: the entitlement tests the raw membership role and fails OPEN
- * on a role outside the union (e.g. a cloud-tenant `support` member), where
- * this decision fails closed. The full reasoning is on the route itself
+ * not for humans. The AND changes the answer for exactly the readers the
+ * entitlement admits and this decision refuses, which is two populations:
+ * every non-viewer CLOUD-TENANT member regardless of role — a Cloud owner or
+ * admin included, because `boardActorIsTranscriptOperator` refuses
+ * `cloud_tenant` on source ahead of any role test and `runs:read_transcript`
+ * is seeded for no human role (`grantsForHumanRole`), so absent an explicit
+ * grant the decider answers `deny_missing_grant` — plus any session (or
+ * `board_key`) member holding a role outside the union, where the entitlement
+ * tests the raw membership role and fails OPEN while this decision normalizes
+ * it and fails closed. The full reasoning is on the route itself
  * (`routes/agents.ts`, the `workspace-operations/:operationId/log` handler).
  * Said explicitly because this docblock is where a maintainer asks "is the
  * operation log gated?" — it has answered that wrongly twice before (Ally

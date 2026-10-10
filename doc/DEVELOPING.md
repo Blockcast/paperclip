@@ -991,27 +991,47 @@ from `PERMISSION_KEYS`, `packages/shared/src/constants.ts`) and is therefore
 the one a future implementer cannot accidentally undo; widening the allow-list
 is the only lever that works.
 
-For humans it does not hold. The two gates read the same unconstrained
-`company_memberships.membership_role` text column in opposite failure
-directions:
+For humans it does not hold. The readers whose answer changed are exactly the
+ones the entitlement admits but the transcript gate refuses, and there are two
+populations of them:
 
-- the transcript gate **normalizes** it (`normalizeHumanRole(value, "viewer")`,
-  union `[owner, admin, operator, viewer]` plus `member → operator`) and so
-  fails **closed** on an unrecognized role — deliberate, see
-  `boardActorIsTranscriptOperator`;
-- `workspace_runtime:read` tests the **raw** column (`membershipRole !== "viewer"`,
-  `allow_simple_company_member`) and so fails **open** on one.
+- **Every non-viewer cloud-tenant member, regardless of role** — a Cloud owner
+  or admin included (`middleware/auth.ts` stamps both `membershipRole:
+  "owner"`). `boardActorIsTranscriptOperator` refuses `source: "cloud_tenant"`
+  ahead of any role test (`routes/authz.ts`), and — absent an explicit
+  `runs:read_transcript` grant — the decider then answers `deny_missing_grant`,
+  because that grant is seeded for no human role (`grantsForHumanRole`). The
+  entitlement does not deny them: the cloud-tenant branch of
+  `services/authorization.ts` returns nothing for `workspace_runtime:read`, so
+  it falls through to the `!permissionKey` block, which resolves
+  `allow_simple_company_member` for any non-viewer member. **This is a
+  user-visible Cloud change** — a Cloud owner or admin now gets the masked
+  `/log` body, which is what both list routes already give the same actor.
+- **Any `session` member holding a role outside the transcript gate's union**
+  (a `board_key` actor too — both load their membership rows from the DB). This
+  is the case the normalize-vs-raw divergence describes: the two gates read the
+  same unconstrained `company_memberships.membership_role` text column in
+  opposite failure directions:
+  - the transcript gate **normalizes** it (`normalizeHumanRole(value,
+    "viewer")`, union `[owner, admin, operator, viewer]` plus `member →
+    operator`) and so fails **closed** on an unrecognized role — deliberate, see
+    `boardActorIsTranscriptOperator`;
+  - `workspace_runtime:read` tests the **raw** column (`membershipRole !==
+    "viewer"`, `allow_simple_company_member`) and so fails **open** on one.
 
-A non-union role really is written: `middleware/auth.ts` persists the Cloud
-stack role verbatim for anything that is not owner/admin, and
-`stackMembershipRole` admits `support`. Such a member had the excerpts withheld
-on both list routes and was served the whole log body here, one URL over — a
-gate on one sibling and not the other, which is the failure this whole section
-exists to prevent. The AND is strictly narrowing: operator-grade humans and the
-local board clear the transcript gate anyway, viewers and agents are already
-withheld by the entitlement, and the only decision that changes is the
-divergent one. If you are tempted to drop one of the two gates, that is the
-case to re-check first.
+  A non-union role really is written: `middleware/auth.ts` persists the Cloud
+  stack role verbatim for anything that is not owner/admin, and
+  `stackMembershipRole` admits `support`, so a `session` actor reading that
+  same membership row carries `support`.
+
+Both populations had the excerpts withheld on both list routes and were served
+the whole log body here, one URL over — a gate on one sibling and not the
+other, which is the failure this whole section exists to prevent. The AND is
+strictly narrowing — no reader gains the body: operator-grade `session` and
+`board_key` humans and the local board clear the transcript gate as before, and
+viewers and agents are already withheld by the entitlement. If you are tempted
+to drop one of the two gates, those two populations are the cases to re-check
+first.
 
 ⚠️ The underlying divergence is **not** fixed by this route — every other
 `workspace_runtime:read` consumer still reads the raw column. Narrowing that is
@@ -1026,9 +1046,10 @@ Two consequences follow, and neither is an oversight:
   run-transcript routes. That is a real narrowing of the PEN-3140 escape hatch,
   decided on PEN-3204 rather than inherited: the grant was sized from an audit
   of *run* transcript reads, no demand for workspace-operation log reads was
-  measured, and human operators (active non-viewer board members) retain the
-  read, which is the principal incident response actually uses. Widening it
-  back is a product decision that needs its own evidence, not a default.
+  measured, and human operators (operator-grade `session`/`board_key` members
+  and the local board — not cloud-tenant members, see above) retain the read,
+  which is the principal incident response actually uses. Widening it back is a
+  product decision that needs its own evidence, not a default.
 - **Withheld here means masked, not emptied.** The body returns 200 with
   `content` replaced wholesale by the redaction sentinel
   (`maskWorkspaceRuntimeTextForRead`), so a reader can still tell "this operation
@@ -1154,9 +1175,9 @@ BLO-34631 gave it both; its row is keyed `entity_type = workspace_operation` and
 carries the operation's owning run in `runId` — the only owner reference it
 records (no owning-agent id is written: the route resolves the owner only to
 decide the transcript gate, and only once `workspace_runtime:read` admits the
-reader, and does not record it). That `runId` is **`null`** for a workspace-scoped operation
-that has no owning run, so a run pivot alone never sees those. See the sweep
-below.
+reader, and does not record it). That `runId` is **`null`** for a
+workspace-scoped operation that has no owning run, so a run pivot alone never
+sees those. See the sweep below.
 
 The audit row records the actor type/id, company id, heartbeat run id, timestamp
 (`activity_log.created_at`), access result, and the requested window (byte
