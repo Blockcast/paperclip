@@ -1016,6 +1016,61 @@ export const AGENT_START_LOCK_PHASE_SECONDS_METRIC = "paperclip_agent_start_lock
  */
 export const AGENT_START_LOCK_ABORTED_METRIC = "paperclip_agent_start_lock_aborted_total";
 /**
+ * How each dispatch pass resolved its start-lock orphan reap (BLO-42010).
+ *
+ * The bound shipped in BLO-41036 stops the outage by letting a waiter give up
+ * at {@link START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS} and dispatch on stale orphan
+ * state. That bail is instrumented log-only, which makes the post-fix bail rate
+ * uncomputable rather than merely inconvenient to read:
+ *
+ * - The per-disposition `logger.debug` line is below the deployed log level, so
+ *   it emits nothing. Measured 2026-10-10, 6h of production: 0 lines.
+ * - The surviving warn/info line is gated on `reapMs >= LOCK_HELD_WARN_MS`, so
+ *   it logs only the slow tail. `timed_out` always clears that gate (it waits
+ *   the full bound by construction) while `ran`/`joined` clear it only when
+ *   slow, so the logged mix is biased toward `timed_out` by the gate itself.
+ *
+ * So logs carry a complete NUMERATOR for `timed_out` and no DENOMINATOR at all,
+ * and the ratio between them -- the thing the bound's health is judged on -- is
+ * not recoverable from Loki at any log level currently deployed. Measured over
+ * the same 6h, the logged mix reads 1499 `timed_out` / 247 `joined` / 74 `ran`,
+ * which is 81% only among slow passes and says nothing about the rate per pass.
+ * This counter increments once per pass on every path, which is the whole point:
+ * it supplies the denominator the logs structurally cannot.
+ *
+ * Not pre-seeded, so an absent series means never incremented. Pair any zero
+ * reading with a populated sibling disposition before concluding no bails
+ * occurred rather than no scrape.
+ *
+ * Deliberately carries no `agent_id`: this is a fleet-level rate, and the
+ * per-agent axis already exists on
+ * {@link AGENT_START_LOCK_PHASE_SECONDS_METRIC} under `phase="reap"`.
+ */
+export const AGENT_START_LOCK_REAP_DISPOSITION_METRIC =
+  "paperclip_agent_start_lock_reap_disposition_total";
+/**
+ * Reap dispositions, as an allow-list so a future branch cannot mint a series.
+ *
+ * The first five are the literal return union of
+ * `reapOrphanedRunsForStartLock`. `error` is not one of its returns: it is the
+ * throw path, where the caller's `finally` has a duration but no disposition.
+ * Without a label that branch is the one failure mode the counter cannot see,
+ * which is the same invisible-failure shape the counter exists to remove.
+ *
+ * `nested` is worth reading separately rather than folding into `ran`: it is
+ * the ONLY disposition that does not pass through `awaitStartLockSweepBounded`,
+ * so it is the only one whose `phase="reap"` hold can exceed the bound at all.
+ */
+export const KNOWN_START_LOCK_REAP_DISPOSITIONS = [
+  "ran",
+  "joined",
+  "skipped_fresh",
+  "nested",
+  "timed_out",
+  "error",
+] as const;
+export type StartLockReapDispositionLabel = (typeof KNOWN_START_LOCK_REAP_DISPOSITIONS)[number];
+/**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
  * correct and stays (Ally review, onprem-k8s#2013: without it, a retry
@@ -3381,6 +3436,7 @@ type HeartbeatRunFailedLabel =
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let retryScheduleOutcome: Counter<"outcome" | "retry_reason"> | null = null;
+let startLockReapDisposition: Counter<"disposition"> | null = null;
 let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
 let penstockGateProbeDuration: Histogram<"path" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
@@ -3539,6 +3595,7 @@ function ensureRegistry(): {
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   retryScheduleOutcomeCounter: Counter<"outcome" | "retry_reason">;
+  startLockReapDispositionCounter: Counter<"disposition">;
   penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
   penstockGateProbeDurationHistogram: Histogram<"path" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
@@ -3638,6 +3695,7 @@ function ensureRegistry(): {
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
     || !retryScheduleOutcome
+    || !startLockReapDisposition
     || !penstockGateProbe
     || !penstockGateProbeDuration
     || !heartbeatTimerSchedulerExclusion
@@ -3950,6 +4008,23 @@ function ensureRegistry(): {
         + "incremented, so pair any zero-abandon reading with a populated control series before "
         + "concluding no abandons occurred rather than no scrape.",
       labelNames: ["outcome", "retry_reason"],
+      registers: [registry],
+    });
+    startLockReapDisposition = new Counter({
+      name: AGENT_START_LOCK_REAP_DISPOSITION_METRIC,
+      help:
+        "Count of start-lock orphan-reap dispositions (BLO-42010), one per dispatch pass. "
+        + "disposition='timed_out' is a pass that gave up waiting on the fleet sweep and "
+        + "dispatched on STALE orphan state; its share of the total is the bail rate, which "
+        + "logs cannot supply because the per-disposition debug line is below the deployed "
+        + "level and the surviving warn line is gated on the hold budget, so it records a "
+        + "complete timed_out numerator against no denominator. disposition='nested' is the "
+        + "only path that skips the wait bound, so it is the only one whose "
+        + AGENT_START_LOCK_PHASE_SECONDS_METRIC + "{phase=\"reap\"} hold can exceed it. "
+        + "Not pre-seeded: an absent series means never incremented, so pair any zero reading "
+        + "with a populated sibling disposition before concluding no bails occurred rather "
+        + "than no scrape.",
+      labelNames: ["disposition"],
       registers: [registry],
     });
     dbPoolConnections = new Gauge({
@@ -5141,6 +5216,7 @@ function ensureRegistry(): {
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
     retryScheduleOutcomeCounter: retryScheduleOutcome,
+    startLockReapDispositionCounter: startLockReapDisposition,
     penstockGateProbeCounter: penstockGateProbe,
     penstockGateProbeDurationHistogram: penstockGateProbeDuration,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
@@ -5470,6 +5546,30 @@ export function recordRetryScheduleOutcome(
     retry_reason: coerceRetryScheduleReason(input.retryReason),
   };
   ensureRegistry().retryScheduleOutcomeCounter.inc(labels);
+  return labels;
+}
+
+/**
+ * Increment {@link AGENT_START_LOCK_REAP_DISPOSITION_METRIC}. Call once per
+ * start-lock dispatch pass, from the `finally` that already times the reap, so
+ * the throw path is counted as `error` rather than silently dropped.
+ *
+ * `disposition` is coerced to {@link KNOWN_START_LOCK_REAP_DISPOSITIONS}, so
+ * the worst-case series count is that list's length regardless of what a caller
+ * passes. An unrecognised value is reported as `error` rather than `other`:
+ * every legitimate value is a compile-time literal of the reap's return union,
+ * so anything else reaching here is a defect, and the metric should not have a
+ * benign-looking bucket to hide one in.
+ */
+export function recordStartLockReapDisposition(
+  disposition: string | null | undefined,
+): { disposition: StartLockReapDispositionLabel } {
+  const labels = {
+    disposition: (KNOWN_START_LOCK_REAP_DISPOSITIONS as readonly string[]).includes(disposition ?? "")
+      ? (disposition as StartLockReapDispositionLabel)
+      : ("error" as const),
+  };
+  ensureRegistry().startLockReapDispositionCounter.inc(labels);
   return labels;
 }
 
@@ -7354,6 +7454,7 @@ export function __resetMetricsForTest(): void {
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
   retryScheduleOutcome = null;
+  startLockReapDisposition = null;
   penstockGateProbe = null;
   penstockGateProbeDuration = null;
   heartbeatTimerSchedulerExclusion = null;
