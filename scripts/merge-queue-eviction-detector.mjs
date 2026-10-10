@@ -113,7 +113,14 @@ export function filterMergeGroupRunsForPr(runs, { base, prNumber }) {
 export function selectLatestQueueAttemptWindow(timelineEvents, { now }) {
   const events = (timelineEvents ?? [])
     .filter((e) => e && typeof e.event === "string" && typeof e.created_at === "string")
-    .map((e) => ({ event: e.event, at: new Date(e.created_at).getTime() }))
+    .map((e) => ({
+      event: e.event,
+      at: new Date(e.created_at).getTime(),
+      // PEN-3926: absent/non-string actor stays `null` so the classifier can
+      // tell "no attribution available" apart from a named actor and fall
+      // back to the pre-PEN-3926 verdict.
+      actor: typeof e.actor === "string" && e.actor.trim().length > 0 ? e.actor : null,
+    }))
     .filter((e) => Number.isFinite(e.at))
     .sort((a, b) => a.at - b.at);
 
@@ -131,6 +138,10 @@ export function selectLatestQueueAttemptWindow(timelineEvents, { now }) {
   return {
     enqueuedAt: new Date(lastEnqueue.at).toISOString(),
     dequeuedAt: dequeueAfter ? new Date(dequeueAfter.at).toISOString() : null,
+    // PEN-3926: who performed the removal this window anchored to. `null`
+    // when no removal is observed yet, or when the timeline carried no
+    // attributable actor.
+    dequeuedBy: dequeueAfter ? dequeueAfter.actor : null,
   };
 }
 
@@ -163,6 +174,33 @@ export function buildRunSearchWindow({ enqueuedAt, dequeuedAt }, bufferMs = WIND
 }
 
 /**
+ * GitHub attributes a removal the merge queue performed itself to this login.
+ * A removal carrying any other actor was performed by a human or an App.
+ * (BLO-40351 measured the same split from the other side: over this
+ * workflow's full 108-run history, every eviction was attributed to this
+ * actor and every successful merge to a human/App, with no actor on both
+ * sides. See `.github/workflows/merge-queue-eviction-detector.yml`'s header.)
+ */
+export const MERGE_QUEUE_REMOVAL_ACTOR = "github-merge-queue[bot]";
+
+/**
+ * PEN-3926: fails TOWARD the pre-PEN-3926 verdict. An absent, empty or
+ * non-string actor returns `true` (treat as queue-initiated), so a timeline
+ * that stops carrying `actor` -- or a caller that does not thread it --
+ * classifies exactly as it did before, and this can never make a genuine
+ * eviction quieter. Only a positively-identified non-queue actor is allowed
+ * to change a verdict.
+ *
+ * @param {string | null | undefined} dequeueActor
+ */
+export function isQueueInitiatedRemoval(dequeueActor) {
+  if (typeof dequeueActor !== "string") return true;
+  const actor = dequeueActor.trim();
+  if (actor.length === 0) return true;
+  return actor.toLowerCase() === MERGE_QUEUE_REMOVAL_ACTOR;
+}
+
+/**
  * Deliberately takes no `mergeable`/`mergeStateStatus` input. On a `REBASE`
  * merge queue (this repo's configuration: `mergeMethod: REBASE`), a PR can
  * read `mergeable: CLEAN` throughout an eviction -- the final tree merges
@@ -175,25 +213,51 @@ export function buildRunSearchWindow({ enqueuedAt, dequeuedAt }, bufferMs = WIND
  * runbooks/merge-queue-stalled-head.md ("A fourth eviction cause...",
  * BLO-19566/#920) before adding a `mergeable`-based check here.
  *
+ * PEN-3926 adds `dequeueActor`, which is NOT that forbidden check: it reads
+ * who performed the removal, not whether the tree merges. The prohibition
+ * above stands -- a `REBASE`-unstageable eviction still reads `CLEAN`, and
+ * nothing here consults `mergeable`. The actor is a different signal, and
+ * the only one that separates "the queue could not stage this" from "a
+ * person took it out on purpose", both of which produce zero runs.
+ *
  * @param {{
  *   merged: boolean,
  *   mergeGroupRuns: Array<{ conclusion: string | null }>,
  *   truncated?: boolean,
+ *   dequeueActor?: string | null,
  * }} input
  * @returns {"merged" | "conflict_unstageable" | "check_failure" | "manual" | "unknown"}
  */
-export function classifyMergeQueueEviction({ merged, mergeGroupRuns, truncated = false }) {
+export function classifyMergeQueueEviction({
+  merged,
+  mergeGroupRuns,
+  truncated = false,
+  dequeueActor = null,
+}) {
   if (merged) return "merged";
   // Ally review #1220: a `gh run list` sample that hit its cap is not proof
   // of absence. Only trust "zero runs found" -> conflict_unstageable when
   // the sample is known-complete; otherwise say so explicitly rather than
   // guessing wrong with confidence.
   if (truncated && (!mergeGroupRuns || mergeGroupRuns.length === 0)) return "unknown";
-  // The queue never staged this PR at all -- GitHub could not construct a
-  // merge_group run for it (un-stageable rebase, dirty tree). This is the
-  // BLO-23395 shape: no failing check exists to explain the eviction because
-  // no check ever ran.
-  if (!mergeGroupRuns || mergeGroupRuns.length === 0) return "conflict_unstageable";
+  // The queue never staged this PR at all. Zero runs has TWO causes, and
+  // run count alone cannot separate them:
+  //
+  //   - GitHub could not construct a merge_group run for it (un-stageable
+  //     rebase, dirty tree) -- the BLO-23395 shape, where no failing check
+  //     exists to explain the eviction because no check ever ran; or
+  //   - someone removed the PR from the queue BEFORE the queue got as far as
+  //     staging a run -- a deliberate hold, on a branch that is typically
+  //     perfectly mergeable.
+  //
+  // PEN-3926: reporting the second as the first told readers of 4 of 5
+  // removals on #2331 to "rebase onto the current base" against a branch
+  // that read `mergeable: MERGEABLE`/`CLEAN` throughout, each within minutes
+  // of its author announcing the hold on the thread. The removal actor is
+  // the discriminator; absent one, this keeps the pre-PEN-3926 verdict.
+  if (!mergeGroupRuns || mergeGroupRuns.length === 0) {
+    return isQueueInitiatedRemoval(dequeueActor) ? "conflict_unstageable" : "manual";
+  }
   if (mergeGroupRuns.some((run) => run?.conclusion === "failure")) return "check_failure";
   // A merge_group run exists and did not fail, yet the PR was evicted
   // unmerged: an administrative/manual dequeue (see
@@ -229,9 +293,17 @@ function ghTimeline(repo, prNumber) {
   // longer and, combined with `--paginate`, emits one flattened element per
   // output line across every page -- no outer-array wrapping needed, and
   // NDJSON-style line splitting works identically on any gh version.
+  // PEN-3926: `actor` is fetched, not just `{event, created_at}`. GitHub
+  // attributes a queue-initiated removal to `github-merge-queue[bot]` and a
+  // deliberate dequeue to the human or App that performed it -- the one
+  // signal that tells a genuine eviction apart from a hold. It is read from
+  // the timeline rather than from `github.event.sender.login` because the
+  // timeline actor belongs to the specific `removed_from_merge_queue` event
+  // this run anchored its window to, and is also present on
+  // `workflow_dispatch` replay, which carries no webhook sender at all.
   const out = run([
     "gh", "api", `repos/${repo}/issues/${prNumber}/timeline`,
-    "--paginate", "--jq", ".[] | {event, created_at}",
+    "--paginate", "--jq", ".[] | {event, created_at, actor: .actor.login}",
   ]);
   return out
     .split("\n")
@@ -294,7 +366,30 @@ function parseArgs(argv) {
 // to two hand-maintained literals.
 export const MERGE_QUEUE_EVICTION_MARKER = "<!-- paperclip:merge-queue-eviction -->";
 
-export function buildEvictionCommentBody({ repo, prNumber, classification, mergeGroupRunCount, base, identifiers }) {
+export function buildEvictionCommentBody({
+  repo,
+  prNumber,
+  classification,
+  mergeGroupRunCount,
+  base,
+  identifiers,
+  dequeueActor = null,
+}) {
+  // PEN-3926: `manual` is now reachable with ZERO runs (a dequeue that beat
+  // the queue to staging), so its cause line can no longer assert that a run
+  // was created. When the removal carries an attributable actor, name it and
+  // say plainly that the branch is probably fine; otherwise emit the original
+  // run-count-based wording verbatim, which is still exactly right for the
+  // path that reaches `manual` through a non-failing run.
+  const namedManualActor = !isQueueInitiatedRemoval(dequeueActor) ? String(dequeueActor).trim() : null;
+  const manualCause = namedManualActor
+    ? `**manual / administrative dequeue** -- \`${namedManualActor}\` removed this PR from the queue, rather ` +
+      "than the queue evicting it. This was a deliberate dequeue, and a deliberately held branch is usually " +
+      "perfectly mergeable -- do **not** rebase it on the strength of this notice. Confirm with whoever " +
+      "dequeued it before re-adding (see `runbooks/merge-queue-stalled-head.md`'s stalled-head procedure)."
+    : "**manual / administrative dequeue** -- a `merge_group` run was created for this PR's head and did not " +
+      "fail, so this was likely a deliberate dequeue (see `runbooks/merge-queue-stalled-head.md`'s stalled-head " +
+      "procedure) rather than an automatic eviction.";
   const causeLine = {
     conflict_unstageable:
       "**conflict / un-stageable rebase** -- the queue never created a `merge_group` run for this PR's head " +
@@ -303,10 +398,7 @@ export function buildEvictionCommentBody({ repo, prNumber, classification, merge
       "un-stageable rebase\").",
     check_failure:
       "**failing required check** -- a `merge_group` run was created for this PR's head and concluded failing.",
-    manual:
-      "**manual / administrative dequeue** -- a `merge_group` run was created for this PR's head and did not " +
-      "fail, so this was likely a deliberate dequeue (see `runbooks/merge-queue-stalled-head.md`'s stalled-head " +
-      "procedure) rather than an automatic eviction.",
+    manual: manualCause,
     unknown:
       "**undetermined** -- the `merge_group` run lookup for this PR's queue attempt hit its sample cap with no " +
       "match, so an incomplete sample can't be told apart from a genuine zero. Diagnose manually via " +
@@ -320,8 +412,14 @@ export function buildEvictionCommentBody({ repo, prNumber, classification, merge
     "",
     `(${mergeGroupRunCount} \`merge_group\` run(s) found for this PR's queue head at ${repo}.)`,
     "",
-    "Re-add this PR to the merge queue once the underlying issue is resolved (rebase onto the current base for " +
-      "an un-stageable eviction; fix the failing check; or confirm with whoever dequeued it manually).",
+    // PEN-3926: a `manual` notice must not lead with "rebase onto the current
+    // base". That instruction is what made the false notices harmful -- it is
+    // an action against a clean branch under a deliberate hold, and both a
+    // human reader and an automated lander can act on it.
+    classification === "manual"
+      ? "Re-add this PR to the merge queue once whoever dequeued it confirms the hold is over."
+      : "Re-add this PR to the merge queue once the underlying issue is resolved (rebase onto the current base " +
+        "for an un-stageable eviction; fix the failing check; or confirm with whoever dequeued it manually).",
     // Ally review #1220 (4th pass): embedded so the webhook's issue_comment
     // handler (which has no branch name to fall back on) can still route the
     // wake for a PR linked to Paperclip only through its branch.
@@ -423,7 +521,12 @@ async function main() {
   const truncated = allRuns.length >= RUN_LIST_LIMIT;
 
   const mergeGroupRuns = filterMergeGroupRunsForPr(allRuns, { base: pr.baseRefName, prNumber });
-  const classification = classifyMergeQueueEviction({ merged: pr.merged, mergeGroupRuns, truncated });
+  const classification = classifyMergeQueueEviction({
+    merged: pr.merged,
+    mergeGroupRuns,
+    truncated,
+    dequeueActor: attemptWindow.dequeuedBy,
+  });
 
   const result = {
     repo,
@@ -448,6 +551,7 @@ async function main() {
       mergeGroupRunCount: mergeGroupRuns.length,
       base: pr.baseRefName,
       identifiers,
+      dequeueActor: attemptWindow.dequeuedBy,
     });
     run(["gh", "pr", "comment", String(prNumber), "--repo", repo, "--body", body]);
   }
