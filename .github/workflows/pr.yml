@@ -426,6 +426,11 @@ jobs:
         run: node --test ./scripts/__tests__/merge-group-concurrency.test.mjs
         timeout-minutes: 1
 
+      - name: Test graphify staleness gate compares against the base tip
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/graphify-staleness-gate.test.mjs
+        timeout-minutes: 1
+
       - name: Test vendored-provenance union-merge invariants (BLO-34872)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/provenance-union-merge.test.mjs
