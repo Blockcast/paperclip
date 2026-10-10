@@ -251,17 +251,62 @@ function isLexicalIdentifier(value: string): boolean {
   );
 }
 
-/** A value is "opaque" when it is long, drawn from a token alphabet, is not a
- *  hyphenated identifier, and has high per-character entropy. Deliberately
- *  narrow: applied only to assignment values, never to bare words. A 40-char
- *  git SHA scores ~4.0 bits/char and would be redacted out of ordinary review
- *  prose if this ran unbound. */
+/** Character classes a value must draw from at least two of, before the entropy
+ *  test is allowed to run. `----------------------------` and `aaaa...` are
+ *  not secrets, and counting classes is the cheap guard that says so.
+ *
+ *  PEN-3932: uppercase and digits are SEPARATE classes. They used to be one
+ *  (`[A-Z0-9]`), which collapsed the very distinction the count exists to
+ *  draw. A value from `A-Z` and `0-9` alone scored ONE class and returned
+ *  before `shannonEntropyBitsPerChar` ever ran, so it was unreachable by this
+ *  rule at any length and any randomness. That is not a narrow shape:
+ *  canonical base32 is `A-Z2-7`, so TOTP/HOTP seeds, recovery codes and
+ *  base32-encoded keys are uppercase by construction, as is hex from any tool
+ *  that uppercases. Measured on the shipped detector: 0/200 random 40-char
+ *  base32 seeds redacted against 200/200 for the same bytes lowercased — the
+ *  lowercase arm being the positive control that proves case alone, not
+ *  entropy or length or alphabet, was doing the discriminating.
+ *
+ *  Splitting the class ADDS exactly one set and removes nothing: values with
+ *  no lowercase, at least one uppercase and at least one digit. Every other
+ *  value scores identically under both forms (22k random values over 11
+ *  alphabets: 0 divergences from that prediction, 0 values losing coverage).
+ *  That bound is why this does not make PEN-3920 worse — its corpus is
+ *  mixed-case and already scored two classes, so it is untouched.
+ *
+ *  The cost was measured, not assumed. Across 8069 distinct real `NAME=VALUE`
+ *  values in Blockcast/paperclip and Blockcast/penstock-llm-proxy-core, 0
+ *  newly fire: `isLexicalIdentifier` already absorbs the SCREAMING_SNAKE
+ *  constants that would otherwise be the whole cost. On a synthetic
+ *  adversarial set of 12 such constants, 3 fire, and all 3 carry a segment
+ *  mixing letters and digits (`..._V2`, `AZURE_EASTUS2_...`) which
+ *  `isLexicalIdentifier` cannot exonerate. Do NOT widen LEXICAL_SEGMENT_RE to
+ *  reach them: homogeneous letter-or-digit runs are precisely what keeps
+ *  random tokens OUT of that exemption, so loosening it trades a bounded false
+ *  positive for a false negative. That residual belongs to PEN-3920.
+ *
+ *  Deliberately still out of reach: a single-case LETTERS-ONLY value scores
+ *  one class under this form too, in both cases, so it never reaches the
+ *  entropy test. For an uppercase credential that means a base32 seed which
+ *  happens to draw no digit at all — 0.69% of 24-char seeds and 0.026% of
+ *  40-char ones (200k trials each). Closing it means dropping this gate
+ *  entirely, which admits a further 181 values from the same real corpus,
+ *  mostly paths and branch slugs (`DATA_DIR=./data/release-smoke-canary`).
+ *  The trade was measured and declined; it is recorded on PEN-3932. */
+function classIndex(value: string): number {
+  return [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(value)).length;
+}
+
+/** A value is "opaque" when it is long, drawn from a token alphabet and from
+ *  at least two character classes, is not a hyphenated identifier, and has
+ *  high per-character entropy. Deliberately narrow: applied only to
+ *  assignment values, never to bare words. A 40-char git SHA scores ~4.0
+ *  bits/char and would be redacted out of ordinary review prose if this ran
+ *  unbound. */
 function isOpaqueSecretValue(value: string): boolean {
   if (value.length < HIGH_ENTROPY_MIN_LENGTH) return false;
   if (!/^[A-Za-z0-9+/=_.\-]+$/.test(value)) return false;
-  // Needs mixed classes; `----------------------------` and `aaaa...` are not secrets.
-  const classes = [/[a-z]/, /[A-Z0-9]/].filter((re) => re.test(value)).length;
-  if (classes < 2) return false;
+  if (classIndex(value) < 2) return false;
   if (isLexicalIdentifier(value)) return false;
   return shannonEntropyBitsPerChar(value) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR;
 }
