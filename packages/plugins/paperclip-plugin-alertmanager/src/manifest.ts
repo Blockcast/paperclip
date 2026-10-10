@@ -42,6 +42,13 @@ const manifest: PaperclipPluginManifestV1 = {
     "secrets.verify-ref",
     // Webhook entrypoint (the plugin is webhook-driven)
     "webhooks.receive",
+    // Outbound network reach: the BLO-40739 liveness read GETs the operator-set
+    // `alertmanagerApiUrl`. It uses Node's own `fetch`, not `ctx.http` (whose
+    // SSRF guard refuses the cluster-internal Alertmanager; see
+    // `readAlertLiveness` in escalation.ts), so the host does not enforce this
+    // for it — but this list is what the host diffs on upgrade and shows an
+    // operator, so the reach is declared where it is reviewed.
+    "http.outbound",
     "instance.settings.register",
     "jobs.schedule",
     // Durable, race-safe storm-cover membership + resolution state (BLO-16120)
@@ -171,6 +178,12 @@ const manifest: PaperclipPluginManifestV1 = {
           "Delay before an unresolved alert climbs the reportsTo chain. Defaults: critical=30, warning=240.",
         default: DEFAULT_ESCALATION_DEADLINE_MINUTES,
         additionalProperties: { type: "number", minimum: 1 },
+      },
+      alertmanagerApiUrl: {
+        type: "string",
+        title: "Alertmanager base URL (for escalation liveness reads)",
+        description:
+          "e.g. http://alertmanager.monitoring.svc.cluster.local:9093. The escalation sweep reads /api/v2/alerts here before a rung posts or reassigns, so it can tell 'still firing' from 'the resolve webhook was never delivered'. Leave unset to keep the ladder running without a liveness claim — rung comments then say liveness was not verified instead of asserting it.",
       },
     },
     // No fields are schema-required: the bootstrap auto-config endpoint

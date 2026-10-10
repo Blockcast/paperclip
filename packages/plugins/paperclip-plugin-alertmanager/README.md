@@ -180,6 +180,60 @@ minutes. Override these globally with `escalationDeadlineMinutes` or per route
 with `issueRouteMap.<label>.<value>.escalationDeadlineMinutes`. Repeat firing
 deliveries preserve ladder state; resolving an alert clears its schedule.
 
+### Liveness is pulled, not assumed (BLO-40739)
+
+Before a rung posts or reassigns anything, the sweep reads
+`GET <alertmanagerApiUrl>/api/v2/alerts?active=true&silenced=true&inhibited=true`
+for the alertname and branches on the answer:
+
+| read | ladder |
+|---|---|
+| at least one instance (including **suppressed** — inhibited or silenced is firing, merely not paging) | climbs, and the comment cites the read and its timestamp |
+| no instance | **holds**: one informational notice, no reassignment, no close, and the same rung re-armed one interval out |
+| unreachable, non-2xx, unparseable, or `alertmanagerApiUrl` unset | climbs (fail-open), and the comment says liveness was **not** verified instead of asserting it |
+
+The ladder's only other resolution signal is `state.resolvedAt`, which is
+written solely when Alertmanager *delivers* a resolve webhook. That delivery is
+at-most-once — Alertmanager retries bounded by `group_interval`, then gives up,
+and a resolved alert is never re-sent — so a webhook outage loses the
+resolution permanently and `resolvedAt: null` degrades from "still firing" to
+"we never heard". The two are correlated: alerts *about* the Paperclip API are
+delivered *to* the Paperclip API. Measured on BLO-40579 (2026-10-05): the
+alert's last sample was 23:08Z, Alertmanager logged ~339 failed webhook
+notifications between 22:50Z and 23:30Z, and the ladder then claimed "Alert is
+still firing" at 23:42Z and reassigned a `critical` to the CTO at 00:12Z.
+
+The read uses Node's own `fetch`, not the host's `ctx.http`: the host's plugin
+fetch refuses any target that resolves only to private addresses (an SSRF
+guard), and the Alertmanager it must reach is a cluster-internal ClusterIP, so
+through `ctx.http` every read failed and the ladder silently fell back to
+"not verified". Each read is capped at 5s for the whole exchange — headers
+*and* body, so a proxy that answers `200` and then stalls is bounded too —
+memoised per alertname within one sweep pass, and the first transport failure
+(refused, timed out, body stalled) is reused for the rest of that pass — so a
+hanging Alertmanager costs a sweep one timeout, not one per due issue.
+
+Bypassing `ctx.http` also bypasses its `http:`/`https:` scheme allowlist, so
+the read applies its own: any other scheme (e.g. `data:`, which would answer
+with a body of the configurer's choosing) is not read, and the ladder fails
+open with "liveness NOT verified". The comment carries a fixed reason sentence
+only; the raw transport or parse error — which can include resolved addresses,
+ports, and response bytes — goes to the plugin log, never into the issue. The
+manifest declares `http.outbound` for this reach even though the host does not
+enforce it on a direct `fetch`, so it shows up where capabilities are reviewed.
+
+The Paperclip pods must also be allowed to reach that address. As read on
+2026-10-09 they are not: `monitoring` runs `default-deny-all` and admits
+ingress only from `gateway-system` and from inside the namespace, so a
+NetworkPolicy admitting the Paperclip namespace to `alertmanager:9093` is a
+deploy prerequisite (onprem-k8s). Without it the read times out and the ladder
+fails open as described above, at the cost of one 5s timeout per sweep.
+
+Leaving `alertmanagerApiUrl` unset is supported; the ladder then never claims
+liveness it did not read. The hold branch deliberately does **not** close or
+cancel the issue — an alert row is often the work ticket for the underlying fix
+and legitimately outlives its alert.
+
 This uses a plugin job rather than core `executionPolicy.monitor`: the plugin SDK
 does not expose monitor policy writes or a callback that can perform `reportsTo`
 reassignment and user-cover creation.
@@ -199,6 +253,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
 | `fallbackAgentName`  | string  | conditionally | Exact agent name used when no mapped owner or issue route resolves. Ownerless creation is refused if this is missing or ambiguous. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
+| `alertmanagerApiUrl` | string  | no       | Base URL of the Alertmanager these webhooks come from, e.g. `http://alertmanager.monitoring.svc.cluster.local:9093`. Enables the escalation liveness read above. Unset = the ladder still runs but never claims liveness. |
 
 ### Example `AlertmanagerConfig` YAML
 
@@ -722,9 +777,15 @@ sibling that is still firing keeps the cover open. The "chain exhausted"
 comment sits behind the swap, so a **refused** swap posts no announcement for
 an alert that has already cleared. A swap that **succeeds** in that same window
 still can: the resolve is mid-delivery and has not stored `resolvedAt` yet, so
-the rung reads the alert as firing and posts "while alert remains firing" on
-the source issue. The cover is still closed by the resolve's post-commit
-cascade below, so the announcement is the only residue.
+the rung posts "Agent chain exhausted with this issue still open" on the source
+issue. Since BLO-40739 that announcement asserts nothing about the alert: it
+carries the liveness line — a timestamped live read, or an explicit "liveness
+NOT verified". And with `alertmanagerApiUrl` set, the liveness read runs before
+the cover is created, so an alert Alertmanager already reports clear *holds*
+the ladder instead of reaching this rung at all; what is left is a resolve that
+clears between that read and the swap, or an instance with no URL configured.
+The cover is still closed by the resolve's post-commit cascade below, so the
+announcement is the only residue.
 
 That compensation only fires when the swap is **refused**, which left one more
 interleaving open (BLO-33497). The webhook's cover cascade ran *before* it

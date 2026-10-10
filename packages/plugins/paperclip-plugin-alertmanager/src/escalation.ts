@@ -11,6 +11,15 @@ const MAX_ATTEMPTS = 3;
 const COVERS_TABLE = "alert_escalation_covers";
 const MEMBERS_TABLE = "alert_escalation_cover_members";
 const STUCK_COVER_RECONCILE_LIMIT = 200;
+/**
+ * Per-call cap on the Alertmanager liveness read (BLO-40739), covering the
+ * whole exchange — headers AND body. The sweep runs every minute and walks due
+ * issues sequentially, so a reachable-but-hanging Alertmanager must cost it
+ * seconds, not the 30s the host's own fetch allows. Combined with
+ * `createSweepLivenessReader`'s short-circuit, one hanging Alertmanager costs a
+ * sweep at most one of these, however many issues are due.
+ */
+const ALERTMANAGER_READ_TIMEOUT_MS = 5_000;
 
 function q(ns: string, table: string): string {
   return `${ns}.${table}`;
@@ -47,6 +56,247 @@ function holdUntil(comments: Array<{ body: string }>): number | null {
   }
   return latest;
 }
+
+// ---------------------------------------------------------------------------
+// BLO-40739 — alert liveness
+//
+// Every user-visible message this ladder posts used to assert the alert was
+// still firing. Nothing read alert state: the ladder fires on the ISSUE being
+// non-terminal, and its only resolution signal is `state.resolvedAt`, written
+// solely when Alertmanager DELIVERS a resolve webhook.
+//
+// That delivery is at-most-once. Alertmanager retries a failing webhook bounded
+// by `group_interval` and then gives up, and a fully-resolved alert is never
+// re-sent — so a webhook outage loses the resolution permanently and
+// `resolvedAt: null` degrades from "still firing" to "we never heard", with
+// nothing distinguishing the two at this call site.
+//
+// The two are not independent, which is what makes this worth pulling for:
+// many of these alerts are ABOUT the Paperclip API and are delivered TO the
+// Paperclip API, so the outage that fires the alert is the outage that eats its
+// resolution. Measured on BLO-40579 (2026-10-05): the alert's last `ALERTS`
+// sample was 23:08Z, Alertmanager logged ~339 failed webhook notifications
+// between 22:50Z and 23:30Z, and this ladder then posted "Alert is still
+// firing" at 23:42Z and reassigned a `critical` to the CTO at 00:12Z — on an
+// alert that had been dead for an hour. The receiving run's correct response to
+// "still firing" is to treat it as a live incident, so the false claim does not
+// merely waste a run, it points the run at the wrong shape of problem.
+//
+// Hence: pull when we can, and when we cannot, say so rather than guess.
+// ---------------------------------------------------------------------------
+
+type AlertLiveness =
+  | { state: "firing"; readAt: string; detail: string }
+  | { state: "not-firing"; readAt: string }
+  /** `unreachable`: the request itself failed (refused, timed out), not just this alertname's answer. */
+  | { state: "unknown"; reason: string; unreachable?: true };
+
+/** Reads liveness for one alertname; see `createSweepLivenessReader`. */
+type LivenessReader = (alertname: string) => Promise<AlertLiveness>;
+
+/**
+ * Asks Alertmanager whether `alertname` currently has any instance.
+ *
+ * `active=true&silenced=true&inhibited=true` is deliberate: a SUPPRESSED alert
+ * is firing and merely not paging (inhibited by a parent, or silenced).
+ * Excluding those would read a live incident as resolved and hold a real
+ * escalation — the expensive direction of this guard.
+ *
+ * Fails open to `unknown` on every error path. An unreachable Alertmanager must
+ * never silence the escalation ladder; it only costs the liveness claim.
+ *
+ * Uses Node's global `fetch`, NOT `ctx.http.fetch`, on purpose. The host's
+ * plugin fetch is an SSRF guard that refuses any target whose resolved
+ * addresses are all private (`plugin-host-services.ts`, `isPrivateIP`), and
+ * the Alertmanager this reads is a cluster-internal ClusterIP (10.x) with no
+ * public address — through `ctx.http` every read failed, so the feature was
+ * inert in production while mocked tests passed. The SDK permits direct
+ * `fetch` (`PluginHttpClient` docs); the target is operator configuration, not
+ * request input. Losing the host's 30s cap is why the timeout is our own, and
+ * losing its `http:`/`https:` allowlist is why the scheme check is too.
+ *
+ * Every `reason` is a fixed sentence: it is written into issue comments, and
+ * raw error text carries resolved addresses, ports, and response bytes. The
+ * raw error goes to the plugin log instead.
+ */
+async function readAlertLiveness(
+  config: AlertmanagerPluginConfig,
+  alertname: string,
+  now: Date,
+  logger: PluginContext["logger"],
+): Promise<AlertLiveness> {
+  const base = config.alertmanagerApiUrl?.trim().replace(/\/+$/, "");
+  if (!base) return { state: "unknown", reason: "no alertmanagerApiUrl is configured for this instance" };
+  // `fetch` takes any scheme. A `data:` URL answers with a body of the
+  // configurer's choosing — `[]` would read every alert as clear and hold
+  // every ladder — so only an actual HTTP request counts as a read.
+  if (!["http:", "https:"].includes(URL.parse(base)?.protocol ?? "")) {
+    return { state: "unknown", reason: "alertmanagerApiUrl is not an http:// or https:// URL, so it was not read" };
+  }
+  // Matcher values are double-quoted strings: escape `\` and `"` so a label
+  // containing either still yields a well-formed matcher.
+  const filter = encodeURIComponent(`alertname="${alertname.replace(/[\\"]/g, "\\$&")}"`);
+  const url = `${base}/api/v2/alerts?active=true&silenced=true&inhibited=true&filter=${filter}`;
+  const failed = (err: unknown) => {
+    const cause = err instanceof Error && err.cause !== undefined ? ` (cause: ${String(err.cause)})` : "";
+    logger.warn(`alert-escalation: Alertmanager liveness read for ${alertname} failed: ${String(err)}${cause}`);
+  };
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetch(url, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(ALERTMANAGER_READ_TIMEOUT_MS),
+    });
+    // The body is transport too, under the same signal: a server that sends
+    // headers and then stalls fails HERE, and must short-circuit the pass
+    // like one that never answered.
+    text = res.ok ? await res.text() : "";
+  } catch (err) {
+    failed(err);
+    const timedOut = err instanceof Error && err.name === "TimeoutError";
+    return {
+      state: "unknown",
+      reason: timedOut
+        ? `the Alertmanager request did not complete within ${ALERTMANAGER_READ_TIMEOUT_MS / 1_000}s`
+        : "the Alertmanager request failed; the error is in the plugin log",
+      unreachable: true,
+    };
+  }
+  if (!res.ok) return { state: "unknown", reason: `Alertmanager returned HTTP ${res.status}` };
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch (err) {
+    failed(err);
+    return { state: "unknown", reason: "Alertmanager returned a body that is not valid JSON" };
+  }
+  if (!Array.isArray(body)) return { state: "unknown", reason: "Alertmanager returned a non-array body" };
+  // Re-apply the filter locally. The server-side `filter` is the belt; this
+  // is the braces, and it guards the fail-open direction: an Alertmanager
+  // that ignored or mis-parsed the filter returns the WHOLE alert set, which
+  // would read as "firing" for every alertname on the cluster and silently
+  // restore the behaviour this guard exists to remove.
+  const matching = body.filter(
+    (entry) => (entry as { labels?: Record<string, string> } | null)?.labels?.alertname === alertname,
+  );
+  const readAt = now.toISOString();
+  if (matching.length === 0) return { state: "not-firing", readAt };
+  const states = [
+    ...new Set(matching.map((entry) => (entry as { status?: { state?: string } } | null)?.status?.state ?? "unknown")),
+  ].sort();
+  return { state: "firing", readAt, detail: `${matching.length} instance(s), state=${states.join("/")}` };
+}
+
+/**
+ * One liveness reader per sweep pass. The sweep walks due issues sequentially,
+ * so without this a hanging Alertmanager stalls it by one read timeout PER due
+ * issue — during exactly the correlated outage this read exists for, when many
+ * ladders come due together.
+ *
+ *  - Memoised by alertname: issues sharing an alert share one read, which is
+ *    also one consistent answer across them for this pass.
+ *  - Once a request fails at the transport level — connect, headers, or body
+ *    read, including the timeout on any of them — the rest of the pass reuses
+ *    that failure instead of re-trying. A non-2xx or bad body is
+ *    alertname-specific and does not short-circuit other alertnames.
+ */
+function createSweepLivenessReader(
+  config: AlertmanagerPluginConfig,
+  now: Date,
+  logger: PluginContext["logger"],
+): LivenessReader {
+  const reads = new Map<string, AlertLiveness>();
+  let unreachable: AlertLiveness | null = null;
+  return async (alertname) => {
+    const cached = reads.get(alertname) ?? unreachable;
+    if (cached) return cached;
+    const read = await readAlertLiveness(config, alertname, now, logger);
+    reads.set(alertname, read);
+    if (read.state === "unknown" && read.unreachable) unreachable = read;
+    return read;
+  };
+}
+
+/**
+ * The liveness sentence appended to every rung message.
+ *
+ * Narrowed to exclude `not-firing` on purpose: that outcome never reaches a
+ * rung, because `advanceIssueLadder` holds the ladder instead of posting.
+ */
+function livenessLine(
+  liveness: Extract<AlertLiveness, { state: "firing" | "unknown" }>,
+  state: AlertStateRecord,
+  now: Date,
+): string {
+  if (liveness.state === "firing") {
+    return `Alert liveness: \`${state.alertname}\` read live from Alertmanager at ${liveness.readAt} — ${liveness.detail}.`;
+  }
+  const lastFired = Date.parse(state.lastFiredAt ?? "");
+  const seen = Number.isFinite(lastFired)
+    ? `last firing notification received ${state.lastFiredAt} (${Math.round((now.getTime() - lastFired) / 60_000)}m ago)`
+    : "last firing notification time not recorded";
+  return `⚠ Alert liveness NOT verified (${liveness.reason}). This rung fires on the ISSUE still being open, not on alert state. What was actually measured: no resolve notification has been received for \`${state.alertname}\`; ${seen}. A resolve notification that was never delivered is indistinguishable from a live alert here, so confirm against Alertmanager before treating this as a live incident.`;
+}
+
+/** Prefix of the hold notice, and the dedup key for it. */
+const NOT_FIRING_MARKER = "[alert-escalation] Source alert is not firing";
+
+/**
+ * The alert is confirmed clear, so the ladder stops here: no comment claiming
+ * an incident, and above all no reassignment up the `reportsTo` chain.
+ *
+ * Re-arms the SAME rung one interval out rather than setting
+ * `escalationComplete`. Completing would be wrong in the one case that matters:
+ * this path is reached precisely when the resolve was never delivered, so
+ * `resolvedAt` is still null and a later re-fire arrives as an ordinary dedup
+ * hit that does not rebuild the ladder — a completed ladder would then stay
+ * dead for an alert that is firing again. Re-arming also keeps the
+ * minute-cadence sweep from re-posting this notice sixty times an hour; the
+ * marker dedup covers the window before the re-arm lands.
+ *
+ * Deliberately does NOT close, cancel, or reassign the issue. An alert row is
+ * frequently the work ticket for the underlying fix and legitimately outlives
+ * its alert; disposition is the assignee's call, not this sweep's.
+ */
+async function holdLadderForClearedAlert(
+  ctx: PluginContext,
+  config: AlertmanagerPluginConfig,
+  issue: SweepIssue,
+  companyId: string,
+  ref: ReturnType<typeof alertStateRef>,
+  state: AlertStateRecord,
+  comments: Array<{ body: string }>,
+  readAt: string,
+  now: Date,
+): Promise<void> {
+  // The re-arm goes FIRST and the notice sits behind it, the same invariant as
+  // the rung path: a webhook that re-fired the alert while this read was in
+  // flight wins the record, and losing the swap must abort before the issue is
+  // told the alert is clear. Posting first would leave that false notice
+  // behind — and, since the marker dedups for the life of the issue, let it
+  // suppress every correct hold notice after it.
+  const held = await casAlertState(ctx, ref, state, {
+    ...state,
+    nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString(),
+  });
+  if (!held) {
+    ctx.logger.info(`alert-escalation: abandoned hold for ${issue.identifier ?? issue.id}; alert state changed under the sweep`);
+    return;
+  }
+  if (!comments.some((comment) => comment.body.startsWith(NOT_FIRING_MARKER))) {
+    await ctx.issues.createComment(
+      issue.id,
+      `${NOT_FIRING_MARKER} — escalation held.\n\n`
+        + `Read from Alertmanager at ${readAt}: \`${state.alertname}\` has no active, silenced, or inhibited instance. `
+        + `The ladder is paused instead of climbing the reportsTo chain, and nothing was reassigned.\n\n`
+        + `This issue is still open, which may well be correct — an alert row is often the work ticket for the underlying fix and outlives the alert. Disposition is the assignee's call. The ladder resumes on its own if the alert fires again.`,
+      companyId,
+    );
+  }
+}
+
 
 /**
  * Bucketed dedup key for the board-cover storm-batching invariant (BLO-15982):
@@ -114,11 +364,13 @@ async function createCover(
   ctx: PluginContext,
   issue: NonNullable<Awaited<ReturnType<PluginContext["issues"]["get"]>>>,
   companyId: string,
-  alertname: string,
+  state: AlertStateRecord,
+  liveness: Extract<AlertLiveness, { state: "firing" | "unknown" }>,
   config: AlertmanagerPluginConfig,
   now: Date,
 ) {
   const ns = ctx.db.namespace;
+  const alertname = state.alertname;
 
   // Already an open member of a still-open cover? Reopen (in case this is a
   // re-fire racing the sweep) and stop — idempotent guard against a partial
@@ -171,7 +423,7 @@ async function createCover(
         projectId: issue.projectId ?? undefined,
         goalId: issue.goalId ?? undefined,
         title: `[user-cover] unresolved alert escalation: ${issue.identifier ?? issue.title}`,
-        description: `Alert ${issue.identifier ?? issue.id} exhausted its agent chain while still firing. Board direction is required.`,
+        description: `Alert ${issue.identifier ?? issue.id} exhausted its agent chain while this issue remained open. Board direction is required.\n\n${livenessLine(liveness, state, now)}`,
         status: "todo",
         priority: issue.priority,
         assigneeUserId: owner?.principalId ?? null,
@@ -361,9 +613,10 @@ export async function runAlertEscalationSweep(ctx: PluginContext, config: Alertm
   const companyId = config.defaultCompanyId;
   if (!companyId) return;
   const issues = await ctx.issues.list({ companyId, originKind: ORIGIN_KIND, limit: 200 });
+  const readLiveness = createSweepLivenessReader(config, now, ctx.logger);
   for (const issue of issues) {
     try {
-      await advanceIssueLadder(ctx, config, issue, companyId, now);
+      await advanceIssueLadder(ctx, config, issue, companyId, now, readLiveness);
     } catch (err) {
       // One broken issue must not stall the sweep for the rest of the fleet
       // (live incident 2026-07-11: a throwing requestWakeup aborted the whole
@@ -442,18 +695,30 @@ async function advanceIssueLadder(
   issue: SweepIssue,
   companyId: string,
   now: Date,
+  readLiveness: LivenessReader,
 ): Promise<void> {
   if (["done", "cancelled"].includes(issue.status) || !issue.originId) return;
   const ref = alertStateRef(companyId, issue.originId);
   const state = await ctx.state.get(ref) as AlertStateRecord | null;
   if (!state || state.resolvedAt || state.escalationComplete || !state.nextEscalationAt || Date.parse(state.nextEscalationAt) > now.getTime()) return;
-  const hold = holdUntil(await ctx.issues.listComments(issue.id, companyId));
+  const comments = await ctx.issues.listComments(issue.id, companyId);
+  const hold = holdUntil(comments);
   if (hold && hold > now.getTime()) {
     // Refusal needs no branch: re-arming the schedule is idempotent and the
     // next sweep recomputes it from whatever the webhook wrote.
     await casAlertState(ctx, ref, state, { ...state, nextEscalationAt: new Date(hold).toISOString() });
     return;
   }
+
+  // BLO-40739: pull alert state before ANY rung side effect. The guard above
+  // only knows what the webhook delivered; this is the one place that can tell
+  // "still firing" apart from "the resolve never arrived".
+  const liveness = await readLiveness(state.alertname);
+  if (liveness.state === "not-firing") {
+    await holdLadderForClearedAlert(ctx, config, issue, companyId, ref, state, comments, liveness.readAt, now);
+    return;
+  }
+
   const attempt = state.escalationAttempt ?? 0;
   const current = issue.assigneeAgentId ? await ctx.agents.get(issue.assigneeAgentId, companyId) : null;
 
@@ -469,7 +734,7 @@ async function advanceIssueLadder(
     // every later sweep, so the alert would never be covered at all — silence
     // where a board escalation belongs. So the CAS stays behind the cover, and
     // the case it cannot prevent is compensated below instead.
-    await createCover(ctx, issue, companyId, state.alertname, config, now);
+    await createCover(ctx, issue, companyId, state, liveness, config, now);
     const claimed = await casAlertState(ctx, ref, state, { ...state, escalationAttempt: MAX_ATTEMPTS, escalationComplete: true, nextEscalationAt: null });
     if (!claimed) {
       // A webhook won the record while the cover was being created. If it was a
@@ -498,7 +763,7 @@ async function advanceIssueLadder(
       ctx.logger.info(`alert-escalation: abandoned cover rung for ${issue.identifier ?? issue.id}; alert state changed under the sweep`);
       return;
     }
-    await ctx.issues.createComment(issue.id, "[alert-escalation] Agent chain exhausted while alert remains firing; created a [user-cover] escalation.", companyId);
+    await ctx.issues.createComment(issue.id, `[alert-escalation] Agent chain exhausted with this issue still open; created a [user-cover] escalation.\n\n${livenessLine(liveness, state, now)}`, companyId);
     return;
   }
 
@@ -508,9 +773,9 @@ async function advanceIssueLadder(
   // live assignee next time, so an interrupted rung self-heals upward.
   //
   // That ordering is also what makes the CAS worth having here: the rung's
-  // user-visible effects (a comment claiming the alert is still firing, and a
-  // wake) all sit behind this write, so losing the swap aborts the rung before
-  // anyone is paged rather than after.
+  // user-visible effects (the escalation comment and the wake) all sit behind
+  // this write, so losing the swap aborts the rung before anyone is paged
+  // rather than after.
   const next = attempt + 1;
   const advanced = await casAlertState(ctx, ref, state, { ...state, escalationAttempt: next, escalationComplete: false, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
   if (!advanced) {
@@ -523,12 +788,12 @@ async function advanceIssueLadder(
   }
 
   if (attempt === 0 && current) {
-    await ctx.issues.createComment(issue.id, `[alert-escalation 1/${MAX_ATTEMPTS}] Alert is still firing; waking current owner ${current.name}.`, companyId);
+    await ctx.issues.createComment(issue.id, `[alert-escalation 1/${MAX_ATTEMPTS}] Escalation deadline reached with this issue still open; waking current owner ${current.name}.\n\n${livenessLine(liveness, state, now)}`, companyId);
     await requestWakeupBestEffort(ctx, issue, companyId, next);
   } else if (current?.reportsTo) {
     const manager = await ctx.agents.get(current.reportsTo, companyId);
     await ctx.issues.update(issue.id, { assigneeAgentId: current.reportsTo, assigneeUserId: null }, companyId);
-    await ctx.issues.createComment(issue.id, `[alert-escalation ${next}/${MAX_ATTEMPTS}] Alert remains firing; reassigned from ${current.name} to ${manager?.name ?? current.reportsTo}.`, companyId);
+    await ctx.issues.createComment(issue.id, `[alert-escalation ${next}/${MAX_ATTEMPTS}] Escalation deadline reached again with this issue still open; reassigned from ${current.name} to ${manager?.name ?? current.reportsTo}.\n\n${livenessLine(liveness, state, now)}`, companyId);
     // Plugin-side issues.update does not fire core's assignment wake, so the
     // new owner is woken explicitly — otherwise the reassignment just sits in
     // their backlog until the next scheduled heartbeat.
