@@ -12,9 +12,12 @@
 // A single "points at the instrument, not the queue" sentence covering both
 // stands an operator down on a real breach. Even on its own, le drift only
 // breaks the page: the queue can still be saturated, and query 2's mean
-// (`_sum`/`_count`, no `le` label) survives the drift. So no branch may end on
-// "not the queue"; the le-drift branch must send the operator to query 2 and
-// the queue instead. Pure text test: it reads the runbook and nothing else.
+// (`_sum`/`_count`, no `le` label) survives the drift. So every branch must send
+// the operator back to the queue, and the le-drift branch must do it through
+// query 2. That is asserted positively: a phrase ban on the stand-down cannot
+// work, because a correctly scoped verdict ("a verdict on the page, not on the
+// queue, which can still be saturated") shares the stand-down's words. Pure
+// text test: it reads the runbook and nothing else.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
@@ -37,9 +40,35 @@ function boundCheckBlocks() {
     .filter(Boolean);
 }
 
-test("no instrument branch stands the operator down on the queue", () => {
-  for (const block of boundCheckBlocks()) {
-    assert.doesNotMatch(block, /not the queue/, `bare stand-down on the queue: ${block}`);
+// The verdict branches: the bound check's list items, one per instrument failure.
+function branches() {
+  const items = boundCheckBlocks().filter((b) => b.startsWith("- "));
+  assert.equal(items.length, 3, "expected three bound-check branches; re-anchor this test");
+  return items;
+}
+
+function assertEachBranchSendsToQueue(items) {
+  for (const branch of items) {
+    assert.match(branch, /\b(?:triage|judge) the queue\b/, `branch stands the operator down: ${branch}`);
+  }
+}
+
+test("every verdict branch sends the operator back to the queue", () => {
+  assertEachBranchSendsToQueue(branches());
+});
+
+test("must-fail: a branch reduced to a stand-down fails however it is spelled", () => {
+  const items = branches();
+  for (const [i, branch] of items.entries()) {
+    for (const standDown of ["not the queue", "not on the queue", "not **on** the queue"]) {
+      const cut = branch.replace(/^(- \*\*[^*]+\*\*).*$/, `$1 This points at the instrument, ${standDown}.`);
+      assert.notEqual(cut, branch, `branch ${i} heading not found; re-anchor this test`);
+      assert.throws(
+        () => assertEachBranchSendsToQueue(items.with(i, cut)),
+        assert.AssertionError,
+        `guard passed branch ${i} spelled "${standDown}"`,
+      );
+    }
   }
 });
 
@@ -56,4 +85,12 @@ test("the missing-_sum / 0s case says the breach is real and to triage the queue
   assert.equal(sumBranch.length, 1, "expected exactly one block for the 0s / missing-_sum case");
   assert.match(sumBranch[0], /breach is real/);
   assert.match(sumBranch[0], /triage the queue/);
+});
+
+test("the partial-arm case sends both outcomes back to the queue", () => {
+  const partial = branches().filter((b) => b.includes("short `_bucket`") && b.includes("short `_sum`"));
+  assert.equal(partial.length, 1, "expected exactly one block for the partial-arm case");
+  assert.match(partial[0], /short `_bucket`[^.]*the queue can still be saturated/);
+  assert.match(partial[0], /judge the queue on that fraction/);
+  assert.match(partial[0], /short `_sum`[^.]*breach is real: file the instrument bug and triage the queue/);
 });
