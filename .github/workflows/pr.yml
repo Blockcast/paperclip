@@ -307,6 +307,25 @@ jobs:
         run: node --test ./scripts/check-docker-retire-in-flight-lock.test.js
         timeout-minutes: 1
 
+      # BLO-41774: the detection half of the two above. Both of those act on a
+      # lock someone already knows is stranded; nothing told anyone. The only
+      # signal has been the NEXT production deploy being refused at its approval
+      # step, which is the most expensive possible moment and burns a run.
+      #
+      # Executable rather than render-level, for its neighbours' reason, and
+      # because a detector is the kind of thing that passes a presence check
+      # while discriminating nothing. Every verdict is exercised in both
+      # directions against a stubbed cluster — including the two known incident
+      # shapes and the `helm upgrade --atomic` rollback window, which must read
+      # as landing rather than stranded — and each seam where the checker lifts
+      # a predicate out of approve-paperclip-api-digest.sh is mutation-tested,
+      # so a renamed block makes it refuse to conclude instead of degrading to
+      # a clean verdict.
+      - name: Validate stranded in-flight approval lock detection (BLO-41774)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-stranded-approval-lock.test.js
+        timeout-minutes: 1
+
       # BLO-33027: pins the negative admission probe that ends the deploy job.
       # It is the only production-side evidence that
       # ValidatingAdmissionPolicy/paperclip-api-image-approval is EVALUATED
