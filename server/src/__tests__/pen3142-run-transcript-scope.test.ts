@@ -1143,9 +1143,12 @@ describe("run transcript scoping (PEN-3142)", () => {
      * fails CLOSED on an unrecognized role, `workspace_runtime:read` tests the raw
      * column (`!== "viewer"`) and fails OPEN. `middleware/auth.ts` persists the Cloud
      * stack role verbatim for anything that is not owner/admin, and
-     * `stackMembershipRole` admits `support`, so the divergent actor is real rather
-     * than hypothetical. Under the merged code that actor had the excerpts withheld on
-     * both list routes and was served the whole log body here, one URL over.
+     * `stackMembershipRole` admits `support`, so a `session` actor on that row is the
+     * divergent actor, real rather than hypothetical. Wider still, and refused on a
+     * DIFFERENT line: every cloud-tenant member, of every role, is refused on `source`
+     * before the role is read (Ally review 5477953658). Under the merged code both
+     * populations had the excerpts withheld on both list routes and were served the
+     * whole log body here, one URL over.
      *
      * These drive the route with the two decisions set INDEPENDENTLY, which is the
      * composition the merge got wrong. Whether `authorization.ts` should answer
@@ -1153,7 +1156,11 @@ describe("run transcript scoping (PEN-3142)", () => {
      * a wider blast radius, and is not decided here.
      */
 
-    /** A cloud-tenant member whose stack role is persisted verbatim and is in neither role union. */
+    /**
+     * A cloud-tenant member whose stack role is persisted verbatim. Note it is refused by
+     * the `cloud_tenant` SOURCE check, not by the role normalization — see the
+     * per-population cases below for which line refuses which reader.
+     */
     const cloudTenantSupportActor = {
       type: "board",
       userId: "user-1",
@@ -1190,6 +1197,47 @@ describe("run transcript scoping (PEN-3142)", () => {
         resource: expect.objectContaining({ type: "agent", agentId: runOwnerAgentId }),
       }));
     });
+
+    /**
+     * Ally review 5477953658 (Important #1). The changed population is every reader the
+     * entitlement admits but the transcript gate refuses, and its two halves are refused by
+     * DIFFERENT lines of `boardActorIsTranscriptOperator`, so each is pinned separately:
+     *
+     *   - any cloud-tenant member, whatever the role — `owner` is what a Cloud owner OR
+     *     admin is persisted as, `member` folds to `operator` — is refused on `source`.
+     *     Drop that check and both match the operator set and get the body.
+     *   - a `session` member with a non-union role is refused by the normalization.
+     *     Widen `normalizedTranscriptRole`'s fallback and `support` gets the body.
+     */
+    for (const [source, membershipRole] of [
+      ["cloud_tenant", "owner"],
+      ["cloud_tenant", "member"],
+      ["session", "support"],
+    ] as const) {
+      it(`withholds the log body from a ${source} ${membershipRole} the entitlement admits`, async () => {
+        mockDecide.mockImplementation(decideRuntimeYesTranscriptNo);
+
+        const res = await requestApp(
+          await createApp({
+            type: "board",
+            userId: "user-1",
+            companyIds: ["company-1"],
+            source,
+            isInstanceAdmin: false,
+            memberships: [{ companyId: "company-1", membershipRole, status: "active" }],
+          }),
+          (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-1/log"),
+        );
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
+        // Refused by falling through to the decider, not by a short-circuit, so an
+        // explicit `runs:read_transcript` grant would still admit this reader.
+        expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+          action: "runs:read_transcript",
+        }));
+      });
+    }
 
     it("still discloses the log body to a reader holding both", async () => {
       mockDecide.mockImplementation(async (input: { action?: string }) => ({

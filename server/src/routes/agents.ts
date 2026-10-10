@@ -5528,26 +5528,44 @@ export function agentRoutes(
     // the fail-open half of the paragraph above. That paragraph is right that
     // `workspace_runtime:read` is tighter than the transcript gate FOR AGENTS — it is absent from
     // the same-company agent allow-list (PEN-2852), so no agent resolves `revealRuntimeConfig`.
-    // It does not hold for humans, because the two gates read the SAME unconstrained
-    // `company_memberships.membership_role` text column in OPPOSITE failure directions:
+    // It does not hold for humans. The readers whose answer changes are exactly the ones the
+    // entitlement admits but the transcript gate refuses, and there are two populations of them:
     //
-    //   - the transcript gate normalizes it (`normalizeHumanRole(v, "viewer")`, union
-    //     `[owner, admin, operator, viewer]` + `member -> operator`) and so fails CLOSED on an
-    //     unrecognized role — deliberate, see `boardActorIsTranscriptOperator`;
-    //   - `workspace_runtime:read` tests the RAW column, `membershipRole !== "viewer"`
-    //     (`services/authorization.ts`, `allow_simple_company_member`), and so fails OPEN on it.
+    //   - Every non-viewer CLOUD-TENANT member, regardless of role — a Cloud owner or admin
+    //     included (both are stamped `membershipRole: "owner"`, `middleware/auth.ts`).
+    //     `boardActorIsTranscriptOperator` refuses `source: "cloud_tenant"` ahead of any role
+    //     test (`routes/authz.ts`), and — absent an explicit `runs:read_transcript` grant — the
+    //     decider then answers `deny_missing_grant`, because that grant is seeded for no human
+    //     role (`grantsForHumanRole`). The entitlement does not deny them on fallthrough — the
+    //     cloud-tenant branch of `services/authorization.ts` returns nothing for
+    //     `workspace_runtime:read`, so it lands on the `!permissionKey` block and resolves
+    //     `allow_simple_company_member` for any non-viewer member. This is a user-visible Cloud
+    //     change: such a reader — a Cloud owner or admin included — now gets the masked body
+    //     here, which is what both list routes already give the same actor.
+    //   - Any SESSION member (or `board_key` actor — both load their membership rows from the
+    //     DB) holding a role outside the transcript gate's union. This is the case the
+    //     normalize-vs-raw divergence describes: the two gates read the SAME unconstrained
+    //     `company_memberships.membership_role` text column in OPPOSITE failure directions:
     //
-    // A non-union role really is written: `middleware/auth.ts` persists the Cloud stack role
-    // verbatim for anything that is not owner/admin, and `stackMembershipRole` admits `support`.
-    // A cloud-tenant `support` member therefore had the captured output withheld on BOTH list
-    // routes while this route — one URL over — served the whole log body. That is the
-    // "gate on one sibling and not the other" failure this series exists to close, reproduced by
-    // the very substitution that was argued as tighter.
+    //       - the transcript gate normalizes it (`normalizeHumanRole(v, "viewer")`, union
+    //         `[owner, admin, operator, viewer]` + `member -> operator`) and so fails CLOSED on
+    //         an unrecognized role — deliberate, see `boardActorIsTranscriptOperator`;
+    //       - `workspace_runtime:read` tests the RAW column, `membershipRole !== "viewer"`
+    //         (`services/authorization.ts`, `allow_simple_company_member`), and so fails OPEN.
     //
-    // Strictly narrowing, so it reopens nothing: operator-grade humans and the local board are
-    // admitted by the transcript gate anyway, viewers and agents are already withheld by the
-    // entitlement, and the only decision that changes is the divergent one. In particular this is
-    // an AND and not an OR, so it does NOT widen `runs:read_transcript` into this route — that
+    //     A non-union role really is written: `middleware/auth.ts` persists the Cloud stack role
+    //     verbatim for anything that is not owner/admin, and `stackMembershipRole` admits
+    //     `support`, so a session actor reading that same membership row carries `support`.
+    //
+    // Both populations had the captured output withheld on BOTH list routes while this route —
+    // one URL over — served the whole log body. That is the "gate on one sibling and not the
+    // other" failure this series exists to close, reproduced by the very substitution that was
+    // argued as tighter.
+    //
+    // Strictly narrowing, so it reopens nothing: no reader gains the body. Operator-grade
+    // SESSION and `board_key` humans and the local board are admitted by the transcript gate as
+    // before, and viewers and agents are already withheld by the entitlement. In particular this
+    // is an AND and not an OR, so it does NOT widen `runs:read_transcript` into this route — that
     // remains the parked product question above, untouched.
     //
     // Owner resolution mirrors `withholdUnentitledWorkspaceOperationOutput` rather than

@@ -74,6 +74,9 @@ describe("PEN-3895: workspace-operation owner resolution is company-scoped", () 
     expect(sql).toContain('"id"');
     // ...AND the company predicate now is. Without it this is `inArray` alone.
     expect(sql).toContain('"company_id"');
+    // ...and the two are ANDed: an `or(...)` would satisfy both presence checks above.
+    expect(sql).not.toMatch(/\bor\b/i);
+    expect(sql).toMatch(/\band\b/i);
     // The caller's company is what reaches the query, not a constant.
     expect(params).toContain("company-1");
     expect(params).toContain("run-1");
