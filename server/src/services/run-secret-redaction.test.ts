@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import { MAX_PERSISTED_LOG_CHUNK_CHARS, sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
 import {
   RUN_SECRET_CARRY_MAX_HOLD_CHARS,
+  ALWAYS_REDACT_MIN_LENGTH,
+  RUN_REDACTION_CANARY_ENV_KEY,
   RUN_SECRET_MASK,
   buildRunSecretRedactionPlan,
+  createRunRedactionCanaryValue,
   createRunSecretBoundaryCarry,
   isRedactableSecretValue,
 } from "./run-secret-redaction.js";
@@ -432,5 +435,69 @@ describe("BLO-39715: chunk-boundary splits", () => {
     // unsorted caller must not silently get a too-short window.
     expect(createRunSecretBoundaryCarry(["ab", "abcdef"]).holdbackChars).toBe(5);
     expect(createRunSecretBoundaryCarry(["abcdef", "ab"]).holdbackChars).toBe(5);
+  });
+});
+
+describe("per-run redaction canary", () => {
+  // The canary exists only so the deployed redactor can be PROVEN live from inside a run.
+  // Its format is therefore load-bearing in a way nothing else in this module is: it is the
+  // one needle whose value this code chooses, so it is the one that can be silently demoted
+  // below the threshold by an edit that looks like tidying up. Pinned here rather than left
+  // to inspection.
+
+  it("mints a value the plan accepts as a needle", () => {
+    const value = createRunRedactionCanaryValue();
+    const plan = buildRunSecretRedactionPlan(
+      { env: { [RUN_REDACTION_CANARY_ENV_KEY]: value } },
+      [RUN_REDACTION_CANARY_ENV_KEY],
+    );
+    // All three assertions, not just the first: a value SHORT enough to be rejected lands in
+    // `uncoveredKeys` with an empty needle list, which is a quiet pass for any test that only
+    // checks `isRedactableSecretValue` in isolation.
+    expect(isRedactableSecretValue(value)).toBe(true);
+    expect(plan.needles).toContain(value);
+    expect(plan.uncoveredKeys).toEqual([]);
+    expect(plan.unresolvedKeys).toEqual([]);
+    // And in the UNCONDITIONAL band, not merely accepted. Checked because the weaker
+    // assertions above do not discriminate: a mutant canary of `canary-1` is 8 chars and
+    // two classes, so it clears `isRedactableSecretValue` and every line above still
+    // passes — while being short enough to collide with ordinary transcript text and mask
+    // it. The probe must never sit in the 8-15 ambiguous band where acceptance depends on
+    // which characters a UUID happened to produce.
+    expect(value.length).toBeGreaterThanOrEqual(ALWAYS_REDACT_MIN_LENGTH);
+  });
+
+  it("is fresh per run", () => {
+    // Reused across runs it would be a standing cross-run identifier rather than a probe, and
+    // a stale copy quoted in one transcript would mask unrelated text in another.
+    expect(createRunRedactionCanaryValue()).not.toBe(createRunRedactionCanaryValue());
+  });
+
+  it("is redacted through each of the three observed disclosure mechanisms", () => {
+    const value = createRunRedactionCanaryValue();
+    const plan = buildRunSecretRedactionPlan(
+      { env: { [RUN_REDACTION_CANARY_ENV_KEY]: value } },
+      [RUN_REDACTION_CANARY_ENV_KEY],
+    );
+    const cases = [
+      // (a) echoed from an env var, with no secret-shaped carrier beside it.
+      `${value}\n`,
+      // (b) read out of a projected Secret volume — bare file contents.
+      `+ cat /var/run/secrets/envdir/CANARY\n${value}\n`,
+      // (c) embedded mid-string inside a libpq DSN. Written in the `key=value` form the
+      // fixtures above use rather than as a credentialed connection URI: the egress
+      // scanner refuses to publish that shape even when the credential is a template
+      // expression, and a suppression would be a worse answer than the shape change.
+      `psql "host=db.internal port=5432 user=traffic_ops password=${value} dbname=to"\n`,
+    ];
+    for (const text of cases) {
+      const sanitized = sanitizeRunLogChunkForStorage(
+        text,
+        NO_CURRENT_USER_REDACTION,
+        plan.needles,
+      );
+      expect(sanitized).not.toContain(value);
+      expect(sanitized).toContain(RUN_SECRET_MASK);
+    }
   });
 });
