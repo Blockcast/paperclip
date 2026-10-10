@@ -5380,6 +5380,10 @@ describe("agent issue mutation checkout ownership", () => {
           .delete("/api/attachments/attachment-1");
 
         expect(res.status, JSON.stringify(res.body)).toBe(409);
+        // The status alone does not discriminate: `assertCheckoutOwner` also
+        // returns 409 on this suite ("Issue run ownership conflict"). Pin the
+        // string so a refusal arriving from the wrong guard fails here.
+        expect(res.body.error).toBe("Issue is checked out by another agent");
         expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
         expect(mockIssueService.removeAttachment).not.toHaveBeenCalled();
       });
@@ -5391,6 +5395,7 @@ describe("agent issue mutation checkout ownership", () => {
           .delete("/api/work-products/product-1");
 
         expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(res.body.error).toBe("Issue is checked out by another agent");
         expect(mockWorkProductService.remove).not.toHaveBeenCalled();
       });
 

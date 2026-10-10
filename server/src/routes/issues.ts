@@ -6709,14 +6709,17 @@ export function issueRoutes(
        */
       allowCreatorOrManagerChainOwnership?: boolean;
       /**
-       * BLO-29150: DELETE /issues/:id only. A bare run lock proves "this run is
-       * executing this row" — the right predicate for mutating in-flight work,
-       * and the wrong one for destroying the row and its attachment objects.
-       * `isCurrentIssueExecutionRun` is assignee-agnostic, so a lock left stale
-       * by a reassignment authorized an irreversible hard delete of a row that
-       * now belongs to another agent. Opt in from routes whose effect outlives
-       * the run holding the lock; leave it off where the lock holder is only
-       * concluding its own in-flight work.
+       * BLO-29150: opt-in, currently DELETE /issues/:id, DELETE
+       * /attachments/:attachmentId and DELETE /work-products/:id. Unlike the
+       * `X only` options above this one is deliberately multi-caller, so do not
+       * read it as a single-route scope contract. A bare run lock proves "this
+       * run is executing this row" — the right predicate for mutating in-flight
+       * work, and the wrong one for destroying the row and its attachment
+       * objects. `isCurrentIssueExecutionRun` is assignee-agnostic, so a lock
+       * left stale by a reassignment authorized an irreversible hard delete of a
+       * row that now belongs to another agent. Opt in from routes whose effect
+       * outlives the run holding the lock; leave it off where the lock holder is
+       * only concluding its own in-flight work.
        */
       requireAssignmentForRunLockAuthority?: boolean;
     } = {},
