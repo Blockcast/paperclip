@@ -323,6 +323,7 @@ export const ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES = [
   "eligible",
   "retained_in_use",
   "retained_fresh",
+  "retained_nested_checkout",
   "vanished",
   "failed",
 ] as const;
@@ -5090,7 +5091,10 @@ function ensureRegistry(): {
         + "{home, session} allowlist (BLO-36814). Its own series, not an outcome "
         + "label: a rise above baseline means the tree is more heterogeneous than "
         + "the allowlist was validated against. BLO-36735 measured that baseline "
-        + "as 1 at maxAgeDays=30 (a stray wt-blo-19094 git worktree).",
+        + "as 1 at maxAgeDays=30 (a stray wt-blo-19094 git worktree). A directory "
+        + "whose top level DID match but which holds a nested git checkout is not "
+        + "counted here; it is " + ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC
+        + "{outcome=\"retained_nested_checkout\"}.",
       labelNames: ["dry_run"],
       registers: [registry],
     });
@@ -5110,7 +5114,8 @@ function ensureRegistry(): {
       name: ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC,
       help:
         "Routine per-entry isolation-workspace reaper outcomes, labeled by bounded "
-        + "outcome (eligible, retained_in_use, retained_fresh, vanished, failed). "
+        + "outcome (eligible, retained_in_use, retained_fresh, retained_nested_checkout, "
+        + "vanished, failed). "
         + "The two findings outcomes — skipped_layout and retained_resurrected — "
         + "are deliberately NOT in this counter; they have their own series so no "
         + "sum-by aggregates them away.",
@@ -7288,6 +7293,7 @@ export function recordIsolationWorkspaceReapSweep(
       eligible: result.eligible,
       retained_in_use: result.retainedInUse,
       retained_fresh: result.retainedFresh,
+      retained_nested_checkout: result.retainedNestedCheckout,
       vanished: result.vanished,
       failed: result.failed,
     };

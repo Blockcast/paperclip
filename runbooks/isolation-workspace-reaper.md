@@ -33,6 +33,7 @@ Neither is part of this alert; both are non-routine when non-zero.
 
 - `paperclip_isolation_workspace_reaper_retained_resurrected_total` — a workspace used again between the sweep's opening snapshot and its unlink, i.e. one that came within a single query of being deleted underneath a live run. Any non-zero value is the exposure window the pre-unlink re-read exists to close, actually occurring.
 - `paperclip_isolation_workspace_reaper_skipped_layout_total` — directories skipped *unexamined* because their top level was not exactly `{home, session}`. Baseline measured **1** at `maxAgeDays=30` ([BLO-36735](https://paperclip.blockcast.net/BLO/issues/BLO-36735): a stray `wt-blo-19094` git worktree). A rise means the tree is more heterogeneous than the allowlist was validated against — investigate before widening the allowlist.
+  A directory whose top level *did* match but which holds a nested git checkout or worktree state is **not** counted here — it was examined, so it is `paperclip_isolation_workspace_reaper_entries_total{outcome="retained_nested_checkout"}` (routine; ~13 per sweep at the 2026-10-09 measurement).
 
 ## Check the mode before acting on `deleted`
 
