@@ -1125,34 +1125,193 @@ describe("run transcript scoping (PEN-3142)", () => {
     }
 
     /**
-     * PEN-3204 / merge of 2026-09-20: the four cases that pinned a
-     * `decideRunTranscriptRead` gate on `GET /workspace-operations/:operationId/log`
-     * were REMOVED here rather than repaired, because the route they described is no
-     * longer the route this branch ships.
+     * PEN-3204 / merge of 2026-09-20, REVISITED 2026-10-09. The merge removed four
+     * cases that pinned a `decideRunTranscriptRead` gate on
+     * `GET /workspace-operations/:operationId/log`, on the reasoning that master's
+     * `workspace_runtime:read` entitlement (BLO-34631) was strictly tighter and the
+     * transcript gate would change no bytes.
      *
-     * Master landed BLO-34631 on that same path while this PR was open, gating the
-     * body on the `workspace_runtime:read` entitlement instead. That control is
-     * strictly tighter for the population this gate protects: `workspace_runtime:read`
-     * is unmapped in `permissionForAction` and absent from the same-company agent
-     * allow-list (`services/authorization.ts`), so NO agent actor resolves
-     * `revealRuntimeConfig` and the content is withheld from every agent, owner or
-     * not. Stacking the transcript gate on top would have converted a withheld 200
-     * into a 403 and changed no bytes.
+     * That reasoning holds for AGENT actors and is why there is still no 403 here:
+     * `workspace_runtime:read` is unmapped in `permissionForAction` and absent from
+     * the same-company agent allow-list, so no agent resolves `revealRuntimeConfig`.
+     * Master's own both-directions cases in `agent-live-run-routes.test.ts` cover that
+     * population and stay green.
      *
-     * The coverage did not move to nothing — it moved to master's cases, which assert
-     * BOTH directions on this route and are green at this head:
-     * `agent-live-run-routes.test.ts` → "withholds workspace-operation log content
-     * from a reader without workspace_runtime:read", "discloses ... to a reader
-     * holding workspace_runtime:read", and "audits denied workspace-operation log
-     * access without reading content".
+     * It does NOT hold for human actors, which is what these cases restore. The two
+     * gates read the same unconstrained `company_memberships.membership_role` text
+     * column in OPPOSITE failure directions — the transcript gate normalizes it and
+     * fails CLOSED on an unrecognized role, `workspace_runtime:read` tests the raw
+     * column (`!== "viewer"`) and fails OPEN. `middleware/auth.ts` persists the Cloud
+     * stack role verbatim for anything that is not owner/admin, and
+     * `stackMembershipRole` admits `support`, so a `session` actor on that row is the
+     * divergent actor, real rather than hypothetical. Wider still, and refused on a
+     * DIFFERENT line: every cloud-tenant member, of every role, is refused on `source`
+     * before the role is read (Ally review 5477953658). Under the merged code both
+     * populations had the excerpts withheld on both list routes and were served the
+     * whole log body here, one URL over.
      *
-     * What is NOT settled by that, and is deliberately left to PEN-3204 rather than
-     * decided in a merge: whether the `runs:read_transcript` grant should reach this
-     * route at all. Under master's entitlement it does not.
-     *
-     * The cross-tenant 404 case below is kept — that posture is unchanged by either
-     * control, and it is the one assertion here that still describes shipped behaviour.
+     * These drive the route with the two decisions set INDEPENDENTLY, which is the
+     * composition the merge got wrong. Whether `authorization.ts` should answer
+     * `workspace_runtime:read` that way for an unknown role is a separate defect with
+     * a wider blast radius, and is not decided here.
      */
+
+    /**
+     * A cloud-tenant member whose stack role is persisted verbatim. Note it is refused by
+     * the `cloud_tenant` SOURCE check, not by the role normalization — see the
+     * per-population cases below for which line refuses which reader.
+     */
+    const cloudTenantSupportActor = {
+      type: "board",
+      userId: "user-1",
+      companyIds: ["company-1"],
+      source: "cloud_tenant",
+      isInstanceAdmin: false,
+      memberships: [{ companyId: "company-1", membershipRole: "support", status: "active" }],
+    };
+
+    /** Entitled for workspace runtime, denied the transcript — the divergence, as decided today. */
+    const decideRuntimeYesTranscriptNo = async (input: { action?: string }) =>
+      input.action === "workspace_runtime:read"
+        ? { allowed: true, action: input.action, reason: "allow_simple_company_member", explanation: "non-viewer member" }
+        : { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "Missing permission: runs:read_transcript." };
+
+    it("withholds the log body from a reader entitled by workspace_runtime:read but denied the transcript", async () => {
+      mockDecide.mockImplementation(decideRuntimeYesTranscriptNo);
+
+      const res = await requestApp(
+        await createApp(cloudTenantSupportActor),
+        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-1/log"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      // The whole point: the entitlement alone would have disclosed this.
+      expect(res.body.content).not.toContain(WORKSPACE_OP_CANARY);
+      expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
+      // Masked, not emptied — a withheld reader can still tell "logged nothing" apart
+      // from "withheld", and the state beside the body survives.
+      expect(res.body).toMatchObject({ offset: 0, nextOffset: 64, eof: true });
+      // It was the transcript decision that withheld it, not the entitlement.
+      expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "runs:read_transcript",
+        resource: expect.objectContaining({ type: "agent", agentId: runOwnerAgentId }),
+      }));
+    });
+
+    /**
+     * Ally review 5477953658 (Important #1). The changed population is every reader the
+     * entitlement admits but the transcript gate refuses, and its two halves are refused by
+     * DIFFERENT lines of `boardActorIsTranscriptOperator`, so each is pinned separately:
+     *
+     *   - any cloud-tenant member, whatever the role — `owner` is what a Cloud owner OR
+     *     admin is persisted as, `member` folds to `operator` — is refused on `source`.
+     *     Drop that check and both match the operator set and get the body.
+     *   - a `session` member with a non-union role is refused by the normalization.
+     *     Widen `normalizedTranscriptRole`'s fallback and `support` gets the body.
+     */
+    for (const [source, membershipRole] of [
+      ["cloud_tenant", "owner"],
+      ["cloud_tenant", "member"],
+      ["session", "support"],
+    ] as const) {
+      it(`withholds the log body from a ${source} ${membershipRole} the entitlement admits`, async () => {
+        mockDecide.mockImplementation(decideRuntimeYesTranscriptNo);
+
+        const res = await requestApp(
+          await createApp({
+            type: "board",
+            userId: "user-1",
+            companyIds: ["company-1"],
+            source,
+            isInstanceAdmin: false,
+            memberships: [{ companyId: "company-1", membershipRole, status: "active" }],
+          }),
+          (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-1/log"),
+        );
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
+        // Refused by falling through to the decider, not by a short-circuit, so an
+        // explicit `runs:read_transcript` grant would still admit this reader.
+        expect(mockDecide).toHaveBeenCalledWith(expect.objectContaining({
+          action: "runs:read_transcript",
+        }));
+      });
+    }
+
+    it("still discloses the log body to a reader holding both", async () => {
+      mockDecide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: input.action === "workspace_runtime:read" ? "allow_simple_company_member" : "allow_manager_chain",
+        explanation: "entitled on both",
+      }));
+
+      const res = await requestApp(
+        await createApp(cloudTenantSupportActor),
+        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-1/log"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.content).toBe(WORKSPACE_OP_CANARY);
+    });
+
+    it("withholds the log body of a run-less operation from a non-operator who holds the entitlement", async () => {
+      // The fail-closed branch on this route: no `heartbeatRunId` means no owner to
+      // decide about, so there is nothing the transcript gate can admit on. Mirrors
+      // `withholdUnentitledWorkspaceOperationOutput` rather than re-deriving it.
+      mockWorkspaceOperationService.getById.mockResolvedValue(runlessCleanupOperation);
+      mockDecide.mockImplementation(decideRuntimeYesTranscriptNo);
+
+      const res = await requestApp(
+        await createApp(cloudTenantSupportActor),
+        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-2/log"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain(WORKSPACE_OP_CANARY);
+    });
+
+    it("gives an operator the run-less operation's log, so the fail-closed branch is not a blanket deny", async () => {
+      mockWorkspaceOperationService.getById.mockResolvedValue(runlessCleanupOperation);
+      mockDecide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_simple_company_member",
+        explanation: "non-viewer member",
+      }));
+
+      const res = await requestApp(
+        await createApp({
+          type: "board",
+          userId: "user-1",
+          companyIds: ["company-1"],
+          source: "session",
+          isInstanceAdmin: false,
+          memberships: [{ companyId: "company-1", membershipRole: "operator", status: "active" }],
+        }),
+        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-2/log"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.content).toBe(WORKSPACE_OP_CANARY);
+    });
+
+    it("books the withheld read as withheld in the access audit", async () => {
+      // BLO-34631 added `withheld` for audit accuracy; it has to follow the composed
+      // decision, or the audit says a withheld read disclosed the body.
+      mockDecide.mockImplementation(decideRuntimeYesTranscriptNo);
+
+      await requestApp(
+        await createApp(cloudTenantSupportActor),
+        (baseUrl) => request(baseUrl).get("/api/workspace-operations/op-1/log"),
+      );
+
+      expect(auditCallsFor("workspace_operation.log_accessed")[0]?.[1]?.details).toMatchObject({
+        result: "allowed",
+        withheld: true,
+      });
+    });
 
     it("keeps the cross-tenant 404 rather than exposing the new 403", async () => {
       mockWorkspaceOperationService.getById.mockResolvedValue({

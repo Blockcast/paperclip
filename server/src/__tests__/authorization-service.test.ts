@@ -4183,11 +4183,15 @@ describeEmbeddedPostgres("authorization service", () => {
      * PEN-3204. The captured output of a workspace operation reaches the wire on two
      * different controls: the list routes project `stdoutExcerpt` / `stderrExcerpt`
      * behind `runs:read_transcript`, while the per-operation `/log` body is withheld
-     * behind `workspace_runtime:read` (BLO-34631). PEN-3204 decided NOT to stack the
-     * transcript gate on the second one, because the entitlement is already strictly
-     * tighter — no agent resolves it, so the body is withheld from every agent.
+     * behind `workspace_runtime:read` (BLO-34631) ANDed with the transcript decision.
+     * PEN-3204 first left the second one on the entitlement alone, as strictly tighter
+     * — no agent resolves it, so the body is withheld from every agent. That holds for
+     * agents only; the AND was added for humans, whose raw membership role the
+     * entitlement fails OPEN on (see the `/log` handler in `routes/agents.ts`).
      *
-     * That decision rests on the two actions staying disjoint for agents. That splits
+     * For agents the AND still rests on the two actions staying disjoint: an agent
+     * that resolved the entitlement would meet only the transcript gate, so
+     * `runs:read_transcript` would reach the `/log` body as a side effect. That splits
      * into two properties, and they are pinned by different mechanisms — only one of
      * them needs a test.
      *
@@ -4202,8 +4206,8 @@ describeEmbeddedPostgres("authorization service", () => {
      * The allow-list half is the one with no structural guard, so it is what this test
      * pins: a future widening of the same-company agent allow-list below for a
      * *runtime-config* workflow, which the PEN-2852 comment on that list explicitly
-     * invites. That widening would open transcript bytes as a side effect, on a route
-     * whose gate was never argued about transcripts, and it compiles cleanly.
+     * invites. That widening would open transcript bytes to grant holders as a side
+     * effect, reversing the narrowing PEN-3204 decided, and it compiles cleanly.
      *
      * This fails if the transcript grant ever carries into the runtime entitlement, so
      * the coupling has to be re-decided deliberately rather than inherited.

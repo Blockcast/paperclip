@@ -5450,7 +5450,10 @@ export function agentRoutes(
     // returns run-less workspace-scoped cleanup rows, so the rows in this one
     // response do not all share this run's owner, and `run.agentId` is the wrong
     // answer for the cleanup ones.
-    const owners = await workspaceOperations.owningAgentIdsByRunId(operations.map((op) => op.heartbeatRunId));
+    const owners = await workspaceOperations.owningAgentIdsByRunId(
+      operations.map((op) => op.heartbeatRunId),
+      run.companyId,
+    );
     const projected = await withholdUnentitledWorkspaceOperationOutput(
       publicWorkspaceOperations(operations, viewer),
       owners,
@@ -5499,25 +5502,91 @@ export function agentRoutes(
       throw error;
     }
 
-    // PEN-3204 / merge of 2026-09-20: this route is deliberately left on BLO-34631's
-    // `workspace_runtime:read` entitlement and is NOT additionally gated on
-    // `decideRunTranscriptRead`, even though the sibling list routes are. The reason is that the
-    // entitlement already answers the transcript question here and answers it more tightly:
-    // `workspace_runtime:read` is unmapped in `permissionForAction` and absent from the
-    // same-company agent allow-list (`services/authorization.ts`), so NO agent actor resolves
-    // `revealRuntimeConfig` — the content below is withheld from every agent, owner or not. A
-    // transcript gate stacked on top would convert a withheld 200 into a 403 for non-owners and
-    // change nothing about which bytes leave.
+    // PEN-3204 / merge of 2026-09-20, SUPERSEDED 2026-10-09 — kept because the half of it that
+    // still holds is load-bearing. The merge left this route on BLO-34631's
+    // `workspace_runtime:read` entitlement and deliberately did NOT also gate it on
+    // `decideRunTranscriptRead`, reasoning that the entitlement answers the transcript question
+    // more tightly: `workspace_runtime:read` is unmapped in `permissionForAction` and absent from
+    // the same-company agent allow-list (`services/authorization.ts`), so NO agent actor resolves
+    // `revealRuntimeConfig`.
     //
-    // That is a narrower claim than "this route is done": stacking the two would also close the
-    // `runs:read_transcript` grant's effect here, which is a product decision about the grant's
-    // reach rather than a leak. It belongs to PEN-3204 with BLO-34631's survey in hand, not to a
-    // merge resolution on PEN-3142.
+    // That reasoning is correct for AGENT actors and is still why this route needs no 403 for
+    // them. It did NOT hold for human actors — see the divergence documented at the gate below,
+    // which is now closed. The route IS additionally gated on `decideRunTranscriptRead` as of
+    // that change, so read this paragraph as the agent-side rationale only.
+    //
+    // Still parked, and deliberately NOT changed by that fix: whether `runs:read_transcript`
+    // should REACH this route. The gate below is an AND, so a grant holder who lacks
+    // `workspace_runtime:read` still gets the masked body. Widening that is a product decision
+    // about the grant's reach rather than a leak, and it wants BLO-34631's survey in hand.
     //
     // Viewer first: the audit record has to say whether this read actually disclosed anything, and
     // only the entitlement knows that. Resolved after the two denial paths, so a caller who never
     // clears company access costs no entitlement lookup.
     const viewer = await resolveWorkspaceRuntimeViewer(access, req, operation.companyId);
+    // PEN-3204: AND the run-transcript decision onto the workspace-runtime entitlement, closing
+    // the fail-open half of the paragraph above. That paragraph is right that
+    // `workspace_runtime:read` is tighter than the transcript gate FOR AGENTS — it is absent from
+    // the same-company agent allow-list (PEN-2852), so no agent resolves `revealRuntimeConfig`.
+    // It does not hold for humans. The readers whose answer changes are exactly the ones the
+    // entitlement admits but the transcript gate refuses, and there are two populations of them:
+    //
+    //   - Every non-viewer CLOUD-TENANT member, regardless of role — a Cloud owner or admin
+    //     included (both are stamped `membershipRole: "owner"`, `middleware/auth.ts`).
+    //     `boardActorIsTranscriptOperator` refuses `source: "cloud_tenant"` ahead of any role
+    //     test (`routes/authz.ts`), and — absent an explicit `runs:read_transcript` grant — the
+    //     decider then answers `deny_missing_grant`, because that grant is seeded for no human
+    //     role (`grantsForHumanRole`). The entitlement does not deny them on fallthrough — the
+    //     cloud-tenant branch of `services/authorization.ts` returns nothing for
+    //     `workspace_runtime:read`, so it lands on the `!permissionKey` block and resolves
+    //     `allow_simple_company_member` for any non-viewer member. This is a user-visible Cloud
+    //     change: such a reader — a Cloud owner or admin included — now gets the masked body
+    //     here, which is what both list routes already give the same actor.
+    //   - Any SESSION member (or `board_key` actor — both load their membership rows from the
+    //     DB) holding a role outside the transcript gate's union. This is the case the
+    //     normalize-vs-raw divergence describes: the two gates read the SAME unconstrained
+    //     `company_memberships.membership_role` text column in OPPOSITE failure directions:
+    //
+    //       - the transcript gate normalizes it (`normalizeHumanRole(v, "viewer")`, union
+    //         `[owner, admin, operator, viewer]` + `member -> operator`) and so fails CLOSED on
+    //         an unrecognized role — deliberate, see `boardActorIsTranscriptOperator`;
+    //       - `workspace_runtime:read` tests the RAW column, `membershipRole !== "viewer"`
+    //         (`services/authorization.ts`, `allow_simple_company_member`), and so fails OPEN.
+    //
+    //     A non-union role really is written: `middleware/auth.ts` persists the Cloud stack role
+    //     verbatim for anything that is not owner/admin, and `stackMembershipRole` admits
+    //     `support`, so a session actor reading that same membership row carries `support`.
+    //
+    // Both populations had the captured output withheld on BOTH list routes while this route —
+    // one URL over — served the whole log body. That is the "gate on one sibling and not the
+    // other" failure this series exists to close, reproduced by the very substitution that was
+    // argued as tighter.
+    //
+    // Strictly narrowing, so it reopens nothing: no reader gains the body. Operator-grade
+    // SESSION and `board_key` humans and the local board are admitted by the transcript gate as
+    // before, and viewers and agents are already withheld by the entitlement. In particular this
+    // is an AND and not an OR, so it does NOT widen `runs:read_transcript` into this route — that
+    // remains the parked product question above, untouched.
+    //
+    // Owner resolution mirrors `withholdUnentitledWorkspaceOperationOutput` rather than
+    // re-deriving it: a run-less operation has no owner to decide about, so it falls back to the
+    // same human-operator test that helper uses, and withholds for everyone else.
+    //
+    // Only asked once the entitlement admits the reader: an AND cannot be turned true by its
+    // second half, and the entitlement withholds every agent actor, so resolving the owner first
+    // cost a `heartbeat_runs` SELECT on each `paperclip run workspace-log` poll that could never
+    // disclose anything (Ally review 5473959448). The decision and the audit flag are unchanged.
+    let revealLogContent = viewer.revealRuntimeConfig;
+    if (revealLogContent) {
+      const owners = await workspaceOperations.owningAgentIdsByRunId(
+        [operation.heartbeatRunId],
+        operation.companyId,
+      );
+      const ownerAgentId = operation.heartbeatRunId ? owners.get(operation.heartbeatRunId) : undefined;
+      revealLogContent = ownerAgentId
+        ? await runTranscriptReadGate(req, access, operation.companyId)(ownerAgentId)
+        : boardActorIsTranscriptOperator(req, operation.companyId);
+    }
     // BLO-34738: then `readLog`, and only then the audit. It throws
     // `notFound("Workspace operation log not found")` when the operation stored no log
     // (`services/workspace-operations.ts`), so auditing first booked `result: "allowed",
@@ -5529,7 +5598,7 @@ export function agentRoutes(
       offset: normalizedOffset,
       limitBytes,
     });
-    await audit("allowed", !viewer.revealRuntimeConfig);
+    await audit("allowed", !revealLogContent);
 
     res.set("Cache-Control", "no-cache, no-store");
     // BLO-34631. `content` is the stored chunk verbatim — the write-time sanitizer is a heuristic
@@ -5542,7 +5611,7 @@ export function agentRoutes(
     res.json(redactCurrentUserValue(
       {
         ...result,
-        content: viewer.revealRuntimeConfig
+        content: revealLogContent
           ? result.content
           : maskWorkspaceRuntimeTextForRead(result.content),
       },
