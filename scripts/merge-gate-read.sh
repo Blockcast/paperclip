@@ -106,10 +106,13 @@ run_extract() { # stdin: actions/runs API body (one object per page) -> run rows
   # Field ORDER is the contract with dead_runs(); a transposition here is
   # invisible at runtime and silently empties DEAD. @tsv renders a null as the
   # empty string, which dead_runs() treats as "no timestamp" and fails CLOSED.
-  # status/name are APPENDED, never interleaved: dead_runs() reads $1..$5 and a
-  # 5-field fixture row must keep meaning what it meant.
+  # status/name/updated_at are APPENDED, never interleaved: dead_runs() reads
+  # $1..$5 plus $8 and a 5-field fixture row must keep meaning what it meant.
+  # $8 is the run's `updated_at` — for a completed run, when it CONCLUDED. See
+  # the "still in flight" paragraph in dead_runs() for why the sibling arm needs
+  # the success's END and not only its start, and why an absent $8 is safe.
   jq -r '.workflow_runs[]|[.workflow_id,.event,.id,.conclusion,.run_started_at,
-                           .status,.name]|@tsv'
+                           .status,.name,.updated_at]|@tsv'
 }
 
 pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
@@ -227,7 +230,7 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses; $2 non-empty = print o
   #                 nothing replaced it. That job produced NO VERDICT, which is a
   #                 STOP. Dropping it is a merge-authorizing false GREEN.
   #
-  # BLO-34619: supersession was proxied through `max run id == the survivor`.
+  # BLO-34367: supersession was proxied through `max run id == the survivor`.
   # Run ids are monotonic, so that reads as sound, but when a workflow fires
   # SEVERAL runs at one head in the same second the concurrency arbiter's
   # survivor is NOT reliably the highest id. Measured on trafficcontrol#1870 @
@@ -241,7 +244,9 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses; $2 non-empty = print o
   #
   # So ask the API the question instead of proxying it through id ordering: a
   # cancelled run is stale iff a SIBLING run concluded `success` AND THAT
-  # SUCCESS STARTED AT OR AFTER THE CANCELLED RUN DID.
+  # SUCCESS WAS STILL IN FLIGHT WHEN THE CANCELLED RUN STARTED — i.e. the
+  # success's `updated_at` ($8, its conclusion time) is at or after the victim's
+  # `run_started_at`.
   #
   # The temporal half is not decoration. Supersession is DIRECTIONAL in time —
   # cancel-in-progress kills the incumbent when a LATER run enters the group —
@@ -253,10 +258,38 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses; $2 non-empty = print o
   # an older success is the common case there, not an exotic one. Direction of
   # the un-ordered failure is GREEN, which is why it is a guard and not a taste.
   #
+  # BLO-42196: the ordering is against the success's END, not its START, and
+  # that distinction is the whole of this row. Keyed on the start alone, the test
+  # asserts that a pass which supersedes a cancel STARTED at-or-after it — true
+  # for cancel-in-progress on a new push, and INVERTED for a same-head burst,
+  # where the arbiter's survivor is the EARLIEST run and its casualties enter the
+  # group a second later. Measured twice on the same lane: trafficcontrol#2239 @
+  # b7d6ce16 (success 07:45:11->07:45:35, three casualties all start 07:45:12)
+  # and #2240 @ 2cb6659d (success 10:59:56->11:00:19, casualties 10:59:57). Both
+  # printed three NO-VERDICT rows that NO later run can ever clear, on a head
+  # whose `review-gate` concluded `success` — permanent unclearable noise, which
+  # is how a reader learns to skim past a line that matters.
+  # `updated_at` keeps the guard above intact rather than relaxing it: a success
+  # that had already CONCLUDED before the victim even started cannot have
+  # displaced it, which is exactly the be0a7003 shape (that success ran
+  # 10:29:56->10:33:31, 46 minutes clear of the 11:19:06 cancellation). Using
+  # `passed_at_head[wf]` here instead — tempting, already computed — deletes the
+  # ordering outright and re-opens that false GREEN.
+  # Note the direction is the OPPOSITE of the witness arm's `min(start, publish)`
+  # below, deliberately: that arm tightens an off-head witness to a tree it
+  # cannot predate, this one widens a SAME-head, SAME-lane pass to the interval
+  # it actually occupied. `max($8, $5)`, not `$8` alone: a row with no $8 (every
+  # 5- and 7-field fixture, and any API response that renders the field null)
+  # falls back to `run_started_at` and so to the strictly TIGHTER pre-BLO-42196
+  # test — missing data fails toward STOP, never toward retiring a victim.
+  # Accepted residual, stated because it is the green-direction cost: a re-run
+  # bumps a run's `updated_at`, so a success later re-run at this head widens its
+  # own window. Bounded to that lane, to that head, and to a run that passed.
+  #
   # `>=`, NOT `>`. run_started_at is SECOND-resolution and a concurrency burst
   # lands inside one second: on trafficcontrol#1870 @ 39e233c3 the surviving
   # success starts 00:04:04 and two of its three casualties start 00:04:04 too.
-  # Under `>` both are retained and BLO-34619 re-opens as a false RED. A later
+  # Under `>` both are retained and BLO-34367 re-opens as a false RED. A later
   # "tightening" to `>` is the obvious-looking cleanup; the fixture is the fence.
   #
   # A sibling is same workflow AND SAME EVENT. Dropping `event` from the key is
@@ -285,7 +318,7 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses; $2 non-empty = print o
   # `!= ""`: on the entry side "" can never win a max, and on the END side an
   # unset newest_pass already loses `>=` against any ISO timestamp, so it fails
   # closed on its own. A `newest_pass[grp[i]] != ""` term shipped here
-  # through BLO-34619 and was deleted on review — all 52 tests stayed green with
+  # through BLO-34367 and was deleted on review — all 52 tests stayed green with
   # it removed, i.e. it was a comment wearing the costume of code, the same
   # shape this paragraph rejects on the entry side.
   # That deletion does NOT rest on the string/numeric compare mode, which was the
@@ -496,7 +529,8 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses; $2 non-empty = print o
                 e = (P[2] < P[3] ? P[2] : P[3])   # earlier of run-start, publish
                 if (e > ext[P[1]]) ext[P[1]] = e } }
     { key = $1 FS $2
-      if ($4 == "success") { newest_pass[key] = ($5 > newest_pass[key] ? $5 : newest_pass[key])
+      if ($4 == "success") { p = ($8 > $5 ? $8 : $5)   # later of run-start, conclude
+                             newest_pass[key] = (p > newest_pass[key] ? p : newest_pass[key])
                              passed_at_head[$1] = 1 }
       if ($4 == "cancelled" || $4 == "failure") {
         id[n] = $3; grp[n] = key; wf[n] = $1; started[n] = $5

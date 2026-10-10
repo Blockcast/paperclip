@@ -343,7 +343,7 @@ describe("merge-gate reader", () => {
       );
     });
 
-    // BLO-34619. Supersession used to be proxied through `max run id == the
+    // BLO-34367. Supersession used to be proxied through `max run id == the
     // survivor`. When a workflow fires several runs at one head in the same
     // second the arbiter's survivor is not reliably the highest id — measured on
     // trafficcontrol#1870 @ 39e233c3, where it is the THIRD of four. Max-id was
@@ -356,7 +356,7 @@ describe("merge-gate reader", () => {
     //
     // run_started_at are live API values, and the TIE is load-bearing: the
     // survivor starts 00:04:04 and two of its casualties start 00:04:04 too.
-    // Under `>` instead of `>=` those two are retained and BLO-34619 re-opens.
+    // Under `>` instead of `>=` those two are retained and BLO-34367 re-opens.
     it("drops a cancelled run that outranks its successful sibling by id", () => {
       assert.equal(
         dead([
@@ -547,7 +547,7 @@ describe("merge-gate reader", () => {
       );
     });
 
-    // BLO-34619, the other direction. Sibling-success is a SET test; supersession
+    // BLO-34367, the other direction. Sibling-success is a SET test; supersession
     // is DIRECTIONAL in time. Without ordering, a success that ran BEFORE the
     // cancellation deletes it — so a lane that passed and was LATER terminally
     // cancelled reads green. Measured live on trafficcontrol @ be0a7003, lane
@@ -561,6 +561,66 @@ describe("merge-gate reader", () => {
         dead([
           ["900", "pull_request", "111", "success", "2026-09-19T10:29:56Z"],
           ["900", "pull_request", "222", "cancelled", "2026-09-19T11:19:06Z"],
+        ]),
+        "",
+      );
+    });
+
+    // BLO-42196. The ordering above is against the success's END, not its START,
+    // and these three fixtures are the fence on that distinction. Keyed on the
+    // start alone the test asserts a superseding pass STARTED at-or-after its
+    // victim — true for cancel-in-progress on a new push, INVERTED for a
+    // same-head burst where the arbiter's survivor is the EARLIEST run and its
+    // casualties enter the group a second later. Measured twice on one lane:
+    // trafficcontrol#2239 @ b7d6ce16 and #2240 @ 2cb6659d, three permanent
+    // unclearable NO-VERDICT rows each, on a head whose `review-gate` passed.
+    //
+    // Rows, ids and BOTH timestamps are live API values, and the 8th field is
+    // the point — these fixtures are the only ones in this file that carry it.
+    it("drops burst casualties whose surviving sibling started one second EARLIER", () => {
+      assert.equal(
+        dead([
+          ["323092531", "pull_request_target", "37921015794", "success", "2026-10-09T10:59:56Z",
+           "completed", "review-gate", "2026-10-09T11:00:19Z"],
+          ["323092531", "pull_request_target", "37921016133", "cancelled", "2026-10-09T10:59:57Z",
+           "completed", "review-gate", "2026-10-09T10:59:58Z"],
+          ["323092531", "pull_request_target", "37921016382", "cancelled", "2026-10-09T10:59:57Z",
+           "completed", "review-gate", "2026-10-09T10:59:58Z"],
+          ["323092531", "pull_request_target", "37921016552", "cancelled", "2026-10-09T10:59:57Z",
+           "completed", "review-gate", "2026-10-09T11:00:06Z"],
+        ]),
+        "37921016133|37921016382|37921016552",
+      );
+    });
+
+    // ...and the BLO-34367 guard survives it, which is what makes the widening a
+    // widening and not a deletion. Same pair as "ran BEFORE it" above, now with
+    // the real ids and the real `updated_at`: that success CONCLUDED at 10:33:31,
+    // 46 minutes clear of the 11:19:06 cancellation, so it cannot have displaced
+    // it. Substituting `passed_at_head[wf]` for the ordering term — tempting,
+    // already computed — passes the burst fixture above and fails this one.
+    it("keeps a cancelled run whose sibling success had already CONCLUDED", () => {
+      assert.equal(
+        dead([
+          ["323092531", "issue_comment", "35437563292", "success", "2026-09-19T10:29:56Z",
+           "completed", "review-gate", "2026-09-19T10:33:31Z"],
+          ["323092531", "issue_comment", "35439779269", "cancelled", "2026-09-19T11:19:06Z",
+           "completed", "review-gate", "2026-09-19T11:19:08Z"],
+        ]),
+        "",
+      );
+    });
+
+    // ...and an absent 8th field falls back to `run_started_at`, i.e. to the
+    // strictly TIGHTER pre-BLO-42196 test — missing data fails toward STOP.
+    // Same burst shape as the first fixture with $8 stripped: the casualties are
+    // KEPT. This is what `max($8, $5)` buys over `$8` alone, and it is why none
+    // of the five- and seven-field fixtures in this file changed meaning.
+    it("falls back to run_started_at when a run carries no updated_at", () => {
+      assert.equal(
+        dead([
+          ["323092531", "pull_request_target", "37921015794", "success", "2026-10-09T10:59:56Z"],
+          ["323092531", "pull_request_target", "37921016133", "cancelled", "2026-10-09T10:59:57Z"],
         ]),
         "",
       );
@@ -728,10 +788,10 @@ describe("merge-gate reader", () => {
       // ...while the SIBLING arm must still retire that same failed victim: a
       // pass at THIS head is the same tree and the same lane, so it IS evidence
       // about this code. Ally review 5375356236 measured that over-applying
-      // `cx` to the sibling arm is ALSO killed by the BLO-34619 fixture above,
+      // `cx` to the sibling arm is ALSO killed by the BLO-34367 fixture above,
       // so this is not the only thing standing between `cx` and that
       // regression — it is redundant cover, kept because it names the intent at
-      // the point of the narrowing, where the BLO-34619 fixture does not.
+      // the point of the narrowing, where the BLO-34367 fixture does not.
       it("still retires a FAILED victim on an at-head pass by its own lane", () => {
         assert.equal(
           dead([
@@ -926,7 +986,7 @@ describe("merge-gate reader", () => {
     assert.doesNotMatch(lines.join("\n"), /ABSENT/);
   });
 
-  // BLO-34619 end to end, on the measured shape. Blockcast/trafficcontrol#1870 @
+  // BLO-34367 end to end, on the measured shape. Blockcast/trafficcontrol#1870 @
   // 39e233c3: `review-gate` fired four pull_request_target runs inside one
   // second, and the ONE that survived is the third of four. The old max-id proxy
   // got this exactly backwards in both directions at once — it spared the
@@ -1360,20 +1420,22 @@ describe("merge-gate reader", () => {
             run_started_at: "2026-09-19T00:04:04Z",
             status: "completed",
             name: "review-gate",
+            updated_at: "2026-09-19T00:05:37Z",
           },
         ]),
         [
           "323092531\tpull_request_target\t35408039808\tsuccess\t2026-09-19T00:04:04Z\t" +
-            "completed\treview-gate",
+            "completed\treview-gate\t2026-09-19T00:05:37Z",
         ],
       );
     });
 
-    // BLO-37887 appended status+name. dead_runs() reads $1..$5 and every stale-run
-    // fixture in this file still passes 5-field rows, so this pins that the two new
-    // fields are APPENDED and not interleaved. A transposition would leave every
-    // dead_runs() fixture green while silently emptying DEAD on the live path.
-    it("appends status and name after the fields dead_runs() reads", () => {
+    // BLO-37887 appended status+name; BLO-42196 appended updated_at. dead_runs()
+    // reads $1..$5 plus $8 and every stale-run fixture in this file still passes
+    // 5-field rows, so this pins that the three new fields are APPENDED and not
+    // interleaved. A transposition would leave every dead_runs() fixture green
+    // while silently emptying DEAD on the live path.
+    it("appends status, name and updated_at after the fields dead_runs() reads", () => {
       const row = runExtract([
         {
           workflow_id: 10,
@@ -1383,6 +1445,7 @@ describe("merge-gate reader", () => {
           run_started_at: "2026-09-29T11:45:33Z",
           status: "pending",
           name: "Go Unit Tests",
+          updated_at: "2026-09-29T11:46:00Z",
         },
       ])[0].split("\t");
       assert.deepEqual(row.slice(0, 5), [
@@ -1392,12 +1455,15 @@ describe("merge-gate reader", () => {
         "",
         "2026-09-29T11:45:33Z",
       ]);
-      assert.deepEqual(row.slice(5), ["pending", "Go Unit Tests"]);
+      assert.deepEqual(row.slice(5), ["pending", "Go Unit Tests", "2026-09-29T11:46:00Z"]);
     });
 
     // Composed across the seam: @tsv renders a null as the empty string, and
     // dead_runs() must read that as "no timestamp" and keep the run — not as a
-    // timestamp that compares low enough to retire it.
+    // timestamp that compares low enough to retire it. The success carries a
+    // real BLO-42196 `updated_at` on purpose: `started[i] != ""` has to fence
+    // the victim BEFORE any comparison, so a present-and-later sibling window
+    // must still not retire a run whose own start is unknown.
     it("renders a null run_started_at as empty, and that fails closed", () => {
       const rows = runExtract([
         {
@@ -1408,6 +1474,7 @@ describe("merge-gate reader", () => {
           run_started_at: null,
           status: "completed",
           name: "ci",
+          updated_at: "2026-09-19T01:06:00Z",
         },
         {
           workflow_id: 10,
@@ -1417,9 +1484,10 @@ describe("merge-gate reader", () => {
           run_started_at: "2026-09-19T01:05:00Z",
           status: "completed",
           name: "ci",
+          updated_at: "2026-09-19T01:10:00Z",
         },
       ]);
-      assert.equal(rows[0], "10\tpush\t100\tcancelled\t\tcompleted\tci");
+      assert.equal(rows[0], "10\tpush\t100\tcancelled\t\tcompleted\tci\t2026-09-19T01:06:00Z");
       assert.equal(dead(rows.map((r) => r.split("\t"))), "");
     });
   });
