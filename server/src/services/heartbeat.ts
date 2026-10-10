@@ -2904,6 +2904,35 @@ export async function resolveExecutionRunAdapterConfig(input: {
       );
     }
   }
+  // BLO-39715 AC 6: opt-in per-run redaction canary.
+  //
+  // The acceptance check for the run-secret redactor is "emit a value that is in
+  // this run's own resolved secret set, then read the stored transcript back".
+  // No agent identity can register such a value: `secretKeys` only ever gains a
+  // key through a `secret_ref` / `user_secret_ref`, minting a company secret is
+  // board-only, and the plain-schema-field path that auto-mints one explicitly
+  // refuses agent callers. So the server mints the probe instead.
+  //
+  // OPT-IN, deliberately, and this is the part not to "simplify" away. An
+  // unconditional needle would engage `createRunSecretBoundaryCarry` on every
+  // run in the fleet: a run whose needle set is empty takes the
+  // `needles.length === 0` short-circuit today, and switching the line-boundary
+  // holdback on everywhere widens the crash-loss window from zero to "everything
+  // since the last newline" and adds per-chunk work — a real cost paid by every
+  // run, to serve a check that only the verifying lane needs. The flag lives on
+  // the agent's own `adapterConfig` so that lane can turn it on and off itself
+  // without a deploy and without touching anyone else.
+  //
+  // The value carries no authority and is regenerated per run, so a run that
+  // leaks it has disclosed nothing. That is what makes it safe to emit on
+  // purpose, which a real credential never is.
+  if (asBoolean((executionRunConfig as Record<string, unknown>).redactionCanary, false)) {
+    resolvedConfig.env = {
+      ...parseObject(resolvedConfig.env),
+      [RUN_REDACTION_CANARY_ENV_KEY]: createRunRedactionCanaryValue(),
+    };
+    secretKeys.add(RUN_REDACTION_CANARY_ENV_KEY);
+  }
   return {
     resolvedConfig,
     secretKeys,
@@ -4672,7 +4701,12 @@ export function boundHeartbeatRunEventPayloadForStorage(payload: Record<string, 
 // Imported for local use below and re-exported so existing importers and tests keep
 // their current entry point.
 import { compactRunLogChunk, sanitizeRunLogChunkForStorage } from "./log-chunk-sanitizer.js";
-import { buildRunSecretRedactionPlan, createRunSecretBoundaryCarry } from "./run-secret-redaction.js";
+import {
+  buildRunSecretRedactionPlan,
+  createRunRedactionCanaryValue,
+  createRunSecretBoundaryCarry,
+  RUN_REDACTION_CANARY_ENV_KEY,
+} from "./run-secret-redaction.js";
 export { compactRunLogChunk, sanitizeRunLogChunkForStorage };
 
 /**

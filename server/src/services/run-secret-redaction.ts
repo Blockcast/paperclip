@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { redactSecretValuesFromText } from "./plugin-config-masking.js";
 
 /**
@@ -57,6 +58,39 @@ export const AMBIGUOUS_BAND_MIN_LENGTH = 8;
  * {@link buildRunSecretRedactionPlan}. A residual gap that announces itself is a different
  * object from one that does not.
  */
+/**
+ * Env key carrying the per-run redaction canary (BLO-39715 AC 6).
+ *
+ * Not a secret. It is minted fresh per run, confers no authority anywhere, and
+ * a run that discloses it has disclosed nothing — which is the entire point: it
+ * exists so that the one check this module cannot otherwise pass ("emit a value
+ * that is in this run's resolved secret set, then read the stored transcript
+ * back") is performable by the agent the acceptance criterion assigns it to.
+ *
+ * Why the server has to mint it: every route into `secretKeys` requires a
+ * company `secret_ref`, creating a company secret is board-only, and the
+ * plain-schema-field path that would auto-mint one refuses agent callers
+ * outright ("Agent-authenticated callers cannot introduce a plain secret schema
+ * field", `secrets.ts`). Measured on 2026-10-10: five distinct routes, all 403
+ * or explicitly forbidden. Without this the redactor is verifiable only by a
+ * human, by hand, once per deploy — and an unverified detector is
+ * indistinguishable from one that never loaded.
+ */
+export const RUN_REDACTION_CANARY_ENV_KEY = "PAPERCLIP_RUN_REDACTION_CANARY";
+
+/**
+ * Mint a canary value.
+ *
+ * The format is load-bearing and is pinned by a test rather than left to
+ * inspection: it must satisfy {@link isRedactableSecretValue}, so a future
+ * "tidy-up" that shortens it to a bare token would silently demote the canary
+ * to an UNCOVERED key — the check would then report a gap on its own probe
+ * instead of on anything real.
+ */
+export function createRunRedactionCanaryValue(): string {
+  return `pc-redaction-canary-${randomUUID()}`;
+}
+
 export function isRedactableSecretValue(value: string): boolean {
   if (value.length >= ALWAYS_REDACT_MIN_LENGTH) return true;
   if (value.length < AMBIGUOUS_BAND_MIN_LENGTH) return false;
