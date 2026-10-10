@@ -207,10 +207,20 @@ The read uses Node's own `fetch`, not the host's `ctx.http`: the host's plugin
 fetch refuses any target that resolves only to private addresses (an SSRF
 guard), and the Alertmanager it must reach is a cluster-internal ClusterIP, so
 through `ctx.http` every read failed and the ladder silently fell back to
-"not verified". Each read is capped at 5s, memoised per alertname within one
-sweep pass, and the first transport failure (refused, timed out) is reused for
-the rest of that pass — so a hanging Alertmanager costs a sweep one timeout,
-not one per due issue.
+"not verified". Each read is capped at 5s for the whole exchange — headers
+*and* body, so a proxy that answers `200` and then stalls is bounded too —
+memoised per alertname within one sweep pass, and the first transport failure
+(refused, timed out, body stalled) is reused for the rest of that pass — so a
+hanging Alertmanager costs a sweep one timeout, not one per due issue.
+
+Bypassing `ctx.http` also bypasses its `http:`/`https:` scheme allowlist, so
+the read applies its own: any other scheme (e.g. `data:`, which would answer
+with a body of the configurer's choosing) is not read, and the ladder fails
+open with "liveness NOT verified". The comment carries a fixed reason sentence
+only; the raw transport or parse error — which can include resolved addresses,
+ports, and response bytes — goes to the plugin log, never into the issue. The
+manifest declares `http.outbound` for this reach even though the host does not
+enforce it on a direct `fetch`, so it shows up where capabilities are reviewed.
 
 The Paperclip pods must also be allowed to reach that address. As read on
 2026-10-09 they are not: `monitoring` runs `default-deny-all` and admits

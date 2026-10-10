@@ -12,11 +12,12 @@ const COVERS_TABLE = "alert_escalation_covers";
 const MEMBERS_TABLE = "alert_escalation_cover_members";
 const STUCK_COVER_RECONCILE_LIMIT = 200;
 /**
- * Per-call cap on the Alertmanager liveness read (BLO-40739). The sweep runs
- * every minute and walks due issues sequentially, so a reachable-but-hanging
- * Alertmanager must cost it seconds, not the 30s the host's own fetch allows.
- * Combined with `createSweepLivenessReader`'s short-circuit, one hanging
- * Alertmanager costs a sweep at most one of these, however many issues are due.
+ * Per-call cap on the Alertmanager liveness read (BLO-40739), covering the
+ * whole exchange — headers AND body. The sweep runs every minute and walks due
+ * issues sequentially, so a reachable-but-hanging Alertmanager must cost it
+ * seconds, not the 30s the host's own fetch allows. Combined with
+ * `createSweepLivenessReader`'s short-circuit, one hanging Alertmanager costs a
+ * sweep at most one of these, however many issues are due.
  */
 const ALERTMANAGER_READ_TIMEOUT_MS = 5_000;
 
@@ -111,50 +112,81 @@ type LivenessReader = (alertname: string) => Promise<AlertLiveness>;
  * public address — through `ctx.http` every read failed, so the feature was
  * inert in production while mocked tests passed. The SDK permits direct
  * `fetch` (`PluginHttpClient` docs); the target is operator configuration, not
- * request input. Losing the host's 30s cap is why the timeout is our own.
+ * request input. Losing the host's 30s cap is why the timeout is our own, and
+ * losing its `http:`/`https:` allowlist is why the scheme check is too.
+ *
+ * Every `reason` is a fixed sentence: it is written into issue comments, and
+ * raw error text carries resolved addresses, ports, and response bytes. The
+ * raw error goes to the plugin log instead.
  */
 async function readAlertLiveness(
   config: AlertmanagerPluginConfig,
   alertname: string,
   now: Date,
+  logger: PluginContext["logger"],
 ): Promise<AlertLiveness> {
   const base = config.alertmanagerApiUrl?.trim().replace(/\/+$/, "");
   if (!base) return { state: "unknown", reason: "no alertmanagerApiUrl is configured for this instance" };
+  // `fetch` takes any scheme. A `data:` URL answers with a body of the
+  // configurer's choosing — `[]` would read every alert as clear and hold
+  // every ladder — so only an actual HTTP request counts as a read.
+  if (!["http:", "https:"].includes(URL.parse(base)?.protocol ?? "")) {
+    return { state: "unknown", reason: "alertmanagerApiUrl is not an http:// or https:// URL, so it was not read" };
+  }
   // Matcher values are double-quoted strings: escape `\` and `"` so a label
   // containing either still yields a well-formed matcher.
   const filter = encodeURIComponent(`alertname="${alertname.replace(/[\\"]/g, "\\$&")}"`);
   const url = `${base}/api/v2/alerts?active=true&silenced=true&inhibited=true&filter=${filter}`;
+  const failed = (err: unknown) => {
+    const cause = err instanceof Error && err.cause !== undefined ? ` (cause: ${String(err.cause)})` : "";
+    logger.warn(`alert-escalation: Alertmanager liveness read for ${alertname} failed: ${String(err)}${cause}`);
+  };
   let res: Response;
+  let text: string;
   try {
     res = await fetch(url, {
       method: "GET",
       headers: { accept: "application/json" },
       signal: AbortSignal.timeout(ALERTMANAGER_READ_TIMEOUT_MS),
     });
+    // The body is transport too, under the same signal: a server that sends
+    // headers and then stalls fails HERE, and must short-circuit the pass
+    // like one that never answered.
+    text = res.ok ? await res.text() : "";
   } catch (err) {
-    return { state: "unknown", reason: `Alertmanager read failed: ${String(err)}`, unreachable: true };
+    failed(err);
+    const timedOut = err instanceof Error && err.name === "TimeoutError";
+    return {
+      state: "unknown",
+      reason: timedOut
+        ? `the Alertmanager request did not complete within ${ALERTMANAGER_READ_TIMEOUT_MS / 1_000}s`
+        : "the Alertmanager request failed; the error is in the plugin log",
+      unreachable: true,
+    };
   }
+  if (!res.ok) return { state: "unknown", reason: `Alertmanager returned HTTP ${res.status}` };
+  let body: unknown;
   try {
-    if (!res.ok) return { state: "unknown", reason: `Alertmanager returned HTTP ${res.status}` };
-    const body: unknown = await res.json();
-    if (!Array.isArray(body)) return { state: "unknown", reason: "Alertmanager returned a non-array body" };
-    // Re-apply the filter locally. The server-side `filter` is the belt; this
-    // is the braces, and it guards the fail-open direction: an Alertmanager
-    // that ignored or mis-parsed the filter returns the WHOLE alert set, which
-    // would read as "firing" for every alertname on the cluster and silently
-    // restore the behaviour this guard exists to remove.
-    const matching = body.filter(
-      (entry) => (entry as { labels?: Record<string, string> } | null)?.labels?.alertname === alertname,
-    );
-    const readAt = now.toISOString();
-    if (matching.length === 0) return { state: "not-firing", readAt };
-    const states = [
-      ...new Set(matching.map((entry) => (entry as { status?: { state?: string } } | null)?.status?.state ?? "unknown")),
-    ].sort();
-    return { state: "firing", readAt, detail: `${matching.length} instance(s), state=${states.join("/")}` };
+    body = JSON.parse(text);
   } catch (err) {
-    return { state: "unknown", reason: `Alertmanager read failed: ${String(err)}` };
+    failed(err);
+    return { state: "unknown", reason: "Alertmanager returned a body that is not valid JSON" };
   }
+  if (!Array.isArray(body)) return { state: "unknown", reason: "Alertmanager returned a non-array body" };
+  // Re-apply the filter locally. The server-side `filter` is the belt; this
+  // is the braces, and it guards the fail-open direction: an Alertmanager
+  // that ignored or mis-parsed the filter returns the WHOLE alert set, which
+  // would read as "firing" for every alertname on the cluster and silently
+  // restore the behaviour this guard exists to remove.
+  const matching = body.filter(
+    (entry) => (entry as { labels?: Record<string, string> } | null)?.labels?.alertname === alertname,
+  );
+  const readAt = now.toISOString();
+  if (matching.length === 0) return { state: "not-firing", readAt };
+  const states = [
+    ...new Set(matching.map((entry) => (entry as { status?: { state?: string } } | null)?.status?.state ?? "unknown")),
+  ].sort();
+  return { state: "firing", readAt, detail: `${matching.length} instance(s), state=${states.join("/")}` };
 }
 
 /**
@@ -165,17 +197,22 @@ async function readAlertLiveness(
  *
  *  - Memoised by alertname: issues sharing an alert share one read, which is
  *    also one consistent answer across them for this pass.
- *  - Once a request fails at the transport level, the rest of the pass reuses
+ *  - Once a request fails at the transport level — connect, headers, or body
+ *    read, including the timeout on any of them — the rest of the pass reuses
  *    that failure instead of re-trying. A non-2xx or bad body is
  *    alertname-specific and does not short-circuit other alertnames.
  */
-function createSweepLivenessReader(config: AlertmanagerPluginConfig, now: Date): LivenessReader {
+function createSweepLivenessReader(
+  config: AlertmanagerPluginConfig,
+  now: Date,
+  logger: PluginContext["logger"],
+): LivenessReader {
   const reads = new Map<string, AlertLiveness>();
   let unreachable: AlertLiveness | null = null;
   return async (alertname) => {
     const cached = reads.get(alertname) ?? unreachable;
     if (cached) return cached;
-    const read = await readAlertLiveness(config, alertname, now);
+    const read = await readAlertLiveness(config, alertname, now, logger);
     reads.set(alertname, read);
     if (read.state === "unknown" && read.unreachable) unreachable = read;
     return read;
@@ -576,7 +613,7 @@ export async function runAlertEscalationSweep(ctx: PluginContext, config: Alertm
   const companyId = config.defaultCompanyId;
   if (!companyId) return;
   const issues = await ctx.issues.list({ companyId, originKind: ORIGIN_KIND, limit: 200 });
-  const readLiveness = createSweepLivenessReader(config, now);
+  const readLiveness = createSweepLivenessReader(config, now, ctx.logger);
   for (const issue of issues) {
     try {
       await advanceIssueLadder(ctx, config, issue, companyId, now, readLiveness);
