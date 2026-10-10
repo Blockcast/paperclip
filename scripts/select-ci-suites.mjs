@@ -103,8 +103,11 @@ const INERT_DIRS = [
   ".github",
   "docker",
   "tests",
-  // vendor/ is not a pnpm workspace; the vendored adapter has its own CI lane
-  // (`vendor_claude_k8s`). Only the files closure sources name by path are relevant.
+  // vendor/ is not a pnpm workspace; each vendored adapter has its own CI lane
+  // (`vendor_claude_k8s`, `vendor_opencode_k8s`). The exclusion is the generic
+  // `vendor` prefix and covers every tree under it, present and future -- do not
+  // narrow it to the lanes that happen to exist. Only the files closure sources
+  // name by path are relevant.
   "vendor",
   // Scripts are inert only for the unit groups, and only when no test command or
   // closure source reaches them.
