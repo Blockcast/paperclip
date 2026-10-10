@@ -153,9 +153,12 @@ for (const [label, override] of Object.entries(FAIL_OPEN)) {
   });
 }
 
-test("CI-control paths are exactly pr.yml, composite actions and this script", () => {
-  assert.equal(CI_CONTROL_PATHS.length, 3);
+test("CI-control paths are exactly pr.yml, composite actions, this script and master-health.yml", () => {
+  assert.equal(CI_CONTROL_PATHS.length, 4);
   assert.ok(CI_CONTROL_PATHS.some((re) => re.test(".github/workflows/pr.yml")));
+  // The trim is safe only because master-health.yml re-runs the server suites
+  // on master; a landing that changes that backstop must not itself be trimmed.
+  assert.ok(CI_CONTROL_PATHS.some((re) => re.test(".github/workflows/master-health.yml")));
   assert.ok(!CI_CONTROL_PATHS.some((re) => re.test(".github/workflows/e2e.yml")));
   assert.ok(!CI_CONTROL_PATHS.some((re) => re.test("scripts/__tests__/merge-group-trim.test.mjs")));
 });
