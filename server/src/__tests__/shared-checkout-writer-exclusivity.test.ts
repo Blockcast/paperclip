@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  derivePaperclipPrReview,
   isNonPrimaryWorkspaceTarget,
   resolveK8sRunIsolationIdentity,
   resolveProjectPrimaryWorkspaceId,
@@ -9,6 +10,7 @@ import {
 import {
   resolveProjectIdNeedingWorkspaceFallback,
   resolveWorkspaceWriterTreeKey,
+  runUsesStatelessReviewWorkspace,
 } from "../services/workspace-writer-key.js";
 
 /**
@@ -467,4 +469,90 @@ describe("the key reaches the reservation (end-to-end through the resolver)", ()
       });
     });
   }
+});
+
+/**
+ * BLO-42212: a HAND-FILED PR-review row must stop serializing behind the shared
+ * `project_primary` writer.
+ *
+ * The lane shape these lock down: many review rows, all bound to ONE project
+ * workspace (the BLO-40317 dispatch workaround), each waking `issue_assigned`
+ * so `derivePaperclipPrReview` is null for it. Before the label every one of
+ * them produced `project-primary:<pw>` and the lane ran one review at a time.
+ */
+describe("runUsesStatelessReviewWorkspace (BLO-42212)", () => {
+  const REVIEW_LABELS = ["stateless-review"];
+
+  it("is true for a webhook review with no labels at all", () => {
+    expect(runUsesStatelessReviewWorkspace({ webhookPrReview: true, issueLabelNames: null })).toBe(true);
+  });
+
+  it("is true for a hand-filed row carrying the label and NO webhook context", () => {
+    // The whole point: `webhookPrReview` is false here, as it is for every
+    // `issue_assigned` review row.
+    expect(runUsesStatelessReviewWorkspace({ webhookPrReview: false, issueLabelNames: REVIEW_LABELS }))
+      .toBe(true);
+  });
+
+  it("is false for an ordinary row, so the exclusion is NOT dropped by default", () => {
+    // The failure direction that matters. If this ever returns true for an
+    // unlabelled row, every shared-checkout run loses its writer key and
+    // BLO-19422 is back.
+    expect(runUsesStatelessReviewWorkspace({ webhookPrReview: false, issueLabelNames: ["backend", "infra"] }))
+      .toBe(false);
+    expect(runUsesStatelessReviewWorkspace({ webhookPrReview: false, issueLabelNames: null })).toBe(false);
+  });
+
+  it("does not match a label that merely CONTAINS the marker as a substring", () => {
+    expect(
+      runUsesStatelessReviewWorkspace({
+        webhookPrReview: false,
+        issueLabelNames: ["stateless-review-candidate", "needs-stateless-review"],
+      }),
+    ).toBe(false);
+  });
+
+  it("drops the writer key, so two labelled reviews on ONE project workspace stop colliding", () => {
+    // End-to-end through the key: this is the measured defect and its fix in
+    // one assertion pair. Same project workspace, two different review rows.
+    const keyFor = (issueId: string, labelNames: string[]) =>
+      resolveWorkspaceWriterTreeKey({
+        statelessPrReview: runUsesStatelessReviewWorkspace({
+          webhookPrReview: false,
+          issueLabelNames: labelNames,
+        }),
+        runResolvesToOwnTree: false,
+        usesPerRunScope: false,
+        issue: { id: issueId, projectWorkspaceId: PW },
+      });
+
+    // Unlabelled: the measured 2026-10-09 state -- one key, one writer, a
+    // serialized lane.
+    expect(keyFor("review-a", [])).toBe(`project-primary:${PW}`);
+    expect(keyFor("review-a", [])).toBe(keyFor("review-b", []));
+
+    // Labelled: no key at all, because the run no longer lands in that tree.
+    expect(keyFor("review-a", REVIEW_LABELS)).toBeNull();
+    expect(keyFor("review-b", REVIEW_LABELS)).toBeNull();
+  });
+
+  it("keeps the label from leaking into webhook-trusted PR-review context", () => {
+    // BLO-9293 guard, stated as a test so the cheap wrong fix is visibly out of
+    // bounds: the label may widen ISOLATION and must never make
+    // `derivePaperclipPrReview` non-null, because the reviewer-output gate
+    // trusts that object's `prAuthorLogin` as signed webhook data. A context
+    // that only carries a label-shaped hint must still derive to null.
+    //
+    // Every fixture carries `githubPrNumber`: without it `derivePaperclipPrReview`
+    // returns null at its `prNumber === null` check whatever the label logic
+    // does, so a widening on `labels`/`reviewKind` would pass this test
+    // unnoticed. The positive control proves the fixture is otherwise complete
+    // -- it derives non-null the moment a TRUSTED signal is present.
+    const prNumber = { githubPrNumber: 2416 };
+    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", reviewKind: "pr_review", ...prNumber }))
+      .not.toBeNull();
+    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", labels: REVIEW_LABELS, ...prNumber })).toBeNull();
+    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", reviewKind: "stateless-review", ...prNumber }))
+      .toBeNull();
+  });
 });
