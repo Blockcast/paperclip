@@ -968,7 +968,7 @@ describe("evaluateCommentReviewGate", () => {
     expect(verbs.filter((v) => !isPublishableToken(v)).length).toBeGreaterThan(0);
   });
 
-  it("keeps the ordinary reason when no unrecognized verb is involved", () => {
+  it("names the findings no ledger entry mentions when no unrecognized verb is involved", () => {
     const verdict = evaluateCommentReviewGate({
       prAuthorLogin: null,
       headSha: CURRENT_HEAD,
@@ -976,8 +976,121 @@ describe("evaluateCommentReviewGate", () => {
     });
 
     expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
-    expect(verdict.reason).toContain("is still undispositioned");
+    // The identity, in the exact token a ledger entry is written with, so the
+    // reader can copy it instead of deriving it from the review (BLO-42525).
+    expect(verdict.reason).toContain(`No ledger entry names prior:${OLD_HEAD.slice(0, 7)} "important 1"`);
     expect(verdict.reason).not.toContain("unrecognized");
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+  });
+
+  it("names the un-named mirror link rather than leaving the author tail as the only explanation", () => {
+    // The BLO-42525 shape, reproduced from moq#4: OLD_HEAD raises a finding,
+    // INTERMEDIATE_HEAD re-reports it as a mirror, and the ledger names only
+    // the ORIGINAL. Under #1707 every link in the chain needs its own entry, so
+    // INTERMEDIATE_HEAD stays carried — correctly. The defect was the message:
+    // the conditional tail about the attesting author was the only explanation
+    // on screen, so it read as the cause. Three independent readers took it
+    // that way, including Ally's own note on NOP#1269.
+    const original = allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z");
+    const mirror = allyComment(
+      reviewBody(INTERMEDIATE_HEAD, [
+        "### Prior Findings Dispositioned (0)",
+        "### Critical Issues (0)",
+        "### Important Issues (1)",
+        `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — carried forward, still unresolved.`,
+      ]),
+      "2026-08-04T21:09:19Z",
+    );
+    // Retires the original by name, and says nothing about the mirror.
+    const ledger = allyComment(
+      dispositioningReview(CURRENT_HEAD, OLD_HEAD, "fixed"),
+      "2026-08-04T22:09:19Z",
+    );
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      // The author IS the reviewer identity, which is what appends the
+      // misleading tail. Without this the fixture cannot exercise the defect.
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [original, mirror, ledger],
+    });
+
+    expect(verdict).toMatchObject({
+      state: "failure",
+      outcome: "carried_finding",
+      carriedFromHeadSha: INTERMEDIATE_HEAD,
+    });
+    // The real gap: the entry Ally still owes, at the MIRRORING head.
+    expect(verdict.reason).toContain(
+      `No ledger entry names prior:${INTERMEDIATE_HEAD.slice(0, 7)} "important 1"`,
+    );
+    // The tail is still true and still earns its place — it is the only thing
+    // that says why the attestation the author just posted did not count — but
+    // it is no longer the whole message.
+    expect(verdict.reason).toMatch(/the only comment attesting it is the PR author's own/i);
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+
+    // Positive control, and the reason this fixture is not just the previous
+    // test with extra comments: point the SAME ledger entry at the mirroring
+    // head instead of the original and the carry clears outright. That is what
+    // pins the message to the mirroring head's own identity — without it the
+    // assertions above would hold just as well with no ledger entry at all,
+    // since INTERMEDIATE_HEAD is the newest carrier either way.
+    const mirrorRetired = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        original,
+        mirror,
+        allyComment(dispositioningReview(CURRENT_HEAD, INTERMEDIATE_HEAD, "fixed"), "2026-08-04T22:09:19Z"),
+      ],
+    });
+    expect(mirrorRetired.carriedFromHeadSha).not.toBe(INTERMEDIATE_HEAD);
+  });
+
+  it("does not claim ledger silence about a finding the ledger explicitly names", () => {
+    // `still-present` leaves the head carried, but Ally did speak about that
+    // finding by name. Saying "no ledger entry names it" there would be a false
+    // statement about the producer, so this branch must stand down.
+    const blocking = allyComment(blockingReview(OLD_HEAD), "2026-08-04T20:09:19Z");
+    const ledger = allyComment(
+      dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "still-present"),
+      "2026-08-04T21:09:19Z",
+    );
+
+    const verdict = evaluateCommentReviewGate({
+      prAuthorLogin: null,
+      headSha: CURRENT_HEAD,
+      comments: [blocking, ledger],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason).not.toContain("No ledger entry names");
+    expect(verdict.reason).toContain("is still undispositioned");
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+  });
+
+  it("trims the unnamed-finding list rather than letting the tail overflow the 140-char cap", () => {
+    // The identity list is budgeted against whatever the tail leaves, the same
+    // way the verb list is. A bucket big enough to overrun it must lose
+    // identities from the list, never characters from the tail — the tail is
+    // the part the author is least likely to guess.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReviewWithFindings(OLD_HEAD, 9), "2026-08-04T20:09:19Z"),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+    expect(verdict.reason).toContain(`No ledger entry names prior:${OLD_HEAD.slice(0, 7)} "important 1"`);
+    // Elided, not silently cut: an author who adds only the entries shown would
+    // re-push straight back into this same red.
+    expect(verdict.reason).toContain("…");
+    expect(verdict.reason).toMatch(/the only comment attesting it is the PR author's own/i);
   });
 
   it("does not blame an unrecognized verb for a finding it never named", () => {
