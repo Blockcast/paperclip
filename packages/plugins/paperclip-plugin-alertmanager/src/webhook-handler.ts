@@ -1426,9 +1426,11 @@ function rebindAlertState(
  *     by definition — it has no wake path, which is the whole defect — but a
  *     deliberate reassignment, by a human or an agent, is never overwritten.
  *
- * Returns the patch that was applied, so the caller can fold it into the alert
- * state record and the firing event rather than re-reading the row. `null` means
- * nothing changed, which is the overwhelmingly common case.
+ * Returns the row's full post-patch owner state, so the caller can fold it into
+ * the alert state record and the firing event rather than re-reading the row.
+ * `null` means nothing changed, which is the overwhelmingly common case. Note
+ * "full state", not "the fields that changed": the agent branch clears the user,
+ * and a caller coalescing field-by-field with `??` would resurrect it.
  */
 async function retrofitAggregateOwner(
   ctx: PluginContext,
@@ -1443,7 +1445,7 @@ async function retrofitAggregateOwner(
   // path, where a rebind can move the target out from under the row we read.
   known: IssueReference | null,
   rosterMemo: CompanyRosterMemo | undefined,
-): Promise<{ assigneeAgentId?: string; assigneeUserId?: string } | null> {
+): Promise<{ assigneeAgentId: string | null; assigneeUserId: string | null } | null> {
   // Resolution first: it is pure over labels/annotations/ownerMap, and the email
   // leg is a cached lookup. Gating the issue read behind it keeps an alertname
   // with no configured owner — i.e. nearly all of them — at zero added cost.
@@ -1475,11 +1477,22 @@ async function retrofitAggregateOwner(
     },
     companyRosterLoader(ctx, companyId, rosterMemo),
   );
-  const patch = invokableAgentId
-    ? { assigneeAgentId: invokableAgentId }
-    : assigneeUserId && !nonEmptyString(issue.assigneeUserId ?? undefined)
-      ? { assigneeUserId }
-      : null;
+  // BLO-42811: the agent branch must clear `assigneeUserId` in the SAME patch.
+  // The host merges the patch over the row (a field absent from the patch keeps
+  // its existing value) and then refuses a row holding both —
+  // `422 Issue can only have one assignee`. Sending `{ assigneeAgentId }` alone
+  // against a user-assigned row is therefore rejected every time, and the
+  // rejection is PERMANENT: the delivery 502s, Alertmanager retries 13-17x and
+  // destroys the whole batch, including every unrelated alert riding in it.
+  // Clearing the user is this function's documented intent (see the header) —
+  // an agent-null row has no wake path, which is the defect BLO-40764 added
+  // this retrofit to repair.
+  const patch: { assigneeAgentId: string | null; assigneeUserId: string | null } | null =
+    invokableAgentId
+      ? { assigneeAgentId: invokableAgentId, assigneeUserId: null }
+      : assigneeUserId && !nonEmptyString(issue.assigneeUserId ?? undefined)
+        ? { assigneeAgentId: null, assigneeUserId }
+        : null;
   if (!patch) return null;
 
   await ctx.issues.update(issueId, patch, companyId, undefined, {
@@ -2452,10 +2465,13 @@ export async function handleFiring(
             rosterMemo,
           );
           if (retrofit) {
+            // Take the retrofit verbatim: it is the row's full post-patch owner
+            // state, so `??` here would resurrect a user the patch just cleared
+            // (BLO-42811).
             tracked = {
               ...tracked,
-              assigneeAgentId: retrofit.assigneeAgentId ?? tracked.assigneeAgentId,
-              assigneeUserId: retrofit.assigneeUserId ?? tracked.assigneeUserId,
+              assigneeAgentId: retrofit.assigneeAgentId,
+              assigneeUserId: retrofit.assigneeUserId,
             };
           }
         } catch (err) {
@@ -2900,12 +2916,18 @@ export async function handleFiring(
           issue,
           rosterMemo,
         );
+  // A non-null `retrofit` is the row's full post-patch owner state, so it is
+  // read whole rather than coalesced field-by-field (BLO-42811).
   const effectiveAssigneeUserId = created
     ? createAssigneeUserId ?? null
-    : retrofit?.assigneeUserId ?? issue.assigneeUserId ?? null;
+    : retrofit
+      ? retrofit.assigneeUserId
+      : issue.assigneeUserId ?? null;
   const effectiveAssigneeAgentId = created
     ? finalAssigneeAgentId ?? null
-    : retrofit?.assigneeAgentId ?? issue.assigneeAgentId ?? null;
+    : retrofit
+      ? retrofit.assigneeAgentId
+      : issue.assigneeAgentId ?? null;
 
   const record: AlertStateRecord = {
     paperclipIssueId: issue.id,
