@@ -22,8 +22,9 @@
  *    skipped *unexamined*. When this cohort was audited by hand over 448 real
  *    directories, 447 matched and **one did not**: it carried `wt-blo-19094`, a
  *    real git worktree. An age-only `rm -rf` would have destroyed it. The
- *    allowlist costs ~0.2% of the reclaim and removes the entire class,
- *    including on future passes whose composition nobody has looked at.
+ *    allowlist costs one directory in 448 (~0.2% of the audited directories)
+ *    and removes the entire class, including on future passes whose
+ *    composition nobody has looked at.
  *
  *    The top level is not the whole story, and the first deployed dry run said
  *    so: a worktree also lives *one level down*, as `home/<name>/.git`, under a
@@ -107,6 +108,7 @@ import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
+import { DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME, REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
 import { recordIsolationWorkspaceReapSweep } from "./metrics.js";
 
 /** Top-level entries a reapable isolation workspace may contain, sorted. */
@@ -118,8 +120,26 @@ export const DEFAULT_ISOLATION_WORKSPACE_ROOT =
 /** Per-tick unlink ceiling. Keeps MDS pressure bounded on a shared filesystem. */
 export const DEFAULT_MAX_DELETES_PER_TICK = 200;
 
-/** Parent directory the worktree helper materializes checkouts under. */
-export const WORKTREE_PARENT_DIR = ".paperclip-worktrees";
+/**
+ * Directories that, non-empty under `home` or `session`, mean live worktree
+ * state sits below them. Both come from the modules that create them rather
+ * than being restated here, so neither can silently drift unreachable:
+ *
+ * - `REPO_MANAGED_WORKTREES_SUBPATH` (`.paperclip/worktrees`) is where
+ *   `workspace-runtime` puts execution-workspace git worktrees by default when
+ *   the side itself is the repo root. A side holding a repo *below* it is
+ *   caught by the `<child>/.git` probe instead, since the repo root is there.
+ * - `DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME` (`.paperclip-worktrees`) is the
+ *   worktree-instance home `~/.paperclip-worktrees` (per-worktree db, logs,
+ *   storage), and `home` is `HOME` here. Observed non-empty as
+ *   `home/.paperclip-worktrees` on the live tree 2026-10-09 (BLO-36735, the
+ *   scan that found the 13 retentions below), so it is kept as a second case.
+ *
+ * Ceiling: an operator-set `workspaceStrategy.worktreeParentDir` can put
+ * worktrees anywhere, deeper than this probe looks. A checkout there is still
+ * caught when its repo root sits at a side or one level below it.
+ */
+export const WORKTREE_PARENT_DIRS = [REPO_MANAGED_WORKTREES_SUBPATH, DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME] as const;
 
 /** Directory names are `execution_workspaces.id`; anything else cannot resolve. */
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -198,8 +218,18 @@ export interface IsolationWorkspaceReapResult {
   scanned: number;
   eligible: number;
   deleted: number;
-  /** Present but not matching the layout allowlist — deliberately untouched. */
+  /**
+   * Present but its *top level* does not match the layout allowlist —
+   * deliberately untouched, and unexamined below that top level.
+   */
   skippedLayout: number;
+  /**
+   * Top level matches the allowlist, but a git checkout or worktree state sits
+   * below it (`hasNestedCheckout`) — retained. Kept apart from `skippedLayout`
+   * so that series keeps meaning "the tree is more heterogeneous than the
+   * allowlist was validated against" rather than absorbing a steady 13.
+   */
+  retainedNestedCheckout: number;
   /** Resolved to a workspace row used inside the window — the live cohort. */
   retainedInUse: number;
   /**
@@ -222,7 +252,7 @@ export interface IsolationWorkspaceReapResult {
    * operator reading a sweep log can name every outcome: with no concurrent
    * removals, `scanned` is exactly
    * `retainedFresh + retainedInUse + retainedResurrected + skippedLayout +
-   * failed + eligible`.
+   * retainedNestedCheckout + failed + eligible`.
    *
    * `failed` is named in that sum rather than assumed away: a present but
    * unreadable directory (`EACCES`, or an MDS hiccup on this filesystem) lands
@@ -263,14 +293,18 @@ function isReapableLayout(entries: string[]): boolean {
  *
  * Measured on the live tree 2026-10-09 (BLO-36735), against the first deployed
  * dry-run tick: **13 of the 503 directories in the match set** hold a checkout
- * or a non-empty `WORKTREE_PARENT_DIR`. Six are worktrees of one live
+ * or a non-empty `home/.paperclip-worktrees`. Six are worktrees of one live
  * `pim-multicast-gateway` checkout and are registered in its `worktree list`;
  * one carries an uncommitted change. Nothing unpushed was found, so the loss is
  * bounded — but it is silent, and it lands on a repo this module does not own.
  *
- * 2.6% of the reclaim buys the whole class, which is the same trade property 1
- * already makes at ~0.2%. Both `home` and `session` are probed: a registered
- * worktree was found under each.
+ * Cost on that tree: 13 of 503 directories (2.6% by count), but 23.7 of
+ * 141.6 GiB — **16.7% of the space** and 15.9% of the entries (550,692 of
+ * 3,467,038). Even by count that is ~12x property 1's one-in-448, so this is
+ * not the same trade; it is still the right one, because what it keeps is live
+ * work in a repo this module does not own. Quote the space share, not the
+ * count, when weighing whether to loosen it. Both
+ * `home` and `session` are probed: a registered worktree was found under each.
  *
  * Cost is bounded by construction — this runs only for a directory that has
  * already passed the age gate *and* the top-level allowlist, i.e. one about to
@@ -280,33 +314,38 @@ function isReapableLayout(entries: string[]): boolean {
  * Unreadable is not evidence of absence, so every fault here retains.
  */
 async function hasNestedCheckout(dir: string): Promise<boolean> {
-  for (const side of REAPABLE_LAYOUT) {
-    const base = path.join(dir, side);
-    let children: string[];
-    try {
-      children = await fs.readdir(base);
-    } catch {
-      return true;
-    }
-    for (const child of children) {
-      if (child === WORKTREE_PARENT_DIR) {
-        try {
-          if ((await fs.readdir(path.join(base, child))).length > 0) return true;
-        } catch {
-          return true;
-        }
-        continue;
+  try {
+    for (const side of REAPABLE_LAYOUT) {
+      const base = path.join(dir, side);
+      const children = await fs.readdir(base);
+      // A repo rooted at the side itself, then one rooted at each child.
+      for (const root of [base, ...children.map((child) => path.join(base, child))]) {
+        if (await isPresent(() => fs.stat(path.join(root, ".git")))) return true;
       }
-      try {
-        await fs.stat(path.join(base, child, ".git"));
-        return true;
-      } catch {
-        // No `.git` under this child. ENOENT and ENOTDIR both mean "not a
-        // checkout"; keep looking rather than condemning the directory.
+      for (const parent of WORKTREE_PARENT_DIRS) {
+        const entries = await isPresent(() => fs.readdir(path.join(base, parent)));
+        if (entries && entries.length > 0) return true;
       }
     }
+  } catch {
+    return true;
   }
   return false;
+}
+
+/**
+ * Runs `probe`, mapping ENOENT/ENOTDIR — "nothing there" — to `false`. Every
+ * other fault is rethrown so `hasNestedCheckout` retains: EACCES or ELOOP on a
+ * `.git` is not evidence that no checkout is there.
+ */
+async function isPresent<T>(probe: () => Promise<T>): Promise<T | false> {
+  try {
+    return await probe();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    throw err;
+  }
 }
 
 /**
@@ -328,6 +367,7 @@ export async function reapIsolationWorkspaces(
     eligible: 0,
     deleted: 0,
     skippedLayout: 0,
+    retainedNestedCheckout: 0,
     retainedInUse: 0,
     retainedResurrected: 0,
     retainedFresh: 0,
@@ -412,11 +452,7 @@ export async function reapIsolationWorkspaces(
       continue;
     }
 
-    const layoutOk = isReapableLayout(children);
-    // Only probed when the top level already qualifies: a directory the
-    // allowlist rejects is skipped unexamined, which is property 1.
-    const nestedCheckout = layoutOk && (await hasNestedCheckout(dir));
-    if (!layoutOk || nestedCheckout) {
+    if (!isReapableLayout(children)) {
       result.skippedLayout += 1;
       // Logged individually and on purpose: a skip count above the historical
       // baseline of 1 means the tree is more heterogeneous than the allowlist
@@ -437,14 +473,28 @@ export async function reapIsolationWorkspaces(
         {
           dir,
           layout: [...children].sort(),
-          // The two skips need telling apart in the log: on a nested-checkout
-          // skip `layout` reads as a compliant `[home, session]`, so without
-          // this the line looks like a contradiction.
-          reason: nestedCheckout ? "nested_checkout" : "top_level_layout",
           ageDays: (now() - idleSinceMs) / 86_400_000,
           ageSource: owner ? "lastUsedAt" : "mtime",
         },
         "isolation-workspace reaper skipped a directory outside the layout allowlist",
+      );
+      continue;
+    }
+
+    // Only reached when the top level already qualifies: a directory the
+    // allowlist rejects was skipped unexamined above, which is property 1.
+    // Counted and logged apart from that skip — this one *was* examined and its
+    // top level *did* match, so folding it in would hide a real rise in
+    // `skippedLayout` under a steady 13 (BLO-36735).
+    if (await hasNestedCheckout(dir)) {
+      result.retainedNestedCheckout += 1;
+      log.warn(
+        {
+          dir,
+          ageDays: (now() - idleSinceMs) / 86_400_000,
+          ageSource: owner ? "lastUsedAt" : "mtime",
+        },
+        "isolation-workspace reaper retained a layout-compliant directory holding a nested git checkout",
       );
       continue;
     }

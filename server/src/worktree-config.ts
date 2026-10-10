@@ -4,6 +4,17 @@ import path from "node:path";
 import type { PaperclipConfig } from "@paperclipai/shared";
 import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
 
+/**
+ * Default parent, relative to a repo root, under which `workspace-runtime`
+ * materializes execution-workspace git worktrees (`<repoRoot>/.paperclip/worktrees/<branch>`).
+ * Shared rather than restated so the isolation-workspace reaper's nested-checkout
+ * probe cannot drift from the path the helper actually builds (BLO-36735).
+ */
+export const REPO_MANAGED_WORKTREES_SUBPATH = path.join(".paperclip", "worktrees");
+
+/** Basename of the default worktree-instance home, `~/.paperclip-worktrees` (per-worktree db, logs, storage). */
+export const DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME = ".paperclip-worktrees";
+
 function nonEmpty(value: string | null | undefined): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
@@ -227,7 +238,7 @@ function resolveWorktreeRuntimeContext(
     nonEmpty(stablePersistedEnv.PAPERCLIP_HOME) ??
       nonEmpty(env.PAPERCLIP_HOME) ??
       nonEmpty(env.PAPERCLIP_WORKTREES_DIR) ??
-      "~/.paperclip-worktrees",
+      `~/${DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME}`,
   );
   const instanceRoot = path.resolve(homeDir, "instances", instanceId);
 
@@ -254,11 +265,11 @@ function writeConfigFile(configPath: string, config: PaperclipConfig): void {
 
 function resolveRepoManagedWorktreesRoot(worktreeRoot: string): string | null {
   const normalized = path.resolve(worktreeRoot);
-  const marker = `${path.sep}.paperclip${path.sep}worktrees${path.sep}`;
+  const marker = `${path.sep}${REPO_MANAGED_WORKTREES_SUBPATH}${path.sep}`;
   const index = normalized.indexOf(marker);
   if (index === -1) return null;
   const repoRoot = normalized.slice(0, index);
-  return path.resolve(repoRoot, ".paperclip", "worktrees");
+  return path.resolve(repoRoot, REPO_MANAGED_WORKTREES_SUBPATH);
 }
 
 function collectSiblingWorktreePorts(

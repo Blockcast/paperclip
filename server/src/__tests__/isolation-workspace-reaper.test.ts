@@ -17,11 +17,13 @@ import {
 import {
   DEFAULT_MAX_DELETES_PER_TICK,
   REAPABLE_LAYOUT,
+  WORKTREE_PARENT_DIRS,
   type WorkspaceUsageLookup,
   type WorkspaceUsageRow,
   reapIsolationWorkspaces,
   startIsolationWorkspaceReaper,
 } from "../services/isolation-workspace-reaper.js";
+import { DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME, REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
 
 const DAY = 86_400_000;
 const NOW = new Date("2026-09-04T12:00:00Z").getTime();
@@ -262,7 +264,7 @@ describe("reapIsolationWorkspaces", () => {
 
     const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
 
-    expect(res).toMatchObject({ scanned: 1, eligible: 0, deleted: 0, skippedLayout: 1 });
+    expect(res).toMatchObject({ scanned: 1, eligible: 0, deleted: 0, skippedLayout: 0, retainedNestedCheckout: 1 });
     await expect(
       fs.readFile(path.join(root, "ws-nested-wt", "home", "blo-32797-wt", "Makefile"), "utf8"),
     ).resolves.toBe("real work");
@@ -277,38 +279,81 @@ describe("reapIsolationWorkspaces", () => {
 
     const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
 
-    expect(res).toMatchObject({ eligible: 0, deleted: 0, skippedLayout: 1 });
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, skippedLayout: 0, retainedNestedCheckout: 1 });
     await expect(fs.stat(path.join(root, "ws-nested-session"))).resolves.toBeDefined();
   });
 
-  it("skips on a non-empty worktree parent dir, and reaps when it is empty", async () => {
+  it("probes the parents named by the modules that create them, not restated literals", () => {
+    // BLO-36735 I1: the probe once carried its own `.paperclip-worktrees`
+    // literal while `workspace-runtime` built `.paperclip/worktrees`, leaving
+    // the helper's real default unreachable. Pin the probe to the producers'
+    // own constants so the two cannot drift apart again.
+    expect(REPO_MANAGED_WORKTREES_SUBPATH).toBe(path.join(".paperclip", "worktrees"));
+    expect([...WORKTREE_PARENT_DIRS].sort()).toEqual(
+      [REPO_MANAGED_WORKTREES_SUBPATH, DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME].sort(),
+    );
+  });
+
+  it.each([
+    ["execution-workspace worktree parent", REPO_MANAGED_WORKTREES_SUBPATH],
+    ["worktree-instance home", DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME],
+  ])("skips on a non-empty %s, and reaps when it is empty", async (_label, parent) => {
+    // `home` is the repo root here, but its own `.git` is gone: only the
+    // parent dir is left to say a worktree lives below — three levels down,
+    // where neither `.git` probe reaches.
     await makeWorkspace("ws-wt-parent", [...REAPABLE_LAYOUT], 60, {
-      "home/.paperclip-worktrees/instances/worktree/go.mod": "module x",
+      [path.join("home", parent, "blo-1-wt", "Makefile")]: "real work",
     });
     // Negative control: the same directory name, empty, must NOT retain —
     // otherwise the guard is a constant on anyone who ever ran the helper.
     await makeWorkspace("ws-wt-parent-empty", [...REAPABLE_LAYOUT], 60);
-    await fs.mkdir(path.join(root, "ws-wt-parent-empty", "home", ".paperclip-worktrees"), { recursive: true });
+    await fs.mkdir(path.join(root, "ws-wt-parent-empty", "home", parent), { recursive: true });
 
     const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
 
-    expect(res).toMatchObject({ scanned: 2, eligible: 1, deleted: 1, skippedLayout: 1 });
+    expect(res).toMatchObject({ scanned: 2, eligible: 1, deleted: 1, skippedLayout: 0, retainedNestedCheckout: 1 });
     await expect(fs.stat(path.join(root, "ws-wt-parent"))).resolves.toBeDefined();
     await expect(fs.stat(path.join(root, "ws-wt-parent-empty"))).rejects.toThrow();
   });
 
+  it("retains a side that is itself a repository root", async () => {
+    await makeWorkspace("ws-side-repo", [...REAPABLE_LAYOUT], 60, {
+      "session/.git/HEAD": "ref: refs/heads/main\n",
+    });
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, retainedNestedCheckout: 1 });
+    await expect(fs.stat(path.join(root, "ws-side-repo", "session", ".git", "HEAD"))).resolves.toBeDefined();
+  });
+
+  it("retains when a child's .git cannot be probed, rather than reading the fault as absence", async () => {
+    // ELOOP, from a self-referential symlink, is a stat fault that is neither
+    // ENOENT nor ENOTDIR and raises for every uid — so unlike chmod it cannot
+    // pass on a root-run CI by deleting the directory.
+    await makeWorkspace("ws-loop", [...REAPABLE_LAYOUT], 60);
+    await fs.symlink("loop", path.join(root, "ws-loop", "home", "loop"));
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, retainedNestedCheckout: 1 });
+    await expect(fs.stat(path.join(root, "ws-loop"))).resolves.toBeDefined();
+  });
+
   it("still reaps a layout-compliant orphan whose home/ holds only tool caches", async () => {
-    // The guard must cost ~2.6% of the reclaim, not all of it. `.config` and
-    // `.local` are on every workspace in the tree.
+    // The guard must not cost all of the reclaim. `.config` and `.local` are
+    // on every workspace in the tree. A dangling symlink must read as absence
+    // too, or every workspace with a stale tool link would be retained.
     await makeWorkspace("ws-plain-orphan", [...REAPABLE_LAYOUT], 60, {
       "home/.config/gh/hosts.yml": "x",
       "home/.local/share/pnpm/store": "y",
       "session/history.jsonl": "z",
     });
+    await fs.symlink("/nonexistent-target", path.join(root, "ws-plain-orphan", "home", ".stale-link"));
 
     const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
 
-    expect(res).toMatchObject({ eligible: 1, deleted: 1, skippedLayout: 0 });
+    expect(res).toMatchObject({ eligible: 1, deleted: 1, skippedLayout: 0, retainedNestedCheckout: 0 });
   });
 
   it("retains rather than deletes when the nested probe cannot read a side", async () => {
@@ -323,7 +368,7 @@ describe("reapIsolationWorkspaces", () => {
 
     const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
 
-    expect(res).toMatchObject({ eligible: 0, deleted: 0, skippedLayout: 1 });
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, skippedLayout: 0, retainedNestedCheckout: 1 });
     await expect(fs.stat(dir)).resolves.toBeDefined();
   });
 
@@ -567,6 +612,7 @@ describe("reapIsolationWorkspaces", () => {
     await makeWorkspace("ws-fresh-dir", [...REAPABLE_LAYOUT], 2);
     await makeWorkspace("ws-live-row", [...REAPABLE_LAYOUT], 45);
     await makeWorkspace("ws-worktree", ["home", "session", "wt-blo-19094"], 60);
+    await makeWorkspace("ws-nested", [...REAPABLE_LAYOUT], 60, { "home/repo/.git": "gitdir: x\n" });
     await makeWorkspace("ws-orphan", [...REAPABLE_LAYOUT], 45);
 
     const res = await reapIsolationWorkspaces({
@@ -578,10 +624,11 @@ describe("reapIsolationWorkspaces", () => {
     });
 
     expect(res).toMatchObject({
-      scanned: 4,
+      scanned: 5,
       retainedFresh: 1,
       retainedInUse: 1,
       skippedLayout: 1,
+      retainedNestedCheckout: 1,
       eligible: 1,
       deleted: 1,
       vanished: 0,
@@ -591,6 +638,7 @@ describe("reapIsolationWorkspaces", () => {
         res.retainedInUse +
         res.retainedResurrected +
         res.skippedLayout +
+        res.retainedNestedCheckout +
         res.failed +
         res.eligible,
     ).toBe(res.scanned);
@@ -811,6 +859,33 @@ describe("reapIsolationWorkspaces metrics", () => {
     expect(
       await valueOf(ISOLATION_WORKSPACE_REAPER_RETAINED_RESURRECTED_METRIC, { dry_run: "false" }),
     ).toBeDefined();
+  });
+
+  it("counts a nested-checkout retention apart from skipped_layout", async () => {
+    // BLO-36735 I2: skipped_layout means "top level outside the allowlist,
+    // unexamined". A nested checkout was examined and its top level matched, so
+    // folding it in would park a steady 13 under that finding's baseline of 1.
+    await makeWorkspace("ws-nested", [...REAPABLE_LAYOUT], 45, { "home/repo/.git": "gitdir: x\n" });
+    const read = async () => ({
+      skipped: (await valueOf(ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC, { dry_run: "false" })) ?? 0,
+      nested:
+        (await valueOf(ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC, {
+          dry_run: "false",
+          outcome: "retained_nested_checkout",
+        })) ?? 0,
+    });
+    const before = await read();
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+    });
+    expect(res).toMatchObject({ skippedLayout: 0, retainedNestedCheckout: 1, deleted: 0 });
+
+    expect(await read()).toEqual({ skipped: before.skipped, nested: before.nested + 1 });
   });
 
   it("labels a dry-run tick so it cannot be read as a live one", async () => {
