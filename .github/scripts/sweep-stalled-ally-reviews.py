@@ -168,9 +168,17 @@ EMITTED_BUCKET_PATTERN = re.compile(
 # check-ally-review-consistency.mjs. That reader is an auditor, where
 # over-matching costs a reported violation; here it costs a duplicate review
 # request, which is the BLO-22892/BLO-28203 loop.
+#
+# The `[*_]{0,3}` runs around the verb mirror the gate's BLO-42492 widening and
+# must move with it. Narrow here while the gate is wide, an emphasised
+# `- **prior:X important 1** - **still-present** -` reads as no ledger entry at
+# all to this sweep, so it would re-request a review Ally already gave; wide
+# here while the gate is narrow is the opposite loop. Both are the divergence
+# the three-reader corpus in scripts/check-ally-review-consistency.test.mjs
+# exists to catch.
 PRIOR_FINDING_DISPOSITION_PATTERN = re.compile(
     r"^(?! *\t)(?! {4}) {0,3}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+[0-9]+"
-    r"[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)",
+    r"[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*[*_]{0,3}([a-z][a-z-]*)[*_]{0,3}[ \t]*(?:—|–|-)",
     re.IGNORECASE | re.MULTILINE | ASCII_RE,
 )
 

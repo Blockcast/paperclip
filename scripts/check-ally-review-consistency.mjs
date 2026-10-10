@@ -163,7 +163,7 @@ const NOT_INDENTED_CODE = String.raw`(?! *\t)(?! {4})`;
  * (mirrored verbatim in .github/scripts/sweep-stalled-ally-reviews.py).
  */
 const PRIOR_FINDING_DISPOSITION_RE = new RegExp(
-  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*[*_]{0,3}([a-z][a-z-]*)[*_]{0,3}[ \t]*(?:—|–|-)`,
   "gi",
 );
 
@@ -190,9 +190,15 @@ const COUNTED_SECTION_GLOBAL_RE = new RegExp(
  * does not, so a ledger entry opening after U+2028 exempted here while the gate
  * read it as still-blocking. That is the divergence this file exists to catch,
  * in the direction that silently clears a red.
+ *
+ * The `[*_]{0,3}` runs around the verb track the gate's BLO-42492 widening.
+ * They have to move together: this reader EXEMPTS, so staying narrow while the
+ * gate widened would be fail-CLOSED here (a deferral the gate counts, reported
+ * as an I4 violation). Safe, but a false violation on a correctly-deferred
+ * review is still a red nobody can clear.
  */
 const TRACKED_DISPOSITION_RE = new RegExp(
-  String.raw`(?:^|\n)${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+\d+[ \t]*\*\*[ \t]*(?:\u2014|\u2013|-)[ \t]*tracked(?![a-z-])[ \t]*(?:\u2014|\u2013|-)`,
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE}-[ \t]*\*\*[ \t]*prior:[0-9a-f]{7,40}[ \t]+[a-z]+[ \t]+\d+[ \t]*\*\*[ \t]*(?:\u2014|\u2013|-)[ \t]*[*_]{0,3}tracked(?![a-z-])[*_]{0,3}[ \t]*(?:\u2014|\u2013|-)`,
   "i",
 );
 
@@ -275,12 +281,14 @@ const BLOCKING_PRIOR_DISPOSITIONS = new Set(["still-present"]);
  *
  * This is the shape master shipped, widened only in directions that add
  * matches — leading indent up to 3, space after the `**`, en dash alongside em
- * dash and hyphen — so every body the old reader blocked on still blocks.
+ * dash and hyphen, and the `[*_]{0,3}` runs around the verb that admit Ally's
+ * emphasised `**still-present**` (BLO-42492) — so every body the old reader
+ * blocked on still blocks.
  * `(?:^|\n)` without `m`, per the U+2028/U+2029 rule the rest of this file and
  * its test scan enforce.
  */
 const LOOSE_STILL_PRESENT_RE = new RegExp(
-  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:[^\n]*\*\*[ \t]*(?:—|–|-)[ \t]*still-present[ \t]*(?:—|–|-)`,
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:[^\n]*\*\*[ \t]*(?:—|–|-)[ \t]*[*_]{0,3}still-present[*_]{0,3}[ \t]*(?:—|–|-)`,
   "i",
 );
 
