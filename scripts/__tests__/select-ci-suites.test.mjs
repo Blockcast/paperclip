@@ -520,8 +520,11 @@ test("the selection shell step skips on the literal 'false' only, per group", ()
 });
 
 test("e2e and canary are skipped at job level, and verify neither needs nor reclassifies them", () => {
-  assert.match(jobBlock("canary_dry_run"), /\n    if: \$\{\{ needs\.policy\.outputs\.release_dry_run_needed != 'false' \}\}\n/);
-  assert.match(jobBlock("e2e"), /\n    if: \$\{\{ needs\.policy\.outputs\.ui_e2e_needed != 'false' \}\}\n/);
+  // The selector's literal-'false' clause opens each job-level `if:`. The
+  // merge-group heavy-lane trim ANDs a merge_group-only conjunct after it;
+  // scripts/__tests__/merge-group-trim.test.mjs pins that conjunct verbatim.
+  assert.match(jobBlock("canary_dry_run"), /\n    if: >-\n      \$\{\{ needs\.policy\.outputs\.release_dry_run_needed != 'false' &&\n/);
+  assert.match(jobBlock("e2e"), /\n    if: >-\n      \$\{\{ needs\.policy\.outputs\.ui_e2e_needed != 'false' &&\n/);
   const verify = jobBlock("verify");
   assert.doesNotMatch(verify, /\n        (?:e2e|canary_dry_run),/);
   // verify still treats a skipped required lane as not-passed, so a lane that never

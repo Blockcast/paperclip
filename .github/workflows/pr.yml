@@ -96,12 +96,16 @@ jobs:
       # pins all three entries against exactly that mistake.
       contents: read
       # `/actions/runs/{id}/jobs` — this job's own step conclusions and their
-      # start/finish timestamps.
+      # start/finish timestamps. Also read by the merge-group trim step below
+      # (the PR head's own pull_request pr.yml jobs).
       actions: read
       # `/check-runs/{id}/annotations` — a DIFFERENT scope from `actions: read`,
       # and the only source of the "has timed out after N minutes" line that
       # says a step was killed by the clock rather than by an assertion.
       checks: read
+      # `/pulls/{n}` — the merge-group trim step reads the queued PR's head SHA.
+      # Read-only; without it the step 403s and fails open to the full suite.
+      pull-requests: read
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
       # Path-scoped suite selection (scripts/select-ci-suites.mjs). Consumers
@@ -113,6 +117,16 @@ jobs:
       workspaces_b_tests_needed: ${{ steps.select_suites.outputs.workspaces_b_tests_needed }}
       ui_e2e_needed: ${{ steps.select_suites.outputs.ui_e2e_needed }}
       release_dry_run_needed: ${{ steps.select_suites.outputs.release_dry_run_needed }}
+      # Merge-group heavy-lane trim (scripts/merge-group-trim.mjs). Consumers
+      # skip a heavy lane ONLY on the literal 'true', ONLY on merge_group, and
+      # ONLY while the PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE kill switch is unset,
+      # so an empty output, a script fault or a pull_request run all run it.
+      merge_group_trim_general_server: ${{ steps.merge_group_trim.outputs.merge_group_trim_general_server }}
+      merge_group_trim_worktree_install: ${{ steps.merge_group_trim.outputs.merge_group_trim_worktree_install }}
+      merge_group_trim_opencode_responses_replay: ${{ steps.merge_group_trim.outputs.merge_group_trim_opencode_responses_replay }}
+      merge_group_trim_opencode_k8s_seed_cold_start: ${{ steps.merge_group_trim.outputs.merge_group_trim_opencode_k8s_seed_cold_start }}
+      merge_group_trim_e2e: ${{ steps.merge_group_trim.outputs.merge_group_trim_e2e }}
+      merge_group_trim_canary_dry_run: ${{ steps.merge_group_trim.outputs.merge_group_trim_canary_dry_run }}
 
     steps:
       - name: Checkout repository
@@ -198,6 +212,34 @@ jobs:
         id: select_suites
         continue-on-error: true
         run: node ./scripts/select-ci-suites.mjs
+        timeout-minutes: 3
+
+      # Owner directives 2026-10-07 / 2026-10-09 (CI CPU waste). arc-merge-queue
+      # burned 293.7 core-h in the 26 h ending 2026-10-09T13:28Z; 70% of it was
+      # the lanes below (Prometheus per-pod CPU joined to this file's jobs). In
+      # merge_group, skip a HEAVY lane (server test shards, e2e, Canary Dry Run,
+      # worktree install, the two OpenCode lanes) when the queued PR's own head
+      # already passed it in pull_request CI and the queue applies exactly the
+      # change set that CI tested (patch-id AND merge-tree identity). Build,
+      # typecheck and the workspaces unit tests always run on the merged tree.
+      # Fails open: see scripts/merge-group-trim.mjs. Kill switch: set the
+      # repository variable PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true and the next
+      # merge-group run is the full suite (runbooks/merge-group-heavy-lane-trim.md).
+      # master-health.yml re-runs the server suites post-merge on any landed head
+      # whose merge-group build did not run them.
+      - name: Decide merge-group heavy-lane trim
+        id: merge_group_trim
+        if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_GROUP_FULL_SUITE: ${{ vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          MERGE_GROUP_BASE_REF: ${{ github.event.merge_group.base_ref }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node ./scripts/merge-group-trim.mjs
         timeout-minutes: 3
 
       - name: Setup actionlint
@@ -424,6 +466,11 @@ jobs:
       - name: Test merge-group concurrency key
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/merge-group-concurrency.test.mjs
+        timeout-minutes: 1
+
+      - name: Test merge-group heavy-lane trim and its kill switch
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/merge-group-trim.test.mjs
         timeout-minutes: 1
 
       - name: Test vendored-provenance union-merge invariants (BLO-34872)
@@ -1285,14 +1332,35 @@ jobs:
       NODE_ENV: production
 
     steps:
+      # Merge-group trim (policy's `Decide merge-group heavy-lane trim`). The
+      # job always runs and reports, so `verify`'s lane list and its
+      # success/failure semantics are unchanged; when trimmed, every step below
+      # is skipped and the job succeeds in seconds. Only the literal 'true',
+      # only on merge_group, only with PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE unset.
+      - name: Resolve merge-group trim for this lane
+        id: trim
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_FULL_SUITE: ${{ vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE }}
+          LANE_TRIM: ${{ needs.policy.outputs.merge_group_trim_worktree_install }}
+        run: |
+          if [ "$EVENT_NAME" = "merge_group" ] && [ "$MERGE_GROUP_FULL_SUITE" != "true" ] && [ "$LANE_TRIM" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Worktree install trimmed in merge group::the queued PR's head already passed this lane in pull_request CI and the queue applies exactly that change set (see policy's 'Decide merge-group heavy-lane trim' step). Set PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true to restore the full suite."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.trim.outputs.run == 'true'
         uses: actions/checkout@v6
 
       - name: Setup pnpm
+        if: steps.trim.outputs.run == 'true'
         uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
-        if: needs.policy.outputs.lockfile_regenerated == '1'
+        if: steps.trim.outputs.run == 'true' && needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -1300,12 +1368,14 @@ jobs:
           path: .
 
       - name: Setup Node.js
+        if: steps.trim.outputs.run == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
 
       - name: Create a scratch git worktree at the checked-out commit
+        if: steps.trim.outputs.run == 'true'
         run: |
           set -euo pipefail
           git worktree add --detach "$RUNNER_TEMP/worktree-install-check" HEAD
@@ -1315,10 +1385,12 @@ jobs:
           cp pnpm-lock.yaml "$RUNNER_TEMP/worktree-install-check/pnpm-lock.yaml"
 
       - name: Install into the worktree
+        if: steps.trim.outputs.run == 'true'
         working-directory: ${{ runner.temp }}/worktree-install-check
         run: pnpm install --frozen-lockfile
 
       - name: Assert the install is complete
+        if: steps.trim.outputs.run == 'true'
         working-directory: ${{ runner.temp }}/worktree-install-check
         run: |
           set -euo pipefail
@@ -1351,7 +1423,7 @@ jobs:
           pnpm exec vitest --version
 
       - name: Remove the scratch worktree
-        if: always()
+        if: always() && steps.trim.outputs.run == 'true'
         run: git worktree remove --force "$RUNNER_TEMP/worktree-install-check" || true
 
   opencode_responses_replay:
@@ -1363,15 +1435,37 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # Merge-group trim (policy's `Decide merge-group heavy-lane trim`). The
+      # job always runs and reports, so `verify`'s lane list and its
+      # success/failure semantics are unchanged; when trimmed, every step below
+      # is skipped and the job succeeds in seconds. Only the literal 'true',
+      # only on merge_group, only with PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE unset.
+      - name: Resolve merge-group trim for this lane
+        id: trim
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_FULL_SUITE: ${{ vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE }}
+          LANE_TRIM: ${{ needs.policy.outputs.merge_group_trim_opencode_responses_replay }}
+        run: |
+          if [ "$EVENT_NAME" = "merge_group" ] && [ "$MERGE_GROUP_FULL_SUITE" != "true" ] && [ "$LANE_TRIM" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=OpenCode Responses replay trimmed in merge group::the queued PR's head already passed this lane in pull_request CI and the queue applies exactly that change set (see policy's 'Decide merge-group heavy-lane trim' step). Set PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true to restore the full suite."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.trim.outputs.run == 'true'
         uses: actions/checkout@v6
 
       - name: Setup Node.js
+        if: steps.trim.outputs.run == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 24
 
       - name: Install the pinned OpenCode release
+        if: steps.trim.outputs.run == 'true'
         run: |
           set -euo pipefail
           version="$(node -e '
@@ -1386,6 +1480,7 @@ jobs:
           echo "OPENCODE_REPLAY_BINARY=$binary" >> "$GITHUB_ENV"
 
       - name: Replay framed and malformed Responses streams
+        if: steps.trim.outputs.run == 'true'
         run: node scripts/smoke/opencode-responses-replay.mjs
 
   opencode_k8s_seed_cold_start:
@@ -1417,14 +1512,35 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # Merge-group trim (policy's `Decide merge-group heavy-lane trim`). The
+      # job always runs and reports, so `verify`'s lane list and its
+      # success/failure semantics are unchanged; when trimmed, every step below
+      # is skipped and the job succeeds in seconds. Only the literal 'true',
+      # only on merge_group, only with PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE unset.
+      - name: Resolve merge-group trim for this lane
+        id: trim
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_FULL_SUITE: ${{ vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE }}
+          LANE_TRIM: ${{ needs.policy.outputs.merge_group_trim_opencode_k8s_seed_cold_start }}
+        run: |
+          if [ "$EVENT_NAME" = "merge_group" ] && [ "$MERGE_GROUP_FULL_SUITE" != "true" ] && [ "$LANE_TRIM" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=k8s-ro seed transport cold start trimmed in merge group::the queued PR's head already passed this lane in pull_request CI and the queue applies exactly that change set (see policy's 'Decide merge-group heavy-lane trim' step). Set PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true to restore the full suite."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.trim.outputs.run == 'true'
         uses: actions/checkout@v6
 
       - name: Setup pnpm
+        if: steps.trim.outputs.run == 'true'
         uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
-        if: needs.policy.outputs.lockfile_regenerated == '1'
+        if: steps.trim.outputs.run == 'true' && needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -1432,21 +1548,25 @@ jobs:
           path: .
 
       - name: Setup Node.js
+        if: steps.trim.outputs.run == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
 
       - name: Install dependencies
+        if: steps.trim.outputs.run == 'true'
         run: pnpm install --frozen-lockfile
 
       # Match the sibling test lanes, which reach vitest through `pnpm test:run:*`
       # and so always relink stale workspace packages first. This lane invokes
       # vitest directly, so it has to run the preflight itself.
       - name: Ensure workspace package links
+        if: steps.trim.outputs.run == 'true'
         run: pnpm run preflight:workspace-links
 
       - name: Run the focused regression three times from a clean OpenCode home
+        if: steps.trim.outputs.run == 'true'
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
@@ -1595,6 +1715,11 @@ jobs:
       # an empty output or a policy fault runs the suite. A suite that runs and
       # fails fails this job exactly as before: nothing here converts a failure
       # into a skip.
+      # The merge-group trim (policy's `Decide merge-group heavy-lane trim`)
+      # reaches ONLY the server shards: workspaces-a/-b are the fast unit tests
+      # that always run against the merged tree. Same contract as the selector:
+      # only the literal 'true', only on merge_group, only with the
+      # PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE kill switch unset.
       - name: Resolve whether this diff can reach this suite group
         id: select
         env:
@@ -1602,6 +1727,9 @@ jobs:
           SERVER_TESTS_NEEDED: ${{ needs.policy.outputs.server_tests_needed }}
           WORKSPACES_A_TESTS_NEEDED: ${{ needs.policy.outputs.workspaces_a_tests_needed }}
           WORKSPACES_B_TESTS_NEEDED: ${{ needs.policy.outputs.workspaces_b_tests_needed }}
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_FULL_SUITE: ${{ vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE }}
+          MERGE_GROUP_TRIM_SERVER: ${{ needs.policy.outputs.merge_group_trim_general_server }}
         run: |
           case "$GROUP" in
             general-server) needed="$SERVER_TESTS_NEEDED" ;;
@@ -1612,6 +1740,10 @@ jobs:
           if [ "$needed" = "false" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=General tests skipped::policy's path selector found no changed path that can reach $GROUP (see its 'Select suites reachable from this diff' step)."
+          elif [ "$GROUP" = "general-server" ] && [ "$EVENT_NAME" = "merge_group" ] \
+            && [ "$MERGE_GROUP_FULL_SUITE" != "true" ] && [ "$MERGE_GROUP_TRIM_SERVER" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=General tests trimmed in merge group::the queued PR's head already passed every server shard in pull_request CI and the queue applies exactly that change set (see policy's 'Decide merge-group heavy-lane trim' step). Set PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true to restore the full suite."
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
@@ -2127,7 +2259,14 @@ jobs:
     # Path-scoped (scripts/select-ci-suites.mjs). Only the literal 'false' skips;
     # an empty/missing output runs the job. Neither this job nor its check name is
     # in `verify`'s needs, so a skip cannot read as a failed or absent lane.
-    if: ${{ needs.policy.outputs.release_dry_run_needed != 'false' }}
+    # Merge-group trim: a job-level skip is safe here for the reason above
+    # (not in `verify`'s needs), and costs no runner. Only the literal 'true',
+    # only on merge_group, only with PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE unset.
+    if: >-
+      ${{ needs.policy.outputs.release_dry_run_needed != 'false' &&
+      !(github.event_name == 'merge_group' &&
+        vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE != 'true' &&
+        needs.policy.outputs.merge_group_trim_canary_dry_run == 'true') }}
     # BLO-22428: route merge_group traffic to the dedicated arc-merge-queue
     # pool so pull_request and merge_group traffic cannot starve each other.
     # See typecheck_release_registry above.
@@ -2196,7 +2335,14 @@ jobs:
     # Path-scoped (scripts/select-ci-suites.mjs). Only the literal 'false' skips;
     # an empty/missing output runs the job. Neither this job nor its check name is
     # in `verify`'s needs, so a skip cannot read as a failed or absent lane.
-    if: ${{ needs.policy.outputs.ui_e2e_needed != 'false' }}
+    # Merge-group trim: a job-level skip is safe here for the reason above
+    # (not in `verify`'s needs), and costs no runner. Only the literal 'true',
+    # only on merge_group, only with PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE unset.
+    if: >-
+      ${{ needs.policy.outputs.ui_e2e_needed != 'false' &&
+      !(github.event_name == 'merge_group' &&
+        vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE != 'true' &&
+        needs.policy.outputs.merge_group_trim_e2e == 'true') }}
     # Keep PR browser suites off the org-wide default pool. Merge groups use
     # the queue's reserved capacity so unrelated repos cannot delay admission.
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}
