@@ -171,7 +171,9 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     await tempDb?.cleanup();
   });
 
-  async function seedAgent(): Promise<{ companyId: string; agentId: string }> {
+  async function seedAgent(
+    adapterType: string = "claude_local",
+  ): Promise<{ companyId: string; agentId: string }> {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -186,7 +188,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
       name: "ClaudeCoder",
       role: "engineer",
       status: "active",
-      adapterType: "claude_local",
+      adapterType,
       adapterConfig: {},
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
       permissions: {},
@@ -594,6 +596,46 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
       .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "skipped")))
       .then((rows) => rows[0] ?? null);
     expect(skipped, "the capacity defer must not terminally drop the wake as skipped").toBeNull();
+  });
+
+  // BLO-23995: four heartbeat suites injected their gate under the key
+  // `penstockGate`, which is not a field on HeartbeatServiceOptions. TypeScript
+  // drops an excess property and vitest transpiles without type checking, so
+  // those gates were silently never injected and the suites ran against the
+  // production default. This pins the wiring for the adapter the real gate
+  // actually probes.
+  it("consults the injected gate for a claude_k8s dispatch", async () => {
+    const { agentId } = await seedAgent("claude_k8s");
+    const probedAdapterTypes: string[] = [];
+    const inner = denyingGate(new Date(Date.now() + 90_000));
+    const heartbeat = heartbeatService(db, {
+      penstockAvailabilityGate: {
+        ...inner,
+        async checkAdapter(input: PenstockAvailabilityGateCheckInput) {
+          probedAdapterTypes.push(input.adapterType);
+          return inner.checkAdapter(input);
+        },
+      },
+      skipQueuedRunDispatch: true,
+    });
+
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+    });
+
+    // Injected, not the production default: the default gate fails open for an
+    // adapterConfig carrying no penstock capacity URL, so a misspelled option
+    // key dispatches the wake instead of parking it and leaves this empty.
+    expect(probedAdapterTypes).toEqual(["claude_k8s"]);
+    const row = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(row?.status).toBe("scheduled_retry");
+    expect(row?.scheduledRetryReason).toBe("ccrotate_capacity");
   });
 
   it("clamps a multi-day advertised reset so no run parks past the 24h ceiling", async () => {

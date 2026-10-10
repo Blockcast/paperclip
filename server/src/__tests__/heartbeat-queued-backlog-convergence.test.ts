@@ -105,7 +105,7 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-queued-backlog-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db, { penstockGate: allowPenstockGate });
+    heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
   });
 
   afterEach(async () => {
@@ -586,7 +586,7 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     // (queuedRunDispatchBounds is test-only injection — see heartbeat.ts),
     // exercised at a scale that runs in milliseconds instead of minutes.
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 5, maxScanBatches: 2 },
     });
 
@@ -1208,7 +1208,7 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     // "cursor advances to the scan boundary, not to right after the claim"
     // property with 12 rows instead of 4,100.
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 5, maxScanBatches: 2 },
     });
     const windowRows = 10;
@@ -1751,7 +1751,7 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     const passReasons: string[] = [];
     const coalescedReasons: Array<{ reason: string; suppressHeadRescanDemand: boolean }> = [];
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 4 },
       beforeQueuedDispatchPassForTest: async (event) => {
         passReasons.push(event.reason);
