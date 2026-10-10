@@ -924,8 +924,29 @@ export function asPublishableToken(token: string): string {
 // still-present here and as nothing in the sweep (Ally, #1721 at 1bc85198,
 // Important 1). Same anchors as REVIEWED_HEAD_ATTESTATION_PATTERN; the group is
 // non-capturing, so no capture index moves.
+//
+// The `[*_]{0,3}` runs around the verb admit Ally's emphasised spelling,
+// `— **fixed** —` (BLO-42492). The structured-block comment in
+// extractAllyPriorFindingDispositions already named "bolded verb" as a shape
+// that silently drops a whole bullet, but the block is what was fixed and this
+// prose fallback was left blind to it — and the fallback is the live path for
+// every body that carries no block. Measured on Blockcast/libmmt#524: both
+// ledger bullets (846d831 at head 9b972d7d, 9b972d7 at head 70b43628) use the
+// emphasised verb and neither parsed, so the gate reported 9b972d7 as
+// undispositioned 9 seconds after Ally's at-head review dispositioned it
+// `fixed`. The bare form stays dominant — 8 of 8 bullets sampled across four
+// repos' recent PRs — so this adds a shape rather than replacing one.
+//
+// Emphasis around a word does not change the word, so this cannot retire a
+// finding Ally did not retire. The capture group is untouched: the alphabet
+// stays `[a-z][a-z-]*`, which is the PEN-3157 bound that
+// github-write-egress-scrub.test.ts reads out of this pattern's own source
+// text. Widening is kept to the verb for the same reason the comma, hyphenated
+// severity and trailing-parenthetical shapes are NOT handled here: those are
+// unmeasured on the prose path, and admitting an unobserved shape in the
+// retiring direction is the one direction this module must not fail in.
 const PRIOR_FINDING_DISPOSITION_PATTERN = new RegExp(
-  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*([a-z][a-z-]*)[ \t]*(?:—|–|-)`,
+  String.raw`(?:^|\n)${NOT_INDENTED_CODE} {0,3}-[ \t]*\*\*[ \t]*prior:([0-9a-f]{7,40})[ \t]+([a-z]+)[ \t]+(\d+)[ \t]*\*\*[ \t]*(?:—|–|-)[ \t]*[*_]{0,3}([a-z][a-z-]*)[*_]{0,3}[ \t]*(?:—|–|-)`,
   "gi",
 );
 
@@ -1196,9 +1217,12 @@ export function extractAllyPriorFindingDispositions(
   // Structured dispositions carry head/severity/index/verb as discrete fields,
   // so the four prose shapes that silently dropped whole ledger bullets
   // (bolded verb, comma instead of a dash, hyphenated severity, a trailing
-  // parenthetical) cannot arise. The verb vocabulary is unchanged: a verb
-  // arriving as a field is still classified by classifyPriorDisposition, so an
-  // unknown one still fails closed rather than retiring anything.
+  // parenthetical) cannot arise. The prose fallback below now reads the bolded
+  // verb too (BLO-42492); the other three still drop their bullet there, which
+  // is why a block remains the only shape with no reader gap. The verb
+  // vocabulary is unchanged: a verb arriving as a field is still classified by
+  // classifyPriorDisposition, so an unknown one still fails closed rather than
+  // retiring anything.
   const block = parseAllyVerdictBlock(body);
   if (block.kind === "ok") {
     return block.verdict.dispositions.map((entry) => ({
