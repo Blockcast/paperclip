@@ -36,6 +36,13 @@ Consequences:
   whose `sp_uuid` has no row, so NOP cannot obtain its bridge cert without it.
 - Neither the soft-disable nor the blocklist INSERT below stops `MintMember`
   today.
+- A `MintMember` call whose subject matches a member with `disabled_at` set
+  already returns that member's `mb_uuid` unchanged and leaves `disabled_at`
+  alone: the insert is `ON CONFLICT (st_uuid, oidc_issuer, oidc_subject) DO
+  NOTHING`, and the follow-up `SELECT mb_uuid` neither filters on nor writes
+  `disabled_at`. The disabled-member rule under "E2 completeness delta" is
+  therefore shipped behaviour, not a new BLO-5410 obligation; step 3's
+  liveness check is what keeps such a member from being bound.
 - Wave 1 has no mechanism that invalidates an already-issued bridge cert
   before its `notAfter`. The orc8r code at `a68ad7e` has no CRL or OCSP check
   for client certs. The certifier's `RevokeCertificate` only deletes the
@@ -66,7 +73,8 @@ registration attempt and send the same logical identity on every retry. A
 repeated successful call returns the original `mb_uuid`; it MUST NOT create
 another `individual_beacon` row. That holds for a disabled member too: a call
 whose subject matches a member with `disabled_at` set returns that member's
-`mb_uuid` unchanged and MUST NOT clear `disabled_at`. Re-enabling a retired
+`mb_uuid` unchanged and MUST NOT clear `disabled_at` (the shipped servicer
+already does both; see "BLO-5410 shipped status"). Re-enabling a retired
 identity is the inverse of retirement, so it belongs to the same authorized
 operation (see the rebind paragraph below), never to registration.
 
@@ -325,8 +333,10 @@ NOP to add a second caller-verification implementation.
   (creates the singleton `st_public` row in `tenant_identity`). This is
   S4 of BLO-5298 (this same parent ticket).
 - You have `psql` access to the orc8r postgres pool with write
-  permissions on `system_principals` and `revocation_blocklist` (the
-  Revocation section writes the latter).
+  permissions on `system_principals`, `members` and `revocation_blocklist`.
+  The rebind and re-enable procedures under "Troubleshooting" write
+  `disabled_at` on `members`; the Revocation section writes
+  `revocation_blocklist`, but only after enforcement lands.
 - For the Wave 1 rebind procedure only (see "Troubleshooting"), you also have
   write access to the **NOP-side registration store**, which is a different
   database from the orc8r pool above and is not otherwise described by this
