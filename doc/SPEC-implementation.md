@@ -257,6 +257,7 @@ Invariants:
 - single assignee only
 - task must trace to company goal chain via `goal_id`, `parent_id`, or project-goal linkage
 - `in_progress` requires assignee
+- every created issue has an assignee: create defaults an unowned issue to its creating agent, else the resolved responsible user, else `companies.default_responsible_user_id`, and rejects the create when none of those identifies an owner. Inbox selection is by assignee and ignores status, so an issue with both assignee columns null is reachable by no routing path at any status.
 - terminal states: `done | cancelled`
 
 ## 7.7 `issue_comments`
