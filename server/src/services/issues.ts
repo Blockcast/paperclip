@@ -610,6 +610,54 @@ async function resolveResponsibleUserIdForIssueCreate(
   return input.createdByUserId ?? null;
 }
 
+/**
+ * BLO-43103 — every inbox selects by assignee, not by status (see
+ * `agent-inbox-lite.ts`), so an issue with both assignee columns null is
+ * reachable by no routing path at any status: mutable by anyone, discoverable
+ * by nobody, and invisible to the sweeps that would otherwise bounce it. 74
+ * live `todo` rows were in that state on 2026-10-10 with zero wake paths
+ * between them. An owner is therefore assigned at creation rather than left to
+ * a sweep — a wrong default costs one PATCH to correct, which is one more
+ * remedy than `null` has.
+ *
+ * The union return type carries the single-assignee invariant: a branch cannot
+ * set both columns, so this cannot reproduce the `"Issue can only have one
+ * assignee"` loop BLO-42855 hit one layer up. And no default here can assign
+ * work to a third party, so none needs the `assertCanAssignTasks` gate the
+ * routes apply to an explicit assignee: `createdByAgentId` is stamped by the
+ * route from the authenticated actor, and both user fallbacks are attribution
+ * already written to this row or configured on the company.
+ *
+ * `companyDefaultResponsibleUserId` is what makes the final throw safe to ship.
+ * A census of the 40,972 live rows on 2026-10-10 found 2,919 whose create had
+ * neither a creating agent nor a resolvable responsible user — 2,559
+ * `plugin:paperclip-plugin-alertmanager` (0 of its 7,564 rows ever set
+ * `createdByAgentId`) and 351 `github_dependabot_alert`. Throwing on those
+ * would not produce an owned alert, it would refuse to record the alert at all,
+ * which is worse than the ownerless row this exists to prevent. Resolved
+ * lazily, so an ordinary create still costs zero extra queries.
+ */
+async function resolveCreateIssueAssignee(
+  input: {
+    assigneeAgentId?: string | null;
+    assigneeUserId?: string | null;
+    createdByAgentId?: string | null;
+    responsibleUserId?: string | null;
+  },
+  companyDefaultResponsibleUserId: () => Promise<string | null>,
+): Promise<{ assigneeAgentId: string } | { assigneeUserId: string }> {
+  if (input.assigneeAgentId) return { assigneeAgentId: input.assigneeAgentId };
+  if (input.assigneeUserId) return { assigneeUserId: input.assigneeUserId };
+  if (input.createdByAgentId) return { assigneeAgentId: input.createdByAgentId };
+  if (input.responsibleUserId) return { assigneeUserId: input.responsibleUserId };
+  const companyDefault = await companyDefaultResponsibleUserId();
+  if (companyDefault) return { assigneeUserId: companyDefault };
+  throw unprocessable(
+    "Issue requires an assignee: no explicit assignee, creating agent, responsible user, "
+      + "or company default responsible user to default to",
+  );
+}
+
 // BLO-27706: a reused execution workspace is shared by every issue bound to it, so
 // an issue update must patch only the config keys that issue actually supplies.
 // Emitting `null` for an absent key defeated mergeExecutionWorkspaceConfig's
@@ -10610,6 +10658,22 @@ export function issueService(db: Db) {
         const values = {
           ...issueData,
           responsibleUserId,
+          // BLO-43103: last writer wins over `...issueData`, so an explicit
+          // assignee is echoed back unchanged and only a create with neither
+          // column set is defaulted.
+          ...(await resolveCreateIssueAssignee({
+            assigneeAgentId: issueData.assigneeAgentId,
+            assigneeUserId: issueData.assigneeUserId,
+            createdByAgentId: issueData.createdByAgentId,
+            responsibleUserId,
+          }, async () => {
+            const [company] = await tx
+              .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
+              .from(companies)
+              .where(eq(companies.id, companyId))
+              .limit(1);
+            return company?.defaultResponsibleUserId ?? null;
+          })),
           requestDepth: clampIssueRequestDepth(issueData.requestDepth),
           originKind: issueData.originKind ?? "manual",
           goalId: resolveIssueGoalId({
