@@ -64,7 +64,11 @@ The key MUST be stable across retries and MUST NOT include request time, a
 random UUID, access token, or mutable display data. Persist it with the
 registration attempt and send the same logical identity on every retry. A
 repeated successful call returns the original `mb_uuid`; it MUST NOT create
-another `individual_beacon` row.
+another `individual_beacon` row. That holds for a disabled member too: a call
+whose subject matches a member with `disabled_at` set returns that member's
+`mb_uuid` unchanged and MUST NOT clear `disabled_at`. Re-enabling a retired
+identity is the inverse of retirement, so it belongs to the same authorized
+operation (see the rebind paragraph below), never to registration.
 
 The orc8r identity is fixed by the bridge contract: `st_uuid` is the seeded
 `st_public` tenant identity, `subject_kind` is `individual_beacon`, and the
@@ -200,8 +204,19 @@ Registration MUST use this order:
    indexes are part of the contract, not an implementation detail.
 2. Call `MintMember` with the same derived identity and bridge mTLS
    credential.
-3. In a second local transaction, validate the returned `mb_uuid`, bind it
-   to the existing intent, and transition to `registered`.
+3. In a second local transaction, validate the returned `mb_uuid`, including
+   that its orc8r member is live, bind it to the existing intent, and
+   transition to `registered`. A returned member that is not live MUST NOT be
+   bound. The lifecycle case is the original wallet re-registering hardware a
+   retirement took from it — H bound to A, retired, rebound to B, sold back to
+   A — where the derived subject is A's old one, so `MintMember` returns A's
+   disabled member; explicit repair that disabled a member reaches the same
+   state. Either way it is a non-retryable identity error: record the intent
+   `registration_failed` with that `mb_uuid` in `last_error` and route it to
+   the operator procedure under "Troubleshooting". Once that procedure
+   re-enables the member, the owner's next registration matches the
+   `registration_failed` intent, takes the update path, and converges to
+   `registered` on the same `mb_uuid`.
 
 If orc8r is unavailable, times out, or returns a retryable error, retain the
 intent as `pending_orc8r` with `last_error`, `next_retry_at`, and an attempt
@@ -280,7 +295,11 @@ NOP half — intent `retired`, member still live — is the ordering the transfe
 operation forbids, and that when it is forced a second live member is created
 and the `gateway_hwid`-only grouping surfaces the pair; and that
 re-registering the same hardware under the *original* wallet after retirement
-inserts a fresh intent and leaves the retired row intact. Finally it MUST
+inserts a fresh intent and leaves the retired row intact, gets back that
+wallet's disabled `mb_uuid` with `disabled_at` still set, and leaves the intent
+`registration_failed` with nothing bound and no member re-enabled; and that once
+the member is re-enabled, the next registration binds that same `mb_uuid`, now
+live, and reaches `registered`. Finally it MUST
 prove that the sweep recovers `gateway_hwid` and
 `wallet` from `oidc_subject` alone, with no NOP-side registration row present,
 and surfaces a member whose subject does not parse rather than skipping it.
@@ -600,6 +619,18 @@ The failure modes you're most likely to hit:
   retiring the intent first releases the constraint while the prior member is
   still live, which is how a second live member gets minted (see "MintMember
   identity and idempotency"). Then have the new wallet register again.
+
+- **A gateway's registration ends `registration_failed` with a non-live
+  `mb_uuid` in `last_error`.** Expected when hardware returns to a wallet that
+  held it before: the derived subject is that wallet's old one, so `MintMember`
+  returns its retired member (see "Local-first ordering and pending state").
+  Treat it as a rebind request, as above. Verify the ownership change out of
+  band, and confirm that no other wallet still holds a live member or a
+  `pending_orc8r`/`registered` intent for this `gateway_hwid`; retire any that
+  does first, in the order above. Then set `disabled_at = NULL` on the returned
+  member (`psql` on the orc8r pool) and have the owner register again. If an
+  explicit repair disabled the member instead, finish that repair rather than
+  re-enabling it.
 
 ## Related
 
