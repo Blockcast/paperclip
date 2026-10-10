@@ -816,7 +816,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     await db.insert(issues).values({
       id: escalationId,
       companyId,
-      title: "ccrotate pool exhausted — claude",
+      title: "Penstock capacity exhausted — claude",
       status: "todo",
       priority: "high",
       originKind: "ccrotate_capacity_exhausted",
@@ -871,7 +871,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
       db.insert(issues).values({
         id: randomUUID(),
         companyId,
-        title: "ccrotate pool exhausted — claude",
+        title: "Penstock capacity exhausted — claude",
         status: "todo",
         priority: "high",
         originKind: "ccrotate_capacity_exhausted",
@@ -1110,6 +1110,21 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     expect(escalations[0]?.originId, "escalation is keyed on the ccrotate target").toBe("claude");
     expect(escalations[0]?.priority).toBe("high");
     expect(escalations[0]?.status).toBe("todo");
+
+    // BLO-29494 AC6. The escalation is the one artifact of this subsystem an
+    // operator actually reads, and it used to tell them to do a "ccrotate token
+    // refresh / capacity top-up" — ccrotate was removed 2026-08-19, so that is
+    // a lever that no longer exists. Pin the operator-facing text, because the
+    // persisted identifiers deliberately keep the old name and nothing else
+    // here distinguishes "the key still says ccrotate" (correct, asserted
+    // above) from "we are still telling a human to go turn a knob that is
+    // gone" (the defect).
+    const operatorText = `${escalations[0]?.title ?? ""}\n${escalations[0]?.description ?? ""}`;
+    expect(operatorText, "escalation names Penstock as the capacity owner").toContain("Penstock");
+    expect(
+      operatorText.toLowerCase(),
+      "escalation must not point an operator at a ccrotate token refresh or pool top-up",
+    ).not.toMatch(/ccrotate (token|pool|capacity pool)/);
   });
 
   it("keeps re-deferring a young chain no matter how many attempts it has burned", async () => {
@@ -1294,7 +1309,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     const { companyId } = await seedAgent();
     const base = {
       companyId,
-      title: "ccrotate pool exhausted — claude",
+      title: "Penstock capacity exhausted — claude",
       originKind: "ccrotate_capacity_exhausted",
       originId: "claude",
     };

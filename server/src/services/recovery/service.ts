@@ -14542,10 +14542,24 @@ export function recoveryService(
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
 
-  // Surface a pool that never recovered within the ccrotate auto-retry budget
-  // (PEN-382). Coalesced per (company, ccrotate target): a pool outage exhausts
+  // Surface a pool that never recovered within the capacity auto-retry budget
+  // (PEN-382). Coalesced per (company, target): a pool outage exhausts
   // many agents' retries at once, so the escalation is keyed on the target —
   // one open issue per pool, not one per cancelled run.
+  //
+  // ## The identifiers still say `ccrotate`; the prose deliberately does not
+  //
+  // ccrotate was removed 2026-08-19 and Penstock owns capacity server-side, so
+  // BLO-29494 AC6 asked for the retired name to stop reaching operators. Only
+  // the operator-facing title/description were changed. `originKind`,
+  // `originId` and the `ccrotateTarget` field keep their names on purpose:
+  // they are an identity contract, not a description. `findOpen` below matches
+  // on (originKind, originId) and the partial unique index
+  // `issues_active_ccrotate_capacity_exhaustion_uq` enforces it, so renaming
+  // them would need a persisted-value migration plus a read-compatibility shim
+  // for every already-open escalation — all to restate what this comment says
+  // in one place. See ccrotate-target.ts, which keeps the same split for the
+  // same reason. Do not "finish" this by renaming the key.
   async function escalateCcrotateCapacityExhausted(input: {
     companyId: string;
     ccrotateTarget: string;
@@ -14579,15 +14593,15 @@ export function recoveryService(
       : input.agentId;
     try {
       const created = await issuesSvc.create(input.companyId, {
-        title: `ccrotate pool exhausted — ${input.ccrotateTarget}`,
+        title: `Penstock capacity exhausted — ${input.ccrotateTarget}`,
         description: [
-          `The ccrotate capacity pool **${input.ccrotateTarget}** did not recover within the auto-retry budget.`,
+          `The **${input.ccrotateTarget}** provider pool did not recover within the auto-retry budget.`,
           "",
           `- Agent: ${agentLabel}`,
           `- Cancelled run: ${input.runId}`,
           `- Retry attempts before giving up: ${input.attempts}`,
           "",
-          "Agent runs are deferring and then cancelling because no account in this pool has usable capacity and none reported a future reset within the retry window. This usually needs a ccrotate token refresh / capacity top-up rather than agent action. This issue is coalesced per pool, so it represents the whole outage rather than a single run — mark it done once the pool recovers.",
+          "Agent runs are deferring and then cancelling because the Penstock capacity gate reports no usable capacity for this pool, and no future reset was advertised within the retry window. Capacity is managed server-side by Penstock, so the lever is this pool's Penstock provider capacity — there is no per-pool token to refresh here. This issue is coalesced per pool, so it represents the whole outage rather than a single run — mark it done once the pool recovers.",
         ].join("\n"),
         status: "todo",
         priority: "high",
