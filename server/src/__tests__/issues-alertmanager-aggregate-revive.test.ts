@@ -30,6 +30,7 @@ describeEmbeddedPostgres("issueService.update Alertmanager aggregate revival", (
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   const AGGREGATE_KEY = 'alert-aggregate:v1:["ArcWorkflowJobQueuedCritical",null]';
+  const COVER_KEY = "cover:ClusterAdminDrift:248571";
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-alertmanager-revive-");
@@ -64,6 +65,16 @@ describeEmbeddedPostgres("issueService.update Alertmanager aggregate revival", (
       originKind: "plugin:paperclip-plugin-alertmanager",
       originId,
       originFingerprint: AGGREGATE_KEY,
+    });
+  }
+
+  async function createCover(companyId: string, originId: string) {
+    return await svc.create(companyId, {
+      title: `[user-cover] ${originId}`,
+      description: `cover ${originId}`,
+      originKind: "plugin:paperclip-plugin-alertmanager:escalation",
+      originId,
+      originFingerprint: COVER_KEY,
     });
   }
 
@@ -115,5 +126,39 @@ describeEmbeddedPostgres("issueService.update Alertmanager aggregate revival", (
     const patched = await svc.update(first.id, { priority: "low" });
     expect(patched.priority).toBe("low");
     expect(patched.status).toBe("done");
+  });
+
+  // The cover index `issues_active_alert_escalation_cover_uq` has the same
+  // predicate shape over the same three key columns, so it carries the identical
+  // revive-into-a-held-slot collision. The plugin itself never revives a cover
+  // (`escalation.ts` only ever moves one to `cancelled`), but any human or agent
+  // PATCHing a cancelled `[user-cover]` row back to `todo` while a newer cover
+  // from the same window holds the fingerprint hits it.
+  it("rejects reviving a terminal escalation cover with a typed 409", async () => {
+    const company = await seedCompany();
+
+    const first = await createCover(company.id, "cover-series-1");
+    await svc.update(first.id, { status: "cancelled" });
+    const second = await createCover(company.id, "cover-series-2");
+    expect(second.id).not.toBe(first.id);
+
+    await expect(svc.update(first.id, { status: "todo" })).rejects.toMatchObject({
+      status: 409,
+      message: "Alert escalation cover conflict",
+    });
+  });
+
+  it("still allows reviving a cover once the sibling has vacated the slot", async () => {
+    const company = await seedCompany();
+
+    const first = await createCover(company.id, "cover-series-1");
+    await svc.update(first.id, { status: "cancelled" });
+    const second = await createCover(company.id, "cover-series-2");
+    await svc.update(second.id, { status: "done" });
+
+    // Same negative control as the aggregate case: a guard that rejected every
+    // cover revival would pass the test above on its own.
+    const revived = await svc.update(first.id, { status: "todo" });
+    expect(revived.status).toBe("todo");
   });
 });
