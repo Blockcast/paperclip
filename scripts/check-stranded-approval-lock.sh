@@ -218,7 +218,12 @@ rollout_complete="$(jq_bool \
 # object has drifted from the plan that was approved -- and an empty annotation
 # (a provisional lock whose second write never landed) can never match, which is
 # deliberate: such a lock is operative and closes the channel to everyone.
-live_server_plan="$(jq -cS "$CANONICAL_DEPLOYMENT_JQ" <<<"$deployment_json" \
+# `printf '%s' "$(...)"` and not `jq ... | sha256sum`: the approval script hashes
+# the canonical JSON with NO trailing newline (CANONICAL_SERVER_PLAN is a command
+# substitution, which strips it), and that is the string whose hash the lock
+# stores. Piping jq straight into sha256sum hashes one extra byte, so this arm
+# read false against every real lock -- see BLO-42073.
+live_server_plan="$(printf '%s' "$(jq -cS "$CANONICAL_DEPLOYMENT_JQ" <<<"$deployment_json")" \
   | sha256sum | awk '{print $1}')"
 server_plan_match=false
 [[ -n "$lock_server_plan" && "$live_server_plan" == "$lock_server_plan" ]] && server_plan_match=true

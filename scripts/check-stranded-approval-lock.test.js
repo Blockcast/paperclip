@@ -121,13 +121,21 @@ function configmap(lock) {
 // The approver's own canonical projection, computed the way the script computes
 // it rather than hard-coded, so a "clean" fixture stays clean if that projection
 // ever changes shape.
+//
+// The hashing form here must be the APPROVAL SCRIPT's -- `printf '%s' "$(jq ...)"`,
+// no trailing newline -- because the approval script is what writes the hash the
+// lock stores. Minting the fixture with the checker's own form instead makes the
+// fixture and the checker agree with each other while both disagree with
+// production: that is how BLO-42073 shipped a `server_plan_match` arm that was
+// constant false, with all 19 tests green. If the checker reverts to piping jq
+// into sha256sum, the "satisfiable lock" case below must fail.
 function canonicalHash(deploymentJson) {
   const run = spawnSync(
     "bash",
     [
       "-c",
       'canon="$(sed -n "/^# BEGIN CANONICAL_DEPLOYMENT_JQ$/,/^# END CANONICAL_DEPLOYMENT_JQ$/p" "$1" | sed "1d;\\$d")"; ' +
-        'jq -cS "$canon" "$2" | sha256sum | awk "{print \\$1}"',
+        'printf "%s" "$(jq -cS "$canon" "$2")" | sha256sum | awk "{print \\$1}"',
       "bash",
       approvePath,
       deploymentJson,
