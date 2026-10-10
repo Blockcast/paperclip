@@ -29,6 +29,12 @@ const sharedOpts = {
 export const logger = pino({
   level: "debug",
   redact: ["req.headers.authorization"],
+  // Pino only applies its Error serializer to the `err` key. ~35 call sites in
+  // this repo log `{ error }` instead, and an Error's own `message`/`stack` are
+  // non-enumerable -- so those lines render the diagnostic as an empty object
+  // and carry nothing at all. Merged over pino's defaults, so `err` keeps
+  // working; non-Error values (`error: String(e)`) pass through untouched.
+  serializers: { error: pino.stdSerializers.err },
 }, pino.transport({
   targets: [
     {
