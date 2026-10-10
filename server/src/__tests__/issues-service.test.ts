@@ -9012,6 +9012,79 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("lets an explicit projectId beat an inheritance source in another project instead of 422ing", async () => {
+    const companyId = randomUUID();
+    const sourceProjectId = randomUUID();
+    const targetProjectId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const sourceProjectWorkspaceId = randomUUID();
+    const targetProjectWorkspaceId = randomUUID();
+    const sourceExecutionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values([
+      { id: sourceProjectId, companyId, name: "Source project", status: "in_progress" },
+      { id: targetProjectId, companyId, name: "Target project", status: "in_progress" },
+    ]);
+
+    await db.insert(projectWorkspaces).values([
+      { id: sourceProjectWorkspaceId, companyId, projectId: sourceProjectId, name: "Source workspace" },
+      {
+        id: targetProjectWorkspaceId,
+        companyId,
+        projectId: targetProjectId,
+        name: "Target workspace",
+        isPrimary: true,
+      },
+    ]);
+
+    await db.insert(executionWorkspaces).values({
+      id: sourceExecutionWorkspaceId,
+      companyId,
+      projectId: sourceProjectId,
+      projectWorkspaceId: sourceProjectWorkspaceId,
+      mode: "operator_branch",
+      strategyType: "git_worktree",
+      name: "Source operator branch",
+      status: "active",
+      providerType: "git_worktree",
+    });
+
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      projectId: sourceProjectId,
+      projectWorkspaceId: sourceProjectWorkspaceId,
+      title: "Source issue",
+      status: "todo",
+      priority: "medium",
+      executionWorkspaceId: sourceExecutionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "operator_branch" },
+    });
+
+    // The route injects `inheritExecutionWorkspaceFromIssueId` from the caller's own
+    // run, so this is what a cross-project create looks like from an agent working a
+    // different project's issue. Before BLO-19924 it inherited the source's workspaces
+    // and then threw 422 "… must belong to the selected project".
+    const created = await svc.create(companyId, {
+      title: "Cross-project follow-up",
+      projectId: targetProjectId,
+      inheritExecutionWorkspaceFromIssueId: sourceIssueId,
+    });
+
+    expect(created.projectId).toBe(targetProjectId);
+    expect(created.projectWorkspaceId).toBe(targetProjectWorkspaceId);
+    expect(created.executionWorkspaceId).toBeNull();
+  });
+
   it("derives project identity when an update adds workspace linkage to a projectless issue", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
