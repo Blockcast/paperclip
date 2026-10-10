@@ -7,6 +7,15 @@ name: graphify staleness gate
 # (bot or human) — so a graph refresh that sat open while base advanced (the way
 # Open-Capacity-Marketplace#85 went stale) can't silently land inconsistent.
 #
+# "Base" means the base branch's tip at the moment this job runs, NOT
+# `pull_request.base.sha`. The reindex bot builds the graph at exactly the
+# commit it branches off, so `built_at_commit` == `base.sha` by construction,
+# and that payload value never moves while the PR sits open (a re-run replays
+# the same event). Diffing against it made the gate green by construction for
+# the one producer it exists to police: Paperclip PR #1550 sat 98 commits
+# behind master with `staleness` green. Against the tip, a late run or a
+# re-run reports the drift that would actually land.
+#
 # Drop this same file into any repo that commits graphify-out/ to get the gate.
 
 on:
@@ -26,10 +35,16 @@ jobs:
           fetch-depth: 0
       - name: Verify committed graphs are fresh vs base
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -uo pipefail
           rc=0
+          if ! git fetch --no-tags --quiet origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" \
+            || ! BASE_SHA=$(git rev-parse --verify --quiet "refs/remotes/origin/${BASE_REF}^{commit}"); then
+            echo "::error::cannot resolve the current tip of base branch '${BASE_REF}'"
+            exit 1
+          fi
+          echo "Comparing against ${BASE_REF} tip ${BASE_SHA:0:12}"
           changed=$(git diff --name-only "$BASE_SHA"...HEAD | grep -E '(^|/)graphify-out/graph\.json$' || true)
           if [ -z "$changed" ]; then
             echo "No graphify-out/graph.json changed in this PR — nothing to gate."
