@@ -695,7 +695,7 @@ const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
  * up only while Alertmanager's `group_by` for the receiver is `[alertname]`.
  * An earlier revision of this comment asserted that as a fact about
  * Alertmanager; it was a fact about one config, and that config had already
- * changed. From 2026-08-28 the Blockcast tree grouped by
+ * changed. By late August 2026 the Blockcast tree grouped by
  * `[alertname, namespace]`, so one alertname firing in N namespaces arrived as
  * N concurrent deliveries racing one fence — ~115 responses in a 6h window
  * failed this way (BLO-41683), which is the shape this memo is powerless
@@ -703,14 +703,20 @@ const DEFAULT_AGGREGATE_FENCE_WAIT: AggregateFenceWaitPolicy = {
  * sibling delivery, not an earlier alert in its own batch.
  *
  * The sender-side fix is pending, not in force: Blockcast/onprem-k8s#5110
- * moves this receiver to `group_by: [alertname]` in
- * `monitoring/alertmanager-configmap.yaml` and pins it in
- * `scripts/check-alertmanager-routes.sh`. Until that merges, the Blockcast root
- * route still groups by `[alertname, namespace]` and this memo is not
- * sufficient. Even after it lands, treat it as an assumption that can lapse
- * without anything here changing: when it does, this memo stays correct but
- * stops being sufficient, and the residual is the delivery's own disposition
- * for a lost fence (BLO-38643).
+ * sets `group_by: [alertname]` on the catch-all `receiver: paperclip` leg and
+ * on the `paperclip-penstock` tenant route in
+ * `monitoring/alertmanager-configmap.yaml`, and pins both in
+ * `scripts/check-alertmanager-routes.sh`. Until that merges, the catch-all leg
+ * sets no `group_by` of its own and inherits the root `[alertname, namespace]`,
+ * so this memo is not sufficient. The root route keeps `namespace` after #5110
+ * too (slack-relay and dead-mans-snitch want it), so the thing to check is the
+ * leg's own `group_by`, never the root's. The other `receiver: paperclip` legs
+ * (AlertmanagerSlackRelay*, LLMProxyProvider*) keep root grouping on purpose:
+ * each carries at most one `namespace` value, so they open one group per
+ * alertname and race no fence. Even after it lands, treat it as an assumption
+ * that can lapse without anything here changing: when it does, this memo stays
+ * correct but stops being sufficient, and the residual is the delivery's own
+ * disposition for a lost fence (BLO-38643).
  *
  * Alerts 2..N gain nothing by waiting: the first already established that this
  * key is not becoming claimable on this delivery's timescale, and none of them
