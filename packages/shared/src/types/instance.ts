@@ -85,7 +85,6 @@ export interface InstanceExperimentalSettings {
   enableExperimentalFileViewer: boolean;
   enableCloudSync: boolean;
   enableDoneExecutionGate: boolean;
-  enableInReviewEvidenceGate: boolean;
   enableExternalObjects: boolean;
   enableSmokeLab: boolean;
   enableBuiltInAgents: boolean;

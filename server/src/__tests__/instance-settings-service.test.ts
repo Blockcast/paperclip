@@ -41,7 +41,6 @@ describe("instance settings service", () => {
       enableBuiltInAgents: true,
       enableSummaries: false,
       enableDecisions: false,
-      enableInReviewEvidenceGate: false,
       enableDoneExecutionGate: false,
       enableGoalsSidebarLink: true,
       enableServerInfoDebugView: true,
