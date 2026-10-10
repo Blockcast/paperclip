@@ -974,7 +974,18 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       }
     });
 
-    it("keeps the stranded-recovery rotation's cursor across a restart too", async () => {
+    /**
+     * The cursor key is `<sweep>:<companyId ?? "*">`. Scoping it per company closes a latent bug
+     * the shared closure had: a company-scoped call advanced the SAME variable the global
+     * rotation used, so one scoped call moved the global rotation's position to a row from
+     * another company's page. Asserting the global row is absent is what actually guards that —
+     * the company-scoped row being present does not, since the old shared closure would have
+     * satisfied it too.
+     *
+     * The stranded-recovery rotation is not re-tested here: it reads and writes through the same
+     * two helpers, differing only in its key prefix and candidate query.
+     */
+    it("writes the cursor under a company-scoped key, leaving the global rotation alone", async () => {
       const seeded = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
       await seedAdditionalBlockedDependents(seeded, 2);
 
@@ -984,14 +995,17 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         limit: 2,
       });
 
-      const cursor = await db
+      const rows = await db
         .select({ cursor: backstopSweepCursors.cursor, sweep: backstopSweepCursors.sweep })
-        .from(backstopSweepCursors)
-        .where(eq(backstopSweepCursors.sweep, `issue_graph_liveness.backstop:${seeded.companyId}`))
-        .then((rows) => rows[0] ?? null);
+        .from(backstopSweepCursors);
 
-      // Persisted, company-scoped, and pointing past page 1 — the state a restart must inherit.
-      expect(cursor?.cursor).toBeTruthy();
+      // Persisted and pointing past page 1 — the state a restart must inherit.
+      const scoped = rows.find(
+        (r) => r.sweep === `issue_graph_liveness.backstop:${seeded.companyId}`,
+      );
+      expect(scoped?.cursor).toBeTruthy();
+      // And the global rotation, which production actually drives, was not moved by it.
+      expect(rows.map((r) => r.sweep)).not.toContain("issue_graph_liveness.backstop:*");
     });
   });
 
