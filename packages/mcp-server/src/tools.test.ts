@@ -122,6 +122,49 @@ describe("paperclip MCP tools", () => {
     expect(description).toMatch(/paperclipListIssues\(assigneeAgentId=me\) per status \u2014 whose own `limit` description carries the same deploy-skew caveat/);
   });
 
+  // BLO-34421: the four wake-path scalars now ship hydrated (489/489 rows,
+  // measured 2026-10-10), so the `has()` gate the description prescribes is
+  // sound ON THE ROWS IT RETURNS. Two reader-side holes survive that fix, and
+  // the gate catches neither — on inbox-lite because the ROW is withheld (no
+  // key to test), on paperclipGetIssue because the KEY can never exist (the
+  // retry arm is nested). Both make the retry arm vote "unattended" silently,
+  // which is the bulk-demotion direction. Keyed on the hazard, not the prose.
+  it("paperclipInboxLite names the foreign scheduled-retry hold among the withheld classes", () => {
+    const { description } = getTool("paperclipInboxLite");
+
+    // The fourth withheld class is named, with the ticket that defines it.
+    expect(description).toMatch(/SIBLING RUN PARKED ON A SCHEDULED RETRY \(BLO-29965\)/);
+    // ...and the count agrees with the list, so a future edit cannot drop one
+    // class and leave a stale tally that still reads as exhaustive.
+    expect(description).toContain("and all four skew attended");
+    expect(description).not.toContain("and all three skew attended");
+
+    // Why this class specifically defeats the `has()` gate prescribed above:
+    // absence of the ROW, not a null field. Without this the gate reads as a
+    // complete control when it is blind to 11 of 33 attended rows.
+    expect(description).toMatch(/defeats the `has\(\)` gate/);
+    expect(description).toContain("ABSENT FROM THE ARRAY");
+    // A count taken here is a floor, and the census surface is named.
+    expect(description).toContain("attendance count taken here is a FLOOR");
+    expect(description).toMatch(/For a lane census use paperclipListIssues\(assigneeAgentId=me\), which withholds neither/);
+  });
+
+  it("paperclipGetIssue states the retry arm is nested and the flat keys never appear", () => {
+    const { description } = getTool("paperclipGetIssue");
+
+    expect(description).toContain("THE FLAT KEYS DO NOT EXIST");
+    // The translation a caller needs, not just the warning.
+    expect(description).toContain(
+      ".scheduledRetry.{scheduledRetryAt,scheduledRetryAttempt,scheduledRetryReason}",
+    );
+    // The gate the sibling description prescribes is explicitly disclaimed
+    // here; omitting this is what makes the hole look already-guarded.
+    expect(description).toMatch(/gate does not save you because that key can never appear on this surface/);
+    // And the fields that need NO translation are named, so the warning does
+    // not read as "nothing on this surface is top-level".
+    expect(description).toMatch(/`monitorNextCheckAt` and `activeRun` ARE top-level/);
+  });
+
   // The shared issue-list `limit` schema (paperclipListIssues, paperclip_search_issues)
   // made the same claim with no caveat, and it is independently measured false:
   // `limit: 1000` returned exactly 1000 rows as a bare array, `offset: 1000` a
