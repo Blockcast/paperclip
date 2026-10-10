@@ -5410,6 +5410,13 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             title: manifestIssue.title,
             description,
             assigneeAgentId,
+            // BLO-43103: an issue whose source assignee could not be imported
+            // has no owner of its own, and create now refuses to persist a row
+            // nothing can route to. Attributing it to the importing user —
+            // the same idiom the project import above already uses — keeps the
+            // import working without depending on the target company having a
+            // default responsible user configured.
+            createdByUserId: actorUserId ?? null,
             status: issueStatus,
             priority: manifestIssue.priority && ISSUE_PRIORITIES.includes(manifestIssue.priority as any)
               ? manifestIssue.priority as typeof ISSUE_PRIORITIES[number]
