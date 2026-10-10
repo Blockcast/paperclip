@@ -542,7 +542,17 @@ describe("runUsesStatelessReviewWorkspace (BLO-42212)", () => {
     // `derivePaperclipPrReview` non-null, because the reviewer-output gate
     // trusts that object's `prAuthorLogin` as signed webhook data. A context
     // that only carries a label-shaped hint must still derive to null.
-    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", labels: REVIEW_LABELS })).toBeNull();
-    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", reviewKind: "stateless-review" })).toBeNull();
+    //
+    // Every fixture carries `githubPrNumber`: without it `derivePaperclipPrReview`
+    // returns null at its `prNumber === null` check whatever the label logic
+    // does, so a widening on `labels`/`reviewKind` would pass this test
+    // unnoticed. The positive control proves the fixture is otherwise complete
+    // -- it derives non-null the moment a TRUSTED signal is present.
+    const prNumber = { githubPrNumber: 2416 };
+    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", reviewKind: "pr_review", ...prNumber }))
+      .not.toBeNull();
+    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", labels: REVIEW_LABELS, ...prNumber })).toBeNull();
+    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", reviewKind: "stateless-review", ...prNumber }))
+      .toBeNull();
   });
 });

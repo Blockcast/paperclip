@@ -157,21 +157,29 @@
  * answers "does this run write a shared tree", and it is isolation-only -- grep
  * it, every consumer is a key/root derivation, none grants trust.
  *
- * WHY A LABEL IS SAFE TO LET AGENTS SET. Marking a row does not un-exclude a
- * run from a tree it still touches; it moves the run OFF that tree.
- * `buildK8sRunIsolationDescriptor` forces `hasProvisionedWorktree` false for a
- * stateless review, so `workspaceRoot` becomes
- * `/runtime-cache/paperclip-runs/<runId>/workspace` on EPHEMERAL storage. The
- * run cannot reach the shared checkout, which is why dropping its writer key is
- * correct rather than merely cheap -- it satisfies this module's contract
- * literally: null means "nothing shared to exclude on". A self-applied label
- * therefore costs the applier a warm checkout and can corrupt nothing.
+ * WHAT THE LABEL DOES -- AND WHAT IT DOES NOT. It moves the run's DEFAULT
+ * workspace root off the shared tree: `buildK8sRunIsolationDescriptor` forces
+ * `hasProvisionedWorktree` false for a stateless review, so `workspaceRoot`
+ * becomes `/runtime-cache/paperclip-runs/<runId>/workspace` on EPHEMERAL
+ * storage, and the run's own default writes no longer need the shared tree's
+ * writer key. That is the whole effect. It is a CONVENTION, NOT AN ENFORCED
+ * BOUNDARY: `/paperclip` stays mounted, `resolveWorkspaceForRun` still resolves
+ * and realizes the issue's project workspace (`k8sIsolationMode` steers only its
+ * workspace-less fallback), and the issue payload can still name the project
+ * BASE checkout -- the path BLO-31282 records base checkouts accumulating
+ * uncommitted work through. A labelled run that reaches the base checkout by an
+ * explicit path is UNEXCLUDED: it writes that tree holding a null writer key,
+ * which is BLO-19422's shape. Webhook-born reviews have carried this same
+ * exposure all along, so the label adds no new kind of hazard; it extends an
+ * existing one to more runs.
  *
- * THE ONE HAZARD, and it is the loud kind: label a row that genuinely needs the
- * project checkout and its run starts in an empty directory. That fails
- * immediately and visibly on the first path that is not there. It does not
- * silently tear a shared tree, which is the failure this module exists to
- * prevent.
+ * WHO MAY APPLY IT, therefore: only a row whose run does not write the project
+ * checkout (a PR review working from its own fetch of the PR). A mislabelled row
+ * that needs the checkout fails one of two ways -- loudly, by starting in an
+ * empty directory, or SILENTLY, by reaching the base checkout by path and
+ * writing it with no writer exclusion. The second is the failure this module
+ * exists to prevent, and nothing here stops it. Widening the label beyond
+ * review rows needs an enforced boundary first, not a broader convention.
  *
  * WHY NOT A PER-RUN WORKTREE instead (the other option on BLO-42212): a
  * worktree per concurrent run costs persistent volume on a filesystem measured
