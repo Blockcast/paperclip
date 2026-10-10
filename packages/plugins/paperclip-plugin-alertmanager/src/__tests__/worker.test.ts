@@ -3108,8 +3108,114 @@ describe("handleWebhook — operator suppression (BLO-24234)", () => {
         },
       }),
     );
+    // BLO-42853 negative control: the slot is free (`issues.list` returns []),
+    // so this MUST reopen in place. A change that rebinds unconditionally
+    // fails here.
+    expect(mocks.issues.createComment).toHaveBeenCalledWith(
+      "issue-existing",
+      expect.stringContaining("closed by hand"),
+      "company-1",
+      expect.any(Object),
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.aggregate.rebound",
+      expect.any(Number),
+      expect.any(Object),
+    );
     const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
     expect(written.operatorSuppressedAt).toBeNull();
+    expect(written.paperclipIssueId).toBe("issue-existing");
+  });
+
+  // BLO-42853: the `suppression_expired` branch used to do a bare
+  // `issues.update(… status: "todo")` with no aggregate lookup. When a live
+  // sibling held the slot that violated
+  // `issues_active_alertmanager_aggregate_creation_uq`, the enclosing catch
+  // swallowed it as `Failed to re-sync …`, and the fingerprint was left with a
+  // closed row and no wake path.
+  it("rebinds a suppression-expiry re-fire to the live aggregate winner", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce(
+      suppressedState({
+        operatorSuppressedAt: hoursAgo(25),
+        nextEscalationAt: "2026-04-29T09:00:00Z",
+        escalationAttempt: 3,
+        escalationComplete: true,
+      }),
+    );
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
+    mocks.issues.list.mockImplementation(async (input) =>
+      input.originFingerprint && input.status === "todo"
+        ? [{ id: "issue-winner", status: "todo", assigneeAgentId: "agent-owner" }]
+        : [],
+    );
+
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
+
+    // AC1 — never resurrect the cancelled member; take over the winner.
+    expect(mocks.issues.update).not.toHaveBeenCalledWith(
+      "issue-existing",
+      expect.objectContaining({ status: "todo" }),
+      "company-1",
+      undefined,
+      expect.any(Object),
+    );
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-winner",
+      expect.objectContaining({ description: expect.any(String) }),
+      "company-1",
+      undefined,
+      expect.objectContaining({
+        fencing: {
+          table: "alertmanager_aggregate_lifecycle_fences",
+          match: expect.objectContaining({
+            company_id: "company-1",
+            phase: "firing",
+            firing_token: expect.any(String),
+          }),
+        },
+      }),
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.aggregate.rebound",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        paperclipIssueId: "issue-winner",
+        assigneeAgentId: "agent-owner",
+      }),
+      FIRING_FENCE_ARG,
+    );
+
+    // The explanatory comment follows the row that now carries the alert, and
+    // does not tell the winner it was "closed by hand" — it was not.
+    expect(mocks.issues.createComment).toHaveBeenCalledWith(
+      "issue-winner",
+      expect.stringContaining("kept firing past"),
+      "company-1",
+      expect.any(Object),
+    );
+    expect(mocks.issues.createComment).not.toHaveBeenCalledWith(
+      "issue-winner",
+      expect.stringContaining("closed by hand"),
+      "company-1",
+      expect.any(Object),
+    );
+
+    // AC3 — the ladder is armed on whichever row ends up carrying the alert,
+    // or the rebound row sits open with no deadline.
+    const written = mocks.state.set.mock.calls.at(-1)?.[1] as AlertStateRecord;
+    expect(written.escalationAttempt).toBe(0);
+    expect(written.escalationComplete).toBe(false);
+    expect(Date.parse(written.nextEscalationAt as string)).toBeGreaterThan(Date.now());
+
+    // AC4 — the collision no longer reaches the enclosing catch.
+    expect(mocks.logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("Failed to re-sync existing issue"),
+    );
   });
 
   it("re-arms the escalation ladder on a suppression-expiry re-open", async () => {

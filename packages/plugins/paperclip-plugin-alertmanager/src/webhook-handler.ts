@@ -2270,23 +2270,26 @@ export async function handleFiring(
             { fencing: firingFence(companyId, aggregateKey, firingToken) },
           );
         } else if (decision.kind === "reopen") {
-          if (decision.reason === "plugin_resolved") {
-            // A different firing in this aggregate may already have created a
-            // live winner while this fingerprint was resolved. Rebind to that
-            // winner before reopening the terminal issue, which avoids
-            // resurrecting a cancelled aggregate member.
-            const activeAggregateIssue = await findActiveAggregateIssue(
-              ctx,
-              existing.paperclipCompanyId,
-              aggregateKey,
-            );
-            if (
-              activeAggregateIssue &&
-              activeAggregateIssue.id !== existing.paperclipIssueId
-            ) {
-              tracked = rebindAlertState(existing, activeAggregateIssue);
+          // A different firing in this aggregate may already have created a
+          // live winner while this fingerprint was closed. Rebind to that
+          // winner before reopening our own row, which avoids resurrecting a
+          // cancelled aggregate member.
+          //
+          // BLO-42853: this used to guard the `plugin_resolved` reason only.
+          // `suppression_expired` did a bare `issues.update(… status: "todo")`
+          // with no lookup and no catch, so a held aggregate slot turned it
+          // into an `issues_active_alertmanager_aggregate_creation_uq`
+          // violation that the enclosing catch swallowed as `Failed to re-sync
+          // … on re-fire` — the row stayed closed, the delivery was acked, and
+          // the fingerprint lost its wake path for good. Both reasons need the
+          // same rebind; only their side effects differ.
+          //
+          // Returns the row the alert ended up on when that is NOT our own row,
+          // else `null` for "reopened in place".
+          const rebindOrReopen = async (): Promise<IssueReference | null> => {
+            const takeOver = async (target: IssueReference) => {
               await ctx.issues.update(
-                activeAggregateIssue.id,
+                target.id,
                 { description: newDescription },
                 existing.paperclipCompanyId,
                 undefined,
@@ -2296,71 +2299,73 @@ export async function handleFiring(
                 alertname,
                 severity,
               });
-            } else {
-              try {
-                await ctx.issues.update(
-                  existing.paperclipIssueId,
-                  { status: "todo", description: newDescription },
-                  existing.paperclipCompanyId,
-                  undefined,
-                  { fencing: firingFence(companyId, aggregateKey, firingToken) },
-                );
-                await ctx.metrics.write("alertmanager.firing.reopened", 1, {
-                  alertname,
-                  severity,
-                });
-              } catch (err) {
-                // A competing firing can win the aggregate between the lookup
-                // and this update. Re-read the winner before surfacing the
-                // original error so the retry follows the active issue.
-                const reboundIssue = await findActiveAggregateIssue(
-                  ctx,
-                  existing.paperclipCompanyId,
-                  aggregateKey,
-                );
-                if (
-                  !reboundIssue ||
-                  reboundIssue.id === existing.paperclipIssueId
-                ) {
-                  throw err;
-                }
-                tracked = rebindAlertState(existing, reboundIssue);
-                await ctx.issues.update(
-                  reboundIssue.id,
-                  { description: newDescription },
-                  existing.paperclipCompanyId,
-                  undefined,
-                  { fencing: firingFence(companyId, aggregateKey, firingToken) },
-                );
-                await ctx.metrics.write("alertmanager.aggregate.rebound", 1, {
-                  alertname,
-                  severity,
-                });
+              return target;
+            };
+            const winner = await findActiveAggregateIssue(
+              ctx,
+              existing.paperclipCompanyId,
+              aggregateKey,
+            );
+            if (winner && winner.id !== existing.paperclipIssueId) {
+              return takeOver(winner);
+            }
+            try {
+              await ctx.issues.update(
+                existing.paperclipIssueId,
+                { status: "todo", description: newDescription },
+                existing.paperclipCompanyId,
+                undefined,
+                { fencing: firingFence(companyId, aggregateKey, firingToken) },
+              );
+              return null;
+            } catch (err) {
+              // A competing firing can win the aggregate between the lookup
+              // and this update. Re-read the winner before surfacing the
+              // original error so the retry follows the active issue.
+              const reboundIssue = await findActiveAggregateIssue(
+                ctx,
+                existing.paperclipCompanyId,
+                aggregateKey,
+              );
+              if (!reboundIssue || reboundIssue.id === existing.paperclipIssueId) {
+                throw err;
               }
+              return takeOver(reboundIssue);
+            }
+          };
+
+          const reboundTo = await rebindOrReopen();
+          if (reboundTo) tracked = rebindAlertState(existing, reboundTo);
+
+          if (decision.reason === "plugin_resolved") {
+            if (!reboundTo) {
+              await ctx.metrics.write("alertmanager.firing.reopened", 1, {
+                alertname,
+                severity,
+              });
             }
           } else {
-            await ctx.issues.update(
-              existing.paperclipIssueId,
-              { status: "todo", description: newDescription },
-              existing.paperclipCompanyId,
-              undefined,
-              { fencing: firingFence(companyId, aggregateKey, firingToken) },
-            );
-            // Say why the close did not stick, on the issue itself — an
-            // operator who closed this yesterday needs to know it re-opened
-            // because the alert never stopped firing, not because something
-            // ignored them.
+            // Say why the close did not stick, on whichever row now carries
+            // the alert — an operator who closed this yesterday needs to know
+            // it is still firing, not that something ignored them. On a rebind
+            // the closed row is NOT what reopened, so it does not get the
+            // "this issue was closed by hand" text: that would be a false
+            // statement about the live row and no statement at all about the
+            // close.
             try {
               await ctx.issues.createComment(
-                existing.paperclipIssueId,
-                `Re-opened by paperclip-plugin-alertmanager: this issue was closed by hand, but \`${alertname}\` has kept firing past the ${operatorSuppressionHoursLabel(config)} suppression window. Closing it again will suppress it for another window; silence the alert rule itself if it should stop paging.`,
+                reboundTo ? reboundTo.id : existing.paperclipIssueId,
+                reboundTo
+                  ? `paperclip-plugin-alertmanager: \`${alertname}\` has kept firing past the ${operatorSuppressionHoursLabel(config)} suppression window that followed a hand-close of issue ${existing.paperclipIssueId}. That issue stays closed; this one now tracks the alert.`
+                  : `Re-opened by paperclip-plugin-alertmanager: this issue was closed by hand, but \`${alertname}\` has kept firing past the ${operatorSuppressionHoursLabel(config)} suppression window. Closing it again will suppress it for another window; silence the alert rule itself if it should stop paging.`,
                 existing.paperclipCompanyId,
                 { fencing: firingFence(companyId, aggregateKey, firingToken) },
               );
             } catch (commentErr) {
-              // The re-open is the load-bearing half and has already landed.
+              // The re-open/rebind is the load-bearing half and has already
+              // landed.
               ctx.logger.warn(
-                `Re-opened issue ${existing.paperclipIssueId} after suppression expiry but could not post the explanatory comment: ${String(commentErr)}`,
+                `Re-opened issue ${tracked.paperclipIssueId} after suppression expiry but could not post the explanatory comment: ${String(commentErr)}`,
               );
             }
             await ctx.metrics.write("alertmanager.firing.suppression_expired", 1, {
