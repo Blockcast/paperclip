@@ -693,11 +693,20 @@ affinity:
               values:
                 - pve2
 
-# A vCPU stalled by hypervisor steal can hold /healthz past 5 s for a couple of
-# probe periods without the process being wedged; the worker already tolerates
-# 10 s x 6. Killing the API on 3 x 5 s is how the 2026-09-05 outage happened
-# (BLO-32054). Readiness keeps the chart default so a slow replica still leaves
-# rotation quickly.
+# A vCPU stalled by hypervisor steal can hold an in-memory probe handler past
+# 5 s for a couple of probe periods without the process being wedged; the worker
+# already tolerates 10 s x 6. Killing the API on 3 x 5 s is how the 2026-09-05
+# outage happened (BLO-32054). The reasoning carries over unchanged now that
+# liveness targets `/livez` (BLO-28615): it is the same synchronous in-memory
+# shape as `/healthz` and is queued behind the same stalled event loop.
+#
+# Readiness keeps the chart default, which BLO-28615 re-derived for
+# `/api/health` at 20 s / 20 s / 3. That is no longer "the chart default so a
+# slow replica leaves rotation quickly" — the opposite is now the point. The
+# timeout deliberately sits above `/api/health`'s own 13.19 s saturation tail
+# so that a slow pool does NOT leave rotation; only a dead one does. Steal on
+# this hypervisor makes that margin more load-bearing here than elsewhere, not
+# less, so do not tighten it.
 probes:
   liveness:
     timeoutSeconds: 10
