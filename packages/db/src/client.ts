@@ -9,7 +9,6 @@ import { registerTrackedClient } from "./embedded-test-client-registry.js";
 import {
   acquireSerializingLock,
   DEFAULT_LOCK_WAIT_TIMEOUT_MS,
-  DEFAULT_STATEMENT_TIMEOUT_MS,
   ensureConcurrentIndexesForMigration,
 } from "./concurrent-index-guard.js";
 
@@ -40,6 +39,24 @@ const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journa
  * neither readers nor writers, so patience there is free. Here it is not.
  */
 export const MIGRATION_DDL_LOCK_TIMEOUT_MS = 3_000;
+/**
+ * `statement_timeout` for transactional migration DDL (BLO-42005).
+ *
+ * Chosen here, not inherited. It equals `concurrent-index-guard`'s
+ * `DEFAULT_STATEMENT_TIMEOUT_MS` today, but that constant is sized for
+ * `CREATE INDEX CONCURRENTLY`, which blocks nobody; this session runs DDL that
+ * holds ACCESS EXCLUSIVE once it has it. `MIGRATION_DDL_LOCK_TIMEOUT_MS` bounds
+ * the wait to ACQUIRE that lock; this bounds how long it can be HELD.
+ *
+ * LONG ON PURPOSE, and the cost is real: an `ALTER TABLE` or
+ * `CREATE UNIQUE INDEX` that has taken ACCESS EXCLUSIVE may hold it for up to
+ * 10 minutes — 20x the role's 30s — blocking every reader and writer of that
+ * table for that long during a deploy. That is accepted because the
+ * alternative is a migration that can never complete: at 30s, 0251's index
+ * build on a populated table is cancelled with `57014` on every attempt (not a
+ * retryable SQLSTATE), and the pod crash-loops with no progress.
+ */
+export const MIGRATION_STATEMENT_TIMEOUT_MS = 10 * 60 * 1000;
 /** Attempts per migration file before a lock race is reported as a failure. */
 export const MIGRATION_LOCK_RETRY_ATTEMPTS = 12;
 const MIGRATION_LOCK_RETRY_BASE_DELAY_MS = 1_000;
@@ -72,8 +89,17 @@ function migrationLockRetryDelayMs(attempt: number): number {
  * BLO-42005, never a multiple of it. For a race lost in the guard's session
  * that is 96s + one `DEFAULT_DDL_LOCK_TIMEOUT_MS` wait = 96s + 2 min, well under
  * the sibling's 20 min (pinned by migration-lock-contention.test.ts). A slow
- * index build or statement is bounded by `DEFAULT_STATEMENT_TIMEOUT_MS` as it
- * was before, and is not replayed: `57014` is not a retryable SQLSTATE.
+ * statement is bounded by `MIGRATION_STATEMENT_TIMEOUT_MS` (a slow online index
+ * build by the guard's `DEFAULT_STATEMENT_TIMEOUT_MS`) and is not replayed:
+ * `57014` is not a retryable SQLSTATE.
+ *
+ * That ceiling is for a lost lock race, not for every attempt. One attempt can
+ * also cost a serializing-lock re-acquire after a postgres.js reconnect (up to
+ * `DEFAULT_LOCK_WAIT_TIMEOUT_MS`, see `prepareMigrationSession`) or one long
+ * statement (up to `MIGRATION_STATEMENT_TIMEOUT_MS`). And the budget is per
+ * FILE while the sibling's 20 min is spent against the whole SEQUENCE: N
+ * contended pending files cost up to N x (budget + one attempt), which at
+ * ~216s per file passes 20 min at six files.
  */
 export const MIGRATION_LOCK_RETRY_BUDGET_MS = Array.from(
   { length: MIGRATION_LOCK_RETRY_ATTEMPTS },
@@ -90,9 +116,9 @@ export const MIGRATION_LOCK_RETRY_BUDGET_MS = Array.from(
  * `runInTransaction` has already rolled the file back, so a replay cannot
  * observe a partial write.
  *
- * `57014` (statement_timeout) is deliberately NOT here. With a 10-minute
- * statement_timeout it means the work itself ran that long, so replaying would
- * double an outage rather than dodge a race.
+ * `57014` (statement_timeout) is deliberately NOT here. Under
+ * `MIGRATION_STATEMENT_TIMEOUT_MS` it means the work itself ran that long, so
+ * replaying would double an outage rather than dodge a race.
  */
 const MIGRATION_LOCK_RETRY_SQLSTATES = new Set(["55P03", "40P01"]);
 
@@ -142,9 +168,9 @@ export async function withMigrationLockRetry(
  * re-asserting costs three round-trips on a path that runs a handful of times
  * per deploy.
  */
-async function prepareMigrationSession(sql: ReturnType<typeof createUtilitySql>): Promise<void> {
+export async function prepareMigrationSession(sql: ReturnType<typeof createUtilitySql>): Promise<void> {
   await acquireSerializingLock(sql, DEFAULT_LOCK_WAIT_TIMEOUT_MS);
-  await sql.unsafe(`SET statement_timeout = '${DEFAULT_STATEMENT_TIMEOUT_MS}ms'`);
+  await sql.unsafe(`SET statement_timeout = '${MIGRATION_STATEMENT_TIMEOUT_MS}ms'`);
   await sql.unsafe(`SET lock_timeout = '${MIGRATION_DDL_LOCK_TIMEOUT_MS}ms'`);
 }
 
@@ -303,7 +329,10 @@ export const POSTGRES_POOL_MAX = 18;
  * IaC re-creates these, and nothing but the startup probe asserts them, so they
  * would vanish silently on a role rebuild (PEN-3598). Treat it as the bound we
  * believe is in force and must not quietly exceed, and take
- * {@link readInheritedTimeoutSettings} as the measurement.
+ * {@link readInheritedTimeoutSettings} as the measurement. The one deliberate
+ * exception is the migration session, which overrides `statement_timeout` to
+ * {@link MIGRATION_STATEMENT_TIMEOUT_MS} (10 min) and `lock_timeout` to
+ * {@link MIGRATION_DDL_LOCK_TIMEOUT_MS}; the 30s above does not bound it.
  */
 export const POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS = 60_000;
 

@@ -27,6 +27,8 @@ import {
   MIGRATION_DDL_LOCK_TIMEOUT_MS,
   MIGRATION_LOCK_RETRY_ATTEMPTS,
   MIGRATION_LOCK_RETRY_BUDGET_MS,
+  MIGRATION_STATEMENT_TIMEOUT_MS,
+  prepareMigrationSession,
   withMigrationLockRetry,
 } from "./client.js";
 import {
@@ -38,6 +40,15 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
+
+// The guard's statement_timeout equals MIGRATION_STATEMENT_TIMEOUT_MS today, so
+// a migration session that inherited it again would be indistinguishable. Give
+// it a value nothing else uses. Only importers see this: the guard's own
+// sessions still read the real constant through its local binding.
+vi.mock("./concurrent-index-guard.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./concurrent-index-guard.js")>()),
+  DEFAULT_STATEMENT_TIMEOUT_MS: 7_777,
+}));
 
 const MIGRATION = "0248_cost_events_cache_creation_tokens.sql";
 const TABLE = "cost_events";
@@ -325,5 +336,28 @@ describe("migration lock retry budget", () => {
     );
     expect(error).toBeNull();
     expect(attempts).toBe(MIGRATION_LOCK_RETRY_ATTEMPTS);
+  });
+});
+
+describe("migration session timeouts", () => {
+  it("sets the migration's own statement_timeout, not the concurrent-index guard's", async () => {
+    // A changed value is a changed worst-case ACCESS EXCLUSIVE hold during a
+    // deploy (see MIGRATION_STATEMENT_TIMEOUT_MS): change it here on purpose.
+    expect(MIGRATION_STATEMENT_TIMEOUT_MS).toBe(10 * 60 * 1000);
+
+    const statements: string[] = [];
+    const fakeSql = Object.assign(async () => [{ locked: true }], {
+      unsafe: async (query: string) => {
+        statements.push(query);
+        return [];
+      },
+    }) as unknown as Parameters<typeof prepareMigrationSession>[0];
+
+    await prepareMigrationSession(fakeSql);
+    // Reusing the guard's DEFAULT_STATEMENT_TIMEOUT_MS fails here ('7777ms').
+    expect(statements).toEqual([
+      `SET statement_timeout = '${MIGRATION_STATEMENT_TIMEOUT_MS}ms'`,
+      `SET lock_timeout = '${MIGRATION_DDL_LOCK_TIMEOUT_MS}ms'`,
+    ]);
   });
 });
