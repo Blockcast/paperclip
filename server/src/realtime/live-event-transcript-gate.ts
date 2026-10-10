@@ -141,9 +141,10 @@ function decisionReason(outcome: { allowed: boolean; decision: { reason: string 
  * plugin event, so there is none to lose). It does NOT keep these rows out of
  * the activity FEED — the stored rows are the feed, read back by
  * `GET /companies/:companyId/activity`. That is handled where the feed is read:
- * a page that does not ask for an `action` leaves this one out
- * (`FEED_EXCLUDED_ACTIONS` in `routes/activity.ts`), and `?action=` with this
- * name still returns every row.
+ * the unnarrowed page (no `action`, `agentId`, `entityType` or `entityId`)
+ * leaves this one out (`FEED_EXCLUDED_ACTIONS` in `routes/activity.ts`), and any
+ * of those filters — including the owning-agent and subscriber queries —
+ * returns every matching row.
  *
  * `deferPublish: true` returns the publisher to the caller instead of firing it
  * inline; dropping that function is how this site declines to publish. Said

@@ -33,11 +33,14 @@ const companyActivityQuerySchema = z.object({
 
 const uuidQueryParamSchema = z.string().uuid();
 
-// Audit records that are not feed items, left off any page that does not ask for an `action`.
-// `heartbeat.run_events_streamed` is written once per (live-events socket x owning agent) per 30s
-// decision window, so S open sockets and A agents streaming transcript content write S*A rows every
-// 30s — enough to be most of every recency-ordered page the board reads. `?action=<name>` still
-// returns every row, and `X-Applied-Filters.excludeActions` says when the exclusion applied.
+// Audit records that are not feed items, left off the unnarrowed page only — one that sets none of
+// `action`, `agentId`, `entityType`, `entityId` (`limit` does not narrow it). `heartbeat.run_events_streamed`
+// is written once per (live-events socket x owning agent) per 30s decision window, so S open sockets and
+// A agents streaming transcript content write S*A rows every 30s — enough to be most of every
+// recency-ordered page the board reads. Any narrowing filter is a forensic query (by owning agent via
+// `entityType=agent&entityId=`, by subscriber via `agentId=`, by `action=`) and returns every matching
+// row: excluding there reads as "nobody streamed this" rather than "filter never applied" (BLO-21979).
+// `X-Applied-Filters.excludeActions` says when the exclusion applied.
 const FEED_EXCLUDED_ACTIONS: readonly string[] = [LIVE_EVENT_TRANSCRIPT_AUDIT_ACTION];
 
 // A caller who mistypes or invents a filter key on an audit surface must not get a plausible-looking
@@ -133,13 +136,15 @@ export function activityRoutes(db: Db) {
       return;
     }
 
+    const { agentId, entityType, entityId, action } = parsedQuery.data;
+    const unnarrowed = agentId === undefined && entityType === undefined && entityId === undefined && action === undefined;
     const filters = {
       companyId,
-      agentId: parsedQuery.data.agentId,
-      entityType: parsedQuery.data.entityType,
-      entityId: parsedQuery.data.entityId,
-      action: parsedQuery.data.action,
-      excludeActions: parsedQuery.data.action === undefined ? FEED_EXCLUDED_ACTIONS : [],
+      agentId,
+      entityType,
+      entityId,
+      action,
+      excludeActions: unnarrowed ? FEED_EXCLUDED_ACTIONS : [],
       limit: normalizeActivityLimit(Number(parsedQuery.data.limit)),
     };
     const result = await svc.list(filters);

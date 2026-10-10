@@ -1088,9 +1088,13 @@ stored rows *are* the feed. At one row per (socket × owning agent) per 30s
 window, S open sockets watching A agents stream write S×A rows every 30s, which
 would be most of every recency-ordered page the board reads. So
 `GET /api/companies/:companyId/activity` leaves `heartbeat.run_events_streamed`
-off any page that does not ask for an `action` (`FEED_EXCLUDED_ACTIONS` in
-`routes/activity.ts`, echoed as `excludeActions` in `X-Applied-Filters`);
-`?action=heartbeat.run_events_streamed` returns every row. There is no retention
+off the unnarrowed page only (`FEED_EXCLUDED_ACTIONS` in `routes/activity.ts`,
+echoed as `excludeActions` in `X-Applied-Filters`): one that sets none of
+`action`, `agentId`, `entityType`, `entityId` (`limit` does not narrow it).
+Any of those filters returns every matching row, including the owning-agent
+(`?entityType=agent&entityId=<owning agent id>`) and subscribing-agent
+(`?agentId=<subscriber agent id>`) queries under *Access auditing* below, and
+`?action=heartbeat.run_events_streamed`. There is no retention
 carve-out because there is no time-based retention to carve out of:
 `activity_log` rows are deleted only with their company, or with the agent that
 was their actor. Size any future retention policy against this action first —
@@ -1139,7 +1143,11 @@ workspace-operation route is keyed `entity_type = workspace_operation` with the
 owning run in `runId`, and the WebSocket fan-out is keyed `entity_type = agent`
 with `entity_id = <owning agent id>` and no run reference at all — so a
 run-scoped query cannot find it, and a complete history has to be assembled by
-owning agent and time window as well as by run. Querying only the `heartbeat_run` rows silently omits the
+owning agent (`?entityType=agent&entityId=<owning agent id>`) and time window as
+well as by run. That owning-agent query, and `?agentId=<subscriber agent id>`
+for an agent subscriber, return these rows without an `action` filter; only the
+unnarrowed page (no `action`, `agentId`, `entityType` or `entityId`) leaves them
+out. Querying only the `heartbeat_run` rows silently omits the
 workspace-operation path, which is the same partial-coverage blindness this
 section warns about immediately above. The event `details.result` value is `allowed` when content was
 eligible to be read and `denied` when an access check rejected the request —

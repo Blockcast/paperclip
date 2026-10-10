@@ -147,7 +147,7 @@ describe.sequential("activity routes", () => {
       entityType: "issue",
       entityId: undefined,
       action: undefined,
-      excludeActions: ["heartbeat.run_events_streamed"],
+      excludeActions: [],
       limit: 500,
     });
   });
@@ -179,21 +179,39 @@ describe.sequential("activity routes", () => {
   });
 
   // PEN-3148 (Ally review 5473258762): the live-event transcript audit writes S*A rows per 30s
-  // window and is not a feed item, so a page that does not ask for an action leaves it out — but
-  // asking for it by name must still return every row, or the audit becomes unreadable.
-  it("leaves the live-event transcript audit off a page that does not ask for it, and says so", async () => {
+  // window and is not a feed item, so the unnarrowed page leaves it out. `limit` does not narrow.
+  it.each(["", "?limit=5"])("leaves the live-event transcript audit off the unnarrowed page %j, and says so", async (query) => {
     mockActivityService.list.mockResolvedValue([]);
 
     const app = await createApp();
-    const res = await requestApp(app, (baseUrl) =>
-      request(baseUrl).get("/api/companies/company-1/activity?entityType=agent&entityId=agent-1"),
-    );
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/company-1/activity${query}`));
 
     expect(res.status).toBe(200);
     expect(mockActivityService.list).toHaveBeenCalledWith(
-      expect.objectContaining({ entityType: "agent", entityId: "agent-1", excludeActions: ["heartbeat.run_events_streamed"] }),
+      expect.objectContaining({ excludeActions: ["heartbeat.run_events_streamed"] }),
     );
     expect(JSON.parse(decodeURIComponent(res.headers["x-applied-filters"])).excludeActions).toEqual(["heartbeat.run_events_streamed"]);
+  });
+
+  // PEN-3148 (Ally review 5477938815): the forensic queries doc/DEVELOPING.md prescribes for this
+  // audit — by owning agent (its entity key) and by subscribing agent (its actor key) — are already
+  // narrowed and must return its rows. Excluding there reads as "nobody streamed this transcript".
+  it.each([
+    ["owning agent", "?entityType=agent&entityId=agent-1", { entityType: "agent", entityId: "agent-1" }],
+    ["subscribing agent", "?agentId=11111111-1111-1111-1111-111111111111", { agentId: "11111111-1111-1111-1111-111111111111" }],
+  ])("returns the live-event transcript audit on a %s query", async (_label, query, narrowed) => {
+    const row = { id: "evt-1", action: "heartbeat.run_events_streamed", entityType: "agent", entityId: "agent-1" };
+    mockActivityService.list.mockResolvedValue([row]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/company-1/activity${query}`));
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.list).toHaveBeenCalledWith(
+      expect.objectContaining({ ...narrowed, action: undefined, excludeActions: [] }),
+    );
+    expect(res.body).toEqual([row]);
+    expect(JSON.parse(decodeURIComponent(res.headers["x-applied-filters"])).excludeActions).toEqual([]);
   });
 
   it("returns the live-event transcript audit when it is asked for by action", async () => {
