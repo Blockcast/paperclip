@@ -4930,7 +4930,7 @@ describe("handleWebhook — acceptOnlyLabels filter", () => {
 });
 
 describe("handleWebhook — severity → priority", () => {
-  it("maps severity=warning to priority=high using the default map", async () => {
+  it("maps severity=warning to priority=medium using the default map (BLO-20576)", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ severityToPriority: undefined });
     const alert = baseAlert({
@@ -4940,7 +4940,209 @@ describe("handleWebhook — severity → priority", () => {
 
     await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.priority).toBe("medium");
+  });
+
+  // The unit tests in issue-mapping.test.ts cover resolveAlertPriority itself.
+  // These two pin the *call site*: that the handler reads the label at all,
+  // and that a junk value cannot reach ctx.issues.create.
+  it("honours the paperclip_priority escape hatch on the created issue", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "high" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.priority).toBe("high");
+  });
+
+  it("falls back to the severity map when paperclip_priority is junk", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "P1" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.priority).toBe("medium");
+  });
+
+  it("warns and counts an ignored paperclip_priority instead of dropping it silently", async () => {
+    // The label exists to override a default this plugin lowered, so a typo
+    // must not be indistinguishable from an absent label.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "hgih" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('ignoring paperclip_priority "hgih"'),
+    );
+    // `label` keeps this non-lossy case apart from a malformed
+    // `paperclip_issue`, which counts on the same metric but drops the alert.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.malformed",
+      1,
+      { alertname: "X", label: "paperclip_priority" },
+    );
+    // Still filed — only the override is dropped, unlike a malformed
+    // `paperclip_issue`, which drops the alert.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("an honoured paperclip_priority does not warn", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "high" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("ignoring paperclip_priority"),
+    );
+  });
+
+  it("honours paperclip_priority set as an annotation on the created issue", async () => {
+    // Same label-or-annotation surface as `paperclip_issue` and
+    // `paperclip_dedupe_domain`; an annotation used to be silently absent.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+      annotations: { summary: "s", paperclip_priority: "high" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.create.mock.calls[0][0].priority).toBe("high");
+  });
+
+  // The escape hatch only prices a *new* issue. A firing alert that joins an
+  // already-open aggregate issue for its alertname — the usual case for the
+  // chronically-firing rule the label targets, since adding the label mints a
+  // new fingerprint — leaves that issue's priority alone (rewriting it would
+  // also overwrite an operator's manual re-prioritization). These pin that
+  // contract so changing it is a decision, not a side effect.
+  it("does not re-price an already-open aggregate issue the alert joins", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-open",
+      status: "todo",
+      assigneeAgentId: "agent-deliberate",
+      assigneeUserId: null,
+    }));
+    const alert = baseAlert({
+      fingerprint: "relabelled-member",
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "high" },
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ severityToPriority: undefined }),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(
+      mocks.issues.update.mock.calls.filter(
+        (call) => "priority" in (call[1] as Record<string, unknown>),
+      ),
+    ).toEqual([]);
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:relabelled-member" }),
+      expect.objectContaining({ paperclipIssueId: "issue-open" }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("an ignored value joining an open aggregate issue does not claim a priority was filed", async () => {
+    // The warn used to end `falling back to the severity map, priority=medium`,
+    // which reads as a statement about the issue — but on this path no
+    // priority is written at all.
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-open",
+      status: "todo",
+      assigneeAgentId: "agent-deliberate",
+      assigneeUserId: null,
+    }));
+    const alert = baseAlert({
+      fingerprint: "relabelled-member",
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "hgih" },
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ severityToPriority: undefined }),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    const warning = mocks.logger.warn.mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes('ignoring paperclip_priority "hgih"'));
+    expect(warning).toBeDefined();
+    expect(warning).toContain("if this files a new issue");
+    expect(warning).toContain("an already-open aggregate issue keeps its own priority");
+  });
+
+  it("a non-string paperclip_priority does not fail the delivery", async () => {
+    // `isAlertmanagerPayload` does not validate label entries, so a YAML
+    // `paperclip_priority: 5` reaches this path as a number. Throwing here
+    // raises a TypeError, not a PermanentAlertError, which fails the whole
+    // batch and makes Alertmanager redeliver into the same crash.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+    });
+    (alert.labels as Record<string, unknown>).paperclip_priority = 5;
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    const result = await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+
+    // Without the guard this rejects with AlertDeliveryIncompleteError rather
+    // than returning, so `accepted: 1` is the assertion that carries the fix.
+    expect(result.accepted).toBe(1);
+    expect(result.rejected).toBeUndefined();
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create.mock.calls[0][0].priority).toBe("medium");
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('ignoring paperclip_priority "<non-string number>"'),
+    );
+  });
+
+  it("an absent severity still resolves under the operator's `unknown` key", async () => {
+    // Pre-BLO-20576 the call site passed `alert.labels.severity ?? "unknown"`.
+    // Passing the raw label instead short-circuits on `!severity`, so an
+    // operator's `unknown` entry would silently stop applying.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: { unknown: "low" } });
+    const alert = baseAlert({ labels: { alertname: "X" } });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    expect(mocks.issues.create.mock.calls[0][0].priority).toBe("low");
   });
 
   it("operator severity-to-priority overrides the default", async () => {
@@ -5250,7 +5452,7 @@ describe("handleWebhook — creation policy", () => {
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.malformed",
       1,
-      { alertname: "MalformedPolicyAlert" },
+      { alertname: "MalformedPolicyAlert", label: "paperclip_issue" },
     );
   });
 

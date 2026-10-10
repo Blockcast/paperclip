@@ -7,6 +7,7 @@
  * tested without spinning up a plugin context or mocking the host RPC.
  */
 
+import { ISSUE_PRIORITIES } from "@paperclipai/shared";
 import {
   DEFAULT_SEVERITY_TO_PRIORITY,
   TERMINAL_SEVERITIES,
@@ -47,6 +48,81 @@ export function severityToPriority(
     if (value !== undefined) return value;
   }
   return FALLBACK_PRIORITY;
+}
+
+/**
+ * Outcome of resolving one alert's issue priority.
+ *
+ * `ignoredValue` is set when a `paperclip_priority` label or annotation was
+ * present but unusable, so the caller — which holds `ctx`, unlike this module —
+ * can warn and emit a metric. Without it a typo (`hgih`) is indistinguishable
+ * from an absent value: the rule author believes they opted back up and
+ * nothing anywhere records that they did not.
+ */
+export interface ResolvedAlertPriority {
+  priority: PaperclipPriority;
+  /** Raw value when present but unusable; `undefined` when honoured or absent. */
+  ignoredValue?: string;
+}
+
+/**
+ * Resolve the issue priority for one alert.
+ *
+ * Resolution order:
+ *   1. `paperclip_priority` (per-rule escape hatch, BLO-20576) — the alert
+ *      label, else the alert annotation, matching the sibling rule-level
+ *      escape hatches `paperclip_issue` and `paperclip_dedupe_domain`. When
+ *      both are present the label wins, as with `paperclip_dedupe_domain`.
+ *   2. `severityToPriority` above (operator override map, then the default map)
+ *
+ * The label is the escape hatch for the `warning → medium` default: a rule
+ * whose warnings genuinely are not self-resolving declares that on itself,
+ * next to its own `severity`, rather than dragging the whole severity band up
+ * with it. It is validated against `ISSUE_PRIORITIES` and ignored when it is
+ * anything else — an unrecognised value must not reach `ctx.issues.create`
+ * and fail the whole delivery, and a `PrometheusRule` is not a trusted enough
+ * surface to pass straight through to the API.
+ *
+ * The result is only ever used as the priority of a *newly created* issue. An
+ * alert that joins an already-open aggregate issue for its alertname leaves
+ * that issue's priority as it is — rewriting it would also overwrite an
+ * operator's manual re-prioritization — so the escape hatch takes effect on
+ * the next issue filed for the rule, not on one already open.
+ *
+ * The value is read as `unknown`: `isAlertmanagerPayload` deliberately does
+ * not validate label or annotation entries (see its docstring), so a YAML `paperclip_priority: 5`
+ * arrives as a number at runtime despite the declared `Record<string, string>`.
+ * Calling a string method on it would throw a `TypeError` — not a
+ * `PermanentAlertError` — which fails the whole batch and makes Alertmanager
+ * redeliver into the same deterministic crash until the alert is lost. Mirrors
+ * the `paperclip_issue` guard in `webhook-handler.ts`.
+ *
+ * A whitespace-only value is treated as absent, not as a typo: Prometheus drops
+ * empty labels, so warning on one would be noise about a value nobody set.
+ */
+export function resolveAlertPriority(
+  alert: AlertmanagerAlert,
+  override?: Record<string, PaperclipPriority>,
+): ResolvedAlertPriority {
+  // `?? "unknown"` is load-bearing: it is the key `severityToPriority` matches
+  // an operator's `severityToPriority: { unknown: … }` entry against. Passing
+  // the raw label would short-circuit on `!severity` and never consult it.
+  const priority = severityToPriority(
+    alert.labels.severity ?? "unknown",
+    override,
+  );
+  const raw: unknown =
+    alert.labels.paperclip_priority ?? alert.annotations.paperclip_priority;
+  if (raw === undefined) return { priority };
+  if (typeof raw !== "string") {
+    return { priority, ignoredValue: `<non-string ${typeof raw}>` };
+  }
+  const key = raw.trim().toLowerCase();
+  if (!key) return { priority };
+  if ((ISSUE_PRIORITIES as readonly string[]).includes(key)) {
+    return { priority: key as PaperclipPriority };
+  }
+  return { priority, ignoredValue: raw };
 }
 
 /**

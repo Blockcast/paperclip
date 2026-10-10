@@ -6,7 +6,7 @@
  * with (here, the Alertmanager v2 webhook envelope).
  */
 
-import type { PluginIssueOriginKind } from "@paperclipai/shared";
+import type { IssuePriority, PluginIssueOriginKind } from "@paperclipai/shared";
 
 /**
  * Severity levels mapped from `alert.labels.severity` to a Paperclip issue
@@ -15,11 +15,13 @@ import type { PluginIssueOriginKind } from "@paperclipai/shared";
 export type AlertSeverity = "critical" | "warning" | "info" | string;
 
 /**
- * Paperclip issue priority values accepted by `ctx.issues.create`. Mirrors
- * the runtime enum on the server. Kept narrow so the severity-to-priority map
- * cannot produce an unsupported value.
+ * Paperclip issue priority values accepted by `ctx.issues.create`. Aliased to
+ * the server's own `IssuePriority` rather than re-declared: `resolveAlertPriority`
+ * validates against `ISSUE_PRIORITIES` and then casts to this type, and a local
+ * copy of the union would make that cast widen silently if shared ever gains a
+ * member.
  */
-export type PaperclipPriority = "critical" | "high" | "medium" | "low";
+export type PaperclipPriority = IssuePriority;
 
 /**
  * Owner-map config: per-instance mapping from a label-key (e.g. `team`) to a

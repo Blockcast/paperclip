@@ -10,6 +10,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { hostname as osHostname } from "node:os";
 import type { PluginContext, PluginFencingPrecondition, PluginWebhookInput, PluginWebhookResult } from "@paperclipai/plugin-sdk";
+import { ISSUE_PRIORITIES } from "@paperclipai/shared";
 import {
   ACCEPTED_SCHEMA_VERSIONS,
   DEFAULT_OPERATOR_SUPPRESSION_HOURS,
@@ -24,7 +25,7 @@ import {
   buildIssueTitle,
   effectiveAlertStatus,
   isTerminalSeverity,
-  severityToPriority,
+  resolveAlertPriority,
 } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { resolveAssigneeUserId, resolveFallbackAgentId } from "./owner-resolver.js";
@@ -2763,7 +2764,35 @@ export async function handleFiring(
 
   const title = buildIssueTitle(alert);
   const description = buildIssueDescription(alert);
-  const priority = severityToPriority(severity, config.severityToPriority);
+  const { priority, ignoredValue } = resolveAlertPriority(
+    alert,
+    config.severityToPriority,
+  );
+  if (ignoredValue !== undefined) {
+    // BLO-20576: the value exists to override a default this plugin lowered, so
+    // "I set paperclip_priority and nothing happened" is a likely support path.
+    // Silently ignoring it makes a typo indistinguishable from an absent value.
+    // Same handling as a malformed `paperclip_issue`, except the alert is still
+    // filed — only the override is dropped. The `label` dimension separates the
+    // two on the shared metric: this one is non-lossy, that one drops the alert.
+    //
+    // `priority` is only written when this delivery creates the issue; an
+    // already-open aggregate issue (retained here or found after losing the
+    // creation claim below) keeps its own, so the log must not claim otherwise.
+    ctx.logger.warn(
+      `paperclip-plugin-alertmanager: ignoring paperclip_priority "${ignoredValue}" on ${alertname} (${alert.fingerprint}); must be one of ${ISSUE_PRIORITIES.join(", ")} — the severity map applies instead (priority=${priority} if this files a new issue; an already-open aggregate issue keeps its own priority)`,
+    );
+    try {
+      await ctx.metrics.write("alertmanager.alert.malformed", 1, {
+        alertname,
+        label: "paperclip_priority",
+      });
+    } catch (metricErr) {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record malformed paperclip_priority metric for ${alert.fingerprint}: ${String(metricErr)}`,
+      );
+    }
+  }
 
   const billingCode = alert.labels.billing_code ?? null;
 
@@ -3672,6 +3701,7 @@ export async function handleWebhook(
           try {
             await ctx.metrics.write("alertmanager.alert.malformed", 1, {
               alertname,
+              label: "paperclip_issue",
             });
           } catch (metricErr) {
             ctx.logger.error(

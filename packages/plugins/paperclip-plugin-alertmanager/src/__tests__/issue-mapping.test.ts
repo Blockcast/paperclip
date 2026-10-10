@@ -7,6 +7,7 @@ import {
   extractObservabilityUrls,
   isTerminalSeverity,
   renderDrillInLinks,
+  resolveAlertPriority,
   severityToPriority,
 } from "../issue-mapping.js";
 import type { AlertmanagerAlert } from "../types.js";
@@ -34,7 +35,9 @@ const baseAlert = (overrides: Partial<AlertmanagerAlert> = {}): AlertmanagerAler
 describe("severityToPriority", () => {
   it("uses default mappings when no override is supplied", () => {
     expect(severityToPriority("critical")).toBe("critical");
-    expect(severityToPriority("warning")).toBe("high");
+    // BLO-20576: `warning` is the fleet's dominant severity and 84.6% of
+    // its aged cohort auto-cancelled unattended, so it no longer mints `high`.
+    expect(severityToPriority("warning")).toBe("medium");
     expect(severityToPriority("info")).toBe("medium");
     // BLO-27018: `page` and `ticket` are part of the emitted vocabulary, not
     // unknown values. `page` previously appeared in the "unknown severities"
@@ -52,7 +55,7 @@ describe("severityToPriority", () => {
 
   it("matches case-insensitively", () => {
     expect(severityToPriority("CRITICAL")).toBe("critical");
-    expect(severityToPriority(" Warning ")).toBe("high");
+    expect(severityToPriority(" Warning ")).toBe("medium");
   });
 
   it("operator override wins over the default map", () => {
@@ -62,7 +65,153 @@ describe("severityToPriority", () => {
     // Unmapped keys fall through to the default map, not the fallback.
     expect(
       severityToPriority("warning", { critical: "high" }),
+    ).toBe("medium");
+  });
+});
+
+describe("resolveAlertPriority (BLO-20576 per-rule escape hatch)", () => {
+  const withLabels = (labels: Record<string, string>) =>
+    baseAlert({ labels: { ...baseAlert().labels, ...labels } });
+
+  it("falls through to the severity map when the label is absent", () => {
+    expect(resolveAlertPriority(withLabels({ severity: "warning" }))).toEqual({
+      priority: "medium",
+    });
+  });
+
+  it("a rule that needs the old behaviour opts itself back up", () => {
+    expect(
+      resolveAlertPriority(
+        withLabels({ severity: "warning", paperclip_priority: "high" }),
+      ).priority,
     ).toBe("high");
+  });
+
+  it("the label outranks the operator override map too", () => {
+    expect(
+      resolveAlertPriority(
+        withLabels({ severity: "warning", paperclip_priority: "low" }),
+        { warning: "critical" },
+      ).priority,
+    ).toBe("low");
+  });
+
+  it("matches case-insensitively and tolerates surrounding space", () => {
+    expect(
+      resolveAlertPriority(
+        withLabels({ severity: "warning", paperclip_priority: " Critical " }),
+      ).priority,
+    ).toBe("critical");
+  });
+
+  it("ignores a value that is not a real priority rather than failing the delivery", () => {
+    // A PrometheusRule is not a trusted surface: an unrecognised value must
+    // not reach ctx.issues.create, where it would reject the whole alert.
+    for (const bad of ["urgent", "P1", "high;drop table"]) {
+      expect(
+        resolveAlertPriority(
+          withLabels({ severity: "warning", paperclip_priority: bad }),
+        ),
+      ).toEqual({ priority: "medium", ignoredValue: bad });
+    }
+  });
+
+  it("reports an ignored label so the caller can warn (a typo is not an absent label)", () => {
+    expect(
+      resolveAlertPriority(
+        withLabels({ severity: "warning", paperclip_priority: "hgih" }),
+      ).ignoredValue,
+    ).toBe("hgih");
+    // An honoured label is not a finding.
+    expect(
+      resolveAlertPriority(
+        withLabels({ severity: "warning", paperclip_priority: "high" }),
+      ).ignoredValue,
+    ).toBeUndefined();
+  });
+
+  it("treats a whitespace-only label as absent, not as a typo", () => {
+    // Prometheus drops empty labels, so warning on one is noise about a value
+    // nobody set.
+    for (const blank of ["", "   "]) {
+      expect(
+        resolveAlertPriority(
+          withLabels({ severity: "warning", paperclip_priority: blank }),
+        ),
+      ).toEqual({ priority: "medium" });
+    }
+  });
+
+  it("a non-string label is ignored, not thrown on", () => {
+    // `isAlertmanagerPayload` deliberately does not validate label entries, so
+    // a YAML `paperclip_priority: 5` arrives as a number despite the declared
+    // Record<string, string>. A TypeError here is not a PermanentAlertError:
+    // it fails the whole batch and Alertmanager redelivers into the same
+    // deterministic crash until the alert is lost.
+    for (const [bad, kind] of [
+      [5, "number"],
+      [true, "boolean"],
+      [{}, "object"],
+      [["high"], "object"],
+    ] as const) {
+      const alert = withLabels({ severity: "warning" });
+      (alert.labels as Record<string, unknown>).paperclip_priority = bad;
+      expect(() => resolveAlertPriority(alert)).not.toThrow();
+      expect(resolveAlertPriority(alert)).toEqual({
+        priority: "medium",
+        ignoredValue: `<non-string ${kind}>`,
+      });
+    }
+  });
+
+  // `paperclip_issue` and `paperclip_dedupe_domain` both accept a label or an
+  // annotation. An annotation-only `paperclip_priority` used to fall through as
+  // "absent" — no effect, no warn, no metric — on the one surface whose whole
+  // point is overriding a default.
+  const withAnnotations = (
+    labels: Record<string, string>,
+    annotations: Record<string, string>,
+  ) =>
+    baseAlert({
+      labels: { ...baseAlert().labels, ...labels },
+      annotations: { ...baseAlert().annotations, ...annotations },
+    });
+
+  it("honours paperclip_priority set as an annotation, like its sibling escape hatches", () => {
+    expect(
+      resolveAlertPriority(
+        withAnnotations({ severity: "warning" }, { paperclip_priority: "high" }),
+      ),
+    ).toEqual({ priority: "high" });
+  });
+
+  it("reports a junk annotation value instead of treating it as absent", () => {
+    expect(
+      resolveAlertPriority(
+        withAnnotations({ severity: "warning" }, { paperclip_priority: "hgih" }),
+      ),
+    ).toEqual({ priority: "medium", ignoredValue: "hgih" });
+  });
+
+  it("the label wins over the annotation when both are set", () => {
+    expect(
+      resolveAlertPriority(
+        withAnnotations(
+          { severity: "warning", paperclip_priority: "low" },
+          { paperclip_priority: "critical" },
+        ),
+      ).priority,
+    ).toBe("low");
+  });
+
+  it("an absent severity still resolves under the operator's `unknown` key", () => {
+    // `severity` is normalized to "unknown" before the map lookup, exactly as
+    // the pre-BLO-20576 call site did. Passing the raw label instead would
+    // short-circuit on `!severity` and silently stop consulting this override.
+    const alert = baseAlert({ labels: { alertname: "X" } });
+    expect(resolveAlertPriority(alert, { unknown: "low" }).priority).toBe("low");
+    // No such key in the default map, so only the override path changes.
+    expect(resolveAlertPriority(alert).priority).toBe("medium");
   });
 });
 

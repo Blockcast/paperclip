@@ -59,12 +59,17 @@ export function legacyInstanceAlertStateRef(fingerprint: string) {
 }
 
 /**
- * Default severity → priority map. Operators can override via
- * `config.severityToPriority`.
+ * Default severity → priority map. Operators can override globally via
+ * `config.severityToPriority`, or per rule via the `paperclip_priority`
+ * alert label (see `resolveAlertPriority`).
  */
 export const DEFAULT_SEVERITY_TO_PRIORITY: Record<string, PaperclipPriority> = {
   critical: "critical",
-  warning: "high",
+  // BLO-20576: `warning` was `high`. Rationale and the numbers behind it live
+  // in README.md § "Severity → priority defaults" — one copy, so the two
+  // cannot drift. A rule that needs the old behaviour sets
+  // `paperclip_priority: high` on itself.
+  warning: "medium",
   info: "medium",
   // BLO-27018: `page` and `ticket` are the severity vocabulary the Blockcast
   // Prometheus rule groups actually emit (`llm-proxy.alerts` and friends), and
