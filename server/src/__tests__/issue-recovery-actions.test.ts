@@ -638,7 +638,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // advisory lock plus transient-deadlock retry (the "v513 saga"). `environments`
     // declares no FK to `companies`, so the cascade cannot reach it and it has to be
     // named as a second root.
-    await truncateCompanyScopedTestState(db, { extraTruncateTables: ["environments"] });
+    // BLO-36017: `backstop_sweep_cursors` declares no FK to `companies` either, so it needs
+    // naming here for the same reason as `environments`. The global-scope row
+    // (`<sweep>:*`, written by any sweep called without a companyId) is shared across tests,
+    // so a cursor left behind would start the next test's rotation mid-page.
+    await truncateCompanyScopedTestState(db, {
+      extraTruncateTables: ["environments", "backstop_sweep_cursors"],
+    });
   });
 
   afterAll(async () => {
