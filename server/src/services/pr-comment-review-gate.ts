@@ -43,26 +43,27 @@ import {
 const DEFAULT_PR_REVIEWER_BOT_LOGIN = "allyblockcast[bot]";
 
 /**
- * Join quoted verbs into at most `budget` characters, cutting BETWEEN entries.
+ * Join quoted tokens into at most `budget` characters, cutting BETWEEN entries.
  *
- * Slicing the joined string cuts inside a verb and drops its closing quote, so
+ * Slicing the joined string cuts inside a token and drops its closing quote, so
  * the author reads a name that is not the one in their ledger — the same
  * hazard `commentReviewGateRetirementDescription` refuses for the context
  * name. On the between-entries path whatever did not fit is marked with ", …",
- * because an author who fixes only the verbs shown would re-push into this
+ * because an author who fixes only the tokens shown would re-push into this
  * same red, which is the loop the carried tail exists to close. That marker is
  * scoped to that path and is NOT an invariant of this function: neither
  * fallback below can afford it, because at the worst-case budget of 21 there
  * is no room for both an entry and the 3-character reserve. There entries
  * 2..n are dropped unmarked, deliberately — spending the reserve would buy the
- * marker by losing the one verb name the author can actually act on.
+ * marker by losing the one token the author can actually act on.
  *
  * There is no separate standalone budget: the caller's cap is always the
- * tighter one (the lead is 63-64 characters and the shortest tail is 38, so
- * the most this can ever be handed is 39), and a second constant that never
- * binds reads as load-bearing while doing nothing.
+ * tighter one (the unrecognized-verb lead is 63-64 characters and the shortest
+ * tail is 38, so that caller hands at most 39; the unnamed-findings lead is 36,
+ * so that one hands at most 66), and a second constant that never binds reads
+ * as load-bearing while doing nothing.
  */
-function fitQuotedVerbs(quoted: string[], budget: number): string {
+function fitQuotedTokens(quoted: string[], budget: number): string {
   const whole = quoted.join(", ");
   if (whole.length <= budget) return whole;
   const kept: string[] = [];
@@ -75,17 +76,17 @@ function fitQuotedVerbs(quoted: string[], budget: number): string {
     used += cost;
   }
   if (kept.length) return `${kept.join(", ")}, …`;
-  // The first verb fits whole and was rejected only by the 3-character reserve
+  // The first token fits whole and was rejected only by the 3-character reserve
   // for the ", …" marker. Return it as is: eliding it would slice through its
   // closing quote when its length is exactly budget - 2 (three quotes in the
   // render, the odd-quote defect the invariant test guards) and would mark a
-  // complete name as truncated while the other verbs vanish unmarked either
+  // complete name as truncated while the other tokens vanish unmarked either
   // way. Below this line quoted[0].length > budget > budget - 2, so the slice
   // can no longer reach the closing quote.
   if (quoted[0].length <= budget) return quoted[0];
-  // Not even the first verb fits whole. Elide inside its quotes so it still
+  // Not even the first token fits whole. Elide inside its quotes so it still
   // reads as truncated and keeps its closing quote, rather than rendering the
-  // lead with no verb at all.
+  // lead with no token at all.
   return budget >= 3 ? `${quoted[0].slice(0, budget - 2)}…"` : "";
 }
 
@@ -274,6 +275,15 @@ interface CarriedFinding extends AttestingComment {
    * the red is explainable by vocabulary drift rather than by an open finding.
    */
   unrecognizedVerbs: string[];
+  /**
+   * Findings this head raised that NO ledger entry names at all, rendered as
+   * `<severity> <index>` — i.e. the entries Ally still has to write for this
+   * head to stop carrying. Empty when the body reports no counted identities
+   * (prose-only feedback), or when every undispositioned finding is already
+   * named by an entry this parser could not act on (`still-present`, or an
+   * unrecognized verb, which the diagnostic above reports instead).
+   */
+  unnamedFindings: string[];
 }
 
 /**
@@ -489,6 +499,39 @@ function headsWithUndispositionedFinding(
     return [...verbs];
   };
 
+  // The findings holding this head red that the ledger never mentions — the
+  // exact entries Ally has to add. Naming them is the whole diagnostic: a head
+  // that re-reports an earlier finding as a mirror needs its OWN ledger entry
+  // under #1707's "every link in a chain needs its own entry", and when Ally
+  // names only the original the gate's only remaining explanation was the
+  // conditional tail about the attesting author — which is a true statement
+  // about a different thing, and read as the cause by three separate readers
+  // (BLO-42525: Ally's own note on NOP#1269, the filing, and this fix's
+  // author).
+  //
+  // `namesFinding` subsumes `isDisposed`, so one predicate covers both: a
+  // retired or deferred finding is by definition one the ledger names, and the
+  // two entry kinds this does NOT want to report — `still-present` and an
+  // unrecognized verb — are named too, which is what keeps the message from
+  // claiming silence where Ally actually spoke.
+  //
+  // Unlike the verb above this needs no asPublishableToken (PEN-3157): a ref's
+  // severity is one of COUNTED_SEVERITIES ("critical"/"important") on the prose
+  // path and of BLOCKING_SEVERITIES on the structured one, and its index is an
+  // integer bounded by MAX_VERDICT_FINDING_COUNT. The verb needs the scrub
+  // because its pattern admits an arbitrarily long name; this is a closed set.
+  const unnamedFindingsBlocking = (entry: {
+    attesting: AttestingComment;
+    timeMs: number;
+  }): string[] => {
+    const headSha = entry.attesting.attestedHeadSha;
+    const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
+    if (!reported) return [];
+    return reported
+      .filter((finding) => !ledger.some((prior) => namesFinding(prior, headSha, entry.timeMs, finding)))
+      .map((finding) => `${finding.severity} ${finding.index}`);
+  };
+
   // Newest statement per head wins, with one precedence above recency: an
   // unreadable review may not *displace* an attested one, however much newer it
   // is, because displacing is retiring by another name. "Newest per head" means
@@ -564,7 +607,11 @@ function headsWithUndispositionedFinding(
             ? 1
             : 0),
     )
-    .map((entry) => ({ ...entry.attesting, unrecognizedVerbs: unrecognizedVerbsBlocking(entry) }));
+    .map((entry) => ({
+      ...entry.attesting,
+      unrecognizedVerbs: unrecognizedVerbsBlocking(entry),
+      unnamedFindings: unnamedFindingsBlocking(entry),
+    }));
 }
 
 /**
@@ -857,12 +904,12 @@ export function evaluateCommentReviewGate(input: {
     // they just did, and which cannot clear a carried finding. Naming why the
     // attestation did not count is the difference between a red that routes
     // the author to the reviewer and a red that routes them into a loop.
-    // Tails measure 38 / 54 / 55. That 55 bounds the NO-VERB branch below to
-    // 131 (its 76-character lead plus the tail), inside the 140 cap. It does
-    // not bound the verb branch directly beneath this comment: that one
-    // budgets the verb list against whatever the tail leaves, so it lands on
-    // exactly 140 whenever the list fills its allowance — which is what the
-    // exact-fit test pins. 131 is this branch's ceiling, not the file's.
+    // Tails measure 38 / 54 / 55. That 55 bounds the LAST branch below to 131
+    // (its 76-character lead plus the tail), inside the 140 cap. It does not
+    // bound the two list branches: each budgets its list against whatever the
+    // tail leaves, so either lands on exactly 140 whenever the list fills its
+    // allowance — which is what the exact-fit tests pin. 131 is that one
+    // branch's ceiling, not the file's.
     const carriedTail = !withheldPositive
       ? "; no comment attests the current head."
       : withheldPositive.authorUnknown
@@ -882,7 +929,7 @@ export function evaluateCommentReviewGate(input: {
     // behind `disposition` accepts an arbitrarily long verb. Worst case (plural
     // lead, longest tail) still leaves 21 characters for it; the `Math.max(0,
     // …)` floor is there because a negative budget would otherwise reach
-    // `fitQuotedVerbs` and elide against it, so a future longer tail would
+    // `fitQuotedTokens` and elide against it, so a future longer tail would
     // overflow the cap silently instead of dropping the verb list.
     //
     // PEN-3157 asked whether this republishes model-authored text to a public
@@ -903,14 +950,31 @@ export function evaluateCommentReviewGate(input: {
     const verbLead =
       `Undispositioned finding from ${shortHead}: unrecognized ledger ` +
       `${carried.unrecognizedVerbs.length === 1 ? "verb" : "verbs"} `;
-    const verbList = fitQuotedVerbs(
+    const verbList = fitQuotedTokens(
       carried.unrecognizedVerbs.map((verb) => `"${verb}"`),
       Math.max(0, MAX_COMMIT_STATUS_DESCRIPTION - verbLead.length - carriedTail.length),
     );
+    // Names the ledger entries Ally still owes for this head, in the exact
+    // `prior:<sha> <severity> <index>` token an entry is written with, so the
+    // reader can copy it rather than reverse-engineer it from the review. It is
+    // deliberately terser than the no-verb lead below (36 characters against
+    // 76) because the identities are the payload here, not the prose: 36 plus
+    // the longest tail at 55 leaves 49, enough for two identities whole.
+    //
+    // Message only. The red is already correct under #1707 and nothing here
+    // reads back into the verdict — crediting a mirror relation as a ledger
+    // alias is the separate design call BLO-42525 reserves to the owner.
+    const unnamedLead = `No ledger entry names prior:${shortHead} `;
+    const unnamedList = fitQuotedTokens(
+      carried.unnamedFindings.map((finding) => `"${finding}"`),
+      Math.max(0, MAX_COMMIT_STATUS_DESCRIPTION - unnamedLead.length - carriedTail.length),
+    );
     const reason = carried.unrecognizedVerbs.length
       ? verbLead + verbList + carriedTail
-      : `An unresolved finding from Ally's review of ${shortHead} is still undispositioned` +
-        carriedTail;
+      : carried.unnamedFindings.length
+        ? unnamedLead + unnamedList + carriedTail
+        : `An unresolved finding from Ally's review of ${shortHead} is still undispositioned` +
+          carriedTail;
     return {
       state: "failure",
       outcome: "carried_finding",
