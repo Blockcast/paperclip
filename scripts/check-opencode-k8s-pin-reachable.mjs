@@ -299,11 +299,14 @@ export function classify(probe) {
       verdict: "inconclusive",
       exitCode: 0,
       message:
-        `GUARD INCONCLUSIVE: pin ${pin} is reachable, but the Secret-PUT search found no ` +
-        "JS/TS sources under `src/` to search. The adapter's layout has moved, so " +
-        "the grep is inert and matching nothing no longer means clean. Not failing the " +
-        "PR — but re-point the search before trusting it, or the BLO-34510 retirement of " +
-        "`secrets: update` is unguarded against the next pin bump.",
+        `GUARD INCONCLUSIVE: pin ${pin} is reachable, but NEITHER source search found ` +
+        "any JS/TS sources under `src/` to search. The adapter's layout has moved, so " +
+        "both greps are inert — and they go wrong in opposite directions: a Secret-PUT " +
+        "search matching nothing no longer means clean, and a wrapper-PATH search " +
+        "matching nothing no longer means the prepend is absent. Not failing the PR — " +
+        "but re-point them before trusting either verdict, or the BLO-34510 retirement " +
+        "of `secrets: update` is unguarded against the next pin bump and the PEN-3732 " +
+        "wrapper-PATH gap can neither be found nor cleared.",
     };
   }
 
@@ -434,7 +437,14 @@ function main() {
     // Exit 0, but never silently: an accepted security gap that stops being
     // mentioned is one nobody re-decides. Annotated so it is visible in every
     // run summary for as long as it is accepted.
-    console.log(`::warning title=opencode_k8s PEN-3732 accepted gap::${result.message}`);
+    //
+    // The title carries the same `opencode_k8s pin guard <verdict>` marker as
+    // every other branch, deliberately: this is the verdict the LIVE pin
+    // produces today, so a branch with no marker would be the one verdict the
+    // end-to-end cases cannot assert on (Ally, #2392).
+    console.log(
+      `::warning title=opencode_k8s pin guard ACCEPTED GAP (PEN-3732)::${result.message}`,
+    );
     console.warn(result.message);
     return;
   }
