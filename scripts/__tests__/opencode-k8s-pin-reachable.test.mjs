@@ -186,6 +186,11 @@ test("the CLI distinguishes empty results from failed Git subprocesses", (t) => 
   const pin = "a".repeat(40);
   const fixtureDockerfile = join(scratch, "Dockerfile");
   writeFileSync(fixtureDockerfile, `ARG OPENCODE_K8S_REF=${pin}\n`);
+  // A second fixture pinned to an ACCEPTED SHA. The accepted-gap verdict is
+  // keyed to the pin itself, so it is unreachable from the fixture above at
+  // any setting — and it is the verdict the live pin produces today.
+  const acceptedDockerfile = join(scratch, "Dockerfile.accepted");
+  if (ACCEPTED_PIN) writeFileSync(acceptedDockerfile, `ARG OPENCODE_K8S_REF=${ACCEPTED_PIN}\n`);
   // Exercise the real execFileSync catch path without network access.
   writeFileSync(join(scratch, "git"), `#!/bin/sh
 case "$1" in clone) exit 0;; esac
@@ -227,15 +232,28 @@ exit 128
     { name: "a failed wrapper grep is not a missing prepend", env: { PIN_GUARD_TEST_WRAPPER_STATUS: "128", PIN_GUARD_TEST_WRAPPER_HITS: "" } },
     { name: "a signalled wrapper grep is not a missing prepend", env: { PIN_GUARD_TEST_WRAPPER_STATUS: "signal", PIN_GUARD_TEST_WRAPPER_HITS: "" } },
     { name: "a test-only mention of the wrapper dir is not the prepend", verdict: "FAILED", env: { PIN_GUARD_TEST_WRAPPER_STATUS: "0", PIN_GUARD_TEST_WRAPPER_HITS: `${pin}:src/server/job-manifest.test.ts:9:${WRAPPER_BIN_DIR}` } },
+    // The one verdict the LIVE pin produces. classify() covers it, but without
+    // this the CLI path did not — and the accepted-gap branch is exactly the
+    // one whose output a reader has to keep seeing for the gap to stay
+    // re-decided. Conditional because README step 3 empties the accepted set
+    // once upstream carries the fix, after which this verdict is unreachable.
+    ...(ACCEPTED_PIN
+      ? [{
+          name: "the accepted gap warns through the CLI and does not fail the bump",
+          verdict: "ACCEPTED GAP",
+          dockerfile: acceptedDockerfile,
+          env: { PIN_GUARD_TEST_WRAPPER_STATUS: "1", PIN_GUARD_TEST_WRAPPER_HITS: "" },
+        }]
+      : []),
   ];
-  for (const { name, verdict = "inconclusive", env } of cases) {
+  for (const { name, verdict = "inconclusive", dockerfile: caseDockerfile, env } of cases) {
     const result = spawnSync(process.execPath, [script], {
       encoding: "utf8",
       timeout: 10_000,
       env: {
         ...process.env,
         PATH: `${scratch}:${process.env.PATH}`,
-        OPENCODE_PIN_GUARD_DOCKERFILE: fixtureDockerfile,
+        OPENCODE_PIN_GUARD_DOCKERFILE: caseDockerfile || fixtureDockerfile,
         PIN_GUARD_TEST_FILES: "src/execute.ts\nsrc/execute.test.ts\nsrc/README.md",
         PIN_GUARD_TEST_TREE_STATUS: "0",
         PIN_GUARD_TEST_GREP_STATUS: "1",
@@ -461,6 +479,10 @@ test("the accepted-gap SHA is the pin the Dockerfile actually carries", () => {
   assert.ok(
     WRAPPER_PATH_GAP_ACCEPTED_PINS.has(extractPin(dockerfile)) ||
       WRAPPER_PATH_GAP_ACCEPTED_PINS.size === 0,
-    "live pin is neither fixed upstream nor in the accepted set — update one of them",
+    // Offline: this test cannot tell a pin that carries the fix from one that
+    // does not, so its message must not claim to. Both remedies, in the order
+    // the README gives them.
+    "the live pin is not in the accepted set — if it carries the fix, drop the stale SHA " +
+      "(emptying the set); if it does not, add it with the measurement that accepts the gap",
   );
 });
