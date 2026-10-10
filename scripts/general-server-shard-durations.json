@@ -347,7 +347,6 @@
     "server/src/__tests__/human-gated-gate-revalidation-backfill.test.ts": 74,
     "server/src/__tests__/human-gated-gate-revalidation-wiring.test.ts": 1471,
     "server/src/__tests__/human-gated-gate-revalidation.test.ts": 59,
-    "server/src/__tests__/in-review-gate.test.ts": 7,
     "server/src/__tests__/inbox-agent-policy-routes.test.ts": 614,
     "server/src/__tests__/inbox-archive-routes.test.ts": 2239,
     "server/src/__tests__/inbox-dismissals.test.ts": 422,
