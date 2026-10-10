@@ -1088,12 +1088,61 @@ the reuse window in time keeps the per-event saving without that fail-open
 direction. The entry is stamped when the decision starts, so a slow authorizer
 shortens the window rather than extending it.
 
-**Not audited, deliberately.** The two pull routes emit an `activity_log` row per
-read. The push channel does not: it would emit one row per log chunk per
-subscriber, which is a different order of volume, and the audit already records
-the pull reads that a `denied` finding would be investigated through. Auditing
-the subscription rather than the event is the shape to reach for if this is ever
-needed.
+**Audited per decision, not per event** (PEN-3148). The push channel emits
+`heartbeat.run_events_streamed`, allowed and denied, from inside the memoized
+decision — so one row covers every event that reuses that answer for up to 30s,
+rather than one row per log chunk per subscriber. Read the row count as
+*decisions*, never as a count of transcript events delivered. This supersedes
+the earlier position that the push channel should stay unaudited because of
+event volume: the volume objection is an argument against auditing *events*, and
+the decision is the thing the other three surfaces actually audit.
+
+The row names the **owning agent** as its subject (`entity_type = agent`,
+`entity_id = <owning agent id>`), with the subscriber as the actor — the socket
+has no single run to key on, because one decision covers every run that agent
+produces. `details.ownerAgentId` is `null`, and `entity_id` the sentinel
+`unresolved-owner`, on the fail-closed branch where a payload cannot name an
+owner; that mirrors the `workspace_operation.log_accessed` convention.
+`details.reason` carries the decider's named boundary vocabulary, plus three
+gate-local values for the branches that carry no `AuthorizationDecision` to read
+a reason off: `allow_board_transcript_operator` (the operator short-circuit),
+`deny_company_scope` (the company-scope miss), and `withhold_unresolved_owner`
+(a payload that cannot name its owner, which never reaches the decider).
+
+**This audit deliberately does not publish its own `activity.logged` live
+event.** It is the one audit site that sits *on* the live-event fan-out, so
+publishing would feed the channel it is auditing: every row becomes an event
+delivered to every socket in the company. It terminates rather than looping —
+`activity.logged` carries none of the four withheld keys, so the gate returns
+before deciding — but the amplification is real. `logActivity` is called with
+`{ deferPublish: true }` and the returned publisher is dropped.
+
+Declining to publish buys exactly that — no live `activity.logged` fan-out, and
+no plugin-outbox enqueue (the action is not a plugin event, so nothing is lost)
+— and nothing more. It does **not** keep the rows out of the activity feed: the
+stored rows *are* the feed. At one row per (socket × owning agent) per 30s
+window, S open sockets watching A agents stream write S×A rows every 30s, which
+would be most of every recency-ordered page the board reads. So
+`GET /api/companies/:companyId/activity` leaves `heartbeat.run_events_streamed`
+off the unnarrowed page only (`FEED_EXCLUDED_ACTIONS` in `routes/activity.ts`,
+echoed as `excludeActions` in `X-Applied-Filters`): one that sets none of
+`action`, `agentId`, `entityType`, `entityId` (`limit` does not narrow it).
+Any of those filters returns every matching row, including the owning-agent
+(`?entityType=agent&entityId=<owning agent id>`) and subscribing-agent
+(`?agentId=<subscriber agent id>`) queries under *Access auditing* below, and
+`?action=heartbeat.run_events_streamed`. There is no retention
+carve-out because there is no time-based retention to carve out of:
+`activity_log` rows are deleted only with their company, or with the agent that
+was their actor. Size any future retention policy against this action first —
+it is the highest-volume writer on the table.
+
+A write that fails withholds the content rather than serving unaudited bytes,
+matching the REST twins where an unguarded `await logRunLogAccessAudit(...)`
+fails the response. Like theirs, the failure is per attempt: the withhold is not
+memoized, so the next event re-attempts the write instead of an entitled reader
+staying withheld for the rest of the window. A failed write is logged apart from
+a failed decision, so a broken auditor is distinguishable from a broken
+authorizer.
 
 ### Access auditing
 
@@ -1105,8 +1154,9 @@ and denied reads:
 | `GET /api/heartbeat-runs/:runId/log` | `heartbeat.run_log_accessed` |
 | `GET /api/heartbeat-runs/:runId/events` | `heartbeat.run_events_accessed` |
 | `GET /api/workspace-operations/:operationId/log` | `workspace_operation.log_accessed` |
+| `GET /api/companies/:companyId/live-events` (WebSocket fan-out) | `heartbeat.run_events_streamed` |
 
-**All three actions exist and a consumer needs all three.** They are separately
+**All four actions exist and a consumer needs all four.** They are separately
 reachable paths over the same material; wiring an alert or digest to some and
 not the others reproduces the blindness that got this audit rejected as a
 standalone compensating control on PEN-3140. The workspace-operation path is the
@@ -1126,10 +1176,17 @@ log chunks, log references/paths, environment values, or credential material.
 
 Incident response can inspect these events through the company activity API or
 activity UI filtered by action/entity/run. To isolate a run's access history,
-query all three actions above — the two run-transcript routes are keyed
-`entity_type = heartbeat_run` with `entity_id = <runId>`, while the
+query all four actions above — the two run-transcript routes are keyed
+`entity_type = heartbeat_run` with `entity_id = <runId>`, the
 workspace-operation route is keyed `entity_type = workspace_operation` with the
-owning run in `runId`. Querying only the `heartbeat_run` rows silently omits the
+owning run in `runId`, and the WebSocket fan-out is keyed `entity_type = agent`
+with `entity_id = <owning agent id>` and no run reference at all — so a
+run-scoped query cannot find it, and a complete history has to be assembled by
+owning agent (`?entityType=agent&entityId=<owning agent id>`) and time window as
+well as by run. That owning-agent query, and `?agentId=<subscriber agent id>`
+for an agent subscriber, return these rows without an `action` filter; only the
+unnarrowed page (no `action`, `agentId`, `entityType` or `entityId`) leaves them
+out. Querying only the `heartbeat_run` rows silently omits the
 workspace-operation path, which is the same partial-coverage blindness this
 section warns about immediately above.
 

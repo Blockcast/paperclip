@@ -33,9 +33,26 @@ const peerAgentId = "33333333-3333-4333-8333-333333333333";
 const boardUserId = "44444444-4444-4444-8444-444444444444";
 
 const mockDecide = vi.hoisted(() => vi.fn());
+/**
+ * PEN-3148: the access audit this path gained. Mocked rather than driven
+ * against a database because every case here builds the gate with a stub `db`
+ * — the assertion is the row's SHAPE and its CARDINALITY, which is where the
+ * streaming path differs from its REST twins.
+ */
+const mockLogActivity = vi.hoisted(() => vi.fn());
+/**
+ * What `logActivity({ deferPublish: true })` hands back. Held as a spy so the
+ * suite can assert this site never calls it: publishing from inside the
+ * fan-out would feed the fan-out (see the gate's `defaultTranscriptStreamAuditor`).
+ */
+const mockPublishAudit = vi.hoisted(() => vi.fn());
 
 vi.mock("../middleware/logger.js", () => ({
   logger: { warn: vi.fn(), error: vi.fn() },
+}));
+
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mockLogActivity,
 }));
 
 vi.mock("../services/access.js", () => ({
@@ -107,6 +124,7 @@ describe("PEN-3142 live-event transcript gate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     allowOnlyOwner();
+    mockLogActivity.mockResolvedValue(mockPublishAudit);
   });
 
   describe("transcript content", () => {
@@ -479,6 +497,226 @@ describe("PEN-3142 live-event transcript gate", () => {
       expect(JSON.stringify(projected)).not.toContain(CANARY);
     });
   });
+
+  /**
+   * PEN-3148 Done-when 4. The socket was the FOURTH transcript surface and the
+   * only one still writing no access record at all, so "who read this
+   * transcript" had no answer for the highest-fidelity copy of the material.
+   *
+   * What is pinned here that the REST twins do not have to pin:
+   *
+   *  - CARDINALITY. One row per DECISION, reused for the whole TTL window. A
+   *    per-event row would be thousands per run and would make the row count
+   *    read as a count of reads, which it is not.
+   *  - NON-PUBLICATION. This audit site is itself on the live-event fan-out, so
+   *    a published `activity.logged` would feed the channel it is auditing.
+   */
+  describe("access audit", () => {
+    const auditCalls = () =>
+      mockLogActivity.mock.calls.filter(
+        (call) => (call[1] as { action?: string } | undefined)?.action === "heartbeat.run_events_streamed",
+      );
+
+    it("records a denied read against the OWNING agent, with the decider's reason", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "agent",
+        actorId: peerAgentId,
+      });
+
+      await project(logEvent() as never);
+
+      expect(auditCalls()).toHaveLength(1);
+      const [, input, options] = auditCalls()[0] as [unknown, Record<string, unknown>, unknown];
+      expect(input).toMatchObject({
+        companyId,
+        actorType: "agent",
+        // The reader is the actor...
+        actorId: peerAgentId,
+        agentId: peerAgentId,
+        // ...and the run's owner is the subject the decision was about.
+        entityType: "agent",
+        entityId: runOwnerAgentId,
+        details: {
+          result: "denied",
+          reason: "deny_missing_grant",
+          ownerAgentId: runOwnerAgentId,
+          transport: "websocket",
+        },
+      });
+      expect(options).toEqual({ deferPublish: true });
+    });
+
+    it("records an allowed read for the owning agent", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "agent",
+        actorId: runOwnerAgentId,
+      });
+
+      await project(logEvent() as never);
+
+      expect(auditCalls()).toHaveLength(1);
+      expect((auditCalls()[0] as [unknown, Record<string, unknown>])[1]).toMatchObject({
+        details: { result: "allowed", reason: "allow_self", ownerAgentId: runOwnerAgentId },
+      });
+    });
+
+    it("writes ONE row per decision, not one per event", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "agent",
+        actorId: peerAgentId,
+      });
+
+      for (const [, build] of transcriptCanaries) await project(build() as never);
+
+      // Three transcript-bearing events, one owning agent, one decision.
+      expect(auditCalls()).toHaveLength(1);
+    });
+
+    it("writes a fresh row once the decision window has expired", async () => {
+      let clock = 0;
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate(
+        {} as never,
+        { companyId, actorType: "agent", actorId: peerAgentId },
+        { now: () => clock, ttlMs: 1000 },
+      );
+
+      await project(logEvent() as never);
+      clock = 1001;
+      await project(logEvent() as never);
+
+      expect(auditCalls()).toHaveLength(2);
+    });
+
+    it("records the unresolved-owner withhold, with a null owner and a gate-local reason", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "agent",
+        actorId: runOwnerAgentId,
+      });
+
+      const orphan = logEvent();
+      (orphan.payload as Record<string, unknown>).agentId = null;
+      await project(orphan as never);
+
+      expect(auditCalls()).toHaveLength(1);
+      expect((auditCalls()[0] as [unknown, Record<string, unknown>])[1]).toMatchObject({
+        entityId: "unresolved-owner",
+        details: { result: "denied", reason: "withhold_unresolved_owner", ownerAgentId: null },
+      });
+    });
+
+    it("records the board operator short-circuit, which carries no AuthorizationDecision", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "board",
+        actorId: boardUserId,
+        membershipRole: "admin",
+      });
+
+      await project(logEvent() as never);
+
+      expect(auditCalls()).toHaveLength(1);
+      expect((auditCalls()[0] as [unknown, Record<string, unknown>])[1]).toMatchObject({
+        actorType: "user",
+        actorId: boardUserId,
+        agentId: null,
+        details: { result: "allowed", reason: "allow_board_transcript_operator" },
+      });
+      // The short-circuit returns before the decider, so there is no
+      // `AuthorizationDecision` to read a reason off — the row must not say
+      // `null` where its REST twin would name a boundary.
+      expect(mockDecide).not.toHaveBeenCalled();
+    });
+
+    it("never publishes the audit back onto the live-event channel it is auditing", async () => {
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "agent",
+        actorId: peerAgentId,
+      });
+
+      await project(logEvent() as never);
+
+      expect(auditCalls()).toHaveLength(1);
+      expect(mockPublishAudit).not.toHaveBeenCalled();
+    });
+
+    it("withholds when the audit cannot be written, rather than serving unaudited bytes", async () => {
+      mockLogActivity.mockRejectedValue(new Error("activity log unavailable"));
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "agent",
+        // The OWNER, who is entitled. The withhold here is the audit failing,
+        // not the decision — same posture as the REST twins, where an unguarded
+        // `await logRunLogAccessAudit(...)` fails the response.
+        actorId: runOwnerAgentId,
+      });
+
+      const projected = await project(logEvent() as never);
+
+      expect(JSON.stringify(projected)).not.toContain(CANARY);
+    });
+
+    // Ally review 5473258762 (Important): the failed write used to be memoized
+    // as a denial for the whole window, so an ENTITLED reader stayed withheld
+    // for up to the TTL after the audit backend recovered. The REST twins fail
+    // only the one request; the next one re-attempts. So must this.
+    it("re-attempts the audit on the next event after a failed write, inside the same window", async () => {
+      mockLogActivity.mockRejectedValueOnce(new Error("activity log unavailable"));
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const project = createLiveEventTranscriptGate(
+        {} as never,
+        { companyId, actorType: "agent", actorId: runOwnerAgentId },
+        // A frozen clock: the second event is well inside the decision window.
+        { now: () => 0, ttlMs: 30_000 },
+      );
+
+      const first = await project(logEvent() as never);
+      const second = await project(logEvent() as never);
+
+      expect(JSON.stringify(first)).not.toContain(CANARY);
+      expect(JSON.stringify(second)).toContain(CANARY);
+      expect(auditCalls()).toHaveLength(2);
+      // ...and the recovered decision IS memoized: a third event writes no row.
+      await project(logEvent() as never);
+      expect(auditCalls()).toHaveLength(2);
+    });
+
+    it("logs a failed audit write apart from a failed decision", async () => {
+      const { logger } = await import("../middleware/logger.js");
+      const { createLiveEventTranscriptGate } = await import("../realtime/live-event-transcript-gate.js");
+      const errorMessages = () => vi.mocked(logger.error).mock.calls.map((call) => String(call[1]));
+
+      mockLogActivity.mockRejectedValueOnce(new Error("activity log unavailable"));
+      await createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "agent",
+        actorId: runOwnerAgentId,
+      })(logEvent() as never);
+      expect(errorMessages()).toEqual([expect.stringMatching(/audit write failed/)]);
+
+      vi.mocked(logger.error).mockClear();
+      mockDecide.mockRejectedValueOnce(new Error("authz unavailable"));
+      await createLiveEventTranscriptGate({} as never, {
+        companyId,
+        actorType: "agent",
+        actorId: runOwnerAgentId,
+      })(logEvent() as never);
+      expect(errorMessages()).toEqual([expect.stringMatching(/decision failed/)]);
+      expect(errorMessages()[0]).not.toMatch(/audit/);
+    });
+  });
 });
 
 /**
@@ -517,6 +755,7 @@ describe("PEN-3142 live-event transcript scope — WebSocket fan-out", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     allowOnlyOwner();
+    mockLogActivity.mockResolvedValue(mockPublishAudit);
   });
 
   it("never delivers a published transcript canary to a non-owning agent socket", async () => {
@@ -562,6 +801,27 @@ describe("PEN-3142 live-event transcript scope — WebSocket fan-out", () => {
     expect(frame.payload.seq).toBe(1);
     expect(frame.payload.chunk).toBeNull();
     expect(frame.payload.withheldFields).toEqual(["chunk"]);
+  });
+
+  it("audits the withhold on the socket path, naming the run's owner", async () => {
+    const { publishLiveEvent } = await import("../services/live-events.js");
+    await connectSubscriber("agent", peerAgentId);
+
+    const event = logEvent();
+    publishLiveEvent({ companyId, type: event.type, payload: event.payload as never });
+    await flush();
+
+    // The wiring proof for PEN-3148 Done-when 4: the record is written by
+    // traffic on the real socket, not only by calling the gate directly.
+    const audits = mockLogActivity.mock.calls.filter(
+      (call) => (call[1] as { action?: string } | undefined)?.action === "heartbeat.run_events_streamed",
+    );
+    expect(audits).toHaveLength(1);
+    expect((audits[0] as [unknown, Record<string, unknown>])[1]).toMatchObject({
+      actorId: peerAgentId,
+      entityId: runOwnerAgentId,
+      details: { result: "denied", ownerAgentId: runOwnerAgentId, transport: "websocket" },
+    });
   });
 
   it("preserves event order across the async gate", async () => {
@@ -661,6 +921,7 @@ describe("PEN-3142 live-event transcript scope — scoped agent keys", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockLogActivity.mockResolvedValue(mockPublishAudit);
     mockDecide.mockImplementation(async (input: { actor: { agentId?: string; keyScope?: { kind?: string } } }) =>
       input.actor.keyScope?.kind === "skill_test"
         ? { allowed: false, reason: "deny_scope", explanation: "Skill-test run token cannot use this API action." }
