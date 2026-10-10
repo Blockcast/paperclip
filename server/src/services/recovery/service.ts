@@ -2363,6 +2363,14 @@ export function recoveryService(
      * arithmetic entirely and stop exercising it.
      */
     perPassMemoClockForTest?: () => number;
+    /**
+     * Test-only seam fired after a backstop page is selected and before any of it is
+     * processed (BLO-36017). It exists to inject the crash-mid-page case the cursor
+     * ordering turns on: the cursor is written only after the page is processed, so a
+     * throw here must leave it where it was and cost a duplicate pass. Production
+     * leaves this unset.
+     */
+    beforeBackstopCandidateLoopForTest?: () => Promise<void> | void;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -2380,8 +2388,10 @@ export function recoveryService(
   // Keyed per company scope rather than globally: production drives both sweeps with no
   // `companyId` (`"*"`), but a scoped call used to advance the same shared closure and clobber
   // the global rotation's position.
+  // `||` rather than `??` on purpose: the candidate filters gate on truthiness
+  // (`if (opts?.companyId)`), so `""` means "global" there and must mean it here too.
   const backstopSweepCursorKey = (sweep: string, companyId?: string | null) =>
-    `${sweep}:${companyId ?? "*"}`;
+    `${sweep}:${companyId || "*"}`;
 
   async function readBackstopSweepCursor(sweep: string): Promise<string | null> {
     const row = await db
@@ -12908,7 +12918,7 @@ export function recoveryService(
         .limit(candidateLimit);
     };
 
-    const cursorKey = backstopSweepCursorKey("issue_graph_liveness.backstop", opts?.companyId);
+    const cursorKey = backstopSweepCursorKey(source, opts?.companyId);
     const cursorBeforeQuery = useCursor ? await readBackstopSweepCursor(cursorKey) : null;
     let cursorWasReset = false;
     let candidateRows = await queryCandidates(cursorBeforeQuery);
@@ -12927,9 +12937,6 @@ export function recoveryService(
     // Null on the tail tick, which is what makes the next tick start a fresh rotation at the
     // head. Persisted rather than held in a closure so the rotation survives the process.
     const nextCursor = result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.id : null;
-    if (useCursor) {
-      await writeBackstopSweepCursor(cursorKey, nextCursor);
-    }
     if (result.candidateLimitSkipped > 0) {
       logger.warn(
         {
@@ -12979,6 +12986,8 @@ export function recoveryService(
       companyCandidates.push(candidate);
       candidatesByCompany.set(candidate.companyId, companyCandidates);
     }
+
+    await deps.beforeBackstopCandidateLoopForTest?.();
 
     for (const [companyId, companyCandidates] of candidatesByCompany.entries()) {
       const readinessMap = await issuesSvc.listDependencyReadiness(
@@ -13099,6 +13108,15 @@ export function recoveryService(
           );
         }
       }
+    }
+
+    // Advanced only after the page has been processed. If anything above throws -- a
+    // transient DB error, not only a SIGKILL -- the cursor stays put and the next tick
+    // re-reads this page. A duplicate pass is idempotency-guarded (`existingWakeSkipped`
+    // and the per-candidate `idempotencyKey`); a skipped page is not recoverable until
+    // the rotation wraps, which is the latency BLO-36017 exists to remove.
+    if (useCursor) {
+      await writeBackstopSweepCursor(cursorKey, nextCursor);
     }
 
     if (source !== "workspace.finalize") {
@@ -13981,7 +13999,6 @@ export function recoveryService(
     const lastCandidate = candidates[candidates.length - 1] ?? null;
     const nextCursor =
       result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.actionId : null;
-    await writeBackstopSweepCursor(cursorKey, nextCursor);
 
     if (result.candidateLimitSkipped > 0) {
       logger.warn(
@@ -14273,6 +14290,10 @@ export function recoveryService(
         );
       }
     }
+
+    // After the page, not before: see the sibling comment in the resolved-dependency
+    // backstop above. A throw mid-page must cost a duplicate pass, never a skipped one.
+    await writeBackstopSweepCursor(cursorKey, nextCursor);
 
     if (result.healed > 0) {
       logger.warn(
