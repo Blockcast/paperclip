@@ -10,8 +10,11 @@
 //     so the breach is real and only the 0s magnitude is broken.
 //
 // A single "points at the instrument, not the queue" sentence covering both
-// stands an operator down on a real breach. Pure text test: it reads the
-// runbook and nothing else.
+// stands an operator down on a real breach. Even on its own, le drift only
+// breaks the page: the queue can still be saturated, and query 2's mean
+// (`_sum`/`_count`, no `le` label) survives the drift. So no branch may end on
+// "not the queue"; the le-drift branch must send the operator to query 2 and
+// the queue instead. Pure text test: it reads the runbook and nothing else.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
@@ -34,12 +37,18 @@ function boundCheckBlocks() {
     .filter(Boolean);
 }
 
-test("the instrument-only verdict never covers the missing-_sum / 0s case", () => {
-  const instrumentOnly = boundCheckBlocks().filter((b) => b.includes("not the queue"));
-  assert.ok(instrumentOnly.length > 0, "le-drift branch must still say it points at the instrument, not the queue");
-  for (const block of instrumentOnly) {
-    assert.doesNotMatch(block, /`_sum`|\b0s\b/, `instrument-only verdict also covers _sum: ${block}`);
+test("no instrument branch stands the operator down on the queue", () => {
+  for (const block of boundCheckBlocks()) {
+    assert.doesNotMatch(block, /not the queue/, `bare stand-down on the queue: ${block}`);
   }
+});
+
+test("the le-drift branch checks the queue through query 2 before standing down", () => {
+  const leBranch = boundCheckBlocks().filter((b) => b.includes("Query 1 returns empty"));
+  assert.equal(leBranch.length, 1, "expected exactly one block for the le-drift (query 1 empty) case");
+  assert.match(leBranch[0], /Query 2/);
+  assert.match(leBranch[0], /unaffected by `le` drift/);
+  assert.match(leBranch[0], /triage the queue/);
 });
 
 test("the missing-_sum / 0s case says the breach is real and to triage the queue", () => {

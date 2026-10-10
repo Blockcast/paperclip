@@ -30,19 +30,26 @@ waited more than 3600s, so with all three series intact the mean is always
 above query 1 × 3600s. Once `onprem-k8s#5124` is live, that rule puts
 `or vector(0)` on its bucket and `_sum` arms on purpose, so a drifted `le`
 label or a missing `_sum` series pages instead of going dark. The two failures
-carry opposite verdicts on the queue, so tell them apart before standing down:
+carry opposite verdicts on the page, so tell them apart before standing down:
 
 - **Query 1 returns empty.** The `le="3600.0"` bucket is no longer reported
   (see the `.0` warning below). The rule's bucket arm fell to `vector(0)`, so
   its fraction read `1 - 0/N = 1.0` whatever the queue was doing: the firing
-  decision itself is an artefact. This points at the instrument, not the queue.
+  decision itself is an artefact, so file the instrument bug. That is a verdict
+  on the page, not on the queue, which can still be saturated. Query 2 reads
+  only `_sum` and `_count`, which carry no `le` label, so its mean is unaffected
+  by `le` drift: read it before standing down. A mean well above 3600s means the
+  queue is genuinely slow whatever the broken page says, so triage the queue
+  below as well. A lower mean does not clear it either: find the edge's current
+  `le` spelling, re-run query 1 with it, and judge the queue on that fraction.
 - **Query 1 returns a number, but query 2 returns empty or the alert reports a
   0s mean.** `_sum` is no longer reported, so only the magnitude readout is
   broken. The firing decision is computed from `_bucket` and `_count` alone and
   never reads `_sum`, so **the breach is real: file the instrument bug and
   triage the queue below as well.** Do not stand down on the 0s.
 - **Both return numbers, but the mean is at or below query 1 × 3600s.** One arm
-  is reported by only some pods (the series carry a `pod` label). Find which
+  is incomplete relative to the others, most often because only some pods
+  report it (the series carry a `pod` label). Find which
   before deciding: a short `_bucket` overstates the fraction, so the page may be
   an artefact; a short `_sum` only understates the mean, so the breach is real.
 
@@ -107,7 +114,7 @@ interpolation across it. It could not tell a 4.5h wait from a 7.5h one, and
 past 8h it degenerates to `+Inf`.
 
 The tell was that the p95 held **flat to within 0.4% across 24 hours** while
-the true mean over the identical window moved **3.2×** (5169s → 16003s). A
+the true mean over the identical window moved **3.1×** (5169s → 16003s). A
 quantile pinned inside one wide bucket only moves when the *ratio* between two
 buckets moves, so it reads as a stable plateau. **An operator reading "7.6h,
 steady for a day" concluded the queue was stable while it was not.**
