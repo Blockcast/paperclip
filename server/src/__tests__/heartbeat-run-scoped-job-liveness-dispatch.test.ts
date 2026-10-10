@@ -134,7 +134,7 @@ describeEmbeddedPostgres("startNextQueuedRunForAgent run-id-aware job liveness (
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("blo-20801-run-scoped-liveness-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db, { penstockGate: allowPenstockGate });
+    heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
   }, 120_000);
 
   afterEach(async () => {

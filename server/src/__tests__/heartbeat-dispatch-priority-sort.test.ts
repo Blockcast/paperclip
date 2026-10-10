@@ -140,7 +140,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-dispatch-priority-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db, { penstockGate: allowPenstockGate });
+    heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
   });
 
   afterEach(async () => {
@@ -2075,7 +2075,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // scanLimit 2 + maxScanBatches 1 makes the first pass stop after exactly
     // two rows with the cursor set and the scan NOT exhausted.
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 8 },
     });
 
@@ -2251,7 +2251,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const freshAt = new Date(baseNow);
 
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 8 },
     });
 
@@ -2439,7 +2439,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const baseNow = Date.now();
 
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 64 },
     });
 
@@ -2889,7 +2889,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const baseNow = Date.now();
 
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 64 },
     });
 
@@ -3192,7 +3192,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     const criticalLaneReschedules: Array<{ agentId: string; reason: string }> = [];
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       onQueuedDispatchScheduledForTest: (event) => {
         if (event.reason === "resume_critical_lane") {
           criticalLaneReschedules.push({ agentId: event.agentId, reason: event.reason });
@@ -3666,7 +3666,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const blockedCount =
       dispatchBounds.scanLimit * dispatchBounds.maxScanBatches * dispatchBounds.maxResumePasses;
     const cappedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: dispatchBounds,
       onQueuedDispatchScheduledForTest: ({ reason }) => {
         dispatchEvents.push(reason);
@@ -3873,7 +3873,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // NOT exhausted, which is the state that owes a continuation.
     const dispatchBounds = { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 };
     const partialHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: dispatchBounds,
     });
 
@@ -4063,7 +4063,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     });
     let boundedHeartbeat!: ReturnType<typeof heartbeatService>;
     boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 },
       beforeQueuedDispatchPassForTest: async (event) => {
         if (event.reason !== "resume_critical_lane") return;
@@ -4273,7 +4273,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const issuePrefix = `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const baseCreatedAt = new Date(Date.now() - 5 * 60 * 1000);
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 },
     });
 
@@ -4484,7 +4484,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       let releasedStaleSlot = false;
 
       const boundedHeartbeat = heartbeatService(db, {
-        penstockGate: allowPenstockGate,
+        penstockAvailabilityGate: allowPenstockGate,
         queuedRunDispatchBounds: { scanLimit: 4, maxScanBatches: 1, maxResumePasses: 5 },
         afterQueuedDispatchContinuationScheduledForTest: async (event) => {
           if (
@@ -4682,7 +4682,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     let sawFullyDeferredRecoveryPage = false;
 
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 12 },
       beforeQueuedDispatchRefusalStatusReadForTest: async () => {
         refusalStatusReads += 1;
@@ -4842,7 +4842,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const scheduledReasons: string[] = [];
     let releasedSlot = false;
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 1, maxScanBatches: 1, maxResumePasses: 5 },
       onQueuedDispatchScheduledForTest: ({ reason }) => scheduledReasons.push(reason),
       beforeQueuedDispatchPassForTest: async ({ reason }) => {
@@ -4964,7 +4964,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const issuePrefix = `F${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     let injectedFailure = false;
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       beforeQueuedDispatchRefusalStatusReadForTest: (run) => {
         if (run.id !== secondRunId || injectedFailure) return;
         injectedFailure = true;
@@ -5101,7 +5101,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // would make the test pass vacuously whenever that agent sorted last.
     let failedAgentId: string | null = null;
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       beforeQueuedDispatchRefusalStatusReadForTest: (run) => {
         if (failedAgentId !== null) return;
         if (agentIdByRefusedRunId.get(run.id) !== run.agentId) return;
@@ -5232,7 +5232,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const issuePrefix = `U${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const cursorEvents: string[] = [];
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 1, maxScanBatches: 1, maxResumePasses: 5 },
       onQueuedDispatchScheduledForTest: ({ reason }) => cursorEvents.push(reason),
     });

@@ -118,11 +118,11 @@ describeEmbeddedPostgres("dispatch is not deadlocked by alive-but-quiet runs", (
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-stale-deadlock-");
     db = createDb(tempDb.connectionString);
-    // No penstockAvailabilityGate: it gates claude_k8s agents only, and the
-    // agent under test is opencode_k8s. (Note the neighbouring backlog test
-    // passes `penstockGate`, which is not a field on HeartbeatServiceOptions —
-    // TypeScript drops it as an excess property, so that gate is never actually
-    // injected there. Not copied here.)
+    // No penstockAvailabilityGate: the default gate fails open for an agent
+    // whose adapterConfig carries no penstock capacity URL, which is the case
+    // for the fixture here. (BLO-23995 fixed the neighbouring suites, which
+    // passed the gate under the wrong key `penstockGate` — an excess property
+    // TypeScript drops, so those gates were never injected at all.)
     heartbeat = heartbeatService(db);
   });
 
