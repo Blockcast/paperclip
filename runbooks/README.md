@@ -51,6 +51,13 @@ platform cannot resolve automatically. Each runbook should be:
   (not failing) and is silently freezing the `master` merge queue. Trigger:
   `master` hasn't advanced in >90 min with the queue non-empty, or the
   position-1 entry's `merge_group` run shows no state change for that long.
+- [`merge-group-heavy-lane-trim.md`](merge-group-heavy-lane-trim.md) — how
+  `pr.yml` skips heavy lanes in `merge_group` when the queued PR's head
+  already passed them, how to read a trim decision, and the repository
+  variable `PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true` that restores the full
+  suite. Trigger: `master` red on a failure a trimmed lane (server shards,
+  e2e, Canary Dry Run, worktree install, OpenCode lanes) would have caught,
+  or a decision summary that trimmed a lane it should not have.
 - [`pr-update-branch-destroys-required-checks.md`](pr-update-branch-destroys-required-checks.md)
   — an approved PR cannot be enqueued because its head has no checks at all,
   after `update-branch` (or a hand-merged base) replaced the head with a merge

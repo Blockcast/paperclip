@@ -54,6 +54,17 @@ name: Master general tests
 # would hit the identical `pretested=1` skip every day and report green every
 # day -- strictly worse than no schedule, because it manufactures confidence
 # rather than merely lacking it.
+#
+# THE MERGE-GROUP TRIM (2026-10-10) NARROWS WHAT "PROVEN" MEANS. pr.yml no
+# longer re-runs every heavy lane in merge_group: when the queued PR's own head
+# already passed the general-server shards in pull_request CI and the queue
+# applies exactly that change set, the merge group carries the result forward
+# and skips the suite steps (scripts/merge-group-trim.mjs). That build is green
+# without having run the server suites on the merged tree. So the gate counts a
+# merge_group build as proof only when its server shards actually ran them, and
+# for most queue landings this workflow is now where the server suites first
+# run on the landed tree. Kill switch for the trim: the repository variable
+# PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true (runbooks/merge-group-heavy-lane-trim.md).
 
 on:
   push:
@@ -133,6 +144,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
+          # Merge-group heavy-lane trim (pr.yml's `Decide merge-group heavy-lane
+          # trim`, scripts/merge-group-trim.mjs): a green merge_group build no
+          # longer means its general-server shards RAN. In most queue entries
+          # they are carried forward from the PR head's pull_request CI, and
+          # their suite steps are skipped while the jobs still succeed. So a
+          # build is proof only if every `General tests (server i/N)` job in it
+          # ran BOTH server suite steps to success. A path-selector skip skips
+          # the same steps and is not proof either; that costs one extra suite
+          # run after a merge group whose diff could not reach the server suites
+          # (7 of 240 measured merge_group builds, 2026-10-03..10-09).
+          # scripts/__tests__/merge-group-trim.test.mjs drives this whole step
+          # against fixtures and pins the step names to pr.yml.
+          SERVER_SUITES_RAN: >-
+            [.jobs[] | select(.name | startswith("General tests (server "))]
+            | length > 0 and all(.[]; .conclusion == "success"
+            and ([.steps[]? | select(.name == "Run grouped general test suites"
+            or .name == "Run serialized server test shard") | .conclusion]
+            == ["success", "success"]))
         run: |
           set -uo pipefail
 
@@ -142,21 +171,24 @@ jobs:
           #   pr-1381 head_sha a9b48d9e -> landed as a9b48d9e
           #   pr-1385 base     a9b48d9e   head_sha 66465314 -> landed
           #   pr-1123 base     66465314   head_sha d4fb292f -> landed (master)
-          # So a successful merge_group run at this SHA means this exact tree
-          # has already been through the full suite, and re-running it would be
-          # pure duplicated cost.
+          # So a successful merge_group run at this SHA that RAN the server
+          # suites (SERVER_SUITES_RAN above) means this exact tree has already
+          # been through them, and re-running them would be pure duplicated
+          # cost. A run that carried them forward from the PR head proves
+          # nothing about this tree: the suite runs here instead, once per
+          # landed head (cancel-in-progress coalesces a burst of landings).
           #
           # Filter on the workflow PATH, not merely on a successful merge_group
           # run: `commitperclip-review.yml` also fires on merge_group, so
           # counting any green run here would let a passing review mask a
           # failing test suite — the guard would fail open in precisely the
           # case it exists to catch.
-          if ! response="$(gh api \
+          if ! runs="$(gh api \
             "repos/${REPO}/actions/runs?event=merge_group&head_sha=${HEAD_SHA}&per_page=100" \
-            --jq '[.workflow_runs[]
-                   | select(.path == ".github/workflows/pr.yml"
-                            and .conclusion == "success")]
-                  | length')"; then
+            --jq '.workflow_runs[]
+                  | select(.path == ".github/workflows/pr.yml"
+                           and .conclusion == "success")
+                  | .id')"; then
             # Fail closed. An API error must cost us a redundant suite run, not
             # a silently skipped one — an unnoticed red master is what this
             # workflow exists to prevent.
@@ -165,13 +197,26 @@ jobs:
             exit 0
           fi
 
-          if [ "${response:-0}" -gt 0 ]; then
-            echo "Commit ${HEAD_SHA} has a successful pr.yml merge_group build; skipping."
-            echo "pretested=1" >> "$GITHUB_OUTPUT"
-          else
+          if [ -z "$runs" ]; then
             echo "No successful pr.yml merge_group build for ${HEAD_SHA} (landed outside the queue); running the suite."
             echo "pretested=0" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          for run_id in $runs; do
+            # Fail closed per build as well: a job list that cannot be read is
+            # not proof that the server suites ran.
+            if ran="$(gh api \
+              "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100" \
+              --jq "$SERVER_SUITES_RAN")" && [ "$ran" = "true" ]; then
+              echo "Commit ${HEAD_SHA} has successful pr.yml merge_group build ${run_id}, which ran every general-server shard; skipping."
+              echo "pretested=1" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          echo "Commit ${HEAD_SHA} has a successful pr.yml merge_group build, but none ran the general-server suites (merge-group trim or path selector), or its jobs were unreadable; running the suite."
+          echo "pretested=0" >> "$GITHUB_OUTPUT"
 
   general_tests:
     name: Master tests (${{ matrix.group_label }})
