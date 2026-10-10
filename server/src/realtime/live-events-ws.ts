@@ -237,6 +237,40 @@ async function authorizeUpgrade(
   };
 }
 
+/**
+ * PEN-3895: cap on the per-socket send queue.
+ *
+ * Every event now awaits an authorization decision before it is sent
+ * (`createLiveEventTranscriptGate`), so each queued event holds a continuation
+ * AND the event payload it closed over alive until that decision resolves. With
+ * no bound, a subscriber whose decider stalls — a slow or wedged authorization
+ * query — accrues one of those per event published company-wide, for as long as
+ * the stall lasts. That is a load shape this gate introduced; before it, the
+ * send was synchronous and nothing could queue.
+ *
+ * Sized well above any healthy burst rather than tuned: live events are
+ * published one at a time from independent request handlers, so a drained
+ * socket sits at a queue depth of ~1 and only a genuinely stuck decider walks
+ * this far. Shedding is the right failure here — dropping an event on an
+ * overloaded socket matches the existing fail-closed drop on a projection
+ * error, and both are strictly better than unbounded retention.
+ */
+const MAX_PENDING_SENDS_PER_SOCKET = 512;
+
+/**
+ * PEN-3895: how often a socket that is STILL saturated may log a summary.
+ *
+ * The bound turns unbounded retention into drops; logging every drop would turn
+ * it into an unbounded log-write rate instead — one line per company-wide event,
+ * per saturated socket, for the whole stall, during exactly the incident the
+ * logs exist for. The first drop carries the whole signal and the 500th carries
+ * none, so a shedding episode logs its start once, its end once (recovery, or
+ * the socket closing), and in between at most one summary per interval carrying
+ * the accumulated drop count. Checked against the clock on each drop rather than
+ * on a timer: a saturated socket that has nothing to drop has nothing to report.
+ */
+const SATURATION_SUMMARY_INTERVAL_MS = 60_000;
+
 export function setupLiveEventsWebSocketServer(
   server: HttpServer,
   db: Db,
@@ -268,18 +302,70 @@ export function setupLiveEventsWebSocketServer(
     }
 
     let sendChain: Promise<void> = Promise.resolve();
+    // PEN-3895: in-flight depth, and a closed latch. `readyState` alone is not
+    // enough to stop work after close — a continuation that is already queued
+    // behind a stalled decider will run later, and it should not project or
+    // send once the socket is gone.
+    let pendingSends = 0;
+    let closed = false;
+    // The open shedding episode, if any. Drops are counted here rather than
+    // logged one by one (see SATURATION_SUMMARY_INTERVAL_MS).
+    let saturation: { dropped: number; since: number; lastLoggedAt: number } | null = null;
+
+    const endSaturation = (message: string) => {
+      if (!saturation) return;
+      logger.warn(
+        {
+          companyId: context.companyId,
+          droppedEvents: saturation.dropped,
+          saturatedMs: Date.now() - saturation.since,
+        },
+        message,
+      );
+      saturation = null;
+    };
 
     const projectForSubscriber = createLiveEventTranscriptGate(db, context);
 
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
-      if (socket.readyState !== WebSocket.OPEN) return;
+      if (closed || socket.readyState !== WebSocket.OPEN) return;
+      if (pendingSends >= MAX_PENDING_SENDS_PER_SOCKET) {
+        // Shed rather than grow. The transition is logged so a saturated
+        // subscriber is visible as itself instead of as unexplained memory
+        // growth; the drops after it are counted, not logged one by one.
+        const now = Date.now();
+        if (!saturation) {
+          saturation = { dropped: 1, since: now, lastLoggedAt: now };
+          logger.warn(
+            { companyId: context.companyId, pendingSends },
+            "live event send queue saturated: shedding events for this socket",
+          );
+        } else {
+          saturation.dropped += 1;
+          if (now - saturation.lastLoggedAt >= SATURATION_SUMMARY_INTERVAL_MS) {
+            saturation.lastLoggedAt = now;
+            logger.warn(
+              {
+                companyId: context.companyId,
+                pendingSends,
+                droppedEvents: saturation.dropped,
+                saturatedMs: now - saturation.since,
+              },
+              "live event send queue still saturated",
+            );
+          }
+        }
+        return;
+      }
+      pendingSends += 1;
       // The transcript decision is async, so ordering is preserved explicitly:
       // each event is chained onto the previous one rather than racing it. A
       // live log stream that arrived out of order would be worse than useless.
       sendChain = sendChain
         .then(async () => {
+          if (closed || socket.readyState !== WebSocket.OPEN) return;
           const projected = await projectForSubscriber(event);
-          if (socket.readyState !== WebSocket.OPEN) return;
+          if (closed || socket.readyState !== WebSocket.OPEN) return;
           socket.send(JSON.stringify(projected));
         })
         .catch((err) => {
@@ -288,6 +374,17 @@ export function setupLiveEventsWebSocketServer(
           // authorization error, so reaching here means send/serialization
           // failed, and the socket's own error handler will take it from there.
           logger.warn({ err, companyId: context.companyId }, "failed to deliver live event");
+        })
+        .finally(() => {
+          pendingSends -= 1;
+          // Recovery is the queue DRAINING, not one send completing. A decider
+          // that is slow rather than wedged frees one slot per decision, the next
+          // event refills it and the one after is shed — so ending the episode on
+          // the first completion would flap it, logging a recovery and a fresh
+          // saturation per decision and never reaching the summary interval
+          // (Ally review 5478526410). One episode spans the whole overload until
+          // the queue is empty. `endSaturation` is a no-op with no open episode.
+          if (pendingSends === 0) endSaturation("live event send queue recovered from saturation");
         });
     });
 
@@ -299,6 +396,22 @@ export function setupLiveEventsWebSocketServer(
     });
 
     socket.on("close", () => {
+      // PEN-3895: the `closed` latch is what makes close correct. Continuations
+      // already queued behind a stalled decider cannot be cancelled, and they
+      // stay reachable from the decider's pending promise — not from
+      // `sendChain`, so reassigning that variable here would free nothing. What
+      // bounds that retention is MAX_PENDING_SENDS_PER_SOCKET; what the latch
+      // adds is that each survivor, when it finally runs, is a no-op instead of
+      // a projection and a send on a dead socket.
+      //
+      // `pendingSends` is deliberately NOT reset: the queued `.finally` handlers
+      // still run and decrement it, and zeroing it here would drive the counter
+      // negative. After `cleanup()` no new events can enter, so its value no
+      // longer gates anything.
+      closed = true;
+      // Close the shedding episode with its count, so the survivors' later
+      // `.finally` does not report a recovery for a socket that is gone.
+      endSaturation("live event socket closed while its send queue was saturated");
       const cleanup = cleanupByClient.get(socket);
       if (cleanup) cleanup();
       cleanupByClient.delete(socket);

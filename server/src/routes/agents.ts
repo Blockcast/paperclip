@@ -5348,12 +5348,28 @@ export function agentRoutes(
     const transcriptAccess = await decideRunTranscriptRead(req, access, run);
 
     const events = await heartbeat.listEvents(runId, normalizedAfterSeq, normalizedLimit);
-    await logRunEventsAccessAudit(
-      req,
-      run,
-      transcriptAccess.allowed ? "allowed" : "denied",
-      { afterSeq: normalizedAfterSeq, limit: normalizedLimit, eventCount: events.length },
-    );
+    // PEN-3895 / BLO-34738: an ALLOWED read that disclosed nothing is not a read.
+    // This is a cursor-paged feed, so a live tailer sits on the empty tail of a
+    // finished run and re-polls it indefinitely; auditing each of those booked a
+    // row plus a write on the response path for a page that carried no transcript,
+    // and made "who read this run's events" over-report by however often the
+    // client happened to poll. Same reasoning already applied to `/log` below,
+    // where the empty case arrives as a 404 instead of an empty array.
+    //
+    // The DENIED write stays unconditional, deliberately. A denial records an
+    // ATTEMPT, which happened regardless of what the page would have contained —
+    // and PEN-3142 added this route's denied-path audit precisely because it had
+    // none, so suppressing it on an empty page would retire the control that row
+    // exists to install. `eventCount: 0` is still recorded on that row.
+    const disclosedNothing = transcriptAccess.allowed && events.length === 0;
+    if (!disclosedNothing) {
+      await logRunEventsAccessAudit(
+        req,
+        run,
+        transcriptAccess.allowed ? "allowed" : "denied",
+        { afterSeq: normalizedAfterSeq, limit: normalizedLimit, eventCount: events.length },
+      );
+    }
 
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const redactedEvents = events.map((event) => {

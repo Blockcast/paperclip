@@ -1095,6 +1095,31 @@ the pull reads that a `denied` finding would be investigated through. Auditing
 the subscription rather than the event is the shape to reach for if this is ever
 needed.
 
+**The per-socket send queue is bounded** (PEN-3895,
+`MAX_PENDING_SENDS_PER_SOCKET` in `live-events-ws.ts`). Because the decision
+above is async, each event's send is chained onto the previous one so the gate
+cannot reorder a live log stream — which means a socket whose decision stalls
+accrues one continuation, and one retained event payload, per company-wide event
+for the length of the stall. Past 512 pending sends the socket sheds further
+events. The bound is the only thing that caps that retention: queued
+continuations stay reachable from the stalled decider's own pending promise, so
+closing the socket does not reclaim them. What close adds is a `closed` latch,
+so a continuation that resolves after the socket is gone neither projects nor
+sends. Shedding matches the existing fail-closed drop on a projection error.
+
+Shedding is logged per episode, not per drop — a per-drop warning would turn the
+memory bound into an unbounded log-write rate for the length of the stall. A
+socket logs `live event send queue saturated` once on entering saturation, at
+most one `still saturated` summary per minute carrying the accumulated
+`droppedEvents`, and one closing line with the final count: `recovered from
+saturation` once its queue drains to empty, or `closed while its send queue was
+saturated` if the socket goes first. Recovery is the drain, not the first
+completed send, so a decider that is slow rather than stuck holds one episode
+open instead of flapping it once per decision. A draining socket sits at a depth
+of ~1, so reaching the bound means the authorizer is stuck or slower than the
+event rate, not that the fleet is busy — treat these lines as a signal about the
+decider.
+
 ### Access auditing
 
 Both transcript routes emit a company-scoped `activity_log` entry for allowed
@@ -1123,6 +1148,22 @@ The audit row records the actor type/id, company id, heartbeat run id, timestamp
 offset/limit for `/log`; `afterSeq`/`limit`/`eventCount` for `/events`), plus the
 log store type for `/log`. It deliberately does not record transcript content,
 log chunks, log references/paths, environment values, or credential material.
+
+**An `allowed` read that disclosed nothing is not audited** (BLO-34738,
+PEN-3895). On `/log` the empty case arrives as `404 Run log not found`, so the
+`allowed` row is written only after `readLog` returns; on the cursor-paged
+`/events` it arrives as an empty array, so the `allowed` row is skipped when
+`eventCount === 0`. Without this a live tailer parked on the empty tail of a
+finished run books one row per poll, and "who read this run's transcript"
+over-reports by however often that client happened to re-poll.
+
+**The `denied` row is unconditional on every one of the three actions**, empty
+page or not. A denial records an *attempt*, which happened regardless of what
+the read would have returned — and `/events` got its denied-path audit in
+PEN-3142 precisely because it had none, so suppressing it on an empty page would
+retire the control that change exists to install. `eventCount: 0` is still
+recorded on that row, which is what lets a reader tell a denied empty poll from a
+denied full page.
 
 Incident response can inspect these events through the company activity API or
 activity UI filtered by action/entity/run. To isolate a run's access history,

@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { IncomingMessage } from "node:http";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { logger } from "../middleware/logger.js";
 
 /**
  * PEN-3142 — the live-event PUSH channel, closed alongside the two REST pull
@@ -685,5 +686,321 @@ describe("PEN-3142 live-event transcript scope — scoped agent keys", () => {
 
     expect(sent).toHaveLength(3);
     for (const frame of sent) expect(frame).toContain(CANARY);
+  });
+});
+
+/**
+ * PEN-3895 item 2 (Ally suggestion on #2324). The ordering guarantee pinned by
+ * "preserves event order across the async gate" above is implemented by chaining
+ * each event's send onto the previous one, which makes `sendChain` per-socket
+ * state with two properties nothing asserted:
+ *
+ *  - nothing stopped a continuation queued behind a stalled decider from
+ *    projecting and sending after the socket had closed (the `closed` latch);
+ *    and
+ *  - it had no depth bound, so a stalled authorization decision accrued one
+ *    continuation per company-wide event, per socket, for the length of the
+ *    stall. Queued continuations stay reachable from the decider's pending
+ *    promise, so the bound — not anything done on close — is what caps that.
+ *
+ * Both are load shapes THIS gate introduced: before it the send was synchronous
+ * and nothing could queue. Driven with a decider that never resolves, which is
+ * the stall these exist for — a fast decider drains the chain between events and
+ * can never reach either condition.
+ *
+ * Shedding is logged per EPISODE, not per drop (Ally review 5477496711,
+ * Important): a per-drop warning turns the memory bound into an unbounded
+ * log-write rate for the length of the stall.
+ */
+describe("PEN-3895 live-event send chain is released and bounded", () => {
+  class FakeClientSocket extends EventEmitter {
+    readyState = 1; // WebSocket.OPEN
+    sent: string[] = [];
+    send(data: string) {
+      this.sent.push(data);
+    }
+    ping() {}
+    terminate() {}
+    close() {}
+  }
+
+  async function flush() {
+    for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  /**
+   * Each test gets its OWN company channel.
+   *
+   * `subscribeCompanyLiveEvents` is backed by a process-global `EventEmitter`
+   * keyed on company id, and no describe in this file closes the sockets it
+   * opens — so a socket from an earlier test stays subscribed for the rest of
+   * the run. Sharing `companyId` would therefore fan these publishes out to
+   * those sockets too, and since they are subject to the same depth bound they
+   * would contribute their own shed-warnings to the count asserted below. A
+   * per-test channel makes the drop count exactly this socket's.
+   */
+  let channelSeq = 0;
+  function nextChannel() {
+    channelSeq += 1;
+    return `99999999-9999-4999-8999-${String(channelSeq).padStart(12, "0")}`;
+  }
+
+  async function connectSubscriber(channelCompanyId: string, actorId: string) {
+    const { setupLiveEventsWebSocketServer } = await import("../realtime/live-events-ws.js");
+    const server = new EventEmitter();
+    const wss = setupLiveEventsWebSocketServer(server as never, {} as never, {
+      deploymentMode: "authenticated",
+    });
+    const socket = new FakeClientSocket();
+    const req = {
+      headers: {},
+      paperclipUpgradeContext: { companyId: channelCompanyId, actorType: "agent", actorId },
+    } as unknown as IncomingMessage;
+    wss.emit("connection", socket as never, req);
+    return socket;
+  }
+
+  /** A decision that never settles, plus the handle that releases it. */
+  function stallTheDecider() {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mockDecide.mockImplementation(async () => {
+      await gate;
+      return { allowed: true, reason: "allow_self", explanation: "test" };
+    });
+    return () => release();
+  }
+
+  async function publishChunk(channelCompanyId: string, seq: number, agentId = runOwnerAgentId) {
+    const { publishLiveEvent } = await import("../services/live-events.js");
+    publishLiveEvent({
+      companyId: channelCompanyId,
+      type: "heartbeat.run.log",
+      payload: { runId: "run-1", agentId, seq, stream: "stdout", chunk: `chunk-${seq}` } as never,
+    });
+  }
+
+  const SATURATED = "live event send queue saturated: shedding events for this socket";
+  const STILL_SATURATED = "live event send queue still saturated";
+  const RECOVERED = "live event send queue recovered from saturation";
+  const CLOSED_SATURATED = "live event socket closed while its send queue was saturated";
+
+  /**
+   * Every warn line this socket's channel produced, as `[message, fields]`.
+   * Keyed on the per-test channel rather than on message text, so a regression
+   * back to one line per drop is counted whatever it is worded as.
+   */
+  function warnsFor(channelCompanyId: string) {
+    return vi
+      .mocked(logger.warn)
+      .mock.calls.filter((call) => (call[0] as { companyId?: string }).companyId === channelCompanyId)
+      .map((call) => [call[1], call[0]] as [string, Record<string, unknown>]);
+  }
+
+  /** Pins the clock the saturation summary is rate-limited against. */
+  let now = 1_700_000_000_000;
+  let nowSpy: { mockRestore(): void } | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    allowOnlyOwner();
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+  });
+
+  afterEach(() => {
+    nowSpy?.mockRestore();
+  });
+
+  it("does not send an event whose decision resolved after the socket closed", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
+
+    await publishChunk(channel, 1);
+    await flush();
+    // Parked on the decider, so nothing has been sent yet — this is the state
+    // the close has to be safe in.
+    expect(socket.sent).toEqual([]);
+
+    socket.emit("close");
+    release();
+    await flush();
+
+    // An in-flight continuation cannot be cancelled, so the guard — not the
+    // absence of a continuation — is what has to stop the send.
+    expect(socket.sent).toEqual([]);
+  });
+
+  it("stops queueing once the socket is closed", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
+
+    socket.emit("close");
+    await publishChunk(channel, 1);
+    await publishChunk(channel, 2);
+    release();
+    await flush();
+
+    expect(socket.sent).toEqual([]);
+  });
+
+  it("sheds events beyond the per-socket depth bound instead of queueing without limit", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
+
+    // 520 against a cap of 512: the first 512 queue behind the stalled decider,
+    // the last 8 are shed. Without the bound all 520 would be retained.
+    for (let seq = 0; seq < 520; seq += 1) await publishChunk(channel, seq);
+    await flush();
+
+    // One line for the transition into saturation, not one per shed event.
+    expect(warnsFor(channel)).toEqual([[SATURATED, expect.objectContaining({ pendingSends: 512 })]]);
+
+    release();
+    await flush();
+
+    // The bound caps what may be held, so it caps what is delivered — and the
+    // recovery line accounts for every shed event.
+    expect(socket.sent).toHaveLength(512);
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [RECOVERED, expect.objectContaining({ droppedEvents: 8 })],
+    ]);
+  });
+
+  it("logs a stall once plus a periodic count, not once per shed event", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    await connectSubscriber(channel, runOwnerAgentId);
+
+    // Saturate, then shed 1000 more inside one summary interval.
+    for (let seq = 0; seq < 512 + 1000; seq += 1) await publishChunk(channel, seq);
+    await flush();
+    expect(warnsFor(channel)).toHaveLength(1);
+
+    // SATURATION_SUMMARY_INTERVAL_MS is 60 s: one short of it, still silent…
+    now += 59_999;
+    await publishChunk(channel, 2000);
+    expect(warnsFor(channel)).toHaveLength(1);
+
+    // …at it, one summary carrying the whole accumulated count…
+    now += 1;
+    await publishChunk(channel, 2001);
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [STILL_SATURATED, expect.objectContaining({ droppedEvents: 1002, saturatedMs: 60_000 })],
+    ]);
+
+    // …and the interval restarts from that summary.
+    for (let seq = 3000; seq < 3100; seq += 1) await publishChunk(channel, seq);
+    expect(warnsFor(channel)).toHaveLength(2);
+
+    release();
+    await flush();
+
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [STILL_SATURATED, expect.anything()],
+      [RECOVERED, expect.objectContaining({ droppedEvents: 1102 })],
+    ]);
+  });
+
+  it("holds one episode open while a slow decider frees one slot at a time", async () => {
+    // Slow, not wedged (Ally review 5478526410, Important): each decision is
+    // released on its own, so the queue passes back through the cap instead of
+    // draining 512 → 0 in one go. Every chunk names a distinct owning agent so
+    // the gate's per-agent decision cache cannot let one release drain the rest.
+    const channel = nextChannel();
+    const decisions: Array<() => void> = [];
+    mockDecide.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          decisions.push(() => resolve({ allowed: true, reason: "allow_grant", explanation: "test" }));
+        }),
+    );
+    const agentFor = (seq: number) => `55555555-5555-4555-8555-${String(seq).padStart(12, "0")}`;
+    let seq = 0;
+    const publish = () => publishChunk(channel, seq, agentFor(seq++));
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
+
+    for (let i = 0; i < 520; i += 1) await publish();
+    await flush();
+    expect(warnsFor(channel)).toEqual([[SATURATED, expect.anything()]]);
+
+    // One decision completes, the next event refills the freed slot, and the
+    // one after is shed. That is still the same episode: no recovery, and no
+    // fresh saturation line, per decision.
+    for (let i = 0; i < 5; i += 1) {
+      decisions.shift()?.();
+      await flush();
+      await publish();
+      await publish();
+    }
+    expect(socket.sent).toHaveLength(5);
+    expect(warnsFor(channel)).toEqual([[SATURATED, expect.anything()]]);
+
+    // Because the episode was never torn down, the summary interval still
+    // engages under a slow decider, carrying the whole accumulated count.
+    now += 60_000;
+    await publish();
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [STILL_SATURATED, expect.objectContaining({ droppedEvents: 8 + 5 + 1 })],
+    ]);
+
+    // The episode ends at the drain, once, with the episode total.
+    mockDecide.mockResolvedValue({ allowed: true, reason: "allow_grant", explanation: "test" });
+    for (const decide of decisions.splice(0)) decide();
+    await flush();
+    expect(socket.sent).toHaveLength(512 + 5);
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [STILL_SATURATED, expect.anything()],
+      [RECOVERED, expect.objectContaining({ droppedEvents: 14 })],
+    ]);
+  });
+
+  it("closes a saturated socket's episode with its count and reports no recovery after", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
+
+    for (let seq = 0; seq < 520; seq += 1) await publishChunk(channel, seq);
+    await flush();
+    socket.emit("close");
+    release();
+    await flush();
+
+    expect(socket.sent).toEqual([]);
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [CLOSED_SATURATED, expect.objectContaining({ droppedEvents: 8 })],
+    ]);
+  });
+
+  it("keeps delivering after a saturating burst drains", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
+
+    for (let seq = 0; seq < 520; seq += 1) await publishChunk(channel, seq);
+    release();
+    await flush();
+    const delivered = socket.sent.length;
+    expect(delivered).toBe(512);
+
+    // Drained, so the counter is back at zero and a later event is not shed.
+    allowOnlyOwner();
+    await publishChunk(channel, 999);
+    await flush();
+
+    expect(socket.sent).toHaveLength(delivered + 1);
+    expect(socket.sent[socket.sent.length - 1]).toContain("chunk-999");
+    // The episode ended at the drain, and the later event opened no new one.
+    expect(warnsFor(channel).map(([message]) => message)).toEqual([SATURATED, RECOVERED]);
   });
 });
