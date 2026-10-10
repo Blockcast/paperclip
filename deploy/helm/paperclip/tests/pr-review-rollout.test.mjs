@@ -26,11 +26,19 @@ function renderApiDeployment() {
   );
 }
 
-test("Blockcast defers the PR-review duplicate guard until compatibility pods drain", () => {
+test("Blockcast enables the PR-review duplicate guard now compatibility pods have drained", () => {
   const rendered = renderApiDeployment();
 
   assert.match(
     rendered,
-    /- name: PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD\n\s+value: "true"/,
+    /- name: PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD\n\s+value: "false"/,
   );
+});
+
+// Separate from the value assertion on purpose: the live admission policy pins an
+// exact container env-list length, so DELETING the var is inadmissible even though
+// an absent var and `"false"` are equivalent to the guard's own parser. This assert
+// fails on removal while the one above passes, and vice versa on a wrong value.
+test("Blockcast keeps the PR-review guard kill switch present in the env list", () => {
+  assert.match(renderApiDeployment(), /- name: PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD\n/);
 });
