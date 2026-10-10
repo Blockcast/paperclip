@@ -318,6 +318,26 @@ describeEmbeddedPostgres("issue list stable enumeration and exact counts", () =>
     expect(res.body.unsupportedParams).toEqual(["createdSince"]);
   });
 
+  // The two guards in this handler read "present" differently, on purpose: an empty `q` is
+  // what list() treats as no search, so the count tolerates it; an empty time bound is a
+  // bound the caller failed to fill in, so it is refused like the list route refuses it.
+  // Pinned side by side so neither reading drifts toward the other unnoticed.
+  it("refuses an empty time-bound param while an empty q still counts", async () => {
+    const companyId = await seedCompany();
+    await db.insert(issues).values([{ companyId, title: "Row A", status: "todo", priority: "medium" }]);
+
+    const emptyQ = await request(createApp(companyId)).get(`/api/companies/${companyId}/issues/count?q=`);
+    expect(emptyQ.status, JSON.stringify(emptyQ.body)).toBe(200);
+    expect(emptyQ.body.count).toBe(1);
+
+    const emptyBound = await request(createApp(companyId)).get(
+      `/api/companies/${companyId}/issues/count?updated_after=`,
+    );
+    expect(emptyBound.status, JSON.stringify(emptyBound.body)).toBe(400);
+    expect(emptyBound.body.count).toBeUndefined();
+    expect(emptyBound.body.unsupportedParams).toEqual(["updated_after"]);
+  });
+
   /** A key scoped to a single issue: denied company_scope:read, so the count route walks. */
   function skillTestActor(companyId: string, agentId: string, issueId: string) {
     return { type: "agent", agentId, companyId, source: "agent_key", keyScope: { kind: "skill_test", issueId } };

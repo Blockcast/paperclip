@@ -9048,6 +9048,14 @@ export function issueRoutes(
     // single integer with no such tell. Reuses the list route's helper rather than a
     // second copy of the pattern: the drift this family keeps producing is one surface
     // getting the guard and its neighbour not.
+    //
+    // Presence, not value, is the test: `?updated_after=` (empty) is a 400 here, while the
+    // COUNT_UNSUPPORTED_FILTERS guard below lets `?q=` through. Deliberate. Those keys are
+    // real list() filters that list() reads as absent when empty (`q` is trimmed), so
+    // tolerating an empty one keeps this count equal to the list it mirrors. No surface
+    // here implements a time bound, so an empty one can only be a bound the caller failed
+    // to fill in; the list route and the MCP list tools (`value === undefined`) refuse it
+    // on presence too, and this route must not be the sibling that answers 200.
     const unsupportedTimeFilterParams = parseUnsupportedTimeFilterParams(req.query);
     if (unsupportedTimeFilterParams.length > 0) {
       res.status(400).json({
