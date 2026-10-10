@@ -22,6 +22,7 @@ import {
 import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
 import {
   createLocalServiceKey,
   findLocalServiceRegistryRecordByRuntimeServiceId,
@@ -4547,7 +4548,7 @@ export async function realizeExecutionWorkspace(input: {
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir
     ? resolveConfiguredPath(configuredParentDir, repoRoot)
-    : path.join(repoRoot, ".paperclip", "worktrees");
+    : path.join(repoRoot, REPO_MANAGED_WORKTREES_SUBPATH);
   const worktreePath = path.join(worktreeParentDir, branchName);
   let pendingForwardBranchReconcile: PendingForwardBranchReconcile | null = null;
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
