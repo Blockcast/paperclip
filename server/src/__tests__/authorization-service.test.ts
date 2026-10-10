@@ -706,6 +706,106 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("ignores a foreign issue row without weakening configured cross-company boundary denial", async () => {
+    const company = await createCompany(db, "ForeignIssuePointer");
+    const foreignCompany = await createCompany(db, "ForeignIssueSource");
+    const actorAgent = await createAgent(db, company.id);
+    // Inserted directly, bypassing the service, so the row's companyId and the
+    // resource's companyId disagree — the data-integrity defect a caller that
+    // derived `resource.companyId` from the actor would produce.
+    const foreignIssue = await createIssue(db, foreignCompany.id, {
+      assigneeAgentId: actorAgent.id,
+    });
+    const inCompanyIssue = await createIssue(db, company.id, {
+      assigneeAgentId: actorAgent.id,
+    });
+    const actor = {
+      type: "agent" as const,
+      agentId: actorAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+    const authorization = authorizationService(db);
+
+    // Before the scoped loadIssue, the foreign row became a policy source and
+    // every action denied as cross_company_boundary / source "issue".
+    for (const action of ["issue:read", "issue:comment"] as const) {
+      await expect(authorization.decide({
+        actor,
+        action,
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: foreignIssue.id,
+          assigneeAgentId: actorAgent.id,
+        },
+      })).resolves.toMatchObject({ allowed: true });
+    }
+
+    // A genuinely configured cross-company boundary on the actor's own issue
+    // still denies: the issue arm is scoped, not dropped.
+    await db.update(issues).set({
+      executionPolicy: {
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: foreignCompany.id,
+            rootIssueId: inCompanyIssue.id,
+          },
+        },
+      },
+    }).where(eq(issues.id, inCompanyIssue.id));
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:read",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: inCompanyIssue.id,
+        assigneeAgentId: actorAgent.id,
+      },
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_policy_restricted",
+      policyResolution: { reason: "cross_company_boundary", source: "issue" },
+    });
+  });
+
+  it("resolves a low-trust project boundary through its root issue's project", async () => {
+    const company = await createCompany(db, "LowTrustRootIssueProject");
+    const project = await createProject(db, company.id, "RootIssueProject");
+    const otherProject = await createProject(db, company.id, "OutsideRootIssue");
+    const rootIssueId = randomUUID();
+    const actorAgent = await createAgent(db, company.id, {
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, rootIssueId },
+        },
+      },
+    });
+    await createIssue(db, company.id, { id: rootIssueId, projectId: project.id });
+    const authorization = authorizationService(db);
+    const actor = {
+      type: "agent" as const,
+      agentId: actorAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+
+    await expect(authorization.decide({
+      actor,
+      action: "project:read",
+      resource: { type: "project", companyId: company.id, projectId: project.id },
+    })).resolves.toMatchObject({ allowed: true, reason: "allow_low_trust_boundary" });
+    await expect(authorization.decide({
+      actor,
+      action: "project:read",
+      resource: { type: "project", companyId: company.id, projectId: otherProject.id },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+  });
+
   it("keeps responsible-user issue mutations denied for viewer memberships", async () => {
     const company = await createCompany(db, "ResponsibleUserIssueViewerDenied");
     const actorAgent = await createAgent(db, company.id, { role: "engineer" });
