@@ -423,10 +423,16 @@ gh run list --repo Blockcast/paperclip --workflow pr.yml --event merge_group \
 
 | grouping | reading | action |
 |---|---|---|
-| **one job name across most or all entries** | the base is red; the entries are innocent | fix `master`, then re-enqueue what was evicted. Do **not** dequeue entries one by one — step 4 of the policy below is the same instinct and the same answer |
+| **one job name across most or all entries, clustered in time** | the base is red; the entries are innocent | fix `master`, then re-enqueue what was evicted. Do **not** dequeue entries one by one — step 4 of the policy below is the same instinct and the same answer |
 | **a different job per entry** | the entries are genuinely bad | ordinary eviction handling; each PR owns its own failure |
 
-**Three ways to read this query wrong:**
+**Clustered in time is half the reading, and the query above does not print
+it.** A window wide enough to hold two separate reds ranks their *sum* at the
+top, which is a shape neither row of the table describes. Add `createdAt` to
+the `--json` list and carry it through the loop when two rows compete; the
+worked example below is exactly that case.
+
+**Four ways to read this query wrong:**
 
 - **Exclude `verify`.** It is the aggregate required check (`needs:` every
   lane, `if: always() && !cancelled()`), so it fails on every failing entry by
@@ -436,34 +442,54 @@ gh run list --repo Blockcast/paperclip --workflow pr.yml --event merge_group \
   three runs and is one data point; the `sort -u` above is what makes the count
   mean what the table says.
 - **Two entries sharing a job name is not a red base.** It is the weakest
-  reading the query can produce and a plausible coincidence — the same window
-  below contains exactly that (`Typecheck + Release Registry`, 2 PRs, hours
-  away from the real cluster). **Confirm on `master` itself before acting**:
-  the one `master-health.yml` failure in the whole of 2026-10-01→10-08 is the
-  red base here, at `73231deccc3c` `09:29:24Z`. ⚠ That workflow is **not** a
-  detector — it self-cancels on supersession (31 of 46 runs that day), so a red
-  can pass under it unobserved. A `success` there is evidence; an absence is
-  not.
+  reading the query can produce and a plausible coincidence — the window below
+  contains two of those (`General tests (workspaces-b)`, and the 10-07 01:4xZ
+  `Typecheck + Release Registry` pair), both hours away from any cluster.
+  **Confirm on `master` itself before acting**: the one `master-health.yml`
+  failure in the whole of 2026-10-01→10-08 is the 10-07 red base, at
+  `73231deccc3c` `09:29:24Z`. ⚠ That workflow is **not** a detector — it
+  self-cancels on supersession (31 of 46 runs that day), so a red can pass
+  under it unobserved. A `success` there is evidence; an absence is not.
+- **A window that includes today returns a prefix of today.** Re-run once the
+  day has closed, or a cluster still in progress reads as a coincidence. This
+  section shipped with `Typecheck + Release Registry` at **2 PRs**, measured
+  2026-10-08T14:0xZ and correct then; the same query re-run on 10-10 returns
+  **9**, because a second red base ran 10-08 17:03Z→23:43Z and was still in the
+  future. The row this section offered as its negative control was the positive
+  case. Same trap as the 19/44 snapshot corrected under "Invalidation fan-out"
+  below — a figure measured mid-window and written down as a total.
 
 **Worked example — 2026-10-07, this repo.** `master` red from **08:59:36Z**
 (`f3e05fc53`, [#2263](https://github.com/Blockcast/paperclip/pull/2263)) until
 **16:31:11Z** ([#2290](https://github.com/Blockcast/paperclip/pull/2290)). The
-query above over `2026-10-07..2026-10-08` returns:
+query above over `2026-10-07..2026-10-08`, re-run 2026-10-10 with the window
+closed, returns:
 
 ```
+9  Typecheck + Release Registry     1864 2157 2311 2312 2318 2322 2330 2331 2333
 6  General tests (server 5/6)       1699 2041 2142 2143 2252 2267
-2  Typecheck + Release Registry     1864 2157
 2  General tests (workspaces-b)     2142 2241
+1  Vendored claude_k8s adapter      2313
 1  Canary Dry Run                   2269
 ```
 
-Six distinct PRs, ten runs, **one assertion** —
-`security-audit-overrides.test.ts > has a guard wired for every ticket bucket`.
-The bottom three rows are the other side of the discriminator in the same
-output — different jobs, one or two entries each, scattered across the window
-rather than clustered in the red period. Those entries own their own failures.
-PR 2142 appears on both sides: innocent at 09:5xZ against the red base,
-genuinely bad at 18:29Z against a fixed one.
+**Read the rows, not the ranking — the top row is not the incident.** Row 2 is
+the 10-07 red base: six distinct PRs, ten runs, **one assertion** —
+`security-audit-overrides.test.ts > has a guard wired for every ticket bucket`
+— every one of them between 09:29Z and 14:51Z.
+
+Row 1 is **a second, unrelated red base**, not a bigger version of the first.
+Seven of its nine PRs (2311–2333) fail between 10-08 17:03Z and 23:43Z, a
+distinct cluster that cleared without a ticket — all seven merged by 10-09,
+and the queue has run green since. Its other two (1864, 2157) sit at 10-07
+01:4xZ and belong to neither. The count alone cannot separate a 9 that is two
+incidents plus noise from a 9 that is one; the timestamps can, which is what
+the "clustered in time" qualifier in the table is for.
+
+The bottom rows are the other side of the discriminator — different jobs, one
+or two entries each, scattered rather than clustered. Those entries own their
+own failures. PR 2142 appears on both sides: innocent at 09:5xZ against the red
+base, genuinely bad at 18:29Z against a fixed one.
 
 **How it landed** — a semantic conflict between two individually-correct
 commits. `3c6322515` ([BLO-40607](/BLO/issues/BLO-40607)) added a
