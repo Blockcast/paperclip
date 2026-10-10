@@ -29,6 +29,7 @@
 import { describe, expect, it } from "vitest";
 import { ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES } from "../services/recovery/zero-token-startup-failure.js";
 import {
+  JOB_FAILED_EQUIVALENT_ERROR_CODES,
   RECOVERABLE_AGENT_STATUS_ERROR_CODES,
   readHeartbeatRunErrorFamily,
   readTransientRecoveryContractFromRun,
@@ -274,11 +275,13 @@ describe("BLO-35668: skill_materialization_pending retries wherever adapter_fail
   });
 });
 
-// The same enrolment gap one arm further down, and the one this row's own
-// :1778 comment described without fixing. `JOB_FAILED_EQUIVALENT_ERROR_CODES`
-// gated on `isIssueRun` alone while every sibling arm above reads
-// `isIssueRun || isPrReviewRetryContext`, so a pr_review run was terminal on a
-// failed external-lifecycle Job however safe the retry provably was.
+// The same enrolment gap as the skill_materialization_pending block above, in
+// the arm just before it in shouldScheduleAutomaticRunRetry.
+// `JOB_FAILED_EQUIVALENT_ERROR_CODES` gated on `isIssueRun` alone while every
+// sibling arm before it admits a pr_review run (the capacity-refusal arm
+// directly above reads `isIssueRun || isPrReviewRetryContext`), so a pr_review
+// run was terminal on a failed external-lifecycle Job however safe the retry
+// provably was.
 //
 // Measured in production 2026-10-09, after the fix for the arm above had
 // deployed, over 13.9h of Ally runs (531 pr_review runs / 391 PRs). The control
@@ -290,42 +293,48 @@ describe("BLO-35668: skill_materialization_pending retries wherever adapter_fail
 // 100%, so the zero was enrolment, not a fleet outage.
 describe("BLO-35668: job_failed retries a pr_review run once invocation is disproved", () => {
   const proved = { externalLifecycleRecovery: { adapterInvocationStarted: false } };
+  const prReview = { reviewKind: "pr_review" };
+  const issue = { issueId: "issue-a" };
 
-  it.each(["job_failed", "oom_killed", "exit_137"] as const)(
+  // Iterates the exported set rather than a hand-copied list, so a member added
+  // later is covered here without anyone remembering to add it.
+  it.each([...JOB_FAILED_EQUIVALENT_ERROR_CODES])(
     "%s on a pr_review run matches the issue run it is gated beside",
     (errorCode) => {
+      const issueVerdict = shouldScheduleAutomaticRunRetry({
+        errorCode,
+        resultJson: proved,
+        contextSnapshot: issue,
+      });
+      // Anchored, not just relative: a symmetric narrowing (`return false`, or a
+      // conjunct false for both run kinds) would keep the parity below green.
+      expect(issueVerdict).toBe(true);
       expect(
-        shouldScheduleAutomaticRunRetry({
-          errorCode,
-          resultJson: proved,
-          contextSnapshot: { reviewKind: "pr_review" },
-        }),
-      ).toBe(
-        shouldScheduleAutomaticRunRetry({
-          errorCode,
-          resultJson: proved,
-          contextSnapshot: { issueId: "issue-a" },
-        }),
-      );
+        shouldScheduleAutomaticRunRetry({ errorCode, resultJson: proved, contextSnapshot: prReview }),
+      ).toBe(issueVerdict);
     },
   );
 
   // The point of the arm. Widening the run-kind scope must not widen this, so
-  // it is asserted on BOTH run kinds: an unproved invocation may have performed
-  // non-idempotent external work and stays terminal.
-  it.each([
-    ["pr_review", { reviewKind: "pr_review" }],
-    ["issue", { issueId: "issue-a" }],
-  ] as const)("stays terminal on %s when invocation is not disproved", (_label, contextSnapshot) => {
-    for (const resultJson of [
-      null,
-      {},
-      { externalLifecycleRecovery: {} },
-      { externalLifecycleRecovery: { adapterInvocationStarted: true } },
-    ]) {
-      expect(
-        shouldScheduleAutomaticRunRetry({ errorCode: "job_failed", resultJson, contextSnapshot }),
-      ).toBe(false);
-    }
+  // it is asserted on BOTH run kinds and every member: an unproved invocation
+  // may have performed non-idempotent external work and stays terminal.
+  const unproved = [
+    ["null", null],
+    ["{}", {}],
+    ["empty recovery", { externalLifecycleRecovery: {} }],
+    ["invocation started", { externalLifecycleRecovery: { adapterInvocationStarted: true } }],
+  ] as const;
+  const runKinds = [
+    ["pr_review", prReview],
+    ["issue", issue],
+  ] as const;
+  it.each(
+    [...JOB_FAILED_EQUIVALENT_ERROR_CODES].flatMap((errorCode) =>
+      runKinds.flatMap(([kind, contextSnapshot]) =>
+        unproved.map(([shape, resultJson]) => [errorCode, kind, shape, contextSnapshot, resultJson] as const),
+      ),
+    ),
+  )("%s stays terminal on %s when resultJson is %s", (errorCode, _kind, _shape, contextSnapshot, resultJson) => {
+    expect(shouldScheduleAutomaticRunRetry({ errorCode, resultJson, contextSnapshot })).toBe(false);
   });
 });

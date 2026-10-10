@@ -1072,7 +1072,7 @@ export const JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 4;
  * `caveman_proxy_not_ready` and this set exists so the next one cannot be
  * half-added.
  */
-const JOB_FAILED_EQUIVALENT_ERROR_CODES: ReadonlySet<string> = new Set([
+export const JOB_FAILED_EQUIVALENT_ERROR_CODES: ReadonlySet<string> = new Set([
   "job_failed",
   "oom_killed",
   "exit_137",
