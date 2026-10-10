@@ -98,10 +98,23 @@ test("production image packages the pinned launcher and Caveman proxy", () => {
 });
 
 test("the Docker workflow keeps launcher credentials separate from vendor credentials", () => {
-  assert.match(
-    dockerWorkflow,
-    /gh_token=\$\{\{ secrets\.PAPERCLIP_BOARD_TOKEN \}\}/,
-  );
+  // BLO-32824's property is that the launcher credential is not the vendor
+  // credential. This line used to assert the vendor credential was PRESENT
+  // (`gh_token=${{ secrets.PAPERCLIP_BOARD_TOKEN }}`) and distinct.
+  //
+  // PEN-3916 made the property hold a stronger way: there is no vendor
+  // credential left. `gh_token` existed solely for the `vendor` stage's clone
+  // of kkroo/paperclip-adapter-opencode-k8s, that adapter is now vendored
+  // in-tree, and no Dockerfile stage mounts the secret — so it was removed
+  // from this workflow rather than left wired into a build with no use for it.
+  //
+  // Asserted as absence, deliberately. Flipping it to a no-op would have left
+  // nothing stopping a future change from re-adding a board-scoped token
+  // "because the build needs GitHub", which is exactly the reach BLO-32824
+  // was about. If a vendor credential is ever genuinely needed again, this
+  // line is the one that must be argued with.
+  assert.doesNotMatch(dockerWorkflow, /gh_token=/);
+  assert.doesNotMatch(dockerWorkflow, /secrets\.PAPERCLIP_BOARD_TOKEN/);
   assert.match(
     dockerWorkflow,
     /uses: actions\/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2\.2\.2/,

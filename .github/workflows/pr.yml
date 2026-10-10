@@ -400,26 +400,28 @@ jobs:
         run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
         timeout-minutes: 1
 
-      - name: Validate opencode_k8s adapter pin
-        if: ${{ !cancelled() }}
-        run: node --test ./scripts/opencode-k8s-runtime-cache-pin.test.js
-        timeout-minutes: 1
-
-      # BLO-33204: its neighbour above pins WHICH commit; this checks the commit
-      # is still REACHABLE. A squash-merge in the adapter repo orphans the branch
-      # head we pinned without changing a byte of our Dockerfile, and the vendor
-      # stage's `git clone` only fetches ref-reachable objects — so the build
-      # dies with `fatal: unable to read tree` on the next cache miss while
-      # cache-hitting builds keep passing. That made a hard, estate-wide deploy
-      # break look intermittent and commit-specific. Needs network (the adapter
-      # repo is public, no token required); it fails the PR only on a definite
-      # orphan and warns rather than blocking when the probe itself cannot run.
-      - name: Validate opencode_k8s adapter pin is reachable (BLO-33204)
-        if: ${{ !cancelled() }}
-        run: |
-          node --test ./scripts/__tests__/opencode-k8s-pin-reachable.test.mjs
-          node ./scripts/check-opencode-k8s-pin-reachable.mjs
-        timeout-minutes: 3
+      # PEN-3916 removed two steps that stood here: a known-bad-pin assertion
+      # (`opencode-k8s-runtime-cache-pin.test.js`) and a network reachability +
+      # tree-property probe (`check-opencode-k8s-pin-reachable.mjs`, BLO-33204).
+      # Both existed only because the opencode_k8s adapter was CLONED at
+      # `ARG OPENCODE_K8S_REF`. There is no pin now — the source is vendored at
+      # vendor/paperclip-adapter-opencode-k8s/ — so an unreachable SHA, a
+      # known-bad SHA and a stale pin are all unrepresentable rather than
+      # merely checked.
+      #
+      # The two TREE properties those probes asserted did not go away with
+      # them; they became ordinary in-tree review, which is stronger than a
+      # grep over a cloned tree and needs no network:
+      #   - no PUT-verb Secret call site (BLO-34510) is now
+      #     vendor/paperclip-adapter-opencode-k8s/src/server/rbac-secret-verbs.test.ts,
+      #     run by the `vendor_opencode_k8s` job, with a positive control so an
+      #     inert scan cannot read as clean.
+      #   - the GitHub-egress wrapper PATH (PEN-3732) is now asserted twice:
+      #     behaviourally, including ORDERING, by five cases in the adapter's
+      #     own job-manifest suite, and structurally against the chart by
+      #     deploy/helm/paperclip/tests/agent-egress-path.test.mjs. The retired
+      #     probe could only attest a MENTION of the directory, which Ally
+      #     correctly flagged on #2392 as not an ordering guarantee.
 
       - name: Test merge-group concurrency key
         if: ${{ !cancelled() }}
@@ -1790,6 +1792,95 @@ jobs:
             exit 1
           fi
 
+  vendor_opencode_k8s:
+    # PEN-3916, mirroring vendor_claude_k8s above. The opencode_k8s adapter
+    # renders every opencode_k8s Job spec, INCLUDING ITS PATH, which is a
+    # security control (PEN-2527 / PEN-3152 / PEN-3156 route all GitHub egress
+    # through wrapper binaries; PEN-3713 makes them win by putting the
+    # root-owned image directory first on PATH). It used to be cloned from
+    # kkroo/paperclip-adapter-opencode-k8s at a pinned SHA — a personal account
+    # no agent seat can push to, measured 2026-10-09 — so a change to that
+    # control could be made by one person and nothing here reviewed it. The
+    # source is now vendored at vendor/paperclip-adapter-opencode-k8s/ and this
+    # job is what makes it reviewable.
+    #
+    # Without this job the vendored tree is dead-lettered: like its claude
+    # sibling it is deliberately outside the pnpm workspace and the root
+    # tsconfig project references, so nothing else in CI compiles or exercises
+    # it. Vendoring without this job would REMOVE review coverage rather than
+    # add it — the in-stage `npm test` in the Dockerfile runs two files.
+    name: Vendored opencode_k8s adapter
+    runs-on: arc-light
+    # HANG DETECTOR, NOT A PERFORMANCE BUDGET. BLO-35615 rule. No W95 series
+    # exists for this job yet — it is new — so this is NOT derived from the
+    # primary form. It is set equal to its claude sibling, which runs the same
+    # npm ci + tsc + vitest shape over a tree of comparable size (44 files /
+    # 672 tests here against 36 / ~600 there). Re-measure W95 over n>=50
+    # successful runs and apply the rule before tuning it, and do NOT lower it
+    # from observed durations.
+    timeout-minutes: 17
+    defaults:
+      run:
+        working-directory: vendor/paperclip-adapter-opencode-k8s
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: vendor/paperclip-adapter-opencode-k8s/package-lock.json
+
+      # --include=dev is explicit: some runner images set `npm config omit=dev`,
+      # which silently skips typescript/vitest and turns this job into a no-op
+      # that still reports green. Reproduced while vendoring (PEN-3916): on an
+      # agent sandbox with `npm config omit=dev`, `npm ci --include=dev` STILL
+      # omitted them and `npm test` died with `vitest: not found` — the flag
+      # alone did not override the config. NPM_CONFIG_OMIT= is what did.
+      - name: Install
+        env:
+          NPM_CONFIG_OMIT: ""
+        run: npm ci --include=dev
+
+      # Fail loudly if the install above did not actually produce the dev
+      # toolchain, rather than discovering it as a confusing `tsc: not found`
+      # three steps later. The whole job is a no-op without these two.
+      - name: Assert the dev toolchain is present
+        run: |
+          set -euo pipefail
+          test -x node_modules/.bin/tsc || { echo "::error::tsc missing — dev dependencies were omitted"; exit 1; }
+          test -x node_modules/.bin/vitest || { echo "::error::vitest missing — dev dependencies were omitted"; exit 1; }
+
+      - name: Typecheck
+        run: npx --no-install tsc --noEmit
+
+      - name: Test
+        run: npm test
+
+      # PEN-3223, same failure as the claude sibling: the vendored version is
+      # recorded in two hand-maintained places — package.json `version` and
+      # PROVENANCE.md's Origin table `Current version` — and nothing else
+      # compares them. That pair drifted on the claude tree for three heads.
+      - name: Verify vendored version is recorded consistently
+        run: |
+          set -euo pipefail
+          pkg=$(node -p 'require("./package.json").version')
+          recorded=$(sed -n 's/^| Current version | `\([^`]*\)`.*/\1/p' PROVENANCE.md | head -1)
+          echo "package.json:   $pkg"
+          echo "PROVENANCE.md:  $recorded"
+          if [ -z "$recorded" ]; then
+            echo "::error::No 'Current version' row found in PROVENANCE.md's Origin table."
+            exit 1
+          fi
+          if [ "$pkg" != "$recorded" ]; then
+            echo "::error::PROVENANCE.md records version '$recorded' but package.json is '$pkg'."
+            echo "Update the 'Current version' row in vendor/paperclip-adapter-opencode-k8s/PROVENANCE.md to: $pkg"
+            exit 1
+          fi
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     # Serialized server suites run inside the general-server matrix jobs,
@@ -1806,6 +1897,7 @@ jobs:
         opencode_k8s_seed_cold_start,
         build,
         vendor_claude_k8s,
+        vendor_opencode_k8s,
       ]
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
     # BLO-28999: the failure path below adds checkout + Node setup + up to N+1
@@ -1887,6 +1979,7 @@ jobs:
           OPENCODE_K8S_SEED_COLD_START_RESULT: ${{ needs.opencode_k8s_seed_cold_start.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           VENDOR_CLAUDE_K8S_RESULT: ${{ needs.vendor_claude_k8s.result }}
+          VENDOR_OPENCODE_K8S_RESULT: ${{ needs.vendor_opencode_k8s.result }}
         run: |
           # Keep these three arrays in the same order — scripts/__tests__/
           # pr-verify-lane-outcome.test.mjs asserts the pairing, and also
@@ -1900,6 +1993,7 @@ jobs:
             opencode_k8s_seed_cold_start
             build
             vendor_claude_k8s
+            vendor_opencode_k8s
           )
           lane_results=(
             "$HELM_CHART_RESULT"
@@ -1910,6 +2004,7 @@ jobs:
             "$OPENCODE_K8S_SEED_COLD_START_RESULT"
             "$BUILD_RESULT"
             "$VENDOR_CLAUDE_K8S_RESULT"
+            "$VENDOR_OPENCODE_K8S_RESULT"
           )
           lane_job_names=(
             "Helm chart"
@@ -1920,6 +2015,7 @@ jobs:
             "k8s-ro seed transport cold start"
             "Build"
             "Vendored claude_k8s adapter"
+            "Vendored opencode_k8s adapter"
           )
 
           # `failed` and `job_names` are built in lockstep so the Nth failed
@@ -1997,6 +2093,7 @@ jobs:
           OPENCODE_K8S_SEED_COLD_START_RESULT: ${{ needs.opencode_k8s_seed_cold_start.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           VENDOR_CLAUDE_K8S_RESULT: ${{ needs.vendor_claude_k8s.result }}
+          VENDOR_OPENCODE_K8S_RESULT: ${{ needs.vendor_opencode_k8s.result }}
         run: |
           lane_names=(
             helm_chart
@@ -2007,6 +2104,7 @@ jobs:
             opencode_k8s_seed_cold_start
             build
             vendor_claude_k8s
+            vendor_opencode_k8s
           )
           lane_results=(
             "$HELM_CHART_RESULT"
@@ -2017,6 +2115,7 @@ jobs:
             "$OPENCODE_K8S_SEED_COLD_START_RESULT"
             "$BUILD_RESULT"
             "$VENDOR_CLAUDE_K8S_RESULT"
+            "$VENDOR_OPENCODE_K8S_RESULT"
           )
 
           cancelled_lanes=()
