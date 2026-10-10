@@ -7,9 +7,12 @@ import { pgTable, text, timestamp } from "drizzle-orm/pg-core";
 // `candidateLimitSkipped` reaches 0 -- never incremented at all. Measured over a 66h churn
 // window: `increase(paperclip_backstop_sweep_completed_total[2h])` was flat 0 on both streams.
 //
-// One row per sweep rotation. `sweep` is composed by the service as `<name>:<companyId ?? "*">`
+// One row per sweep rotation. `sweep` is composed by the service as `<name>:<companyId || "*">`
 // so a company-scoped call keeps its own rotation instead of advancing the global one -- the
 // previous shared-closure behaviour let a scoped call clobber the global cursor.
+//
+// The service writes this *after* processing the page it covers, so a throw mid-page costs a
+// duplicate pass rather than skipping rows until the rotation wraps.
 //
 // ponytail: last-writer-wins across processes. Two workers racing a tick can re-visit one page,
 // which costs a duplicate pass and never skips a row. Take a row lock here if the deployment
