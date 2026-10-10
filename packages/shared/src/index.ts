@@ -1432,6 +1432,7 @@ export {
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedExecutionWorkspace,
   isClosedIsolatedExecutionWorkspace,
+  isExecutionWorkspaceDetachPatch,
 } from "./execution-workspace-guards.js";
 
 export {
