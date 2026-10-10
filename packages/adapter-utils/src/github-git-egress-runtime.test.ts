@@ -67,10 +67,58 @@ describe("buildGitArgv", () => {
   it("leaves every non-push invocation completely untouched", () => {
     // Scoping the injection matters: a hooks directory holding only `pre-push`
     // silently disables a repository's pre-commit and commit-msg hooks, so this
-    // must not be set globally.
-    for (const argv of [["status"], ["commit", "-m", "x"], ["fetch", "origin"], ["log"]]) {
+    // must not be set globally. `commit` is excluded from this list on purpose
+    // — it takes `--signoff`, below — and NOT because the hooks path reaches it.
+    for (const argv of [["status"], ["fetch", "origin"], ["log"]]) {
       expect(buildGitArgv(argv, { ...PRESENT })).toEqual(argv);
     }
+  });
+
+  it("signs off a commit, so the DCO gate on magma/frr cannot be lost to a typo", () => {
+    // BLO-42063: the gate reads each commit's own message and there is no
+    // remediation-commit path, so one unsigned commit blocks the PR until the
+    // branch is force-pushed. `--signoff` takes the committer identity, which
+    // the run's GIT_COMMITTER_* overlay already pins to the same values git
+    // stamps on the commit, so the match the gate wants is structural.
+    expect(buildGitArgv(["commit", "-m", "x"], { ...PRESENT })).toEqual([
+      "commit",
+      "--signoff",
+      "-m",
+      "x",
+    ]);
+  });
+
+  it("puts --signoff AFTER the subcommand and ahead of the caller's own arguments", () => {
+    // Two placement properties, both load-bearing. `--signoff` is a `commit`
+    // option, not a global one, so ahead of the subcommand git rejects it. And
+    // first among the caller's arguments means an explicit `--no-signoff` later
+    // in argv still wins, and that it cannot land after a `--` and be read as a
+    // pathspec.
+    const argv = buildGitArgv(["-C", "/repo", "commit", "--amend", "--", "file"], {
+      ...PRESENT,
+    });
+    expect(argv).toEqual(["-C", "/repo", "commit", "--signoff", "--amend", "--", "file"]);
+    expect(argv.indexOf("--signoff")).toBeGreaterThan(argv.indexOf("commit"));
+    expect(argv.indexOf("--signoff")).toBeLessThan(argv.indexOf("--"));
+  });
+
+  it("leaves a commit reached through an alias alone", () => {
+    // `classification.subcommand` is the token the caller TYPED, not the verb
+    // the alias walk resolves to — that verb is computed inside
+    // `classifyGitInvocation` and surfaced only as `publishVerb`, i.e. only
+    // when it is NOT allowlisted. So `alias.ci=commit` goes unsigned.
+    //
+    // Pinned rather than fixed, deliberately. This is a convenience that fails
+    // toward the status quo (the gate still catches an unsigned commit, and the
+    // agent instruction to sign by hand is still there), so it does not earn
+    // widening the classifier's surface — which is a security boundary where
+    // four measured bypasses have come from exactly that kind of drift.
+    expect(
+      buildGitArgv(["ci", "-m", "x"], {
+        ...PRESENT,
+        resolveAlias: (name) => (name === "ci" ? "commit" : null),
+      }),
+    ).toEqual(["ci", "-m", "x"]);
   });
 
   it("refuses the flag that would skip the hook", () => {
@@ -248,6 +296,81 @@ describe.skipIf(!GIT)("runGitEgressRuntime alias resolution", () => {
   });
 });
 
+describe.skipIf(!GIT)("--signoff against a real repository", () => {
+  // Drives REAL git, because the argv-shape tests above cannot answer the only
+  // question the DCO gate asks: does the trailer git writes MATCH the identity
+  // git stamps on the commit? `--signoff` takes the committer, the run env pins
+  // the committer, and nothing short of running it proves those are the same
+  // string.
+
+  const NAME = "BackendEngineerGo";
+  const EMAIL = "backendengineergo@paperclip.blockcast.net";
+
+  function commitWith(argv: readonly string[]): { message: string; ident: string } {
+    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-signoff-"));
+    execFileSync("git", ["init", "-q", repo]);
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: NAME,
+      GIT_AUTHOR_EMAIL: EMAIL,
+      GIT_COMMITTER_NAME: NAME,
+      GIT_COMMITTER_EMAIL: EMAIL,
+    };
+    execFileSync("git", buildGitArgv(argv, { ...PRESENT }), { cwd: repo, env });
+    const read = (format: string) =>
+      execFileSync("git", ["-C", repo, "log", "-1", `--format=${format}`], {
+        encoding: "utf8",
+        env,
+      });
+    return { message: read("%B"), ident: read("%cn <%ce>").trim() };
+  }
+
+  /**
+   * magma's `.github/workflows/scripts/check-dco.mjs`, reduced to the predicate.
+   * Asserting a substring would pass for a sign-off naming the wrong person,
+   * which is the one way this can be present and still fail the gate.
+   */
+  function dcoPasses(message: string, ident: string): boolean {
+    const wanted = ident.toLowerCase();
+    return [...message.matchAll(/^Signed-off-by: (.+ <[^<>\s]+@[^<>\s]+>)$/gim)].some(
+      (match) => match[1]!.toLowerCase() === wanted,
+    );
+  }
+
+  it("writes a sign-off the DCO gate accepts", () => {
+    const { message, ident } = commitWith(["commit", "--allow-empty", "-m", "subject"]);
+    expect(ident).toBe(`${NAME} <${EMAIL}>`);
+    expect(dcoPasses(message, ident)).toBe(true);
+  });
+
+  it("does not double a sign-off the agent already wrote by hand", () => {
+    // Agents are instructed to add the trailer themselves in these repos, and
+    // mostly do — this must not punish the ones that remember.
+    const { message, ident } = commitWith([
+      "commit",
+      "--allow-empty",
+      "-m",
+      `subject\n\nCo-Authored-By: X <x@example.invalid>\nSigned-off-by: ${NAME} <${EMAIL}>`,
+    ]);
+    expect(dcoPasses(message, ident)).toBe(true);
+    expect(message.match(/^Signed-off-by:/gim)).toHaveLength(1);
+  });
+
+  it("lets an explicit --no-signoff win", () => {
+    // The injection goes first among the caller's arguments, so an operator who
+    // means it can still turn it off. Nothing in the fleet does; this pins the
+    // placement property the argv test asserts to real git's precedence.
+    const { message, ident } = commitWith([
+      "commit",
+      "--allow-empty",
+      "--no-signoff",
+      "-m",
+      "subject",
+    ]);
+    expect(dcoPasses(message, ident)).toBe(false);
+  });
+});
+
 describe("entrypoint configuration", () => {
   // Regression for a bypass Ally found on 6228564: both of these were `env`
   // overrides defaulting to the constants, and the deployed entrypoint called
@@ -366,7 +489,6 @@ describe("publishing verbs other than `push` (PEN-3156)", () => {
     // allowlist is what it omits.
     for (const argv of [
       ["status"],
-      ["commit", "-m", "x"],
       ["fetch", "origin"],
       ["log"],
       ["rev-parse", "HEAD"],
@@ -380,6 +502,15 @@ describe("publishing verbs other than `push` (PEN-3156)", () => {
     ]) {
       expect(buildGitArgv(argv, { ...PRESENT }), argv.join(" ")).toEqual(argv);
     }
+    // `commit` belongs to the same control — it must not be refused — but it is
+    // the one allowlisted verb this wrapper rewrites, so it is asserted apart
+    // from the identity loop rather than dropped from the coverage.
+    expect(buildGitArgv(["commit", "-m", "x"], { ...PRESENT })).toEqual([
+      "commit",
+      "--signoff",
+      "-m",
+      "x",
+    ]);
   });
 
   it("still guards a real push rather than refusing it", () => {
