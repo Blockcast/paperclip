@@ -211,8 +211,11 @@ describeEmbeddedPostgres("authorization service", () => {
     await db.delete(instanceUserRoles);
     await db.delete(issueRecoveryActions);
     await db.delete(issues);
-    await db.delete(agents);
+    // Before `agents`: `projects.leadAgentId` has an FK to `agents`, so any
+    // fixture that sets a project lead makes the agent delete fail and poisons
+    // every later test's teardown.
     await db.delete(projects);
+    await db.delete(agents);
     await db.delete(companies);
     await db.delete(authUsers);
   });
