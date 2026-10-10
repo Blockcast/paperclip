@@ -12012,3 +12012,134 @@ describeEmbeddedPostgres("issueService.update expectedCurrentStatus (BLO-18797)"
     },
   );
 });
+
+describeEmbeddedPostgres("issueService cross-company parentId (BLO-28635)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-xcompany-parent-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  });
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompany(name: string) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name,
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    return companyId;
+  }
+
+  async function seedIssue(companyId: string, title: string) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title,
+      status: "todo",
+      priority: "medium",
+    });
+    return issueId;
+  }
+
+  it("rejects a foreign parentId on create and persists nothing", async () => {
+    const homeCompanyId = await seedCompany("Home");
+    const foreignCompanyId = await seedCompany("Foreign");
+    const foreignParentId = await seedIssue(foreignCompanyId, "Foreign parent");
+    // Supplying inheritExecutionWorkspaceFromIssueId is the API-reachable shape
+    // that used to slip past: it steers the workspace-inheritance read away from
+    // parentId, which was the only thing incidentally rejecting a foreign parent.
+    const workspaceSourceId = await seedIssue(homeCompanyId, "Workspace source");
+
+    await expect(
+      svc.create(homeCompanyId, {
+        title: "Child of another company's issue",
+        parentId: foreignParentId,
+        inheritExecutionWorkspaceFromIssueId: workspaceSourceId,
+      } as Parameters<typeof svc.create>[1]),
+    ).rejects.toMatchObject({ status: 422 });
+
+    const created = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.companyId, homeCompanyId));
+    expect(created.map((row) => row.id)).toEqual([workspaceSourceId]);
+  });
+
+  it("rejects a foreign parentId on update without partially persisting the patch", async () => {
+    const homeCompanyId = await seedCompany("Home");
+    const foreignCompanyId = await seedCompany("Foreign");
+    const foreignParentId = await seedIssue(foreignCompanyId, "Foreign parent");
+    const issueId = await seedIssue(homeCompanyId, "Original title");
+
+    await expect(
+      svc.update(issueId, { title: "Patched title", parentId: foreignParentId }),
+    ).rejects.toMatchObject({ status: 422 });
+
+    const row = await db
+      .select({ title: issues.title, parentId: issues.parentId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.title).toBe("Original title");
+    expect(row?.parentId).toBeNull();
+  });
+
+  it("still accepts a same-company parentId on create", async () => {
+    const companyId = await seedCompany("Home");
+    const parentId = await seedIssue(companyId, "Local parent");
+
+    const child = await svc.create(companyId, {
+      title: "Local child",
+      parentId,
+    } as Parameters<typeof svc.create>[1]);
+
+    expect(child.parentId).toBe(parentId);
+  });
+
+  it("does not leak a foreign ancestor through getAncestors", async () => {
+    const homeCompanyId = await seedCompany("Home");
+    const foreignCompanyId = await seedCompany("Foreign");
+    const foreignParentId = await seedIssue(foreignCompanyId, "Foreign parent secrets");
+    const childId = randomUUID();
+    // Written straight to the table: the guard above now refuses to mint this
+    // shape, but the historical rows repaired by 0254 look exactly like it.
+    await db.insert(issues).values({
+      id: childId,
+      companyId: homeCompanyId,
+      parentId: foreignParentId,
+      title: "Child with a foreign parent",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const ancestors = await svc.getAncestors(childId);
+
+    expect(ancestors).toEqual([]);
+  });
+});

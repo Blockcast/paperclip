@@ -6573,9 +6573,13 @@ export function issueService(db: Db) {
     }
   }
 
+  // BLO-28635: `issueId` is null on the create path — the row does not exist yet,
+  // so it cannot be locked and cannot be its own ancestor. The company check and
+  // the ancestry depth bound still apply, and they are the whole point of calling
+  // this from create: without it a foreign `parentId` persisted silently.
   async function assertValidIssueParent(
     companyId: string,
-    issueId: string,
+    issueId: string | null,
     parentId: string | null | undefined,
     dbOrTx: any = db,
   ) {
@@ -6583,7 +6587,10 @@ export function issueService(db: Db) {
     if (parentId === issueId) throw unprocessable("Parent issue would create a cycle");
     await dbOrTx.execute(
       sql`SELECT ${issues.id} FROM ${issues}
-          WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, [issueId, parentId]))}
+          WHERE ${and(
+            eq(issues.companyId, companyId),
+            inArray(issues.id, issueId ? [issueId, parentId] : [parentId]),
+          )}
           ORDER BY ${issues.id}
           FOR UPDATE`,
     );
@@ -10343,6 +10350,14 @@ export function issueService(db: Db) {
         if (issueData.parentId !== undefined || blockedByIssueIds !== undefined) {
           await lockIssueParentMutationCompany(companyId, tx);
         }
+        // BLO-28635: create validated `projectId` (BLO-23207) but never `parentId`,
+        // so a foreign parent persisted. The only thing that caught it was an
+        // incidental 404 from the workspace-inheritance read below, and that read
+        // is skipped whenever `inheritExecutionWorkspaceFromIssueId` is supplied
+        // (API-exposed) or `skipExecutionWorkspaceInheritance` is set. Assert here —
+        // ahead of that read, so the failure is the correct 422 rather than a
+        // misleading "Workspace inheritance issue not found".
+        await assertValidIssueParent(companyId, issueData.id ?? null, issueData.parentId, tx);
 
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
@@ -13656,14 +13671,20 @@ export function issueService(db: Db) {
       const visited = new Set<string>([issueId]);
       const start = await db.select().from(issues).where(eq(issues.id, issueId)).then(r => r[0] ?? null);
       let currentId = start?.parentId ?? null;
-      while (currentId && !visited.has(currentId) && raw.length < 50) {
+      // BLO-28635: the walk was unscoped, so a cross-company parent_id leaked the
+      // foreign ancestor's title, description, assignee, project and goal into
+      // GET /issues/:id and the heartbeat context — the same shape as BLO-23207's
+      // unscoped loadProject. Scope the walk; a foreign ancestor now truncates it.
+      while (start && currentId && !visited.has(currentId) && raw.length < 50) {
         visited.add(currentId);
         const parent = await db.select({
           id: issues.id, identifier: issues.identifier, title: issues.title, description: issues.description,
           status: issues.status, priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId, projectId: issues.projectId,
           goalId: issues.goalId, parentId: issues.parentId,
-        }).from(issues).where(eq(issues.id, currentId)).then(r => r[0] ?? null);
+        }).from(issues)
+          .where(and(eq(issues.id, currentId), eq(issues.companyId, start.companyId)))
+          .then(r => r[0] ?? null);
         if (!parent) break;
         raw.push({
           id: parent.id, identifier: parent.identifier ?? null, title: parent.title, description: parent.description ?? null,
