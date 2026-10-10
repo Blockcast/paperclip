@@ -243,11 +243,24 @@ It then enumerates `merge_group` runs created inside that window
 (`buildRunSearchWindow`, `gh run list --created <window>`), and classifies
 the eviction:
 
-- **zero `merge_group` runs found inside that attempt's window → `conflict_unstageable`**
+- **zero `merge_group` runs found inside that attempt's window, and the
+  removal is attributed to `github-merge-queue[bot]` → `conflict_unstageable`**
   (this shape),
+- **zero runs, but the removal carries any other actor → `manual`** (PEN-3926).
+  A human or App can remove a PR from the queue *before* the queue gets as far
+  as staging a run, which produces zero runs for a reason that has nothing to
+  do with stageability — so run count alone cannot separate the two. Measured
+  2026-10-10 over 74 removals across 56 PRs: 53 queue-bot, 21 human, none
+  absent, no actor on both sides; before the fix this misreported 13 notices
+  across 8 PRs, each telling the reader to rebase a branch that was clean and
+  deliberately held. An absent or unparseable actor falls back to
+  `conflict_unstageable`, so the classifier cannot be made quieter by a missing
+  field,
 - **a run exists and concluded `failure` → `check_failure`** (the automatic
   shape above — should already have produced its own signal; a detector hit
-  here means something upstream is missing evidence),
+  here means something upstream is missing evidence). The actor does *not*
+  override this: a human who dequeues a PR whose run already failed still
+  reports `check_failure`,
 - **a run exists, did not fail, PR still unmerged → `manual`** (the stalled-head
   procedure's manual dequeue, or a GitHub-side timeout),
 - **the run-list lookup hit its 500-run sample cap with no match → `unknown`**
@@ -259,6 +272,15 @@ Bounding the lookup to the specific attempt's time window (rather than an
 unbounded newest-N sample across the whole repo's history) is what makes the
 zero-runs signal trustworthy even on a busy repo, and what keeps a re-queued
 PR's earlier attempt from being misread as this attempt's outcome.
+
+The removal actor is read from the attempt's own `removed_from_merge_queue`
+timeline event (`selectLatestQueueAttemptWindow` → `dequeuedBy`), not from
+`github.event.sender.login`. That binds it to the removal the window already
+anchored to rather than to whoever sent the webhook, and it keeps working on
+`workflow_dispatch` replay, which carries no sender at all. It is not a
+`mergeable`/`mergeStateStatus` check — see "A fourth eviction cause..." below,
+whose prohibition stands: a `REBASE`-unstageable branch still reads `CLEAN`,
+and nothing in the classifier consults it.
 
 The posted comment also embeds any Paperclip identifier the detector can
 recover from the PR's branch name, title, or body (Ally review #1220, 4th
