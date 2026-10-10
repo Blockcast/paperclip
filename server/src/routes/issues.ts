@@ -66,6 +66,7 @@ import {
   updateIssueSchema,
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
+  isExecutionWorkspaceDetachPatch,
   isAgentStatusInvokable,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
@@ -12670,7 +12671,19 @@ export function issueRoutes(
     const isAgentWorkUpdate =
       req.actor.type === "agent" && (Object.keys(updateFields).length > 0 || reviewRequest !== undefined);
 
-    if (closedExecutionWorkspace && (commentBody || isAgentWorkUpdate)) {
+    // BLO-42036: a collected workspace used to brick its source issue permanently, because
+    // the remedy the 409 names ("move it to an open workspace") was itself gated here. Let
+    // a patch whose ONLY effect is that move through. See isExecutionWorkspaceDetachPatch.
+    const isExecutionWorkspaceDetach =
+      !!closedExecutionWorkspace &&
+      isExecutionWorkspaceDetachPatch({
+        updateFields,
+        hasComment: !!commentBody,
+        hasReviewRequest: reviewRequest !== undefined,
+        closedExecutionWorkspaceId: closedExecutionWorkspace.id,
+      });
+
+    if (closedExecutionWorkspace && (commentBody || isAgentWorkUpdate) && !isExecutionWorkspaceDetach) {
       respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
       await recordDeniedIssueWrite(req, existing, "issue:mutate", {
         reason: "deny_closed_execution_workspace",
