@@ -164,9 +164,11 @@ test("production image carries a pinned Ponytail tree without shared activation"
     dockerfile,
     /ARG PONYTAIL_HOOKS_SHA256=dd0837e870a8b81eb45ef4adebfc413a48c6daf84329befd897640f731aa0e39/,
   );
+  // BLO-43044: blobless clone. `--filter=blob:none` is asserted here so the
+  // /tmp byte reduction cannot be silently dropped on a later Dockerfile edit.
   assert.match(
     dockerfile,
-    /git clone --no-tags https:\/\/github\.com\/dietrichgebert\/ponytail\.git/,
+    /git clone --no-tags --filter=blob:none https:\/\/github\.com\/dietrichgebert\/ponytail\.git/,
   );
   assert.match(dockerfile, /git -C \/tmp\/ponytail checkout --detach/);
   assert.match(dockerfile, /hooks\/claude-codex-hooks\.json/);

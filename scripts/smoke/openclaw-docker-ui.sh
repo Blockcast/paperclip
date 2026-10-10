@@ -105,7 +105,9 @@ if [[ -d "$OPENCLAW_DOCKER_DIR/.git" ]]; then
   git -C "$OPENCLAW_DOCKER_DIR" fetch --quiet --tags origin || true
 else
   rm -rf "$OPENCLAW_DOCKER_DIR"
-  git clone "$OPENCLAW_REPO_URL" "$OPENCLAW_DOCKER_DIR"
+  # BLO-43044: blobless. The checkout below lazily fetches only the blobs at
+  # the resolved ref, instead of every blob in OpenClaw's history.
+  git clone --filter=blob:none "$OPENCLAW_REPO_URL" "$OPENCLAW_DOCKER_DIR"
   git -C "$OPENCLAW_DOCKER_DIR" fetch --quiet --tags origin || true
 fi
 
