@@ -1043,6 +1043,12 @@ const RUN_RESULT_JSON_MACHINE_TEXT_KEYS = new Set([
   "penstockReason", "penstockProvider", "penstockModel",
   "penstockAdvertisedResumeAt", "penstockCapacityParkClampedFrom",
   "penstockCapacityFirstDeferredAt",
+  // BLO-42916: the sixth park-diagnosis field. Its value is a bounded enum
+  // ("capacity" | "messages_fallback"), but it is a *string*, so the
+  // value-shape rule withholds it unless named here — and it would have been
+  // the one field of the six this endpoint renders that an unentitled reader
+  // could not see.
+  "penstockProbePath",
   "providerCapacityResetAt", "providerQuotaRetryNotBefore",
   "upstreamCapacityCode", "ccrotateTarget", "recoveryClassification",
   // retry timing (ISO instants)
