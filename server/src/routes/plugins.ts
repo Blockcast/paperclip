@@ -2912,6 +2912,11 @@ export function pluginRoutes(
    * existed since the company-scoping work but had no caller, so the only
    * available repair was raw SQL against the production database.
    *
+   * Scope: `plugin_config` and its secret-ref bindings only. A
+   * `plugin_company_settings` row for the same (plugin, company) pair is
+   * deliberately left alone — `listConfigCompanyIds()` reads `plugin_config`
+   * only, so it does not keep the install multi-company.
+   *
    * Response: `{ deleted: true }`
    * Errors:
    * - 400 if `companyId` is missing
@@ -2938,17 +2943,24 @@ export function pluginRoutes(
         sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:plugin-config:${plugin.id}:${companyId}`}, 0))`,
       );
 
-      // Drop this company's bindings first: `syncSecretRefsForTarget` with an
-      // empty set and `replaceAll` is the same call the POST makes, so the
-      // delete leaves exactly the state a save of an empty config would.
+      // Delete the row first and stop if there was none. The binding sync
+      // below is an unconditional delete, so running it ahead of this check
+      // would commit a destructive write on the 404 path: an operator probing
+      // candidate companyIds for the phantom row would wipe each probed
+      // company's plugin secret-ref bindings while every probe reported 404.
+      const row = await pluginRegistryService(txDb).deleteConfig(plugin.id, companyId);
+      if (!row) return null;
+
+      // `syncSecretRefsForTarget` with an empty set and `replaceAll` is the
+      // same call the POST makes, so the delete leaves exactly the state a save
+      // of an empty config would.
       await secretService(txDb).syncSecretRefsForTarget(
         companyId,
         { targetType: "plugin", targetId: plugin.id },
         [],
         { replaceAll: true },
       );
-
-      return pluginRegistryService(txDb).deleteConfig(plugin.id, companyId);
+      return row;
     });
 
     if (!deleted) {

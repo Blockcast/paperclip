@@ -872,6 +872,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/plugins/{pluginId}/upgrade",
   "GET /api/plugins/{pluginId}/config",
   "POST /api/plugins/{pluginId}/config",
+  "DELETE /api/plugins/{pluginId}/config",
   "POST /api/plugins/{pluginId}/config/test",
   "POST /api/plugins/{pluginId}/jobs/{jobId}/trigger",
 ]);
@@ -5131,6 +5132,22 @@ registry.registerPath({
     body: jsonBody(z.object({ companyId: z.string(), configJson: z.record(z.unknown()) })),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/plugins/{pluginId}/config",
+  tags: ["plugins"],
+  summary: "Delete one company's plugin config",
+  description:
+    "Requires instance admin. Removes the `plugin_config` row and its secret-ref bindings " +
+    "for that company only; other companies' config rows are untouched. 404 (with nothing " +
+    "changed) when that company has no config row.",
+  request: {
+    params: z.object({ pluginId: z.string() }),
+    query: z.object({ companyId: z.string() }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({
