@@ -245,8 +245,28 @@ exit 128
           env: { PIN_GUARD_TEST_WRAPPER_STATUS: "1", PIN_GUARD_TEST_WRAPPER_HITS: "" },
         }]
       : []),
+    // The two Secret-PUT searches fail independently. The `128`/`signal`
+    // Secret-PUT cases above inherit the default NON-empty wrapper hits, so
+    // they never reach the wrapper-PATH branch; these do (Ally, #2392). On the
+    // accepted pin a failed Secret-PUT search must surface as inconclusive, not
+    // hide behind an exit-0 ACCEPTED GAP; on a new pin the proven missing
+    // prepend still fails, and says the Secret-PUT search failed too.
+    ...(ACCEPTED_PIN
+      ? [{
+          name: "a failed Secret-PUT grep is inconclusive, not an accepted gap",
+          dockerfile: acceptedDockerfile,
+          mentions: /source search over the pinned tree failed/,
+          env: { PIN_GUARD_TEST_GREP_STATUS: "128", PIN_GUARD_TEST_WRAPPER_STATUS: "1", PIN_GUARD_TEST_WRAPPER_HITS: "" },
+        }]
+      : []),
+    {
+      name: "a failed Secret-PUT grep does not downgrade a new pin's missing prepend",
+      verdict: "FAILED",
+      mentions: /Secret-PUT search over this pin FAILED/,
+      env: { PIN_GUARD_TEST_GREP_STATUS: "128", PIN_GUARD_TEST_WRAPPER_STATUS: "1", PIN_GUARD_TEST_WRAPPER_HITS: "" },
+    },
   ];
-  for (const { name, verdict = "inconclusive", dockerfile: caseDockerfile, env } of cases) {
+  for (const { name, verdict = "inconclusive", dockerfile: caseDockerfile, mentions, env } of cases) {
     const result = spawnSync(process.execPath, [script], {
       encoding: "utf8",
       timeout: 10_000,
@@ -271,6 +291,7 @@ exit 128
     assert.match(output, new RegExp(`opencode_k8s pin guard ${verdict}`), name);
     if (verdict !== "OK") assert.doesNotMatch(output, /pin guard OK/, name);
     else assert.match(output, /1 non-test source file/, name);
+    if (mentions) assert.match(output, mentions, name);
   }
 });
 
@@ -416,8 +437,12 @@ test("a pin that names the wrapper directory passes, and says only that", () => 
   assert.equal(result.verdict, "ok");
   assert.equal(result.exitCode, 0);
   assert.match(result.message, /references .*libexec\/paperclip\/bin/);
-  // A presence hit must not read as an ordering attestation (Ally, #2392).
+  // A presence hit must not read as an ordering attestation (Ally, #2392) —
+  // nor hand the ordering to the parked patch's tests, which run only if this
+  // pin is that patch's merge, the one thing a presence grep cannot tell.
   assert.match(result.message, /does not attest that the directory is PREPENDED/);
+  assert.doesNotMatch(result.message, /ordering is pinned by/);
+  assert.match(result.message, /only if this pin is the merge of .*this check cannot tell/);
 });
 
 test("the measured, accepted gap warns at its own SHA without failing the PR", () => {
@@ -471,6 +496,25 @@ test("a Secret PUT still outranks the wrapper-PATH verdict", () => {
   });
   assert.equal(result.verdict, "secret-put");
   assert.equal(result.exitCode, 1);
+});
+
+test("a FAILED Secret-PUT search is inconclusive, never an accepted gap", { skip: !ACCEPTED_PIN }, () => {
+  // The accepted gap exits 0, so reporting it over a failed Secret-PUT search
+  // reads as "known gap, Secret-PUT clean" when BLO-34510 was never
+  // established (Ally, #2392).
+  const result = classify({ ...WRAPPED, pin: ACCEPTED_PIN, secretPutHits: null, wrapperPathHits: [] });
+  assert.equal(result.verdict, "inconclusive");
+  assert.equal(result.exitCode, 0);
+  assert.match(result.message, /source search over the pinned tree failed/);
+});
+
+test("a FAILED Secret-PUT search does not downgrade a new pin's missing prepend", () => {
+  // The empty wrapper search completed over a non-empty tree, so the missing
+  // prepend is proven; an unrelated probe fault must not turn it into a warning.
+  const result = classify({ ...WRAPPED, pin: "c".repeat(40), secretPutHits: null, wrapperPathHits: [] });
+  assert.equal(result.verdict, "wrapper-path-missing");
+  assert.equal(result.exitCode, 1);
+  assert.match(result.message, /Secret-PUT search over this pin FAILED/);
 });
 
 test("the accepted-gap SHA is the pin the Dockerfile actually carries", () => {

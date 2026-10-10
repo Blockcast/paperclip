@@ -240,13 +240,23 @@ export function classify(probe) {
   // `srcFileCount === 0` (nothing to search) must therefore both reach the
   // inconclusive branch below rather than be read as "prepend missing" — which
   // is why this branch requires a completed search over a non-empty tree.
+  //
+  // The SECRET-PUT search is a separate subprocess and can fail on its own.
+  // An accepted gap exits 0, so it may only be reported once that search has
+  // also completed. Otherwise "ACCEPTED GAP" reads as "known gap, Secret-PUT
+  // clean" when BLO-34510 was never established, so that case falls through
+  // to the inconclusive branch instead. A NEW pin's missing prepend is still a
+  // proven finding (a completed search over a non-empty tree), so it keeps
+  // failing, and carries the failed-search note rather than being downgraded
+  // to a warning by an unrelated probe fault (Ally, #2392).
   if (
     wrapperPathHits !== null &&
     wrapperPathHits !== undefined &&
     wrapperPathHits.length === 0 &&
     srcFileCount
   ) {
-    if (WRAPPER_PATH_GAP_ACCEPTED_PINS.has(pin)) {
+    const accepted = WRAPPER_PATH_GAP_ACCEPTED_PINS.has(pin);
+    if (accepted && secretPutHits !== null) {
       return {
         verdict: "wrapper-path-accepted-gap",
         exitCode: 0,
@@ -258,7 +268,7 @@ export function classify(probe) {
           `a fork no agent seat can push to. The mirror is ready at ${WRAPPER_PATCH_PATH}.`,
       };
     }
-    return {
+    if (!accepted) return {
       verdict: "wrapper-path-missing",
       exitCode: 1,
       message:
@@ -277,7 +287,12 @@ export function classify(probe) {
         "verified green on the previous pin) and pin the merge commit — or add this SHA " +
         "to WRAPPER_PATH_GAP_ACCEPTED_PINS in this script, re-stating the measurement " +
         "that makes the gap acceptable. Re-accepting a known security gap on a new pin " +
-        "is a stated decision, not a fix-up.",
+        "is a stated decision, not a fix-up." +
+        (secretPutHits === null
+          ? "\n\nSeparately, the Secret-PUT search over this pin FAILED, so the BLO-34510 " +
+            `property (no ${SECRET_PUT_SYMBOL} call) is not established either. Fix the ` +
+            "probe before trusting a green on the next run."
+          : ""),
     };
   }
 
@@ -321,8 +336,9 @@ export function classify(probe) {
           (wrapperPathHits && wrapperPathHits.length > 0
             ? `, and references ${WRAPPER_BIN_DIR} in non-test source. That is a ` +
               "presence check only: it does not attest that the directory is PREPENDED " +
-              "to the agent Job PATH, which is what PEN-3732 needs; the ordering is " +
-              "pinned by the adapter's own tests (vendor/opencode-k8s-patches)."
+              "to the agent Job PATH, which is what PEN-3732 needs. Ordering is asserted " +
+              "by the adapter's own suite only if this pin is the merge of " +
+              `${WRAPPER_PATCH_PATH} (README step 2); this check cannot tell.`
             : ".")),
   };
 }
