@@ -45,6 +45,26 @@ const SYNTHETIC_SHA256 = createHash("sha256").update("pen-3907 fixture").digest(
 const SYNTHETIC_SHA1 = createHash("sha1").update("pen-3907 fixture").digest("hex");
 const SYNTHETIC_SHA512 = createHash("sha512").update("pen-3907 fixture").digest("hex");
 
+// PEN-3932 fixtures. DERIVED for the same reason as the PEN-3907 ones above:
+// an uppercase credential literal is exactly what this change teaches the
+// guard to refuse, so pasting one would make this file unpushable the moment
+// the fix it tests ships. Deriving from a hash also makes each fixture
+// reproducibly random rather than a value someone chose to look random.
+const SYNTHETIC_SHA256_UPPER = SYNTHETIC_SHA256.toUpperCase();
+
+/** Canonical RFC 4648 base32 — `A-Z2-7`, the alphabet TOTP/HOTP seeds, recovery
+ *  codes and base32-encoded keys all use, and uppercase by construction. */
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function syntheticBase32(length: number, label: string): string {
+  const bytes = createHash("sha512").update(label).digest();
+  let out = "";
+  for (let i = 0; i < length; i += 1) {
+    out += BASE32_ALPHABET[(bytes[i % bytes.length] as number) % 32] as string;
+  }
+  return out;
+}
+const SYNTHETIC_TOTP_SEED = syntheticBase32(40, "pen-3932 totp seed");
+
 describe("scrubGitHubEgressText", () => {
   describe("byte-exact pass-through", () => {
     it("returns ordinary review prose completely unchanged", () => {
@@ -291,6 +311,107 @@ describe("scrubGitHubEgressText", () => {
       // refuse.
       const text = `DIGEST="sha256:${SYNTHETIC_SHA256}"`;
       expect(scrubGitHubEgressText(text).redacted).toBe(false);
+    });
+  });
+
+  describe("PEN-3932: an all-uppercase credential is still a credential", () => {
+    // `isOpaqueSecretValue` bucketed uppercase and digits into ONE character
+    // class, so a value drawn only from `A-Z` and `0-9` scored one class and
+    // returned BEFORE the entropy test ran — unreachable at any randomness.
+    // Canonical base32 is `A-Z2-7`, so every TOTP seed and recovery code sat in
+    // that blind spot, as did hex from any tool that uppercases.
+
+    it("redacts a 64-hex value whose only difference from a redacted one is case", () => {
+      // THE regression. Identical name, identical length, identical bytes —
+      // case is the only variable, so a pass here cannot be explained by
+      // entropy, length, or alphabet admissibility.
+      const lower = scrubGitHubEgressText(`SECRET_KEY="${SYNTHETIC_SHA256}"`);
+      const upper = scrubGitHubEgressText(`SECRET_KEY="${SYNTHETIC_SHA256_UPPER}"`);
+
+      expect(lower.classes).toContain("high-entropy-assignment");
+      expect(upper.classes).toContain("high-entropy-assignment");
+      expect(upper.text).not.toContain(SYNTHETIC_SHA256_UPPER);
+    });
+
+    it("redacts a canonical base32 seed, the family that motivated this", () => {
+      const result = scrubGitHubEgressText(`TOTP_SEED="${SYNTHETIC_TOTP_SEED}"`);
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_TOTP_SEED);
+    });
+
+    it("redacts an uppercase-alphanumeric token under a name claiming nothing", () => {
+      const token = SYNTHETIC_TOTP_SEED.slice(0, 24);
+      const result = scrubGitHubEgressText(`API_TOKEN="${token}"`);
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    // -- controls: the widening must not have cost anything it was not meant to --
+
+    it("still exempts a lowercase digest bound to a digest-naming key", () => {
+      // PEN-3907's conjunction, re-asserted here rather than only in its own
+      // block: this change moves the gate that runs immediately before it, and
+      // a widening that swallowed the exemption would still pass that block.
+      const text = `sha256="${SYNTHETIC_SHA256}"`;
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+    });
+
+    it("does NOT extend that exemption to the uppercase form of the same digest", () => {
+      // HEX_DIGEST_RE is lowercase-only on purpose — an uppercase digest is not
+      // the canonical form any consuming tool emits, so it stays a credential.
+      // Before this change the class gate refused it anyway and this could not
+      // be observed; now it is the exemption's own anchoring that holds.
+      const result = scrubGitHubEgressText(`sha256="${SYNTHETIC_SHA256_UPPER}"`);
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_SHA256_UPPER);
+    });
+
+    it("still exonerates a SCREAMING_SNAKE constant as a lexical identifier", () => {
+      // The false-positive direction. These values only became REACHABLE by
+      // the entropy rule with this change, so `isLexicalIdentifier` is now
+      // load-bearing for them where previously the class gate hid them.
+      const text = "CLUSTER=US_EAST_1_PRODUCTION_CLUSTER";
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+
+    it("leaves PEN-3920's mixed-case corpus exactly where it was", () => {
+      // These already scored two classes, so splitting the class cannot move
+      // them. Pinned because the obvious reading of this change is that it
+      // makes PEN-3920 worse, and the bound is that it cannot touch any value
+      // carrying a lowercase letter.
+      for (const value of [
+        "ArcRunnerPoolCeilingClipped",
+        "Vlan1MacvlanV6ProbeInstrumentBroken",
+        "vlan1_macvlan_v6_listener",
+      ]) {
+        expect(scrubGitHubEgressText(`alertname=${value}`).redacted).toBe(true);
+      }
+    });
+
+    it("leaves every other detector intact on the same call", () => {
+      const result = scrubGitHubEgressText(
+        `TOTP_SEED="${SYNTHETIC_TOTP_SEED}"\n${SYNTHETIC_PEM}\nPAT=ghp_${"A1b2C3d4E5f6G7h8I9j0"}`,
+      );
+
+      expect(result.classes).toContain("private-key-block");
+      expect(result.classes).toContain("vendor-key");
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_PEM_BODY);
+    });
+
+    it("documents the residual: a single-case LETTERS-ONLY value is still unreachable", () => {
+      // Scoring is symmetric, so uppercase-letters-only scores one class just
+      // as lowercase-letters-only does and never reaches the entropy test. For
+      // a base32 seed that means the ~0.7% of 24-char draws (0.026% at 40) that
+      // happen to contain no digit. Closing it means dropping the class gate,
+      // which admits paths and branch slugs; the trade is recorded on PEN-3932
+      // and in `classIndex`. Pinned so the gap is a decision, not a surprise.
+      const lettersOnly = SYNTHETIC_TOTP_SEED.replace(/[2-7]/g, "Q");
+      expect(/^[A-Z]+$/.test(lettersOnly)).toBe(true);
+      expect(scrubGitHubEgressText(`SEED="${lettersOnly}"`).redacted).toBe(false);
     });
   });
 
