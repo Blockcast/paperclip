@@ -58,7 +58,6 @@ export const instanceExperimentalSettingsSchema = z.object({
   enableExperimentalFileViewer: z.boolean().default(false),
   enableCloudSync: z.boolean().default(false),
   enableDoneExecutionGate: z.boolean().default(false),
-  enableInReviewEvidenceGate: z.boolean().default(false),
   enableExternalObjects: z.boolean().default(false),
   enableSmokeLab: z.boolean().default(false),
   enableBuiltInAgents: z.boolean().default(false),
