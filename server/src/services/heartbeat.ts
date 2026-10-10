@@ -1072,7 +1072,7 @@ export const JOB_FAILED_HEARTBEAT_RETRY_MAX_ATTEMPTS = 4;
  * `caveman_proxy_not_ready` and this set exists so the next one cannot be
  * half-added.
  */
-const JOB_FAILED_EQUIVALENT_ERROR_CODES: ReadonlySet<string> = new Set([
+export const JOB_FAILED_EQUIVALENT_ERROR_CODES: ReadonlySet<string> = new Set([
   "job_failed",
   "oom_killed",
   "exit_137",
@@ -1777,9 +1777,18 @@ export function shouldScheduleAutomaticRunRetry(
   // lock/status gates alone cannot make partial external writes safe. A missing
   // Job is only produced after adapter.invoke and therefore never reaches this
   // safe state; pre-invocation disappearance is process_lost instead.
+  //
+  // BLO-35668: the run-kind scope matches the sibling arms. It was `isIssueRun`
+  // alone, and a pr_review run has no other retry path (the issue continuation
+  // sweep never sees it), so a review whose Job failed before invocation was
+  // dropped silently. The invocation proof is what makes the retry safe, and it
+  // is unchanged for both run kinds.
   if (JOB_FAILED_EQUIVALENT_ERROR_CODES.has(run.errorCode ?? "")) {
     const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
-    return isIssueRun && recovery.adapterInvocationStarted === false;
+    return (
+      (isIssueRun || isPrReviewRetryContext(contextSnapshot)) &&
+      recovery.adapterInvocationStarted === false
+    );
   }
   if (run.errorCode === "session_unavailable") return true;
   // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) rides this arm
