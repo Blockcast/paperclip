@@ -12,6 +12,10 @@ import {
   resolveExecutionRunAdapterConfig,
   translateGithubSeatTokenForExecutionTarget,
 } from "../services/heartbeat.ts";
+import {
+  RUN_REDACTION_CANARY_ENV_KEY,
+  buildRunSecretRedactionPlan,
+} from "../services/run-secret-redaction.ts";
 
 describe("resolveExecutionRunAdapterConfig", () => {
   it("overlays environment, project, and routine env on top of agent env and unions secret keys", async () => {
@@ -1085,5 +1089,66 @@ describe("applyRunScopedMentionedSkillKeys", () => {
         ],
       },
     });
+  });
+});
+
+describe("resolveExecutionRunAdapterConfig: per-run redaction canary (BLO-39715)", () => {
+  // The unit tests in run-secret-redaction.test.ts prove the canary VALUE is a usable
+  // needle. They cannot prove it ever reaches a run: that is this wiring, and without a
+  // case here the whole opt-in path is unexercised until a post-deploy liveness check
+  // days later — which is the shape of a detector that silently never loaded.
+  const passthroughSecretsSvc = () =>
+    ({
+      resolveAdapterConfigForRuntime: vi.fn(async (_companyId: string, config: Record<string, unknown>) => ({
+        config: { ...config, env: { ...((config.env ?? {}) as Record<string, unknown>) } },
+        secretKeys: new Set<string>(),
+        manifest: [],
+      })),
+      resolveEnvBindings: vi.fn(async (_companyId: string, env: Record<string, unknown>) => ({
+        env: Object.fromEntries(
+          Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+        ),
+        secretKeys: new Set<string>(),
+        manifest: [],
+      })),
+    }) as any;
+
+  it("injects nothing when the flag is unset", async () => {
+    // The default path, i.e. every agent in the fleet. An unconditional canary would
+    // engage the line-boundary holdback on every run, so "off means byte-identical" is
+    // the property that makes this safe to merge, not a nicety.
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      executionRunConfig: { env: { AGENT_ONLY: "agent-only" } },
+      secretsSvc: passthroughSecretsSvc(),
+    });
+
+    expect(result.resolvedConfig.env).not.toHaveProperty(RUN_REDACTION_CANARY_ENV_KEY);
+    expect(Array.from(result.secretKeys)).toEqual([]);
+  });
+
+  it("injects a redactable canary into BOTH the env and the secret key set when enabled", async () => {
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      executionRunConfig: { redactionCanary: true, env: { AGENT_ONLY: "agent-only" } },
+      secretsSvc: passthroughSecretsSvc(),
+    });
+
+    const env = result.resolvedConfig.env as Record<string, string>;
+    const value = env[RUN_REDACTION_CANARY_ENV_KEY];
+    expect(typeof value).toBe("string");
+    // Pre-existing env must survive the injection — a spread written as a replacement
+    // would pass every assertion below while dropping the run's real configuration.
+    expect(env.AGENT_ONLY).toBe("agent-only");
+    expect(Array.from(result.secretKeys)).toContain(RUN_REDACTION_CANARY_ENV_KEY);
+
+    // Both halves, because either alone is a silent no-op: a value in `env` whose key is
+    // absent from `secretKeys` is never built into a needle, and a key in `secretKeys`
+    // with no value lands in `unresolvedKeys` and is reported as a gap rather than
+    // redacted. Asserted end-to-end against the real plan builder, not by inspection.
+    const plan = buildRunSecretRedactionPlan(result.resolvedConfig, result.secretKeys);
+    expect(plan.needles).toContain(value);
+    expect(plan.uncoveredKeys).toEqual([]);
+    expect(plan.unresolvedKeys).toEqual([]);
   });
 });
