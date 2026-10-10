@@ -377,9 +377,14 @@ export function setupLiveEventsWebSocketServer(
         })
         .finally(() => {
           pendingSends -= 1;
-          // The queue only ever sits at the cap while saturated, so the first
-          // send that completes after a stall is the recovery. No-op otherwise.
-          endSaturation("live event send queue recovered from saturation");
+          // Recovery is the queue DRAINING, not one send completing. A decider
+          // that is slow rather than wedged frees one slot per decision, the next
+          // event refills it and the one after is shed — so ending the episode on
+          // the first completion would flap it, logging a recovery and a fresh
+          // saturation per decision and never reaching the summary interval
+          // (Ally review 5478526410). One episode spans the whole overload until
+          // the queue is empty. `endSaturation` is a no-op with no open episode.
+          if (pendingSends === 0) endSaturation("live event send queue recovered from saturation");
         });
     });
 

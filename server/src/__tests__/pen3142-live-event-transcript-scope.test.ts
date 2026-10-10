@@ -773,12 +773,12 @@ describe("PEN-3895 live-event send chain is released and bounded", () => {
     return () => release();
   }
 
-  async function publishChunk(channelCompanyId: string, seq: number) {
+  async function publishChunk(channelCompanyId: string, seq: number, agentId = runOwnerAgentId) {
     const { publishLiveEvent } = await import("../services/live-events.js");
     publishLiveEvent({
       companyId: channelCompanyId,
       type: "heartbeat.run.log",
-      payload: { runId: "run-1", agentId: runOwnerAgentId, seq, stream: "stdout", chunk: `chunk-${seq}` } as never,
+      payload: { runId: "run-1", agentId, seq, stream: "stdout", chunk: `chunk-${seq}` } as never,
     });
   }
 
@@ -906,6 +906,61 @@ describe("PEN-3895 live-event send chain is released and bounded", () => {
       [SATURATED, expect.anything()],
       [STILL_SATURATED, expect.anything()],
       [RECOVERED, expect.objectContaining({ droppedEvents: 1102 })],
+    ]);
+  });
+
+  it("holds one episode open while a slow decider frees one slot at a time", async () => {
+    // Slow, not wedged (Ally review 5478526410, Important): each decision is
+    // released on its own, so the queue passes back through the cap instead of
+    // draining 512 → 0 in one go. Every chunk names a distinct owning agent so
+    // the gate's per-agent decision cache cannot let one release drain the rest.
+    const channel = nextChannel();
+    const decisions: Array<() => void> = [];
+    mockDecide.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          decisions.push(() => resolve({ allowed: true, reason: "allow_grant", explanation: "test" }));
+        }),
+    );
+    const agentFor = (seq: number) => `55555555-5555-4555-8555-${String(seq).padStart(12, "0")}`;
+    let seq = 0;
+    const publish = () => publishChunk(channel, seq, agentFor(seq++));
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
+
+    for (let i = 0; i < 520; i += 1) await publish();
+    await flush();
+    expect(warnsFor(channel)).toEqual([[SATURATED, expect.anything()]]);
+
+    // One decision completes, the next event refills the freed slot, and the
+    // one after is shed. That is still the same episode: no recovery, and no
+    // fresh saturation line, per decision.
+    for (let i = 0; i < 5; i += 1) {
+      decisions.shift()?.();
+      await flush();
+      await publish();
+      await publish();
+    }
+    expect(socket.sent).toHaveLength(5);
+    expect(warnsFor(channel)).toEqual([[SATURATED, expect.anything()]]);
+
+    // Because the episode was never torn down, the summary interval still
+    // engages under a slow decider, carrying the whole accumulated count.
+    now += 60_000;
+    await publish();
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [STILL_SATURATED, expect.objectContaining({ droppedEvents: 8 + 5 + 1 })],
+    ]);
+
+    // The episode ends at the drain, once, with the episode total.
+    mockDecide.mockResolvedValue({ allowed: true, reason: "allow_grant", explanation: "test" });
+    for (const decide of decisions.splice(0)) decide();
+    await flush();
+    expect(socket.sent).toHaveLength(512 + 5);
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [STILL_SATURATED, expect.anything()],
+      [RECOVERED, expect.objectContaining({ droppedEvents: 14 })],
     ]);
   });
 

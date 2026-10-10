@@ -1076,10 +1076,13 @@ memory bound into an unbounded log-write rate for the length of the stall. A
 socket logs `live event send queue saturated` once on entering saturation, at
 most one `still saturated` summary per minute carrying the accumulated
 `droppedEvents`, and one closing line with the final count: `recovered from
-saturation` when its decider unsticks, or `closed while its send queue was
-saturated` if the socket goes first. A draining socket sits at a depth of ~1, so
-reaching the bound means the authorizer is stuck, not that the fleet is busy —
-treat these lines as a signal about the decider.
+saturation` once its queue drains to empty, or `closed while its send queue was
+saturated` if the socket goes first. Recovery is the drain, not the first
+completed send, so a decider that is slow rather than stuck holds one episode
+open instead of flapping it once per decision. A draining socket sits at a depth
+of ~1, so reaching the bound means the authorizer is stuck or slower than the
+event rate, not that the fleet is busy — treat these lines as a signal about the
+decider.
 
 ### Access auditing
 
