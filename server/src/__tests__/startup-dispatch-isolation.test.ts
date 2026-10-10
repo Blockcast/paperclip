@@ -216,10 +216,16 @@ const RECOVERY_IIFE_BINDING = "startupHeartbeatRecovery";
 // re-raising syntactically. `throw`/`return` are handled structurally below.
 const ESCAPE_CALLS = new Set(["process.exit", "process.abort"]);
 
-describe("every startup recovery pass is isolated from its siblings (PEN-3810)", () => {
+// Positive-control floor: the 16 passes measured at 8bcb44c1. Both cases below
+// assert it so neither can pass vacuously against an empty pass list.
+const PASS_FLOOR = 16;
+
+// The whole analysis, as a function of the source text, so a fixture can drive
+// the exact pipeline the real assertions use (see the last case below).
+function analyzeRecoveryIife(source: string) {
   const sourceFile = ts.createSourceFile(
     "index.ts",
-    serverSource,
+    source,
     ts.ScriptTarget.Latest,
     /* setParentNodes */ true,
     ts.ScriptKind.TS,
@@ -268,14 +274,20 @@ describe("every startup recovery pass is isolated from its siblings (PEN-3810)",
 
   // Only awaits whose nearest enclosing function IS the IIFE are part of its
   // serial flow; one inside a nested callback rejects somewhere else entirely.
+  // EVERY such await is a pass, whatever its operand's shape: narrowing to call
+  // expressions silently dropped `await newPass;` and `await (x.newPass());`,
+  // so an unguarded pass in either shape was invisible to both cases below and
+  // the floor still held on the surviving 16 (PEN-3897, Ally on PR #2414). A
+  // call is named by its callee; anything else by its own text.
   const passes = iife === null
     ? []
     : collect(iife, ts.isAwaitExpression)
       .filter((await_) => enclosingFunction(await_) === iife)
-      .filter((await_) => ts.isCallExpression(await_.expression))
       .map((await_) => ({
         node: await_ as ts.Node,
-        name: normalize((await_.expression as ts.CallExpression).expression),
+        name: ts.isCallExpression(await_.expression)
+          ? normalize(await_.expression.expression)
+          : normalize(await_.expression),
       }));
 
   // Nearest enclosing `try` whose TRY BLOCK contains the pass — a pass sitting
@@ -315,6 +327,17 @@ describe("every startup recovery pass is isolated from its siblings (PEN-3810)",
     return found;
   };
 
+  // Named rather than counted: the failure output should say WHICH pass lost
+  // its guard, not just that one did.
+  const unguarded = passes.filter((pass) => guardFor(pass.node) === null).map((pass) => pass.name);
+
+  return { bindings, asyncArrows, iife, passes, guardFor, escapesOf, unguarded };
+}
+
+describe("every startup recovery pass is isolated from its siblings (PEN-3810)", () => {
+  const { bindings, asyncArrows, iife, passes, guardFor, escapesOf, unguarded } =
+    analyzeRecoveryIife(serverSource);
+
   it("has exactly one locatable startup recovery IIFE", () => {
     expect(bindings).toHaveLength(1);
     expect(asyncArrows).toHaveLength(1);
@@ -327,16 +350,12 @@ describe("every startup recovery pass is isolated from its siblings (PEN-3810)",
     // Unlike the regex this replaced, the floor cannot be tripped by
     // reformatting a call across lines — only by losing the IIFE or by
     // deleting passes.
-    expect(passes.length).toBeGreaterThanOrEqual(16);
-
-    // Named rather than counted: the failure output should say WHICH pass lost
-    // its guard, not just that one did.
-    const unguarded = passes.filter((pass) => guardFor(pass.node) === null).map((pass) => pass.name);
+    expect(passes.length).toBeGreaterThanOrEqual(PASS_FLOOR);
     expect(unguarded).toEqual([]);
   });
 
   it("lets no guard re-raise the failure it just caught", () => {
-    expect(passes.length).toBeGreaterThanOrEqual(16);
+    expect(passes.length).toBeGreaterThanOrEqual(PASS_FLOOR);
 
     // Reported as two lists, not one: a handler that escapes and a `try` with
     // no handler at all are different edits with different fixes, and the
@@ -356,5 +375,23 @@ describe("every startup recovery pass is isolated from its siblings (PEN-3810)",
 
     expect(uncaught).toEqual([]);
     expect(escaping).toEqual([]);
+  });
+
+  it("reports an unguarded pass awaited in a non-call shape", () => {
+    // Fixture, not index.ts: the real IIFE has no non-call await today, so only
+    // a fixture can prove the walk would notice one being added. Both shapes
+    // are the ones Ally measured slipping past the call-only filter.
+    const fixture = `
+      const ${RECOVERY_IIFE_BINDING} = (async () => {
+        try { await heartbeat.guardedPass(); } catch (err) { logger.error(err); }
+        const newPass = somethingElse.newPass();
+        await newPass;
+        await (somethingElse.newPass());
+      })().catch((err) => logger.error(err));
+    `;
+    expect(analyzeRecoveryIife(fixture).unguarded).toEqual([
+      "newPass",
+      "(somethingElse.newPass())",
+    ]);
   });
 });
