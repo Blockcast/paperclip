@@ -7,10 +7,10 @@ import {
   resolveProjectPrimaryWorkspaceId,
   selectBindTimeProjectWorkspaceFallbackId,
 } from "../services/heartbeat.js";
+import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import {
   resolveProjectIdNeedingWorkspaceFallback,
   resolveWorkspaceWriterTreeKey,
-  runUsesStatelessReviewWorkspace,
 } from "../services/workspace-writer-key.js";
 
 /**
@@ -472,87 +472,91 @@ describe("the key reaches the reservation (end-to-end through the resolver)", ()
 });
 
 /**
- * BLO-42212: a HAND-FILED PR-review row must stop serializing behind the shared
- * `project_primary` writer.
+ * BLO-42212: which HAND-FILED review rows escape the shared `project_primary`
+ * writer. Pins the supported path end to end -- issue origin -> assignment wake
+ * context -> `derivePaperclipPrReview` -> writer key -> reservation -- because
+ * that composition is what a review lane filed by hand depends on, and no single
+ * module's tests see all of it.
  *
- * The lane shape these lock down: many review rows, all bound to ONE project
- * workspace (the BLO-40317 dispatch workaround), each waking `issue_assigned`
- * so `derivePaperclipPrReview` is null for it. Before the label every one of
- * them produced `project-primary:<pw>` and the lane ran one review at a time.
+ * The boundary is `originKind: "pr_review"`, which only `prReviewTarget` at
+ * create sets and nothing updates. It is NOT an issue label or any other marker
+ * writable on an existing issue: that would let any task drop its writer key.
  */
-describe("runUsesStatelessReviewWorkspace (BLO-42212)", () => {
-  const REVIEW_LABELS = ["stateless-review"];
+describe("hand-filed review rows: isolation follows prReviewTarget, not prose (BLO-42212)", () => {
+  const REPO = "blockcast/paperclip";
+  const PR = 2416;
 
-  it("is true for a webhook review with no labels at all", () => {
-    expect(runUsesStatelessReviewWorkspace({ webhookPrReview: true, issueLabelNames: null })).toBe(true);
+  /** Runs the real assignment-wake builder and returns what the run would see. */
+  async function wakeFor(issue: { id: string; originKind: string; originFingerprint: string | null }) {
+    const calls: Array<{ reason?: string | null; contextSnapshot?: Record<string, unknown> }> = [];
+    await queueIssueAssignmentWakeup({
+      heartbeat: {
+        wakeup: async (_agentId, opts) => {
+          calls.push(opts);
+          return null;
+        },
+      },
+      issue: { ...issue, assigneeAgentId: "ally", status: "todo" },
+      reason: "issue_assigned",
+      mutation: "create",
+      contextSource: "issue.create",
+    });
+    expect(calls).toHaveLength(1);
+    const { reason, contextSnapshot } = calls[0]!;
+    // `enrichWakeContextSnapshot` stamps `wakeReason = reason` when absent.
+    const context = { wakeReason: reason, ...contextSnapshot };
+    const prReview = derivePaperclipPrReview(context);
+    const writerKey = resolveWorkspaceWriterTreeKey({
+      statelessPrReview: prReview !== null,
+      runResolvesToOwnTree: false,
+      usesPerRunScope: false,
+      issue: { id: issue.id, projectWorkspaceId: PW },
+    });
+    const reservationFor = (runId: string) =>
+      resolveK8sRunIsolationIdentity({
+        adapterType: "claude_k8s",
+        runId,
+        agentId: "ally",
+        statelessPrReview: prReview !== null,
+        isWorkspaceIsolated: false,
+        persistedExecutionWorkspaceId: null,
+        effectiveMaxConcurrentRuns: 3,
+        perIssueWorkspaceTreeKey: writerKey,
+      })?.reservationKey;
+    return { reason, prReview, writerKey, reservationFor };
+  }
+
+  it("a row created WITH prReviewTarget wakes as a PR review and takes a run-unique reservation", async () => {
+    const wake = await wakeFor({
+      id: "review-row",
+      originKind: "pr_review",
+      originFingerprint: `pr_review:${REPO}:${PR}`,
+    });
+
+    expect(wake.reason).toBe("issue_pr_review_requested");
+    expect(wake.prReview).toMatchObject({ prNumber: PR, repoFullName: REPO, prRole: "reviewer" });
+    // BLO-9293: the self-review anchor must still come only from the signed
+    // webhook; an assignment wake never supplies it.
+    expect(wake.prReview?.prAuthorLogin).toBeNull();
+    expect(wake.writerKey).toBeNull();
+    expect(wake.reservationFor("run-1")).toBe("run:run-1");
+    expect(wake.reservationFor("run-1")).not.toBe(wake.reservationFor("run-2"));
   });
 
-  it("is true for a hand-filed row carrying the label and NO webhook context", () => {
-    // The whole point: `webhookPrReview` is false here, as it is for every
-    // `issue_assigned` review row.
-    expect(runUsesStatelessReviewWorkspace({ webhookPrReview: false, issueLabelNames: REVIEW_LABELS }))
-      .toBe(true);
-  });
+  it("a row created WITHOUT it keys the shared checkout, even if its fingerprint names the PR", async () => {
+    // `originKind` is the gate, not the fingerprint text: a `manual` row whose
+    // fingerprint happens to read like a PR-review scope must still serialize.
+    const manual = await wakeFor({
+      id: "review-row-a",
+      originKind: "manual",
+      originFingerprint: `pr_review:${REPO}:${PR}`,
+    });
+    const other = await wakeFor({ id: "review-row-b", originKind: "manual", originFingerprint: null });
 
-  it("is false for an ordinary row, so the exclusion is NOT dropped by default", () => {
-    // The failure direction that matters. If this ever returns true for an
-    // unlabelled row, every shared-checkout run loses its writer key and
-    // BLO-19422 is back.
-    expect(runUsesStatelessReviewWorkspace({ webhookPrReview: false, issueLabelNames: ["backend", "infra"] }))
-      .toBe(false);
-    expect(runUsesStatelessReviewWorkspace({ webhookPrReview: false, issueLabelNames: null })).toBe(false);
-  });
-
-  it("does not match a label that merely CONTAINS the marker as a substring", () => {
-    expect(
-      runUsesStatelessReviewWorkspace({
-        webhookPrReview: false,
-        issueLabelNames: ["stateless-review-candidate", "needs-stateless-review"],
-      }),
-    ).toBe(false);
-  });
-
-  it("drops the writer key, so two labelled reviews on ONE project workspace stop colliding", () => {
-    // End-to-end through the key: this is the measured defect and its fix in
-    // one assertion pair. Same project workspace, two different review rows.
-    const keyFor = (issueId: string, labelNames: string[]) =>
-      resolveWorkspaceWriterTreeKey({
-        statelessPrReview: runUsesStatelessReviewWorkspace({
-          webhookPrReview: false,
-          issueLabelNames: labelNames,
-        }),
-        runResolvesToOwnTree: false,
-        usesPerRunScope: false,
-        issue: { id: issueId, projectWorkspaceId: PW },
-      });
-
-    // Unlabelled: the measured 2026-10-09 state -- one key, one writer, a
-    // serialized lane.
-    expect(keyFor("review-a", [])).toBe(`project-primary:${PW}`);
-    expect(keyFor("review-a", [])).toBe(keyFor("review-b", []));
-
-    // Labelled: no key at all, because the run no longer lands in that tree.
-    expect(keyFor("review-a", REVIEW_LABELS)).toBeNull();
-    expect(keyFor("review-b", REVIEW_LABELS)).toBeNull();
-  });
-
-  it("keeps the label from leaking into webhook-trusted PR-review context", () => {
-    // BLO-9293 guard, stated as a test so the cheap wrong fix is visibly out of
-    // bounds: the label may widen ISOLATION and must never make
-    // `derivePaperclipPrReview` non-null, because the reviewer-output gate
-    // trusts that object's `prAuthorLogin` as signed webhook data. A context
-    // that only carries a label-shaped hint must still derive to null.
-    //
-    // Every fixture carries `githubPrNumber`: without it `derivePaperclipPrReview`
-    // returns null at its `prNumber === null` check whatever the label logic
-    // does, so a widening on `labels`/`reviewKind` would pass this test
-    // unnoticed. The positive control proves the fixture is otherwise complete
-    // -- it derives non-null the moment a TRUSTED signal is present.
-    const prNumber = { githubPrNumber: 2416 };
-    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", reviewKind: "pr_review", ...prNumber }))
-      .not.toBeNull();
-    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", labels: REVIEW_LABELS, ...prNumber })).toBeNull();
-    expect(derivePaperclipPrReview({ wakeReason: "issue_assigned", reviewKind: "stateless-review", ...prNumber }))
-      .toBeNull();
+    expect(manual.reason).toBe("issue_assigned");
+    expect(manual.prReview).toBeNull();
+    expect(manual.writerKey).toBe(`project-primary:${PW}`);
+    // Two hand-filed rows on one project workspace: one writer at a time.
+    expect(manual.reservationFor("run-1")).toBe(other.reservationFor("run-2"));
   });
 });
