@@ -32,6 +32,7 @@ import {
 } from "./trust-preset-resolver.js";
 import { ACTIVE_RECOVERY_ACTION_STATUSES, RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, recoveryHandoffGrantIsWithinTtl } from "./issue-recovery-actions.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { normalizeHumanRole } from "./company-member-roles.js";
 import { logger } from "../middleware/logger.js";
 
 export type AuthorizationActor =
@@ -541,6 +542,37 @@ export function responsibleUserAuthzShadowMode() {
   return mode === "shadow" || shadow === "1" || shadow === "true" || shadow === "yes";
 }
 
+/**
+ * PEN-3913. Whether a stored membership row clears a non-viewer bar, failing
+ * CLOSED on anything outside the normalized human role union.
+ *
+ * `company_memberships.membership_role` is a plain nullable `text` column with
+ * no DB constraint (`packages/db/src/schema/company_memberships.ts`), and two
+ * writers put values outside `HUMAN_COMPANY_MEMBERSHIP_ROLES` into it:
+ * the cloud-tenant path persists `support` verbatim (`middleware/auth.ts`,
+ * `stackMembershipRole`), and `updateCompanyMemberSchema`
+ * (`packages/shared/src/validators/access.ts`) accepts an explicit `null`,
+ * which the member-update path writes straight through. A raw
+ * `role !== "viewer"` test counts BOTH as non-viewer and fails OPEN.
+ *
+ * `boardActorIsTranscriptOperator` (`routes/authz.ts`) already reads the same
+ * column through `normalizeHumanRole(value, "viewer")` and fails closed on
+ * exactly these values. This keeps the two gates in step: a role string this
+ * codebase does not recognize lands where a viewer lands — needing an explicit
+ * grant — on both sides, rather than being privileged by one and refused by
+ * the other. `member` still folds to `operator`, which is the agreement with
+ * `normalizeHumanRole` that both call sites exist to hold.
+ *
+ * Note the fallback is `viewer`, NOT `normalizeHumanRole`'s own `operator`
+ * default. That default is right for its other callers (grant seeding, label
+ * rendering) and wrong for an authorization bar, for the reason spelled out at
+ * `normalizedTranscriptRole`: it would turn every unknown or legacy role
+ * string into a privileged member.
+ */
+function membershipRoleIsNonViewer(value: unknown): boolean {
+  return normalizeHumanRole(value, "viewer") !== "viewer";
+}
+
 function activeActorMembership(
   memberships: Array<{ companyId: string; membershipRole?: string | null; status?: string }> | null | undefined,
   companyId: string,
@@ -555,7 +587,7 @@ function activeResponsibleUserCanAuthorizeIssueAction(
   return Boolean(
     membership &&
     membership.status === "active" &&
-    membership.membershipRole !== "viewer" &&
+    membershipRoleIsNonViewer(membership.membershipRole) &&
     // BLO-18289: issue:coordination_metadata belongs here for the same reason
     // as issue:mutate — there is no board permission mapping for it, so the
     // responsible-user intersection would otherwise deny it as an unsupported
@@ -586,7 +618,7 @@ function activeResponsibleUserCanAuthorizeAgentGrantedSkillChange(
     action === "skill_config:update" &&
     membership &&
     membership.status === "active" &&
-    membership.membershipRole !== "viewer" &&
+    membershipRoleIsNonViewer(membership.membershipRole) &&
     agentDecision.allowed &&
     (agentDecision.reason === "allow_direct_change" || agentDecision.reason === "allow_consented_change") &&
     agentDecision.grant?.principalType === "agent" &&
@@ -1909,7 +1941,7 @@ export function authorizationService(db: Db) {
           }
           if (
             (input.action === "issue:comment" || input.action === "issue:mutate") &&
-            membership.membershipRole !== "viewer"
+            membershipRoleIsNonViewer(membership.membershipRole)
           ) {
             return allow({
               action: input.action,
@@ -1939,7 +1971,7 @@ export function authorizationService(db: Db) {
         const policyDeny = await denyForAssignmentPolicyIfNeeded(policyEffect);
         if (policyDeny) return policyDeny;
         const membership = await getActiveMembership(companyId, "user", input.actor.userId);
-        if (policyEffect.kind === "none" && membership && membership.membershipRole !== "viewer") {
+        if (policyEffect.kind === "none" && membership && membershipRoleIsNonViewer(membership.membershipRole)) {
           return allow({
             action: input.action,
             reason: "allow_simple_company_member",
@@ -1979,7 +2011,7 @@ export function authorizationService(db: Db) {
             input.action === "runtime:manage" ||
             input.action === "secrets:read" ||
             input.action === "workspace_runtime:read";
-          if (membership && (!requiresNonViewer || membership.membershipRole !== "viewer")) {
+          if (membership && (!requiresNonViewer || membershipRoleIsNonViewer(membership.membershipRole))) {
             return allow({
               action: input.action,
               reason: "allow_simple_company_member",
@@ -1990,7 +2022,7 @@ export function authorizationService(db: Db) {
             return deny({
               action: input.action,
               reason: "deny_missing_grant",
-              explanation: `Viewer membership does not grant ${input.action}.`,
+              explanation: `Membership role does not grant ${input.action}.`,
             });
           }
           return deny({

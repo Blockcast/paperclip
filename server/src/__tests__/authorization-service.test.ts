@@ -4255,5 +4255,120 @@ describeEmbeddedPostgres("authorization service", () => {
         resource: { type: "company", companyId: company.id },
       })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
     });
+
+    /**
+     * PEN-3913. The block above covers agent / on-behalf / `member` / `viewer`
+     * and had NO case for a role outside `HUMAN_COMPANY_MEMBERSHIP_ROLES`,
+     * which is why the fail-open went unnoticed.
+     *
+     * `membership_role` is a nullable `text` column with no DB constraint, and
+     * two writers put a non-union value in it: the cloud-tenant header path
+     * persists `support` verbatim (`middleware/auth.ts`, `stackMembershipRole`),
+     * and `updateCompanyMemberSchema` accepts an explicit `null`. The old gate
+     * read the column raw as `role !== "viewer"`, so both counted as non-viewer
+     * and were ALLOWED, while the sibling transcript gate reading the same
+     * column through `normalizeHumanRole(value, "viewer")` refused them.
+     *
+     * Each case below carries its own control allow, because the deny alone
+     * does not discriminate: `support` would read as denied just as well if
+     * cloud-tenant actors were refused wholesale (they are not — they fall
+     * through the cloud-tenant branch into the generic arm), and the `null`
+     * case would read as denied just as well if the membership row had simply
+     * not been found. The control is what makes each test about the ROLE.
+     */
+    it("denies a cloud-tenant member whose role is outside the human union, while the same stack's owner is allowed (PEN-3913)", async () => {
+      const company = await createCompany(db, "WorkspaceRuntimeReadCloudSupport");
+      const supportUserId = `user-${randomUUID()}`;
+      const ownerUserId = `user-${randomUUID()}`;
+      // `support` is what middleware/auth.ts writes for a `support` stack role:
+      // only `owner`/`admin` collapse to `owner`, everything else is verbatim.
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: supportUserId,
+        status: "active",
+        membershipRole: "support",
+      });
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: ownerUserId,
+        status: "active",
+        membershipRole: "owner",
+      });
+      const authorization = authorizationService(db);
+
+      // Control: a cloud-tenant actor is NOT refused wholesale on this action.
+      // Without this, the deny below passes on a blanket cloud-tenant refusal
+      // that does not exist, and the test stops being about the role at all.
+      await expect(authorization.decide({
+        actor: { type: "board", userId: ownerUserId, source: "cloud_tenant" },
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: true, reason: "allow_simple_company_member" });
+
+      // The assertion: an unrecognized role fails CLOSED, matching the
+      // transcript gate that reads the same column.
+      await expect(authorization.decide({
+        actor: { type: "board", userId: supportUserId, source: "cloud_tenant" },
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    });
+
+    it("denies a member whose role is NULL, which the member-update API accepts (PEN-3913)", async () => {
+      const company = await createCompany(db, "WorkspaceRuntimeReadNullRole");
+      const nullRoleUserId = `user-${randomUUID()}`;
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: nullRoleUserId,
+        status: "active",
+        membershipRole: null,
+      });
+      const authorization = authorizationService(db);
+
+      // Control: the membership row IS found and IS active, so the deny below
+      // is `deny_missing_grant` (role too low) and not `deny_missing_membership`
+      // (no row). `company_scope:read` has no non-viewer bar, so it allows for
+      // any active member regardless of role.
+      await expect(authorization.decide({
+        actor: { type: "board", userId: nullRoleUserId, source: "session" },
+        action: "company_scope:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: true, reason: "allow_simple_company_member" });
+
+      await expect(authorization.decide({
+        actor: { type: "board", userId: nullRoleUserId, source: "session" },
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    });
+
+    /**
+     * PEN-3913. The fix normalizes rather than widens: `member` is the one
+     * non-union string `normalizeHumanRole` deliberately folds (to `operator`),
+     * and that agreement is what keeps the runtime editors working for an
+     * ordinary cloud-tenant `member`. Pinned next to the deny cases so a future
+     * "just use the union" simplification that drops the fold fails here
+     * instead of silently locking those members out.
+     */
+    it("still allows a `member` role, which normalizes to operator (PEN-3913)", async () => {
+      const company = await createCompany(db, "WorkspaceRuntimeReadCloudMember");
+      const userId = `user-${randomUUID()}`;
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: userId,
+        status: "active",
+        membershipRole: "member",
+      });
+
+      await expect(authorizationService(db).decide({
+        actor: { type: "board", userId, source: "cloud_tenant" },
+        action: "workspace_runtime:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: true, reason: "allow_simple_company_member" });
+    });
   });
 });
