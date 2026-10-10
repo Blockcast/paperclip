@@ -433,6 +433,7 @@ import {
   recordHeartbeatPostTerminalRunEventDropped,
   recordHeartbeatTimerTick,
   recordRetryScheduleOutcome,
+  recordStartLockReapDisposition,
   recordConcurrentRunBlocked,
   recordAgentDispatchDeclined,
   recordHeartbeatRunFailed,
@@ -30133,6 +30134,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           reapDisposition = await reapOrphanedRunsForStartLock();
         } finally {
           const reapMs = Date.now() - reapStartedAtMs;
+          // BLO-42010: count every pass, on every path. The debug line below is
+          // below the deployed log level and the warn line is gated on
+          // LOCK_HELD_WARN_MS, so logs hold a complete `timed_out` numerator and
+          // no denominator — the bail RATE is not recoverable from them at all.
+          // `undefined` here is the throw path and is counted as `error`.
+          recordStartLockReapDisposition(reapDisposition);
           if (reapMs >= LOCK_HELD_WARN_MS) {
             // A nested sweep is unshared by design (BLO-35940), so its cost here
             // is expected; keep the warn for the paths where it is an anomaly.
