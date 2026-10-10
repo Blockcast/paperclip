@@ -4260,4 +4260,328 @@ describeEmbeddedPostgres("authorization service", () => {
       })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
     });
   });
+
+  // BLO-30034: the issue-write boundary as a grid, not as one case per incident.
+  //
+  // Four tickets each widened this boundary by exactly one variant — BLO-19036
+  // (ancestry), BLO-19087 (mention), BLO-19913 (manager comment), BLO-20451
+  // (productivity review) — and each shipped with a test for its own variant
+  // only, so none of them would have caught the next one. The four are rows
+  // here rather than separate `it` blocks, which is the specific thing that was
+  // missing. The companion prose is `docs/security/issue-authorization-model.md`;
+  // the two are meant to be edited together.
+  //
+  // The rule the grid encodes: an agent may SAY anything on an issue it is
+  // related to, and CHANGE only an issue it holds. The two denied
+  // manager/`issue:mutate` cells are the finding BLO-30034 was filed about and
+  // are intentional — see the doc's asymmetry section before relaxing either.
+  describe("issue authorization matrix (BLO-30034)", () => {
+    type IssueAction = "issue:comment" | "issue:mutate" | "issue:coordination_metadata";
+
+    type Relation =
+      | "assignee"
+      | "unassigned"
+      | "creator"
+      | "manager"
+      | "manager_with_tasks_assign"
+      | "mentioned"
+      | "recovery_handoff"
+      | "productivity_reviewer"
+      | "project_lead"
+      | "parent_issue_assignee"
+      | "peer"
+      | "other_company";
+
+    async function buildFixture(relation: Relation) {
+      const company = await createCompany(db, `Matrix-${relation}`);
+      const assignee = await createAgent(db, company.id, { role: "engineer" });
+      const issueInput: NonNullable<Parameters<typeof createIssue>[2]> = {
+        title: `Matrix target (${relation})`,
+        assigneeAgentId: assignee.id,
+        createdByAgentId: assignee.id,
+      };
+      let actorAgentId: string;
+      let actorCompanyId = company.id;
+      let parentIssueId: string | null = null;
+
+      switch (relation) {
+        case "assignee": {
+          actorAgentId = assignee.id;
+          break;
+        }
+        case "unassigned": {
+          // Deliberately `originKind: "manual"`: a review or escalation shell is
+          // suppressed here on purpose (BLO-19094) and is covered elsewhere.
+          issueInput.assigneeAgentId = null;
+          actorAgentId = (await createAgent(db, company.id, { role: "engineer" })).id;
+          break;
+        }
+        case "creator": {
+          const creator = await createAgent(db, company.id, { role: "engineer" });
+          issueInput.createdByAgentId = creator.id;
+          actorAgentId = creator.id;
+          break;
+        }
+        case "manager":
+        case "manager_with_tasks_assign": {
+          // `ceo` on purpose: this is the exact principal BLO-30034 was filed
+          // from, and the role must not widen the decision by itself.
+          const manager = await createAgent(db, company.id, { role: "ceo" });
+          await db.update(agents).set({ reportsTo: manager.id }).where(eq(agents.id, assignee.id));
+          if (relation === "manager_with_tasks_assign") {
+            await grantAgentPermission(db, company.id, manager.id, "tasks:assign");
+          }
+          actorAgentId = manager.id;
+          break;
+        }
+        case "mentioned":
+        case "recovery_handoff":
+        case "productivity_reviewer":
+        case "project_lead":
+        case "peer": {
+          actorAgentId = (await createAgent(db, company.id, { role: "engineer" })).id;
+          break;
+        }
+        case "parent_issue_assignee": {
+          const actor = await createAgent(db, company.id, { role: "engineer" });
+          const parent = await createIssue(db, company.id, {
+            title: "Matrix parent",
+            assigneeAgentId: actor.id,
+            createdByAgentId: actor.id,
+          });
+          parentIssueId = parent.id;
+          issueInput.parentId = parent.id;
+          actorAgentId = actor.id;
+          break;
+        }
+        case "other_company": {
+          const otherCompany = await createCompany(db, `Matrix-${relation}-other`);
+          actorCompanyId = otherCompany.id;
+          actorAgentId = (await createAgent(db, otherCompany.id, { role: "ceo" })).id;
+          break;
+        }
+      }
+
+      if (relation === "project_lead") {
+        const project = await createProject(db, company.id, "MatrixLead");
+        await db.update(projects).set({ leadAgentId: actorAgentId }).where(eq(projects.id, project.id));
+        issueInput.projectId = project.id;
+      }
+
+      const issue = await createIssue(db, company.id, issueInput);
+
+      if (relation === "mentioned") {
+        // The assignee is entitled to grant a mention on the issue it holds.
+        await db.insert(issueComments).values({
+          companyId: company.id,
+          issueId: issue.id,
+          body: `[@Matrix Actor](agent://${actorAgentId}) please weigh in`,
+          authorAgentId: assignee.id,
+        });
+      }
+
+      if (relation === "recovery_handoff") {
+        await db.insert(issueRecoveryActions).values({
+          companyId: company.id,
+          sourceIssueId: issue.id,
+          kind: "stranded_assigned_issue",
+          status: "active",
+          ownerType: "agent",
+          ownerAgentId: assignee.id,
+          previousOwnerAgentId: actorAgentId,
+          returnOwnerAgentId: actorAgentId,
+          cause: "stranded_assigned_issue",
+          fingerprint: `matrix-${randomUUID()}`,
+          nextAction: "Hand the diagnosis back to the previous owner.",
+        });
+      }
+
+      if (relation === "productivity_reviewer") {
+        await createIssue(db, company.id, {
+          title: `Review productivity for ${issue.title}`,
+          parentId: issue.id,
+          assigneeAgentId: actorAgentId,
+          originKind: "issue_productivity_review",
+          originId: issue.id,
+        });
+      }
+
+      return {
+        actor: { type: "agent", agentId: actorAgentId, companyId: actorCompanyId, source: "agent_jwt" } as const,
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: issue.id,
+          projectId: issue.projectId,
+          parentIssueId,
+          assigneeAgentId: issue.assigneeAgentId,
+          createdByAgentId: issue.createdByAgentId,
+          status: issue.status,
+        } as const,
+      };
+    }
+
+    // `reason` is asserted only where the decision has a single stable cause.
+    // Where a denial is reached through the grant helper its reason depends on
+    // whether a membership row happens to exist, which is not what this grid is
+    // pinning, so those cells assert `allowed` alone.
+    const MATRIX: Array<{
+      relation: Relation;
+      note: string;
+      cells: Array<{ action: IssueAction; allowed: boolean; reason?: string }>;
+    }> = [
+      {
+        relation: "assignee",
+        note: "holds the issue, so it may rewrite every field — the escape hatch the model points managers at",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_self" },
+          { action: "issue:mutate", allowed: true, reason: "allow_self" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        relation: "unassigned",
+        note: "nobody is accountable yet, so any same-company agent may pick it up",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_company_agent" },
+          { action: "issue:mutate", allowed: true, reason: "allow_company_agent" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        relation: "creator",
+        note: "filing an issue buys a voice on the thread, not ownership of its definition of done",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_issue_creator" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        relation: "manager",
+        note: "BLO-19913 — the manager-chain comment path; description stays denied (BLO-30034)",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_manager_chain" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: false },
+        ],
+      },
+      {
+        relation: "manager_with_tasks_assign",
+        note: "BLO-18289 — the grant opens coordination metadata and must NOT open description (BLO-30034)",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_manager_chain" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: true, reason: "allow_explicit_grant" },
+        ],
+      },
+      {
+        relation: "mentioned",
+        note: "BLO-19087 — a mention grants reply, not rewrite",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_issue_mention_grant" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        relation: "recovery_handoff",
+        note: "a handed-back previous owner regains the thread, not the fields",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_recovery_handoff_grant" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        relation: "productivity_reviewer",
+        note: "BLO-20451 / BLO-19094 — the one grant that carries issue:mutate, because every review remedy is one",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_productivity_review_grant" },
+          { action: "issue:mutate", allowed: true, reason: "allow_productivity_review_grant" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        relation: "project_lead",
+        note: "negative control — decideBase never loads the project, so leading it confers nothing",
+        cells: [
+          { action: "issue:comment", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        relation: "parent_issue_assignee",
+        note: "BLO-19036 negative control — ancestry is not an allow-path; parentIssueId is never consulted",
+        cells: [
+          { action: "issue:comment", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        relation: "peer",
+        note: "negative control — same company, no relation",
+        cells: [
+          { action: "issue:comment", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        relation: "other_company",
+        note: "negative control — the company boundary outranks every role and grant",
+        cells: [
+          { action: "issue:comment", allowed: false },
+          { action: "issue:mutate", allowed: false },
+          { action: "issue:coordination_metadata", allowed: false },
+        ],
+      },
+    ];
+
+    for (const row of MATRIX) {
+      it(`${row.relation}: ${row.note}`, async () => {
+        const fixture = await buildFixture(row.relation);
+        const authorization = authorizationService(db);
+
+        for (const cell of row.cells) {
+          const decision = await authorization.decide({
+            actor: fixture.actor,
+            action: cell.action,
+            resource: fixture.resource,
+          });
+          const label = `${row.relation} x ${cell.action} -> ${decision.reason}: ${decision.explanation}`;
+          expect(decision.allowed, label).toBe(cell.allowed);
+          if (cell.reason) expect(decision.reason, label).toBe(cell.reason);
+        }
+      });
+    }
+
+    it("covers every relation the model documents, in both directions", () => {
+      // Guards against a row being deleted to make a failure go away, and
+      // against a cell being dropped rather than fixed.
+      expect(MATRIX).toHaveLength(12);
+      for (const row of MATRIX) {
+        expect(row.cells.map((cell) => cell.action), row.relation).toEqual([
+          "issue:comment",
+          "issue:mutate",
+          "issue:coordination_metadata",
+        ]);
+      }
+      // The asymmetry itself: at least one relation that may comment and may
+      // not mutate must exist, or the model has silently collapsed.
+      const commentOnly = MATRIX.filter((row) =>
+        row.cells.some((cell) => cell.action === "issue:comment" && cell.allowed) &&
+        row.cells.some((cell) => cell.action === "issue:mutate" && !cell.allowed),
+      );
+      expect(commentOnly.map((row) => row.relation)).toEqual([
+        "creator",
+        "manager",
+        "manager_with_tasks_assign",
+        "mentioned",
+        "recovery_handoff",
+      ]);
+    });
+  });
 });
