@@ -62,6 +62,10 @@ export function parseUnsupportedPaginationParams(query: {
 // tools build their refusal keys from the same two lists: an MCP caller's
 // undeclared key is stripped before it reaches this route, so a name matched
 // here but not declared there is silently dropped again.
+//
+// Keys on PRESENCE, not value: an empty `?updated_after=` is refused too, the
+// same reading the MCP refusal (`value === undefined`) applies. See the
+// issues/count call site for why that differs from COUNT_UNSUPPORTED_FILTERS.
 const TIME_FILTER_PARAM_PATTERN = new RegExp(
   `^(${TIME_FILTER_PREFIXES.join("|")})_?(${TIME_FILTER_SUFFIXES.join("|")})$`,
   "i",

@@ -656,6 +656,19 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/open-assignment-censu
     expect(res.body.error).toMatch(/\/search with updatedAfter/);
   });
 
+  // Presence, not value: an empty bound is still refused, matching issues/count and the
+  // list route. Answering 200 here would make the census the one sibling that serves the
+  // whole corpus for `?updated_after=`.
+  it("rejects an empty time-bound param too", async () => {
+    const res = await request(appAs(boardActorFor([companyId]))).get(
+      `/api/companies/${companyId}/issues/open-assignment-census?updated_after=`,
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.totals).toBeUndefined();
+    expect(res.body.unsupportedParams).toEqual(["updated_after"]);
+  });
+
   it("keeps company isolation: an agent key from another company is refused", async () => {
     // A `local_implicit` board actor is the trusted local-dev bypass and is
     // exempt from company scoping by design, so it would assert nothing here.
