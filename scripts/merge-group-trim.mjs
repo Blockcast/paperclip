@@ -47,10 +47,13 @@
 // merge. Build, typecheck and the workspaces unit tests still run on the merged
 // tree, and master-health.yml re-runs the server suites on the landed master
 // head whenever its merge-group build did not run them (scripts/__tests__/
-// merge-group-trim.test.mjs pins that gate).
+// merge-group-trim.test.mjs pins that gate). e2e and Canary Dry Run have NO
+// post-merge backstop: nothing runs them on master (e2e.yml is
+// workflow_dispatch only), so a trimmed landing's merged tree meets them only
+// in a later PR's own, non-required, pull_request e2e.
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -332,8 +335,15 @@ export function summarize(decision, facts) {
   );
 }
 
+// pr.yml runs the merge group base's copy of this file from RUNNER_TEMP, so the
+// checkout it decides about is named explicitly rather than derived from where
+// the file sits.
+export function repoRoot(env = process.env, scriptUrl = import.meta.url) {
+  return env.MERGE_GROUP_TRIM_REPO_ROOT || path.resolve(path.dirname(fileURLToPath(scriptUrl)), "..");
+}
+
 async function main() {
-  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const root = repoRoot();
   let decision;
   let facts = {};
   try {
@@ -349,7 +359,8 @@ async function main() {
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, summarize(decision, facts));
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// realpath: import.meta.url is the resolved path, argv[1] may run through a symlink.
+if (process.argv[1] && realpathSync(path.resolve(process.argv[1])) === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
     console.log(`::warning title=merge-group trim fell back to the full suite::${error?.message ?? error}`);
   });
