@@ -1723,6 +1723,13 @@
       "when": 1790875351921,
       "tag": "0253_repair_exit_zero_timeouts_after_adapter_migration",
       "breakpoints": true
+    },
+    {
+      "idx": 254,
+      "version": "7",
+      "when": 1790875451921,
+      "tag": "0254_backstop_sweep_cursors",
+      "breakpoints": true
     }
   ]
 }

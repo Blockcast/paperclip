@@ -98,6 +98,7 @@ export { heartbeatRuns } from "./heartbeat_runs.js";
 export { detachedQueuedRunRecoveries } from "./detached_queued_run_recoveries.js";
 export { externalRuntimeReservations } from "./external_runtime_reservations.js";
 export { branchRunClaims } from "./branch_run_claims.js";
+export { backstopSweepCursors } from "./backstop_sweep_cursors.js";
 export { heartbeatRunEvents } from "./heartbeat_run_events.js";
 export { heartbeatRunWatchdogDecisions } from "./heartbeat_run_watchdog_decisions.js";
 export { smokeRuns, smokeRunSteps } from "./smoke_lab.js";

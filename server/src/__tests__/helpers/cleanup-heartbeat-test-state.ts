@@ -97,7 +97,12 @@ export async function cleanupHeartbeatTestState(
 
   await cancelActiveRunsForCleanup(db, errorLabel, cancelTimeoutMs);
   await heartbeat.drainInFlightExecutions(drainTimeoutMs);
-  await truncateCompanyScopedTestState(db, { extraTruncateTables });
+  // BLO-36017: `backstop_sweep_cursors` has no company FK, so the `companies` cascade does not
+  // reach it. It is global sweep state, so a cursor left behind by one test would start the next
+  // test's rotation mid-page — exactly the cross-test leak the cascade exists to prevent.
+  await truncateCompanyScopedTestState(db, {
+    extraTruncateTables: ["backstop_sweep_cursors", ...extraTruncateTables],
+  });
 }
 
 async function cancelActiveRunsForCleanup(

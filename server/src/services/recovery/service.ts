@@ -18,6 +18,7 @@ import {
   agentWakeupRequests,
   approvals,
   activityLog,
+  backstopSweepCursors,
   companies,
   detachedQueuedRunRecoveries,
   externalRuntimeReservations,
@@ -895,6 +896,13 @@ type ResolvedDependencyWakeBackstopOptions = {
   companyId?: string | null;
   blockerIssueId?: string | null;
   source?: ResolvedDependencyWakeBackstopSource;
+  /**
+   * Page size for the rotating sweep. Injectable for the same reason the hand-back drain's is:
+   * the production limit is a parameter, not a branch, so `limit: 2` against 5 candidates drives
+   * the identical over-limit rotation that seeding 501 rows would, in milliseconds instead of
+   * minutes.
+   */
+  limit?: number;
 };
 
 type LatestIssueRun = Pick<
@@ -2363,8 +2371,34 @@ export function recoveryService(
   const budgets = budgetService(db);
   const instanceSettings = instanceSettingsService(db);
   const runLogStore = getRunLogStore();
-  let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
-  let strandedRecoveryWakeBackstopCandidateCursor: string | null = null;
+
+  // BLO-36017: these two rotations used to be in-memory `let`s. Every process replacement reset
+  // them to null and restarted at page 1, so under worker churn shorter than one rotation the
+  // tail was never visited and the completion counter -- which fires only on the tail tick --
+  // never incremented. The cursor now lives in `backstop_sweep_cursors`, one row per rotation.
+  //
+  // Keyed per company scope rather than globally: production drives both sweeps with no
+  // `companyId` (`"*"`), but a scoped call used to advance the same shared closure and clobber
+  // the global rotation's position.
+  const backstopSweepCursorKey = (sweep: string, companyId?: string | null) =>
+    `${sweep}:${companyId ?? "*"}`;
+
+  async function readBackstopSweepCursor(sweep: string): Promise<string | null> {
+    const row = await db
+      .select({ cursor: backstopSweepCursors.cursor })
+      .from(backstopSweepCursors)
+      .where(eq(backstopSweepCursors.sweep, sweep))
+      .then((rows) => rows[0] ?? null);
+    return row?.cursor ?? null;
+  }
+
+  async function writeBackstopSweepCursor(sweep: string, cursor: string | null) {
+    const updatedAt = new Date();
+    await db
+      .insert(backstopSweepCursors)
+      .values({ sweep, cursor, updatedAt })
+      .onConflictDoUpdate({ target: backstopSweepCursors.sweep, set: { cursor, updatedAt } });
+  }
 
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -12824,6 +12858,10 @@ export function recoveryService(
       ? "workspace_finalize_reconciliation"
       : "issue_graph_liveness_reconciliation";
     const useCursor = !opts?.blockerIssueId;
+    const candidateLimit = Math.max(
+      1,
+      Math.floor(asNumber(opts?.limit, RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT)),
+    );
 
     const queryCandidates = (afterIssueId: string | null) => {
       const filters = [
@@ -12853,7 +12891,7 @@ export function recoveryService(
           .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
           .where(and(...filters))
           .orderBy(asc(issues.id))
-          .limit(RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
+          .limit(candidateLimit);
       }
 
       return db
@@ -12867,15 +12905,15 @@ export function recoveryService(
         .from(issues)
         .where(and(...filters))
         .orderBy(asc(issues.id))
-        .limit(RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
+        .limit(candidateLimit);
     };
 
-    const cursorBeforeQuery = resolvedDependencyWakeBackstopCandidateCursor;
+    const cursorKey = backstopSweepCursorKey("issue_graph_liveness.backstop", opts?.companyId);
+    const cursorBeforeQuery = useCursor ? await readBackstopSweepCursor(cursorKey) : null;
     let cursorWasReset = false;
-    let candidateRows = await queryCandidates(useCursor ? cursorBeforeQuery : null);
-    if (useCursor && candidateRows.length === 0 && resolvedDependencyWakeBackstopCandidateCursor) {
+    let candidateRows = await queryCandidates(cursorBeforeQuery);
+    if (useCursor && candidateRows.length === 0 && cursorBeforeQuery) {
       cursorWasReset = true;
-      resolvedDependencyWakeBackstopCandidateCursor = null;
       candidateRows = await queryCandidates(null);
     }
     const totalCandidateCount = candidateRows[0]?.totalCount ?? 0;
@@ -12886,9 +12924,11 @@ export function recoveryService(
       setBackstopDeferredCandidates("issue_graph_liveness.backstop", result.candidateLimitSkipped);
     }
     const lastCandidate = candidates[candidates.length - 1] ?? null;
+    // Null on the tail tick, which is what makes the next tick start a fresh rotation at the
+    // head. Persisted rather than held in a closure so the rotation survives the process.
+    const nextCursor = result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.id : null;
     if (useCursor) {
-      resolvedDependencyWakeBackstopCandidateCursor =
-        result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.id : null;
+      await writeBackstopSweepCursor(cursorKey, nextCursor);
     }
     if (result.candidateLimitSkipped > 0) {
       logger.warn(
@@ -12900,8 +12940,8 @@ export function recoveryService(
           // until the sweep-completion tick logs below.
           deferredToNextTick: result.candidateLimitSkipped,
           skipped: result.candidateLimitSkipped,
-          limit: RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
-          nextCursor: useCursor ? resolvedDependencyWakeBackstopCandidateCursor : null,
+          limit: candidateLimit,
+          nextCursor: useCursor ? nextCursor : null,
           source,
           blockerIssueId: opts?.blockerIssueId ?? null,
         },
@@ -12924,7 +12964,7 @@ export function recoveryService(
       logger.info(
         {
           processed: candidates.length,
-          limit: RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
+          limit: candidateLimit,
           sweptFromCursor: cursorBeforeQuery,
           completionPath: cursorWasReset ? "cursor_wrap" : "page_drained",
           source,
@@ -13851,6 +13891,11 @@ export function recoveryService(
     companyId?: string | null;
     now?: Date;
     cooldownMs?: number;
+    /**
+     * Page size for the rotating sweep. Injectable for the same reason as the sibling option on
+     * `ResolvedDependencyWakeBackstopOptions`.
+     */
+    limit?: number;
   }) {
     const result = {
       checked: 0,
@@ -13876,6 +13921,10 @@ export function recoveryService(
       Math.floor(asNumber(opts?.cooldownMs, STRANDED_RECOVERY_WAKE_BACKSTOP_COOLDOWN_MS)),
     );
     const cooldownBefore = new Date(now.getTime() - cooldownMs);
+    const candidateLimit = Math.max(
+      1,
+      Math.floor(asNumber(opts?.limit, STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT)),
+    );
 
     const queryCandidates = (afterActionId: string | null) => {
       const filters = [
@@ -13913,15 +13962,15 @@ export function recoveryService(
         .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
         .where(and(...filters))
         .orderBy(asc(issueRecoveryActions.id))
-        .limit(STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT);
+        .limit(candidateLimit);
     };
 
-    const cursorBeforeQuery = strandedRecoveryWakeBackstopCandidateCursor;
+    const cursorKey = backstopSweepCursorKey("stranded_recovery_wake_backstop", opts?.companyId);
+    const cursorBeforeQuery = await readBackstopSweepCursor(cursorKey);
     let cursorWasReset = false;
     let candidateRows = await queryCandidates(cursorBeforeQuery);
-    if (candidateRows.length === 0 && strandedRecoveryWakeBackstopCandidateCursor) {
+    if (candidateRows.length === 0 && cursorBeforeQuery) {
       cursorWasReset = true;
-      strandedRecoveryWakeBackstopCandidateCursor = null;
       candidateRows = await queryCandidates(null);
     }
     const totalCandidateCount = candidateRows[0]?.totalCount ?? 0;
@@ -13930,8 +13979,9 @@ export function recoveryService(
     result.candidateLimitSkipped = Math.max(0, totalCandidateCount - candidates.length);
     setBackstopDeferredCandidates("stranded_recovery_wake_backstop", result.candidateLimitSkipped);
     const lastCandidate = candidates[candidates.length - 1] ?? null;
-    strandedRecoveryWakeBackstopCandidateCursor =
+    const nextCursor =
       result.candidateLimitSkipped > 0 && lastCandidate ? lastCandidate.actionId : null;
+    await writeBackstopSweepCursor(cursorKey, nextCursor);
 
     if (result.candidateLimitSkipped > 0) {
       logger.warn(
@@ -13941,8 +13991,8 @@ export function recoveryService(
           // the sibling comment in the resolved-dependency backstop above.
           deferredToNextTick: result.candidateLimitSkipped,
           skipped: result.candidateLimitSkipped,
-          limit: STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
-          nextCursor: strandedRecoveryWakeBackstopCandidateCursor,
+          limit: candidateLimit,
+          nextCursor,
         },
         "stranded recovery wake backstop deferred candidates past page limit",
       );
@@ -13959,7 +14009,7 @@ export function recoveryService(
       logger.info(
         {
           processed: candidates.length,
-          limit: STRANDED_RECOVERY_WAKE_BACKSTOP_CANDIDATE_LIMIT,
+          limit: candidateLimit,
           sweptFromCursor: cursorBeforeQuery,
           completionPath: cursorWasReset ? "cursor_wrap" : "page_drained",
         },
