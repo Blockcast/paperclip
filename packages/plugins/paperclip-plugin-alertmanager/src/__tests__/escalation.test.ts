@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
 import { COVER_ORIGIN, escalationDeadlineMs, recordSourceResolvedAndCloseCovers, runAlertEscalationSweep } from "../escalation.js";
 import { handleFiring, handleResolved } from "../webhook-handler.js";
 import { BLOCKCAST_PHYSICAL_INFRA_AGENT_ID, DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
+import manifest from "../manifest.js";
 import { ORIGIN_KIND } from "../types.js";
 import type { AlertmanagerAlert, AlertmanagerPluginConfig, AlertStateRecord } from "../types.js";
 
@@ -1084,6 +1085,13 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
     return { config: config({ alertmanagerApiUrl: url }), requests };
   };
 
+  /** A loopback Alertmanager answering every read with `body` verbatim (not JSON-encoded). */
+  const startRawAlertmanager = async (body: string) =>
+    config({ alertmanagerApiUrl: await listen(createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(body);
+    })) });
+
   /** An Alertmanager address that refuses connections (listened on, then closed). */
   const refusedAlertmanager = async () => {
     const server = createServer();
@@ -1274,12 +1282,22 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
     expect(bodies(mocks).filter((body) => body.startsWith("[alert-escalation] Source alert is not firing"))).toHaveLength(3);
   });
 
-  it("costs a sweep one timeout, not one per due issue, when Alertmanager hangs", async () => {
+  it.each([
     // Reachable but never answering: the NetworkPolicy-drop / partition shape,
-    // not the ECONNREFUSED one. Two different alertnames, so the memo alone
-    // cannot help — the transport short-circuit has to.
+    // not the ECONNREFUSED one.
+    ["never sends headers", (_res: ServerResponse) => {}],
+    // A proxy or mesh sidecar that answers 200 and then stalls: `fetch`
+    // resolves, so only the body read can time out. That read is transport
+    // too, and must short-circuit the pass the same way.
+    ["sends headers, then stalls the body", (res: ServerResponse) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.flushHeaders();
+    }],
+  ])("costs a sweep one timeout, not one per due issue, when Alertmanager %s", async (_shape, respond) => {
+    // Two different alertnames, so the memo alone cannot help — the transport
+    // short-circuit has to.
     const requests: string[] = [];
-    const url = await listen(createServer((req) => { requests.push(req.url ?? ""); }));
+    const url = await listen(createServer((req, res) => { requests.push(req.url ?? ""); respond(res); }));
     const { ctx, mocks } = sweepOf([due({ alertname: "AlertA" }), due({ alertname: "AlertB" })]);
     const started = Date.now();
     await runAlertEscalationSweep(ctx, config({ alertmanagerApiUrl: url }), NOW);
@@ -1288,9 +1306,54 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
     expect(requests).toHaveLength(1);
     // One per-call cap (5s) — well under two of them, and far under the host's 30s.
     expect(elapsed).toBeLessThan(9_000);
-    // Fail-open still holds for both: neither ladder is silenced.
-    expect(bodies(mocks).filter((body) => body.includes("Alert liveness NOT verified"))).toHaveLength(2);
+    // Fail-open still holds for both: neither ladder is silenced, and the
+    // comment names the bound rather than echoing the abort.
+    const notVerified = bodies(mocks).filter((body) => body.includes("Alert liveness NOT verified"));
+    expect(notVerified).toHaveLength(2);
+    for (const body of notVerified) {
+      expect(body).toContain("Alert liveness NOT verified (the Alertmanager request did not complete within 5s)");
+      expect(body).not.toMatch(/TimeoutError|AbortError|aborted/);
+    }
   }, 20_000);
+
+  it("refuses a non-http(s) alertmanagerApiUrl instead of trusting what it answers", async () => {
+    // `fetch` takes a `data:` URL, and the fragment swallows the appended API
+    // path, so this "Alertmanager" answers `[]` for every alertname — which
+    // would read every alert as clear and hold every ladder.
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
+    await runAlertEscalationSweep(ctx, config({ alertmanagerApiUrl: "data:application/json,[]#" }), NOW);
+
+    // Fail-open: the rung climbs, and says why liveness was not read.
+    expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+    const [body] = bodies(mocks);
+    expect(body).toContain("Alert liveness NOT verified (alertmanagerApiUrl is not an http:// or https:// URL, so it was not read)");
+    expect(body).not.toContain("Source alert is not firing");
+  });
+
+  it("keeps raw read errors out of issue comments and puts them in the plugin log", async () => {
+    // Error text carries addresses, ports, and response bytes; a comment is the
+    // wrong audience for any of it. The operator still gets it, server-side.
+    for (const [amConfig, reason] of [
+      [await refusedAlertmanager(), "the Alertmanager request failed; the error is in the plugin log"],
+      [await startRawAlertmanager("SECRET-BODY"), "Alertmanager returned a body that is not valid JSON"],
+    ] as const) {
+      const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1 }));
+      await runAlertEscalationSweep(ctx, amConfig, NOW);
+
+      const [body] = bodies(mocks);
+      expect(body).toContain(`Alert liveness NOT verified (${reason})`);
+      expect(body).not.toMatch(/TypeError|fetch failed|ECONNREFUSED|127\.0\.0\.1|SyntaxError|SECRET-BODY/);
+      expect(mocks.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Alertmanager liveness read for SyntheticAlert failed: .*(fetch failed|SyntaxError)/));
+    }
+  });
+
+  it("declares http.outbound, the network reach the liveness read has", () => {
+    // The read bypasses `ctx.http`, so the host never enforces this capability
+    // for it — but `capabilities` is what the host diffs on upgrade and shows
+    // an operator. Leaving it off hides that this plugin now dials out.
+    expect(manifest.instanceConfigSchema?.properties).toHaveProperty("alertmanagerApiUrl");
+    expect(manifest.capabilities).toContain("http.outbound");
+  });
 
   it("never reassigns, comments, or covers for a known-resolved alert", async () => {
     // The pre-existing `state.resolvedAt` guard. AC2 of BLO-40739 depends on
