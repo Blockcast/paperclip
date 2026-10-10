@@ -1403,19 +1403,34 @@ async function executeCommentReviewGateCheck(
     // surface showing that finding as absent rather than red. A red going
     // silent is the direction this module must not get wrong.
     // `prAuthorLane: null` is the honest value here, not a stub awaiting a
-    // fetch (BLO-34389). Two things have to land before a non-null one would
-    // mean anything, and neither is this module's:
+    // fetch (BLO-34389).
     //
-    //   1. Ally's producer has to EMIT `reviewer` in its verdict block. Nothing
-    //      in the current corpus carries it, so every value this gate could
-    //      supply today compares against `null` and credits.
-    //   2. The token space has to be AGREED. BLO-32695's ruling names an agent
-    //      uuid, and the only PR-author lane signal this gate can cheaply read
-    //      — the head commit's git author, `Staff Engineer
-    //      <staff-engineer@paperclip.blockcast.net>` — is not a uuid. Wiring a
-    //      fetch across that mismatch would cost a GitHub call per evaluation
-    //      and could never match, which reads as a working control. Open
-    //      question for BLO-32695's owner; see BLO-34389.
+    // The TOKEN SPACE is settled: BLO-32695's owner ruled on 2026-10-10 that
+    // `reviewer` carries the lane's full git author email, lowercased and
+    // compared verbatim (`ally@paperclip.blockcast.net`), overturning that
+    // row's earlier agent-uuid wording. GitHub carries no agent uuid anywhere,
+    // so a uuid is this same string plus a join; an agent's stored `urlKey` is
+    // already the email's local-part, and the email additionally keeps a human
+    // author or the App from colliding with a lane slug. Both sides already
+    // lowercase (`ally-review-detection.ts` on parse, the
+    // `prAuthorLane?.trim().toLowerCase()` feeding
+    // `headsWithUndispositionedFinding` here), so no normalization is owed.
+    //
+    // The PRODUCER lands alongside this comment — `.planning/ally-agent/
+    // AGENTS.md` now emits `reviewer` as a literal in its verdict template —
+    // but no review in any existing corpus carries one, and a lane this gate
+    // supplied today would still compare against `null` and credit. Keeping
+    // `null` is therefore the no-op direction, not a deferral of a red.
+    //
+    // When the fetch does land, gate it on `declaredLane !== null` rather than
+    // on the verdict outcome: while no comment in a PR's corpus carries
+    // `reviewer` that is zero extra GitHub calls, and it goes live by itself
+    // the day a producer emits one, with no ordering constraint between the two
+    // edits in either direction. Read the lane from the head commit's
+    // `commit.author.email` (`GET /repos/{o}/{r}/commits/{headSha}`, one call;
+    // `headSha` is already in hand) — NOT from `git config user.email`, which
+    // in an agent worktree routinely names a different lane than the one that
+    // authored the commits.
     //
     // So the exclusion ships exercised by tests and inert in production, the
     // same way `prAuthorLogin` shipped here before its fetch landed below.
