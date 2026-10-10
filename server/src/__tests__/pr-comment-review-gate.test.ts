@@ -56,7 +56,15 @@ function cleanReview(headSha: string): string {
 }
 
 function allyComment(body: string, createdAt: string) {
-  return { authorLogin: ALLY_BOT_LOGIN, body, createdAt };
+  return { authorLogin: ALLY_BOT_LOGIN, body, createdAt, source: "issue_comment" as const };
+}
+
+/**
+ * The same body carried as a formal `pull_request_review` instead. Only the
+ * artifact differs, which is the whole of the BLO-42525 exemption.
+ */
+function allyReview(body: string, createdAt: string) {
+  return { authorLogin: ALLY_BOT_LOGIN, body, createdAt, source: "pull_request_review" as const };
 }
 
 /**
@@ -1363,6 +1371,153 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
 
     expect(commentReviewGateVerdictIsMisreadable(verdict, "review/ally-comment")).toBe(true);
     expect(admitsNothingEvaluated(verdict.reason)).toBe(true);
+  });
+});
+
+/**
+ * BLO-42525 — the self-attestation withholding above made `clean` unreachable
+ * for the entire App-authored population, because there the PR author IS the
+ * reviewer identity by construction and no amount of re-reviewing changes it.
+ *
+ * Both fixtures use a SINGLE shared login, for the same reason the BLO-34389
+ * block below does: that is the only shape production produces. A fixture that
+ * varies the login would pass against the un-exempted gate and prove nothing.
+ *
+ * Measured on the two live PRs that produced this row, 2026-10-09:
+ *   - Blockcast/moq#4 @ a2578771 — formal COMMENTED review 5470228329, 0C/0I,
+ *     `Reviewed head:` the exact head; a finding carried from 0024a2a.
+ *   - Blockcast/Network-Operator-Portal#1269 @ 6ed113f0 — formal review
+ *     5473756533, 0C/0I, ledger retiring `prior:15c8614 important 1`, while
+ *     the carry holding it red came from a DIFFERENT head (b45737e).
+ * Both published `carried_finding` with "the only comment attesting it is the
+ * PR author's own".
+ */
+describe("evaluateCommentReviewGate — formal review on an App-authored PR (BLO-42525)", () => {
+  it("credits a formal at-head review from the reviewer identity on its own PR", () => {
+    // moq#4's shape: the at-head review is clean, a finding carried from an
+    // earlier head, author === reviewer. Crediting the attestation disposes the
+    // carry by the pre-existing BLO-29711 rule, which is what makes this one
+    // change enough to clear the gate.
+    const comments = [
+      allyComment(blockingReview(OLD_HEAD), "2026-10-09T07:07:54Z"),
+      allyReview(cleanReview(CURRENT_HEAD), "2026-10-09T12:49:27Z"),
+    ];
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments,
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+    expect(commentReviewGateCheckConclusion(verdict)).toBe("success");
+    // The author no longer decides this outcome, so the caller must not be sent
+    // to fetch one: `authorUnknown` is what keys that call.
+    expect(
+      evaluateCommentReviewGate({ headSha: CURRENT_HEAD, prAuthorLogin: null, comments }),
+    ).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  it("credits a formal at-head review whose ledger names a different head than the carry", () => {
+    // NOP#1269's shape, and the reason it is a separate fixture: the ledger
+    // retires a finding from INTERMEDIATE_HEAD while the red was held by
+    // OLD_HEAD. Nothing retires OLD_HEAD by name, so this passes only if the
+    // at-head attestation itself is credited — not if the ledger route happens
+    // to cover it.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReview(INTERMEDIATE_HEAD), "2026-10-08T23:42:01Z"),
+        allyComment(blockingReview(OLD_HEAD), "2026-10-09T10:50:24Z"),
+        allyReview(
+          dispositioningReview(CURRENT_HEAD, INTERMEDIATE_HEAD, "fixed"),
+          "2026-10-09T18:13:17Z",
+        ),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  it("still withholds for the same body delivered as an issue comment", () => {
+    // The BLO-34316 hole, unchanged: an author-written ISSUE COMMENT reaching
+    // `clean` is what that row closed, and the exemption is by artifact type.
+    // Byte-identical bodies and timestamps to the first fixture — only `source`
+    // differs — so this is the mutation guard for the `source` check itself.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-10-09T07:07:54Z"),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-10-09T12:49:27Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason).toMatch(/the only comment attesting it is the PR author's own/i);
+  });
+
+  it("treats an absent source as an issue comment", () => {
+    // Fail closed on omission. `source` is optional so the ~100 pre-existing
+    // fixtures keep their meaning, which only holds if absence is the
+    // restrictive reading — a call site that forgets it must publish a false
+    // red, never a false green.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [{ authorLogin: ALLY_BOT_LOGIN, body: cleanReview(CURRENT_HEAD), createdAt: "2026-10-09T12:49:27Z" }],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+  });
+
+  it("keeps a formal at-head review author-blind when it carries a finding", () => {
+    // The exemption releases only the POSITIVE claim. A finding in a formal
+    // review is still a finding, and the branch that reports it never consulted
+    // the author in the first place.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyReview(blockingReview(CURRENT_HEAD), "2026-10-09T12:49:27Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+  });
+
+  it("does not let a newer self-authored issue comment launder a formal finding at the same head", () => {
+    // Why the exemption is keyed on the artifact carrying THIS verdict rather
+    // than on "some formal review also attests this head". Under the set-based
+    // reading the author could answer a formal blocking review by posting a
+    // plain 0/0 issue comment at the same head and go green — BLO-34316's hole
+    // through a side door. Newest-wins already lets the clean comment supply the
+    // verdict, so `source` is the only thing standing between these and `clean`.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyReview(blockingReview(CURRENT_HEAD), "2026-10-09T12:49:27Z"),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-10-09T13:42:23Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated" });
+    expect(commentReviewGateCheckConclusion(verdict)).not.toBe("success");
+  });
+
+  it("still reports a deferred finding rather than clean on a formal at-head review", () => {
+    // The deferral branch sits behind the same independence check, so the
+    // exemption reaches it too — and must land on `deferred_finding`, not
+    // `clean`. Reporting "no unresolved findings" for an accepted residual is
+    // the misreport BLO-36903 closed.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [allyReview(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "tracked"), "2026-10-09T12:49:27Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "deferred_finding" });
+    expect(commentReviewGateCheckConclusion(verdict)).toBe("neutral");
   });
 });
 

@@ -270,6 +270,17 @@ async function probeOne(
       // it. Surface 2 below keeps reading `surfaces.reviews` separately — it
       // asks a question only it can (the bodyless CHANGES_REQUESTED veto, keyed
       // on review STATE rather than on grammar).
+      // `source` is deliberately NOT carried here, so these rows take
+      // `evaluateCommentReviewGate`'s restrictive default and this probe's
+      // author rule stays surface-independent (BLO-34969). BLO-42525 exempts a
+      // formal `pull_request_review` from that rule in the MERGE gate only, and
+      // the two controls differ in blast radius, not in rigour: there the
+      // withholding publishes a red check that parks App-authored PRs under the
+      // landing bar, while here it is the documented and accepted outcome at
+      // :372-415 — `review:ally-clean` unreachable on that population, demoted
+      // to `warn` by `truthOnlyGap`, never `block`. Adding `source` here would
+      // reverse that ruling silently. Decide it on BLO-34969's own terms if it
+      // is ever revisited; do not let it ride along on a merge-gate fix.
       comments: [
         ...surfaces.comments.map((c) => ({ authorLogin: c.login, body: c.body, createdAt: c.createdAt })),
         ...surfaces.reviews
