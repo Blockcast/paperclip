@@ -40378,8 +40378,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        * Returns whether the write landed; callers must gate their counters on
        * it, so a lost fence is never reported as a delivery outcome this pass
        * did not actually get to own.
+       *
+       * `delivered` marks the one caller whose wake already reached a run
+       * (`dispatch_recovered`). A lost fence there discards only bookkeeping:
+       * nothing was declined, so it must not count as a suppression (Ally
+       * review on #2415).
        */
-      const finishClaimedRow = async (values: Record<string, unknown>) => {
+      const finishClaimedRow = async (values: Record<string, unknown>, delivered = false) => {
         const updated = await db
           .update(agentWakeupRequests)
           .set(values)
@@ -40392,7 +40397,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
           .returning({ id: agentWakeupRequests.id });
         if (updated.length === 0) {
-          recordWakeRedeliverySuppressed("fence_lost");
+          if (!delivered) recordWakeRedeliverySuppressed("fence_lost");
           logger.warn(
             { wakeupRequestId: row.id, agentId: row.agentId },
             "wake dispatch claim expired and was reclaimed before this pass finished; discarding "
@@ -40505,11 +40510,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
           continue;
         }
-        const fenced = await finishClaimedRow({
-          status: "dispatch_recovered",
-          finishedAt: now,
-          updatedAt: now,
-        });
+        const fenced = await finishClaimedRow(
+          {
+            status: "dispatch_recovered",
+            finishedAt: now,
+            updatedAt: now,
+          },
+          true,
+        );
         if (!fenced) continue;
         recovered += 1;
         // The delivery reached the queued state after all, just later than the

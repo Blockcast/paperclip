@@ -1476,13 +1476,9 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       // revision asserted the sum, which a mutation sweep showed passes with
       // the zero-init loop deleted -- an un-materialized child sums to zero
       // just as happily as an initialized one, so the test could not fail.
-      expect(await redeliverySuppressedCauses()).toEqual([
-        "already_delivered",
-        "claim_contended",
-        "claim_lost",
-        "fence_lost",
-      ]);
-      for (const cause of ["claim_contended", "claim_lost", "already_delivered", "fence_lost"]) {
+      const causes = ["already_delivered", "claim_contended", "claim_lost", "fence_lost"];
+      expect(await redeliverySuppressedCauses()).toEqual(causes);
+      for (const cause of causes) {
         expect(await redeliverySuppressedCount(cause), cause).toBe(0);
       }
     });
@@ -2094,6 +2090,83 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       // And the new owner's claim must survive intact. Without the fence the
       // row reads `dispatch_recovered` with a null claim, so the new owner's
       // own write later lands on a row someone else already retired.
+      const [marker] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, markerId));
+      expect(marker?.status).toBe("dispatch_retrying");
+      expect(marker?.claimedAt?.getTime()).toBe(stolenClaimAt.getTime());
+      // Ally review on #2415: this pass DID deliver -- the run committed before
+      // the lease lapsed -- so the fence discarded only bookkeeping. Nothing was
+      // declined, and counting it would report a suppression that did not
+      // happen. The counted shape is the next test.
+      expect(await runsForAgent(agentId)).toHaveLength(1);
+      expect(await redeliverySuppressedCount("fence_lost")).toBe(0);
+    });
+
+    it("counts fence_lost when a pass that did NOT deliver loses its lease before re-arming", async () => {
+      // The genuinely-suppressed shape: the re-dispatch failed, and by the time
+      // this pass re-arms the row a new owner holds it. A stale re-arm would
+      // hand the row back to the due-rows query while the new owner is still
+      // dispatching it, so the fence declining it is a real suppression.
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const markerId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: markerId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_opened",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_opened",
+              payload: { taskKey: "pr_review:Blockcast/test#25726-fence-undelivered" },
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+
+      // Every insert fails, so the enqueue transaction throws a non-HttpError
+      // (the re-arm path). The steal runs after that transaction rolls back --
+      // it holds the marker FOR UPDATE, so stealing inside it would deadlock.
+      const failing = dbWithFailingInserts(db, Number.MAX_SAFE_INTEGER);
+      const stolenClaimAt = new Date(now.getTime() + 60_000);
+      let stolen = 0;
+      const stealingDb = new Proxy(failing as unknown as object, {
+        get(target, prop) {
+          const value = (target as Record<PropertyKey, unknown>)[prop];
+          if (prop !== "transaction") return value;
+          return async (...args: unknown[]) => {
+            try {
+              return await (value as (...a: unknown[]) => Promise<unknown>)(...args);
+            } catch (err) {
+              if (stolen === 0) {
+                stolen += 1;
+                await db
+                  .update(agentWakeupRequests)
+                  .set({ status: "dispatch_retrying", claimedAt: stolenClaimAt })
+                  .where(eq(agentWakeupRequests.id, markerId));
+              }
+              throw err;
+            }
+          };
+        },
+      }) as unknown as typeof db;
+
+      const result = await heartbeatService(stealingDb, { skipQueuedRunDispatch: true })
+        .reconcileFailedWakeDispatches(now);
+
+      expect(stolen).toBe(1);
+      expect(result.stillFailing).toBe(0);
+      expect(await runsForAgent(agentId)).toHaveLength(0);
       const [marker] = await db
         .select()
         .from(agentWakeupRequests)

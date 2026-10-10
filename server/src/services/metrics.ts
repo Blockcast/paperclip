@@ -165,7 +165,7 @@ export const HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC = "paperclip_heartbeat_reco
  * construction, so a second dispatch minting a fresh wake row is invisible to
  * it. A zero there is vacuous. A non-zero here is positive proof the guard ran.
  *
- * Both causes are zero-initialized so the series exists before the first
+ * Every cause is zero-initialized so the series exists before the first
  * suppression; an absent series and a quiet one must not look alike.
  *
  * Non-zero is EXPECTED and must not page -- it means a crash or a concurrent
@@ -173,6 +173,13 @@ export const HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC = "paperclip_heartbeat_reco
  * alertable inversion is this staying at zero while duplicate runs appear.
  */
 export const WAKE_REDELIVERY_SUPPRESSED_METRIC = "paperclip_agent_wake_redelivery_suppressed_total";
+
+const WAKE_REDELIVERY_SUPPRESSED_CAUSES = [
+  "claim_contended",
+  "claim_lost",
+  "already_delivered",
+  "fence_lost",
+] as const;
 
 /**
  * Which of the four BLO-25726 guards declined this redelivery.
@@ -190,21 +197,16 @@ export const WAKE_REDELIVERY_SUPPRESSED_METRIC = "paperclip_agent_wake_redeliver
  * - `already_delivered`: `enqueueWakeup`'s enqueue-time claim found a live wake
  *   row under the same idempotency key and delivery token and handed back that
  *   run rather than committing a second one (AC1/AC2).
- * - `fence_lost`: this pass ran past its lease, another pass legitimately
- *   reclaimed the row, and this pass's terminal write was discarded rather than
- *   stamped over the new owner's live state.
+ * - `fence_lost`: this pass did NOT deliver (its re-dispatch failed, or a gate
+ *   declined or deferred it), ran past its lease, another pass reclaimed the
+ *   row, and this pass's re-arm or terminal write was discarded rather than
+ *   stamped over the new owner's live state -- a stale re-arm would hand the row
+ *   back to the due-rows query while the new owner is still dispatching it. A
+ *   fence lost AFTER this pass delivered is not counted: that wake reached a
+ *   run, nothing was declined, and the new owner's redelivery of it is counted
+ *   once, as `already_delivered`.
  */
-export type WakeRedeliverySuppressedCause =
-  | "claim_contended"
-  | "claim_lost"
-  | "already_delivered"
-  | "fence_lost";
-const WAKE_REDELIVERY_SUPPRESSED_CAUSES: readonly WakeRedeliverySuppressedCause[] = [
-  "claim_contended",
-  "claim_lost",
-  "already_delivered",
-  "fence_lost",
-];
+export type WakeRedeliverySuppressedCause = (typeof WAKE_REDELIVERY_SUPPRESSED_CAUSES)[number];
 /**
  * Wall-clock duration of the last COMPLETED periodic recovery chain, in seconds
  * (PEN-3314).
@@ -4846,7 +4848,9 @@ function ensureRegistry(): {
       name: WAKE_REDELIVERY_SUPPRESSED_METRIC,
       help:
         "Duplicate wake redeliveries declined by the BLO-25726 guards, labeled by which guard "
-        + "declined it. Non-zero is EXPECTED and must not page: it means the crash or "
+        + "declined it; cause=fence_lost counts only passes that did not deliver, so a delivered "
+        + "wake whose bookkeeping write lost its lease is not counted. Non-zero is EXPECTED and "
+        + "must not page: it means the crash or "
         + "concurrency window fired and the duplicate was suppressed. This is the observable "
         + "for a defect whose absence-based signal is unmeasurable -- heartbeat_runs carries no "
         + "idempotency key and its wakeupRequestId is 1:1 with runs, so a duplicate dispatch is "
