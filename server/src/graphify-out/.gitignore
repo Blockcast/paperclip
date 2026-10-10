@@ -1,8 +1,22 @@
-# graphify: commit graph.json/GRAPH_REPORT.md/.graphify_labels.json;
-# ignore the local interpreter pins, the HTML viz, cost accounting, and caches.
+# graphify: commit graph.json + GRAPH_REPORT.md. .graphify_labels.json is
+# committed only while it is already TRACKED here — that is the one durable
+# record that a human named these communities, and the reindex job then re-keys
+# those names onto each rebuild rather than overwriting them (BLO-40331). An
+# untracked copy is machine-generated and stays out of the index, so the first
+# commit of this file is always a deliberate human act.
+# .graphify_labels.json.sig is graphify's membership-signature sidecar for that
+# file (cli.py writes community_member_sigs() beside every labels persist). It
+# is derived, rewritten on every rebuild, and its only consumer is graphify's
+# own reuse path — which DROPS a label whose community changed rather than
+# re-keying it, so committing it would not preserve curated names. Ignore it.
+# manifest.json is graphify's incremental-rebuild cache: this job rebuilds with
+# --force from a fresh clone every run, so it is never read and a committed copy
+# can only ever describe an older graph (NOP#1079).
 cost.json
 .graphify_python
 .graphify_root
 graph.html
+.graphify_labels.json.sig
 cache/
 memory/
+manifest.json
