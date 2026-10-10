@@ -976,8 +976,9 @@ describe("evaluateCommentReviewGate", () => {
     });
 
     expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
-    // The identity, in the exact token a ledger entry is written with, so the
-    // reader can copy it instead of deriving it from the review (BLO-42525).
+    // The identity, by the same head and `<severity> <index>` a ledger entry is
+    // written with, so the reader can transcribe it instead of deriving it from
+    // the review (BLO-42525).
     expect(verdict.reason).toContain(`No ledger entry names prior:${OLD_HEAD.slice(0, 7)} "important 1"`);
     expect(verdict.reason).not.toContain("unrecognized");
     expect(verdict.reason.length).toBeLessThanOrEqual(140);
@@ -1031,11 +1032,14 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict.reason.length).toBeLessThanOrEqual(140);
 
     // Positive control, and the reason this fixture is not just the previous
-    // test with extra comments: point the SAME ledger entry at the mirroring
-    // head instead of the original and the carry clears outright. That is what
-    // pins the message to the mirroring head's own identity — without it the
-    // assertions above would hold just as well with no ledger entry at all,
-    // since INTERMEDIATE_HEAD is the newest carrier either way.
+    // test with extra comments: the assertions above would hold just as well
+    // with no ledger entry at all, since INTERMEDIATE_HEAD is the newest
+    // carrier either way. So point the SAME entry at the mirroring head
+    // instead of the original. The carry does not clear — it RELOCATES:
+    // INTERMEDIATE_HEAD is retired, but now no entry names OLD_HEAD, so
+    // OLD_HEAD carries and the message has to follow it. That is what pins the
+    // message to the carrying head's own identity rather than to whichever
+    // head happens to be newest.
     const mirrorRetired = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
       prAuthorLogin: ALLY_BOT_LOGIN,
@@ -1045,9 +1049,37 @@ describe("evaluateCommentReviewGate", () => {
         allyComment(dispositioningReview(CURRENT_HEAD, INTERMEDIATE_HEAD, "fixed"), "2026-08-04T22:09:19Z"),
       ],
     });
-    expect(
-      mirrorRetired.outcome === "carried_finding" ? mirrorRetired.carriedFromHeadSha : null,
-    ).not.toBe(INTERMEDIATE_HEAD);
+    expect(mirrorRetired).toMatchObject({
+      state: "failure",
+      outcome: "carried_finding",
+      carriedFromHeadSha: OLD_HEAD,
+    });
+    expect(mirrorRetired.reason).toContain(`No ledger entry names prior:${OLD_HEAD.slice(0, 7)} "important 1"`);
+    expect(mirrorRetired.reason).not.toContain(`prior:${INTERMEDIATE_HEAD.slice(0, 7)}`);
+
+    // And it clears only once every link in the chain has its own entry
+    // (#1707). With the reviewer as author that lands on the withheld
+    // positive rather than `clean` — the same author as every red above, so
+    // those reds were the ledger's, not the author's.
+    const chainRetired = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        original,
+        mirror,
+        allyComment(
+          reviewBody(CURRENT_HEAD, [
+            "### Prior Findings Dispositioned (2)",
+            `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — fixed — re-checked against this head.`,
+            `- **prior:${INTERMEDIATE_HEAD.slice(0, 7)} important 1** — fixed — re-checked against this head.`,
+            "### Critical Issues (0)",
+            "### Important Issues (0)",
+          ]),
+          "2026-08-04T22:09:19Z",
+        ),
+      ],
+    });
+    expect(chainRetired).toMatchObject({ state: "success", outcome: "not_evaluated" });
   });
 
   it("does not claim ledger silence about a finding the ledger explicitly names", () => {
