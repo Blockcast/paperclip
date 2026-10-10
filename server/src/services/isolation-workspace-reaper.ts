@@ -227,7 +227,8 @@ export interface IsolationWorkspaceReapResult {
    * Top level matches the allowlist, but a git checkout or worktree state sits
    * below it (`hasNestedCheckout`) — retained. Kept apart from `skippedLayout`
    * so that series keeps meaning "the tree is more heterogeneous than the
-   * allowlist was validated against" rather than absorbing a steady 13.
+   * allowlist was validated against" rather than absorbing a steady
+   * population (13 when the live tree was measured, BLO-36735).
    */
   retainedNestedCheckout: number;
   /** Resolved to a workspace row used inside the window — the live cohort. */
@@ -485,7 +486,7 @@ export async function reapIsolationWorkspaces(
     // allowlist rejects was skipped unexamined above, which is property 1.
     // Counted and logged apart from that skip — this one *was* examined and its
     // top level *did* match, so folding it in would hide a real rise in
-    // `skippedLayout` under a steady 13 (BLO-36735).
+    // `skippedLayout` under a steady nested-checkout population (BLO-36735).
     if (await hasNestedCheckout(dir)) {
       result.retainedNestedCheckout += 1;
       log.warn(
