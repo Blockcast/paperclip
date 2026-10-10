@@ -356,8 +356,29 @@ test("the real script still decides when run from a copy outside the checkout", 
 // the GitHub API.
 // ---------------------------------------------------------------------------
 
+// A fixture must inherit none of the runner's own GITHUB_*, RUNNER_* or MERGE_GROUP_* variables. These tests aim
+// GITHUB_OUTPUT and RUNNER_TEMP at files of their own, and an env spread that came after those keys let the
+// runner's values win: the decide-step test wrote its outputs into policy's real step-output file and read an
+// empty one back, red on ARC and green on a laptop where those variables do not exist.
+const RUNNER_ENV_PREFIXES = ["GITHUB_", "RUNNER_", "MERGE_GROUP_"];
+function withoutRunnerEnv(env) {
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !RUNNER_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))));
+}
+
+test("fixtures inherit none of the runner's own GITHUB_*, RUNNER_* or MERGE_GROUP_* variables", () => {
+  const inherited = withoutRunnerEnv({
+    PATH: "/usr/bin",
+    HOME: "/home/runner",
+    GITHUB_OUTPUT: "/home/runner/_work/_temp/_runner_file_commands/set_output_1",
+    GITHUB_EVENT_NAME: "pull_request",
+    RUNNER_TEMP: "/home/runner/_work/_temp",
+    MERGE_GROUP_BASE_SHA: "base",
+  });
+  assert.deepEqual(inherited, { PATH: "/usr/bin", HOME: "/home/runner" });
+});
+
 const GIT_ENV = {
-  ...process.env,
+  ...withoutRunnerEnv(process.env),
   GIT_CONFIG_NOSYSTEM: "1",
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_AUTHOR_NAME: "Fixture",
@@ -365,7 +386,7 @@ const GIT_ENV = {
   GIT_COMMITTER_NAME: "Fixture",
   GIT_COMMITTER_EMAIL: "fixture@example.invalid",
 };
-const BLOCK = ["c1", "c2", "c3", "x = 1", "c4", "c5", "c6"];
+const BLOCK =["c1", "c2", "c3", "x = 1", "c4", "c5", "c6"];
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "mg-trim-git-"));
