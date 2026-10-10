@@ -1083,3 +1083,24 @@ test("changing only the opencode LICENSE or PROVENANCE.md needs no entry", () =>
 
   assert.equal(check().ok, true);
 });
+
+test("the opencode reproduction recipe defers to the whole ledger instead of counting patches", () => {
+  // PEN-3916 review. The recipe said "apply the one Blockcast patch" while the
+  // tree carried three deviations across two entries; followed literally it
+  // rebuilt a tree WITHOUT the PEN-3732 PATH control. Entries are added by later
+  // PRs, so any count restated here goes stale -- the recipe must name the
+  // directory and say "every entry", and must not count patches or entries.
+  const provenance = read(`${OPENCODE.vendorDir}/PROVENANCE.md`);
+  const start = provenance.indexOf("### Reproducing it");
+  assert.ok(start >= 0, "PROVENANCE.md lost its '### Reproducing it' section");
+  const end = provenance.indexOf("\n### ", start + 1);
+  const recipe = provenance.slice(start, end < 0 ? undefined : end);
+
+  assert.match(recipe, /\]\(\.\/PROVENANCE-CHANGES\.d\/\)/, "the recipe must link the ledger directory itself");
+  assert.match(recipe, /\bevery entry\b/i, "the recipe must say to re-apply every entry, not a subset");
+  assert.doesNotMatch(
+    recipe,
+    /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|a single|\d+)\s+(?:Blockcast\s+)?(?:patch(?:es)?|entr(?:y|ies))\b/i,
+    "the recipe states a count of patches/entries; that count drifts as entries are added",
+  );
+});

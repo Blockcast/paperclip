@@ -138,8 +138,26 @@ cd paperclip-adapter-opencode-k8s
 git archive 133f4c1a65085a6c141aab5aa8818afe51e2689c | tar -x -C <this directory>
 ```
 
-44 files. Then apply the one Blockcast patch recorded under
-[Local modifications](#local-modifications).
+That is the **upstream half only**: 44 files, byte-for-byte `133f4c1`. It is
+not this directory. To reproduce this directory, re-apply **every entry** in
+[PROVENANCE-CHANGES.d/](./PROVENANCE-CHANGES.d/) — each `*.md` except
+`README.md`, which documents the directory. Do not count them here: later PRs
+add entries, so a count restated in this file goes stale, and
+`scripts/__tests__/provenance-union-merge.test.mjs` rejects one.
+
+Measured at vendor time by `diff -rq` of that snapshot against this directory:
+6 files added, 5 modified, 0 removed — three distinct deviations, recorded in
+[pen-3732.md](./PROVENANCE-CHANGES.d/pen-3732.md) and
+[pen-3916.md](./PROVENANCE-CHANGES.d/pen-3916.md):
+
+| deviation | files | recorded in |
+|---|---|---|
+| PEN-3732 GitHub-wrapper PATH prepend — a **security control**; a reproduction without it lets an inherited or operator-set PATH put agent-writable PVC directories ahead of the wrappers | `src/server/job-manifest.ts` (the only non-test source change under `src/`); five cases in `src/server/job-manifest.test.ts` | `pen-3732.md` |
+| vendor-time additions and version | `package.json` `0.2.7` and `package-lock.json` `0.2.6` (upstream's lockfile lagged its own `package.json`) both → `0.2.8-blockcast.1`; added `src/server/rbac-secret-verbs.test.ts`, `LICENSE`, `PROVENANCE.md`, `PROVENANCE-CHANGES.d/` | `pen-3916.md` |
+| three derived path literals | `src/server/job-manifest.test.ts` (2 sites), `src/server/runtime-pin.test.ts` (1 site) | `pen-3916.md` |
+
+To check a reproduction, `diff -rq` it against this directory: no difference
+should remain.
 
 ### Deliberate exclusions
 
