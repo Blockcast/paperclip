@@ -1310,7 +1310,36 @@ export const PROCESS_OPEN_FDS_BY_CLASS_METRIC = "paperclip_process_open_fds_by_c
 export const POOL_IDLE_IN_TRANSACTION_SERIES = "idle_in_transaction_session_timeout_pool";
 /** Queue wait observed when a sanctioned GitHub PR-review run starts. */
 export const PR_REVIEW_QUEUE_WAIT_METRIC = "paperclip_pr_review_queue_wait_seconds";
-export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [60, 300, 600, 900, 1800, 3600, 7200, 14400, 28800];
+/**
+ * BLO-31298. Edges past 28800 for the same reason
+ * {@link RUN_DISPATCH_WAIT_BUCKETS_SECONDS} has them, found the hard way on
+ * this metric: with 28800 (8h) as the top finite edge, every sample in the
+ * saturated regime lands in +Inf and histogram_quantile() returns exactly
+ * 28800 — the last finite edge — however bad the wait actually is.
+ *
+ * Measured 2026-10-10T11:44Z, 61h into a continuously-firing
+ * PaperclipPrReviewQueueWaitSaturated: `rate(..._bucket[6h])` was 0 for every
+ * finite le and 0.0025 at +Inf (100% of samples past 8h), p95 read a flat
+ * 28800 for 14h straight, and the uncensored `_sum/_count` mean was 48941s
+ * (13.6h) and rising. The alert still fires correctly — the 3600 threshold is
+ * far below the censoring point — but it carries no severity gradient above
+ * 8h, and the flat p95 panel reads as "stable" while the wait triples.
+ */
+export const PR_REVIEW_QUEUE_WAIT_BUCKETS_SECONDS = [
+  60,
+  300,
+  600,
+  900,
+  1800,
+  3600,
+  7200,
+  14400,
+  28800,
+  43200,
+  86400,
+  172800,
+  259200,
+];
 /**
  * BLO-25024. Time-to-dispatch for EVERY heartbeat run, not just PR-review ones.
  *
