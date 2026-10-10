@@ -171,15 +171,27 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(prWorkflow).toContain("node scripts/smoke/opencode-responses-replay.mjs");
   });
 
-  it("builds the claude_k8s adapter from in-tree vendored source, not a pinned fork clone", () => {
+  it("builds BOTH k8s adapters from in-tree vendored source, not a pinned fork clone", () => {
     // BLO-17980: CLAUDE_K8S_REF is retired. The adapter source lives in this
     // repo so the credential-injection fix is reviewable under our own CI.
     expect(serverDockerfile).not.toMatch(/^ARG CLAUDE_K8S_REF=/m);
     expect(serverDockerfile).not.toContain("clone https://github.com/kkroo/paperclip-adapter-claude-k8s.git");
     expect(serverDockerfile).toContain("COPY vendor/paperclip-adapter-claude-k8s /vendor/claude-k8s-src");
     expect(serverDockerfile).toContain("mv paperclip-adapter-claude-k8s-*.tgz /vendor/paperclip-adapter-claude-k8s.tgz");
-    // opencode_k8s still clones, so the gh_token secret must survive.
-    expect(serverDockerfile).toContain("clone https://github.com/kkroo/paperclip-adapter-opencode-k8s.git");
+
+    // PEN-3916: opencode_k8s is vendored too. This line previously asserted the
+    // OPPOSITE — that the clone survived, because gh_token depended on it.
+    expect(serverDockerfile).not.toMatch(/^ARG OPENCODE_K8S_REF=/m);
+    expect(serverDockerfile).not.toContain("clone https://github.com/kkroo/paperclip-adapter-opencode-k8s.git");
+    expect(serverDockerfile).toContain("COPY vendor/paperclip-adapter-opencode-k8s /vendor/opencode-k8s-src");
+    expect(serverDockerfile).toContain("mv paperclip-adapter-opencode-k8s-*.tgz /vendor/paperclip-adapter-opencode-k8s.tgz");
+
+    // That clone was the LAST consumer of the gh_token build secret, so the
+    // `vendor` stage must now mount no secret at all. Asserted as the absence
+    // of the mount rather than of the word, because the Dockerfile still
+    // discusses gh_token in prose (the BLO-32824 note telling the Penstock
+    // launcher stage not to reach for a board-scoped token).
+    expect(serverDockerfile).not.toContain("type=secret,id=gh_token");
   });
 
   it("keeps the claude_k8s adapter changelog as the history of the vendored source", () => {
@@ -222,13 +234,21 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(serverDockerfile).toContain("execute/job-manifest suite 230/230");
   });
 
-  it("vendors the opencode_k8s adapter commit and executes its env-guard and runtime regressions", () => {
-    // BLO-33204: this is the SECOND place the pin is asserted; the canonical one is
-    // scripts/opencode-k8s-runtime-cache-pin.test.js, which also holds the known-bad
-    // list. Both must move together — 87a865de was orphaned by adapter #62's squash
-    // and is now asserted *against* over there, so leaving this line stale puts the
-    // two suites in direct contradiction.
-    expect(serverDockerfile).toContain("ARG OPENCODE_K8S_REF=133f4c1a65085a6c141aab5aa8818afe51e2689c");
+  it("vendors the opencode_k8s adapter in-tree and executes its env-guard and runtime regressions", () => {
+    // PEN-3916: there is no pin to assert any more. This used to be the SECOND
+    // place `ARG OPENCODE_K8S_REF` was asserted (the canonical one being
+    // scripts/opencode-k8s-runtime-cache-pin.test.js, which also held the
+    // known-bad list); both that script and the ARG are retired, because the
+    // adapter is now built from vendored source rather than a clone.
+    //
+    // What replaces the pin assertion is the pair below: the vendor stage must
+    // COPY the in-tree source, and the ARG must be GONE. The second half is
+    // the load-bearing one — without it a reintroduced ARG would sit beside a
+    // COPY and nothing here would notice, which is the drift this test exists
+    // to catch. The remaining expectations in this block assert the retained
+    // fork-pin changelog, which is kept as history (see the Dockerfile).
+    expect(serverDockerfile).toContain("COPY vendor/paperclip-adapter-opencode-k8s /vendor/opencode-k8s-src");
+    expect(serverDockerfile).not.toMatch(/^ARG OPENCODE_K8S_REF=/m);
     expect(serverDockerfile).toContain(
       "npm test -- src/server/env-guard-plugin.test.ts src/server/execute.test.ts",
     );

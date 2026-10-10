@@ -1,15 +1,37 @@
-# `paperclip-adapter-claude-k8s` repo ownership
+# k8s-Job adapter repo ownership
 
-**Status: open — waiting on one human GitHub action.**
-**Decision date: 2026-08-07.** Tracking issue: BLO-18174.
+**Status: RESOLVED for every adapter this repo builds, as of 2026-10-10
+(PEN-3916).** Neither `claude_k8s` nor `opencode_k8s` is cloned from
+`kkroo/*` any more; both are vendored in-tree under `vendor/` and both
+`ARG *_REF` pins are retired. **No human GitHub action is outstanding.**
+
+**Original decision date: 2026-08-07.** Tracking issues: BLO-18174 (the
+question), BLO-17980 (`claude_k8s` vendored 2026-08-06), PEN-3916
+(`opencode_k8s` vendored 2026-10-10).
+
+> **Read this before acting on anything below.** The transfer and mirror
+> sections are retained as a RECORD of the options that were considered, and
+> because the underlying repositories still exist and are still personally
+> owned. They are **no longer asks**. Vendoring resolved the dependency without
+> needing either, which is the point worth carrying forward: the fallback that
+> required no specific individual turned out not to be the mirror, but to be
+> taking the code in-tree.
+>
+> This file previously said the ownership question "now applies only to
+> `paperclip-adapter-opencode-k8s`". That sentence is now spent.
 
 ## Why this file exists
 
-The `claude_k8s` adapter plugin renders every agent Job/Pod spec this fleet
-runs. It lives at `github.com/kkroo/paperclip-adapter-claude-k8s` — a **personal
-account**, not the `Blockcast` org.
+Each k8s-Job adapter plugin renders every agent Job/Pod spec this fleet runs
+for its adapter type — including the Job's PATH, which is a security control.
+Both lived on a **personal account**, not the `Blockcast` org:
+`github.com/kkroo/paperclip-adapter-claude-k8s` and
+`github.com/kkroo/paperclip-adapter-opencode-k8s`.
 
-That ownership has three operational consequences, all re-verified 2026-08-01:
+That ownership had three operational consequences, originally verified
+2026-08-01 against the claude repo and re-verified 2026-10-09 against the
+opencode one with `git push --dry-run` (which writes nothing) — the upstream
+repo, its existing `allyblockcast` fork, and `POST /repos/…/forks` all `403`:
 
 1. **No agent can open a pull request against it.** The `allyblockcast` App
    installation token returns `403 Resource not accessible by integration` on
@@ -100,11 +122,23 @@ That vendoring also settled the stale-reference question flagged here: the
 `parent: none` — it is not a GitHub fork of anything. `vendor/README.md` has
 been corrected accordingly.
 
-For opencode_k8s, both paths below must still change together:
+**Resolved for opencode_k8s as of 2026-10-10 (PEN-3916).** That adapter is no
+longer cloned either: its source is vendored at
+`vendor/paperclip-adapter-opencode-k8s/`, `ARG OPENCODE_K8S_REF` is retired, and
+the `vendor` build stage now needs no GitHub credential at all — `gh_token`
+(`PAPERCLIP_BOARD_TOKEN`) existed solely for that clone and was removed from
+`docker.yml` with it. The guards built around the pin went with it too
+(`scripts/check-opencode-k8s-pin-reachable.mjs`,
+`scripts/opencode-k8s-runtime-cache-pin.test.js`, the hourly
+`adapter-pin-drift-monitor.yml`); the tree properties they asserted are now
+ordinary in-tree tests. See
+`vendor/paperclip-adapter-opencode-k8s/PROVENANCE.md`.
 
-- `Dockerfile` — the vendor-stage `git clone` of
-  `kkroo/paperclip-adapter-opencode-k8s`, pinned by `ARG OPENCODE_K8S_REF`.
-- `vendor/README.md` — the repository URL under "Fork pins".
+That vendoring also discharged PEN-3732, whose PATH fix had nowhere to be sent:
+it is now `PROVENANCE-CHANGES.d/pen-3732.md` in the vendored tree.
+
+**Nothing in this repository references either `kkroo/*` repo as a build
+input any more.** The remaining mentions are provenance and history.
 
 `adapter-plugins.json` and `/opt/paperclip-bundled-adapters` are **not**
 affected: they are local-dev only. Production packaging clones, builds and packs

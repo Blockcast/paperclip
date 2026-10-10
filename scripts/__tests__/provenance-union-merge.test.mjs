@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -8,6 +8,7 @@ import { after, test } from "node:test";
 import {
   LOG,
   LOG_DIR,
+  VENDOR_TREES,
   NOT_SOURCE,
   VENDOR_DIR,
   checkVendoredProvenanceLog,
@@ -960,4 +961,125 @@ test("an entry with a non-ASCII filename satisfies the guard", () => {
   commit("record the change under a non-ASCII entry name");
 
   assert.deepEqual(check(), { ok: true });
+});
+
+
+// --------------------------------------------------------------------------
+// PEN-3916. The guard now covers TWO vendored trees. Everything above exercises
+// the claude tree, which the module-level constants still name -- so without
+// these the opencode tree could be dropped from VENDOR_TREES, or its checks
+// could be inert, and this file would stay green. That is the failure mode the
+// whole guard exists to prevent, one level up.
+// --------------------------------------------------------------------------
+
+const OPENCODE = VENDOR_TREES.find(
+  (t) => t.vendorDir === "vendor/paperclip-adapter-opencode-k8s",
+);
+
+test("both vendored adapter trees are registered, and the claude one stays first", () => {
+  assert.deepEqual(
+    VENDOR_TREES.map((t) => t.vendorDir),
+    ["vendor/paperclip-adapter-claude-k8s", "vendor/paperclip-adapter-opencode-k8s"],
+  );
+  // The default `tree` parameter is VENDOR_TREES[0], and every test above
+  // relies on that default being the claude tree. Pinning the order keeps a
+  // reordering from silently re-pointing all of them.
+  assert.equal(VENDOR_TREES[0].vendorDir, VENDOR_DIR);
+});
+
+test("the opencode tree has no frozen predecessor, and that is deliberate", () => {
+  // BLO-41101's frozen rule exists for a single-table file the claude tree
+  // cannot rewrite. The opencode tree started with the per-change directory,
+  // so there is nothing to freeze -- and a null here must mean "skip", not
+  // "check a path that does not exist".
+  assert.equal(OPENCODE.frozenLog, null);
+  assert.deepEqual(OPENCODE.notSource, [
+    `${OPENCODE.vendorDir}/LICENSE`,
+    `${OPENCODE.vendorDir}/PROVENANCE.md`,
+  ]);
+  assert.equal(OPENCODE.logDir, `${OPENCODE.vendorDir}/PROVENANCE-CHANGES.d`);
+});
+
+test("every registered tree's declared paths exist in the working tree", () => {
+  // A tree registered at a path nobody ships is a check that can never fire.
+  for (const tree of VENDOR_TREES) {
+    for (const rel of [tree.vendorDir, tree.logDir, `${tree.logDir}/README.md`, ...tree.notSource]) {
+      assert.ok(
+        existsSync(new URL(rel, repoRoot)),
+        `${rel} is registered in VENDOR_TREES but is not in the repository`,
+      );
+    }
+  }
+});
+
+function opencodeScratchRepo() {
+  const dir = mkdtempSync(join(tmpdir(), "provenance-guard-opencode-"));
+  scratchDirs.push(dir);
+  const git = (...args) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+  const write = (rel, body) => {
+    mkdirSync(dirname(join(dir, rel)), { recursive: true });
+    writeFileSync(join(dir, rel), body);
+  };
+
+  git("init", "--quiet", "--initial-branch=master");
+  git("config", "user.email", "test@example.com");
+  git("config", "user.name", "test");
+
+  write(`${OPENCODE.vendorDir}/LICENSE`, "MIT\n");
+  write(`${OPENCODE.vendorDir}/PROVENANCE.md`, "# Provenance\n");
+  write(`${OPENCODE.vendorDir}/src/server/job-manifest.ts`, "export const manifest = 1;\n");
+  write(`${OPENCODE.logDir}/README.md`, "# Per-change provenance entries\n");
+  git("add", "-A");
+  git("commit", "--quiet", "-m", "seed");
+
+  const base = git("rev-parse", "HEAD").trim();
+  return {
+    write,
+    commit: (m) => { git("add", "-A"); git("commit", "--quiet", "-m", m); },
+    check: () => checkVendoredProvenanceLog({ base, head: "HEAD", cwd: dir, tree: OPENCODE }),
+  };
+}
+
+test("an opencode vendored source change with no entry is rejected", () => {
+  const { write, commit, check } = opencodeScratchRepo();
+  write(`${OPENCODE.vendorDir}/src/server/job-manifest.ts`, "export const manifest = 2;\n");
+  commit("touch vendored opencode source");
+
+  const result = check();
+  assert.equal(result.ok, false, "the opencode tree must be enforced, not merely registered");
+  assert.match(result.reason, /gained no entry/);
+  assert.ok(
+    result.detail.some((line) => line.includes(`${OPENCODE.vendorDir}/src/server/job-manifest.ts`)),
+    "the failure should name the changed file",
+  );
+});
+
+test("an opencode vendored source change WITH an entry passes", () => {
+  // The negative control for the test above: without this, a guard that
+  // rejected every opencode change unconditionally would also look correct.
+  const { write, commit, check } = opencodeScratchRepo();
+  write(`${OPENCODE.vendorDir}/src/server/job-manifest.ts`, "export const manifest = 2;\n");
+  write(`${OPENCODE.logDir}/pen-9999.md`, "# PEN-9999\n\nBumped the manifest.\n");
+  commit("touch vendored opencode source and record it");
+
+  assert.equal(check().ok, true);
+});
+
+test("an empty opencode entry does not satisfy the guard", () => {
+  const { write, commit, check } = opencodeScratchRepo();
+  write(`${OPENCODE.vendorDir}/src/server/job-manifest.ts`, "export const manifest = 2;\n");
+  write(`${OPENCODE.logDir}/pen-9999.md`, "   \n");
+  commit("record nothing");
+
+  const result = check();
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /records nothing/);
+});
+
+test("changing only the opencode LICENSE or PROVENANCE.md needs no entry", () => {
+  const { write, commit, check } = opencodeScratchRepo();
+  write(`${OPENCODE.vendorDir}/PROVENANCE.md`, "# Provenance\n\nReworded.\n");
+  commit("prose only");
+
+  assert.equal(check().ok, true);
 });

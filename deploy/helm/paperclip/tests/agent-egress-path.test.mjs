@@ -589,6 +589,37 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
     "job-manifest.ts must take the wrapper directory from runtime-pin.ts, the one place it is declared",
   );
 
+  // PEN-3916: opencode_k8s prepends the same directory, on the same
+  // unreachable-from-Helm surface. The assertion above used to stand alone,
+  // because opencode_k8s was cloned from a fork at a pinned SHA and there was no
+  // in-tree file to read; `scripts/check-opencode-k8s-pin-reachable.mjs` covered
+  // it by grepping the pinned tree over the network for a MENTION of the
+  // directory -- which, as Ally noted on #2392, attests presence and not
+  // ordering. The source is vendored now, so this is an ordinary file read, and
+  // the ORDERING itself is asserted behaviourally by the adapter's own suite
+  // (`buildJobManifest -- GitHub egress wrapper PATH ordering`, five cases
+  // including present-but-late). Neither property depends on a network probe.
+  //
+  // The shape differs from claude_k8s above deliberately, and it is not drift to
+  // reconcile here: PEN-3714's declare-once refactor moved the claude constant
+  // into runtime-pin.ts because its runtime-pin bootstrap also keys PATH
+  // ordering off it. This adapter's runtime-pin.ts does not, so PEN-3732's patch
+  // declares the directory in job-manifest.ts, its only consumer. One consumer,
+  // one declaration -- the property both assertions carry is the same: the
+  // directory the adapter prepends is the directory the chart names.
+  assert.ok(
+    fs
+      .readFileSync(
+        path.join(
+          repoRoot,
+          "vendor/paperclip-adapter-opencode-k8s/src/server/job-manifest.ts",
+        ),
+        "utf8",
+      )
+      .includes(`const GITHUB_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`),
+    "the opencode_k8s adapter must prepend the same directory the chart names",
+  );
+
   // The third place the directory is named: inside the wrapper scripts
   // themselves. `git` and `github-mcp-server` chain-load
   // `<dir>/paperclip-github-token-env` as an ABSOLUTE path, so they do not
