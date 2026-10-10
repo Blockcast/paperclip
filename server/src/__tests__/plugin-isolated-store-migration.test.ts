@@ -526,7 +526,9 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
       }
     };
 
-    await expect(npmInstallPlugin(ISOLATED_PACKAGE, dir, { installPeers: true })).resolves.toBeUndefined();
+    await expect(
+      npmInstallPlugin(ISOLATED_PACKAGE, dir, { installPeers: true, fallbackToLegacyPeerDeps: true }),
+    ).resolves.toBeUndefined();
 
     const calls = installArgsFor(dir);
     expect(calls.length).toBe(2);
@@ -552,6 +554,27 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
     ).rejects.toThrow(/ERESOLVE/);
 
     expect(installArgsFor(dir).length).toBe(1);
+  }, 30_000);
+
+  it("BLO-34794: the retry is opt-in — a caller that omits the flag never gets the destructive retry", async () => {
+    // Fail-closed default: forgetting `fallbackToLegacyPeerDeps` must get the
+    // safe behaviour. Mocked so the legacy argv WOULD succeed; a second call
+    // here means `undefined` re-enabled the retry that prunes an installed SDK.
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-optin-"));
+    cleanupPaths.add(dir);
+
+    npmMock.onInstall = (argv) => {
+      if (!argv.includes(dir)) return;
+      if (!argv.includes("--legacy-peer-deps")) {
+        throw new Error("ERESOLVE could not resolve peer dependency");
+      }
+    };
+
+    await expect(npmInstallPlugin(ISOLATED_PACKAGE, dir, { installPeers: true })).rejects.toThrow(/ERESOLVE/);
+
+    const calls = installArgsFor(dir);
+    expect(calls.length).toBe(1);
+    expect(calls[0]).not.toContain("--legacy-peer-deps");
   }, 30_000);
 
   it("BLO-34794: the install path never falls back to --legacy-peer-deps on an isolated tree", async () => {
@@ -585,6 +608,7 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
 
     const installs = npmMock.calls.filter((argv) => argv[0] === "install");
     expect(installs.length).toBe(1);
+    expect(installs[0]).toContain(resolveDefaultInstallDir(ISOLATED_PACKAGE, sharedDir));
     expect(installs[0]).not.toContain("--legacy-peer-deps");
   }, 30_000);
 
