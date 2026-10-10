@@ -1,0 +1,24 @@
+-- BLO-32638 / Ally review on Blockcast/paperclip#2352: back the routine
+-- fire-gap gauge's per-routine "most recent COMPLETED fire" probe.
+--
+-- refreshRoutineFireGapMetrics (#2352) runs, on every scrape-metrics collector
+-- tick on every control-plane replica,
+--
+--   (select max(completed_at) from routine_runs
+--     where routine_id = r.id and status = 'completed')
+--
+-- once per active scheduled routine. No existing routine_runs index carries
+-- `status`, so without this each probe walks every run that routine has ever
+-- had, and `completed` is the monotonically-growing majority of a table that
+-- nothing trims. Partial on the one status, with completed_at after routine_id,
+-- so the planner answers each max() with a single backward index probe and the
+-- indexed set holds only the receipts the gauge reads.
+--
+-- Not a created_at bound instead: that silently changes the answer for a
+-- routine whose last completed fire predates the window (it would age from
+-- routines.created_at and report a wrong value).
+--
+-- Plain, not CONCURRENTLY: Drizzle migrations are transactional, and
+-- routine_runs is in the small bucket (packages/db/src/table-size-estimates.ts),
+-- so the SHARE lock is held only for a build over a few thousand rows.
+CREATE INDEX IF NOT EXISTS "routine_runs_routine_completed_idx" ON "routine_runs" USING btree ("routine_id","completed_at") WHERE "routine_runs"."status" = 'completed';
