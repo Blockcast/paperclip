@@ -39,18 +39,47 @@ const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journa
  * `CREATE INDEX CONCURRENTLY` takes only ShareUpdateExclusive, which blocks
  * neither readers nor writers, so patience there is free. Here it is not.
  */
-const MIGRATION_DDL_LOCK_TIMEOUT_MS = 3_000;
-/**
- * Attempts per migration file before a lock race is reported as a failure.
- *
- * 12 attempts against a 3s lock_timeout and a 1s..8s backoff is a ceiling of
- * roughly 100s per file — bounded, and well under the 2-minute single wait
- * `concurrent-index-guard` already tolerates on the same startup path, so this
- * adds no new worst case to pod startup.
- */
-const MIGRATION_LOCK_RETRY_ATTEMPTS = 12;
+export const MIGRATION_DDL_LOCK_TIMEOUT_MS = 3_000;
+/** Attempts per migration file before a lock race is reported as a failure. */
+export const MIGRATION_LOCK_RETRY_ATTEMPTS = 12;
 const MIGRATION_LOCK_RETRY_BASE_DELAY_MS = 1_000;
 const MIGRATION_LOCK_RETRY_MAX_DELAY_MS = 8_000;
+
+function migrationLockRetryDelayMs(attempt: number): number {
+  return Math.min(MIGRATION_LOCK_RETRY_BASE_DELAY_MS * attempt, MIGRATION_LOCK_RETRY_MAX_DELAY_MS);
+}
+
+/**
+ * Wall-clock window, from the start of a file's first attempt, inside which a
+ * retry may still START. Derived rather than chosen: it is exactly what
+ * `MIGRATION_LOCK_RETRY_ATTEMPTS` attempts cost when each one loses at
+ * `MIGRATION_DDL_LOCK_TIMEOUT_MS` — 12 x 3s + (1+2+...+7+8+8+8+8)s backoff =
+ * 36s + 60s = 96s — so the attempt count it was sized for is never cut short.
+ *
+ * Why a deadline and not just the attempt count: an attempt is NOT uniformly
+ * 3s. It also runs `ensureConcurrentIndexesForMigration`, whose own session
+ * keeps the guard's `DEFAULT_DDL_LOCK_TIMEOUT_MS` (2 min) and
+ * `DEFAULT_STATEMENT_TIMEOUT_MS` (10 min) — deliberately, since patience is free
+ * for `CREATE INDEX CONCURRENTLY` (see `MIGRATION_DDL_LOCK_TIMEOUT_MS`). Counted
+ * in attempts, 12 guard lock waits alone are 24 min: past the
+ * `DEFAULT_LOCK_WAIT_TIMEOUT_MS` (20 min) a sibling pod waits for the
+ * serializing lock this sequence holds, so pod A's retries would crash-loop
+ * pod B — the rev-795 failure one hop removed.
+ *
+ * Ceiling per file, which the next reader can check: no retry STARTS later
+ * than this budget after the first attempt began, so a file costs at most this
+ * budget plus ONE attempt — the single attempt the runner made before
+ * BLO-42005, never a multiple of it. For a race lost in the guard's session
+ * that is 96s + one `DEFAULT_DDL_LOCK_TIMEOUT_MS` wait = 96s + 2 min, well under
+ * the sibling's 20 min (pinned by migration-lock-contention.test.ts). A slow
+ * index build or statement is bounded by `DEFAULT_STATEMENT_TIMEOUT_MS` as it
+ * was before, and is not replayed: `57014` is not a retryable SQLSTATE.
+ */
+export const MIGRATION_LOCK_RETRY_BUDGET_MS = Array.from(
+  { length: MIGRATION_LOCK_RETRY_ATTEMPTS },
+  (_, index) => MIGRATION_DDL_LOCK_TIMEOUT_MS
+    + (index + 1 < MIGRATION_LOCK_RETRY_ATTEMPTS ? migrationLockRetryDelayMs(index + 1) : 0),
+).reduce((total, ms) => total + ms, 0);
 
 /**
  * SQLSTATEs worth replaying a whole migration file for.
@@ -72,22 +101,25 @@ function isMigrationLockContention(error: unknown): boolean {
   return typeof code === "string" && MIGRATION_LOCK_RETRY_SQLSTATES.has(code);
 }
 
-/** Run `apply`, replaying it with backoff while it keeps losing a lock race. */
-async function withMigrationLockRetry(
+/**
+ * Run `apply`, replaying it with backoff while it keeps losing a lock race —
+ * for at most `MIGRATION_LOCK_RETRY_ATTEMPTS` attempts, and never starting one
+ * past `MIGRATION_LOCK_RETRY_BUDGET_MS` after the first began.
+ */
+export async function withMigrationLockRetry(
   migrationFile: string,
   apply: () => Promise<void>,
   log?: (message: string) => void,
 ): Promise<void> {
+  const deadline = Date.now() + MIGRATION_LOCK_RETRY_BUDGET_MS;
   for (let attempt = 1; ; attempt += 1) {
     try {
       await apply();
       return;
     } catch (error) {
       if (attempt >= MIGRATION_LOCK_RETRY_ATTEMPTS || !isMigrationLockContention(error)) throw error;
-      const delayMs = Math.min(
-        MIGRATION_LOCK_RETRY_BASE_DELAY_MS * attempt,
-        MIGRATION_LOCK_RETRY_MAX_DELAY_MS,
-      );
+      const delayMs = migrationLockRetryDelayMs(attempt);
+      if (Date.now() + delayMs > deadline) throw error;
       log?.(
         `${migrationFile}: lost the lock race on attempt ${attempt}/${MIGRATION_LOCK_RETRY_ATTEMPTS} `
         + `(${(error as { code?: string }).code}); retrying in ${delayMs}ms`,
@@ -1276,6 +1308,8 @@ export async function applyPendingMigrations(
   if (initialState.status === "upToDate") return;
 
   if (initialState.reason === "no-migration-journal-empty-db") {
+    // Deliberately outside BLO-42005's serializing lock, timeouts and retry: an
+    // empty database has no old pods and no live traffic to race.
     const sql = createUtilitySql(url);
     try {
       const db = drizzlePg(sql);

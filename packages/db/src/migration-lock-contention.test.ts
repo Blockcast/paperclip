@@ -20,10 +20,20 @@
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
-import { applyPendingMigrations } from "./client.js";
-import { SERIALIZING_LOCK_KEY } from "./concurrent-index-guard.js";
+import {
+  applyPendingMigrations,
+  MIGRATION_DDL_LOCK_TIMEOUT_MS,
+  MIGRATION_LOCK_RETRY_ATTEMPTS,
+  MIGRATION_LOCK_RETRY_BUDGET_MS,
+  withMigrationLockRetry,
+} from "./client.js";
+import {
+  DEFAULT_DDL_LOCK_TIMEOUT_MS,
+  DEFAULT_LOCK_WAIT_TIMEOUT_MS,
+  SERIALIZING_LOCK_KEY,
+} from "./concurrent-index-guard.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -255,4 +265,65 @@ describeEmbeddedPostgres("transactional migration lock contention", () => {
     },
     180_000,
   );
+});
+
+/**
+ * The retry budget's ceiling, as Ally's review of #2413 framed it: an attempt is
+ * not uniformly `MIGRATION_DDL_LOCK_TIMEOUT_MS`, because it also runs
+ * `ensureConcurrentIndexesForMigration` under the guard's own
+ * `DEFAULT_DDL_LOCK_TIMEOUT_MS`. No database needed: each attempt advances a
+ * fake clock by what it would really cost and then loses the race.
+ */
+describe("migration lock retry budget", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Retry `attemptCostMs`-long attempts, the first `losses` losing the race. */
+  async function retryLosingAttempts(
+    attemptCostMs: number,
+    losses: number,
+  ): Promise<{ attempts: number; elapsedMs: number; error: unknown }> {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    let attempts = 0;
+    const settled = withMigrationLockRetry("0999_example.sql", async () => {
+      attempts += 1;
+      vi.setSystemTime(Date.now() + attemptCostMs);
+      if (attempts <= losses) {
+        throw Object.assign(new Error("canceling statement due to lock timeout"), { code: "55P03" });
+      }
+    }).then(() => null, (error: unknown) => error);
+    await vi.runAllTimersAsync();
+    const error = await settled;
+    return { attempts, elapsedMs: Date.now() - startedAt, error };
+  }
+
+  it("does not multiply an in-loop guard lock wait past a sibling's serializing-lock wait", async () => {
+    // Every attempt spends the guard's full lock_timeout and loses. Counted in
+    // attempts alone that is 12 x 2 min + backoff = 25 min, and the sibling pod
+    // waiting on SERIALIZING_LOCK_KEY gives up at 20. Reverting the wall-clock
+    // deadline in `withMigrationLockRetry` fails both assertions.
+    const { attempts, elapsedMs, error } = await retryLosingAttempts(
+      DEFAULT_DDL_LOCK_TIMEOUT_MS,
+      Number.POSITIVE_INFINITY,
+    );
+    expect(error).toMatchObject({ code: "55P03" });
+    expect(elapsedMs).toBeLessThan(DEFAULT_LOCK_WAIT_TIMEOUT_MS);
+    expect(attempts).toBe(1);
+    // The documented ceiling — budget plus one guard lock wait — itself fits.
+    expect(MIGRATION_LOCK_RETRY_BUDGET_MS + DEFAULT_DDL_LOCK_TIMEOUT_MS)
+      .toBeLessThan(DEFAULT_LOCK_WAIT_TIMEOUT_MS);
+  });
+
+  it("still spends every attempt on races lost at the migration's own lock_timeout", async () => {
+    // The deadline is derived from these attempts, so it must not cut them
+    // short: a budget sized too small fails here.
+    const { attempts, error } = await retryLosingAttempts(
+      MIGRATION_DDL_LOCK_TIMEOUT_MS,
+      MIGRATION_LOCK_RETRY_ATTEMPTS - 1,
+    );
+    expect(error).toBeNull();
+    expect(attempts).toBe(MIGRATION_LOCK_RETRY_ATTEMPTS);
+  });
 });
