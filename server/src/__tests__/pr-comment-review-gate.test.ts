@@ -433,6 +433,80 @@ describe("evaluateCommentReviewGate", () => {
     expect(verdict.outcome).not.toBe("carried_finding");
   });
 
+  it("reads Ally's emphasised ledger verb, the libmmt#524 shape (BLO-42492)", () => {
+    // Ally emits the verb bolded as well as bare: `— **fixed** —`. The prose
+    // ledger pattern required a bare verb, so the whole bullet dropped and the
+    // gate reported the prior head undispositioned 9 seconds after the at-head
+    // review dispositioned it `fixed`. Both of libmmt#524's ledger bullets are
+    // this shape, and its reviews carry no structured verdict block, so the
+    // prose path is the only reader.
+    //
+    // The author IS the reviewer identity here, as on every Ally-authored PR,
+    // which is what produced the observed tail "the only comment attesting it
+    // is the PR author's own". Post-fix the carry is gone and the verdict falls
+    // back to the documented self-attestation fail-open — non-blocking, and
+    // deliberately not `clean`.
+    const ledgerLine =
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — **fixed** — ` +
+      "`packages/container/src/__tests__/fec-track-coverage-invariants.test.ts:8` — all three " +
+      "requested sentences landed, and the diff is comment-only.";
+    const atHead = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      ledgerLine,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    expect(extractAllyPriorFindingDispositions(atHead)).toEqual([
+      {
+        shortSha: OLD_HEAD.slice(0, 7),
+        severity: "important",
+        index: 1,
+        disposition: "fixed",
+        kind: "retires",
+      },
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: INTERMEDIATE_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-10-09T02:10:07Z"),
+        allyComment(atHead, "2026-10-09T16:34:27Z"),
+      ],
+    });
+
+    expect(verdict.state).toBe("success");
+    expect(verdict.outcome).not.toBe("carried_finding");
+  });
+
+  it("emphasis does not widen the ledger vocabulary (BLO-42492)", () => {
+    // The negative control for the widening above: `[*_]{0,3}` admits the
+    // emphasis, never a verb. An unknown verb still fails closed whether or not
+    // it is bolded, so this cannot retire a finding Ally did not retire.
+    const unknownVerb = reviewBody(INTERMEDIATE_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — **wibble** — re-checked against this head.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    expect(extractAllyPriorFindingDispositions(unknownVerb)).toMatchObject([
+      { disposition: "wibble", kind: "unrecognized" },
+    ]);
+
+    const verdict = evaluateCommentReviewGate({
+      headSha: INTERMEDIATE_HEAD,
+      prAuthorLogin: null,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-10-09T02:10:07Z"),
+        allyComment(unknownVerb, "2026-10-09T16:34:27Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
   it("keeps carrying a head whose findings are only partly tracked", () => {
     // One entry must not clear a review that reported several findings — the
     // `isFullyDispositioned` invariant, re-pinned for the new verb because
