@@ -567,19 +567,31 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
     "the agent image must carry the same wrappers as the server image",
   );
 
-  // The adapter prepends this same directory to every agent Job's PATH, on a
+  // Both adapters prepend this same directory to every agent Job's PATH, on a
   // surface the Helm render guard above cannot reach.
-  const adapter = fs.readFileSync(
-    path.join(
-      repoRoot,
-      "vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts",
-    ),
-    "utf8",
-  );
-  assert.ok(
-    adapter.includes(`const GITHUB_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`),
-    "the claude_k8s adapter must prepend the same directory the chart names",
-  );
+  //
+  // PEN-3916: this loop used to name claude_k8s alone, because opencode_k8s was
+  // cloned from a fork at a pinned SHA and there was no in-tree file to read.
+  // `scripts/check-opencode-k8s-pin-reachable.mjs` covered it instead, by
+  // grepping the pinned tree over the network for a MENTION of the directory --
+  // which, as Ally noted on #2392, attests presence and not ordering. Now that
+  // the source is vendored the assertion is an ordinary file read, and the
+  // ORDERING itself is asserted behaviourally by the adapter's own suite
+  // (`buildJobManifest -- GitHub egress wrapper PATH ordering`, five cases
+  // including present-but-late). Neither property depends on a network probe.
+  for (const adapterDir of [
+    "vendor/paperclip-adapter-claude-k8s",
+    "vendor/paperclip-adapter-opencode-k8s",
+  ]) {
+    const adapter = fs.readFileSync(
+      path.join(repoRoot, adapterDir, "src/server/job-manifest.ts"),
+      "utf8",
+    );
+    assert.ok(
+      adapter.includes(`const GITHUB_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`),
+      `${adapterDir} must prepend the same directory the chart names`,
+    );
+  }
 
   // The third place the directory is named: inside the wrapper scripts
   // themselves. `git` and `github-mcp-server` chain-load

@@ -54,13 +54,60 @@ export const NOT_SOURCE = [`${VENDOR_DIR}/LICENSE`, `${VENDOR_DIR}/PROVENANCE.md
 
 /** An entry file under LOG_DIR. README.md documents the directory, it is not an entry. */
 export function isEntryPath(path) {
-  return path.startsWith(`${LOG_DIR}/`) && path.endsWith(".md") && !path.endsWith("/README.md");
+  return isEntryPathIn(LOG_DIR, path);
 }
+
+/** The same predicate, for an arbitrary tree's log directory. */
+function isEntryPathIn(logDir, path) {
+  return path.startsWith(`${logDir}/`) && path.endsWith(".md") && !path.endsWith("/README.md");
+}
+
+/**
+ * PEN-3916. There are now TWO vendored adapter trees, and the property this
+ * script enforces -- vendored source does not change without the change being
+ * recorded -- has to hold for both. Previously the whole file was hard-coded to
+ * the claude tree, so a change to the (then non-existent) opencode tree would
+ * have been unrecorded and silently fine.
+ *
+ * The exports above still name the claude tree. That is deliberate rather than
+ * leftover: `scripts/__tests__/provenance-union-merge.test.mjs` pins VENDOR_DIR,
+ * LOG, LOG_DIR and NOT_SOURCE exactly, and those pins are about the claude tree
+ * specifically (its frozen PROVENANCE-CHANGES.md, and the stale-exclusion check
+ * that reads its working tree). Re-pointing them at a list would have deleted
+ * that coverage to add this.
+ *
+ * `frozenLog` is null for the opencode tree and that is a real asymmetry, not an
+ * omission: BLO-41101's frozen-file rule exists because the claude tree carries
+ * a single-table predecessor that cannot be rewritten without conflicting with
+ * every in-flight PR. The opencode tree started with the per-change directory,
+ * so it has no such file and nothing to freeze.
+ */
+export const VENDOR_TREES = [
+  {
+    vendorDir: VENDOR_DIR,
+    frozenLog: LOG,
+    logDir: LOG_DIR,
+    notSource: NOT_SOURCE,
+  },
+  {
+    vendorDir: "vendor/paperclip-adapter-opencode-k8s",
+    frozenLog: null,
+    logDir: "vendor/paperclip-adapter-opencode-k8s/PROVENANCE-CHANGES.d",
+    notSource: [
+      "vendor/paperclip-adapter-opencode-k8s/LICENSE",
+      "vendor/paperclip-adapter-opencode-k8s/PROVENANCE.md",
+    ],
+  },
+];
 
 /**
  * @returns {{ok: true} | {ok: false, reason: string, detail: string[]}}
  */
-export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
+export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd, tree = VENDOR_TREES[0] }) {
+  // Shadow the module-level claude constants with this tree's. Every check
+  // below is written against these names and is otherwise unchanged.
+  const { vendorDir: VENDOR_DIR, frozenLog: LOG, logDir: LOG_DIR, notSource: NOT_SOURCE } = tree;
+  const isEntryPath = (path) => isEntryPathIn(LOG_DIR, path);
   // core.quotePath defaults on, so an entry with any non-ASCII character comes
   // back as `"vendor/.../caf\303\251.md"` -- surrounding quotes and all. That
   // fails isEntryPath AND the startsWith filter below, so the entry is counted
@@ -119,7 +166,11 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   // is not a shallow-clone backstop either: on a shallow clone BOTH commands
   // exit non-zero and throw, which is the safe direction and not something a
   // second arm improves on.
-  const netTouchesLog = git("diff", "--numstat", range, "--", LOG).trim() !== "";
+  // PEN-3916: a tree with no frozen predecessor has nothing to freeze, so both
+  // probes are skipped rather than run against a path that does not exist
+  // (`git rev-list -- <missing>` would return empty and read as "clean", which
+  // is the right answer by accident; this says so on purpose).
+  const netTouchesLog = LOG ? git("diff", "--numstat", range, "--", LOG).trim() !== "" : false;
 
   // Two dots, not the three-dot `range`: `base..head` is exactly the set
   // `git rebase base` replays. For rev-list, three dots is a SYMMETRIC
@@ -132,11 +183,11 @@ export function checkVendoredProvenanceLog({ base, head = "HEAD", cwd }) {
   // LOG change and then discarded it. --no-merges because a rebase replays
   // non-merge commits only, so naming a merge commit sends the author to a
   // commit that is not the problem: measured 2 listed without it against 1.
-  const logCommits = git(
-    "rev-list", "--no-merges", "--full-history", `${base}..${head}`, "--", LOG,
-  )
-    .split("\n")
-    .filter(Boolean);
+  const logCommits = LOG
+    ? git("rev-list", "--no-merges", "--full-history", `${base}..${head}`, "--", LOG)
+        .split("\n")
+        .filter(Boolean)
+    : [];
 
   if (logCommits.length > 0) {
     // Two different repairs, and conflating them is what sent three previous
@@ -377,11 +428,21 @@ if (isMainModule()) {
     console.error("usage: --base <sha> [--head <sha>]");
     process.exit(2);
   }
-  const result = checkVendoredProvenanceLog({ base, head: arg("--head") ?? "HEAD" });
-  if (!result.ok) {
-    console.error(`::error::${result.reason}`);
-    for (const line of result.detail) console.error(line);
-    process.exit(1);
+  // PEN-3916: check EVERY vendored tree, and report every failure rather than
+  // the first. Exiting on the first would hide a second tree's missing entry
+  // behind the first's, so an author fixing one would be sent back for the
+  // other on the next run.
+  const head = arg("--head") ?? "HEAD";
+  let failed = false;
+  for (const tree of VENDOR_TREES) {
+    const result = checkVendoredProvenanceLog({ base, head, tree });
+    if (!result.ok) {
+      failed = true;
+      console.error(`::error::${result.reason}`);
+      for (const line of result.detail) console.error(line);
+    } else {
+      console.log(`${tree.logDir}: ok`);
+    }
   }
-  console.log(`${LOG_DIR}: ok`);
+  if (failed) process.exit(1);
 }

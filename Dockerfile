@@ -52,14 +52,18 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
 
 FROM base AS vendor
 WORKDIR /vendor
-# The two k8s-Job adapters are sourced differently as of 2026-08-06:
+# Both k8s-Job adapters are VENDORED IN-TREE as of 2026-10-10:
 #
-#   claude_k8s   — VENDORED IN-TREE at vendor/paperclip-adapter-claude-k8s/.
-#                  No clone, no pin. Edit the source and open a PR.
-#   opencode_k8s — still cloned from the kkroo fork at the pinned
-#                  ARG OPENCODE_K8S_REF below. Bump it by pushing the fork
-#                  branch and updating the ARG. Public repo, so no auth is
-#                  required at clone time.
+#   claude_k8s   — vendor/paperclip-adapter-claude-k8s/   (BLO-17980, 2026-08-06)
+#   opencode_k8s — vendor/paperclip-adapter-opencode-k8s/ (PEN-3916, 2026-10-10)
+#
+# No clone, no pin, no ARG, and no GitHub credential in this stage. Edit the
+# source and open an ordinary PR; each tree is compiled and tested by its own
+# required CI job (`vendor_claude_k8s` / `vendor_opencode_k8s` in pr.yml) and
+# gated by a PROVENANCE-CHANGES.d/ entry.
+#
+# The bump-by-bump fork-pin changelogs below are retained as history of what
+# each adapter carried while it WAS a pin. They are not live instructions.
 #
 # Each adapter's build → `pnpm pack` (or `npm pack`) produces the .tgz the
 # production stage installs. We never commit the tgz; it's reproduced on
@@ -391,8 +395,10 @@ WORKDIR /vendor
 # every build that missed the vendor-stage cache with
 # `fatal: unable to read tree (87a865de...)`. Builds reusing a pre-force-push
 # vendor layer kept passing, which is why the break looked commit-timed rather
-# than cache-timed. scripts/check-opencode-k8s-pin-reachable.mjs now fails a PR
-# for an unreachable pin instead of waiting for a cache miss to find it.
+# than cache-timed. scripts/check-opencode-k8s-pin-reachable.mjs was added to
+# fail a PR for an unreachable pin instead of waiting for a cache miss to find
+# it; both that script and this whole failure class were retired by PEN-3916,
+# which removed the clone.
 # Re-pinned 2026-10-07 to kkroo/paperclip-adapter-opencode-k8s master 133f4c1
 # (was 2075ae1): #64 pins the opencode-ai binary (`opencodeVersion`, default
 # 1.18.35) and bootstraps it onto the data PVC instead of running whatever the
@@ -401,7 +407,11 @@ WORKDIR /vendor
 # to the model catalog, pricing fallback and context-window table; #63 moves
 # Rust build output off the shared PVC (BLO-15567). Local adapter verification:
 # typecheck clean, 664/664 (#64) and the pricing/models/execute suites (#65).
-ARG OPENCODE_K8S_REF=133f4c1a65085a6c141aab5aa8818afe51e2689c
+# ARG OPENCODE_K8S_REF is RETIRED (PEN-3916, 2026-10-10). The bump-by-bump
+# changelog above is kept as the history of what this adapter carried while it
+# was a fork pin; it ends at 133f4c1, which is the exact snapshot vendored into
+# vendor/paperclip-adapter-opencode-k8s/. Do not reintroduce the ARG: there is
+# no pin to bump and no fork to push to. Edit the vendored source and open a PR.
 
 # Pack paperclip's in-tree adapter-utils so the bundled adapters consume
 # the workspace version (may include exports newer than the latest
@@ -458,8 +468,8 @@ RUN cd /vendor/adapter-utils-src \
 # rebuild we still re-resolve every transitive dep. The pnpm and npm
 # caches let those resolutions reuse tarballs from prior builds.
 
-# The claude_k8s adapter is built from in-tree vendored source (no clone, and
-# therefore no gh_token needed for it — opencode_k8s below still clones).
+# BOTH k8s-Job adapters are built from in-tree vendored source: no clone, no
+# pin, and as of PEN-3916 no `gh_token` anywhere in this stage.
 COPY vendor/paperclip-adapter-claude-k8s /vendor/claude-k8s-src
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     cd /vendor/claude-k8s-src \
@@ -470,13 +480,13 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
   && npm pack \
   && mv paperclip-adapter-claude-k8s-*.tgz /vendor/paperclip-adapter-claude-k8s.tgz
 
+# PEN-3916: the opencode_k8s adapter is built from in-tree vendored source too,
+# as of 2026-10-10. No clone, no pin, no gh_token — the `vendor` stage now needs
+# no GitHub credential at all. See vendor/paperclip-adapter-opencode-k8s/PROVENANCE.md.
+COPY vendor/paperclip-adapter-opencode-k8s /vendor/opencode-k8s-src
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    --mount=type=secret,id=gh_token \
-    GH="$(cat /run/secrets/gh_token)" \
- && git -c "url.https://x-access-token:${GH}@github.com/.insteadOf=https://github.com/" \
-      clone https://github.com/kkroo/paperclip-adapter-opencode-k8s.git opencode-k8s \
-  && cd opencode-k8s && git checkout "${OPENCODE_K8S_REF}" \
-  && rm -rf .git \
+    cd /vendor/opencode-k8s-src \
+  && rm -rf node_modules dist \
   && npm ci \
   && npm install --no-save /vendor/adapter-utils.tgz \
   && npm test -- src/server/env-guard-plugin.test.ts src/server/execute.test.ts \
@@ -491,18 +501,24 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # Pin to a release tag — bump deliberately, not via :latest.
 FROM ghcr.io/github/github-mcp-server:v1.0.3 AS github-mcp
 
-# BLO-32824: this stage previously reused `gh_token`, which is
-# `PAPERCLIP_BOARD_TOKEN` for the private `kkroo/*` vendor clone and cannot read
-# the Blockcast Penstock repository. Keep the launcher credential separate: an
-# absent or unreadable `penstock_runtime_token` must fail the build rather than
-# silently producing an agent image without the runtime.
+# BLO-32824: this stage previously reused `gh_token` (`PAPERCLIP_BOARD_TOKEN`,
+# then mounted for the `kkroo/*` vendor clone), which cannot read the Blockcast
+# Penstock repository. Keep the launcher credential separate: an absent or
+# unreadable `penstock_runtime_token` must fail the build rather than silently
+# producing an agent image without the runtime.
+#
+# PEN-3916 removed `gh_token` from the build entirely — the clone it existed
+# for is gone — so `penstock_runtime_token` is now the ONLY build secret. That
+# makes the rule below moot rather than wrong; it is kept because the failure
+# it prevents (reaching for a convenient existing credential) recurs whenever a
+# second one is reintroduced.
 
 # The Penstock launcher is deliberately kept as a standalone Node script. It is
 # fetched at an immutable core commit with a credential dedicated to that
-# private repository. Do not reuse `gh_token`: that secret is
-# `PAPERCLIP_BOARD_TOKEN`, which is scoped to the private `kkroo/*` vendor
-# clone. The launcher credential is mounted only for this build step, and the
-# content digest prevents a refetch from silently changing the executable.
+# private repository. Do not reuse a board-scoped token here (`gh_token` /
+# `PAPERCLIP_BOARD_TOKEN` was the one to avoid; PEN-3916 retired it). The
+# launcher credential is mounted only for this build step, and the content
+# digest prevents a refetch from silently changing the executable.
 FROM base AS penstock-agent-runtime
 USER root
 ARG PENSTOCK_RUNTIME_REF=9878ca2499ea8a8e24ec7d8bcf3222db65ac014a
@@ -616,17 +632,16 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 WORKDIR /app
 # Both k8s-Job adapters are built from source in the `vendor` stage above and
-# installed here. claude_k8s builds from in-tree vendored source; opencode_k8s
-# builds from the pinned kkroo fork.
+# installed here. Both build from in-tree vendored source; neither is pinned.
 #
 # Do not install a local ccrotate CLI in this image. Paperclip production uses
 # ccrotate-auth-bot / ccrotate-serve as the source of truth; a baked local
 # rotator can read stale PVC state and switch agents onto exhausted accounts.
-# Refresh procedure:
+# Refresh procedure (identical for both since PEN-3916):
 #   claude_k8s   — edit vendor/paperclip-adapter-claude-k8s/ and open a PR.
-#                  Nothing to pin or bump.
-#   opencode_k8s — push kkroo/paperclip-adapter-opencode-k8s#master, then bump
-#                  OPENCODE_K8S_REF in the `vendor` stage.
+#   opencode_k8s — edit vendor/paperclip-adapter-opencode-k8s/ and open a PR.
+# Nothing to pin or bump in either case. Picking up an upstream commit is a
+# deliberate port; see each tree's PROVENANCE.md.
 RUN mkdir -p /tmp/paperclip-bundled-adapters
 COPY --from=vendor /vendor/paperclip-adapter-claude-k8s.tgz /tmp/paperclip-bundled-adapters/
 COPY --from=vendor /vendor/paperclip-adapter-opencode-k8s.tgz /tmp/paperclip-bundled-adapters/

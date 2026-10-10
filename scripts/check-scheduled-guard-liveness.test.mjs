@@ -124,27 +124,39 @@ describe("classifyGuard — reconstruction of the 2026-09-15 outage (PEN-3281)",
     "codeowners-guard.yml",
     "relay-ssl-multicert-guard.yml",
     "lockfile-drift-monitor.yml",
-    "adapter-pin-drift-monitor.yml",
+    // adapter-pin-drift-monitor.yml was the sixth member of this cohort. It is
+    // dropped rather than preserved as a fixture because PEN-3916 retired the
+    // workflow, and this cohort is fed to classifyAll() against the LIVE
+    // WATCHED_GUARDS — a member the script no longer watches yields no verdict
+    // to assert on. The 2026-09 outage this cohort records is unaffected: five
+    // of the six still share a cron minute, which is the property the
+    // simultaneity argument rests on.
     twiceDaily,
   ];
 
   const outage = Object.fromEntries(PEN_3281_COHORT.map((workflow) => [workflow, observed(workflow)]));
 
-  it("reds the six hourly guards at detection time", () => {
+  it("reds the surviving hourly guards at detection time", () => {
+    // Was 6 of 7 when this reconstruction was written. PEN-3916 retired
+    // adapter-pin-drift-monitor.yml — one of the six hourly legs — so the
+    // replay now runs 5 hourly + the twice-daily guard. The RECONSTRUCTION is
+    // unchanged: every surviving leg still reds at detection time, which is
+    // the property this test asserts. Only the cohort size moved, and it moved
+    // because the workflow no longer exists, not because the detector changed.
     const results = classifyAll(outage, now);
     const summary = summarize(results);
 
-    assert.equal(summary.checked, 7);
-    assert.equal(summary.staleCount, 6);
+    assert.equal(summary.checked, 6);
+    assert.equal(summary.staleCount, 5);
     assert.equal(summary.exitCode, 1, "the detector must fail the job against the real condition");
-    assert.match(summary.headline, /6 of 7 watched scheduled guard\(s\) have stopped executing/);
+    assert.match(summary.headline, /5 of 6 watched scheduled guard\(s\) have stopped executing/);
   });
 
   it("correctly leaves the twice-daily guard green at 09:45Z — 12.7h is inside its own bar", () => {
     // Honest about coverage rather than flattering: at detection time this guard
     // was genuinely within ordinary twice-daily jitter. Reporting it stale here
     // would be a false positive, and per-EVENT detection does not need it — the
-    // six hourly legs already red.
+    // surviving hourly legs already red.
     const result = classifyAll(outage, now).find((r) => r.workflow === twiceDaily);
 
     assert.equal(result.status, "ok");
@@ -1496,11 +1508,17 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     }
   });
 
-  it("carries the six PEN-3281 guards, the security control the original list missed, the clock-rot guard, and the consumer merge-control guard", () => {
+  it("carries the five surviving PEN-3281 guards, the security control the original list missed, the clock-rot guard, and the consumer merge-control guard", () => {
+    // PEN-3916 retired adapter-pin-drift-monitor.yml, so the PEN-3281 hourly
+    // cohort is five here rather than six. It watched for `ARG
+    // OPENCODE_K8S_REF` rotting from outside this repo; the opencode_k8s
+    // adapter is vendored in-tree now, so there is no pin to rot. Removing it
+    // from WATCHED_GUARDS is the deliberate-retirement path the script's own
+    // 404 branch names — the alternative is this guard going permanently red
+    // on a workflow that no longer exists.
     assert.deepEqual(
       [...WATCHED_WORKFLOWS].sort(),
       [
-        "adapter-pin-drift-monitor.yml",
         "ally-review-consistency.yml",
         "codeowners-guard.yml",
         "commit-attribution-audit.yml",

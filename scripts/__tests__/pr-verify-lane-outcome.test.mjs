@@ -66,6 +66,7 @@ function laneEnv(results) {
     OPENCODE_K8S_SEED_COLD_START_RESULT: results.opencode_k8s_seed_cold_start ?? "success",
     BUILD_RESULT: results.build ?? "success",
     VENDOR_CLAUDE_K8S_RESULT: results.vendor_claude_k8s ?? "success",
+    VENDOR_OPENCODE_K8S_RESULT: results.vendor_opencode_k8s ?? "success",
   };
 }
 

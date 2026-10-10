@@ -91,12 +91,16 @@ rules:
   #     file is edited.)
   #   claude-k8s SSAR self-test, checkRbac — probes secrets create/delete/get.
   #     Never probes update, so it cannot fail on the verb's absence.
-  #   opencode-k8s at the pinned ref (ARG OPENCODE_K8S_REF, Dockerfile) — zero
-  #     `replaceNamespaced*` and zero PUT in non-test src/; its own checkRbac
-  #     probes secrets create/delete/get. HOLDS ONLY AT THAT PIN, which is why
-  #     scripts/check-opencode-k8s-pin-reachable.mjs now also fails a pin whose
-  #     source reintroduces a Secret PUT. Retirement without that guard would
-  #     be a latent break on the next pin advance.
+  #   opencode-k8s (vendored in-tree at vendor/paperclip-adapter-opencode-k8s/
+  #     since PEN-3916) — zero `replaceNamespaced*` and zero PUT in non-test
+  #     src/; its own checkRbac probes secrets create/delete/get.
+  #     This USED to hold only at a pinned ref, enforced over the network by
+  #     scripts/check-opencode-k8s-pin-reachable.mjs. There is no pin now, so
+  #     the property is asserted in-tree on every change by
+  #     vendor/paperclip-adapter-opencode-k8s/src/server/rbac-secret-verbs.test.ts
+  #     (run by the `vendor_opencode_k8s` job), which carries a positive
+  #     control so an inert scan cannot read as clean. Do not delete that test
+  #     without re-homing this assertion: this grant's retirement depends on it.
   #   in-tree sweep of server/, packages/, scripts/ for a Secret PUT — exactly
   #     one hit, the tenant-namespace one below.
   #
