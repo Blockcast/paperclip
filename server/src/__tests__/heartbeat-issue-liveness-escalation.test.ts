@@ -975,7 +975,61 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
 
     /**
-     * The cursor key is `<sweep>:<companyId ?? "*">`. Scoping it per company closes a latent bug
+     * Ordering guard. The cursor is written AFTER the page it covers is processed, so a throw
+     * mid-page — a transient DB error, not only a SIGKILL — costs a duplicate pass instead of
+     * skipping those rows until the rotation wraps. Writing it before the loop (the mutation
+     * this pins) inverts that: the page is lost for the rest of the rotation, which is exactly
+     * the heal latency BLO-36017 set out to remove.
+     *
+     * The re-visit is the safe direction because it is idempotency-guarded (`existingWakeSkipped`
+     * and the per-candidate `idempotencyKey`); a skipped page has no such guard. The stranded
+     * rotation is not re-tested here — it writes through the same helper at the same point,
+     * after its own candidate loop.
+     */
+    it("leaves the cursor unmoved when the page throws mid-processing, so the page is re-visited", async () => {
+      const seeded = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      await seedAdditionalBlockedDependents(seeded, 4);
+
+      const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+      const tick = (
+        extra?: { beforeBackstopCandidateLoopForTest?: () => Promise<void> | void },
+      ) =>
+        recoveryService(db, { enqueueWakeup, ...extra }).reconcileResolvedDependencyWakeBackstop({
+          companyId: seeded.companyId,
+          limit: 2,
+        });
+
+      const first = await tick();
+      expect(first).toMatchObject({ checked: 2, healed: 2 });
+      const cursorAfterFirst = await db
+        .select({ cursor: backstopSweepCursors.cursor })
+        .from(backstopSweepCursors)
+        .then((rows) => rows[0]?.cursor ?? null);
+      expect(cursorAfterFirst).toBeTruthy();
+
+      await expect(
+        tick({
+          beforeBackstopCandidateLoopForTest: () => {
+            throw new Error("transient dependency readiness failure");
+          },
+        }),
+      ).rejects.toThrow("transient dependency readiness failure");
+
+      // The crashed tick healed nothing, so its page must still be the next one read.
+      expect(
+        await db
+          .select({ cursor: backstopSweepCursors.cursor })
+          .from(backstopSweepCursors)
+          .then((rows) => rows[0]?.cursor ?? null),
+      ).toBe(cursorAfterFirst);
+
+      // And the rotation picks that page up rather than having skipped past it.
+      const retry = await tick();
+      expect(retry).toMatchObject({ checked: 2, healed: 2 });
+    });
+
+    /**
+     * The cursor key is `<sweep>:<companyId || "*">`. Scoping it per company closes a latent bug
      * the shared closure had: a company-scoped call advanced the SAME variable the global
      * rotation used, so one scoped call moved the global rotation's position to a row from
      * another company's page. Asserting the global row is absent is what actually guards that —
