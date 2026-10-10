@@ -66,17 +66,22 @@ const EXECUTION_WORKSPACE_DETACH_FIELDS = new Set([
  * workspace: it performs no work inside the dead workspace, and it cannot carry a comment,
  * a review request, or any other field along with it. Re-pinning the SAME closed workspace
  * is not a detach — otherwise the guard would be bypassable by echoing the current value.
+ *
+ * `body` must be the WHOLE validated request body, not the route's `updateFields`. The
+ * route destructures `comment`, `reviewRequest`, `reopen`, `resume`, `interrupt` and
+ * `hiddenAt` out of the body before building `updateFields`, so a predicate keyed on
+ * `updateFields` could not see them — and `hiddenAt` is written unconditionally after the
+ * guard, so `{executionWorkspaceId: <another closed ws>, hiddenAt}` landed a write on an
+ * issue that stayed bricked. Keyed on the whole body, any key the route pulls out (today's
+ * six or a future one) is rejected by default instead of admitted by default.
  */
 export function isExecutionWorkspaceDetachPatch(input: {
-  updateFields: Record<string, unknown>;
-  hasComment: boolean;
-  hasReviewRequest: boolean;
+  body: Record<string, unknown>;
   closedExecutionWorkspaceId: string;
 }): boolean {
-  if (input.hasComment || input.hasReviewRequest) return false;
-  const keys = Object.keys(input.updateFields);
+  const keys = Object.keys(input.body);
   if (!keys.every((key) => EXECUTION_WORKSPACE_DETACH_FIELDS.has(key))) return false;
   // Also covers the empty patch: `every` is vacuously true on no keys, and this rejects it.
-  if (!Object.prototype.hasOwnProperty.call(input.updateFields, "executionWorkspaceId")) return false;
-  return input.updateFields.executionWorkspaceId !== input.closedExecutionWorkspaceId;
+  if (!Object.prototype.hasOwnProperty.call(input.body, "executionWorkspaceId")) return false;
+  return input.body.executionWorkspaceId !== input.closedExecutionWorkspaceId;
 }
