@@ -15,6 +15,7 @@ import { eq, and } from "drizzle-orm";
 import type { SecretProvider } from "@paperclipai/shared";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { logActivity, secretService } from "../services/index.js";
+import { setCompanyIssueIdentity } from "../services/company-issue-identity.js";
 import {
   linearTeamResolutionError,
   resolveLinearTeam,
@@ -387,15 +388,24 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
           console.log(`[linear-auth] highest issue number from Linear: ${issueCounter}`);
         }
 
-        await db
-          .update(companies)
-          .set({
-            issuePrefix: teamKey,
-            issueCounter,
-            updatedAt: new Date(),
-          })
-          .where(eq(companies.id, companyId));
-        console.log(`[linear-auth] synced company prefix to ${teamKey}, counter to ${issueCounter}`);
+        // BLO-31228: never a raw write on identity columns. Connecting is not
+        // confirmation to re-identify a company, so `confirmPrefixChange` stays
+        // false here: a company with no prefix adopts the team key, a company
+        // that already has one keeps it and the refusal is logged and audited.
+        const identity = await setCompanyIssueIdentity(db, {
+          companyId,
+          prefix: teamKey,
+          counter: issueCounter,
+          confirmPrefixChange: false,
+          actorType: "system",
+          actorId: LINEAR_OAUTH_ACTOR,
+          reason: "linear-oauth-callback",
+        });
+        console.log(
+          `[linear-auth] issue identity now prefix=${identity.issuePrefix} ` +
+            `counter=${identity.issueCounter}` +
+            (identity.refusals.length ? ` (refused: ${identity.refusals.join(", ")})` : ""),
+        );
       } catch (err) {
         console.warn("[linear-auth] could not sync issue prefix:", err);
       }
@@ -1007,10 +1017,17 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
       // Update company counter to highest imported number (unless user chose "start fresh")
       // Re-read company to pick up any configure call that ran before import
       const [freshCompany] = await db.select().from(companies).where(eq(companies.id, companyId));
-      if (freshCompany && freshCompany.issueCounter !== 0 && highestImportedNumber > freshCompany.issueCounter) {
-        await db.update(companies)
-          .set({ issueCounter: highestImportedNumber, updatedAt: new Date() })
-          .where(eq(companies.id, companyId));
+      if (freshCompany && freshCompany.issueCounter !== 0) {
+        // BLO-31228: same guarded path as the callback. The counter floor makes
+        // the `> issueCounter` check redundant, but it is kept so "start fresh"
+        // (counter deliberately 0) still means what it has always meant.
+        await setCompanyIssueIdentity(db, {
+          companyId,
+          counter: highestImportedNumber,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          reason: "linear-import",
+        });
       }
 
       await logActivity(db, {
@@ -1448,24 +1465,23 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
     assertCompanyAccess(req, companyId);
 
     const { prefix, startAt } = req.body as { prefix?: string; startAt?: number };
-    const updates: Record<string, unknown> = { updatedAt: new Date() };
 
-    if (prefix && typeof prefix === "string") {
-      const cleanPrefix = prefix.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-      if (cleanPrefix.length > 0) {
-        updates.issuePrefix = cleanPrefix;
-      }
-    }
+    // The board asking for a prefix here IS the explicit confirmation BLO-31228
+    // requires; the counter floor still applies, to anyone.
+    const identity = await setCompanyIssueIdentity(db, {
+      companyId,
+      prefix: prefix ?? null,
+      counter: typeof startAt === "number" && startAt >= 0 ? startAt : null,
+      confirmPrefixChange: true,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      reason: "linear-configure-endpoint",
+    });
 
-    if (typeof startAt === "number" && startAt >= 0) {
-      updates.issueCounter = startAt;
-    }
-
-    await db.update(companies).set(updates).where(eq(companies.id, companyId));
-    const [updated] = await db.select().from(companies).where(eq(companies.id, companyId));
     res.json({
-      issuePrefix: updated.issuePrefix,
-      issueCounter: updated.issueCounter,
+      issuePrefix: identity.issuePrefix,
+      issueCounter: identity.issueCounter,
+      refusals: identity.refusals,
     });
   });
 
