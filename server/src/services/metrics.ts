@@ -156,6 +156,58 @@ export const BACKSTOP_SOURCES = [
  */
 export const HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC = "paperclip_heartbeat_recovery_chain_skipped_total";
 /**
+ * Duplicate wake deliveries that the BLO-25726 idempotency machinery SUPPRESSED.
+ *
+ * This counts the race firing and being caught, not an absence. That direction
+ * is deliberate: the obvious field signal for BLO-25726 ("no two runs share a
+ * wake idempotency key") is unmeasurable from any read surface -- `heartbeat_runs`
+ * carries no idempotency key, and its `wakeupRequestId` is 1:1 with runs by
+ * construction, so a second dispatch minting a fresh wake row is invisible to
+ * it. A zero there is vacuous. A non-zero here is positive proof the guard ran.
+ *
+ * Every cause is zero-initialized so the series exists before the first
+ * suppression; an absent series and a quiet one must not look alike.
+ *
+ * Non-zero is EXPECTED and must not page -- it means a crash or a concurrent
+ * reconciler pass hit the delivery window and the duplicate was declined. The
+ * alertable inversion is this staying at zero while duplicate runs appear.
+ */
+export const WAKE_REDELIVERY_SUPPRESSED_METRIC = "paperclip_agent_wake_redelivery_suppressed_total";
+
+const WAKE_REDELIVERY_SUPPRESSED_CAUSES = [
+  "claim_contended",
+  "claim_lost",
+  "already_delivered",
+  "fence_lost",
+] as const;
+
+/**
+ * Which of the four BLO-25726 guards declined this redelivery.
+ *
+ * They are four, not one, because they fire at four different points in the
+ * dispatch and are not interchangeable — collapsing them would make AC3
+ * (concurrent reconcilers) indistinguishable from AC1 (enqueue-time key).
+ *
+ * - `claim_contended`: the compare-and-set claim on the `dispatch_failed` /
+ *   expired-lease row lost to a concurrent pass, so this pass skipped BEFORE
+ *   dispatching. The scheduler is not leader-elected, so this is the shape two
+ *   replicas actually run (AC3).
+ * - `claim_lost`: this pass held the claim, but the lease was reclaimed before
+ *   its enqueue could commit, so the stale redelivery was dropped mid-flight.
+ * - `already_delivered`: `enqueueWakeup`'s enqueue-time claim found a live wake
+ *   row under the same idempotency key and delivery token and handed back that
+ *   run rather than committing a second one (AC1/AC2).
+ * - `fence_lost`: this pass did NOT deliver (its re-dispatch failed, or a gate
+ *   declined or deferred it), ran past its lease, another pass reclaimed the
+ *   row, and this pass's re-arm or terminal write was discarded rather than
+ *   stamped over the new owner's live state -- a stale re-arm would hand the row
+ *   back to the due-rows query while the new owner is still dispatching it. A
+ *   fence lost AFTER this pass delivered is not counted: that wake reached a
+ *   run, nothing was declined, and the new owner's redelivery of it is counted
+ *   once, as `already_delivered`.
+ */
+export type WakeRedeliverySuppressedCause = (typeof WAKE_REDELIVERY_SUPPRESSED_CAUSES)[number];
+/**
  * Wall-clock duration of the last COMPLETED periodic recovery chain, in seconds
  * (PEN-3314).
  *
@@ -3507,6 +3559,7 @@ let projectPrimaryWorkspaceFallback: Counter | null = null;
 let backstopDeferredCandidates: Gauge<"source"> | null = null;
 let backstopSweepCompleted: Counter<"source"> | null = null;
 let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
+let wakeRedeliverySuppressed: Counter<"cause"> | null = null;
 let heartbeatRecoveryChainSkipped: Counter | null = null;
 let heartbeatRecoveryChainDuration: Gauge | null = null;
 let heartbeatRecoveryChainInflight: Gauge | null = null;
@@ -3608,6 +3661,7 @@ function ensureRegistry(): {
   backstopDeferredCandidatesGauge: Gauge<"source">;
   backstopSweepCompletedCounter: Counter<"source">;
   backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
+  wakeRedeliverySuppressedCounter: Counter<"cause">;
   heartbeatRecoveryChainSkippedCounter: Counter;
   heartbeatRecoveryChainDurationGauge: Gauge;
   heartbeatRecoveryChainInflightGauge: Gauge;
@@ -3705,6 +3759,7 @@ function ensureRegistry(): {
     || !backstopDeferredCandidates
     || !backstopSweepCompleted
     || !backstopCandidatesSkipped
+    || !wakeRedeliverySuppressed
     || !heartbeatRecoveryChainSkipped
     || !heartbeatRecoveryChainDuration
     || !heartbeatRecoveryChainInflight
@@ -4789,6 +4844,24 @@ function ensureRegistry(): {
       labelNames: ["source", "reason"],
       registers: [registry],
     });
+    wakeRedeliverySuppressed = new Counter({
+      name: WAKE_REDELIVERY_SUPPRESSED_METRIC,
+      help:
+        "Duplicate wake redeliveries declined by the BLO-25726 guards, labeled by which guard "
+        + "declined it; cause=fence_lost counts only passes that did not deliver, so a delivered "
+        + "wake whose bookkeeping write lost its lease is not counted. Non-zero is EXPECTED and "
+        + "must not page: it means the crash or "
+        + "concurrency window fired and the duplicate was suppressed. This is the observable "
+        + "for a defect whose absence-based signal is unmeasurable -- heartbeat_runs carries no "
+        + "idempotency key and its wakeupRequestId is 1:1 with runs, so a duplicate dispatch is "
+        + "invisible there by construction. The alertable inversion is this staying flat while "
+        + "duplicate agent runs appear.",
+      labelNames: ["cause"],
+      registers: [registry],
+    });
+    for (const cause of WAKE_REDELIVERY_SUPPRESSED_CAUSES) {
+      wakeRedeliverySuppressed.inc({ cause }, 0);
+    }
     heartbeatRecoveryChainSkipped = new Counter({
       name: HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
       help:
@@ -5210,6 +5283,7 @@ function ensureRegistry(): {
     backstopDeferredCandidatesGauge: backstopDeferredCandidates,
     backstopSweepCompletedCounter: backstopSweepCompleted,
     backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
+    wakeRedeliverySuppressedCounter: wakeRedeliverySuppressed,
     heartbeatRecoveryChainSkippedCounter: heartbeatRecoveryChainSkipped,
     heartbeatRecoveryChainDurationGauge: heartbeatRecoveryChainDuration,
     heartbeatRecoveryChainInflightGauge: heartbeatRecoveryChainInflight,
@@ -7039,6 +7113,11 @@ export function recordBackstopCandidateSkipped(source: BackstopSource, reason: B
   ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
 }
 
+/** BLO-25726: a duplicate wake delivery was declined. See WAKE_REDELIVERY_SUPPRESSED_METRIC. */
+export function recordWakeRedeliverySuppressed(cause: WakeRedeliverySuppressedCause): void {
+  ensureRegistry().wakeRedeliverySuppressedCounter.inc({ cause });
+}
+
 /**
  * Record one completed isolation-workspace reaper sweep (BLO-36814).
  *
@@ -7419,6 +7498,7 @@ export function __resetMetricsForTest(): void {
   backstopDeferredCandidates = null;
   backstopSweepCompleted = null;
   backstopCandidatesSkipped = null;
+  wakeRedeliverySuppressed = null;
   heartbeatRecoveryChainSkipped = null;
   heartbeatRecoveryChainDuration = null;
   heartbeatRecoveryChainInflight = null;
