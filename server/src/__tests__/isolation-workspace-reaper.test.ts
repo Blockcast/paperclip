@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ISOLATION_WORKSPACE_REAPER_DELETED_METRIC,
@@ -458,6 +460,38 @@ describe("reapIsolationWorkspaces", () => {
     expect(res).toMatchObject({ deleted: 1, capped: false });
   });
 
+  /**
+   * The runbook's reading of `retained_nested_checkout` rests on this: a
+   * retention spends no unlink budget, but the cap `break`s, so a nested
+   * checkout past the break is never reached and a capped sweep undercounts.
+   * Root order is pinned through `readdir` because the filesystem's is not.
+   */
+  it("a capped sweep never reaches a nested checkout past its break", async () => {
+    const order = ["ws-nest-early", "ws-a", "ws-b", "ws-c", "ws-nest-late"];
+    for (const name of order) {
+      await makeWorkspace(name, [...REAPABLE_LAYOUT], 45, name.startsWith("ws-nest") ? { "home/repo/.git": "gitdir: x\n" } : {});
+    }
+    const realReaddir = fs.readdir;
+    const spy = vi.spyOn(fs, "readdir").mockImplementation(async (target, opts) => {
+      const out = (await realReaddir.call(fs, target as never, opts as never)) as never as { name: string }[];
+      if (target === root) out.sort((x, y) => order.indexOf(x.name) - order.indexOf(y.name));
+      return out as never;
+    });
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      maxDeletesPerTick: 2,
+      dryRun: true,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+    });
+
+    spy.mockRestore();
+    expect(res).toMatchObject({ scanned: 3, eligible: 2, retainedNestedCheckout: 1, capped: true });
+  });
+
   it("is idempotent: a second pass over a drained tree deletes nothing", async () => {    await makeWorkspace("ws-old", [...REAPABLE_LAYOUT], 45);
 
     const first = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
@@ -864,7 +898,7 @@ describe("reapIsolationWorkspaces metrics", () => {
   it("counts a nested-checkout retention apart from skipped_layout", async () => {
     // BLO-36735 I2: skipped_layout means "top level outside the allowlist,
     // unexamined". A nested checkout was examined and its top level matched, so
-    // folding it in would park a steady 13 under that finding's baseline of 1.
+    // folding it in would park a steady population under that finding's baseline of 1.
     await makeWorkspace("ws-nested", [...REAPABLE_LAYOUT], 45, { "home/repo/.git": "gitdir: x\n" });
     const read = async () => ({
       skipped: (await valueOf(ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC, { dry_run: "false" })) ?? 0,
@@ -983,5 +1017,33 @@ describe("reapIsolationWorkspaces metrics", () => {
         stop_reason: "complete",
       }),
     ).toBe(before.complete);
+  });
+});
+
+/**
+ * BLO-36735: the runbook once read the nested-checkout series as "~13 per
+ * sweep", which a capped sweep cannot report and the measurement never was.
+ * Nothing rendered breaks when that prose rots, so pin it to the label sets
+ * the code actually emits.
+ */
+describe("isolation-workspace reaper runbook", () => {
+  it("reads retained_nested_checkout against the stop reason, not as a per-sweep figure", () => {
+    const runbook = readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../runbooks/isolation-workspace-reaper.md"),
+      "utf8",
+    );
+    const start = runbook.indexOf('outcome="retained_nested_checkout"');
+    const end = runbook.indexOf("\n## ", start);
+    expect(start).toBeGreaterThan(-1);
+    const block = runbook.slice(start, end).replace(/\s+/g, " ");
+
+    const stopReasons = [...block.matchAll(/stop_reason="([a-z_]+)"/g)].map((m) => m[1]);
+    expect(stopReasons).toEqual(expect.arrayContaining(["capped", "complete"]));
+    for (const reason of stopReasons) expect(ISOLATION_WORKSPACE_REAPER_STOP_REASONS).toContain(reason);
+    for (const [, outcome] of block.matchAll(/`(retained_[a-z_]+)`/g)) {
+      expect(ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES).toContain(outcome);
+    }
+    expect(block).toMatch(/\bfloor\b/);
+    expect(block).not.toMatch(/\d+\s+per sweep/i);
   });
 });
