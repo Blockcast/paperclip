@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { IncomingMessage } from "node:http";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { logger } from "../middleware/logger.js";
 
 /**
@@ -956,17 +956,22 @@ describe("PEN-3142 live-event transcript scope — scoped agent keys", () => {
  * each event's send onto the previous one, which makes `sendChain` per-socket
  * state with two properties nothing asserted:
  *
- *  - it was not released on close, so the tail promise — and every event payload
- *    a queued continuation closed over — stayed reachable for as long as the
- *    socket's closure did; and
+ *  - nothing stopped a continuation queued behind a stalled decider from
+ *    projecting and sending after the socket had closed (the `closed` latch);
+ *    and
  *  - it had no depth bound, so a stalled authorization decision accrued one
  *    continuation per company-wide event, per socket, for the length of the
- *    stall.
+ *    stall. Queued continuations stay reachable from the decider's pending
+ *    promise, so the bound — not anything done on close — is what caps that.
  *
  * Both are load shapes THIS gate introduced: before it the send was synchronous
  * and nothing could queue. Driven with a decider that never resolves, which is
  * the stall these exist for — a fast decider drains the chain between events and
  * can never reach either condition.
+ *
+ * Shedding is logged per EPISODE, not per drop (Ally review 5477496711,
+ * Important): a per-drop warning turns the memory bound into an unbounded
+ * log-write rate for the length of the stall.
  */
 describe("PEN-3895 live-event send chain is released and bounded", () => {
   class FakeClientSocket extends EventEmitter {
@@ -1038,16 +1043,36 @@ describe("PEN-3895 live-event send chain is released and bounded", () => {
     });
   }
 
-  function dropWarnings() {
-    return vi.mocked(logger.warn).mock.calls.filter(
-      (call) => call[1] === "live event dropped: per-socket send queue is saturated",
-    );
+  const SATURATED = "live event send queue saturated: shedding events for this socket";
+  const STILL_SATURATED = "live event send queue still saturated";
+  const RECOVERED = "live event send queue recovered from saturation";
+  const CLOSED_SATURATED = "live event socket closed while its send queue was saturated";
+
+  /**
+   * Every warn line this socket's channel produced, as `[message, fields]`.
+   * Keyed on the per-test channel rather than on message text, so a regression
+   * back to one line per drop is counted whatever it is worded as.
+   */
+  function warnsFor(channelCompanyId: string) {
+    return vi
+      .mocked(logger.warn)
+      .mock.calls.filter((call) => (call[0] as { companyId?: string }).companyId === channelCompanyId)
+      .map((call) => [call[1], call[0]] as [string, Record<string, unknown>]);
   }
+
+  /** Pins the clock the saturation summary is rate-limited against. */
+  let now = 1_700_000_000_000;
+  let nowSpy: { mockRestore(): void } | undefined;
 
   beforeEach(() => {
     vi.clearAllMocks();
     allowOnlyOwner();
     mockLogActivity.mockResolvedValue(mockPublishAudit);
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+  });
+
+  afterEach(() => {
+    nowSpy?.mockRestore();
   });
 
   it("does not send an event whose decision resolved after the socket closed", async () => {
@@ -1094,13 +1119,74 @@ describe("PEN-3895 live-event send chain is released and bounded", () => {
     for (let seq = 0; seq < 520; seq += 1) await publishChunk(channel, seq);
     await flush();
 
-    expect(dropWarnings()).toHaveLength(8);
+    // One line for the transition into saturation, not one per shed event.
+    expect(warnsFor(channel)).toEqual([[SATURATED, expect.objectContaining({ pendingSends: 512 })]]);
 
     release();
     await flush();
 
-    // The bound caps what may be held, so it caps what is delivered.
+    // The bound caps what may be held, so it caps what is delivered — and the
+    // recovery line accounts for every shed event.
     expect(socket.sent).toHaveLength(512);
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [RECOVERED, expect.objectContaining({ droppedEvents: 8 })],
+    ]);
+  });
+
+  it("logs a stall once plus a periodic count, not once per shed event", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    await connectSubscriber(channel, runOwnerAgentId);
+
+    // Saturate, then shed 1000 more inside one summary interval.
+    for (let seq = 0; seq < 512 + 1000; seq += 1) await publishChunk(channel, seq);
+    await flush();
+    expect(warnsFor(channel)).toHaveLength(1);
+
+    // SATURATION_SUMMARY_INTERVAL_MS is 60 s: one short of it, still silent…
+    now += 59_999;
+    await publishChunk(channel, 2000);
+    expect(warnsFor(channel)).toHaveLength(1);
+
+    // …at it, one summary carrying the whole accumulated count…
+    now += 1;
+    await publishChunk(channel, 2001);
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [STILL_SATURATED, expect.objectContaining({ droppedEvents: 1002, saturatedMs: 60_000 })],
+    ]);
+
+    // …and the interval restarts from that summary.
+    for (let seq = 3000; seq < 3100; seq += 1) await publishChunk(channel, seq);
+    expect(warnsFor(channel)).toHaveLength(2);
+
+    release();
+    await flush();
+
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [STILL_SATURATED, expect.anything()],
+      [RECOVERED, expect.objectContaining({ droppedEvents: 1102 })],
+    ]);
+  });
+
+  it("closes a saturated socket's episode with its count and reports no recovery after", async () => {
+    const channel = nextChannel();
+    const release = stallTheDecider();
+    const socket = await connectSubscriber(channel, runOwnerAgentId);
+
+    for (let seq = 0; seq < 520; seq += 1) await publishChunk(channel, seq);
+    await flush();
+    socket.emit("close");
+    release();
+    await flush();
+
+    expect(socket.sent).toEqual([]);
+    expect(warnsFor(channel)).toEqual([
+      [SATURATED, expect.anything()],
+      [CLOSED_SATURATED, expect.objectContaining({ droppedEvents: 8 })],
+    ]);
   });
 
   it("keeps delivering after a saturating burst drains", async () => {
@@ -1112,7 +1198,7 @@ describe("PEN-3895 live-event send chain is released and bounded", () => {
     release();
     await flush();
     const delivered = socket.sent.length;
-    expect(delivered).toBeGreaterThan(0);
+    expect(delivered).toBe(512);
 
     // Drained, so the counter is back at zero and a later event is not shed.
     allowOnlyOwner();
@@ -1121,6 +1207,7 @@ describe("PEN-3895 live-event send chain is released and bounded", () => {
 
     expect(socket.sent).toHaveLength(delivered + 1);
     expect(socket.sent[socket.sent.length - 1]).toContain("chunk-999");
-    expect(dropWarnings()).toHaveLength(8);
+    // The episode ended at the drain, and the later event opened no new one.
+    expect(warnsFor(channel).map(([message]) => message)).toEqual([SATURATED, RECOVERED]);
   });
 });
