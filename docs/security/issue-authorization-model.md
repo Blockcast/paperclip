@@ -2,8 +2,9 @@
 
 Status: **ratified**. The model below was proposed on 2026-08-26 and accepted by the
 board on 2026-10-08 (Paperclip issue `BLO-30034`). It is descriptive of
-`server/src/services/authorization.ts` as shipped, not aspirational: every row is
-pinned by the matrix regression test named at the bottom of this file.
+`server/src/services/authorization.ts` as shipped, not aspirational: every row of
+the principal × field grid is a relation in the matrix regression test named at the
+bottom of this file.
 
 This document exists because the issue-write boundary was patched four times, once
 per incident (`BLO-19036`, `BLO-19087`, `BLO-19913`, `BLO-20451`), without anyone
@@ -35,7 +36,7 @@ Two consequences are load-bearing and are the source of most confusion:
 | Action | Fields it gates | Enforced at |
 | --- | --- | --- |
 | `issue:comment` | posting a comment | route → `access.decide` |
-| `issue:mutate` | `description`, `title`, `status`, `assigneeAgentId`, everything not below | route → `access.decide` |
+| `issue:mutate` | `description`, `title`, `status`, `assigneeAgentId` — every field, including the six below | route → `access.decide` |
 | `issue:coordination_metadata` | `blockedByIssueIds`, `priority`, `projectId`, `parentId`, `milestoneId`, `projectWorkspaceId` | `COORDINATION_METADATA_FIELDS`, `server/src/routes/issues.ts:560` |
 
 `issue:coordination_metadata` is a **narrower** action than `issue:mutate`, not a
@@ -45,23 +46,27 @@ path at all and falls back to `issue:mutate` (`server/src/routes/issues.ts:6105`
 
 ## Principal × field
 
-`A` = allowed, `—` = denied. "manager" means the actor is above the issue's
-**assignee** in the `reportsTo` chain, at any depth.
+Each cell is **field reachability**: `A` = the principal can write those fields
+through *some* action, `—` = it cannot through any. Which action carries each `A` is
+the allow-path table below; in particular the third column is `issue:mutate` **or**
+`issue:coordination_metadata`, so it is pinned by those two cells of the matrix.
+"manager" means the actor is above the issue's **assignee** in the `reportsTo`
+chain, at any depth.
 
 | Principal (relation to the target issue) | comment | description / title / status / assignee | coordination metadata + blocker edges |
 | --- | :---: | :---: | :---: |
 | Instance admin (board) | A | A | A |
 | Local implicit board | A | A | A |
-| Cloud-tenant user with active non-`viewer` membership | A | **A** | A |
+| Cloud-tenant user with active non-`viewer` membership | A | **A** | A (via `issue:mutate`) |
 | Cloud-tenant user with `viewer` membership | — | — | — |
-| Agent — **assignee** of the issue | A | **A** | — (use `issue:mutate`) |
-| Agent — issue has **no** assignee | A | A | — (use `issue:mutate`) |
+| Agent — **assignee** of the issue | A | **A** | A (via `issue:mutate`) |
+| Agent — issue has **no** assignee | A | A | A (via `issue:mutate`) |
 | Agent — **creator**, someone else assigned | A | — | — |
 | Agent — **manager** of the assignee | A | **—** | — (grant missing) |
-| Agent — **manager** of the assignee **+ `tasks:assign` grant** | A | **—** | A |
+| Agent — **manager** of the assignee **+ `tasks:assign` grant** | A | **—** | A (via `issue:coordination_metadata`) |
 | Agent — `agent://` **mentioned** on the thread | A | — | — |
 | Agent — holds a **recovery handoff** on the issue | A | — | — |
-| Agent — assigned the issue's **productivity review** | A | **A** | — |
+| Agent — assigned the issue's **productivity review** | A | **A** | A (via `issue:mutate`) |
 | Agent — **project lead**, no other relation | — | — | — |
 | Agent — assignee of the **parent** or a **sibling** issue | — | — | — |
 | Agent — same company, no relation | — | — | — |
@@ -76,22 +81,28 @@ Every path that can return `allowed: true` for `issue:comment` / `issue:mutate` 
 `issue:coordination_metadata`, in evaluation order. Line numbers are as of
 `98839e63`; the reason strings are stable and are what the tests assert on.
 
-| Reason | `authorization.ts` | comment | mutate | Condition |
-| --- | --- | :---: | :---: | --- |
-| `allow_local_board` | `:1872` | A | A | `actor.source === "local_implicit"` |
-| `allow_instance_admin` | `:1886` | A | A | instance-admin row, never for `cloud_tenant` |
-| `allow_company_member` | `:1916` | A | A | active membership, `membershipRole !== "viewer"` |
-| `allow_self` | `:2420` | A | A | `resource.assigneeAgentId === actor` |
-| `allow_company_agent` | `:2438` | A | A | issue has no assignee, and is not a review/escalation shell |
-| `allow_issue_creator` | `:2449` | A | — | `resource.createdByAgentId === actor` |
-| `allow_manager_chain` | `:2466` | A | — | `isManagerOf(actor, resource.assigneeAgentId)` |
-| `allow_issue_mention_grant` | `:2481` | A | — | a live, non-deleted `agent://<actor>` mention from a principal entitled to grant it |
-| `allow_recovery_handoff_grant` | `:2493` | A | — | an open recovery handoff naming the actor |
-| `allow_productivity_review_grant` | `:2518` | A | **A** | the actor is assigned the review whose `originId` is this issue |
-| `allow_explicit_grant` | `:857` via `:2411` | n/a | n/a | **coordination metadata only** — `tasks:assign`/`tasks:assign_scope` **and** `isManagerOf(assignee)` |
+| Reason | `authorization.ts` | comment | mutate | coordination metadata | Condition |
+| --- | --- | :---: | :---: | :---: | --- |
+| `allow_local_board` | `:1872` | A | A | A | `actor.source === "local_implicit"` |
+| `allow_instance_admin` | `:1886` | A | A | A | instance-admin row, never for `cloud_tenant` |
+| `allow_company_member` | `:1916` | A | A | — | cloud-tenant board user (`actor.type === "board"`, `:1867`; `actor.source === "cloud_tenant" && actor.userId`, `:1895`) with active membership, `membershipRole !== "viewer"` |
+| `allow_self` | `:2420` | A | A | — | `resource.assigneeAgentId === actor` |
+| `allow_company_agent` | `:2438` | A | A | — | issue has no assignee, and is not a review/escalation shell |
+| `allow_issue_creator` | `:2449` | A | — | — | `resource.createdByAgentId === actor` |
+| `allow_manager_chain` | `:2466` | A | — | — | `isManagerOf(actor, resource.assigneeAgentId)` |
+| `allow_issue_mention_grant` | `:2481` | A | — | — | a live, non-deleted `agent://<actor>` mention from a principal entitled to grant it |
+| `allow_recovery_handoff_grant` | `:2493` | A | — | — | an open recovery handoff naming the actor |
+| `allow_productivity_review_grant` | `:2518` | A | **A** | — | the actor is assigned the review whose `originId` is this issue |
+| `allow_explicit_grant` | `:857` via `:2411` | n/a | n/a | A | **coordination metadata only** — `tasks:assign`/`tasks:assign_scope` **and** `isManagerOf(assignee)` |
 
 Terminal denials:
 
+- `:2004` `deny_unsupported_action` — the board-branch fallthrough (`:1965`) for an
+  action with no board mapping. That covers `issue:coordination_metadata` for every
+  cloud-tenant user, and `issue:comment` / `issue:mutate` for a `viewer`. The route
+  never asks `issue:coordination_metadata` for a non-agent
+  (`server/src/routes/issues.ts:6168`), so a cloud-tenant user reaches the
+  coordination fields through `issue:mutate` instead.
 - `:2523` `deny_missing_grant` — generic unassigned-issue access cannot claim a
   recovery or review shell (`BLO-19094`).
 - `:2398`, `:2404` `deny_scope` — coordination metadata on a self-owned, unassigned,
@@ -163,6 +174,7 @@ This model is a boundary, not a backlog of widenings. These must not become allo
 without re-deciding the model itself:
 
 - A peer agent with no relation to an issue: denied on all three actions.
+- A cloud-tenant user with `viewer` membership: denied on all three actions.
 - A manager of the assignee: denied `issue:mutate`, **even holding `tasks:assign`**.
 - A `tasks:assign` holder who does **not** manage the assignee: denied
   `issue:coordination_metadata` (`deny_scope`).
@@ -174,9 +186,11 @@ without re-deciding the model itself:
 
 `server/src/__tests__/authorization-service.test.ts`, describe block
 **"issue authorization matrix (BLO-30034)"**. It is table-driven over
-(principal relation × action) and asserts the whole grid above, including the
-denials. The four historical incidents are rows in that table rather than separate
-cases, which is the specific thing that was missing when each of them shipped.
+(principal relation × action): one relation per row of the principal × field grid —
+the four board principals included, and the parent-or-sibling row split into two —
+asserting every action verdict in the allow-path table, including the denials. The
+four historical incidents are rows in that table rather than separate cases, which
+is the specific thing that was missing when each of them shipped.
 
 Changing any outcome documented above fails that test. It does **not** notice a new
 allow-path reachable only by a relation the table does not model — so adding an
