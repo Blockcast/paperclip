@@ -351,6 +351,23 @@ describe("openapi routes", () => {
     expect(spec.paths["/api/companies/import"].post.responses["202"]).toBeDefined();
   });
 
+  it("keeps the issue aggregates' response codes in line with their /search siblings", () => {
+    const { spec } = loadSpecRoutes();
+    // BLO-41592: issues/count and the census refuse time-bound params with a 400, and both
+    // open with assertCompanyAccess, so a 401 is reachable too. registerCurrentRoute treats
+    // a supplied `responses` map as a replacement for its default, not an addition, so
+    // declaring only { 200, 400 } there silently dropped the 401. Pin the pair to /search —
+    // same tag, same auth — so neither drifts narrower than the family it is registered in.
+    const sibling = Object.keys(spec.paths["/api/companies/{companyId}/search"].get.responses).sort();
+    expect(sibling).toEqual(expect.arrayContaining(["400", "401"]));
+    for (const routePath of [
+      "/api/companies/{companyId}/issues/count",
+      "/api/companies/{companyId}/issues/open-assignment-census",
+    ]) {
+      expect(Object.keys(spec.paths[routePath].get.responses).sort()).toEqual(sibling);
+    }
+  });
+
   it("resolves every route registration form in the route sources", () => {
     // The guard audit below can only classify routes this scanner resolved, and its
     // vacuity check counts only what was found — so an unresolvable registration form
