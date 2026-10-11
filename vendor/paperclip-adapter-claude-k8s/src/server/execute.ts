@@ -3204,6 +3204,46 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   // Parse Claude output (reuse claude_local parsing)
+  const parsedStream = parseClaudeStreamJson(stdout);
+
+  // BLO-43344: a declared MCP server that fails to connect contributes no tools
+  // and is otherwise indistinguishable from one that was never configured, so
+  // its absence reads as deliberate policy. The CLI does report it — the init
+  // event carries every declared server with a status — so name the ones that
+  // did not come up. Logged rather than raised: a dead MCP server degrades a run
+  // but does not fail it, and failing the run here would turn one unreachable
+  // endpoint into a fleet-wide outage. `logQuietly` is what makes that true of
+  // the log call itself: a rejecting sink must not become the throw site, and
+  // the trigger is fleet-correlated — one dead endpoint puts every run here.
+  //
+  // Emitted above the `jobTimedOut` return, not below it: a run that spun
+  // because a tool namespace was missing is a likely candidate for hitting the
+  // wall, so the timeout path is one of the cases that most wants this signal.
+  // `parseClaudeStreamJson` is pure and `stdout` is final from the tail/on-disk
+  // reconciliation above, so moving the parse up costs only the parse itself on
+  // the paths that used to return before it.
+  const unconnectedMcpServers = parsedStream.mcpServers.filter((s) => s.status !== "connected");
+  if (unconnectedMcpServers.length > 0) {
+    // `name` is interpolated into a `[paperclip] `-prefixed line that is read
+    // back as host run output, so quote it: a name carrying a newline would
+    // otherwise forge a second such line. Names come from operator
+    // `adapterConfig.mcpServers` rather than from the model, so this is
+    // defence in depth, not a live escape.
+    await logQuietly(
+      onLog,
+      "stderr",
+      `[paperclip] MCP servers declared but not connected: ` +
+        `${unconnectedMcpServers.map((s) => `${JSON.stringify(s.name)}=${s.status}`).join(", ")} ` +
+        `(connected: ${
+          parsedStream.mcpServers
+            .filter((s) => s.status === "connected")
+            .map((s) => JSON.stringify(s.name))
+            .join(", ") || "none"
+        }). ` +
+        `Each contributes no mcp__<name>__* tools to this run.\n`,
+    );
+  }
+
   if (jobTimedOut) {
     return {
       exitCode,
@@ -3214,31 +3254,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   }
 
-  const parsedStream = parseClaudeStreamJson(stdout);
   let parsed = parsedStream.resultJson;
-
-  // BLO-43344: a declared MCP server that fails to connect contributes no tools
-  // and is otherwise indistinguishable from one that was never configured, so
-  // its absence reads as deliberate policy. The CLI does report it — the init
-  // event carries every declared server with a status — so name the ones that
-  // did not come up. Logged rather than raised: a dead MCP server degrades a run
-  // but does not fail it, and failing the run here would turn one unreachable
-  // endpoint into a fleet-wide outage.
-  const unconnectedMcpServers = parsedStream.mcpServers.filter((s) => s.status !== "connected");
-  if (unconnectedMcpServers.length > 0) {
-    await onLog(
-      "stderr",
-      `[paperclip] MCP servers declared but not connected: ` +
-        `${unconnectedMcpServers.map((s) => `${s.name}=${s.status}`).join(", ")} ` +
-        `(connected: ${
-          parsedStream.mcpServers
-            .filter((s) => s.status === "connected")
-            .map((s) => s.name)
-            .join(", ") || "none"
-        }). ` +
-        `Each contributes no mcp__<name>__* tools to this run.\n`,
-    );
-  }
 
   // Recovery path for malformed or partially duplicated streams: if a complete
   // result event is present as its own line, preserve the successful run rather
