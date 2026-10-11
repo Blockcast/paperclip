@@ -95,6 +95,20 @@ function denyingGate(resumeAt: Date | null): PenstockAvailabilityGate {
   };
 }
 
+/**
+ * BLO-29494 AC6. Operator-facing escalation prose — the issue that opens on
+ * exhaustion AND the comment that closes it — must name Penstock and never the
+ * retired ccrotate. Both halves of the lifecycle go through this one guard so
+ * they cannot drift apart. A bare substring check is safe: the only value
+ * interpolated into that prose is the target ("claude" | "codex"), while the
+ * persisted identifiers that deliberately keep the old name (originKind,
+ * activity action) are not operator text.
+ */
+function expectPenstockOperatorProse(text: string, artifact: string) {
+  expect(text, `${artifact} names Penstock as the capacity owner`).toContain("Penstock");
+  expect(text.toLowerCase(), `${artifact} must not point an operator at ccrotate`).not.toContain("ccrotate");
+}
+
 /** Deterministic gate that always allows (capacity recovered). */
 function allowingGate(): PenstockAvailabilityGate {
   return {
@@ -863,7 +877,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
       .from(issueComments)
       .where(eq(issueComments.issueId, escalationId))
       .then((rows) => rows[0] ?? null);
-    expect(recoveryComment?.body).toContain("ccrotate pool recovered");
+    expectPenstockOperatorProse(recoveryComment?.body ?? "", "recovery close comment");
 
     // Closing the stale escalation removes it from the partial unique index so
     // a later real outage for the same pool can open a fresh issue.
@@ -1120,11 +1134,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
     // above) from "we are still telling a human to go turn a knob that is
     // gone" (the defect).
     const operatorText = `${escalations[0]?.title ?? ""}\n${escalations[0]?.description ?? ""}`;
-    expect(operatorText, "escalation names Penstock as the capacity owner").toContain("Penstock");
-    expect(
-      operatorText.toLowerCase(),
-      "escalation must not point an operator at a ccrotate token refresh or pool top-up",
-    ).not.toMatch(/ccrotate (token|pool|capacity pool)/);
+    expectPenstockOperatorProse(operatorText, "escalation");
   });
 
   it("keeps re-deferring a young chain no matter how many attempts it has burned", async () => {
