@@ -17,6 +17,45 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { serverVersion } from "../version.js";
 import type { AuthCapabilities } from "../auth/capabilities.js";
 
+/**
+ * BLO-28615. Upper bound on the dependency work behind `/api/health`, chosen to
+ * sit below the 20s readiness probe timeout the chart pins on both tiers.
+ *
+ * Without it a *dead* pool — not merely a saturated one — takes every replica
+ * down. The driver's `connect_timeout` is the 30s default and the role's
+ * `statement_timeout` is 30s, both longer than the probe timeout, so kubelet
+ * abandons the probe first. An abandoned response has `res.writableFinished`
+ * false, so `noteApiResponseCompleted()` never fires (middleware/http-metrics.ts)
+ * and the `/livez` wedge detector sees arrivals with no completions. Once
+ * readiness has drained the endpoints the probe is the only `/api` traffic
+ * left, so `sinceLastCompletionMs` reaches API_PIPELINE_STALL_MS and liveness
+ * restarts the pod — on every replica at once, for the duration of the outage.
+ *
+ * Completing is what matters, not the verdict: a 503 returned inside the probe
+ * timeout is an `/api` completion, so the detector stays green and a DB outage
+ * degrades to NotReady — which is what readiness on this path is for — instead
+ * of NotReady plus a tier-wide kill loop.
+ *
+ * The bound is on the probe's own work. It is not a statement timeout: the
+ * query keeps running server-side until `statement_timeout` ends it.
+ */
+export const HEALTH_PROBE_DEADLINE_MS = 10_000;
+
+async function withHealthProbeDeadline(work: () => Promise<void>): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`health dependency check exceeded ${HEALTH_PROBE_DEADLINE_MS}ms`)),
+      HEALTH_PROBE_DEADLINE_MS,
+    );
+  });
+  try {
+    await Promise.race([work(), deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 function shouldExposeFullHealthDetails(
   actorType: "none" | "board" | "agent" | null | undefined,
   deploymentMode: DeploymentMode,
@@ -148,35 +187,40 @@ export function healthRoutes(
     // this guard, so a failure in any of them is the 503 the chart's BLO-35948
     // record describes rather than an unhandled 500. The bootstrap counts only
     // run in authenticated mode, which is the mode the worker runs in.
+    //
+    // The deadline is what keeps a *failure* on this path from becoming a
+    // restart loop. See HEALTH_PROBE_DEADLINE_MS.
     let bootstrapStatus: "ready" | "bootstrap_pending" = "ready";
     let bootstrapInviteActive = false;
     try {
-      await db.execute(sql`SELECT 1`);
-      if (opts.deploymentMode === "authenticated") {
-        const roleCount = await db
-          .select({ count: count() })
-          .from(instanceUserRoles)
-          .where(sql`${instanceUserRoles.role} = 'instance_admin'`)
-          .then((rows) => Number(rows[0]?.count ?? 0));
-        bootstrapStatus = roleCount > 0 ? "ready" : "bootstrap_pending";
-
-        if (bootstrapStatus === "bootstrap_pending") {
-          const now = new Date();
-          const inviteCount = await db
+      await withHealthProbeDeadline(async () => {
+        await db.execute(sql`SELECT 1`);
+        if (opts.deploymentMode === "authenticated") {
+          const roleCount = await db
             .select({ count: count() })
-            .from(invites)
-            .where(
-              and(
-                eq(invites.inviteType, "bootstrap_ceo"),
-                isNull(invites.revokedAt),
-                isNull(invites.acceptedAt),
-                gt(invites.expiresAt, now),
-              ),
-            )
+            .from(instanceUserRoles)
+            .where(sql`${instanceUserRoles.role} = 'instance_admin'`)
             .then((rows) => Number(rows[0]?.count ?? 0));
-          bootstrapInviteActive = inviteCount > 0;
+          bootstrapStatus = roleCount > 0 ? "ready" : "bootstrap_pending";
+
+          if (bootstrapStatus === "bootstrap_pending") {
+            const now = new Date();
+            const inviteCount = await db
+              .select({ count: count() })
+              .from(invites)
+              .where(
+                and(
+                  eq(invites.inviteType, "bootstrap_ceo"),
+                  isNull(invites.revokedAt),
+                  isNull(invites.acceptedAt),
+                  gt(invites.expiresAt, now),
+                ),
+              )
+              .then((rows) => Number(rows[0]?.count ?? 0));
+            bootstrapInviteActive = inviteCount > 0;
+          }
         }
-      }
+      });
     } catch (error) {
       logger.warn({ err: error }, "Health check database probe failed");
       res.status(503).json({

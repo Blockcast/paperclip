@@ -378,7 +378,10 @@ probes:
   # recovered before the kill landed. See values.blockcast.yaml, which raises
   # this further for a steal-prone hypervisor (BLO-32054).
   #
-  # Rollback: set this back to `/healthz`. Nothing else has to move.
+  # Rollback, during an incident: `helm upgrade --set
+  # probes.liveness.httpGet.path=/healthz`. Nothing else has to move. A
+  # committed revert of this file also needs the `/livez` assertion in
+  # deploy/helm/paperclip/tests/probes.test.mjs, which pins the path.
   liveness:
     httpGet:
       path: /livez
@@ -438,10 +441,20 @@ probes:
   # this probe an input to that detector, because the detector counts
   # completed `/api` responses and this is now `/api` traffic. kubelet
   # abandons a probe at its timeout, which the detector reads as an arrival
-  # with no completion — so a saturation episode holding `/api/health` above
-  # this value for the detector's 180s window would restart the pod rather
-  # than merely de-register it. 20s is the same margin the worker carries.
-  # See server/src/services/api-pipeline-liveness.ts.
+  # with no completion — so an `/api/health` held above this value for the
+  # detector's 180s window would restart the pod rather than merely
+  # de-register it. 20s is the same margin the worker carries.
+  #
+  # That window is not only the saturation case. An unreachable pool fails on
+  # the driver's 30s `connect_timeout`, and a wedged one on the role's 30s
+  # `statement_timeout` — both longer than this timeout, so a *dead* database
+  # would reach that restart loop by the ordinary path, on every replica at
+  # once, not as an edge case. What closes it is in the handler, not here:
+  # HEALTH_PROBE_DEADLINE_MS bounds the dependency work at 10s so the probe
+  # always completes, and a completed 503 keeps the detector green while
+  # readiness does its job. Raising that constant above this timeout
+  # re-opens it. See server/src/routes/health.ts and
+  # server/src/services/api-pipeline-liveness.ts.
   readiness:
     httpGet:
       path: /api/health
@@ -544,7 +557,10 @@ workerProbes:
   # stays green and only a genuine wedge goes red. The prohibition above is
   # unchanged and still binds.
   #
-  # Rollback: set this back to `/healthz`. Nothing else has to move.
+  # Rollback, during an incident: `helm upgrade --set
+  # workerProbes.liveness.httpGet.path=/healthz`. Nothing else has to move. A
+  # committed revert of this file also needs the `/livez` assertion in
+  # deploy/helm/paperclip/tests/probes.test.mjs, which pins the path.
   liveness:
     httpGet:
       path: /livez
