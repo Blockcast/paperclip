@@ -604,3 +604,58 @@ test("PEN-3926: a conflict_unstageable notice still prescribes the rebase", () =
   assert.ok(body.includes("rebase onto the current base"));
   assert.ok(body.includes("un-stageable"));
 });
+
+// ---------------------------------------------------------------------------
+// PEN-3926: the production wire that feeds a REAL actor into the fix is not
+// exercised by any test above. Every PEN-3926 test hands `dequeueActor` to the
+// pure functions directly, so the three links that carry a live actor from
+// GitHub to the classifier are unpinned:
+//
+//   1. `ghTimeline`'s jq projection, which must select `.actor.login`;
+//   2. `main()` passing `attemptWindow.dequeuedBy` to `classifyMergeQueueEviction`;
+//   3. `main()` passing it to `buildEvictionCommentBody`.
+//
+// Breaking ANY of the three -- a conflict resolution restoring the old
+// `.[] | {event, created_at}` projection, or a dropped argument -- is silent:
+// `dequeuedBy` becomes `null`, `isQueueInitiatedRemoval(null)` returns `true`
+// by its deliberate fail-open, and every zero-run removal is classified
+// `conflict_unstageable` again with the rebase instruction restored. The whole
+// suite stays green, because the fail-open is exactly what the unit tests
+// assert. That is the precise regression PEN-3926 was filed to remove.
+//
+// Asserted textually for the same reason as the webhook pin above: `main()`
+// shells out to `gh`, so there is no way to reach these lines from a unit test
+// without a live queue. Ally review #2454.
+// ---------------------------------------------------------------------------
+
+const DETECTOR_SOURCE_PATH = new URL("../merge-queue-eviction-detector.mjs", import.meta.url);
+
+test("PEN-3926: the timeline fetch still selects the removal actor", () => {
+  const source = readFileSync(DETECTOR_SOURCE_PATH, "utf8");
+
+  assert.match(
+    source,
+    /--jq",\s*"\.\[\] \| \{event, created_at, actor: \.actor\.login\}"/,
+    "`ghTimeline`'s jq projection no longer selects `actor: .actor.login`. Do NOT delete this " +
+      "assertion to make the change pass: without the actor, `selectLatestQueueAttemptWindow` " +
+      "returns `dequeuedBy: null` on every window, `isQueueInitiatedRemoval(null)` fails open to " +
+      "`true`, and every deliberate hold is reported as a conflict / un-stageable rebase again -- " +
+      "telling the reader to rebase a clean, deliberately held branch (PEN-3926). The rest of the " +
+      "suite cannot see this: it passes the actor to the classifier directly.",
+  );
+});
+
+test("PEN-3926: main() threads the window's actor into both the classifier and the notice", () => {
+  const source = readFileSync(DETECTOR_SOURCE_PATH, "utf8");
+  const handoffs = source.match(/dequeueActor:\s*attemptWindow\.dequeuedBy/g) ?? [];
+
+  assert.equal(
+    handoffs.length,
+    2,
+    "expected `dequeueActor: attemptWindow.dequeuedBy` at exactly two call sites -- " +
+      "`classifyMergeQueueEviction` (which decides manual vs conflict_unstageable) and " +
+      `\`buildEvictionCommentBody\` (which names the remover) -- found ${handoffs.length}. ` +
+      "Dropping either one silently restores the pre-PEN-3926 rebase instruction, because the " +
+      "classifier's missing-actor fail-open is indistinguishable from a genuine queue eviction.",
+  );
+});
