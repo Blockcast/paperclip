@@ -61,6 +61,7 @@ describeEmbeddedPostgres("issueService.create Alertmanager aggregate arbitration
         name: `alertmanager-linear ${randomUUID()}`,
         issuePrefix: `AM${randomUUID().slice(0, 6).toUpperCase()}`,
         identifierProvider: "linear",
+        defaultResponsibleUserId: "responsible-user",
       })
       .returning();
     const [plugin] = await db

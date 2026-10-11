@@ -11085,14 +11085,20 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
   // BLO-26613: the Dependabot alert route has exactly one configured owner
   // and no fallback. A paused (or otherwise uninvokable) configured agent
-  // must not receive the new alert issue silently -- it should file
-  // unassigned so `allow_company_agent` lets any agent pick it up. The wake
-  // to the paused agent itself still fails (heartbeat.wakeup rejects a
-  // paused target and the error is caught/logged a few lines below) --
-  // that is a pre-existing, separate mechanism this change does not touch.
-  // The point of this test is that the ISSUE doesn't silently inherit the
-  // paused assignee merely because the wake attempt happened to fail too.
-  it("files a new dependabot alert issue unassigned when the configured agent is paused", async () => {
+  // must not receive the new alert issue silently. The wake to the paused
+  // agent itself still fails (heartbeat.wakeup rejects a paused target and
+  // the error is caught/logged a few lines below) -- that is a pre-existing,
+  // separate mechanism this change does not touch. The point of this test is
+  // that the ISSUE doesn't silently inherit the paused assignee merely
+  // because the wake attempt happened to fail too.
+  //
+  // BLO-43103 corrected where it lands instead. This filed *unassigned* on
+  // the premise that `allow_company_agent` would let any agent pick it up --
+  // but every inbox selects by assignee and ignores status, so an unassigned
+  // row is mutable by anyone and discoverable by nobody. The webhook has no
+  // creating agent, so the create now falls back to the company's default
+  // responsible user: still not the paused agent, and now reachable.
+  it("files a new dependabot alert issue to the company default when the configured agent is paused", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
     const app = buildApp({ dependabotAgentId: agentId });
@@ -11108,7 +11114,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "github_dependabot_alert")));
     expect(issue).toBeTruthy();
     expect(issue!.assigneeAgentId).toBeNull();
-    expect(issue!.assigneeUserId).toBeNull();
+    expect(issue!.assigneeUserId).toBe("test-board-user");
     expect(issue!.status).toBe("todo");
   });
 

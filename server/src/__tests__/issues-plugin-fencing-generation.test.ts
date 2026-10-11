@@ -85,6 +85,7 @@ describeEmbeddedPostgres("plugin fencing generation enforced by the issues servi
       .values({
         name: `fencing ${randomUUID()}`,
         issuePrefix: `FN${randomUUID().slice(0, 6).toUpperCase()}`,
+        defaultResponsibleUserId: "responsible-user",
       })
       .returning();
     return company;
