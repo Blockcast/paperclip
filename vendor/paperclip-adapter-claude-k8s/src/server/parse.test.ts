@@ -78,6 +78,59 @@ describe("parseClaudeStreamJson", () => {
     expect(parseClaudeStreamJson(stdout).mcpServers).toEqual([]);
   });
 
+  it("lets a resumed session's init replace the earlier MCP statuses (BLO-43344)", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess_resume",
+        model: "claude-opus-4-6",
+        mcp_servers: [
+          { name: "gbrain", status: "failed" },
+          { name: "k8s-ro", status: "connected" },
+        ],
+      }),
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess_resume",
+        model: "claude-opus-4-6",
+        mcp_servers: [{ name: "gbrain", status: "connected" }],
+      }),
+    ].join("\n");
+    // Replace, not append: the resumed session's statuses supersede the first
+    // init's. Appending would report `gbrain` twice with contradictory statuses
+    // and keep `k8s-ro` alive after the CLI stopped declaring it.
+    expect(parseClaudeStreamJson(stdout).mcpServers).toEqual([
+      { name: "gbrain", status: "connected" },
+    ]);
+  });
+
+  it("keeps the earlier MCP list when a later init carries no mcp_servers (BLO-43344)", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess_resume_nomcp",
+        model: "claude-opus-4-6",
+        mcp_servers: [{ name: "gbrain", status: "failed" }],
+      }),
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess_resume_nomcp",
+        model: "claude-opus-4-6",
+      }),
+    ].join("\n");
+    // The `Array.isArray` guard at parse.ts:50 is what makes "replace" mean
+    // replace-when-reported rather than erase-when-silent. Dropping the guard,
+    // or moving the assignment outside it, clears the list here and the dead
+    // `gbrain` goes unreported again — the exact regression BLO-43344 is about.
+    expect(parseClaudeStreamJson(stdout).mcpServers).toEqual([
+      { name: "gbrain", status: "failed" },
+    ]);
+  });
+
   it("parses assistant text blocks", () => {
     const lines = [
       JSON.stringify({
