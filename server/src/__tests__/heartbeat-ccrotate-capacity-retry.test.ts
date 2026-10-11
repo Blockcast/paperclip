@@ -179,6 +179,7 @@ describeEmbeddedPostgres("heartbeat ccrotate capacity-defer → scheduled retry"
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
     await db.insert(agents).values({
       id: agentId,
