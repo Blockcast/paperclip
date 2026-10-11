@@ -2399,6 +2399,71 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
     );
   });
 
+  // BLO-42811 — the AMPLIFIER, not the trigger. The test above pins the patch
+  // shape, which removes the one rejection we measured. This one pins what
+  // happens when the host refuses the write for ANY reason: the aggregate-join
+  // call site used to be unguarded, so the throw propagated to `handleWebhook`,
+  // which classifies everything but `PermanentAlertError` as transient and
+  // re-throws `AlertDeliveryIncompleteError` for the whole batch — destroying
+  // every unrelated alert riding alongside it.
+  //
+  // The trigger set is open, which is why guarding beats enumerating: the
+  // plugin vets the agent against its own (memoized) roster read while the host
+  // re-vets against a fresh in-transaction one, so a status change between the
+  // two still throws `conflict` — and `issues.get`, the owner-email lookup and
+  // the fenced write itself can each throw independently of assignability.
+  it("a refused retrofit on the aggregate-join path does not destroy the delivery", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-winner",
+      status: "backlog",
+      assigneeAgentId: null,
+      assigneeUserId: "user-42",
+    }));
+    mocks.issues.update.mockRejectedValue(
+      new Error("Assignee is terminated and cannot be assigned work"),
+    );
+
+    await expect(
+      handleWebhook(
+        ctx,
+        baseConfig({ ownerMap: {} }),
+        true,
+        baseInput({
+          parsedBody: baseEnvelope({
+            alerts: [
+              {
+                ...OWNER_ANNOTATION_ALERT("agent:agent-multicast"),
+                fingerprint: "second-member-1",
+              },
+            ],
+          }),
+        }),
+      ),
+    ).resolves.not.toThrow();
+
+    // The retrofit was attempted and refused...
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-winner",
+      { assigneeAgentId: "agent-multicast", assigneeUserId: null },
+      "company-1",
+      undefined,
+      FIRING_FENCE_ARG,
+    );
+    // ...and the delivery still completed, recording the owner the row ACTUALLY
+    // has. Claiming the agent here would be worse than the crash: state would
+    // disagree with the row, and the next re-fire would skip the retrofit.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        paperclipIssueId: "issue-winner",
+        assigneeAgentId: null,
+        assigneeUserId: "user-42",
+      }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
   // Ally review 5471368783 I2. The creation guard leaves exactly this row
   // behind: `ownerMap` names an uninvokable agent, the route supplies a human,
   // so the row is created human-owned and agent-null. Without the same guard
@@ -2686,6 +2751,10 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
         if (nextAgent && nextUser) {
           throw new Error("Issue can only have one assignee");
         }
+        // Model the commit too, not just the merge: a later `issues.update` in
+        // the same delivery must observe the cleared user rather than `user-42`.
+        row.assigneeAgentId = nextAgent as string | null;
+        row.assigneeUserId = nextUser as string | null;
         return { id: "issue-existing" };
       },
     );
