@@ -557,10 +557,11 @@ export function responsibleUserAuthzShadowMode() {
  *
  * `boardActorIsTranscriptOperator` (`routes/authz.ts`) already reads the same
  * column through `normalizeHumanRole(value, "viewer")` and fails closed on
- * exactly these values. This keeps the two gates in step: a role string this
- * codebase does not recognize lands where a viewer lands — needing an explicit
- * grant — on both sides, rather than being privileged by one and refused by
- * the other. `member` still folds to `operator`, which is the agreement with
+ * exactly these values. This keeps THOSE TWO gates in step — the decider's
+ * non-viewer bars and the transcript gate: a role string this codebase does
+ * not recognize lands where a viewer lands, needing an explicit grant, on
+ * both sides rather than being privileged by one and refused by the other.
+ * `member` still folds to `operator`, which is the agreement with
  * `normalizeHumanRole` that both call sites exist to hold.
  *
  * Note the fallback is `viewer`, NOT `normalizeHumanRole`'s own `operator`
@@ -568,6 +569,29 @@ export function responsibleUserAuthzShadowMode() {
  * rendering) and wrong for an authorization bar, for the reason spelled out at
  * `normalizedTranscriptRole`: it would turn every unknown or legacy role
  * string into a privileged member.
+ *
+ * SCOPE — the column is NOT uniformly normalized, and this helper does not
+ * make it so. Do not read the paragraph above as a whole-codebase claim.
+ * `membership_role` is read through three dispositions:
+ *
+ *   1. `viewer` fallback, fails closed — here and `routes/authz.ts`
+ *      (`normalizedTranscriptRole`). `support`/`null` are denied.
+ *   2. `operator` fallback, privileged — `principal-access-compatibility.ts`
+ *      (`ensureHumanRoleDefaultGrants`, the provisioning path),
+ *      `company-member-roles.ts` (`resolveHumanInviteRole`) and four sites in
+ *      `routes/access.ts`. A cloud-tenant `support` row is SEEDED with
+ *      `operator` grants here.
+ *   3. raw `=== "viewer"`, fails open — `routes/authz.ts` (the
+ *      `assertCompanyAccess` board write bar and the `onBehalfOf` write bar),
+ *      `routes/tool-access.ts` and `routes/tool-gateway.ts`.
+ *
+ * So a `support` principal is seeded operator-level by (2), admitted by (3),
+ * and denied by (1). Converting (3) to this helper would NOT merely restore
+ * agreement — it would put the HTTP write bars in conflict with the
+ * provisioning path that deliberately seeds `support` as `operator`.
+ * Reconciling them needs a decision about what `support` is entitled to, not
+ * a mechanical substitution, so it is deliberately NOT done here. Tracked on
+ * PEN-3954; do not widen this helper's claim until that lands.
  */
 function membershipRoleIsNonViewer(value: unknown): boolean {
   return normalizeHumanRole(value, "viewer") !== "viewer";
