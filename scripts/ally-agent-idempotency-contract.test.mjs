@@ -278,13 +278,37 @@ test("Step 4 emits the structured verdict block the gate reads first", () => {
     "the template must emit an `<!-- ally-verdict:1` block — without a producer"
     + " every review takes the prose fallback that BLO-32695 exists to retire");
 
-  // The three fields the gate actually consumes. `head` decides attestation,
+  // The four fields the gate actually consumes. `head` decides attestation,
   // `findings` is the only route to blocking_finding, `dispositions` is the
-  // only route that retires a prior finding.
-  for (const field of ["head", "findings", "dispositions"]) {
+  // only route that retires a prior finding, and `reviewer` is the only route
+  // that refuses one (BLO-34389).
+  for (const field of ["head", "findings", "dispositions", "reviewer"]) {
     assert.match(template, new RegExp(`"${field}"`),
       `the block must carry a "${field}" field`);
   }
+
+  // `reviewer` is compared verbatim against the PR head commit's
+  // `commit.author.email`, so its VALUE is as load-bearing as its presence: a
+  // literal in the wrong token space matches nothing and the exclusion reads as
+  // configured while failing open. Pin both halves — the producer template here
+  // and the spec note that defines the token space — so neither can drift away
+  // from the other silently.
+  //
+  // ☠️ The trap that makes this hard to audit: on `master` every agent PR has
+  // already been SQUASH-MERGED, and GitHub re-attributes a squash commit to the
+  // App that pressed merge. So `git log master` shows the Ally lane authoring
+  // under `290875700+allyblockcast[bot]@users.noreply.github.com` (committer
+  // `GitHub`, 32/32 of them over 2026-10-03..10), and a reader measuring there
+  // concludes the lane email is dead. That is the wrong population: the gate
+  // reads `GET /commits/{headSha}` at the PR HEAD, which is pre-squash and
+  // carries the lane email — 8/8 open PR heads on 2026-10-11, zero under the
+  // App noreply. Re-pointing this literal at the noreply address would be
+  // strictly worse: it is the fleet-SHARED identity, so it matches no PR head
+  // today and would match every lane's at once if it ever did.
+  assert.match(template, /"reviewer":\s*"ally@paperclip\.blockcast\.net"/,
+    "the producer must declare the Ally lane's git author email verbatim");
+  assert.match(agentsDoc, /git author email.*\bcommit\.author\.email\b/,
+    "the spec note must keep naming the token space the gate compares against");
 
   // The parser's opener is line-anchored (`^` plus the NOT_INDENTED_CODE
   // lookahead), so that a quoted mention cannot mint a phantom second block.
