@@ -32,7 +32,23 @@ sum by (stop_reason) (increase(paperclip_isolation_workspace_reaper_sweeps_total
 Neither is part of this alert; both are non-routine when non-zero.
 
 - `paperclip_isolation_workspace_reaper_retained_resurrected_total` — a workspace used again between the sweep's opening snapshot and its unlink, i.e. one that came within a single query of being deleted underneath a live run. Any non-zero value is the exposure window the pre-unlink re-read exists to close, actually occurring.
-- `paperclip_isolation_workspace_reaper_skipped_layout_total` — directories skipped *unexamined* because their top level was not exactly `{home, session}`. Baseline measured **1** at `maxAgeDays=30` ([BLO-36735](https://paperclip.blockcast.net/BLO/issues/BLO-36735): a stray `wt-blo-19094` git worktree). A rise means the tree is more heterogeneous than the allowlist was validated against — investigate before widening the allowlist.
+- `paperclip_isolation_workspace_reaper_skipped_layout_total` — directories skipped *unexamined* because their top level was not exactly `{home, session}`. **It sums two populations with opposite meanings and carries no label to tell them apart, so split it before reading it.** Measured over the whole live tree at `maxAgeDays=30` on 2026-10-11 ([BLO-36735](https://paperclip.blockcast.net/BLO/issues/BLO-36735)): 50 skips = **42 single-sided or empty** (`{home}` or `{session}` alone — a half-materialized workspace, carrying no heterogeneity at all) + **8 genuine supersets** (`scratch`×2, `blo16208`, `blo32457-logs`, `wt-29038`, `wt-31323`, `wt-blo-19094`, `wt-blo-30976`, `wt-blo-31507`). Only the supersets are the signal: a rise *there* means the tree is more heterogeneous than the allowlist was validated against — investigate before widening the allowlist. That subset was identical on 2026-10-10 and 2026-10-11, so treat **8** as the current baseline and a change in its membership, not the total, as the thing to look at.
+  ⚠ This line previously gave the baseline as **1** — the superset count when BLO-36735 first measured it, before the single-sided population existed at scale. Read against a live total of 50 that is a 50× apparent rise with a benign cause, i.e. a signal that fires permanently and so cannot be acted on. Split it by hand until the counter carries a `reason` label:
+
+  ```bash
+  cd /paperclip/instances/default/data/k8s-isolation/workspaces
+  CUT=$(( $(date +%s) - 30*86400 ))   # match PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_AGE_DAYS
+  for d in */; do d=${d%/}; m=$(stat -c %Y "$d") || continue
+    [ "$m" -gt "$CUT" ] && continue   # layout is only checked on aged candidates
+    case "$(ls -A "$d" | sort | tr '\n' ',')" in
+      "home,session,") ;;
+      "home,"|"session,"|"") echo "single-sided  $d" ;;
+      *) echo "SUPERSET      $d" ;;
+    esac
+  done | sort | uniq -c -w12
+  ```
+
+  Note this walks the whole tree, while the counter only covers the directories a sweep actually reached — a `stop_reason="capped"` sweep reports a fraction of both populations (23 of the 50 above, on the 2026-10-11 tick).
   A directory whose top level *did* match but which holds a nested git checkout or worktree state is **not** counted here — it was examined, so it is `paperclip_isolation_workspace_reaper_entries_total{outcome="retained_nested_checkout"}` (routine). Read that series with these three properties in mind:
   - **One increment per such directory the sweep reaches, on every sweep.** Only a directory that already passed the age gate (root `mtime`, and the owning row's `lastUsedAt` when it has one) and the `{home, session}` allowlist is probed; each hit also logs `retained a layout-compliant directory holding a nested git checkout` with its path. A retained directory is counted again by the next sweep, so divide `increase()` over a window by the sweeps in it — `sum(increase(paperclip_isolation_workspace_reaper_sweeps_total[…]))` — rather than reading it as new arrivals.
   - **A capped sweep undercounts it.** The probe runs before the per-tick cap, so a retention spends no unlink budget, but the sweep stops at the first directory that would take `eligible` past `PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_DELETES_PER_TICK` (200 here and by default) and never reaches anything after it. A sweep that ends `stop_reason="capped"` (or `stop_reason="lookup_faulted"`) therefore reports only the nested checkouts it reached; only a `stop_reason="complete"` sweep covers the whole set. Under `dry_run="true"` nothing is unlinked, so while the eligible backlog exceeds the cap **every** dry-run sweep ends capped and this count stays partial.
