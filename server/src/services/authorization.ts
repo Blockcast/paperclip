@@ -977,8 +977,15 @@ export function authorizationService(db: Db) {
   // company". `resource.companyId` is NOT always row-derived — `previewAssignment`
   // and `explainAssignment` (plugin-host-services.ts:3350,3366) build it from
   // `params.companyId` alongside a caller-supplied `params.target.issueId`, so the
-  // two can disagree by construction. Any call site that would fall back to a
-  // caller-supplied field when this returns null must fail closed instead.
+  // two can disagree by construction. Any call site that would fall back to
+  // ANYTHING OTHER THAN THE ROW when this returns null must fail closed instead.
+  // Not just a caller-supplied field: falling back to a literal that happens to
+  // mean "no restriction" is the same hazard and is easier to miss, because
+  // there is no caller-supplied value in sight to make it look suspicious —
+  // `?.originKind ?? null` at :1745 read exactly that way until Ally caught it.
+  // "Fail closed" is a direction, not a return value: it is `false` where the
+  // function answers "is this within the boundary", and `true` where it answers
+  // "does this block the claim".
   async function loadIssue(companyId: string, issueId: string): Promise<IssueAuthorizationRow | null> {
     const row = await loadIssueAnyCompany(issueId);
     return row && row.companyId === companyId ? row : null;
@@ -1795,12 +1802,26 @@ export function authorizationService(db: Db) {
     // would make every ordinary (origin-less) issue reload the full row here —
     // the common case, and the one this branch exists to serve — while only
     // issues that already carry an origin kind took the cheap path.
-    const originKind = resource.originKind !== undefined
-      ? resource.originKind
-      : resource.issueId
-        ? (await loadIssue(resource.companyId, resource.issueId))?.originKind ?? null
-        : null;
-    return AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.has(originKind ?? "");
+    if (resource.originKind !== undefined) {
+      return AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.has(resource.originKind ?? "");
+    }
+    if (!resource.issueId) return false;
+    const issue = await loadIssue(resource.companyId, resource.issueId);
+    // Same fail-closed rule as the two boundary checks above, inverted because
+    // here `true` is the blocking answer. An `issueId` this company cannot read
+    // is foreign or dangling, not "an issue with no origin kind" — and the
+    // difference matters precisely on the path that reaches here. This gates the
+    // BLO-19094 self-appointment deny at :2343, inside the `tasks:assign` block,
+    // and `tasks:assign` is what `previewAssignment` / `explainAssignment`
+    // (plugin-host-services.ts:3350,3366) pass to `decide()` with a
+    // caller-supplied `issueId` and no `originKind`. Degrading an unreadable row
+    // to `null` would answer "not a review shell" — the permissive direction —
+    // for a shell in another company. Neither sibling guard reaches this path:
+    // `issueResourceWithinLowTrustBoundary` sees `tasks:assign` only for a
+    // low-trust actor, and `issueMatchesTaskBridgeWriteBoundary` needs a
+    // `task_bridge` keyScope that `pluginAssignmentActor` does not emit.
+    if (!issue) return true;
+    return AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.has(issue.originKind ?? "");
   }
 
   async function decideBase(input: {
