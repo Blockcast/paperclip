@@ -1609,6 +1609,74 @@ test("PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed exposes a st
   );
 });
 
+test("the start-lock regimes are separable from the alert payload and land on separate bridge rows (BLO-43728)", () => {
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  // Slice each alert's own block first, for the reason spelled out in the
+  // wedged test above: an unbounded `alert: Name[\s\S]*?label:` borrows the
+  // next alert's fields when the alert's own are missing, which is exactly the
+  // mutation these assertions exist to catch.
+  const sliceOf = (name) => {
+    const [, block] = rendered.match(
+      new RegExp(`\\n\\s+- alert: ${name}\\n([\\s\\S]*?)(?=\\n\\s+- alert: |\\n\\s+- name: |$)`),
+    ) ?? [];
+    assert.ok(block, `${name} must render its own block`);
+    return block;
+  };
+  const wedged = sliceOf("PaperclipAgentStartLockWedged");
+  const aborted = sliceOf("PaperclipAgentStartLockAborted");
+
+  // AC1. The regime must be readable from the payload, without opening the
+  // worker pod's agent rows. The label is honest because the predicate already
+  // selects only this regime: a landed abort releases the lock, the held gauge
+  // is emitted only for locks held right now, so a landed abort deletes the
+  // series inside a scrape and the `for:` window can never complete.
+  assert.match(
+    wedged,
+    /\n\s+regime: stalled\n/,
+    "the wedge arm must declare regime=stalled so a responder can tell it from the self-healing regime",
+  );
+  // The asymmetry is load-bearing, not an omission. The aborted counter is
+  // incremented at abort-REQUEST time, so that alert fires in BOTH regimes and
+  // a regime label on it would be a claim it cannot support -- which is the
+  // defect BLO-43728 fixed on its description.
+  assert.doesNotMatch(
+    aborted,
+    /\n\s+regime:/,
+    "PaperclipAgentStartLockAborted fires in both regimes and must NOT claim one",
+  );
+  assert.doesNotMatch(
+    aborted,
+    /lock released and dispatch has RESUMED|this is not an outage|[Nn]obody needs waking/,
+    "the aborted alert must not assert the abort landed: its counter increments at abort-REQUEST time",
+  );
+  assert.match(
+    aborted,
+    /paperclip_agent_start_lock_held_seconds/,
+    "the aborted alert must name the held-gauge query that separates landed from unlanded",
+  );
+
+  // AC2. Both arms carry a per-agent dedupe domain. The bridge keys issue
+  // CREATION on [alertname, paperclip_dedupe_domain]; with no domain every
+  // firing of an alertname converges on one immortal row, and a stalled page
+  // then arrives carrying whatever verdict that row already had.
+  for (const [name, block] of [
+    ["PaperclipAgentStartLockWedged", wedged],
+    ["PaperclipAgentStartLockAborted", aborted],
+  ]) {
+    assert.match(
+      block,
+      /\n\s+paperclip_dedupe_domain: "\{\{ \$labels\.agent_id \}\}"\n/,
+      `${name} must carry a per-agent paperclip_dedupe_domain so the bridge files one row per agent`,
+    );
+  }
+});
+
 test("PaperclipAgentStartLockWedged pages on the abort boundary, so firing means the abort did not land (PEN-3305/PEN-3328)", () => {
   const rendered = renderChart([
     "--show-only",
