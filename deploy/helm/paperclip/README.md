@@ -213,7 +213,7 @@ kubectl -n paperclip exec paperclip-0 -- \
 | prometheusRule.scheduledRetryParkHorizonFor | string | `"5m"` | Scrape-flap tolerance for the scheduled-retry park-horizon alert (BLO-25036). |
 | prometheusRule.scheduledRetryParkHorizonRefreshFailureFor | string | `"5m"` | Alert hold for failed scheduled-retry park-horizon metric refreshes (BLO-25036). |
 | prometheusRule.scheduledRetryParkHorizonRunbookUrl | string | `"https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md#scheduled-retry-park-horizon-blo-25036"` | Runbook URL for scheduled-retry park-horizon and freshness alerts. |
-| prometheusRule.scheduledRetryParkHorizonSeconds | int | `5400` | Maximum observed-population-derived booked scheduled-retry horizon before warning (BLO-25036). |
+| prometheusRule.scheduledRetryParkHorizonBackstopSeconds | int | `86400` | Backstop park-horizon ceiling for scheduled_retry reasons with no per-class writer constant (BLO-25036/BLO-31174). Classes that clamp explicitly carry their own constants inline in the alert expression; the superseded flat `5400` was measured 100% false positive. |
 | prometheusRule.processLostElevatedFor | string | `"10m"` | How long the elevated process_lost daily count must persist before warning. |
 | prometheusRule.processLostLivenessNullWindowCount | int | `5` | Warn when the reaper gets more than this many null kube Job-status lists in 15m (blind-to-kube denominator guard: a low process_lost count is untrustworthy while this fires). |
 | prometheusRule.processLostPageFor | string | `"2h"` | How long the high process_lost daily count must be sustained before paging. |

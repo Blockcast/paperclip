@@ -34,14 +34,20 @@ Owner: Platform / SRE (BLO-21116)
 from `heartbeat_runs.updated_at` to `scheduled_retry_at` for live
 `status='scheduled_retry'` rows — i.e. how far out the most recent park decision
 booked. `PaperclipScheduledRetryParkHorizonImplausible` fires when that future-due
-horizon exceeds 5,400 seconds. That bound was set from an earlier seven-day
-population (n=5,253, p99=1,594.8s, maximum 3,567.5s) which is now
-**superseded**: in the seven days to 2026-09-28 there were 1,016 breaching
-samples across 12 agents, every one inside [5,590.1s, 8,977.8s], i.e. below the
-`transient_failure` ladder's designed 9,000s ceiling. That ladder's final hop is
-7,200s with +/-25% jitter, i.e. [5,400s, 9,000s], so a `transient_failure` page
-anywhere in that band is designed backoff, not an implausible booking -- check
-the `reason` label before treating a page as a fault.
+horizon exceeds **the ceiling for the row's own park class**, joined per `reason`
+from the table below — it is no longer a flat bound, in either the deployed
+`Blockcast/onprem-k8s` rule (since
+[onprem-k8s#4145](https://github.com/Blockcast/onprem-k8s/pull/4145), 2026-10-09)
+or this repo's Helm chart (BLO-42711). The flat 5,400s predicate it replaced came
+from an earlier seven-day population (n=5,253, p99=1,594.8s, maximum 3,567.5s) and
+is **superseded** and measured 100% false positive: in the seven days to
+2026-09-28 there were 1,016 breaching samples across 12 agents, every one inside
+[5,590.1s, 8,977.8s], i.e. below the `transient_failure` ladder's designed 9,000s
+ceiling. That ladder's final hop is 7,200s with +/-25% jitter, i.e.
+[5,400s, 9,000s], so a `transient_failure` booking anywhere in that band is
+designed backoff, not an implausible one — which is why the flat rule could only
+ever be wrong. A page from the per-class form means the writer for that class
+exceeded **its own clamp**, so fix the writer; do not raise the bound.
 `PaperclipScheduledRetryParkHorizonMetricsRefreshFailed` is the companion
 alert for a failed gauge refresh; while it is firing, the horizon alert is
 gated off and its last snapshot is not trustworthy.
