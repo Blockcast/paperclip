@@ -2677,12 +2677,14 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     // is restored on the NEXT sweep, not this one (asserted by case (b)).
     expect(swept.findings).toBe(0);
 
-    // Retiring the row is not a source-status change: the source stays open.
+    // Retiring the row is not a source-status change: the source stays open,
+    // still `blocked` by the real blocker leaf. Pinned as the exact status
+    // rather than "not terminal" so a vanished row cannot pass this.
     const [source] = await db
       .select({ status: issues.status })
       .from(issues)
       .where(eq(issues.id, blockedIssueId));
-    expect(["done", "cancelled"]).not.toContain(source?.status);
+    expect(source?.status).toBe("blocked");
 
     // Discoverable without reading sweep logs. The activity row is keyed to the
     // SOURCE, so "which sources were suppressed by an abandoned row" is a query;
@@ -2861,22 +2863,28 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       );
     expect(abandonedActivity).toEqual([]);
 
+    // Asserted as "no comment at all", not "no marker comment": the clock reset
+    // is an AFTER INSERT trigger on `issue_comments`, so ANY body resets it.
     const comments = await db
       .select({ body: issueComments.body })
       .from(issueComments)
       .where(eq(issueComments.issueId, recoveryIssueId));
-    expect(comments.some((row) => row.body.includes(ABANDONED_LIVENESS_RECOVERY_MARKER))).toBe(
-      false,
-    );
+    expect(comments).toEqual([]);
 
-    // The source keeps its wake path deferred, not restored: this sweep decided
-    // nothing about it. Pinned so a future change cannot "helpfully" free the
-    // source while leaving the row attached to its run.
+    // The source is untouched -- but note what that does and does not pin.
+    // `removeRecoveryBlockerFromSource` runs BEFORE the live-run guard, so a
+    // deferral DOES prune a recovery->source blocker edge and can restore the
+    // source off `blocked`. That ordering is deliberate: the fabricated edge is
+    // legacy (BLO-28618 stopped writing it) and un-wedging the source is the
+    // point of pruning it, while the row stays open and keeps suppressing
+    // findings either way. This fixture has no such edge -- the source is
+    // `blocked` by the real blocker leaf, not by the recovery row -- so the
+    // prune is `PRUNE_NOT_APPLICABLE` here and the seeded status survives.
     const [source] = await db
       .select({ status: issues.status })
       .from(issues)
       .where(eq(issues.id, blockedIssueId));
-    expect(["done", "cancelled"]).not.toContain(source?.status);
+    expect(source?.status).toBe("blocked");
   });
 
   // BLO-29761: the suppression decision is persisted, so "suppressed by
