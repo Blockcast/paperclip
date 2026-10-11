@@ -43,6 +43,41 @@ describe("parseClaudeStreamJson", () => {
     expect(result.model).toBe("claude-opus-4-6");
   });
 
+  it("records every declared MCP server with the status the CLI reached (BLO-43344)", () => {
+    const stdout = JSON.stringify({
+      type: "system",
+      subtype: "init",
+      session_id: "sess_mcp",
+      model: "claude-opus-4-6",
+      mcp_servers: [
+        { name: "gbrain", status: "connected", source: "dynamic" },
+        { name: "k8s-ro", status: "pending", source: "dynamic" },
+        { name: "linear", status: "failed", source: "dynamic" },
+        { status: "connected" },
+      ],
+    });
+    const result = parseClaudeStreamJson(stdout);
+    // A server that never connects is reported, not omitted — that is the only
+    // signal distinguishing it from one that was never declared.
+    expect(result.mcpServers).toEqual([
+      { name: "gbrain", status: "connected" },
+      { name: "k8s-ro", status: "pending" },
+      { name: "linear", status: "failed" },
+    ]);
+  });
+
+  it("reports no MCP servers when the init event carries none", () => {
+    const stdout = JSON.stringify({
+      type: "system",
+      subtype: "init",
+      session_id: "sess_nomcp",
+      model: "claude-opus-4-6",
+    });
+    // Absent must stay absent: a CLI that does not report mcp_servers must not
+    // read as "every server failed".
+    expect(parseClaudeStreamJson(stdout).mcpServers).toEqual([]);
+  });
+
   it("parses assistant text blocks", () => {
     const lines = [
       JSON.stringify({
