@@ -55,6 +55,18 @@ Query parameters:
 
 `limit` and `offset` are rejected with 400 — the census is not paginated.
 
+Time-bound params (`updated_after`, `createdSince`, `completedWithin`, … — any
+`{updated,created,started,completed,resolved,closed,modified}` prefix with an
+`{after,before,since,until,within,from,to}` suffix, in either spelling) are
+rejected with 400 as well, on presence rather than value, so `?updated_after=`
+is refused too. This census implements no time bound; before BLO-41592 such a
+param was dropped unread and the whole-corpus totals came back as a success.
+The refusal body carries `unsupportedParams` naming the offending keys, and
+points at `GET /api/companies/{companyId}/search?updatedAfter=`, which does
+apply one. `GET /api/companies/{companyId}/issues/count` refuses the same
+family for the same reason. Both check the time bound before the pagination
+refusal, so a request carrying both is told about the time bound.
+
 Response:
 
 ```json

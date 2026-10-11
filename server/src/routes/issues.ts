@@ -9277,22 +9277,27 @@ export function issueRoutes(
       res.status(403).json({ error: "Task bridge keys cannot use company-wide issue census APIs" });
       return;
     }
-    if (req.query.limit !== undefined || req.query.offset !== undefined) {
-      res.status(400).json({
-        error: "open-assignment-census is not paginated and does not accept limit or offset",
-      });
-      return;
-    }
     // BLO-41592: same hole as issues/count above, and this surface is literally named
     // "census" — the exact read the defect description describes going silently
     // corpus-wide. Guarded here in the same change because fixing one aggregate and
     // leaving its neighbour is how this family keeps regressing.
+    //
+    // Checked ahead of the limit/offset refusal so the two aggregates answer
+    // `?limit=1&updated_after=X` identically: both are 400 either way, but a dropped time
+    // bound is the one that was silently returning a wrong answer, so it is the one worth
+    // naming — and the one whose message points at the surface that honours it.
     const unsupportedCensusTimeFilterParams = parseUnsupportedTimeFilterParams(req.query);
     if (unsupportedCensusTimeFilterParams.length > 0) {
       res.status(400).json({
         error:
           "time-bound filtering is not supported on this endpoint; the param was previously dropped unread and returned a census of the whole corpus. Use GET /api/companies/:companyId/search with updatedAfter or updatedWithin.",
         unsupportedParams: unsupportedCensusTimeFilterParams,
+      });
+      return;
+    }
+    if (req.query.limit !== undefined || req.query.offset !== undefined) {
+      res.status(400).json({
+        error: "open-assignment-census is not paginated and does not accept limit or offset",
       });
       return;
     }
