@@ -811,6 +811,84 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
 
+  it("keeps a boundary closed when the issueId is unreadable in the resource's company", async () => {
+    // `previewAssignment` / `explainAssignment` build their resource as
+    // `{ companyId: params.companyId, ...params.target }`, so `companyId` and
+    // `issueId` are both caller-supplied and can disagree. An unreadable row
+    // must not degrade to the caller-supplied projectId / assigneeAgentId.
+    const company = await createCompany(db, "UnreadableIssuePointer");
+    const foreignCompany = await createCompany(db, "UnreadableIssueSource");
+    const project = await createProject(db, company.id, "InBoundary");
+    const foreignIssue = await createIssue(db, foreignCompany.id, {
+      projectId: null,
+    });
+    const authorization = authorizationService(db);
+
+    const bridgeAgent = await createAgent(db, company.id);
+    const keyId = randomUUID();
+    const bridgeActor = {
+      type: "agent" as const,
+      agentId: bridgeAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+      keyId,
+      keyScope: { kind: "task_bridge" as const, projectId: project.id },
+    };
+    const ownIssue = await createIssue(db, company.id, { assigneeAgentId: bridgeAgent.id });
+
+    // Control: the write boundary does clear on a readable assigned issue.
+    await expect(authorization.decide({
+      actor: bridgeActor,
+      action: "issue:mutate",
+      resource: { type: "issue", companyId: company.id, issueId: ownIssue.id },
+    })).resolves.toMatchObject({ allowed: true });
+
+    await expect(authorization.decide({
+      actor: bridgeActor,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: foreignIssue.id,
+        assigneeAgentId: bridgeAgent.id,
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+
+    const lowTrustAgent = await createAgent(db, company.id, {
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, projectIds: [project.id] },
+        },
+      },
+    });
+    const lowTrustActor = {
+      type: "agent" as const,
+      agentId: lowTrustAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+
+    // Control: with no issueId, the caller-supplied projectId is all there is
+    // and the boundary opens on it.
+    await expect(authorization.decide({
+      actor: lowTrustActor,
+      action: "issue:read",
+      resource: { type: "issue", companyId: company.id, projectId: project.id },
+    })).resolves.toMatchObject({ allowed: true, reason: "allow_low_trust_boundary" });
+
+    await expect(authorization.decide({
+      actor: lowTrustActor,
+      action: "issue:read",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: foreignIssue.id,
+        projectId: project.id,
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+  });
+
   it("keeps responsible-user issue mutations denied for viewer memberships", async () => {
     const company = await createCompany(db, "ResponsibleUserIssueViewerDenied");
     const actorAgent = await createAgent(db, company.id, { role: "engineer" });

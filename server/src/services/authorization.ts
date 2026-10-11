@@ -973,6 +973,12 @@ export function authorizationService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  // Returns null for both "no such issue" and "the issue belongs to another
+  // company". `resource.companyId` is NOT always row-derived — `previewAssignment`
+  // and `explainAssignment` (plugin-host-services.ts:3350,3366) build it from
+  // `params.companyId` alongside a caller-supplied `params.target.issueId`, so the
+  // two can disagree by construction. Any call site that would fall back to a
+  // caller-supplied field when this returns null must fail closed instead.
   async function loadIssue(companyId: string, issueId: string): Promise<IssueAuthorizationRow | null> {
     const row = await loadIssueAnyCompany(issueId);
     return row && row.companyId === companyId ? row : null;
@@ -1076,6 +1082,12 @@ export function authorizationService(db: Db) {
     resource: Extract<AuthorizationResource, { type: "issue" }>,
   ) {
     const issue = resource.issueId ? await loadIssue(resource.companyId, resource.issueId) : null;
+    // An `issueId` this company cannot read is foreign or dangling, not absent.
+    // Falling through would decide the boundary from the caller-supplied
+    // `projectId` instead — and `previewAssignment` / `explainAssignment`
+    // (plugin-host-services.ts:3350,3366) take both straight from the caller,
+    // so the two can disagree by construction. Fail closed.
+    if (resource.issueId && !issue) return false;
     const candidate = {
       companyId: resource.companyId,
       id: issue?.id ?? resource.issueId ?? null,
@@ -1305,6 +1317,10 @@ export function authorizationService(db: Db) {
     const issue = input.resource.issueId
       ? await loadIssue(input.resource.companyId, input.resource.issueId)
       : null;
+    // Same fail-closed rule as the low-trust boundary above: an unreadable
+    // `issueId` must not degrade to the caller-supplied `assigneeAgentId`,
+    // which would clear this write boundary on an actor match alone.
+    if (input.resource.issueId && !issue) return false;
     const assigneeAgentId = issue?.assigneeAgentId ?? input.resource.assigneeAgentId ?? null;
     if (assigneeAgentId === input.actorAgentId) return true;
     const originKind = issue?.originKind ?? input.resource.originKind ?? null;
