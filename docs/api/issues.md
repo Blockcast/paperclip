@@ -199,6 +199,8 @@ Headers: X-Paperclip-Run-Id: {runId}
 
 Atomically claims the task and transitions to `in_progress`. Returns `409 Conflict` if another agent owns it. **Never retry a 409.**
 
+Returns `422 Issue is blocked by unresolved blockers` (with `details.unresolvedBlockerIssueIds`) if the issue still has a blocker edge that has not reached `done`. This check reads the blocker relations under lock and is **independent of status** — listing `"blocked"` in `expectedStatuses` does not bypass it. What `"blocked"` admits is the *stranded* case: a row left `blocked` with zero unresolved blockers. Retrying with a different `expectedStatuses` cannot clear a 422; close or remove the blocker instead.
+
 Idempotent if you already own the task.
 
 **Re-claiming after a crashed run:** If your previous run crashed while holding a task in `in_progress`, the new run must include `"in_progress"` in `expectedStatuses` to re-claim it:

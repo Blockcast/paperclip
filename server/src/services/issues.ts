@@ -11923,6 +11923,44 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
+    /**
+     * BLO-29597 — the recorded decision on claiming a `blocked` row, because it
+     * was previously implicit in the `expectedStatuses` examples and the obvious
+     * reading of those examples is wrong.
+     *
+     * `blocked` in `expectedStatuses` does NOT mean checkout will claim a
+     * blocked issue. {@link withLockedIssueCheckoutExecution} refuses any issue
+     * with a live blocker edge outright — `422 Issue is blocked by unresolved
+     * blockers` — under the blocker-relation lock, status-independently, before
+     * any promotion. So the two populations BLO-29597 calls indistinguishable
+     * are in fact already separated here, by the same
+     * `listIssueDependencyReadinessMap` the stranded-blocked reconciler uses:
+     *
+     *   - genuinely blocked (an edge that can still reach `done`) -> refused.
+     *     Work that cannot proceed never starts, and the row keeps the
+     *     `blockers_resolved` wake that will actually move it.
+     *   - stranded blocked (zero unresolved blockers) -> admitted. This is the
+     *     deliberate half: an agent picking the row up is one of the two things
+     *     that can repair it, and refusing here would lock out the actor while
+     *     leaving the strand in place.
+     *
+     * The consequence is sharper than "checkout may claim blocked rows": EVERY
+     * `blocked` row checkout can ever claim is, by construction, a stranded one.
+     * While the run holds it the row reads `in_progress`, so it is invisible to
+     * the reconciler's `status = 'blocked'` predicate — which is the BLO-29597
+     * defect, and also why a `status = 'blocked'` census is a floor rather than
+     * a count. A census wanting the count must union in `status = 'in_progress'
+     * AND checkout_restore_status = 'blocked'`, and every row that union adds is
+     * a genuine strand rather than a maybe.
+     *
+     * The ratchet itself is closed on the way OUT, not the way in:
+     * {@link checkoutRestoreTargetStatus} recomputes readiness from the live
+     * edges when the promotion is undone, so a no-progress round trip cannot
+     * hand the row back in the stranded shape it was found in — and an edge
+     * filed DURING the run (the one way a claimed row becomes genuinely blocked)
+     * is honoured, because the recomputation reads the edges at restore time
+     * rather than replaying the marker.
+     */
     checkout: async (
       id: string,
       agentId: string,
@@ -12823,6 +12861,18 @@ export function issueService(db: Db) {
             executionRunId: null,
             executionAgentNameKey: null,
             executionLockedAt: null,
+            // BLO-29597: this branch writes the terminal status itself, so the
+            // promotion is already undone and the marker describes a checkout
+            // that no longer exists. Leaving it set is inert for the restore
+            // path — `restorableCheckoutPromotion` requires `in_progress`, which
+            // this write just left — but it leaves `todo` rows carrying
+            // `checkout_restore_status = 'blocked'`, and the stranded-blocked
+            // census keys on exactly that column. Clear it here so the column
+            // means "a live checkout promoted this row from X" and nothing else.
+            // The lock-only relinquish branch above deliberately does NOT clear
+            // it: that row keeps its status, so its promotion is still pending a
+            // restore.
+            checkoutRestoreStatus: null,
             updatedAt: new Date(),
             // BLO-28900: release strips BOTH monitor-eligibility conditions
             // (status leaves `in_progress`, the agent assignee is dropped), so a
