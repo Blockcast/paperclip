@@ -1035,8 +1035,17 @@ first.
 
 ⚠️ The underlying divergence is **not** fixed by this route — every other
 `workspace_runtime:read` consumer still reads the raw column. Narrowing that is
-tracked separately; do not assume an unrecognized role is handled safely
-elsewhere.
+tracked on **PEN-3913** and **PEN-3930**, which split the class between them:
+PEN-3913 is the decider half (make `workspace_runtime:read`'s own read of the
+column normalize, so an unrecognized role fails closed like the transcript gate
+does), and PEN-3930 is the `operator`-fallback half PEN-3913 deliberately does
+not close (`normalizeHumanRole(value, "operator")`, where the same unrecognized
+role is still seeded a real `tasks:assign` grant row and still ranks `operator`
+on the member-management ladder). Neither had landed when this note was written
+— `services/authorization.ts` still tests the raw column under
+`allow_simple_company_member`, which is the oracle to re-read before trusting
+either id. Do not assume an unrecognized role is handled safely elsewhere, and
+do not read either ticket as covering the whole divergence on its own.
 
 Two consequences follow, and neither is an oversight:
 
