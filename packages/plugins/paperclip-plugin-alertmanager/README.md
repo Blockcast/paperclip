@@ -586,6 +586,54 @@ allocation. Each attached fingerprint is tracked in
 only after the last unresolved sibling clears. Same-fingerprint re-fires that
 point at an older terminal issue rebind to the current active aggregate winner.
 
+### What an aggregate row's description means (BLO-42850)
+
+**An aggregate row is not a single-subject row, and its body says so.** Do not
+read the `**Summary**` / `**Severity**` / `### Labels` block at the top as *the*
+alert this row is about — it describes **one representative member**. When the
+row has more than one active member, an `### Active members (N)` table lists
+every one of them, by fingerprint, with its own `started`, `severity`, and the
+labels that differ across the aggregate.
+
+This matters for triage specifically. The protocol is to falsify the alert
+against Alertmanager before closing; on an aggregate row you must falsify
+**every fingerprint in that table**, not just the one named at the top.
+Falsifying only the representative is what reopened
+[BLO-41538](https://paperclip.blockcast.net/BLO/issues/BLO-41538): the body
+named a member that had already cleared while its siblings were still firing, so
+correct protocol produced a wrong close.
+
+Three properties the bridge now guarantees, and which a reader may rely on:
+
+| property | why |
+|---|---|
+| The representative is always an **active** member, and on an untouched row is the fingerprint in `originId` | the body and `originId` cannot name different alerts |
+| `**Started**` is **non-decreasing** for the life of the row | it is the oldest-joined member's `first_seen_starts_at`, which the member upsert writes through a `COALESCE(existing, EXCLUDED)` so a value already present is never rewritten (migration 006). It is the **aggregate's** start, not the current episode's — the current firing is rendered separately as `**Latest firing**` when the two differ, and that field *may* move backwards |
+| A resolve that leaves siblings firing **re-renders** the body | the resolve path refreshes the description, so the representative swaps to a survivor instead of the body being pinned to a cleared alert |
+
+Route (b) from the ticket — refusing any body write from a member other than
+`originId` — was **not** taken. It is ~3 lines and needs no migration, but it
+cannot satisfy the third property: once the creating member resolves, the body
+is pinned to a cleared alert permanently, which makes the wrong-close failure
+permanent rather than removing it.
+
+Members written before migration 006 carry neither a snapshot nor an anchor.
+They render as a fingerprint-only line, and the row's `**Started**` falls back
+to the current firing until an anchor exists — i.e. a pre-006 aggregate keeps
+the old defect for exactly that long. Both columns are re-populated by that
+member's next firing delivery, which Alertmanager sends every
+`repeat_interval`, so **there is no backfill job** — the data self-heals within
+one interval. The anchor it then records is that delivery's `startsAt`, not the
+episode the row was really opened for; the original is not recoverable, and an
+anchor that is stable from here beats one that keeps moving. A row whose
+members are *all* unsnapshotted keeps the description it already has rather
+than being rewritten into a bare fingerprint list.
+
+Note the issue **title** is still built from one alert and is not revised on
+re-fire. That is deliberate — a title that churned with every member would make
+the row unrecognisable between heartbeats — so the title is a label, not an
+inventory. The body is the inventory.
+
 ### Channel precision policy
 
 **Cancellation rate is not the precision metric. Do not use it.** The resolve

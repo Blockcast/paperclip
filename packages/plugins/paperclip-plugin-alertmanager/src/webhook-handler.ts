@@ -21,12 +21,14 @@ import {
 } from "./constants.js";
 import {
   alertMatchesLabelFilter,
+  buildAggregateIssueDescription,
   buildIssueDescription,
   buildIssueTitle,
   effectiveAlertStatus,
   isTerminalSeverity,
   resolveAlertPriority,
 } from "./issue-mapping.js";
+import type { AggregateMemberSubject } from "./issue-mapping.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import {
   resolveAssigneeUserId,
@@ -440,12 +442,14 @@ async function upsertAggregateMember(
   issueId: string,
   fingerprint: string,
   firingToken: string,
+  alert: AlertmanagerAlert,
 ): Promise<void> {
   const ns = ctx.db.namespace;
   const result = await ctx.db.execute(
     `INSERT INTO ${q(ns, AGGREGATE_MEMBERS_TABLE)}
-       (company_id, aggregate_key, fingerprint, issue_id)
-     SELECT $1, $2, $3, $4
+       (company_id, aggregate_key, fingerprint, issue_id, alert_snapshot,
+        first_seen_starts_at)
+     SELECT $1, $2, $3, $4, $6::jsonb, $7
      WHERE EXISTS (
        SELECT 1 FROM ${q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE)}
         WHERE company_id = $1
@@ -457,8 +461,32 @@ async function upsertAggregateMember(
      DO UPDATE SET
        issue_id = EXCLUDED.issue_id,
        resolved_at = NULL,
+       alert_snapshot = EXCLUDED.alert_snapshot,
+       first_seen_starts_at = COALESCE(
+         ${AGGREGATE_MEMBERS_TABLE}.first_seen_starts_at,
+         EXCLUDED.first_seen_starts_at
+       ),
        updated_at = now()`,
-    [companyId, aggregateKey, fingerprint, issueId, firingToken],
+    [
+      companyId,
+      aggregateKey,
+      fingerprint,
+      issueId,
+      firingToken,
+      // BLO-42850: the subject this member renders as. Refreshed on every
+      // re-fire so drill-in time ranges and a changed summary stay current.
+      JSON.stringify(memberSnapshot(alert)),
+      // Write-once, via the COALESCE above rather than by omission: a value
+      // already present is never rewritten — which IS the non-decreasing
+      // **Started** guarantee, since the row's anchor is the oldest-joined
+      // member's value — while a member row written before migration 006
+      // carries NULL and would otherwise stay anchorless forever. Omitting the
+      // column entirely from DO UPDATE looks more immutable and is strictly
+      // worse: every aggregate that predates the migration would fall back to
+      // the current firing's `startsAt` on every delivery, i.e. keep the exact
+      // defect this change removes. See migration 006.
+      alert.startsAt,
+    ],
   );
   if (result.rowCount === 0) {
     throw new Error(
@@ -468,6 +496,133 @@ async function upsertAggregateMember(
         `Alertmanager retries against the owner that now holds the fence.`,
     );
   }
+}
+
+/**
+ * The slice of an alert an aggregate row needs to render that member.
+ *
+ * Deliberately not the whole alert: `endsAt` is meaningless on a firing member
+ * and `status` is implied by `resolved_at`, while `labels`/`annotations` are
+ * unbounded operator-authored maps already stored on the issue body. Keeping
+ * the shape explicit means a new AM field cannot silently widen what this table
+ * retains.
+ */
+function memberSnapshot(alert: AlertmanagerAlert): Record<string, unknown> {
+  return {
+    labels: alert.labels,
+    annotations: alert.annotations,
+    startsAt: alert.startsAt,
+    ...(alert.generatorURL ? { generatorURL: alert.generatorURL } : {}),
+  };
+}
+
+/**
+ * BLO-42850 — render an aggregate row's description from its members.
+ *
+ * `alert`, when given, is the firing being delivered right now. It is merged in
+ * rather than re-read because the firing path builds the body *before*
+ * `upsertAggregateMember` writes the row, and reordering those would move an
+ * issue RPC inside the window the firing fence's barrier deliberately keeps
+ * free of them. Pass `null` from the resolve path, where the member's
+ * `resolved_at` is already set and the body must name a survivor.
+ *
+ * Scoped by `aggregate_key` and not by `issue_id`: every active member of an
+ * aggregate belongs on the aggregate's row whichever issue it currently points
+ * at, which also makes one computed body correct across a rebind.
+ *
+ * Tolerant by construction — a failed read returns `fallback` (or leaves the
+ * body alone) and logs. The description is triage context, not a correctness
+ * invariant, and failing a delivery over it would trade a stale body for a
+ * retry loop. That matches how the firing path already treats a failed
+ * description refresh.
+ */
+async function describeAggregate(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  alert: AlertmanagerAlert | null,
+  fallback: string | null = null,
+): Promise<string | null> {
+  const ns = ctx.db.namespace;
+  try {
+    const rows = await ctx.db.query<{
+      fingerprint: string;
+      alert_snapshot: Record<string, unknown> | string | null;
+      first_seen_starts_at: string | null;
+      resolved_at: string | null;
+    }>(
+      `SELECT fingerprint, alert_snapshot, first_seen_starts_at, resolved_at
+       FROM ${q(ns, AGGREGATE_MEMBERS_TABLE)}
+       WHERE company_id = $1 AND aggregate_key = $2
+       ORDER BY created_at ASC, fingerprint ASC`,
+      [companyId, aggregateKey],
+    );
+    // Oldest-joined member, resolved or not. Resolved members stay in the
+    // ordering on purpose: the anchor must not jump forward when the founding
+    // member clears, and nothing deletes member rows.
+    const anchor = rows[0]?.first_seen_starts_at ?? alert?.startsAt ?? null;
+
+    const members: AggregateMemberSubject[] = [];
+    for (const row of rows) {
+      if (row.resolved_at !== null) continue;
+      if (alert && row.fingerprint === alert.fingerprint) continue;
+      members.push({
+        fingerprint: row.fingerprint,
+        alert: parseMemberSnapshot(row.fingerprint, row.alert_snapshot),
+      });
+    }
+    // Appended rather than spliced into join order: a brand-new fingerprint is
+    // the newest joiner, and one already present was skipped above so its
+    // stored snapshot cannot shadow the firing in hand.
+    if (alert) members.push({ fingerprint: alert.fingerprint, alert });
+
+    return buildAggregateIssueDescription(members, anchor) ?? fallback;
+  } catch (err) {
+    ctx.logger.warn(
+      `paperclip-plugin-alertmanager: could not read aggregate members for ${aggregateKey}; leaving the description as it is: ${String(err)}`,
+    );
+    return fallback;
+  }
+}
+
+/**
+ * Rehydrate a stored snapshot into the alert shape the renderer wants.
+ *
+ * Returns null for a member written before migration 006, and for a row whose
+ * JSON cannot carry a subject. Null is rendered as a fingerprint-only line, not
+ * dropped: it is a genuinely firing member, and hiding it would reintroduce the
+ * invisibility this change removes.
+ */
+function parseMemberSnapshot(
+  fingerprint: string,
+  raw: Record<string, unknown> | string | null,
+): AlertmanagerAlert | null {
+  if (raw === null || raw === undefined) return null;
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value !== "object" || value === null) return null;
+  const snapshot = value as Partial<AlertmanagerAlert>;
+  if (typeof snapshot.labels !== "object" || snapshot.labels === null) return null;
+  return {
+    status: "firing",
+    labels: snapshot.labels,
+    annotations:
+      typeof snapshot.annotations === "object" && snapshot.annotations !== null
+        ? snapshot.annotations
+        : {},
+    startsAt: typeof snapshot.startsAt === "string" ? snapshot.startsAt : "",
+    endsAt: "",
+    ...(typeof snapshot.generatorURL === "string"
+      ? { generatorURL: snapshot.generatorURL }
+      : {}),
+    fingerprint,
+  };
 }
 
 /**
@@ -2244,7 +2399,23 @@ export async function handleFiring(
       // re-open if the plugin previously auto-cancelled it on resolve, or if an
       // operator's close has aged past the suppression window (BLO-24234).
       let tracked = existing;
-      const newDescription = buildIssueDescription(alert);
+      // BLO-42850: rendered from the aggregate's active members, not from this
+      // one alert. A plain read, so it sits ahead of the ownership barrier
+      // below with the other reads; `describeAggregate` swallows its own read
+      // failure and hands back the single-alert body, so this cannot fail a
+      // delivery that would otherwise have succeeded.
+      const newDescription =
+        (await describeAggregate(
+          ctx,
+          // Same company the member write below uses. `companyId` and
+          // `existing.paperclipCompanyId` agree on every live path, but reading
+          // members under one and writing them under the other is the kind of
+          // skew that only shows up on the row nobody is looking at.
+          existing.paperclipCompanyId,
+          aggregateKey,
+          alert,
+          buildIssueDescription(alert),
+        )) ?? buildIssueDescription(alert);
       // Carried out of the try so the state write below records what actually
       // happened. A decision the RPC then failed to apply must not be persisted
       // as applied — otherwise a transient issues.update outage would bank the
@@ -2565,6 +2736,7 @@ export async function handleFiring(
         tracked.paperclipIssueId,
         alert.fingerprint,
         firingToken,
+        alert,
       );
 
       const updated: AlertStateRecord = {
@@ -2832,7 +3004,18 @@ export async function handleFiring(
   }
 
   const title = buildIssueTitle(alert);
-  const description = buildIssueDescription(alert);
+  // BLO-42850: for a brand-new aggregate this has one member — `alert` itself —
+  // so it renders exactly as it did before. For a fingerprint JOINING an
+  // existing aggregate it renders the whole active set, which is what the
+  // `!created` refresh below publishes onto the retained row.
+  const description =
+    (await describeAggregate(
+      ctx,
+      companyId,
+      aggregateKey,
+      alert,
+      buildIssueDescription(alert),
+    )) ?? buildIssueDescription(alert);
   const { priority, ignoredValue } = resolveAlertPriority(
     alert,
     config.severityToPriority,
@@ -2994,7 +3177,30 @@ export async function handleFiring(
     issue.id,
     alert.fingerprint,
     firingToken,
+    alert,
   );
+  // BLO-42850: a fingerprint joining an existing aggregate used to update
+  // nothing on the retained row — owner retrofit aside, the body was left
+  // naming only whoever wrote it last, so the new member stayed invisible until
+  // some later re-fire happened to redraw it. Publish the member list now.
+  // Tolerated like the owner retrofit above: a stale body must not fail a
+  // delivery whose member and state writes have already landed.
+  if (!created) {
+    try {
+      await ctx.issues.update(
+        issue.id,
+        { description },
+        companyId,
+        undefined,
+        { fencing: firingFence(companyId, aggregateKey, firingToken) },
+      );
+    } catch (err) {
+      if (err instanceof AggregateGenerationLostError) throw err;
+      ctx.logger.warn(
+        `Failed to refresh aggregate description on issue ${issue.id} after ${alert.fingerprint} joined: ${String(err)}`,
+      );
+    }
+  }
   // Fenced for the same reason as the re-fire path above: winning the member
   // write proves ownership at that statement only, and the creation path has
   // the same unguarded tail. Ally flagged this site specifically — a creation
@@ -3348,6 +3554,42 @@ export async function handleResolved(
         existing.paperclipCompanyId,
         resolvedAt,
       );
+    }
+
+    // BLO-42850 — AC3. This member is now `resolved_at`-stamped but its
+    // siblings are still firing, so the row stays open. Nothing used to redraw
+    // the body on this path, which is the whole wrong-close mechanism: the
+    // description kept naming THIS alert, the documented triage protocol
+    // falsified it against Alertmanager, Alertmanager said resolved, and a live
+    // aggregate got closed on a correct reading of a stale body
+    // (BLO-41538, reopened). Re-render from the survivors — `alert` is passed
+    // as null precisely so the member that just cleared cannot be merged back
+    // in as the representative.
+    //
+    // Tolerated, and placed ahead of the commit point for the same reason the
+    // cover cascade is not: a body refresh is triage context, so it must not
+    // abort a resolve whose member write has already landed. A failure here
+    // leaves the pre-existing body, which is exactly the status quo ante.
+    if (aggregateResolution.disposition === "has-unresolved-siblings") {
+      try {
+        const description = await describeAggregate(
+          ctx,
+          existing.paperclipCompanyId,
+          aggregateKey,
+          null,
+        );
+        if (description) {
+          await ctx.issues.update(
+            aggregateResolution.issueId,
+            { description },
+            existing.paperclipCompanyId,
+          );
+        }
+      } catch (err) {
+        ctx.logger.warn(
+          `Alertmanager: ${alert.fingerprint} resolved but the aggregate description on issue ${aggregateResolution.issueId} could not be refreshed; it may still name a cleared alert: ${String(err)}`,
+        );
+      }
     }
 
     // BLO-16120: mark this source resolved within every cover it's a member

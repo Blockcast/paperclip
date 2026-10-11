@@ -1,0 +1,53 @@
+-- BLO-42850 — give an aggregate member row enough to render itself.
+--
+-- A Paperclip row created by this bridge aggregates N Alertmanager fingerprints,
+-- but its description rendered exactly one of them (whichever fired last). So the
+-- body named a different alert than `originId`, **Started** moved in whichever
+-- direction the last writer pointed — including backwards — and every other
+-- member was invisible. Worse, the resolve path never refreshed the body, so a
+-- row could keep naming a *cleared* alert while its siblings fired, and the
+-- documented triage protocol (falsify the named alert against Alertmanager)
+-- then produced a wrong close.
+--
+-- `alert_snapshot` is what makes route (a) — render the active members —
+-- possible: the members table previously held only (fingerprint, issue_id,
+-- resolved_at), and `AlertStateRecord` carries no labels, so there was nothing
+-- to render a subject from.
+--
+-- `first_seen_starts_at` is deliberately a SEPARATE column rather than a field
+-- read out of the snapshot, and the upsert's `DO UPDATE SET` writes it through
+-- a `COALESCE(existing, EXCLUDED)` so a value already present is never
+-- rewritten. That write-once property is the whole mechanism behind the
+-- non-decreasing **Started** guarantee — the row's anchor is the oldest-joined
+-- member's value, and a value that is never rewritten cannot move in either
+-- direction. A monotonic `GREATEST(...)` clamp was considered and rejected: it
+-- needs a `::timestamptz` cast (RFC3339 offsets make lexicographic comparison
+-- wrong), and a cast that throws on one malformed `startsAt` would fail the
+-- whole delivery. The current firing's own `startsAt` is still rendered, as
+-- **Latest firing**, where moving backwards is meaningless rather than
+-- misleading.
+--
+-- COALESCE rather than omitting the column from `DO UPDATE SET` entirely:
+-- omission looks more immutable and is strictly worse. A member row written
+-- before this migration carries NULL, and nothing would ever fill it, so every
+-- aggregate that predates the migration would fall back to the current firing's
+-- `startsAt` on every delivery — i.e. keep the exact defect this exists to fix,
+-- permanently. COALESCE keeps "never rewritten" for every row that has a value
+-- and backfills the ones that do not.
+--
+-- `text`, not `timestamptz`, because the description renders `alert.startsAt`
+-- verbatim: a timestamptz round-trip would reformat the string and churn the
+-- body of every existing row on its next re-fire.
+--
+-- Both columns are nullable and there is NO backfill job. A pre-existing member
+-- re-acquires both on its next firing delivery, which Alertmanager re-sends
+-- every `repeat_interval`, so the data self-heals within one interval. Note the
+-- anchor it then records is that delivery's `startsAt`, not the episode the row
+-- was really created for — the original is not recoverable, and an anchor that
+-- is stable from now on beats one that keeps moving. Until a member heals it
+-- renders as a fingerprint-only line, and a row whose members are ALL
+-- unsnapshotted keeps the description it already has rather than being
+-- rewritten into something worse.
+ALTER TABLE plugin_alertmanager_184163d1ba.alertmanager_aggregate_members
+  ADD COLUMN IF NOT EXISTS alert_snapshot jsonb,
+  ADD COLUMN IF NOT EXISTS first_seen_starts_at text;
