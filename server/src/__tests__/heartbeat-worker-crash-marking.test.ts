@@ -418,6 +418,61 @@ describeEmbeddedPostgres("heartbeat worker-crash marking and recovery convergenc
     expect(afterReplay.crashRecoveryLastError).toBeNull();
   });
 
+  // ---- BLO-20795: provider release is at-least-once ------------------------
+
+  it("converges when the provider release already succeeded but its lease write was lost", async () => {
+    // The interleaving BLO-20795 names: `releaseRunLeases` reaches the provider
+    // *before* the lease row is persisted. If the provider call succeeds and
+    // the database write is then lost — the worker dies in between, or the
+    // update itself fails — nothing durable records that the provider side
+    // already ran, so the next recovery pass calls it a second time.
+    //
+    // This pins the host half of the contract: a second provider call is
+    // expected and the run must still converge. The provider half — that
+    // calling release again for an already-released resource resolves rather
+    // than throwing — is the written interface guarantee on
+    // `EnvironmentRuntimeDriver.releaseRunLease`, pinned per driver by the
+    // release-twice conformance test in
+    // `environment-runtime-driver-contract.test.ts`.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const run = await seedCrashMarkedRun({ companyId, agentId, finishedAt: new Date(Date.now() - 60_000) });
+
+    const providerReleaseCalls: number[] = [];
+    const lostWriteRuntime = {
+      releaseRunLeases: async () => {
+        providerReleaseCalls.push(Date.now());
+        if (providerReleaseCalls.length === 1) {
+          // Provider released fine; persisting that fact did not.
+          throw new Error("could not persist environment lease release");
+        }
+        return [];
+      },
+    } as unknown as HeartbeatEnvironmentRuntime;
+
+    const heartbeat = service({ environmentRuntime: lostWriteRuntime });
+
+    const first = await heartbeat.reconcileWorkerCrashedRuns();
+    expect(first.reconciledRunIds).toEqual([]);
+    expect(first.unresolvedRunIds).toEqual([run.id]);
+    const afterLostWrite = await readRun(run.id);
+    // Not stamped complete: the lease is still `active` as far as the database
+    // knows, so the environment is still reserved and the row must replay.
+    expect(afterLostWrite.crashRecoveryCompletedAt).toBeNull();
+    expect(afterLostWrite.crashRecoveryLastError).toContain("environment_leases");
+
+    const second = await heartbeat.reconcileWorkerCrashedRuns({
+      now: new Date(afterLostWrite.crashRecoveryNextAttemptAt!.getTime() + 1000),
+    });
+
+    // The replay called the provider a second time — the at-least-once
+    // delivery this issue is about — and converged.
+    expect(providerReleaseCalls).toHaveLength(2);
+    expect(second.reconciledRunIds).toEqual([run.id]);
+    const afterReplay = await readRun(run.id);
+    expect(afterReplay.crashRecoveryCompletedAt).not.toBeNull();
+    expect(afterReplay.crashRecoveryLastError).toBeNull();
+  });
+
   // ---- (c) poison rows do not starve the batch ------------------------------
 
   it("recovers a newer run even when a permanently-failing row sits at the head of the batch", async () => {

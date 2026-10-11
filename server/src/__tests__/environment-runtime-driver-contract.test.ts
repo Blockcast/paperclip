@@ -22,6 +22,7 @@ import {
   environmentLeases,
   environments,
   heartbeatRuns,
+  plugins,
 } from "@paperclipai/db";
 import type { Environment } from "@paperclipai/shared";
 import {
@@ -29,6 +30,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { secretService } from "../services/secrets.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -46,10 +48,21 @@ interface RuntimeContractCase<C extends object = Record<string, unknown>> {
   driver: string;
   config: C;
   setup?: () => Promise<() => Promise<void>>;
+  /**
+   * Optional plugin worker manager. Supplying one also registers the `plugin`
+   * driver in the runtime under test.
+   */
+  pluginWorkerManager?: PluginWorkerManager;
   expectLease: (lease: {
     providerLeaseId: string | null;
     metadata: Record<string, unknown> | null;
   }, environment: Environment) => void;
+  /**
+   * BLO-20795: asserted after the replayed (second) release, for drivers whose
+   * provider calls are observable — e.g. "the plugin RPC was invoked twice and
+   * neither call threw".
+   */
+  expectAfterReplay?: () => void;
 }
 
 describeEmbeddedPostgres("environment runtime driver contract", () => {
@@ -78,6 +91,7 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(environments);
+    await db.delete(plugins);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
     await db.delete(companies);
@@ -219,7 +233,10 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
   async function runContract<C extends object>(testCase: RuntimeContractCase<C>) {
     const cleanup = await testCase.setup?.();
     try {
-      const runtime = environmentRuntimeService(db);
+      const runtime = environmentRuntimeService(
+        db,
+        testCase.pluginWorkerManager ? { pluginWorkerManager: testCase.pluginWorkerManager } : {},
+      );
       // seedEnvironment serialises config to JSON, so widen the concrete shape
       // (e.g. SshConnectionConfig) to the schema-level Record<string, unknown>.
       const { companyId, environment, issueId, runId } = await seedEnvironment({
@@ -264,6 +281,34 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
         .where(eq(environmentLeases.status, "active"));
       expect(activeRows).toHaveLength(0);
       await expect(runtime.releaseRunLeases(runId)).resolves.toEqual([]);
+
+      // ---- BLO-20795: release is at-least-once -----------------------------
+      // Provider release happens *before* the lease row is written. If that
+      // write is lost — the worker dies in between, or the update itself fails
+      // — the row stays `active` and worker-crash recovery replays the
+      // release. Rewind the row to exactly that state: the provider side has
+      // already been released, the database does not know it.
+      await db
+        .update(environmentLeases)
+        .set({ status: "active", releasedAt: null, cleanupStatus: null, failureReason: null })
+        .where(eq(environmentLeases.id, acquired.lease.id));
+
+      const replayed = await runtime.releaseRunLeases(runId);
+
+      // Converges: the second provider call did not throw, and the lease
+      // reaches a released state rather than being stranded `active`.
+      expect(replayed).toHaveLength(1);
+      expect(replayed[0]?.lease.id).toBe(acquired.lease.id);
+      expect(replayed[0]?.lease.status).toBe("released");
+      // `cleanupStatus` is only written by drivers that reach a provider; a
+      // driver that does reach one must not report the replay as failed.
+      expect(replayed[0]?.lease.cleanupStatus).not.toBe("failed");
+      const activeAfterReplay = await db
+        .select()
+        .from(environmentLeases)
+        .where(eq(environmentLeases.status, "active"));
+      expect(activeAfterReplay).toHaveLength(0);
+      testCase.expectAfterReplay?.();
     } finally {
       await cleanup?.();
     }
@@ -321,6 +366,88 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
       await runContract(testCase);
     });
   }
+
+  it("plugin driver satisfies the acquire/release host contract", async () => {
+    const pluginId = randomUUID();
+    const pluginKey = `acme.environments.${pluginId}`;
+    const releaseCalls: Array<string | null> = [];
+    const workerManager = {
+      isRunning: (id: string) => id === pluginId,
+      call: async (_pluginId: string, method: string, params: Record<string, unknown>) => {
+        if (method === "environmentAcquireLease") {
+          return { providerLeaseId: "plugin-contract-lease", metadata: { remoteCwd: "/workspace" } };
+        }
+        if (method === "environmentReleaseLease") {
+          // A well-behaved provider releases an already-gone resource without
+          // throwing (BLO-20795). Record the calls so the replay is observable.
+          releaseCalls.push((params.providerLeaseId as string | null) ?? null);
+          return undefined;
+        }
+        throw new Error(`Unexpected plugin environment method: ${method}`);
+      },
+    } as unknown as PluginWorkerManager;
+
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey,
+      packageName: "@acme/paperclip-environments",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: pluginKey,
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Acme Environments",
+        description: "Contract-test plugin environment driver",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{ driverKey: "sandbox", displayName: "Sandbox", configSchema: { type: "object" } }],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as never);
+
+    await runContract({
+      name: "plugin",
+      driver: "plugin",
+      config: { pluginKey, driverKey: "sandbox", driverConfig: { template: "base" } },
+      pluginWorkerManager: workerManager,
+      expectLease: (lease) => {
+        expect(lease.providerLeaseId).toBe("plugin-contract-lease");
+        expect(lease.metadata).toMatchObject({ pluginId, pluginKey, driverKey: "sandbox" });
+      },
+      expectAfterReplay: () => {
+        // The whole point: the host called the provider twice for one lease,
+        // the second time against a resource it had already released, and the
+        // run still converged.
+        expect(releaseCalls).toEqual(["plugin-contract-lease", "plugin-contract-lease"]);
+      },
+    });
+  });
+
+  // BLO-20795 AC 3: no provider silently exempt. The covered set is checked
+  // against the live registry rather than a hand-written list, so a driver
+  // added to `environmentRuntimeService` fails this test until it has a case
+  // above exercising release-twice.
+  it("covers every driver registered in the environment runtime", () => {
+    const stubWorkerManager = {
+      isRunning: () => false,
+      call: async () => undefined,
+    } as unknown as PluginWorkerManager;
+    const registered = environmentRuntimeService(db, { pluginWorkerManager: stubWorkerManager })
+      .listDrivers()
+      .map((driver) => driver.driver);
+
+    // `ssh` and `plugin` have their own `it` blocks; the rest come from the
+    // table above.
+    const covered = [...new Set([...contractCases.map((testCase) => testCase.driver), "ssh", "plugin"])];
+
+    expect([...registered].sort()).toEqual([...covered].sort());
+  });
 
   it("SSH satisfies the acquire/release host contract", async () => {
     if (!sshFixtureSupport.supported) {
