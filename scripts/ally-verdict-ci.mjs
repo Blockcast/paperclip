@@ -20,8 +20,9 @@
 // heavy lane, so a wrong decision costs CPU or latency, never a merge.
 // Dependency-free on purpose: it runs on a bare arc-light checkout.
 import { appendFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { realpathSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { manualTestAuthorized } from './pr-test-request.mjs';
 
 export const ALLY_APP_ID = 3966421;
 export const ACTIONS_APP_ID = 15368;
@@ -81,10 +82,13 @@ export function chooseRun(runs, { headSha, headRef, repository }) {
 // Exactly once per (head, lock): only attempt 1, only once it has completed,
 // and only when the hold itself is what failed. Anything else is covered,
 // live, or needs a human.
-export function rerunDecision(run, lockJobs) {
+export function rerunDecision(run, lockJobs, manual = false) {
   if (run === null) return { rerun: false, reason: `no pull_request run of ${PR_WORKFLOW_FILE} at this head` };
   if (run.status !== "completed") {
     return { rerun: false, reason: `run ${run.id} is ${run.status} (attempt ${run.run_attempt}); covered while live` };
+  }
+  if (manual && ['failure', 'cancelled', 'timed_out'].includes(run.conclusion)) {
+    return { rerun: true, reason: `trusted /test retries the failed jobs of run ${run.id}` };
   }
   if (run.run_attempt !== 1) {
     return {
@@ -243,8 +247,9 @@ function context() {
 async function resolve() {
   const { repository, api } = context();
   const event = process.env.EVENT_NAME ?? "";
-  if (event === "workflow_dispatch") {
-    const number = process.env.INPUT_PR_NUMBER ?? "";
+  if (event === "workflow_dispatch" || event === "issue_comment") {
+    const payload = event === 'issue_comment' ? JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')) : null;
+    const number = payload ? String(payload.issue.number) : process.env.INPUT_PR_NUMBER ?? "";
     if (!PR_NUMBER.test(number)) throw new Error(`pr_number is not a PR number: ${JSON.stringify(number)}`);
     const pull = await api.get(`/repos/${repository}/pulls/${number}`);
     const head = String(pull?.head?.sha ?? "");
@@ -280,7 +285,10 @@ async function unlock() {
     throw new Error(`need PR_NUMBER and a full HEAD_SHA, got ${JSON.stringify(number)} ${JSON.stringify(headSha)}`);
   }
   const label = `PR #${number} at ${headSha}`;
-  if (process.env.ELIGIBLE !== "true") {
+  const manual = process.env.MANUAL === 'true' && manualTestAuthorized(
+    (await api.get(`/repos/${repository}/commits/${headSha}/status?per_page=100`)).statuses ?? [],
+  );
+  if (!manual && process.env.ELIGIBLE !== "true") {
     return summary(`${label}: not eligible, heavy lanes stay held: ${process.env.REASON || "no reason reported"}`);
   }
   let pull = await api.get(`/repos/${repository}/pulls/${number}`);
@@ -293,7 +301,7 @@ async function unlock() {
   const jobs = run === null || run.status !== "completed" || run.run_attempt !== 1
     ? []
     : (await api.get(`/repos/${repository}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`))?.jobs ?? [];
-  const decision = rerunDecision(run, jobs);
+  const decision = rerunDecision(run, jobs, manual);
   if (!decision.rerun) return summary(`${label} (${process.env.BASIS}): SKIP, ${decision.reason}`);
   // Re-read the head immediately before the write (design §3.6).
   pull = await api.get(`/repos/${repository}/pulls/${number}`);

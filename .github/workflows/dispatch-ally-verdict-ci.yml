@@ -41,6 +41,8 @@ name: dispatch-ally-verdict-ci
 # nothing but `actions` (ally-verdict-gate.test.mjs enforces all of it).
 
 on:
+  issue_comment:
+    types: [created]
   check_run:
     types: [completed]
   workflow_dispatch:
@@ -53,13 +55,43 @@ on:
 permissions: {}
 
 jobs:
-  unlock:
-    name: Release heavy CI after an Ally verdict
+  manual_request:
     if: >-
+      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      github.event.comment.user.type == 'User' && github.event.comment.user.login != 'allyblockcast' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+      contains(github.event.comment.body, '/test')
+    runs-on: arc-light
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    outputs:
+      manual: ${{ steps.request.outputs.manual }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: scripts/pr-test-request.mjs
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+      - id: request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/pr-test-request.mjs request
+  unlock:
+    needs: manual_request
+    name: Release heavy CI after review or /test
+    if: >-
+      always() && (
       (github.event_name == 'check_run' && github.event.check_run.app.id == 3966421 &&
       github.event.check_run.conclusion == 'success' && (github.event.check_run.name ==
       'gate/ally-comment-findings' || github.event.check_run.name == 'ci/ally-head-attested'))
       || (github.event_name == 'workflow_dispatch')
+      || (github.event_name == 'issue_comment' && needs.manual_request.outputs.manual == 'true'))
     runs-on: arc-light
     # A hang detector: one checkout, one Node setup, about six API calls.
     timeout-minutes: 10
@@ -71,7 +103,7 @@ jobs:
     # that head. On the job, not the workflow, so non-matching check_run events
     # (skipped by the `if:` above) never take or evict this slot.
     concurrency:
-      group: ally-verdict-dispatch-${{ github.event.check_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
+      group: ally-verdict-dispatch-${{ github.event.check_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.run_id }}
       cancel-in-progress: false
     permissions:
       # rerun-failed-jobs
@@ -104,7 +136,7 @@ jobs:
 
       - name: Evaluate the Ally verdict at the head
         id: verdict
-        if: ${{ steps.resolve.outputs.pr_number != '' }}
+        if: ${{ steps.resolve.outputs.pr_number != '' && needs.manual_request.outputs.manual != 'true' }}
         # Vendored from Blockcast/review-gate-action (PROVENANCE.json), as in
         # pr.yml. No carry-forward input: it stays off with this copy.
         uses: ./.github/actions/verdict-dispatch
@@ -124,6 +156,7 @@ jobs:
           PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
           HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
           ELIGIBLE: ${{ steps.verdict.outputs.eligible }}
+          MANUAL: ${{ needs.manual_request.outputs.manual }}
           BASIS: ${{ steps.verdict.outputs.basis }}
           REASON: ${{ steps.verdict.outputs.reason }}
         run: node scripts/ally-verdict-ci.mjs unlock

@@ -1926,18 +1926,12 @@ jobs:
             echo "evaluate=false" >>"$GITHUB_OUTPUT"
             exit 0
           fi
-          # BLO-34316: the server withholds B's `clean` whenever the PR author
-          # shares the reviewer identity (githubSharesReviewerIdentity against
-          # its default reviewer allyblockcast[bot]: the `allyblockcast` seat,
-          # `allyblockcast[bot]` or `app/allyblockcast`, lowercased). Until S
-          # (ci/ally-head-attested) is published, no signal can release such a
-          # PR, so it is not held. The login comes from GitHub's event payload,
-          # not from the PR's content; the exemption only restores per-push
-          # heavy CI, and `verify` still needs every lane.
+          # Self-authored heads need S or an independent human /test. Keep
+          # the old exemption until the owner verifies the manual recovery route.
           case "$(lower "${PR_AUTHOR:-}")" in
             allyblockcast|allyblockcast\[bot\]|app/allyblockcast)
               if [ "$(lower "${HOLD_SELF_AUTHORED:-}")" != "true" ]; then
-                echo "::notice title=ally-verdict: self-authored PR::$PR_AUTHOR opened this PR, so Ally's verdict cannot be B success here (BLO-34316) and ci/ally-head-attested is not published yet: heavy CI runs per push. The owner sets ALLY_GATED_CI_HOLD_SELF_AUTHORED=true once it is."
+                echo "::notice title=ally-verdict: self-authored PR::$PR_AUTHOR opened this PR, so Ally's verdict cannot be B success here (BLO-34316) and ci/ally-head-attested is not published yet: heavy CI runs per push. The owner sets ALLY_GATED_CI_HOLD_SELF_AUTHORED=true after the human /test recovery route is verified."
                 echo "evaluate=false" >>"$GITHUB_OUTPUT"
                 exit 0
               fi
@@ -1952,12 +1946,28 @@ jobs:
         if: ${{ steps.mode.outputs.evaluate == 'true' }}
         uses: actions/checkout@v6
         with:
-          sparse-checkout: .github/actions/verdict-dispatch
+          sparse-checkout: |
+            .github/actions/verdict-dispatch
+            scripts/pr-test-request.mjs
           persist-credentials: false
+
+      - name: Set up Node for the manual request check
+        if: ${{ steps.mode.outputs.evaluate == 'true' }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Check the trusted human test request at this head
+        id: manual
+        if: ${{ steps.mode.outputs.evaluate == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/pr-test-request.mjs check
 
       - name: Evaluate the Ally verdict at this head
         id: verdict
-        if: ${{ steps.mode.outputs.evaluate == 'true' }}
+        if: ${{ steps.mode.outputs.evaluate == 'true' && steps.manual.outputs.manual != 'true' }}
         # Same predicate the dispatcher evaluates, so the job that holds the
         # lanes and the job that releases them agree. No carry-forward input:
         # it stays off with this copy (PROVENANCE.json).
@@ -1973,7 +1983,7 @@ jobs:
         # annotation; anything but eligible=true holds the lanes.
         if: ${{ !cancelled() && steps.mode.outputs.evaluate == 'true' }}
         env:
-          ELIGIBLE: ${{ steps.verdict.outputs.eligible }}
+          ELIGIBLE: ${{ steps.manual.outputs.manual == 'true' && 'true' || steps.verdict.outputs.eligible }}
           BASIS: ${{ steps.verdict.outputs.basis }}
           REASON: ${{ steps.verdict.outputs.reason }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}

@@ -204,7 +204,7 @@ test("the hold job never skips, keeps merge_group off arc-light, and evaluates t
   assert.equal(jobIf(block), undefined, "a job-level `if:` would skip the hold, and a skipped need passes (I2)");
   assert.doesNotMatch(block, /continue-on-error/, "an evaluation error must hold the lanes, not pass");
   assert.equal([...block.matchAll(LOCAL_ACTION)].length, 1);
-  assert.match(block, /sparse-checkout: \.github\/actions\/verdict-dispatch\n/);
+  assert.match(block, /sparse-checkout: \|\n {12}\.github\/actions\/verdict-dispatch\n {12}scripts\/pr-test-request\.mjs\n/);
   assert.match(block, /head-sha: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
   assert.match(block, /bypass: \$\{\{ vars\.ALLY_GATED_CI_BYPASS \}\}/);
   assert.match(block, /PR_AUTHOR: \$\{\{ github\.event\.pull_request\.user\.login \}\}/);
@@ -490,18 +490,18 @@ const CANONICAL =
 
 test("dispatcher: only the verdict and manual arms, each a trusted default-branch trigger", () => {
   const on = dispatcherYml.slice(dispatcherYml.indexOf("\non:\n"), dispatcherYml.indexOf("\npermissions:"));
-  assert.deepEqual([...on.matchAll(/^ {2}([a-z_]+):/gm)].map((m) => m[1]), ["check_run", "workflow_dispatch"]);
+  assert.deepEqual([...on.matchAll(/^ {2}([a-z_]+):/gm)].map((m) => m[1]), ["issue_comment", "check_run", "workflow_dispatch"]);
   assert.match(on, /check_run:\n {4}types: \[completed\]\n/);
   assert.match(on, /workflow_dispatch:\n {4}inputs:\n {6}pr_number:\n/);
   assert.doesNotMatch(dispatcherYml, /^ {2}(pull_request|pull_request_target|pull_request_review)\b/m);
 });
 
-test("dispatcher: one job, the canonical filter (built from the predicate's constants), arc-light, default branch", () => {
+test("dispatcher: canonical unlock and manual writer, arc-light, default branch", () => {
   const dj = jobBlocks(dispatcherYml);
-  assert.deepEqual(Object.keys(dj), ["unlock"]);
+  assert.deepEqual(Object.keys(dj), ["manual_request", "unlock"]);
   const block = dj.unlock;
   const ifText = /^ {4}if: >-\n((?: {6}.*\n)+)/m.exec(block)?.[1];
-  assert.equal(collapse(ifText), CANONICAL);
+  assert.equal(collapse(ifText), collapse(`always() && ( ${CANONICAL} || (github.event_name == 'issue_comment' && needs.manual_request.outputs.manual == 'true'))`));
   assert.equal(runsOn(block), "arc-light");
   assert.match(block, /uses: actions\/checkout@[0-9a-f]{40}[^\n]*\n {8}with:\n {10}ref: \$\{\{ github\.event\.repository\.default_branch \}\}\n/);
   assert.match(block, /concurrency:\n {6}group: ally-verdict-dispatch-\$\{\{[^\n]*\}\}\n {6}cancel-in-progress: false\n/);
@@ -825,4 +825,21 @@ test("backstop under the kill switch releases a head held before it was thrown; 
     assert.deepEqual(dispatchesIn(on.bodies), [{ ref: BACKSTOP_BASE, inputs: { pr_number: "4" } }]);
     assert.match(on.stdout, /ALLY_GATED_CI_BYPASS=true/);
   }
+});
+
+
+test("a human /test may retry a failed later attempt, while automatic release stays once per head", () => {
+  const run = { id: 1, status: "completed", conclusion: "failure", run_attempt: 2 };
+  assert.equal(rerunDecision(run, [], true).rerun, true);
+  assert.equal(rerunDecision(run, [], false).rerun, false);
+  assert.equal(rerunDecision({ ...run, conclusion: "success" }, [{name: "ally-verdict", conclusion: "success"}], true).rerun, false);
+  assert.equal(rerunDecision({ ...run, status: "in_progress" }, [], true).rerun, false);
+});
+test("only the trusted manual job may write the CPU request status", () => {
+  const manual = jobBlocks(dispatcherYml).manual_request;
+  assert.match(manual, /github\.event\.comment\.user\.type == 'User'/);
+  assert.match(manual, /statuses: write/);
+  assert.doesNotMatch(manual, /actions: write|pull-requests: write/);
+  assert.match(manual, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
+  assert.match(manual, /run: node scripts\/pr-test-request\.mjs request/);
 });
