@@ -1028,13 +1028,28 @@ export interface AggregateFenceReclaimCounts {
 export async function reconcileAbandonedAggregateFences(
   ctx: PluginContext,
 ): Promise<AggregateFenceReclaimCounts> {
+  // 'finalizing' belongs here for exactly the reason stated above, and leaving
+  // it out was the gap: a resolver that dies between `tryClaimAggregateFinalization`
+  // and `beginAggregateCancellation` leaves the row in 'finalizing', and the only
+  // thing that clears it is a *firing* claim (the upsert admits 'finalizing').
+  // An aggregate whose alert has stopped firing never sends one, so the row sits
+  // there forever refusing every resolution delivery — the same "property of
+  // alerts that happen to repeat" this sweep exists to replace, one phase over.
+  // Measured 2026-10-11: three rows wedged in 'finalizing', the oldest since
+  // 2026-09-14 (27 days), surviving every restart in between.
+  //
+  // Safe by the same argument as 'cancelling': `beginAggregateCancellation`
+  // requires `phase = 'finalizing' AND resolution_token = $3`, so a holder that
+  // resumes after an over-eager release cannot complete the terminal transition
+  // — it fails and Alertmanager retries. One retry, versus every resolution for
+  // that aggregate lost indefinitely.
   const RELEASE = `SET phase = 'active',
            firing_token = NULL,
            resolution_token = NULL,
            owner_instance_id = NULL,
            owner_slot = NULL,
            updated_at = now()
-       WHERE phase IN ('firing', 'cancelling')`;
+       WHERE phase IN ('firing', 'cancelling', 'finalizing')`;
   let byIdentity = 0;
   let byAge = 0;
   try {
