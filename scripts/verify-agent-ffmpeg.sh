@@ -6,8 +6,10 @@ probe_timeout=${FFMPEG_PROBE_TIMEOUT_SECONDS:-15}
 probe_output_bytes=${FFMPEG_PROBE_OUTPUT_BYTES:-65536}
 pull_timeout=${FFMPEG_PULL_TIMEOUT_SECONDS:-300}
 pull_attempts=${FFMPEG_PULL_ATTEMPTS:-3}
+probe_attempts=${FFMPEG_PROBE_ATTEMPTS:-3}
 pull_timeout_limit=600
 pull_attempts_limit=5
+probe_attempts_limit=5
 
 case "$probe_output_bytes" in
   ""|0|*[!0-9]*)
@@ -38,6 +40,7 @@ validate_bounded_positive_integer() {
 
 validate_bounded_positive_integer FFMPEG_PULL_TIMEOUT_SECONDS "$pull_timeout" "$pull_timeout_limit" || exit 2
 validate_bounded_positive_integer FFMPEG_PULL_ATTEMPTS "$pull_attempts" "$pull_attempts_limit" || exit 2
+validate_bounded_positive_integer FFMPEG_PROBE_ATTEMPTS "$probe_attempts" "$probe_attempts_limit" || exit 2
 
 if ! declared_volumes=$(
   docker buildx imagetools inspect "$image" --format '{{json .Image.Config.Volumes}}' 2>/dev/null
@@ -88,6 +91,12 @@ probe_output_file="$probe_dir/output"
 
 cleanup() {
   local status=$?
+  remove_probe_container
+  rm -rf "$probe_dir"
+  return "$status"
+}
+
+remove_probe_container() {
   if [ -s "$cidfile" ]; then
     local cid
     cid=$(cat "$cidfile")
@@ -95,52 +104,82 @@ cleanup() {
       docker rm -f "$cid" >/dev/null 2>&1 || true
     fi
   fi
-  rm -rf "$probe_dir"
-  return "$status"
+  # `docker run --cidfile` refuses to start when the file already exists, so a
+  # retry must clear it along with the container it named.
+  rm -f "$cidfile"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-set +e
-timeout --foreground --kill-after=5s "${probe_timeout}s" \
-  docker run --pull=never --rm \
-    --cidfile "$cidfile" \
-    --network none \
-    --read-only \
-    --cap-drop ALL \
-    --security-opt no-new-privileges \
-    --pids-limit 64 \
-    --cpus 1 \
-    --memory 256m \
-    --memory-swap 256m \
-    --user 65534:65534 \
-    --entrypoint ffmpeg \
-    "$image" -hide_banner -muxers 2>&1 \
-  | {
-      head -c "$probe_output_bytes" > "$probe_output_file"
-      capture_status=$?
-      cat >/dev/null
-      drain_status=$?
-      if [ "$capture_status" -ne 0 ]; then
-        exit "$capture_status"
-      fi
-      exit "$drain_status"
-    }
-pipeline_status=("${PIPESTATUS[@]}")
-probe_status=${pipeline_status[0]}
-filter_status=${pipeline_status[1]}
-set -e
+probe_attempt=1
+while :; do
+  set +e
+  timeout --foreground --kill-after=5s "${probe_timeout}s" \
+    docker run --pull=never --rm \
+      --cidfile "$cidfile" \
+      --network none \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --pids-limit 64 \
+      --cpus 1 \
+      --memory 256m \
+      --memory-swap 256m \
+      --user 65534:65534 \
+      --entrypoint ffmpeg \
+      "$image" -hide_banner -muxers 2>&1 \
+    | {
+        head -c "$probe_output_bytes" > "$probe_output_file"
+        capture_status=$?
+        cat >/dev/null
+        drain_status=$?
+        if [ "$capture_status" -ne 0 ]; then
+          exit "$capture_status"
+        fi
+        exit "$drain_status"
+      }
+  pipeline_status=("${PIPESTATUS[@]}")
+  probe_status=${pipeline_status[0]}
+  filter_status=${pipeline_status[1]}
+  set -e
 
-if [ "$filter_status" -ne 0 ]; then
-  echo "FFmpeg capability probe failed for ${image} while filtering output (status ${filter_status})" >&2
-  exit 2
-fi
+  if [ "$filter_status" -ne 0 ]; then
+    echo "FFmpeg capability probe failed for ${image} while filtering output (status ${filter_status})" >&2
+    exit 2
+  fi
+
+  if [ "$probe_status" -eq 0 ]; then
+    break
+  fi
+
+  # Retry only a KILLED probe. 124 is `timeout` expiring, 137 is the SIGKILL
+  # that follows it (or the cgroup OOM killer); both mean the probe never
+  # reported, which on this lane is a runner-contention outlier rather than a
+  # budget that is too tight: successful probes on arc-dind complete in under
+  # 6s against the 15s budget (BLO-30219, six consecutive master runs measured
+  # 2026-10-11, 6.05-8.49s each including two registry round trips the probe
+  # does not pay). Raising the budget would be guessing at an unmeasured tail.
+  # Any other nonzero status is a completed probe reporting a verdict, so it is
+  # final. If every attempt is killed the script still exits 2 and the caller
+  # still refuses the publisher fallback.
+  if { [ "$probe_status" -eq 124 ] || [ "$probe_status" -eq 137 ]; } &&
+    [ "$probe_attempt" -lt "$probe_attempts" ]; then
+    echo "FFmpeg capability probe attempt ${probe_attempt}/${probe_attempts} was killed (status ${probe_status}); retrying" >&2
+    remove_probe_container
+    sleep "$probe_attempt"
+    probe_attempt=$((probe_attempt + 1))
+    continue
+  fi
+  break
+done
 
 if [ "$probe_status" -ne 0 ]; then
-  if [ "$probe_status" -eq 124 ] || [ "$probe_status" -eq 137 ]; then
-    echo "FFmpeg capability probe timed out for ${image}" >&2
+  if [ "$probe_status" -eq 124 ]; then
+    echo "FFmpeg capability probe timed out for ${image} after ${probe_attempt} attempt(s)" >&2
+  elif [ "$probe_status" -eq 137 ]; then
+    echo "FFmpeg capability probe was killed for ${image} after ${probe_attempt} attempt(s) (timeout escalation or out-of-memory)" >&2
   else
     echo "FFmpeg capability probe failed for ${image} (status ${probe_status})" >&2
   fi
