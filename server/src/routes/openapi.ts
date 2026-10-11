@@ -5660,6 +5660,21 @@ for (const route of [
   ["get", "/api/companies/import/jobs/{jobId}", "Get company import job status"],
   ["get", "/api/companies/{companyId}/search", "Search company data"],
   ["get", "/api/companies/{companyId}/search/extract", "Extract company search matches"],
+] as const) {
+  registerCurrentRoute({
+    method: route[0],
+    path: route[1],
+    tags: ["companies"],
+    summary: route[2],
+  });
+}
+
+// BLO-41592: these two aggregates refuse time-bound params (`updated_after` and the rest
+// of that family) with a 400 carrying `unsupportedParams`, because neither implements a
+// time bound and the param was previously dropped unread — a whole-corpus answer returned
+// as a success. Registered out of the loop above so the refusal is declared rather than
+// left to be rediscovered from the route source.
+for (const route of [
   ["get", "/api/companies/{companyId}/issues/count", "Count issues in a company"],
   [
     "get",
@@ -5672,6 +5687,7 @@ for (const route of [
     path: route[1],
     tags: ["companies"],
     summary: route[2],
+    responses: { 200: r.ok(), 400: r.badRequest },
   });
 }
 

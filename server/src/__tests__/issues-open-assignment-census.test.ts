@@ -669,6 +669,22 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/open-assignment-censu
     expect(res.body.unsupportedParams).toEqual(["updated_after"]);
   });
 
+  // Ally review 5479758829: the two aggregates ordered their refusals differently, so
+  // `?limit=1&updated_after=X` named pagination here and the time bound on issues/count.
+  // Both are 400 either way — what this pins is which one gets named, and the time bound
+  // is the one that was silently answering wrong and the one whose message redirects.
+  // The limit/offset-alone refusal above is the control that the reorder moved that guard
+  // rather than removing it.
+  it("names the time bound, not pagination, when both are passed", async () => {
+    const res = await request(appAs(boardActorFor([companyId])))
+      .get(`/api/companies/${companyId}/issues/open-assignment-census`)
+      .query({ limit: "1", updated_after: "2099-01-01T00:00:00Z" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.unsupportedParams).toEqual(["updated_after"]);
+    expect(res.body.error).toMatch(/\/search with updatedAfter/);
+  });
+
   it("keeps company isolation: an agent key from another company is refused", async () => {
     // A `local_implicit` board actor is the trusted local-dev bypass and is
     // exempt from company scoping by design, so it would assert nothing here.
