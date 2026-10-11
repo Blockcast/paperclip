@@ -65,6 +65,24 @@ function strandedSweepBody(): string {
   return SERVICE_SRC.slice(start, end);
 }
 
+/**
+ * The body of one nested function in `service.ts`, from its declaration to the next
+ * sibling declaration at the same indent.
+ *
+ * The three attendance predicates are adjacent `  async function` declarations inside
+ * `recoveryService`, so the next `\n  async function ` is a sound terminator: anything
+ * nested within the body is indented deeper and cannot match. Asserting the marker was
+ * found matters as much as the slice — a renamed predicate would otherwise silently
+ * yield an empty region and pass every count below vacuously.
+ */
+function regionBody(declaration: string): string {
+  const start = SERVICE_SRC.indexOf(declaration);
+  expect(start, `${declaration} not found in service.ts`).toBeGreaterThan(-1);
+  const end = SERVICE_SRC.indexOf("\n  async function ", start + declaration.length);
+  expect(end, `no sibling declaration terminates ${declaration}`).toBeGreaterThan(start);
+  return SERVICE_SRC.slice(start, end);
+}
+
 describe("stranded sweep attendance prefetch wiring", () => {
   it("routes both of the sweep's attendance checks through the prefetch", () => {
     const body = strandedSweepBody();
@@ -83,18 +101,46 @@ describe("stranded sweep attendance prefetch wiring", () => {
   });
 
   it("composes the batched window and the single-issue predicates from the same terms", () => {
-    // One call site in the single-issue form, one in `readStrandedAttendanceWindow`.
-    // Inlining either side is what lets the two queries drift, so a count of 1 here is
-    // the drift this file exists to refuse.
-    for (const terms of [
-      "executionPathRunTerms",
-      "deferredExecutionWakeTerms",
-      "pendingWakeInteractionTerms",
-      "heartbeatRunIssueIdExpr",
-      "deferredExecutionWakeIssueIdExpr",
-    ]) {
-      expect(callSiteCount(SERVICE_SRC, `\\b${terms}\\b`), `${terms} is no longer shared`)
-        .toBeGreaterThanOrEqual(2);
+    // Each shared symbol must appear on BOTH sides of the equivalence: in the
+    // single-issue predicate that owns it, and in `readStrandedAttendanceWindow`.
+    // Inlining either side is what lets the two queries drift.
+    //
+    // ⚠️ Asserted per REGION, at >= 1 each, rather than as one whole-file count at >= 2.
+    // A whole-file count is blind on exactly the symbols it most needs to cover: the two
+    // JSONB expression helpers have THREE call sites each — one single-issue, two inside
+    // the batch (a select and a where) — so the batch's own two satisfy a >= 2 threshold
+    // alone, and inlining the single-issue site leaves the guard green. Mutation-tested,
+    // not reasoned: under the old assertion that edit left the three `*Terms` helpers at
+    // 1 (fired) and both expression helpers at 2 (passed, drift undetected). Raising the
+    // threshold to 3 for those two would work today and rot on the next edit to the
+    // batch; the region split does not.
+    const singleIssueRegions = {
+      hasActiveExecutionPath: regionBody("async function hasActiveExecutionPath("),
+      hasPendingWakeInteraction: regionBody("async function hasPendingWakeInteraction("),
+    };
+    const batch = regionBody("async function readStrandedAttendanceWindow(");
+
+    // Which single-issue predicate each shared symbol belongs to. Listing them rather
+    // than searching both regions keeps the assertion specific: a term that migrated to
+    // the other predicate is itself a change worth failing on.
+    const shared: [symbol: string, singleIssueRegion: keyof typeof singleIssueRegions][] = [
+      ["executionPathRunTerms", "hasActiveExecutionPath"],
+      ["deferredExecutionWakeTerms", "hasActiveExecutionPath"],
+      ["heartbeatRunIssueIdExpr", "hasActiveExecutionPath"],
+      ["deferredExecutionWakeIssueIdExpr", "hasActiveExecutionPath"],
+      ["pendingWakeInteractionTerms", "hasPendingWakeInteraction"],
+    ];
+
+    for (const [symbol, region] of shared) {
+      const pattern = `\\b${symbol}\\b`;
+      expect(
+        callSiteCount(singleIssueRegions[region], pattern),
+        `${symbol} is no longer called in ${region} — the single-issue side was inlined`,
+      ).toBeGreaterThanOrEqual(1);
+      expect(
+        callSiteCount(batch, pattern),
+        `${symbol} is no longer called in readStrandedAttendanceWindow — the batch drifted`,
+      ).toBeGreaterThanOrEqual(1);
     }
   });
 

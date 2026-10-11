@@ -204,9 +204,12 @@ export type StrandedAttendanceWindow = {
  * single-issue `hasActiveExecutionPath` / `hasPendingWakeInteraction` it must stay
  * equivalent to. Drift between a batched query and the single-issue one it replaces is
  * the main hazard of this change, and adjacency is the control available for it;
- * `stranded-attendance-prefetch.test.ts` pins the windowing, and
- * `recovery-stranded-attendance-batch.test.ts` pins the equivalence against the live
- * predicates.
+ * `stranded-attendance-prefetch.test.ts` pins the windowing;
+ * `recovery-attendance-prefetch-call-shape.test.ts` pins, statically, that both forms
+ * compose the same shared terms; and `recovery-stranded-attendance-batch.test.ts` runs
+ * the two against the same embedded-Postgres rows and compares their verdicts issue by
+ * issue, which is the only one of the three that can catch two queries built from the
+ * same terms that nonetheless disagree.
  */
 export type StrandedAttendanceWindowLoader = (
   companyId: string,

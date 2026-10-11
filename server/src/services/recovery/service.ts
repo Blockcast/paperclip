@@ -2376,6 +2376,35 @@ export function recoveryService(
      * leaves this unset.
      */
     beforeBackstopCandidateLoopForTest?: () => Promise<void> | void;
+    /**
+     * Test-only accessor for the three attendance predicates (PEN-3636), handed out at
+     * construction. Production leaves it unset.
+     *
+     * ⚠️ Why a seam rather than an export: the batched `readStrandedAttendanceWindow`
+     * and the two single-issue predicates it stands in for are deliberately closures in
+     * this file, immediately adjacent to the shared terms they compose — that adjacency
+     * IS the drift control the batch's own doc comment argues for. Hoisting them into a
+     * separate module to make them importable would dissolve the control in order to
+     * test it.
+     *
+     * What it buys: `recovery-stranded-attendance-batch.test.ts` runs the batch and the
+     * single-issue forms against the SAME embedded-Postgres rows and compares verdicts
+     * issue by issue. That is the one control the static call-site guards cannot be —
+     * they prove the two queries are composed from shared terms, never that the two
+     * agree on an answer.
+     */
+    attendancePredicatesForTest?: (predicates: {
+      hasActiveExecutionPath: (
+        companyId: string,
+        issueId: string,
+        agentId?: string | null,
+      ) => Promise<boolean>;
+      hasPendingWakeInteraction: (companyId: string, issueId: string) => Promise<boolean>;
+      readStrandedAttendanceWindow: (
+        companyId: string,
+        issueIds: readonly string[],
+      ) => Promise<StrandedAttendanceWindow>;
+    }) => void;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -2987,8 +3016,9 @@ export function recoveryService(
    * `hasPendingWakeInteraction`, and composed from the SAME shared terms, so the one
    * hazard of this change — a batched query drifting away from the single-issue one it
    * stands in for — is structural rather than something a reviewer has to re-derive.
-   * The only thing that differs below is the issue-id predicate (`= ANY` instead of
-   * `=`) and the absence of the agent filter, which is applied in memory instead.
+   * The only thing that differs below is the issue-id predicate (`IN (...)` instead of
+   * `=` — drizzle's `inArray` emits an expanded `IN` list, not `= ANY`) and the absence
+   * of the agent filter, which is applied in memory instead.
    *
    * ⭐ The equivalence is exact, not approximate:
    *
@@ -3011,7 +3041,7 @@ export function recoveryService(
    *
    * Both JSONB predicates hit the partial expression indexes on
    * `(company_id, (context_snapshot ->> 'issueId'))` (migrations 0077 and 0204); the
-   * `= ANY` widening keeps the same leading column and the same expression, so the
+   * `IN (...)` widening keeps the same leading column and the same expression, so the
    * index remains usable.
    */
   async function readStrandedAttendanceWindow(
@@ -3078,6 +3108,15 @@ export function recoveryService(
       pendingWakeInteractionIssueIds: new Set(interactionRows.map((row) => row.issueId)),
     };
   }
+
+  // Handed out immediately after the three are defined, so a predicate added to this
+  // trio later is in scope here and its absence from the equivalence test is a compile
+  // error rather than a silent gap. Production leaves this unset; see the field's doc.
+  deps.attendancePredicatesForTest?.({
+    hasActiveExecutionPath,
+    hasPendingWakeInteraction,
+    readStrandedAttendanceWindow,
+  });
 
   // PEN-3352: named rather than three adjacent bare `number` positionals. The three
   // graces differ by more than an order of magnitude (6h / 7d / 14d) and a transposition
@@ -9301,6 +9340,13 @@ export function recoveryService(
       attendancePrefetchLiveReads: 0,
       attendancePrefetchHits: 0,
       attendancePrefetchWindowExpiries: 0,
+      // The only counter that answers whether `windowSize` is sized right:
+      // `attendancePrefetchIdsLoaded / attendancePrefetchLiveReads` is the mean window
+      // actually requested, and comparing it to `candidatesScanned` shows how much of
+      // each window the loop went on to use. A window that is mostly unused is rows
+      // fetched for candidates the pass never reached; one that is always full means the
+      // bound, not the company boundary, is what ended it.
+      attendancePrefetchIdsLoaded: 0,
       issueIds: [] as string[],
     };
     // Resolved once for the whole pass, not once per candidate. See
@@ -10999,6 +11045,7 @@ export function recoveryService(
     result.attendancePrefetchLiveReads = attendancePrefetchStats.liveReads;
     result.attendancePrefetchHits = attendancePrefetchStats.prefetchHits;
     result.attendancePrefetchWindowExpiries = attendancePrefetchStats.windowExpiries;
+    result.attendancePrefetchIdsLoaded = attendancePrefetchStats.idsLoaded;
     logger.info(
       {
         candidatesScanned: result.candidatesScanned,
@@ -11010,6 +11057,7 @@ export function recoveryService(
         attendancePrefetchLiveReads: result.attendancePrefetchLiveReads,
         attendancePrefetchHits: result.attendancePrefetchHits,
         attendancePrefetchWindowExpiries: result.attendancePrefetchWindowExpiries,
+        attendancePrefetchIdsLoaded: result.attendancePrefetchIdsLoaded,
         skipped: strandedLoopSkipped,
         reconcileErrors: result.reconcileErrors,
       },
