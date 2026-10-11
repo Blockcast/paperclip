@@ -3988,13 +3988,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(persistedReservation?.releasedAt).toBeNull();
   });
 
-  it("does not treat expected Job ownership as a terminal prelaunch orphan", async () => {
+  // BLO-19148: the pair below replaces an earlier case that asserted an
+  // `expectedJobName`-only reservation was never even *selected* by the reclaim
+  // sweep (#740, "does not treat expected Job ownership as a terminal prelaunch
+  // orphan"). That exclusion predated the exact `readAgentJobRunStatusByName`
+  // verification #831 added to the loop body, and it leaked a slot forever: the
+  // migration-0128 trigger does not fire on `interrupted`, so a SIGTERM landing
+  // between `onMeta` (which persists `expectedJobName`) and
+  // `createNamespacedJob` left a row no selection branch could see. The guard
+  // the old case was really buying — "a live Job keeps its slot" — is now the
+  // second test here, asserted against the Job rather than against the name
+  // column.
+  it("releases an expectedJobName-only reservation whose Job never existed and whose run was interrupted", async () => {
     const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
     const expectedJobName = "agent-opencode-expected-job";
     const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
       agentStatus: "idle",
-      runStatus: "failed",
+      runStatus: "interrupted",
       processPid: null,
       processGroupId: null,
       includeIssue: false,
@@ -4010,7 +4021,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       reservedAt,
     });
     mockListManagedAgentJobs.mockResolvedValueOnce([]);
-    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+    mockReadAgentJobRunStatusByName.mockResolvedValue({
       phase: "missing",
       reason: "NotFound",
       name: expectedJobName,
@@ -4023,9 +4034,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(externalRuntimeReservations)
       .where(eq(externalRuntimeReservations.id, reservation.id))
       .then((rows) => rows[0]);
+    expect(persistedReservation).toMatchObject({
+      state: "released",
+      releaseReason: "terminal_prelaunch_orphan",
+    });
+    expect(persistedReservation?.releasedAt).not.toBeNull();
+    expect(mockReadAgentJobRunStatusByName).toHaveBeenCalledWith(expectedJobName);
+  });
+
+  it("keeps an expectedJobName-only reservation whose expected Job is still active", async () => {
+    const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
+    const expectedJobName = "agent-opencode-live-job";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      runStatus: "interrupted",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    const reservation = await seedPrelaunchReservation({
+      companyId,
+      agentId,
+      runId,
+      state: "launching",
+      isolationMode: "shared",
+      expectedJobName,
+      reservedAt,
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValue({
+      phase: "active",
+      name: expectedJobName,
+    });
+
+    await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    const persistedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id))
+      .then((rows) => rows[0]);
     expect(persistedReservation?.state).toBe("launching");
     expect(persistedReservation?.releasedAt).toBeNull();
-    expect(mockReadAgentJobRunStatusByName).not.toHaveBeenCalled();
   });
 
   it("keeps a recent shared prelaunch reservation while terminal execution teardown may still be unwinding", async () => {
