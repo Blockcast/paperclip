@@ -455,12 +455,25 @@ export async function reapIsolationWorkspaces(
 
     if (!isReapableLayout(children)) {
       result.skippedLayout += 1;
-      // Logged individually and on purpose: a skip count above the historical
-      // baseline of 1 means the tree is more heterogeneous than the allowlist
-      // was validated against, and that is worth a human look before the next
-      // pass widens.
+      // Logged individually and on purpose: the log line carries the path, and
+      // the path is the only way to tell the two populations in this counter
+      // apart. A skip is either single-sided (`{home}` or `{session}` alone — a
+      // half-materialized workspace, carrying no heterogeneity at all) or a
+      // genuine superset (an extra top-level entry), and only the second is
+      // worth a human look before the next pass widens the allowlist.
       //
-      // Scope, so the baseline is not over-read: this observes **aged**
+      // ⚠ The counter cannot distinguish them, so do not read its total as a
+      // rise. Measured over the whole live tree at maxAgeDays=30 on 2026-10-11
+      // (BLO-36735): 50 skips = 42 single-sided + 8 supersets, that subset
+      // unchanged from 2026-10-10. This comment previously gave "the historical
+      // baseline of 1" — the superset count when BLO-36735 first measured it,
+      // before the single-sided population existed at scale. Against a live
+      // total of 50 that reads as a 50x rise with a benign cause, which is how
+      // a real rise gets missed. Splitting this by a `reason` label is the
+      // durable fix; until then runbooks/isolation-workspace-reaper.md carries
+      // the tree-side split.
+      //
+      // Scope, so the counts are not over-read: this observes **aged**
       // directories only. The fresh-`mtime` retention above `continue`s before
       // the layout check, so a newly created worktree-shaped directory is
       // counted `retainedFresh` and goes unreported until it crosses
