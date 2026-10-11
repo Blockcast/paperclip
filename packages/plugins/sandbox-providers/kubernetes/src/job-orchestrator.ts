@@ -43,10 +43,19 @@ export interface CreateJobOptions {
 
 const CONFLICT_RETRY_TIMEOUT_MS = 10_000;
 const CONFLICT_RETRY_POLL_MS = 250;
+const MANAGED_BY_LABEL = "paperclip.io/managed-by";
+const MANAGED_BY_VALUE = "paperclip-k8s-plugin";
 const IDENTITY_LABELS = [
   "paperclip.io/run-id",
+  // BLO-27156: every server-side exact-identity check compares agent-id; this
+  // one omitted it. `paperclipLabels` has always stamped it, so adding it
+  // cannot fail an adoption that would previously have succeeded. It is
+  // currently redundant with run-id -- plugin.ts passes `agentId: params.runId`
+  // as a stand-in pending a real agentId on AcquireLeaseParams -- and starts
+  // doing independent work the moment that TODO is resolved.
+  "paperclip.io/agent-id",
   "paperclip.io/company-id",
-  "paperclip.io/managed-by",
+  MANAGED_BY_LABEL,
   "paperclip.io/adapter",
 ] as const;
 
@@ -219,15 +228,54 @@ export async function streamPodLogs(
   if (text.length > 0) await onChunk("stdout", text);
 }
 
+/**
+ * BLO-27156: this used to delete by name alone, the only Job delete in the
+ * repo with neither an identity check nor a uid precondition. `release()` is
+ * handed a `providerLeaseId` from a lease row, so a stale or mis-recorded one
+ * aimed the DELETE at whatever currently answers to that name in a shared
+ * tenant namespace.
+ *
+ * Read first, then delete under `preconditions.uid` from that read, matching
+ * the server-side `deleteAgentJobExact` discipline: if the name was recycled
+ * between the read and the delete, Kubernetes rejects it 409 and the object
+ * survives. Throwing on a foreign Job is deliberate -- a silent no-op would
+ * leak the real lease invisibly, and if we are wrong about what we own,
+ * aborting the rest of the teardown is the conservative outcome.
+ */
 export async function deleteJob(
   clients: KubeClients,
   namespace: string,
   name: string,
 ): Promise<void> {
+  let existing: ExistingJob;
+  try {
+    existing = (await clients.batch.readNamespacedJob({ namespace, name })) as ExistingJob;
+  } catch (err) {
+    // Already gone: release is idempotent, and callers that translate 404 to
+    // success keep doing so because nothing is thrown here.
+    if (isNotFound(err)) return;
+    throw err;
+  }
+
+  const managedBy = existing.metadata?.labels?.[MANAGED_BY_LABEL];
+  if (managedBy !== MANAGED_BY_VALUE) {
+    throw new Error(
+      `Refusing to delete Job ${namespace}/${name}: ${MANAGED_BY_LABEL} is ${managedBy ?? "absent"}, not ${MANAGED_BY_VALUE}`,
+    );
+  }
+  const uid = existing.metadata?.uid;
+  if (!uid) {
+    throw new Error(`Refusing to delete Job ${namespace}/${name}: it has no uid to precondition on`);
+  }
+
   await clients.batch.deleteNamespacedJob({
     namespace,
     name,
+    // Foreground propagation is load-bearing: batch/v1 defaults to
+    // OrphanDependents, which strips the pod's ownerReferences and strands it
+    // permanently (BLO-28008). Do not drop it.
     propagationPolicy: "Foreground",
+    body: { preconditions: { uid } },
   });
 }
 
