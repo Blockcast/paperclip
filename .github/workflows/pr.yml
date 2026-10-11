@@ -1388,7 +1388,10 @@ jobs:
           MERGE_GROUP_FULL_SUITE: ${{ vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE }}
           LANE_TRIM: ${{ needs.policy.outputs.merge_group_trim_worktree_install }}
         run: |
-          if [ "$EVENT_NAME" = "merge_group" ] && [ "$MERGE_GROUP_FULL_SUITE" != "true" ] && [ "$LANE_TRIM" = "true" ]; then
+          # Read the kill switch as decideTrim does (trim + lowercase), so TRUE or
+          # " true" un-trims this lane too; interior whitespace only un-trims more.
+          full_suite=$(printf '%s' "$MERGE_GROUP_FULL_SUITE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+          if [ "$EVENT_NAME" = "merge_group" ] && [ "$full_suite" != "true" ] && [ "$LANE_TRIM" = "true" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=Worktree install trimmed in merge group::the queued PR's head already passed this lane in pull_request CI and the queue applies exactly that change set (see policy's 'Decide merge-group heavy-lane trim' step). Set PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true to restore the full suite."
           else
@@ -1491,7 +1494,10 @@ jobs:
           MERGE_GROUP_FULL_SUITE: ${{ vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE }}
           LANE_TRIM: ${{ needs.policy.outputs.merge_group_trim_opencode_responses_replay }}
         run: |
-          if [ "$EVENT_NAME" = "merge_group" ] && [ "$MERGE_GROUP_FULL_SUITE" != "true" ] && [ "$LANE_TRIM" = "true" ]; then
+          # Read the kill switch as decideTrim does (trim + lowercase), so TRUE or
+          # " true" un-trims this lane too; interior whitespace only un-trims more.
+          full_suite=$(printf '%s' "$MERGE_GROUP_FULL_SUITE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+          if [ "$EVENT_NAME" = "merge_group" ] && [ "$full_suite" != "true" ] && [ "$LANE_TRIM" = "true" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=OpenCode Responses replay trimmed in merge group::the queued PR's head already passed this lane in pull_request CI and the queue applies exactly that change set (see policy's 'Decide merge-group heavy-lane trim' step). Set PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true to restore the full suite."
           else
@@ -1568,7 +1574,10 @@ jobs:
           MERGE_GROUP_FULL_SUITE: ${{ vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE }}
           LANE_TRIM: ${{ needs.policy.outputs.merge_group_trim_opencode_k8s_seed_cold_start }}
         run: |
-          if [ "$EVENT_NAME" = "merge_group" ] && [ "$MERGE_GROUP_FULL_SUITE" != "true" ] && [ "$LANE_TRIM" = "true" ]; then
+          # Read the kill switch as decideTrim does (trim + lowercase), so TRUE or
+          # " true" un-trims this lane too; interior whitespace only un-trims more.
+          full_suite=$(printf '%s' "$MERGE_GROUP_FULL_SUITE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+          if [ "$EVENT_NAME" = "merge_group" ] && [ "$full_suite" != "true" ] && [ "$LANE_TRIM" = "true" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=k8s-ro seed transport cold start trimmed in merge group::the queued PR's head already passed this lane in pull_request CI and the queue applies exactly that change set (see policy's 'Decide merge-group heavy-lane trim' step). Set PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true to restore the full suite."
           else
@@ -1781,11 +1790,14 @@ jobs:
             general-workspaces-b) needed="$WORKSPACES_B_TESTS_NEEDED" ;;
             *) needed=true ;;
           esac
+          # Read the kill switch as decideTrim does (trim + lowercase), so TRUE or
+          # " true" un-trims this lane too; interior whitespace only un-trims more.
+          full_suite=$(printf '%s' "$MERGE_GROUP_FULL_SUITE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
           if [ "$needed" = "false" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=General tests skipped::policy's path selector found no changed path that can reach $GROUP (see its 'Select suites reachable from this diff' step)."
           elif [ "$GROUP" = "general-server" ] && [ "$EVENT_NAME" = "merge_group" ] \
-            && [ "$MERGE_GROUP_FULL_SUITE" != "true" ] && [ "$MERGE_GROUP_TRIM_SERVER" = "true" ]; then
+            && [ "$full_suite" != "true" ] && [ "$MERGE_GROUP_TRIM_SERVER" = "true" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=General tests trimmed in merge group::the queued PR's head already passed every server shard in pull_request CI and the queue applies exactly that change set (see policy's 'Decide merge-group heavy-lane trim' step). Set PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true to restore the full suite."
           else

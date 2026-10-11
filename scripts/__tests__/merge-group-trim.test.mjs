@@ -650,6 +650,11 @@ const LANE_ENV = { EVENT_NAME: "merge_group", MERGE_GROUP_FULL_SUITE: "", LANE_T
 for (const [label, env, expected] of [
   ["TRIM mode skips", LANE_ENV, "run=false"],
   ["kill switch runs", { ...LANE_ENV, MERGE_GROUP_FULL_SUITE: "true" }, "run=true"],
+  // Same reading as decideTrim (trim + lowercase): a stale TRIM decision must not
+  // keep a lane trimmed once the lane itself sees the switch in any letter case.
+  ["kill switch TRUE runs", { ...LANE_ENV, MERGE_GROUP_FULL_SUITE: "TRUE" }, "run=true"],
+  ["kill switch ' true\\n' runs", { ...LANE_ENV, MERGE_GROUP_FULL_SUITE: " true\n" }, "run=true"],
+  ["a non-true kill switch value still trims", { ...LANE_ENV, MERGE_GROUP_FULL_SUITE: "false" }, "run=false"],
   ["pull_request runs", { ...LANE_ENV, EVENT_NAME: "pull_request" }, "run=true"],
   ["an empty policy output runs", { ...LANE_ENV, LANE_TRIM: "" }, "run=true"],
   ["a 'false' policy output runs", { ...LANE_ENV, LANE_TRIM: "false" }, "run=true"],
@@ -674,6 +679,9 @@ for (const [label, env, expected] of [
   ["TRIM mode still runs workspaces-a", { GROUP: "general-workspaces-a" }, "run=true"],
   ["TRIM mode still runs workspaces-b", { GROUP: "general-workspaces-b" }, "run=true"],
   ["kill switch runs a server shard", { GROUP: "general-server", MERGE_GROUP_FULL_SUITE: "true" }, "run=true"],
+  ["kill switch TRUE runs a server shard", { GROUP: "general-server", MERGE_GROUP_FULL_SUITE: "TRUE" }, "run=true"],
+  ["kill switch ' true\\n' runs a server shard", { GROUP: "general-server", MERGE_GROUP_FULL_SUITE: " true\n" }, "run=true"],
+  ["a non-true kill switch value still trims a server shard", { GROUP: "general-server", MERGE_GROUP_FULL_SUITE: "false" }, "run=false"],
   ["pull_request runs a server shard", { GROUP: "general-server", EVENT_NAME: "pull_request" }, "run=true"],
   ["an empty trim output runs a server shard", { GROUP: "general-server", MERGE_GROUP_TRIM_SERVER: "" }, "run=true"],
   ["the path selector still skips on its own", { GROUP: "general-server", SERVER_TESTS_NEEDED: "false", MERGE_GROUP_TRIM_SERVER: "" }, "run=false"],
