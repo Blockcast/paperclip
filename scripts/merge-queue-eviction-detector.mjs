@@ -106,9 +106,14 @@ export function filterMergeGroupRunsForPr(runs, { base, prNumber }) {
  * signals "enqueue found, no removal observed yet" so the caller can retry
  * instead of guessing.
  *
- * @param {Array<{ event: string, created_at: string }>} timelineEvents
+ * @param {Array<{ event: string, created_at: string, actor?: string | null }>} timelineEvents
  * @param {{ now: number }} opts
- * @returns {{ enqueuedAt: string, dequeuedAt: string | null } | null}
+ * @returns {{ enqueuedAt: string, dequeuedAt: string | null, dequeuedBy: string | null } | null}
+ *   `dequeuedBy` is the actor of the removal this window anchored to, and is
+ *   load-bearing: it is the sole input to `isQueueInitiatedRemoval`, which is
+ *   what separates a genuine eviction from a deliberate hold (PEN-3926).
+ *   `null` means no attribution was available, which fails back to the
+ *   pre-PEN-3926 `conflict_unstageable` verdict.
  */
 export function selectLatestQueueAttemptWindow(timelineEvents, { now }) {
   const events = (timelineEvents ?? [])
@@ -197,7 +202,7 @@ export function isQueueInitiatedRemoval(dequeueActor) {
   if (typeof dequeueActor !== "string") return true;
   const actor = dequeueActor.trim();
   if (actor.length === 0) return true;
-  return actor.toLowerCase() === MERGE_QUEUE_REMOVAL_ACTOR;
+  return actor.toLowerCase() === MERGE_QUEUE_REMOVAL_ACTOR.toLowerCase();
 }
 
 /**
@@ -377,10 +382,14 @@ export function buildEvictionCommentBody({
 }) {
   // PEN-3926: `manual` is now reachable with ZERO runs (a dequeue that beat
   // the queue to staging), so its cause line can no longer assert that a run
-  // was created. When the removal carries an attributable actor, name it and
-  // say plainly that the branch is probably fine; otherwise emit the original
-  // run-count-based wording verbatim, which is still exactly right for the
-  // path that reaches `manual` through a non-failing run.
+  // was created. The branch below is keyed on the ACTOR, not on the run
+  // count: whenever the removal carries an attributable actor we name it and
+  // say plainly that the branch is probably fine -- including on the older
+  // path into `manual` (a run existed and did not fail), where naming the
+  // remover is strictly more useful than asserting the run, and the run count
+  // is printed on its own line regardless. The original run-count-based
+  // wording is emitted verbatim only when no actor is attributable, which is
+  // the one case where there is nothing better to say.
   const namedManualActor = !isQueueInitiatedRemoval(dequeueActor) ? String(dequeueActor).trim() : null;
   const manualCause = namedManualActor
     ? `**manual / administrative dequeue** -- \`${namedManualActor}\` removed this PR from the queue, rather ` +
