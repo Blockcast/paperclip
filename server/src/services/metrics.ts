@@ -1023,6 +1023,24 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC =
 export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_external_runtime_reservation_strand_metrics_refresh_success";
 /**
+ * Board-approval-queue depth and staleness (BLO-29850). The approval queue is
+ * the mandated escalation path for shared-infra changes and had no telemetry at
+ * all: it stopped serving for 3.2 days while 39 new cards were filed into it,
+ * and the only observable difference between "the board decided everything" and
+ * "the board decided nothing" was an API call nobody made.
+ *
+ * The LAST-DECISION timestamp is the load-bearing one. Depth alone is a staffing
+ * opinion -- 88 pending against a healthy service rate is a backlog, 3 pending
+ * against a dead one is an outage -- so the alert is a staleness threshold on
+ * this series gated on pending > 0, never a threshold on depth.
+ */
+export const APPROVALS_PENDING_METRIC = "paperclip_approvals_pending";
+export const APPROVAL_OLDEST_PENDING_AGE_METRIC = "paperclip_approval_oldest_pending_age_seconds";
+export const APPROVAL_LAST_DECISION_TIMESTAMP_METRIC =
+  "paperclip_approval_last_decision_timestamp_seconds";
+export const APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_approval_queue_metrics_refresh_success";
+/**
  * How long each currently-held per-agent start lock has been held (PEN-3305).
  *
  * `withAgentStartLock` serializes queued-run dispatch per agent and has no
@@ -3474,6 +3492,10 @@ let environmentLeasesOrphanedOldestAge: Gauge | null = null;
 let orphanedRuntimeResourceMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
+let approvalsPending: Gauge<"type"> | null = null;
+let approvalOldestPendingAge: Gauge<"type"> | null = null;
+let approvalLastDecisionTimestamp: Gauge | null = null;
+let approvalQueueMetricsRefreshSuccess: Gauge | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
 let agentStartLockPhaseSeconds: Gauge<"agent_id" | "phase"> | null = null;
 let agentStartLockAbortedTotal: Counter<"agent_id"> | null = null;
@@ -3670,6 +3692,10 @@ function ensureRegistry(): {
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
+  approvalsPendingGauge: Gauge<"type">;
+  approvalOldestPendingAgeGauge: Gauge<"type">;
+  approvalLastDecisionTimestampGauge: Gauge;
+  approvalQueueMetricsRefreshSuccessGauge: Gauge;
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
   agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
   agentStartLockAbortedTotalCounter: Counter<"agent_id">;
@@ -3737,6 +3763,10 @@ function ensureRegistry(): {
     || !orphanedRuntimeResourceMetricsRefreshSuccess
     || !externalRuntimeReservationStrandedOldestAge
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
+    || !approvalsPending
+    || !approvalOldestPendingAge
+    || !approvalLastDecisionTimestamp
+    || !approvalQueueMetricsRefreshSuccess
     || !agentStartLockHeldSeconds
     || !agentStartLockPhaseSeconds
     || !agentStartLockAbortedTotal
@@ -4205,6 +4235,53 @@ function ensureRegistry(): {
       registers: [registry],
     });
     externalRuntimeReservationStrandMetricsRefreshSuccess.set(0);
+    approvalsPending = new Gauge({
+      name: APPROVALS_PENDING_METRIC,
+      help:
+        "Board approvals currently in status 'pending', labeled by bounded approval type "
+        + "(BLO-29850). `revision_requested` is excluded deliberately: that card is back in the "
+        + "REQUESTER's court to resubmit or withdraw, so counting it would attribute a requester "
+        + "backlog to board unresponsiveness. Reset-then-set every refresh so a type whose queue "
+        + "drains reads back an explicit 0 rather than a frozen stale value. This gauge is the "
+        + "alert's GATE, never its trigger -- depth alone is a staffing opinion; see "
+        + APPROVAL_LAST_DECISION_TIMESTAMP_METRIC + " for the fault signal.",
+      labelNames: ["type"],
+      registers: [registry],
+    });
+    approvalOldestPendingAge = new Gauge({
+      name: APPROVAL_OLDEST_PENDING_AGE_METRIC,
+      help:
+        "Age in seconds of the oldest still-'pending' board approval, labeled by bounded approval "
+        + "type (BLO-29850). Slow-burn companion to the staleness alert: a queue being served at a "
+        + "healthy rate can still strand one card forever, which the last-decision timestamp alone "
+        + "cannot see. Reset-then-set every refresh.",
+      labelNames: ["type"],
+      registers: [registry],
+    });
+    approvalLastDecisionTimestamp = new Gauge({
+      name: APPROVAL_LAST_DECISION_TIMESTAMP_METRIC,
+      help:
+        "Unix timestamp (seconds) of the most recent BOARD decision on an approval -- "
+        + "approved/rejected/revision_requested only (BLO-29850). `withdrawn` and `cancelled` are "
+        + "excluded because they are requester-side cleanup: a burst of agents retiring their own "
+        + "moot cards drains the pending count without the board deciding anything, and a "
+        + "depth-only metric scores that as progress. Excluding them here is what makes "
+        + "`time() - <this>` a true service-liveness signal. 0 means no board decision has ever "
+        + "been recorded, so alerts must gate on " + APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC
+        + " rather than reading 0 as an infinitely stale queue.",
+      registers: [registry],
+    });
+    approvalLastDecisionTimestamp.set(0);
+    approvalQueueMetricsRefreshSuccess = new Gauge({
+      name: APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent approval-queue database refresh completed before metrics "
+        + "exposition; 0 when it failed, so a stale pending count cannot be read as a fresh empty "
+        + "queue. Silence is not health: this gauge is what separates 'measured nothing pending' "
+        + "from 'failed to measure'.",
+      registers: [registry],
+    });
+    approvalQueueMetricsRefreshSuccess.set(0);
     processLostTotal = new Counter({
       name: PROCESS_LOST_TOTAL_METRIC,
       help:
@@ -5320,6 +5397,10 @@ function ensureRegistry(): {
     externalRuntimeReservationStrandedOldestAgeGauge: externalRuntimeReservationStrandedOldestAge,
     externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
       externalRuntimeReservationStrandMetricsRefreshSuccess,
+    approvalsPendingGauge: approvalsPending,
+    approvalOldestPendingAgeGauge: approvalOldestPendingAge,
+    approvalLastDecisionTimestampGauge: approvalLastDecisionTimestamp,
+    approvalQueueMetricsRefreshSuccessGauge: approvalQueueMetricsRefreshSuccess,
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
     agentStartLockPhaseSecondsGauge: agentStartLockPhaseSeconds,
     agentStartLockAbortedTotalCounter: agentStartLockAbortedTotal,
@@ -6296,6 +6377,46 @@ export function setExternalRuntimeReservationStrandedOldestAgeMetrics(
 /** Mark whether the stranded-reservation gauge was refreshed from the database. */
 export function setExternalRuntimeReservationStrandMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().externalRuntimeReservationStrandMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/**
+ * Publish board-approval-queue depth, oldest-pending age, and last-board-decision
+ * timestamp (BLO-29850). Same reset-then-set contract as
+ * {@link setExternalRuntimeReservationStrandedOldestAgeMetrics}: a type whose
+ * queue drains must read back an explicit 0, because an absent series and "nothing
+ * pending" render identically on every dashboard.
+ *
+ * `lastDecisionTimestampSeconds` is left UNTOUCHED when null rather than zeroed.
+ * Zeroing it would make `time() - <gauge>` enormous and fire the staleness alert
+ * on an installation that has simply never recorded a board decision, which is a
+ * cold-start artifact rather than an outage. The gauge's initial value is already
+ * 0 and the freshness gate distinguishes the two cases.
+ */
+export function setApprovalQueuePendingMetrics(input: {
+  entries: ReadonlyArray<{ type: string; pending: number; oldestAgeSeconds: number }>;
+  lastDecisionTimestampSeconds: number | null;
+}): void {
+  const metrics = ensureRegistry();
+  metrics.approvalsPendingGauge.reset();
+  metrics.approvalOldestPendingAgeGauge.reset();
+  for (const entry of input.entries) {
+    const type = entry.type || "unknown";
+    const pending = Number.isFinite(entry.pending) ? Math.max(0, entry.pending) : 0;
+    const age = Number.isFinite(entry.oldestAgeSeconds) ? Math.max(0, entry.oldestAgeSeconds) : 0;
+    metrics.approvalsPendingGauge.set({ type }, pending);
+    metrics.approvalOldestPendingAgeGauge.set({ type }, age);
+  }
+  if (
+    input.lastDecisionTimestampSeconds !== null
+    && Number.isFinite(input.lastDecisionTimestampSeconds)
+  ) {
+    metrics.approvalLastDecisionTimestampGauge.set(Math.max(0, input.lastDecisionTimestampSeconds));
+  }
+}
+
+/** Mark whether the approval-queue gauges were refreshed from the database. */
+export function setApprovalQueueMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().approvalQueueMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 export function computePrReviewQueueWaitSeconds(
@@ -7587,6 +7708,10 @@ export function __resetMetricsForTest(): void {
   orphanedRuntimeResourceMetricsRefreshSuccess = null;
   externalRuntimeReservationStrandedOldestAge = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
+  approvalsPending = null;
+  approvalOldestPendingAge = null;
+  approvalLastDecisionTimestamp = null;
+  approvalQueueMetricsRefreshSuccess = null;
   agentStartLockHeldSeconds = null;
   agentStartLockPhaseSeconds = null;
   agentStartLockAbortedTotal = null;
