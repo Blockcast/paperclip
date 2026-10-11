@@ -7,7 +7,10 @@ mkdir -p "$PC_HOME" "$PC_CACHE" "$PC_DATA"
 echo "PC_TEST_ROOT: $PC_TEST_ROOT"
 echo "PC_HOME: $PC_HOME"
 cd $PC_TEST_ROOT
-git clone https://github.com/paperclipai/paperclip.git repo
+# BLO-43044: blobless. Destination is $PC_TEST_ROOT/repo under `mktemp -d /tmp/...`,
+# so this is a /tmp clone even though no `/tmp` literal appears on this line.
+# The checkout below fetches only the blobs at HEAD, not every blob in history.
+git clone --filter=blob:none https://github.com/paperclipai/paperclip.git repo
 cd repo
 pnpm install
 env HOME="$PC_HOME" npm_config_cache="$PC_CACHE" npm_config_userconfig="$PC_HOME/.npmrc" \
