@@ -344,6 +344,7 @@ const laneEnv = (overrides) => ({
   OPENCODE_K8S_SEED_COLD_START_RESULT: "success",
   BUILD_RESULT: "success",
   VENDOR_CLAUDE_K8S_RESULT: "success",
+  VENDOR_OPENCODE_K8S_RESULT: "success",
   ALLY_VERDICT_RESULT: "success",
   RUN_ATTEMPT: "1",
   ...overrides,

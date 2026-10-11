@@ -172,6 +172,11 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
   // Deliberately outside the pnpm workspace; pr.yml's `Vendored claude_k8s
   // adapter` job installs it and runs `npm test` on its own.
   ["paperclip-adapter-claude-k8s", "pr.yml :: vendor_claude_k8s"],
+  // Same arrangement, added by PEN-3916 when this adapter was vendored in-tree.
+  // EXECUTED_BY_ANOTHER_LANE, not UNEXECUTED_WITH_TESTS: the lane really does
+  // install it and run `npm test` (674 tests), so this is a true statement
+  // about where the suite runs, not debt parked on the ratchet.
+  ["paperclip-adapter-opencode-k8s", "pr.yml :: vendor_opencode_k8s"],
   // The root package owns ~96 node:test files under scripts/, .github/scripts/
   // and deploy/helm/. Those run through the enumerated `node --test` steps in
   // pr.yml's policy job, not through Vitest. NOTE: this sweep does not verify
