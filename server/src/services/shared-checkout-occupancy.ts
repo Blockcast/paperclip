@@ -87,6 +87,45 @@ export async function listSiblingRunningRunIds(
 export const SHARED_CHECKOUT_WARNING_RUN_SAMPLE = 4;
 
 /**
+ * BLO-42212: does this run actually land in `executionWorkspace.cwd`?
+ *
+ * The probe used to exempt `git_worktree` and nothing else, and that missed the
+ * commonest case on this fleet. `buildK8sRunIsolationDescriptor` relocates the
+ * workspace to a per-run ephemeral root whenever `isolationMode === "run"` and
+ * the run has no provisioned worktree -- which is every K8s run of a
+ * concurrency-enabled agent on `project_primary`, including the repo-less
+ * `empty-workspaces/<agentId>` fallback. Such a run never opens `cwd`, so
+ * warning it about a sibling in that directory is false, and because the sibling
+ * count is agent-scoped it fired on EVERY run of such an agent at once.
+ * Measured 2026-10-11 on two live runs (Ally `23434662`, Staff `e502006e`): both
+ * carried the warning naming `empty-workspaces/...` while their own
+ * `paperclipK8sIsolation` read `isolationMode: "run"`, `storage.workspace:
+ * "ephemeral"`, `workspaceRoot: /runtime-cache/paperclip-runs/<runId>/workspace`.
+ *
+ * That is the universality this module's own `listSiblingRunningRunIds` docs
+ * argue against ("a universal warning is noise") -- the self-exclusion guard
+ * closed one source of it and this was the other, larger one.
+ *
+ * Keyed on `storage.workspace`, not on `isolationMode`: the descriptor sets that
+ * field from the same `usesEphemeralWorkspace` that picks `workspaceRoot`, and
+ * its own comment requires the two to track exactly. `isolationMode === "run"`
+ * alone is wrong -- a run pinned to a provisioned worktree is also mode `run`
+ * yet keeps a persistent workspace.
+ *
+ * Absent isolation (non-K8s adapters) means no relocation, so we still warn:
+ * forgetting to pass it costs noise, never a missed real collision.
+ */
+export function runLandsInSharedCheckout(input: {
+  strategyType: string;
+  isolation?: { storage: { workspace: "ephemeral" | "persistent" } } | null;
+}): boolean {
+  // git_worktree gives every run its own path and stamps ownership, so there is
+  // no shared tree to warn about.
+  if (input.strategyType === "git_worktree") return false;
+  return input.isolation?.storage.workspace !== "ephemeral";
+}
+
+/**
  * The warning text. Its caller (heartbeat.ts) pushes it onto
  * `runtimeWorkspaceWarnings`, which is bound BY REFERENCE into
  * `context.paperclipWorkspace.warnings` and spread into the adapter context --
@@ -137,8 +176,17 @@ export async function describeSharedCheckoutOccupancy(input: {
   heartbeatRunId: string | null;
   cwd: string;
   strategyType: string;
+  /**
+   * The run's resolved K8s isolation descriptor, when it has one. Omit for a
+   * non-K8s run: that is the warn-anyway default (see
+   * `runLandsInSharedCheckout`).
+   */
+  isolation?: { storage: { workspace: "ephemeral" | "persistent" } } | null;
 }): Promise<string | null> {
-  const { db, companyId, agentId, heartbeatRunId, cwd, strategyType } = input;
+  const { db, companyId, agentId, heartbeatRunId, cwd, strategyType, isolation } = input;
+  // Before the query, not after: a run that does not land in this tree should
+  // cost nothing to clear.
+  if (!runLandsInSharedCheckout({ strategyType, isolation })) return null;
   // Without a db, an agent identity, and our own run id we cannot tell a
   // sibling from ourselves -- and counting ourselves as contention would warn
   // on every single-run agent. Stay silent rather than cry wolf.

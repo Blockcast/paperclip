@@ -6,6 +6,7 @@ import {
   describeSharedCheckoutOccupancy,
   formatSharedCheckoutOccupancyWarning,
   listSiblingRunningRunIds,
+  runLandsInSharedCheckout,
 } from "../services/shared-checkout-occupancy.js";
 
 const COMPANY = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -175,6 +176,51 @@ describe("listSiblingRunningRunIds", () => {
   });
 });
 
+describe("runLandsInSharedCheckout", () => {
+  const ephemeral = { storage: { workspace: "ephemeral" as const } };
+  const persistent = { storage: { workspace: "persistent" as const } };
+
+  it("warns on a project_primary run with no isolation descriptor", () => {
+    // Non-K8s adapters relocate nothing, and omitting the field must not buy a
+    // silent exemption: the cost of forgetting it is noise, never a missed
+    // collision.
+    expect(runLandsInSharedCheckout({ strategyType: "project_primary" })).toBe(true);
+    expect(runLandsInSharedCheckout({ strategyType: "project_primary", isolation: null })).toBe(true);
+  });
+
+  it("stays silent when the isolation descriptor made the workspace ephemeral", () => {
+    // BLO-42212. This is the case that fired on every run of every
+    // concurrency-enabled K8s agent: the run executes in
+    // /runtime-cache/paperclip-runs/<runId>/workspace and never opens the cwd
+    // the warning names.
+    expect(
+      runLandsInSharedCheckout({ strategyType: "project_primary", isolation: ephemeral }),
+    ).toBe(false);
+  });
+
+  it("still warns when isolation kept the workspace persistent", () => {
+    // The control that separates this fix from "exempt isolationMode === run".
+    // `shared` and `workspace` modes, and a run pinned to a provisioned
+    // worktree, all keep storage.workspace persistent -- they really do open
+    // executionWorkspace.cwd, so BLO-27858's warning must survive.
+    expect(
+      runLandsInSharedCheckout({ strategyType: "project_primary", isolation: persistent }),
+    ).toBe(true);
+    expect(
+      runLandsInSharedCheckout({ strategyType: "shared_workspace", isolation: persistent }),
+    ).toBe(true);
+  });
+
+  it("stays silent for git_worktree regardless of isolation", () => {
+    // Pre-existing exemption, moved here from the heartbeat call site. Assert
+    // it against both descriptors so the move cannot quietly narrow it.
+    expect(runLandsInSharedCheckout({ strategyType: "git_worktree" })).toBe(false);
+    expect(runLandsInSharedCheckout({ strategyType: "git_worktree", isolation: persistent })).toBe(
+      false,
+    );
+  });
+});
+
 describe("describeSharedCheckoutOccupancy", () => {
   const base = {
     companyId: COMPANY,
@@ -212,6 +258,41 @@ describe("describeSharedCheckoutOccupancy", () => {
       throw new Error("connection terminated");
     });
     await expect(describeSharedCheckoutOccupancy({ ...base, db })).resolves.toBeNull();
+  });
+
+  it("clears an ephemeral-workspace run without querying for siblings", async () => {
+    // The `where` assertion is the load-bearing half. Returning null after the
+    // query would still read as "silent" here, so without it this test would
+    // pass even if the exemption were applied in the wrong place -- and the
+    // sibling count runs on the path that provisions every run's workspace.
+    const { db, where } = selectStub([{ id: SIBLING_RUN }]);
+    await expect(
+      describeSharedCheckoutOccupancy({
+        ...base,
+        db,
+        isolation: { storage: { workspace: "ephemeral" } },
+      }),
+    ).resolves.toBeNull();
+    expect(where).not.toHaveBeenCalled();
+  });
+
+  it("clears git_worktree without querying for siblings", async () => {
+    const { db, where } = selectStub([{ id: SIBLING_RUN }]);
+    await expect(
+      describeSharedCheckoutOccupancy({ ...base, db, strategyType: "git_worktree" }),
+    ).resolves.toBeNull();
+    expect(where).not.toHaveBeenCalled();
+  });
+
+  it("still warns a persistent-workspace run that has a sibling", async () => {
+    const { db } = selectStub([{ id: SIBLING_RUN }]);
+    await expect(
+      describeSharedCheckoutOccupancy({
+        ...base,
+        db,
+        isolation: { storage: { workspace: "persistent" } },
+      }),
+    ).resolves.toContain(SIBLING_RUN);
   });
 });
 
