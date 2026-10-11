@@ -24,6 +24,7 @@ import {
   authorizationDeniedDetails,
   authorizationService,
   commentAuthorCanGrantIssueMention,
+  type AuthorizationActor,
 } from "../services/authorization.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -4282,6 +4283,10 @@ describeEmbeddedPostgres("authorization service", () => {
     type IssueAction = "issue:comment" | "issue:mutate" | "issue:coordination_metadata";
 
     type Relation =
+      | "local_board"
+      | "instance_admin"
+      | "cloud_tenant_member"
+      | "cloud_tenant_viewer"
       | "assignee"
       | "unassigned"
       | "creator"
@@ -4292,6 +4297,7 @@ describeEmbeddedPostgres("authorization service", () => {
       | "productivity_reviewer"
       | "project_lead"
       | "parent_issue_assignee"
+      | "sibling_issue_assignee"
       | "peer"
       | "other_company";
 
@@ -4303,11 +4309,38 @@ describeEmbeddedPostgres("authorization service", () => {
         assigneeAgentId: assignee.id,
         createdByAgentId: assignee.id,
       };
-      let actorAgentId: string;
+      let actorAgentId = "";
       let actorCompanyId = company.id;
+      let boardActor: AuthorizationActor | null = null;
       let parentIssueId: string | null = null;
 
       switch (relation) {
+        // The four principal rows of the doc's grid. Their actor is a board
+        // user, not an agent; the target issue is the same assigned issue.
+        case "local_board": {
+          boardActor = { type: "board", userId: "local-board", source: "local_implicit" };
+          break;
+        }
+        case "instance_admin": {
+          // `session`, not `cloud_tenant`: cloud-tenant users are never elevated.
+          const userId = `user-${randomUUID()}`;
+          await db.insert(instanceUserRoles).values({ userId, role: "instance_admin" });
+          boardActor = { type: "board", userId, source: "session" };
+          break;
+        }
+        case "cloud_tenant_member":
+        case "cloud_tenant_viewer": {
+          const userId = `user-${randomUUID()}`;
+          await db.insert(companyMemberships).values({
+            companyId: company.id,
+            principalType: "user",
+            principalId: userId,
+            status: "active",
+            membershipRole: relation === "cloud_tenant_viewer" ? "viewer" : "member",
+          });
+          boardActor = { type: "board", userId, companyIds: [company.id], source: "cloud_tenant" };
+          break;
+        }
         case "assignee": {
           actorAgentId = assignee.id;
           break;
@@ -4349,6 +4382,28 @@ describeEmbeddedPostgres("authorization service", () => {
           const actor = await createAgent(db, company.id, { role: "engineer" });
           const parent = await createIssue(db, company.id, {
             title: "Matrix parent",
+            assigneeAgentId: actor.id,
+            createdByAgentId: actor.id,
+          });
+          parentIssueId = parent.id;
+          issueInput.parentId = parent.id;
+          actorAgentId = actor.id;
+          break;
+        }
+        case "sibling_issue_assignee": {
+          // The shape behind the false ancestry hypothesis in BLO-19036: the
+          // actor holds sibling A, and the target is sibling B under the same
+          // parent with a different assignee. `peer` has no shared parent and
+          // does not reproduce it; `allow_self` on A is covered elsewhere.
+          const actor = await createAgent(db, company.id, { role: "engineer" });
+          const parent = await createIssue(db, company.id, {
+            title: "Matrix sibling parent",
+            assigneeAgentId: assignee.id,
+            createdByAgentId: assignee.id,
+          });
+          await createIssue(db, company.id, {
+            title: "Matrix sibling held by the actor",
+            parentId: parent.id,
             assigneeAgentId: actor.id,
             createdByAgentId: actor.id,
           });
@@ -4409,8 +4464,10 @@ describeEmbeddedPostgres("authorization service", () => {
         });
       }
 
+      const actor: AuthorizationActor = boardActor
+        ?? { type: "agent", agentId: actorAgentId, companyId: actorCompanyId, source: "agent_jwt" };
       return {
-        actor: { type: "agent", agentId: actorAgentId, companyId: actorCompanyId, source: "agent_jwt" } as const,
+        actor,
         resource: {
           type: "issue",
           companyId: company.id,
@@ -4433,6 +4490,42 @@ describeEmbeddedPostgres("authorization service", () => {
       note: string;
       cells: Array<{ action: IssueAction; allowed: boolean; reason?: string }>;
     }> = [
+      {
+        relation: "local_board",
+        note: "the local implicit board short-circuits every issue action",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_local_board" },
+          { action: "issue:mutate", allowed: true, reason: "allow_local_board" },
+          { action: "issue:coordination_metadata", allowed: true, reason: "allow_local_board" },
+        ],
+      },
+      {
+        relation: "instance_admin",
+        note: "an instance-admin row elevates a non-cloud-tenant board user on every issue action",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_instance_admin" },
+          { action: "issue:mutate", allowed: true, reason: "allow_instance_admin" },
+          { action: "issue:coordination_metadata", allowed: true, reason: "allow_instance_admin" },
+        ],
+      },
+      {
+        relation: "cloud_tenant_member",
+        note: "a non-viewer member writes every field through issue:mutate; the coordination action is unmapped for boards",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_company_member" },
+          { action: "issue:mutate", allowed: true, reason: "allow_company_member" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_unsupported_action" },
+        ],
+      },
+      {
+        relation: "cloud_tenant_viewer",
+        note: "viewer membership is read-only: no comment, no write",
+        cells: [
+          { action: "issue:comment", allowed: false, reason: "deny_unsupported_action" },
+          { action: "issue:mutate", allowed: false, reason: "deny_unsupported_action" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_unsupported_action" },
+        ],
+      },
       {
         relation: "assignee",
         note: "holds the issue, so it may rewrite every field — the escape hatch the model points managers at",
@@ -4524,6 +4617,15 @@ describeEmbeddedPostgres("authorization service", () => {
         ],
       },
       {
+        relation: "sibling_issue_assignee",
+        note: "BLO-19036 negative control — holding a sibling under the same parent confers nothing on the target",
+        cells: [
+          { action: "issue:comment", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
         relation: "peer",
         note: "negative control — same company, no relation",
         cells: [
@@ -4564,7 +4666,9 @@ describeEmbeddedPostgres("authorization service", () => {
     it("covers every relation the model documents, in both directions", () => {
       // Guards against a row being deleted to make a failure go away, and
       // against a cell being dropped rather than fixed.
-      expect(MATRIX).toHaveLength(12);
+      // 17 = the 16 rows of the doc's grid, with its parent-or-sibling row
+      // modelled as two relations.
+      expect(MATRIX).toHaveLength(17);
       for (const row of MATRIX) {
         expect(row.cells.map((cell) => cell.action), row.relation).toEqual([
           "issue:comment",
@@ -4578,13 +4682,13 @@ describeEmbeddedPostgres("authorization service", () => {
         row.cells.some((cell) => cell.action === "issue:comment" && cell.allowed) &&
         row.cells.some((cell) => cell.action === "issue:mutate" && !cell.allowed),
       );
-      expect(commentOnly.map((row) => row.relation)).toEqual([
+      expect(new Set(commentOnly.map((row) => row.relation))).toEqual(new Set([
         "creator",
         "manager",
         "manager_with_tasks_assign",
         "mentioned",
         "recovery_handoff",
-      ]);
+      ]));
     });
   });
 });
