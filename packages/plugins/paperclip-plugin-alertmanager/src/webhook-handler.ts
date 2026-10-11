@@ -1455,9 +1455,21 @@ function rebindAlertState(
  *     by definition — it has no wake path, which is the whole defect — but a
  *     deliberate reassignment, by a human or an agent, is never overwritten.
  *
- * Returns the patch that was applied, so the caller can fold it into the alert
- * state record and the firing event rather than re-reading the row. `null` means
- * nothing changed, which is the overwhelmingly common case.
+ * BLO-42855 — when an agent target does land on a user-assigned row, the patch
+ * must clear `assigneeUserId` in the *same* write. `issueService.update` merges
+ * incoming over existing before validating, so a bare `{assigneeAgentId}` leaves
+ * both fields set and is rejected `422 Issue can only have one assignee`. That
+ * rejection never self-clears: the caller only warns, so the row keeps its user,
+ * the ownerMap keeps resolving the agent, and every subsequent delivery repeats
+ * it — 900 denials in 95 minutes on `paperclip-0`, 2026-10-10. Clearing the user
+ * is also exactly the create path's own precedence (an agent target discards a
+ * resolved human there too), so retrofit and creation now agree.
+ *
+ * Returns the ownership the row ends up with — both fields, exactly one non-null
+ * — so the caller can fold it into the alert state record and the firing event
+ * rather than re-reading the row. Both are returned explicitly because a `??`
+ * fold cannot express a *cleared* user: it would silently keep the stale one.
+ * `null` means nothing changed, which is the overwhelmingly common case.
  */
 async function retrofitAggregateOwner(
   ctx: PluginContext,
@@ -1472,7 +1484,7 @@ async function retrofitAggregateOwner(
   // path, where a rebind can move the target out from under the row we read.
   known: IssueReference | null,
   rosterMemo: CompanyRosterMemo | undefined,
-): Promise<{ assigneeAgentId?: string; assigneeUserId?: string } | null> {
+): Promise<{ assigneeAgentId: string | null; assigneeUserId: string | null } | null> {
   // Resolution first: it is pure over labels/annotations/ownerMap, and the email
   // leg is a cached lookup. Gating the issue read behind it keeps an alertname
   // with no configured owner — i.e. nearly all of them — at zero added cost.
@@ -1504,11 +1516,19 @@ async function retrofitAggregateOwner(
     },
     companyRosterLoader(ctx, companyId, rosterMemo),
   );
-  const patch = invokableAgentId
-    ? { assigneeAgentId: invokableAgentId }
-    : assigneeUserId && !nonEmptyString(issue.assigneeUserId ?? undefined)
-      ? { assigneeUserId }
-      : null;
+  // BLO-42855: on the agent leg the user field is cleared in the same write, or
+  // the merge in `issueService.update` leaves both set and 422s forever. The row
+  // is agent-null by the guard above, so the patch below always lands exactly
+  // one owner — which is what lets the return value carry both fields honestly.
+  const rowAssigneeUserId = nonEmptyString(issue.assigneeUserId ?? undefined);
+  const patch: { assigneeAgentId?: string; assigneeUserId?: string | null } | null =
+    invokableAgentId
+      ? rowAssigneeUserId
+        ? { assigneeAgentId: invokableAgentId, assigneeUserId: null }
+        : { assigneeAgentId: invokableAgentId }
+      : assigneeUserId && !rowAssigneeUserId
+        ? { assigneeUserId }
+        : null;
   if (!patch) return null;
 
   await ctx.issues.update(issueId, patch, companyId, undefined, {
@@ -1533,7 +1553,10 @@ async function retrofitAggregateOwner(
       `paperclip-plugin-alertmanager: failed to record owner retrofit metric for ${alert.fingerprint}: ${String(metricErr)}`,
     );
   }
-  return patch;
+  return {
+    assigneeAgentId: patch.assigneeAgentId ?? null,
+    assigneeUserId: patch.assigneeUserId ?? null,
+  };
 }
 
 function isAggregateCreationConflict(err: unknown): boolean {
@@ -2481,10 +2504,14 @@ export async function handleFiring(
             rosterMemo,
           );
           if (retrofit) {
+            // BLO-42855: assigned, not `??`-folded. The retrofit just wrote the
+            // row, so it is the freshest truth — and a fold would silently keep
+            // a user it had deliberately cleared, leaving state disagreeing with
+            // the row for the life of the record.
             tracked = {
               ...tracked,
-              assigneeAgentId: retrofit.assigneeAgentId ?? tracked.assigneeAgentId,
-              assigneeUserId: retrofit.assigneeUserId ?? tracked.assigneeUserId,
+              assigneeAgentId: retrofit.assigneeAgentId,
+              assigneeUserId: retrofit.assigneeUserId,
             };
           }
         } catch (err) {
@@ -2957,12 +2984,18 @@ export async function handleFiring(
           issue,
           rosterMemo,
         );
+  // BLO-42855: a committed retrofit replaces both fields rather than being
+  // `??`-folded over the row — see the fold on the re-fire path.
   const effectiveAssigneeUserId = created
     ? createAssigneeUserId ?? null
-    : retrofit?.assigneeUserId ?? issue.assigneeUserId ?? null;
+    : retrofit
+      ? retrofit.assigneeUserId
+      : issue.assigneeUserId ?? null;
   const effectiveAssigneeAgentId = created
     ? finalAssigneeAgentId ?? null
-    : retrofit?.assigneeAgentId ?? issue.assigneeAgentId ?? null;
+    : retrofit
+      ? retrofit.assigneeAgentId
+      : issue.assigneeAgentId ?? null;
 
   const record: AlertStateRecord = {
     paperclipIssueId: issue.id,

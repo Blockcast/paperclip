@@ -2193,7 +2193,11 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
 
     expect(mocks.issues.update).toHaveBeenCalledWith(
       "issue-existing",
-      { assigneeAgentId: "agent-multicast" },
+      // BLO-42855: both fields, one write. `issueService.update` merges incoming
+      // over existing before validating, so sending `{assigneeAgentId}` alone
+      // here leaves both set and is rejected 422 "Issue can only have one
+      // assignee" on every delivery, forever.
+      { assigneeAgentId: "agent-multicast", assigneeUserId: null },
       "company-1",
       undefined,
       FIRING_FENCE_ARG,
@@ -2202,13 +2206,21 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
     // next resolve/escalation read would still think nobody owns it.
     expect(mocks.state.set).toHaveBeenCalledWith(
       expect.any(Object),
-      expect.objectContaining({ assigneeAgentId: "agent-multicast" }),
+      expect.objectContaining({
+        assigneeAgentId: "agent-multicast",
+        // BLO-42855: cleared, not carried over from the pre-retrofit record.
+        assigneeUserId: null,
+      }),
       FIRING_FENCE_ARG,
     );
     expect(mocks.events.emit).toHaveBeenCalledWith(
       "alertmanager.alert.firing",
       "company-1",
-      expect.objectContaining({ assigneeAgentId: "agent-multicast", reFired: true }),
+      expect.objectContaining({
+        assigneeAgentId: "agent-multicast",
+        assigneeUserId: null,
+        reFired: true,
+      }),
       FIRING_EMIT_OWNERSHIP_ARG,
     );
     expect(mocks.metrics.write).toHaveBeenCalledWith(
@@ -2279,6 +2291,97 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
     // Resolution runs before the row read, so an unconfigured alertname costs
     // no extra RPC — only the re-fire path's own `issues.get`.
     expect(mocks.issues.get).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * BLO-42855 — AC1/AC2 pair.
+   *
+   * `issues.update` is stubbed with the *real* server precondition
+   * (`server/src/services/issues.ts:11162-11169`): it merges the incoming patch
+   * over the existing row and rejects when both assignee fields end up set. The
+   * shipped bug sent a bare `{assigneeAgentId}` to a user-assigned row, so the
+   * merge left both set and every delivery was denied 422 — 900 of them in 95
+   * minutes, because the caller only warns and the row never changes.
+   *
+   * Asserting the patch *shape* alone would not have caught it: the pre-fix
+   * assertion did exactly that and passed. The validator is the thing that has
+   * to be in the test.
+   */
+  const mkOneAssigneeValidatingCtx = (row: {
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+  }) => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce({ ...refireState, ...row });
+    mocks.issues.get.mockResolvedValue({ id: "issue-existing", status: "todo", ...row });
+    mocks.issues.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+      const nextAgent =
+        patch.assigneeAgentId !== undefined ? patch.assigneeAgentId : row.assigneeAgentId;
+      const nextUser =
+        patch.assigneeUserId !== undefined ? patch.assigneeUserId : row.assigneeUserId;
+      if (nextAgent && nextUser) throw new Error("Issue can only have one assignee");
+      return { id: "issue-existing", status: "todo", ...row, ...patch };
+    });
+    return { ctx, mocks };
+  };
+
+  it("AC1 — retrofitting an agent onto a user-assigned row clears the user in the same write, so the one-assignee precondition never rejects", async () => {
+    const { ctx, mocks } = mkOneAssigneeValidatingCtx({
+      assigneeAgentId: null,
+      assigneeUserId: "user-42",
+    });
+    const warn = vi.spyOn(ctx.logger, "warn");
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("agent:agent-multicast")],
+        }),
+      }),
+    );
+
+    expect(assigneePatches(mocks)).toEqual([
+      { assigneeAgentId: "agent-multicast", assigneeUserId: null },
+    ]);
+    // The pre-fix build reached `ctx.issues.update`, was rejected, and the
+    // caller swallowed it as this warning — the row stayed user-assigned and
+    // the next delivery repeated it forever.
+    expect(
+      warn.mock.calls.filter(([msg]) => String(msg).includes("Failed to retrofit owner")),
+    ).toEqual([]);
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        assigneeAgentId: "agent-multicast",
+        assigneeUserId: null,
+      }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("AC2 CONTROL — a genuinely ownerless row still retrofits (a guard that skipped every row would pass AC1 alone)", async () => {
+    const { ctx, mocks } = mkOneAssigneeValidatingCtx({
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [OWNER_ANNOTATION_ALERT("agent:agent-multicast")],
+        }),
+      }),
+    );
+
+    // No `assigneeUserId: null` here: there is nothing to clear, so the write
+    // stays the single field it has always been.
+    expect(assigneePatches(mocks)).toEqual([{ assigneeAgentId: "agent-multicast" }]);
   });
 
   it("CONTROL — does not re-route a user-assigned row to a different resolved user", async () => {
