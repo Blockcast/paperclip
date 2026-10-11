@@ -5718,7 +5718,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           "- Stop/cancel (the work is not delivering value and should be wound down)",
           "- Continue with a snooze window (only if the assignee has a clear next step but no surface evidence yet)",
           "",
-          "If you choose \"Block with an unblock owner\", file the escalation in this same run: create a `request_board_approval` approval with this review's source issue in `issueIds`, naming the gate and the exact human action needed. The source link is required and the source must be authorized before the approval is created — an unlinked card reaches a human with no context, and a review run may not attach arbitrary same-company issues. A stated gate with no approval card reaches nobody, and polling a human-only gate is not a substitute. This review runs on the cheap status-only profile, which is permitted to create that one approval type and no other.",
+          // BLO-23040: the paragraph below is the THIRD restatement of
+          // `assertApprovalMutationAllowedByRunContext`'s verdict (the other two
+          // are the 403 itself and `recoveryRunWriteClassNotice`). It used to
+          // stop at "that one approval type and no other", which is a claim
+          // about the approval TYPE and is silent on the follow-up OPERATIONS —
+          // so a reviewer could read it, file the card, and plan to append the
+          // evidence in a comment that is refused. Creating is the run's only
+          // approval write, and a card filed incomplete cannot be corrected
+          // from here by any route, so the limit and the alternative path are
+          // stated rather than left to the wake notice the reviewer may not
+          // re-read. Pinned by productivity-review-service.test.ts.
+          "If you choose \"Block with an unblock owner\", file the escalation in this same run: create a `request_board_approval` approval with this review's source issue in `issueIds`, naming the gate and the exact human action needed. The source link is required and the source must be authorized before the approval is created — an unlinked card reaches a human with no context, and a review run may not attach arbitrary same-company issues. A stated gate with no approval card reaches nobody, and polling a human-only gate is not a substitute. This review runs on the cheap status-only profile, which is permitted to create that one approval type and no other. Creating it is also the only approval write this run has: commenting on, resubmitting, withdrawing and applying are all refused here, including on the card you just filed. So the card must be complete at creation — put the gate, the exact human action and the supporting evidence in the payload rather than planning a follow-up. Anything you establish after filing goes in a comment on this review issue, which is not refused.",
         ]),
     ].join("\n");
   }

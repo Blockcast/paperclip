@@ -259,6 +259,13 @@ export function approvalRoutes(
   // that PR found `apply` refused here but absent from the enumeration — a list that presents
   // itself as exhaustive while omitting an operation licenses the agent to plan around it. Add the
   // guard to a new route, add the operation to that constant.
+  //
+  // BLO-23040: there is a THIRD restatement, and it is the one a productivity reviewer actually
+  // reads — the "Block with an unblock owner" paragraph in `productivity-review.ts`'s Manager
+  // Decision block, which tells that run it may create a `request_board_approval` and may not
+  // comment on, resubmit, withdraw or apply it. That paragraph is prose in another service, so
+  // nothing here fails when it drifts; it is pinned by `productivity-review-service.test.ts`.
+  // Widen or narrow this guard and update it in the same edit.
   async function assertApprovalMutationAllowedByRunContext(
     req: Request,
     res: any,
