@@ -1092,7 +1092,9 @@ export const AGENT_START_LOCK_ABORTED_METRIC = "paperclip_agent_start_lock_abort
  * How each dispatch pass resolved its start-lock orphan reap (BLO-42010).
  *
  * The bound shipped in BLO-41036 stops the outage by letting a waiter give up
- * at {@link START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS} and dispatch on stale orphan
+ * at its wait bound (120 s by default, overridable via
+ * `AGENT_START_LOCK_REAP_WAIT_BOUND_MS`; see `START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS`
+ * in `server/src/services/heartbeat.ts`) and dispatch on stale orphan
  * state. That bail is instrumented log-only, which makes the post-fix bail rate
  * uncomputable rather than merely inconvenient to read:
  *
@@ -4098,14 +4100,21 @@ function ensureRegistry(): {
     startLockReapDisposition = new Counter({
       name: AGENT_START_LOCK_REAP_DISPOSITION_METRIC,
       help:
-        "Count of start-lock orphan-reap dispositions (BLO-42010), one per dispatch pass. "
+        "Count of start-lock orphan-reap dispositions (BLO-42010), once per "
+        + "EXTERNAL-LIFECYCLE dispatch pass -- the reap call site is inside "
+        + "`if (hasExternalLifecycle(...))`, so this is NOT a count of all dispatch "
+        + "passes and must not be divided by one. "
         + "disposition='timed_out' is a pass that gave up waiting on the fleet sweep and "
         + "dispatched on STALE orphan state; its share of the total is the bail rate, which "
         + "logs cannot supply because the per-disposition debug line is below the deployed "
         + "level and the surviving warn line is gated on the hold budget, so it records a "
         + "complete timed_out numerator against no denominator. disposition='nested' is the "
         + "only path that skips the wait bound, so it is the only one whose "
-        + AGENT_START_LOCK_PHASE_SECONDS_METRIC + "{phase=\"reap\"} hold can exceed it. "
+        // No braces around the label: this help text is rendered into the shared
+        // exposition, and agent-start-lock-liveness.test.ts asserts the whole
+        // body contains no `<phase_seconds>{` substring to prove the gauge is
+        // not zero-filled. A brace here is indistinguishable from a live series.
+        + AGENT_START_LOCK_PHASE_SECONDS_METRIC + " phase=\"reap\" hold can exceed it. "
         + "Not pre-seeded: an absent series means never incremented, so pair any zero reading "
         + "with a populated sibling disposition before concluding no bails occurred rather "
         + "than no scrape.",
