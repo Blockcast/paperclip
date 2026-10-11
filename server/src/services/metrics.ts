@@ -5208,9 +5208,17 @@ function ensureRegistry(): {
       help:
         "Directories skipped UNEXAMINED because their top level did not match the "
         + "{home, session} allowlist (BLO-36814). Its own series, not an outcome "
-        + "label: a rise above baseline means the tree is more heterogeneous than "
-        + "the allowlist was validated against. BLO-36735 measured that baseline "
-        + "as 1 at maxAgeDays=30 (a stray wt-blo-19094 git worktree). A directory "
+        + "label. SUMS TWO POPULATIONS WITH OPPOSITE MEANINGS AND CANNOT SPLIT "
+        + "THEM: single-sided ({home} or {session} alone -- a half-materialized "
+        + "workspace, benign) and genuine supersets (an extra top-level entry -- "
+        + "the real heterogeneity signal). BLO-36735 measured the whole live tree "
+        + "at maxAgeDays=30 on 2026-10-11: 50 skips = 42 single-sided + 8 "
+        + "supersets, that subset unchanged from 2026-10-10. So the total is not "
+        + "readable as a rise -- an earlier reading of this help gave the baseline "
+        + "as 1 (the superset count before the single-sided population existed at "
+        + "scale) and against 50 that fires permanently on a benign cause. Until "
+        + "this carries a reason label, split it against the tree; see "
+        + "runbooks/isolation-workspace-reaper.md. A directory "
         + "whose top level DID match but which holds a nested git checkout is not "
         + "counted here; it is " + ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC
         + "{outcome=\"retained_nested_checkout\"}.",
