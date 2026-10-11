@@ -1443,7 +1443,8 @@ export const RUN_DISPATCH_WAIT_INVOCATION_SOURCES = [
  * Day-granular edges past 86400 because the regime this metric was filed for
  * is multi-day: the worst wait measured on BLO-25024 was 28h 19m. With 86400
  * as the top finite edge that sample lands in +Inf, and histogram_quantile()
- * then returns +Inf for the p95 exactly while the incident is happening.
+ * then returns 86400 — the last finite edge — for the p95 exactly while the
+ * incident is happening, however bad the wait actually is.
  */
 export const RUN_DISPATCH_WAIT_BUCKETS_SECONDS = [
   10,
