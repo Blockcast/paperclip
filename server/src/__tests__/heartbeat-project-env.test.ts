@@ -8,6 +8,7 @@ import {
   PUSH_CAPABILITY_ENV_KEYS,
   applyRunScopedMentionedSkillKeys,
   extractMentionedSkillIdsFromSources,
+  mergeModelProfileAdapterConfig,
   requiresPushCapabilityPreflight,
   resolveExecutionRunAdapterConfig,
   translateGithubSeatTokenForExecutionTarget,
@@ -1130,7 +1131,8 @@ describe("resolveExecutionRunAdapterConfig: per-run redaction canary (BLO-39715)
   it("injects a redactable canary into BOTH the env and the secret key set when enabled", async () => {
     const result = await resolveExecutionRunAdapterConfig({
       companyId: "company-1",
-      executionRunConfig: { redactionCanary: true, env: { AGENT_ONLY: "agent-only" } },
+      executionRunConfig: { env: { AGENT_ONLY: "agent-only" } },
+      redactionCanary: true,
       secretsSvc: passthroughSecretsSvc(),
     });
 
@@ -1150,5 +1152,36 @@ describe("resolveExecutionRunAdapterConfig: per-run redaction canary (BLO-39715)
     expect(plan.needles).toContain(value);
     expect(plan.uncoveredKeys).toEqual([]);
     expect(plan.unresolvedKeys).toEqual([]);
+  });
+
+  it("ignores a redactionCanary flag that reaches the run only through the issue-overlaid config", async () => {
+    // `executionRunConfig` is the MERGED config: `mergeModelProfileAdapterConfig` spreads
+    // `issue.assigneeAdapterOverrides.adapterConfig` over the agent's own config last, and
+    // that object accepts arbitrary keys from anyone able to create or patch the issue.
+    // Reading the switch off it would let them engage the boundary holdback (and inject an
+    // env var) on another agent's run. Driven through the real merge, not a hand-built
+    // object, so the test follows the actual path the flag would travel.
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { env: { AGENT_ONLY: "agent-only" } },
+      modelProfile: {
+        requested: null,
+        requestedBy: null,
+        applied: null,
+        configSource: null,
+        fallbackReason: null,
+        adapterConfig: null,
+      },
+      issueAdapterConfig: { redactionCanary: true },
+    });
+    expect(merged.redactionCanary).toBe(true); // the overlay does carry it through
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      executionRunConfig: merged,
+      secretsSvc: passthroughSecretsSvc(),
+    });
+
+    expect(result.resolvedConfig.env).not.toHaveProperty(RUN_REDACTION_CANARY_ENV_KEY);
+    expect(Array.from(result.secretKeys)).toEqual([]);
   });
 });
