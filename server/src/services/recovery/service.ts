@@ -14679,7 +14679,7 @@ export function recoveryService(
       await issuesSvc.addComment(
         issueId,
         [
-          "ccrotate pool recovered; closing stale capacity escalation.",
+          "Penstock capacity recovered for this pool; closing stale escalation.",
           "",
           `- Target: ${input.ccrotateTarget}`,
           `- Recovery run: \`${input.runId}\``,
