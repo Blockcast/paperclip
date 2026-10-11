@@ -854,12 +854,25 @@ test("PaperclipAgentHeartbeatStale is an outcome-side per-agent-interval alert (
 test("no rendered alert applies a vector-matching modifier to a scalar operand (BLO-23413)", () => {
   const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
 
-  const exprs = [...rendered.matchAll(/^\s+expr:\s*(.+?)\s*$/gm)].map(
-    ([, expr]) => expr,
-  );
+  // Both expr forms. `expr: <one line>` and `expr: |` + an indented block --
+  // BLO-42711 introduced the first block-scalar expr in this file, and an
+  // inline-only scrape silently stops covering whichever rules move to a
+  // block.
+  const exprs = [
+    ...[...rendered.matchAll(/^\s+expr:[ \t]*(?!\|)(.+?)\s*$/gm)].map(
+      ([, expr]) => expr,
+    ),
+    ...[...rendered.matchAll(/^(\s+)expr:[ \t]*\|\s*\n((?:\1\s+.*\n)+)/gm)].map(
+      ([, , block]) => block.replace(/\s+/g, " ").trim(),
+    ),
+  ];
   assert.ok(
     exprs.length > 0,
     "expected the PrometheusRule to render at least one expr to check",
+  );
+  assert.ok(
+    exprs.some((expr) => expr.includes("group_left")),
+    "expected the block-scalar park-horizon expr to be collected (BLO-42711)",
   );
 
   // Match `<operand> <binop> on|ignoring (`; flag it when <operand> is a bare
@@ -1036,7 +1049,7 @@ test("PaperclipOverdueScheduledRetryAgeMetricsRefreshFailed exposes a stale snap
   );
 });
 
-test("PaperclipScheduledRetryParkHorizonImplausible has an independent horizon threshold and freshness alert (BLO-25036)", () => {
+test("PaperclipScheduledRetryParkHorizonImplausible joins per-reason ceilings, never a bare scalar (BLO-25036/BLO-31174/BLO-42711)", () => {
   const rendered = renderChart([
     "--show-only",
     "templates/prometheusrule.yaml",
@@ -1044,15 +1057,58 @@ test("PaperclipScheduledRetryParkHorizonImplausible has an independent horizon t
     "prometheusRule.enabled=true",
   ]);
 
-  const [, expr] = rendered.match(
-    /alert: PaperclipScheduledRetryParkHorizonImplausible\n[\s\S]*?\n\s+expr: (.+)\n/,
-  ) ?? [];
-  assert.match(
-    expr ?? "",
-    /^max by \(agent_id\) \(paperclip_scheduled_retry_park_horizon_seconds and on\(instance\) \(paperclip_scheduled_retry_park_horizon_refresh_success == 1\)\) > (\d+)$/,
+  const [, expr] =
+    rendered.match(
+      /alert: PaperclipScheduledRetryParkHorizonImplausible\n[\s\S]*?\n\s+expr: \|\n([\s\S]*?)\n\s+for:/,
+    ) ?? [];
+  assert.ok(expr, "park-horizon alert must render a block expr");
+
+  // BLO-31174 measured the flat `> 5400` form 100% false positive: several
+  // park classes breach any single scalar by construction. The ceiling must
+  // be joined per `reason`, and nothing in the expression may compare the
+  // gauge against a bare number.
+  assert.match(expr, /max by \(agent_id, reason\) \(paperclip_scheduled_retry_park_horizon_seconds\)/);
+  assert.match(expr, /> on \(reason\) group_left \(\)/);
+  assert.doesNotMatch(
+    expr,
+    />\s*\d/,
+    "no bare scalar comparison -- every ceiling must arrive through the per-reason join",
   );
-  const [, threshold] = expr.match(/> (\d+)$/) ?? [];
-  assert.equal(threshold, "5400");
+
+  // Writer constants, not hand-picked numbers (server/src/services/).
+  for (const [reason, ceiling] of [
+    ["max_turns_continuation", 300],
+    ["ccrotate_capacity", 1080],
+    ["dependency_blocked", 3600],
+    ["transient_failure", 9000],
+    ["transient_failure_floor", 86700],
+    ["none", 0],
+  ]) {
+    assert.match(
+      expr,
+      new RegExp(`label_replace\\(vector\\(${ceiling}\\), "reason", "${reason}", "", ""\\)`),
+      `${reason} must carry its writer's own ceiling of ${ceiling}s`,
+    );
+  }
+
+  // A provider_quota floor is never clamped, so a multi-day park there is the
+  // contract being honoured. It must carry no arm at all, or the alert pages
+  // on correct behaviour.
+  assert.doesNotMatch(expr, /transient_failure_quota_floor/);
+
+  // Reasons with no per-class constant fall through to the operator backstop.
+  assert.match(expr, /label_replace\(vector\(86400\), "reason", "job_failed", "", ""\)/);
+  const backstopOverride = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+    "--set",
+    "prometheusRule.scheduledRetryParkHorizonBackstopSeconds=77777",
+  ]);
+  assert.match(backstopOverride, /label_replace\(vector\(77777\), "reason", "job_failed", "", ""\)/);
+
+  assert.match(expr, /and on \(\) min\(paperclip_scheduled_retry_park_horizon_refresh_success\) == 1/);
   assert.match(
     rendered,
     /alert: PaperclipScheduledRetryParkHorizonImplausible[\s\S]*?runbook_url: "[^\"]*runbooks\/queued-run-stranded\.md#scheduled-retry-park-horizon-blo-25036"/,

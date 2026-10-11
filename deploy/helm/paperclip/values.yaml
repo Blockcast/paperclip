@@ -791,9 +791,9 @@ prometheusRule:
   overdueScheduledRetryAgeMetricsRefreshFailureFor: 5m
   # -- Runbook for the overdue-scheduled-retry alert, linked from its annotation.
   overdueScheduledRetryRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/queued-run-stranded.md#overdue-scheduled-retry-blo-22094"
-  # -- Maximum booked interval from heartbeat_runs.updated_at (the moment the due time is chosen) to scheduled_retry_at before a future-due park is considered implausible (BLO-25036; subtrahend corrected from created_at in BLO-31174, which made the reading accumulate across re-parks instead of measuring one booking). Derived as a conservative bound from the observed seven-day park-to-promotion lag population: n=5253, p50=21.5s, p90=83.7s, p95=131.9s, p99=1594.8s, max=3567.5s -- that lag is a different quantity from a booked horizon, so treat these percentiles as a proxy for scale rather than as park-horizon percentiles.
-  scheduledRetryParkHorizonSeconds: 5400
-  # -- Scrape-flap tolerance only (BLO-25036); the horizon age lives in scheduledRetryParkHorizonSeconds.
+  # -- Absolute BACKSTOP ceiling, in seconds, for scheduled_retry park classes that have no per-class constant of their own (BLO-25036; per-class ceilings from BLO-31174). It is NOT a class ceiling: the classes whose writers clamp explicitly (max_turns_continuation, ccrotate_capacity, dependency_blocked, transient_failure, transient_failure_floor) carry their own writer constants inline in the alert expression, and reason=transient_failure_quota_floor carries no arm at all because a provider_quota floor is never clamped. 86400 is MAX_TRANSIENT_RETRY_HORIZON_MS, so a breach here is severe but weakly diagnostic -- give the class its own arm once someone reads its clamp. SUPERSEDED DERIVATION: this key previously held 5400, derived from a seven-day park-to-promotion LAG population (n=5253, p50=21.5s, p90=83.7s, p95=131.9s, p99=1594.8s, max=3567.5s). That lag is a different quantity from a booked horizon and several park classes exceed 5400 by construction; BLO-31174 measured the resulting flat rule 100% false positive. Do not re-derive a ceiling from those percentiles.
+  scheduledRetryParkHorizonBackstopSeconds: 86400
+  # -- Scrape-flap tolerance only (BLO-25036); the per-class horizon ceilings live in the alert expression and scheduledRetryParkHorizonBackstopSeconds.
   scheduledRetryParkHorizonFor: 5m
   # -- Alert after sustained failed refreshes of the scheduled-retry park-horizon gauge (BLO-25036).
   scheduledRetryParkHorizonRefreshFailureFor: 5m
