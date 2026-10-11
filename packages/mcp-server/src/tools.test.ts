@@ -128,16 +128,32 @@ describe("paperclip MCP tools", () => {
   // the gate catches neither — on inbox-lite because the ROW is withheld (no
   // key to test), on paperclipGetIssue because the KEY can never exist (the
   // retry arm is nested). Both make the retry arm vote "unattended" silently,
-  // which is the bulk-demotion direction. Keyed on the hazard, not the prose.
+  // which is the bulk-demotion direction. The phrases below are pinned
+  // verbatim, so a reword fails here even when it keeps the hazard; the tally
+  // check is the one structural assertion.
   it("paperclipInboxLite names the foreign scheduled-retry hold among the withheld classes", () => {
     const { description } = getTool("paperclipInboxLite");
 
-    // The fourth withheld class is named, with the ticket that defines it.
-    expect(description).toMatch(/SIBLING RUN PARKED ON A SCHEDULED RETRY \(BLO-29965\)/);
-    // ...and the count agrees with the list, so a future edit cannot drop one
-    // class and leave a stale tally that still reads as exhaustive.
-    expect(description).toContain("and all four skew attended");
-    expect(description).not.toContain("and all three skew attended");
+    // The spelled tally is derived from the withheld-class list itself, so
+    // dropping or adding a class without updating the number fails here, as
+    // does a revert of the number alone.
+    const census = description.match(
+      /It is NOT a lane-wide attendance census: (.+?) are withheld, and all (\w+) skew attended\./,
+    );
+    expect(census).not.toBeNull();
+    const [, classList, tally] = census!;
+    const withheld = classList.split(/, (?:and )?/);
+    const spelled = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+    expect(spelled.indexOf(tally)).toBe(withheld.length);
+    // Each known class is named, including the fourth with the ticket that defines it.
+    for (const withheldClass of [
+      "rows held by another running run",
+      "rows held by a SIBLING RUN PARKED ON A SCHEDULED RETRY (BLO-29965)",
+      "`in_review` rows",
+      "pre-cutoff worktree rows",
+    ]) {
+      expect(withheld).toContain(withheldClass);
+    }
 
     // Why this class specifically defeats the `has()` gate prescribed above:
     // absence of the ROW, not a null field. Without this the gate reads as a
