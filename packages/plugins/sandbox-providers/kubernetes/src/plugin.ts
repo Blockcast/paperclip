@@ -27,7 +27,6 @@ import { buildJobManifest } from "./pod-spec-builder.js";
 import { buildSandboxCrManifest } from "./sandbox-cr-builder.js";
 import { ensureTenant } from "./tenant-orchestrator.js";
 import { createPerRunSecret } from "./secret-manager.js";
-import { FastUploadInterceptor } from "./upload-interceptor.js";
 import { jobOrchestrator, JobTimeoutError } from "./job-orchestrator.js";
 import {
   sandboxCrOrchestrator,
@@ -73,22 +72,6 @@ function generateBootstrapToken(): string {
   // this plugin. For now this per-run random token is stored in the per-run
   // Secret and read by the runtime image entrypoint for initial registration.
   return randomBytes(32).toString("hex");
-}
-
-// One FastUploadInterceptor instance per active lease. Scoping per lease
-// prevents `releaseLease` from wiping in-flight upload buffers belonging to
-// other concurrent leases — a single shared singleton would do exactly that
-// on `reset()`. The Map is keyed by `providerLeaseId`; entries are lazily
-// created in `onEnvironmentExecute` and removed in `onEnvironmentReleaseLease`.
-const uploadInterceptorsByLease = new Map<string, FastUploadInterceptor>();
-
-function getOrCreateUploadInterceptor(leaseId: string): FastUploadInterceptor {
-  let interceptor = uploadInterceptorsByLease.get(leaseId);
-  if (!interceptor) {
-    interceptor = new FastUploadInterceptor();
-    uploadInterceptorsByLease.set(leaseId, interceptor);
-  }
-  return interceptor;
 }
 
 // In-memory cache of sandbox CR names we've already observed reaching the
@@ -389,9 +372,7 @@ const plugin = definePlugin({
       };
     }
 
-    // A resumed lease starts with clean per-lease state: drop any stale upload
-    // interceptor buffers a previous run on this lease may have left behind.
-    uploadInterceptorsByLease.delete(params.providerLeaseId);
+    // A resumed lease starts with clean per-lease state.
     if (leaseBackend === "sandbox-cr") {
       // We just observed the Sandbox pod Ready, so the first exec on the
       // resumed lease can skip its readiness poll.
@@ -458,10 +439,8 @@ const plugin = definePlugin({
     const releaseOrchestrator =
       leaseBackend === "sandbox-cr" ? sandboxCrOrchestrator : jobOrchestrator;
 
-    // Drop the FastUploadInterceptor associated with THIS lease (only).
-    // Each lease has its own interceptor instance via uploadInterceptorsByLease,
-    // so unrelated concurrent leases keep their in-flight buffers intact.
-    uploadInterceptorsByLease.delete(params.providerLeaseId);
+    // Drop per-lease in-memory state for THIS lease (only), so unrelated
+    // concurrent leases are untouched.
     readySandboxesByLease.delete(params.providerLeaseId);
 
     try {
@@ -499,7 +478,6 @@ const plugin = definePlugin({
 
     // Clear per-lease in-memory state up front, regardless of what the
     // cluster says — the lease is dead either way.
-    uploadInterceptorsByLease.delete(params.providerLeaseId);
     readySandboxesByLease.delete(params.providerLeaseId);
 
     const kc = createKubeConfig({
@@ -634,100 +612,6 @@ const plugin = definePlugin({
       // drop args. If only command is present (no args), wrap in a login shell.
       const command = typeof params.command === "string" ? params.command.trim() : "";
       const args = Array.isArray(params.args) ? params.args : [];
-
-      // Fast-upload interceptor: short-circuit the chunked-shell file transfer
-      // protocol (adapter-utils writeFile) so an N-chunk upload becomes 1 exec
-      // instead of N+2. Falls back transparently when patterns don't match.
-      // See upload-interceptor.ts.
-      const shellScript =
-        command === "sh" && args[0] === "-c" && typeof args[1] === "string"
-          ? args[1]
-          : null;
-      if (shellScript) {
-        const decision = getOrCreateUploadInterceptor(lease.providerLeaseId).decide(shellScript);
-        if (decision.action === "ack") {
-          return {
-            exitCode: 0,
-            timedOut: false,
-            stdout: "",
-            stderr: "",
-            metadata: {
-              provider: "kubernetes",
-              backend: "sandbox-cr",
-              namespace,
-              sandboxName: lease.providerLeaseId,
-              podName,
-              fastUpload: "ack",
-            },
-          };
-        }
-        if (decision.action === "flush") {
-          // Single exec: `head -c <N> | base64 -d > '<TARGET>'` with stdin =
-          // base64 ASCII. `head -c` reads EXACTLY N bytes and exits, so we
-          // don't depend on WebSocket-driven EOF detection on stdin (which is
-          // racy against the `base64 -d` exit timing in @kubernetes/client-node
-          // v0.21.0 — see pod-exec.ts). All bytes are sent through the
-          // WebSocket data channel; size is unbounded by ARG_MAX.
-          const base64Body = decision.flush.payload.toString("base64");
-          const dir = decision.flush.targetPath.substring(
-            0,
-            decision.flush.targetPath.lastIndexOf("/"),
-          );
-          const script =
-            `mkdir -p '${dir}' && ` +
-            `head -c ${base64Body.length} | base64 -d > '${decision.flush.targetPath}'`;
-          // The flush shares the caller's single execute budget (same contract
-          // as the normal exec path below) and surfaces watchdog/WebSocket
-          // failures as a timed-out result instead of an uncaught throw.
-          const flushTimeoutMs = Math.max(
-            5_000,
-            effectiveTimeoutMs - (Date.now() - executeStartedAt),
-          );
-          let flushResult: { exitCode: number; stdout: string; stderr: string };
-          try {
-            flushResult = await execInPod(
-              kc,
-              namespace,
-              podName,
-              "agent",
-              ["/bin/sh", "-c", script],
-              base64Body,
-              flushTimeoutMs,
-            );
-          } catch (err) {
-            return {
-              exitCode: null,
-              timedOut: true,
-              stdout: "",
-              stderr: `fast-upload flush failed: ${err instanceof Error ? err.message : String(err)}`,
-              metadata: {
-                provider: "kubernetes",
-                backend: "sandbox-cr",
-                namespace,
-                sandboxName: lease.providerLeaseId,
-                podName,
-                fastUpload: "flush",
-              },
-            };
-          }
-          return {
-            exitCode: flushResult.exitCode,
-            timedOut: false,
-            stdout: flushResult.stdout,
-            stderr: flushResult.stderr,
-            metadata: {
-              provider: "kubernetes",
-              backend: "sandbox-cr",
-              namespace,
-              sandboxName: lease.providerLeaseId,
-              podName,
-              fastUpload: "flush",
-              uploadedBytes: decision.flush.payload.length,
-            },
-          };
-        }
-        // decision.action === "passthrough" — fall through to normal exec
-      }
 
       const baseExecCommand =
         command.length > 0 && args.length > 0

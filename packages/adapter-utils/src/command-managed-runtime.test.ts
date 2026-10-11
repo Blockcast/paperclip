@@ -338,6 +338,54 @@ describe("command managed runtime", () => {
     expect(progress.at(-1)).toEqual({ done: payload.length, total: payload.length });
   });
 
+  // BLO-19065. The k8s sandbox provider used to carry a `FastUploadInterceptor`
+  // that re-assembled a chunked-shell upload by regex-matching the shell
+  // strings emitted here. It was deleted because this producer now (a) keeps
+  // the round-trip count O(1)-ish on its own and (b) carries the payload on
+  // stdin, where a command-string interceptor cannot see it at all.
+  //
+  // Both of those are properties of THIS function, so they are pinned here.
+  // A regression on either one — shrinking the chunk size back toward the old
+  // 32 KB loop, or moving the base64 body back into the command string — fails
+  // this test instead of silently costing k8s uploads hundreds of exec
+  // round-trips with nothing to notice it.
+  it("uploads 1 MB over the sandbox fallback in 3 round-trips with the body on stdin", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-command-write-roundtrips-"));
+    cleanupDirs.push(rootDir);
+    const remotePath = path.join(rootDir, "nested", "payload.bin");
+
+    const payload = Buffer.alloc(1024 * 1024);
+    for (let i = 0; i < payload.length; i++) payload[i] = i % 256;
+
+    // `supportsSingleStreamStdinProgress: false` is the shape every
+    // sandbox-driver runner has in production (environment-execution-target.ts),
+    // so this is the path a real k8s sandbox upload takes.
+    const { runner, calls } = makeSpawnRunner({ supportsSingleStreamStdinProgress: false });
+    const client = createCommandManagedRuntimeClient({ runner, commandCwd: "/", timeoutMs: 30_000 });
+
+    await client.writeFile(remotePath, toArrayBuffer(payload), {});
+
+    // init + one bounded append + atomic rename.
+    expect(calls.map((call) => call.args?.[1] ?? "")).toEqual([
+      expect.stringContaining("mkdir -p"),
+      expect.stringContaining("base64 -d >>"),
+      expect.stringContaining("mv -f"),
+    ]);
+
+    // The base64 body never appears in the command string, so no interceptor
+    // reading `sh -c <script>` can reconstruct this upload.
+    const stdinBytes = calls.reduce(
+      (total, call) => total + Buffer.byteLength(call.stdin ?? "", "utf8"),
+      0,
+    );
+    expect(stdinBytes).toBeGreaterThan(payload.length);
+    for (const call of calls) {
+      expect((call.args?.[1] ?? "").length).toBeLessThan(1024);
+    }
+
+    expect((await readFile(remotePath)).equals(payload)).toBe(true);
+  });
+
   it("falls back to bounded chunks when the runner does not explicitly opt in", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-command-write-fallback-no-progress-"));
     cleanupDirs.push(rootDir);
