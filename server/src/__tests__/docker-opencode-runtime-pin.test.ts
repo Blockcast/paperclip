@@ -35,7 +35,9 @@ function runFfmpegProbe(
     | "volume"
     | "slow-pull"
     | "retry-pull"
-    | "pull-failed",
+    | "pull-failed"
+    | "retry-probe"
+    | "probe-killed",
   overrides: Record<string, string> = {},
 ) {
   const stubDir = mkdtempSync(path.join(tmpdir(), "paperclip-ffmpeg-probe-"));
@@ -43,6 +45,7 @@ function runFfmpegProbe(
   const pullArgsFile = path.join(stubDir, "docker-pull-args");
   const pullAttemptsFile = path.join(stubDir, "docker-pull-attempts");
   const runArgsFile = path.join(stubDir, "docker-run-args");
+  const runAttemptsFile = path.join(stubDir, "docker-run-attempts");
   const cleanupArgsFile = path.join(stubDir, "docker-cleanup-args");
   const cidfileStateFile = path.join(stubDir, "docker-cidfile-state");
   writeFileSync(
@@ -71,6 +74,8 @@ case "$cmd" in
     ;;
   run)
     printf '%s\\n' "$@" > "$DOCKER_RUN_ARGS_FILE"
+    runs=$(($(cat "$DOCKER_RUN_ATTEMPTS_FILE" 2>/dev/null || printf '0') + 1))
+    printf '%s\\n' "$runs" > "$DOCKER_RUN_ATTEMPTS_FILE"
     cidfile=""
     while [ "$#" -gt 0 ]; do
       if [ "$1" = "--cidfile" ]; then
@@ -104,6 +109,13 @@ case "$cmd" in
       missing) printf ' E matroska Matroska muxer\\n' ;;
       failed) exit 42 ;;
       timeout) sleep 1 ;;
+      # 124 is what \`timeout\` returns when it expires; the stub returns it
+      # directly so the retry path is exercised without wall-clock sleeps.
+      probe-killed) exit 124 ;;
+      retry-probe)
+        if [ "$runs" -eq 1 ]; then exit 124; fi
+        printf ' E moq_mmt MMTP muxer\\n'
+        ;;
       newline-free)
         printf ' E moq_mmt '
         dd if=/dev/zero bs=1024 count=1024 2>/dev/null | tr '\\000' x
@@ -127,6 +139,7 @@ esac
         DOCKER_PULL_ARGS_FILE: pullArgsFile,
         DOCKER_PULL_ATTEMPTS_FILE: pullAttemptsFile,
         DOCKER_RUN_ARGS_FILE: runArgsFile,
+        DOCKER_RUN_ATTEMPTS_FILE: runAttemptsFile,
         DOCKER_CLEANUP_ARGS_FILE: cleanupArgsFile,
         DOCKER_CIDFILE_STATE_FILE: cidfileStateFile,
         DOCKER_STUB_MODE: mode,
@@ -139,6 +152,10 @@ esac
           mode === "timeout" ? "0.5" : mode === "slow-pull" ? "3" : "15",
         FFMPEG_PULL_TIMEOUT_SECONDS: "15",
         FFMPEG_PULL_ATTEMPTS: mode === "pull-failed" ? "1" : "3",
+        // The probe retry backoff sleeps `attempt` seconds between tries, so
+        // the modes that exhaust every attempt pin a low count to stay fast.
+        // `timeout` keeps its pre-retry wall-clock by pinning a single attempt.
+        FFMPEG_PROBE_ATTEMPTS: mode === "timeout" ? "1" : mode === "probe-killed" ? "2" : "3",
         ...overrides,
       },
       encoding: "utf8",
@@ -148,11 +165,14 @@ esac
       ? Number(readFileSync(pullAttemptsFile, "utf8").trim())
       : 0;
     const args = existsSync(runArgsFile) ? readFileSync(runArgsFile, "utf8").trim().split("\n") : [];
+    const probeAttempts = existsSync(runAttemptsFile)
+      ? Number(readFileSync(runAttemptsFile, "utf8").trim())
+      : 0;
     const cleanupArgs = existsSync(cleanupArgsFile)
       ? readFileSync(cleanupArgsFile, "utf8").trim().split("\n")
       : [];
     const cidfileState = existsSync(cidfileStateFile) ? readFileSync(cidfileStateFile, "utf8").trim() : "";
-    return { result, pullArgs, pullAttempts, args, cleanupArgs, cidfileState };
+    return { result, pullArgs, pullAttempts, args, probeAttempts, cleanupArgs, cidfileState };
   } finally {
     rmSync(stubDir, { recursive: true, force: true });
   }
@@ -425,6 +445,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
       ["FFMPEG_PULL_ATTEMPTS", "0", "must be a positive integer"],
       ["FFMPEG_PULL_ATTEMPTS", "6", "must not exceed 5"],
       ["FFMPEG_PULL_ATTEMPTS", "08", "must not exceed 5"],
+      ["FFMPEG_PROBE_ATTEMPTS", "0", "must be a positive integer"],
+      ["FFMPEG_PROBE_ATTEMPTS", "6", "must not exceed 5"],
+      ["FFMPEG_PROBE_ATTEMPTS", "08", "must not exceed 5"],
     ] as const;
 
     for (const [name, value, message] of cases) {
@@ -469,6 +492,38 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("timed out");
     expect(cleanupArgs).toEqual(["rm", "-f", "paperclip-ffmpeg-probe-test"]);
+  });
+
+  it("retries a killed capability probe and clears the cidfile between attempts", () => {
+    const { result, pullAttempts, probeAttempts, cidfileState } = runFfmpegProbe("retry-probe");
+
+    expect(result.status).toBe(0);
+    expect(probeAttempts).toBe(2);
+    // The retry must not re-pull: registry latency stays outside the budget.
+    expect(pullAttempts).toBe(1);
+    // `docker run --cidfile` exits 125 on an existing file, so a retry that
+    // left the first attempt's cidfile behind would never reach the muxer.
+    expect(cidfileState).toBe("missing:700");
+    expect(result.stderr).toContain("was killed (status 124); retrying");
+  });
+
+  it("fails closed when every capability probe attempt is killed", () => {
+    const { result, probeAttempts } = runFfmpegProbe("probe-killed");
+
+    expect(result.status).toBe(2);
+    expect(probeAttempts).toBe(2);
+    expect(result.stderr).toContain("timed out");
+    expect(result.stderr).toContain("after 2 attempt(s)");
+  });
+
+  it("does not retry a completed probe that reported a nonzero verdict", () => {
+    const { result, probeAttempts } = runFfmpegProbe("failed");
+
+    expect(result.status).toBe(2);
+    // Only 124/137 are retryable. A completed nonzero exit is a verdict, so
+    // widening the retry to any nonzero status must redden this.
+    expect(probeAttempts).toBe(1);
+    expect(result.stderr).not.toContain("retrying");
   });
 
   it("returns the capability-missing status only for a completed negative probe", () => {
