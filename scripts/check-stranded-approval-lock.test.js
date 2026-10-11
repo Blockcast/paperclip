@@ -205,6 +205,16 @@ test("no in-flight lock reports clean", () => {
 // The post-release steady state the acceptance criteria call for: a live lock is
 // by design here, and the next approval retires it on its own.
 test("a lock whose rollout completed reports clean", () => {
+  // canonicalHash restates the approval script's hashing form rather than
+  // lifting it, so pin that form here: if the approval script ever hashes with a
+  // trailing newline again (BLO-42073 with the sign flipped), this case must fail
+  // instead of the fixture silently tracking the wrong string.
+  assert.match(
+    approveScript,
+    /^[ \t]*SERVER_PLAN_SHA256="\$\(printf '%s' "\$CANONICAL_SERVER_PLAN" \| sha256sum/m,
+    "the approval script's server-plan hashing form changed; canonicalHash and the " +
+      "checker's live_server_plan must follow it -- see BLO-42073",
+  );
   const deploy = deployment();
   const dir = mkdtempSync(path.join(tmpdir(), "stranded-hash-"));
   const p = path.join(dir, "d.json");
@@ -414,6 +424,36 @@ test("refuses to conclude when a lifted predicate cannot be evaluated", () => {
   assert.equal(run.status, 2, `expected exit 2, got ${run.status}:\n${run.stdout}${run.stderr}`);
   assert.doesNotMatch(run.stdout, /verdict=/);
   assert.match(run.stderr, /jq could not evaluate a lifted predicate/);
+});
+
+// CANONICAL_DEPLOYMENT_JQ is the one lifted program not routed through jq_bool,
+// so the case above cannot reach it. Hashing `printf '%s' "$(jq ...)"` in one
+// statement swallowed jq's exit status: a program jq could not run hashed the
+// empty string and reported this live, satisfied lock as stranded, exit 1, with
+// a remedy that retires it and nothing on stderr.
+test("refuses to conclude when the canonical server-plan program cannot be evaluated", () => {
+  const deploy = deployment();
+  const dir = mkdtempSync(path.join(tmpdir(), "stranded-mutate-"));
+  const p = path.join(dir, "d.json");
+  writeFileSync(p, JSON.stringify(deploy, null, 2));
+  const serverPlan = canonicalHash(p);
+  const mutated = path.join(dir, "approve.sh");
+  const before = readFileSync(approvePath, "utf8");
+  const after = before.replace(
+    "# BEGIN CANONICAL_DEPLOYMENT_JQ\n",
+    "# BEGIN CANONICAL_DEPLOYMENT_JQ\n(.metadata.generation | keys) as $boom |\n",
+  );
+  assert.notEqual(after, before, "body mutation matched nothing -- it tests nothing");
+  writeFileSync(mutated, after);
+
+  const run = runChecker({
+    cm: configmap({ generation: 590, serverPlan, writtenAt: minutesAgo(300) }),
+    deploy,
+    approveScriptOverride: mutated,
+  });
+  assert.equal(run.status, 2, `expected exit 2, got ${run.status}:\n${run.stdout}${run.stderr}`);
+  assert.doesNotMatch(run.stdout, /verdict=/);
+  assert.match(run.stderr, /jq could not evaluate CANONICAL_DEPLOYMENT_JQ/);
 });
 
 test("a missing approval script is refused, not treated as no lock", () => {

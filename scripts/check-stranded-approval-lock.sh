@@ -218,13 +218,19 @@ rollout_complete="$(jq_bool \
 # object has drifted from the plan that was approved -- and an empty annotation
 # (a provisional lock whose second write never landed) can never match, which is
 # deliberate: such a lock is operative and closes the channel to everyone.
-# `printf '%s' "$(...)"` and not `jq ... | sha256sum`: the approval script hashes
-# the canonical JSON with NO trailing newline (CANONICAL_SERVER_PLAN is a command
-# substitution, which strips it), and that is the string whose hash the lock
-# stores. Piping jq straight into sha256sum hashes one extra byte, so this arm
-# read false against every real lock -- see BLO-42073.
-live_server_plan="$(printf '%s' "$(jq -cS "$CANONICAL_DEPLOYMENT_JQ" <<<"$deployment_json")" \
-  | sha256sum | awk '{print $1}')"
+# Capture, then `printf '%s'`, and not `jq ... | sha256sum`: the approval script
+# hashes the canonical JSON with NO trailing newline (CANONICAL_SERVER_PLAN is a
+# command substitution, which strips it), and that is the string whose hash the
+# lock stores. Piping jq straight into sha256sum hashes one extra byte, so this
+# arm read false against every real lock -- see BLO-42073. The capture is its own
+# statement because `printf '%s' "$(jq ...)"` swallows jq's exit status: a jq
+# that cannot evaluate the program would hash the empty string and report a live,
+# satisfied lock as stranded. Fail closed like jq_bool instead.
+if ! live_canonical="$(jq -cS "$CANONICAL_DEPLOYMENT_JQ" <<<"$deployment_json" 2>&1)"; then
+  echo "jq could not evaluate CANONICAL_DEPLOYMENT_JQ: ${live_canonical}" >&2
+  exit 2
+fi
+live_server_plan="$(printf '%s' "$live_canonical" | sha256sum | awk '{print $1}')"
 server_plan_match=false
 [[ -n "$lock_server_plan" && "$live_server_plan" == "$lock_server_plan" ]] && server_plan_match=true
 
