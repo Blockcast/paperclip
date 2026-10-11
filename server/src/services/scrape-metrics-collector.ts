@@ -35,7 +35,6 @@ import {
   refreshQueuedRunAgeMetrics,
   refreshScheduledRetryParkHorizonMetrics,
 } from "./queued-run-age-metrics.js";
-import { refreshRoutineFireGapMetrics } from "./routine-fire-gap-metrics.js";
 import {
   setAgentStartLockHeldMetrics,
   setDbPoolStats,
@@ -44,7 +43,6 @@ import {
   setFdClassMetrics,
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
-  setRoutineFireGapMetricsRefreshSuccess,
   setScheduledRetryParkHorizonRefreshSuccess,
   type DbPoolStats,
 } from "./metrics.js";
@@ -105,15 +103,6 @@ const REFRESHES: readonly ScrapeRefresh[] = [
     name: "scheduled-retry-park-horizon",
     run: (db) => refreshScheduledRetryParkHorizonMetrics(db),
     setFresh: setScheduledRetryParkHorizonRefreshSuccess,
-  },
-  {
-    // BLO-32638. Not a run-table refresh: the receipt it ages is a `done`
-    // issue row recorded on `routine_runs`, which every refresh above is
-    // structurally blind to. A routine silently disabled for intervals reads
-    // identically to a healthy quiet one without it.
-    name: "routine-fire-gap",
-    run: (db) => refreshRoutineFireGapMetrics(db),
-    setFresh: setRoutineFireGapMetricsRefreshSuccess,
   },
   {
     name: "external-runtime-reservation-strand",
