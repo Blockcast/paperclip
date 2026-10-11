@@ -1125,6 +1125,68 @@ describe("run transcript scoping (PEN-3142)", () => {
     }
 
     /**
+     * Ally suggestion S2 on PR #2421, carried to PEN-3941. `owningAgentIdsByRunId`
+     * is the SOLE owner resolution feeding the transcript gate on all three
+     * workspace-operation reads, and its second argument is the PEN-3895
+     * cross-tenant narrowing — the service ANDs it into the rendered SQL, so a call
+     * site that drops or mis-sources it resolves owners across tenants while every
+     * withholding assertion above still passes. `GET /workspace-operations/:id/log`
+     * has carried that pin since PEN-3895 (`agent-live-run-routes.test.ts`); the two
+     * LIST routes carried none and were correct only by inspection.
+     *
+     * The resource's company is deliberately NOT `company-1` in these two cases.
+     * Each route must pass the RUN's / the WORKSPACE's own company, and all three
+     * plausible mis-sources — the caller's company, the operation ROWS' own
+     * `companyId`, and this file's default everywhere else — are `company-1`, so a
+     * fixture that reused it would pass whichever of them the route happened to read
+     * and would pin nothing.
+     *
+     * Division of labour: `pen3895-workspace-operation-owner-scope.test.ts` calls the
+     * service directly and pins the SQL it renders from this argument; these two pin
+     * what the routes hand it.
+     */
+    const OWNER_LOOKUP_COMPANY = "company-9";
+
+    it("passes the RUN's company to the owner lookup on the run list route", async () => {
+      const run = await mockHeartbeatService.getRun("run-1");
+      mockHeartbeatService.getRun.mockResolvedValue({ ...run, companyId: OWNER_LOOKUP_COMPANY });
+
+      const res = await requestApp(
+        // `local_implicit` reaches any company (`hasCompanyAccess`), so the handler is
+        // exercised rather than refused at the door on the mismatched company.
+        await createApp(boardActor),
+        (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/workspace-operations"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      // Both rows' run ids in `listForRun` order, including the run-less `null` — the
+      // route resolves per OPERATION, not per run, which is why the cleanup row is here.
+      expect(mockWorkspaceOperationService.owningAgentIdsByRunId).toHaveBeenCalledWith(
+        ["run-1", null],
+        OWNER_LOOKUP_COMPANY,
+      );
+    });
+
+    it("passes the WORKSPACE's company to the owner lookup on the execution-workspace list route", async () => {
+      allowCompanyScopeOnly();
+      mockExecutionWorkspaceService.getById.mockResolvedValue({
+        id: "workspace-1",
+        companyId: OWNER_LOOKUP_COMPANY,
+      });
+
+      const res = await requestApp(
+        await createWorkspaceApp(boardActor),
+        (baseUrl) => request(baseUrl).get("/api/execution-workspaces/workspace-1/workspace-operations"),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockWorkspaceOperationService.owningAgentIdsByRunId).toHaveBeenCalledWith(
+        ["run-1", null],
+        OWNER_LOOKUP_COMPANY,
+      );
+    });
+
+    /**
      * PEN-3204 / merge of 2026-09-20, REVISITED 2026-10-09. The merge removed four
      * cases that pinned a `decideRunTranscriptRead` gate on
      * `GET /workspace-operations/:operationId/log`, on the reasoning that master's
