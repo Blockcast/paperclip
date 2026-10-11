@@ -278,11 +278,25 @@ function normalizedTranscriptRole(value: unknown): HumanCompanyMembershipRole {
  * `cloud_tenant` is refused outright, ahead of any role test. Those actors are
  * company-scoped BY CONTRACT and the decider is where that contract lives:
  * `services/authorization.ts` refuses to elevate them "not even via stale
- * instance_admin rows" and enumerates exactly four readable actions
- * (`agent:read`, `company_scope:read`, `issue:read`, `project:read`).
- * `runs:read_transcript` is not among them and `grantsForHumanRole` seeds it
- * for no role, so a cloud-tenant owner is `deny_missing_grant` through the
- * decider. The short-circuit must not answer the opposite — and it would,
+ * instance_admin rows".
+ *
+ * PEN-3913 CORRECTION. This comment used to say the decider "enumerates
+ * exactly four readable actions (`agent:read`, `company_scope:read`,
+ * `issue:read`, `project:read`)". That describes the cloud-tenant BRANCH, not
+ * the path a cloud-tenant actor takes. The branch has no terminal deny, so an
+ * action it does not name falls through to the generic `!permissionKey` arm,
+ * which admits an active member to three more: `runtime:manage`,
+ * `secrets:read` and `workspace_runtime:read`. Four is the wrong number and
+ * "readable" is the wrong word — `runtime:manage` mutates.
+ *
+ * What this short-circuit actually rests on is narrower and still true:
+ * `runs:read_transcript` is named by NEITHER list, so it reaches
+ * `deny_unsupported_action`/`deny_missing_grant` either way, and
+ * `grantsForHumanRole` seeds it for no role. Do not re-derive "cloud tenants
+ * only read four things" from this comment — that was measured false on
+ * `origin/master @ c72d5c322` and only `secrets:read` is independently blocked
+ * (by `assertCanAccessInstanceEnvironments`, which requires instance admin).
+ * The short-circuit must not answer the opposite — and it would,
  * because a cloud-tenant user is stamped `membershipRole: "owner"` whenever
  * their stack role is owner OR admin (`middleware/auth.ts`) and carries
  * `companyIds: [companyId]`, so they clear `hasCompanyAccess` and then match
