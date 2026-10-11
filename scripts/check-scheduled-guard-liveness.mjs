@@ -107,7 +107,18 @@ export const WATCHED_GUARDS = [
   { workflow: "codeowners-guard.yml", staleHours: 2.75 },
   { workflow: "relay-ssl-multicert-guard.yml", staleHours: 2.75 },
   { workflow: "lockfile-drift-monitor.yml", staleHours: 2.75 },
-  { workflow: "adapter-pin-drift-monitor.yml", staleHours: 2.75 },
+  // adapter-pin-drift-monitor.yml was RETIRED by PEN-3916 and removed here
+  // deliberately, which is the path the 404 branch below names. It watched for
+  // `ARG OPENCODE_K8S_REF` rotting retroactively when a squash-merge in
+  // kkroo/paperclip-adapter-opencode-k8s orphaned the pinned SHA (BLO-33204).
+  // The opencode_k8s adapter is now vendored in-tree, so there is no pin, no
+  // clone, and no out-of-repo event that can rot one. Leaving the row here
+  // would red this guard permanently on a workflow that no longer exists.
+  //
+  // This drops the PEN-3281 hourly cohort from six to five. That cohort is a
+  // frozen record of one 2026-09 outage, not the live set, so the historical
+  // reasoning above is unaffected — five of the six still share a cron minute
+  // and the magnitude argument for 2.75h is unchanged.
 
   // Twice daily (cron "43 6,18"), so the hourly bar above would red it
   // permanently.
