@@ -1206,6 +1206,25 @@ spec:
           for: {{ .Values.prometheusRule.agentStartLockHeldFor }}
           labels:
             severity: critical
+            # BLO-43728. STRUCTURAL, not asserted: at the abort boundary the
+            # abort is requested, a landed abort releases the lock, and the
+            # held gauge is emitted only for locks held right now -- so a
+            # landed abort deletes the series inside a scrape and the `for:`
+            # window can never complete. Only an UNLANDED abort reaches this
+            # alert. PaperclipAgentStartLockAborted below fires in BOTH regimes
+            # and therefore carries no `regime` label; that asymmetry is the
+            # point, not an omission.
+            regime: stalled
+            # BLO-43728. The alertmanager bridge keys issue CREATION on
+            # [alertname, paperclip_dedupe_domain], and the RE-FIRE path keys on
+            # the Alertmanager fingerprint (the whole label set). With no domain
+            # every firing of this alertname for all time converges on one open
+            # row: on 2026-10-09 the live wedge landed on a row whose top
+            # comment was a 2026-09-25 triage verdict written for the opposite
+            # (contention) regime, and sat 11h20m unactioned behind it. Same
+            # pattern and same reason as PaperclipExternalRuntimeReservation-
+            # Stranded in the live rules.
+            paperclip_dedupe_domain: "{{`{{ $labels.agent_id }}`}}"
           annotations:
             summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} held its start lock past the {{ .Values.prometheusRule.agentStartLockHeldSeconds }}s abort boundary and the abort did not land"
             description: "Agent {{`{{ $labels.agent_id }}`}} has held its per-agent start lock for {{`{{ $value | printf \"%.0f\" }}`}}s (PEN-3305/PEN-3328). Queued-run dispatch for THIS agent is stopped for as long as the hold lasts. Past this threshold the section's abort signal has ALREADY fired and failed to release the lock -- cancellation only reaches awaits that observe the signal, so a section wedged on something else (a socket with no timeout, a promise that never settles) survives it. That residue does not self-heal: the section must settle or the process must be replaced. The agent will still read `status: idle` / `errorReason: null` / `orgChainHealth: healthy` and its runs will sit in `queued` -- do NOT clear that as healthy. Confirm the abort really did not land before replacing anything: `dispatchHealth` on the agent row reads `stalled` for requested-but-unlanded versus `aborted` for landed, and must be read on the WORKER pod (the api tier never holds a lock and always reports `null`). Correlate with the `agent start lock held past its abort budget` error log for the same agentId, and with PaperclipQueuedRunStranded, which fires on the consequence rather than the cause. A hold under this threshold is NOT this alert and is usually a slow section that settles by itself -- 21 agents held past 300s in the 14 days to 2026-09-25, peak 8073s, all self-resolved. See the runbook for the pool-exhaustion-versus-lock split; note that a pod restart clearing it does NOT discriminate between the two, because lockIssueOwnership is pg_advisory_xact_lock and dies with the connection."
@@ -1236,11 +1255,24 @@ spec:
           # The cancellation bounded the damage; it did not fix whatever hung,
           # and that cause is still there.
           #
-          # `warning`, not `critical`, and the split is the point: by the time
-          # this fires the agent is dispatching again and queued runs were not
-          # lost, so nobody needs waking. Sustained or repeating aborts are the
-          # thing to chase, and `increase` over an hour surfaces that without a
-          # second rule.
+          # `warning`, not `critical`, and the split is the point -- but the
+          # reason is NOT that the lock has been released. BLO-43728: this
+          # counter is incremented where the abort is REQUESTED (`abort.abort(...)`
+          # then `recordAgentStartLockAborted(agentId)` in agent-start-lock.ts),
+          # not where it lands, so this rule fires identically in both regimes
+          # and cannot tell them apart. It stays `warning` because the regime it
+          # CANNOT exclude -- requested-but-unlanded -- is covered at `critical`
+          # by the wedge arm above, which is the arm the held gauge keeps alive.
+          # The text that used to stand here asserted the landed case
+          # unconditionally -- that the agent was dispatching again and nobody
+          # had to be woken. On 2026-10-09 that was false, and the bridge row
+          # carrying it auto-cancelled after 1h while the agent stayed wedged
+          # for 11h. (Stated rather than quoted: the retired wording is banned
+          # by the BLO-43728 assertion in tests/prometheus-rule.test.mjs, which
+          # is a substring ban and cannot tell a quotation from a claim.) The
+          # one-query discriminator is in the description. Sustained or
+          # repeating aborts are still the thing to chase, and `increase` over
+          # an hour surfaces that without a second rule.
           # ⚠️ This expression depends on a SERVER-SIDE seed and is wrong
           # without it. `increase()` takes `last - first` over the range, so it
           # can only read a difference between two samples -- it cannot read a
@@ -1265,9 +1297,13 @@ spec:
           for: {{ .Values.prometheusRule.agentStartLockAbortedFor }}
           labels:
             severity: warning
+            # BLO-43728. Repeats on ONE agent_id are what this alert's own text
+            # names as the thing to chase; without a domain the bridge collapses
+            # every agent onto one row for the alertname and that signal is lost.
+            paperclip_dedupe_domain: "{{`{{ $labels.agent_id }}`}}"
           annotations:
             summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} had a queued-run dispatch section cancelled after overrunning its budget"
-            description: "Agent {{`{{ $labels.agent_id }}`}} held its per-agent start lock past its abort budget and the section was cancelled (PEN-3328), so the lock released and dispatch has RESUMED -- queued runs were not lost and this is not an outage. That budget is LOCK_ABORT_MS in server/src/services/agent-start-lock.ts: compiled in, NOT the chart's agentStartLockHeldSeconds, which this alert does not threshold on -- read the constant rather than a rendered number. Treat it as evidence of the underlying hang, not of the recovery: the section outran the worst hold ever observed settling on its own (8073s) by ~1.8x, so this is not the slow-but-healthy case. Correlate with the `agent start lock held past its abort budget` error log for the same agentId, and check `dispatchHealth` on the agent row (worker tier only) for the post-mortem. If this repeats for one agent_id, the cancellation is masking a persistent condition -- most likely pool exhaustion or a circular advisory-lock wait in lockIssueOwnership -- and that is what to fix. See the runbook."
+            description: "Agent {{`{{ $labels.agent_id }}`}} overran its start-lock abort budget and cancellation was REQUESTED (PEN-3328, BLO-43728). Whether the abort LANDED is NOT knowable from this alert: the counter is incremented where the abort is requested (`abort.abort(...)` then `recordAgentStartLockAborted(agentId)` in server/src/services/agent-start-lock.ts), not where it lands, so this fires identically in both regimes. The discriminator needs no agent row and no worker pod -- query `paperclip_agent_start_lock_held_seconds` for this agent_id, which is emitted only while a lock is held: ABSENT means the abort landed, the lock released and dispatch has resumed (`dispatchHealth: aborted`), so this is a post-mortem; STILL PRESENT means the section survived cancellation and the agent is wedged (`dispatchHealth: stalled`), and PaperclipAgentStartLockWedged pages that regime `critical`. That budget is LOCK_ABORT_MS in agent-start-lock.ts: compiled in, NOT the chart's agentStartLockHeldSeconds, which this alert does not threshold on -- read the constant rather than a rendered number. Treat it as evidence of the underlying hang, not of the recovery: the section outran the worst hold ever observed settling on its own (8073s) by ~1.8x, so this is not the slow-but-healthy case. Correlate with the `agent start lock held past its abort budget` error log for the same agentId. If this repeats for one agent_id, the cancellation is masking a persistent condition -- most likely pool exhaustion or a circular advisory-lock wait in lockIssueOwnership -- and that is what to fix. See the runbook."
             runbook_url: {{ .Values.prometheusRule.agentStartLockAbortedRunbookUrl | quote }}
     - name: paperclip-pr-review-queue
       rules:

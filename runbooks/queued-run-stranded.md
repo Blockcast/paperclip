@@ -536,6 +536,66 @@ Owner: Platform / SRE (PEN-3305, re-fitted in PEN-3328)
 > **not** in this chart copy — see KNOWN DIVERGENCE below, and verify at
 > `/api/v1/rules` before relying on either name.
 
+### ⚠️ READ THE ROW YOU LANDED ON, NOT JUST THE ALERT (BLO-43728)
+
+**If the Paperclip issue you are reading already carries a triage verdict,
+check its date before believing it.** Until 2026-10-11 this alertname had no
+`paperclip_dedupe_domain`, so the alertmanager bridge's creation key was
+`alert-aggregate:v1:["PaperclipAgentStartLockWedged",null]` — one row for every
+firing of this alertname, for all time, across all agents and across every
+retune of the rule.
+
+That is how the 2026-10-09 wedge cost 11h20m. The alert fired `critical` at
+20:45Z, correctly and on time, and the bridge routed it one minute later — onto
+[BLO-35522](https://paperclip.blockcast.net/BLO/issues/BLO-35522), whose top
+comment was a 2026-09-25 triage verdict reading *"Start-lock **contention**,
+not a wedge … The alert's central claim is false … Both regimes clear
+themselves with no restart."* That verdict was correct for the regime it was
+written about — the pre-retune 300s rule — and arrived attached to its
+opposite. The row sat open, `critical`, assigned, until it auto-cancelled when
+the pod was recreated at 08:06Z. Zero work was done on it.
+
+**Why that row was re-opened rather than a fresh one minted, and why it is the
+fingerprint and not the aggregate key that decides.** `webhook-handler.ts`
+looks up the Alertmanager **fingerprint**'s state record first; only when none
+exists does it fall through to the aggregate-key creation path. A fingerprint
+hashes the alert's whole label set, so:
+
+- The five September episodes were five *different* `agent_id`s → five distinct
+  fingerprints (`1f1ea5f8…`, `8cf1eb46…`, `4bc5748b…`, `331124e7…`,
+  `82659832…`) → no state record → creation path → five new rows.
+- On 2026-10-09 agent `7500672d…` wedged — **the same agent** whose 2026-09-23
+  firing created BLO-35522, hence the same fingerprint `8265983284d98b85` →
+  state record found → `decideRefire`. It saw a terminal row the plugin had not
+  closed (an operator had), measured the first re-fire observation against
+  `operatorSuppressionHours` (24h, BLO-24234), found it expired, and returned
+  `reopen` / `suppression_expired`. That is verbatim what the re-open comment on
+  the row says.
+
+So "a 3-week-old alert row" was a fresh page wearing an old issue, with an old
+verdict on it.
+
+**What changed.** The rule now carries two labels:
+`regime: stalled` and `paperclip_dedupe_domain: {{ $labels.agent_id }}`. Adding
+either changes the label set, hence the fingerprint, hence orphans the old state
+record for good — that is what severs the inheritance. The dedupe domain is what
+stops it re-forming: the bridge now files **one row per wedged agent** instead of
+converging every firing of the alertname onto one immortal row. Both are needed;
+neither alone is sufficient.
+
+**`regime: stalled` is structural, not asserted.** At 14400s the abort is
+requested; a landed abort releases the lock, and the held gauge is emitted only
+for locks held right now, so a landed abort deletes the series inside a scrape
+and the `for: 5m` window can never complete. Only an *unlanded* abort reaches
+this alert. Residual, stated rather than claimed away: an abort landing between
+t+300s and the next scrape fires this briefly in a regime that was really
+`aborted` — if the alert resolves within a minute or two of firing, read
+`paperclip_agent_start_lock_aborted_total` for that `agent_id` before acting on
+the label. The sibling `PaperclipAgentStartLockAborted` fires in **both**
+regimes and therefore carries no `regime` label; see
+[its section](#agent-start-lock-aborted-pen-3328) for the one-query
+discriminator.
+
 ### ⚠️ What these alerts claim, and what they no longer claim (BLO-36522)
 
 **The name says "wedged". For the regime the old 300s rule actually fired on,
@@ -1103,8 +1163,40 @@ critical path (BLO-35878), which is **not** excluded.
 ### What it means
 
 A queued-run dispatch section held its agent's start lock past `LOCK_ABORT_MS`
-(4h), was cancelled, and the lock was released. **Dispatch has already resumed
-and no queued runs were lost.** Nobody needs waking; this is a post-mortem.
+(4h) and cancellation was **requested**.
+
+**It does not mean the lock was released.** The counter this alert fires on is
+incremented where the abort is *requested*, not where it lands —
+`abort.abort(new AgentStartLockAbortedError(...))` followed immediately by
+`recordAgentStartLockAborted(agentId)` in `agent-start-lock.ts`. Cancellation
+only reaches awaits that observe the signal, so a section wedged on something
+else (a socket with no timeout, a promise that never settles) survives it. This
+alert fires identically in both outcomes and cannot tell them apart.
+
+This page used to open *"Dispatch has already resumed and no queued runs were
+lost. Nobody needs waking."* That was false on 2026-10-09 (BLO-43728): the
+abort was requested at 20:41Z, the row carrying that reassurance auto-cancelled
+an hour later, and the agent stayed wedged until `paperclip-0` was recreated at
+08:00Z — **11h20m**.
+
+### Which regime you are in — one Prometheus query, no agent row needed
+
+```
+paperclip_agent_start_lock_held_seconds{agent_id="<the paged agent>"}
+```
+
+`describeHeldAgentStartLocks()` walks `heldSinceByAgent`, so this gauge exists
+**only while a lock is held right now**.
+
+| result | regime | `dispatchHealth` | what to do |
+| --- | --- | --- | --- |
+| **absent** | abort landed | `aborted` | the post-mortem below; dispatch has resumed |
+| **present** | abort did not land | `stalled` | `PaperclipAgentStartLockWedged` is paging this `critical` — go to [the wedged section](#agent-start-lock-wedged-pen-3305) and replace the pod |
+
+`dispatchHealth` on the agent row says the same thing and is the authoritative
+in-process reading, but it must be read on the **worker** pod (the api tier
+never holds a lock and always reports `null`), which is why the gauge is listed
+first: it answers from the alert payload alone.
 
 ### Why it is a separate alert, and not redundant with the wedge alert
 
@@ -1121,10 +1213,11 @@ release and keeps the event answerable afterwards.
 
 ### What to do
 
-**Do not close this on the strength of the recovery.** The cancellation bounded
-the damage; it did not fix whatever blocked the section. Holds of minutes to a
-couple of hours do settle on their own — the worst measured over the 14 days
-to 2026-09-25 was 8073s (2h14m)
+**Do not close this on the strength of the recovery** — and establish that
+there *was* a recovery first, with the query above. The cancellation, if it
+landed, bounded the damage; it did not fix whatever blocked the section. Holds
+of minutes to a couple of hours do settle on their own — the worst measured
+over the 14 days to 2026-09-25 was 8073s (2h14m)
 — so a section that reached 4h outran that tail by ~1.8× and is not the
 slow-but-healthy case.
 
