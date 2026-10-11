@@ -611,6 +611,22 @@ describe("merge-gate reader", () => {
       );
     });
 
+    // ...and the widening is for CANCELLED victims only. A `failure` ran to
+    // completion and produced a verdict; a same-lane pass that merely overlapped it
+    // in time is not evidence it was superseded. Keyed on one shared END window,
+    // this overlapping pair retires the failure (its check-runs are then filtered
+    // out by verdicts()) and a real at-head failure reads GREEN. Ally review of
+    // eede1fa1 reproduced exactly this. The failure must be KEPT.
+    it("keeps a failure that overlapped a same-lane success (END window is cancelled-only)", () => {
+      assert.equal(
+        dead([
+          ["10", "push", "1", "success", "2026-10-11T10:00:00Z", "completed", "ci", "2026-10-11T10:30:00Z"],
+          ["10", "push", "2", "failure", "2026-10-11T10:20:00Z", "completed", "ci", "2026-10-11T10:25:00Z"],
+        ]),
+        "",
+      );
+    });
+
     // ...and an absent 8th field falls back to `run_started_at`, i.e. to the
     // strictly TIGHTER pre-BLO-42196 test — missing data fails toward STOP.
     // Same burst shape as the first fixture with $8 stripped: the casualties are

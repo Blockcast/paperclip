@@ -282,9 +282,18 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses; $2 non-empty = print o
   # 5- and 7-field fixture, and any API response that renders the field null)
   # falls back to `run_started_at` and so to the strictly TIGHTER pre-BLO-42196
   # test — missing data fails toward STOP, never toward retiring a victim.
+  # The widening applies to CANCELLED victims only. Both measured shapes are
+  # cancellation bursts; a `failure` ran to completion and produced a verdict, so
+  # it is not a concurrency casualty and a pass that merely overlapped it must not
+  # retire it. Failures keep the start-ordered test (`newest_pass`, $5), and the
+  # END arm selects the window on `cx[i]`. Widening both from one map turns an
+  # overlapping at-head failure from STOP into dropped: GREEN, the direction of
+  # every prior regression here. The overlapping success/failure fixture fences it.
+  #
   # Accepted residual, stated because it is the green-direction cost: a re-run
   # bumps a run's `updated_at`, so a success later re-run at this head widens its
-  # own window. Bounded to that lane, to that head, and to a run that passed.
+  # own window for its cancelled siblings. Bounded to that lane, to that head, to
+  # cancelled victims, and to a run that passed.
   #
   # `>=`, NOT `>`. run_started_at is SECOND-resolution and a concurrency burst
   # lands inside one second: on trafficcontrol#1870 @ 39e233c3 the surviving
@@ -529,15 +538,17 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses; $2 non-empty = print o
                 e = (P[2] < P[3] ? P[2] : P[3])   # earlier of run-start, publish
                 if (e > ext[P[1]]) ext[P[1]] = e } }
     { key = $1 FS $2
-      if ($4 == "success") { p = ($8 > $5 ? $8 : $5)   # later of run-start, conclude
-                             newest_pass[key] = (p > newest_pass[key] ? p : newest_pass[key])
+      if ($4 == "success") { newest_pass[key] = ($5 > newest_pass[key] ? $5 : newest_pass[key])
+                             p = ($8 > $5 ? $8 : $5)   # later of run-start, conclude
+                             newest_pass_end[key] = (p > newest_pass_end[key] ? p : newest_pass_end[key])
                              passed_at_head[$1] = 1 }
       if ($4 == "cancelled" || $4 == "failure") {
         id[n] = $3; grp[n] = key; wf[n] = $1; started[n] = $5
         cx[n] = ($4 == "cancelled"); n++ } }
     END { for (i = 0; i < n; i++) {
             if (started[i] == "") continue
-            if (newest_pass[grp[i]] >= started[i]) { if (!wonly) print id[i]; continue }
+            # END window for a cancelled victim only (BLO-42196); a failure keeps the START test.
+            if ((cx[i] ? newest_pass_end[grp[i]] : newest_pass[grp[i]]) >= started[i]) { if (!wonly) print id[i]; continue }
             if (cx[i] && !passed_at_head[wf[i]] && ext[wf[i]] >= started[i]) print id[i] } }' \
     | sort -n | paste -sd'|' -
 }
