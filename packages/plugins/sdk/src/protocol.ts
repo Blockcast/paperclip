@@ -704,6 +704,12 @@ export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDri
   leaseMetadata?: Record<string, unknown>;
 }
 
+/**
+ * BLO-20795: the host persists its lease row only *after* this RPC resolves,
+ * so a host crash or a lost database write in between makes crash recovery
+ * replay the release with the same `providerLeaseId`. Implementations MUST be
+ * idempotent — releasing an already-gone resource resolves, it does not throw.
+ */
 export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDriverBaseParams {
   providerLeaseId: string | null;
   leaseMetadata?: Record<string, unknown>;

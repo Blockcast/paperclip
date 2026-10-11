@@ -83,7 +83,14 @@ export interface SandboxProvider {
   probe(config: SandboxEnvironmentConfig): Promise<EnvironmentProbeResult>;
   acquireLease(input: AcquireSandboxLeaseInput): Promise<SandboxLeaseHandle>;
   resumeLease(input: ResumeSandboxLeaseInput): Promise<SandboxLeaseHandle | null>;
+  /**
+   * BLO-20795 — AT-LEAST-ONCE. The lease row is persisted only *after* this
+   * resolves, so a lost database write (or a worker crash) makes crash
+   * recovery call this again for the same `providerLeaseId`. Releasing a
+   * provider resource that is already gone MUST resolve, not throw.
+   */
   releaseLease(input: ReleaseSandboxLeaseInput): Promise<void>;
+  /** Same at-least-once idempotency contract as `releaseLease`. */
   destroyLease(input: DestroySandboxLeaseInput): Promise<void>;
   matchesReusableLease(input: {
     config: SandboxEnvironmentConfig;

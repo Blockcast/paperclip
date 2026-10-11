@@ -192,8 +192,30 @@ export interface EnvironmentDriverExecuteInput extends EnvironmentDriverLeaseInp
 export interface EnvironmentRuntimeDriver {
   readonly driver: string;
   acquireRunLease(input: EnvironmentDriverAcquireInput): Promise<EnvironmentLease>;
+  /**
+   * BLO-20795 — RELEASE IS AT-LEAST-ONCE AND MUST BE IDEMPOTENT.
+   *
+   * Release reaches the provider *before* the lease row is persisted
+   * (`releaseRunLeases` → this method → `environmentsSvc.releaseLease`). If the
+   * provider call succeeds and the database write is then lost — the worker
+   * dies in between, or the write itself fails — the row stays `active`, and
+   * worker-crash recovery replays the release. Advisory locks are released
+   * automatically on crash, so nothing blocks that replay.
+   *
+   * So a second call for a `providerLeaseId` whose provider-side resource is
+   * already gone MUST resolve, not throw: treat "not found" / "already
+   * released" as success. Throwing turns an already-clean provider into a
+   * permanently unresolvable recovery row, because the lease can never be
+   * marked released.
+   *
+   * Pinned by the release-twice conformance test in
+   * `server/src/__tests__/environment-runtime-driver-contract.test.ts`, which
+   * enumerates this registry via `listDrivers()` — a new driver is covered the
+   * moment it is registered, and the test fails if it is not.
+   */
   releaseRunLease(input: EnvironmentDriverReleaseInput): Promise<EnvironmentLease | null>;
   resumeRunLease?(input: EnvironmentDriverLeaseInput): Promise<PluginEnvironmentLease | EnvironmentLease | null>;
+  /** Same at-least-once idempotency contract as `releaseRunLease`. */
   destroyRunLease?(input: EnvironmentDriverLeaseInput): Promise<EnvironmentLease | null>;
   realizeWorkspace?(input: EnvironmentDriverRealizeWorkspaceInput): Promise<PluginEnvironmentRealizeWorkspaceResult>;
   execute?(input: EnvironmentDriverExecuteInput): Promise<PluginEnvironmentExecuteResult>;
@@ -1859,6 +1881,18 @@ export function environmentRuntimeService(
 
   return {
     getDriver,
+
+    /**
+     * Every driver registered in this runtime, in registration order.
+     *
+     * BLO-20795: exists so the release-idempotency conformance test can
+     * enumerate the registry instead of sampling a hand-written list — a
+     * driver added here is covered automatically, and the test fails if it has
+     * no case.
+     */
+    listDrivers(): EnvironmentRuntimeDriver[] {
+      return [...drivers.values()];
+    },
 
     async acquireRunLease(input: {
       companyId: string;
