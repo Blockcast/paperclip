@@ -167,6 +167,37 @@ export async function persistLinearPluginConfig(
   return true;
 }
 
+/**
+ * After a legacy Linear import, raise the company counter to the highest
+ * imported issue number — unless the user chose "start fresh" (counter 0).
+ *
+ * BLO-31228: through the guarded path, in raise-only mode. An import that
+ * matched nothing new (empty team, a re-imported older subset, every row
+ * failing) leaves `highestImportedNumber` at or below the stored counter, and
+ * that is a silent no-op — not an audited counter-regression refusal, which is
+ * reserved for someone trying to re-identify the company. "Start fresh" is
+ * honoured only for a company whose counter was never raised: the floor applies
+ * to `/configure` too, so a raised counter can no longer be reset to 0.
+ */
+export async function raiseIssueCounterAfterImport(
+  db: Db,
+  companyId: string,
+  highestImportedNumber: number,
+  actorId: string,
+): Promise<void> {
+  // Re-read company to pick up any configure call that ran before import
+  const [freshCompany] = await db.select().from(companies).where(eq(companies.id, companyId));
+  if (!freshCompany || freshCompany.issueCounter === 0) return;
+  await setCompanyIssueIdentity(db, {
+    companyId,
+    counter: highestImportedNumber,
+    raiseCounterOnly: true,
+    actorType: "user",
+    actorId,
+    reason: "linear-import",
+  });
+}
+
 export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
   const router = Router();
   const svc = secretService(db);
@@ -1014,21 +1045,7 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
         cursor = issuesData.data?.issues?.pageInfo.endCursor ?? undefined;
       }
 
-      // Update company counter to highest imported number (unless user chose "start fresh")
-      // Re-read company to pick up any configure call that ran before import
-      const [freshCompany] = await db.select().from(companies).where(eq(companies.id, companyId));
-      if (freshCompany && freshCompany.issueCounter !== 0) {
-        // BLO-31228: same guarded path as the callback. The counter floor makes
-        // the `> issueCounter` check redundant, but it is kept so "start fresh"
-        // (counter deliberately 0) still means what it has always meant.
-        await setCompanyIssueIdentity(db, {
-          companyId,
-          counter: highestImportedNumber,
-          actorType: "user",
-          actorId: req.actor.userId ?? "board",
-          reason: "linear-import",
-        });
-      }
+      await raiseIssueCounterAfterImport(db, companyId, highestImportedNumber, req.actor.userId ?? "board");
 
       await logActivity(db, {
         companyId,
@@ -1467,7 +1484,9 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
     const { prefix, startAt } = req.body as { prefix?: string; startAt?: number };
 
     // The board asking for a prefix here IS the explicit confirmation BLO-31228
-    // requires; the counter floor still applies, to anyone.
+    // requires; the counter floor still applies, to anyone — there is no
+    // counter-reset path, because identifiers below the stored counter have
+    // already been handed out.
     const identity = await setCompanyIssueIdentity(db, {
       companyId,
       prefix: prefix ?? null,
@@ -1478,9 +1497,14 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
       reason: "linear-configure-endpoint",
     });
 
-    res.json({
+    // A refused change must not read as success: 409 with what was refused and
+    // the identity as it now stands (`changed` says whether any other part of
+    // the request was applied).
+    res.status(identity.refusals.length > 0 ? 409 : 200).json({
+      ...(identity.refusals.length > 0 ? { error: "Issue identity change refused" } : {}),
       issuePrefix: identity.issuePrefix,
       issueCounter: identity.issueCounter,
+      changed: identity.changed,
       refusals: identity.refusals,
     });
   });
