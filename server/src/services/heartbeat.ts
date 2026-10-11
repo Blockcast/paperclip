@@ -26501,41 +26501,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           onlyRunId ? eq(externalRuntimeReservations.runId, onlyRunId) : undefined,
           or(
             eq(externalRuntimeReservations.state, "release_pending"),
-            and(
-              inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
-              isNull(externalRuntimeReservations.expectedJobName),
-              isNull(externalRuntimeReservations.jobName),
-              isNull(externalRuntimeReservations.jobUid),
-              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
-            ),
-            // BLO-18995: an *identified* reservation (a Job name was recorded)
-            // whose run reached a terminal status without the normal
-            // finalize-time release running — the canonical case is
-            // `drainRunningRunsForShutdown` marking a running run
-            // `interrupted` on SIGTERM, which never releases the reservation.
-            // The two branches above cannot see it: it is not
-            // `release_pending`, and it is `launched` with a non-null
-            // `jobName`. The row then keeps `released_at IS NULL` forever and
-            // the partial unique index
-            // `external_runtime_reservations_active_slot_idx (agent_id,
-            // slot_id) WHERE released_at IS NULL` blocks that slot
+            // BLO-18995: a reservation whose run reached a terminal status
+            // without the normal finalize-time release running — the canonical
+            // case is `drainRunningRunsForShutdown` marking a running run
+            // `interrupted` on SIGTERM. `interrupted` is the one terminal
+            // status the migration-0128 trigger does NOT cover (it fires only
+            // on succeeded/failed/cancelled/timed_out), so nothing else moves
+            // the row to `release_pending` and the branch above cannot see it.
+            // The row then keeps `released_at IS NULL` forever and the partial
+            // unique index `external_runtime_reservations_active_slot_idx
+            // (agent_id, slot_id) WHERE released_at IS NULL` blocks that slot
             // permanently, so every worker restart with a run in flight
             // ratchets the agent's effective concurrency down by one. Observed
             // in production: four agents each stuck a slot for 1-5 days (Ally
             // 4/5 slots, Release Engineer 1/2).
             //
-            // Selecting the row here is safe because it does not release it:
-            // the loop below still verifies the recorded Job is genuinely gone
-            // or finished (exact `readAgentJobRunStatusByName` lookup plus
-            // jobUid identity match) and skips any reservation whose Job is
-            // still `active`. A Job that outlives the worker therefore keeps
-            // its slot until it actually terminates.
+            // BLO-19148: this branch carries NO predicate on the recorded Job
+            // name, deliberately. It used to be split in two — an all-names-null
+            // arm and a `jobName IS NOT NULL OR jobUid IS NOT NULL` arm — which
+            // between them could not see the third shape: `expectedJobName` set
+            // (persisted by `onMeta`) with `jobName`/`jobUid` still null, left
+            // by a SIGTERM landing between `onMeta` and `createNamespacedJob`.
+            // That is the same permanent slot leak via a narrower door, and
+            // every future name column would re-open it. Selection is not
+            // release, so there is nothing for a name predicate to protect:
+            // the loop below verifies the Job (`reservation.jobName ??
+            // reservation.expectedJobName`) is genuinely gone or finished via
+            // an exact `readAgentJobRunStatusByName` lookup plus a jobUid
+            // identity match, skips anything still `active`, and holds a
+            // nameless recent shared/workspace row behind
+            // `isolationSetupGraceActive`. A Job that outlives the worker
+            // therefore keeps its slot until it actually terminates.
             and(
               inArray(externalRuntimeReservations.state, ["reserved", "launching", "launched"]),
-              or(
-                isNotNull(externalRuntimeReservations.jobName),
-                isNotNull(externalRuntimeReservations.jobUid),
-              ),
               inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
             ),
           ),
