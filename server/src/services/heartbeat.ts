@@ -27602,12 +27602,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ambiguousExternalRunIds.add(run.id);
           jobRunStatuses.delete(run.id);
         } else if (jobName && jobUid) {
+          // Hoisted out of the try so the catch can name the reservation the
+          // stamp disagreed with as structured fields, rather than depending on
+          // the thrown Error's message being the only carrier of that detail.
+          let reservation: Awaited<ReturnType<typeof getActiveExternalRuntimeReservation>> = null;
           try {
             // Read at the stamp decision point rather than trusting the earlier
             // reservation inventory. An in-process retry can re-arm ownership
             // after that snapshot; a terminal Job from the consumed attempt must
             // never be rebound onto its replacement reservation.
-            const reservation = await getActiveExternalRuntimeReservation(db, run.id);
+            reservation = await getActiveExternalRuntimeReservation(db, run.id);
             const reservationUpdatedAt = reservation
               ? new Date(reservation.updatedAt).getTime()
               : Number.NaN;
@@ -27621,6 +27625,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               now.getTime() - reservationUpdatedAt < EXTERNAL_LIFECYCLE_STALE_MS
             );
             if (terminalAttemptStillOwned) continue;
+            // The reservation reconciler releases a reservation as soon as its
+            // backing Job stops being active -- seconds to minutes before the
+            // run row itself leaves `running` (postRun hook, workspace
+            // finalize, terminal write). Every sweep inside that window used to
+            // re-attempt this stamp against a gone-or-draining reservation and
+            // land in the catch below, which reports *any* failure as an
+            // identity mismatch at ERROR. Measured 2026-10-10: 295 lines / 3h,
+            // 44% of the API's whole ERROR budget, on runs that then finished
+            // normally. Nothing is mismatched here and nothing is left to
+            // stamp: the launch callback already wrote external_run_id, and
+            // cleanupTerminalExternalLifecycleJobs owns the Job from here.
+            // A still-active Job with no reservation is a real orphan and still
+            // falls through. Bookkeeping matches the catch so the sweep's
+            // liveness view is unchanged.
+            const reservationFinalizing = !reservation || reservation.state === "release_pending";
+            if (reservationFinalizing && jobStatus?.phase !== "active") {
+              logger.debug(
+                {
+                  runId: run.id,
+                  jobName,
+                  jobUid,
+                  jobPhase: jobStatus?.phase ?? null,
+                  reservationState: reservation?.state ?? "released",
+                },
+                "external-runtime reservation already finalizing for a terminal Job; skipping identity stamp",
+              );
+              ambiguousExternalRunIds.add(run.id);
+              jobRunStatuses.delete(run.id);
+              continue;
+            }
             if (managedJobs) {
               const exact = matchExactAgentJob(managedJobs, {
                 runId: run.id,
@@ -27660,7 +27694,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           } catch (error) {
             logger.error(
-              { runId: run.id, jobName, jobUid: jobStatus?.uid ?? null, error },
+              {
+                runId: run.id,
+                jobName,
+                jobUid: jobStatus?.uid ?? null,
+                jobPhase: jobStatus?.phase ?? null,
+                reservationId: reservation?.id ?? null,
+                slotId: reservation?.slotId ?? null,
+                reservationState: reservation?.state ?? null,
+                expectedJobName: reservation?.expectedJobName ?? null,
+                persistedJobName: reservation?.jobName ?? null,
+                persistedJobUid: reservation?.jobUid ?? null,
+                error,
+              },
               "external-runtime reservation Job identity mismatch",
             );
             ambiguousExternalRunIds.add(run.id);

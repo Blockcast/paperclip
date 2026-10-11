@@ -34,6 +34,10 @@ const mockPino = vi.hoisted(() => {
     child: vi.fn(),
   }));
   (fn as any).transport = mockTransport;
+  // The logger module reads `pino.stdSerializers.err` to wire the `error`
+  // serializer; without it on the mock, importing the module throws here and
+  // every assertion below fails for a reason that has nothing to do with time.
+  (fn as any).stdSerializers = { err: vi.fn() };
   return fn;
 });
 

@@ -1548,6 +1548,214 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(reservation.jobUid).toBeNull();
   }, 120_000);
 
+  // BLO-29133: the secondary stamp path above runs over a snapshot of runs that
+  // were `running` when the sweep began. The reservation reconciler releases a
+  // reservation as soon as its backing Job stops being active, and that lands
+  // seconds to minutes before the run row itself leaves `running` (postRun
+  // hook, workspace finalize, terminal write). Every reap tick inside that
+  // window re-read a reservation that was already gone, threw `No active
+  // external-runtime reservation`, and the catch reported it as an identity
+  // mismatch at ERROR -- 295 lines / 3h measured 2026-10-10, 44% of the API's
+  // entire ERROR budget, on runs that then finished normally. Nothing was
+  // mismatched and nothing was left to stamp.
+  const MISMATCH_MESSAGE = "external-runtime reservation Job identity mismatch";
+  const FINALIZING_SKIP_MESSAGE = "external-runtime reservation already finalizing for a terminal Job";
+
+  async function seedRunningRunWithObservedJob(input: {
+    name: string;
+    slotId: number;
+    reservation:
+      | { kind: "released" }
+      | { kind: "launched"; expectedJobName: string; jobName: string; jobUid: string };
+  }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `M${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: input.name,
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: `${input.name} Agent`,
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 5, concurrencyEnabled: true } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: {},
+    });
+
+    const reservationId = randomUUID();
+    const common = {
+      id: reservationId,
+      companyId,
+      agentId,
+      runId,
+      slotId: input.slotId,
+      isolationMode: "run" as const,
+      isolationKey: `run:${runId}`,
+      isolationBoundAt: new Date(),
+      reservedAt: new Date(),
+      launchingAt: new Date(),
+      launchedAt: new Date(),
+    };
+    if (input.reservation.kind === "released") {
+      // Exactly what the reservation reconciler leaves behind once it observes
+      // a non-active Job: released_at set, so getActiveExternalRuntimeReservation
+      // returns null while the run row is still `running`.
+      await db.insert(externalRuntimeReservations).values({
+        ...common,
+        state: "released",
+        expectedJobName: `ac-${runId.slice(0, 8)}`,
+        jobName: `ac-${runId.slice(0, 8)}`,
+        jobUid: `uid-${runId.slice(0, 8)}`,
+        releasedAt: new Date(),
+        releaseReason: "job_terminal_or_missing",
+      });
+    } else {
+      await db.insert(externalRuntimeReservations).values({
+        ...common,
+        state: "launched",
+        expectedJobName: input.reservation.expectedJobName,
+        jobName: input.reservation.jobName,
+        jobUid: input.reservation.jobUid,
+        releasedAt: null,
+      });
+    }
+    return { companyId, agentId, runId, reservationId };
+  }
+
+  it("does not log an identity mismatch when a terminal Job's reservation is already released (BLO-29133)", async () => {
+    const { agentId, runId } = await seedRunningRunWithObservedJob({
+      name: "TerminalJobReleasedReservationCo",
+      slotId: 0,
+      reservation: { kind: "released" },
+    });
+    const jobName = `ac-${runId.slice(0, 8)}`;
+    const jobUid = `uid-${runId.slice(0, 8)}`;
+
+    mockListManagedAgentJobs.mockResolvedValue([
+      {
+        // The run's own Job, already finished -- which is precisely why the
+        // reconciler released the reservation.
+        phase: "succeeded",
+        reason: null,
+        message: null,
+        runId,
+        agentId,
+        name: jobName,
+        uid: jobUid,
+        createdAt: new Date(),
+      },
+    ]);
+
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+    const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
+    let mismatches: unknown[][] = [];
+    let skips: unknown[][] = [];
+    try {
+      await heartbeat.reapOrphanedRuns();
+      // Snapshot BEFORE restoring: mockRestore() also clears mock.calls, so a
+      // post-restore read makes every "was not logged" assertion vacuous.
+      mismatches = callsMatching(errorSpy, MISMATCH_MESSAGE);
+      skips = callsMatching(debugSpy, FINALIZING_SKIP_MESSAGE);
+    } finally {
+      errorSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
+
+    // The load-bearing assertion: this benign window contributes nothing to the
+    // error rate. Fails on the parent commit, where it logs once per reap tick.
+    expect(mismatches).toEqual([]);
+
+    // ...but it stays observable at debug, naming the condition that identified
+    // it in production.
+    expect(skips).toHaveLength(1);
+    expect(skips[0][0]).toMatchObject({
+      runId,
+      jobName,
+      jobUid,
+      jobPhase: "succeeded",
+      reservationState: "released",
+    });
+  }, 120_000);
+
+  it("still logs a real Job-name divergence at error, naming the reservation and slot (BLO-29133)", async () => {
+    const observedJobName = "ac-observed-divergent";
+    const observedJobUid = "uid-observed-divergent";
+    const { agentId, runId, reservationId } = await seedRunningRunWithObservedJob({
+      name: "DivergentJobIdentityCo",
+      slotId: 3,
+      reservation: {
+        kind: "launched",
+        expectedJobName: "ac-persisted-divergent",
+        jobName: "ac-persisted-divergent",
+        jobUid: "uid-persisted-divergent",
+      },
+    });
+
+    mockListManagedAgentJobs.mockResolvedValue([
+      {
+        // Still active, and carrying an identity the persisted reservation
+        // disagrees with: a genuine mismatch, not a finalize-window artefact.
+        phase: "active",
+        reason: null,
+        message: null,
+        runId,
+        agentId,
+        name: observedJobName,
+        uid: observedJobUid,
+        createdAt: new Date(),
+      },
+    ]);
+
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+    let mismatches: unknown[][] = [];
+    try {
+      await heartbeat.reapOrphanedRuns();
+      mismatches = callsMatching(errorSpy, MISMATCH_MESSAGE);
+    } finally {
+      errorSpy.mockRestore();
+    }
+
+    expect(mismatches).toHaveLength(1);
+    const payload = mismatches[0][0] as Record<string, unknown>;
+    // The guard that tripped is now readable without the Error message: before
+    // this change the payload carried only runId/jobName/jobUid, and `error`
+    // serialized to `{}` because pino only applies its Error serializer to `err`.
+    expect(payload).toMatchObject({
+      runId,
+      jobName: observedJobName,
+      jobUid: observedJobUid,
+      jobPhase: "active",
+      reservationId,
+      slotId: 3,
+      reservationState: "launched",
+      expectedJobName: "ac-persisted-divergent",
+      persistedJobName: "ac-persisted-divergent",
+      persistedJobUid: "uid-persisted-divergent",
+    });
+    expect(payload.error).toBeInstanceOf(Error);
+    expect((payload.error as Error).message).toContain("Job identity mismatch");
+  }, 120_000);
+
   // BLO-18995: `drainRunningRunsForShutdown` marks in-flight runs `interrupted`
   // on SIGTERM but never releases their runtime slot reservation. The row keeps
   // `released_at IS NULL`, and the partial unique index
