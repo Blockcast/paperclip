@@ -18,7 +18,10 @@
  *      Adopting a prefix on a company that has none is still automatic — that
  *      is the useful first-time-connection behaviour this came from.
  *   2. The counter never decreases. A lower proposed value is refused loudly
- *      and the stored value kept.
+ *      and the stored value kept — unless the caller only asked to raise the
+ *      floor (`raiseCounterOnly`), in which case "nothing higher" is a silent
+ *      no-op. A refusal means someone tried to re-identify the company, never
+ *      that an import had nothing new.
  */
 import { eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -70,7 +73,7 @@ export function normalizeIssuePrefix(prefix: string | null | undefined): string 
 export function planIssueIdentityChange(
   current: IssueIdentityState,
   requested: IssueIdentityRequest,
-  options: { confirmPrefixChange?: boolean } = {},
+  options: { confirmPrefixChange?: boolean; raiseCounterOnly?: boolean } = {},
 ): IssueIdentityPlan {
   const refusals: IssueIdentityRefusal[] = [];
   const storedPrefix = normalizeIssuePrefix(current.issuePrefix);
@@ -90,11 +93,13 @@ export function planIssueIdentityChange(
   }
 
   let counter: number | null = null;
-  const wantCounter = requested.counter;
-  if (typeof wantCounter === "number" && Number.isFinite(wantCounter)) {
+  if (typeof requested.counter === "number" && Number.isFinite(requested.counter)) {
+    // Floor before comparing, so a fractional request one notch above the
+    // stored value is not reported as a change that writes nothing.
+    const wantCounter = Math.floor(requested.counter);
     if (wantCounter > storedCounter) {
-      counter = Math.floor(wantCounter);
-    } else if (wantCounter < storedCounter) {
+      counter = wantCounter;
+    } else if (wantCounter < storedCounter && !options.raiseCounterOnly) {
       // Never below the stored value, whoever asks and however they got the
       // number: identifiers below it have already been handed out.
       refusals.push("counter-regression");
@@ -112,6 +117,12 @@ export interface SetCompanyIssueIdentityInput extends IssueIdentityRequest {
    * connecting or reconnecting.
    */
   confirmPrefixChange?: boolean;
+  /**
+   * The caller is asking "make the counter at least this", not "the counter is
+   * this" (e.g. the Linear import's highest-imported-number bump). A value at
+   * or below the stored counter is then a silent no-op, not a refusal.
+   */
+  raiseCounterOnly?: boolean;
   actorType?: "agent" | "user" | "system" | "plugin";
   actorId?: string;
   /** Recorded in the audit row, e.g. "linear-oauth-callback". */
@@ -151,6 +162,7 @@ export async function setCompanyIssueIdentity(
 
   const plan = planIssueIdentityChange(state, input, {
     confirmPrefixChange: input.confirmPrefixChange,
+    raiseCounterOnly: input.raiseCounterOnly,
   });
 
   for (const refusal of plan.refusals) {
