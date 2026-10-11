@@ -53,8 +53,11 @@ describe("recordStartLockReapDisposition", () => {
 
   it("counts every disposition of the reap's return union under its own label", async () => {
     // `nested` is the load-bearing one and must not be folded into `ran`: it is
-    // the ONLY path that skips `awaitStartLockSweepBounded`, so it is the only
-    // disposition whose `phase="reap"` hold can exceed the bound at all.
+    // the only disposition that WAITS on a sweep without
+    // `awaitStartLockSweepBounded`, so while the bound is enabled it is the only
+    // one whose `phase="reap"` hold can exceed it. (`skipped_fresh` also skips
+    // the bound but returns synchronously; `AGENT_START_LOCK_REAP_WAIT_BOUND_MS=0`
+    // removes the guarantee for every disposition.)
     // Measured 2026-10-10 over 24h, exactly 2 agents exceeded 121s in that
     // phase while 8 more sat pinned at 119.8-119.97s -- the bimodality that
     // separates an unbounded leader from a bailing waiter. Collapsing the label
@@ -127,6 +130,9 @@ describe("recordStartLockReapDisposition", () => {
     );
     expect(help).toHaveLength(1);
     expect(help[0]).toContain(AGENT_START_LOCK_PHASE_SECONDS_METRIC);
+    // An operator who set the kill switch must not be told a long reap hold can
+    // only be `nested`: with the bound off, `ran`/`joined` are unbounded too.
+    expect(help[0]).toContain("AGENT_START_LOCK_REAP_WAIT_BOUND_MS=0 disables the bound");
 
     // No phase series exists in this test, so the selector must appear nowhere.
     expect(body).not.toContain(`${AGENT_START_LOCK_PHASE_SECONDS_METRIC}{`);

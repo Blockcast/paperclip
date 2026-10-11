@@ -28,6 +28,11 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import {
+  AGENT_START_LOCK_REAP_DISPOSITION_METRIC,
+  __resetMetricsForTest,
+  renderMetrics,
+} from "../services/metrics.js";
 import { runningProcesses } from "../adapters/index.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -222,6 +227,34 @@ describeEmbeddedPostgres("startNextQueuedRunForAgent run-id-aware job liveness (
     expect(mockHasActiveJobForAgent).toHaveBeenCalledWith(agentId, expect.objectContaining({
       isRunTerminal: expect.any(Function),
     }));
+  });
+
+  it("counts the start-lock reap disposition on a real external-lifecycle dispatch pass (BLO-42010)", async () => {
+    // The disposition counter's only production increment is the call in
+    // `startNextQueuedRunForAgent`'s reap `finally`; the metric's own suite
+    // drives the helper directly and cannot see that call deleted. Absent
+    // series read as "no bails occurred", so a lost increment is silent.
+    // Default TTL is 0 and this agent is the only dispatcher, so every pass
+    // sweeps fresh and must land under `ran`, and nothing else.
+    __resetMetricsForTest();
+    const { queuedRunId } = await seedExternalLifecycleAgentWithTerminalRuns();
+
+    await heartbeat.resumeQueuedRuns();
+    const dispatched = await waitUntil(async () => {
+      const [row] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queuedRunId));
+      return row?.status !== "queued";
+    });
+    expect(dispatched).toBe(true);
+
+    const { body } = await renderMetrics();
+    const series = body
+      .split("\n")
+      .filter((line) => line.startsWith(`${AGENT_START_LOCK_REAP_DISPOSITION_METRIC}{`));
+    expect(series.map((line) => /disposition="([^"]+)"/.exec(line)?.[1])).toEqual(["ran"]);
+    expect(Number(series[0].trim().split(/\s+/).pop())).toBeGreaterThanOrEqual(1);
   });
 
   it("still blocks dispatch when the surviving Job's run-id maps to a live (non-terminal) run", async () => {
