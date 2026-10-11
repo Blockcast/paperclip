@@ -59,6 +59,7 @@ vi.mock("@kubernetes/client-node", () => {
 });
 
 let hasActiveJobForAgent: typeof import("../services/k8s-job-liveness.js")["hasActiveJobForAgent"];
+let deleteAgentJobsForRun: typeof import("../services/k8s-job-liveness.js")["deleteAgentJobsForRun"];
 let resetClient: typeof import("../services/k8s-job-liveness.js")["__resetK8sJobLivenessClient"];
 
 beforeAll(async () => {
@@ -68,6 +69,7 @@ beforeAll(async () => {
   vi.stubEnv("KUBERNETES_SERVICE_HOST", "10.96.0.1");
   const mod = await import("../services/k8s-job-liveness.js");
   hasActiveJobForAgent = mod.hasActiveJobForAgent;
+  deleteAgentJobsForRun = mod.deleteAgentJobsForRun;
   resetClient = mod.__resetK8sJobLivenessClient;
 });
 
@@ -478,5 +480,81 @@ describe("hasActiveJobForAgent propagates the dispatch section's abort (BLO-4249
     const outcome = await settleInAbortedSection(() => hasActiveJobForAgent(AGENT_ID));
 
     expect(outcome).toEqual({ error: expect.any(AgentStartLockAbortedError) });
+  });
+});
+
+/**
+ * BLO-27156: `deleteAgentJobsForRun` was the only reconciler delete with
+ * neither a UID precondition nor a name check — it listed by run-id label and
+ * deleted every match by name alone. That is correct in breadth (its one
+ * caller fires only for a DB-terminal run whose reservation identity failed to
+ * reconcile, so no exact identity is left to match on) but was not
+ * point-in-time honest: a Job deleted and recreated under the same name
+ * between the list and the delete was destroyed by a DELETE aimed at its
+ * predecessor.
+ *
+ * Run against pre-fix `master`, the first two cases below fail: the delete
+ * carries no `body` at all, and a 409 is counted as a successful delete.
+ */
+describe("deleteAgentJobsForRun uid preconditions (BLO-27156)", () => {
+  function listedJob(name: string, uid: string) {
+    return {
+      metadata: {
+        name,
+        uid,
+        labels: {
+          "app.kubernetes.io/managed-by": "paperclip",
+          "paperclip.io/agent-id": AGENT_ID,
+          "paperclip.io/run-id": "run-1",
+        },
+      },
+    };
+  }
+
+  it("preconditions each delete on the uid it listed, keeping Background propagation", async () => {
+    mockListNamespacedJob.mockResolvedValue({ items: [listedJob("job-a", "uid-a"), listedJob("job-b", "uid-b")] });
+    mockDeleteNamespacedJob.mockResolvedValue({});
+
+    expect(await deleteAgentJobsForRun("run-1")).toBe(2);
+    expect(mockDeleteNamespacedJob.mock.calls.map((call) => call[0])).toEqual([
+      expect.objectContaining({
+        name: "job-a",
+        propagationPolicy: "Background",
+        body: { preconditions: { uid: "uid-a" } },
+      }),
+      expect.objectContaining({
+        name: "job-b",
+        propagationPolicy: "Background",
+        body: { preconditions: { uid: "uid-b" } },
+      }),
+    ]);
+  });
+
+  // The replacement case this exists for: the listed Job is torn down and a
+  // live replacement takes its name before our DELETE lands. Kubernetes
+  // rejects the stale precondition 409 and the replacement survives — so the
+  // reaper must report 0 deleted, not claim a delete it did not make.
+  it("does not count a 409-rejected delete as deleted", async () => {
+    mockListNamespacedJob.mockResolvedValue({ items: [listedJob("job-a", "stale-uid")] });
+    mockDeleteNamespacedJob.mockRejectedValue({ code: 409 });
+
+    expect(await deleteAgentJobsForRun("run-1")).toBe(0);
+  });
+
+  // Identity doubt never licenses a delete anywhere else in this module, and
+  // a listed object always has a uid — so a uid-less item means we are reading
+  // something we do not understand, not that we should delete it blind.
+  it("refuses to delete a listed Job that carries no uid", async () => {
+    mockListNamespacedJob.mockResolvedValue({ items: [{ metadata: { name: "job-a" } }] });
+
+    expect(await deleteAgentJobsForRun("run-1")).toBe(0);
+    expect(mockDeleteNamespacedJob).not.toHaveBeenCalled();
+  });
+
+  it("still reports null when the list itself fails", async () => {
+    mockListNamespacedJob.mockRejectedValue(new Error("apiserver exploded"));
+
+    expect(await deleteAgentJobsForRun("run-1")).toBeNull();
+    expect(mockDeleteNamespacedJob).not.toHaveBeenCalled();
   });
 });
