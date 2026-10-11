@@ -1516,11 +1516,19 @@ async function retrofitAggregateOwner(
   // Clearing the user is this function's documented intent (see the header) —
   // an agent-null row has no wake path, which is the defect BLO-40764 added
   // this retrofit to repair.
-  const patch: { assigneeAgentId: string | null; assigneeUserId: string | null } | null =
+  //
+  // The user branch, by contrast, writes `{ assigneeUserId }` ALONE. It is
+  // reached only when the row as read has neither owner, so an explicit
+  // `assigneeAgentId: null` would be a no-op against that row — and if an agent
+  // is assigned between the read and the fenced write, it would silently clear
+  // that agent in favour of a human. Leaving the field out keeps the host's
+  // single-assignee rejection as the backstop for that race. The return below
+  // still widens to the full owner state.
+  const patch: { assigneeAgentId?: string; assigneeUserId: string | null } | null =
     invokableAgentId
       ? { assigneeAgentId: invokableAgentId, assigneeUserId: null }
       : assigneeUserId && !nonEmptyString(issue.assigneeUserId ?? undefined)
-        ? { assigneeAgentId: null, assigneeUserId }
+        ? { assigneeUserId }
         : null;
   if (!patch) return null;
 
@@ -1546,7 +1554,7 @@ async function retrofitAggregateOwner(
       `paperclip-plugin-alertmanager: failed to record owner retrofit metric for ${alert.fingerprint}: ${String(metricErr)}`,
     );
   }
-  return patch;
+  return { assigneeAgentId: patch.assigneeAgentId ?? null, assigneeUserId: patch.assigneeUserId };
 }
 
 function isAggregateCreationConflict(err: unknown): boolean {
