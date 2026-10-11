@@ -158,7 +158,7 @@ conversation, with jobs running without new signal on each PR, or before ally
 approved resulting in CI runs that are unecessary."
 
 On a pull request, `pr.yml` runs its heavy (Tier 1) jobs only once Ally has a
-typed verdict at the exact head. Tier 1 is every job on `arc-paperclip-general`
+typed verdict or a trusted human `/test` at the exact head. Tier 1 is every job on `arc-paperclip-general`
 or `arc-e2e`: Typecheck + Release Registry, Worktree install, OpenCode Responses
 replay, k8s-ro seed transport cold start, General tests, Build, Canary Dry Run
 and the Playwright e2e job. `policy`, Helm chart and Vendored claude_k8s adapter
@@ -168,7 +168,12 @@ still run on every push.
   `gate/ally-comment-findings` check-run (the newest one at the head) is
   `success`, or its `ci/ally-head-attested` check-run is, and the findings
   check-run is not `failure`. Until then it fails, the heavy jobs are skipped,
-  and `verify` is red with `verify: awaiting-ally-verdict`.
+  and `verify` is red with `verify: awaiting-ally-verdict`. An owner/member/collaborator
+  may comment `/test` to release the current same-repository head before review.
+  The default-branch workflow writes `ci/manual-test-request` at that head; it
+  grants CI CPU only and leaves every merge review requirement intact. Bots and
+  the Ally user seat cannot issue this command. A new head needs a new request.
+  Green or active runs are not repeated; failed runs can be retried with `/test`.
 - **That red is a schedule state, not a finding.** Do not push a fix for it, and
   do not report it in a review. Do not wait for a green `verify` before you
   request a review: request it first, because the review is what releases the
@@ -187,17 +192,15 @@ still run on every push.
 - A non-blocking verdict that is not clean also waits: a finding Ally accepted
   onto a follow-up, or an unreadable verdict block, leaves the findings
   check-run `neutral`, and no automatic release comes at that head. Push the fix
-  (a clean review of the new head releases it), or ask the owner for the bypass.
-- A draft is held until it is ready for review. A fork PR is not held: no
+  (a clean review of the new head releases it), or request validation with a trusted human `/test`.
+- A draft is held until it is ready for review or a trusted human requests `/test`. A fork PR is not held: no
   release path acts on a head outside this repository, so it runs its heavy
   jobs on every push, as before this gate.
-- **A PR its own reviewer opened is not held.** The server never reports the
-  findings check-run `success` on a PR opened by `allyblockcast[bot]` (or the
-  `allyblockcast` seat): it withholds a self-attested clean (BLO-34316), and
-  nothing publishes `ci/ally-head-attested` yet. Such a PR runs its heavy jobs on
-  every push, as before this gate. Once `ci/ally-head-attested` is seen `success`
-  on one, the owner sets the repository variable
-  `ALLY_GATED_CI_HOLD_SELF_AUTHORED=true` to gate them too.
+- `ALLY_GATED_CI_HOLD_SELF_AUTHORED=true` holds Ally-authored PRs too. The owner
+  may enable it once the human `/test` recovery route has passed a live canary.
+  This replaces the old requirement to wait for the server's self-head attestation
+  rollout: where that signal is absent, an independent trusted human's `/test`
+  is the release route. The command does not manufacture an approving review.
 - `ALLY_GATED_CI_BYPASS=true` (a repository variable; owner or admin sets it) is
   the outage lever for Ally, the Paperclip server, or a missing signal. With it,
   `ally-verdict` passes at once and the heavy jobs run on every push again,
