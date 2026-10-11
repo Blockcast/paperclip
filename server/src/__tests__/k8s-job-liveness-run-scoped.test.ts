@@ -493,8 +493,9 @@ describe("hasActiveJobForAgent propagates the dispatch section's abort (BLO-4249
  * between the list and the delete was destroyed by a DELETE aimed at its
  * predecessor.
  *
- * Run against pre-fix `master`, the first two cases below fail: the delete
- * carries no `body` at all, and a 409 is counted as a successful delete.
+ * Run against pre-fix `master`, the first case below fails: the delete
+ * carries no `body` at all. Mutation-tested 2026-10-11 -- dropping the
+ * precondition, or the uid-less refusal, each turns this suite red.
  */
 describe("deleteAgentJobsForRun uid preconditions (BLO-27156)", () => {
   function listedJob(name: string, uid: string) {
@@ -534,6 +535,13 @@ describe("deleteAgentJobsForRun uid preconditions (BLO-27156)", () => {
   // live replacement takes its name before our DELETE lands. Kubernetes
   // rejects the stale precondition 409 and the replacement survives — so the
   // reaper must report 0 deleted, not claim a delete it did not make.
+  //
+  // Honest limit: this pins the COUNT, not the dedicated 409 branch. Deleting
+  // that branch leaves this suite green (mutation-tested) because the generic
+  // catch declines to increment too — the branch exists only to log the
+  // precondition rejection distinctly from a real delete failure, and a log
+  // line is not worth a logger spy. It would fail if someone "fixed" the
+  // branch by counting a 409 as deleted, which is the regression that matters.
   it("does not count a 409-rejected delete as deleted", async () => {
     mockListNamespacedJob.mockResolvedValue({ items: [listedJob("job-a", "stale-uid")] });
     mockDeleteNamespacedJob.mockRejectedValue({ code: 409 });
