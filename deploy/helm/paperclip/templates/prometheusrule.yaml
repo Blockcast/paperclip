@@ -985,8 +985,17 @@ spec:
           # reason=transient_failure_quota_floor deliberately carries NO arm
           # and can never fire: a provider_quota floor is never clamped, so a
           # multi-day park there is the contract being honoured, not a breach.
-          # Reasons falling through to the backstop are only weakly monitored
-          # until someone reads their clamp and gives them an arm.
+          #
+          # There is NO catch-all arm. `> on (reason) group_left ()` drops any
+          # left-hand series whose reason has no match on the right, so a
+          # reason absent from BOTH the explicit arms and the range tuple
+          # below is not weakly monitored -- it can never fire at all. Adding
+          # a value to KNOWN_RETRY_SCHEDULE_REASONS (server/src/services/
+          # metrics.ts) without adding an arm here makes that class
+          # permanently unalertable, silently. The "every known retry reason
+          # carries an arm" test reads that constant out of metrics.ts and
+          # fails the suite when the two drift, so this is enforced rather
+          # than documented.
           expr: |
             (
               max by (agent_id, reason) (paperclip_scheduled_retry_park_horizon_seconds)

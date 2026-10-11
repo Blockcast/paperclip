@@ -851,21 +851,60 @@ test("PaperclipAgentHeartbeatStale is an outcome-side per-agent-interval alert (
 // so nothing here reaches a live Prometheus. This guard is cheap, hermetic and
 // catches the specific mistake that was made; it is not a substitute for
 // promtool, and should not be described as one.
+
+// Collect every `expr:` in rendered YAML, in both forms: `expr: <one line>`
+// and `expr: |` + an indented block. BLO-42711 introduced the first
+// block-scalar expr in this file, and an inline-only scrape silently stops
+// covering whichever rules move to a block.
+//
+// Two details are load-bearing, and both fail SILENTLY rather than loudly:
+//   - the inline lookahead must sit immediately after `expr:` and span to
+//     end-of-line. A plain `(?!\|)` lets `[ \t]*` backtrack to empty, passes
+//     against the space, and captures the block header itself as " |".
+//   - the block body must admit whitespace-only lines. A blank line cannot
+//     carry the captured indentation, so without that alternative the match
+//     stops at the first one and the rest of the block goes unchecked.
+// Extracted so `collectExprs` can be exercised on synthetic input below --
+// neither mistake shows up against the chart as it renders today, so an
+// assertion against real output alone would not catch a regression.
+function collectExprs(rendered) {
+  return [
+    ...[
+      ...rendered.matchAll(/^\s+expr:(?![ \t]*\|[ \t]*$)[ \t]*(.+?)\s*$/gm),
+    ].map(([, expr]) => expr),
+    ...[
+      ...rendered.matchAll(
+        /^([ \t]+)expr:[ \t]*\|[ \t]*\n((?:(?:\1[ \t]+.*|[ \t]*)\n)+)/gm,
+      ),
+    ].map(([, , block]) => block.replace(/\s+/g, " ").trim()),
+  ];
+}
+
+test("collectExprs survives the two scrape failures that fail silently (BLO-42711)", () => {
+  // A block header must not leak into the inline pass as the literal " |".
+  assert.deepEqual(collectExprs("    expr: up == 1\n    expr: |\n      foo\n"), [
+    "up == 1",
+    "foo",
+  ]);
+
+  // An interior blank line must not truncate the block: everything after it
+  // would otherwise escape the scalar-operand check below.
+  assert.deepEqual(
+    collectExprs("    expr: |\n      head > on (x) group_left ()\n\n      tail\n    for: 5m\n"),
+    ["head > on (x) group_left () tail"],
+  );
+
+  // ...and the block must still stop at the next sibling key.
+  assert.deepEqual(
+    collectExprs("    expr: |\n      only\n    for: 5m\n    labels:\n      severity: warning\n"),
+    ["only"],
+  );
+});
+
 test("no rendered alert applies a vector-matching modifier to a scalar operand (BLO-23413)", () => {
   const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
 
-  // Both expr forms. `expr: <one line>` and `expr: |` + an indented block --
-  // BLO-42711 introduced the first block-scalar expr in this file, and an
-  // inline-only scrape silently stops covering whichever rules move to a
-  // block.
-  const exprs = [
-    ...[...rendered.matchAll(/^\s+expr:[ \t]*(?!\|)(.+?)\s*$/gm)].map(
-      ([, expr]) => expr,
-    ),
-    ...[...rendered.matchAll(/^(\s+)expr:[ \t]*\|\s*\n((?:\1\s+.*\n)+)/gm)].map(
-      ([, , block]) => block.replace(/\s+/g, " ").trim(),
-    ),
-  ];
+  const exprs = collectExprs(rendered);
   assert.ok(
     exprs.length > 0,
     "expected the PrometheusRule to render at least one expr to check",
@@ -1069,9 +1108,20 @@ test("PaperclipScheduledRetryParkHorizonImplausible joins per-reason ceilings, n
   // gauge against a bare number.
   assert.match(expr, /max by \(agent_id, reason\) \(paperclip_scheduled_retry_park_horizon_seconds\)/);
   assert.match(expr, /> on \(reason\) group_left \(\)/);
+  // `>=` is a bare scalar comparison too, and `/>\s*\d/` misses it -- the `=`
+  // sits between the `>` and the digit. Pinned on a literal, because the
+  // expression as it renders today contains neither form, so the chart cannot
+  // demonstrate the difference.
+  const bareScalarComparison = />=?\s*\d/;
+  assert.ok(bareScalarComparison.test(">= 5400"), "guard must catch >=");
+  assert.ok(bareScalarComparison.test("> 5400"), "guard must catch >");
+  assert.ok(
+    !bareScalarComparison.test("> on (reason) group_left ()"),
+    "guard must not flag the per-reason join itself",
+  );
   assert.doesNotMatch(
     expr,
-    />\s*\d/,
+    bareScalarComparison,
     "no bare scalar comparison -- every ceiling must arrive through the per-reason join",
   );
 
@@ -1082,7 +1132,6 @@ test("PaperclipScheduledRetryParkHorizonImplausible joins per-reason ceilings, n
     ["dependency_blocked", 3600],
     ["transient_failure", 9000],
     ["transient_failure_floor", 86700],
-    ["none", 0],
   ]) {
     assert.match(
       expr,
@@ -1090,6 +1139,18 @@ test("PaperclipScheduledRetryParkHorizonImplausible joins per-reason ceilings, n
       `${reason} must carry its writer's own ceiling of ${ceiling}s`,
     );
   }
+
+  // `none` is NOT a writer clamp and 0 is not a ceiling: it is a per-agent
+  // zero floor emitted for every known agent, so `metrics.ts` says it "is not
+  // a park class, is always 0, and must never carry a bound". The arm is
+  // inert (`0 > 0` is false) and is retained solely to stay byte-identical to
+  // the deployed onprem-k8s rule. Asserted apart from the loop above so it
+  // does not read as a writer constant.
+  assert.match(
+    expr,
+    /label_replace\(vector\(0\), "reason", "none", "", ""\)/,
+    "none carries an inert vector(0) arm, retained only for lockstep with the deployed rule",
+  );
 
   // A provider_quota floor is never clamped, so a multi-day park there is the
   // contract being honoured. It must carry no arm at all, or the alert pages
@@ -1120,6 +1181,62 @@ test("PaperclipScheduledRetryParkHorizonImplausible joins per-reason ceilings, n
   assert.match(
     rendered,
     /alert: PaperclipScheduledRetryParkHorizonMetricsRefreshFailed[\s\S]*?runbook_url: "[^\"]*runbooks\/queued-run-stranded\.md#scheduled-retry-park-horizon-blo-25036"/,
+  );
+});
+
+// The assertions above pin the chart against itself: they would stay green
+// if a new park class were added to the writer and never given an arm. That
+// is the exact drift that produced BLO-42711, and it fails open -- the join
+// `> on (reason) group_left ()` drops a left-hand series with no matching
+// right-hand arm, so an un-armed reason can never fire at all. This test is
+// the one that pins the chart against the WRITER.
+test("every KNOWN_RETRY_SCHEDULE_REASONS member carries a park-horizon arm (BLO-42711)", () => {
+  const metricsSource = readFileSync(
+    path.join(repoRoot, "server/src/services/metrics.ts"),
+    "utf8",
+  );
+  const [, block] =
+    metricsSource.match(
+      /export const KNOWN_RETRY_SCHEDULE_REASONS = \[([\s\S]*?)\] as const;/,
+    ) ?? [];
+  assert.ok(
+    block,
+    "could not read KNOWN_RETRY_SCHEDULE_REASONS out of server/src/services/metrics.ts -- if it moved or was renamed, re-point this test rather than deleting it",
+  );
+  const reasons = [...block.matchAll(/"([^"]+)"/g)].map(([, reason]) => reason);
+  // Guard the scrape itself: a regex that silently matched nothing would make
+  // this whole test vacuously pass, which is the failure mode it exists to stop.
+  assert.ok(
+    reasons.length >= 14,
+    `expected to scrape the full reason list, got ${reasons.length}: ${reasons.join(", ")}`,
+  );
+
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+  const [, expr] =
+    rendered.match(
+      /alert: PaperclipScheduledRetryParkHorizonImplausible\n[\s\S]*?\n\s+expr: \|\n([\s\S]*?)\n\s+for:/,
+    ) ?? [];
+  assert.ok(expr, "park-horizon alert must render a block expr");
+
+  const unarmed = reasons.filter(
+    (reason) => !new RegExp(`"reason", "${reason}", "", ""`).test(expr),
+  );
+  assert.deepEqual(
+    unarmed,
+    [],
+    `these retry reasons have no arm in the park-horizon join and can therefore NEVER fire: ${unarmed.join(", ")}. Give each one its writer's own clamp, or add it to the backstop range tuple in deploy/helm/paperclip/templates/prometheusrule.yaml. Do not delete it from KNOWN_RETRY_SCHEDULE_REASONS to make this pass.`,
+  );
+
+  // transient_failure_quota_floor is deliberately un-armed and is deliberately
+  // NOT in KNOWN_RETRY_SCHEDULE_REASONS, so the check above must not reach it.
+  assert.ok(
+    !reasons.includes("transient_failure_quota_floor"),
+    "transient_failure_quota_floor must stay outside KNOWN_RETRY_SCHEDULE_REASONS -- it is never clamped and must carry no arm",
   );
 });
 
