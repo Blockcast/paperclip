@@ -146,6 +146,11 @@ import {
 import { createPassTimer, type PassTimer } from "./pass-timing.js";
 import { type AgentRosterMemo, createAgentRosterMemo } from "./agent-roster-memo.js";
 import {
+  createStrandedAttendancePrefetch,
+  type IssueAttendanceEvidence,
+  type StrandedAttendanceWindow,
+} from "./stranded-attendance-prefetch.js";
+import {
   resolveStrandedEscalationStatus,
   shouldReuseStrandedRecoveryAction,
 } from "./stranded-escalation-status.js";
@@ -2810,6 +2815,37 @@ export function recoveryService(
     return { consecutive, latestFinishedAt };
   }
 
+  // PEN-3636: the issue-id expressions and the non-issue, non-agent terms of the three
+  // attendance predicates, factored out so the single-issue forms below and the windowed
+  // batch in `readStrandedAttendanceWindow` cannot drift apart. A batched query that
+  // silently loses a term answers "unattended" for real attendance — the harmful
+  // direction — and no type or test would catch it, so the control has to be structural.
+  // This is the same "by construction" argument `activePauseHoldPredicate` gives the
+  // pause-hold prefilter: a new term lands on both call sites or on neither.
+  //
+  // Functions rather than constants so each query composes a fresh `SQL` node, and so the
+  // JSONB key appears exactly once per predicate in this file.
+  const heartbeatRunIssueIdExpr = () => sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
+  const deferredExecutionWakeIssueIdExpr = () =>
+    sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`;
+  const executionPathRunTerms = (companyId: string) =>
+    and(
+      eq(heartbeatRuns.companyId, companyId),
+      inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+    );
+  const deferredExecutionWakeTerms = (companyId: string) =>
+    and(
+      eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    );
+  const pendingWakeInteractionTerms = (companyId: string, cutoff: Date) =>
+    and(
+      eq(issueThreadInteractions.companyId, companyId),
+      eq(issueThreadInteractions.status, "pending"),
+      inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
+      gt(issueThreadInteractions.createdAt, cutoff),
+    );
+
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
     const [run, deferredWake] = await Promise.all([
       db
@@ -2817,9 +2853,8 @@ export function recoveryService(
         .from(heartbeatRuns)
         .where(
           and(
-            eq(heartbeatRuns.companyId, companyId),
-            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            executionPathRunTerms(companyId),
+            eq(heartbeatRunIssueIdExpr(), issueId),
             agentId ? eq(heartbeatRuns.agentId, agentId) : sql`true`,
           ),
         )
@@ -2830,9 +2865,8 @@ export function recoveryService(
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, companyId),
-            eq(agentWakeupRequests.status, "deferred_issue_execution"),
-            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            deferredExecutionWakeTerms(companyId),
+            eq(deferredExecutionWakeIssueIdExpr(), issueId),
             agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
           ),
         )
@@ -2938,15 +2972,111 @@ export function recoveryService(
       .from(issueThreadInteractions)
       .where(
         and(
-          eq(issueThreadInteractions.companyId, companyId),
+          pendingWakeInteractionTerms(companyId, new Date(Date.now() - PENDING_INTERACTION_MAX_AGE_MS)),
           eq(issueThreadInteractions.issueId, issueId),
-          eq(issueThreadInteractions.status, "pending"),
-          inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
-          gt(issueThreadInteractions.createdAt, new Date(Date.now() - PENDING_INTERACTION_MAX_AGE_MS)),
         ),
       )
       .limit(1)
       .then((rows) => Boolean(rows[0]));
+  }
+
+  /**
+   * The two predicates immediately above, asked for a whole window of issues at once.
+   *
+   * PEN-3636. Deliberately adjacent to `hasActiveExecutionPath` and
+   * `hasPendingWakeInteraction`, and composed from the SAME shared terms, so the one
+   * hazard of this change — a batched query drifting away from the single-issue one it
+   * stands in for — is structural rather than something a reviewer has to re-derive.
+   * The only thing that differs below is the issue-id predicate (`= ANY` instead of
+   * `=`) and the absence of the agent filter, which is applied in memory instead.
+   *
+   * ⭐ The equivalence is exact, not approximate:
+   *
+   *   - The run and wake halves are unioned per issue, so membership of `agentIds` is
+   *     exactly "(a run by this agent) OR (a deferred wake by this agent)" — the
+   *     agent-scoped form — while `any` is "(any run) OR (any wake)" — the unfiltered
+   *     form the single-issue version expresses as `agentId ? eq(...) : sql`true``.
+   *     Doing the agent filter in memory is what lets ONE window serve both forms.
+   *   - The interaction age cutoff is computed ONCE per window rather than once per
+   *     candidate. The bound is 24 h; a few seconds of drift across one window cannot
+   *     move a row across it.
+   *
+   * ⚠️ No `LIMIT`, and that is deliberate rather than an oversight: the single-issue
+   * forms use `limit(1)` because they answer a boolean about one issue, and a `LIMIT`
+   * here would silently truncate the window and return "unattended" for real
+   * attendance — the harmful direction. The row counts are bounded in practice by the
+   * narrowness of the predicates (three non-terminal run statuses; one wake status;
+   * pending cards inside a 24 h window) over at most one window of issues, all of which
+   * are by construction *stranded* candidates whose runs have already died.
+   *
+   * Both JSONB predicates hit the partial expression indexes on
+   * `(company_id, (context_snapshot ->> 'issueId'))` (migrations 0077 and 0204); the
+   * `= ANY` widening keeps the same leading column and the same expression, so the
+   * index remains usable.
+   */
+  async function readStrandedAttendanceWindow(
+    companyId: string,
+    issueIds: readonly string[],
+  ): Promise<StrandedAttendanceWindow> {
+    const ids = [...issueIds];
+    if (ids.length === 0) {
+      return { executionPath: new Map(), pendingWakeInteractionIssueIds: new Set() };
+    }
+    const interactionCutoff = new Date(Date.now() - PENDING_INTERACTION_MAX_AGE_MS);
+    const [runRows, deferredWakeRows, interactionRows] = await Promise.all([
+      db
+        .select({ issueId: heartbeatRunIssueIdExpr(), agentId: heartbeatRuns.agentId })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            executionPathRunTerms(companyId),
+            inArray(heartbeatRunIssueIdExpr(), ids),
+          ),
+        ),
+      db
+        .select({
+          issueId: deferredExecutionWakeIssueIdExpr(),
+          agentId: agentWakeupRequests.agentId,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            deferredExecutionWakeTerms(companyId),
+            inArray(deferredExecutionWakeIssueIdExpr(), ids),
+          ),
+        ),
+      db
+        .select({ issueId: issueThreadInteractions.issueId })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            pendingWakeInteractionTerms(companyId, interactionCutoff),
+            inArray(issueThreadInteractions.issueId, ids),
+          ),
+        ),
+    ]);
+
+    const executionPath = new Map<string, IssueAttendanceEvidence & { agentIds: Set<string> }>();
+    const note = (issueId: string | null, agentId: string | null) => {
+      // A row whose JSONB key is absent cannot match any requested id, so it is dropped
+      // rather than recorded under a falsy key — the same rows the single-issue form's
+      // equality would never have returned.
+      if (!issueId) return;
+      let evidence = executionPath.get(issueId);
+      if (!evidence) {
+        evidence = { any: false, agentIds: new Set<string>() };
+        executionPath.set(issueId, evidence);
+      }
+      evidence.any = true;
+      if (agentId) evidence.agentIds.add(agentId);
+    };
+    for (const row of runRows) note(row.issueId, row.agentId);
+    for (const row of deferredWakeRows) note(row.issueId, row.agentId);
+
+    return {
+      executionPath,
+      pendingWakeInteractionIssueIds: new Set(interactionRows.map((row) => row.issueId)),
+    };
   }
 
   // PEN-3352: named rather than three adjacent bare `number` positionals. The three
@@ -9150,6 +9280,27 @@ export function recoveryService(
       // projection rather than a reading.
       agentRosterMemoLiveReads: 0,
       agentRosterMemoHits: 0,
+      // Issue-scoped attendance windows loaded vs lookups answered from one (PEN-3636).
+      //
+      // ⚠️ NOT in the same unit as the four fields above, and the adjacency invites
+      // reading them the same way. There, one memo hit is one round-trip removed. Here
+      // the unit is a *lookup*, and each candidate makes two of them (execution path,
+      // then wake interaction) against a single window. The honest reading is at the
+      // window level: master issued 3 queries per candidate in 2 serialized steps, so
+      // the round-trips this pass avoided is
+      // `3 * (candidatesScanned - attendancePrefetchLiveReads)`.
+      // `attendancePrefetchHits` is best read as a health signal — it should sit near
+      // `2 * candidatesScanned` on a healthy database, and collapse toward
+      // `candidatesScanned` as windows start expiring on arrival.
+      //
+      // `attendancePrefetchWindowExpiries` separates a window replaced because the loop
+      // walked off its end (intended) from one replaced because its TTL bound (a slow
+      // database). A pass where the second approaches `attendancePrefetchLiveReads` is
+      // reporting latency, not a mis-sized window — and is also the pass on which the
+      // staleness this optimisation trades for is SMALLEST.
+      attendancePrefetchLiveReads: 0,
+      attendancePrefetchHits: 0,
+      attendancePrefetchWindowExpiries: 0,
       issueIds: [] as string[],
     };
     // Resolved once for the whole pass, not once per candidate. See
@@ -9190,6 +9341,17 @@ export function recoveryService(
     // same reason. See `createAgentRosterMemo` for the freshness trade — it is narrower
     // than the prefilter's, because the subject agent's own row is never memoised.
     const agentRosterMemo = createAgentRosterMemo(db, { now: deps.perPassMemoClockForTest });
+    // The third sibling, and the only one keyed by ISSUE rather than by company — so it
+    // is a forward window over the candidate list rather than a memo. It stands in for
+    // the two attendance reads at the top of every candidate — 3 queries in 2 serialized
+    // steps — which the 2026-10-10 phase timing put at 31.9% of a pass together with
+    // `prologue.getLatestIssueRun`. See `stranded-attendance-prefetch.ts` for the
+    // freshness trade and for why a whole-pass pre-pass was rejected.
+    const attendancePrefetch = createStrandedAttendancePrefetch(
+      readStrandedAttendanceWindow,
+      candidates,
+      { now: deps.perPassMemoClockForTest },
+    );
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -9207,7 +9369,13 @@ export function recoveryService(
         return;
       }
 
-      if (await passTimer.time("prologue.hasActiveExecutionPath", () => hasActiveExecutionPath(
+      // PEN-3636: served from the windowed prefetch, so this phase now measures a map
+      // lookup on most candidates and one bulk load on the rest. ⚠️ Its mean is
+      // therefore NOT comparable to the pre-change mean — the population behind the
+      // phase changed, exactly as `prologue.getLatestIssueRun`'s sample count did when
+      // #2194 inserted an early return above it. Read `attendancePrefetchLiveReads`
+      // against `candidatesScanned` for what the batching actually bought.
+      if (await passTimer.time("prologue.hasActiveExecutionPath", () => attendancePrefetch.hasActiveExecutionPath(
         issue.companyId,
         issue.id,
         issue.status === "in_review" ? agentId : null,
@@ -9216,9 +9384,13 @@ export function recoveryService(
         return;
       }
 
+      // Shares the window the check above loaded, so on a candidate that reached here
+      // this is a map lookup rather than a round-trip — except when the TTL lapses
+      // between the two lookups, which reloads. That exception is the point: it is what
+      // keeps the freshness bound a wall-clock one rather than a per-candidate one.
       if (await passTimer.time(
         "prologue.hasPendingWakeInteraction",
-        () => hasPendingWakeInteraction(issue.companyId, issue.id),
+        () => attendancePrefetch.hasPendingWakeInteraction(issue.companyId, issue.id),
       )) {
         result.skipped += 1;
         return;
@@ -10823,6 +10995,10 @@ export function recoveryService(
     result.pauseHoldPrefilterMemoHits = pauseHoldPrefilterStats.memoHits;
     result.agentRosterMemoLiveReads = agentRosterMemoStats.liveReads;
     result.agentRosterMemoHits = agentRosterMemoStats.memoHits;
+    const attendancePrefetchStats = attendancePrefetch.stats();
+    result.attendancePrefetchLiveReads = attendancePrefetchStats.liveReads;
+    result.attendancePrefetchHits = attendancePrefetchStats.prefetchHits;
+    result.attendancePrefetchWindowExpiries = attendancePrefetchStats.windowExpiries;
     logger.info(
       {
         candidatesScanned: result.candidatesScanned,
@@ -10831,6 +11007,9 @@ export function recoveryService(
         pauseHoldPrefilterMemoHits: result.pauseHoldPrefilterMemoHits,
         agentRosterMemoLiveReads: result.agentRosterMemoLiveReads,
         agentRosterMemoHits: result.agentRosterMemoHits,
+        attendancePrefetchLiveReads: result.attendancePrefetchLiveReads,
+        attendancePrefetchHits: result.attendancePrefetchHits,
+        attendancePrefetchWindowExpiries: result.attendancePrefetchWindowExpiries,
         skipped: strandedLoopSkipped,
         reconcileErrors: result.reconcileErrors,
       },
