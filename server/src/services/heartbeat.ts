@@ -27688,23 +27688,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // identity mismatch at ERROR. Measured 2026-10-10: 295 lines / 3h,
             // 44% of the API's whole ERROR budget, on runs that then finished
             // normally. Nothing is mismatched here and nothing is left to
-            // stamp: the launch callback already wrote external_run_id, and
-            // cleanupTerminalExternalLifecycleJobs owns the Job from here.
+            // stamp: the launch callback already wrote external_run_id. The
+            // finished Job is reclaimed by its own `ttlSecondsAfterFinished`
+            // (agent Job manifests set it), not by the reaper:
+            // cleanupTerminalExternalLifecycleJobs only considers phase=active
+            // Jobs, and this branch fires only for non-active ones.
             // A still-active Job with no reservation is a real orphan and still
             // falls through. Bookkeeping matches the catch so the sweep's
             // liveness view is unchanged.
             const reservationFinalizing = !reservation || reservation.state === "release_pending";
             if (reservationFinalizing && jobStatus?.phase !== "active") {
-              logger.debug(
-                {
-                  runId: run.id,
-                  jobName,
-                  jobUid,
-                  jobPhase: jobStatus?.phase ?? null,
-                  reservationState: reservation?.state ?? "released",
-                },
-                "external-runtime reservation already finalizing for a terminal Job; skipping identity stamp",
-              );
+              // The same condition holds forever for a run whose row never
+              // leaves `running` (postRun or workspace finalize died after the
+              // release). Such a run is skipped by the reap loop below via
+              // ambiguousExternalRunIds, so this line is its only trace: keep
+              // the benign finalize window at debug, and escalate to warn once
+              // the run has been silent past EXTERNAL_LIFECYCLE_STALE_MS.
+              const lastSignalRef = externalLifecycleRecentRefTime(run);
+              const finalizeOverdue = !lastSignalRef || now.getTime() - lastSignalRef >= EXTERNAL_LIFECYCLE_STALE_MS;
+              const skipPayload = {
+                runId: run.id,
+                jobName,
+                jobUid,
+                jobPhase: jobStatus?.phase ?? null,
+                // null = no active reservation row (released); distinct from a
+                // row still in `release_pending`.
+                reservationState: reservation?.state ?? null,
+                silentForMs: lastSignalRef ? now.getTime() - lastSignalRef : null,
+              };
+              if (finalizeOverdue) {
+                logger.warn(
+                  skipPayload,
+                  "external-runtime run still running past the stale window after its reservation finalized; skipping identity stamp",
+                );
+              } else {
+                logger.debug(
+                  skipPayload,
+                  "external-runtime reservation already finalizing for a terminal Job; skipping identity stamp",
+                );
+              }
               ambiguousExternalRunIds.add(run.id);
               jobRunStatuses.delete(run.id);
               continue;

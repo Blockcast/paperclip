@@ -1560,13 +1560,17 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
   // mismatched and nothing was left to stamp.
   const MISMATCH_MESSAGE = "external-runtime reservation Job identity mismatch";
   const FINALIZING_SKIP_MESSAGE = "external-runtime reservation already finalizing for a terminal Job";
+  const FINALIZE_OVERDUE_MESSAGE = "external-runtime run still running past the stale window after its reservation finalized";
 
   async function seedRunningRunWithObservedJob(input: {
     name: string;
     slotId: number;
     reservation:
       | { kind: "released" }
+      | { kind: "release_pending" }
       | { kind: "launched"; expectedJobName: string; jobName: string; jobUid: string };
+    // Last run activity. Defaults to now, i.e. inside the stale window.
+    lastActivityAt?: Date;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1598,7 +1602,8 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       invocationSource: "assignment",
       triggerDetail: "system",
       status: "running",
-      startedAt: new Date(),
+      startedAt: input.lastActivityAt ?? new Date(),
+      createdAt: input.lastActivityAt ?? new Date(),
       contextSnapshot: {},
     });
 
@@ -1628,6 +1633,19 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
         jobUid: `uid-${runId.slice(0, 8)}`,
         releasedAt: new Date(),
         releaseReason: "job_terminal_or_missing",
+      });
+    } else if (input.reservation.kind === "release_pending") {
+      // The reconciler has started the release but not finished it: the row is
+      // still active (released_at NULL), so getActiveExternalRuntimeReservation
+      // returns it, and the stamp would throw `is not launchable from
+      // release_pending` rather than `No active external-runtime reservation`.
+      await db.insert(externalRuntimeReservations).values({
+        ...common,
+        state: "release_pending",
+        expectedJobName: `ac-${runId.slice(0, 8)}`,
+        jobName: `ac-${runId.slice(0, 8)}`,
+        jobUid: `uid-${runId.slice(0, 8)}`,
+        releasedAt: null,
       });
     } else {
       await db.insert(externalRuntimeReservations).values({
@@ -1666,35 +1684,107 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       },
     ]);
 
-    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
-    const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
-    let mismatches: unknown[][] = [];
-    let skips: unknown[][] = [];
-    try {
-      await heartbeat.reapOrphanedRuns();
-      // Snapshot BEFORE restoring: mockRestore() also clears mock.calls, so a
-      // post-restore read makes every "was not logged" assertion vacuous.
-      mismatches = callsMatching(errorSpy, MISMATCH_MESSAGE);
-      skips = callsMatching(debugSpy, FINALIZING_SKIP_MESSAGE);
-    } finally {
-      errorSpy.mockRestore();
-      debugSpy.mockRestore();
-    }
+    const { mismatches, skips, overdue } = await reapCapturingFinalizeLogs();
 
     // The load-bearing assertion: this benign window contributes nothing to the
     // error rate. Fails on the parent commit, where it logs once per reap tick.
     expect(mismatches).toEqual([]);
 
     // ...but it stays observable at debug, naming the condition that identified
-    // it in production.
+    // it in production. `null` is the no-active-row sentinel: a literal
+    // "released" fallback could not be told apart from a real row state.
     expect(skips).toHaveLength(1);
     expect(skips[0][0]).toMatchObject({
       runId,
       jobName,
       jobUid,
       jobPhase: "succeeded",
-      reservationState: "released",
+      reservationState: null,
     });
+    // Inside the stale window the skip is quiet: nothing above debug.
+    expect(overdue).toEqual([]);
+  }, 120_000);
+
+  async function reapCapturingFinalizeLogs() {
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
+    try {
+      await heartbeat.reapOrphanedRuns();
+      // Snapshot BEFORE restoring: mockRestore() also clears mock.calls, so a
+      // post-restore read makes every "was not logged" assertion vacuous.
+      return {
+        mismatches: callsMatching(errorSpy, MISMATCH_MESSAGE),
+        skips: callsMatching(debugSpy, FINALIZING_SKIP_MESSAGE),
+        overdue: callsMatching(warnSpy, FINALIZE_OVERDUE_MESSAGE),
+      };
+    } finally {
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
+  }
+
+  function terminalJobFor(input: { runId: string; agentId: string }) {
+    return {
+      phase: "succeeded" as const,
+      reason: null,
+      message: null,
+      runId: input.runId,
+      agentId: input.agentId,
+      name: `ac-${input.runId.slice(0, 8)}`,
+      uid: `uid-${input.runId.slice(0, 8)}`,
+      createdAt: new Date(),
+    };
+  }
+
+  it("does not log an identity mismatch while the reservation is still release_pending (BLO-29133)", async () => {
+    const { agentId, runId } = await seedRunningRunWithObservedJob({
+      name: "TerminalJobReleasePendingCo",
+      slotId: 0,
+      reservation: { kind: "release_pending" },
+    });
+    mockListManagedAgentJobs.mockResolvedValue([terminalJobFor({ runId, agentId })]);
+
+    const { mismatches, skips, overdue } = await reapCapturingFinalizeLogs();
+
+    // The reconciler has started but not finished the release. Without the
+    // release_pending arm of the guard this lands in the catch via
+    // recordExternalRuntimeJobIdentity's `is not launchable from` throw.
+    expect(mismatches).toEqual([]);
+    expect(skips).toHaveLength(1);
+    expect(skips[0][0]).toMatchObject({
+      runId,
+      jobPhase: "succeeded",
+      reservationState: "release_pending",
+    });
+    expect(overdue).toEqual([]);
+  }, 120_000);
+
+  it("escalates the finalizing skip to warn once the run is silent past the stale window (BLO-29133)", async () => {
+    // The same condition holds forever for a run whose row never leaves
+    // `running` (postRun or workspace finalize died after the release). The
+    // reap loop skips it as ambiguous, so this line is its only trace.
+    const { agentId, runId } = await seedRunningRunWithObservedJob({
+      name: "TerminalJobFinalizeOverdueCo",
+      slotId: 0,
+      reservation: { kind: "released" },
+      // RUN_STALE_SILENCE_MS (EXTERNAL_LIFECYCLE_STALE_MS) is 15 min.
+      lastActivityAt: new Date(Date.now() - 20 * 60 * 1000),
+    });
+    mockListManagedAgentJobs.mockResolvedValue([terminalJobFor({ runId, agentId })]);
+
+    const { mismatches, skips, overdue } = await reapCapturingFinalizeLogs();
+
+    expect(mismatches).toEqual([]);
+    expect(skips).toEqual([]);
+    expect(overdue).toHaveLength(1);
+    expect(overdue[0][0]).toMatchObject({
+      runId,
+      jobPhase: "succeeded",
+      reservationState: null,
+    });
+    expect((overdue[0][0] as { silentForMs: number }).silentForMs).toBeGreaterThanOrEqual(20 * 60 * 1000);
   }, 120_000);
 
   it("still logs a real Job-name divergence at error, naming the reservation and slot (BLO-29133)", async () => {
