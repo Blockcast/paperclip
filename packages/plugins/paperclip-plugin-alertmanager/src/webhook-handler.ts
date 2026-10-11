@@ -2902,20 +2902,40 @@ export async function handleFiring(
   // above records `assigneeResolutionSource = "aggregate-winner"` in as many
   // words — so the winner keeps whatever owner it was created with forever.
   // Retrofit here, on the same terms as the re-fire path.
-  const retrofit =
-    created || terminal
-      ? null
-      : await retrofitAggregateOwner(
-          ctx,
-          config,
-          alert,
-          companyId,
-          aggregateKey,
-          firingToken,
-          issue.id,
-          issue,
-          rosterMemo,
-        );
+  //
+  // Tolerated exactly like the re-fire call site: a failed retrofit must not
+  // abort the delivery. Unguarded, any throw here propagates to `handleWebhook`,
+  // which classifies everything but `PermanentAlertError` as transient and
+  // re-throws `AlertDeliveryIncompleteError` for the WHOLE batch — so one row
+  // the host refuses to write destroys every unrelated alert batched alongside
+  // it. That amplifier is the expensive half of BLO-42811; clearing the user
+  // above removes the trigger we measured, this removes the amplification.
+  // Retrofit is best-effort by construction — it already returns `null` for
+  // every "nothing to do" case, and `null` falls through to the row's existing
+  // owner below, which is exactly the right state when no patch committed.
+  // Only a lost generation stays fatal.
+  let retrofit: { assigneeAgentId: string | null; assigneeUserId: string | null } | null =
+    null;
+  if (!created && !terminal) {
+    try {
+      retrofit = await retrofitAggregateOwner(
+        ctx,
+        config,
+        alert,
+        companyId,
+        aggregateKey,
+        firingToken,
+        issue.id,
+        issue,
+        rosterMemo,
+      );
+    } catch (err) {
+      if (err instanceof AggregateGenerationLostError) throw err;
+      ctx.logger.warn(
+        `Failed to retrofit owner onto issue ${issue.id} on aggregate join: ${String(err)}`,
+      );
+    }
+  }
   // A non-null `retrofit` is the row's full post-patch owner state, so it is
   // read whole rather than coalesced field-by-field (BLO-42811).
   const effectiveAssigneeUserId = created
