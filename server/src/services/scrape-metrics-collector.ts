@@ -29,6 +29,7 @@ import { logger } from "../middleware/logger.js";
 import { describeHeldAgentStartLocks } from "./agent-start-lock.js";
 import { refreshExternalRuntimeReservationMetrics } from "./external-runtime-reservations.js";
 import { refreshExternalRuntimeReservationStrandMetrics } from "./external-runtime-reservation-strand-metrics.js";
+import { refreshApprovalQueueMetrics } from "./approval-queue-metrics.js";
 import {
   refreshDeferredIssueExecutionWakeAgeMetrics,
   refreshOverdueScheduledRetryAgeMetrics,
@@ -38,6 +39,7 @@ import {
 import { refreshRoutineFireGapMetrics } from "./routine-fire-gap-metrics.js";
 import {
   setAgentStartLockHeldMetrics,
+  setApprovalQueueMetricsRefreshSuccess,
   setDbPoolStats,
   setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
   setExternalRuntimeReservationStrandMetricsRefreshSuccess,
@@ -119,6 +121,15 @@ const REFRESHES: readonly ScrapeRefresh[] = [
     name: "external-runtime-reservation-strand",
     run: (db) => refreshExternalRuntimeReservationStrandMetrics(db),
     setFresh: setExternalRuntimeReservationStrandMetricsRefreshSuccess,
+  },
+  {
+    // BLO-29850. Not a run-table refresh and not a queue the platform serves at
+    // all: the board approval queue is served by humans, so every refresh above
+    // is blind to it. It stopped for 3.2 days with 39 cards filed into it and
+    // nothing could tell that apart from an empty queue.
+    name: "approval-queue",
+    run: (db) => refreshApprovalQueueMetrics(db),
+    setFresh: setApprovalQueueMetricsRefreshSuccess,
   },
 ];
 
