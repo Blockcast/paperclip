@@ -1268,7 +1268,7 @@ PEN-3895). On `/log` the empty case arrives as `404 Run log not found`, so the
 finished run books one row per poll, and "who read this run's transcript"
 over-reports by however often that client happened to re-poll.
 
-**The `denied` row is unconditional on every one of the three actions**, empty
+**The `denied` row is unconditional on all three REST routes**, empty
 page or not. A denial records an *attempt*, which happened regardless of what
 the read would have returned — and `/events` got its denied-path audit in
 PEN-3142 precisely because it had none, so suppressing it on an empty page would
