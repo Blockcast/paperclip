@@ -2126,6 +2126,109 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
   });
 
+  it("does not let an agent self-appoint onto a review shell in another company", async () => {
+    // Ally on #2479 at 1bc9a2b7: the scoped `loadIssue` made "foreign" and
+    // "absent" indistinguishable at a third converted site,
+    // `recoveryOrReviewIssueBlocksUnassignedAgentClaim`, which got no guard
+    // because the prior commit judged it to "want null-means-nothing". It does
+    // not: an unreadable row yielded `?.originKind ?? null`, and
+    // `DENIED_ORIGIN_KINDS.has("")` is `false` — "not a review shell", the
+    // permissive answer.
+    //
+    // This is the path that matters. The guard gates the self-appointment deny
+    // inside the `tasks:assign` block, and `tasks:assign` is exactly what
+    // `previewAssignment` / `explainAssignment` (plugin-host-services.ts:3350,
+    // 3366) pass to `decide()` — with `{ companyId: params.companyId,
+    // ...params.target }`, so companyId and issueId are both caller-supplied,
+    // can disagree by construction, and `originKind` is not among the fields
+    // `params.target` carries. Neither sibling guard covers it: the low-trust
+    // boundary sees `tasks:assign` only for a low-trust actor, and the
+    // task-bridge boundary needs a keyScope `pluginAssignmentActor` never emits.
+    const company = await createCompany(db, "SelfAppointForeignShellPointer");
+    const foreignCompany = await createCompany(db, "SelfAppointForeignShellSource");
+    const actor = await createAgent(db, company.id, { role: "engineer" });
+    const other = await createAgent(db, foreignCompany.id, { role: "engineer" });
+    const authorization = authorizationService(db);
+    const actorContext = { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_key" } as const;
+
+    const foreignSource = await createIssue(db, foreignCompany.id, {
+      title: "Source issue in another company",
+      assigneeAgentId: other.id,
+      originKind: "manual",
+    });
+    const foreignReview = await createIssue(db, foreignCompany.id, {
+      title: "Orphaned productivity review in another company",
+      assigneeAgentId: null,
+      originKind: "issue_productivity_review",
+      originId: foreignSource.id,
+    });
+
+    // The finding: companyId is the actor's, issueId names a shell the actor's
+    // company cannot read, and no originKind is supplied — the exact shape the
+    // plugin callers produce. Unreadable must mean blocking, not "no origin
+    // kind". Before the guard this fell through to the ordinary assignment path.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: foreignReview.id,
+        assigneeAgentId: actor.id,
+        currentAssigneeAgentId: null,
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // A dangling issueId takes the same branch, and must answer the same way.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: randomUUID(),
+        assigneeAgentId: actor.id,
+        currentAssigneeAgentId: null,
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // CONTROL, on the readable path — without it this test would pass on a
+    // guard that denied every self-claim, which is the regression that would
+    // shut ordinary checkout fleet-wide.
+    const ownIssue = await createIssue(db, company.id, {
+      title: "Ordinary issue in the actor's own company",
+      assigneeAgentId: null,
+      originKind: "manual",
+    });
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: ownIssue.id,
+        assigneeAgentId: actor.id,
+        currentAssigneeAgentId: null,
+      },
+    })).resolves.toMatchObject({ allowed: true });
+
+    // CONTROL on the caller-supplied short-circuit: a supplied `originKind` is
+    // still answered without a row read, so the `undefined` / `null`
+    // distinction the branch is built around survives the guard.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: foreignReview.id,
+        assigneeAgentId: actor.id,
+        currentAssigneeAgentId: null,
+        originKind: null,
+      },
+    })).resolves.toMatchObject({ allowed: true });
+  });
+
   it("does not let an agent self-appoint onto a review shell through tasks:assign", async () => {
     // The `issue:mutate` deny above closes the PATCH door. The door agents
     // actually claim work through is POST /issues/:id/checkout, which
