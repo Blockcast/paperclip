@@ -136,7 +136,7 @@ describe("paperclip MCP tools", () => {
       // Keyed on the hazard, not on retired wording: the only completeness
       // "proof" the description may state is the one conditioned on the fix.
       expect(limitDescription.match(/the proof/g)).toHaveLength(1);
-      expect(limitDescription).toMatch(/with the BLO-39015 fix a plain array back is the proof/);
+      expect(limitDescription).toMatch(/with the BLO-33741 fix a plain array back is the proof/);
       // The default path (no `limit` sent) is a named case of the tell.
       expect(limitDescription).toContain("500 if you sent none");
       // The short-page stop is sound only for a company-scope reader: the
