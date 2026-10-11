@@ -2399,6 +2399,59 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
     );
   });
 
+  // BLO-42811 (Ally review 5481954446 I1) — the USER branch writes
+  // `{ assigneeUserId }` alone. It is reached only when the row as read has
+  // neither owner, so `assigneeAgentId: null` would be a no-op against that row
+  // and would silently clear an agent assigned between the read and the fenced
+  // write; without the field, the host's single-assignee rejection backstops
+  // that race. The window is widest here, where the row was read during the
+  // winner lookup rather than just before the write.
+  it("assigns the annotated user to an ownerless aggregate row without writing assigneeAgentId", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.users.findByEmail.mockResolvedValue({ id: "user-oncall" });
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-winner",
+      status: "backlog",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }));
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ ownerMap: {} }),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [
+            {
+              ...OWNER_ANNOTATION_ALERT("oncall@example.com"),
+              fingerprint: "second-member-1",
+            },
+          ],
+        }),
+      }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(assigneePatches(mocks)).toEqual([{ assigneeUserId: "user-oncall" }]);
+    // The return still widens to the full owner state, so state records an
+    // explicit agent-null rather than an absent field.
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        paperclipIssueId: "issue-winner",
+        assigneeAgentId: null,
+        assigneeUserId: "user-oncall",
+      }),
+      FIRING_FENCE_ARG,
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.retrofitted",
+      1,
+      { alertname: "CiliumPolicyDropsHigh", target: "user" },
+    );
+  });
+
   // BLO-42811 — the AMPLIFIER, not the trigger. The test above pins the patch
   // shape, which removes the one rejection we measured. This one pins what
   // happens when the host refuses the write for ANY reason: the aggregate-join
