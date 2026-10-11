@@ -297,6 +297,53 @@ function classIndex(value: string): number {
   return [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(value)).length;
 }
 
+/**
+ * BLO-41153: a fully-qualified gRPC method path is a wire identifier, not a
+ * credential, and `isLexicalIdentifier` cannot reach it.
+ *
+ * `/magma.orc8r.Bootstrapper/GetChallenge`, bound to a `method` key, scores
+ * 4.05 bits/char and is refused. (Every mention of that binding in this file
+ * and its tests keeps a space around the `=`, or builds the pair at runtime:
+ * written out contiguously it is the very material the unfixed rule refuses,
+ * so the fix for the false positive could not be pushed past the false
+ * positive. Same convention as the PEN-3907 and BLO-41262 fixtures.)
+ *
+ * It fails the lexical exemption three separate ways, so loosening that
+ * rule's constants is not the fix: `/` is not one of its separators,
+ * `orc8r` is neither a plain word nor a plain number, `Bootstrapper` and
+ * `GetChallenge` are two segments over LEXICAL_LONG_SEGMENT_LENGTH, and the
+ * segments sum to 34 against a cap of 30. Each of those bounds is load-bearing
+ * against random letter runs and must stay where it is.
+ *
+ * So this is a separate shape rather than a widened one, and it is anchored so
+ * tightly that no credential ENCODING can reach it: the value must be
+ * slash-rooted, carry at least one `.` inside the package, then exactly one
+ * more `/`, with every run starting with a letter and holding only
+ * `[A-Za-z0-9]`. base64url has no `.` and no `/`; standard base64 and hex have
+ * no `.` either. A JWT has dots but no slash, and decodes under its own
+ * detector first.
+ *
+ * The dot is the conjunct carrying the security argument, and it is the one to
+ * leave alone: without it a standard-base64 secret beginning with `/` — 1 in
+ * 64 of them — walks through. The letter-initial runs are shape hygiene after
+ * that, mirroring proto identifier rules; each is pinned by a failing mutation
+ * in the test file so the narrowing is not merely a comment.
+ *
+ * Shape alone, with no name conjunction — unlike `isContentDigestAssignment`,
+ * where bare hex IS a real credential shape (`SECRET_KEY=<64 hex>`) and the
+ * name has to carry half the decision. Nothing of this shape is a credential,
+ * and a name list would drift: the same path is bound to `method`, `rpc`,
+ * `grpc_method` and `full_method` across the fleet's runbooks and alert rules,
+ * and the first name nobody enumerated reproduces this false positive.
+ *
+ * The trailing method is optional because a grep pattern legitimately stops at
+ * the service — `grep -c 'method = /magma.orc8r.Bootstrapper/'` (modulo the
+ * spacing convention above) is BLO-41153's own verifying signal, and under the
+ * unfixed rule the runbook documenting that command could not be pushed.
+ */
+const GRPC_METHOD_PATH_RE =
+  /^\/[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+\/(?:[A-Za-z][A-Za-z0-9]*)?$/;
+
 /** A value is "opaque" when it is long, drawn from a token alphabet and from
  *  at least two character classes, is not a hyphenated identifier, and has
  *  high per-character entropy. Deliberately narrow: applied only to
@@ -308,6 +355,7 @@ function isOpaqueSecretValue(value: string): boolean {
   if (!/^[A-Za-z0-9+/=_.\-]+$/.test(value)) return false;
   if (classIndex(value) < 2) return false;
   if (isLexicalIdentifier(value)) return false;
+  if (GRPC_METHOD_PATH_RE.test(value)) return false;
   return shannonEntropyBitsPerChar(value) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR;
 }
 
