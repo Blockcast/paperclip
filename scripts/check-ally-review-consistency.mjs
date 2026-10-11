@@ -470,6 +470,23 @@ function structuredVerdict(rawText) {
   const counts = severityCountsIn(parsed?.findings);
   const stillPresent = stillPresentIn(parsed?.dispositions);
   if (counts === null || stillPresent === null) return { kind: "unreadable" };
+  // The third field the payload carries (BLO-34389), held to the rule the other
+  // two are. This auditor never reads the lane, but readability is a property
+  // of the block rather than of the field a given reader uses: a `reviewer` the
+  // gate rejects would leave the gate red on `unreadable_verdict` while this
+  // reader called the same body `ok` and reported the disagreement as a
+  // violation — the divergence both files exist to prevent, with an extra false
+  // finding on top.
+  //
+  // Absent stays readable, deliberately: every review posted before the field
+  // existed declares nothing. `=== undefined` matches the gate's own test, and
+  // is exact here because JSON cannot carry an explicit `undefined` — a stated
+  // `null` is a field Ally tried to write and nothing could read, which fails
+  // closed in all three readers.
+  const reviewer = parsed?.reviewer;
+  if (reviewer !== undefined && (typeof reviewer !== "string" || !reviewer.trim())) {
+    return { kind: "unreadable" };
+  }
   const crossCheckText = withoutFencedSpans(rawText, true);
   if (proseCountContradicts(crossCheckText, counts)) return { kind: "unreadable" };
   // The same rule on the other field, mirroring proseDispositionContradicting

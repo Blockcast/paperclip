@@ -697,6 +697,36 @@ describe("attestedHead", () => {
     const dispositions = ',"dispositions":[{"head":"abc1234","severity":"critical","index":1,"verb":"still-present"}]';
     assert.equal(attestedHead(ledgered(dispositions, "still-present")), HEAD);
   });
+
+  // BLO-34389 — the third field, and the third instance of this same defect.
+  // The gate fails a present-but-unreadable `reviewer` closed; left unmirrored,
+  // this reader called the identical body `ok`, so the gate went red on
+  // `unreadable_verdict` while the auditor whose whole job is to notice that
+  // disagreement reported the disagreement as a violation instead.
+  const reviewered = (reviewer) =>
+    [
+      `<!-- ally-verdict:1\n{"head":"${HEAD}","findings":{"critical":0,"important":0},"reviewer":${reviewer}}\n-->`,
+      "",
+      "## Ally — Consolidated PR Review",
+    ].join("\n");
+
+  it("fails closed on a present-but-malformed reviewer lane, as the gate does", () => {
+    // The five shapes the gate enumerates, and the ones a model emits when it
+    // is unsure which lane it is — `null` most of all.
+    for (const reviewer of ["null", "7", '""', '"   "', '{"lane":"ally"}']) {
+      assert.equal(attestedHead(reviewered(reviewer)), null, reviewer);
+    }
+  });
+
+  it("control: an absent or well-formed reviewer lane still attests", () => {
+    // ABSENT is the permissive direction on purpose: every review posted before
+    // the field existed declares no lane, so failing those closed would wedge
+    // the whole open-PR population red with no route out.
+    assert.equal(attestedHead(ledgered(',"dispositions":[]', "fixed")), HEAD);
+    for (const reviewer of ['"ally@paperclip.blockcast.net"', '"  Staff-Engineer "']) {
+      assert.equal(attestedHead(reviewered(reviewer)), HEAD, reviewer);
+    }
+  });
 });
 
 describe("operativeAllyReviews", () => {
