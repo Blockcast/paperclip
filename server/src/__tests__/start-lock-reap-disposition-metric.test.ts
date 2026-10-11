@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  AGENT_START_LOCK_PHASE_SECONDS_METRIC,
   AGENT_START_LOCK_REAP_DISPOSITION_METRIC,
   KNOWN_START_LOCK_REAP_DISPOSITIONS,
   __resetMetricsForTest,
@@ -99,5 +100,36 @@ describe("recordStartLockReapDisposition", () => {
     expect(await readDispositionCount("timed_out")).toBeNull();
     recordStartLockReapDisposition("timed_out");
     expect(await readDispositionCount("timed_out")).toBe(1);
+  });
+
+  it("renders a /metrics exposition whose HELP text cannot be mistaken for a sample", async () => {
+    // Exposition-level, not metric-local: a HELP line is rendered whether or
+    // not the metric has series, so help text added to ONE metric can break an
+    // assertion about ANOTHER. This counter's help once read
+    // `<phase metric>{phase="reap"}`, which failed the
+    // `not.toContain(\`${AGENT_START_LOCK_PHASE_SECONDS_METRIC}{\`)` check in
+    // agent-start-lock-liveness.test.ts with zero phase series present, and no
+    // metric-local assertion could see it. Parse the same body the /metrics
+    // route serves (renderMetrics).
+    //
+    // ponytail: scoped to this metric's HELP line. The registry-wide form of
+    // the second check currently flags 3 pre-existing HELP lines owned by other
+    // metrics (github_review_request_*, isolation_workspace_reaper_deleted);
+    // widen it once those are rewritten.
+    const { body } = await renderMetrics();
+    const lines = body.split("\n");
+    const names = lines.flatMap((line) => /^# TYPE (\S+) /.exec(line)?.[1] ?? []);
+    // Positive controls, so an empty result is not the parser seeing nothing.
+    expect(names).toContain(AGENT_START_LOCK_REAP_DISPOSITION_METRIC);
+    expect(names).toContain(AGENT_START_LOCK_PHASE_SECONDS_METRIC);
+    const help = lines.filter((line) =>
+      line.startsWith(`# HELP ${AGENT_START_LOCK_REAP_DISPOSITION_METRIC} `),
+    );
+    expect(help).toHaveLength(1);
+    expect(help[0]).toContain(AGENT_START_LOCK_PHASE_SECONDS_METRIC);
+
+    // No phase series exists in this test, so the selector must appear nowhere.
+    expect(body).not.toContain(`${AGENT_START_LOCK_PHASE_SECONDS_METRIC}{`);
+    expect(names.filter((name) => help[0].includes(`${name}{`))).toEqual([]);
   });
 });
