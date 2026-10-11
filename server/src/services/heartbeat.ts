@@ -40371,6 +40371,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     alreadyDelivered: boolean;
   };
 
+  /**
+   * Shape a wake-dispatch failure for durable storage (BLO-18877).
+   *
+   * Both records a failed dispatch leaves behind -- the inline safety net's
+   * `payload.dispatchRetry.lastError` and the reconciler's terminal
+   * `dispatch_failed_exhausted` `error` -- used to persist `err.message` raw.
+   * For a drizzle write failure that message is the "Failed query" wrapper with
+   * every bind param inlined and *no* SQLSTATE: the code that actually explains
+   * the failure hangs off `.cause`. The three rows dead-lettered on 2026-07-23
+   * recorded only `update "issues" set "execution_run_id" = $1 ...` plus their
+   * params, which cannot distinguish a constraint violation from a lock timeout
+   * from a serialization failure -- so that incident was undiagnosable after
+   * the fact, and a dead-letter queue you cannot read is a queue nobody drains.
+   *
+   * Same shaping as the run-finalization path (BLO-19085): keep the cause, drop
+   * the params. Non-database errors fall through to their own message
+   * unchanged, so HttpError business-rule text is untouched.
+   */
+  function describeWakeDispatchError(err: unknown): string {
+    return isDbError(err)
+      ? describeDbError(err, "wake dispatch failed")
+      : err instanceof Error
+        ? err.message
+        : String(err);
+  }
+
   async function wakeupWithDispatchRetry(agentId: string, opts: WakeupOptions = {}) {
     const githubReviewReason = githubPrReviewWakeReason(opts);
     // Filled in by enqueueWakeup's writeSkippedRequest when a gate declines the
@@ -40469,7 +40495,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               attempts: 0,
               nextAttemptAt: new Date(Date.now() + DISPATCH_RETRY_RECONCILE_BACKOFF_MS[0]).toISOString(),
               originalOpts: safeJson(opts, { unserializable: true, reason: opts.reason ?? null, source: opts.source ?? null }),
-              lastError: lastError instanceof Error ? lastError.message : String(lastError),
+              lastError: describeWakeDispatchError(lastError),
             },
           },
           status: "dispatch_failed",
@@ -40835,7 +40861,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (attempts >= DISPATCH_RETRY_MAX_ATTEMPTS) {
           const fenced = await finishClaimedRow({
             status: "dispatch_failed_exhausted",
-            error: err instanceof Error ? err.message : String(err),
+            error: describeWakeDispatchError(err),
             finishedAt: now,
             updatedAt: now,
           });
