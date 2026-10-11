@@ -5,6 +5,11 @@
   "compilerOptions": {
     "noEmit": true
   },
-  "include": ["src/__tests__/pr-comment-review-gate.test.ts"],
+  "include": [
+    "src/__tests__/pr-comment-review-gate.test.ts",
+    "src/__tests__/scrape-metrics-routine-fire-gap-work.test.ts",
+    "src/__tests__/zoned-cron-equivalence.test.ts",
+    "src/__tests__/zoned-cron-work-bound.test.ts"
+  ],
   "exclude": ["node_modules", "dist"]
 }
