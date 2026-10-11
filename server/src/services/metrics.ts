@@ -1112,8 +1112,13 @@ export const AGENT_START_LOCK_REAP_DISPOSITION_METRIC =
  * which is the same invisible-failure shape the counter exists to remove.
  *
  * `nested` is worth reading separately rather than folding into `ran`: it is
- * the ONLY disposition that does not pass through `awaitStartLockSweepBounded`,
- * so it is the only one whose `phase="reap"` hold can exceed the bound at all.
+ * the only disposition that WAITS on a sweep without
+ * `awaitStartLockSweepBounded`, so while the bound is enabled it is the only
+ * one whose `phase="reap"` hold can exceed it. (`skipped_fresh` also skips the
+ * bound, but returns synchronously, so its hold cannot be long.) Disabling the
+ * bound (`AGENT_START_LOCK_REAP_WAIT_BOUND_MS=0`) removes that guarantee for
+ * every disposition: `ran` and `joined` then wait unbounded too, and
+ * `timed_out` is never emitted.
  */
 export const KNOWN_START_LOCK_REAP_DISPOSITIONS = [
   "ran",
@@ -4106,11 +4111,15 @@ function ensureRegistry(): {
         + "logs cannot supply because the per-disposition debug line is below the deployed "
         + "level and the surviving warn line is gated on the hold budget, so it records a "
         + "complete timed_out numerator against no denominator. disposition='nested' is the "
-        + "only path that skips the wait bound, so it is the only one whose "
+        + "only one that WAITS on a sweep without the wait bound, so while the bound is "
+        + "enabled it is the only one whose "
         // No `{` after the metric name: HELP text must not look like a sample line,
         // or a substring assertion over the exposition (and a human grep) will
         // match it. Guarded by start-lock-reap-disposition-metric.test.ts.
-        + AGENT_START_LOCK_PHASE_SECONDS_METRIC + " phase=\"reap\" hold can exceed it. "
+        + AGENT_START_LOCK_PHASE_SECONDS_METRIC + " phase=\"reap\" hold can exceed it "
+        + "(skipped_fresh also skips the bound but returns synchronously). "
+        + "AGENT_START_LOCK_REAP_WAIT_BOUND_MS=0 disables the bound for every disposition: "
+        + "ran and joined then wait unbounded too and timed_out is never emitted. "
         + "Not pre-seeded: an absent series means never incremented, so pair any zero reading "
         + "with a populated sibling disposition before concluding no bails occurred rather "
         + "than no scrape.",
