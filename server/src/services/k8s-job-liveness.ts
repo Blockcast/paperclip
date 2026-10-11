@@ -433,15 +433,29 @@ function readNumericField(value: unknown, key: string): number | null {
   return typeof candidate === "number" ? candidate : null;
 }
 
-function isKubernetesNotFoundError(error: unknown) {
-  if (readNumericField(error, "code") === 404 || readNumericField(error, "statusCode") === 404) {
+function isKubernetesStatusError(error: unknown, status: number) {
+  if (readNumericField(error, "code") === status || readNumericField(error, "statusCode") === status) {
     return true;
   }
   const response = error && typeof error === "object"
     ? (error as Record<string, unknown>).response
     : null;
-  return readNumericField(response, "statusCode") === 404 ||
-    readNumericField(response, "status") === 404;
+  return readNumericField(response, "statusCode") === status ||
+    readNumericField(response, "status") === status;
+}
+
+function isKubernetesNotFoundError(error: unknown) {
+  return isKubernetesStatusError(error, 404);
+}
+
+/**
+ * A DELETE carrying `preconditions.uid` that no longer matches is rejected
+ * 409 Conflict and the object survives untouched (measured on k8s v1.35.3,
+ * BLO-17291). That is the success case for the precondition, not a failure of
+ * the reaper, so callers log it distinctly rather than as a delete error.
+ */
+function isKubernetesConflictError(error: unknown) {
+  return isKubernetesStatusError(error, 409);
 }
 
 export function classifyAgentJobRunStatus(job: k8s.V1Job): AgentJobRunStatus {
@@ -947,6 +961,22 @@ export async function listLiveAgentJobRunIds(): Promise<Set<string> | null> {
  * Returns the number of Jobs deleted, or null when the kube API is unavailable
  * or fails. Caller should treat null as best-effort (the run still gets the
  * status flip; the operator may have to clean the Job by hand).
+ *
+ * BLO-27156: each delete carries `preconditions.uid` taken from the listing
+ * above, closing the list->delete window. The agent Job name is derived from
+ * the run id (`agent-opencode-<runId>`), so a Job torn down and recreated for
+ * the same run reuses the same name -- without the precondition a DELETE
+ * aimed at the predecessor destroys the live replacement instead. With it,
+ * Kubernetes rejects that DELETE 409 and the replacement survives.
+ *
+ * Deliberately NOT narrowed at the call site instead. The caller
+ * (`cleanupTerminalExternalLifecycleJobs`) reaches this only for a run that is
+ * already DB-terminal AND whose reservation identity failed to reconcile, and
+ * the whole point of the run-id fallback is that no exact identity is left to
+ * match on; requiring one would reintroduce the BLO-16473 leak where a
+ * terminal-but-live Job wedges `hasActiveJobForAgent` forever. The
+ * run-id-scoped sweep is the intended breadth -- it just needed to be
+ * point-in-time honest about WHICH objects it had actually observed.
  */
 export async function deleteAgentJobsForRun(runId: string): Promise<number | null> {
   if (!runId) return 0;
@@ -964,18 +994,40 @@ export async function deleteAgentJobsForRun(runId: string): Promise<number | nul
     let deleted = 0;
     for (const job of list.items ?? []) {
       const name = job.metadata?.name;
+      const uid = job.metadata?.uid;
       if (!name) continue;
+      // A listed object always carries a uid. Refusing rather than deleting
+      // unconditionally keeps this path fail-closed like every other exact
+      // delete in this module: identity doubt never licenses a delete.
+      if (!uid) {
+        logger.warn(
+          { runId, jobName: name },
+          "k8s deleteAgentJobsForRun: listed Job has no uid; refusing to delete without a precondition",
+        );
+        continue;
+      }
       try {
         await state.batchApi.deleteNamespacedJob(
           {
             name,
             namespace: PAPERCLIP_K8S_NAMESPACE,
+            // Background propagation is load-bearing: batch/v1 defaults to
+            // OrphanDependents, which strips the pod's ownerReferences and
+            // strands it permanently (BLO-28008). Do not drop it.
             propagationPolicy: "Background",
+            body: { preconditions: { uid } },
           },
           requestOptionsWithTimeout(),
         );
         deleted += 1;
       } catch (error) {
+        if (isKubernetesConflictError(error)) {
+          logger.warn(
+            { runId, jobName: name, uid },
+            "k8s deleteAgentJobsForRun: uid precondition rejected the delete; a replacement Job now holds this name and was left alone",
+          );
+          continue;
+        }
         logger.warn(
           { runId, jobName: name, error: error instanceof Error ? error.message : String(error) },
           "k8s deleteAgentJobsForRun: per-job delete failed",
