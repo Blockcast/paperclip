@@ -25,6 +25,15 @@ export function parseClaudeStreamJson(stdout: string) {
   // event arrived — indicates the run was truncated mid-stream (pod terminated,
   // OOMKill, or claude CLI crash after producing content).
   let assistantContentSeen = false;
+  // Every server from --mcp-config, with the connection status the CLI reached.
+  // A server that never connects is reported here as `pending`/`failed` rather
+  // than omitted, so this is the only surface on which a declared-but-dead MCP
+  // server is distinguishable from one that was never declared. An absent tool
+  // namespace alone cannot make that distinction, which is what let a configured
+  // server go missing unnoticed across three runs and two months (BLO-43344).
+  // Empty when the CLI emits no `mcp_servers`, so a version that does not report
+  // it stays silent rather than reporting every server as failed.
+  let mcpServers: { name: string; status: string }[] = [];
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -36,6 +45,15 @@ export function parseClaudeStreamJson(stdout: string) {
     if (type === "system" && asString(event.subtype, "") === "init") {
       sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
       model = asString(event.model, model);
+      // Replace rather than append: a resumed session emits a fresh init whose
+      // statuses supersede the earlier one.
+      if (Array.isArray(event.mcp_servers)) {
+        mcpServers = event.mcp_servers.flatMap((entry) => {
+          const server = parseObject(entry);
+          const name = asString(server.name, "");
+          return name ? [{ name, status: asString(server.status, "unknown") }] : [];
+        });
+      }
       continue;
     }
 
@@ -96,6 +114,7 @@ export function parseClaudeStreamJson(stdout: string) {
       resultJson: null as Record<string, unknown> | null,
       llmApiEmptyResponse,
       truncatedMidStream: assistantContentSeen,
+      mcpServers,
     };
   }
 
@@ -130,6 +149,7 @@ export function parseClaudeStreamJson(stdout: string) {
     resultJson: finalResult,
     llmApiEmptyResponse: false,
     truncatedMidStream: false,
+    mcpServers,
   };
 }
 
