@@ -1,3 +1,56 @@
+# Asserts that every relay pod's on-disk ssl_multicert.config stays
+# gateway-cert-only, reading the live file via `kubectl exec` (PCL-525's
+# corrected invariant; PCL-492 is the staging image-side safety net).
+#
+# WHAT HAPPENS WHEN THIS GOES RED — read this before improvising (BLO-43371).
+#
+# The red run is NOT the signal. This workflow was red for 9 consecutive
+# hourly runs on 2026-10-10 (11:26Z -> 19:24Z, ~8h), recovered on its own at
+# 20:28Z, and NEITHER EDGE produced a ticket or a page. Both agents who found
+# it found it incidentally, from unrelated merge-gate reads.
+#
+# [BLO-7911](https://paperclip.blockcast.net/BLO/issues/BLO-7911) was closed
+# asserting "the runbook documents Alert Rules + Dispatcher ownership and
+# Platform/SRE paging for scheduled failures". No such runbook was found
+# anywhere in the Blockcast org (three single-token code searches, 2026-10-11:
+# `relay-ssl-multicert`, `Relay SSL Multicert` -> zero hits; `ssl_multicert`
+# -> only ATS/t3c source). That claim documented paging that did not exist,
+# which is worse than documenting none. This header replaces it, and is here
+# rather than in a docs/ file because this is where someone reading a red run
+# actually lands — the same convention scheduled-guard-liveness.yml follows.
+#
+# The routing path is now REAL and is this:
+#
+#   red run  ->  master-gate-exporter (onprem-k8s,
+#                monitoring/master-gate-exporter/workload/deployment.yaml,
+#                TARGETS names this workflow)
+#            ->  blockcast_master_gate_verdict_fatal{workflow="relay-ssl-multicert-guard.yml"}
+#            ->  MasterGateRed, for: 30m, severity=warning, team=platform
+#            ->  Alertmanager default route -> paperclip receiver
+#            ->  a Paperclip issue, assigned, in the Platform/SRE lane.
+#
+# So a sustained red reaches a named owner in ~30-60 min. It is a `warning`,
+# not a page in the wake-a-human sense; that is deliberate and matches every
+# other master gate. If you are reading this because a run is red and NO issue
+# exists, the routing is broken — check the exporter is up and that this
+# workflow is still named in its TARGETS, and say so on BLO-43371.
+#
+# This is a VERDICT watch. The separate liveness watch
+# (scheduled-guard-liveness.yml) asks only whether this job EXECUTED, never
+# whether it passed, and deliberately will not fire on a red run. The two are
+# orthogonal; neither covers the other.
+#
+# EXIT CODES — a capacity incident and a config regression are not the same
+# red, and the distinction is in the exit status so you need not read the log:
+#
+#   1  relay pods were read and the file shape is WRONG. A config regression.
+#      Delivery-path / Traffic Ops lane, not Platform.
+#   2  a namespace had NO running relay pods, so the invariant could not be
+#      evaluated there at all. Usually scheduling or capacity. Platform lane.
+#      The 2026-10-10 red was this: the staging relay was unschedulable.
+#
+# Both fail closed. "No pods" is never read as "nothing wrong".
+# Logic and its tests: scripts/check-relay-ssl-multicert.mjs
 name: Relay SSL Multicert Guard
 
 on:
