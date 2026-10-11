@@ -328,8 +328,12 @@ jobs:
           cache-to: type=inline
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # PEN-3916 retired `gh_token`. It existed solely for the `vendor`
+          # stage's clone of kkroo/paperclip-adapter-opencode-k8s; that adapter
+          # is now vendored in-tree, no stage mounts the secret, and leaving
+          # PAPERCLIP_BOARD_TOKEN wired into the image build would hand a
+          # high-privilege credential to a build that has no use for it.
           secrets: |
-            gh_token=${{ secrets.PAPERCLIP_BOARD_TOKEN }}
             penstock_runtime_token=${{ steps.penstock-runtime-token.outputs.token }}
 
       - name: Record built artifact
