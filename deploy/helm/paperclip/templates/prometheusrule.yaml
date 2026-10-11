@@ -969,13 +969,47 @@ spec:
         - alert: PaperclipScheduledRetryParkHorizonImplausible
           # BLO-25036: distinct from the overdue detector because this measures
           # the booked future horizon before scheduled_retry_at has passed.
-          expr: max by (agent_id) (paperclip_scheduled_retry_park_horizon_seconds and on(instance) (paperclip_scheduled_retry_park_horizon_refresh_success == 1)) > {{ .Values.prometheusRule.scheduledRetryParkHorizonSeconds }}
+          #
+          # BLO-31174/BLO-42711: the ceiling is PER PARK CLASS, not a single
+          # scalar. A flat bound was measured 100% false positive -- several
+          # park classes exceed any one number by construction, because each
+          # writer clamps to its own constant. The arms below ARE those
+          # writer constants (server/src/services/), not hand-picked numbers,
+          # so a breach means the writer exceeded its own clamp. Fix the
+          # writer; do NOT raise an arm to silence it. Kept in lockstep with
+          # the deployed rule in Blockcast/onprem-k8s
+          # paperclip/paperclip-runtime-alerts-prometheusrule.yaml, which is
+          # the copy that actually pages -- this chart's prometheusRule is
+          # disabled by default (BLO-14591 RBAC gap).
+          #
+          # reason=transient_failure_quota_floor deliberately carries NO arm
+          # and can never fire: a provider_quota floor is never clamped, so a
+          # multi-day park there is the contract being honoured, not a breach.
+          # Reasons falling through to the backstop are only weakly monitored
+          # until someone reads their clamp and gives them an arm.
+          expr: |
+            (
+              max by (agent_id, reason) (paperclip_scheduled_retry_park_horizon_seconds)
+                > on (reason) group_left ()
+              (
+                   label_replace(vector(300), "reason", "max_turns_continuation", "", "")
+                or label_replace(vector(1080), "reason", "ccrotate_capacity", "", "")
+                or label_replace(vector(3600), "reason", "dependency_blocked", "", "")
+                or label_replace(vector(9000), "reason", "transient_failure", "", "")
+                or label_replace(vector(86700), "reason", "transient_failure_floor", "", "")
+                or label_replace(vector(0), "reason", "none", "", "")
+{{- range tuple "capacity_blocked" "execution_review_participant_recovery" "interaction_continuation_infra_retry" "issue_continuation_needed" "job_failed" "missing_issue_comment" "other" "queued_run_detachment_recovery" "session_unavailable" "zero_token_session_reset" }}
+                or label_replace(vector({{ $.Values.prometheusRule.scheduledRetryParkHorizonBackstopSeconds }}), "reason", "{{ . }}", "", "")
+{{- end }}
+              )
+            )
+            and on () min(paperclip_scheduled_retry_park_horizon_refresh_success) == 1
           for: {{ .Values.prometheusRule.scheduledRetryParkHorizonFor }}
           labels:
             severity: warning
           annotations:
-            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has an implausibly long scheduled_retry park horizon"
-            description: "Agent {{`{{ $labels.agent_id }}`}} has a live scheduled_retry row booked {{`{{ $value }}`}}s from the park decision (heartbeat_runs.updated_at) to its future due time, exceeding {{ .Values.prometheusRule.scheduledRetryParkHorizonSeconds }}s (BLO-25036). This is a park-horizon signal, not the BLO-22094 overdue-against-due-time signal. Inspect the retry/capacity decision for the parked row."
+            summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} booked a scheduled-retry park horizon past the ceiling for its park class (reason={{`{{ $labels.reason }}`}})"
+            description: "Agent {{`{{ $labels.agent_id }}`}} has a live scheduled_retry row booked {{`{{ $value }}`}}s from the park decision (heartbeat_runs.updated_at) to its future due time, past the ceiling for scheduled_retry_reason={{`{{ $labels.reason }}`}} (BLO-25036, per-class ceilings from BLO-31174). Per-class bounds are the writer's own constants: max_turns_continuation 300s (MAX_TURN_CONTINUATION_MAX_DELAY_MS); ccrotate_capacity 1080s (CCROTATE_CAPACITY_MAX_PARK_MS 900s plus CCROTATE_CAPACITY_PARK_JITTER_RATIO 0.2 applied additively AFTER the clamp); dependency_blocked 3600s (DEP_BLOCKED_MAX_DELAY_MS); transient_failure 9000s (BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS final 2h hop x 1.25 jitter); transient_failure_floor 86700s (MAX_TRANSIENT_RETRY_HORIZON_MS 86400s plus TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS 300s). A breach means the writer for that class exceeded its own clamp -- fix the writer, do NOT raise the bound to silence it. This is a park-horizon signal, not the BLO-22094 overdue-against-due-time signal. Inspect the retry/capacity decision for the parked row."
             runbook_url: {{ .Values.prometheusRule.scheduledRetryParkHorizonRunbookUrl | quote }}
         - alert: PaperclipScheduledRetryParkHorizonMetricsRefreshFailed
           expr: paperclip_scheduled_retry_park_horizon_refresh_success == 0
