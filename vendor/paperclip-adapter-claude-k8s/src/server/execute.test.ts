@@ -1220,6 +1220,48 @@ describe("execute: concurrency guard", () => {
     });
   });
 
+  // The one reason `ClaudeK8sConcurrentRunBlockedRate` actually alerts on
+  // (BLO-4296 AC2). It needs a live Job that carries valid isolation metadata
+  // but NO run-id label, so `classifyConcurrentBlock` falls past the
+  // shared-mode and unknown-isolation arms to the null `conflictingRunId`.
+  // The neighbouring unlabeled-Job test takes the unknown-isolation arm
+  // instead, so without this case the alerting branch has no adapter-level
+  // assertion that it emits the reason the rule matches on.
+  it("reports a true orphan as live_job_for_unknown_run when the live Job has isolation labels but no run-id", async () => {
+    const orphan = makeJob({
+      agentId: "agent-abc",
+      taskId: "task-conflict",
+      sessionId: "session-conflict",
+      isolationMode: "workspace",
+      isolationKey: "orphan-key",
+    });
+    mockBatchListJobs.mockResolvedValue({ items: [orphan] });
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return { ok: true, status: 202 };
+      throw new Error("run-table lookup must not run for a Job with no run-id label");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({
+      authToken: "run-token",
+      runtime: makeIsolatedRuntime("current-key"),
+    }));
+
+    expect(result.errorCode).toBe("k8s_orphan_task_unknown");
+    const reportCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).endsWith("/api/metrics/claude-k8s/concurrent-run-blocked")
+      && (init as RequestInit | undefined)?.method === "POST"
+    );
+    expect(reportCall).toBeDefined();
+    expect(JSON.parse((reportCall![1] as RequestInit).body as string)).toMatchObject({
+      reason: "live_job_for_unknown_run",
+      isolationMode: "workspace",
+      isolationKey: "orphan-key",
+      taskKey: "task-conflict",
+      sessionId: "session-conflict",
+    });
+  });
+
   it("still blocks unlabeled jobs as unknown orphans without consulting the run table", async () => {
     process.env.PAPERCLIP_API_URL = "https://paperclip.test";
     const orphan = makeJob({ agentId: "agent-abc", taskId: "task-current" });
