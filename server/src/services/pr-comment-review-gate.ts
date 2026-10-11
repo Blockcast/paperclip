@@ -29,6 +29,7 @@ import {
   type AllyPriorFindingDisposition,
 } from "./ally-review-detection.js";
 import {
+  githubFetchCommitAuthorEmail,
   githubFetchPrAuthorLogin,
   githubFetchPrHeadSha,
   githubListIssueCommentsWithTimestamps,
@@ -1410,8 +1411,9 @@ async function executeCommentReviewGateCheck(
     // or `carried_finding` that was already fully justified, leaving the merge
     // surface showing that finding as absent rather than red. A red going
     // silent is the direction this module must not get wrong.
-    // `prAuthorLane: null` is the honest value here, not a stub awaiting a
-    // fetch (BLO-34389).
+    // The same ordering governs the LANE read added below, for the same
+    // reason: both are facts about the author, and neither may silence a red
+    // the comment surfaces already justify.
     //
     // The TOKEN SPACE is settled: BLO-32695's owner ruled on 2026-10-10 that
     // `reviewer` carries the lane's full git author email, lowercased and
@@ -1422,32 +1424,8 @@ async function executeCommentReviewGateCheck(
     // author or the App from colliding with a lane slug. Both sides already
     // lowercase (`ally-review-detection.ts` on parse, the
     // `prAuthorLane?.trim().toLowerCase()` feeding
-    // `headsWithUndispositionedFinding` here), so no normalization is owed.
-    //
-    // The PRODUCER lands alongside this comment — `.planning/ally-agent/
-    // AGENTS.md` now emits `reviewer` as a literal in its verdict template —
-    // but no review in any existing corpus carries one, and a lane this gate
-    // supplied today would still compare against `null` and credit. Keeping
-    // `null` is therefore the no-op direction, not a deferral of a red.
-    //
-    // When the fetch does land, gate it on `declaredLane !== null` rather than
-    // on the verdict outcome: while no comment in a PR's corpus carries
-    // `reviewer` that is zero extra GitHub calls, and it goes live by itself
-    // the day a producer emits one, with no ordering constraint between the two
-    // edits in either direction. Read the lane from the head commit's
-    // `commit.author.email` (`GET /repos/{o}/{r}/commits/{headSha}`, one call;
-    // `headSha` is already in hand) — NOT from `git config user.email`, which
-    // in an agent worktree routinely names a different lane than the one that
-    // authored the commits.
-    //
-    // So the exclusion ships exercised by tests and inert in production, the
-    // same way `prAuthorLogin` shipped here before its fetch landed below.
-    //
-    // THAT FETCH IS BLO-43550, and the row exists because this paragraph is
-    // not a wake path. A plan written in a comment ages quietly: the producer
-    // half merges now, so from the day one emits, every Ally review declares a
-    // lane nothing reads and BLO-34389's defect stands in production with
-    // nothing scheduled to notice.
+    // `headsWithUndispositionedFinding` here), so no normalization is owed and
+    // `githubFetchCommitAuthorEmail` deliberately does none of its own.
     let verdict = evaluateCommentReviewGate({
       comments,
       headSha,
@@ -1456,10 +1434,68 @@ async function executeCommentReviewGateCheck(
       prAuthorLane: null,
     });
 
+    // The author LANE (BLO-43550), supplying what BLO-34389 shipped exercised
+    // by tests and hardcoded `null` in production.
+    //
+    // Gated on a DECLARED lane rather than on the verdict outcome. While no
+    // comment in a PR's corpus carries `reviewer` this costs zero extra GitHub
+    // calls, and it goes live by itself the day a producer emits one — no
+    // ordering constraint against `.planning/ally-agent/AGENTS.md`'s emitter in
+    // either direction. Gating on the outcome instead would skip exactly the
+    // route the exclusion exists to red: a retirement that has already turned
+    // the verdict green is not distinguishable, from the outcome alone, from
+    // one that never existed.
+    //
+    // The predicate is one honest question — does any body here declare a lane
+    // at all — rather than a partial replay of the consumer's filter chain
+    // (`isAllyConsolidatedReviewComment` → attested head → ledger entries).
+    // Mirroring one link of that chain would read as a complete mirror while
+    // being none, and a predicate STRICTER than the consumer's would skip a
+    // fetch the exclusion needed, leaving it silently inert again. Looser is
+    // the safe direction: its whole cost is one wasted GET on a corpus that
+    // quotes a verdict block without being one, and it cannot move a verdict.
+    //
+    // Placed AFTER the author-blind pass, and `null` on failure, so an
+    // unreadable `GET /repos/{o}/{r}/commits/{sha}` can only ever leave this
+    // verdict where the author-blind pass already put it. A null lane CREDITS
+    // the retirement — today's behaviour — so this read can make the verdict
+    // redder and never quieter.
+    //
+    // ⚠ `reviewer` is a SELF-DECLARATION, not a trust boundary. This read
+    // disambiguates which lane authored a review-shaped comment, on the honest
+    // case that is the one actually measured. A lane set on retiring its own
+    // finding writes the whole block itself and need only omit the field to be
+    // credited exactly as before. Nothing here prevents that, and no
+    // description this gate publishes may imply otherwise.
+    let prAuthorLane: string | null = null;
+    if (comments.some((comment) => allyVerdictReviewerLane(comment.body) !== null)) {
+      prAuthorLane = await withBoundedRetry(
+        () => githubFetchCommitAuthorEmail({ repoFullName: input.repoFullName, sha: headSha }),
+        (email) => email == null,
+      );
+      if (prAuthorLane) {
+        verdict = evaluateCommentReviewGate({
+          comments,
+          headSha,
+          reviewerBotLogin,
+          prAuthorLogin: null,
+          prAuthorLane,
+        });
+      }
+    }
+
     // `authorUnknown` marks every outcome the author could still change, which
     // is both the withheld positive and the carried finding that consumed it —
     // gating on the OUTCOME instead would never fetch on the carried route, and
     // `clean` is unreachable on the author-blind pass by construction.
+    //
+    // Read off the lane-informed verdict above, which is safe because the flag
+    // is INVARIANT under that re-evaluation: it is carried from
+    // `withheldPositive`, which is computed from the at-head attestation and
+    // `prAuthorLogin` alone and never consults the lane, while the lane can
+    // only add carried findings. Reading the later verdict is also the
+    // conservative choice if that ever stopped holding — it reflects strictly
+    // more evidence than the author-blind one.
     if ("authorUnknown" in verdict && verdict.authorUnknown) {
       const prAuthorLogin = await withBoundedRetry(
         () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
@@ -1471,7 +1507,7 @@ async function executeCommentReviewGateCheck(
           headSha,
           reviewerBotLogin,
           prAuthorLogin,
-          prAuthorLane: null,
+          prAuthorLane,
         });
       } else if (verdict.state === "success") {
         // Publishing `neutral` on incomplete evidence would overwrite a correct

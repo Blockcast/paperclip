@@ -82,6 +82,13 @@ function deps(o: Partial<GithubTruthDeps> = {}): GithubTruthDeps {
     // fixture is an independently-reviewed PR, so the comment surface can
     // still reach `clean`. Tests that want the self-attested shape override it.
     fetchPrAuthorLogin: async () => "some-human",
+    // Throws rather than returning a value, so a test that reaches this call
+    // without meaning to fails loudly instead of quietly taking a default.
+    // Nothing in the default fixture declares a `reviewer`, so nothing should
+    // reach it (BLO-43550).
+    fetchCommitAuthorEmail: async () => {
+      throw new Error("fetchCommitAuthorEmail: no fixture declares a reviewer lane");
+    },
     reviewerBotLogin: ALLY,
     ...o,
   };
