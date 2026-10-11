@@ -2620,6 +2620,14 @@ export async function resolveExecutionRunAdapterConfig(input: {
   routineEnv?: unknown;
   secretsSvc: RuntimeConfigSecretResolver;
   trustPreset?: TrustPresetResolution;
+  /**
+   * BLO-39715 AC 6: the per-run redaction canary switch, read by the caller from
+   * the AGENT's own `adapterConfig.redactionCanary` (a JSON boolean). It is a
+   * separate input, never read off `executionRunConfig`, because that is the
+   * merged config with `issue.assigneeAdapterOverrides.adapterConfig` overlaid
+   * last — any actor able to create or patch the issue could otherwise flip it.
+   */
+  redactionCanary?: boolean;
   requiredScopedEnvBinding?: {
     keys: string[];
     consumerScopes: Array<"agent" | "project">;
@@ -2933,18 +2941,29 @@ export async function resolveExecutionRunAdapterConfig(input: {
   // holdback on everywhere widens the crash-loss window from zero to "everything
   // since the last newline" and adds per-chunk work — a real cost paid by every
   // run, to serve a check that only the verifying lane needs. The flag lives on
-  // the agent's own `adapterConfig` so that lane can turn it on and off itself
-  // without a deploy and without touching anyone else.
+  // the agent's own `adapterConfig` (set it as a JSON boolean: `asBoolean` is
+  // strict, so the string "true" is a no-op) so that lane can turn it on and off
+  // itself without a deploy and without touching anyone else.
+  //
+  // It arrives as `input.redactionCanary`, NOT off `executionRunConfig`: the
+  // latter is the merged config, and `parseIssueAssigneeAdapterOverrides`
+  // overlays an issue's free-form `adapterConfig` onto it last, so reading it
+  // there would let any issue creator/patcher switch the holdback on for
+  // another agent's run.
   //
   // The value carries no authority and is regenerated per run, so a run that
   // leaks it has disclosed nothing. That is what makes it safe to emit on
   // purpose, which a real credential never is.
-  if (asBoolean((executionRunConfig as Record<string, unknown>).redactionCanary, false)) {
+  if (input.redactionCanary === true) {
     resolvedConfig.env = {
       ...parseObject(resolvedConfig.env),
       [RUN_REDACTION_CANARY_ENV_KEY]: createRunRedactionCanaryValue(),
     };
     secretKeys.add(RUN_REDACTION_CANARY_ENV_KEY);
+    logger.info(
+      { runId: input.heartbeatRunId ?? null, agentId: input.agentId ?? null },
+      "run redaction canary injected",
+    );
   }
   return {
     resolvedConfig,
@@ -32435,6 +32454,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       routineEnv: routineEnvContext.env,
       secretsSvc,
       trustPreset,
+      // The agent's own adapterConfig, not the issue-overlaid `executionRunConfig`.
+      redactionCanary: asBoolean(config.redactionCanary, false),
       requiredScopedEnvBinding: pushCapabilityPreflightRequired
         ? {
             keys: [...PUSH_CAPABILITY_ENV_KEYS],
