@@ -5,6 +5,7 @@ import type { Express } from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createApp } from "../app.js";
+import { HEALTH_PROBE_DEADLINE_MS } from "../routes/health.js";
 
 /**
  * BLO-32164. `/healthz` is the endpoint every Kubernetes probe targets, and it
@@ -276,6 +277,54 @@ describe("/api/health as a readiness probe path", () => {
     expect(res.status).toBe(503);
     expect(res.body).toMatchObject({ status: "unhealthy", error: "database_unreachable" });
     expect(res.headers["content-type"]).toMatch(/^application\/json\b/);
+  });
+
+  it("answers 503 inside the probe timeout when the pool hangs rather than refusing", async () => {
+    // The *dead*-pool case, which is not the one above. `connect_timeout` is
+    // the driver's 30s default and the role `statement_timeout` is 30s, both
+    // longer than the 20s readiness timeout the chart pins — so without a
+    // bound the probe is abandoned by kubelet rather than answered. An
+    // abandoned response is not a completion (`res.writableFinished` is
+    // false), so it never refreshes the `/livez` wedge detector's clock, and
+    // once readiness has drained the endpoints the probe is the only /api
+    // traffic left: the detector reaches API_PIPELINE_STALL_MS and liveness
+    // restarts every replica, repeatedly, for the length of the outage.
+    //
+    // What this pins is that the handler *completes*. The verdict is the same
+    // 503 either way; the difference is whether anything answers at all.
+    expect(HEALTH_PROBE_DEADLINE_MS).toBeLessThan(20_000);
+
+    let enteredHandler: () => void = () => {};
+    const entered = new Promise<void>((resolve) => {
+      enteredHandler = resolve;
+    });
+    execute.mockImplementation(() => {
+      enteredHandler();
+      // Never settles: a pool with no reachable server, before the driver's
+      // own 30s connect timeout fires.
+      return new Promise(() => {});
+    });
+
+    // Only the two timer functions the deadline itself uses. Faking the full
+    // set takes `nextTick`/`setImmediate` with it, which the http server the
+    // request is travelling over needs to make progress.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const pending = request(app).get("/api/health").set("Host", "127.0.0.1:3100");
+      const responded = pending.then((res) => res);
+      // Advance only once the handler has registered its deadline, otherwise
+      // there is no timer to advance and the request hangs forever.
+      await entered;
+      await vi.advanceTimersByTimeAsync(HEALTH_PROBE_DEADLINE_MS + 1);
+
+      const res = await responded;
+      expect(res.status).toBe(503);
+      expect(res.body).toMatchObject({ status: "unhealthy", error: "database_unreachable" });
+    } finally {
+      vi.useRealTimers();
+      execute.mockReset();
+      execute.mockResolvedValue([{ "?column?": 1 }]);
+    }
   });
 
   it("cannot be impersonated by an undeclared /api path falling through to the SPA", async () => {
