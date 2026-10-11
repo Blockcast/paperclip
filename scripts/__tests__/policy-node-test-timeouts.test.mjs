@@ -206,6 +206,15 @@ const CONTENTION_SENSITIVE_STEPS = [
   "Test approval admissibility-probe backoff (BLO-28471)",
   "Test pending-migration pre-flight phase budgets (BLO-31254)",
   "Test bounded PR-check polling skills",
+  // BLO-43484. Same fork-heavy shape, measured the same way: each case builds
+  // and rebases real git repos. p50 11s, max-healthy 24s, and 2 of 10 runs in
+  // one 6h window hit the old 60s cap -- during process teardown, after the
+  // suite had printed `fail 0`, so `policy` went red on a passing suite and
+  // every downstream lane was skipped. Its bound is 5m rather than the floor,
+  // because every CI observation of the slow mode is censored at that old cap:
+  // the two uncensored runs (a contended agent pod) took 162s and 192s. The
+  // floor is what this list enforces; sizing above it is the step's own call.
+  "Test vendored-provenance union-merge invariants (BLO-34872)",
 ];
 
 function assertContentionFloor(steps) {
