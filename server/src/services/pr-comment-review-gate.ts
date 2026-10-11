@@ -429,8 +429,16 @@ function headsWithUndispositionedFinding(
       // or an unknown author is today's behaviour — credited — because every
       // review posted before this field existed declares nothing, and refusing
       // those would wedge the open-PR population on arrival.
-      const target = refusedByLane ? refusedByAuthorLane : ledger;
+      //
+      // Narrow to the RETIRING directions, matching what the paragraph above
+      // claims. `blocks` (`still-present`) is the author's own lane saying a
+      // finding stands — the fail-closed direction, which this refusal is not
+      // named for and must not swallow. Diverting it too would leave
+      // `isExplicitlyBlocked` unable to see it, so the gate would report an
+      // unrecognized verb for a finding that carries a perfectly recognized one.
       for (const entry of extractAllyPriorFindingDispositions(comment.body)) {
+        const retiring = entry.kind === "retires" || entry.kind === "defers";
+        const target = refusedByLane && retiring ? refusedByAuthorLane : ledger;
         target.push({ entry, timeMs: commentTime, attestedHeadSha });
       }
     }
@@ -1434,6 +1442,12 @@ async function executeCommentReviewGateCheck(
     //
     // So the exclusion ships exercised by tests and inert in production, the
     // same way `prAuthorLogin` shipped here before its fetch landed below.
+    //
+    // THAT FETCH IS BLO-43550, and the row exists because this paragraph is
+    // not a wake path. A plan written in a comment ages quietly: the producer
+    // half merges now, so from the day one emits, every Ally review declares a
+    // lane nothing reads and BLO-34389's defect stands in production with
+    // nothing scheduled to notice.
     let verdict = evaluateCommentReviewGate({
       comments,
       headSha,
