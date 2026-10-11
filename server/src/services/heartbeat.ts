@@ -33356,18 +33356,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // probability of contention.
     //
     // git_worktree is exempt: it gives every run its own path and stamps
-    // ownership, so there is no shared tree to warn about.
-    const sharedCheckoutWarning =
-      executionWorkspace.strategy === "git_worktree"
-        ? null
-        : await describeSharedCheckoutOccupancy({
-            db,
-            companyId: agent.companyId,
-            agentId: agent.id,
-            heartbeatRunId: run.id,
-            cwd: executionWorkspace.cwd,
-            strategyType: executionWorkspace.strategy,
-          });
+    // ownership, so there is no shared tree to warn about. BLO-42212: so is a
+    // run whose K8s isolation descriptor relocated the workspace to a per-run
+    // ephemeral root -- it never opens `executionWorkspace.cwd` either. Both
+    // exemptions live in `runLandsInSharedCheckout`, which
+    // `describeSharedCheckoutOccupancy` applies before it queries.
+    const sharedCheckoutWarning = await describeSharedCheckoutOccupancy({
+      db,
+      companyId: agent.companyId,
+      agentId: agent.id,
+      heartbeatRunId: run.id,
+      cwd: executionWorkspace.cwd,
+      strategyType: executionWorkspace.strategy,
+      isolation: k8sRunIsolation,
+    });
     const runtimeWorkspaceWarnings = [
       ...resolvedWorkspace.warnings,
       ...executionWorkspace.warnings,
