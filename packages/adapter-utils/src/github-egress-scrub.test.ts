@@ -574,6 +574,110 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("BLO-41153 regression: a gRPC method path is not a credential", () => {
+    // Measured on Blockcast/magma PR #2289 @ 7c95ac44: scanning the two files
+    // the push guard named found exactly one firing value in each, and it was
+    // neither a metric name nor a Chart.lock digest — it was the gRPC method
+    // path, at 4.05 bits/char in the runbook and 3.64 in the alert rule.
+    //
+    // Every binding below is assembled at runtime. Written out contiguously
+    // the pair is the material the unfixed rule refuses, so a literal here
+    // could not be pushed past the false positive it tests for. Same reason
+    // as the PEN-3907 and BLO-41262 fixtures above.
+    const GRPC_METHOD = "/magma.orc8r.Bootstrapper/GetChallenge";
+    const GRPC_SERVICE = "/magma.orc8r.Bootstrapper/";
+    const bind = (name: string, value: string) => `${name}=${value}`;
+
+    it.each([GRPC_METHOD, GRPC_SERVICE])("passes %s through byte-exact", (path) => {
+      const text = bind("method", path);
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+      expect(result.classes).toEqual([]);
+    });
+
+    it.each(["method", "rpc", "grpc_method", "full_method"])(
+      "exempts on shape, not on the name %s",
+      (name) => {
+        // The exemption is deliberately name-free. A name list would drift,
+        // and the first name nobody enumerated reproduces this false positive.
+        const text = bind(name, GRPC_METHOD);
+        expect(scrubGitHubEgressText(text).text).toBe(text);
+      },
+    );
+
+    it("still refuses an opaque token in the same assignment position", () => {
+      // The negative control for the name half: `method` is not a pass.
+      const result = scrubGitHubEgressText(bind("method", SYNTHETIC_OPAQUE_VALUE));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+
+    it("still refuses a slash-rooted value with no dot in the package", () => {
+      // The dot is what keeps every credential ENCODING out of this shape:
+      // base64url has no `.` and no `/`, standard base64 and hex have no `.`.
+      // Without this conjunct a standard-base64 secret that happens to start
+      // with `/` — 1 in 64 of them — would be exonerated, so this case is the
+      // whole security argument for the rule and not a corner.
+      //
+      // Both runs are sliced to start with a LETTER on purpose. An earlier
+      // split landed a digit at the head of the second run, which the
+      // per-segment shape refused on its own — so the test passed with the
+      // dot conjunct deleted and pinned nothing.
+      const token = `/${SYNTHETIC_OPAQUE_VALUE.slice(0, 15)}/${SYNTHETIC_OPAQUE_VALUE.slice(15)}`;
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it.each([
+      "/0agma.orc8r.Bootstrapper/GetChallenge",
+      "/magma.0rc8r.Bootstrapper/GetChallenge",
+      "/magma.orc8r.Bootstrapper/0etChallenge",
+    ])("still refuses %s: a run that does not start with a letter", (token) => {
+      // Shape hygiene rather than a security bound — the dot conjunct is what
+      // keeps token encodings out — but pinned in all three run positions so
+      // the narrowing is not a comment. A proto identifier starts with a
+      // letter; one case per position, because a mutation to any one of them
+      // is invisible to the other two.
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("still refuses a credential with a real method path appended", () => {
+      // Pins the start anchor, as the extra-segment case below pins the end
+      // one. Unanchored, the regex would find the valid path in the tail and
+      // exonerate the whole value, token and all.
+      const token = `${SYNTHETIC_OPAQUE_VALUE}${GRPC_METHOD}`;
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+
+    it("still refuses a dotted path whose segments leave the identifier alphabet", () => {
+      // Pins the per-run `[A-Za-z][A-Za-z0-9]*` shape. `-` and `_` are in the
+      // token alphabet a secret is drawn from, so admitting them here would
+      // reopen the gap the dot conjunct closes.
+      const token = `/magma.orc8r.Boot_strapper/${SYNTHETIC_OPAQUE_VALUE}`;
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("still refuses a path with an extra segment carrying a credential", () => {
+      // The regex is anchored at both ends and allows exactly one `/` after
+      // the dotted package, so a real method path is not a prefix a token can
+      // ride in on. Appended inside the token alphabet deliberately: an
+      // out-of-alphabet joiner such as `?` would be refused by the alphabet
+      // gate upstream and would not exercise the anchoring at all.
+      const token = `${GRPC_METHOD}/${SYNTHETIC_OPAQUE_VALUE}`;
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+  });
+
   describe("BLO-41262: locateGitHubEgressMatches names the line", () => {
     const token = SYNTHETIC_OPAQUE_VALUE;
 
