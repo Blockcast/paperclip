@@ -96,34 +96,62 @@ function kubectl(args, options) {
   return execFileSync(options.kubectl, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
-function listPods(namespace, options) {
-  const output = kubectl(
+function listPods(namespace, options, exec) {
+  const output = exec(
     ["-n", namespace, "get", "pods", "-l", options.selector, "--field-selector", "status.phase=Running", "-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}"],
     options,
   );
   return output.split("\n").map((pod) => pod.trim()).filter(Boolean);
 }
 
-function readPodFile(namespace, pod, options) {
+function readPodFile(namespace, pod, options, exec) {
   const args = ["-n", namespace, "exec", pod];
   if (options.container) args.push("-c", options.container);
   args.push("--", "cat", options.file);
-  return kubectl(args, options);
+  return exec(args, options);
 }
 
-export function run(options) {
+// Two ways to be red, and they route to DIFFERENT lanes (BLO-43371).
+//
+//   1 NONCONFORMING  relay pods were read and the file shape is wrong.
+//                    A config regression. Delivery-path / Traffic Ops lane.
+//   2 UNOBSERVABLE   a namespace has no running relay pods, so the invariant
+//                    could not be evaluated there at all. Usually capacity or
+//                    scheduling. Platform/SRE lane.
+//
+// Both still fail closed — "no pods" has never been read as "nothing wrong"
+// here and still is not. This only makes the two tellable apart without
+// reading the log, because on 2026-10-10 an 8h case of (2) was triaged by two
+// people as if it might be (1).
+export const EXIT_NONCONFORMING = 1;
+export const EXIT_UNOBSERVABLE = 2;
+
+export function exitCodeFor(result) {
+  // NONCONFORMING wins a tie deliberately: an unobservable namespace must
+  // never mask a real regression in a sibling namespace that WAS readable.
+  // The quieter failure losing is the safe direction.
+  if (result.failures.length > 0) return EXIT_NONCONFORMING;
+  if (result.unobservable.length > 0) return EXIT_UNOBSERVABLE;
+  return 0;
+}
+
+// `exec` is injected so the namespace-walk is testable without a cluster;
+// it defaults to the real kubectl. Same shape as the fetch= injection the
+// master-gate reducer uses.
+export function run(options, exec = kubectl) {
   const failures = [];
+  const unobservable = [];
   const checked = [];
 
   for (const namespace of options.namespaces) {
-    const pods = listPods(namespace, options);
+    const pods = listPods(namespace, options, exec);
     if (pods.length === 0) {
-      failures.push(`${namespace}: no running relay pods matched selector ${options.selector}`);
+      unobservable.push(`${namespace}: no running relay pods matched selector ${options.selector}`);
       continue;
     }
 
     for (const pod of pods) {
-      const contents = readPodFile(namespace, pod, options);
+      const contents = readPodFile(namespace, pod, options, exec);
       const result = validateSslMulticert(contents, { expectedLine: options.expectedLine });
       checked.push(`${namespace}/${pod}`);
       if (!result.ok) {
@@ -132,7 +160,7 @@ export function run(options) {
     }
   }
 
-  return { ok: failures.length === 0, checked, failures };
+  return { ok: failures.length === 0 && unobservable.length === 0, checked, failures, unobservable };
 }
 
 function main() {
@@ -142,7 +170,8 @@ function main() {
   for (const pod of result.checked) console.log(`PASS ${pod}`);
   if (!result.ok) {
     for (const failure of result.failures) console.error(`FAIL ${failure}`);
-    process.exitCode = 1;
+    for (const gap of result.unobservable) console.error(`UNOBSERVABLE ${gap}`);
+    process.exitCode = exitCodeFor(result);
     return;
   }
 
@@ -154,6 +183,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     main();
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
+    // KNOWN RESIDUAL: a thrown kubectl error (API unreachable, namespace
+    // missing, exec denied) is an UNOBSERVABLE condition but exits 1 here,
+    // because this catch also covers parseArgs usage errors, which are not.
+    // Splitting them needs a second try block and buys nothing today: the
+    // workflow treats any non-zero as red either way, and the message on
+    // stderr already names the cause. Revisit if a transport failure is ever
+    // mistaken for a regression.
+    process.exitCode = EXIT_NONCONFORMING;
   }
 }
