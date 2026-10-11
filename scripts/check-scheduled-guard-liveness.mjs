@@ -296,6 +296,14 @@ export const EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS = [
       "cron also makes any liveness bar coarse to the point of noise — a threshold would have to " +
       "exceed 7 days to clear ordinary jitter, by which point it reports nothing worth waking for.",
   },
+  {
+    workflow: "merge-queue-orphan-sweeper.yml",
+    reason:
+      "Not a guard. BLO-41174 backstop that cancels pr.yml merge_group runs orphaned by a queue " +
+      "re-formation; nothing is enforced, so its stopping degrades to the pre-BLO-41174 status quo " +
+      "(orphans hold arc-merge-queue runners until they finish) rather than losing coverage. It " +
+      "also has no completion-gap history to derive a threshold from.",
+  },
 ];
 
 /**

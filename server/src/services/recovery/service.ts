@@ -6221,6 +6221,11 @@ export function recoveryService(
         : recoveryCause === "codex_output_inactivity_monitor"
           ? "Retry the same agent from durable progress after the output-inactivity termination."
         : recoveryCause === "workspace_validation_failed"
+          // BLO-19924: reachable via BLO-32628's branch-containment park, which keeps this
+          // cause on `provenance.ancestryVerdict: "diverged"` (a positively confirmed
+          // divergence). An earlier revision of that change deleted this arm as
+          // "unreachable" and broke heartbeat-workspace-branch-containment.test.ts, which
+          // is its positive control.
           ? readWorkspaceValidationPayload(input.latestRun)?.reason === "git_worktree_branch_incoherence"
             ? "Repair the source issue git worktree branch incoherence, or choose a new execution workspace, before resuming adapter execution."
             : "Repair the source issue workspace link, project workspace cwd, or git checkout before resuming adapter execution."
@@ -8064,6 +8069,9 @@ export function recoveryService(
         isProviderQuotaWait,
         blockerIssueIds: blockerIds,
         recoveryCause,
+        // BLO-19924: the run, not just the cause — a re-routed workspace park carries
+        // `stranded_assigned_issue` but must not be released to `todo` on exhaustion.
+        latestRunErrorCode: latestRunForReceipt?.errorCode ?? null,
       });
 
       const escalatedAssigneeAgentId = action.ownerAgentId ?? fresh.assigneeAgentId;
@@ -10797,24 +10805,15 @@ export function recoveryService(
     const openPullRequestFreshSinceIso =
       new Date(Date.now() - openPullRequestAttendanceGraceMs).toISOString();
 
+    // PEN-3314: this scan feeds exactly one consumer -- `rows.map((row) => row.id)` below,
+    // which narrows the `issueRecoveryActions` lookup. It used to project sixteen columns,
+    // including the `executionPolicy` and `executionState` JSONB blobs, for every visible
+    // issue; fifteen of them were parsed, allocated and then dropped unread on every pass.
+    // The pass is long-lived (measured 372s settled, 1162s in flight on 2026-10-09), so
+    // those blobs were retained for its whole duration. Select only the column that is read.
     const issueRowsPromise = Promise.resolve(db
       .select({
         id: issues.id,
-        companyId: issues.companyId,
-        identifier: issues.identifier,
-        title: issues.title,
-        status: issues.status,
-        projectId: issues.projectId,
-        goalId: issues.goalId,
-        parentId: issues.parentId,
-        assigneeAgentId: issues.assigneeAgentId,
-        assigneeUserId: issues.assigneeUserId,
-        createdByAgentId: issues.createdByAgentId,
-        createdByUserId: issues.createdByUserId,
-        executionPolicy: issues.executionPolicy,
-        executionState: issues.executionState,
-        monitorNextCheckAt: issues.monitorNextCheckAt,
-        monitorAttemptCount: issues.monitorAttemptCount,
       })
       .from(issues)
       .where(
@@ -10870,7 +10869,17 @@ export function recoveryService(
             isNull(issues.hiddenAt),
             notInArray(issues.originKind, [RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation]),
           ),
-        ),
+        )
+        // PEN-3314: derive `hasExternalWaitOwner` here rather than at the `sharedInput` call
+        // site. `externalWaitFromDescription` stays the single authority for the predicate --
+        // the projection is identical -- but the full prose is now confined to this
+        // short-lived intermediate instead of being retained in `issueRows` for the whole
+        // pass. Descriptions are the largest column in this scan and the pass holds its
+        // snapshot for minutes, so that retention dominated the per-pass heap.
+        .then((rows) => rows.map(({ description, ...issue }) => ({
+          ...issue,
+          hasExternalWaitOwner: externalWaitFromDescription(description ?? null) !== null,
+        }))),
       db
         .select({
           companyId: issueRelations.companyId,
@@ -11042,10 +11051,7 @@ export function recoveryService(
     });
 
     const sharedInput = {
-      issues: issueRows.map(({ description, ...issue }) => ({
-        ...issue,
-        hasExternalWaitOwner: externalWaitFromDescription(description ?? null) !== null,
-      })),
+      issues: issueRows,
       relations: relationRows,
       agents: agentRows,
       activeRuns: activeRunRows.map((row) => ({

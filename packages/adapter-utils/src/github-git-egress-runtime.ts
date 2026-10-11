@@ -256,6 +256,56 @@ function publishVerbRefusal(publishVerb: GitPublishVerb): GitEgressRuntimeError 
   );
 }
 
+/**
+ * Add `--signoff` to a `git commit`, so every agent commit carries a DCO
+ * `Signed-off-by:` trailer (BLO-42063).
+ *
+ * `magma` and `frr` gate merges on a DCO check that reads each commit's own
+ * message and requires a `Signed-off-by:` matching that commit's author or
+ * committer. There is no remediation-commit path: one unsigned commit blocks the
+ * PR until the branch is rewritten and force-pushed, which is why a trailer the
+ * agent has to remember is the wrong mechanism. Measured on `magma#2289`, 14 of
+ * 15 commits by one agent carried it and one did not.
+ *
+ * `--signoff` takes its identity from the COMMITTER, which for an agent run is
+ * the `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` overlay
+ * (`git-checkout-identity.ts`) — the same values git stamps on the commit. The
+ * match the gate asks for is therefore structural rather than something that can
+ * drift.
+ *
+ * Injected for every repository, not just the two that gate on it. A trailer is
+ * accurate wherever an agent commits, and a per-repo allowlist is a second thing
+ * to keep correct that fails silently — toward the unsigned commit — when it is
+ * not.
+ *
+ * Placement is AFTER the subcommand, unlike the `core.hooksPath` injection
+ * below: `--signoff` is a `commit` option, not a global one. It goes first among
+ * the caller's own `commit` arguments so an explicit `--no-signoff` later in
+ * argv still wins, and ahead of any `--` so it cannot be read as a pathspec.
+ *
+ * Duplicates are git's problem and it handles them: measured against git 2.47.3,
+ * `--signoff` is a no-op when the same trailer is already last, so an agent that
+ * also writes the line by hand gets one. A non-final identical trailer is
+ * repeated, which is cosmetic — the gate passes on any matching sign-off.
+ *
+ * Scoped to `commit`. `revert` and `cherry-pick` also create commits and also
+ * take `--signoff`; neither has been measured failing the gate, so neither is
+ * swept in here. `classification.subcommand` is the token the caller TYPED, so
+ * a commit reached through `alias.ci=commit` goes unsigned — the resolved verb
+ * lives inside `classifyGitInvocation` and is surfaced only as `publishVerb`,
+ * i.e. only when it is not allowlisted. Left that way on purpose: this is a
+ * convenience that fails toward the status quo, which does not earn widening
+ * the surface of a classifier whose four measured bypasses were all drift of
+ * exactly that kind.
+ */
+function withSignoff(
+  argv: readonly string[],
+  classification: { subcommandIndex: number },
+): string[] {
+  const at = classification.subcommandIndex + 1;
+  return [...argv.slice(0, at), "--signoff", ...argv.slice(at)];
+}
+
 export function buildGitArgv(
   argv: readonly string[],
   options: {
@@ -319,6 +369,8 @@ export function buildGitArgv(
   if (classification.publishVerb) {
     throw publishVerbRefusal(classification.publishVerb);
   }
+
+  if (classification.subcommand === "commit") return withSignoff(argv, classification);
 
   if (!classification.isPush) return [...argv];
 

@@ -1,7 +1,12 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 
 import {
   ENVIRONMENT_DUMP_MIN_RUN,
+  GITHUB_EGRESS_REGION_CLASSES,
+  type GitHubEgressScrubClass,
+  locateGitHubEgressMatches,
   redactionMarker,
   scrubGitHubEgressText,
 } from "./github-egress-scrub.js";
@@ -27,6 +32,18 @@ const SYNTHETIC_JWT =
 
 // High per-character entropy, obviously fake, mixed case + digits.
 const SYNTHETIC_OPAQUE_VALUE = "s7Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0Tg";
+// A 20-letter run, derived rather than written out for the same reason: as a
+// literal it is itself credential-shaped and the publish guard refuses it.
+const LONG_LEXICAL_TAIL = "abcdefghijklmnopqrstuvwxyz".slice(0, 20);
+
+// PEN-3907 fixtures. DERIVED, not pasted: a 64-hex literal in `name="value"`
+// form is exactly what the pre-push guard refuses, so a hardcoded digest here
+// would make this very file unpushable from an agent seat until the fix it
+// tests has already shipped. Deriving it also makes the fixture self-evidently
+// a content digest rather than a value someone chose.
+const SYNTHETIC_SHA256 = createHash("sha256").update("pen-3907 fixture").digest("hex");
+const SYNTHETIC_SHA1 = createHash("sha1").update("pen-3907 fixture").digest("hex");
+const SYNTHETIC_SHA512 = createHash("sha512").update("pen-3907 fixture").digest("hex");
 
 describe("scrubGitHubEgressText", () => {
   describe("byte-exact pass-through", () => {
@@ -189,6 +206,94 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-3907: content digests are not credentials", () => {
+    // A lowercase-hex digest saturates the 4.0 bits/char ceiling a 16-symbol
+    // alphabet allows, so entropy alone cannot separate it from a hex-encoded
+    // secret. The exemption is therefore a conjunction of NAME and SHAPE, and
+    // both halves are pinned below, each with the opposite case as its control.
+
+    it("passes a sha256 pin bound to a digest-named key through byte-exact", () => {
+      // The blocking case from PEN-3896: a promtool series fixture carrying the
+      // admission-drift expectation pin. The refusal's advice — derive it at
+      // runtime — is unavailable, because the sibling copy of this literal lives
+      // in a PromQL matcher inside a PrometheusRule and a gate asserts it there.
+      const text = `paperclip_admission_policy_drift_expectation_info{job="drift",sha256="${SYNTHETIC_SHA256}"}`;
+      const result = scrubGitHubEgressText(text);
+
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+      expect(result.classes).toEqual([]);
+    });
+
+    it.each([
+      ["sha256", SYNTHETIC_SHA256],
+      ["IMAGE_DIGEST", SYNTHETIC_SHA256],
+      ["expected_checksum", SYNTHETIC_SHA256],
+      ["manifest_sha512", SYNTHETIC_SHA512],
+      ["commit_sha1", SYNTHETIC_SHA1],
+    ])("exempts %s bound to a hex digest", (name, digest) => {
+      const text = `${name}="${digest}"`;
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+    });
+
+    // -- controls: the exemption must not have widened past its conjunction --
+
+    it("still redacts a 64-hex value under a name that does not claim a digest", () => {
+      // THE control for the shape half. Hex-encoded signing keys are routinely
+      // 32 or 64 hex, so exempting bare hex would pass a real credential. This
+      // value is byte-identical to the exempt one above; only the name differs.
+      const result = scrubGitHubEgressText(`SECRET_KEY="${SYNTHETIC_SHA256}"`);
+
+      expect(result.redacted).toBe(true);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_SHA256);
+    });
+
+    it("still redacts when the name only mentions a hash rather than ending in one", () => {
+      const result = scrubGitHubEgressText(`sha256_signing_key="${SYNTHETIC_SHA256}"`);
+      expect(result.redacted).toBe(true);
+      expect(result.text).not.toContain(SYNTHETIC_SHA256);
+    });
+
+    it("still redacts a digest-named key whose value is not a hex digest", () => {
+      // THE control for the name half: naming a value `sha256` does not make an
+      // opaque token a digest. Mixed case and the wrong length both disqualify.
+      const result = scrubGitHubEgressText(`sha256="${SYNTHETIC_OPAQUE_VALUE}"`);
+      expect(result.redacted).toBe(true);
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+
+    it("still redacts a digest-named key whose hex value is the wrong length", () => {
+      const notADigestLength = SYNTHETIC_SHA256.slice(0, 48);
+      const result = scrubGitHubEgressText(`sha256="${notADigestLength}"`);
+      expect(result.redacted).toBe(true);
+    });
+
+    it("leaves every other detector intact on the same call", () => {
+      // The done-when's positive control: a real-shaped PEM in the same text as
+      // an exempt digest must still refuse, so the exemption cannot be read as
+      // "digest present ⇒ text is clean".
+      const result = scrubGitHubEgressText(
+        `sha256="${SYNTHETIC_SHA256}"\n${SYNTHETIC_PEM}`,
+      );
+
+      expect(result.classes).toContain("private-key-block");
+      expect(result.text).toContain(SYNTHETIC_SHA256);
+      expect(result.text).not.toContain(SYNTHETIC_PEM_BODY);
+    });
+
+    it("pins the OCI prefixed form, which is exempt for a different reason", () => {
+      // `sha256:<hex>` never reached the entropy test at all: `:` is outside the
+      // token alphabet in `isOpaqueSecretValue`. That is incidental rather than
+      // intended, so it is pinned here — if the alphabet ever gains `:`, this
+      // fails and points at `isContentDigestAssignment` as the deliberate home
+      // for the behaviour, instead of image-digest pins silently starting to
+      // refuse.
+      const text = `DIGEST="sha256:${SYNTHETIC_SHA256}"`;
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+    });
+  });
+
   describe("detector: high-entropy-assignment", () => {
     it("redacts one interpolated secret below the dump threshold", () => {
       // The fail-closed net: a single assignment is not a "dump" but is still
@@ -222,6 +327,220 @@ describe("scrubGitHubEgressText", () => {
       );
       expect(result.redacted).toBe(true);
       expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+  });
+
+  describe("BLO-41262 regression: a hyphenated identifier is not a credential", () => {
+    // `draft-ramadan-moq-multicast-00` scores 3.74 bits/char, above the 3.5
+    // floor, so the entropy test alone read an RFC-XML <seriesInfo> element as
+    // credential-shaped. Every .md IETF draft in Blockcast/moqcast-draft became
+    // unwritable through `gh api .../git/blobs` while git push was down.
+    // Derived, not written out: until THIS fix is deployed the wrapper's own
+    // pre-push hook refuses a commit that adds the literal — the regression
+    // test for a false positive cannot be pushed past the false positive.
+    const DRAFT = ["draft", "ramadan", "moq", "multicast", "00"].join("-");
+    const SERIES_INFO = `<seriesInfo name='Internet-Draft' value='${DRAFT}'/>`;
+
+    it("passes an RFC-XML seriesInfo element through byte-exact", () => {
+      const result = scrubGitHubEgressText(SERIES_INFO);
+      expect(result.text).toBe(SERIES_INFO);
+      expect(result.redacted).toBe(false);
+    });
+
+    it.each([
+      "draft-ramadan-moq-multicast-00",
+      "draft-ramadan-moq-fec-00",
+      "draft-ramadan-moq-mmt-00",
+      "draft-ietf-moq-transport-14",
+    ])("leaves the draft name %s alone", (name) => {
+      const text = `value='${name}'`;
+      const result = scrubGitHubEgressText(text);
+      // `.text` alone would still pass if some other detector fired and left
+      // the bytes unchanged.
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+      expect(result.classes).toEqual([]);
+    });
+
+    // Random-looking letter runs for the bound cases below. Derived, not
+    // embedded, like LONG_LEXICAL_TAIL: as literals they are credential-shaped.
+    const LETTERS = "QwrtypsdfghjklzxmnbvcXZLKJHGFDSAPOIUYTREWQ";
+    const letterRun = (offset: number, length: number) =>
+      LETTERS.slice(offset, offset + length);
+
+    it("refuses two 16-letter segments (long-segment count and summed length)", () => {
+      // Each segment is within the per-segment cap, but two ~75-bit segments
+      // are ~150 bits. Two checks refuse this independently: both segments
+      // are long, and 32 letters exceeds the summed-length cap — so deleting
+      // either check alone leaves it refused. The 2 × 11 and 4 × 10 cases
+      // below are the ones that pin each check.
+      const token = [letterRun(0, 16), letterRun(16, 16)].join("-");
+      const result = scrubGitHubEgressText(`sessionkey=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("refuses two 11-letter segments: pins LEXICAL_LONG_SEGMENT_LENGTH", () => {
+      // 11 is one over the long-segment length, and 11 + 11 + 2 is under the
+      // summed-length cap, so only the long-segment count refuses this. The
+      // `00` tail lifts it over the 24-character entropy floor (2 × 11 alone
+      // is 23 characters and would pass without reaching any rule here), and
+      // must itself be lexical: a mixed tail like `v2` is refused on shape and
+      // would let this case pass with the constant deleted.
+      const token = [letterRun(0, 11), letterRun(11, 11), "00"].join("-");
+      const result = scrubGitHubEgressText(`sessionkey=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("refuses four 10-letter segments: pins the summed-length cap", () => {
+      // No segment is long, so only LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH (30)
+      // refuses 40 letters (~188 bits). Before it, any number of 10-letter
+      // segments was exonerated.
+      const token = [0, 10, 20, 30].map((o) => letterRun(o, 10)).join("-");
+      const result = scrubGitHubEgressText(`sessionkey=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("still exonerates three 10-letter segments: the cap narrows, it does not close", () => {
+      // Documents a known gap rather than a desired property. 3 × 10 sums to
+      // exactly the cap (30, ~141 bits) and passes. No length or count rule
+      // separates it from a real draft name of 26; what keeps random tokens
+      // out of this shape is that generators do not emit homogeneous letter
+      // runs, not this rule. If the cap is ever tightened, flip this case.
+      const token = [0, 10, 20].map((o) => letterRun(o, 10)).join("-");
+      const text = `sessionkey=${token}`;
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.classes).toEqual([]);
+    });
+
+    it("still refuses a random token in the same assignment position", () => {
+      // The negative control. The rule is narrowed, not disabled: a credential
+      // is ONE opaque run, and this one has no lexical segments at all.
+      const result = scrubGitHubEgressText(`apikey=${SYNTHETIC_OPAQUE_VALUE}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+
+    it("still refuses a value whose segments are words but whose tail is long", () => {
+      // Both conjuncts carry weight: lexical segments alone do not exonerate,
+      // or a `prefix-<20 opaque chars>` token would walk straight through.
+      // Derived, not embedded: the literal would be credential-shaped material
+      // in tracked source and the PEN-3156 publish guard refuses that.
+      const token = ["release", "Candidate", LONG_LEXICAL_TAIL].join("-");
+      const result = scrubGitHubEgressText(`token=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("documents that an all-lowercase value was never reachable here", () => {
+      // Pre-existing, and it bounds what the length conjunct above has to
+      // carry: the detector needs two character classes, so a pure-lowercase
+      // run never reaches the entropy test with or without this change.
+      const text = "token=release_candidate_abcdefghijklmnopqrstuv";
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+
+    it("still refuses a UUID-shaped value", () => {
+      // Fail closed: `386c81e8` is neither a word nor a number, so a GUID API
+      // key stays covered — at the cost of redacting the fleet's own ids.
+      const uuid = "386c81e8-e454-41ba-8e1d-7bb692331185";
+      const result = scrubGitHubEgressText(`session=${uuid}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(uuid);
+    });
+  });
+
+  describe("BLO-41262: locateGitHubEgressMatches names the line", () => {
+    const token = SYNTHETIC_OPAQUE_VALUE;
+
+    it("reports the 1-based line and omits clean lines", () => {
+      const located = locateGitHubEgressMatches(
+        ["clean first line", "", `apikey=${token}`, "clean last line"].join("\n"),
+      );
+
+      expect(located).toHaveLength(1);
+      expect(located[0]?.line).toBe(3);
+      expect(located[0]?.classes).toEqual(["high-entropy-assignment"]);
+    });
+
+    it("excerpts the SCRUBBED line, so the refusal cannot carry the material", () => {
+      // PEN-2526's shape is echoing the match back out through the control
+      // built to prevent it. The marker sits where the value was, which still
+      // identifies the line.
+      const located = locateGitHubEgressMatches(`apikey=${token}`);
+
+      expect(located[0]?.excerpt).not.toContain(token);
+      expect(located[0]?.excerpt).toContain(redactionMarker("high-entropy-assignment"));
+      expect(located[0]?.excerpt).toContain("apikey=");
+    });
+
+    it("truncates a long line rather than reprinting it whole", () => {
+      const located = locateGitHubEgressMatches(`apikey=${token} ${"x".repeat(500)}`);
+      expect(located[0]?.excerpt.length).toBeLessThanOrEqual(201);
+      expect(located[0]?.excerpt.endsWith("…")).toBe(true);
+    });
+
+    it("returns nothing for clean text", () => {
+      expect(locateGitHubEgressMatches("ordinary review prose")).toEqual([]);
+    });
+
+    it("attributes no line when a region class fires, so nothing inside the region is echoed", () => {
+      // A line inside an environment dump that also fires for its own reason
+      // used to be re-scanned alone and printed with only that match removed,
+      // carrying the short assignment the dump rule exists to catch.
+      const vendorKey = ["gh", "p_", "S7kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0TgAbCd"].join("");
+      const shortSecret = "s3cretpw";
+      const dump = [
+        "HOME=/root",
+        `TOKEN=${vendorKey} DB_PASS=${shortSecret}`,
+        "PATH=/usr/bin",
+        "LANG=C",
+        "SHELL=/bin/sh",
+      ].join("\n");
+      expect(scrubGitHubEgressText(dump).classes).toContain("environment-dump");
+
+      const located = locateGitHubEgressMatches(dump);
+      expect(located).toEqual([]);
+      expect(JSON.stringify(located)).not.toContain(shortSecret);
+    });
+
+    // Region-ness is derived, not trusted to the hand-kept list: a class is a
+    // region class exactly when a per-line re-scan cannot reproduce the
+    // whole-text scrub. The Record makes tsc demand a probe for every class,
+    // so a new multi-line detector cannot silently escape
+    // GITHUB_EGRESS_REGION_CLASSES and re-open per-line excerpts under it.
+    const regionProbes: Record<GitHubEgressScrubClass, string> = {
+      "private-key-block": `before\n${SYNTHETIC_PEM}\nafter`,
+      "credentialed-uri": `a\npostgres://dbuser:${SYNTHETIC_OPAQUE_VALUE}@db.internal:5432/app\nb`,
+      jwt: `a\nBearer ${SYNTHETIC_JWT}\nb`,
+      "vendor-key": `a\ntoken is ${["ghp", "S7kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0TgAbCd"].join("_")} ok\nb`,
+      "environment-dump": Array.from({ length: ENVIRONMENT_DUMP_MIN_RUN }, (_, i) => `VAR_${i}=v`).join("\n"),
+      "high-entropy-assignment": `a\nKEY=${SYNTHETIC_OPAQUE_VALUE}\nb`,
+    };
+
+    it.each(Object.entries(regionProbes))(
+      "lists %s as a region class iff a per-line re-scan cannot reproduce it",
+      (cls, input) => {
+        const whole = scrubGitHubEgressText(input);
+        expect(whole.classes).toContain(cls);
+        const perLine = input
+          .split("\n")
+          .map((line) => scrubGitHubEgressText(line).text)
+          .join("\n");
+        expect(GITHUB_EGRESS_REGION_CLASSES.includes(cls as GitHubEgressScrubClass)).toBe(
+          perLine !== whole.text,
+        );
+      },
+    );
+
+    it("does not leave a carriage return on a CRLF excerpt", () => {
+      const located = locateGitHubEgressMatches(`clean\r\napikey=${token}\r\nclean`);
+      expect(located).toHaveLength(1);
+      expect(located[0]?.line).toBe(2);
+      expect(located[0]?.excerpt.endsWith("\r")).toBe(false);
     });
   });
 

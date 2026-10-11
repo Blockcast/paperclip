@@ -509,13 +509,13 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
     expect(isolatedArgs.join(" ")).not.toContain(SDK_PACKAGE);
   });
 
-  it("retries a failed peer-resolving install with --legacy-peer-deps, and that retry is what keeps the install alive", async () => {
-    // The fallback is this change's central non-regression claim: three of the
-    // four isolated packages are healthy today, and if resolving one of their
-    // peer trees ERESOLVEs we must land the pre-BLO-34795 argv rather than fail
-    // the install outright. Nothing else in the suite reaches the *succeeding*
-    // retry — the budget test fails both invocations, so it only ever pins the
-    // double-failure shape.
+  it("retries a failed peer-resolving install with --legacy-peer-deps when a caller opts in (no production caller does)", async () => {
+    // ⚠ BLO-34794: this pins the HELPER's retry mechanics only. It is no longer
+    // a claim about production — the fallback is unreachable from both call
+    // sites now, because the retry's `--save` PRUNES an SDK that is already
+    // installed and that is what killed `lucitra.plugin-secrets` for 20 days.
+    // The non-regression claim this test was written to defend was false; see
+    // the test below, which pins the install path refusing the retry.
     const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-fallback-"));
     cleanupPaths.add(dir);
 
@@ -526,7 +526,9 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
       }
     };
 
-    await expect(npmInstallPlugin(ISOLATED_PACKAGE, dir, { installPeers: true })).resolves.toBeUndefined();
+    await expect(
+      npmInstallPlugin(ISOLATED_PACKAGE, dir, { installPeers: true, fallbackToLegacyPeerDeps: true }),
+    ).resolves.toBeUndefined();
 
     const calls = installArgsFor(dir);
     expect(calls.length).toBe(2);
@@ -552,6 +554,62 @@ describeEmbeddedPostgres("BLO-20961 — pre-isolation rows migrate into an isola
     ).rejects.toThrow(/ERESOLVE/);
 
     expect(installArgsFor(dir).length).toBe(1);
+  }, 30_000);
+
+  it("BLO-34794: the retry is opt-in — a caller that omits the flag never gets the destructive retry", async () => {
+    // Fail-closed default: forgetting `fallbackToLegacyPeerDeps` must get the
+    // safe behaviour. Mocked so the legacy argv WOULD succeed; a second call
+    // here means `undefined` re-enabled the retry that prunes an installed SDK.
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-optin-"));
+    cleanupPaths.add(dir);
+
+    npmMock.onInstall = (argv) => {
+      if (!argv.includes(dir)) return;
+      if (!argv.includes("--legacy-peer-deps")) {
+        throw new Error("ERESOLVE could not resolve peer dependency");
+      }
+    };
+
+    await expect(npmInstallPlugin(ISOLATED_PACKAGE, dir, { installPeers: true })).rejects.toThrow(/ERESOLVE/);
+
+    const calls = installArgsFor(dir);
+    expect(calls.length).toBe(1);
+    expect(calls[0]).not.toContain("--legacy-peer-deps");
+  }, 30_000);
+
+  it("BLO-34794: the install path never falls back to --legacy-peer-deps on an isolated tree", async () => {
+    // The fallback was introduced as a non-regression guard and is the opposite
+    // on an isolated tree: `--legacy-peer-deps` cannot place the peer, and the
+    // `--save` it carries PRUNES an SDK that is already installed. Measured in
+    // production 2026-10-09 — `removed 5 packages`, `node_modules/@paperclipai`
+    // emptied, lockfile rewritten without the SDK entry — which converted one
+    // transient failure of the peer-resolving attempt into the permanent
+    // SDK_NOT_INSTALLED latch, 20 days of a dead plugin.
+    //
+    // So a failed peer install must leave the tree ALONE. The install then
+    // fails, which is strictly better: the row errors, the next boot retries,
+    // and an SDK that is already there keeps working in the meantime.
+    //
+    // Deliberately mocked so the legacy argv WOULD have succeeded — that is the
+    // shipped behaviour, and a second call here is the regression.
+    const sharedDir = await tornSharedStore();
+    npmMock.onInstall = (argv) => {
+      if (!argv.includes("--legacy-peer-deps")) {
+        throw new Error("ERESOLVE could not resolve peer dependency");
+      }
+    };
+
+    const { runtimeServices } = createRuntimeServices();
+    const loader = pluginLoader(db, { localPluginDir: sharedDir }, runtimeServices);
+
+    await expect(loader.installPlugin({ packageName: ISOLATED_PACKAGE })).rejects.toThrow(
+      /npm install failed/,
+    );
+
+    const installs = npmMock.calls.filter((argv) => argv[0] === "install");
+    expect(installs.length).toBe(1);
+    expect(installs[0]).toContain(resolveDefaultInstallDir(ISOLATED_PACKAGE, sharedDir));
+    expect(installs[0]).not.toContain("--legacy-peer-deps");
   }, 30_000);
 
   it("stops reinstalling after the boot budget, leaving the exhausting failure in lastError", async () => {

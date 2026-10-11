@@ -5956,20 +5956,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issueRecoveryActions)
       .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)))
       .then((rows) => rows[0] ?? null);
+    // BLO-19924: `missing_project_id` is an unanswered-probe park, not a confirmed git
+    // hazard, so it no longer keeps the `workspace_validation_failed` cause. That cause
+    // is what carried `wakePolicy: manual_repair_required` — no wake at all, recoverable
+    // only by a hand-run sweep. The wake_owner assertion below IS the fix; it is the
+    // assertion that fails if the cause ever latches back.
     expect(recoveryAction).toMatchObject({
-      kind: "workspace_validation",
-      cause: "workspace_validation_failed",
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
       status: "active",
       ownerAgentId: agentId,
       recoveryIssueId: null,
+    });
+    expect(recoveryAction?.wakePolicy).toMatchObject({
+      type: "wake_owner",
+      reason: "source_scoped_recovery_action",
+      ownerAgentId: agentId,
     });
     expect(recoveryAction?.evidence).toMatchObject({
       sourceIssueId: issueId,
       latestRunId: runId,
       latestRunErrorCode: "workspace_validation_failed",
-      recoveryCause: "workspace_validation_failed",
+      recoveryCause: "stranded_assigned_issue",
     });
-    expect(recoveryAction?.nextAction).toContain("Repair the source issue workspace link");
 
     const validationComment = await waitForValue(async () => {
       const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));

@@ -32,7 +32,7 @@ const HUMAN_USER_ID = "user_human_owner";
 // The agent runtime's installation token, same one the `gh` wrapper injects.
 // Overridable so this can be pointed at any credential rather than assuming the
 // pod layout.
-const TOKEN_PATH = process.env.BLO_30259_TOKEN_PATH ?? "/paperclip/.secrets/github-token/token";
+const TOKEN_PATH = process.env.BLO_30259_TOKEN_PATH ?? "/etc/paperclip/secrets/github-token/token";
 const token = readFileSync(TOKEN_PATH, "utf8").trim();
 
 const tempDb = await startEmbeddedPostgresTestDatabase("blo-30259-observe-");

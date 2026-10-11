@@ -76,6 +76,15 @@ function writeExecutable(dir, name, body) {
   return file;
 }
 
+// BLO-40279: both token-file readers refuse a file on the shared data volume
+// (`${PAPERCLIP_HOME:-/paperclip}`), compared by device. Agent Jobs run these
+// tests with PAPERCLIP_HOME=/paperclip and TMPDIR on that same CephFS, so every
+// temp token file below would read as "on the shared volume". Pin the root to
+// /proc — always present, never the device of a regular file — so the check is
+// live in every test and each token-file test doubles as its distinct-device
+// positive control. The shared-volume tests override it per call.
+process.env.PAPERCLIP_HOME = "/proc";
+
 const rendered = renderStatefulSet();
 const envScriptBody = extractHeredoc(rendered, "paperclip-github-token-env");
 const credHelperBody = extractHeredoc(rendered, "github-token-credential-helper");
@@ -191,6 +200,9 @@ test("paperclip-github-token-env: rejects a whitespace-only override instead of 
 
   assert.equal(result.status, 64);
   assert.match(result.stderr, /holds only whitespace/);
+  // BLO-40279: `GH_SEAT_TOKEN_VALUE="$(cat /paperclip/.secrets/...)"` leaves it
+  // set-but-empty, so this refusal is where a stale pin through `git` surfaces.
+  assert.match(result.stderr, /stale since BLO-40279/);
 });
 
 test("paperclip-github-token-env: rejects an override with embedded whitespace", () => {
@@ -238,6 +250,85 @@ test("paperclip-github-token-env: fails loudly when the fallback token file is u
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /not readable/);
+  // Anti-vacuity for the stale-path test below: the hint is conditional.
+  assert.doesNotMatch(result.stderr, /BLO-40279/);
+});
+
+// BLO-40279: `git` and `github-mcp-server` exec this wrapper, not the `gh`
+// wrapper, so a stale /paperclip/.secrets pin reaching them must get the same
+// pointer to the new mount instead of a bare "not readable".
+test("paperclip-github-token-env: names the BLO-40279 move for a stale /paperclip/.secrets path", (t) => {
+  const stale = "/paperclip/.secrets/gh-seat-token-test-absent/token";
+  if (fs.existsSync(stale)) return t.skip(`${stale} unexpectedly exists`);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-seat-token-"));
+  const script = writeExecutable(dir, "paperclip-github-token-env", envScriptBody);
+
+  const env = { ...process.env, PAPERCLIP_GITHUB_TOKEN_FILE: stale };
+  delete env.GH_SEAT_TOKEN_VALUE;
+
+  const result = spawnSync("sh", [script, "true"], { encoding: "utf8", env });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /not readable/);
+  assert.match(
+    result.stderr,
+    /moved to \/etc\/paperclip\/secrets\/<name>\/token in BLO-40279/,
+  );
+});
+
+// BLO-40279: the vacated /paperclip/.secrets/<name>/ is a bare, group-writable
+// directory on the shared volume, so a token read from there may be one any
+// agent planted. The wrapper must refuse it rather than authenticate as it.
+test("paperclip-github-token-env: refuses a readable token file on the shared data volume", () => {
+  const shared = fs.mkdtempSync(path.join(os.tmpdir(), "gh-seat-token-shared-"));
+  const script = writeExecutable(shared, "paperclip-github-token-env", envScriptBody);
+  const planted = path.join(shared, ".secrets", "github-merge-token", "token");
+  fs.mkdirSync(path.dirname(planted), { recursive: true });
+  fs.writeFileSync(planted, "planted-token\n");
+
+  const env = { ...process.env, PAPERCLIP_HOME: shared, PAPERCLIP_GITHUB_TOKEN_FILE: planted };
+  delete env.GH_SEAT_TOKEN_VALUE;
+
+  const result = spawnSync("sh", [script, "sh", "-c", 'echo "GH_TOKEN=${GH_TOKEN}"'], {
+    encoding: "utf8",
+    env,
+  });
+
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /is on the shared .* volume, which every agent can write; refusing/);
+  assert.doesNotMatch(result.stderr, /planted-token/);
+});
+
+// Device, not path prefix: a symlink from another filesystem still lands on the
+// shared volume, and `stat -L` must follow it there.
+test("paperclip-github-token-env: refuses a symlink that resolves onto the shared data volume", (t) => {
+  const elsewhere = "/dev/shm";
+  const shared = fs.mkdtempSync(path.join(os.tmpdir(), "gh-seat-token-shared-"));
+  if (!fs.existsSync(elsewhere) || fs.statSync(elsewhere).dev === fs.statSync(shared).dev) {
+    return t.skip(`${elsewhere} is not a second filesystem here`);
+  }
+  const planted = path.join(shared, "token");
+  fs.writeFileSync(planted, "planted-token\n");
+  const linkDir = fs.mkdtempSync(path.join(elsewhere, "gh-seat-token-link-"));
+  const link = path.join(linkDir, "token");
+  fs.symlinkSync(planted, link);
+  const script = writeExecutable(shared, "paperclip-github-token-env", envScriptBody);
+
+  const env = { ...process.env, PAPERCLIP_HOME: shared, PAPERCLIP_GITHUB_TOKEN_FILE: link };
+  delete env.GH_SEAT_TOKEN_VALUE;
+
+  try {
+    const result = spawnSync("sh", [script, "sh", "-c", 'echo "GH_TOKEN=${GH_TOKEN}"'], {
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /is on the shared .* volume/);
+  } finally {
+    fs.rmSync(linkDir, { recursive: true, force: true });
+  }
 });
 
 function runCredHelper(
@@ -349,4 +440,23 @@ test("github-token-credential-helper: stays silent for a plaintext http remote i
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "");
+});
+
+test("github-token-credential-helper: refuses to emit a token file on the shared data volume", () => {
+  const shared = fs.mkdtempSync(path.join(os.tmpdir(), "gh-seat-token-shared-"));
+  const script = writeExecutable(shared, "github-token-credential-helper", credHelperBody);
+  const planted = path.join(shared, "token");
+  fs.writeFileSync(planted, "planted-token\n");
+
+  const env = { ...process.env, PAPERCLIP_HOME: shared, PAPERCLIP_GITHUB_TOKEN_FILE: planted };
+  delete env.GH_SEAT_TOKEN_VALUE;
+  const result = spawnSync("sh", [script, "get"], {
+    encoding: "utf8",
+    input: "protocol=https\nhost=github.com\n",
+    env,
+  });
+
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /is on the shared .* volume, which every agent can write; refusing/);
 });

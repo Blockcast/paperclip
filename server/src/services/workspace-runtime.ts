@@ -22,6 +22,7 @@ import {
 import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
 import {
   createLocalServiceKey,
   findLocalServiceRegistryRecordByRuntimeServiceId,
@@ -3112,7 +3113,9 @@ async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
 // the subprocess twice — once by path, once by branch — is pure overhead on the
 // common `sameHead` path that repairs without ever reading the branch lookup.
 async function listRegisteredGitWorktrees(repoRoot: string): Promise<GitWorktreeListEntry[] | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot).catch(() => null);
+  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot, {
+    timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+  }).catch(() => null);
   if (!raw) return null;
   return parseGitWorktreeListPorcelain(raw);
 }
@@ -3829,10 +3832,46 @@ async function stampGitWorktreeOwnership(input: {
   return result.warnings;
 }
 
+/**
+ * Whether `worktreePath` is a linked worktree registered with `repoRoot`, read
+ * from the registration itself rather than from `git worktree list`: the
+ * worktree's `.git` file names an admin dir under `<repoRoot>/.git/worktrees/`,
+ * and that dir's `gitdir` file points back at the same `.git`. That pair is
+ * what the list enumerates. Used only when the list failed (BLO-42089). A
+ * missing or mismatched file resolves to "not registered", the verdict a failed
+ * list already gave. A read that outlives the reclaim deadline answers nothing,
+ * so it returns `null` and the caller decides.
+ */
+async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: string): Promise<boolean | null> {
+  const dotGit = path.join(worktreePath, ".git");
+  // A read already abandoned under this dir holds a pool thread; don't spend another.
+  if (isReclaimFsWedgedDir(path.dirname(path.resolve(dotGit)))) return null;
+  const read = async () => {
+    const adminRef = /^gitdir:\s*(.+)$/m.exec(await fs.readFile(dotGit, "utf8"))?.[1]?.trim();
+    if (!adminRef) return false;
+    const adminDir = await resolvePathForWorktreeComparison(path.resolve(worktreePath, adminRef));
+    if (path.dirname(adminDir) !== await resolvePathForWorktreeComparison(path.join(repoRoot, ".git", "worktrees"))) {
+      return false;
+    }
+    const backRef = (await fs.readFile(path.join(adminDir, "gitdir"), "utf8")).trim();
+    return await resolvePathForWorktreeComparison(path.resolve(adminDir, backRef))
+      === await resolvePathForWorktreeComparison(dotGit);
+  };
+  return withReclaimFsDeadline(read(), dotGit).catch((error: unknown) =>
+    (error as { code?: unknown } | null)?.code === "ETIMEDOUT" ? null : false);
+}
+
 export async function inspectManagedGitWorktreeBranch(input: {
   worktreePath: string;
   expectedBranchName: string | null | undefined;
   repoRoot?: string | null;
+  /**
+   * Whether a stalled registration check is rethrown (default) so the run
+   * fails retryably. Finalize passes `false`: it runs after the adapter
+   * returned, where a retry could replay finished work, so it keeps the
+   * non-replaying `not_registered` verdict.
+   */
+  rethrowListStall?: boolean;
 }): Promise<ManagedGitWorktreeBranchInspection> {
   const worktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
   const expectedBranchName = asString(input.expectedBranchName, "").trim() || null;
@@ -3865,8 +3904,29 @@ export async function inspectManagedGitWorktreeBranch(input: {
     };
   }
 
-  const listedWorktrees = await listLinkedGitWorktreePaths(repoRoot).catch(() => null);
-  if (!listedWorktrees?.has(worktreePath)) {
+  // BLO-42089: a failed `git worktree list` is not evidence this path is
+  // unregistered. The list touches every registration (340-453 on the shared
+  // CephFS checkouts), so one contended `getattr` can push it past its 30s
+  // bound. Measured on 2026-10-09: 33s and 50s, then 0.1-1.5s minutes later,
+  // with the worktree listed both times. Reporting that as `not_registered`
+  // blocked healthy issues for manual repair, so read this one registration
+  // directly instead.
+  const listed = await listLinkedGitWorktreePaths(repoRoot).then(
+    (paths) => ({ paths, error: null as unknown }),
+    (error: unknown) => ({ paths: null, error }),
+  );
+  const registered = listed.paths
+    ? listed.paths.has(worktreePath)
+    : await hasLinkedGitWorktreeRegistration(repoRoot, worktreePath);
+  // The list stalled and the direct read stalled too, so there is no answer.
+  // `not_registered` would become a workspace-validation failure, which recovery
+  // parks for manual repair. Rethrow the stall instead: the run fails as a
+  // retryable setup/adapter failure and the next attempt re-checks. Only before
+  // dispatch: see `rethrowListStall`.
+  if (registered === null && input.rethrowListStall !== false && listed.error instanceof GitCommandTimeoutError) {
+    throw listed.error;
+  }
+  if (!registered) {
     return {
       ...base,
       valid: false,
@@ -4488,7 +4548,7 @@ export async function realizeExecutionWorkspace(input: {
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir
     ? resolveConfiguredPath(configuredParentDir, repoRoot)
-    : path.join(repoRoot, ".paperclip", "worktrees");
+    : path.join(repoRoot, REPO_MANAGED_WORKTREES_SUBPATH);
   const worktreePath = path.join(worktreeParentDir, branchName);
   let pendingForwardBranchReconcile: PendingForwardBranchReconcile | null = null;
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0

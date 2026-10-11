@@ -36,6 +36,7 @@ import {
   BLOCKCAST_PHYSICAL_INFRA_AGENT_ID,
   BLOCKCAST_PHYSICAL_INFRA_GOAL_ID,
   BLOCKCAST_PHYSICAL_INFRA_PROJECT_ID,
+  DEFAULT_CONFIG,
   DEFAULT_ISSUE_ROUTE_MAP,
   MAX_OPERATOR_SUPPRESSION_HOURS,
 } from "../constants.js";
@@ -221,8 +222,15 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       findByEmail: vi.fn(async () => null),
     },
     agents: {
+      // BLO-26613: the assignee guard vets every resolved route / owner-map /
+      // override agent against this roster, so each agent a test expects to be
+      // assigned is on it, invokable and with a healthy (root) reporting chain.
+      // Tests for the guard itself override this.
       list: vi.fn(async () => [
-        { id: "agent-fallback", name: "Alert Fallback", status: "idle" },
+        { id: "agent-fallback", companyId: "company-1", name: "Alert Fallback", status: "idle" },
+        ...[BLOCKCAST_PHYSICAL_INFRA_AGENT_ID, "agent-override", "agent-multicast"].map(
+          (id) => ({ id, companyId: "company-1", name: id, status: "idle" }),
+        ),
       ]),
     },
     issues: {
@@ -1554,6 +1562,241 @@ describe("handleWebhook — firing first time", () => {
     expect(createArgs.assigneeAgentId).toBe("agent-override");
   });
 
+  // BLO-26613 guard roster: the named fallback, plus whichever route agent a
+  // test needs in a given state.
+  const guardRoster = (...extra: Array<{ id: string; status: string; reportsTo?: string }>) => [
+    { id: "agent-fallback", companyId: "company-1", name: "Alert Fallback", status: "idle" },
+    ...extra.map((agent) => ({ companyId: "company-1", name: agent.id, ...agent })),
+  ];
+  const physicalDiskAlert = (fingerprint: string) =>
+    baseAlert({
+      labels: {
+        alertname: "PhysicalInfraDiskReallocatedSectorsHigh",
+        severity: "warning",
+        class: "physical_infra_disk",
+      },
+      fingerprint,
+    });
+
+  it("does not file a new issue on a paused route assignee (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(guardRoster({ id: "agent-paused", status: "paused" }));
+    const config = baseConfig({
+      issueRouteMap: {
+        class: { physical_infra_disk: { assigneeAgentId: "agent-paused" } },
+      },
+      ownerMap: {},
+    });
+
+    await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [physicalDiskAlert("physical-disk-paused")] }) }),
+    );
+
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    // Falls through to the (invokable) named fallback agent instead.
+    expect(createArgs.assigneeAgentId).toBe("agent-fallback");
+    expect(mocks.metrics.write).toHaveBeenCalledWith("alertmanager.owner.assignee_dropped", 1, {
+      alertname: "PhysicalInfraDiskReallocatedSectorsHigh",
+      severity: "warning",
+      reason: "paused",
+    });
+    // The guard and the fallback leg share one roster read per delivery.
+    expect(mocks.agents.list).toHaveBeenCalledTimes(1);
+  });
+
+  // Ally review 5471368783 I1: `idle` passes a status-only check, but the wake
+  // path rejects an agent whose reporting chain is broken (`invalidOrgChain`).
+  it.each([
+    ["is terminated", [{ id: "agent-orphan", status: "idle", reportsTo: "mgr" }, { id: "mgr", status: "terminated" }]],
+    // Production shape: `agents.list` omits terminated agents entirely.
+    ["is missing from the roster", [{ id: "agent-orphan", status: "idle", reportsTo: "mgr-gone" }]],
+  ])(
+    "does not assign an idle route agent whose manager %s (BLO-26613)",
+    async (_label, extra) => {
+      const { ctx, mocks } = mkCtx();
+      mocks.agents.list.mockResolvedValue(guardRoster(...extra));
+      const config = baseConfig({
+        issueRouteMap: {
+          class: { physical_infra_disk: { assigneeAgentId: "agent-orphan" } },
+        },
+        ownerMap: {},
+      });
+
+      await handleWebhook(
+        ctx,
+        config,
+        true,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [physicalDiskAlert("physical-disk-orphan")] }) }),
+      );
+
+      expect(mocks.issues.create.mock.calls[0][0].assigneeAgentId).toBe("agent-fallback");
+      expect(mocks.metrics.write).toHaveBeenCalledWith(
+        "alertmanager.owner.assignee_dropped",
+        1,
+        expect.objectContaining({ reason: "invalid_org_chain" }),
+      );
+    },
+  );
+
+  it("CONTROL — assigns an idle route agent whose manager is healthy (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(
+      guardRoster({ id: "agent-managed", status: "idle", reportsTo: "mgr" }, { id: "mgr", status: "active" }),
+    );
+    const config = baseConfig({
+      issueRouteMap: {
+        class: { physical_infra_disk: { assigneeAgentId: "agent-managed" } },
+      },
+      ownerMap: {},
+    });
+
+    await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [physicalDiskAlert("physical-disk-managed")] }) }),
+    );
+
+    expect(mocks.issues.create.mock.calls[0][0].assigneeAgentId).toBe("agent-managed");
+  });
+
+  it("keeps an owner-map human owner when the guard drops a paused route agent (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(guardRoster({ id: "agent-paused", status: "paused" }));
+    mocks.users.findByEmail.mockResolvedValueOnce({
+      id: "user-carol",
+      email: "carol@example.com",
+      name: "Carol",
+    });
+    const config = baseConfig({
+      issueRouteMap: { class: { physical_infra_disk: { assigneeAgentId: "agent-paused" } } },
+      ownerMap: { class: { physical_infra_disk: "carol@example.com" } },
+    });
+
+    await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [physicalDiskAlert("physical-disk-paused-human")] }) }),
+    );
+
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.assigneeUserId).toBe("user-carol");
+    expect(createArgs.assigneeAgentId).toBeUndefined();
+  });
+
+  it("keeps the route's own human fallback when the guard drops a paused route agent (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(guardRoster({ id: "agent-paused", status: "paused" }));
+    const config = baseConfig({
+      issueRouteMap: {
+        class: {
+          physical_infra_disk: { assigneeAgentId: "agent-paused", assigneeUserId: "user-carol" },
+        },
+      },
+      ownerMap: {},
+    });
+
+    await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [physicalDiskAlert("physical-disk-paused-route-human")] }) }),
+    );
+
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.assigneeUserId).toBe("user-carol");
+    expect(createArgs.assigneeAgentId).toBeUndefined();
+  });
+
+  // Ally review 5475541309: on the shipped default config the route-map agent
+  // has no human owner behind it (support@ does not resolve here) and
+  // `fallbackAgentName` is "", so the owner chain ends in a refusal. A roster
+  // read that *failed* is no evidence the route agent is bad, so that refusal
+  // must keep Alertmanager's retry window instead of a 200 PermanentAlertError.
+  const defaultShapedConfig = (): AlertmanagerPluginConfig => ({
+    ...DEFAULT_CONFIG,
+    defaultCompanyId: "company-1",
+    webhookToken: TOKEN,
+  });
+  const physicalProxmoxAlert = (fingerprint: string) =>
+    baseAlert({
+      labels: {
+        alertname: "PhysicalInfraProxmoxApiDown",
+        severity: "critical",
+        class: "physical_infra_proxmox",
+      },
+      fingerprint,
+    });
+
+  it.each([
+    ["rejects (lookup_failed)", (list: ReturnType<typeof vi.fn>) =>
+      list.mockRejectedValue(new Error("agents rpc unavailable"))],
+    ["comes back empty (roster_empty)", (list: ReturnType<typeof vi.fn>) =>
+      list.mockResolvedValue([])],
+  ])(
+    "keeps the retry window on the default config when the roster read %s (BLO-26613)",
+    async (_label, failRoster) => {
+      const { ctx, mocks } = mkCtx();
+      failRoster(mocks.agents.list);
+
+      await expect(
+        handleWebhook(
+          ctx,
+          defaultShapedConfig(),
+          true,
+          baseInput({ parsedBody: baseEnvelope({ alerts: [physicalProxmoxAlert("proxmox-degraded")] }) }),
+        ),
+      ).rejects.toBeInstanceOf(AlertDeliveryIncompleteError);
+
+      expect(mocks.issues.create).not.toHaveBeenCalled();
+      expect(mocks.metrics.write).toHaveBeenCalledWith("alertmanager.owner.fallback_failed", 1, {
+        alertname: "PhysicalInfraProxmoxApiDown",
+        severity: "critical",
+        refusal: "transient",
+      });
+      expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+        "alertmanager.alert.permanent_error",
+        1,
+        expect.anything(),
+      );
+    },
+  );
+
+  it("CONTROL — still drops a paused route agent permanently on the default config (BLO-26613)", async () => {
+    // Same config and alert as above, but the roster read succeeds and shows
+    // the route agent paused — a real verdict on the agent, so the
+    // empty-fallback refusal stays permanent. The fix must not regress this.
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(
+      guardRoster({ id: BLOCKCAST_PHYSICAL_INFRA_AGENT_ID, status: "paused" }),
+    );
+
+    await expect(
+      handleWebhook(
+        ctx,
+        defaultShapedConfig(),
+        true,
+        baseInput({ parsedBody: baseEnvelope({ alerts: [physicalProxmoxAlert("proxmox-gone")] }) }),
+      ),
+    ).resolves.toEqual({ accepted: 0 });
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.assignee_dropped",
+      1,
+      expect.objectContaining({ reason: "paused" }),
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.permanent_error",
+      1,
+      { alertname: "PhysicalInfraProxmoxApiDown", severity: "critical" },
+    );
+  });
+
   it("lets explicit assignee overrides win over route assignees", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({
@@ -2136,6 +2379,80 @@ describe("BLO-40764 — re-fire retrofits a configured owner onto an agent-null 
       }),
       FIRING_FENCE_ARG,
     );
+  });
+
+  // Ally review 5471368783 I2. The creation guard leaves exactly this row
+  // behind: `ownerMap` names an uninvokable agent, the route supplies a human,
+  // so the row is created human-owned and agent-null. Without the same guard
+  // here, the very next re-fire / aggregate join patches the dropped agent
+  // straight back in.
+  const uninvokableOwnerMapAlert = (fingerprint?: string) =>
+    baseAlert({
+      labels: { ...baseAlert().labels, class: "physical_infra_disk" },
+      ...(fingerprint ? { fingerprint } : {}),
+    });
+  const uninvokableOwnerMapConfig = () =>
+    baseConfig({
+      issueRouteMap: { class: { physical_infra_disk: { assigneeUserId: "user-carol" } } },
+      ownerMap: { class: { physical_infra_disk: "agent:agent-paused" } },
+    });
+  const pausedRoster = [
+    { id: "agent-fallback", companyId: "company-1", name: "Alert Fallback", status: "idle" },
+    { id: "agent-paused", companyId: "company-1", name: "agent-paused", status: "paused" },
+  ];
+
+  it("does not retrofit an uninvokable owner-map agent onto a re-fired row (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(pausedRoster);
+    mocks.state.get.mockResolvedValueOnce({ ...refireState, assigneeUserId: "user-carol" });
+    mocks.issues.get.mockResolvedValue({
+      id: "issue-existing",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-carol",
+    });
+
+    await handleWebhook(
+      ctx,
+      uninvokableOwnerMapConfig(),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [uninvokableOwnerMapAlert()] }) }),
+    );
+
+    expect(assigneePatches(mocks)).toEqual([]);
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.owner.assignee_dropped",
+      1,
+      expect.objectContaining({ reason: "paused" }),
+    );
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ assigneeAgentId: null, assigneeUserId: "user-carol" }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("does not retrofit an uninvokable owner-map agent when a new fingerprint joins the row (BLO-26613)", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.agents.list.mockResolvedValue(pausedRoster);
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-winner",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-carol",
+    }));
+
+    await handleWebhook(
+      ctx,
+      uninvokableOwnerMapConfig(),
+      true,
+      baseInput({
+        parsedBody: baseEnvelope({ alerts: [uninvokableOwnerMapAlert("second-member-paused")] }),
+      }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(assigneePatches(mocks)).toEqual([]);
   });
 
   it("CONTROL — a new fingerprint joining an already-owned aggregate row leaves its owner alone", async () => {
@@ -4930,7 +5247,7 @@ describe("handleWebhook — acceptOnlyLabels filter", () => {
 });
 
 describe("handleWebhook — severity → priority", () => {
-  it("maps severity=warning to priority=high using the default map", async () => {
+  it("maps severity=warning to priority=medium using the default map (BLO-20576)", async () => {
     const { ctx, mocks } = mkCtx();
     const config = baseConfig({ severityToPriority: undefined });
     const alert = baseAlert({
@@ -4940,7 +5257,209 @@ describe("handleWebhook — severity → priority", () => {
 
     await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
     const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.priority).toBe("medium");
+  });
+
+  // The unit tests in issue-mapping.test.ts cover resolveAlertPriority itself.
+  // These two pin the *call site*: that the handler reads the label at all,
+  // and that a junk value cannot reach ctx.issues.create.
+  it("honours the paperclip_priority escape hatch on the created issue", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "high" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    const createArgs = mocks.issues.create.mock.calls[0][0];
     expect(createArgs.priority).toBe("high");
+  });
+
+  it("falls back to the severity map when paperclip_priority is junk", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "P1" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    const createArgs = mocks.issues.create.mock.calls[0][0];
+    expect(createArgs.priority).toBe("medium");
+  });
+
+  it("warns and counts an ignored paperclip_priority instead of dropping it silently", async () => {
+    // The label exists to override a default this plugin lowered, so a typo
+    // must not be indistinguishable from an absent label.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "hgih" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('ignoring paperclip_priority "hgih"'),
+    );
+    // `label` keeps this non-lossy case apart from a malformed
+    // `paperclip_issue`, which counts on the same metric but drops the alert.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.alert.malformed",
+      1,
+      { alertname: "X", label: "paperclip_priority" },
+    );
+    // Still filed — only the override is dropped, unlike a malformed
+    // `paperclip_issue`, which drops the alert.
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("an honoured paperclip_priority does not warn", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "high" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("ignoring paperclip_priority"),
+    );
+  });
+
+  it("honours paperclip_priority set as an annotation on the created issue", async () => {
+    // Same label-or-annotation surface as `paperclip_issue` and
+    // `paperclip_dedupe_domain`; an annotation used to be silently absent.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+      annotations: { summary: "s", paperclip_priority: "high" },
+    });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+
+    expect(mocks.issues.create.mock.calls[0][0].priority).toBe("high");
+  });
+
+  // The escape hatch only prices a *new* issue. A firing alert that joins an
+  // already-open aggregate issue for its alertname — the usual case for the
+  // chronically-firing rule the label targets, since adding the label mints a
+  // new fingerprint — leaves that issue's priority alone (rewriting it would
+  // also overwrite an operator's manual re-prioritization). These pin that
+  // contract so changing it is a decision, not a side effect.
+  it("does not re-price an already-open aggregate issue the alert joins", async () => {
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-open",
+      status: "todo",
+      assigneeAgentId: "agent-deliberate",
+      assigneeUserId: null,
+    }));
+    const alert = baseAlert({
+      fingerprint: "relabelled-member",
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "high" },
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ severityToPriority: undefined }),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    expect(
+      mocks.issues.update.mock.calls.filter(
+        (call) => "priority" in (call[1] as Record<string, unknown>),
+      ),
+    ).toEqual([]);
+    expect(mocks.state.set).toHaveBeenCalledWith(
+      expect.objectContaining({ stateKey: "alert:relabelled-member" }),
+      expect.objectContaining({ paperclipIssueId: "issue-open" }),
+      FIRING_FENCE_ARG,
+    );
+  });
+
+  it("an ignored value joining an open aggregate issue does not claim a priority was filed", async () => {
+    // The warn used to end `falling back to the severity map, priority=medium`,
+    // which reads as a statement about the issue — but on this path no
+    // priority is written at all.
+    const { ctx, mocks } = mkCtx();
+    mocks.issues.list.mockImplementation(aggregateWinner({
+      id: "issue-open",
+      status: "todo",
+      assigneeAgentId: "agent-deliberate",
+      assigneeUserId: null,
+    }));
+    const alert = baseAlert({
+      fingerprint: "relabelled-member",
+      labels: { alertname: "X", severity: "warning", paperclip_priority: "hgih" },
+    });
+
+    await handleWebhook(
+      ctx,
+      baseConfig({ severityToPriority: undefined }),
+      true,
+      baseInput({ parsedBody: baseEnvelope({ alerts: [alert] }) }),
+    );
+
+    expect(mocks.issues.create).not.toHaveBeenCalled();
+    const warning = mocks.logger.warn.mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.includes('ignoring paperclip_priority "hgih"'));
+    expect(warning).toBeDefined();
+    expect(warning).toContain("if this files a new issue");
+    expect(warning).toContain("an already-open aggregate issue keeps its own priority");
+  });
+
+  it("a non-string paperclip_priority does not fail the delivery", async () => {
+    // `isAlertmanagerPayload` does not validate label entries, so a YAML
+    // `paperclip_priority: 5` reaches this path as a number. Throwing here
+    // raises a TypeError, not a PermanentAlertError, which fails the whole
+    // batch and makes Alertmanager redeliver into the same crash.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: undefined });
+    const alert = baseAlert({
+      labels: { alertname: "X", severity: "warning" },
+    });
+    (alert.labels as Record<string, unknown>).paperclip_priority = 5;
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    const result = await handleWebhook(
+      ctx,
+      config,
+      true,
+      baseInput({ parsedBody: envelope }),
+    );
+
+    // Without the guard this rejects with AlertDeliveryIncompleteError rather
+    // than returning, so `accepted: 1` is the assertion that carries the fix.
+    expect(result.accepted).toBe(1);
+    expect(result.rejected).toBeUndefined();
+    expect(mocks.issues.create).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.create.mock.calls[0][0].priority).toBe("medium");
+    expect(mocks.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('ignoring paperclip_priority "<non-string number>"'),
+    );
+  });
+
+  it("an absent severity still resolves under the operator's `unknown` key", async () => {
+    // Pre-BLO-20576 the call site passed `alert.labels.severity ?? "unknown"`.
+    // Passing the raw label instead short-circuits on `!severity`, so an
+    // operator's `unknown` entry would silently stop applying.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ severityToPriority: { unknown: "low" } });
+    const alert = baseAlert({ labels: { alertname: "X" } });
+    const envelope = baseEnvelope({ alerts: [alert] });
+
+    await handleWebhook(ctx, config, true, baseInput({ parsedBody: envelope }));
+    expect(mocks.issues.create.mock.calls[0][0].priority).toBe("low");
   });
 
   it("operator severity-to-priority overrides the default", async () => {
@@ -5250,7 +5769,7 @@ describe("handleWebhook — creation policy", () => {
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.alert.malformed",
       1,
-      { alertname: "MalformedPolicyAlert" },
+      { alertname: "MalformedPolicyAlert", label: "paperclip_issue" },
     );
   });
 

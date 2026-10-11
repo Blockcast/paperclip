@@ -182,6 +182,24 @@ async function readGitStdout(args: string[], cwd: string): Promise<string | null
   return output.stdout.trim() || null;
 }
 
+// Git's own first stderr line, for error messages that would otherwise assert
+// something false about the repo when it was the probe that failed (BLO-40279:
+// a hidden secret mount made the `git` wrapper exit 1 before git ever ran, and
+// intact checkouts were reported as "not inside a git repository").
+//
+// Exported because heartbeat.ts' workspace validation needs the identical
+// treatment and imports from here already (the reverse edge does not exist).
+export function describeGitFailure(error: unknown): string {
+  const stderr = (error as { stderr?: unknown })?.stderr;
+  const raw = typeof stderr === "string" && stderr.trim()
+    ? stderr
+    : (error as Error)?.message ?? String(error);
+  // Truthiness, not `??`: for whitespace-only stderr and an empty message,
+  // `"".split(/\r?\n/)[0]` is `""` — not `undefined` — so `??` never fires and
+  // the caller renders a bare "(git: )".
+  return raw.trim().split(/\r?\n/)[0]?.slice(0, 300) || "unknown git failure";
+}
+
 function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((entry) => stableStringify(entry)).join(",")}]`;
@@ -277,9 +295,16 @@ async function inspectExecutionWorkspaceBranchForReconcile(
     throw unprocessable("Execution workspace needs a local worktree path before Paperclip can reconcile its branch record");
   }
 
-  const repoRoot = await readGitStdout(["rev-parse", "--show-toplevel"], worktreePath).catch(() => null);
+  let repoRoot: string | null;
+  try {
+    repoRoot = await readGitStdout(["rev-parse", "--show-toplevel"], worktreePath);
+  } catch (error: unknown) {
+    throw unprocessable(`Execution workspace path is not inside a git repository (git: ${describeGitFailure(error)})`);
+  }
   if (!repoRoot) {
-    throw unprocessable("Execution workspace path is not inside a git repository");
+    throw unprocessable(
+      "Execution workspace path is not inside a git repository (git: rev-parse --show-toplevel printed nothing)",
+    );
   }
 
   const toBranch = await readGitStdout(["symbolic-ref", "--quiet", "--short", "HEAD"], worktreePath).catch(() => null);

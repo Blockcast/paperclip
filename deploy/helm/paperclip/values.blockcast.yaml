@@ -184,7 +184,7 @@ env:
     # /paperclip/bin stays on PATH because Claude hooks call the shared ccrotate
     # wrapper from there. Override with `env.path`, not an `env.extra` entry.
     - name: PAPERCLIP_GITHUB_TOKEN_FILE
-      value: /paperclip/.secrets/github-token/token
+      value: /etc/paperclip/secrets/github-token/token
     # gbrain per-agent OAuth clients are now read from Penstock/Authbot instead
     # of the legacy paperclip-plugin-gbrain-oauth-secrets clients.json Secret.
     - name: PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL
@@ -359,13 +359,30 @@ env:
     # decision with its own audit, not a knob to turn while enabling.
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_AGE_DAYS
       value: "30"
-    # 200 — also the code default, made explicit so it stays inert on purpose
-    # rather than by luck. It does not bind today (4 eligible << 200). It becomes
-    # load-bearing the moment MAX_AGE_DAYS drops: unlink here is MDS-metadata
-    # bound, measured at 145 files/s serial, and the tree averages ~6.9k entries
-    # per directory — so a capped 200-directory tick is ~1.4M entries, ~2.7h of
-    # MDS pressure borne by every other CephFS consumer on the cluster. The four
-    # directories eligible today total 42,892 entries, ~5 min.
+    # 200 — also the code default, made explicit. It was recorded here as
+    # "inert on purpose … does not bind today (4 eligible << 200)". That is no
+    # longer true and the cap is now load-bearing without MAX_AGE_DAYS having
+    # moved: the first deployed dry run (2026-10-09T08:07:57Z) stopped with
+    # stop_reason="capped" at exactly 200 eligible, because the cohort the
+    # 2026-09-26 sweep counted as retainedFresh=798 has simply aged past 30d.
+    # So treat an eligible count of 200 as a floor, never a total.
+    #
+    # Re-measured against the live tree the same day: the match set is 503
+    # directories / 141.6 GiB / 3,467,038 entries, of which the nested-checkout
+    # guard excludes 13 (23.7 GiB), leaving 490 / 117.9 GiB / 2,916,346 entries.
+    # Unlink is MDS-metadata bound at 145 files/s serial, so the whole backlog
+    # is ~5.6h of MDS pressure, a typical 200-directory tick ~2.3h, and a
+    # worst-case tick (the 200 largest) ~5.2h — entries per directory are highly
+    # skewed, median 1,712 against a max of 93,966, so the ~6.9k mean this
+    # comment previously reasoned from describes almost no actual directory.
+    #
+    # Deliberately NOT raised. Total MDS work is a property of the backlog, not
+    # of the cap; the cap only decides how it is spread. At 200/tick on the
+    # default 1440-minute interval the backlog drains in ~3 daily ticks and
+    # steady state is then ~0.5h/day. The tree gained ~35-64 directories/day
+    # over 2026-09-26..10-09, and eligible arrivals lag that by MAX_AGE_DAYS at
+    # a lower historical rate, so 200/tick keeps up with room to spare. Raising
+    # it buys nothing but a bigger burst.
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_DELETES_PER_TICK
       value: "200"
 
@@ -825,15 +842,77 @@ extraVolumes:
       secretName: paperclip-github-merge-token
       defaultMode: 0444
       optional: true
+# NOT under `/paperclip` (BLO-40279). These used to mount at
+# /paperclip/.secrets/<name>, i.e. *beneath* persistence.mountPath. On
+# 2026-10-04/05 a CephFS re-mount of /paperclip stacked a fresh mount over the
+# old one in three long-running pods, which hid the secret mounts sitting under
+# it without restarting anything: /proc/mounts showed one /paperclip entry, and
+# /paperclip/.secrets/github-token/ read back as the bare CephFS directory.
+# `paperclip-github-token-env` then exited 1 on every invocation, so every `git`
+# call in the control plane failed and 32 worktree validations across 16 issues
+# were recorded as "not a git checkout".
+#
+# Availability is the lesser half. That bare directory is mode 2775 on a volume
+# the whole fleet shares, so with the mount hidden PAPERCLIP_GITHUB_TOKEN_FILE
+# kept resolving — to a path any agent uid can write. The same hazard is already
+# written up at job-manifest.ts' `optional` passthrough (PEN-3705); nesting the
+# mount under the shared volume is what makes it reachable.
+#
+# /etc/paperclip/ is already an allowlisted secret-mount root in
+# plugin-sandbox-kubernetes' sensitive-env-guard, so no guard change is needed.
+# Agent Jobs inherit `mountPath` verbatim (job-manifest.ts: `mountPath:
+# sv.mountPath`), so this moves them too.
+#
+# Deliberately NOT /var/run/* — but NOT because of shadowing. An earlier draft
+# of this comment said the DinD emptyDir at /var/run "would shadow anything
+# underneath it"; that is unproven, and this chart argues against it. /var/run
+# is a symlink to /run (measured in-pod: the authbot mount reads back in
+# /proc/self/mountinfo as /run/authbot), so DinD's `{docker-sock, /var/run}`
+# lands on /run — the same directory the kubelet projects the serviceaccount
+# token under, and the same one this chart mounts gbrain-authbot-service-key
+# under six lines below (allowlisted at inherit-allowlist.ts:228, so it does
+# reach agent Jobs). If a parent emptyDir shadowed its children, both would
+# already be dead in every DinD Job. A live control in this cluster has the
+# exact shape: arc-runners/arc-ciab-zzdpg-runner-vh88s mounts the `dind-sock`
+# emptyDir at /var/run AND kube-api-access-bt5m2 at
+# /var/run/secrets/kubernetes.io/serviceaccount nested beneath it — Running,
+# ready, 0 restarts. Precisely: that proves the kubelet accepts and runs the
+# nested shape, not that the child is readable (exec is denied to us in
+# arc-runners, verified with a fake-subresource control). Read this as a reason
+# not to state shadowing as the rule — not as a claim that authbot is fine.
+#
+# The rule BLO-40279 actually earns does not involve mount ordering at all: the
+# hazard is a parent that can be RE-MOUNTED UNDER A LIVE POD. /paperclip is
+# CSI/CephFS and was; an emptyDir cannot be. /run is still the wrong home for a
+# credential, because it is a shared runtime directory several parties mount
+# into, while /etc/paperclip is a root we own and already allowlist.
+#
+# The vacated /paperclip/.secrets/<name>/ directories are deliberately LEFT in
+# place, and that is not what keeps a stale pin safe. Deleting them closes
+# nothing: /paperclip itself is `drwxrwsr-x root:node` and writable by uid 1000
+# (measured in paperclip-0, 2026-10-09), so any agent can recreate the tree and
+# plant a token in it. Deleting them during a rollout is actively harmful: every
+# pod using this PVC on a node bind-mounts one staged CephFS superblock, and
+# since Linux 3.18 an rmdir of a directory that is a mountpoint in ANOTHER mount
+# namespace succeeds and lazily detaches that mount (a network fs invalidating
+# the dentry on other nodes does the same). So the seed would unmount the token
+# Secret out from under not-yet-replaced pods and Jobs — recreating this outage
+# in the mixed-version window. The closure is at the readers instead:
+# paperclip-github-token-env, github-token-credential-helper and the `gh`
+# wrapper refuse any token file on the same device as ${PAPERCLIP_HOME} (this
+# volume), so a planted file is never read, while a Secret genuinely mounted
+# under it — its own tmpfs — still is. What no reader can see is a value
+# already read by the caller (`GH_SEAT_TOKEN_VALUE="$(cat <path>)"`); the
+# in-repo recipes name /etc/paperclip, which agents cannot write.
 extraVolumeMounts:
   - name: gbrain-authbot-service-key
     mountPath: /var/run/authbot
     readOnly: true
   - name: github-mcp-token
-    mountPath: /paperclip/.secrets/github-token
+    mountPath: /etc/paperclip/secrets/github-token
     readOnly: true
   - name: github-merge-token
-    mountPath: /paperclip/.secrets/github-merge-token
+    mountPath: /etc/paperclip/secrets/github-merge-token
     readOnly: true
 
 # Disabled (BLO-14591): same RBAC gap as prometheusRule below — the

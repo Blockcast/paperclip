@@ -36,7 +36,7 @@ const chartDir = "deploy/helm/paperclip";
 // PEN-3713: the root-owned image directory the wrappers now ship in. Restated
 // here on purpose — it is the one value in this file that MUST agree with
 // three places outside the chart (the Dockerfile COPY target, Dockerfile.agent's
-// COPY --from=server, and GITHUB_WRAPPER_BIN_DIR in the claude_k8s adapter), and
+// COPY --from=server, and IMAGE_WRAPPER_BIN_DIR in the claude_k8s adapter), and
 // a test that derived it from the chart could not catch the chart drifting away
 // from the image. The agreement is asserted explicitly further down.
 const IMAGE_WRAPPER_BIN = "/usr/local/libexec/paperclip/bin";
@@ -568,17 +568,25 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
   );
 
   // The adapter prepends this same directory to every agent Job's PATH, on a
-  // surface the Helm render guard above cannot reach.
-  const adapter = fs.readFileSync(
-    path.join(
-      repoRoot,
-      "vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts",
-    ),
-    "utf8",
-  );
+  // surface the Helm render guard above cannot reach. It is declared once, in
+  // runtime-pin.ts: the runtime-pin bootstrap keys its PATH ordering off it
+  // (PEN-3714), and job-manifest.ts imports it rather than restating it, so a
+  // directory move cannot leave one of the two on a stale literal.
+  const adapterSource = (file) =>
+    fs.readFileSync(
+      path.join(repoRoot, "vendor/paperclip-adapter-claude-k8s/src/server", file),
+      "utf8",
+    );
   assert.ok(
-    adapter.includes(`const GITHUB_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`),
+    adapterSource("runtime-pin.ts").includes(
+      `export const IMAGE_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`,
+    ),
     "the claude_k8s adapter must prepend the same directory the chart names",
+  );
+  assert.match(
+    adapterSource("job-manifest.ts"),
+    /import \{[^}]*\bIMAGE_WRAPPER_BIN_DIR\b[^}]*\} from "\.\/runtime-pin\.js";/,
+    "job-manifest.ts must take the wrapper directory from runtime-pin.ts, the one place it is declared",
   );
 
   // The third place the directory is named: inside the wrapper scripts
@@ -594,14 +602,31 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
   // before comparing, so a stale absolute path in the repo copy shows up as a
   // mismatch. That cover disappears with the seed block in the PEN-3713
   // follow-up — which is also the change most likely to tidy these paths.
-  for (const name of ["git", "github-mcp-server"]) {
+  // The count, not merely the presence. `git` names the directory TWICE — once
+  // to chain-load paperclip-github-token-env, once to point
+  // credential.https://github.com.helper at github-token-credential-helper —
+  // and `.includes()` is satisfied by either one alone. A hand-edited directory
+  // move that updates the first and misses the second passes a presence check
+  // while leaving the helper pointing at a path that is not there, and git
+  // treats an unresolvable credential helper as NO credential helper: it keeps
+  // running, so the half-done move degrades silently rather than failing.
+  //
+  // The expected counts are per wrapper and are deliberately not derived from
+  // the file (a count read out of the body it is checking asserts nothing).
+  // They are small integers that change only when a wrapper is rewritten, which
+  // is exactly when a human should re-read this.
+  for (const [name, expected] of [
+    ["git", 2],
+    ["github-mcp-server", 1],
+  ]) {
     const body = fs.readFileSync(
       path.join(repoRoot, "docker/github-wrappers", name),
       "utf8",
     );
-    assert.ok(
-      body.includes(IMAGE_WRAPPER_BIN),
-      `the ${name} wrapper chain-loads an absolute path and must name ${IMAGE_WRAPPER_BIN}: it does not resolve this one through PATH, so a directory move that misses it execs a path that is not there`,
+    assert.equal(
+      body.split(IMAGE_WRAPPER_BIN).length - 1,
+      expected,
+      `the ${name} wrapper chain-loads an absolute path and must name ${IMAGE_WRAPPER_BIN} exactly ${expected} time(s): it does not resolve this one through PATH, so a directory move that misses it execs a path that is not there`,
     );
   }
 });

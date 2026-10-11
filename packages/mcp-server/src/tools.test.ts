@@ -90,6 +90,109 @@ describe("paperclip MCP tools", () => {
     expect(String(fetchMock.mock.calls[0]![0])).toContain("/agents/me/inbox-lite?offset=500");
   });
 
+  // BLO-39015: the envelope and `offset` ship in the server; this description
+  // ships in the MCP package, and the two reach an agent on different cadences.
+  // Against a server predating the fix, `offset` is ignored and a capped page
+  // comes back as a BARE ARRAY — so "a bare array is the proof you have every
+  // row" is not merely stale, it is backwards, and it fails OPEN. The scalar
+  // fields above already carry this caveat; THE TELL shipped without it.
+  // Measured 2026-10-08: 532 eligible rows, 494 returned bare, `offset=400`
+  // byte-identical to `offset=0`, 38 rows absent including all 23 `low`.
+  it("tells the caller how to detect a server that predates the truncation fix", () => {
+    const { description } = getTool("paperclipInboxLite");
+
+    // The caveat exists and names the fail-open direction.
+    expect(description).toContain("fails OPEN");
+    expect(description).toContain("BARE ARRAY even when the cap bit");
+
+    // And it is actionable: a runnable discriminator, not just a warning. Keyed
+    // on the guarantee rather than the prose: the discriminator must be the
+    // content-independent empty-page test. Comparing the ids of two pages is
+    // churn-sensitive (the page re-orders by last activity between calls), so
+    // on a server that ignores `offset` it can fake "the fix is live".
+    expect(description).toContain("POSITIVE CONTROL");
+    expect(description).toContain("an `offset` larger than the lane could plausibly hold");
+    expect(description).toContain("test for an EMPTY array");
+    expect(description).toMatch(/NON-EMPTY \u21d2 `offset` is being ignored/);
+    expect(description).not.toMatch(/DIFFERENT ids \u21d2/);
+    expect(description).toContain("a bare array proves NOTHING");
+
+    // The prescribed fallback must not route the caller onto a surface that
+    // carries the same uncaveated claim.
+    expect(description).toMatch(/paperclipListIssues\(assigneeAgentId=me\) per status \u2014 whose own `limit` description carries the same deploy-skew caveat/);
+  });
+
+  // The shared issue-list `limit` schema (paperclipListIssues, paperclip_search_issues)
+  // made the same claim with no caveat, and it is independently measured false:
+  // `limit: 1000` returned exactly 1000 rows as a bare array, `offset: 1000` a
+  // disjoint second 1000 (true population 2083).
+  it.each(["paperclipListIssues", "paperclip_search_issues"])(
+    "%s's limit carries the deploy-skew caveat instead of an unconditional bare-array proof",
+    (name) => {
+      const tool = getTool(name);
+      const limitDescription = (tool.schema.shape.limit as { description?: string }).description ?? "";
+      expect(limitDescription).toContain("fails OPEN");
+      expect(limitDescription).toMatch(/bare array whose length equals the limit actually applied[^.]*NOT proof of completeness/);
+      // Keyed on the hazard, not on retired wording: the only completeness
+      // "proof" the description may state is the one conditioned on the fix.
+      expect(limitDescription.match(/the proof/g)).toHaveLength(1);
+      expect(limitDescription).toMatch(/with the BLO-39015 fix a plain array back is the proof/);
+      // The default path (no `limit` sent) is a named case of the tell.
+      expect(limitDescription).toContain("500 if you sent none");
+      // The short-page stop is sound only for a company-scope reader: the
+      // server ACL-filters the raw `offset`/`limit` window AFTER the cap
+      // (server/src/routes/issues.ts), so a restricted seat's page can come
+      // back short, or even empty, with readable rows still behind it.
+      expect(limitDescription).toMatch(/advancing `offset` by that limit/);
+      expect(limitDescription).toMatch(/sound only for a seat with company-scope read/);
+      expect(limitDescription).toMatch(/no page length, short or even empty, proves completeness/);
+    },
+  );
+
+  // The `offset` field hint is the surface a caller who suspects truncation
+  // reads in isolation; "repeat until a bare array returns" terminates on the
+  // first call against a pre-BLO-39015 server, so it must carry the caveat.
+  it("paperclipInboxLite's offset hint carries the deploy-skew caveat", () => {
+    const tool = getTool("paperclipInboxLite");
+    const offsetDescription =
+      (tool.schema.shape.offset as { description?: string }).description ?? "";
+    expect(offsetDescription).toContain("deploy-skew caveat");
+    expect(offsetDescription).toMatch(/predating BLO-39015 a bare array returns immediately and proves nothing/);
+  });
+
+  it("paperclip_search_issues does not restate the bare-array proof unqualified", () => {
+    const { description } = getTool("paperclip_search_issues");
+    expect(description).not.toContain("a bare array means you have every match, an object");
+    expect(description).toContain("deploy-skew caveat");
+    expect(description).toContain("for a seat without company-scope read neither is a shorter one");
+  });
+
+  // paperclipListIssues' own tool description is the surface a caller reads
+  // first, and the inbox-lite fallback routes there. It must not state the
+  // bare-array completeness proof unconditionally (fails open pre-BLO-39015).
+  it("paperclipListIssues does not state the bare-array proof unqualified", () => {
+    const { description } = getTool("paperclipListIssues");
+    expect(description).not.toMatch(/positive proof/);
+    expect(description).toContain(
+      "on a server with the fix a bare array back is proof you have every matching row — but see the `limit` parameter for the deploy-skew caveat",
+    );
+  });
+
+  // The shared `offset` hint (paperclipListIssues, paperclip_search_issues) is
+  // read in isolation by a caller paging; on an older server a truncated result
+  // is never observable, and the window is raw (pre-ACL), so the increment is
+  // the applied limit, never returnedCount.
+  it.each(["paperclipListIssues", "paperclip_search_issues"])(
+    "%s's offset hint carries the increment rule and the deploy-skew caveat",
+    (name) => {
+      const offset = getTool(name).schema.shape.offset as { description?: string } | undefined;
+      expect(offset).toBeDefined();
+      expect(offset!.description).toContain("advance by the applied limit, not by the number of rows returned");
+      expect(offset!.description).toContain("deploy-skew caveat");
+      expect(offset!.description).toContain("on an older server you will never see a truncated result to page past");
+    },
+  );
+
   it("adds auth headers and run id to mutating requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ ok: true }),

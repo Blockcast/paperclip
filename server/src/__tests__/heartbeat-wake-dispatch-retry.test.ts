@@ -28,6 +28,7 @@ import {
   GITHUB_REVIEW_REQUEST_DEAD_LETTER_UNRESOLVED_METRIC,
   GITHUB_REVIEW_REQUEST_DELIVERY_METRIC,
   GITHUB_REVIEW_REQUEST_SUPPRESSION_METRIC,
+  WAKE_REDELIVERY_SUPPRESSED_METRIC,
   __resetMetricsForTest,
   getMetricsRegistry,
   recordGithubReviewRequestDelivery,
@@ -1440,6 +1441,48 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
     }
 
+    /**
+     * Sum {@link WAKE_REDELIVERY_SUPPRESSED_METRIC} for one cause.
+     *
+     * This counter is the issue's field signal, so the tests assert on it in
+     * BOTH directions: the two suppressing shapes must bump their own cause,
+     * and the deliberately-not-suppressed recurring-key shape must leave both
+     * at zero. A counter that only ever goes up is indistinguishable from one
+     * wired to the wrong branch.
+     */
+    async function redeliverySuppressedCount(cause: string): Promise<number> {
+      const metric = getMetricsRegistry().getSingleMetric(WAKE_REDELIVERY_SUPPRESSED_METRIC);
+      expect(metric, `${WAKE_REDELIVERY_SUPPRESSED_METRIC} must be registered`).toBeTruthy();
+      const data = (await metric!.get()) as { values: Array<{ labels: Record<string, string>; value: number }> };
+      return data.values
+        .filter((entry) => entry.labels.cause === cause)
+        .reduce((sum, entry) => sum + entry.value, 0);
+    }
+
+    /** Label values the counter has actually materialized, not their sum. */
+    async function redeliverySuppressedCauses(): Promise<string[]> {
+      const metric = getMetricsRegistry().getSingleMetric(WAKE_REDELIVERY_SUPPRESSED_METRIC);
+      expect(metric, `${WAKE_REDELIVERY_SUPPRESSED_METRIC} must be registered`).toBeTruthy();
+      const data = (await metric!.get()) as { values: Array<{ labels: Record<string, string> }> };
+      return [...new Set(data.values.map((entry) => String(entry.labels.cause)))].sort();
+    }
+
+    it("zero-initializes every suppression cause so a quiet series is not an absent one", async () => {
+      // An absent Prometheus series and a zero one read identically to a human
+      // scanning a dashboard, and this metric's whole job is to be trustworthy
+      // when it reads zero.
+      //
+      // This asserts the child EXISTS, not that it sums to zero. An earlier
+      // revision asserted the sum, which a mutation sweep showed passes with
+      // the zero-init loop deleted -- an un-materialized child sums to zero
+      // just as happily as an initialized one, so the test could not fail.
+      const causes = ["already_delivered", "claim_contended", "claim_lost", "fence_lost"];
+      expect(await redeliverySuppressedCauses()).toEqual(causes);
+      for (const cause of causes) {
+        expect(await redeliverySuppressedCount(cause), cause).toBe(0);
+      }
+    });
+
     it("does not re-enter enqueue when acknowledgement is lost after the run commits", async () => {
       // Fails once, inside enqueueWakeup's post-commit window: the run and its
       // wake row are already durable, and only the acknowledgement is lost.
@@ -1556,6 +1599,13 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         .from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.agentId, agentId));
       expect(wakeRows).toHaveLength(2);
+      // The losing pass is observable, not merely silent. Its only other trace
+      // is a logger.DEBUG line, which production does not emit -- so without
+      // this counter AC3's guard firing is invisible in the field. Asserting
+      // the specific cause (not a total) is what keeps this from passing if the
+      // inc were wired to one of the other three guards.
+      expect(await redeliverySuppressedCount("claim_contended")).toBe(1);
+      expect(await redeliverySuppressedCount("already_delivered")).toBe(0);
     });
 
     it("returns the already-delivered run instead of a second one when a redelivery repeats an idempotency key", async () => {
@@ -1652,6 +1702,10 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       // delivered it; counting again would push `queued` past `received` and
       // break the funnel invariant BLO-18859 relies on.
       expect(await deliveryCount("queued")).toBe(0);
+      // The suppression itself is the observable. `recovered: 1` above cannot
+      // carry it -- a genuine re-dispatch reports `recovered: 1` too.
+      expect(await redeliverySuppressedCount("already_delivered")).toBe(1);
+      expect(await redeliverySuppressedCount("claim_contended")).toBe(0);
     });
 
     it("does NOT suppress a recurring key whose earlier delivery predates this marker", async () => {
@@ -1731,6 +1785,13 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       const runs = await runsForAgent(agentId);
       expect(runs).toHaveLength(2);
       expect(runs.some((r) => r.id !== oldRunId && r.status === "queued")).toBe(true);
+      // Negative control for the counter: a legitimate recurrence must leave
+      // every cause at zero. Without this the counter's assertions are all
+      // one-directional and a mis-wired inc that fired on every redelivery
+      // would pass them.
+      for (const cause of ["claim_contended", "claim_lost", "already_delivered", "fence_lost"]) {
+        expect(await redeliverySuppressedCount(cause), cause).toBe(0);
+      }
     });
 
     it("leaves a live claim alone but reclaims an expired one, and only one stealer wins", async () => {
@@ -1799,6 +1860,14 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       expect(stealerAResult.recovered).toBe(0);
       // One reclaim == one run, not two.
       expect(await runsForAgent(agentId)).toHaveLength(1);
+      // Stealer A lost at the claim CAS -- the peer had already moved the row's
+      // status by the time A tried -- so this is `claim_contended`, the same
+      // guard as the two-replica race above and NOT the mid-enqueue
+      // `claim_lost`. Measured, not assumed: an earlier revision asserted
+      // `claim_lost` here on the reasoning that an expired-lease steal must
+      // fail later, and it read zero.
+      expect(await redeliverySuppressedCount("claim_contended")).toBe(1);
+      expect(await redeliverySuppressedCount("claim_lost")).toBe(0);
     });
 
     it("dispatches its own wake when a LATER independent delivery reuses the recurring key", async () => {
@@ -2027,6 +2096,84 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         .where(eq(agentWakeupRequests.id, markerId));
       expect(marker?.status).toBe("dispatch_retrying");
       expect(marker?.claimedAt?.getTime()).toBe(stolenClaimAt.getTime());
+      // Ally review on #2415: this pass DID deliver -- the run committed before
+      // the lease lapsed -- so the fence discarded only bookkeeping. Nothing was
+      // declined, and counting it would report a suppression that did not
+      // happen. The counted shape is the next test.
+      expect(await runsForAgent(agentId)).toHaveLength(1);
+      expect(await redeliverySuppressedCount("fence_lost")).toBe(0);
+    });
+
+    it("counts fence_lost when a pass that did NOT deliver loses its lease before re-arming", async () => {
+      // The genuinely-suppressed shape: the re-dispatch failed, and by the time
+      // this pass re-arms the row a new owner holds it. A stale re-arm would
+      // hand the row back to the due-rows query while the new owner is still
+      // dispatching it, so the fence declining it is a real suppression.
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const markerId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: markerId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_opened",
+        payload: {
+          dispatchRetry: {
+            attempts: 1,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_opened",
+              payload: { taskKey: "pr_review:Blockcast/test#25726-fence-undelivered" },
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+
+      // Every insert fails, so the enqueue transaction throws a non-HttpError
+      // (the re-arm path). The steal runs after that transaction rolls back --
+      // it holds the marker FOR UPDATE, so stealing inside it would deadlock.
+      const failing = dbWithFailingInserts(db, Number.MAX_SAFE_INTEGER);
+      const stolenClaimAt = new Date(now.getTime() + 60_000);
+      let stolen = 0;
+      const stealingDb = new Proxy(failing as unknown as object, {
+        get(target, prop) {
+          const value = (target as Record<PropertyKey, unknown>)[prop];
+          if (prop !== "transaction") return value;
+          return async (...args: unknown[]) => {
+            try {
+              return await (value as (...a: unknown[]) => Promise<unknown>)(...args);
+            } catch (err) {
+              if (stolen === 0) {
+                stolen += 1;
+                await db
+                  .update(agentWakeupRequests)
+                  .set({ status: "dispatch_retrying", claimedAt: stolenClaimAt })
+                  .where(eq(agentWakeupRequests.id, markerId));
+              }
+              throw err;
+            }
+          };
+        },
+      }) as unknown as typeof db;
+
+      const result = await heartbeatService(stealingDb, { skipQueuedRunDispatch: true })
+        .reconcileFailedWakeDispatches(now);
+
+      expect(stolen).toBe(1);
+      expect(result.stillFailing).toBe(0);
+      expect(await runsForAgent(agentId)).toHaveLength(0);
+      const [marker] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, markerId));
+      expect(marker?.status).toBe("dispatch_retrying");
+      expect(marker?.claimedAt?.getTime()).toBe(stolenClaimAt.getTime());
+      expect(await redeliverySuppressedCount("fence_lost")).toBe(1);
     });
 
     it("does not commit a run after its retry-marker lease is reclaimed before enqueue", async () => {
@@ -2083,6 +2230,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         .where(eq(agentWakeupRequests.id, markerId));
       expect(marker?.status).toBe("dispatch_retrying");
       expect(marker?.claimedAt?.getTime()).toBe(replacementClaimAt.getTime());
+      expect(await redeliverySuppressedCount("claim_lost")).toBe(1);
     });
   });
 });

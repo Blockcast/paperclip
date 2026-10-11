@@ -385,7 +385,7 @@ import {
 } from "./issue-continuation-summary.js";
 import { buildPlanReviewContext } from "./plan-review-context.js";
 import { truncateText } from "./truncate-text.js";
-import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { describeGitFailure, executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import {
   applyAgentGitIdentityToRuntimeConfig,
   ensureCheckoutGitIdentity,
@@ -440,6 +440,7 @@ import {
   recordProcessLost,
   recordProcessLostLivenessNull,
   recordGithubReviewRequestDelivery,
+  recordWakeRedeliverySuppressed,
   recordGithubReviewRequestSuppressed,
   recordGithubReviewCompletion,
   GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
@@ -509,6 +510,10 @@ import {
   readContinuationAttempt,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
+import {
+  WORKSPACE_VALIDATION_RECOVERY_CAUSE,
+  workspaceValidationRecoveryCause,
+} from "./recovery/workspace-validation-probe.js";
 import {
   runUsageHasNoModelTokens,
   SESSION_UNAVAILABLE_RECOVERY_MAX_ATTEMPTS,
@@ -1292,7 +1297,6 @@ export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuat
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 3;
 const RESOLVED_INTERACTION_CONTINUATION_STATUSES = new Set(["accepted", "answered", "rejected"]);
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
-const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON = "execution_review_participant_recovery";
@@ -3782,10 +3786,13 @@ async function ensureManagedProjectWorkspace(input: {
   const partialClone = await ensureManagedCheckoutCanServeClones({ cwd: realized.cwd });
   if (partialClone.state === "partial_cannot_serve") {
     // Raised as a workspace validation failure rather than a bare Error so the
-    // recovery machinery treats it as the manual-repair, budget-exempt cause it
-    // is. A partial mirror missing objects cannot be fixed by retrying the same
-    // agent against the same path, and `workspace_validation_failed` is the one
-    // cause that neither wakes an owner nor spends a wake attempt.
+    // park keeps the diagnostics and the run carries `workspace_validation_failed`.
+    // It does NOT keep that no-wake recovery cause: the payload has no
+    // `gitProbeState` or `provenance`, so `workspaceValidationRecoveryCause`
+    // (recovery/workspace-validation-probe.ts) returns undefined and the park
+    // takes the ordinary stranded cause -- bounded wake attempts, then a visible
+    // escalation to `blocked`. That is deliberate (BLO-19924): a mirror only a
+    // human can repair is the case where a permanent silent strand costs most.
     throw new WorkspaceValidationFailure(partialClone.fatalMessage ?? "Managed checkout cannot serve clones.", {
       workspaceValidation: {
         reason: "managed_checkout_partial_clone_unservable",
@@ -3884,12 +3891,42 @@ async function hasGitMetadata(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
-async function isGitCheckout(cwd: string | null | undefined) {
+// Carries git's own first stderr line out with the verdict (BLO-40279). This
+// helper fails open-to-"not a checkout" on ANY probe error, so the message it
+// feeds — "is not a git checkout" — is a claim about the repo that is wrong
+// whenever the probe itself was what broke. The modes that still reach the
+// catch below say nothing about .git and are mutually indistinguishable once
+// the stderr is dropped: EACCES on the directory or on .git, a stale or
+// severed handle on the shared network filesystem, ENOTDIR, a cwd that was
+// removed mid-run, and a failure to spawn `git` at all under the filtered
+// PATH. Quoting stderr is what separates those from a genuinely non-git path.
+//
+// Historically (pre-BLO-40317) one further mode reached it, and that is the
+// one this change was written for: a hidden secret mount made the credential
+// shim at <paperclip-home>/.local/bin/git exit 1 with "paperclip github token
+// file not readable", and 32 validations across 16 issues were reported as bad
+// checkouts whose .git was entirely intact. That route is closed *here*, by
+// strictGitCheckoutProbeEnv() below — it drops the agent-home bin dirs from
+// PATH and names this function as one of the three readers it protects, and a
+// false git_worktree_base_not_git_checkout as one of the failures it fixed. So
+// do not reintroduce the shim as a live cause at this call site. It remains a
+// live cause wherever the shim is still on PATH: see the same argument, still
+// correctly in present tense, around runGit()/resolveWorkspacePaths() in
+// packages/plugins/plugin-workspace-diff/src/workspace-diff.ts, which
+// overrides no env.
+async function probeGitCheckout(cwd: string | null | undefined): Promise<{ ok: boolean; detail: string }> {
   const normalized = readNonEmptyString(cwd);
-  if (!normalized) return false;
-  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized, env: strictGitCheckoutProbeEnv() })
-    .then((result) => Boolean(readNonEmptyString(result.stdout)))
-    .catch(() => false);
+  if (!normalized) return { ok: false, detail: "no workspace path" };
+  try {
+    const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
+      cwd: normalized,
+      env: strictGitCheckoutProbeEnv(),
+    });
+    if (readNonEmptyString(result.stdout)) return { ok: true, detail: "" };
+    return { ok: false, detail: "git rev-parse --show-toplevel printed nothing" };
+  } catch (error: unknown) {
+    return { ok: false, detail: describeGitFailure(error) };
+  }
 }
 
 async function pathIsAbsent(cwd: string): Promise<boolean> {
@@ -3902,7 +3939,7 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
 }
 
 // BLO-40317: resolve `git` for local-only reads (the strict probe below,
-// isGitCheckout() and hasGitPushRemote(), none of which contacts a remote)
+// probeGitCheckout() and hasGitPushRemote(), none of which contacts a remote)
 // WITHOUT the Paperclip home bin dirs on PATH. `/paperclip/.local/bin/git` is a
 // credential shim that execs the real git through a token wrapper and exits 1
 // when its token file is unreadable. That stderr is neither ENOENT nor "not a
@@ -3926,7 +3963,7 @@ function strictGitCheckoutProbeEnv(): NodeJS.ProcessEnv {
   return { ...process.env, PATH: entries.join(path.delimiter) };
 }
 
-// Unlike isGitCheckout(), this does not fail open: a probe error that isn't
+// Unlike probeGitCheckout(), this does not fail open: a probe error that isn't
 // positively identifiable as "cwd is not a git checkout" (missing directory,
 // or git's own "not a git repository" fatal) is treated as "could be a
 // checkout". That covers the storage-layer failures (permission denied,
@@ -4116,10 +4153,12 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
     );
   }
 
-  if (!await isGitCheckout(input.base.baseCwd)) {
+  const baseProbe = await probeGitCheckout(input.base.baseCwd);
+  if (!baseProbe.ok) {
     fail(
       "git_worktree_base_not_git_checkout",
-      `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but base workspace "${input.base.baseCwd}" is not a git checkout. ${remediation}`,
+      `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but base workspace "${input.base.baseCwd}" is not a git checkout (git: ${baseProbe.detail}). ${remediation}`,
+      { gitProbeDetail: baseProbe.detail },
     );
   }
 }
@@ -4206,7 +4245,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     effectiveCwd !== null &&
     (cwdIsWorkspaceLessFallback || input.resolvedWorkspace.source === "agent_home")
   ) {
-    // Deliberately not isGitCheckout(): that helper fails open (any probe
+    // Deliberately not probeGitCheckout(): that helper fails open (any probe
     // error -> false), which would wave a storage-layer probe failure
     // straight through to dispatch and reproduce the exact exit-128 this
     // guard exists to prevent. Reject dispatch unless the probe positively
@@ -34096,6 +34135,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const inspection = await inspectManagedGitWorktreeBranch({
           worktreePath,
           expectedBranchName,
+          rethrowListStall: false,
         });
         return { workspaceRecord, inspection };
       };
@@ -34194,6 +34234,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 worktreePath: inspection.worktreePath,
                 expectedBranchName: repairedExpectedBranchName,
                 repoRoot: inspection.repoRoot,
+                rethrowListStall: false,
               });
               finalizeBranchRepairMetadata = {
                 attempted: true,
@@ -36603,7 +36644,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : buildWorkspaceValidationRecoveryComment({ latestRun: run }),
             recoveryCause: configurationIncomplete
               ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
-              : WORKSPACE_VALIDATION_RECOVERY_CAUSE,
+              // BLO-19924: an unanswered git probe is not a confirmed hazard, so it
+              // must not take the no-wake `manual_repair_required` shape. The dispatch
+              // refusal above is unchanged.
+              : workspaceValidationRecoveryCause(readWorkspaceValidationPayloadFromRun(run)),
             recoveryOwnerAgentId: undefined,
             expectedReviewStage: undefined,
           },
@@ -37202,7 +37246,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             previousStatus: issue.status,
             comment,
             recoveryCause: workspaceValidationFailure
-              ? WORKSPACE_VALIDATION_RECOVERY_CAUSE
+              // BLO-19924: an inconclusive probe keeps the workspace-validation comment
+              // (the diagnostics stay) but gives up the no-wake recovery shape, so
+              // something re-probes it.
+              ? workspaceValidationRecoveryCause(readWorkspaceValidationPayloadFromRun(run))
               : configurationIncompleteFailure
                 ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
                 : undefined,
@@ -39939,6 +39986,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Tell the caller this was NOT a new queue, so it does not count a second
       // `queued` for a delivery already counted (see WakeSuppressionOutcome).
       if (suppression) suppression.alreadyDelivered = true;
+      recordWakeRedeliverySuppressed("already_delivered");
       // No new run was committed, so there is no post-commit dispatch work to
       // do here: whichever wake first delivered under this key owns that run's
       // lifecycle, and `resumeQueuedRuns` re-drives it if it is still queued.
@@ -40394,6 +40442,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         )
         .returning({ id: agentWakeupRequests.id });
       if (claimed.length === 0) {
+        recordWakeRedeliverySuppressed("claim_contended");
         logger.debug(
           { wakeupRequestId: row.id, agentId: row.agentId },
           "wake dispatch row was claimed by a concurrent reconciler pass; skipping (BLO-25726)",
@@ -40420,8 +40469,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        * Returns whether the write landed; callers must gate their counters on
        * it, so a lost fence is never reported as a delivery outcome this pass
        * did not actually get to own.
+       *
+       * `delivered` marks the one caller whose wake already reached a run
+       * (`dispatch_recovered`). A lost fence there discards only bookkeeping:
+       * nothing was declined, so it must not count as a suppression (Ally
+       * review on #2415).
        */
-      const finishClaimedRow = async (values: Record<string, unknown>) => {
+      const finishClaimedRow = async (values: Record<string, unknown>, delivered = false) => {
         const updated = await db
           .update(agentWakeupRequests)
           .set(values)
@@ -40434,6 +40488,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
           .returning({ id: agentWakeupRequests.id });
         if (updated.length === 0) {
+          if (!delivered) recordWakeRedeliverySuppressed("fence_lost");
           logger.warn(
             { wakeupRequestId: row.id, agentId: row.agentId },
             "wake dispatch claim expired and was reclaimed before this pass finished; discarding "
@@ -40546,11 +40601,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
           continue;
         }
-        const fenced = await finishClaimedRow({
-          status: "dispatch_recovered",
-          finishedAt: now,
-          updatedAt: now,
-        });
+        const fenced = await finishClaimedRow(
+          {
+            status: "dispatch_recovered",
+            finishedAt: now,
+            updatedAt: now,
+          },
+          true,
+        );
         if (!fenced) continue;
         recovered += 1;
         // The delivery reached the queued state after all, just later than the
@@ -40569,6 +40627,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       } catch (err) {
         if (err instanceof WakeDispatchClaimLostError) {
+          recordWakeRedeliverySuppressed("claim_lost");
           logger.info(
             { wakeupRequestId: row.id, agentId: row.agentId },
             "wake dispatch lease was reclaimed before enqueue could commit; skipping stale redelivery (BLO-25726)",

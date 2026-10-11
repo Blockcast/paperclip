@@ -3517,6 +3517,8 @@ async function attemptPrReviewerWake(params: {
           {
             configuredReviewerCount: reviewerAgentIds.length,
             event: eventName,
+            deliveryId,
+            idempotencyKey,
             prNumber: context.prNumber,
             repoFullName: context.repoFullName,
             transientlyUnavailable: reviewerEligibility.transientlyUnavailable,
@@ -3589,7 +3591,18 @@ async function attemptPrReviewerWake(params: {
         {
           agentId: reviewerAgentId,
           event: eventName,
-          githubDeliveryId: deliveryId,
+          // BLO-22758 follow-up: this is `deliveryId`, NOT `githubDeliveryId`.
+          // The prefixed spelling is the convention for persisted wake-metadata
+          // payloads (whose sibling keys are all `github*`), and it was wrong
+          // here: every other key in THIS logger object is unprefixed, and so
+          // is every sibling outcome line. A `deliveryId`-keyed query therefore
+          // could not see the declined case at all — which is the very
+          // "terminal state is unrecoverable from logs" defect this issue
+          // exists to close, one layer down. `idempotencyKey` is what joins
+          // this line to the `agent_wakeup_requests` skipped row that the
+          // message below tells the reader to go and check.
+          deliveryId,
+          idempotencyKey,
           prNumber: context.prNumber,
           repoFullName: context.repoFullName,
           wakeReason: context.wakeReason,
@@ -6122,6 +6135,14 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             err,
             agentIds: reviewerAgentIds,
             event: eventName,
+            // BLO-22758 follow-up: `failed` is one of the four terminal states
+            // this issue's AC requires the logs to name, and it carried no
+            // delivery id, so it could not be joined to a PR's webhook trail.
+            // `idempotencyKey` is deliberately absent rather than forgotten:
+            // it is local to attemptPrReviewerWake and out of scope in this
+            // caller-side catch. `deliveryId` is the join key the webhook
+            // trail is already indexed by, so it is sufficient here.
+            deliveryId,
             prNumber: context?.prNumber,
             repoFullName: context?.repoFullName,
           },

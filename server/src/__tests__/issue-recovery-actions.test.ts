@@ -52,6 +52,7 @@ import {
   summarizeStrandedRecoveryHandBackPass,
 } from "../services/recovery/service.js";
 import { postRoutineDispatchFailureHeartbeat } from "../services/recovery/routine-scheduler-heartbeat.js";
+import { workspaceValidationRecoveryCause } from "../services/recovery/workspace-validation-probe.js";
 
 // BLO-19160: seam for the adoption-interleaving regression test. The stranded
 // sweep reads its candidates as one bulk snapshot and only reaches the
@@ -1695,6 +1696,100 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
     expect(actionRows).toHaveLength(1);
+  });
+
+  // BLO-19924: what an unconfirmed workspace park leaves behind once its wake budget is
+  // spent. The park takes `stranded_assigned_issue` (bounded wakes) instead of the no-wake
+  // manual-repair cause, so `resolveStrandedEscalationStatus` can no longer see "manual
+  // repair" in the cause. Released to `todo`, the row re-dispatches, the dispatch guard
+  // refuses it pre-adapter, and it re-parks — a workspace binding re-dispatch cannot change.
+  // The ordinary strand is the control: its `todo` is the BLO-27635/BLO-30743 self-heal.
+  describe("post-exhaustion status of a re-routed workspace park (BLO-19924)", () => {
+    async function escalateOverBurnedHorizon(latestRunOverrides: {
+      errorCode: string;
+      resultJson: Record<string, unknown> | null;
+    }) {
+      const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, sourceIssue.id));
+      // The shape `escalateExpiredWakeHorizons` leaves: escalated on a burned horizon, the
+      // owner the ladder still routes to (coder's manager). The stale fingerprint keeps
+      // `shouldReuseStrandedRecoveryAction` from short-circuiting, so the escalation reaches
+      // the status write — and the persisted horizon keeps the retirement sticky through it.
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: sourceIssue.id,
+        kind: "stranded_assigned_issue",
+        cause: "stranded_assigned_issue",
+        status: "escalated",
+        retiringBound: "timeout_horizon",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        returnOwnerAgentId: null,
+        fingerprint: `source_scoped_recovery:${companyId}:${sourceIssue.id}:stale`,
+        evidence: {},
+        nextAction: "Wake the recovery owner.",
+        attemptCount: defaultRecoveryActionMaxAttempts,
+        maxAttempts: defaultRecoveryActionMaxAttempts,
+        timeoutAt: new Date("2026-05-01T00:00:00.000Z"),
+        lastAttemptAt: new Date("2026-05-01T00:00:00.000Z"),
+      });
+      const latestRun = {
+        id: randomUUID(),
+        agentId: coderId,
+        status: "failed",
+        error: "run failed",
+        contextSnapshot: { issueId: sourceIssue.id },
+        livenessState: null,
+        usageJson: null,
+        createdAt: new Date(),
+        ...latestRunOverrides,
+      } as const;
+      const workspaceValidation = latestRunOverrides.resultJson?.workspaceValidation as
+        | Record<string, unknown>
+        | undefined;
+      const [freshIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+      await recovery.escalateStrandedAssignedIssue({
+        issue: freshIssue!,
+        previousStatus: "todo",
+        latestRun,
+        // Exactly what both heartbeat.ts park sites pass for a workspace run.
+        recoveryCause: workspaceValidation
+          ? workspaceValidationRecoveryCause(workspaceValidation)
+          : undefined,
+      });
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+      return { action: action!, issue: issue! };
+    }
+
+    it("keeps an exhausted inconclusive-probe park `blocked`, not dispatchable", async () => {
+      const { action, issue } = await escalateOverBurnedHorizon({
+        errorCode: "workspace_validation_failed",
+        resultJson: {
+          workspaceValidation: {
+            reason: "k8s_agent_home_git_bootstrap_unsupported",
+            gitProbeState: "indeterminate",
+            fingerprint: "workspace-validation:indeterminate",
+          },
+        },
+      });
+      // Precondition: this really is the re-routed shape on an exhausted action.
+      expect(action).toMatchObject({ cause: "stranded_assigned_issue", status: "escalated" });
+      expect(issue.status).toBe("blocked");
+    });
+
+    it("still releases an exhausted ordinary strand to `todo`", async () => {
+      const { action, issue } = await escalateOverBurnedHorizon({
+        errorCode: "adapter_failed",
+        resultJson: null,
+      });
+      expect(action).toMatchObject({ cause: "stranded_assigned_issue", status: "escalated" });
+      expect(issue.status).toBe("todo");
+    });
   });
 
   it("does not mutate an ownerless action on repeated sweep passes", async () => {

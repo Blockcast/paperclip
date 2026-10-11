@@ -160,6 +160,51 @@ describeEmbeddedPostgres("activity service", () => {
     expect(emptyActionResult).toEqual([]);
   });
 
+  it("leaves excluded actions off the page while an action filter still reaches them", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: randomUUID(),
+        createdAt: new Date("2026-04-21T10:00:00.000Z"),
+      },
+      {
+        companyId,
+        actorType: "agent",
+        actorId: randomUUID(),
+        action: "heartbeat.run_events_streamed",
+        entityType: "agent",
+        entityId: randomUUID(),
+        createdAt: new Date("2026-04-21T11:00:00.000Z"),
+      },
+    ]);
+
+    const page = await activityService(db).list({
+      companyId,
+      excludeActions: ["heartbeat.run_events_streamed"],
+    });
+    expect(page.map((event) => event.action)).toEqual(["issue.updated"]);
+
+    const asked = await activityService(db).list({
+      companyId,
+      action: "heartbeat.run_events_streamed",
+      excludeActions: [],
+    });
+    expect(asked.map((event) => event.action)).toEqual(["heartbeat.run_events_streamed"]);
+  });
+
   it("returns compact usage and result summaries for issue runs", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

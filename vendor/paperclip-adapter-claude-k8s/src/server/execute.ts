@@ -24,9 +24,23 @@ import {
   isClaudeSkillNotFoundStartupFailure,
   extractClaudeRetryNotBefore,
 } from "./parse.js";
-import { getSelfPodInfo, getBatchApi, getCoreApi } from "./k8s-client.js";
+import { getSelfPodInfo, getBatchApi, getCoreApi, SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
+import {
+  ADAPTER_TYPE_LABEL,
+  ADAPTER_TYPE as ADAPTER_TYPE_VALUE,
+  createSweepGate,
+  DEFAULT_SWEEP_AGE_FLOOR_SEC,
+  DEFAULT_SWEEP_INTERVAL_SEC,
+  DEFAULT_SWEEP_TIMEOUT_MS,
+  LAUNCH_AT_ANNOTATION,
+  MANAGED_BY_LABEL,
+  MANAGED_BY_VALUE,
+  RUN_ID_LABEL,
+} from "./secret-sweep.js";
 import {
   buildJobManifest,
+  buildPodLogPath,
+  resolveDataMountPath,
   resolveJobIsolation,
   sanitizeLabelValue,
   type JobIsolation,
@@ -47,11 +61,9 @@ const KEEPALIVE_INTERVAL_MS = 15_000;
 // them.
 const POD_TEARDOWN_TIMEOUT_MS = 60_000;
 const K8S_CONCURRENCY_GUARD_TIMEOUT_MS = 15_000;
-const RUN_ID_LABEL = "paperclip.io/run-id";
-const MANAGED_BY_LABEL = "app.kubernetes.io/managed-by";
-const MANAGED_BY_VALUE = "paperclip";
-const ADAPTER_TYPE_LABEL = "paperclip.io/adapter-type";
-const ADAPTER_TYPE_VALUE = "claude_k8s";
+// RUN_ID_LABEL / MANAGED_BY_* / ADAPTER_TYPE_* are imported from secret-sweep.ts
+// so the labels written at Secret creation and the selector the orphan sweep
+// queries with cannot drift apart (BLO-21857).
 const ISOLATION_MODE_LABEL = "paperclip.io/isolation-mode";
 const ISOLATION_KEY_LABEL = "paperclip.io/isolation-key";
 /** Pod-log path stamped on the Job at creation (BLO-39114). Read verbatim — never recomputed. */
@@ -62,6 +74,13 @@ const SESSION_ID_LABEL = "paperclip.io/session-id";
 const CONCURRENT_RUN_BLOCKED_PATH = "/api/metrics/claude-k8s/concurrent-run-blocked";
 const ISOLATED_RUN_STARTED_PATH = "/api/metrics/claude-k8s/isolated-run-started";
 const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timeout", "timed_out"]);
+
+/**
+ * Module-level so the interval is shared across every execute() call in this
+ * process. No adapter lifecycle hook exists to attach a real timer to, so the
+ * ownerless-Secret sweep (BLO-21857) piggybacks on execute() instead.
+ */
+const maybeSweepOrphanedSecrets = createSweepGate();
 
 async function withK8sConcurrencyGuardTimeout<T>(operation: Promise<T>): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -307,6 +326,17 @@ function safePathComponent(value: string): string {
   return sanitizePathComponent(value) || "unknown";
 }
 
+/**
+ * POD address of the prompt-cache root, or null to let the bundle fall back to
+ * its managed server-side default.
+ *
+ * Every branch returns a path the CONTAINER must be able to resolve, which is
+ * why the last one is rooted at `resolveDataMountPath` and not at a literal
+ * `/paperclip` — the same correction BLO-32734 applied to the other five
+ * isolation roots. That branch is the runtime-descriptor case: config-source
+ * isolation always populates `isolation.promptCacheRoot`, but a runtime
+ * descriptor may leave it "".
+ */
 function resolvePromptCacheRoot(
   config: Record<string, unknown>,
   ctx: AdapterExecutionContext,
@@ -316,7 +346,7 @@ function resolvePromptCacheRoot(
   if (configured) return configured;
   if (!isolation.enabled) return null;
   if (isolation.promptCacheRoot) return isolation.promptCacheRoot;
-  const root = `/paperclip/instances/default/data/k8s-isolation/${safePathComponent(ctx.agent.companyId)}/${safePathComponent(ctx.agent.id)}/${isolation.key}`;
+  const root = `${resolveDataMountPath(config)}/instances/default/data/k8s-isolation/${safePathComponent(ctx.agent.companyId)}/${safePathComponent(ctx.agent.id)}/${isolation.key}`;
   return `${root}/prompt-cache`;
 }
 
@@ -652,6 +682,11 @@ export async function createOrAdoptRunSecret(
         [ADAPTER_TYPE_LABEL]: ADAPTER_TYPE_VALUE,
         [RUN_ID_LABEL]: input.runId,
       },
+      // On the create AND the adopt write (the PATCH below reuses this body):
+      // a merge PATCH keeps the orphan's creationTimestamp, so without this the
+      // orphan-Secret sweep would judge an adopted Secret by its old age and
+      // could delete it before this run's Job exists (BLO-21857).
+      annotations: { [LAUNCH_AT_ANNOTATION]: new Date().toISOString() },
     },
     stringData: input.data,
   };
@@ -1742,7 +1777,10 @@ async function reapPodLogFile(
  *                  one without the other.
  * - `unobserved` — no list call ever succeeded, so nothing was observed either
  *                  way.  Notably this is also the branch where the pod delete
- *                  itself may never have been issued.
+ *                  itself may never have been issued.  A list whose body has no
+ *                  `items` array counts as not having succeeded: an
+ *                  unparseable read is a third input to this outcome, not zero
+ *                  pods (see the `Array.isArray` guard below).
  */
 type PodTeardownOutcome = "gone" | "alive" | "undeleted" | "unobserved";
 
@@ -1804,7 +1842,19 @@ async function deleteJobPodsAndWait(
     let observed: k8s.V1Pod[] | null = null;
     try {
       const podList = await coreApi.listNamespacedPod({ namespace, labelSelector });
-      observed = podList?.items ?? [];
+      // A response we cannot parse is not "zero pods".  `?? []` collapsed the
+      // two, and `lastObserved === 0` below is the caller's licence to delete
+      // the run's mounted Secrets — so an unparseable read authorised deleting
+      // them under a pod that may still be alive, the exact BLO-35486 failure
+      // by another route.  Throw into the catch below rather than branching
+      // here: that is the "could not observe" path, and it already logs once,
+      // retries to the deadline, and fails closed into `unobserved` (or
+      // `alive`/`undeleted` if an earlier poll did see pods).  The message must
+      // not look like a 404 to `isK8s404`, which would return "gone".
+      if (!Array.isArray(podList?.items)) {
+        throw new Error(`pod list for ${labelSelector} returned no items array`);
+      }
+      observed = podList.items;
       lastObserved = observed.length;
     } catch (err) {
       // Can't observe the pods, so we can't prove they are gone — unless the
@@ -2228,6 +2278,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   try {
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
+  // Best-effort, rate-limited sweep of run Secrets orphaned by a control-plane
+  // crash between Secret creation and the ownerReferences patch (BLO-21857).
+  // Never throws and never hangs: this await sits inside the per-agent creation
+  // mutex, whose slot is released only by the `finally` at the bottom of this
+  // function, so an unbounded wait here would wedge the agent permanently rather
+  // than merely delay one run. The gate enforces both bounds.
+  await maybeSweepOrphanedSecrets({
+    namespace: guardNamespace,
+    coreApi,
+    batchApi,
+    onLog,
+    intervalMs:
+      Math.max(0, asNumber(config.orphanSecretSweepIntervalSec, DEFAULT_SWEEP_INTERVAL_SEC)) * 1000,
+    ageFloorMs:
+      Math.max(0, asNumber(config.orphanSecretSweepAgeFloorSec, DEFAULT_SWEEP_AGE_FLOOR_SEC)) * 1000,
+    timeoutMs: asNumber(config.orphanSecretSweepTimeoutMs, DEFAULT_SWEEP_TIMEOUT_MS),
+  });
   try {
     const existing = await withK8sConcurrencyGuardTimeout(
       batchApi.listNamespacedJob({
@@ -2396,8 +2463,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   // Prepare the prompt bundle (skills + instructions) on the server filesystem.
-  // The K8s Job pod mounts the same PVC at /paperclip, so bundle paths written
-  // here are accessible inside the pod at the identical absolute path.
+  // One volume, TWO mount points: this process writes at
+  // `SELF_POD_DATA_MOUNT_PATH` and the K8s Job pod reaches the same bytes at
+  // `resolveDataMountPath(config)`. They coincide on the default mount and
+  // diverge under a custom `workspaceMountPath`, which is why both are passed
+  // to `prepareClaudePromptBundle` below rather than one absolute path being
+  // reused as write target, `--add-dir` and `--append-system-prompt-file`
+  // (BLO-37760).
   const skillEntries = await readPaperclipRuntimeSkillEntries(config, import.meta.dirname ?? __dirname);
   const desiredSkillNames = new Set(resolvePaperclipDesiredSkillNames(config, skillEntries));
   const desiredSkills = skillEntries.filter((e) => desiredSkillNames.has(e.key));
@@ -2438,6 +2510,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       skills: desiredSkills,
       instructionsContents,
       rootDir: resolvePromptCacheRoot(config, effectiveCtx, jobIsolation),
+      // `rootDir` above is a POD address (the isolation roots are derived from
+      // `resolveDataMountPath`), but the bundle is written HERE. Hand over both
+      // mounts so the writer and the reported `--add-dir` name the same bytes
+      // under a custom `workspaceMountPath` (BLO-37760).
+      podDataMountPath: resolveDataMountPath(config),
+      serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
       catalogBackedSkillKeys,
       onLog,
     });

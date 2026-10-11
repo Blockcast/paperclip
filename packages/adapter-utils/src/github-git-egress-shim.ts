@@ -966,10 +966,36 @@ function readGit(runGit: GitReader, args: string[], commit?: string): string {
 /**
  * Commits that a push would publish for one ref update.
  *
- * For an existing remote ref the range is `remoteSha..localSha`. For a ref the
- * remote does not have, `--not --remotes` excludes everything already published
- * under any remote-tracking ref, which is what keeps a new branch off a shared
- * base from re-reporting the entire history of the repository.
+ * Both arms exclude everything already published under any remote-tracking ref
+ * (`--not --remotes`), which is what keeps a branch off a shared base from
+ * re-reporting the entire history of the repository. The existing-ref arm
+ * additionally excludes `remoteSha` itself, because the pre-push hook's view of
+ * what the remote holds is authoritative and can be AHEAD of the local
+ * remote-tracking ref when someone else has pushed since the last fetch.
+ *
+ * PEN-3907: the existing-ref arm used to be a bare `remoteSha..localSha`, which
+ * contradicted the narrowness this function claims two paragraphs down. A
+ * force-push after rebasing onto a newer upstream puts every intervening
+ * upstream commit in that range: measured 43 commits, 4 of them flagged and all
+ * 4 already on `origin/master`. Three consequences, all bad, and the third is
+ * the dangerous one:
+ *
+ *   - the author is refused for material they did not write;
+ *   - they cannot fix it, because amending another branch's merged history is
+ *     not a thing a feature branch can do; and
+ *   - the remedy text names the oldest offending commit in a `git rebase -i`
+ *     suggestion, so following the tool's own instructions literally means
+ *     REWRITING PUBLISHED HISTORY of a shared branch.
+ *
+ * The third is fixed here rather than in the message: once the range cannot
+ * contain a published commit, the suggestion cannot name one. That is a
+ * structural fix, so a future edit to the message cannot reintroduce it.
+ *
+ * This also removes an asymmetry that bought nothing. The strict arm was only
+ * ever reachable for a ref the remote already has, and an author refused by it
+ * could push the identical commits to a fresh branch name and take the lenient
+ * arm — so the extra strictness never held against anyone who wanted around it,
+ * while falling on every ordinary rebase.
  *
  * A known trade-off, recorded rather than fixed: `--remotes` is EVERY remote,
  * not the push target's. A commit present only on a second remote — a fork, an
@@ -982,6 +1008,15 @@ function readGit(runGit: GitReader, args: string[], commit?: string): string {
  * narrow — material already published to another remote, i.e. already disclosed
  * once — where the alternative's cost falls on ordinary clean pushes.
  *
+ * PEN-3907 widened that trade-off to the existing-ref arm, which previously did
+ * not consult `--remotes` at all. Stated plainly so it is not discovered later:
+ * an agent can now also shrink a FORCE-PUSH's scan range by adding a remote and
+ * pushing there first. That is not a new capability — the same agent could
+ * always take the lenient arm by pushing to a branch name the remote does not
+ * have — so the change costs no enforcement that was holding, and PEN-3183
+ * tracks moving enforcement off the agent's machine, which is the only thing
+ * that closes this class properly.
+ *
  * Throws {@link GitEgressScanError} if `rev-list` fails: without its output the
  * scanner does not know what the push contains, and an empty list would read as
  * "nothing to check" and pass.
@@ -993,7 +1028,7 @@ export function commitsForRefUpdate(
   if (isNullSha(update.localSha)) return []; // a deletion publishes no content
   const args = isNullSha(update.remoteSha)
     ? ["rev-list", update.localSha, "--not", "--remotes"]
-    : ["rev-list", `${update.remoteSha}..${update.localSha}`];
+    : ["rev-list", update.localSha, "--not", update.remoteSha, "--remotes"];
   return readGit(runGit, args)
     .split("\n")
     .map((line) => line.trim())

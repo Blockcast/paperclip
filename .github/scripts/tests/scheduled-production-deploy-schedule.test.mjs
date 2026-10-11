@@ -207,8 +207,13 @@ test('node is set up unconditionally, so the record-closing path is not silently
   // PATH for `run:` steps, and the close step runs on the three NON-pending
   // outcomes — the exact outcomes the old `skipped-pending` gate excluded. Left
   // conditional, the close would fail `command not found` on every slot that was
-  // supposed to run it, and one open record would carry its clock into the next,
-  // unrelated stall.
+  // supposed to run it, and with no `continue-on-error` that fails the run.
+  //
+  // On THIS repository there is no record for that close to act on
+  // (`has_issues: false`; see the workflow's escalation step), and the stall
+  // clock is derived from run history (deploy-stall-chain.mjs), so the red run is
+  // what this pin prevents here. Until 2026-10-05 this comment ended "and one
+  // open record would carry its clock into the next, unrelated stall".
   const setup = code.match(/- name: Set up Node\n(?:.*\n)*?\s+uses: actions\/setup-node/);
   assert.ok(setup, 'the workflow must still pin setup-node rather than trust a bare `node`');
   assert.ok(
@@ -225,6 +230,13 @@ test('node is set up unconditionally, so the record-closing path is not silently
 // safe to leave running unattended: it is armed by its own threshold, separate
 // from the escalation (BLO-25050), it approves nothing, and it cannot be starved
 // by an Alertmanager outage.
+//
+// "The durable record" in this banner is PEN-3315's design, not this
+// repository's state: Blockcast/paperclip has `has_issues: false`, so the record
+// write returns 410 and none ever exists here, and the stall clock comes from
+// deploy-stall-chain.mjs. Until 2026-10-05 the banner carried no such
+// qualification. The record wiring below is still pinned because
+// deploy-stall-record.mjs keeps it for repositories with Issues enabled.
 // ---------------------------------------------------------------------------
 
 const stepIndex = (needle) => {
@@ -234,9 +246,13 @@ const stepIndex = (needle) => {
 };
 
 test('the supersede runs AFTER the escalation, so the alert reports the pre-supersede run', () => {
-  // Order matters twice. The durable record must exist before the supersede can
-  // annotate it, and the Alertmanager alert must describe the run a reviewer was
-  // actually looking at rather than the replacement dispatched seconds earlier.
+  // The Alertmanager alert must describe the run a reviewer was actually looking
+  // at rather than the replacement dispatched seconds earlier, and a durable
+  // record, where one exists, can then be annotated by the supersede. On THIS
+  // repository none does (`has_issues: false`), so STALL_ISSUE_NUMBER is always
+  // empty here and the alert is why this ordering is pinned. Until 2026-10-05
+  // this comment opened "Order matters twice. The durable record must exist
+  // before the supersede can annotate it".
   assert.ok(
     stepIndex('id: escalate') < stepIndex('id: supersede'),
     'the escalation must run before the supersede',
@@ -339,9 +355,15 @@ test('the supersede APPROVES NOTHING — the red backstop stays gated on the esc
 
 test('the durable record is closed on every outcome that means nothing is pending', () => {
   // `dispatched`, `up-to-date` and `checked-no-pending` all mean the reviewer
-  // gate is clear, which ends the stall by definition. Without a close, one open
-  // record would carry its stall clock into the next, unrelated stall and report
-  // it as days old from the first slot.
+  // gate is clear, which ends the stall by definition. Where Issues are enabled,
+  // an unclosed record's marker stays a stall-start candidate in
+  // resolveStallStartedAt, so the next, unrelated stall would report as days old
+  // from the first slot. On THIS repository no record exists
+  // (`has_issues: false`) and the clock comes from deploy-stall-chain.mjs; the
+  // condition is still pinned because it is the wiring deploy-stall-record.mjs
+  // keeps for those repositories. Until 2026-10-05 this comment stated the
+  // carried clock unconditionally: "Without a close, one open record would carry
+  // its stall clock into the next, unrelated stall".
   const close = code.match(/- name: Close the durable deploy-stall record[\s\S]*?--resolve/);
   assert.ok(close, 'the workflow must close the stall record');
   assert.match(
@@ -352,10 +374,13 @@ test('the durable record is closed on every outcome that means nothing is pendin
 });
 
 test('the workflow grants exactly the permissions the new paths need, and no more', () => {
-  // `issues: write` is the entire credential cost of the durable record — the
-  // reason a GitHub issue was chosen over any external store. `actions: write`
-  // was already there for the dispatch and now also covers the cancel. Anything
-  // beyond these two on a workflow that holds a deploy dispatch is worth a stop.
+  // `issues: write` is retained for repositories with Issues enabled; on THIS
+  // repository (`has_issues: false`) the record write returns 410 and the grant
+  // is inert (see the workflow's `permissions:` block). Until 2026-10-05 this
+  // comment called it "the entire credential cost of the durable record". It is
+  // still pinned so the set cannot grow silently. `actions: write` was already
+  // there for the dispatch and now also covers the cancel. Anything beyond these
+  // two on a workflow that holds a deploy dispatch is worth a stop.
   const block = code.split(/^permissions:\n/m)[1] ?? '';
   const granted = [];
   for (const line of block.split('\n')) {
@@ -373,6 +398,13 @@ test('the workflow grants exactly the permissions the new paths need, and no mor
 // train of 6.0h ones and the critical alert flaps firing/resolved on the
 // threshold instead of firing continuously with a climbing age. That would be a
 // regression in the one control that demonstrably worked during the incident.
+//
+// These three exercise selectStuckApproval's `stallStartedAt` input, which they
+// call the "recorded" stall start (and one assertion message, "the record"). On
+// THIS repository that input never comes from a record (`has_issues: false`):
+// resolveStallStartedAt takes it from the waiting run or the run-history
+// derivation in deploy-stall-chain.mjs. The function does not know its source,
+// so the pins hold for either.
 test('a supersede cannot reset the escalation clock', () => {
   const STALL_START = '2026-09-14T19:55:57.000Z';
   const NOW = new Date('2026-09-16T13:00:00.000Z'); // ~41h into the real stall
@@ -427,9 +459,12 @@ test('the recorded stall start can only move the clock EARLIER, never later', ()
 });
 
 test('an unreadable recorded stall start degrades to the run, it does not disable the escalation', () => {
-  // The value comes from a marker in an issue body that a human can edit. Going
-  // fatal there would take the escalation down over a cosmetic change; ignoring
-  // it costs precision only, and only until the next slot rewrites the marker.
+  // Where Issues are enabled, the value can come from a marker in an issue body
+  // that a human can edit. Going fatal there would take the escalation down over
+  // a cosmetic change; ignoring it costs precision only, and only until the next
+  // slot rewrites the marker. On THIS repository (`has_issues: false`) there is
+  // no marker. Until 2026-10-05 this comment opened "The value comes from a
+  // marker in an issue body".
   const verdict = selectStuckApproval({
     pendingRuns: [
       {
@@ -511,6 +546,12 @@ test('replay 2026-09-11: hourly sampling catches the gate the daily cron structu
 // The refusal lives in the script, not in the step `if:`, because a labelled
 // record must still close on `dispatched` / `up-to-date`. These assert the wiring
 // the script depends on is actually there.
+//
+// On THIS repository no record is opened (`has_issues: false`), so there is
+// nothing to label or refuse to close; the wiring is pinned because
+// deploy-stall-record.mjs keeps it for repositories with Issues enabled. Until
+// 2026-10-05 this block described "The record opened to make the stall
+// auditable" without that qualification.
 test('the supersede can reach the record it must label on its failure paths', () => {
   const supersede = code.match(/- name: Supersede a stale pending deploy[\s\S]*?run: node/);
   assert.ok(supersede, 'the workflow must run the supersede');

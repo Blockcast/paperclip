@@ -15,9 +15,33 @@
 # WHAT THIS DOES NOT DO
 # ---------------------
 # It does NOT approve anything. docker.yml's `deploy` job stays gated on the
-# paperclip-production environment and its three named human reviewers. This only
-# performs the mechanical step (dispatch), so there is always a build ready to approve
-# and approving means reviewing a day of commits instead of a quarter's worth.
+# paperclip-production environment, whose ratified reviewer set is
+# RATIFIED_REVIEWERS in .github/scripts/check-production-environment-protection.mjs.
+# ⛔ DO NOT RESTATE THE COUNT HERE — read the symbol. Two successive counts
+# written into this line were false by the time they landed (see below); a count
+# in prose is a second source of truth that drifts silently, and this file is a
+# design document that readers plan against.
+#
+# That set is EMPTY as of 2026-10-07: the owner removed the required_reviewers
+# rule on 2026-10-06 and recorded the decision in Blockcast/onprem-k8s#4913
+# (merged 2026-10-07T01:13:11Z), which SUPERSEDES the reviewer clause of card
+# 60e271b7. The environment now holds a branch_policy rule only. The guard file
+# above carries the full record, the accepted risk, and the revert recipe — read
+# it there rather than re-deriving any of it here.
+#
+# Two superseded readings, kept as a quoted record so a later run does not
+# re-litigate them. Until 2026-10-04 this read "its three named human
+# reviewers"; that was never a ratified shape. A correction to "its ONE ratified
+# human reviewer" was TRUE when authored on 2026-10-04, while the environment
+# still required kkroo, and went stale before it landed on 2026-10-08: the owner
+# removed the rule on 2026-10-06 in between. Both rest on the same drifting fact,
+# that this job is gated on named humans, which is why the count is gone rather
+# than re-corrected.
+#
+# The residual single-approver risk is homed on BLO-22329 and PEN-2863 is
+# RESOLVED on it — do not re-file it. This only performs the mechanical step
+# (dispatch), so there is always a build ready to ship and shipping means
+# reviewing a day of commits instead of a quarter's worth.
 #
 # Auto-approval was considered and rejected on 2026-08-28: three green guards prove the
 # code builds, not that a human intends to ship it. That reasoning is unchanged.
@@ -58,10 +82,20 @@
 # the button; they press it on a current head, so the click that eventually lands
 # ships everything instead of a partial. See .github/scripts/supersede-stale-deploy.mjs.
 #
-# The escalation also writes a durable GitHub issue now, because an Alertmanager
+# The escalation also ATTEMPTS a durable GitHub issue, because an Alertmanager
 # alert is gone from /api/v2/alerts three hours after the last push and PEN-3289
-# could not audit the incident afterwards. That record doubles as the stall clock,
-# so superseding a run cannot reset the reported age.
+# could not audit the incident afterwards.
+#
+# Until 2026-10-04 these lines asserted that record exists and "doubles as the
+# stall clock". Neither is true here. Blockcast/paperclip has
+# `has_issues: false`, so POST /issues returns 410 on every escalation and no
+# token scope reaches it — and because the clock was sourced from that record,
+# the supersede below duly reset it: on 2026-09-18 a stall running since
+# 09-17T02:01:24Z reported "3.0h old, under the 6h threshold — not escalating"
+# on a GREEN dispatcher run while paperclip_api_deploy_commits_behind read 107.
+# A PEN-3315 follow-up repaired that by DERIVING the clock from Actions run
+# history instead. See deploy-stall-chain.mjs — that derivation, not the issue,
+# is what makes a supersede unable to reset the reported age.
 name: Scheduled production deploy dispatch
 
 on:
@@ -92,9 +126,11 @@ on:
 permissions:
   contents: read
   actions: write # required to dispatch docker.yml, and to cancel a stale dispatch
-  # PEN-3315: the escalation writes a durable GitHub issue alongside the
-  # Alertmanager push. This is the ONLY new permission the change needs — no new
-  # credential — which is why a GitHub issue was chosen over any external store.
+  # PEN-3315: the escalation ATTEMPTS a durable GitHub issue alongside the
+  # Alertmanager push. It needed no new credential, which is why a GitHub issue
+  # was chosen over any external store. Retained for repositories with Issues
+  # enabled; on Blockcast/paperclip (`has_issues: false`) that write returns 410
+  # and this grant is inert. The stall clock comes from deploy-stall-chain.mjs.
   issues: write
 
 concurrency:
@@ -293,10 +329,15 @@ jobs:
       # `python3`: an unproven `command not found` on the escalation path would
       # be worse than the gap it closes.
       #
-      # Unconditional since PEN-3315: the non-pending outcomes now close the
-      # durable stall record, so every outcome needs node. That costs a few
-      # seconds on the common path and buys a record lifecycle that ends, rather
-      # than one open issue inheriting the next stall's clock.
+      # Unconditional since PEN-3315: the non-pending outcomes run the
+      # record-closing step below, so every outcome needs node. That costs a few
+      # seconds on the common path.
+      #
+      # On THIS repository there is no record for that step to close
+      # (`has_issues: false`; see the escalation step below), so the lifecycle it
+      # exists for never starts here. Until 2026-10-04 these lines claimed the
+      # cost "buys a record lifecycle that ends, rather than one open issue
+      # inheriting the next stall's clock".
       - name: Set up Node
         if: ${{ !cancelled() }}
         uses: actions/setup-node@v6
@@ -318,11 +359,16 @@ jobs:
       # production-environment-protection-guard has been pushing to this same
       # endpoint from the same arc-runners network namespace.
       #
-      # PEN-3315 adds a durable GitHub issue alongside that push. The alert's
-      # own TTL is 3h, so PEN-3289 could not audit the 41.2h stall afterwards —
-      # the same query that returned 5 hits for a live alert returned 0 for this
-      # one. The issue is deduplicated on a label and also carries the stall
-      # start, so a supersede below cannot reset the reported age.
+      # PEN-3315 attempts a durable GitHub issue alongside that push. The
+      # alert's own TTL is 3h, so PEN-3289 could not audit the 41.2h stall
+      # afterwards — the same query that returned 5 hits for a live alert
+      # returned 0 for this one.
+      #
+      # On THIS repository that write returns 410 (`has_issues: false`), so no
+      # such record is ever created and the post-hoc audit artifact degrades to
+      # this run's own red conclusion. The stall start that survives a supersede
+      # comes from the run-history derivation in deploy-stall-chain.mjs, NOT
+      # from the issue. Until 2026-10-04 these lines claimed otherwise.
       - name: Escalate a production approval that is stuck past its threshold
         id: escalate
         if: steps.dispatch.outputs.outcome == 'skipped-pending'
@@ -358,8 +404,11 @@ jobs:
       # the deploy lane. This step is independently correct — it re-reads the run's
       # live status before touching anything.
       #
-      # AFTER the escalation, so the durable record exists to be annotated and so
-      # the alert reports the pre-supersede run.
+      # AFTER the escalation, so the alert reports the pre-supersede run, and so a
+      # durable record, where one exists, can be annotated. On THIS repository
+      # none does (`has_issues: false`; see the escalation step above), so
+      # STALL_ISSUE_NUMBER is always empty here. Until 2026-10-04 these lines
+      # claimed "the durable record exists to be annotated".
       - name: Supersede a stale pending deploy so the approvable head is current
         id: supersede
         if: ${{ !cancelled() && steps.dispatch.outputs.outcome == 'skipped-pending' }}
@@ -388,6 +437,13 @@ jobs:
       # the record, and --resolve refuses to close a labelled record on an outcome
       # that did not refill the lane. The condition stays here so a labelled record
       # still closes on `dispatched` / `up-to-date`.
+      #
+      # On THIS repository none of the above has a record to act on
+      # (`has_issues: false`; see the escalation step above): the supersede's
+      # failure paths have nothing to label and this step has nothing to close.
+      # The step name is kept because the schedule tests match on it. Until
+      # 2026-10-04 these lines, and that name, described the record lifecycle as
+      # operating here.
       - name: Close the durable deploy-stall record once nothing is pending
         if: ${{ !cancelled() && steps.dispatch.outputs.outcome != '' && steps.dispatch.outputs.outcome != 'skipped-pending' }}
         env:

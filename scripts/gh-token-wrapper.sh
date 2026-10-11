@@ -19,7 +19,7 @@
 # rather than mounted fleet-wide: see GH_SEAT_TOKEN_VALUE below.
 set -eu
 
-TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
+TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/etc/paperclip/secrets/github-token/token}"
 REAL_GH="${GH_TOKEN_WRAPPER_REAL_GH:-/usr/bin/gh.real}"
 GH_SELF="${GH_TOKEN_WRAPPER_SELF:-/usr/bin/gh}"
 # Absolute, not `git` via PATH: some pods reorder PATH ahead of this image's
@@ -155,8 +155,13 @@ if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
   # or to the real binary: a malformed binding is a misconfiguration, and
   # continuing would run `gh` under whatever ambient GH_TOKEN/GITHUB_TOKEN the
   # caller happened to inherit — an unintended identity, silently.
+  #
+  # The empty case also names the BLO-40279 move: the documented recipe fills
+  # this from `$(cat <token file>)`, and a stale /paperclip/.secrets path makes
+  # that cat fail and leave the variable set-but-empty, so the refusal fires
+  # here and never reaches reject_token_file()'s path-specific hint below.
   if [ -z "${TOKEN}" ]; then
-    echo "gh-token-wrapper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+    echo "gh-token-wrapper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth. If it was filled by cat-ing a token file, that read failed: a path under /paperclip/.secrets is stale since BLO-40279, and the token Secrets now mount at /etc/paperclip/secrets/<name>/token" >&2
     exit 64
   fi
   case "${TOKEN}" in
@@ -229,12 +234,50 @@ fi
 # the path printed is the compiled-in default and the variable named nothing.
 # Keeping the `+x` guard is the point — `-n` would let a set-but-empty value
 # fall through to ambient auth, which is the fail-open this file exists to kill.
+#
+# A caller naming a path under /paperclip/.secrets gets the move named for it
+# (BLO-40279): that was where both token Secrets mounted until they moved out
+# from under the shared CephFS volume, and an absolute path pinned in prose —
+# a runbook, an agent instruction bundle, muscle memory — cannot be swept the
+# way an in-repo one can. Deliberately a HINT and not a fallback: the two
+# Secrets are two *different principals* (the App installation vs the
+# `allyblockcast` user seat), whose approvals GitHub counts differently, so
+# silently resolving a named merge-seat path to the compiled-in App default
+# would run as an identity the caller did not ask for — the exact silent
+# downgrade BLO-37977 made this branch refuse.
 reject_token_file() {
-  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set, so a token file is required, but ${TOKEN_FILE} ${1}; refusing to run with ambient auth. GH_TOKEN/GITHUB_TOKEN are not used as a fallback; to run under a specific token, set GH_SEAT_TOKEN_VALUE" >&2
+  moved=""
+  case "${TOKEN_FILE}" in
+    /paperclip/.secrets/*)
+      moved=". That path is stale: the token Secrets moved to /etc/paperclip/secrets/<name>/token in BLO-40279, out from under the shared /paperclip volume. Point PAPERCLIP_GITHUB_TOKEN_FILE at the new path — this wrapper will not pick a credential for you, because the App token and the merge seat are different identities"
+      ;;
+  esac
+  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set, so a token file is required, but ${TOKEN_FILE} ${1}; refusing to run with ambient auth. GH_TOKEN/GITHUB_TOKEN are not used as a fallback; to run under a specific token, set GH_SEAT_TOKEN_VALUE${moved}" >&2
   exit 64
 }
 
-if [ -r "${TOKEN_FILE}" ]; then
+# BLO-40279: never read a credential off the fleet-shared data volume. Every
+# agent uid can write there, so a readable file on it proves nothing about who
+# put it there — a vacated /paperclip/.secrets/<name>/ is a bare, group-writable
+# directory, and a token planted in it would run `gh` as an identity the caller
+# never chose. A Secret mounted *under* the volume is its own tmpfs with its own
+# device, so it still passes. Compared by device rather than by path prefix,
+# because a symlink or any other pinned path reaches the same filesystem. Fails
+# closed when either side cannot be stat'ed.
+SHARED_VOLUME="${PAPERCLIP_HOME:-/paperclip}"
+token_file_on_shared_volume() {
+  [ -d "${SHARED_VOLUME}" ] || return 1
+  shared_dev="$(stat -L -c %d -- "${SHARED_VOLUME}" 2>/dev/null)" || return 0
+  file_dev="$(stat -L -c %d -- "${TOKEN_FILE}" 2>/dev/null)" || return 0
+  [ "${file_dev}" = "${shared_dev}" ]
+}
+
+if [ -r "${TOKEN_FILE}" ] && token_file_on_shared_volume; then
+  if require_token_file; then
+    reject_token_file "is on the shared ${SHARED_VOLUME} volume, which every agent can write"
+  fi
+  echo "gh-token-wrapper: ${TOKEN_FILE} is on the shared ${SHARED_VOLUME} volume, which every agent can write; not reading a credential from it, falling back to unwrapped auth" >&2
+elif [ -r "${TOKEN_FILE}" ]; then
   TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}" 2>/dev/null || true)"
   # `tr -d '\r\n'` strips line terminators but leaves spaces/tabs, so a
   # whitespace-only file would otherwise export a whitespace GH_TOKEN and

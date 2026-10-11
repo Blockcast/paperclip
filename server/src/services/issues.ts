@@ -11753,7 +11753,50 @@ export function issueService(db: Db) {
         return enriched;
       };
 
-      const updateResult = dbOrTx === db ? await db.transaction(runUpdate) : await runUpdate(dbOrTx);
+      // BLO-40673: an update that moves a terminal row (`done`/`cancelled`) back to
+      // any active status re-enters every partial unique index whose predicate is
+      // `status NOT IN ('done','cancelled')`. When a *different* row already holds
+      // that slot the UPDATE raises 23505. `create` translates both such indexes
+      // into typed 409s; this path translated neither, so the identical collision
+      // surfaced as a raw 500. Measured on BLO-37470 via the aggregate index:
+      // ~3 failures/minute for 11 days, each costing ~2.9s of the alertmanager
+      // delivery budget and trending toward whole-batch abandonment.
+      //
+      // Both indexes are handled, not just the one that was observed firing: they
+      // have the same predicate shape over the same three key columns, so the cause
+      // is "an update that re-enters a partial unique index", not either index in
+      // particular. The cover index is reachable today by any caller PATCHing a
+      // cancelled `[user-cover]` row back to an active status while a newer cover
+      // from the same window holds the fingerprint.
+      //
+      // What this delivers is the classification, and only that: an expected race
+      // reported as 409 instead of 500. It does NOT by itself make the plugin
+      // reopen anything — the `plugin_resolved` re-fire branch already rebinds
+      // through an error-agnostic catch, and `suppression_expired` has no rebind at
+      // all (BLO-42853). Do not read a drop in these 500s as "revivals succeeded".
+      //
+      // Note for the first caller that passes `dbOrTx`: on that branch the 409
+      // leaves the *caller's* transaction aborted, so catch-and-continue on the
+      // same handle yields 25P02. The `db.transaction` branch rolls back cleanly.
+      const updateResult = await (dbOrTx === db
+        ? db.transaction(runUpdate)
+        : runUpdate(dbOrTx)
+      ).catch((err: unknown) => {
+        const originFingerprint = data.originFingerprint ?? existing.originFingerprint;
+        if (isAlertEscalationCoverDedupConflict(err)) {
+          throw conflict("Alert escalation cover conflict", {
+            companyId: existing.companyId,
+            originFingerprint,
+          });
+        }
+        if (isAlertmanagerAggregateCreationConflict(err)) {
+          throw conflict("Alertmanager aggregate creation conflict", {
+            companyId: existing.companyId,
+            originFingerprint,
+          });
+        }
+        throw err;
+      });
 
       // BLO-27572: deliberately after the write, on `db` rather than `dbOrTx`, and
       // last — mirroring the strand-time call site in `recovery/service.ts`. This

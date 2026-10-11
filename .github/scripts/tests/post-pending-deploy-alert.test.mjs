@@ -43,7 +43,7 @@ test('selectStuckApproval: a young waiting run is NOT escalated', () => {
 
 test('selectStuckApproval: queued/in_progress runs never escalate — no human is being waited on', () => {
   // These block the dispatcher's anti-stacking guard too, but they are runner
-  // and build states. Paging three named reviewers for a slow build would be
+  // and build states. Paging the production reviewer for a slow build would be
   // the wrong people.
   const verdict = selectStuckApproval({
     pendingRuns: [

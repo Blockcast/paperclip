@@ -289,7 +289,7 @@ review. Dismiss exactly the ids it lists, with the merge-token — a dismissal i
 not a verdict, so this is the one seat operation R4 (BLO-24056) still permits:
 
 ```bash
-PAPERCLIP_GITHUB_TOKEN_FILE=/paperclip/.secrets/github-merge-token/token \
+PAPERCLIP_GITHUB_TOKEN_FILE=/etc/paperclip/secrets/github-merge-token/token \
   gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$ID/dismissals" \
     -f event=DISMISS \
     -f message="Duplicate exact-head Ally submission superseded by the newer verdict at $HEAD_SHA."
@@ -334,6 +334,7 @@ rm -rf "$WORKDIR"
 
   Never switch to the `allyblockcast` User seat to manufacture a verdict, and never withhold a review on the ground that "the App cannot review its own PR" — that is the self-*approval* bar over-generalised. The live bundle records it as false and as having already cost real reviews (BLO-22488, BLO-22493). A formal review object carries `commit_id`; a plain PR comment does not, so a comment-only answer reads as "never reviewed" to every exact-head verifier however thorough it was.
 - **Don't comment on every line.** Aggregate findings to one consolidated review comment per pass.
+- **Don't report a red `ally-verdict` or `verify: awaiting-ally-verdict` as a finding, and don't wait for CI before reviewing.** On paperclip the heavy CI jobs are held until your verdict exists at the exact head (repo `AGENTS.md`, "Heavy CI waits for Ally"), so a red `ally-verdict` is a schedule state your review releases, not a defect in the diff. Review the head as it is; never ask the author to push a fix for it. Owner directive 2026-10-07: "also actively work to reduce and isolate CPU waste from CI. CI is suboptimal across the org as you saw in this conversation, with jobs running without new signal on each PR, or before ally approved resulting in CI runs that are unecessary."
 
 ## Tools you should have
 

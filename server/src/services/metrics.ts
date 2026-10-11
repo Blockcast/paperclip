@@ -156,6 +156,58 @@ export const BACKSTOP_SOURCES = [
  */
 export const HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC = "paperclip_heartbeat_recovery_chain_skipped_total";
 /**
+ * Duplicate wake deliveries that the BLO-25726 idempotency machinery SUPPRESSED.
+ *
+ * This counts the race firing and being caught, not an absence. That direction
+ * is deliberate: the obvious field signal for BLO-25726 ("no two runs share a
+ * wake idempotency key") is unmeasurable from any read surface -- `heartbeat_runs`
+ * carries no idempotency key, and its `wakeupRequestId` is 1:1 with runs by
+ * construction, so a second dispatch minting a fresh wake row is invisible to
+ * it. A zero there is vacuous. A non-zero here is positive proof the guard ran.
+ *
+ * Every cause is zero-initialized so the series exists before the first
+ * suppression; an absent series and a quiet one must not look alike.
+ *
+ * Non-zero is EXPECTED and must not page -- it means a crash or a concurrent
+ * reconciler pass hit the delivery window and the duplicate was declined. The
+ * alertable inversion is this staying at zero while duplicate runs appear.
+ */
+export const WAKE_REDELIVERY_SUPPRESSED_METRIC = "paperclip_agent_wake_redelivery_suppressed_total";
+
+const WAKE_REDELIVERY_SUPPRESSED_CAUSES = [
+  "claim_contended",
+  "claim_lost",
+  "already_delivered",
+  "fence_lost",
+] as const;
+
+/**
+ * Which of the four BLO-25726 guards declined this redelivery.
+ *
+ * They are four, not one, because they fire at four different points in the
+ * dispatch and are not interchangeable — collapsing them would make AC3
+ * (concurrent reconcilers) indistinguishable from AC1 (enqueue-time key).
+ *
+ * - `claim_contended`: the compare-and-set claim on the `dispatch_failed` /
+ *   expired-lease row lost to a concurrent pass, so this pass skipped BEFORE
+ *   dispatching. The scheduler is not leader-elected, so this is the shape two
+ *   replicas actually run (AC3).
+ * - `claim_lost`: this pass held the claim, but the lease was reclaimed before
+ *   its enqueue could commit, so the stale redelivery was dropped mid-flight.
+ * - `already_delivered`: `enqueueWakeup`'s enqueue-time claim found a live wake
+ *   row under the same idempotency key and delivery token and handed back that
+ *   run rather than committing a second one (AC1/AC2).
+ * - `fence_lost`: this pass did NOT deliver (its re-dispatch failed, or a gate
+ *   declined or deferred it), ran past its lease, another pass reclaimed the
+ *   row, and this pass's re-arm or terminal write was discarded rather than
+ *   stamped over the new owner's live state -- a stale re-arm would hand the row
+ *   back to the due-rows query while the new owner is still dispatching it. A
+ *   fence lost AFTER this pass delivered is not counted: that wake reached a
+ *   run, nothing was declined, and the new owner's redelivery of it is counted
+ *   once, as `already_delivered`.
+ */
+export type WakeRedeliverySuppressedCause = (typeof WAKE_REDELIVERY_SUPPRESSED_CAUSES)[number];
+/**
  * Wall-clock duration of the last COMPLETED periodic recovery chain, in seconds
  * (PEN-3314).
  *
@@ -271,6 +323,7 @@ export const ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES = [
   "eligible",
   "retained_in_use",
   "retained_fresh",
+  "retained_nested_checkout",
   "vanished",
   "failed",
 ] as const;
@@ -911,6 +964,26 @@ export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_externa
 // identifies which agent is starved.
 export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_seconds";
 export const QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_queued_run_age_metrics_refresh_success";
+// BLO-32638: a routine's receipt that it took a measurement is a `done` issue
+// row, which Prometheus cannot see. So a routine silently disabled for
+// intervals is indistinguishable, on every existing metrics surface, from one
+// that is healthy and quiet -- 11 blind windows (largest 47.5h) accumulated on
+// the alert-delivery bridge watchdog that way, one of them hiding a real
+// outage that destroyed 22 of 42 alerts.
+//
+// Deliberately NOT covered by ROUTINE_DISPATCH_METRIC, and the gap is the
+// point: every label on that counter requires a fire to have ATTEMPTED
+// dispatch. None of them move when a routine stops producing completed fires,
+// and none are emitted at all when a fire dispatches fine and its run then
+// dies quietly. Through the measured window cadence was correct, run-status
+// tallies read healthy, and no dispatch counter moved abnormally.
+//
+// The pair is a gauge and its own denominator so ONE alert rule covers every
+// routine: `age > 2 * interval`. A hand-maintained per-routine threshold is
+// the thing that rots silently when a cron is edited.
+export const ROUTINE_LAST_DONE_FIRE_AGE_METRIC = "paperclip_routine_last_done_fire_age_seconds";
+export const ROUTINE_FIRE_INTERVAL_METRIC = "paperclip_routine_fire_interval_seconds";
+export const ROUTINE_FIRE_GAP_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_routine_fire_gap_metrics_refresh_success";
 // PEN-3734: age of the oldest *pending* `deferred_issue_execution` wake per
 // agent. A wake deferred behind an issue's execution lock is promoted only
 // when a run on that issue finalizes, one per finalization, and the lock is
@@ -3420,6 +3493,9 @@ let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
 let githubWebhookDelivery: Counter<"event" | "outcome"> | null = null;
 let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
+let routineLastDoneFireAge: Gauge<"routine_id"> | null = null;
+let routineFireInterval: Gauge<"routine_id"> | null = null;
+let routineFireGapMetricsRefreshSuccess: Gauge | null = null;
 let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
 let scheduledRetryParkHorizon: Gauge<"agent_id"> | null = null;
@@ -3507,6 +3583,7 @@ let projectPrimaryWorkspaceFallback: Counter | null = null;
 let backstopDeferredCandidates: Gauge<"source"> | null = null;
 let backstopSweepCompleted: Counter<"source"> | null = null;
 let backstopCandidatesSkipped: Counter<"source" | "reason"> | null = null;
+let wakeRedeliverySuppressed: Counter<"cause"> | null = null;
 let heartbeatRecoveryChainSkipped: Counter | null = null;
 let heartbeatRecoveryChainDuration: Gauge | null = null;
 let heartbeatRecoveryChainInflight: Gauge | null = null;
@@ -3570,6 +3647,9 @@ function ensureRegistry(): {
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
   githubWebhookDeliveryCounter: Counter<"event" | "outcome">;
   queuedRunOldestAgeGauge: Gauge<"agent_id">;
+  routineLastDoneFireAgeGauge: Gauge<"routine_id">;
+  routineFireIntervalGauge: Gauge<"routine_id">;
+  routineFireGapMetricsRefreshSuccessGauge: Gauge;
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   deferredIssueExecutionWakeOldestAgeGauge: Gauge<"agent_id">;
   deferredIssueExecutionWakeAgeMetricsRefreshSuccessGauge: Gauge;
@@ -3608,6 +3688,7 @@ function ensureRegistry(): {
   backstopDeferredCandidatesGauge: Gauge<"source">;
   backstopSweepCompletedCounter: Counter<"source">;
   backstopCandidatesSkippedCounter: Counter<"source" | "reason">;
+  wakeRedeliverySuppressedCounter: Counter<"cause">;
   heartbeatRecoveryChainSkippedCounter: Counter;
   heartbeatRecoveryChainDurationGauge: Gauge;
   heartbeatRecoveryChainInflightGauge: Gauge;
@@ -3675,6 +3756,9 @@ function ensureRegistry(): {
     || !githubWorkflowRunConclusion
     || !githubWebhookDelivery
     || !queuedRunOldestAge
+    || !routineLastDoneFireAge
+    || !routineFireInterval
+    || !routineFireGapMetricsRefreshSuccess
     || !deferredIssueExecutionWakeOldestAge
     || !deferredIssueExecutionWakeAgeMetricsRefreshSuccess
     || !overdueScheduledRetryOldestAge
@@ -3705,6 +3789,7 @@ function ensureRegistry(): {
     || !backstopDeferredCandidates
     || !backstopSweepCompleted
     || !backstopCandidatesSkipped
+    || !wakeRedeliverySuppressed
     || !heartbeatRecoveryChainSkipped
     || !heartbeatRecoveryChainDuration
     || !heartbeatRecoveryChainInflight
@@ -4430,6 +4515,59 @@ function ensureRegistry(): {
         githubWebhookDelivery.inc({ event, outcome }, 0);
       }
     }
+    routineLastDoneFireAge = new Gauge({
+      name: ROUTINE_LAST_DONE_FIRE_AGE_METRIC,
+      help:
+        "Seconds since the most recent COMPLETED fire of an active, schedule-triggered routine "
+        + "(BLO-32638). A routine's receipt that it took a measurement is a `done` issue row, "
+        + "which nothing else on this surface can see -- so a silently-disabled routine and a "
+        + "healthy quiet one are identical to Prometheus without this. Distinct from "
+        + ROUTINE_DISPATCH_METRIC
+        + ", which cannot see this at any age: every label there requires a fire to have "
+        + "ATTEMPTED dispatch, so none move when fires stop completing, and none are emitted "
+        + "at all when a fire dispatches fine and its run then dies quietly. A routine that has "
+        + "NEVER completed a fire ages from routines.created_at rather than going absent -- an "
+        + "absent series and `nothing is wrong` render identically on a dashboard, which is the "
+        + "exact failure this gauge exists to close. Refreshed on the scrape-metrics collector "
+        + "tick from a live MAX(routine_runs.completed_at) WHERE status='completed' aggregate, "
+        + "and reset-then-set every refresh (see setRoutineFireGapMetrics). Alert against its "
+        + "companion " + ROUTINE_FIRE_INTERVAL_METRIC + " rather than a fixed threshold.",
+      labelNames: ["routine_id"],
+      registers: [registry],
+    });
+    routineFireInterval = new Gauge({
+      name: ROUTINE_FIRE_INTERVAL_METRIC,
+      help:
+        "The LONGEST gap in seconds between consecutive scheduled fires of an active, "
+        + "schedule-triggered routine (BLO-32638), sampled from the trigger's own cron by "
+        + "deriveRoutineFireGapsMs -- the SAME sample routine dispatch bounds its lock with, so "
+        + "the alert threshold and the dispatch bound cannot drift apart when a cron is edited. "
+        + "Dispatch takes that sample's shortest gap; this takes its longest, because on an "
+        + "irregular cron (`0 15 * * 1-5`) the shortest gap would page on every healthy weekend "
+        + "gap. The raw gap, not the jitter-shaved dispatch horizon. Exists so one relative rule ("
+        + ROUTINE_LAST_DONE_FIRE_AGE_METRIC + " > 2 * this) covers every routine instead of a "
+        + "hand-maintained per-routine threshold. A paused routine, and a routine whose only "
+        + "triggers are webhook/api, emit NO series here: with no right-hand side the alert's "
+        + "vector match drops them, which is the correct behaviour rather than a special case. "
+        + "Where several enabled schedule triggers exist the MINIMUM of their longest gaps wins: "
+        + "fires arrive from all of them, so that is still an upper bound on any healthy gap.",
+      labelNames: ["routine_id"],
+      registers: [registry],
+    });
+    routineFireGapMetricsRefreshSuccess = new Gauge({
+      name: ROUTINE_FIRE_GAP_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent routine-fire-gap database refresh completed before metrics "
+        + "exposition; 0 when it failed, so stale fire ages cannot be read as fresh. A failed "
+        + "refresh deliberately leaves the previous snapshot in place rather than publishing "
+        + "zeros: a synthetic 0 age reads as the healthy state and would hide exactly the "
+        + "silently-disabled routine this family exists to catch. Separate from "
+        + QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC
+        + " because the two refreshes run different aggregates against different tables and "
+        + "can fail independently.",
+      registers: [registry],
+    });
+    routineFireGapMetricsRefreshSuccess.set(0);
     queuedRunOldestAge = new Gauge({
       name: QUEUED_RUN_OLDEST_AGE_METRIC,
       help:
@@ -4789,6 +4927,24 @@ function ensureRegistry(): {
       labelNames: ["source", "reason"],
       registers: [registry],
     });
+    wakeRedeliverySuppressed = new Counter({
+      name: WAKE_REDELIVERY_SUPPRESSED_METRIC,
+      help:
+        "Duplicate wake redeliveries declined by the BLO-25726 guards, labeled by which guard "
+        + "declined it; cause=fence_lost counts only passes that did not deliver, so a delivered "
+        + "wake whose bookkeeping write lost its lease is not counted. Non-zero is EXPECTED and "
+        + "must not page: it means the crash or "
+        + "concurrency window fired and the duplicate was suppressed. This is the observable "
+        + "for a defect whose absence-based signal is unmeasurable -- heartbeat_runs carries no "
+        + "idempotency key and its wakeupRequestId is 1:1 with runs, so a duplicate dispatch is "
+        + "invisible there by construction. The alertable inversion is this staying flat while "
+        + "duplicate agent runs appear.",
+      labelNames: ["cause"],
+      registers: [registry],
+    });
+    for (const cause of WAKE_REDELIVERY_SUPPRESSED_CAUSES) {
+      wakeRedeliverySuppressed.inc({ cause }, 0);
+    }
     heartbeatRecoveryChainSkipped = new Counter({
       name: HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC,
       help:
@@ -4935,7 +5091,10 @@ function ensureRegistry(): {
         + "{home, session} allowlist (BLO-36814). Its own series, not an outcome "
         + "label: a rise above baseline means the tree is more heterogeneous than "
         + "the allowlist was validated against. BLO-36735 measured that baseline "
-        + "as 1 at maxAgeDays=30 (a stray wt-blo-19094 git worktree).",
+        + "as 1 at maxAgeDays=30 (a stray wt-blo-19094 git worktree). A directory "
+        + "whose top level DID match but which holds a nested git checkout is not "
+        + "counted here; it is " + ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC
+        + "{outcome=\"retained_nested_checkout\"}.",
       labelNames: ["dry_run"],
       registers: [registry],
     });
@@ -4955,7 +5114,8 @@ function ensureRegistry(): {
       name: ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC,
       help:
         "Routine per-entry isolation-workspace reaper outcomes, labeled by bounded "
-        + "outcome (eligible, retained_in_use, retained_fresh, vanished, failed). "
+        + "outcome (eligible, retained_in_use, retained_fresh, retained_nested_checkout, "
+        + "vanished, failed). "
         + "The two findings outcomes — skipped_layout and retained_resurrected — "
         + "are deliberately NOT in this counter; they have their own series so no "
         + "sum-by aggregates them away.",
@@ -5179,6 +5339,9 @@ function ensureRegistry(): {
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
     githubWebhookDeliveryCounter: githubWebhookDelivery,
     queuedRunOldestAgeGauge: queuedRunOldestAge,
+    routineLastDoneFireAgeGauge: routineLastDoneFireAge,
+    routineFireIntervalGauge: routineFireInterval,
+    routineFireGapMetricsRefreshSuccessGauge: routineFireGapMetricsRefreshSuccess,
     deferredIssueExecutionWakeOldestAgeGauge: deferredIssueExecutionWakeOldestAge,
     deferredIssueExecutionWakeAgeMetricsRefreshSuccessGauge:
       deferredIssueExecutionWakeAgeMetricsRefreshSuccess,
@@ -5210,6 +5373,7 @@ function ensureRegistry(): {
     backstopDeferredCandidatesGauge: backstopDeferredCandidates,
     backstopSweepCompletedCounter: backstopSweepCompleted,
     backstopCandidatesSkippedCounter: backstopCandidatesSkipped,
+    wakeRedeliverySuppressedCounter: wakeRedeliverySuppressed,
     heartbeatRecoveryChainSkippedCounter: heartbeatRecoveryChainSkipped,
     heartbeatRecoveryChainDurationGauge: heartbeatRecoveryChainDuration,
     heartbeatRecoveryChainInflightGauge: heartbeatRecoveryChainInflight,
@@ -5749,6 +5913,50 @@ export function setQueuedRunOldestAgeMetrics(
 /** Mark whether the queued-run age gauge was refreshed from the database. */
 export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/**
+ * Publish the fire-gap pair for every active, schedule-triggered routine
+ * (BLO-32638).
+ *
+ * Reset-then-set for the usual reason, plus one specific to this pair: a
+ * routine that is paused, or whose schedule trigger is disabled or deleted,
+ * must DROP OUT of the interval gauge rather than keep a stale cadence. If it
+ * did not, the alert would keep a right-hand side for a routine that is
+ * deliberately not firing and page forever on an intentional pause.
+ *
+ * Both gauges are written from the same `entries` list, so a routine can never
+ * have an age without an interval or vice versa -- a half-published pair would
+ * make `age > 2 * interval` either silently drop a real routine (no RHS) or
+ * compare against another routine's cadence.
+ *
+ * `intervalSeconds: null` means "scheduled but no derivable cadence" -- a cron
+ * that fires once and never again. That still gets an age series (it is an
+ * active scheduled routine, and "no series" must only ever mean "not
+ * scheduled") but no interval, so the vector match drops it from the alert.
+ */
+export function setRoutineFireGapMetrics(
+  entries: ReadonlyArray<{
+    routineId: string;
+    ageSeconds: number;
+    intervalSeconds: number | null;
+  }>,
+): void {
+  const metrics = ensureRegistry();
+  metrics.routineLastDoneFireAgeGauge.reset();
+  metrics.routineFireIntervalGauge.reset();
+  for (const entry of entries) {
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    metrics.routineLastDoneFireAgeGauge.set({ routine_id: entry.routineId }, ageSeconds);
+    if (entry.intervalSeconds !== null && Number.isFinite(entry.intervalSeconds) && entry.intervalSeconds > 0) {
+      metrics.routineFireIntervalGauge.set({ routine_id: entry.routineId }, entry.intervalSeconds);
+    }
+  }
+}
+
+/** Mark whether the routine fire-gap gauges were refreshed from the database. */
+export function setRoutineFireGapMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().routineFireGapMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -7039,6 +7247,11 @@ export function recordBackstopCandidateSkipped(source: BackstopSource, reason: B
   ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
 }
 
+/** BLO-25726: a duplicate wake delivery was declined. See WAKE_REDELIVERY_SUPPRESSED_METRIC. */
+export function recordWakeRedeliverySuppressed(cause: WakeRedeliverySuppressedCause): void {
+  ensureRegistry().wakeRedeliverySuppressedCounter.inc({ cause });
+}
+
 /**
  * Record one completed isolation-workspace reaper sweep (BLO-36814).
  *
@@ -7080,6 +7293,7 @@ export function recordIsolationWorkspaceReapSweep(
       eligible: result.eligible,
       retained_in_use: result.retainedInUse,
       retained_fresh: result.retainedFresh,
+      retained_nested_checkout: result.retainedNestedCheckout,
       vanished: result.vanished,
       failed: result.failed,
     };
@@ -7391,6 +7605,9 @@ export function __resetMetricsForTest(): void {
   githubWorkflowRunConclusion = null;
   githubWebhookDelivery = null;
   queuedRunOldestAge = null;
+  routineLastDoneFireAge = null;
+  routineFireInterval = null;
+  routineFireGapMetricsRefreshSuccess = null;
   deferredIssueExecutionWakeOldestAge = null;
   deferredIssueExecutionWakeAgeMetricsRefreshSuccess = null;
   overdueScheduledRetryOldestAge = null;
@@ -7419,6 +7636,7 @@ export function __resetMetricsForTest(): void {
   backstopDeferredCandidates = null;
   backstopSweepCompleted = null;
   backstopCandidatesSkipped = null;
+  wakeRedeliverySuppressed = null;
   heartbeatRecoveryChainSkipped = null;
   heartbeatRecoveryChainDuration = null;
   heartbeatRecoveryChainInflight = null;

@@ -260,6 +260,9 @@ const REFUSAL_CLASS_BY_INVOKABILITY_REASON: Record<
   eligible: "transient",
 };
 
+/** One unwindowed `agents.list({ companyId })` snapshot of a company's roster. */
+export type CompanyAgentRoster = Awaited<ReturnType<PluginContext["agents"]["list"]>>;
+
 /**
  * Resolve the configured `fallbackAgentName` to exactly one invokable agent id,
  * or explain why it could not.
@@ -268,6 +271,9 @@ export async function resolveFallbackAgentId(
   ctx: Pick<PluginContext, "agents" | "logger">,
   companyId: string,
   fallbackAgentName: string | undefined,
+  // Injected so a delivery can share one roster read between this and
+  // `resolveInvokableAssigneeAgentId` (see the handler's roster memo).
+  loadRoster: () => Promise<CompanyAgentRoster> = () => ctx.agents.list({ companyId }),
 ): Promise<FallbackOwnerResolution> {
   const target = fallbackAgentName?.trim().toLowerCase();
   // No name configured at all: nothing resolves until someone edits config.
@@ -275,7 +281,7 @@ export async function resolveFallbackAgentId(
   // One unwindowed company-wide snapshot rather than a paged scan: the host's
   // list is unordered, so paging could drift a match across page boundaries
   // and turn a stable config into an intermittent ownerless-issue bug.
-  const agents = await ctx.agents.list({ companyId });
+  const agents = await loadRoster();
   // A host fault that *throws* is already handled correctly downstream: the
   // caller's memo evicts and a plain `Error` keeps Alertmanager's retry window.
   // This guard covers the same class of degradation arriving by a quieter
@@ -352,6 +358,95 @@ export async function resolveFallbackAgentId(
   }
   const agentId = invokable[0]?.agent.id;
   return agentId ? { agentId } : { refusal: "permanent" };
+}
+
+/**
+ * `agentId` is set only for an invokable agent. `degraded` means the roster
+ * could not be read, so the missing `agentId` says nothing about the agent.
+ */
+export type InvokableAssigneeResolution = { agentId?: string; degraded?: true };
+
+/**
+ * BLO-26613: drop a resolved assignee agent that cannot be woken.
+ *
+ * A label-override, owner-map, or issue-route resolution names an agentId
+ * unconditionally. If that agent is paused, terminated, or otherwise
+ * uninvokable, the issue used to be assigned to it anyway, and — unlike an
+ * inert `todo` row — the alert keeps re-firing against a dead run path while
+ * looking handled.
+ *
+ * Eligibility is `getAgentWorkEligibility` against the company roster — the
+ * same check `resolveFallbackAgentId` makes, and the plugin-side equivalent of
+ * the full status + reporting-chain check (`evaluateAgentInvokabilityFromDb`)
+ * behind the Dependabot path's `resolveDependabotIssueAssigneeId`. A status
+ * check alone would pass an `idle` agent whose manager was terminated or whose
+ * chain cycles, and the wake path rejects that one too (`invalidOrgChain`).
+ * The host's `agents.list` omits terminated agents, so a terminated assignee
+ * reads as `not_found` and a terminated manager as `missing_manager` — both
+ * still refused.
+ *
+ * A result without `agentId` hands the caller's owner chain the next step: a
+ * resolvable human owner, else the named fallback agent (itself
+ * invokability-checked by `resolveFallbackAgentId`), else a refused creation.
+ * It never files a silent assignment.
+ *
+ * A failed roster read (`lookup_failed`) or an empty one (`roster_empty`) also
+ * drops the agent, matching `resolveOwnerUserId` above — an agents-RPC outage
+ * must not fail a delivery that still has a human owner to land on — but is
+ * flagged `degraded`: it is no evidence the agent is bad, so the caller must
+ * not turn an ownerless refusal on that read into a permanent drop. Without the
+ * flag, a default config (`fallbackAgentName: ""`) answered a transient
+ * `agents.list` fault with `PermanentAlertError` — a 200 and a lost alert, for
+ * a route agent that was most likely fine (Ally review 5475541309).
+ *
+ * Every drop writes `alertmanager.owner.assignee_dropped`, labelled by reason,
+ * so a route or owner-map entry that is being dropped on every alert can back
+ * an alert rule rather than hide in per-delivery log lines.
+ */
+export async function resolveInvokableAssigneeAgentId(
+  ctx: Pick<PluginContext, "agents" | "logger" | "metrics">,
+  companyId: string,
+  agentId: string | undefined,
+  alert: { alertname: string; severity: string },
+  loadRoster: () => Promise<CompanyAgentRoster> = () => ctx.agents.list({ companyId }),
+): Promise<InvokableAssigneeResolution> {
+  if (!agentId) return {};
+  // `reason` is the bounded metric label; `detail` carries the free-form part.
+  let reason: string;
+  let detail = "";
+  try {
+    const agents = await loadRoster();
+    const agent = agents.find((candidate) => candidate.id === agentId);
+    if (agent) {
+      const eligibility = getAgentWorkEligibility({ agent, agents });
+      if (eligibility.invokable) return { agentId };
+      reason = eligibility.invokabilityReason;
+      detail = ` status=${agent.status} chain=${eligibility.orgChainHealth.reason}`;
+    } else {
+      // An empty roster is a degraded host read, not proof the id is wrong.
+      reason = agents.length === 0 ? "roster_empty" : "not_found";
+    }
+  } catch (err) {
+    reason = "lookup_failed";
+    detail = ` ${String(err)}`;
+  }
+  ctx.logger.warn(
+    `alertmanager: resolved assignee ${agentId} is not invokable (reason=${reason}${detail}); not assigning it, falling through the owner chain`,
+  );
+  try {
+    await ctx.metrics.write("alertmanager.owner.assignee_dropped", 1, {
+      alertname: alert.alertname,
+      severity: alert.severity,
+      reason,
+    });
+  } catch (metricErr) {
+    // Best-effort, like every other metric write in this flow: the drop has
+    // already been decided, and a metrics outage must not fail the delivery.
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: failed to record dropped-assignee metric for ${agentId}: ${String(metricErr)}`,
+    );
+  }
+  return reason === "roster_empty" || reason === "lookup_failed" ? { degraded: true } : {};
 }
 
 function normalizeEmail(email: string): string {

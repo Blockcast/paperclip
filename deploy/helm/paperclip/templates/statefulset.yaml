@@ -352,7 +352,7 @@ spec:
               # override was silently ignored here, because .local/bin precedes
               # /usr/bin on PATH and this file is the one every agent pod
               # actually runs. That gap is why the fleet-wide merge-token PAT
-              # mounted at /paperclip/.secrets/github-merge-token/token (covers
+              # mounted at /etc/paperclip/secrets/github-merge-token/token (covers
               # repos outside the allyblockcast[bot] App installation, e.g.
               # user-owned allyblockcast/*) had no wired-in way to reach `gh`
               # or `git` except a bare 403. Do not make this override the
@@ -391,7 +391,7 @@ spec:
                   esac
                 done
                 if [ -z "${TOKEN}" ]; then
-                  echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth" >&2
+                  echo "paperclip-github-token-env: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth. If it was filled by cat-ing a token file, that read failed: a path under /paperclip/.secrets is stale since BLO-40279, and the token Secrets now mount at /etc/paperclip/secrets/<name>/token" >&2
                   exit 64
                 fi
                 case "${TOKEN}" in
@@ -405,14 +405,36 @@ spec:
                 export GITHUB_PERSONAL_ACCESS_TOKEN="${TOKEN}"
                 exec "$@"
               fi
-              TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
+              TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/etc/paperclip/secrets/github-token/token}"
+              MOVED=""
+              case "${TOKEN_FILE}" in
+                /paperclip/.secrets/*)
+                  MOVED=" (stale path: the token Secrets moved to /etc/paperclip/secrets/<name>/token in BLO-40279; point PAPERCLIP_GITHUB_TOKEN_FILE at the new path)"
+                  ;;
+              esac
               if [ ! -r "${TOKEN_FILE}" ]; then
-                echo "paperclip github token file not readable: ${TOKEN_FILE}" >&2
+                echo "paperclip github token file not readable: ${TOKEN_FILE}${MOVED}" >&2
                 exit 1
+              fi
+              # BLO-40279: never read a credential off the fleet-shared data volume. Every
+              # agent uid can write there, so a readable file on it proves nothing about who
+              # put it there — a vacated /paperclip/.secrets/<name>/ is a bare, group-writable
+              # directory, and a token planted in it would authenticate the caller as an
+              # identity it never chose. A Secret mounted *under* the volume is its own tmpfs
+              # with its own device, so it still passes. Compared by device, not by path
+              # prefix, because symlinks and other pinned paths reach the same filesystem.
+              SHARED="${PAPERCLIP_HOME:-/paperclip}"
+              if [ -d "${SHARED}" ]; then
+                SHARED_DEV="$(stat -L -c %d -- "${SHARED}" 2>/dev/null || :)"
+                FILE_DEV="$(stat -L -c %d -- "${TOKEN_FILE}" 2>/dev/null || :)"
+                if [ -z "${SHARED_DEV}" ] || [ -z "${FILE_DEV}" ] || [ "${FILE_DEV}" = "${SHARED_DEV}" ]; then
+                  echo "paperclip github token file is on the shared ${SHARED} volume, which every agent can write; refusing to read a credential from it: ${TOKEN_FILE}${MOVED}" >&2
+                  exit 1
+                fi
               fi
               TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}")"
               if [ -z "${TOKEN}" ]; then
-                echo "paperclip github token file is empty: ${TOKEN_FILE}" >&2
+                echo "paperclip github token file is empty: ${TOKEN_FILE}${MOVED}" >&2
                 exit 1
               fi
               export GH_TOKEN="${TOKEN}"
@@ -460,8 +482,19 @@ spec:
                 printf 'username=x-access-token\npassword=%s\n\n' "${TOKEN}"
                 exit 0
               fi
-              TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/paperclip/.secrets/github-token/token}"
+              TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/etc/paperclip/secrets/github-token/token}"
               [ -r "${TOKEN_FILE}" ] || exit 0
+              # BLO-40279: same refusal as paperclip-github-token-env — a file on the
+              # fleet-shared, agent-writable volume is never handed to git as a credential.
+              SHARED="${PAPERCLIP_HOME:-/paperclip}"
+              if [ -d "${SHARED}" ]; then
+                SHARED_DEV="$(stat -L -c %d -- "${SHARED}" 2>/dev/null || :)"
+                FILE_DEV="$(stat -L -c %d -- "${TOKEN_FILE}" 2>/dev/null || :)"
+                if [ -z "${SHARED_DEV}" ] || [ -z "${FILE_DEV}" ] || [ "${FILE_DEV}" = "${SHARED_DEV}" ]; then
+                  echo "github-token-credential-helper: ${TOKEN_FILE} is on the shared ${SHARED} volume, which every agent can write; refusing to emit it as a credential" >&2
+                  exit 1
+                fi
+              fi
               TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}")"
               [ -n "${TOKEN}" ] || exit 0
               printf 'username=x-access-token\npassword=%s\n\n' "${TOKEN}"

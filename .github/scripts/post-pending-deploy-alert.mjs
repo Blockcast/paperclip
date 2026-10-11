@@ -9,12 +9,24 @@
  * --------------------------
  * scheduled-production-deploy.yml's guard (1) refuses to stack a second
  * dispatch while one is already pending. The guard is correct. But the job it
- * protects is gated on three named human reviewers, so while any deploy sits
+ * protects is gated on the paperclip-production reviewer set (RATIFIED_REVIEWERS
+ * in check-production-environment-protection.mjs — read the symbol, do not
+ * restate the count here; two successive counts written into this comment were
+ * false by the time they landed, see scheduled-production-deploy.yml's header)
+ * — so while any deploy sits
  * `waiting`, the daily dispatcher is a permanent no-op — and every skipped run
  * reported `conclusion: success`. On 2026-09-01 that took production to 45
  * commits behind with an oldest-missing-commit age of 28.8h, and nothing
  * escalated: the mechanism built to remove a human from the loop disarmed itself
  * precisely when the human is what is stuck.
+ *
+ * ⚠️ THAT SET IS EMPTY AS OF 2026-10-07 (onprem-k8s#4913), so a deploy can no
+ * longer park on a reviewer and this escalation may now be unreachable in
+ * practice. Corroboration, not proof: the 15 most recent docker.yml runs read
+ * `completed`, none `waiting` (2026-10-08). Deliberately NOT acted on here —
+ * whether the stuck-approval ladder still has a trigger is a behavioural
+ * question, not a prose-matching-code one, and it is carried on PEN-2918. This
+ * marker exists so the next reader does not plan against a gate that is gone.
  *
  * WHY severity=critical, WHEN THE SIBLING DRIFT ALERT IS ONLY `warning`
  * --------------------------------------------------------------------
@@ -24,7 +36,10 @@
  * dispatching the manual release - there is no automated remediation to page
  * for". This alert is a different signal and does not inherit that reasoning.
  * It fires only when a named reviewer has a specific button in front of them
- * and has not pressed it, so it is actionable by construction. Alertmanager
+ * and has not pressed it, so it is actionable by construction (⚠️ that premise
+ * depends on a reviewer gate that no longer exists — see the marker above; the
+ * severity choice is left as-is pending the PEN-2918 behavioural review).
+ * Alertmanager
  * routes `severity=~"critical|page"` to the slack-relay receiver; `warning`
  * reaches the paperclip webhook only — the very receiver whose outage this
  * alert may be needed to fix (PEN-2581). Reaching a human on a path
@@ -144,7 +159,7 @@ export class UnreadableWaitingRunError extends Error {}
  *
  * Only `waiting` counts. `queued` and `in_progress` also block the dispatcher's
  * anti-stacking guard, but they are runner/build states — no human is being
- * waited on, and paging three named reviewers for a slow build would be the
+ * waited on, and paging the production reviewer for a slow build would be the
  * wrong people and the start of alert fatigue. Their timestamps are never read,
  * so a malformed one on a non-waiting run is ignored rather than fatal.
  *

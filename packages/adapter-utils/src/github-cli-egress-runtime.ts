@@ -17,6 +17,7 @@ import {
   hasGitHubCliStdinTextFile,
   scrubGitHubCliInvocation,
 } from "./github-cli-egress-shim.js";
+import { GITHUB_EGRESS_REGION_CLASSES } from "./github-egress-scrub.js";
 import {
   type CommitReachability,
   evaluateReviewSubmission,
@@ -85,11 +86,31 @@ export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOption
     const detail = result.refusals
       .map((refusal) => {
         const where = refusal.path ? ` (${refusal.path})` : "";
-        return `\`${refusal.field}\`${where} matched ${refusal.classes.join(", ")}`;
+        // BLO-41262: name the lines. Without them, finding the match in a
+        // 3000-line draft took ~12 bisecting API calls. The excerpt is the
+        // SCRUBBED line, so the refusal cannot carry the material it refused.
+        const lines = refusal.locations
+          .map((location) => {
+            const key = location.key ? `${location.key}:` : "";
+            return `\n    ${key}${location.line}: ${location.excerpt}`;
+          })
+          .join("");
+        // A region class never has line attribution (see
+        // locateGitHubEgressMatches), so say so rather than print nothing.
+        // Keyed on the class, not on `locations.length === 0`: in an --input
+        // body one key can trip a region class while another prints a line,
+        // and the region key still needs explaining. The lines that do print
+        // come from other keys, so say that too rather than read as a
+        // contradiction.
+        const unlocated = refusal.classes.some((cls) => GITHUB_EGRESS_REGION_CLASSES.includes(cls))
+          ? " (spans lines; no per-line location is reported for environment-dump or private-key-block;" +
+            " any lines listed are other, single-line matches)"
+          : "";
+        return `\`${refusal.field}\`${where} matched ${refusal.classes.join(", ")}${unlocated}${lines}`;
       })
       .join("; ");
     throw new GitHubCliEgressRuntimeError(
-      `refusing to rewrite GitHub repository content: ${detail}. ` +
+      `refusing to rewrite GitHub repository content: ${detail}\n` +
         "Content fields are never scrubbed in place — a silent rewrite would corrupt the committed bytes. " +
         "Remove the credential-shaped material; if it is a test fixture, derive the value at runtime " +
         "rather than embedding a literal.",

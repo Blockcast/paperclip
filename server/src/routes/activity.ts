@@ -7,6 +7,7 @@ import { activityService, normalizeActivityLimit } from "../services/activity.js
 import { assertAuthenticated, assertBoard, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
 import { accessService, heartbeatService, issueService } from "../services/index.js";
 import { sanitizeRecord } from "../redaction.js";
+import { LIVE_EVENT_TRANSCRIPT_AUDIT_ACTION } from "../realtime/live-event-transcript-gate.js";
 
 const createActivitySchema = z.object({
   actorType: z.enum(["agent", "user", "system", "plugin"]).optional().default("system"),
@@ -31,6 +32,16 @@ const companyActivityQuerySchema = z.object({
 });
 
 const uuidQueryParamSchema = z.string().uuid();
+
+// Audit records that are not feed items, left off the unnarrowed page only — one that sets none of
+// `action`, `agentId`, `entityType`, `entityId` (`limit` does not narrow it). `heartbeat.run_events_streamed`
+// is written once per (live-events socket x owning agent) per 30s decision window, so S open sockets and
+// A agents streaming transcript content write S*A rows every 30s — enough to be most of every
+// recency-ordered page the board reads. Any narrowing filter is a forensic query (by owning agent via
+// `entityType=agent&entityId=`, by subscriber via `agentId=`, by `action=`) and returns every matching
+// row: excluding there reads as "nobody streamed this" rather than "filter never applied" (BLO-21979).
+// `X-Applied-Filters.excludeActions` says when the exclusion applied.
+const FEED_EXCLUDED_ACTIONS: readonly string[] = [LIVE_EVENT_TRANSCRIPT_AUDIT_ACTION];
 
 // A caller who mistypes or invents a filter key on an audit surface must not get a plausible-looking
 // unfiltered page back — that reads as "verified absent" instead of "filter never applied" (BLO-21979).
@@ -125,12 +136,15 @@ export function activityRoutes(db: Db) {
       return;
     }
 
+    const { agentId, entityType, entityId, action } = parsedQuery.data;
+    const unnarrowed = agentId === undefined && entityType === undefined && entityId === undefined && action === undefined;
     const filters = {
       companyId,
-      agentId: parsedQuery.data.agentId,
-      entityType: parsedQuery.data.entityType,
-      entityId: parsedQuery.data.entityId,
-      action: parsedQuery.data.action,
+      agentId,
+      entityType,
+      entityId,
+      action,
+      excludeActions: unnarrowed ? FEED_EXCLUDED_ACTIONS : [],
       limit: normalizeActivityLimit(Number(parsedQuery.data.limit)),
     };
     const result = await svc.list(filters);
@@ -146,6 +160,7 @@ export function activityRoutes(db: Db) {
           entityType: filters.entityType ?? null,
           entityId: filters.entityId ?? null,
           action: filters.action ?? null,
+          excludeActions: filters.excludeActions,
           limit: filters.limit,
         }),
       ),

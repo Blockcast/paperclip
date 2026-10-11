@@ -64,6 +64,15 @@ platform cannot resolve automatically. Each runbook should be:
   snapshot cannot be refreshed safely. Trigger: alert
   `PaperclipQueuedRunStranded`, `PaperclipQueuedRunAgeMetricsRefreshFailed`,
   or `max(paperclip_queued_run_oldest_age_seconds) by (agent_id) > 1800`.
+- [`routine-fire-gap.md`](routine-fire-gap.md) — an active, schedule-triggered
+  routine has stopped completing fires. Its receipt for a measurement is a
+  `done` issue row, which Prometheus cannot see, so before this gauge a
+  silently-disabled routine and a healthy quiet one were identical on every
+  metrics surface: 11 blind windows accumulated on the alert-delivery bridge
+  watchdog, one of them hiding an outage that destroyed 22 of 42 alerts.
+  `paperclip_routine_dispatch_total` does not cover it at any value — every
+  label there requires a fire to have attempted dispatch. Trigger: alert
+  `PaperclipRoutineFireGap` or `PaperclipRoutineFireGapMetricsRefreshFailed`.
 - [`deferred-issue-execution-wake.md`](deferred-issue-execution-wake.md) — an
   `agent_wakeup_requests` row sitting at `status='deferred_issue_execution'`
   for a long time: one agent's comment to an issue is undeliverable behind

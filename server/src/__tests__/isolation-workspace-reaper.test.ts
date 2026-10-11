@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ISOLATION_WORKSPACE_REAPER_DELETED_METRIC,
@@ -17,11 +19,13 @@ import {
 import {
   DEFAULT_MAX_DELETES_PER_TICK,
   REAPABLE_LAYOUT,
+  WORKTREE_PARENT_DIRS,
   type WorkspaceUsageLookup,
   type WorkspaceUsageRow,
   reapIsolationWorkspaces,
   startIsolationWorkspaceReaper,
 } from "../services/isolation-workspace-reaper.js";
+import { DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME, REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
 
 const DAY = 86_400_000;
 const NOW = new Date("2026-09-04T12:00:00Z").getTime();
@@ -251,6 +255,125 @@ describe("reapIsolationWorkspaces", () => {
     expect(silentLogger!.warn).toHaveBeenCalledTimes(1);
   });
 
+  it("skips an aged, layout-compliant directory holding a git worktree one level down", async () => {
+    // The shape property 1 cannot see: top level is exactly {home, session},
+    // and `home/<name>/.git` is the worktree pointer file. Measured on 13 of
+    // 503 live match-set directories (BLO-36735).
+    await makeWorkspace("ws-nested-wt", [...REAPABLE_LAYOUT], 60, {
+      "home/blo-32797-wt/.git": "gitdir: /paperclip/.../pim-multicast-gateway/.git/worktrees/blo-32797-wt\n",
+      "home/blo-32797-wt/Makefile": "real work",
+    });
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ scanned: 1, eligible: 0, deleted: 0, skippedLayout: 0, retainedNestedCheckout: 1 });
+    await expect(
+      fs.readFile(path.join(root, "ws-nested-wt", "home", "blo-32797-wt", "Makefile"), "utf8"),
+    ).resolves.toBe("real work");
+  });
+
+  it("probes session/ for a nested checkout, not only home/", async () => {
+    // A registered worktree was found under each side on the live tree, so
+    // probing one of them is not enough.
+    await makeWorkspace("ws-nested-session", [...REAPABLE_LAYOUT], 60, {
+      "session/pmg-34906-wt/.git": "gitdir: /paperclip/.../.git/worktrees/pmg-34906-wt\n",
+    });
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, skippedLayout: 0, retainedNestedCheckout: 1 });
+    await expect(fs.stat(path.join(root, "ws-nested-session"))).resolves.toBeDefined();
+  });
+
+  it("probes the parents named by the modules that create them, not restated literals", () => {
+    // BLO-36735 I1: the probe once carried its own `.paperclip-worktrees`
+    // literal while `workspace-runtime` built `.paperclip/worktrees`, leaving
+    // the helper's real default unreachable. Pin the probe to the producers'
+    // own constants so the two cannot drift apart again.
+    expect(REPO_MANAGED_WORKTREES_SUBPATH).toBe(path.join(".paperclip", "worktrees"));
+    expect([...WORKTREE_PARENT_DIRS].sort()).toEqual(
+      [REPO_MANAGED_WORKTREES_SUBPATH, DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME].sort(),
+    );
+  });
+
+  it.each([
+    ["execution-workspace worktree parent", REPO_MANAGED_WORKTREES_SUBPATH],
+    ["worktree-instance home", DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME],
+  ])("skips on a non-empty %s, and reaps when it is empty", async (_label, parent) => {
+    // `home` is the repo root here, but its own `.git` is gone: only the
+    // parent dir is left to say a worktree lives below — three levels down,
+    // where neither `.git` probe reaches.
+    await makeWorkspace("ws-wt-parent", [...REAPABLE_LAYOUT], 60, {
+      [path.join("home", parent, "blo-1-wt", "Makefile")]: "real work",
+    });
+    // Negative control: the same directory name, empty, must NOT retain —
+    // otherwise the guard is a constant on anyone who ever ran the helper.
+    await makeWorkspace("ws-wt-parent-empty", [...REAPABLE_LAYOUT], 60);
+    await fs.mkdir(path.join(root, "ws-wt-parent-empty", "home", parent), { recursive: true });
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ scanned: 2, eligible: 1, deleted: 1, skippedLayout: 0, retainedNestedCheckout: 1 });
+    await expect(fs.stat(path.join(root, "ws-wt-parent"))).resolves.toBeDefined();
+    await expect(fs.stat(path.join(root, "ws-wt-parent-empty"))).rejects.toThrow();
+  });
+
+  it("retains a side that is itself a repository root", async () => {
+    await makeWorkspace("ws-side-repo", [...REAPABLE_LAYOUT], 60, {
+      "session/.git/HEAD": "ref: refs/heads/main\n",
+    });
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, retainedNestedCheckout: 1 });
+    await expect(fs.stat(path.join(root, "ws-side-repo", "session", ".git", "HEAD"))).resolves.toBeDefined();
+  });
+
+  it("retains when a child's .git cannot be probed, rather than reading the fault as absence", async () => {
+    // ELOOP, from a self-referential symlink, is a stat fault that is neither
+    // ENOENT nor ENOTDIR and raises for every uid — so unlike chmod it cannot
+    // pass on a root-run CI by deleting the directory.
+    await makeWorkspace("ws-loop", [...REAPABLE_LAYOUT], 60);
+    await fs.symlink("loop", path.join(root, "ws-loop", "home", "loop"));
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, retainedNestedCheckout: 1 });
+    await expect(fs.stat(path.join(root, "ws-loop"))).resolves.toBeDefined();
+  });
+
+  it("still reaps a layout-compliant orphan whose home/ holds only tool caches", async () => {
+    // The guard must not cost all of the reclaim. `.config` and `.local` are
+    // on every workspace in the tree. A dangling symlink must read as absence
+    // too, or every workspace with a stale tool link would be retained.
+    await makeWorkspace("ws-plain-orphan", [...REAPABLE_LAYOUT], 60, {
+      "home/.config/gh/hosts.yml": "x",
+      "home/.local/share/pnpm/store": "y",
+      "session/history.jsonl": "z",
+    });
+    await fs.symlink("/nonexistent-target", path.join(root, "ws-plain-orphan", "home", ".stale-link"));
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ eligible: 1, deleted: 1, skippedLayout: 0, retainedNestedCheckout: 0 });
+  });
+
+  it("retains rather than deletes when the nested probe cannot read a side", async () => {
+    // Fail-closed branch. `home` is made a plain file so `readdir` raises
+    // ENOTDIR for every uid — a chmod 0 would not block a root-run CI, and
+    // would then pass by deleting the thing it is meant to protect.
+    const dir = path.join(root, "ws-unreadable");
+    await fs.mkdir(path.join(dir, "session"), { recursive: true });
+    await fs.writeFile(path.join(dir, "home"), "not a directory");
+    const stamp = new Date(NOW - 60 * DAY);
+    await fs.utimes(dir, stamp, stamp);
+
+    const res = await reapIsolationWorkspaces({ root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) });
+
+    expect(res).toMatchObject({ eligible: 0, deleted: 0, skippedLayout: 0, retainedNestedCheckout: 1 });
+    await expect(fs.stat(dir)).resolves.toBeDefined();
+  });
+
   it("skips a partial layout rather than treating a missing member as inert", async () => {
     await makeWorkspace("ws-home-only", ["home"], 60);
 
@@ -335,6 +458,38 @@ describe("reapIsolationWorkspaces", () => {
     });
 
     expect(res).toMatchObject({ deleted: 1, capped: false });
+  });
+
+  /**
+   * The runbook's reading of `retained_nested_checkout` rests on this: a
+   * retention spends no unlink budget, but the cap `break`s, so a nested
+   * checkout past the break is never reached and a capped sweep undercounts.
+   * Root order is pinned through `readdir` because the filesystem's is not.
+   */
+  it("a capped sweep never reaches a nested checkout past its break", async () => {
+    const order = ["ws-nest-early", "ws-a", "ws-b", "ws-c", "ws-nest-late"];
+    for (const name of order) {
+      await makeWorkspace(name, [...REAPABLE_LAYOUT], 45, name.startsWith("ws-nest") ? { "home/repo/.git": "gitdir: x\n" } : {});
+    }
+    const realReaddir = fs.readdir;
+    const spy = vi.spyOn(fs, "readdir").mockImplementation(async (target, opts) => {
+      const out = (await realReaddir.call(fs, target as never, opts as never)) as never as { name: string }[];
+      if (target === root) out.sort((x, y) => order.indexOf(x.name) - order.indexOf(y.name));
+      return out as never;
+    });
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      maxDeletesPerTick: 2,
+      dryRun: true,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+    });
+
+    spy.mockRestore();
+    expect(res).toMatchObject({ scanned: 3, eligible: 2, retainedNestedCheckout: 1, capped: true });
   });
 
   it("is idempotent: a second pass over a drained tree deletes nothing", async () => {    await makeWorkspace("ws-old", [...REAPABLE_LAYOUT], 45);
@@ -491,6 +646,7 @@ describe("reapIsolationWorkspaces", () => {
     await makeWorkspace("ws-fresh-dir", [...REAPABLE_LAYOUT], 2);
     await makeWorkspace("ws-live-row", [...REAPABLE_LAYOUT], 45);
     await makeWorkspace("ws-worktree", ["home", "session", "wt-blo-19094"], 60);
+    await makeWorkspace("ws-nested", [...REAPABLE_LAYOUT], 60, { "home/repo/.git": "gitdir: x\n" });
     await makeWorkspace("ws-orphan", [...REAPABLE_LAYOUT], 45);
 
     const res = await reapIsolationWorkspaces({
@@ -502,10 +658,11 @@ describe("reapIsolationWorkspaces", () => {
     });
 
     expect(res).toMatchObject({
-      scanned: 4,
+      scanned: 5,
       retainedFresh: 1,
       retainedInUse: 1,
       skippedLayout: 1,
+      retainedNestedCheckout: 1,
       eligible: 1,
       deleted: 1,
       vanished: 0,
@@ -515,6 +672,7 @@ describe("reapIsolationWorkspaces", () => {
         res.retainedInUse +
         res.retainedResurrected +
         res.skippedLayout +
+        res.retainedNestedCheckout +
         res.failed +
         res.eligible,
     ).toBe(res.scanned);
@@ -737,6 +895,33 @@ describe("reapIsolationWorkspaces metrics", () => {
     ).toBeDefined();
   });
 
+  it("counts a nested-checkout retention apart from skipped_layout", async () => {
+    // BLO-36735 I2: skipped_layout means "top level outside the allowlist,
+    // unexamined". A nested checkout was examined and its top level matched, so
+    // folding it in would park a steady population under that finding's baseline of 1.
+    await makeWorkspace("ws-nested", [...REAPABLE_LAYOUT], 45, { "home/repo/.git": "gitdir: x\n" });
+    const read = async () => ({
+      skipped: (await valueOf(ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC, { dry_run: "false" })) ?? 0,
+      nested:
+        (await valueOf(ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC, {
+          dry_run: "false",
+          outcome: "retained_nested_checkout",
+        })) ?? 0,
+    });
+    const before = await read();
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+    });
+    expect(res).toMatchObject({ skippedLayout: 0, retainedNestedCheckout: 1, deleted: 0 });
+
+    expect(await read()).toEqual({ skipped: before.skipped, nested: before.nested + 1 });
+  });
+
   it("labels a dry-run tick so it cannot be read as a live one", async () => {
     await makeWorkspace("ws-old", [...REAPABLE_LAYOUT], 45);
     const before = {
@@ -832,5 +1017,33 @@ describe("reapIsolationWorkspaces metrics", () => {
         stop_reason: "complete",
       }),
     ).toBe(before.complete);
+  });
+});
+
+/**
+ * BLO-36735: the runbook once read the nested-checkout series as "~13 per
+ * sweep", which a capped sweep cannot report and the measurement never was.
+ * Nothing rendered breaks when that prose rots, so pin it to the label sets
+ * the code actually emits.
+ */
+describe("isolation-workspace reaper runbook", () => {
+  it("reads retained_nested_checkout against the stop reason, not as a per-sweep figure", () => {
+    const runbook = readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../runbooks/isolation-workspace-reaper.md"),
+      "utf8",
+    );
+    const start = runbook.indexOf('outcome="retained_nested_checkout"');
+    const end = runbook.indexOf("\n## ", start);
+    expect(start).toBeGreaterThan(-1);
+    const block = runbook.slice(start, end).replace(/\s+/g, " ");
+
+    const stopReasons = [...block.matchAll(/stop_reason="([a-z_]+)"/g)].map((m) => m[1]);
+    expect(stopReasons).toEqual(expect.arrayContaining(["capped", "complete"]));
+    for (const reason of stopReasons) expect(ISOLATION_WORKSPACE_REAPER_STOP_REASONS).toContain(reason);
+    for (const [, outcome] of block.matchAll(/`(retained_[a-z_]+)`/g)) {
+      expect(ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES).toContain(outcome);
+    }
+    expect(block).toMatch(/\bfloor\b/);
+    expect(block).not.toMatch(/\d+\s+per sweep/i);
   });
 });

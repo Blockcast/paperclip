@@ -111,6 +111,57 @@ const ENVIRONMENT_DUMP_RE = new RegExp(
 // still a secret. Structural — it tests the value, not the name.
 const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([^\s"'`\r\n]{16,})\2/g;
 
+// PEN-3907: a cryptographic content digest bound to a name that says so.
+//
+// A lowercase-hex digest is indistinguishable from a hex-encoded secret by
+// entropy alone — both saturate the 4.0 bits/char ceiling that a 16-symbol
+// alphabet allows, and `isOpaqueSecretValue` therefore fires on every one.
+// Measured: 200/200 random sha256 digests redact. That makes every digest
+// REPIN unpushable from an agent seat, and the refusal's advice — derive the
+// value at runtime — is unavailable when the literal lives inside a PromQL
+// matcher in a `PrometheusRule`, which is exactly where the admission-drift
+// detector keeps its expectation pin.
+//
+// The exemption is deliberately a CONJUNCTION of name and shape, and the name
+// half is why this does not contradict the structural-detection rule at the
+// top of this file. That rule governs DETECTION: firing on a name is unsound
+// because material hides under names nobody enumerated, and the default must
+// be to fire. Here the default is unchanged — an unrecognised name still
+// fires. The name only narrows an exemption, so the failure mode of a name we
+// did not anticipate is a false positive, not a leak.
+//
+// Shape alone would not be safe: `SECRET_KEY=<64 hex>` is a real credential
+// shape (hex-encoded HMAC and framework signing keys are routinely 32 or 64
+// hex), and exempting bare hex would pass it. Name alone would not be safe
+// either, so both are required.
+//
+// Note the OCI form `name="sha256:<64hex>"` is already exempt for an unrelated
+// reason — `:` is outside the token alphabet in `isOpaqueSecretValue` — and
+// `digestExemptionApplies` does not cover it. A test pins that so the two
+// paths cannot silently diverge.
+
+/** Lengths of the hex digests this exemption recognises, in characters:
+ *  md5/sha1/sha224/sha256/sha384/sha512. Anchored, lowercase only — an
+ *  uppercase or mixed-case value is not the canonical form any of the tools
+ *  that consume these pins emit, so it stays subject to the entropy test. */
+const HEX_DIGEST_RE = /^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{56}|[0-9a-f]{64}|[0-9a-f]{96}|[0-9a-f]{128})$/;
+
+/** A binding name that declares its value to be a digest rather than a secret:
+ *  `sha256`, `image_digest`, `expected-checksum`, `manifest.sha512`.
+ *
+ *  Anchored at the END so `sha256_signing_key` — a name that merely mentions a
+ *  hash — does not qualify. The leading `[_.-]` alternative is mostly belt and
+ *  braces: `ASSIGNMENT_RE` captures a name from `[A-Za-z0-9_]` only, so `-`
+ *  and `.` already terminate the capture and arrive here pre-trimmed
+ *  (`expected-checksum=` captures `checksum`). It is kept so the predicate
+ *  stays correct if that capture ever widens. */
+const DIGEST_NAME_RE = /(?:^|[_.\-])(?:sha(?:1|224|256|384|512)|md5|digest|checksum)$/i;
+
+/** True when a NAME=VALUE pair is a content digest pin rather than a secret. */
+function isContentDigestAssignment(name: string, value: string): boolean {
+  return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
+}
+
 function shannonEntropyBitsPerChar(value: string): number {
   if (value.length === 0) return 0;
   const counts = new Map<string, number>();
@@ -123,16 +174,95 @@ function shannonEntropyBitsPerChar(value: string): number {
   return bits;
 }
 
-/** A value is "opaque" when it is long, drawn from a token alphabet, and has
- *  high per-character entropy. Deliberately narrow: applied only to assignment
- *  values, never to bare words. A 40-char git SHA scores ~4.0 bits/char and
- *  would be redacted out of ordinary review prose if this ran unbound. */
+/** A segment is "lexical" when it is a plain word or a plain number — the
+ *  shape hyphenated identifiers are built from, and the shape a random token's
+ *  segments essentially never take, because a token mixes letters with digits
+ *  inside each run. */
+const LEXICAL_SEGMENT_RE = /^(?:[A-Za-z]+|[0-9]+)$/;
+
+/** Longest segment an identifier may carry and still be exonerated. This is
+ *  identifier HEADROOM, not a security bound: 16 random lowercase letters is
+ *  already ~75 bits, so a segment at the limit is a usable secret on its own.
+ *  Chosen with room over the longest segment real identifiers use —
+ *  `multicast` and `transport` are 9, `authentication` is 14.
+ *
+ *  None of the length bounds here closes the rule; see isLexicalIdentifier for
+ *  what actually keeps random tokens out. */
+const LEXICAL_SEGMENT_MAX_LENGTH = 16;
+
+/** Segments longer than this count as "long", and an exonerated value may hold
+ *  at most one. Without it the per-segment cap admits any NUMBER of ~75-bit
+ *  segments — two random 16-letter words joined by a hyphen (~150 bits) passed.
+ *  Real identifiers carry at most one long word: the longest segment of
+ *  `draft-ramadan-moq-multicast-00` and `draft-ietf-moq-transport-14` is 9.
+ *
+ *  This bounds LONG segments only. It says nothing about how many segments of
+ *  this length or less a value carries, so on its own it left exonerated
+ *  entropy unbounded: 16 × 10 random letters (~750 bits) passed. The total is
+ *  capped separately, by LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH. */
+const LEXICAL_LONG_SEGMENT_LENGTH = 10;
+
+/** Ceiling on the summed length of an exonerated value's segments, separators
+ *  excluded. Derived from the regression set, not from an entropy budget: the
+ *  longest real identifier there, `draft-ramadan-moq-multicast-00`, sums to 26
+ *  (`draft-ietf-moq-transport-14` to 23, the `-fec-`/`-mmt-` drafts to 20), and
+ *  this is 26 rounded up to the next whole LEXICAL_LONG_SEGMENT_LENGTH — three
+ *  long-segment widths, 30. So 4 × 10 random letters and above go back to
+ *  refused. It narrows the rule rather than closing it: 3 × 10 sums to exactly
+ *  30 (~141 bits) and is still exonerated. */
+const LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH = 3 * LEXICAL_LONG_SEGMENT_LENGTH;
+
+/**
+ * BLO-41262: a separator-delimited run of short words is an identifier, not a
+ * credential, and per-character entropy cannot tell the two apart.
+ * `draft-ramadan-moq-multicast-00` scores 3.74 bits/char — above the floor —
+ * so an RFC-XML `<seriesInfo … value='draft-…'/>` element read as
+ * credential-shaped, and every `.md` IETF draft in Blockcast/moqcast-draft
+ * became unwritable through `gh api .../git/blobs` while the push path was down.
+ *
+ * The discriminator is structure, not vocabulary (no word list to drift): a
+ * credential is ONE opaque run, so a value is exonerated only when every
+ * separator-delimited segment is itself a plain word or number, none exceeds
+ * LEXICAL_SEGMENT_MAX_LENGTH, at most one exceeds LEXICAL_LONG_SEGMENT_LENGTH,
+ * AND the segments sum to at most LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH. Each
+ * conjunct carries weight — `release-Candidate-<20 letters>` is refused on the
+ * length of its tail, two 11-letter words on the long-segment count, and four
+ * 10-letter words on the summed length.
+ *
+ * These are bounds on SHAPE, not on entropy, and they do not close the rule:
+ * 3 × 10 random letters (~141 bits) is still exonerated. What keeps random
+ * tokens out is that generators do not emit homogeneous letter-or-digit runs.
+ * Measured through the whole of isOpaqueSecretValue over 20k random values per
+ * shape (Ally, review 5476147384): 0/20000 alnum-40, 1/20000 base64url-43 and
+ * 1/20000 alnum-24 pass, and each of those passes is the entropy floor, not
+ * this rule; re-measured with the summed-length cap in place, 0/20000 of each.
+ * A UUID stays opaque, because `386c81e8` is neither a word nor a number.
+ */
+function isLexicalIdentifier(value: string): boolean {
+  const segments = value.split(/[-._]/);
+  if (segments.length < 2) return false;
+  const longSegments = segments.filter((s) => s.length > LEXICAL_LONG_SEGMENT_LENGTH).length;
+  if (longSegments > 1) return false;
+  const contentLength = segments.reduce((sum, s) => sum + s.length, 0);
+  if (contentLength > LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH) return false;
+  return segments.every(
+    (segment) =>
+      segment.length <= LEXICAL_SEGMENT_MAX_LENGTH && LEXICAL_SEGMENT_RE.test(segment),
+  );
+}
+
+/** A value is "opaque" when it is long, drawn from a token alphabet, is not a
+ *  hyphenated identifier, and has high per-character entropy. Deliberately
+ *  narrow: applied only to assignment values, never to bare words. A 40-char
+ *  git SHA scores ~4.0 bits/char and would be redacted out of ordinary review
+ *  prose if this ran unbound. */
 function isOpaqueSecretValue(value: string): boolean {
   if (value.length < HIGH_ENTROPY_MIN_LENGTH) return false;
   if (!/^[A-Za-z0-9+/=_.\-]+$/.test(value)) return false;
   // Needs mixed classes; `----------------------------` and `aaaa...` are not secrets.
   const classes = [/[a-z]/, /[A-Z0-9]/].filter((re) => re.test(value)).length;
   if (classes < 2) return false;
+  if (isLexicalIdentifier(value)) return false;
   return shannonEntropyBitsPerChar(value) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR;
 }
 
@@ -216,6 +346,7 @@ export function scrubGitHubEgressText(input: string): GitHubEgressScrubResult {
   // Redact only the value; the name is often the point of the sentence and is
   // not itself sensitive.
   text = text.replace(ASSIGNMENT_RE, (match, name: string, quote: string, value: string) => {
+    if (isContentDigestAssignment(name, value)) return match;
     if (!isOpaqueSecretValue(value)) return match;
     fired.add("high-entropy-assignment");
     return `${name}=${quote}${redactionMarker("high-entropy-assignment")}${quote}`;
@@ -235,4 +366,78 @@ export function scrubGitHubEgressText(input: string): GitHubEgressScrubResult {
     redacted: fired.size > 0,
     classes: order.filter((cls) => fired.has(cls)),
   };
+}
+
+/** One line of a refused value, and what fired on it. */
+export interface GitHubEgressMatchLocation {
+  /** 1-based line number within the value that was scanned. */
+  line: number;
+  classes: GitHubEgressScrubClass[];
+  /**
+   * The line AS SCRUBBED, truncated.
+   *
+   * Safe to print for SINGLE-LINE classes, and that is the whole reason it is the
+   * scrubbed line rather than the matched substring BLO-41262's acceptance
+   * criterion asked for: echoing the raw match sends the material into agent
+   * stderr and from there into run logs and whatever the agent pastes when it
+   * reports the refusal — PEN-2526's shape, reached from inside the control
+   * built to prevent it. The marker sits where the material was, so the
+   * surrounding bytes still identify the line unambiguously.
+   */
+  excerpt: string;
+}
+
+/** Classes that suppress a REGION of the text rather than a match: a run of
+ *  environment assignments, or a PEM envelope (an unterminated one takes
+ *  everything to end of input). A per-line re-scan cannot reproduce that, so
+ *  when one fires no line is attributed at all — see
+ *  `locateGitHubEgressMatches`. */
+export const GITHUB_EGRESS_REGION_CLASSES: readonly GitHubEgressScrubClass[] = [
+  "private-key-block",
+  "environment-dump",
+];
+
+/** Longest excerpt reported. Long enough to carry an XML element or an
+ *  assignment with its context, short enough that a minified line cannot turn
+ *  a refusal into a page of output. */
+const EXCERPT_MAX_LENGTH = 200;
+
+/**
+ * Locate, per line, what `scrubGitHubEgressText` fired on.
+ *
+ * BLO-41262: a content refusal named only the field and the class, so finding
+ * the offending line in a 3000-line draft took ~12 API calls of manual
+ * bisection. This runs the same detectors line by line, so the refusal can say
+ * where.
+ *
+ * Only called on the refusal path, which is already failing, so the per-line
+ * re-scan costs nothing in the common case.
+ *
+ * A class that suppresses a REGION — `environment-dump` (a run of five
+ * assignments) or `private-key-block` — has no single line, and worse, the
+ * lines underneath it are only protected by the whole-text pass: re-scanned
+ * one at a time, a line inside a dump that fires for its own reason would be
+ * echoed with only its own match removed, carrying the short assignments the
+ * dump rule exists to catch. So when any region class fires on the whole
+ * value this returns no locations at all, and the caller reports the classes
+ * without line attribution.
+ */
+export function locateGitHubEgressMatches(input: string): GitHubEgressMatchLocation[] {
+  if (typeof input !== "string" || input.length === 0) return [];
+  const whole = scrubGitHubEgressText(input);
+  if (whole.classes.some((cls) => GITHUB_EGRESS_REGION_CLASSES.includes(cls))) return [];
+
+  const located: GitHubEgressMatchLocation[] = [];
+  const lines = input.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] as string;
+    const scrubbed = scrubGitHubEgressText(line);
+    if (!scrubbed.redacted) continue;
+    const excerpt =
+      scrubbed.text.length > EXCERPT_MAX_LENGTH
+        ? `${scrubbed.text.slice(0, EXCERPT_MAX_LENGTH)}…`
+        : scrubbed.text;
+    located.push({ line: i + 1, classes: scrubbed.classes, excerpt });
+  }
+  return located;
 }

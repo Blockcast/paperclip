@@ -54,6 +54,7 @@ function ownerRefPatchCalls(): [{ name: string; body: unknown[] }, { middleware:
   return mockCorePatchSecret.mock.calls.filter((c) => Array.isArray(c[0]?.body)) as never;
 }
 const mockCoreDeleteSecret = vi.fn();
+const mockCoreListSecrets = vi.fn();
 // vi.hoisted ensures a single vi.fn() instance shared between the mock factory
 // (which runs at hoist time) and the test body (which calls mockResolvedValue).
 // A plain const would be re-assigned at its original position, leaving the
@@ -88,6 +89,7 @@ vi.mock("./k8s-client.js", async (importOriginal) => {
       readNamespacedSecret: mockCoreReadSecret,
       patchNamespacedSecret: mockCorePatchSecret,
       deleteNamespacedSecret: mockCoreDeleteSecret,
+      listNamespacedSecret: mockCoreListSecrets,
     }),
     getAuthzApi: () => ({}),
     getSelfPodInfo: mockGetSelfPodInfo,
@@ -187,6 +189,10 @@ function makeJob(opts: {
 // job-manifest.test.ts and manage this env var themselves.
 beforeEach(() => {
   process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "test-default-sa";
+  // The BLO-21857 orphan-secret sweep runs on the execute() path. Without a
+  // default here it would reject inside its own best-effort catch, so every
+  // test in this file would pass while never exercising the wire-up at all.
+  mockCoreListSecrets.mockResolvedValue({ items: [] });
 });
 
 afterEach(() => {
@@ -987,6 +993,74 @@ describe("execute: concurrency guard", () => {
     expectScopedDirsPreCreatedThroughMock();
   });
 
+  // BLO-37760. `rootDir` is a POD address, but the bundle is written by THIS
+  // process, which reaches the volume at SELF_POD_DATA_MOUNT_PATH. Under a
+  // custom workspaceMountPath the two diverge, so execute() must hand over both
+  // mounts — and the config-source root must be derived from the pod's mount
+  // rather than from a literal /paperclip.
+  it("hands the prompt bundle both address spaces under a custom workspaceMountPath", async () => {
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+
+    const result = await execute(makeCtx({
+      config: {
+        isolationMode: "isolated",
+        isolationKey: "key-1",
+        workspaceMountPath: "/srv/agent-data",
+      },
+    }));
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    const args = mockPrepareBundle.mock.calls.at(-1)?.[0];
+    // The root the container will be handed lives under the POD's mount.
+    expect(args.rootDir.startsWith("/srv/agent-data/")).toBe(true);
+    expect(args.rootDir.endsWith("/prompt-cache")).toBe(true);
+    expect(args.rootDir.startsWith("/paperclip/")).toBe(false);
+    // ...and both mounts are supplied, so the writer can translate it.
+    const { SELF_POD_DATA_MOUNT_PATH } = await import("./k8s-client.js");
+    expect(args.podDataMountPath).toBe("/srv/agent-data");
+    expect(args.serverDataMountPath).toBe(SELF_POD_DATA_MOUNT_PATH);
+    expect(args.podDataMountPath).not.toBe(args.serverDataMountPath);
+  });
+
+  // A RUNTIME isolation descriptor leaves `promptCacheRoot` empty, so
+  // `resolvePromptCacheRoot` falls through to its own derived root — a
+  // different branch from the config-source case above, and the one that used
+  // to hardcode `/paperclip`. Reverting that derivation must turn this red.
+  it("derives the runtime-descriptor prompt-cache fallback from the pod mount, not a literal /paperclip", async () => {
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+
+    await execute(makeCtx({
+      config: { workspaceMountPath: "/srv/agent-data" },
+      runtime: makeIsolatedRuntime("key-1"),
+    }));
+
+    const args = mockPrepareBundle.mock.calls.at(-1)?.[0];
+    expect(args.rootDir).toBe(
+      "/srv/agent-data/instances/default/data/k8s-isolation/co1/agent-abc/key-1/prompt-cache",
+    );
+    expect(args.rootDir.startsWith("/paperclip/")).toBe(false);
+  });
+
+  // The no-op control for the same path: the default mount is the only
+  // configuration in production use.
+  it("keeps the default-mount prompt-cache root and mounts byte-identical", async () => {
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+
+    await execute(makeCtx({ config: { isolationMode: "isolated", isolationKey: "key-1" } }));
+
+    const args = mockPrepareBundle.mock.calls.at(-1)?.[0];
+    const { SELF_POD_DATA_MOUNT_PATH } = await import("./k8s-client.js");
+    expect(args.rootDir.startsWith(`${SELF_POD_DATA_MOUNT_PATH}/`)).toBe(true);
+    expect(args.podDataMountPath).toBe(SELF_POD_DATA_MOUNT_PATH);
+    expect(args.serverDataMountPath).toBe(SELF_POD_DATA_MOUNT_PATH);
+  });
+
   it("recognizes legacy isolated labels when allowing a different isolation key", async () => {
     const other = makeJob({
       runId: "active-run",
@@ -1315,33 +1389,41 @@ describe("execute: job creation", () => {
     mkdirSpy.mockRestore();
   });
 
+  // The Job's pod, present but unplaceable. Left unset, the reset mock
+  // resolved `undefined`, and this block leaned on TWO separate readings of
+  // that: `waitForPod` did `podList.items` and threw a TypeError — which is
+  // what made these cases fail fast instead of waiting out the 120s scheduling
+  // budget — and teardown's old `podList?.items ?? []` read it as gone without
+  // any list having succeeded, i.e. they passed on the BLO-42185 fail-open
+  // itself. Same shape, and same fix, as the `cleanupJob pod-log reaping`
+  // beforeEach. Unschedulable keeps the fast failure honest: the Job was
+  // created, its pod exists, and it cannot be placed. Parameterised by uid
+  // because selectJobOwnedPod scopes to the Job that owns the pod, so a case
+  // reattaching to a different uid must supply its own.
+  const unschedulablePodList = (jobUid: string) => ({
+    items: [{
+      metadata: { name: "pod-unschedulable", ownerReferences: [jobOwnerRef(jobUid)] },
+      status: {
+        phase: "Pending",
+        conditions: [
+          { type: "PodScheduled", status: "False", reason: "Unschedulable", message: "no nodes available" },
+        ],
+        containerStatuses: [],
+        initContainerStatuses: [],
+      },
+    }],
+  });
+
+  // Single source for this block's defaults: `armJobCreationDefaults` below is
+  // called mid-test by `deterministicJobName`, and it had drifted from the
+  // beforeEach it claims to re-apply — it re-armed neither mockCoreListPods nor
+  // mockCoreDeletePod, so the second execute() of those cases ran against the
+  // unset mock described above. Calling it here keeps the two from diverging
+  // again.
   beforeEach(() => {
-    vi.resetAllMocks();
+    armJobCreationDefaults();
+    // After the reset inside armJobCreationDefaults, as before (BLO-32734).
     mkdirSpy = vi.spyOn(fsPromises, "mkdir").mockResolvedValue(undefined);
-    mockReadSkillEntries.mockResolvedValue([]);
-    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
-    // Model the real API: a successful pod delete makes the pods go
-    // away, so the BLO-35486 teardown poll observes an empty list. Tests that
-    // want the "pod outlived teardown" branch override this.
-    mockCoreDeletePod.mockImplementation(async () => {
-      mockCoreListPods.mockResolvedValue({ items: [] });
-      return {};
-    });
-    mockBatchListJobs.mockResolvedValue({ items: [] }); // no concurrent jobs
-    mockPrepareBundle.mockResolvedValue(makeBundle());
-    mockBatchCreateJob.mockResolvedValue({ metadata: { uid: "job-uid-1" } });
-    mockBatchDeleteJob.mockResolvedValue({});
-    // The real client always returns a Promise, and the secret-cleanup paths
-    // chain .catch() onto it. Left unstubbed these return undefined, so the
-    // cleanup throws a TypeError instead of doing what it says (BLO-21858).
-    mockCoreCreateSecret.mockResolvedValue({});
-    mockCoreDeleteSecret.mockResolvedValue({});
-    // Same reasoning as the two above, for the 409 adopt path (BLO-31665).
-    // Left unstubbed, a future test that trips a 409 gets `existing ===
-    // undefined` from the read and a TypeError masked into a secret-create
-    // failure — the exact trap the comment above was written about.
-    mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
-    mockCorePatchSecret.mockResolvedValue({});
   });
 
   it("returns k8s_job_create_failed when createNamespacedJob throws", async () => {
@@ -1528,20 +1610,37 @@ describe("execute: job creation", () => {
   // the real execute() path rather than the `jobAdoptionVerdict` helper, which
   // is unit-tested separately in job-adopt.test.ts.
 
-  // Re-applies this block's beforeEach defaults.  Needed because these cases
-  // call execute() twice — once to learn the deterministic Job name, then again
-  // to drive the collision — and the first call must not leak call history or a
-  // spent one-shot rejection into the second.
+  // Re-applies this block's beforeEach defaults — and is also what the
+  // beforeEach itself calls, so the two cannot drift.  Needed because these
+  // cases call execute() twice — once to learn the deterministic Job name, then
+  // again to drive the collision — and the first call must not leak call
+  // history or a spent one-shot rejection into the second.
   function armJobCreationDefaults() {
     vi.resetAllMocks();
     mockReadSkillEntries.mockResolvedValue([]);
     mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
-    mockBatchListJobs.mockResolvedValue({ items: [] });
+    mockCoreListPods.mockResolvedValue(unschedulablePodList("job-uid-1"));
+    // Model the real API: a successful pod delete makes the pods go away, so
+    // the BLO-35486 teardown poll observes an empty list. Tests that want the
+    // "pod outlived teardown" branch override this. Not a substitute for the
+    // list default above — the teardown poll lists before it deletes.
+    mockCoreDeletePod.mockImplementation(async () => {
+      mockCoreListPods.mockResolvedValue({ items: [] });
+      return {};
+    });
+    mockBatchListJobs.mockResolvedValue({ items: [] }); // no concurrent jobs
     mockPrepareBundle.mockResolvedValue(makeBundle());
     mockBatchCreateJob.mockResolvedValue({ metadata: { uid: "job-uid-1" } });
     mockBatchDeleteJob.mockResolvedValue({});
+    // The real client always returns a Promise, and the secret-cleanup paths
+    // chain .catch() onto it. Left unstubbed these return undefined, so the
+    // cleanup throws a TypeError instead of doing what it says (BLO-21858).
     mockCoreCreateSecret.mockResolvedValue({});
     mockCoreDeleteSecret.mockResolvedValue({});
+    // Same reasoning as the two above, for the 409 adopt path (BLO-31665).
+    // Left unstubbed, a future test that trips a 409 gets `existing ===
+    // undefined` from the read and a TypeError masked into a secret-create
+    // failure — the exact trap the comment above was written about.
     mockCoreReadSecret.mockResolvedValue({ metadata: { resourceVersion: "1" } });
     mockCorePatchSecret.mockResolvedValue({});
   }
@@ -1578,6 +1677,10 @@ describe("execute: job creation", () => {
     mockBatchReadJob.mockResolvedValue(
       makeJob({ name: jobName, uid: liveUid, runId: "run-test-001", agentId: "agent-abc" }),
     );
+    // The reattached Job's own pod. The default is owned by "job-uid-1", and
+    // selectJobOwnedPod scopes to the owning Job, so without this the run finds
+    // no pod of its own and waits out the entire scheduling budget.
+    mockCoreListPods.mockResolvedValue(unschedulablePodList(liveUid));
     const onExternalRuntimeLaunched = vi.fn().mockResolvedValue(undefined);
 
     const result = await execute(
@@ -2475,6 +2578,70 @@ describe("execute: run Secrets outlive the pod that mounts them (BLO-35486)", ()
     // fails rather than merely weakening.
     expect(order[0]).toBe("deletePods");
     expect(order).toContain("deleteSecret");
+  });
+
+  // BLO-42185 (Ally, raised on #2336 at e93b1b1c / 861428d0 / 30e17ae7). The
+  // reaper read `podList?.items ?? []`, so a response it could not parse
+  // produced an empty array, `lastObserved === 0`, and `gone` — which is the
+  // licence to delete the run's mounted Secrets. An unparseable read is not
+  // evidence of absence, and here it authorised reaping the credential Secret
+  // under a pod that may still be running.
+  it("does not read an unparseable pod list as zero pods", async () => {
+    vi.useFakeTimers();
+    try {
+      // A body with no `items` at all: the shape `?? []` silently laundered.
+      // Applied from the first poll, so nothing is ever observed and the
+      // verdict is `unobserved` rather than `alive` — the strongest form of
+      // AC 1, where the malformed read is the only read.
+      mockCoreListPods.mockResolvedValue({ metadata: { resourceVersion: "42" } });
+      mockCoreDeletePod.mockResolvedValue({});
+
+      const promise = execute(
+        makeCtx({
+          config: { podStartTimeoutSec: 0, env: { MY_API_KEY: "s3cret" } },
+        } as Partial<AdapterExecutionContext>),
+      );
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      // Non-vacuous guard: teardown must actually have been reached with a
+      // Secret in existence to delete. Without this the test passes on any
+      // change that never gets as far as creating one.
+      expect(mockCoreCreateSecret).toHaveBeenCalled();
+      expect(mockCoreDeleteSecret).not.toHaveBeenCalled();
+      expect(mockBatchDeleteJob).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The AC 2 control for the test above. Failing closed on an unparseable list
+  // is only correct if a list that genuinely succeeded with zero pods still
+  // reaps — otherwise the fix strands every run Secret forever, which is the
+  // leak this subsystem exists to prevent. Reverting the guard leaves this
+  // green and only the test above red, which is what makes the pair a measure
+  // of the distinction rather than of retention.
+  it("still reaps the run Secrets when the list genuinely sees zero pods", async () => {
+    vi.useFakeTimers();
+    try {
+      mockCoreDeletePod.mockImplementation(async () => {
+        mockCoreListPods.mockResolvedValue({ items: [] });
+        return {};
+      });
+
+      const promise = execute(
+        makeCtx({
+          config: { podStartTimeoutSec: 0, env: { MY_API_KEY: "s3cret" } },
+        } as Partial<AdapterExecutionContext>),
+      );
+      await vi.advanceTimersByTimeAsync(90_000);
+      await promise;
+
+      expect(mockCoreCreateSecret).toHaveBeenCalled();
+      expect(mockCoreDeleteSecret).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("gives a cold image pull 1800s by default, not 600s", async () => {
@@ -3593,6 +3760,148 @@ describe("execute: per-agent creation mutex prevents TOCTOU race", () => {
     resolveAgentAList({ items: [] });
     await Promise.allSettled([pA, pB]);
   });
+});
+// ─── execute: orphan-secret sweep wire-up (BLO-21857) ────────────────────────
+
+// The sweep itself is unit-tested in secret-sweep.test.ts. What these two cover
+// is the wire-up: that execute() actually reaches it, with the namespace and the
+// real CoreV1Api, and that a sweep failure cannot fail the run. Both re-import
+// execute.js under vi.resetModules() because the interval gate is module-level
+// state — without a fresh module the first execute() anywhere in this file has
+// already consumed the interval slot.
+describe("execute: orphan-secret sweep wire-up (BLO-21857)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    // Default for this block: the API server confirms the derived Job is gone,
+    // which is what lets the sweep act. Individual tests override.
+    mockBatchReadJob.mockRejectedValue(
+      Object.assign(new Error("jobs.batch not found"), { code: 404 }),
+    );
+    mockCoreDeleteSecret.mockResolvedValue({});
+  });
+
+  it("collects an ownerless run Secret on the execute() path", async () => {
+    vi.resetModules();
+    mockCoreListSecrets.mockResolvedValue({
+      items: [
+        {
+          metadata: {
+            name: "ac-agent-run-orphan-prompt",
+            labels: {
+              "app.kubernetes.io/managed-by": "paperclip",
+              "paperclip.io/adapter-type": "claude_k8s",
+              "paperclip.io/run-id": "run-orphan",
+            },
+            creationTimestamp: new Date(Date.now() - 3_600_000),
+            resourceVersion: "4242",
+          },
+        },
+      ],
+    });
+
+    const { execute: freshExecute } = await import("./execute.js");
+    // The run itself is irrelevant here — the sweep fires before the job guard.
+    await freshExecute(makeCtx()).catch(() => {});
+
+    expect(mockCoreListSecrets).toHaveBeenCalledWith({
+      namespace: "paperclip",
+      labelSelector:
+        "app.kubernetes.io/managed-by=paperclip,paperclip.io/adapter-type=claude_k8s,paperclip.io/run-id",
+    });
+    // The pre-delete point read is what authorises the delete: the list snapshot
+    // alone is never enough (PR #1459 review).
+    expect(mockBatchReadJob).toHaveBeenCalledWith({
+      name: "ac-agent-run-orphan",
+      namespace: "paperclip",
+    });
+    // Conditional on the version the sweep judged (PR #2370 review I1).
+    expect(mockCoreDeleteSecret).toHaveBeenCalledWith({
+      name: "ac-agent-run-orphan-prompt",
+      namespace: "paperclip",
+      body: { preconditions: { resourceVersion: "4242" } },
+    });
+  });
+
+  it("does not collect an ownerless run Secret whose Job the API server still reports", async () => {
+    // Same Secret, but the point read finds the Job — a launch that created it
+    // after the sweep's list snapshot. Deleting here would strip a live run's
+    // credentials.
+    vi.resetModules();
+    mockCoreListSecrets.mockResolvedValue({
+      items: [
+        {
+          metadata: {
+            name: "ac-agent-run-orphan-prompt",
+            labels: {
+              "app.kubernetes.io/managed-by": "paperclip",
+              "paperclip.io/adapter-type": "claude_k8s",
+              "paperclip.io/run-id": "run-orphan",
+            },
+            creationTimestamp: new Date(Date.now() - 3_600_000),
+            resourceVersion: "4242",
+          },
+        },
+      ],
+    });
+    mockBatchReadJob.mockResolvedValue({ metadata: { name: "ac-agent-run-orphan" } });
+
+    const { execute: freshExecute } = await import("./execute.js");
+    await freshExecute(makeCtx()).catch(() => {});
+
+    // Keyed on the name alone: an exact-shape negative would pass vacuously
+    // once the delete carries a body.
+    expect(mockCoreDeleteSecret).not.toHaveBeenCalledWith(
+      expect.objectContaining({ name: "ac-agent-run-orphan-prompt" }),
+    );
+    // And it was the point read that saved it, not an earlier retain.
+    expect(mockBatchReadJob).toHaveBeenCalledWith({
+      name: "ac-agent-run-orphan",
+      namespace: "paperclip",
+    });
+  });
+
+  it("does not fail the run when the sweep itself throws", async () => {
+    vi.resetModules();
+    mockCoreListSecrets.mockRejectedValue(new Error("secrets forbidden"));
+
+    const { execute: freshExecute } = await import("./execute.js");
+    const result = await freshExecute(makeCtx());
+
+    expect(mockCoreListSecrets).toHaveBeenCalled();
+    // Whatever this run's outcome is, it must not be attributed to cleanup.
+    expect(result.errorCode ?? "").not.toContain("secret");
+    expect(result.errorMessage ?? "").not.toContain("secrets forbidden");
+  });
+
+  // PR #1459 review: the sweep is awaited inside the per-agent creation mutex,
+  // which is released only by the `finally` at the bottom of execute(). A
+  // rejection is caught by the gate, but a *hang* is not a rejection — so before
+  // the timeout, a wedged listNamespacedSecret stalled the run that triggered it
+  // AND held that agent's mutex slot for the lifetime of the process, blocking
+  // every later execute() for the same agent. Both calls below hang forever
+  // without the bound, so asserting that they settle at all is the regression.
+  it("survives a listNamespacedSecret that never settles, and frees the agent mutex", async () => {
+    vi.resetModules();
+    mockCoreListSecrets.mockImplementation(() => new Promise(() => {}));
+
+    const { execute: freshExecute } = await import("./execute.js");
+    // Same agent id => same creation-mutex key => the second call queues behind
+    // the first. A short sweep bound keeps the test fast; 15s is the default.
+    const config = { orphanSecretSweepTimeoutMs: 100 };
+    const first = freshExecute(makeCtx({ config, runId: "run-hang-1" })).catch(() => "settled");
+    const second = freshExecute(makeCtx({ config, runId: "run-hang-2" })).catch(() => "settled");
+
+    const outcome = await Promise.race([
+      Promise.all([first, second]).then(() => "settled"),
+      new Promise((resolve) => setTimeout(() => resolve("stuck"), 10_000)),
+    ]);
+
+    expect(outcome).toBe("settled");
+    expect(mockCoreListSecrets).toHaveBeenCalled();
+  }, 20_000);
 });
 
 // BLO-39114: the integration test that exercises this guard feeds it

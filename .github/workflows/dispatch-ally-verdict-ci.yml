@@ -1,0 +1,129 @@
+name: dispatch-ally-verdict-ci
+
+# Ally-gated heavy CI, R1 unlock (design ally-gated-ci.md §3.4-§3.6, §4.2).
+#
+# Owner directive 2026-10-07 (~01:55Z): "also actively work to reduce and
+# isolate CPU waste from CI. CI is suboptimal across the org as you saw in this
+# conversation, with jobs running without new signal on each PR, or before
+# ally approved resulting in CI runs that are unecessary."
+#
+# pr.yml's `ally_verdict` job fails while a head has no Ally verdict, so its
+# heavy lanes are skipped and `verify` is red. This workflow releases them once
+# a verdict exists: it evaluates the shared predicate at the exact head, then
+# re-runs the held pr.yml run's failed jobs (`ally-verdict`, the heavy lanes and
+# `verify`) as attempt 2 on the same check suite, so `verify` stays attached to
+# the PR head.
+#
+# Arms (trusted default-branch code only, never a pull_request event):
+#   verdict  check_run completed: the Ally App's (3966421) B
+#            gate/ally-comment-findings or S ci/ally-head-attested concluded
+#            success. GitHub does not deliver check_run for suites GitHub
+#            Actions creates, so Actions job check-runs never wake this.
+#   manual   workflow_dispatch with pr_number; also how review-gate-sweep.yml's
+#            hourly backstop re-fires a head whose event was lost.
+# A non-matching check_run event gets no pod: the filter is on the job.
+#
+# Exactly once per head: only attempt 1 of the newest pull_request run at the
+# head is ever re-run, only after it completed, and only when `ally-verdict`
+# itself failed (scripts/ally-verdict-ci.mjs rerunDecision). The PR's live head
+# is re-read before the write, because pr.yml's `pr-<n>` concurrency cancels
+# in progress: re-running an old head would cancel the live head's run.
+#
+# SCHEDULE-ONLY. Nothing here is merge authority: `verify` still needs every
+# heavy lane. ALLY_GATED_CI_BYPASS=true makes every open, same-repo, non-draft
+# head eligible here, so held runs are released through this same path: the
+# hourly backstop re-fires the manual arm for every held attempt-1 head (up to
+# 10 a sweep) while it is set, whatever the Ally signals say.
+#
+# Trusted code only (design I4), because this job holds `actions: write`: the
+# one checkout is a SHA-pinned actions/checkout of the default branch, no step
+# names pull request content or moves the work tree, and the token writes
+# nothing but `actions` (ally-verdict-gate.test.mjs enforces all of it).
+
+on:
+  check_run:
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request whose held pr.yml run should be re-evaluated and, if eligible, released.
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  unlock:
+    name: Release heavy CI after an Ally verdict
+    if: >-
+      (github.event_name == 'check_run' && github.event.check_run.app.id == 3966421 &&
+      github.event.check_run.conclusion == 'success' && (github.event.check_run.name ==
+      'gate/ally-comment-findings' || github.event.check_run.name == 'ci/ally-head-attested'))
+      || (github.event_name == 'workflow_dispatch')
+    runs-on: arc-light
+    # A hang detector: one checkout, one Node setup, about six API calls.
+    timeout-minutes: 10
+    # Per PR, never cancelling a running job: B and S success for one head
+    # arrive seconds apart, and the second must see the first's re-run as
+    # "covered". It serialises two: GitHub keeps at most one PENDING run per
+    # group, so a third event arriving while one runs and one waits replaces
+    # the waiting one, and the running one or the next hourly backstop covers
+    # that head. On the job, not the workflow, so non-matching check_run events
+    # (skipped by the `if:` above) never take or evict this slot.
+    concurrency:
+      group: ally-verdict-dispatch-${{ github.event.check_run.pull_requests[0].number || inputs.pr_number || github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      # rerun-failed-jobs
+      actions: write
+      checks: read
+      contents: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Check out the default branch (trusted code only)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Resolve the pull request and head
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          CHECK_HEAD_SHA: ${{ github.event.check_run.head_sha }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node scripts/ally-verdict-ci.mjs resolve
+
+      - name: Evaluate the Ally verdict at the head
+        id: verdict
+        if: ${{ steps.resolve.outputs.pr_number != '' }}
+        # Vendored from Blockcast/review-gate-action (PROVENANCE.json), as in
+        # pr.yml. No carry-forward input: it stays off with this copy.
+        uses: ./.github/actions/verdict-dispatch
+        with:
+          github-token: ${{ github.token }}
+          pull-number: ${{ steps.resolve.outputs.pr_number }}
+          head-sha: ${{ steps.resolve.outputs.head_sha }}
+          bypass: ${{ vars.ALLY_GATED_CI_BYPASS }}
+          # The composite sets up its own Node and leaves it on PATH; keep the
+          # job on the 24 the step above chose, for the unlock step below.
+          node-version: "24"
+
+      - name: Re-run the held pr.yml run at the head
+        if: ${{ steps.resolve.outputs.pr_number != '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+          ELIGIBLE: ${{ steps.verdict.outputs.eligible }}
+          BASIS: ${{ steps.verdict.outputs.basis }}
+          REASON: ${{ steps.verdict.outputs.reason }}
+        run: node scripts/ally-verdict-ci.mjs unlock

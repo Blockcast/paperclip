@@ -21,7 +21,7 @@ echo "ARGS=$*"
 // inside an agent pod it holds the live bot token, and the stub gh below prints
 // GH_TOKEN to stdout, so running there would both break hermeticity and print a
 // live credential into the test log.
-const COMPILED_IN_DEFAULT_TOKEN_FILE = "/paperclip/.secrets/github-token/token";
+const COMPILED_IN_DEFAULT_TOKEN_FILE = "/etc/paperclip/secrets/github-token/token";
 
 function withTempDir(fn) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "gh-token-wrapper-test-"));
@@ -48,11 +48,19 @@ const WRAPPER_CREDENTIAL_ENV_VARS = [
 // The single way any test in this file builds an environment. Starts from a
 // copy of process.env with every credential input stripped, then applies only
 // what the caller asked for, so each test states its full credential premise.
+//
+// PAPERCLIP_HOME is pinned too (BLO-40279): the wrapper refuses a token file on
+// the shared data volume `${PAPERCLIP_HOME:-/paperclip}`, compared by device,
+// and agent Jobs run this file with TMPDIR on that same CephFS — so every temp
+// token file here would otherwise read as "on the shared volume". /proc is
+// always present and never the device of a regular file, so the check stays
+// live and each token-file test is also its distinct-device positive control.
 function sanitizedEnv(overrides = {}) {
   const env = { ...process.env };
   for (const name of WRAPPER_CREDENTIAL_ENV_VARS) {
     delete env[name];
   }
+  env.PAPERCLIP_HOME = "/proc";
   return Object.assign(env, overrides);
 }
 
@@ -157,6 +165,58 @@ test("refuses when PAPERCLIP_GITHUB_TOKEN_FILE names an absent file (BLO-37977)"
     assert.match(proc.stderr, /is absent; refusing to run with ambient auth/);
     // Must not have reached the real binary at all.
     assert.equal(proc.stdout, "");
+  });
+});
+
+// BLO-40279: both token Secrets used to mount under /paperclip/.secrets, and an
+// absolute path pinned in prose (a runbook, an agent instruction bundle) cannot
+// be swept the way an in-repo one can. The refusal stays a refusal — resolving a
+// named merge-seat path to the compiled-in App default would run as a different
+// GitHub identity than the caller asked for — but it names where the path went,
+// so a stale pin costs one read instead of a silent dead end.
+test("names the BLO-40279 move when the stale /paperclip/.secrets path is pinned", (t) => {
+  // Deliberately a name nothing mounts: a readable file here would exec the stub
+  // gh, which echoes GH_TOKEN. Same hermeticity rule as the compiled-in default.
+  const stale = "/paperclip/.secrets/gh-token-wrapper-test-absent/token";
+  if (existsSync(stale)) return t.skip(`${stale} unexpectedly exists`);
+
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, {
+      setTokenFileVar: false,
+      extraEnv: { PAPERCLIP_GITHUB_TOKEN_FILE: stale },
+      args: ["auth", "status"],
+    });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /is absent; refusing to run with ambient auth/);
+    assert.match(proc.stderr, /moved to \/etc\/paperclip\/secrets\/<name>\/token in BLO-40279/);
+    assert.equal(proc.stdout, "");
+  });
+});
+
+test("does not mention the BLO-40279 move for a path that was never under it", () => {
+  // Anti-vacuity for the test above: the hint must be conditional on the stale
+  // prefix, not unconditional boilerplate every refusal happens to carry.
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, { args: ["auth", "status"] });
+    assert.equal(proc.status, 64);
+    assert.doesNotMatch(proc.stderr, /BLO-40279/);
+  });
+});
+
+// BLO-40279: the vacated /paperclip/.secrets/<name>/ is a bare, group-writable
+// directory on the shared volume, so a readable token there may be one any agent
+// planted. A named path on that volume is refused, not read — the token never
+// reaches the stub gh, which would echo it.
+test("refuses a named token file on the shared data volume instead of reading it", () => {
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, {
+      tokenFileContent: "planted-token\n",
+      extraEnv: { PAPERCLIP_HOME: dir },
+    });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /is on the shared .* volume, which every agent can write; refusing to run with ambient auth/);
+    assert.equal(proc.stdout, "");
+    assert.doesNotMatch(proc.stderr, /planted-token/);
   });
 });
 
@@ -411,6 +471,9 @@ for (const [label, tokenValue] of [
       const proc = runMalformedValue(dir, tokenValue);
       assert.equal(proc.status, 64);
       assert.match(proc.stderr, /GH_SEAT_TOKEN_VALUE is set but holds only whitespace/);
+      // BLO-40279: the documented `$(cat <token file>)` recipe against a stale
+      // /paperclip/.secrets path lands here, not in reject_token_file().
+      assert.match(proc.stderr, /stale since BLO-40279/);
       assert.equal(proc.stdout, "");
     });
   });

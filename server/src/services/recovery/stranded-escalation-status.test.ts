@@ -23,6 +23,7 @@ describe("resolveStrandedEscalationStatus", () => {
     isProviderQuotaWait: false,
     blockerIssueIds: [] as string[],
     recoveryCause: "stranded_assigned_issue",
+    latestRunErrorCode: null as string | null,
   };
 
   describe("keeps parking in `blocked` where a path exists", () => {
@@ -184,6 +185,31 @@ describe("resolveStrandedEscalationStatus", () => {
         recoveryOwnerAgentId: null,
         isProviderQuotaWait: true,
       })).toEqual({ status: "blocked", hasNoRecoveryPath: false });
+    });
+
+    it("still parks a re-routed workspace park, whose cause no longer says manual repair (BLO-19924)", () => {
+      // An unconfirmed probe takes `stranded_assigned_issue` for bounded wakes, but its
+      // fault is a workspace binding dispatch refuses pre-adapter. `todo` here would buy
+      // dispatch -> refuse -> re-park, indefinitely. The run, not the cause, says so.
+      expect(resolveStrandedEscalationStatus({
+        ...exhausted,
+        latestRunErrorCode: "workspace_validation_failed",
+      })).toEqual({ status: "blocked", hasNoRecoveryPath: false });
+      // Ownerless is the same question with no owner ever named.
+      expect(resolveStrandedEscalationStatus({
+        ...owned,
+        recoveryOwnerAgentId: null,
+        latestRunErrorCode: "workspace_validation_failed",
+      })).toEqual({ status: "blocked", hasNoRecoveryPath: false });
+    });
+
+    it("still releases an ordinary exhausted strand whose run failed some other way", () => {
+      // The control for the case above: only the workspace run code is held back. A
+      // capacity strand stays dispatchable (BLO-27635/BLO-30743).
+      expect(resolveStrandedEscalationStatus({
+        ...exhausted,
+        latestRunErrorCode: "adapter_failed",
+      })).toEqual({ status: "todo", hasNoRecoveryPath: true });
     });
 
     it.each(["workspace_validation_failed", "configuration_incomplete"])(

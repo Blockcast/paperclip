@@ -1477,6 +1477,85 @@ export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set(
   // run, but it is issue-scoped and reachable here, so naming it beats "other".
   "workspace_worktree_requires_project",
   "execution_review_participant_recovery",
+  // PEN-3855: the first admitted reason written OUTSIDE `heartbeat.ts`
+  // (`services/recovery/service.ts`, the provider-quota retry). It satisfies the
+  // same criterion as `execution_review_participant_recovery` directly above --
+  // it queues a run, but it is issue-scoped and reachable here, so naming it
+  // beats "other". Reachability is measured, not assumed: the writer sets
+  // `payload: withRecoveryModelProfileHint({ issueId, ... }, "normal_model")`,
+  // `issueId` is not among `RECOVERY_MODEL_PROFILE_HINT_KEYS` so the scrub
+  // preserves it, and `wakeTargetIssueIdSql` coalesces `payload ->> 'issueId'`
+  // first under a WHERE that filters on company and time window only -- no
+  // status predicate. The row is selected unconditionally and projected to
+  // "other", which is the degradation this list exists to remove.
+  //
+  // Deliberately NOT admitted, both measured rather than assumed:
+  //   - `issue_assignment_recovery_capacity_reservation` (same file) is
+  //     doubly unreachable -- its insert carries NO `payload` at all, and the
+  //     row is deleted unconditionally in a `finally`. It is an
+  //     ephemeral capacity token, not a durable wake record, so adding a payload
+  //     alone would still not make it a diagnostic row.
+  //   - the `routes/github-webhook.ts` contended-retry row writes a dynamic
+  //     `wakeupOptions.reason`, but the reason being dynamic is moot: its payload
+  //     is built by `buildPrReviewerWakeupOptions` and carries none of the four
+  //     coalesce arms, so the row can never bind to an issue and can never reach
+  //     this projector.
+  // Admitting either would assert a reachability this route does not have --
+  // the same rule the timer-scheduler exclusions above are held to.
+  "provider_quota_recovery",
+  // PEN-3855 review follow-up. The five below come from the SAME helper family in
+  // `heartbeat.ts` as the `heartbeat.*` entries already admitted above, and they were
+  // omitted for no stated reason -- the scan could not see them, so nothing forced the
+  // question. `writeSkippedHeartbeatRequest` (3 call sites) is a thin delegate to
+  // `writeSkippedRequest` (8 further literal call sites); the suite scanned only the
+  // delegate, so the parent's reasons were invisible to the control that is supposed
+  // to hold this list honest. The scan now reads both.
+  //
+  // Reachability is measured, not assumed, and it rests on the SAME mechanism for all
+  // five. `writeSkippedRequest` writes the enclosing `payload` verbatim, and `payload`
+  // is `opts.payload` from the caller (`enqueueWakeup`) -- so the row binds here iff
+  // the originating wake was issue-scoped. It routinely is: every `issue_commented`
+  // wake in this file wakes the assignee with `source: "automation"` and
+  // `payload: { issueId, ... }`, which makes coalesce arm 1 (`payload ->> 'issueId'`)
+  // bind under a WHERE carrying no status predicate. Four of the five gates below
+  // fire on such a request, write that same payload, and project to "other" today;
+  // `heartbeat.cooldown.active` has a different entry point, given below.
+  //
+  // The internal controls are decisive, one per entry point. Both are already
+  // admitted and sit INSIDE this run of gates -- same helper, same payload, same
+  // function. `heartbeat.wakeOnDemand.disabled` writes under `source !== "timer"`,
+  // the `issue_commented` path the four take. `heartbeat.disabled` writes under
+  // `source === "timer"`, the precondition `heartbeat.cooldown.active` shares
+  // further down the function. There is no reading on which either control is
+  // reachable and the gates on its path are not. Per-gate specifics, all on an
+  // issue-scoped request:
+  //   - `company.inactive` and `agent.not_invokable` write only when
+  //     `requestedByActorType !== "user"`. An `issue_commented` wake stamps the
+  //     triggering actor's `actorType` (the commenter, or the resolver on an
+  //     interaction-continuation wake), so an agent actor takes this path (a
+  //     user's throws without writing).
+  //   - `budget.blocked` is the sharpest case: the gate immediately above it
+  //     passes `issueId` into `budgets.getInvocationBlock`, so the issue binding is not
+  //     merely present on the row, it is what the block was computed against.
+  //   - `heartbeat.cooldown.active` does NOT fire on `issue_commented`:
+  //     `isHeartbeatCooldownActive` is inert unless `source === "timer"`, and the
+  //     gate then exempts only `schedulerTimerTick` (the scheduler's own ticks). It
+  //     fires on a `source: "timer"` wake from `POST /agents/:id/wakeup`, whose
+  //     schema admits that source and passes the caller's `payload` through -- the
+  //     same `source === "timer"` condition `heartbeat.disabled` writes under.
+  //   - `issue_execution_ownership_changed` is strictly MORE issue-scoped
+  //     than the already-admitted `issue_tree_hold_active`: its enclosing
+  //     block only runs after the issue is loaded by `eq(issues.id, issueId)` and it
+  //     reads `issue.executionRunId` / `checkoutRunId` / `assigneeAgentId`. The
+  //     `worktree_execution_cutoff` path five lines later is a direct insert
+  //     and was already admitted; the two differed only by which helper they routed
+  //     through, which is precisely the hand-maintenance failure this list is meant to
+  //     have stopped.
+  "company.inactive",
+  "budget.blocked",
+  "agent.not_invokable",
+  "heartbeat.cooldown.active",
+  "issue_execution_ownership_changed",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([

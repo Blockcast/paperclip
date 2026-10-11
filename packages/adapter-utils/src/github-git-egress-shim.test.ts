@@ -446,7 +446,13 @@ describe("parsePrePushInput", () => {
 describe("commitsForRefUpdate", () => {
   const zero = "0".repeat(40);
 
-  it("uses a two-dot range when the remote already has the ref", () => {
+  it("excludes the remote tip AND everything already published when the remote has the ref", () => {
+    // PEN-3907. This was a bare `old..new` two-dot range, which re-reported
+    // every commit a rebase pulled in from upstream: measured 43 commits in
+    // range on one force-push, 4 flagged and all 4 already on `origin/master`.
+    // `remoteSha` stays in the exclusion set because the pre-push hook's view
+    // of the remote is authoritative and can be AHEAD of the local
+    // remote-tracking ref; `--remotes` is what removes the upstream commits.
     const seen: string[][] = [];
     const runGit: GitReader = (args) => {
       seen.push(args);
@@ -456,8 +462,29 @@ describe("commitsForRefUpdate", () => {
       { localRef: "r", localSha: "new", remoteRef: "r", remoteSha: "old" },
       runGit,
     );
-    expect(seen[0]).toEqual(["rev-list", "old..new"]);
+    expect(seen[0]).toEqual(["rev-list", "new", "--not", "old", "--remotes"]);
     expect(commits).toEqual(["c1", "c2"]);
+  });
+
+  it("narrows both arms the same way, so a fresh branch name is not a softer path", () => {
+    // The asymmetry this removes was not enforcing anything: an author refused
+    // by the strict arm could push the identical commits under a branch name
+    // the remote does not have and take the lenient one. Pinning both arms to
+    // the same exclusion keeps that from silently coming back.
+    const armFor = (remoteSha: string): string[] => {
+      const seen: string[][] = [];
+      commitsForRefUpdate(
+        { localRef: "r", localSha: "new", remoteRef: "r", remoteSha },
+        (args) => {
+          seen.push(args);
+          return "";
+        },
+      );
+      return seen[0];
+    };
+
+    expect(armFor(zero)).toContain("--remotes");
+    expect(armFor("old")).toContain("--remotes");
   });
 
   it("excludes everything already published when the ref is new", () => {
@@ -608,6 +635,23 @@ describe("scanCommit", () => {
     // The surrounding prose survives — the point is a recognisable subject, not
     // an opaque one.
     expect(findings[0]!.subject).toContain("fix: drop");
+  });
+
+  it("passes a commit that adds an RFC-XML draft reference (BLO-41262)", () => {
+    // The same predicate gates both doors, so the gh-side false positive was
+    // also a pre-push refusal: bumping a `<seriesInfo value='draft-…'/>`
+    // reference is an ordinary edit and must push.
+    const findings = scanCommit(
+      sha,
+      fakeGit({
+        [`log -1 --format=%s ${sha}`]: "docs: bump the multicast reference",
+        [`log -1 --format=%B ${sha}`]: "docs: bump the multicast reference\n",
+        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]:
+          // Derived — see github-egress-scrub.test.ts on why.
+          `+  <seriesInfo name='Internet-Draft' value='${["draft", "ramadan", "moq", "multicast", "00"].join("-")}'/>\n`,
+      }),
+    );
+    expect(findings).toEqual([]);
   });
 
   it("passes a clean commit", () => {
