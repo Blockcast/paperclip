@@ -434,6 +434,45 @@ export const RECOVERY_ACTION_KIND_DISCHARGED_BY_RESTORED_EXECUTION: Record<Issue
   issue_graph_liveness: false,
 };
 
+/**
+ * PEN-3976: how far behind `now` the restored-execution evidence watermark is allowed to
+ * advance.
+ *
+ * The watermark bounds the probe, and this term is what keeps that bound from eating
+ * evidence. `heartbeat_runs.created_at` is stamped when the run is QUEUED, but `status`
+ * flips to `succeeded` much later, so a watermark that advanced to a bare `now()` would
+ * permanently skip every run that was already in flight when it moved -- the run's
+ * `created_at` would sit below the floor by the time it qualified.
+ *
+ * 48h is sized off this repo's own sanctioned worst case for that gap, not off a round
+ * number: a `queued` holder may legitimately wait on capacity up to the 6h pre-claim bound,
+ * and a `running` one up to `STALE_RUNNING_ISSUE_LOCK_MS` (2h) before it is reaped
+ * (recovery/service.ts:390). That is ~8h end to end, and this is 6x it.
+ *
+ * Missing a run is a SOFT failure and that is deliberate: the action is simply not
+ * discharged by that particular run and waits for the next one, which is exactly today's
+ * behaviour for it. Nothing is written wrongly. So the headroom is sized to make the miss
+ * rare rather than to make it impossible, because making it impossible means pinning the
+ * floor to the oldest non-terminal run in the company -- which a single zombie `queued` row
+ * would hold open forever, reinstating the unbounded scan this exists to close.
+ */
+export const RESTORED_EXECUTION_EVIDENCE_LAG_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * PEN-3976: the smallest watermark advance worth a write.
+ *
+ * Without it the sweep would UPDATE every stuck action on every 30s tick, turning a sweep
+ * that is read-only when idle into one that writes continuously. This is the same economy
+ * `handBackResidualAt` keeps on the same table (it is rewritten only when the reason
+ * changes, so a stable population costs no writes on a tick).
+ *
+ * The cost of the deferral is scan width, and it is additive and bounded: the floor can trail
+ * `now - RESTORED_EXECUTION_EVIDENCE_LAG_MS` by at most this much, so the probe covers at
+ * most `RESTORED_EXECUTION_EVIDENCE_LAG_MS + RESTORED_EXECUTION_WATERMARK_MIN_ADVANCE_MS`
+ * (49h) rather than the action's whole life.
+ */
+export const RESTORED_EXECUTION_WATERMARK_MIN_ADVANCE_MS = 60 * 60 * 1000;
+
 export const RESTORED_EXECUTION_DISCHARGE_KINDS = (
   Object.keys(RECOVERY_ACTION_KIND_DISCHARGED_BY_RESTORED_EXECUTION) as IssueRecoveryActionKind[]
 ).filter((kind) => RECOVERY_ACTION_KIND_DISCHARGED_BY_RESTORED_EXECUTION[kind]);
