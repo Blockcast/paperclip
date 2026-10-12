@@ -832,10 +832,6 @@ spec:
                   "github": {
                     "command": "${LOCAL_BIN}/github-mcp-server",
                     "args": ["stdio"]
-                  },
-                  "linear": {
-                    "type": "http",
-                    "url": "http://linear-mcp-server.paperclip.svc.cluster.local:8000/mcp"
                   }${GBRAIN_JSON}
                 }
               }

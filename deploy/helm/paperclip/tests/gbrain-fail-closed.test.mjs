@@ -193,7 +193,7 @@ test("mcp.json omits gbrain entirely when the mint failed — never writes a nul
   assert.doesNotMatch(raw, /null/, "no null literal may appear in the written config");
 
   // The rest of the baseline must survive untouched.
-  for (const name of ["paperclip", "prometheus", "tempo", "k8s-ro", "github", "linear"]) {
+  for (const name of ["paperclip", "prometheus", "tempo", "k8s-ro", "github"]) {
     assert.ok(parsed.mcpServers[name], `expected ${name} to remain in mcp.json`);
   }
 });
@@ -207,7 +207,7 @@ test("mcp.json keeps gbrain when a Bearer was minted", () => {
   assert.equal(parsed.mcpServers.gbrain.type, "http");
   assert.match(parsed.mcpServers.gbrain.url, /:3130\/mcp$/);
   assert.equal(parsed.mcpServers.gbrain.headers.Authorization, "Bearer test-token");
-  assert.ok(parsed.mcpServers.linear, "sibling servers must be unaffected");
+  assert.ok(parsed.mcpServers.github, "sibling servers must be unaffected");
 });
 
 test("fail-closed branch 1: no Authbot clients bundle available", () => {
