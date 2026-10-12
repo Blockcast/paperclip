@@ -4,6 +4,11 @@ type ExecutionWorkspaceGuardTarget = Pick<ExecutionWorkspace, "closedAt" | "mode
 
 const CLOSED_EXECUTION_WORKSPACE_STATUSES = new Set<ExecutionWorkspace["status"]>(["archived", "cleanup_failed"]);
 
+/** Does this status, on its own, mean "closed"? */
+export function isClosedExecutionWorkspaceStatus(status: ExecutionWorkspace["status"]): boolean {
+  return CLOSED_EXECUTION_WORKSPACE_STATUSES.has(status);
+}
+
 /**
  * Mode-independent: is this workspace closed, whatever kind it is?
  *
