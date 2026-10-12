@@ -118,14 +118,9 @@ describeEmbeddedPostgres("issueService.create assignee default", () => {
   it("falls back to the company default responsible user when nothing else identifies an owner", async () => {
     const companyId = await seedCompany("operator-1");
 
-    // The shape every alertmanager row has: no creating agent (0 of 7,564 live
-    // rows carry one) and nothing that resolves a responsible user. 2,919 live
-    // rows were created this way, so a throw here would refuse to record the
-    // alert rather than record it with an owner.
     const issue = await svc.create(companyId, {
-      title: "plugin-filed, no agent and no responsible user",
+      title: "manual, no agent and no responsible user",
       status: "todo",
-      originKind: "plugin:paperclip-plugin-alertmanager",
     });
 
     const [persisted] = await db.select().from(issues).where(eq(issues.id, issue.id));
@@ -134,12 +129,37 @@ describeEmbeddedPostgres("issueService.create assignee default", () => {
     expect(persisted?.assigneeAgentId).toBeNull();
   });
 
+  it("leaves retrofit-owned origins as created, so the alertmanager owner retrofit still applies", async () => {
+    const companyId = await seedCompany("operator-1");
+    const ownerAgentId = await seedAgent(companyId, "owner");
+
+    // The alertmanager owner retrofit (BLO-40764) patches `{ assigneeAgentId }`
+    // alone. A defaulted `assigneeUserId` made that patch 422 with "Issue can
+    // only have one assignee" on every re-fire, so these origins get no default.
+    for (const originKind of ["plugin:paperclip-plugin-alertmanager", "github_dependabot_alert"]) {
+      const issue = await svc.create(companyId, { title: `filed by ${originKind}`, status: "todo", originKind });
+      const [created] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(created?.assigneeUserId).toBeNull();
+      expect(created?.assigneeAgentId).toBeNull();
+    }
+
+    const [alertRow] = await db.select().from(issues)
+      .where(eq(issues.originKind, "plugin:paperclip-plugin-alertmanager"));
+    await svc.update(alertRow!.id, { assigneeAgentId: ownerAgentId });
+    const [retrofitted] = await db.select().from(issues).where(eq(issues.id, alertRow!.id));
+    expect(retrofitted?.assigneeAgentId).toBe(ownerAgentId);
+    expect(retrofitted?.assigneeUserId).toBeNull();
+  });
+
   it("rejects a create when the company has no default responsible user either", async () => {
     const companyId = await seedCompany();
 
     await expect(
       svc.create(companyId, { title: "nobody to own this", status: "todo" }),
-    ).rejects.toMatchObject({ status: 422 });
+    ).rejects.toMatchObject({
+      status: 422,
+      message: expect.stringContaining("Issue requires an assignee"),
+    });
 
     // The reject must not leave a half-created row behind.
     const rows = await db.select().from(issues);
