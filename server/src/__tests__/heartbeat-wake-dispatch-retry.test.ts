@@ -732,6 +732,52 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       expect(error).not.toContain(DEAD_LETTER_BIND_PARAM);
     });
 
+    it("records the driver SQLSTATE on the reconciler re-arm's lastError, which the exhausted row keeps", async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const wakeupRequestId = randomUUID();
+      const now = new Date();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_review_submitted",
+        payload: {
+          dispatchRetry: {
+            // attempts: 2 => this pass computes 3 < DISPATCH_RETRY_MAX_ATTEMPTS and re-arms.
+            attempts: 2,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_review_submitted",
+              payload: GITHUB_REVIEW_PAYLOAD,
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+
+      const failingHeartbeat = heartbeatService(
+        dbWithFailingInserts(db, Number.MAX_SAFE_INTEGER, makeDrizzlePgError),
+        { skipQueuedRunDispatch: true },
+      );
+      const result = await failingHeartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.stillFailing).toBe(1);
+
+      const [row] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId));
+      expect(row!.status).toBe("dispatch_failed");
+      const retryState = (row!.payload as { dispatchRetry?: { lastError?: string } } | null)?.dispatchRetry;
+      // The terminal write sets only `error`, so this payload field survives
+      // onto the dispatch_failed_exhausted row; it must not carry the params.
+      expect(retryState?.lastError ?? "").toContain("SQLSTATE 23503");
+      expect(retryState?.lastError ?? "").not.toContain(DEAD_LETTER_BIND_PARAM);
+    });
+
     it("records the driver SQLSTATE on the inline safety-net row's lastError", async () => {
       const { agentId } = await seedCompanyAndAgent();
       const failingHeartbeat = heartbeatService(
