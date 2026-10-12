@@ -10869,6 +10869,95 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     /**
+     * PEN-3983: `enqueueWakeup` returning null is NOT proof that no run was queued, and the
+     * refund must not treat it as such. The provider-capacity gate POSTPONES a wake rather
+     * than declining it — it commits a durable `scheduled_retry` run and then returns null
+     * (`heartbeat.ts`, BLO-31344). That run is later promoted, dispatched through the
+     * recovery lane, and executed.
+     *
+     * Before this fix the refund fired anyway, so the action dropped back to
+     * `attemptCount: 0` while its wake was still on its way. That reading is what the
+     * horizon then retired as wake-exhausted and labelled `never_delivered`. Measured on
+     * the live fleet 2026-10-12: of the 100 most recent recovery actions, 49 sat at
+     * `attemptCount: 0` and all 49 carried `nonDeliverySweepCount >= 1` — every zero in
+     * the population was minted by this refund. On the four actions PEN-3983 was filed
+     * from, three of the parked wakes later ran and SUCCEEDED, 2.3-2.7h after their
+     * actions had already been retired for never being woken.
+     *
+     * The mock reproduces the gate exactly: commit a `scheduled_retry` run carrying the
+     * wake's own `contextSnapshot` (which is where `recoveryActionId` lives), then return
+     * null.
+     */
+    it("keeps the attempt spent when the capacity gate parked a run and returned null", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      await seedStrandedJobMissingRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: null,
+      });
+      const parkedRunIds: string[] = [];
+      const enqueueWakeup = vi.fn(async (agentId: string, opts: any) => {
+        const snapshot = opts?.contextSnapshot ?? {};
+        if (snapshot.source === "issue_recovery_action") {
+          const runId = randomUUID();
+          parkedRunIds.push(runId);
+          await db.insert(heartbeatRuns).values({
+            id: runId,
+            companyId,
+            agentId,
+            invocationSource: "assignment",
+            status: "scheduled_retry",
+            scheduledRetryAt: new Date("2026-09-07T18:00:00.000Z"),
+            scheduledRetryReason: "ccrotate_capacity",
+            errorCode: "rate_limit_exhausted",
+            contextSnapshot: snapshot,
+          });
+        }
+        return null;
+      });
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      // The gate really did commit a run — without this the assertion below would pass for
+      // the wrong reason, on a sweep that never reached the recovery wake at all.
+      expect(parkedRunIds).toHaveLength(1);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action).toMatchObject({ attemptCount: 1, nonDeliverySweepCount: 0 });
+    });
+
+    /**
+     * PEN-3983 control. The refund still has to fire on the paths that genuinely queue
+     * nothing — a pause hold, a cooldown, wake-on-demand disabled. Without this the fix
+     * above could be "never refund", which would restore the unbounded budget BLO-18996
+     * and BLO-19124 closed. Same sweep, same null return, no committed run.
+     */
+    it("still refunds the attempt when the null return queued nothing", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      await seedStrandedJobMissingRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: null,
+      });
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action.attemptCount).toBe(0);
+      expect(action.nonDeliverySweepCount).toBeGreaterThanOrEqual(1);
+    });
+
+    /**
      * BLO-32566 (review): the exhaustion gate inside `enqueueSourceScopedStrandedRecoveryWake`
      * refuses to enqueue once the action's wake budget is spent, so a refused newest run on an
      * exhausted action must produce no delivered-escalation telemetry. The transaction-time

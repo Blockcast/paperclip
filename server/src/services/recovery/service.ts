@@ -194,6 +194,14 @@ class ProviderQuotaMonitorRollback extends Error {
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
+/**
+ * Heartbeat-run statuses meaning "this run has not finished and is still going to run".
+ *
+ * Deliberately a POSITIVE list rather than the complement of the terminal set: a status
+ * added upstream would silently read as pending through a `notInArray` test, and the
+ * consumer below turns "pending" into "this wake was delivered" (PEN-3983).
+ */
+const PENDING_HEARTBEAT_RUN_STATUSES = ["queued", "scheduled_retry", "running"] as const;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
@@ -2492,6 +2500,55 @@ export function recoveryService(
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Is a wake run for this recovery action still on its way?
+   *
+   * PEN-3983. `enqueueWakeup` returning null does NOT mean "no run was queued", though the
+   * refund in `enqueueOrRefundAttempt` used to assume exactly that. The provider-capacity
+   * gate is the exception, and on this fleet it is the DOMINANT null path: it does not
+   * decline a wake, it POSTPONES it — committing a durable `scheduled_retry` run and then
+   * returning null. The gate says so itself (`heartbeat.ts`, BLO-31344): "The capacity gate
+   * does not decline a wake, it *postpones* it: it commits a `scheduled_retry` run and
+   * returns null." That row is later promoted to `queued`, dispatched through the recovery
+   * lane, and executed.
+   *
+   * So the refund's stated premise — every null path "either writes a *skipped* request row
+   * or nothing at all. None of them queues a run" — is false for that one path, and the
+   * consequence was not cosmetic. Measured 2026-10-12 across the 100 most recent recovery
+   * actions: 49 sat at `attemptCount: 0` and ALL 49 carried `nonDeliverySweepCount >= 1`,
+   * i.e. every zero in the population was minted by this refund and none by any other route.
+   * On the four actions PEN-3983 was filed from, all four were refunded to 0 while their wake
+   * runs sat parked on `ccrotate_capacity`; three of those runs then promoted, dispatched and
+   * SUCCEEDED (`9e4ef21c`, `da1039b8`, `a48593dc`, started 10:00-10:26Z) — 2.3-2.7h AFTER the
+   * horizon had retired their actions as wake-exhausted and labelled them `never_delivered`.
+   *
+   * The test is for a run that is still PENDING, not merely for one that exists: a terminal
+   * run says nothing about whether this attempt ever reached anyone, whereas a `queued` /
+   * `scheduled_retry` / `running` row is positive evidence that it did.
+   *
+   * Over-crediting is bounded and is the safe direction. At worst a pending run left by an
+   * earlier attempt keeps one attempt of five spent on a sweep that enqueued nothing itself —
+   * and that is arguably the right reading anyway, since a wake for this action IS in flight.
+   * `timeoutAt` bounds the row on wall-clock regardless of `attemptCount`, so this cannot
+   * reopen the unbounded loop BLO-18996/BLO-19124 closed. Under-crediting is what produced
+   * the incident.
+   */
+  async function hasPendingWakeRunForRecoveryAction(
+    companyId: string,
+    recoveryActionId: string,
+  ): Promise<boolean> {
+    const [row] = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' = ${recoveryActionId}`,
+        inArray(heartbeatRuns.status, [...PENDING_HEARTBEAT_RUN_STATUSES]),
+      ))
+      .limit(1);
+    return Boolean(row);
   }
 
   // BLO-18860: the run that took over `adoptedRun`'s checkout — i.e. the run the
@@ -6515,6 +6572,33 @@ export function recoveryService(
         throw error;
       }
       if (!queued) {
+        // PEN-3983: a null return means "nobody was woken" for the paths that write a skipped
+        // request row or nothing at all — but NOT for the provider-capacity deferral, which
+        // commits a durable `scheduled_retry` run and returns null anyway. Refunding there
+        // records a wake that is demonstrably still on its way as never delivered, which is
+        // what made `attemptCount: 0` the dominant reading on this fleet. See
+        // `hasPendingWakeRunForRecoveryAction` for the measurement.
+        let wakeIsStillPending = false;
+        try {
+          wakeIsStillPending = await hasPendingWakeRunForRecoveryAction(
+            input.issue.companyId,
+            input.action.id,
+          );
+        } catch (error) {
+          // Fall back to the pre-PEN-3983 behaviour and refund. Over-refunding costs at most
+          // one attempt of five and `timeoutAt` bounds the row either way, whereas throwing
+          // from here would abort an escalation whose status transition has already committed.
+          logger.warn(
+            {
+              err: error,
+              companyId: input.issue.companyId,
+              issueId: input.issue.id,
+              recoveryActionId: input.action.id,
+            },
+            "could not determine whether a recovery wake run is still pending; refunding the attempt",
+          );
+        }
+        if (wakeIsStillPending) return queued;
         await refundUnspentWakeAttempt("enqueue_not_delivered");
         return queued;
       }
