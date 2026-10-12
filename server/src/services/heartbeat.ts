@@ -40729,7 +40729,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ...retryState,
               attempts,
               nextAttemptAt: new Date(now.getTime() + backoffMs).toISOString(),
-              lastError: err instanceof Error ? err.message : String(err),
+              lastError: describeWakeDispatchError(err),
             },
           },
           updatedAt: now,
