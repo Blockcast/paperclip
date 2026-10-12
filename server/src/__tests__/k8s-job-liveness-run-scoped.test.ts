@@ -22,7 +22,16 @@
  * unless the delete confirms the Job is gone. The "delayed pod creation /
  * controller retry" and "still genuinely active" cases below cover that.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { logger } from "../middleware/logger.js";
+import {
+  _resetAgentStartLocksForTesting,
+  AgentStartLockAbortedError,
+  currentAgentStartLockSignal,
+  LOCK_HELD_WARN_MS,
+  withAgentStartLock,
+} from "../services/agent-start-lock.js";
 
 const mockListNamespacedJob = vi.hoisted(() => vi.fn());
 const mockListNamespacedPod = vi.hoisted(() => vi.fn());
@@ -391,5 +400,83 @@ describe("hasActiveJobForAgent run-id awareness (BLO-20801)", () => {
     expect(result).toBe(true);
     expect(mockListNamespacedJob).toHaveBeenCalled();
     expect(mockDeleteNamespacedJob).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * BLO-42493 wiring. `agent-start-lock-abort.test.ts` proves the
+ * `rethrowIfAgentStartLockAborted` helper inside a synthetic section; these
+ * drive the real `hasActiveJobForAgent` inside a real, aborted agent start lock
+ * section, so deleting either of its two guard call sites goes red here. The
+ * non-aborted twins above ("still fails open", "fails closed ... when
+ * isRunTerminal rejects") are the negative controls: the same faults outside an
+ * aborted section must keep their fail-open / fail-closed answers.
+ */
+describe("hasActiveJobForAgent propagates the dispatch section's abort (BLO-42493)", () => {
+  /** Hand-copied from `agent-start-lock.ts` (not exported); see `stillHeld`. */
+  const LOCK_ABORT_MS = 4 * 60 * 60_000;
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    _resetAgentStartLocksForTesting();
+  });
+
+  /** An await that rejects with `reason(signal)` once this section is aborted. */
+  function rejectOnAbort(reason: (signal: AbortSignal) => unknown): Promise<never> {
+    const signal = currentAgentStartLockSignal();
+    expect(signal, "test bug: not inside an agent start lock section").toBeDefined();
+    return new Promise<never>((_resolve, reject) => {
+      const fail = () => reject(reason(signal!));
+      if (signal!.aborted) fail();
+      else signal!.addEventListener("abort", fail, { once: true });
+    });
+  }
+
+  /** Runs `fn` as a real start-lock section and drives it past the abort budget. */
+  async function settleInAbortedSection<T>(fn: () => Promise<T>) {
+    vi.useFakeTimers();
+    vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    vi.spyOn(logger, "error").mockImplementation(() => logger);
+    const settled = withAgentStartLock(randomUUID(), fn, { onCoalesced: () => undefined as T }).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + LOCK_HELD_WARN_MS);
+    // A section the abort never reached would hang the `await` forever; racing
+    // a settled sentinel turns that (or a drifted LOCK_ABORT_MS) into a failure.
+    return Promise.race([settled, Promise.resolve({ stillHeld: true as const })]);
+  }
+
+  it("rethrows a 57014-cancelled isRunTerminal instead of failing closed on it", async () => {
+    // The dominant abort path: postgres.js `Query#cancel()` rejects the
+    // in-flight DB lookup with an ordinary `57014 query_canceled`. Without the
+    // inner guard it is absorbed as an isRunTerminal failure and the section
+    // carries on with `true` — holding the agent's start lock.
+    mockListNamespacedJob.mockResolvedValue({
+      items: [terminalJob("run-unknown", { active: 1, succeeded: 0, failed: 0 })],
+    });
+
+    const outcome = await settleInAbortedSection(() =>
+      hasActiveJobForAgent(AGENT_ID, {
+        isRunTerminal: () =>
+          rejectOnAbort(() =>
+            Object.assign(new Error("canceling statement due to user request"), { code: "57014" }),
+          ),
+      }),
+    );
+
+    expect(outcome).toEqual({ error: expect.objectContaining({ code: "57014" }) });
+  });
+
+  it("rethrows an abort raised under the fail-open catch instead of reporting a kube outage", async () => {
+    // The outer catch spans every await in the function. Without its guard an
+    // abort landing anywhere in them is reported as "kube API unreachable" and
+    // the section carries on with `false`.
+    mockListNamespacedJob.mockImplementation(() => rejectOnAbort((signal) => signal.reason));
+
+    const outcome = await settleInAbortedSection(() => hasActiveJobForAgent(AGENT_ID));
+
+    expect(outcome).toEqual({ error: expect.any(AgentStartLockAbortedError) });
   });
 });

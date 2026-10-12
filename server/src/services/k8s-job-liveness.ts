@@ -1108,6 +1108,11 @@ export async function deleteStaleTerminalJob(
       requestOptionsWithTimeout(),
     );
   } catch (error) {
+    // Unguarded against the dispatch section's abort (BLO-42493), and
+    // unreachable by it while the abort is DB-only (postgres.js `Query#cancel`):
+    // this function awaits only kube calls and a sleep. Threading the section signal
+    // into `requestOptionsWithTimeout()` makes this catch, and the re-read catch
+    // below, live holes — add `rethrowIfAgentStartLockAborted(error)` first.
     if (isKubernetesNotFoundError(error)) return "missing";
     logger.warn(
       { identity, error: error instanceof Error ? error.message : String(error) },
@@ -1408,6 +1413,9 @@ export async function hasActiveJobForAgent(
       );
       return (podRes.items ?? []).some(isActiveOrTerminatingAgentPod);
     } catch (error) {
+      // Unguarded against the section abort (BLO-42493) and unreachable by it
+      // while the abort is DB-only: this wraps a kube call alone. Threading the
+      // signal into `requestOptionsWithTimeout()` makes it a live hole.
       if (staleWaivedJobs.length > 0) {
         const reason = error instanceof Error ? error.message : String(error);
         logger.warn(

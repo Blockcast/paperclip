@@ -293,14 +293,18 @@ export function currentAgentStartLockSignal(): AbortSignal | undefined {
  * `57014 query_canceled` — an ordinary database error, carrying nothing that
  * identifies it as this section's abort. `instanceof AgentStartLockAbortedError`
  * would therefore pass exactly the case this guard exists to catch, while
- * looking correct. Only a section that has NOT been aborted reaches an
- * untouched `catch`, so testing the signal is both sufficient and exact.
+ * looking correct. Testing the signal is sufficient but deliberately broader
+ * than "this error is the abort": once the signal has fired, the guard rethrows
+ * *any* error, including one unrelated to the abort (an unabortable await that
+ * outlived the abort settles, and a later kube call then returns 503). That is
+ * intended — the section is being torn down either way, and swallowing anything
+ * after the abort keeps the lock held just the same.
  *
  * Rethrows the original error when it is one, so the catch site's own log keeps
  * naming the real fault rather than a synthesized stand-in.
  */
 export function rethrowIfAgentStartLockAborted(error: unknown): void {
-  const signal = sectionSignals.getStore();
+  const signal = currentAgentStartLockSignal();
   if (!signal?.aborted) return;
   if (error instanceof Error) throw error;
   if (signal.reason instanceof Error) throw signal.reason;
