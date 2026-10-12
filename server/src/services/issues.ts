@@ -838,8 +838,13 @@ export interface IssueFilters {
    * over it re-orders rows mid-sweep, so an exhaustive walk both duplicates and skips
    * rows. "id" sorts by the immutable primary key instead: rows never move, so a walk
    * is safe to paginate. Pair it with `afterId` for a keyset cursor.
+   *
+   * "pick" is the agent work-pick order (BLO-44922): priority band first, then OLDEST
+   * first within the band. The default order is newest-activity first within a band,
+   * so under inflow >= drain the oldest row's in-band rank grows without bound and it
+   * is never reached. Created-at is also immutable, so offset paging stays stable.
    */
-  sortField?: "updated" | "id";
+  sortField?: "updated" | "id" | "pick";
   sortDir?: "asc" | "desc";
   /** Keyset cursor: return only rows with `id > afterId`. Requires sortField "id". */
   afterId?: string;
@@ -2271,6 +2276,9 @@ function issueListOrderBy(
     // row between pages. Relevance ranking is deliberately dropped: a stable walk that
     // visits every row exactly once is the whole point of this mode.
     return [sortDir === "desc" ? desc(issues.id) : asc(issues.id)];
+  }
+  if (sortField === "pick") {
+    return [asc(priorityOrder), asc(issues.createdAt), asc(issues.id)];
   }
   if (sortField === "updated") {
     const activityOrder = sortDir === "asc"
