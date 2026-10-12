@@ -14340,6 +14340,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return;
     }
 
+    // BLO-36049: this notice reports what ONE reviewer run did, and was emitted
+    // without re-reading the artifact — so it fired on PRs that had already
+    // merged (Blockcast/paperclip#1375: 2h20m after merge) and on heads that
+    // already carried a clean review (#1375 again, ~1d21h earlier;
+    // trafficcontrol#2001). On a merged PR the remedy is meaningless; on an
+    // open one with an at-head review it invites a push that voids it.
+    // Deliberately after the linked-issue lookup, so a notice with nobody to
+    // tell costs no GitHub calls. Fail-soft toward NOTIFYING: an unreadable PR
+    // or evidence surface keeps the status-quo notice, because this notifier's
+    // failure mode is the silence BLO-33589 exists to remove.
+    const suppressedBy = await prReviewGateNoticeSuppression(target);
+    if (suppressedBy) {
+      logger.info(
+        {
+          runId: run.id,
+          repoFullName: target.repoFullName,
+          prNumber: target.prNumber,
+          headSha: target.sha,
+          suppressedBy,
+        },
+        "suppressed failed PR-review gate notice: artifact state already answers it",
+      );
+      return;
+    }
+
     const shortSha = target.sha.slice(0, 7);
     const cause = reason === "retry_exhausted"
       ? "exhausted its automatic retries"
@@ -14380,7 +14405,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted by that run**, and the gate below is red on its behalf.`,
       "",
       `- Head: \`${target.sha}\``,
-      `- Gate status: \`${target.context}\` set to \`failure\` on that commit`,
+      // BLO-36049: the status is only QUEUED here. The outbox re-checks
+      // reviewer evidence and may skip the write, so claiming it was "set"
+      // was measured false on paperclip#1375 and trafficcontrol#2001.
+      `- Gate status: a \`failure\` for \`${target.context}\` is queued for that commit (the delivery is skipped if a review is found there first)`,
       mergeImpact,
       ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
       `- Reviewer run: \`${run.id}\``,
@@ -14411,6 +14439,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         });
     }
+  }
+
+  /**
+   * BLO-36049: `null` means "emit the notice". The evidence read is the same
+   * predicate the status outbox uses before writing the failure, so the two
+   * cannot disagree about whether a review exists — it reads both surfaces
+   * (formal reviews + `## Ally` comments) and attests head via the immutable
+   * `Reviewed head:` marker, never `reviews[].commit_id` (BLO-34666).
+   */
+  async function prReviewGateNoticeSuppression(
+    target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
+  ): Promise<"pull_request_closed" | "reviewer_evidence_found" | null> {
+    const pr = await githubGetPullRequestGate({
+      repoFullName: target.repoFullName,
+      prNumber: target.prNumber,
+    }).catch(() => ({ error: "pull_request_gate_threw" }));
+    if ("state" in pr && pr.state === "closed") return "pull_request_closed";
+
+    const evidence = await githubHasReviewerEvidenceForPr({
+      repoFullName: target.repoFullName,
+      prNumber: target.prNumber,
+      headSha: target.sha,
+    }).catch(() => ({ error: "reviewer_evidence_threw" }));
+    if ("found" in evidence && evidence.found) return "reviewer_evidence_found";
+    return null;
   }
 
   async function notifyOneLinkedIssueOfFailedPrReviewGate(
