@@ -13,7 +13,7 @@ test("PR jobs do not install an ineffective compiler cache", async () => {
   assert.doesNotMatch(workflow, /sccache|SCCACHE|RUSTC_WRAPPER/);
 });
 
-test("Docker builds use persistent remote BuildKit, exact-SHA cache, and bounded compression", async () => {
+test("Docker builds use persistent remote BuildKit, master cache, and bounded compression", async () => {
   const workflow = await readFile(dockerWorkflowPath, "utf8");
   const agentWorkflow = await readFile(dockerAgentWorkflowPath, "utf8");
   const buildJob = workflow.match(/\n  build-and-push:\n([\s\S]*?)\n  deploy:\n/)?.[1];
@@ -51,13 +51,15 @@ test("Docker builds use persistent remote BuildKit, exact-SHA cache, and bounded
     agentWorkflow,
     /uses: docker\/setup-buildx-action@v4\n        with:\n          driver: remote\n          endpoint: \$\{\{ steps\.buildkit-endpoint\.outputs\.endpoint \}\}\n/,
   );
+  assert.doesNotMatch(buildJob, /buildcache-\$\{\{ steps\.target\.outputs\.full \}\}/);
+  assert.match(buildJob, /type=raw,value=\$\{\{ steps\.image_tag\.outputs\.value \}\}/);
   assert.match(
     buildJob,
-    /type=raw,value=buildcache-\$\{\{ steps\.target\.outputs\.full \}\}-k8s-vendored/,
+    /type=raw,value=latest-k8s-vendored,enable=\$\{\{ github\.ref == 'refs\/heads\/master' && github\.event_name != 'workflow_dispatch' \}\}/,
   );
   assert.match(
     buildJob,
-    /cache-from: \|\n            type=registry,ref=harbor\.blockcast\.net\/paperclip\/paperclip:buildcache-\$\{\{ steps\.target\.outputs\.full \}\}-k8s-vendored\n            type=registry,ref=harbor\.blockcast\.net\/paperclip\/paperclip:latest-k8s-vendored\n            type=registry,ref=harbor\.blockcast\.net\/paperclip\/paperclip:buildcache-v6\n/,
+    /cache-from: \|\n            type=registry,ref=harbor\.blockcast\.net\/paperclip\/paperclip:latest-k8s-vendored\n            type=registry,ref=harbor\.blockcast\.net\/paperclip\/paperclip:buildcache-v6\n/,
   );
   assert.match(buildJob, /cache-to: type=inline/);
   assert.match(
