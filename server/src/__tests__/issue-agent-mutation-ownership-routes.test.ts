@@ -551,10 +551,18 @@ function allowStandardAgentRootIssueCreation() {
   }));
 }
 
-function createAuthorizationDecisionDb(input: { actor?: { agentId?: string | null } }, agentRows: Record<string, unknown>[]) {
+function createAuthorizationDecisionDb(
+  input: { actor?: { agentId?: string | null } },
+  agentRows: Record<string, unknown>[],
+  issueRows: Record<string, unknown>[] = [],
+) {
   const rowsForSelection = (selection: Record<string, unknown>) => {
     const keys = Object.keys(selection);
     if (keys.includes("contextSnapshot")) return [];
+    // The authorization service's own issue read (`loadIssue`). Empty by default:
+    // since BLO-29127 a company-scoped miss fails closed, so a test whose decision
+    // reads the row must hand the double the row the route itself sees.
+    if (keys.includes("originKind") && keys.includes("assigneeAgentId")) return issueRows;
     if (keys.includes("reportsTo") && keys.length <= 2) return agentRows;
     if (keys.includes("role") && keys.includes("permissions")) {
       return agentRows.filter((agent) => agent.id === input.actor?.agentId);
@@ -584,11 +592,14 @@ function createAuthorizationDecisionDb(input: { actor?: { agentId?: string | nul
   };
 }
 
-function useProductionIssueAuthorization(agentRows: Record<string, unknown>[]) {
+function useProductionIssueAuthorization(
+  agentRows: Record<string, unknown>[],
+  issueRows: Record<string, unknown>[] = [],
+) {
   mockAccessService.decide.mockImplementation(async (input: { actor?: { agentId?: string | null }; action: string }) => {
     const { authorizationService } =
       await vi.importActual<typeof import("../services/authorization.js")>("../services/authorization.js");
-    return authorizationService(createAuthorizationDecisionDb(input, agentRows) as never).decide(input as never);
+    return authorizationService(createAuthorizationDecisionDb(input, agentRows, issueRows) as never).decide(input as never);
   });
 }
 
@@ -5166,10 +5177,10 @@ describe("agent issue mutation checkout ownership", () => {
     ["reassign", { assigneeAgentId: peerAgentId }],
     ["cancel", { status: "cancelled" }],
   ])("allows a manager-chain agent to %s an issue held by a non-invokable assignee", async (_kind, body) => {
-    useProductionIssueAuthorization([
-      makeAgent(peerAgentId),
-      makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }),
-    ]);
+    useProductionIssueAuthorization(
+      [makeAgent(peerAgentId), makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" })],
+      [makeIssue({ assigneeAgentId: ownerAgentId })],
+    );
     mockAgentService.getById.mockResolvedValue(makeAgent(ownerAgentId, { reportsTo: peerAgentId, status: "paused" }));
     mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(peerAgentId) });
     mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
