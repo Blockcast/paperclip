@@ -19,7 +19,7 @@ const STUCK_COVER_RECONCILE_LIMIT = 200;
  * `createSweepLivenessReader`'s short-circuit, one hanging Alertmanager costs a
  * sweep at most one of these, however many issues are due.
  */
-const ALERTMANAGER_READ_TIMEOUT_MS = 5_000;
+export const ALERTMANAGER_READ_TIMEOUT_MS = 5_000;
 
 function q(ns: string, table: string): string {
   return `${ns}.${table}`;

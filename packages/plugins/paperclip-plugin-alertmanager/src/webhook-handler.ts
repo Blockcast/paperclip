@@ -1668,7 +1668,7 @@ export function isAlertmanagerPayload(
  * firing at upgrade time would look new — duplicating live issues and orphaning
  * the originals so their resolution could never close them.
  */
-async function readAlertState(
+export async function readAlertState(
   ctx: PluginContext,
   companyId: string,
   fingerprint: string,

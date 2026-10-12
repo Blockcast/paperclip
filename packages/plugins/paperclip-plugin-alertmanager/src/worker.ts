@@ -23,6 +23,7 @@ import {
 } from "@paperclipai/plugin-sdk";
 import { handleWebhook, reconcileAbandonedAggregateFences } from "./webhook-handler.js";
 import { runAlertEscalationSweep } from "./escalation.js";
+import { reconcileActiveAlerts } from "./reconcile.js";
 import {
   authenticateWebhook,
   CompanyScopeUnavailableError,
@@ -70,6 +71,25 @@ export const plugin = definePlugin({
         );
       }
       await runAlertEscalationSweep(ctx, config);
+    });
+    ctx.jobs.register("reconcile-active-alerts", async (job: PluginJobContext) => {
+      // Same scope rules as the sweep: a run that silently does nothing would
+      // report success while the backfill it exists for never happens.
+      if (!job.companyId) {
+        throw new CompanyScopeUnavailableError(
+          "paperclip-plugin-alertmanager: alert reconcile cannot run without a company scope",
+        );
+      }
+      const config = await resolveEscalationSweepConfig(ctx, job.companyId);
+      if (!config) {
+        throw new CompanyScopeUnavailableError(
+          `paperclip-plugin-alertmanager: alert reconcile cannot run for company ${job.companyId} — no matching stored config`,
+        );
+      }
+      const result = await reconcileActiveAlerts(ctx, config);
+      if (result.skipped) {
+        ctx.logger.debug(`paperclip-plugin-alertmanager: alert reconcile skipped: ${result.skipped}`);
+      }
     });
     ctx.logger.info("paperclip-plugin-alertmanager started");
   },

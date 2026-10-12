@@ -136,6 +136,16 @@ export interface AlertmanagerPluginConfig {
    */
   alertmanagerApiUrl?: string;
   /**
+   * Alertmanager receiver names whose alerts belong to this company
+   * (BLO-44820). When set, the `reconcile-active-alerts` job reads the alerts
+   * Alertmanager holds active at `alertmanagerApiUrl` and files any routed to
+   * one of these receivers that has no state row — the backfill for a webhook
+   * Alertmanager gave up on while the control plane was down. Unset disables
+   * the job, because without it there is no way to tell which tenant an
+   * active alert was delivered to.
+   */
+  reconcileReceivers?: string[];
+  /**
    * Width (minutes) of the board-cover dedup window (BLO-15982). Concurrent
    * same-alertname escalation ladders that reach the cover rung within the
    * same window bucket share one retained cover instead of each opening
