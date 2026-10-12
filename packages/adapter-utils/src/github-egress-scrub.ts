@@ -180,6 +180,18 @@ function shannonEntropyBitsPerChar(value: string): number {
  *  inside each run. */
 const LEXICAL_SEGMENT_RE = /^(?:[A-Za-z]+|[0-9]+)$/;
 
+/** BLO-44747: a word carrying ONE short digit run — `orc8r`, `k8s`, `ipv6`,
+ *  `i18n`, `eastus2`. Infrastructure names are built from these, and the
+ *  strict form above refused them: the orc8r CDN forward-queue federate job, a
+ *  Prometheus scrape-job name already public on onprem-k8s master, made every
+ *  agent push touching that file unpublishable. Bounded so it stays a word:
+ *  must open with a letter, one digit run of at most 2, and an exonerated value
+ *  may carry at most ONE such segment. A UUID stays opaque — `386c81e8` opens
+ *  with a digit, `e454` has a 3-digit run. This is NOT a widening of
+ *  LEXICAL_SEGMENT_RE: a random token mixes letters and digits repeatedly, and
+ *  one mixed segment per value admits a few bits, not an opaque run. */
+const MIXED_LEXICAL_SEGMENT_RE = /^(?=.{2,8}$)[A-Za-z]+[0-9]{1,2}[A-Za-z]*$/;
+
 /** Longest segment an identifier may carry and still be exonerated. This is
  *  identifier HEADROOM, not a security bound: 16 random lowercase letters is
  *  already ~75 bits, so a segment at the limit is a usable secret on its own.
@@ -245,10 +257,9 @@ function isLexicalIdentifier(value: string): boolean {
   if (longSegments > 1) return false;
   const contentLength = segments.reduce((sum, s) => sum + s.length, 0);
   if (contentLength > LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH) return false;
-  return segments.every(
-    (segment) =>
-      segment.length <= LEXICAL_SEGMENT_MAX_LENGTH && LEXICAL_SEGMENT_RE.test(segment),
-  );
+  if (segments.some((s) => s.length > LEXICAL_SEGMENT_MAX_LENGTH)) return false;
+  const nonPlain = segments.filter((s) => !LEXICAL_SEGMENT_RE.test(s));
+  return nonPlain.length === 0 || (nonPlain.length === 1 && MIXED_LEXICAL_SEGMENT_RE.test(nonPlain[0]!));
 }
 
 /** Character classes a value must draw from at least two of, before the entropy
@@ -284,6 +295,8 @@ function isLexicalIdentifier(value: string): boolean {
  *  reach them: homogeneous letter-or-digit runs are precisely what keeps
  *  random tokens OUT of that exemption, so loosening it trades a bounded false
  *  positive for a false negative. That residual belongs to PEN-3920.
+ *  (BLO-44747 since admits ONE such segment per value under a bounded shape —
+ *  see MIXED_LEXICAL_SEGMENT_RE; it leaves this regex untouched.)
  *
  *  Deliberately still out of reach: a single-case LETTERS-ONLY value scores
  *  one class under this form too, in both cases, so it never reaches the

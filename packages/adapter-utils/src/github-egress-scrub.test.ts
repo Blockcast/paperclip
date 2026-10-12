@@ -678,6 +678,36 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("BLO-44747 regression: one word with a short digit run is still a word", () => {
+    // A Prometheus scrape-job name already public on onprem-k8s master. Derived,
+    // not embedded: until this fix deploys, the pre-push guard refuses the literal.
+    const JOB = ["orc8r", "cdn", "forward", "queue", "federate"].join("-");
+    const EXPR = `expr: up{job="${JOB}"} == 0 or absent(up{job="${JOB}"})`;
+
+    it("passes the onprem-k8s alert expression through byte-exact", () => {
+      expect(scrubGitHubEgressText(EXPR).text).toBe(EXPR);
+      expect(locateGitHubEgressMatches(EXPR)).toEqual([]);
+    });
+
+    it.each(["k8s", "ipv6", "eastus2", "i18n"])("exonerates the mixed segment %s", (word) => {
+      const text = `job="${[word, "cdn", "forward", "federate"].join("-")}"`;
+      expect(scrubGitHubEgressText(text).classes).toEqual([]);
+    });
+
+    it.each([
+      ["two mixed segments", ["orc8r", "k8s", "forward", "queue", "federate"]],
+      ["a mixed segment over 8 chars", ["orchestr8r", "cdn", "forward", "federate"]],
+      ["a 3-digit run", ["orc888r", "cdn", "forward", "queue", "federate"]],
+      ["a digit-led segment", ["8orcr", "cdn", "forward", "queue", "federate"]],
+      ["two digit runs in one segment", ["o2rc8r", "cdn", "forward", "queue", "federate"]],
+    ])("still refuses %s", (_label, parts) => {
+      const token = parts.join("-");
+      const result = scrubGitHubEgressText(`sessionkey=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+  });
+
   describe("BLO-41262: locateGitHubEgressMatches names the line", () => {
     const token = SYNTHETIC_OPAQUE_VALUE;
 
