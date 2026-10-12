@@ -75,6 +75,7 @@ import {
   SYSTEM_ISSUE_DOCUMENT_KEYS,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   type ExecutionWorkspaceConfig,
+  type IssueExecutionState,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import {
@@ -3875,6 +3876,16 @@ async function listIssueBlockerAttentionMap(
   return attentionMap;
 }
 
+const ISSUE_LIST_EXECUTION_STATE_KEYS = [
+  "status",
+  "currentStageId",
+  "currentStageIndex",
+  "currentStageType",
+  "currentParticipant",
+  "returnAssignee",
+  "lastDecisionOutcome",
+] as const satisfies readonly (keyof IssueExecutionState)[];
+
 const issueListSelect = {
   id: issues.id,
   companyId: issues.companyId,
@@ -3918,8 +3929,24 @@ const issueListSelect = {
   requestDepth: issues.requestDepth,
   billingCode: issues.billingCode,
   assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
-  executionPolicy: sql<null>`null`,
-  executionState: sql<null>`null`,
+  // BLO-44407: these were literal `null` — present, type-correct, and unconditionally wrong — so
+  // every list-surface wake-path predicate read "no review stage, no pinned participant" on every
+  // row in the estate, scoring rows with a live reviewer as strands. Never project a forged null.
+  //
+  // `executionPolicy` is deliberately ABSENT from list rows (not null): it is unbounded, and
+  // `PATCH /issues/:id` replaces it whole, so a trimmed copy would be a lost-update trap for
+  // anyone who reads it here and writes it back (BLO-40082). Read the single-issue surface.
+  //
+  // `executionState` is server-owned, so it CAN be trimmed: only the keys below are copied, and
+  // only when present. The multi-KB `reviewRequest`, `completedStageIds`, `lastDecisionId` and
+  // `monitor` (mirrored by the monitor_* columns) are ABSENT, never null. ~150 B/row populated.
+  executionState: sql<Pick<IssueExecutionState, (typeof ISSUE_LIST_EXECUTION_STATE_KEYS)[number]> | null>`CASE
+    WHEN ${issues.executionState} IS NULL THEN NULL
+    ELSE coalesce((
+      SELECT jsonb_object_agg(key, value) FROM jsonb_each(${issues.executionState})
+      WHERE key IN (${sql.join(ISSUE_LIST_EXECUTION_STATE_KEYS.map((key) => sql`${key}`), sql`, `)})
+    ), '{}'::jsonb)
+  END`,
   monitorNextCheckAt: issues.monitorNextCheckAt,
   monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
   monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
@@ -8170,7 +8197,8 @@ export function issueService(db: Db) {
         ? (limit === undefined ? baseQuery.offset(offset) : baseQuery.limit(limit).offset(offset))
         : (limit === undefined ? baseQuery : baseQuery.limit(limit));
       const rows = await pageQuery;
-      const withLabels = await withIssueLabels(db, rows);
+      // BLO-44407: list rows carry no `executionPolicy` key at runtime (see issueListSelect).
+      const withLabels = await withIssueLabels(db, rows as IssueRow[]);
       // Both derived maps are built from the already-paginated page, so this
       // stays additive to the row shape and neutral to `limit`/`offset`.
       const [runMap, retryMap] = await Promise.all([
