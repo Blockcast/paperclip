@@ -313,12 +313,26 @@ jobs:
           fi
 
           gh workflow run docker.yml --repo "$REPO" --ref master -f target_sha="$MASTER_SHA"
-          echo "::notice::Dispatched docker.yml at $MASTER_SHA — awaiting human approval on paperclip-production."
+          # ⛔ DO NOT ASSERT THAT THIS PARKS FOR APPROVAL. Whether it does is a
+          # property of the paperclip-production reviewer set (RATIFIED_REVIEWERS in
+          # .github/scripts/check-production-environment-protection.mjs), which is
+          # EMPTY since the owner removed the required_reviewers rule on 2026-10-06
+          # (Blockcast/onprem-k8s#4913, merged 2026-10-07T01:13:11Z). Read the
+          # symbol; a parking claim in prose is a second source of truth that drifts
+          # silently, exactly as the reviewer COUNT struck from this file's header
+          # did twice. This is the runtime half of that same correction.
+          #
+          # Measured 2026-10-10: pending_deployments == 0 on every docker.yml run
+          # since the removal. Kept as a quoted record — until 2026-10-10 these two
+          # lines read "awaiting human approval on paperclip-production" and "It now
+          # awaits human approval on `paperclip-production`" unconditionally, which
+          # was false for every dispatch after 2026-10-06.
+          echo "::notice::Dispatched docker.yml at $MASTER_SHA to paperclip-production. Whether it parks for approval depends on that environment's ratified reviewer set — read RATIFIED_REVIEWERS rather than assuming it parks."
           {
             echo "### Dispatched"
             echo
             echo "Dispatched \`docker.yml\` at \`$MASTER_SHA\` (\`$AHEAD\` commit(s) ahead of the last successful deploy)."
-            echo "It now awaits human approval on \`paperclip-production\`."
+            echo "It targets \`paperclip-production\`. Whether it parks for approval depends on that environment's ratified reviewer set (\`RATIFIED_REVIEWERS\` in \`.github/scripts/check-production-environment-protection.mjs\`), which is EMPTY since 2026-10-07 — so on today's shape it does not park."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "outcome=dispatched" >> "$GITHUB_OUTPUT"
 
@@ -369,6 +383,22 @@ jobs:
       # this run's own red conclusion. The stall start that survives a supersede
       # comes from the run-history derivation in deploy-stall-chain.mjs, NOT
       # from the issue. Until 2026-10-04 these lines claimed otherwise.
+      #
+      # ⚠️ DORMANT, NOT REMOVED, since 2026-10-07 — and that is the whole ladder,
+      # not just this step. This step is gated on `skipped-pending`, which requires
+      # a deploy already parked awaiting approval; the "Fail the run when a
+      # production approval is stuck" backstop below is gated in turn on this
+      # step's output. With RATIFIED_REVIEWERS empty nothing parks, so neither can
+      # fire. The record shows the transition cleanly: of the 57 dispatcher runs in
+      # the 2.4 days before 2026-10-06T23:00Z, 30 were red and ALL 30 failed on
+      # that backstop and nothing else; of the 43 runs in the 3.9 days after, 0
+      # were red (measured 2026-10-10, last red run 2026-10-06T22:32:10Z).
+      #
+      # Keep both steps. Restoring a reviewer to RATIFIED_REVIEWERS re-arms them
+      # with no change here, and the backstop's own message stays accurate because
+      # it prints only when something is genuinely parked. PEN-2918 tracks the
+      # absence of an acknowledgement primitive that this ladder stood in for;
+      # removing the obligation is not the same as discharging that row.
       - name: Escalate a production approval that is stuck past its threshold
         id: escalate
         if: steps.dispatch.outputs.outcome == 'skipped-pending'
