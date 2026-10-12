@@ -3512,6 +3512,140 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     expect(starvedRun?.status).not.toBe("queued");
   });
 
+  it("dispatches an issue-less run past the absolute starvation ceiling before fresh critical issue work (BLO-44443)", async () => {
+    // Regression for BLO-44443: the `!hasId` branch of dispatchRank returned
+    // before the BLO-21792 absolute ceiling, so every GitHub PR-review wake
+    // (issue-less by construction) could age past STARVATION_ABSOLUTE_ESCALATION_MS
+    // and still rank 2, behind any fresh critical issue row forever. Measured
+    // on Ally 2026-10-12: 502 queued pr_review runs, 24-36h mean wait on every
+    // repo, while the ceiling bounds every issue-backed tier at 6h. Past the
+    // ceiling an issue-less run must rank ABSOLUTE_STARVATION_DISPATCH_RANK and
+    // win even against fresh critical work, exactly like an issue-backed run.
+    // The 3h-old sibling case (BLO-19337) pins that below the ceiling critical
+    // work still wins.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const criticalIssueId = randomUUID();
+    const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "IssuelessAbsoluteCeilingTestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "IssuelessAbsoluteCeilingTestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: criticalIssueId,
+        companyId,
+        title: "Critical exact-head review",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+    ]);
+    // One hour past the 6h ceiling; the BLO-19337 sibling uses 3h, under it.
+    const starvedCreatedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    const freshCreatedAt = new Date();
+    const starvedWakeId = randomUUID();
+    const starvedRunId = randomUUID();
+    const criticalWakeId = randomUUID();
+    const criticalRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: starvedWakeId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_ready_for_review",
+        payload: {},
+        status: "queued",
+        runId: starvedRunId,
+        requestedAt: starvedCreatedAt,
+        updatedAt: starvedCreatedAt,
+      },
+      {
+        id: criticalWakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "heartbeat_timer",
+        payload: { issueId: criticalIssueId },
+        status: "queued",
+        runId: criticalRunId,
+        requestedAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: starvedRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: starvedWakeId,
+        contextSnapshot: { wakeReason: "github_pr_ready_for_review" },
+        createdAt: starvedCreatedAt,
+        updatedAt: starvedCreatedAt,
+      },
+      {
+        id: criticalRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: criticalWakeId,
+        contextSnapshot: { issueId: criticalIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, starvedRunId);
+
+    // The ceiling is the only rank that outranks fresh critical work, and past
+    // it the issue-less run must take the single slot first.
+    expect(dispatchedRunIds[0]).toBe(starvedRunId);
+    const starvedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, starvedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(starvedRun?.status).not.toBe("queued");
+  });
+
   it("keeps a fresh issue-less run behind issue work (BLO-18995 does not invert normal order)", async () => {
     // Guard the other side of the BLO-18995 change: the escalation must be an
     // aging floor, not a blanket promotion. A *fresh* issue-less run still
