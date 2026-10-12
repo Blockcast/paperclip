@@ -29,9 +29,10 @@ describe("nextCronTickInTimeZone formatter caching", () => {
       return new RealDateTimeFormat(...args);
     } as unknown as typeof Intl.DateTimeFormat);
 
-    // A monthly cron scanned from just after the previous firing walks tens of
-    // thousands of minute-steps before it matches. Use a timezone that nothing
-    // else in this test file has warmed so cache misses are observable.
+    // A monthly cron searched from just after the previous firing. The bounded
+    // search (BLO-32638) makes a handful of wall-clock lookups for it; the old
+    // minute stepper made ~43k. Use a timezone that nothing else in this test
+    // file has warmed so cache misses are observable.
     const next = nextCronTickInTimeZone(
       "0 12 1 * *",
       "Pacific/Kiritimati",
@@ -39,9 +40,9 @@ describe("nextCronTickInTimeZone formatter caching", () => {
     );
     expect(next).not.toBeNull();
 
-    // One construction to populate the per-timezone cache; the ~43k subsequent
-    // minute-steps must reuse it. Before the cache this was one construction
-    // per step, which blocked the event loop for minutes (#8033).
+    // One construction to populate the per-timezone cache; every later lookup
+    // must reuse it. Before the cache the minute stepper constructed one per
+    // step, which blocked the event loop for minutes (#8033).
     expect(constructions).toBeLessThanOrEqual(1);
 
     constructions = 0;
