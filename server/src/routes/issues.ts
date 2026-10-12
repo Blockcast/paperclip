@@ -43,6 +43,7 @@ import {
   createIssueSchema,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
+  isContradictedRestoredClaim,
   feedbackTargetTypeSchema,
   feedbackTraceStatusSchema,
   feedbackVoteValueSchema,
@@ -9954,11 +9955,39 @@ export function issueRoutes(
     if (handBackAgentId) {
       await normalizeIssueAssigneeAgentReference(existing.companyId, handBackAgentId);
     }
-    const recordedOutcome = handBackAgentId
-      ? "handed_back"
-      : outcome === "restored" && sourceIssueStatus === "done"
-        ? "owner_completed"
-        : outcome;
+    // PEN-3991: `restored` asserts the source issue has a live execution path
+    // again. The schema enforces that only for an EXPLICIT `sourceIssueStatus`
+    // (it refuses `restored` + `blocked` by name); it cannot enforce it when the
+    // field is omitted, because the status that then applies is `existing.status`
+    // and a body validator never sees it. So the same end state was refused one
+    // way and accepted the other, and the accepted way is the one this
+    // subsystem's own `nextAction` text tells resolvers to use.
+    //
+    // Downgrade rather than refuse. The discharge itself is sanctioned — both by
+    // that `nextAction` text and by PEN-2756's "omission asserts nothing" — so
+    // refusing would delete a working exit under exactly the incident pressure
+    // it exists for. What was wrong is only that the ledger recorded a repair
+    // that did not happen. Deriving a truthful outcome fixes that and leaves
+    // every caller's request still accepted.
+    const contradictedRestoredClaim =
+      outcome === "restored" &&
+      isContradictedRestoredClaim({
+        requestedSourceIssueStatus: sourceIssueStatus ?? null,
+        currentIssueStatus: existing.status,
+      });
+    const recordedOutcome = contradictedRestoredClaim
+      // Checked BEFORE the hand-back arm on purpose. A hand-back returns the issue
+      // to its original owner, which is an ownership move and says nothing about
+      // whether execution was restored; recording `handed_back` here would let the
+      // contradiction back in under a different name. In practice the two cannot
+      // both fire today — hand-back requires `todo`, which is not a contradicting
+      // status — but the precedence is what keeps that true if either list moves.
+      ? "restored_unverified"
+      : handBackAgentId
+        ? "handed_back"
+        : outcome === "restored" && sourceIssueStatus === "done"
+          ? "owner_completed"
+          : outcome;
     const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
     await assertAgentInReviewReviewPath({
       existing,
@@ -10059,7 +10088,19 @@ export function issueRoutes(
         recoveryActionId: result.recoveryAction.id,
         recoveryActionStatus: result.recoveryAction.status,
         outcome: result.recoveryAction.outcome,
+        // PEN-3991: `outcome` above is the DERIVED value. Record what the caller
+        // actually asked for beside it, so a downgrade is legible as a downgrade
+        // rather than reading as the resolver having claimed the derived value.
+        // This row carries `actorType`/`actorId`/`agentId`, so it is also the one
+        // place a contradicted claim is attributable to the principal that made
+        // it — the action record itself holds no resolver identity.
+        claimedOutcome: outcome,
+        claimDowngraded: result.recoveryAction.outcome !== outcome,
         sourceIssueStatus: sourceIssueStatus ?? null,
+        // The status that actually applied. With `sourceIssueStatus` omitted
+        // this is the issue's pre-existing status, which is the value the
+        // contradiction check keys on and the one absent from every prior record.
+        effectiveSourceIssueStatus: sourceIssueStatus ?? existing.status,
         resolutionNote: result.recoveryAction.resolutionNote,
       },
     });

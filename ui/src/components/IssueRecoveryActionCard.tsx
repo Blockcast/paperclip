@@ -203,6 +203,11 @@ const STATE_TONE: Record<RecoveryCardCardState, {
 
 const OUTCOME_LABEL: Record<IssueRecoveryActionOutcome, string> = {
   restored: "restored",
+  // PEN-3991: read by a human deciding whether to trust the ledger, so it says
+  // what was claimed AND that nothing stood behind it. "unverified" alone would
+  // read as "not yet checked"; this was checked, against the resolving write's
+  // own evidence, and contradicted.
+  restored_unverified: "restored (unverified — the issue was not left runnable)",
   handed_back: "handed back to original owner",
   owner_completed: "completed by recovery owner",
   delegated: "delegated to follow-up",

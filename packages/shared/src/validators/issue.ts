@@ -457,6 +457,57 @@ export const resolveIssueRecoveryActionSchema = z.object({
   }
 });
 
+/**
+ * The source-issue statuses that CONTRADICT a `restored` claim (PEN-3991).
+ *
+ * `blocked` is the status the schema above already refuses to accept as an
+ * explicit `restored` landing. `cancelled` cannot even be requested — the
+ * `sourceIssueStatus` enum omits it — so it reaches this check only by the
+ * omitted-field route below, and an issue nobody will ever run again has no
+ * execution path by construction.
+ *
+ * Deliberately NOT here: `in_progress` and `backlog`. PEN-2756 added the
+ * omitted-`sourceIssueStatus` branch precisely so a beacon sitting on those two
+ * could be discharged without the resolver claiming a status it cannot verify,
+ * and `restored` is honest on both — `in_progress` is a live run, `backlog` is
+ * a board-approved park. Widening this list to "everything outside
+ * todo/done/in_review" would re-break what PEN-2756 fixed.
+ */
+export const RESTORED_CONTRADICTING_ISSUE_STATUSES = ["blocked", "cancelled"] as const;
+
+/**
+ * Does this `restored` resolution contradict the state it leaves the issue in?
+ *
+ * `outcome: "restored"` asserts the source issue has a live execution path
+ * again. `resolveIssueRecoveryActionSchema` enforces that for an EXPLICIT
+ * `sourceIssueStatus` — it refuses `restored` + `blocked` by name. It cannot
+ * enforce it when the field is OMITTED, because the status that then applies is
+ * the issue's existing one and a body validator never sees it.
+ *
+ * That gap is the whole defect (PEN-3991): `restored` + explicit `blocked` is
+ * refused, while `restored` + omitted-while-already-`blocked` is accepted. Same
+ * end state, same ledger contradiction, opposite verdicts. Four actions on four
+ * issues were discharged `restored` at 2026-10-12T00:15Z and again at 07:54Z
+ * with `resolutionSnapshot.issueStatus: "blocked"` captured by the very same
+ * write, and replacements were minted on all four within 71 minutes.
+ *
+ * It is reached through the sanctioned path, not through misuse: the
+ * `nextAction` text this subsystem writes instructs resolvers to
+ * `omit "sourceIssueStatus" to leave the source issue's status untouched`.
+ *
+ * Keep this adjacent to the schema. The two encode one rule, and the bug is
+ * what it looks like when they drift apart.
+ */
+export function isContradictedRestoredClaim(input: {
+  /** `sourceIssueStatus` as sent. `undefined`/`null` => assert nothing, leave the status alone. */
+  requestedSourceIssueStatus?: string | null;
+  /** The source issue's status as it stands now, which an omitted request leaves in place. */
+  currentIssueStatus: string;
+}): boolean {
+  const effectiveStatus = input.requestedSourceIssueStatus ?? input.currentIssueStatus;
+  return (RESTORED_CONTRADICTING_ISSUE_STATUSES as readonly string[]).includes(effectiveStatus);
+}
+
 export type ResolveIssueRecoveryAction = z.infer<typeof resolveIssueRecoveryActionSchema>;
 
 const issueRequestDepthInputSchema = z
