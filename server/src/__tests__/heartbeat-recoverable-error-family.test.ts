@@ -32,6 +32,7 @@ import {
   JOB_FAILED_EQUIVALENT_ERROR_CODES,
   RECOVERABLE_AGENT_STATUS_ERROR_CODES,
   readHeartbeatRunErrorFamily,
+  readPrReviewProviderCapacityRefusalRetryNotBefore,
   readTransientRecoveryContractFromRun,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
@@ -336,5 +337,54 @@ describe("BLO-35668: job_failed retries a pr_review run once invocation is dispr
     ),
   )("%s stays terminal on %s when resultJson is %s", (errorCode, _kind, _shape, contextSnapshot, resultJson) => {
     expect(shouldScheduleAutomaticRunRetry({ errorCode, resultJson, contextSnapshot })).toBe(false);
+  });
+});
+
+// BLO-45251: a pr_review Job the provider refused with a 429 is booked
+// `job_failed` with a server-parsed reset instant and no `errorFamily`
+// (PEN-3129). Its adapter had started, so the invocation proof above can never
+// admit it. Measured 2026-10-12 on Ally: run fd6dce90 and two siblings were
+// never retried. The retry is admitted only on the reconciler's
+// review-absent-at-head probe.
+describe("BLO-45251: a pr_review 429 park retries once no review exists at head", () => {
+  const resetAt = "2026-10-12T19:48:32.000Z";
+  const fd6dce90 = (recovery: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => ({
+    providerCapacityResetAt: resetAt,
+    providerCapacityResetProvenance: {
+      source: "server_parse_provider_capacity_horizon",
+      errorFamily: "rate_limit_exhausted",
+      observedStatusCode: 429,
+    },
+    externalLifecycleRecovery: {
+      reason: "job_failed",
+      jobReason: "BackoffLimitExceeded",
+      adapterInvocationStarted: true,
+      providerRefusalStatusCode: 429,
+      providerRefusalHorizon: "usable",
+      reviewEvidenceFound: false,
+      ...recovery,
+    },
+    ...extra,
+  });
+  const prReview = { reviewKind: "pr_review" };
+
+  it("retries the fd6dce90 shape, floored at the parsed reset instant", () => {
+    const run = { errorCode: "job_failed", resultJson: fd6dce90(), contextSnapshot: prReview };
+    expect(shouldScheduleAutomaticRunRetry(run)).toBe(true);
+    expect(readPrReviewProviderCapacityRefusalRetryNotBefore(run)?.toISOString()).toBe(resetAt);
+  });
+
+  it.each([
+    ["a review exists at head", fd6dce90({ reviewEvidenceFound: true }), prReview],
+    ["the probe was unproven", fd6dce90({ reviewEvidenceFound: undefined }), prReview],
+    ["no 429 evidence (f02576ba)", fd6dce90({ providerRefusalStatusCode: undefined }), prReview],
+    ["a non-429 refusal", fd6dce90({ providerRefusalStatusCode: 529 }), prReview],
+    ["no parsed reset instant", fd6dce90({}, { providerCapacityResetAt: undefined }), prReview],
+    ["adapter-forged provenance", fd6dce90({}, { providerCapacityResetProvenance: { source: "adapter" } }), prReview],
+    ["an issue run", fd6dce90(), { issueId: "issue-a" }],
+  ])("stays terminal when %s", (_label, resultJson, contextSnapshot) => {
+    const run = { errorCode: "job_failed", resultJson, contextSnapshot };
+    expect(shouldScheduleAutomaticRunRetry(run)).toBe(false);
+    expect(readPrReviewProviderCapacityRefusalRetryNotBefore(run)).toBeNull();
   });
 });
