@@ -284,6 +284,39 @@ export const HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC = "paperclip_heartbeat_rec
 export const HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC = "paperclip_heartbeat_recovery_chain_stalled_total";
 
 /**
+ * Whether THIS process currently holds a named scheduler lease (BLO-43292).
+ * `1` while it runs the loop, `0` while it does not.
+ *
+ * Labelled by pod, not by holder id: the holder id carries a per-process nonce
+ * so a restarted pod cannot renew its predecessor's lease, and using it here
+ * would mint a fresh series on every restart. The nonce is in the DB row and
+ * in the acquire/lose log lines, which is where you want it when reconstructing
+ * a handover.
+ *
+ * The alert is `sum by (lease) (...) != 1` — zero means nothing is running the
+ * loop (fleet dispatch is dark, the 2026-10-05 failure), and more than one
+ * means two processes believe they are the leader, which should be impossible
+ * and is worth knowing immediately if it is not. Evaluate it with a `for:`
+ * longer than {@link SCHEDULER_LEASE_RENEWED_METRIC}'s renew interval, since a
+ * handover legitimately passes through zero.
+ */
+export const SCHEDULER_LEASE_HELD_METRIC = "paperclip_scheduler_lease_held";
+/**
+ * Unix time of this process's last SUCCESSFUL lease renewal, in seconds;
+ * `0` if it has never held the lease (BLO-43292).
+ *
+ * `time() - ` this is renewal age. It is the one signal that separates "the
+ * leader is renewing and the loop is simply quiet" from "the leader stopped
+ * renewing and nobody has taken over yet" — the two look identical on
+ * {@link SCHEDULER_LEASE_HELD_METRIC} alone for the length of the TTL.
+ *
+ * Written on every renew attempt including failed ones (the value then stays
+ * where it was, so the age climbs), which is what makes a wedged renewer
+ * visible rather than merely absent.
+ */
+export const SCHEDULER_LEASE_RENEWED_METRIC = "paperclip_scheduler_lease_last_renewal_timestamp_seconds";
+
+/**
  * Isolation-workspace reaper sweep metrics (BLO-36814).
  *
  * The reaper (BLO-31222) performs a daily **irreversible** delete pass over
@@ -3680,6 +3713,8 @@ let heartbeatRecoveryChainSkipped: Counter | null = null;
 let heartbeatRecoveryChainDuration: Gauge | null = null;
 let heartbeatRecoveryChainInflight: Gauge | null = null;
 let heartbeatRecoveryChainStalled: Counter | null = null;
+let schedulerLeaseHeld: Gauge<"lease" | "holder"> | null = null;
+let schedulerLeaseRenewed: Gauge<"lease" | "holder"> | null = null;
 let pluginWebhookDeliveryRejected:
   | Counter<"plugin_key" | "response_class" | "plugin_status">
   | null = null;
@@ -3786,6 +3821,8 @@ function ensureRegistry(): {
   heartbeatRecoveryChainDurationGauge: Gauge;
   heartbeatRecoveryChainInflightGauge: Gauge;
   heartbeatRecoveryChainStalledCounter: Counter;
+  schedulerLeaseHeldGauge: Gauge<"lease" | "holder">;
+  schedulerLeaseRenewedGauge: Gauge<"lease" | "holder">;
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
   workerTierProxyFailuresCounter: Counter<"reason">;
@@ -3888,6 +3925,8 @@ function ensureRegistry(): {
     || !heartbeatRecoveryChainDuration
     || !heartbeatRecoveryChainInflight
     || !heartbeatRecoveryChainStalled
+    || !schedulerLeaseHeld
+    || !schedulerLeaseRenewed
     || !pluginWebhookDeliveryRejected
     || !recoveryHorizonExpired
     || !workerTierProxyFailures
@@ -5111,6 +5150,30 @@ function ensureRegistry(): {
       registers: [registry],
     });
     heartbeatRecoveryChainStalled.inc(0);
+    schedulerLeaseHeld = new Gauge({
+      name: SCHEDULER_LEASE_HELD_METRIC,
+      help:
+        "1 while this process holds the named scheduler lease and runs that loop, 0 while it "
+        + "does not (BLO-43292). Alert on sum by (lease) (...) != 1: zero means nobody is "
+        + "running the loop, >1 means two processes both believe they lead.",
+      labelNames: ["lease", "holder"] as const,
+      registers: [registry],
+    });
+    schedulerLeaseRenewed = new Gauge({
+      name: SCHEDULER_LEASE_RENEWED_METRIC,
+      help:
+        "Unix time of this process's last successful scheduler-lease renewal, in seconds; 0 if "
+        + "it has never held the lease (BLO-43292). time() minus this is renewal age, which is "
+        + "what separates a quiet leader from one that has stopped renewing.",
+      labelNames: ["lease", "holder"] as const,
+      registers: [registry],
+    });
+    // Deliberately NOT pre-seeded. Both series are labelled, so there is no
+    // label set to seed without inventing a lease name; and unlike the
+    // unlabelled gauges above, an absent series here is the honest reading —
+    // a process that holds no lease and has never tried is not "0 held", it
+    // has no opinion. The series appears on the first renew attempt, which is
+    // within one renew interval of start.
     // Pre-seed every backstop series so "healthy" reads as a literal 0 rather than an
     // absent series. The gauge already did this; the counters did not, which reproduced
     // the exact silence defect BLO-29763 was opened to remove, one metric over: on a
@@ -5506,6 +5569,8 @@ function ensureRegistry(): {
     heartbeatRecoveryChainDurationGauge: heartbeatRecoveryChainDuration,
     heartbeatRecoveryChainInflightGauge: heartbeatRecoveryChainInflight,
     heartbeatRecoveryChainStalledCounter: heartbeatRecoveryChainStalled,
+    schedulerLeaseHeldGauge: schedulerLeaseHeld,
+    schedulerLeaseRenewedGauge: schedulerLeaseRenewed,
     pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
     recoveryHorizonExpiredCounter: recoveryHorizonExpired,
     workerTierProxyFailuresCounter: workerTierProxyFailures,
@@ -7395,6 +7460,29 @@ export function recordHeartbeatRecoveryChainStalled(): void {
   ensureRegistry().heartbeatRecoveryChainStalledCounter.inc();
 }
 
+/**
+ * BLO-43292: publish this process's view of one scheduler lease.
+ *
+ * Both series are written on every renew attempt, successful or not. That is
+ * the point: on a failed renewal `held` still reads 1 until the cached
+ * deadline passes while `lastRenewedAtMs` stops advancing, so renewal age is
+ * what makes a wedged leader visible before the TTL turns it into an outage.
+ */
+export function recordSchedulerLeaseState(input: {
+  lease: string;
+  holder: string;
+  held: boolean;
+  lastRenewedAtMs: number;
+}): void {
+  const registry = ensureRegistry();
+  const labels = { lease: input.lease, holder: input.holder };
+  registry.schedulerLeaseHeldGauge.set(labels, input.held ? 1 : 0);
+  registry.schedulerLeaseRenewedGauge.set(
+    labels,
+    input.lastRenewedAtMs > 0 ? input.lastRenewedAtMs / 1000 : 0,
+  );
+}
+
 export function recordBackstopCandidateSkipped(source: BackstopSource, reason: BackstopSkipReason): void {
   ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
 }
@@ -7794,6 +7882,8 @@ export function __resetMetricsForTest(): void {
   heartbeatRecoveryChainDuration = null;
   heartbeatRecoveryChainInflight = null;
   heartbeatRecoveryChainStalled = null;
+  schedulerLeaseHeld = null;
+  schedulerLeaseRenewed = null;
   recoveryHorizonExpired = null;
   gbrainRecallTotal = null;
   pluginWebhookDeliveryRejected = null;

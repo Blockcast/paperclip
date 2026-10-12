@@ -64,6 +64,13 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
+import {
+  HEARTBEAT_TIMER_LEASE,
+  SCHEDULER_LEASE_RENEW_INTERVAL_MS,
+  SCHEDULER_LEASE_TTL_MS,
+  schedulerLeaseHolder,
+  type SchedulerLeaseHolder,
+} from "./services/scheduler-lease.js";
 import { setDbInheritedTimeouts } from "./services/metrics.js";
 import { auditConfiguredHookCommandsOnBoot } from "./services/lifecycle-hook-command-audit.js";
 import {
@@ -1140,6 +1147,19 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * BLO-43292. Leader election for the periodic scheduler tick, so a second
+   * replica can take the loop over when this one stops renewing.
+   *
+   * Declared out here, next to the interval handle it gates, because
+   * `shutdown()` has to release the lease: a graceful release is what keeps a
+   * rolling restart from costing a full lease TTL of dispatch silence.
+   *
+   * Null when leader election is switched off (see
+   * `PAPERCLIP_SCHEDULER_LEASE_ENABLED` at its construction below), in which
+   * case the tick behaves exactly as it did before this change.
+   */
+  let schedulerLease: SchedulerLeaseHolder | null = null;
   // PEN-3314. Separate timer from `heartbeatSchedulerInterval` on purpose — see
   // the watchdog registration below for why the recovery-chain detector must
   // not ride the heartbeat tick.
@@ -1716,6 +1736,50 @@ export async function startServer(): Promise<StartedServer> {
       }
     }, HEARTBEAT_RECOVERY_CHAIN_WATCHDOG_INTERVAL_MS);
 
+    // BLO-43292. Leader election for the periodic tick below, so that raising
+    // `replicas` above 1 does not double-enqueue every heartbeat.
+    //
+    // Default ON, deliberately. A flag defaulted off would make the safety of
+    // the (separate, later, Platform/SRE-owned) `replicas` bump depend on
+    // somebody remembering to flip it in the same change — which is exactly
+    // the accident the sequencing requirement exists to prevent. With the
+    // lease always armed, the bump is safe whenever it lands.
+    //
+    // `=false` is the incident kill-switch: it restores pre-BLO-43292
+    // behaviour (this process always runs the loop) without a code change, for
+    // the case where the lease itself is implicated in an outage. It is NOT a
+    // normal operating mode, and setting it with more than one replica running
+    // reintroduces the double-enqueue.
+    if (process.env.PAPERCLIP_SCHEDULER_LEASE_ENABLED !== "false") {
+      schedulerLease = schedulerLeaseHolder(db as any, {
+        name: HEARTBEAT_TIMER_LEASE,
+        ttlMs: SCHEDULER_LEASE_TTL_MS,
+        renewIntervalMs: SCHEDULER_LEASE_RENEW_INTERVAL_MS,
+      });
+      // Awaited so the first tick already has a verdict rather than skipping
+      // on a not-yet-acquired lease. A failure here is logged by the holder
+      // and leaves this process a follower; the renew timer retries.
+      const leader = await schedulerLease.start();
+      logger.info(
+        {
+          lease: HEARTBEAT_TIMER_LEASE,
+          holder: schedulerLease.identity.holderId,
+          leader,
+          ttlMs: SCHEDULER_LEASE_TTL_MS,
+          renewIntervalMs: SCHEDULER_LEASE_RENEW_INTERVAL_MS,
+        },
+        leader
+          ? "heartbeat timer lease acquired at startup"
+          : "heartbeat timer lease held elsewhere - running as follower",
+      );
+    } else {
+      logger.warn(
+        { lease: HEARTBEAT_TIMER_LEASE },
+        "heartbeat timer leader election DISABLED by PAPERCLIP_SCHEDULER_LEASE_ENABLED=false "
+        + "- this process always runs the timer loop; do not run more than one replica",
+      );
+    }
+
     heartbeatSchedulerInterval = setInterval(() => {
       // Async so the suppression checks below can honor the override-aware
       // resolver (e.g. worktree run-execution opt-in). The gated work is still
@@ -1816,6 +1880,22 @@ export async function startServer(): Promise<StartedServer> {
           }));
 
         if (heartbeatStartupRecoveryPending) return;
+        // BLO-43292: everything below this line enqueues runs or reconciles
+        // shared rows, so exactly one process in the estate may reach it.
+        //
+        // Placed BELOW the four gauge publishers above on purpose, and for the
+        // same reason those sit below the two gates they sit below: all four
+        // are read-only, and a follower that published nothing would not
+        // render "No data" — the three unlabelled ones are zero-initialized at
+        // registration, so it would export a confident `0` for the fleet it
+        // can see perfectly well. Fabricated health is the defect those
+        // publishers were hoisted to remove; a follower is not a licence to
+        // reintroduce it.
+        //
+        // `isLeader()` is an in-memory deadline comparison with no database
+        // access, so it cannot be starved by the pool exhaustion that stops a
+        // tick reaching anything further down.
+        if (schedulerLease && !schedulerLease.shouldRunLoop()) return;
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
           logger.info(
@@ -3107,6 +3187,22 @@ export async function startServer(): Promise<StartedServer> {
       if (heartbeatRecoveryChainWatchdogInterval) {
         clearInterval(heartbeatRecoveryChainWatchdogInterval);
         heartbeatRecoveryChainWatchdogInterval = null;
+      }
+
+      // BLO-43292. Released here, right after the tick is disarmed and before
+      // the drain, so the window in which this process holds the lease without
+      // running the loop is as short as possible.
+      //
+      // This is the difference between a rolling restart costing one follower
+      // poll and costing a full lease TTL: the replacement process is a new
+      // holder (the holder id carries a per-process nonce, so it cannot renew
+      // its predecessor's lease) and would otherwise have to wait the lease
+      // out. Best-effort by construction — the holder swallows and logs a
+      // failed release, because the lease expires on its own and a slow
+      // shutdown is worse than a slow handover.
+      if (schedulerLease) {
+        await schedulerLease.stop();
+        schedulerLease = null;
       }
 
       // Disarmed alongside the scheduler, and before the drain below, because a
