@@ -1,6 +1,7 @@
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 import { heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
+import { RESTORED_EXECUTION_DISCHARGE_KINDS } from "@paperclipai/shared";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -129,6 +130,17 @@ export const PENDING_RECOVERY_WAKE_RUN_STATUSES = ["queued", "scheduled_retry", 
  * early (it is the unbounded-row harm the derived arm below exists to close).
  */
 export const PENDING_RECOVERY_WAKE_CEILING_TIMEOUT_MULTIPLIER = 4;
+
+/**
+ * Stable lead-in on every automatically written discharge note, so the machine-written
+ * population is greppable from the issue thread and the activity log as well as from
+ * `retiringBound`.
+ */
+export const RESTORED_EXECUTION_DISCHARGE_NOTE_PREFIX =
+  "Recovery action discharged automatically:";
+
+/** Evidence key recording the run that discharged the action. */
+export const RESTORED_EXECUTION_RUN_ID_EVIDENCE_KEY = "restoredExecutionRunId";
 
 const MAX_UPSERT_RETRIES = 3;
 const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
@@ -1337,6 +1349,193 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     return updated.map(toReadModel);
   }
 
+  /**
+   * PEN-3976: discharge an action whose own stated remedy is already satisfied.
+   *
+   * Before this, a recovery action had exactly ONE discharge: a manual
+   * `POST /issues/:id/recovery-actions/resolve` from its owner. Neither the source issue
+   * recovering nor the action's own `timeoutAt` ended it, so the active set was a one-way
+   * accumulator — and because every wake on a row carrying an active action is dispatched
+   * status-only (PEN-3275), each stuck action permanently degraded its source row. Two rows
+   * were measured independently: PEN-3631's action sat `escalated` five days after a run on
+   * its own issue succeeded, and PEN-3102's sat 20 days across FIVE succeeded runs with
+   * `updatedAt` frozen the whole time.
+   *
+   * ⚠ Do NOT read `timeoutAt` as the fix for this. It is a WAKE horizon, not an action
+   * lifetime: `escalateExpiredWakeHorizons` spends it to move the row `active` -> `escalated`
+   * with `retiringBound: "timeout_horizon"`, and `escalated` is deliberately inside
+   * `ACTIVE_RECOVERY_ACTION_STATUSES` so the row keeps holding
+   * `issue_recovery_actions_active_source_uq`. An earlier revision of BLO-19124 did make that
+   * sweep discharge, and it was withdrawn on review for a reason that still stands: freeing
+   * the uniqueness slot on a TIMER lets `upsertSourceScoped` INSERT a replacement with a
+   * fresh budget and a fresh horizon on the very next pass, which is the unbounded re-fire
+   * loop BLO-18996 closed. So a past `timeoutAt` is not inert, and it is also not a discharge.
+   *
+   * This path is safe from that loop by construction, and the bound is arithmetic rather than
+   * a judgement call:
+   *
+   *   1. Evidence must be a run DISPATCHED strictly after the action (`heartbeat_runs.
+   *      created_at > issue_recovery_actions.created_at`). A replacement minted at T can
+   *      therefore never be discharged by a run that already existed at T — so one
+   *      successful run buys at most ONE discharge, not a cycle.
+   *   2. Evidence must not be a run this subsystem caused. Every recovery-raised wake stamps
+   *      `recoveryActionId` into its context snapshot, so requiring that key to be ABSENT is
+   *      what stops an action's own status-only wake from discharging it and re-arming a
+   *      fresh budget on each sweep. This is the conjunct that carries the whole no-loop
+   *      argument; deleting it reinstates BLO-18996.
+   *
+   * Deliberately NOT filtered on `recoveryIntent`/`modelProfile`. While an action is active
+   * every wake on the row is forced status-only, so demanding a normal-model run as evidence
+   * would make this sweep almost unsatisfiable on exactly the population it exists to drain.
+   * What is being asserted is the action's own words — that a live execution path exists —
+   * not that the run was able to do deliverable work.
+   *
+   * This closes the ACTION only — it never writes the source issue's status, matching the
+   * PEN-3397 discharge. A succeeded run does not mean the issue's Done-when was evaluated,
+   * and moving the row here would silently complete work nobody checked. What it does change
+   * downstream is wake class: the row stops being one whose every wake is forced status-only
+   * (PEN-3275), and a row left `blocked` with no blockers becomes eligible for the
+   * stranded-blocked auto-resume again.
+   *
+   * Unlike `reconcileStrandedRecoveryWakeBackstop`, rows that already carry a `retiringBound`
+   * are IN scope. They are the accumulated population: once a row is retired-but-not-
+   * discharged, that backstop drops it (`isNull(retiringBound)`) and the only remaining
+   * discharge is a human-equivalent call. A sweep that handled only `active` rows would leave
+   * every measured instance exactly as stuck as before.
+   */
+  async function dischargeActionsWithRestoredExecution(input: {
+    now?: Date;
+    companyId?: string | null;
+    limit?: number;
+  } = {}): Promise<Array<{
+    action: IssueRecoveryAction;
+    evidenceRunId: string;
+    previousStatus: IssueRecoveryActionStatus;
+  }>> {
+    const now = input.now ?? new Date();
+    const limit = Math.max(1, Math.floor(input.limit ?? 200));
+    if (RESTORED_EXECUTION_DISCHARGE_KINDS.length === 0) return [];
+
+    // One definition, shared by the candidate predicate and by the scalar subquery that
+    // names the run in the note. Two copies would be free to drift, and a drifted pair
+    // discharges on one run while citing another.
+    const restoredExecutionEvidence = and(
+      // `(company_id, created_at DESC)` is `heartbeat_runs_company_created_at_desc_idx`, and
+      // this pair is what keeps the sweep affordable on a 30s scheduler tick: the evidence
+      // range starts at the action's own `createdAt`, so a fresh action probes a few minutes
+      // of that company's runs and even a month-old one probes a bounded window that it then
+      // leaves forever. There is no index over `(company_id, context_issue_id)`, so dropping
+      // either of these two columns turns each probe into a scan of every run the company has
+      // ever succeeded — multiplied by the candidate count, on every tick.
+      eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
+      gt(heartbeatRuns.createdAt, issueRecoveryActions.createdAt),
+      eq(heartbeatRuns.status, "succeeded"),
+      // Generated stored columns over the same snapshot keys every other issue-scoped run
+      // query reads, so this is a small-text comparison and not a JSONB detoast per row. Both
+      // arms are needed: `handleSuccessfulRunHandoff` resolves an issue as `issueId ?? taskId`,
+      // so a taskId-only context is a real shape. Both columns are `text`, hence the cast on
+      // the uuid side.
+      or(
+        sql`${heartbeatRuns.contextIssueId} = ${issueRecoveryActions.sourceIssueId}::text`,
+        sql`${heartbeatRuns.contextTaskId} = ${issueRecoveryActions.sourceIssueId}::text`,
+      )!,
+      sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' is null`,
+    )!;
+
+    const latestEvidenceRun = db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(restoredExecutionEvidence)
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1);
+
+    const candidatePredicates = [
+      inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      inArray(issueRecoveryActions.kind, RESTORED_EXECUTION_DISCHARGE_KINDS),
+      exists(
+        db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(restoredExecutionEvidence),
+      ),
+    ];
+    if (input.companyId) {
+      candidatePredicates.push(eq(issueRecoveryActions.companyId, input.companyId));
+    }
+
+    const candidates = await db
+      .select({
+        id: issueRecoveryActions.id,
+        // Read BEFORE the UPDATE. The returned row is already `resolved`, so this is the only
+        // place the state the sweep FOUND the action in survives — and that state is the
+        // finding: `escalated` here is the accumulated population, a row whose wake horizon
+        // was already spent and which no other sweep could reach again.
+        previousStatus: issueRecoveryActions.status,
+        evidenceRunId: sql<string | null>`(${latestEvidenceRun})`,
+        issueAssigneeAgentId: issues.assigneeAgentId,
+        issueStatus: issues.status,
+      })
+      .from(issueRecoveryActions)
+      .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
+      .where(and(...candidatePredicates))
+      // Oldest first: the backlog this drains is measured in weeks, and a cap that bites
+      // should spend itself on the rows that have been degrading their source longest.
+      .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id))
+      .limit(limit);
+
+    const discharged: Array<{
+      action: IssueRecoveryAction;
+      evidenceRunId: string;
+      previousStatus: IssueRecoveryActionStatus;
+    }> = [];
+    for (const candidate of candidates) {
+      // The two subqueries agree by construction; a null here would mean the row stopped
+      // qualifying between them, which is a skip rather than a discharge with no citation.
+      if (!candidate.evidenceRunId) continue;
+      const resolutionNote =
+        `${RESTORED_EXECUTION_DISCHARGE_NOTE_PREFIX} run ${candidate.evidenceRunId} was dispatched `
+        + "on this issue after this action was created and reached \"succeeded\", so the live "
+        + "execution path the action asks for already exists. Nobody recorded this disposition — "
+        + "retiringBound \"execution_restored\" is what separates it from a discharge somebody "
+        + "decided.";
+      // Status re-checked inside the UPDATE so two schedulers cannot both claim one row,
+      // and so a row resolved by hand in the gap is left exactly as its owner left it.
+      const [updated] = await db
+        .update(issueRecoveryActions)
+        .set({
+          status: "resolved",
+          outcome: "restored",
+          retiringBound: "execution_restored",
+          resolutionNote,
+          resolvedAt: now,
+          updatedAt: now,
+          // Same snapshot keys `resolveActiveForIssue` writes, for the same reason
+          // (BLO-33600): `classifyRecoveryHandoff` reads them instead of a live `issues`
+          // join, so omitting them here would classify every machine discharge `unknown`.
+          // Merged in SQL rather than read-modify-written so a concurrent evidence write
+          // is not lost.
+          evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+            [RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY]: candidate.issueAssigneeAgentId ?? null,
+            [RESOLVED_ISSUE_STATUS_EVIDENCE_KEY]: candidate.issueStatus ?? null,
+            [RESTORED_EXECUTION_RUN_ID_EVIDENCE_KEY]: candidate.evidenceRunId,
+          })}::jsonb`,
+        })
+        .where(and(
+          eq(issueRecoveryActions.id, candidate.id),
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        ))
+        .returning();
+      if (!updated) continue;
+      discharged.push({
+        action: toReadModel(updated),
+        evidenceRunId: candidate.evidenceRunId,
+        previousStatus: candidate.previousStatus as IssueRecoveryActionStatus,
+      });
+    }
+
+    return discharged;
+  }
+
   async function resolveActiveForIssue(
     input: ResolveIssueRecoveryActionInput,
     dbOrTx: DbOrTransaction = db,
@@ -1421,6 +1620,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     listActiveForIssues,
     resolveActiveForIssue,
     escalateExpiredWakeHorizons,
+    dischargeActionsWithRestoredExecution,
     upsertSourceScoped,
     releaseWakeAttempt,
     retireAndReleaseWakeAttempt,

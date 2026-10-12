@@ -2392,7 +2392,12 @@ export async function startServer(): Promise<StartedServer> {
                 if (
                   reconciled.escalationsCreated > 0 ||
                   reconciled.dependencyWakesHealed > 0 ||
-                  reconciled.staleEscalationsAutoResolved > 0
+                  reconciled.staleEscalationsAutoResolved > 0 ||
+                  // PEN-3976, same reason as the BLO-29601 clause above: discharging a
+                  // recovery action whose remedy already landed changes the issue graph
+                  // (the row stops being wake-degraded), and without it in this gate the
+                  // drain runs silently.
+                  reconciled.restoredExecutionRecoveryActionsDischarged > 0
                 ) {
                   logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
                 }

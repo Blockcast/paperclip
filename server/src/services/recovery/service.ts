@@ -164,6 +164,7 @@ import {
 import {
   recordBackstopCandidateSkipped,
   recordBackstopSweepCompleted,
+  recordRecoveryActionAutoDischarged,
   recordRecoveryHorizonExpired,
   setBackstopDeferredCandidates,
 } from "../metrics.js";
@@ -595,15 +596,17 @@ export function serializeSweepInvocations<Args extends unknown[], Result>(
  */
 export const ACTION_SCOPED_SWEEP_NAMES = [
   "resolved_dependency_wake_backstop",
+  "restored_execution_recovery_actions",
   "stranded_recovery_wake_backstop",
   "expired_recovery_wake_horizons",
 ] as const;
 
 export type ActionScopedSweepName = (typeof ACTION_SCOPED_SWEEP_NAMES)[number];
 
-export interface ActionScopedSweepOutcome<Dependency, Stranded, Expired> {
+export interface ActionScopedSweepOutcome<Dependency, Restored, Stranded, Expired> {
   /** `null` when that sweep threw; its roll-up fields then keep their initialized zeros. */
   resolvedDependencyWakeBackstop: Dependency | null;
+  restoredExecutionRecoveryActions: Restored | null;
   strandedRecoveryWakeBackstop: Stranded | null;
   expiredRecoveryWakeHorizons: Expired | null;
   failedSweeps: ActionScopedSweepName[];
@@ -618,9 +621,12 @@ export interface ActionScopedSweepOutcome<Dependency, Stranded, Expired> {
  * and the one that runs first is whichever was added most recently -- so the newest and
  * least-proven sweep held the power to silence the oldest and most load-bearing ones.
  *
- * All three are isolated symmetrically rather than special-casing whichever is newest,
+ * All of them are isolated symmetrically rather than special-casing whichever is newest,
  * because the argument applies to every pair and a sweep added later should inherit the
- * isolation instead of having to remember to ask for it.
+ * isolation instead of having to remember to ask for it. PEN-3976's restored-execution
+ * discharge is the first sweep to arrive after that rule existed, and it needed no local
+ * guard of its own: it is registered here and inherits the isolation, which is what the
+ * rule was for.
  *
  * A failing sweep yields `null`, which leaves its roll-up counters at the zeros the result
  * was initialized with. Zero is already this result's "nothing to do" reading, so the
@@ -632,11 +638,12 @@ export interface ActionScopedSweepOutcome<Dependency, Stranded, Expired> {
  * cursors that `serializeSweepInvocations` exists to protect, so isolating them must not be
  * taken as licence to run them concurrently.
  */
-export async function runActionScopedRecoverySweeps<Dependency, Stranded, Expired>(sweeps: {
+export async function runActionScopedRecoverySweeps<Dependency, Restored, Stranded, Expired>(sweeps: {
   resolvedDependencyWakeBackstop: () => Promise<Dependency>;
+  restoredExecutionRecoveryActions: () => Promise<Restored>;
   strandedRecoveryWakeBackstop: () => Promise<Stranded>;
   expiredRecoveryWakeHorizons: () => Promise<Expired>;
-}): Promise<ActionScopedSweepOutcome<Dependency, Stranded, Expired>> {
+}): Promise<ActionScopedSweepOutcome<Dependency, Restored, Stranded, Expired>> {
   const failedSweeps: ActionScopedSweepName[] = [];
 
   const isolate = async <T>(
@@ -659,6 +666,10 @@ export async function runActionScopedRecoverySweeps<Dependency, Stranded, Expire
     "resolved_dependency_wake_backstop",
     sweeps.resolvedDependencyWakeBackstop,
   );
+  const restoredExecutionRecoveryActions = await isolate(
+    "restored_execution_recovery_actions",
+    sweeps.restoredExecutionRecoveryActions,
+  );
   const strandedRecoveryWakeBackstop = await isolate(
     "stranded_recovery_wake_backstop",
     sweeps.strandedRecoveryWakeBackstop,
@@ -670,6 +681,7 @@ export async function runActionScopedRecoverySweeps<Dependency, Stranded, Expire
 
   return {
     resolvedDependencyWakeBackstop,
+    restoredExecutionRecoveryActions,
     strandedRecoveryWakeBackstop,
     expiredRecoveryWakeHorizons,
     failedSweeps,
@@ -13966,6 +13978,102 @@ export function recoveryService(
     return { neverDelivered, neverDeliveredButWorked, announced: true };
   }
 
+  /**
+   * PEN-3976: discharge recovery actions whose own stated remedy the source row already
+   * satisfies.
+   *
+   * The sweep half of a pair. `classifySourceRecoveryRevalidation` already retires an action
+   * whose PREMISE went stale, but only when an HTTP route touches the issue — so the rows
+   * that accumulate are exactly the ones nobody opens, which is the same property that made
+   * them stuck in the first place. `reconcileStrandedRecoveryWakeBackstop` cannot pick them
+   * up either: it filters `isNull(retiringBound)`, so a row that `escalateExpiredWakeHorizons`
+   * has already retired is permanently outside it. Nothing on a timer looked at that set.
+   *
+   * The measured consequence, on two rows found by different owners on different sweeps:
+   * PEN-3631's action was still `escalated` five days after a run on its own issue
+   * succeeded, and PEN-3102's sat 20 days and five succeeded runs with `updatedAt` frozen
+   * throughout. In both cases the action's `nextAction` asked for a live execution path that
+   * demonstrably existed the whole time.
+   *
+   * Everything that makes this safe from the BLO-18996 re-fire loop lives in
+   * `dischargeActionsWithRestoredExecution`; read the two numbered conjuncts there before
+   * widening anything here.
+   *
+   * Per-row decoration is contained, following BLO-19124's lesson on the sibling sweep: the
+   * discharge is already committed by the time this loop runs, so a failure to log or count
+   * one row must not abort the rest of the batch.
+   */
+  async function reconcileRestoredExecutionRecoveryActions(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    now?: Date;
+    limit?: number;
+  }) {
+    const result = {
+      discharged: 0,
+      actionIds: [] as string[],
+      issueIds: [] as string[],
+    };
+    const discharged = await recoveryActionsSvc.dischargeActionsWithRestoredExecution({
+      now: opts?.now,
+      companyId: opts?.companyId ?? null,
+      limit: opts?.limit,
+    });
+    if (discharged.length === 0) return result;
+
+    for (const { action, evidenceRunId, previousStatus } of discharged) {
+      result.discharged += 1;
+      result.actionIds.push(action.id);
+      result.issueIds.push(action.sourceIssueId);
+      try {
+        recordRecoveryActionAutoDischarged(action.kind);
+        logger.info(
+          {
+            recoveryActionId: action.id,
+            issueId: action.sourceIssueId,
+            kind: action.kind,
+            cause: action.cause,
+            ownerAgentId: action.ownerAgentId,
+            // The state the row was in when this found it, read before the UPDATE —
+            // `action.status` is already `resolved` and so answers a different question.
+            // `escalated` here is the accumulated population: a row whose wake horizon had
+            // already been spent and which no other sweep could reach again.
+            previousStatus,
+            evidenceRunId,
+          },
+          "recovery action discharged by restored execution",
+        );
+        await logActivity(db, {
+          companyId: action.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: opts?.runId ?? null,
+          // Same action name the read-time revalidation writes, so the issue timeline has one
+          // vocabulary for "this action ended"; `source` is what separates the writers.
+          action: "issue.recovery_action_resolved",
+          entityType: "issue",
+          entityId: action.sourceIssueId,
+          details: {
+            recoveryActionId: action.id,
+            recoveryActionStatus: action.status,
+            outcome: action.outcome,
+            retiringBound: action.retiringBound,
+            resolutionNote: action.resolutionNote,
+            evidenceRunId,
+            source: "restored_execution_sweep",
+          },
+        });
+      } catch (err) {
+        logger.warn(
+          { err, recoveryActionId: action.id, issueId: action.sourceIssueId },
+          "failed to announce restored-execution recovery discharge",
+        );
+      }
+    }
+
+    return result;
+  }
 
   /**
    * BLO-24662: move recovery actions that have burned their wake horizon out of `active`.
@@ -15225,6 +15333,8 @@ export function recoveryService(
       obsoleteRecoveryBlockerPruneRestoreDegraded: obsoleteRecoveryCleanup.blockerPruneRestoreDegraded,
       doneRecoveryBlockerRelationsRemoved: doneRecoveryBlockerCleanup.blockerRelationsRemoved,
       doneRecoveryBlockerPruneRestoreDegraded: doneRecoveryBlockerCleanup.blockerPruneRestoreDegraded,
+      restoredExecutionRecoveryActionsDischarged: 0,
+      restoredExecutionRecoveryActionIssueIds: [] as string[],
       dependencyWakeBackstopChecked: 0,
       dependencyWakesHealed: 0,
       dependencyWakeExistingSkipped: 0,
@@ -15258,11 +15368,21 @@ export function recoveryService(
       failedSweeps: [] as ActionScopedSweepName[],
     };
 
-    // PEN-4094: isolated, so a throw from any one of these three cannot skip the other two
-    // for this tick. Each is itself a recovery backstop; see `runActionScopedRecoverySweeps`.
+    // PEN-4094: isolated, so a throw from any one of these cannot skip the others for this
+    // tick. Each is itself a recovery backstop; see `runActionScopedRecoverySweeps`.
     const actionScopedSweeps = await runActionScopedRecoverySweeps({
       resolvedDependencyWakeBackstop: () => reconcileResolvedDependencyWakeBackstop({
         runId: opts?.runId ?? null,
+      }),
+      // PEN-3976. Ordered ahead of the two sweeps below, and that is load-bearing rather than
+      // stylistic: a dischargeable action should not be woken for (the stranded backstop) or
+      // escalated with an announcement comment (the horizon sweep) one tick before it is
+      // discharged. Like them it is independent of liveness findings and stays enabled when
+      // automatic liveness escalation is off, because it retires an already-committed action
+      // rather than creating recovery work.
+      restoredExecutionRecoveryActions: () => reconcileRestoredExecutionRecoveryActions({
+        runId: opts?.runId ?? null,
+        now,
       }),
       // This sibling backstop is independent of liveness findings and remains enabled even
       // when automatic liveness escalation is disabled: it only redelivers an already-committed
@@ -15295,6 +15415,12 @@ export function recoveryService(
       result.dependencyWakeDeferredOrFailed = dependencyWakeBackstop.deferredOrFailed;
       result.dependencyWakeEnqueueFailed = dependencyWakeBackstop.enqueueFailed;
       result.dependencyWakeIssueIds = dependencyWakeBackstop.issueIds;
+    }
+
+    const restoredExecutionDischarges = actionScopedSweeps.restoredExecutionRecoveryActions;
+    if (restoredExecutionDischarges) {
+      result.restoredExecutionRecoveryActionsDischarged = restoredExecutionDischarges.discharged;
+      result.restoredExecutionRecoveryActionIssueIds = restoredExecutionDischarges.issueIds;
     }
 
     const strandedRecoveryWakeBackstop = actionScopedSweeps.strandedRecoveryWakeBackstop;
@@ -17374,6 +17500,7 @@ export function recoveryService(
     reconcileStrandedRecoveryWakeBackstop,
     reconcileStrandedRecoveryHandBacks,
     reconcileExpiredRecoveryWakeHorizons,
+    reconcileRestoredExecutionRecoveryActions,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
   };
