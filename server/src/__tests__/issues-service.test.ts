@@ -12201,7 +12201,7 @@ describeEmbeddedPostgres("issueService cross-company parentId (BLO-28635)", () =
     const foreignParentId = await seedIssue(foreignCompanyId, "Foreign parent secrets");
     const childId = randomUUID();
     // Written straight to the table: the guard above now refuses to mint this
-    // shape, but the historical rows repaired by 0254 look exactly like it.
+    // shape, but the historical rows repaired by 0255 look exactly like it.
     await db.insert(issues).values({
       id: childId,
       companyId: homeCompanyId,
