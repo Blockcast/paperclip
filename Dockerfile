@@ -573,7 +573,7 @@ RUN set -eu; \
         return 1; \
       fi; \
     }; \
-    git clone --no-tags --filter=blob:none https://github.com/dietrichgebert/ponytail.git /tmp/ponytail; \
+    git clone --no-tags --filter=blob:none --no-checkout https://github.com/dietrichgebert/ponytail.git /tmp/ponytail; \
     git -C /tmp/ponytail checkout --detach "${PONYTAIL_REF}"; \
     test "$(git -C /tmp/ponytail rev-parse HEAD)" = "${PONYTAIL_REF}"; \
     install -d -m 0755 /opt/penstock/ponytail; \

@@ -9,7 +9,9 @@ echo "PC_HOME: $PC_HOME"
 cd $PC_TEST_ROOT
 # BLO-43044: blobless. Destination is $PC_TEST_ROOT/repo under `mktemp -d /tmp/...`,
 # so this is a /tmp clone even though no `/tmp` literal appears on this line.
-# The checkout below fetches only the blobs at HEAD, not every blob in history.
+# Measured no saving here (56.08 -> 56.39 MiB in-pack): `pnpm install` below needs
+# every blob at HEAD, so this defers the fetch rather than avoiding it. Kept for
+# uniformity with the onprem-k8s /tmp clone guard, not as an optimization.
 git clone --filter=blob:none https://github.com/paperclipai/paperclip.git repo
 cd repo
 pnpm install
