@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { sql } from "drizzle-orm";
-import { approvals, companies, createDb } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
+import { activityLog, approvals, companies, createDb } from "@paperclipai/db";
+import { APPROVAL_TYPES } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -15,6 +16,14 @@ import {
   renderMetrics,
 } from "../services/metrics.js";
 import { refreshApprovalQueueMetrics } from "../services/approval-queue-metrics.js";
+import { approvalService } from "../services/approvals.js";
+import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
+
+/** Value of an unlabelled gauge in the exposition body, or null when it is absent. */
+function gaugeValue(body: string, name: string): number | null {
+  const match = body.match(new RegExp(`^${name} (\\S+)$`, "m"));
+  return match ? Number(match[1]) : null;
+}
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -169,7 +178,7 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     expect(body).toContain(`${APPROVAL_LAST_DECISION_TIMESTAMP_METRIC} ${decidedAt.getTime() / 1000}`);
     // The card is back in the requester's court, so it must not hold the
     // board-unresponsiveness alert's pending>0 gate open.
-    expect(body).not.toContain(`${APPROVALS_PENDING_METRIC}{type="request_board_approval"}`);
+    expect(body).toContain(`${APPROVALS_PENDING_METRIC}{type="request_board_approval"} 0`);
   });
 
   it("resets a drained type to an explicit 0 rather than leaving a stale series", async () => {
@@ -189,7 +198,77 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     const { body } = await renderMetrics();
 
     expect(body).not.toContain(`${APPROVALS_PENDING_METRIC}{type="request_board_approval"} 1`);
+    // An absent series is what "never exported" looks like, so drained must be a
+    // real 0 -- for the drained type and for every type the queue could hold.
+    for (const type of APPROVAL_TYPES) {
+      expect(body).toContain(`${APPROVALS_PENDING_METRIC}{type="${type}"} 0`);
+    }
+    // No pending card means no oldest card: absent, not a misleading 0.
+    expect(body).not.toContain(`${APPROVAL_OLDEST_PENDING_AGE_METRIC}{type=`);
   });
+
+  // A board `revision_requested` is a real board decision, but the requester's
+  // cleanup erases it from the approval row: `withdraw` moves it to `withdrawn`
+  // (and, with no board note, overwrites `decided_at`), `resubmit` nulls
+  // `decided_at`. Each exit runs through the real service, so this pins that the
+  // decision survives on the path that actually records it.
+  it.each([
+    ["withdrawn with the board note preserved", "Needs a rollback plan.", "withdraw"],
+    ["withdrawn when the board left no note", null, "withdraw"],
+    ["resubmitted back to pending", "Needs a rollback plan.", "resubmit"],
+  ] as const)(
+    "keeps a revision request as the last board decision after it is %s",
+    async (_label, decisionNote, exit) => {
+      const companyId = await insertCompany();
+      // An older real decision: the value a row-only MAX falls back to.
+      const olderDecisionAt = new Date("2026-08-19T20:52:50.000Z");
+      await insertApproval({
+        companyId,
+        status: "approved",
+        createdAt: new Date(olderDecisionAt.getTime() - 3_600_000),
+        decidedAt: olderDecisionAt,
+      });
+      const [card] = await db
+        .insert(approvals)
+        .values({ companyId, type: "request_board_approval", status: "pending", payload: {} })
+        .returning();
+
+      await resolveApprovalWithSideEffects(db, {}, {
+        approvalId: card!.id,
+        decision: "revise",
+        decidedByUserId: "board-user",
+        decisionNote,
+        actor: {
+          activityActorType: "user",
+          activityActorId: "board-user",
+          requesterWakeActorType: "user",
+          requesterWakeActorId: "board-user",
+        },
+      });
+      const [revisionEvent] = await db
+        .select({ createdAt: activityLog.createdAt })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityId, card!.id), eq(activityLog.action, "approval.revision_requested")));
+      expect(revisionEvent).toBeDefined();
+
+      const svc = approvalService(db);
+      if (exit === "withdraw") {
+        await svc.withdraw(card!.id, "superseded", {
+          userId: null,
+          activity: { actorType: "agent", actorId: "requester-1", agentId: null },
+        });
+      } else {
+        await svc.resubmit(card!.id);
+      }
+
+      await refreshApprovalQueueMetrics(db, NOW);
+      const { body } = await renderMetrics();
+
+      expect(gaugeValue(body, APPROVAL_LAST_DECISION_TIMESTAMP_METRIC)).toBe(
+        revisionEvent!.createdAt.getTime() / 1000,
+      );
+    },
+  );
 
   // Silence is not health: a failed refresh must not publish a healthy-looking
   // empty queue. The gauges keep their last real values and the freshness gate

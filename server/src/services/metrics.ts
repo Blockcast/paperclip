@@ -21,6 +21,7 @@
  */
 
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
+import { APPROVAL_TYPES } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 // Type-only, so it is erased at runtime and creates no import cycle with the
 // reaper (which imports the recorder below). Structurally restating the result
@@ -4399,8 +4400,9 @@ function ensureRegistry(): {
         "Board approvals currently in status 'pending', labeled by bounded approval type "
         + "(BLO-29850). `revision_requested` is excluded deliberately: that card is back in the "
         + "REQUESTER's court to resubmit or withdraw, so counting it would attribute a requester "
-        + "backlog to board unresponsiveness. Reset-then-set every refresh so a type whose queue "
-        + "drains reads back an explicit 0 rather than a frozen stale value. This gauge is the "
+        + "backlog to board unresponsiveness. Every known approval type is seeded with 0 on each "
+        + "refresh, so a drained type -- and an empty queue -- reads back an explicit 0 rather than "
+        + "an absent series or a frozen stale value. This gauge is the "
         + "alert's GATE, never its trigger -- depth alone is a staffing opinion; see "
         + APPROVAL_LAST_DECISION_TIMESTAMP_METRIC + " for the fault signal.",
       labelNames: ["type"],
@@ -4412,7 +4414,9 @@ function ensureRegistry(): {
         "Age in seconds of the oldest still-'pending' board approval, labeled by bounded approval "
         + "type (BLO-29850). Slow-burn companion to the staleness alert: a queue being served at a "
         + "healthy rate can still strand one card forever, which the last-decision timestamp alone "
-        + "cannot see. Reset-then-set every refresh.",
+        + "cannot see. Reset-then-set every refresh; a type with nothing pending has no series here "
+        + "(its " + APPROVALS_PENDING_METRIC + " reads 0), because 0 would read as a card filed this "
+        + "instant.",
       labelNames: ["type"],
       registers: [registry],
     });
@@ -4424,7 +4428,9 @@ function ensureRegistry(): {
         + "excluded because they are requester-side cleanup: a burst of agents retiring their own "
         + "moot cards drains the pending count without the board deciding anything, and a "
         + "depth-only metric scores that as progress. Excluding them here is what makes "
-        + "`time() - <this>` a true service-liveness signal. 0 means no board decision has ever "
+        + "`time() - <this>` a true service-liveness signal. A revision request is also read from "
+        + "the append-only activity log, because the requester's resubmit/withdraw erases it from "
+        + "the approval row. 0 means no board decision has ever "
         + "been recorded, so alerts must gate on " + APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC
         + " rather than reading 0 as an infinitely stale queue.",
       registers: [registry],
@@ -6598,10 +6604,19 @@ export function setExternalRuntimeReservationStrandMetricsRefreshSuccess(success
 
 /**
  * Publish board-approval-queue depth, oldest-pending age, and last-board-decision
- * timestamp (BLO-29850). Same reset-then-set contract as
- * {@link setExternalRuntimeReservationStrandedOldestAgeMetrics}: a type whose
- * queue drains must read back an explicit 0, because an absent series and "nothing
- * pending" render identically on every dashboard.
+ * timestamp (BLO-29850). Reset-then-set like
+ * {@link setExternalRuntimeReservationStrandedOldestAgeMetrics}, plus one thing
+ * that setter cannot do: the pending gauge is SEEDED with 0 for every known
+ * `APPROVAL_TYPES` value before the query rows are applied. The query only
+ * returns types that have pending rows, so without the seed a drained type (and
+ * the whole family, on an empty queue) is absent rather than 0 -- and an absent
+ * series is exactly what "never exported" looks like. The type set is bounded, so
+ * seeding it costs nothing in cardinality; a row outside the enum still gets its
+ * own series.
+ *
+ * The oldest-pending-age gauge is deliberately NOT seeded: a type with nothing
+ * pending has no oldest card, and 0 would read as "a card filed this instant".
+ * Its absence is unambiguous because the seeded pending gauge reads 0 alongside.
  *
  * `lastDecisionTimestampSeconds` is left UNTOUCHED when null rather than zeroed.
  * Zeroing it would make `time() - <gauge>` enormous and fire the staleness alert
@@ -6616,6 +6631,7 @@ export function setApprovalQueuePendingMetrics(input: {
   const metrics = ensureRegistry();
   metrics.approvalsPendingGauge.reset();
   metrics.approvalOldestPendingAgeGauge.reset();
+  for (const type of APPROVAL_TYPES) metrics.approvalsPendingGauge.set({ type }, 0);
   for (const entry of input.entries) {
     const type = entry.type || "unknown";
     const pending = Number.isFinite(entry.pending) ? Math.max(0, entry.pending) : 0;

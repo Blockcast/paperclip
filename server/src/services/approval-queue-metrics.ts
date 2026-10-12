@@ -1,6 +1,6 @@
 import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvals } from "@paperclipai/db";
+import { activityLog, approvals } from "@paperclipai/db";
 import {
   setApprovalQueueMetricsRefreshSuccess,
   setApprovalQueuePendingMetrics,
@@ -19,6 +19,25 @@ import {
  * leaves the staleness alert firing, which is the correct reading.
  */
 const BOARD_DECISION_STATUSES = ["approved", "rejected", "revision_requested"] as const;
+
+/**
+ * The one board decision whose ROW cannot be trusted to remember it.
+ *
+ * `approved` and `rejected` are terminal, so their `decided_at` is permanent. A
+ * `revision_requested` card is not: the requester is expected to clean it up,
+ * and both exits erase the board's timestamp from the row. `resubmit` nulls
+ * `decided_at` and puts the card back to `pending`; `withdraw` moves it to
+ * `withdrawn` (excluded above), and when the board left no note it also
+ * overwrites `decided_at` with the withdrawal time. "Board sends a batch back,
+ * agents clean up within hours" is the common path, so a row-only MAX jumps back
+ * to an older decision and pages on a board that did act.
+ *
+ * The activity log is append-only, and `requestRevision`'s only caller
+ * (`resolveApprovalWithSideEffects`) writes this event for every revision, so it
+ * survives both exits. Approve/reject stay on the row because one approve path
+ * (`routes/agents.ts`, hire approval) logs `agent.approved`, not this family.
+ */
+const REVISION_REQUESTED_ACTIVITY = "approval.revision_requested";
 
 /**
  * `revision_requested` is NOT counted as pending, even though the server treats
@@ -58,7 +77,7 @@ const PENDING_STATUS = "pending";
  */
 export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Promise<void> {
   try {
-    const [pendingByType, lastDecision] = await Promise.all([
+    const [pendingByType, lastDecision, lastRevisionRequest] = await Promise.all([
       db
         .select({
           type: approvals.type,
@@ -83,6 +102,23 @@ export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Pro
             isNotNull(approvals.decidedAt),
           ),
         ),
+      // ponytail: no index matches either filter shape. This one can narrow to
+      // approval rows through activity_log_entity_type_id_idx's leading column;
+      // the two approvals aggregates above filter on status alone, so they
+      // seq-scan the table (~1k rows) every tick. Add a status-leading approvals
+      // index, or an (entity_type, action, created_at) activity_log index, if
+      // either aggregate shows up in collector latency.
+      db
+        .select({
+          createdAt: sql<Date | string | null>`max(${activityLog.createdAt})`,
+        })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityType, "approval"),
+            eq(activityLog.action, REVISION_REQUESTED_ACTIVITY),
+          ),
+        ),
     ]);
 
     const entries = pendingByType.map((row) => ({
@@ -93,13 +129,18 @@ export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Pro
         : 0,
     }));
 
-    const decidedAt = lastDecision[0]?.decidedAt ?? null;
+    const decidedAtMs = Math.max(
+      ...[lastDecision[0]?.decidedAt, lastRevisionRequest[0]?.createdAt]
+        .filter((at): at is Date | string => at != null)
+        .map((at) => new Date(at).getTime()),
+    );
 
     setApprovalQueuePendingMetrics({
       entries,
       // Seconds, not ms: `time() - <gauge>` in the alert expression only type-checks
       // against a Unix-seconds series.
-      lastDecisionTimestampSeconds: decidedAt ? new Date(decidedAt).getTime() / 1000 : null,
+      // Math.max() of nothing is -Infinity: no decision from either source.
+      lastDecisionTimestampSeconds: Number.isFinite(decidedAtMs) ? decidedAtMs / 1000 : null,
     });
     setApprovalQueueMetricsRefreshSuccess(true);
   } catch (error) {
