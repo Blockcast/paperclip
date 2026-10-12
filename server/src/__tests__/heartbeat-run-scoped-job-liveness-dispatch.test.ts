@@ -34,6 +34,13 @@ import {
   renderMetrics,
 } from "../services/metrics.js";
 import { runningProcesses } from "../adapters/index.js";
+import { logger } from "../middleware/logger.js";
+import {
+  _resetAgentStartLocksForTesting,
+  currentAgentStartLockSignal,
+  describeAgentStartLockDispatchHealth,
+  LOCK_HELD_WARN_MS,
+} from "../services/agent-start-lock.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -47,6 +54,17 @@ const mockAdapterExecute = vi.hoisted(() =>
   })),
 );
 const mockHasActiveJobForAgent = vi.hoisted(() => vi.fn(async () => false));
+/** When set, replaces the roster read `noteDispatchDeclined` makes (BLO-42493). */
+const rosterFault = vi.hoisted(() => ({ next: null as null | (() => Promise<never>) }));
+
+vi.mock("../services/agent-roster.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/agent-roster.ts")>();
+  return {
+    ...actual,
+    getActiveAgentIds: (...args: Parameters<typeof actual.getActiveAgentIds>) =>
+      rosterFault.next ? rosterFault.next() : actual.getActiveAgentIds(...args),
+  };
+});
 
 vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
@@ -346,5 +364,65 @@ describeEmbeddedPostgres("startNextQueuedRunForAgent run-id-aware job liveness (
 
     expect(row?.status).toBe("queued");
     expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("propagates the section's abort out of noteDispatchDeclined instead of swallowing it (BLO-42493)", async () => {
+    // "Instrumentation must never fail dispatch" is right for a roster-read
+    // fault and wrong for the section's own abort: the lock is released only
+    // when the section settles, so a swallowed abort keeps the agent's start
+    // lock held. Drives the real decline path — a live untracked Job declines
+    // the pass as `untracked_external_job` — with the roster read cancelled
+    // the way postgres.js `Query#cancel()` cancels it (`57014`).
+    const { agentId, queuedRunId } = await seedExternalLifecycleAgentWithTerminalRuns();
+    mockHasActiveJobForAgent.mockResolvedValue(true);
+    let rosterReadInSection!: () => void;
+    const rosterRead = new Promise<void>((resolve) => {
+      rosterReadInSection = resolve;
+    });
+    rosterFault.next = () => {
+      const signal = currentAgentStartLockSignal();
+      expect(signal, "the decline's roster read must run inside the start-lock section").toBeDefined();
+      rosterReadInSection();
+      return new Promise<never>((_resolve, reject) => {
+        signal!.addEventListener(
+          "abort",
+          () => reject(Object.assign(new Error("canceling statement due to user request"), { code: "57014" })),
+          { once: true },
+        );
+      });
+    };
+    // The lock logs a line per tick across the simulated four hours.
+    const quiet = [
+      vi.spyOn(logger, "warn").mockImplementation(() => logger),
+      vi.spyOn(logger, "error").mockImplementation(() => logger),
+    ];
+    // Only the lock's escalation/abort clock is faked; DB I/O keeps real timers.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      const pass = heartbeat.resumeQueuedRuns().then(
+        () => ({ resolved: true as const }),
+        (error: unknown) => ({ error }),
+      );
+      await rosterRead;
+      // Hand-copied LOCK_ABORT_MS (4 h, not exported from agent-start-lock.ts).
+      await vi.advanceTimersByTimeAsync(4 * 60 * 60_000 + LOCK_HELD_WARN_MS);
+      // Fails fast, instead of hanging on `pass`, if the abort never fired.
+      expect(describeAgentStartLockDispatchHealth(agentId)).not.toBeNull();
+
+      expect(await pass).toEqual({ error: expect.objectContaining({ code: "57014" }) });
+      // Released by the section settling, not left `stalled` behind a swallow.
+      expect(describeAgentStartLockDispatchHealth(agentId)?.status).toBe("aborted");
+    } finally {
+      vi.useRealTimers();
+      for (const spy of quiet) spy.mockRestore();
+      rosterFault.next = null;
+      _resetAgentStartLocksForTesting();
+    }
+
+    const [row] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, queuedRunId));
+    expect(row?.status).toBe("queued");
   });
 });
