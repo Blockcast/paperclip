@@ -1685,6 +1685,42 @@ export async function probeStaleKillReviewEvidence(
   }
 }
 
+/**
+ * BLO-45251: the retry floor for a pr_review Job the provider refused with a
+ * 429, or null when the run is not that shape.
+ *
+ * PEN-3129 recovers the refusal from the run log and books it `job_failed`
+ * with a server-parsed `providerCapacityResetAt`, deliberately without a
+ * top-level `errorFamily`. That keeps issue runs on the
+ * `adapterInvocationStarted === false` proof, but a pr_review Job that reached
+ * the provider has always started its adapter, so it could never pass that
+ * proof and the review was dropped. Measured 2026-10-12 on Ally: 3 of 4 such
+ * 429 runs were never retried.
+ *
+ * The retry is safe for pr_review because of a different proof. The
+ * reconciler's GitHub probe found no review at the exact head after the Job
+ * had already terminated (`reviewEvidenceFound === false`). That is the same
+ * gate the stale-kill arm uses. Issue runs have no equivalent proof and stay
+ * terminal, and so does a `job_failed` run with no 429 evidence.
+ */
+export function readPrReviewProviderCapacityRefusalRetryNotBefore(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
+): Date | null {
+  if (run.errorCode !== "job_failed") return null;
+  const resultJson = parseObject(run.resultJson);
+  const recovery = parseObject(resultJson.externalLifecycleRecovery);
+  if (recovery.providerRefusalStatusCode !== 429) return null;
+  if (recovery.reviewEvidenceFound !== false) return null;
+  // Only the server terminal path's own write. The adapter-owner path strips
+  // these keys from adapter output, so a matching source cannot be forged.
+  const provenance = parseObject(resultJson.providerCapacityResetProvenance);
+  if (provenance.source !== PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE) return null;
+  const resetAt = readNonEmptyString(resultJson.providerCapacityResetAt);
+  const parsed = resetAt ? new Date(resetAt) : null;
+  if (!parsed || Number.isNaN(parsed.getTime())) return null;
+  return isPrReviewRetryContext(parseObject(run.contextSnapshot)) ? parsed : null;
+}
+
 export function shouldScheduleAutomaticRunRetry(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
 ) {
@@ -1788,10 +1824,13 @@ export function shouldScheduleAutomaticRunRetry(
   // is unchanged for both run kinds.
   if (JOB_FAILED_EQUIVALENT_ERROR_CODES.has(run.errorCode ?? "")) {
     const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
-    return (
+    if (
       (isIssueRun || isPrReviewRetryContext(contextSnapshot)) &&
       recovery.adapterInvocationStarted === false
-    );
+    ) {
+      return true;
+    }
+    return readPrReviewProviderCapacityRefusalRetryNotBefore(run) !== null;
   }
   if (run.errorCode === "session_unavailable") return true;
   // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) rides this arm
@@ -22271,7 +22310,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       clampTransientHorizon && transientRetryNotBefore
         ? clampTransientRetryHorizon({ retryNotBefore: transientRetryNotBefore, now })
         : null;
-    const effectiveRetryNotBefore = clampedTransientRetry?.dueAt ?? transientRetryNotBefore;
+    // BLO-45251: a pr_review 429 park carries no transient family, so its floor
+    // is the server-parsed reset instant (already bounded by the parser's cap).
+    const effectiveRetryNotBefore =
+      clampedTransientRetry?.dueAt ??
+      transientRetryNotBefore ??
+      readPrReviewProviderCapacityRefusalRetryNotBefore(run);
     // PEN-2509: the floor is adopted verbatim below, and an advertised floor is
     // an absolute instant shared by every run that saw the same denial — so
     // "adopt verbatim" is also "resume in lockstep". Disperse it forward before
@@ -25906,6 +25950,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : providerCapacityRefusal?.horizon.kind === "over_horizon"
           ? providerCapacityRefusal.horizon.parkAt
           : null;
+    // BLO-45251: a pr_review refused with a 429 has started its adapter, so the
+    // invocation proof can never admit its retry. Ask GitHub whether a review
+    // landed at the exact head instead. The Job has already failed
+    // (`backoffLimit: 0`), so no live agent can post after a negative probe.
+    // A probe error records nothing and the run stays terminal.
+    const providerCapacityReviewEvidenceFound =
+      providerCapacityParkAt &&
+      input.jobStatus?.phase !== "active" &&
+      isPrReviewRetryContext(parseObject(input.run.contextSnapshot))
+        ? await probeStaleKillReviewEvidence(input.run)
+        : null;
 
     const terminalClaimToken = randomUUID();
     let resultJson = mergeRunStopMetadataForAgent(
@@ -25972,6 +26027,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     providerCapacityRefusal.statusEvidence.statusCode,
                   providerRefusalHorizon: providerCapacityRefusal.horizon.kind,
                 }
+              : {}),
+            ...(providerCapacityReviewEvidenceFound !== null
+              ? { reviewEvidenceFound: providerCapacityReviewEvidenceFound }
               : {}),
           },
         },
@@ -26126,7 +26184,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (
       persistedDecision.outcome === "failed" &&
       !persistedDecision.pipelineStageExited &&
-      adapterInvocationStarted !== true &&
+      (adapterInvocationStarted !== true ||
+        readPrReviewProviderCapacityRefusalRetryNotBefore(finalizedRun) !== null) &&
       shouldScheduleAutomaticRunRetry(finalizedRun) &&
       finalizationAgent
     ) {
