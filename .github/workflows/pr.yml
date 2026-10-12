@@ -1854,15 +1854,15 @@ jobs:
   #
   # Fail closed, deliberately: it never skips (a skipped job would pass
   # `verify`'s needs), and a missing signal is "not eligible". In this repo
-  # only B (gate/ally-comment-findings) and S (ci/ally-head-attested) can
-  # admit a head; there is no review/ally-complete producer here.
+  # B (gate/ally-comment-findings), S (ci/ally-head-attested), or a trusted
+  # human /test can release CPU; there is no review/ally-complete producer here.
   #
   # Not held: a PR its own reviewer opened. The server never reports B
   # `success` on one (BLO-34316 withholds a self-attested clean, so B is
   # `neutral`), and nothing publishes S yet, so holding it would hold it for
-  # good: no heavy lanes, `verify` red, no way into the merge queue. Such a PR
-  # runs heavy CI on every push, as before this gate, until the owner sets
-  # ALLY_GATED_CI_HOLD_SELF_AUTHORED=true -- after S is seen `success` on one.
+  # good without S or a human /test. Such a PR runs heavy CI per push until
+  # the owner sets ALLY_GATED_CI_HOLD_SELF_AUTHORED=true after a live manual
+  # release canary succeeds (see AGENTS.md).
   # Not held either: a fork head. The shared predicate refuses a head outside
   # this repository and both release paths skip one, so it could never be
   # released; it runs heavy CI on every push, as before this gate.

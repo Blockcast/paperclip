@@ -286,7 +286,7 @@ async function unlock() {
   }
   const label = `PR #${number} at ${headSha}`;
   const manual = process.env.MANUAL === 'true' && manualTestAuthorized(
-    (await api.get(`/repos/${repository}/commits/${headSha}/status?per_page=100`)).statuses ?? [],
+    await api.get(`/repos/${repository}/commits/${headSha}/statuses?per_page=100`),
   );
   if (!manual && process.env.ELIGIBLE !== "true") {
     return summary(`${label}: not eligible, heavy lanes stay held: ${process.env.REASON || "no reason reported"}`);

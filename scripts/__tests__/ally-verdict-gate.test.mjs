@@ -843,3 +843,13 @@ test("only the trusted manual job may write the CPU request status", () => {
   assert.match(manual, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
   assert.match(manual, /run: node scripts\/pr-test-request\.mjs request/);
 });
+
+test('manual unlock validates the status-list producer rather than the combined status', async()=>{
+  const permission={id:1,context:'ci/manual-test-request',state:'success',creator:{id:41898282,login:'github-actions[bot]',type:'Bot'}};
+  for(const status of [permission,{...permission,creator:{...permission.creator,id:7}},{...permission,state:'pending'}]){
+    const routes=[['GET',/\/commits\/b{40}\/statuses\?per_page=100$/,()=>[200,[status]]],...baseRoutes([livePull(),livePull()])];
+    const result=await unlockAgainst(routes,{ELIGIBLE:'false',MANUAL:'true'});
+    assert.equal(result.status,0,result.stdout);
+    assert.equal(result.calls.filter(call=>call.startsWith('POST')).length,status===permission?1:0,result.stdout);
+  }
+});

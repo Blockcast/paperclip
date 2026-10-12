@@ -19,13 +19,13 @@ export function api(endpoint, method = 'GET', body) {
     encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GH_TOKEN: process.env.GITHUB_TOKEN || process.env.GH_TOKEN }, input: body ? JSON.stringify(body) : undefined,
   }));
   if (method !== 'GET') return result;
+  if (result.every(Array.isArray)) return result.flat();
   if (result.length === 1) return result[0];
-  if (!result.every(page => Array.isArray(page.statuses))) throw new Error('unexpected paginated response');
-  return { ...result[0], statuses: result.flatMap(page => page.statuses) };
+  throw new Error('unexpected paginated response');
 }
 export function readManualTest(repository, head, get = api) {
   if (!/^[0-9a-f]{40}$/.test(head)) throw new Error('manual CI requires an exact lowercase head SHA');
-  return manualTestAuthorized(get(`repos/${repository}/commits/${head}/status?per_page=100`).statuses ?? []);
+  return manualTestAuthorized(get(`repos/${repository}/commits/${head}/statuses?per_page=100`));
 }
 export async function requestTest(event, repository, { get = api, post = (endpoint, body) => api(endpoint, 'POST', body) } = {}) {
   if (!trustedTestComment(event)) return { pr_number: '', head_sha: '', manual: 'false' };
@@ -36,11 +36,11 @@ export async function requestTest(event, repository, { get = api, post = (endpoi
   const head = pull.head?.sha;
   if (pull.state !== 'open' || !/^[0-9a-f]{40}$/.test(head ?? '') ||
       pull.head.repo?.full_name?.toLowerCase() !== repository.toLowerCase()) throw new Error('closed, unreadable or cross-repository PR');
-  const statuses = await get(`repos/${repository}/commits/${head}/status?per_page=100`);
+  const statuses = await get(`repos/${repository}/commits/${head}/statuses?per_page=100`);
   const live = await get(endpoint);
   if (live.state !== 'open' || live.head?.sha !== head || live.head.repo?.full_name?.toLowerCase() !== repository.toLowerCase())
     throw new Error('PR head moved before its manual test request');
-  if (!manualTestAuthorized(statuses.statuses ?? [])) await post(`repos/${repository}/statuses/${head}`, {
+  if (!manualTestAuthorized(statuses)) await post(`repos/${repository}/statuses/${head}`, {
     state: 'success', context: MANUAL_TEST_CONTEXT, target_url: event.comment.html_url,
     description: 'Trusted human /test at this exact PR head; CI permission only',
   });
