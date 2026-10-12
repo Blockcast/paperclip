@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
 
-function renderApiDeployment() {
+function render(template, extraArgs = []) {
   return execFileSync(
     "helm",
     [
@@ -18,27 +18,33 @@ function renderApiDeployment() {
       "-f",
       "deploy/helm/paperclip/values.blockcast.yaml",
       "--show-only",
-      "templates/deployment-api.yaml",
-      "--set",
-      "api.enabled=true",
+      template,
+      ...extraArgs,
     ],
     { cwd: repoRoot, encoding: "utf8" },
   );
 }
 
-test("Blockcast enables the PR-review duplicate guard now compatibility pods have drained", () => {
-  const rendered = renderApiDeployment();
+// `env.extra` feeds both tiers; render each once and pin both against a future split.
+const tiers = {
+  api: render("templates/deployment-api.yaml", ["--set", "api.enabled=true"]),
+  workers: render("templates/statefulset.yaml"),
+};
 
-  assert.match(
-    rendered,
-    /- name: PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD\n\s+value: "false"/,
-  );
-});
+for (const [tier, rendered] of Object.entries(tiers)) {
+  test(`Blockcast enables the PR-review duplicate guard (${tier} tier)`, () => {
+    assert.match(
+      rendered,
+      /- name: PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD\n\s+value: "false"/,
+    );
+  });
 
-// Separate from the value assertion on purpose: the live admission policy pins an
-// exact container env-list length, so DELETING the var is inadmissible even though
-// an absent var and `"false"` are equivalent to the guard's own parser. This assert
-// fails on removal while the one above passes, and vice versa on a wrong value.
-test("Blockcast keeps the PR-review guard kill switch present in the env list", () => {
-  assert.match(renderApiDeployment(), /- name: PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD\n/);
-});
+  // Both asserts fail if the var is removed. This one additionally pins presence
+  // independently of the expected value, so a later change to that value cannot
+  // silently drop the var: the live admission policy pins an exact container
+  // env-list length, so DELETING it is inadmissible even though an absent var and
+  // `"false"` are equivalent to the guard's own parser.
+  test(`Blockcast keeps the PR-review guard kill switch present (${tier} tier)`, () => {
+    assert.match(rendered, /- name: PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD\n/);
+  });
+}
