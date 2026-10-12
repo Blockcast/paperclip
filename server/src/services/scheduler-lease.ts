@@ -188,8 +188,15 @@ export function schedulerLeaseHolder(
     renewIntervalMs = SCHEDULER_LEASE_RENEW_INTERVAL_MS,
     identity = schedulerLeaseIdentity(),
     now = () => Date.now(),
+    onAcquire,
   }: {
     name: string;
+    /**
+     * Fired on every transition from not-holding to holding: the first
+     * acquisition and every failover takeover (BLO-45212). Synchronous and
+     * fire-and-forget; a throw is logged and does not affect the lease.
+     */
+    onAcquire?: () => void;
     ttlMs?: number;
     renewIntervalMs?: number;
     identity?: { pod: string; holderId: string };
@@ -286,6 +293,11 @@ export function schedulerLeaseHolder(
             { lease: name, holder: identity.holderId, ttlMs, renewIntervalMs },
             "scheduler lease acquired - this process now runs the heartbeat timer loop",
           );
+          try {
+            onAcquire?.();
+          } catch (err) {
+            logger.error({ err, lease: name }, "scheduler lease onAcquire callback failed");
+          }
         }
       } else if (wasLeader) {
         // Another process took it while we still believed we held it. Only
