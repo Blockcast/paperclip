@@ -266,7 +266,6 @@ jobs:
       # Tag scheme matches values.blockcast.yaml's expectation:
       #   - `sha-<7>-k8s-vendored` per-commit tag for push builds
       #   - `sha-<7>-run-<run>-<attempt>-k8s-vendored` private manual candidate
-      #   - `buildcache-<full-sha>-k8s-vendored` exact cache shared by retries
       #   - `latest-k8s-vendored` floating tag for ad-hoc pulls
       # The `-k8s-vendored` suffix marks a kkroo-fork build (vendored
       # adapter tarballs + ccrotate kkroo patch baked in via the
@@ -279,7 +278,6 @@ jobs:
             harbor.blockcast.net/paperclip/paperclip
           tags: |
             type=raw,value=${{ steps.image_tag.outputs.value }}
-            type=raw,value=buildcache-${{ steps.target.outputs.full }}-k8s-vendored
             type=raw,value=latest-k8s-vendored,enable=${{ github.ref == 'refs/heads/master' && github.event_name != 'workflow_dispatch' }}
 
       # Mint this immediately before the consuming build so the one-hour App
@@ -316,13 +314,9 @@ jobs:
           sbom: false
           build-args: |
             RUNTIME_IMAGE=${{ steps.runtime.outputs.image }}
-          # Read the exact commit graph first. Manual release candidates use a
-          # run-scoped deployment tag, so without this stable cache tag a retry
-          # cannot address its earlier graph. The floating and frozen caches
-          # remain fallbacks for the first build of a commit. Cache metadata is
-          # published inline with all image tags to avoid a second exporter.
+          # Master refreshes the shared inline cache; manual releases only read
+          # it. Persistent BuildKit retains retry graphs without extra SHA tags.
           cache-from: |
-            type=registry,ref=harbor.blockcast.net/paperclip/paperclip:buildcache-${{ steps.target.outputs.full }}-k8s-vendored
             type=registry,ref=harbor.blockcast.net/paperclip/paperclip:latest-k8s-vendored
             type=registry,ref=harbor.blockcast.net/paperclip/paperclip:buildcache-v6
           cache-to: type=inline
