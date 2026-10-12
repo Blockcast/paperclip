@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
-import { issueRecoveryActions, issues } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -59,6 +59,17 @@ export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const 
  *     conclusion is unchanged: a null budget is reserved for the causes that never wake
  *     an owner at all.
  *
+ * ⚠ PEN-4006 narrows the FIRST of those three writers: a burned wake horizon alone no longer
+ * retires a row whose wake run is still pending (`queued` / `scheduled_retry` / `running`,
+ * matched on `contextSnapshot ->> 'recoveryActionId'`). Such a row stays `active` until an
+ * absolute ceiling of `PENDING_RECOVERY_WAKE_CEILING_TIMEOUT_MULTIPLIER x
+ * recoveryActionTimeoutMs` from `createdAt`, and is then retired carrying
+ * `retiringBound: "pending_wake_ceiling"` rather than `timeout_horizon`. This does NOT weaken
+ * the guarantee above: the ceiling is absolute, no sweep spends it either, and
+ * `upsertSourceScoped` lifts it on exactly the same single event that lifts a derived
+ * `timeout_horizon`. What changes is WHEN the guarantee starts applying — which is the point,
+ * because it was previously applying to actions whose repair was still in flight.
+ *
  * The platform says as much verbatim when it escalates: "Paperclip has stopped waking
  * anyone for it". Suppressing auto-resume on an `escalated` action therefore preserves
  * no repair path — it only pins the issue `blocked` with zero unresolved blockers, which
@@ -70,6 +81,31 @@ export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const 
  * only decides whether the row may return to `todo`.
  */
 export const BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES = ["active"] as const satisfies readonly IssueRecoveryActionStatus[];
+
+/**
+ * PEN-4006: run statuses that mean "a wake for this action has been committed and has not
+ * finished yet". Deliberately the same triple the rest of the server uses for a live run
+ * (`routes/agents.ts`, `routes/company-skills.ts`, `recovery/service.ts`), including
+ * `scheduled_retry` — a capacity-parked run is a DURABLE row the dispatcher will claim, and
+ * treating it as absent is the exact mistake the accounting half of PEN-3983 fixed one layer
+ * up (`enqueueWakeup` returns null on that path even though it committed the run).
+ */
+export const PENDING_RECOVERY_WAKE_RUN_STATUSES = ["queued", "scheduled_retry", "running"] as const;
+
+/**
+ * PEN-4006: how far past `recoveryActionTimeoutMs` an action may be held open by a wake that
+ * has not dispatched, as a multiple of that same horizon. One knob, not two — the ceiling
+ * moves with the horizon an operator actually tunes.
+ *
+ * 4 (24 h at the 6 h default) is sized from measured owner dispatch lag over ~3 days to
+ * 2026-10-12: median 4.39 h / max 13.36 h on @Devops, median 7.17 h / max 17.46 h on @Cto.
+ * 24 h clears the worst observed lag by 6.5 h. It is a CEILING, not a target: a row only
+ * reaches it when its wake has been parked that whole time, and the ceiling is what keeps the
+ * deferral safe — without one, a permanently-parked wake would hold
+ * `issue_recovery_actions_active_source_uq` forever, which is strictly worse than retiring
+ * early (it is the unbounded-row harm the derived arm below exists to close).
+ */
+export const PENDING_RECOVERY_WAKE_CEILING_TIMEOUT_MULTIPLIER = 4;
 
 const MAX_UPSERT_RETRIES = 3;
 const SOURCE_SCOPED_WAKE_HORIZON_EVIDENCE_KEY = "sourceScopedWakeHorizonAt";
@@ -661,8 +697,16 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       // deciding whether the gate is safe to widen. The gate otherwise fires only where the
       // horizon is being created for the first time. `discharged` and `cancelled` are
       // explicit disposals and are excluded by the bound check.
+      //
+      // PEN-4006: `pending_wake_ceiling` is lifted on exactly the same terms. It is the same
+      // creation-anchored retirement written by the same sweep — only the reason it gave up
+      // differs (a wake was still parked at the ceiling) — so a derived-arm row carrying it
+      // reaches the dishonest state described above by an identical route. Excluding it would
+      // reopen BLO-40297's hole for the subset of rows that had a wake in flight, which is
+      // the subset most likely to be genuinely repairable.
       const liftsDerivedHorizonRetirement = isNewlyBoundedSequence &&
-        existing.retiringBound === "timeout_horizon";
+        (existing.retiringBound === "timeout_horizon"
+          || existing.retiringBound === "pending_wake_ceiling");
       const liftsRetirement = liftsAttemptBudgetRetirement || liftsDerivedHorizonRetirement;
       // BLO-20263: refresh the handoff-grant anchor only when the transfer actually
       // moves the issue away from a different source agent. Every sweep passes
@@ -1114,6 +1158,18 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
      * means the derived arm is off, which is what the pre-BLO-40297 callers get.
      */
     unboundedHorizonMs?: number | null;
+    /**
+     * PEN-4006: the ABSOLUTE ceiling, measured from `createdAt`, past which an action is
+     * retired even though a wake run for it is still pending. Below the ceiling, a pending
+     * wake defers retirement; at or past it the row is retired as `pending_wake_ceiling`.
+     *
+     * Defaults to `unboundedHorizonMs * PENDING_RECOVERY_WAKE_CEILING_TIMEOUT_MULTIPLIER`, so
+     * the one caller that already passes the configured horizon gets the deferral without a
+     * second knob. `0` (or a non-positive value) turns the deferral off entirely, which is
+     * also what a caller that passes no `unboundedHorizonMs` gets — the pre-PEN-4006
+     * behaviour, retained so existing callers and fixtures are unaffected.
+     */
+    pendingWakeCeilingMs?: number | null;
   } = {}): Promise<IssueRecoveryAction[]> {
     const now = input.now ?? new Date();
     const limit = Math.max(1, Math.floor(input.limit ?? 200));
@@ -1140,8 +1196,8 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       candidatePredicates.push(eq(issueRecoveryActions.companyId, input.companyId));
     }
 
-    const candidateIds = await db
-      .select({ id: issueRecoveryActions.id })
+    const candidates = await db
+      .select({ id: issueRecoveryActions.id, createdAt: issueRecoveryActions.createdAt })
       .from(issueRecoveryActions)
       .where(and(...candidatePredicates))
       // ponytail: `timeoutAt ASC` puts rows with a NULL `timeoutAt` last, so a sweep that
@@ -1151,18 +1207,88 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       // first. That shape is itself an incident and the derived cohort is 21; add
       // `NULLS FIRST` if it ever stops draining.
       .orderBy(asc(issueRecoveryActions.timeoutAt), asc(issueRecoveryActions.createdAt))
-      .limit(limit)
-      .then((rows) => rows.map((row) => row.id));
-    if (candidateIds.length === 0) return [];
+      .limit(limit);
+    if (candidates.length === 0) return [];
+    const candidateIds = candidates.map((row) => row.id);
 
-    const updated = await db
-      .update(issueRecoveryActions)
-      .set({ status: "escalated", retiringBound: "timeout_horizon", updatedAt: now })
-      .where(and(
-        inArray(issueRecoveryActions.id, candidateIds),
-        eq(issueRecoveryActions.status, "active"),
-      ))
-      .returning();
+    // PEN-4006: split the batch by whether a wake for the action is still in flight.
+    //
+    // The horizon is wall-clock from `createdAt`, but the thing it is supposed to bound —
+    // the owner being woken — is not. Measured owner dispatch lag runs to 17.46 h against a
+    // 6 h horizon, so an action was routinely retired BEFORE its own wake ran: four PEN-3983
+    // instances were flipped `escalated` at 07:41:39Z and their wakes then started at
+    // 10:00-10:26Z and SUCCEEDED. `escalated` states "Paperclip has stopped waking anyone for
+    // it" and (per `BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES` above) pins the
+    // source issue `blocked` with no re-entry from any wake, retry or monitor. So the system
+    // declared the repair dead while the repair was demonstrably in flight.
+    //
+    // Deferring on pending-wake evidence is bounded by `pendingWakeCeilingMs` and nothing
+    // else. It is explicitly NOT a dispatch-relative horizon: anchoring the bound to dispatch
+    // would mean an action whose wake never dispatches never expires at all.
+    const pendingWakeCeilingMs = input.pendingWakeCeilingMs
+      ?? (unboundedHorizonMs !== null && unboundedHorizonMs > 0
+        ? unboundedHorizonMs * PENDING_RECOVERY_WAKE_CEILING_TIMEOUT_MULTIPLIER
+        : null);
+    const pendingWakeActionIds = pendingWakeCeilingMs !== null && pendingWakeCeilingMs > 0
+      ? await db
+        .selectDistinct({
+          recoveryActionId: sql<string>`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId'`,
+        })
+        .from(heartbeatRuns)
+        .where(and(
+          // The action id is a UUID and the runs carry it verbatim, so matching on it alone
+          // is already company-scoped by construction. No `issueId` fallback here, unlike
+          // `ensureProviderQuotaRecoveryMonitor`: that compatibility arm exists for monitors
+          // written before the stable key, and admitting a null-key run would let ANY live
+          // run on the issue defer this retirement indefinitely.
+          inArray(sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId'`, candidateIds),
+          inArray(heartbeatRuns.status, [...PENDING_RECOVERY_WAKE_RUN_STATUSES]),
+        ))
+        .then((rows) => new Set(rows.map((row) => row.recoveryActionId)))
+      : new Set<string>();
+
+    const ceilingReachedIds: string[] = [];
+    const retirableIds: string[] = [];
+    for (const candidate of candidates) {
+      if (!pendingWakeActionIds.has(candidate.id)) {
+        retirableIds.push(candidate.id);
+        continue;
+      }
+      // `createdAt` is the anchor, matching the derived arm above and the ticket's decision:
+      // dispatch time does not predict anything (the same seat spans 0.03 h to 13.36 h), and
+      // sizing the bound from queue depth at mint would make it unpredictable and unauditable.
+      const ceilingAt = new Date(new Date(candidate.createdAt).getTime() + pendingWakeCeilingMs!);
+      if (ceilingAt <= now) ceilingReachedIds.push(candidate.id);
+      // Otherwise: deferred. The row stays `active`, keeps its slot, and is re-examined on the
+      // next sweep — either the wake runs and resolves it, or it reaches the ceiling and is
+      // retired below. Deferred rows consume `limit`, so a batch of them retires fewer rows
+      // than the cap; that is bounded by the ceiling and self-clearing, and the candidate
+      // ordering is oldest-first, so the rows nearest their ceiling are the ones examined.
+    }
+
+    // Two UPDATEs, not one with a CASE: `retiringBound` is the only field that tells
+    // "retired with a wake still pending" from "retired having been woken", and it must be
+    // discriminated HERE. `retireWakeAction` writes the column with `coalesce` (first writer
+    // wins permanently), so a wrong value cannot be repaired downstream.
+    //
+    // The `status` re-check in each UPDATE is what makes concurrent sweeps safe, exactly as
+    // before: only rows this call actually transitioned come back, so the caller announces
+    // once. Splitting the batch does not weaken that — the two id sets are disjoint.
+    const retire = async (ids: string[], retiringBound: IssueRecoveryActionRetiringBound) => {
+      if (ids.length === 0) return [];
+      return db
+        .update(issueRecoveryActions)
+        .set({ status: "escalated", retiringBound, updatedAt: now })
+        .where(and(
+          inArray(issueRecoveryActions.id, ids),
+          eq(issueRecoveryActions.status, "active"),
+        ))
+        .returning();
+    };
+    const updated = [
+      ...await retire(retirableIds, "timeout_horizon"),
+      ...await retire(ceilingReachedIds, "pending_wake_ceiling"),
+    ];
 
     return updated.map(toReadModel);
   }
