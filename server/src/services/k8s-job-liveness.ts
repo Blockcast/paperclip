@@ -2,6 +2,7 @@ import * as k8s from "@kubernetes/client-node";
 
 import { logger } from "../middleware/logger.js";
 import { redactSensitiveText } from "../redaction.js";
+import { rethrowIfAgentStartLockAborted } from "./agent-start-lock.js";
 import { CAVEMAN_PROXY_NOT_READY_ERROR_CODE } from "./metrics.js";
 
 // Namespace where the claude_k8s / opencode_k8s adapters create their agent
@@ -1325,6 +1326,11 @@ export async function hasActiveJobForAgent(
       try {
         terminalRunIds = await options.isRunTerminal(candidateRunIds);
       } catch (error) {
+        // The dispatch section's abort is not an isRunTerminal failure and must
+        // not be absorbed as one (BLO-42493): swallowing it here resumes a
+        // section the lock has already given up on, and the lock is released
+        // only when `fn` settles.
+        rethrowIfAgentStartLockAborted(error);
         logger.warn(
           {
             agentId,
@@ -1413,6 +1419,12 @@ export async function hasActiveJobForAgent(
       throw error;
     }
   } catch (error) {
+    // Fail-open means "the kube API is unreachable, so proceed on DB evidence".
+    // It must not also mean "the dispatch section was cancelled, so proceed
+    // anyway" (BLO-42493) — this catch spans every await above, so without the
+    // guard an abort raised anywhere in them is reported as a kube outage and
+    // the section keeps the agent's start lock.
+    rethrowIfAgentStartLockAborted(error);
     const reason = error instanceof Error ? error.message : String(error);
     logger.warn({ agentId, error: reason }, "k8s in-flight check failed; falling back to DB-only");
     return false;

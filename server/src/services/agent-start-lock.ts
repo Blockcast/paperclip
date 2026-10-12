@@ -273,6 +273,41 @@ export function currentAgentStartLockSignal(): AbortSignal | undefined {
 }
 
 /**
+ * Rethrow from a `catch` that would otherwise swallow this section's abort
+ * (BLO-42493).
+ *
+ * `runExclusively` releases the lock if and only if `fn` settles, and the abort
+ * is delivered *as a rejection* — so every broad `catch` on the dispatch path is
+ * a hole in it. A catch that logs and continues converts the abort into a no-op:
+ * the section resumes, the lock stays held, and the escalating log reports
+ * `aborted: true` with the abort "not landed" forever. That is indistinguishable
+ * from a section wedged on an unabortable await, which is why the hole is
+ * invisible in production — and the only remedy left is replacing the pod. The
+ * measured cost of reaching that state once was 15.3 h of dead dispatch for one
+ * agent (BLO-42493), 11.5 h of it under a continuously-firing `critical` page.
+ *
+ * ⚠️ Keys on the SIGNAL, never on the error's type, and that is load-bearing
+ * rather than defensive. The dominant abort path does not raise
+ * {@link AgentStartLockAbortedError} at all: a statement already in flight is
+ * taken down by postgres.js `cancel()`, which rejects it with a PostgreSQL
+ * `57014 query_canceled` — an ordinary database error, carrying nothing that
+ * identifies it as this section's abort. `instanceof AgentStartLockAbortedError`
+ * would therefore pass exactly the case this guard exists to catch, while
+ * looking correct. Only a section that has NOT been aborted reaches an
+ * untouched `catch`, so testing the signal is both sufficient and exact.
+ *
+ * Rethrows the original error when it is one, so the catch site's own log keeps
+ * naming the real fault rather than a synthesized stand-in.
+ */
+export function rethrowIfAgentStartLockAborted(error: unknown): void {
+  const signal = sectionSignals.getStore();
+  if (!signal?.aborted) return;
+  if (error instanceof Error) throw error;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error(`Agent start lock section aborted (${String(error)})`);
+}
+
+/**
  * Rejection raised into a dispatch section whose lock hold passed
  * `LOCK_ABORT_MS`.
  *
