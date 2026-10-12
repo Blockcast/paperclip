@@ -38,6 +38,23 @@
  *   5. `startedAtAnchor` ignored in `buildIssueDescription`
  *                                              → cases 4, 5 and 6 fail.
  *
+ * Measured 2026-10-12 for the two cases added after Ally's review of 217f7b773e
+ * ("re-firing member in place", "newly filed row"), same one-at-a-time rule:
+ *
+ *   6. `describeAggregate` back to skip-and-append (the firing in hand skipped
+ *      from its row and always appended) → both new cases fail.
+ *   7. anchor back to `rows[0]` of the aggregate_key, live row or not
+ *                                              → "newly filed row" fails.
+ *   8. the `created_at` / `first_seen_starts_at` restart dropped from the
+ *      upsert, plain COALESCE again          → "newly filed row" fails.
+ *   9. `rejoinsLiveRow` forced false, so a member rebinding onto a different
+ *      live row resumes its old join position → "newly filed row" fails.
+ *
+ * ⚠ 6 and 8 SURVIVED the first draft of those cases: their re-deliveries were
+ * byte-identical, so the BLO-33168 replay window skipped them and the asserted
+ * body was the previous delivery's. They now go through `heartbeat`, which
+ * ages the replay marker and asserts the delivery issued an update.
+ *
  * ⚠ Mutation 2 SURVIVED this suite until case 5 grew a THIRD delivery. The body
  * is rendered before `upsertAggregateMember` writes, so a corrupted anchor is
  * invisible on the delivery that corrupts it and only surfaces on the next one
@@ -51,7 +68,7 @@ import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { handleWebhook } from "../webhook-handler.js";
+import { __firingReplayCacheForTests, handleWebhook } from "../webhook-handler.js";
 import { DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
 import type {
   AlertmanagerAlert,
@@ -264,6 +281,25 @@ const deliver = (ctx: PluginContext, alert: AlertmanagerAlert) =>
     requestId: `req-${alert.fingerprint}-${alert.status}-${alert.startsAt}`,
   } as never);
 
+/**
+ * A `repeat_interval` re-send. It is byte-identical to the member's last
+ * delivery, so the BLO-33168 replay window would skip it inside a test's run
+ * time — the re-render under test would never happen and the case would pass
+ * vacuously (measured: the first draft of the two cases below did). Clearing
+ * the markers is what that window expiring does; the update count proves the
+ * delivery was really processed.
+ */
+async function heartbeat(
+  ctx: PluginContext,
+  issues: ReturnType<typeof mkIssues>,
+  alert: AlertmanagerAlert,
+) {
+  __firingReplayCacheForTests(ctx).clear();
+  const before = issues.api.update.mock.calls.length;
+  await deliver(ctx, alert);
+  expect(issues.api.update.mock.calls.length).toBeGreaterThan(before);
+}
+
 /** The single aggregate row every case here produces. */
 function onlyIssue(issues: ReturnType<typeof mkIssues>) {
   const rows = [...issues.rows.values()];
@@ -430,6 +466,79 @@ describe("BLO-42850 — an aggregate row's body describes every active member", 
     expect(row.description).toContain(`**Started**: ${STARTS_A}`);
     expect(row.description).not.toContain(`**Started**: ${STARTS_B_EARLIER}`);
     expect(row.description).toContain(`**Latest firing**: ${STARTS_C_EARLIER}`);
+  });
+
+  it("keeps originId as the representative when a non-newest member re-fires", async () => {
+    const { ctx, issues } = mkCtx();
+
+    // Case 5's sibling: there the founding member re-fires ALONE, so no swap is
+    // observable. Alertmanager re-sends every member each `repeat_interval`, so
+    // the founder re-firing while a later joiner exists is the steady state.
+    await deliver(ctx, alertFor(FP_A, "build", STARTS_A));
+    await deliver(ctx, alertFor(FP_B, "deploy", STARTS_B_LATER));
+    const row = onlyIssue(issues);
+    expect(row.originId).toBe(FP_A);
+
+    await heartbeat(ctx, issues, alertFor(FP_A, "build", STARTS_A));
+    // Skip-and-append rendered [FP_B, FP_A] here: the representative flipped to
+    // FP_B while `originId` stayed FP_A.
+    expect(row.description).toContain("**Summary**: master is red on build");
+    expect(row.description).not.toContain("**Summary**: master is red on deploy");
+    // Join order kept in the members table too, not just the representative.
+    expect(row.description.indexOf(`\`${FP_A}\``)).toBeLessThan(
+      row.description.indexOf(`\`${FP_B}\``),
+    );
+
+    // And it does not alternate on the next heartbeat.
+    await heartbeat(ctx, issues, alertFor(FP_B, "deploy", STARTS_B_LATER));
+    expect(row.description).toContain("**Summary**: master is red on build");
+  });
+
+  it("dates a newly filed row from its own episode, not a member that resolved with an earlier row", async () => {
+    const { ctx, issues } = mkCtx();
+    const EPISODE_2_B = "2026-10-11T09:00:00Z";
+    /** Later than B, so an anchor taken from A's rejoin would move forwards. */
+    const EPISODE_2_A = "2026-10-11T09:20:00Z";
+    const byOrigin = (fingerprint: string) => {
+      const found = [...issues.rows.values()].filter((r) => r.originId === fingerprint);
+      expect(found).toHaveLength(1);
+      return found[0];
+    };
+
+    // Episode 1: A alone, then resolved — the row closes, A's member row stays.
+    await deliver(ctx, alertFor(FP_A, "build", STARTS_A));
+    await deliver(ctx, alertFor(FP_A, "build", STARTS_A, "resolved"));
+    const first = byOrigin(FP_A);
+    expect(first.status).toBe("cancelled");
+
+    // Episode 2: a new fingerprint on the same aggregate files a NEW row.
+    await deliver(ctx, alertFor(FP_B, "deploy", EPISODE_2_B));
+    const second = byOrigin(FP_B);
+    expect(second.id).not.toBe(first.id);
+    expect(second.description).toContain(`**Started**: ${EPISODE_2_B}`);
+    expect(second.description).not.toContain(STARTS_A);
+
+    // B's next heartbeat re-renders from the member table. Anchoring only the
+    // creation render would pass above and regress here.
+    await heartbeat(ctx, issues, alertFor(FP_B, "deploy", EPISODE_2_B));
+    expect(second.description).toContain(`**Started**: ${EPISODE_2_B}`);
+    expect(second.description).not.toContain(STARTS_A);
+
+    // A fires again and rebinds onto the live row as its NEWEST member: its
+    // episode-1 join order and anchor must not make it the founder.
+    await deliver(ctx, alertFor(FP_A, "build", EPISODE_2_A));
+    expect(first.status).toBe("cancelled");
+    expect(second.description).toContain("### Active members (2)");
+    expect(second.description).toContain(`**Started**: ${EPISODE_2_B}`);
+    expect(second.description).toContain("**Summary**: master is red on deploy");
+    expect(second.description).not.toContain(STARTS_A);
+
+    // The render after A's member write is the one that sees what the upsert
+    // stored (the body is rendered before the write — see case 5).
+    await heartbeat(ctx, issues, alertFor(FP_B, "deploy", EPISODE_2_B));
+    expect(second.description).toContain(`**Started**: ${EPISODE_2_B}`);
+    expect(second.description).toContain("**Summary**: master is red on deploy");
+    expect(second.description).not.toContain(STARTS_A);
   });
 
   it("backfills the anchor on a member row that predates migration 006, then holds it", async () => {

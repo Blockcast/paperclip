@@ -445,6 +445,11 @@ async function upsertAggregateMember(
   alert: AlertmanagerAlert,
 ): Promise<void> {
   const ns = ctx.db.namespace;
+  // `created_at` and `first_seen_starts_at` restart when a member that resolved
+  // with one row now fires onto a DIFFERENT row: it is that row's newest
+  // joiner, not its founder. Kept, its old `created_at` would sort it first and
+  // its old anchor would drag the new row's **Started** back into a finished
+  // episode. Same predicate as `rejoinsLiveRow` in `describeAggregate`.
   const result = await ctx.db.execute(
     `INSERT INTO ${q(ns, AGGREGATE_MEMBERS_TABLE)}
        (company_id, aggregate_key, fingerprint, issue_id, alert_snapshot,
@@ -462,10 +467,21 @@ async function upsertAggregateMember(
        issue_id = EXCLUDED.issue_id,
        resolved_at = NULL,
        alert_snapshot = EXCLUDED.alert_snapshot,
-       first_seen_starts_at = COALESCE(
-         ${AGGREGATE_MEMBERS_TABLE}.first_seen_starts_at,
-         EXCLUDED.first_seen_starts_at
-       ),
+       created_at = CASE
+         WHEN ${AGGREGATE_MEMBERS_TABLE}.resolved_at IS NOT NULL
+          AND ${AGGREGATE_MEMBERS_TABLE}.issue_id <> EXCLUDED.issue_id
+         THEN now()
+         ELSE ${AGGREGATE_MEMBERS_TABLE}.created_at
+       END,
+       first_seen_starts_at = CASE
+         WHEN ${AGGREGATE_MEMBERS_TABLE}.resolved_at IS NOT NULL
+          AND ${AGGREGATE_MEMBERS_TABLE}.issue_id <> EXCLUDED.issue_id
+         THEN EXCLUDED.first_seen_starts_at
+         ELSE COALESCE(
+           ${AGGREGATE_MEMBERS_TABLE}.first_seen_starts_at,
+           EXCLUDED.first_seen_starts_at
+         )
+       END,
        updated_at = now()`,
     [
       companyId,
@@ -476,10 +492,11 @@ async function upsertAggregateMember(
       // BLO-42850: the subject this member renders as. Refreshed on every
       // re-fire so drill-in time ranges and a changed summary stay current.
       JSON.stringify(memberSnapshot(alert)),
-      // Write-once, via the COALESCE above rather than by omission: a value
-      // already present is never rewritten — which IS the non-decreasing
-      // **Started** guarantee, since the row's anchor is the oldest-joined
-      // member's value — while a member row written before migration 006
+      // Write-once per row, via the COALESCE above rather than by omission: a
+      // value already present is never rewritten while the member stays on the
+      // same row (the CASE restarts it only on a move to a DIFFERENT row) —
+      // which IS the non-decreasing **Started** guarantee, since the row's
+      // anchor is the oldest-joined member's value — while a member row written before migration 006
       // carries NULL and would otherwise stay anchorless forever. Omitting the
       // column entirely from DO UPDATE looks more immutable and is strictly
       // worse: every aggregate that predates the migration would fall back to
@@ -547,34 +564,65 @@ async function describeAggregate(
   try {
     const rows = await ctx.db.query<{
       fingerprint: string;
+      issue_id: string;
       alert_snapshot: Record<string, unknown> | string | null;
       first_seen_starts_at: string | null;
       resolved_at: string | null;
     }>(
-      `SELECT fingerprint, alert_snapshot, first_seen_starts_at, resolved_at
+      `SELECT fingerprint, issue_id, alert_snapshot, first_seen_starts_at, resolved_at
        FROM ${q(ns, AGGREGATE_MEMBERS_TABLE)}
        WHERE company_id = $1 AND aggregate_key = $2
        ORDER BY created_at ASC, fingerprint ASC`,
       [companyId, aggregateKey],
     );
-    // Oldest-joined member, resolved or not. Resolved members stay in the
-    // ordering on purpose: the anchor must not jump forward when the founding
-    // member clears, and nothing deletes member rows.
-    const anchor = rows[0]?.first_seen_starts_at ?? alert?.startsAt ?? null;
+    // Rows that are live right now: those with at least one active member.
+    const liveIssueIds = new Set(
+      rows.filter((row) => row.resolved_at === null).map((row) => row.issue_id),
+    );
+    // The firing in hand's own row, if it has fired before. A resolved member
+    // coming back while a DIFFERENT row is live joins that row as its newest
+    // member (`upsertAggregateMember` restarts its join order and anchor on the
+    // same predicate); otherwise it resumes its own row, in place.
+    const own = alert
+      ? rows.find((row) => row.fingerprint === alert.fingerprint)
+      : undefined;
+    const rejoinsLiveRow =
+      own !== undefined &&
+      own.resolved_at !== null &&
+      liveIssueIds.size > 0 &&
+      !liveIssueIds.has(own.issue_id);
+    if (own && !rejoinsLiveRow) liveIssueIds.add(own.issue_id);
+
+    // **Started** is the oldest-joined member OF A LIVE ROW: active, or
+    // resolved while its row stayed live — so the anchor does not jump forward
+    // when the founding member clears. A member that resolved with an earlier,
+    // finished row belongs to that episode and must not date a new one; nothing
+    // deletes member rows, so without this a freshly filed row would render an
+    // old incident's start.
+    const anchorRow = rows.find((row) => liveIssueIds.has(row.issue_id));
+    const anchor = anchorRow?.first_seen_starts_at ?? alert?.startsAt ?? null;
 
     const members: AggregateMemberSubject[] = [];
     for (const row of rows) {
+      if (alert && row === own) {
+        // In place, at its join position: the firing in hand shadows its stored
+        // snapshot without reordering the row. Skip-and-append made a re-firing
+        // founder trail its siblings, so the representative stopped being
+        // `originId` on every other heartbeat.
+        if (!rejoinsLiveRow) members.push({ fingerprint: alert.fingerprint, alert });
+        continue;
+      }
       if (row.resolved_at !== null) continue;
-      if (alert && row.fingerprint === alert.fingerprint) continue;
       members.push({
         fingerprint: row.fingerprint,
         alert: parseMemberSnapshot(row.fingerprint, row.alert_snapshot),
       });
     }
-    // Appended rather than spliced into join order: a brand-new fingerprint is
-    // the newest joiner, and one already present was skipped above so its
-    // stored snapshot cannot shadow the firing in hand.
-    if (alert) members.push({ fingerprint: alert.fingerprint, alert });
+    // Only a genuine newcomer — or a member rejoining a different live row — is
+    // appended: it is the newest joiner.
+    if (alert && (own === undefined || rejoinsLiveRow)) {
+      members.push({ fingerprint: alert.fingerprint, alert });
+    }
 
     return buildAggregateIssueDescription(members, anchor) ?? fallback;
   } catch (err) {
