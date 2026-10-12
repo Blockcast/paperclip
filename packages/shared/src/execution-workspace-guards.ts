@@ -88,5 +88,8 @@ export function isExecutionWorkspaceDetachPatch(input: {
   if (!keys.every((key) => EXECUTION_WORKSPACE_DETACH_FIELDS.has(key))) return false;
   // Also covers the empty patch: `every` is vacuously true on no keys, and this rejects it.
   if (!Object.prototype.hasOwnProperty.call(input.body, "executionWorkspaceId")) return false;
-  return input.body.executionWorkspaceId !== input.closedExecutionWorkspaceId;
+  // UUIDs compare case-insensitively: the validator accepts an uppercase id, so a strict
+  // `!==` let an echo of the same workspace in upper case pass as a rebind.
+  const target = input.body.executionWorkspaceId;
+  return typeof target !== "string" || target.toLowerCase() !== input.closedExecutionWorkspaceId.toLowerCase();
 }
