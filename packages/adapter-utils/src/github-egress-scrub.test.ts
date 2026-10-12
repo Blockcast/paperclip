@@ -700,6 +700,10 @@ describe("scrubGitHubEgressText", () => {
       ["a 3-digit run", ["orc888r", "cdn", "forward", "queue", "federate"]],
       ["a digit-led segment", ["8orcr", "cdn", "forward", "queue", "federate"]],
       ["two digit runs in one segment", ["o2rc8r", "cdn", "forward", "queue", "federate"]],
+      ["a mixed-case mixed segment", ["oRc8r", "cdn", "forward", "queue", "federate"]],
+      // A random 4×6 lower+digit key with exactly one admissible mixed segment:
+      // refused by the uniform-length check (Ally, review 5496550156).
+      ["a fixed-layout key", ["xotjia", "uzvdso", "mhknub", "sn1prx"]],
     ])("still refuses %s", (_label, parts) => {
       const token = parts.join("-");
       const result = scrubGitHubEgressText(`sessionkey=${token}`);
