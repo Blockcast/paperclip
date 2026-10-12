@@ -1986,3 +1986,72 @@ describe("BLO-32695 -- U+2028 is not a line break in any reader", () => {
     expect(parseAllyVerdictBlock(blocked("### Critical Issues (3)")).kind).toBe("unreadable");
   });
 });
+
+/**
+ * BLO-34389 — the `reviewer` lane field, and the forward-compat invariant that
+ * makes adding ANY optional top-level key safe.
+ *
+ * The invariant is NOT "every optional top-level field fails closed". That is
+ * what `dispositions` does (`asDispositions(undefined) -> []`, retiring
+ * nothing), and `reviewer` deliberately does not: an absent `reviewer` leaves
+ * every retirement credited. Stating the strong version here would be a
+ * comfortable falsehood, and the next person to add a field would rely on it.
+ *
+ * The invariant that actually holds, and that a new optional key must preserve:
+ * ITS ABSENCE MUST NEVER MAKE A HEAD MORE RETIRED THAN THE CODE DID BEFORE THE
+ * KEY EXISTED. `dispositions` satisfies it by retiring nothing; `reviewer`
+ * satisfies it by reproducing the pre-field behaviour exactly. A field whose
+ * absence cleared a head would break it, and that is the shape to refuse.
+ */
+describe("BLO-34389 — the reviewer lane field", () => {
+  const HEAD = "1111111111111111111111111111111111111111";
+  const base = { head: HEAD, findings: { critical: 0, important: 0 } };
+  const body = (payload: unknown) =>
+    [verdictBlock(payload), "## Ally — Consolidated PR Review", `Reviewed head: ${HEAD}`].join("\n");
+
+  const parsed = (payload: unknown) => {
+    const result = parseAllyVerdictBlock(body(payload));
+    if (result.kind !== "ok") throw new Error(`expected ok, got ${result.kind}`);
+    return result.verdict;
+  };
+
+  it("reads the declared lane, trimmed and lowercased", () => {
+    expect(parsed({ ...base, reviewer: "  Staff-Engineer " }).reviewer).toBe("staff-engineer");
+  });
+
+  it("reports null when the block declares no lane", () => {
+    expect(parsed(base).reviewer).toBeNull();
+  });
+
+  // Present-but-malformed is a different fact from absent, and fails closed for
+  // the same reason an opener with no terminator does: a field Ally tried to
+  // state and we could not read is not a review that predates the field.
+  it.each([
+    ["a non-string", 7],
+    ["an empty string", ""],
+    ["whitespace only", "   "],
+    ["an object", { lane: "ally" }],
+    ["null", null],
+  ])("fails closed on %s reviewer", (_label, reviewer) => {
+    const result = parseAllyVerdictBlock(body({ ...base, reviewer }));
+    expect(result.kind).toBe("unreadable");
+    if (result.kind === "unreadable") expect(result.reason).toContain("reviewer");
+  });
+
+  // AC7. Forward compat: a key this parser does not know must not make the
+  // whole block unreadable, or every future field addition reds the estate on
+  // the day the producer ships it and before the server rolls out.
+  it("ignores an unknown top-level key rather than failing closed", () => {
+    expect(parsed({ ...base, somethingNobodyHasWrittenYet: { a: 1 } }).reviewer).toBeNull();
+  });
+
+  // ⚠ THE COST OF THAT, STATED SO IT IS NOT DISCOVERED LATER: there is no
+  // top-level key-set validation, so a MISSPELLED `reviewer` is silently an
+  // absent one and the exclusion does not fire. Tolerable only because the
+  // field is a self-declaration — an author retiring its own finding can omit
+  // it outright, so a typo is the same class of bypass, not a new one. It would
+  // NOT be tolerable for a field that is load-bearing against a forger.
+  it("treats a misspelled reviewer key as absent — the known cost of AC7", () => {
+    expect(parsed({ ...base, reviewr: "staff-engineer" }).reviewer).toBeNull();
+  });
+});

@@ -505,6 +505,22 @@ def parse_verdict_block_head(body):
     # The other field the payload carries, held to the same rule.
     if not dispositions_ok(parsed):
         return ("unreadable", None)
+    # And the third, `reviewer` (BLO-34389). This sweep never reads the lane --
+    # it only wants the head -- but readability is a property of the block, not
+    # of the field any one reader happens to use, and the rule above applies
+    # unchanged: a field the gate rejects makes the gate red while this sweep
+    # sees a review that already happened, so it never re-requests the one that
+    # would clear it.
+    #
+    # ABSENT is legitimate and stays readable: every review posted before the
+    # field existed declares nothing, so failing those closed would wedge the
+    # whole open-PR population. `in`, not `.get()`, for the same reason as
+    # `dispositions_ok` -- an explicit `null` is a stated-but-unreadable field,
+    # which the gate fails closed on, and `.get()` cannot tell it from absent.
+    if "reviewer" in parsed:
+        reviewer = parsed["reviewer"]
+        if not isinstance(reviewer, str) or not js_trim(reviewer):
+            return ("unreadable", None)
     if prose_count_contradicts(body, counts):
         return ("unreadable", None)
     # The same rule on the other field the payload carries.
