@@ -1961,6 +1961,9 @@ describe("evaluateCommentReviewGate — ledger author-lane exclusion", () => {
     expect(verdict.reason.length).toBeLessThanOrEqual(140);
     // And it must not claim a reviewer looked at this tree.
     expect(verdict.reason).not.toContain("no comment attests");
+    // Nor that no entry names the finding: the refused entry named it, and a
+    // lead saying otherwise sends the author to add an entry that exists.
+    expect(verdict.reason).not.toContain("No ledger entry names");
   });
 
   // The explanation may only ever cite a refusal that was actually load-bearing
@@ -1982,6 +1985,10 @@ describe("evaluateCommentReviewGate — ledger author-lane exclusion", () => {
 
     expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
     expect(verdict.reason).not.toContain("own lane");
+    // Only the finding no entry names is listed. The refused entry named
+    // finding 1, so listing it would ask for an entry that already exists.
+    expect(verdict.reason).toContain('"important 2"');
+    expect(verdict.reason).not.toContain('"important 1"');
   });
 
   // The refusal is named for RETIREMENT, and must stay that narrow. `blocks`
