@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { issues, projects, projectWorkspaces } from "@paperclipai/db";
 import {
   findWorkspaceCommandDefinition,
+  isClosedExecutionWorkspaceStatus,
   matchWorkspaceRuntimeServiceToCommand,
   reconcileExecutionWorkspaceBranchSchema,
   updateExecutionWorkspaceSchema,
@@ -674,6 +675,24 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     }
     let workspace = existing;
     let cleanupWarnings: string[] = [];
+    // BLO-42036: every closed-workspace guard keys on `closedAt`, which this
+    // route does not accept, while it did accept any `status`. So
+    // `{"status":"active"}` on an archived row returned 200 and left `closedAt`
+    // set — the caller then read `status: "active"` and "This issue is linked to
+    // the closed workspace" out of the same payload, and nothing had changed.
+    // Refuse the contradiction rather than clearing `closedAt` behind it: the row
+    // is closed because its artifacts were torn down, so re-opening it would hand
+    // the caller a workspace whose directory is gone. Re-point the issue instead.
+    if (
+      req.body.status !== undefined
+      && !isClosedExecutionWorkspaceStatus(req.body.status)
+      && existing.closedAt != null
+    ) {
+      res.status(409).json({
+        error: `Execution workspace "${existing.name}" is closed and cannot be reopened. Its artifacts have been torn down; move the issue to a new workspace instead.`,
+      });
+      return;
+    }
     const configForCleanup = readExecutionWorkspaceConfig(
       ((patch.metadata as Record<string, unknown> | null | undefined) ?? (existing.metadata as Record<string, unknown> | null)) ?? null,
     );
