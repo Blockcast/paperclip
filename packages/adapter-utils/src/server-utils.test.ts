@@ -1190,6 +1190,14 @@ describe("renderPaperclipWakePrompt", () => {
       expect(prompt).toContain("evidence, not valid liveness paths by themselves");
       expect(prompt).toContain("Use child issues for long or parallel delegated work instead of polling");
       expect(prompt).toContain("named unblock owner/action");
+      // PEN-3974: "a named unblock owner/action" named the concept but never the
+      // carrier, so an agent could satisfy it with prose in a comment and have the
+      // stranded-blocked reconciler sweep the row straight back to `todo`. The
+      // declaration lines are the only thing that holds the park, so the contract
+      // has to say where they go.
+      expect(prompt).toContain("external owner:");
+      expect(prompt).toContain("external action:");
+      expect(prompt).toContain("description");
     }
   });
 
