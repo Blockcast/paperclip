@@ -147,7 +147,7 @@ describe("PR-review queue-wait metrics (BLO-30623)", () => {
     expect(body).not.toContain("Blockcast");
   });
 
-  it("keeps the saturated regime measured on BLO-31298 in a finite bucket", () => {
+  it("keeps the saturated regime's measured mean (BLO-31298) in a finite bucket", () => {
     // 2026-10-10T11:44Z: 100% of samples past the then-top edge of 28800, mean
     // 48941s. Past the top finite edge histogram_quantile() returns that edge
     // verbatim, so the p95 panel flatlines at 8h while the wait keeps growing.
