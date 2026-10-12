@@ -314,3 +314,35 @@ test("comment-stripping removes prose but never an executed line", () => {
       "which is why whole-line stripping is sufficient here",
   );
 });
+
+// BLO-43939: the delivery defect in the same lane. `github.ref` is constant on
+// a master-only `workflow_run` trigger, so the job's concurrency group covers
+// all of trunk; with `cancel-in-progress: true` a ~73-minute build was killed
+// by the next successful server build. 17 of 100 master runs died mid-build at
+// a median 38 minutes and the worst gap between two published agent images was
+// 16.3h — silently, because `alert-on-failure` keys on `failure`, not
+// `cancelled`. `false` keeps supersession (GitHub holds one run pending per
+// group and the newest commit wins that slot) without destroying work in
+// flight, and leaves max concurrency at 1 so arc-dind gains no parallel builds.
+test("a master push does not cancel an agent-base build already in flight", () => {
+  const buildJob = executableLines(getJobBlock("build-and-push"));
+
+  assert.match(buildJob, /^\s*concurrency:$/m, "build-and-push must still declare a concurrency group");
+  assert.match(
+    buildJob,
+    /^\s*cancel-in-progress: false$/m,
+    "build-and-push must set cancel-in-progress: false — this group is all of trunk, and `true` " +
+      "destroys a ~73-minute build every time the next master commit lands (BLO-43939)",
+  );
+  assert.doesNotMatch(buildJob, /^\s*cancel-in-progress: true$/m);
+});
+
+test("reintroducing cancel-in-progress: true falsifies the delivery assertion", () => {
+  const poisoned = workflow.replace("cancel-in-progress: false", "cancel-in-progress: true");
+  assert.notEqual(poisoned, workflow, "fixture check: the literal must be present to be swapped");
+  assert.match(
+    executableLines(getJobBlock("build-and-push", poisoned)),
+    /^\s*cancel-in-progress: true$/m,
+    "the guard must read the executed key, not the comment above it that quotes the old value",
+  );
+});

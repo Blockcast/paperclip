@@ -26,9 +26,30 @@ jobs:
     # the base paperclip server image changes. Keep enough room for that path;
     # Buildx still fails fast on real command errors.
     timeout-minutes: 90
+    # BLO-43939. `github.ref` is constant here — the trigger is `workflow_run`
+    # on master only — so this is ONE group for the whole of trunk, and
+    # `cancel-in-progress: true` meant the next successful server build killed
+    # whatever agent build was in flight. Measured over the 100 master runs in
+    # 2026-10-08T03:28Z..2026-10-12T00:24Z: 17 died mid-build at a median 38
+    # minutes each (~10.8 arc-dind hours that published nothing), and the
+    # longest gap between two published agent images was 16.3h — the window in
+    # which a merged fix cannot reach any agent pod. Nothing paged for it:
+    # `alert-on-failure` below fires on `failure`, not `cancelled`.
+    #
+    # `false` does not serialize trunk. It moves supersession from the running
+    # build to the queue: GitHub parks at most ONE run pending per group and
+    # evicts the earlier pending run when a newer one arrives — the BLO-26972
+    # mechanism documented at length above `guard-pending-deploy` in
+    # docker.yml. That eviction is the behaviour we want here, because the run
+    # it drops is a stale intermediate commit and the newest master commit
+    # always takes the pending slot. It was harmful in docker.yml only because
+    # the evicted run was a production deploy parked on a human approval gate;
+    # this job has no gate, publishes an immutable per-SHA tag, and is
+    # re-dispatchable. Max concurrency stays 1, so arc-dind — the tightest
+    # elastic pool — gains no parallel builds and needs no capacity ruling.
     concurrency:
       group: docker-agent-${{ github.ref }}
-      cancel-in-progress: true
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v5
