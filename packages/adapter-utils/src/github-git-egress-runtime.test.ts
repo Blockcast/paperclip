@@ -1,7 +1,7 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -19,6 +19,18 @@ import {
   runPrePushHook,
 } from "./github-git-egress-runtime.js";
 import { commitsForRefUpdate, type GitReader } from "./github-git-egress-shim.js";
+
+// Every fixture repo is registered here when created and removed when the file
+// finishes, so test runs do not leave throwaway repos behind in $TMPDIR (BLO-44941).
+const tempDirs = new Set<string>();
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  tempDirs.add(dir);
+  return dir;
+}
+afterAll(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+});
 
 const HOOKS = "/hooks";
 
@@ -266,7 +278,7 @@ describe.skipIf(!GIT)("runGitEgressRuntime alias resolution", () => {
     // before the caller's global options were forwarded to the lookup,
     // `git -C <repo> <push-alias>` published a commit carrying credential-shaped
     // material with the hook never running.
-    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-"));
+    const repo = tempDir("git-egress-");
     execFileSync("git", ["init", "-q", repo]);
     execFileSync("git", ["-C", repo, "config", "alias.yolo", "push --no-verify"]);
 
@@ -282,7 +294,7 @@ describe.skipIf(!GIT)("runGitEgressRuntime alias resolution", () => {
   it("prefers a command-line definition over the repository's own", () => {
     // Git takes the command-line one; so must the guard, or a benign on-disk
     // alias masks a hostile command-line redefinition of the same name.
-    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-"));
+    const repo = tempDir("git-egress-");
     execFileSync("git", ["init", "-q", repo]);
     execFileSync("git", ["-C", repo, "config", "alias.p", "status"]);
 
@@ -307,7 +319,7 @@ describe.skipIf(!GIT)("--signoff against a real repository", () => {
   const EMAIL = "backendengineergo@paperclip.blockcast.net";
 
   function commitWith(argv: readonly string[]): { message: string; ident: string } {
-    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-signoff-"));
+    const repo = tempDir("git-egress-signoff-");
     execFileSync("git", ["init", "-q", repo]);
     const env = {
       ...process.env,
@@ -805,7 +817,7 @@ describe.skipIf(!GIT)("content leg against a real repository", () => {
     runGit: GitReader;
     input: string;
   } {
-    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-content-"));
+    const repo = tempDir("git-egress-content-");
     execFileSync("git", ["init", "-q", repo]);
     execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
     execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
@@ -866,7 +878,7 @@ describe.skipIf(!GIT)("content leg against a real repository", () => {
     // and replaces a file's content with that command's output for display.
     // Without `--no-textconv` the scanner reads `innocuous` and passes the
     // commit while the real bytes go to the remote.
-    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-textconv-"));
+    const repo = tempDir("git-egress-textconv-");
     execFileSync("git", ["init", "-q", repo]);
     execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
     execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
@@ -900,7 +912,7 @@ describe.skipIf(!GIT)("content leg against a real repository", () => {
     //
     // The commit here is deliberately spotless, so a pass would mean the tag
     // message went out unscanned rather than that something else caught it.
-    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-tag-"));
+    const repo = tempDir("git-egress-tag-");
     execFileSync("git", ["init", "-q", repo]);
     execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
     execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
@@ -940,7 +952,7 @@ describe.skipIf(!GIT)("content leg against a real repository", () => {
     // A lightweight tag's ref points straight at the commit, so there is no tag
     // object to read and the commit leg already covers it. This asserts the
     // scan does not refuse or error on the no-tag-object shape.
-    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-lightweight-"));
+    const repo = tempDir("git-egress-lightweight-");
     execFileSync("git", ["init", "-q", repo]);
     execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
     execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
@@ -964,7 +976,7 @@ describe.skipIf(!GIT)("content leg against a real repository", () => {
 
   it("still passes an annotated tag with a clean message", async () => {
     // The tag leg must not turn every release tag into a refusal.
-    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-tag-clean-"));
+    const repo = tempDir("git-egress-tag-clean-");
     execFileSync("git", ["init", "-q", repo]);
     execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
     execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
@@ -1088,7 +1100,7 @@ describe.skipIf(!SPAWNED_GIT)("pre-push hook bootstrap, spawned as git spawns it
     // checking, which keeps the test independent of whether `@types/node` is
     // installed in the sandbox.
     const ts = (await import("typescript")).default;
-    const out = mkdtempSync(path.join(tmpdir(), "git-egress-boot-"));
+    const out = tempDir("git-egress-boot-");
     for (const name of [
       "github-egress-scrub",
       "github-git-egress-shim",
@@ -1105,7 +1117,7 @@ describe.skipIf(!SPAWNED_GIT)("pre-push hook bootstrap, spawned as git spawns it
     // The shape the finding names: the package directory is a symlink, as it is
     // under a pnpm store layout or workspace hoisting. `argv[1]` is then the
     // link path while `import.meta.url` is the realpath.
-    const linkRoot = mkdtempSync(path.join(tmpdir(), "git-egress-link-"));
+    const linkRoot = tempDir("git-egress-link-");
     symlinkSync(out, path.join(linkRoot, "adapter-utils"));
     linked = path.join(linkRoot, "adapter-utils", "github-git-egress-runtime.js");
   });
@@ -1136,7 +1148,7 @@ describe.skipIf(!SPAWNED_GIT)("pre-push hook bootstrap, spawned as git spawns it
 
   /** A commit carrying credential-shaped material, and the hook stdin for it. */
   function dirtyPush(): { repo: string; input: string } {
-    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-boot-repo-"));
+    const repo = tempDir("git-egress-boot-repo-");
     execFileSync("git", ["init", "-q", repo]);
     execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
     execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
@@ -1183,7 +1195,7 @@ describe.skipIf(!SPAWNED_GIT)("pre-push hook bootstrap, spawned as git spawns it
   it("does not refuse a clean push through the symlinked path", () => {
     // Entering the hook on argv alone must not turn the bootstrap into a
     // blanket refusal: the common case still has to push.
-    const repo = mkdtempSync(path.join(tmpdir(), "git-egress-boot-clean-"));
+    const repo = tempDir("git-egress-boot-clean-");
     execFileSync("git", ["init", "-q", repo]);
     execFileSync("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
     execFileSync("git", ["-C", repo, "config", "user.name", "T"]);
@@ -1213,7 +1225,7 @@ describe("PEN-3907: a force-push after a rebase reports only the author's own co
     execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 
   it.skipIf(!GIT)("excludes commits already published upstream", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "git-egress-rebase-"));
+    const root = tempDir("git-egress-rebase-");
     const upstream = path.join(root, "up.git");
     const work = path.join(root, "work");
 
