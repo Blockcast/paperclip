@@ -83,6 +83,18 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 const execFileAsync = promisify(execFile);
 
+// Every temp dir is registered here when created and removed when the file
+// finishes, so test runs do not leave throwaway repos behind in $TMPDIR (BLO-44941).
+const tempDirs = new Set<string>();
+async function makeTempDir(prefix: string): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  tempDirs.add(dir);
+  return dir;
+}
+afterAll(async () => {
+  await Promise.all(Array.from(tempDirs, (dir) => fs.rm(dir, { recursive: true, force: true })));
+});
+
 // Captured before any test can prepend a `git` shim directory. See the PATH
 // backstop in the global `afterEach`.
 const BASELINE_PATH = process.env.PATH;
@@ -149,7 +161,7 @@ async function runPnpm(cwd: string, args: string[]) {
 }
 
 async function createTempRepo(defaultBranch = "main") {
-  const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-repo-"));
+  const repoRoot = await makeTempDir("paperclip-worktree-repo-");
   await runGit(repoRoot, ["init"]);
   // Make the repo hermetic: neutralize any global core.hooksPath (e.g. a
   // developer's Git LFS hooks). Otherwise `git worktree add`/`checkout` runs
@@ -456,11 +468,11 @@ async function captureBranchCoherenceRefusal(input: {
 
 async function createClonedRepoWithRemote() {
   const sourceRepo = await createTempRepo("master");
-  const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-remote-"));
+  const remoteDir = await makeTempDir("paperclip-worktree-remote-");
   const remotePath = path.join(remoteDir, "paperclip.git");
   await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
 
-  const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-clone-"));
+  const cloneRoot = await makeTempDir("paperclip-worktree-clone-");
   const repoRoot = path.join(cloneRoot, "paperclip");
   await execFileAsync("git", ["clone", remotePath, repoRoot]);
   await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
@@ -639,8 +651,8 @@ describe("sanitizeRuntimeServiceBaseEnv", () => {
 
 describe("ensureServerWorkspaceLinksCurrent", () => {
   it("relinks stale server workspace dependencies inside the current repo root", async () => {
-    const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-links-"));
-    const staleRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-links-stale-"));
+    const repoRoot = await makeTempDir("paperclip-runtime-links-");
+    const staleRoot = await makeTempDir("paperclip-runtime-links-stale-");
     const serverNodeModulesScopeDir = path.join(repoRoot, "server", "node_modules", "@paperclipai");
     const expectedPackageDir = path.join(repoRoot, "packages", "db");
     const stalePackageDir = path.join(staleRoot, "db");
@@ -678,7 +690,7 @@ describe("ensureServerWorkspaceLinksCurrent", () => {
   });
 
   it("skips relinking when server workspace dependencies already point at the repo", async () => {
-    const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-links-current-"));
+    const repoRoot = await makeTempDir("paperclip-runtime-links-current-");
     const serverNodeModulesScopeDir = path.join(repoRoot, "server", "node_modules", "@paperclipai");
     const expectedPackageDir = path.join(repoRoot, "packages", "db");
 
@@ -708,8 +720,8 @@ describe("ensureServerWorkspaceLinksCurrent", () => {
   });
 
   it("skips relinking outside linked git worktrees", async () => {
-    const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-links-non-worktree-"));
-    const staleRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-links-non-worktree-stale-"));
+    const repoRoot = await makeTempDir("paperclip-runtime-links-non-worktree-");
+    const staleRoot = await makeTempDir("paperclip-runtime-links-non-worktree-stale-");
     const serverNodeModulesScopeDir = path.join(repoRoot, "server", "node_modules", "@paperclipai");
     const expectedPackageDir = path.join(repoRoot, "packages", "db");
     const stalePackageDir = path.join(staleRoot, "db");
@@ -750,11 +762,11 @@ describe("ensureServerWorkspaceLinksCurrent", () => {
 describe("realizeExecutionWorkspace", () => {
   it("defaults new git worktrees to freshly fetched origin/master", async () => {
     const sourceRepo = await createTempRepo("master");
-    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-remote-"));
+    const remoteDir = await makeTempDir("paperclip-worktree-remote-");
     const remotePath = path.join(remoteDir, "paperclip.git");
     await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
 
-    const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-clone-"));
+    const cloneRoot = await makeTempDir("paperclip-worktree-clone-");
     const repoRoot = path.join(cloneRoot, "paperclip");
     await execFileAsync("git", ["clone", remotePath, repoRoot]);
     await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
@@ -1681,9 +1693,9 @@ describe("realizeExecutionWorkspace", () => {
     const repoRoot = await createTempRepo();
     const previousCwd = process.cwd();
     const previousPath = process.env.PATH;
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-home-"));
-    const isolatedWorktreeHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktrees-"));
-    const isolatedBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-bin-"));
+    const paperclipHome = await makeTempDir("paperclip-worktree-home-");
+    const isolatedWorktreeHome = await makeTempDir("paperclip-worktrees-");
+    const isolatedBin = await makeTempDir("paperclip-worktree-bin-");
     const instanceId = "worktree-base";
     const sharedConfigDir = path.join(paperclipHome, "instances", instanceId);
     const sharedConfigPath = path.join(sharedConfigDir, "config.json");
@@ -2044,7 +2056,7 @@ describe("realizeExecutionWorkspace", () => {
   }, 120_000);
 
   it("reinstalls worktree-local pnpm dependencies when package metadata changes", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-stale-deps-"));
+    const tempRoot = await makeTempDir("paperclip-worktree-stale-deps-");
     const baseRoot = path.join(tempRoot, "base");
     const worktreeRoot = path.join(tempRoot, "worktree");
     const fakeBin = path.join(tempRoot, "bin");
@@ -2137,7 +2149,7 @@ describe("realizeExecutionWorkspace", () => {
   }, 30_000);
 
   it("fails instead of writing an unseeded fallback config when worktree init errors after CLI detection succeeds", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-provision-fail-"));
+    const tempRoot = await makeTempDir("paperclip-worktree-provision-fail-");
     const baseRoot = path.join(tempRoot, "base");
     const worktreeRoot = path.join(tempRoot, "worktree");
     const fakeBin = path.join(tempRoot, "bin");
@@ -2193,7 +2205,7 @@ describe("realizeExecutionWorkspace", () => {
   });
 
   it("regenerates stale worktree config that points at another host", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-stale-config-"));
+    const tempRoot = await makeTempDir("paperclip-worktree-stale-config-");
     const baseRoot = path.join(tempRoot, "base");
     const worktreeRoot = path.join(tempRoot, "worktree");
     const fakeBin = path.join(tempRoot, "bin");
@@ -2284,7 +2296,7 @@ describe("realizeExecutionWorkspace", () => {
   });
 
   it("retries worktree-local pnpm install without a frozen lockfile when the lockfile is outdated", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-outdated-lockfile-"));
+    const tempRoot = await makeTempDir("paperclip-worktree-outdated-lockfile-");
     const baseRoot = path.join(tempRoot, "base");
     const worktreeRoot = path.join(tempRoot, "worktree");
     const fakeBin = path.join(tempRoot, "bin");
@@ -3611,7 +3623,7 @@ describe("realizeExecutionWorkspace", () => {
   }, 15_000);
 
   it("does not reuse a missing persisted local filesystem workspace", async () => {
-    const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-base-"));
+    const baseCwd = await makeTempDir("paperclip-workspace-base-");
     const missingCwd = path.join(baseCwd, "missing-workspace");
 
     const restored = await ensurePersistedExecutionWorkspaceAvailable({
@@ -3734,7 +3746,7 @@ describe("realizeExecutionWorkspace", () => {
   }, 120_000);
 
   it("rebinds a stale shared project_primary cwd to the managed checkout when the persisted cwd is not a git repo", async () => {
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-home-"));
+    const paperclipHome = await makeTempDir("paperclip-rebind-home-");
     const previousHome = process.env.PAPERCLIP_HOME;
     const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
     process.env.PAPERCLIP_HOME = paperclipHome;
@@ -3856,7 +3868,7 @@ describe("realizeExecutionWorkspace", () => {
   it("rebinds a reused shared project_primary cwd when its git origin is wrong and the managed checkout is verified", async () => {
     const repoRoot = await createTempRepo();
     await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-existing-home-"));
+    const paperclipHome = await makeTempDir("paperclip-rebind-existing-home-");
     const previousHome = process.env.PAPERCLIP_HOME;
     const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
     process.env.PAPERCLIP_HOME = paperclipHome;
@@ -3923,7 +3935,7 @@ describe("realizeExecutionWorkspace", () => {
   it("rebinds a freshly realized project_primary cwd to a verified managed checkout", async () => {
     const repoRoot = await createTempRepo();
     await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-fresh-home-"));
+    const paperclipHome = await makeTempDir("paperclip-rebind-fresh-home-");
     const previousHome = process.env.PAPERCLIP_HOME;
     const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
     process.env.PAPERCLIP_HOME = paperclipHome;
@@ -3980,7 +3992,7 @@ describe("realizeExecutionWorkspace", () => {
   it("rejects a reused shared project_primary cwd when the managed checkout has the wrong origin", async () => {
     const repoRoot = await createTempRepo();
     await runGit(repoRoot, ["remote", "add", "origin", "https://example.test/Blockcast/Network-Operator-Portal.git"]);
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rebind-wrong-managed-home-"));
+    const paperclipHome = await makeTempDir("paperclip-rebind-wrong-managed-home-");
     const previousHome = process.env.PAPERCLIP_HOME;
     const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
     process.env.PAPERCLIP_HOME = paperclipHome;
@@ -4178,7 +4190,7 @@ describe("realizeExecutionWorkspace", () => {
       // emits nothing, so there is nothing to salvage, at any scheduler latency.
       const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
       const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const shimDir = await makeTempDir("paperclip-git-shim-");
       const counterPath = path.join(shimDir, "status-calls");
       const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
       const shimPath = path.join(shimDir, "git");
@@ -4367,7 +4379,7 @@ describe("realizeExecutionWorkspace", () => {
       // only the *second* `submodule status --recursive` -- the verification call.
       const { repoRoot, submodulePath } = await createTempRepoWithSubmodule();
       const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const shimDir = await makeTempDir("paperclip-git-shim-");
       const counterPath = path.join(shimDir, "status-calls");
       const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
       const shimPath = path.join(shimDir, "git");
@@ -4449,7 +4461,7 @@ describe("realizeExecutionWorkspace", () => {
       // walk, well before the budget expires, so this is reachable in production.
       const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
       const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const shimDir = await makeTempDir("paperclip-git-shim-");
       const counterPath = path.join(shimDir, "status-calls");
       const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
       const shimPath = path.join(shimDir, "git");
@@ -4535,7 +4547,7 @@ describe("realizeExecutionWorkspace", () => {
       //   3. a tail fragment whose path is truncated (would name the wrong module).
       const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
       const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const shimDir = await makeTempDir("paperclip-git-shim-");
       const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
       const shimPath = path.join(shimDir, "git");
       await fs.writeFile(
@@ -4613,7 +4625,7 @@ describe("realizeExecutionWorkspace", () => {
       // signal send.
       const { repoRoot } = await createTempRepoWithSubmodule({ removeCheckout: false });
       const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const shimDir = await makeTempDir("paperclip-git-shim-");
       const counterPath = path.join(shimDir, "status-calls");
       const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
       const shimPath = path.join(shimDir, "git");
@@ -4692,7 +4704,7 @@ describe("realizeExecutionWorkspace", () => {
     it("does not repair salvaged missing submodules while the timed-out process group remains alive", async () => {
       const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: false });
       const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const shimDir = await makeTempDir("paperclip-git-shim-");
       const statusCounterPath = path.join(shimDir, "status-calls");
       const repairCounterPath = path.join(shimDir, "repair-calls");
       const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
@@ -4792,7 +4804,7 @@ describe("realizeExecutionWorkspace", () => {
       // start of the run.
       const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: true });
       const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const shimDir = await makeTempDir("paperclip-git-shim-");
       const counterPath = path.join(shimDir, "status-calls");
       const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
       const shimPath = path.join(shimDir, "git");
@@ -4899,7 +4911,7 @@ describe("realizeExecutionWorkspace", () => {
       // budget, which is what pins this path rather than any other.
       const { repoRoot, submodulePath } = await createTempRepoWithSubmodule({ removeCheckout: true });
       const { recorder, operations } = createWorkspaceOperationRecorderDouble();
-      const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+      const shimDir = await makeTempDir("paperclip-git-shim-");
       const counterPath = path.join(shimDir, "status-calls");
       const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
       const shimPath = path.join(shimDir, "git");
@@ -5228,7 +5240,7 @@ describe("realizeExecutionWorkspace", () => {
     // exists locally. Note: refs/remotes/origin/HEAD is NOT set by a manual
     // fetch — that requires git clone or git remote set-head. This test
     // exercises the heuristic fallback path in detectDefaultBranch.
-    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-bare-"));
+    const bareRemote = await makeTempDir("paperclip-worktree-bare-");
     await runGit(bareRemote, ["init", "--bare"]);
     await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
     await runGit(repoRoot, ["push", "-u", "origin", "master"]);
@@ -5283,7 +5295,7 @@ describe("realizeExecutionWorkspace", () => {
     // master, so a plain `git branch master main` fails "already exists").
     await runGit(repoRoot, ["branch", "-f", "master", "main"]);
 
-    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-bare-symref-"));
+    const bareRemote = await makeTempDir("paperclip-worktree-bare-symref-");
     await runGit(bareRemote, ["init", "--bare"]);
     await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
     await runGit(repoRoot, ["branch", "-f", "master"]);
@@ -5535,7 +5547,7 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
   // `exit` fails the list with exit 128; `stall` hangs it so the 30s bound fires.
   async function withFailingWorktreeList<T>(run: () => Promise<T>, mode: "exit" | "stall" = "exit"): Promise<T> {
     const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
-    const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-list-fails-"));
+    const fakeBin = await makeTempDir("paperclip-git-list-fails-");
     const failList = mode === "stall" ? "exec sleep 300" : `echo "simulated failure" >&2; exit 128`;
     await fs.writeFile(
       path.join(fakeBin, "git"),
@@ -5638,7 +5650,7 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
 
 describe("ensureRuntimeServicesForRun", () => {
   it("leaves manual runtime services untouched during agent runs", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-manual-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-manual-");
     const workspace = buildWorkspace(workspaceRoot);
 
     const services = await ensureRuntimeServicesForRun({
@@ -5669,7 +5681,7 @@ describe("ensureRuntimeServicesForRun", () => {
   });
 
   it("requires Paperclip dev runtime services to pass /api/health readiness", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-health-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-health-");
     const workspace = buildWorkspace(workspaceRoot);
     const runId = "run-paperclip-health";
     const serviceCommand =
@@ -5721,7 +5733,7 @@ describe("ensureRuntimeServicesForRun", () => {
   });
 
   it("uses explicit readiness URL when exposed URL is not the local probe address", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-explicit-readiness-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-explicit-readiness-");
     const workspace = buildWorkspace(workspaceRoot);
     const runId = "run-paperclip-explicit-readiness";
     const serviceCommand =
@@ -5774,7 +5786,7 @@ describe("ensureRuntimeServicesForRun", () => {
   });
 
   it("reuses shared runtime services across runs and starts a new service after release", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-workspace-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-workspace-");
     const workspace = buildWorkspace(workspaceRoot);
     const serviceCommand =
       "node -e \"require('node:http').createServer((req,res)=>res.end('ok')).listen(Number(process.env.PORT), '127.0.0.1')\"";
@@ -5873,7 +5885,7 @@ describe("ensureRuntimeServicesForRun", () => {
   }, 120_000);
 
   it("does not reuse project-scoped shared services across different workspace launch contexts", async () => {
-    const primaryWorkspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-primary-"));
+    const primaryWorkspaceRoot = await makeTempDir("paperclip-runtime-primary-");
     const worktreeWorkspaceRoot = path.join(primaryWorkspaceRoot, ".paperclip", "worktrees", "PAP-874-chat-speed-issues");
     await fs.mkdir(worktreeWorkspaceRoot, { recursive: true });
 
@@ -5968,7 +5980,7 @@ describe("ensureRuntimeServicesForRun", () => {
   });
 
   it("does not leak parent Paperclip instance env into runtime service commands", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-env-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-env-");
     const workspace = buildWorkspace(workspaceRoot);
     const envCapturePath = path.join(workspaceRoot, "captured-env.json");
     const serviceCommand = [
@@ -6048,7 +6060,7 @@ describe("ensureRuntimeServicesForRun", () => {
   });
 
   it("stops execution workspace runtime services by executionWorkspaceId", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-stop-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-stop-");
     const workspace = buildWorkspace(workspaceRoot);
     const runId = "run-stop";
     leasedRunIds.add(runId);
@@ -6102,7 +6114,7 @@ describe("ensureRuntimeServicesForRun", () => {
   });
 
   it("does not stop services in sibling directories when matching by workspace cwd", async () => {
-    const workspaceParent = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-sibling-"));
+    const workspaceParent = await makeTempDir("paperclip-runtime-sibling-");
     const targetWorkspaceRoot = path.join(workspaceParent, "project");
     const siblingWorkspaceRoot = path.join(workspaceParent, "project-extended", "service");
     await fs.mkdir(targetWorkspaceRoot, { recursive: true });
@@ -6161,7 +6173,7 @@ describe("ensureRuntimeServicesForRun", () => {
   });
 
   it("starts only the selected workspace-controlled runtime service", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-control-start-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-control-start-");
     const workspace = buildWorkspace(workspaceRoot);
 
     const services = await startRuntimeServicesForWorkspaceControl({
@@ -6222,7 +6234,7 @@ describe("ensureRuntimeServicesForRun", () => {
   });
 
   it("stops only the selected execution workspace runtime service", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-control-stop-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-control-stop-");
     const workspace = buildWorkspace(workspaceRoot);
 
     const services = await startRuntimeServicesForWorkspaceControl({
@@ -6456,7 +6468,7 @@ describe("executeProcess (timeout classification)", () => {
     // checkout we have already given up waiting for, which is how one stalled
     // probe makes the *next* one slower. The marker file is the observable
     // proof: it is only ever written if the grandchild outlived the timeout.
-    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reap-"));
+    const markerDir = await makeTempDir("paperclip-reap-");
     const markerPath = path.join(markerDir, "survived");
     const started = Date.now();
 
@@ -6489,7 +6501,7 @@ describe("executeProcess (timeout classification)", () => {
     // that is shorter than the remaining kill grace, so leaving the SIGKILL
     // merely *scheduled* would overlap attempt N+1 with a straggler still
     // walking the same checkout.
-    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reap-ignore-term-"));
+    const markerDir = await makeTempDir("paperclip-reap-ignore-term-");
     const markerPath = path.join(markerDir, "survived");
     const pidPath = path.join(markerDir, "descendant.pid");
     const started = Date.now();
@@ -6551,7 +6563,7 @@ describe("executeProcess (timeout classification)", () => {
     // Drain grace must resolve the call, but it also has to close our captured
     // stream handles; otherwise the pipe, listeners, and output accumulators live
     // until the descendant eventually exits.
-    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stdio-drain-"));
+    const markerDir = await makeTempDir("paperclip-stdio-drain-");
     const markerPath = path.join(markerDir, "write-after-drain");
     // The invariant is an ordering one: the call must return on the 2s
     // PROCESS_STDIO_DRAIN_GRACE_MS rather than waiting for the descendant. The
@@ -6833,7 +6845,7 @@ describe("readLocalServicePortOwner", () => {
   });
 
   it("accepts service cwd nested within the requested workspace", async () => {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-workspace-"));
+    const workspace = await makeTempDir("paperclip-runtime-workspace-");
     const serviceCwd = path.join(workspace, "server");
     await fs.mkdir(serviceCwd);
 
@@ -6852,7 +6864,7 @@ describe("readLocalServicePortOwner", () => {
     const address = server.address();
     const port = typeof address === "object" && address ? address.port : null;
     const serviceKey = `unsupported-cwd-${randomUUID()}`;
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-home-"));
+    const paperclipHome = await makeTempDir("paperclip-runtime-home-");
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = `unsupported-cwd-${randomUUID()}`;
     expect(port).toBeTypeOf("number");
@@ -6908,9 +6920,9 @@ describe("readLocalServicePortOwner", () => {
       return;
     }
 
-    const targetWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-target-"));
-    const ownerWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-owner-"));
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-home-"));
+    const targetWorkspace = await makeTempDir("paperclip-runtime-target-");
+    const ownerWorkspace = await makeTempDir("paperclip-runtime-owner-");
+    const paperclipHome = await makeTempDir("paperclip-runtime-home-");
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = `cross-workspace-${randomUUID()}`;
     const serviceKey = `cross-workspace-${randomUUID()}`;
@@ -8403,8 +8415,8 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
   });
 
   it("commits a starting service row before waiting for slow readiness", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-slow-control-"));
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-control-home-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-slow-control-");
+    const paperclipHome = await makeTempDir("paperclip-runtime-control-home-");
     const previousPaperclipHome = process.env.PAPERCLIP_HOME;
     const previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
     process.env.PAPERCLIP_HOME = paperclipHome;
@@ -8610,8 +8622,8 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
   });
 
   it("adopts a live auto-port shared service after runtime state is reset", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-reconcile-"));
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-home-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-reconcile-");
+    const paperclipHome = await makeTempDir("paperclip-runtime-home-");
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = `runtime-reconcile-${randomUUID()}`;
 
@@ -8719,8 +8731,8 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
   });
 
   it("does not reuse a stopped auto-port service port while another process owns it", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-unhealthy-adopt-"));
-    const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-home-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-unhealthy-adopt-");
+    const paperclipHome = await makeTempDir("paperclip-runtime-home-");
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = `runtime-unhealthy-adopt-${randomUUID()}`;
 
@@ -9138,7 +9150,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
   });
 
   it("persists controlled execution workspace stops as stopped", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-stop-persisted-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-stop-persisted-");
     const companyId = randomUUID();
     const agentId = randomUUID();
     const projectId = randomUUID();
@@ -9259,7 +9271,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
   });
 
   it("restarts a stopped auto-port service on the same port when rendered env changes", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-port-reuse-env-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-port-reuse-env-");
     const companyId = randomUUID();
     const agentId = randomUUID();
     const projectId = randomUUID();
@@ -9384,7 +9396,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
   });
 
   it("restarts a stopped auto-port service on the same port when it is available", async () => {
-    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-port-reuse-"));
+    const workspaceRoot = await makeTempDir("paperclip-runtime-port-reuse-");
     const companyId = randomUUID();
     const agentId = randomUUID();
     const projectId = randomUUID();
