@@ -450,10 +450,11 @@ probes:
   # `statement_timeout` — both longer than this timeout, so a *dead* database
   # would reach that restart loop by the ordinary path, on every replica at
   # once, not as an edge case. What closes it is in the handler, not here:
-  # HEALTH_PROBE_DEADLINE_MS bounds the dependency work at 10s so the probe
+  # HEALTH_PROBE_DEADLINE_MS bounds the dependency work at 17s so the probe
   # always completes, and a completed 503 keeps the detector green while
   # readiness does its job. Raising that constant above this timeout
-  # re-opens it. See server/src/routes/health.ts and
+  # re-opens it; lowering it below the 13.19s saturation tail makes the
+  # deadline, not this timeout, the effective readiness threshold. See server/src/routes/health.ts and
   # server/src/services/api-pipeline-liveness.ts.
   readiness:
     httpGet:

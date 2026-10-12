@@ -38,8 +38,15 @@ import type { AuthCapabilities } from "../auth/capabilities.js";
  *
  * The bound is on the probe's own work. It is not a statement timeout: the
  * query keeps running server-side until `statement_timeout` ends it.
+ *
+ * The value is pinned between two bounds, and both matter. Above the 13.19s
+ * saturation tail (measured 2026-09-10), so a merely *slow* pool still answers
+ * 200 — below it the deadline itself becomes the readiness threshold and a
+ * saturation episode empties the Service on every replica together. Below the
+ * chart's 20s readiness timeout with room for the 503 to be written, so a dead
+ * pool still completes. ~1.3x the tail leaves ~3s of that room.
  */
-export const HEALTH_PROBE_DEADLINE_MS = 10_000;
+export const HEALTH_PROBE_DEADLINE_MS = 17_000;
 
 async function withHealthProbeDeadline(work: () => Promise<void>): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
