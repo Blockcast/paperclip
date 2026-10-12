@@ -70,6 +70,7 @@ import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import { parseCron, validateCron } from "./cron.js";
+import { getZonedMinuteFormatter, getZonedMinuteParts, searchNextZonedCronTick } from "./zoned-cron.js";
 import { heartbeatService } from "./heartbeat.js";
 import {
   instanceSettingsService,
@@ -162,16 +163,6 @@ const ACTIVITY_GATE_IGNORED_ACTIONS = [
   "issue.inbox_archived",
   "issue.inbox_unarchived",
 ];
-const WEEKDAY_INDEX: Record<string, number> = {
-  Sun: 0,
-  Mon: 1,
-  Tue: 2,
-  Wed: 3,
-  Thu: 4,
-  Fri: 5,
-  Sat: 6,
-};
-
 async function resolveCompanyDefaultResponsibleUserId(db: Db, companyId: string) {
   const company = await db
     .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
@@ -233,67 +224,21 @@ function assertTimeZone(timeZone: string) {
   }
 }
 
-function floorToMinute(date: Date) {
-  const copy = new Date(date.getTime());
-  copy.setUTCSeconds(0, 0);
-  return copy;
-}
-
-// Constructing an Intl.DateTimeFormat costs ~1ms of ICU work, and
-// computeNextRun calls getZonedMinuteParts once per minute-step (up to
-// 366*24*60*5 iterations for sparse schedules), which can block the event
-// loop for minutes per scheduler tick. Formatter instances are immutable,
-// so cache one per timezone. See #8033.
-const zonedMinuteFormatterCache = new Map<string, Intl.DateTimeFormat>();
-
-function getZonedMinuteFormatter(timeZone: string) {
-  let formatter = zonedMinuteFormatterCache.get(timeZone);
-  if (!formatter) {
-    formatter = new Intl.DateTimeFormat("en-US", {
-      timeZone,
-      hour12: false,
-      year: "numeric",
-      month: "numeric",
-      day: "numeric",
-      hour: "numeric",
-      minute: "numeric",
-      weekday: "short",
-    });
-    zonedMinuteFormatterCache.set(timeZone, formatter);
-  }
-  return formatter;
-}
-
-function getZonedMinuteParts(date: Date, timeZone: string) {
-  const formatter = getZonedMinuteFormatter(timeZone);
-  const parts = formatter.formatToParts(date);
-  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  const weekday = WEEKDAY_INDEX[map.weekday ?? ""];
-  if (weekday == null) {
-    throw new Error(`Unable to resolve weekday for timezone ${timeZone}`);
-  }
-  return {
-    year: Number(map.year),
-    month: Number(map.month),
-    day: Number(map.day),
-    hour: Number(map.hour),
-    minute: Number(map.minute),
-    weekday,
-  };
-}
-
-function matchesCronMinute(expression: string, timeZone: string, date: Date) {
-  const cron = parseCron(expression);
-  const parts = getZonedMinuteParts(date, timeZone);
-  return (
-    cron.minutes.includes(parts.minute) &&
-    cron.hours.includes(parts.hour) &&
-    cron.daysOfMonth.includes(parts.day) &&
-    cron.months.includes(parts.month) &&
-    cron.daysOfWeek.includes(parts.weekday)
-  );
-}
-
+/**
+ * The first UTC minute strictly after `after` whose wall clock in `timeZone`
+ * matches the cron expression, or null when none falls within the five-year
+ * search horizon. Throws `unprocessable` for an invalid timezone or cron, and
+ * a RangeError for an invalid `after` or one outside the years
+ * `searchNextZonedCronTick` supports (no caller comes near them).
+ *
+ * BLO-32638: this used to step one UTC minute at a time, re-parsing the cron
+ * and calling `Intl` on every step -- ~527,000 steps for a yearly cron. The
+ * routine fire-gap gauge called it seven times per trigger on every 15 s
+ * scrape tick, and helm revision 798 spent 95-135 s of synchronous CPU per
+ * tick until the liveness probe killed the pods. `searchNextZonedCronTick`
+ * returns the same answer by jumping between candidate wall-clock times; see
+ * zoned-cron.ts for how it stays exact across DST transitions.
+ */
 export function nextCronTickInTimeZone(expression: string, timeZone: string, after: Date) {
   const trimmed = expression.trim();
   assertTimeZone(timeZone);
@@ -302,16 +247,17 @@ export function nextCronTickInTimeZone(expression: string, timeZone: string, aft
     throw unprocessable(error);
   }
 
-  const cursor = floorToMinute(after);
-  cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
-  const limit = 366 * 24 * 60 * 5;
-  for (let i = 0; i < limit; i += 1) {
-    if (matchesCronMinute(trimmed, timeZone, cursor)) {
-      return new Date(cursor.getTime());
-    }
-    cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
+  const search = searchNextZonedCronTick(parseCron(trimmed), after, (ms) => getZonedMinuteParts(ms, timeZone));
+  if (search.exhausted) {
+    // Unreachable for any IANA zone (see ZONED_CRON_SEARCH_MAX_STEPS). If it
+    // ever fires, the caller sees "no tick within the horizon", which every
+    // caller already handles, rather than an unbounded search.
+    logger.warn(
+      { cronExpression: trimmed, timeZone, after: after.toISOString(), steps: search.steps, lookups: search.lookups },
+      "cron next-tick search exhausted its step budget; treating it as no tick within the horizon",
+    );
   }
-  return null;
+  return search.tick;
 }
 
 // BLO-31996: how long one fire may hold the dispatch lock, derived from the
@@ -334,38 +280,146 @@ export function nextCronTickInTimeZone(expression: string, timeZone: string, aft
 // in-flight work is protected by the separate started-and-young waiver rather
 // than by this number.
 const ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS = 6;
-export function deriveRoutineFireAgeHorizonMs(
+
+/**
+ * The trigger's sampled cadence in milliseconds -- the shortest AND the longest
+ * gap between consecutive scheduled ticks over the sample -- or null when it
+ * has none.
+ *
+ * BLO-32638 split this out of {@link deriveRoutineFireAgeHorizonMs} so the
+ * dispatch bound and the fire-gap alert gauge read ONE derivation. They
+ * answer different questions off the same sample and need OPPOSITE extremes
+ * of it, so this returns both rather than picking one:
+ *
+ * - dispatch asks "may this fire still hold the lock?" and wants `minMs`
+ *   (see the BLO-31996 note above: erring short only ever releases a fire);
+ * - the gauge asks "how long may a healthy routine legitimately go between
+ *   fires?" and wants `maxMs`. On an irregular cron the minimum is the wrong
+ *   denominator for an alert: `0 15 * * 1-5` samples min 86400s, so
+ *   `age > 2 * min` is 172800s, but the legitimate Fri 15:00 -> Mon 15:00 gap
+ *   is 259200s -- a ~24h false page every weekend (Ally review on #2352).
+ *   The price of `maxMs` is detection latency on such a cron: a dead weekday
+ *   routine pages after 2 * 72h instead of 2 * 24h. Chosen deliberately --
+ *   a rule that pages on healthy behaviour every week is noise, and the
+ *   measured incident (a 1h cadence) is regular, so it is unaffected.
+ *
+ * If each caller sampled the cron itself they would silently drift apart on
+ * the next edit to either.
+ *
+ * ponytail: a longest gap that recurs less often than once per
+ * ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS gaps (e.g. a daily cron that skips one
+ * month a year) is under-sampled and can page once at that gap. Upgrade path
+ * if such a cron appears: publish a deadline (the second scheduled tick after
+ * the last completed fire) instead of a cadence.
+ *
+ * Returns null rather than a fallback because the two callers want opposite
+ * things from "no cadence": dispatch keeps gating on a flat horizon, while the
+ * gauge must emit no interval series at all so the alert's vector match drops
+ * the routine. A number here cannot express the second.
+ *
+ * Memoized per (timezone, cron) -- see {@link routineFireGapsMemo}. The gauge
+ * re-derives every trigger on every 15 s scrape tick, so in steady state a
+ * tick reads the memo and makes no `Intl` calls at all.
+ */
+export function deriveRoutineFireGapsMs(
   trigger: Pick<RoutineTriggerRow, "kind" | "cronExpression" | "timezone"> | null | undefined,
   now: Date,
-) {
-  if (trigger?.kind !== "schedule" || !trigger.cronExpression || !trigger.timezone) {
-    return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
+): RoutineFireGaps | null {
+  if (trigger?.kind !== "schedule" || !trigger.cronExpression || !trigger.timezone) return null;
+  const nowMs = now.getTime();
+  const key = `${trigger.timezone}\n${trigger.cronExpression}`;
+  const memo = routineFireGapsMemo.get(key);
+  if (memo && memo.computedAtMs <= nowMs && nowMs < memo.validUntilMs) {
+    return memo.gaps === null ? null : { ...memo.gaps };
   }
+
+  const sample = sampleRoutineFireGapsMs(trigger.cronExpression, trigger.timezone, now);
+  routineFireGapsMemo.delete(key);
+  if (routineFireGapsMemo.size >= ROUTINE_FIRE_GAPS_MEMO_MAX_ENTRIES) {
+    const oldest = routineFireGapsMemo.keys().next();
+    if (!oldest.done) routineFireGapsMemo.delete(oldest.value);
+  }
+  routineFireGapsMemo.set(key, {
+    computedAtMs: nowMs,
+    validUntilMs: sample.firstTickMs ?? nowMs + ROUTINE_FIRE_GAPS_NO_TICK_TTL_MS,
+    gaps: sample.gaps,
+  });
+  return sample.gaps === null ? null : { ...sample.gaps };
+}
+
+type RoutineFireGaps = { minMs: number; maxMs: number };
+
+/**
+ * BLO-32638: {@link deriveRoutineFireGapsMs} results per (timezone, cron).
+ *
+ * The sample is the run of ticks that starts at the first tick after `now`, so
+ * it stays the same until that tick passes. Reusing a result for any later
+ * `now` before `validUntilMs` (the first tick) therefore gives exactly what a
+ * fresh derivation would. When that tick passes, the entry is re-derived.
+ * Results with no first tick (an unparseable cron or timezone, or no tick
+ * within the search horizon) are kept for {@link ROUTINE_FIRE_GAPS_NO_TICK_TTL_MS}.
+ * That also limits the "failed to derive" warning to one per hour per trigger,
+ * instead of one per scrape tick. A `now` earlier than the one an entry was
+ * derived at always re-derives.
+ *
+ * Bounded at {@link ROUTINE_FIRE_GAPS_MEMO_MAX_ENTRIES} entries, evicting the
+ * oldest, so edited crons cannot grow it without limit.
+ */
+const routineFireGapsMemo = new Map<string, { computedAtMs: number; validUntilMs: number; gaps: RoutineFireGaps | null }>();
+const ROUTINE_FIRE_GAPS_MEMO_MAX_ENTRIES = 1024;
+const ROUTINE_FIRE_GAPS_NO_TICK_TTL_MS = 60 * 60 * 1000;
+
+/** Test hook: forget every memoized {@link deriveRoutineFireGapsMs} result. */
+export function resetRoutineFireGapsMemoForTests() {
+  routineFireGapsMemo.clear();
+}
+
+function sampleRoutineFireGapsMs(
+  cronExpression: string,
+  timeZone: string,
+  now: Date,
+): { gaps: RoutineFireGaps | null; firstTickMs: number | null } {
   try {
-    let cursor = nextCronTickInTimeZone(trigger.cronExpression, trigger.timezone, now);
-    if (!cursor) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
-    let intervalMs: number | null = null;
+    let cursor = nextCronTickInTimeZone(cronExpression, timeZone, now);
+    if (!cursor) return { gaps: null, firstTickMs: null };
+    const firstTickMs = cursor.getTime();
+    let gaps: RoutineFireGaps | null = null;
     for (let i = 0; i < ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS; i += 1) {
-      const next = nextCronTickInTimeZone(trigger.cronExpression, trigger.timezone, cursor);
+      const next = nextCronTickInTimeZone(cronExpression, timeZone, cursor);
       if (!next) break;
       const gapMs = next.getTime() - cursor.getTime();
       cursor = next;
       if (!Number.isFinite(gapMs) || gapMs <= 0) continue;
-      if (intervalMs === null || gapMs < intervalMs) intervalMs = gapMs;
+      if (gaps === null) gaps = { minMs: gapMs, maxMs: gapMs };
+      else {
+        if (gapMs < gaps.minMs) gaps.minMs = gapMs;
+        if (gapMs > gaps.maxMs) gaps.maxMs = gapMs;
+      }
     }
-    // No usable gap at all (a cron that fires once and never again) means there
-    // is no cadence to bound against, so keep the flat fallback.
-    if (intervalMs === null) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
-    return Math.max(
-      ROUTINE_FIRE_AGE_HORIZON_FLOOR_MS,
-      intervalMs - ROUTINE_FIRE_AGE_HORIZON_JITTER_MS,
-    );
+    // No usable gap at all (a cron that fires once and never again) means
+    // there is no cadence.
+    return { gaps, firstTickMs };
   } catch (err) {
-    // A cron that no longer validates must not take routine dispatch down with
-    // it; fall back to the flat horizon and keep gating.
-    logger.warn({ err, cronExpression: trigger.cronExpression }, "failed to derive routine fire-age horizon");
-    return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
+    // A cron that no longer validates must not take routine dispatch (or the
+    // metrics refresh) down with it.
+    logger.warn({ err, cronExpression }, "failed to derive routine fire interval");
+    return { gaps: null, firstTickMs: null };
   }
+}
+
+export function deriveRoutineFireAgeHorizonMs(
+  trigger: Pick<RoutineTriggerRow, "kind" | "cronExpression" | "timezone"> | null | undefined,
+  now: Date,
+) {
+  const gaps = deriveRoutineFireGapsMs(trigger, now);
+  // No cadence to bound against -- a webhook/api trigger, an unparseable cron,
+  // or a cron that fires once and never again -- so keep the flat fallback and
+  // keep gating.
+  if (gaps === null) return ROUTINE_FIRE_AGE_HORIZON_FALLBACK_MS;
+  return Math.max(
+    ROUTINE_FIRE_AGE_HORIZON_FLOOR_MS,
+    gaps.minMs - ROUTINE_FIRE_AGE_HORIZON_JITTER_MS,
+  );
 }
 
 function isSubHourlyCronExpression(expression: string, timeZone: string, after: Date) {
