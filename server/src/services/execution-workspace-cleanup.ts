@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { companies, executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
+import { companies, executionWorkspaces, issues, projectWorkspaces } from "@paperclipai/db";
 import { and, asc, eq, isNull, lte, ne, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import {
@@ -538,6 +538,38 @@ export function executionWorkspaceCleanupService(db: Db) {
             updatedAt: now,
           })
           .where(eq(executionWorkspaces.id, candidate.id));
+
+        // BLO-42036: drop the now-dangling pointer from every issue bound to
+        // this row. `isClosedIsolatedExecutionWorkspace` refuses comments,
+        // agent patches and checkout on any issue whose linked workspace is
+        // closed, and the only route that can re-point the binding is the
+        // issue PATCH — which that same guard refuses for an agent. So a
+        // collected workspace used to make its source issue permanently
+        // unwritable by its own assignee, with no agent-reachable remedy; a
+        // `critical` alert row was born unwritable 53 minutes after its
+        // worktree was collected and carried no record of the incident it
+        // fired for.
+        //
+        // Safe precisely here and nowhere else on the close paths: reaching
+        // this statement means `inspectWorktreeReclaimSafety` PROVED the tree
+        // held no uncommitted change and no unpushed commit and that it is
+        // gone from disk, so the binding points at nothing recoverable. The
+        // operator-archive and `cleanup_failed` paths keep their binding, and
+        // keep the guard, because there the directory may still hold work.
+        // `executionWorkspaces.sourceIssueId` is the durable reverse link, so
+        // history survives the unbind.
+        //
+        // Mirrors the `shared_workspace` unbind the operator archive already
+        // performs in `routes/execution-workspaces.ts`.
+        await db
+          .update(issues)
+          .set({ executionWorkspaceId: null, updatedAt: now })
+          .where(
+            and(
+              eq(issues.companyId, candidate.companyId),
+              eq(issues.executionWorkspaceId, candidate.id),
+            ),
+          );
         collected += 1;
         logger.info(
           {
