@@ -109,7 +109,22 @@ const ENVIRONMENT_DUMP_RE = new RegExp(
 // NAME=VALUE where the value is long and opaque. This is the fail-closed net
 // under the count threshold: one interpolated secret is not a "dump" but is
 // still a secret. Structural — it tests the value, not the name.
-const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([^\s"'`\r\n]{16,})\2/g;
+//
+// BLO-43580: the value capture is the token alphabet, NOT "anything up to
+// whitespace". The old `[^\s"'`]` capture was greedy to end of line, so one
+// out-of-alphabet joiner (`?`, `&`, `,`, `;`, `(`, `|`, `#`, …) made the
+// whole run fail the alphabet gate then in isOpaqueSecretValue — and because the
+// regex had already CONSUMED that run, a nested `key=<secret>` inside it was
+// never offered to the detector at all. Stopping the capture at the first
+// out-of-alphabet character leaves the rest of the line to be scanned.
+//
+// No closing-quote backreference either: a quote is consumed only on the way
+// in, and the replacer leaves whatever follows the value in place. Requiring
+// the closing quote let `x="<secret>?…"` escape the same way.
+//
+// This capture IS the alphabet gate: isOpaqueSecretValue used to re-test the
+// value against the same class, which can no longer fail, so it was removed.
+const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([A-Za-z0-9+/=_.\-]{16,})/g;
 
 // PEN-3907: a cryptographic content digest bound to a name that says so.
 //
@@ -136,7 +151,7 @@ const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([^\s"'`\r\n]{16,})\
 // either, so both are required.
 //
 // Note the OCI form `name="sha256:<64hex>"` is already exempt for an unrelated
-// reason — `:` is outside the token alphabet in `isOpaqueSecretValue` — and
+// reason — `:` is outside the token alphabet ASSIGNMENT_RE captures — and
 // `digestExemptionApplies` does not cover it. A test pins that so the two
 // paths cannot silently diverge.
 
@@ -157,8 +172,18 @@ const HEX_DIGEST_RE = /^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{56}|[0-9a-f]{64}|[
  *  stays correct if that capture ever widens. */
 const DIGEST_NAME_RE = /(?:^|[_.\-])(?:sha(?:1|224|256|384|512)|md5|digest|checksum)$/i;
 
+/** BLO-43580: pnpm's `patch_hash` — a base32 md5 of a patch file, 26 chars
+ *  of `[a-z2-7]` — as written into pnpm-lock.yaml inside a version specifier:
+ *  `postgres@3.4.9(patch_hash=<26>)`. It used to pass only because the old
+ *  greedy capture swallowed the trailing `)` and failed the alphabet gate;
+ *  once the capture stopped at `)` every dependency bump that re-wrote such a
+ *  line became unpushable. Exact name AND exact shape, same reasoning as the
+ *  hex digest pin above: neither half is safe alone. */
+const PNPM_PATCH_HASH_RE = /^[a-z2-7]{26}$/;
+
 /** True when a NAME=VALUE pair is a content digest pin rather than a secret. */
 function isContentDigestAssignment(name: string, value: string): boolean {
+  if (name === "patch_hash" && PNPM_PATCH_HASH_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
 }
 
@@ -344,15 +369,14 @@ function classIndex(value: string): number {
 const GRPC_METHOD_PATH_RE =
   /^\/[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+\/(?:[A-Za-z][A-Za-z0-9]*)?$/;
 
-/** A value is "opaque" when it is long, drawn from a token alphabet and from
- *  at least two character classes, is not a hyphenated identifier, and has
- *  high per-character entropy. Deliberately narrow: applied only to
- *  assignment values, never to bare words. A 40-char git SHA scores ~4.0
- *  bits/char and would be redacted out of ordinary review prose if this ran
- *  unbound. */
+/** A value is "opaque" when it is long (its token alphabet is guaranteed by
+ *  ASSIGNMENT_RE's capture), is drawn from at least two character classes,
+ *  is not a hyphenated identifier, and has high per-character entropy.
+ *  Deliberately narrow: applied only to assignment values, never to bare
+ *  words. A 40-char git SHA scores ~4.0 bits/char and would be redacted out
+ *  of ordinary review prose if this ran unbound. */
 function isOpaqueSecretValue(value: string): boolean {
   if (value.length < HIGH_ENTROPY_MIN_LENGTH) return false;
-  if (!/^[A-Za-z0-9+/=_.\-]+$/.test(value)) return false;
   if (classIndex(value) < 2) return false;
   if (isLexicalIdentifier(value)) return false;
   if (GRPC_METHOD_PATH_RE.test(value)) return false;
@@ -442,7 +466,7 @@ export function scrubGitHubEgressText(input: string): GitHubEgressScrubResult {
     if (isContentDigestAssignment(name, value)) return match;
     if (!isOpaqueSecretValue(value)) return match;
     fired.add("high-entropy-assignment");
-    return `${name}=${quote}${redactionMarker("high-entropy-assignment")}${quote}`;
+    return `${name}=${quote}${redactionMarker("high-entropy-assignment")}`;
   });
 
   const order: GitHubEgressScrubClass[] = [
