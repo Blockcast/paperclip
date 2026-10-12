@@ -9,6 +9,7 @@ import {
   getAgentWorkEligibility,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueRecoveryAction,
   type IssueRecoveryActionKind,
   type IssueStatus,
 } from "@paperclipai/shared";
@@ -6669,18 +6670,22 @@ export function recoveryService(
       // Using `>=` here would attribute the last legitimate wake to the budget.
       const attemptBudgetReached = input.action.maxAttempts !== null &&
         input.action.attemptCount > input.action.maxAttempts;
+      const retiringBound = attemptBudgetReached ? "attempt_budget" : "timeout_horizon";
       const retireAndRefund = () => recoveryActionsSvc.retireAndReleaseWakeAttempt({
         companyId: input.issue.companyId,
         actionId: input.action.id,
         expectedOwnerAgentId: reservedOwnerAgentId,
         expectedAttemptCount: reservedAttemptCount,
-        retiringBound: attemptBudgetReached ? "attempt_budget" : "timeout_horizon",
+        retiringBound,
       });
+      let retirementCommitted = false;
       try {
         await retireAndRefund();
+        retirementCommitted = true;
       } catch (firstError) {
         try {
           await retireAndRefund();
+          retirementCommitted = true;
         } catch (secondError) {
           logger.warn(
             {
@@ -6693,6 +6698,43 @@ export function recoveryService(
               maxAttempts: input.action.maxAttempts,
             },
             "recovery wake retirement/refund failed after retry",
+          );
+        }
+      }
+      // PEN-3989: the third `timeout_horizon` writer, and it emitted neither observable
+      // either. Same cause as the backstop gate above — see
+      // `announceRecoveryHorizonRetirement`.
+      //
+      // Transition evidence here is the PRE-STATE read, not a return value:
+      // `retireAndReleaseWakeAttempt` is deliberately idempotent (`coalesce` on the bound, a
+      // `CASE` on the status) so that a re-run still refunds, which means a successful call
+      // does not by itself prove THIS call transitioned the row. `input.action.retiringBound
+      // === null` is that proof, read moments earlier in this same dispatch. A concurrent
+      // racer could make both paths announce; the marker dedup inside the helper keeps that to
+      // one notice, and a duplicate counter increment is harmless for a `> 0` alert.
+      //
+      // `attemptCount` is adjusted because the refund has already landed: the row we are
+      // describing carries `greatest(attemptCount - 1, 0)`, not the reserved count still held
+      // in `input.action`. Announcing the unrefunded value would report `Attempts: 1` on a row
+      // that reads 0, and — worse — would flip `neverDelivered` to false and label a
+      // never-woken action as `delivered`, which is precisely the mislabel PEN-3000 exists to
+      // prevent.
+      if (retirementCommitted && retiringBound === "timeout_horizon" && input.action.retiringBound === null) {
+        try {
+          await announceRecoveryHorizonRetirement({
+            ...input.action,
+            status: "escalated",
+            retiringBound: "timeout_horizon",
+            attemptCount: Math.max(input.action.attemptCount - 1, 0),
+          }, { retiredBy: "stranded_recovery_wake_dispatch" });
+        } catch (error) {
+          logger.warn(
+            {
+              err: error,
+              actionId: input.action.id,
+              sourceIssueId: input.issue.id,
+            },
+            "failed to announce recovery wake horizon expiry from the stranded wake dispatch",
           );
         }
       }
@@ -13476,6 +13518,193 @@ export function recoveryService(
   }
 
   /**
+   * PEN-3989: emit the two observables a horizon retirement owes an operator — the PEN-3000
+   * counter and the source-row notice — for ONE action, regardless of which code path
+   * performed the retirement.
+   *
+   * This used to be inlined in `reconcileExpiredRecoveryWakeHorizons`'s per-row loop, which
+   * made it an effect of ONE CALLER rather than of the TRANSITION. `retiring_bound =
+   * 'timeout_horizon'` has three writers, not one:
+   *
+   *   1. `escalateExpiredWakeHorizons`   (this sweep)                      — emitted both
+   *   2. `retireAndReleaseWakeAttempt`   (`enqueueSourceScopedStrandedRecoveryWake`) — emitted neither
+   *   3. `retireWakeAction`              (`strandedRecoveryWakeBackstop`)  — emitted neither
+   *
+   * Writers 2 and 3 take the value from a ternary (`attemptBudgetReached ? "attempt_budget" :
+   * "timeout_horizon"`), so a grep for the contiguous literal `retiringBound:
+   * "timeout_horizon"` returns writer 1 only and reads as proof of single ownership. It is
+   * not. Both sit behind `strandedRecoveryWakeAttemptsExhausted`, which is DISJUNCTIVE — true
+   * on the attempt budget OR on `timeoutAt <= now` — so they fire on exactly the condition
+   * writer 1 exists to handle, and they race it.
+   *
+   * Writer 1 then cannot recover: it selects `status = 'active'` and nothing else, so once
+   * writer 2 or 3 has flipped the row to `escalated` the row is permanently unselectable,
+   * `candidateIds` comes back empty, and the per-row loop below is never entered. The
+   * transition commits; both observables are silently skipped.
+   *
+   * Measured (PEN-3989, 2026-10-12): four `stranded_assigned_issue` actions passed a 6 h
+   * horizon at 07:26:3x–4xZ and were flipped to `escalated` with `retiring_bound =
+   * 'timeout_horizon'` at 07:41:39Z. `paperclip_recovery_horizon_expired_total{delivery=
+   * "never_delivered"}` stayed 0 across four reads on one uninterrupted process, and no
+   * notice reached any source row. Writer 3 did it: writer 1 stamps ONE batch-scoped `now`
+   * across every row of its single UPDATE, and the four `updatedAt` values are distinct
+   * across 746 ms, which only a per-row loop calling `new Date()` can produce. Writer 2 is
+   * excluded because it is reachable only downstream of the dispatch reserve that stamps
+   * `lastAttemptAt: now`, and all four still carried their creation claim.
+   *
+   * Consequence for PEN-3322's alerts, which are the reason this counter exists: they did not
+   * measure "an action was retired at its horizon" but "an action was retired at its horizon
+   * BY WRITER 1", and the backstop reliably gets there first.
+   *
+   * Call this from every site that performs the retirement, gated on that site having
+   * actually transitioned the row (writers 1 and 3 can prove it; see their call sites). The
+   * `alreadyAnnounced` marker check stays the authority on posting at most one notice per
+   * action, so two paths racing the same row cost a duplicate metric increment at worst —
+   * harmless for a `> 0` alert, and strictly better than the silence it replaces.
+   */
+  async function announceRecoveryHorizonRetirement(
+    action: IssueRecoveryAction,
+    opts?: { runId?: string | null; retiredBy?: string | null },
+  ): Promise<{
+    neverDelivered: boolean;
+    neverDeliveredButWorked: boolean;
+    counted: boolean;
+    announced: boolean;
+  }> {
+    // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
+    // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
+    // freezes at the delivered count. It also restarts on owner change (`isNewOwnerSequence`
+    // in `upsertSourceScopedUnlocked`), so 0 means no wake was delivered to the CURRENT
+    // owner since it took over — not necessarily across the row's whole life. Within that
+    // scope it is a wake-channel fault rather than an owner who was woken and did not
+    // converge; those are different incidents with different responders and they render
+    // identically without this split. Not gated on `previousOwnerAgentId`: the stranded
+    // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
+    // call above), so it is non-null on the un-churned rows this label exists to catch.
+    const neverDelivered = action.attemptCount === 0;
+    recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
+
+    // BLO-19124: only asked on the `neverDelivered` branch, because that is the only notice
+    // arm that claims the stranding went unworked — the delivered arm makes no such claim,
+    // so buying this row would be a query per sweep for nothing.
+    //
+    // "Since the action opened" is deliberately an OVERLAP test, not a containment one:
+    // `hasSuccessfulIssueRunSince` matches `createdAt >= since OR finishedAt >= since`, so a
+    // run that started before this action and finished inside its window counts. That is the
+    // meaning the notice needs — such a run WAS working the issue during the horizon.
+    //
+    // `hasActiveExecutionPath`, the guard the sibling decision points in this subsystem use,
+    // is the wrong instrument here: it asks whether a run is in flight RIGHT NOW and would
+    // have missed all three BLO-19124 runs, every one of which had finished before the sweep
+    // read the row.
+    // `createdAt` is `string | Date` on the read model — the driver hands back a Date, but
+    // the type is widened, so normalise rather than relying on the runtime shape.
+    const neverDeliveredButWorked = neverDelivered
+      && await hasSuccessfulIssueRunSince(
+        action.companyId,
+        action.sourceIssueId,
+        new Date(action.createdAt),
+      );
+
+    logger.warn(
+      {
+        actionId: action.id,
+        companyId: action.companyId,
+        sourceIssueId: action.sourceIssueId,
+        cause: action.cause,
+        ownerAgentId: action.ownerAgentId,
+        attemptCount: action.attemptCount,
+        maxAttempts: action.maxAttempts,
+        neverDelivered,
+        neverDeliveredButWorked,
+        timeoutAt: action.timeoutAt,
+        runId: opts?.runId ?? null,
+        retiredBy: opts?.retiredBy ?? null,
+      },
+      "recovery action passed its wake horizon and was escalated out of active",
+    );
+
+    // Same marker text and the same exact-match dedup as the notice in
+    // `escalateStrandedAssignedIssue`, so whichever path gets there first wins and the
+    // other stays quiet — the operator sees one horizon notice per action, not two.
+    const horizonAt = action.timeoutAt instanceof Date
+      ? action.timeoutAt.toISOString()
+      : action.timeoutAt != null
+        ? String(action.timeoutAt)
+        // BLO-40297 derived arm: the row never persisted a horizon, so report the one it
+        // was actually retired on — `createdAt` plus the configured horizon. This is for
+        // operator legibility only; the marker would still dedup correctly without it,
+        // because it embeds the unique `action.id` (an earlier version of this comment
+        // claimed a null horizon would collide across rows — it would not).
+        //
+        // `createdAt` is deliberately NOT null-guarded, though the read model widens it to
+        // `Date | string | null`: the derived arm selects on `lte(createdAt, …)`, which
+        // never matches SQL NULL, and the persisted arm does not reach this branch. If you
+        // widen that predicate, guard this first — `new Date(null)` is the epoch, so a null
+        // would render a 1970 horizon into an operator notice instead of failing.
+        : new Date(
+          new Date(action.createdAt).getTime() + recoveryActionBoundsConfig().timeoutMs,
+        ).toISOString();
+    const marker = `Recovery wake horizon reached for action \`${action.id}\` (horizon \`${horizonAt}\`)`;
+    const alreadyAnnounced = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, action.sourceIssueId),
+        eq(issueComments.authorType, "system"),
+        sql`${issueComments.body} LIKE ${`%${escapeLikePattern(marker)}%`} ESCAPE '\\'`,
+      ))
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    if (alreadyAnnounced) {
+      return { neverDelivered, neverDeliveredButWorked, counted: false, announced: false };
+    }
+
+    await issuesSvc.addComment(
+      action.sourceIssueId,
+      [
+        `${marker}.`,
+        "",
+        "This recovery action passed its auto-recovery horizon without being discharged, so Paperclip has " +
+          "stopped waking anyone for it and has moved it out of `active` to `escalated`. It now needs a human " +
+          "or a board operator to resolve it.",
+        "",
+        `- Attempts: ${action.attemptCount} (budget ${action.maxAttempts ?? "none — this action was created before wake bounds existed, or by a cause that carries none"})`,
+        `- Auto-recovery horizon: ${horizonAt}${action.timeoutAt == null ? " (derived from `createdAt`; none was persisted)" : ""}`,
+        `- Cause: \`${action.cause}\``,
+        action.attemptCount === 0
+          ? "- Note: no wake reached the queue for this action's current owner. `Attempts` counts wakes " +
+            "that were DELIVERED, not sweeps attempted — each sweep reserves an attempt and refunds it " +
+            "when the wake is not delivered, and the count restarts when ownership changes — so 0 means " +
+            "every sweep since the current owner took over was refused by the wake channel " +
+            "(provider-capacity deferral, an active tree pause hold, wake disabled, or cooldown). An " +
+            "earlier owner may have been woken; check the action's owner history before concluding the " +
+            "whole window was refused. " +
+            (neverDeliveredButWorked
+              // BLO-19124: the claim below is about THIS ACTION's wakes, never about the issue.
+              // Saying "never worked" here was false on every row where the issue was serviced by
+              // another path, and it is the whole reason an operator would open this notice.
+              ? "The issue itself WAS worked inside this window even so — at least one run on it " +
+                "succeeded after this action was opened — so this is a bookkeeping failure (the " +
+                "action was never discharged) rather than an unworked stranding. Check whether the " +
+                "work that happened actually resolved the stranding before treating this as an " +
+                "incident."
+              : "No run on the issue succeeded inside this window either, so within the current " +
+                "owner's tenure the stranding this action was opened to repair was never worked, and " +
+                "that is a scheduler-side fault rather than an owner who was woken and could not " +
+                "resolve it.")
+          : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
+            "the action, so a new owner does not get fresh attempts.",
+        "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
+      ].join("\n"),
+      {},
+      { authorType: "system" },
+    );
+    return { neverDelivered, neverDeliveredButWorked, counted: true, announced: true };
+  }
+
+
+  /**
    * BLO-24662: move recovery actions that have burned their wake horizon out of `active`.
    *
    * `strandedRecoveryWakeAttemptsExhausted` already makes every sweep skip these, and
@@ -13545,141 +13774,20 @@ export function recoveryService(
       // BLO-19124: the WHOLE per-row body is inside this try, not just the comment write.
       // `escalateExpiredWakeHorizons` flipped the entire batch to `escalated` in one UPDATE
       // above and only ever selects `status = "active"` rows, so a row this loop drops is
-      // never re-selected and its notice is lost for good. Both reads below hit the database
-      // — a connection blip or a statement timeout on either used to abort the sweep and
-      // silently strand every remaining row in the batch (default limit 200), which is the
-      // BLO-24662 shape this pass exists to end. The status transition is the load-bearing
-      // half and is already committed; nothing here may roll it back or abort the rest.
+      // never re-selected and its notice is lost for good. Both reads inside the helper hit
+      // the database — a connection blip or a statement timeout on either used to abort the
+      // sweep and silently strand every remaining row in the batch (default limit 200), which
+      // is the BLO-24662 shape this pass exists to end. The status transition is the
+      // load-bearing half and is already committed; nothing here may roll it back or abort
+      // the rest.
       try {
-        // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
-        // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
-        // freezes at the delivered count. It also restarts on owner change (`isNewOwnerSequence`
-        // in `upsertSourceScopedUnlocked`), so 0 means no wake was delivered to the CURRENT
-        // owner since it took over — not necessarily across the row's whole life. Within that
-        // scope it is a wake-channel fault rather than an owner who was woken and did not
-        // converge; those are different incidents with different responders and they render
-        // identically without this split. Not gated on `previousOwnerAgentId`: the stranded
-        // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
-        // call above), so it is non-null on the un-churned rows this label exists to catch.
-        const neverDelivered = action.attemptCount === 0;
-        if (neverDelivered) result.neverDelivered += 1;
-        recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
-
-        // BLO-19124: only asked on the `neverDelivered` branch, because that is the only notice
-        // arm that claims the stranding went unworked — the delivered arm makes no such claim,
-        // so buying this row would be a query per sweep for nothing.
-        //
-        // "Since the action opened" is deliberately an OVERLAP test, not a containment one:
-        // `hasSuccessfulIssueRunSince` matches `createdAt >= since OR finishedAt >= since`, so a
-        // run that started before this action and finished inside its window counts. That is the
-        // meaning the notice needs — such a run WAS working the issue during the horizon.
-        //
-        // `hasActiveExecutionPath`, the guard the sibling decision points in this subsystem use,
-        // is the wrong instrument here: it asks whether a run is in flight RIGHT NOW and would
-        // have missed all three BLO-19124 runs, every one of which had finished before the sweep
-        // read the row.
-        // `createdAt` is `string | Date` on the read model — the driver hands back a Date, but
-        // the type is widened, so normalise rather than relying on the runtime shape.
-        const neverDeliveredButWorked = neverDelivered
-          && await hasSuccessfulIssueRunSince(
-            action.companyId,
-            action.sourceIssueId,
-            new Date(action.createdAt),
-          );
-        if (neverDeliveredButWorked) result.neverDeliveredButWorked += 1;
-
-        logger.warn(
-          {
-            actionId: action.id,
-            companyId: action.companyId,
-            sourceIssueId: action.sourceIssueId,
-            cause: action.cause,
-            ownerAgentId: action.ownerAgentId,
-            attemptCount: action.attemptCount,
-            maxAttempts: action.maxAttempts,
-            neverDelivered,
-            neverDeliveredButWorked,
-            timeoutAt: action.timeoutAt,
-            runId: opts?.runId ?? null,
-          },
-          "recovery action passed its wake horizon and was escalated out of active",
-        );
-
-        // Same marker text and the same exact-match dedup as the notice in
-        // `escalateStrandedAssignedIssue`, so whichever path gets there first wins and the
-        // other stays quiet — the operator sees one horizon notice per action, not two.
-        const horizonAt = action.timeoutAt instanceof Date
-          ? action.timeoutAt.toISOString()
-          : action.timeoutAt != null
-            ? String(action.timeoutAt)
-            // BLO-40297 derived arm: the row never persisted a horizon, so report the one it
-            // was actually retired on — `createdAt` plus the configured horizon. This is for
-            // operator legibility only; the marker would still dedup correctly without it,
-            // because it embeds the unique `action.id` (an earlier version of this comment
-            // claimed a null horizon would collide across rows — it would not).
-            //
-            // `createdAt` is deliberately NOT null-guarded, though the read model widens it to
-            // `Date | string | null`: the derived arm selects on `lte(createdAt, …)`, which
-            // never matches SQL NULL, and the persisted arm does not reach this branch. If you
-            // widen that predicate, guard this first — `new Date(null)` is the epoch, so a null
-            // would render a 1970 horizon into an operator notice instead of failing.
-            : new Date(
-              new Date(action.createdAt).getTime() + recoveryActionBoundsConfig().timeoutMs,
-            ).toISOString();
-        const marker = `Recovery wake horizon reached for action \`${action.id}\` (horizon \`${horizonAt}\`)`;
-        const alreadyAnnounced = await db
-          .select({ id: issueComments.id })
-          .from(issueComments)
-          .where(and(
-            eq(issueComments.issueId, action.sourceIssueId),
-            eq(issueComments.authorType, "system"),
-            sql`${issueComments.body} LIKE ${`%${escapeLikePattern(marker)}%`} ESCAPE '\\'`,
-          ))
-          .limit(1)
-          .then((rows) => rows.length > 0);
-        if (alreadyAnnounced) continue;
-
-        await issuesSvc.addComment(
-          action.sourceIssueId,
-          [
-            `${marker}.`,
-            "",
-            "This recovery action passed its auto-recovery horizon without being discharged, so Paperclip has " +
-              "stopped waking anyone for it and has moved it out of `active` to `escalated`. It now needs a human " +
-              "or a board operator to resolve it.",
-            "",
-            `- Attempts: ${action.attemptCount} (budget ${action.maxAttempts ?? "none — this action was created before wake bounds existed, or by a cause that carries none"})`,
-            `- Auto-recovery horizon: ${horizonAt}${action.timeoutAt == null ? " (derived from `createdAt`; none was persisted)" : ""}`,
-            `- Cause: \`${action.cause}\``,
-            action.attemptCount === 0
-              ? "- Note: no wake reached the queue for this action's current owner. `Attempts` counts wakes " +
-                "that were DELIVERED, not sweeps attempted — each sweep reserves an attempt and refunds it " +
-                "when the wake is not delivered, and the count restarts when ownership changes — so 0 means " +
-                "every sweep since the current owner took over was refused by the wake channel " +
-                "(provider-capacity deferral, an active tree pause hold, wake disabled, or cooldown). An " +
-                "earlier owner may have been woken; check the action's owner history before concluding the " +
-                "whole window was refused. " +
-                (neverDeliveredButWorked
-                  // BLO-19124: the claim below is about THIS ACTION's wakes, never about the issue.
-                  // Saying "never worked" here was false on every row where the issue was serviced by
-                  // another path, and it is the whole reason an operator would open this notice.
-                  ? "The issue itself WAS worked inside this window even so — at least one run on it " +
-                    "succeeded after this action was opened — so this is a bookkeeping failure (the " +
-                    "action was never discharged) rather than an unworked stranding. Check whether the " +
-                    "work that happened actually resolved the stranding before treating this as an " +
-                    "incident."
-                  : "No run on the issue succeeded inside this window either, so within the current " +
-                    "owner's tenure the stranding this action was opened to repair was never worked, and " +
-                    "that is a scheduler-side fault rather than an owner who was woken and could not " +
-                    "resolve it.")
-              : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
-                "the action, so a new owner does not get fresh attempts.",
-            "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
-          ].join("\n"),
-          {},
-          { authorType: "system" },
-        );
-        result.announced += 1;
+        const emitted = await announceRecoveryHorizonRetirement(action, {
+          runId: opts?.runId ?? null,
+          retiredBy: "expired_wake_horizon_sweep",
+        });
+        if (emitted.neverDelivered) result.neverDelivered += 1;
+        if (emitted.neverDeliveredButWorked) result.neverDeliveredButWorked += 1;
+        if (emitted.announced) result.announced += 1;
       } catch (error) {
         logger.warn(
           { err: error, actionId: action.id, sourceIssueId: action.sourceIssueId },
@@ -14434,11 +14542,41 @@ export function recoveryService(
       }, now, false)) {
         const attemptBudgetReached = candidate.actionMaxAttempts !== null &&
           candidate.actionAttemptCount >= candidate.actionMaxAttempts;
-        await recoveryActionsSvc.retireWakeAction({
+        const retired = await recoveryActionsSvc.retireWakeAction({
           companyId: candidate.companyId,
           actionId: candidate.actionId,
           retiringBound: attemptBudgetReached ? "attempt_budget" : "timeout_horizon",
         });
+        // PEN-3989: this gate is the horizon's DOMINANT retirement path, and it used to emit
+        // nothing at all — no PEN-3000 counter, no source-row notice, only
+        // `exhaustedSkipped += 1` on an in-memory tally that is logged and discarded. Because
+        // `escalateExpiredWakeHorizons` (the path that does emit both) selects
+        // `status = 'active'` and nothing else, retiring the row here makes it permanently
+        // unselectable there, so the announcement was not deferred — it was lost. Four actions
+        // retired silently this way on 2026-10-12; see `announceRecoveryHorizonRetirement`.
+        //
+        // `retireWakeAction` returns the updated row only when IT performed the transition
+        // (its UPDATE is guarded on `retiring_bound IS NULL`), and `null` otherwise — so this
+        // is exact transition evidence, not an inference, and a row another path already
+        // retired cannot be announced twice from here.
+        //
+        // Gated on `timeout_horizon`: `attempt_budget` is a different retirement with a
+        // different meaning, and PEN-3322's alerts key on the horizon arm.
+        if (retired && retired.retiringBound === "timeout_horizon") {
+          try {
+            await announceRecoveryHorizonRetirement(retired, {
+              runId: opts?.runId ?? null,
+              retiredBy: "stranded_recovery_wake_backstop",
+            });
+          } catch (error) {
+            // Never abort the backstop for an announcement failure: the retirement is already
+            // committed and the remaining candidates still need sweeping.
+            logger.warn(
+              { err: error, actionId: candidate.actionId, sourceIssueId: candidate.issueId },
+              "failed to announce recovery wake horizon expiry from the stranded wake backstop",
+            );
+          }
+        }
         result.exhaustedSkipped += 1;
         continue;
       }
