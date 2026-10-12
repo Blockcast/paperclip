@@ -2300,7 +2300,7 @@ const EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS = 5 * 60 * 1000;
 // STARVATION_FULL_ESCALATION_MS, promote it ahead of routine work while
 // preserving ranks 0-1 for explicit critical issues.
 const STARVATION_STATUS_BOOST_MS = 30 * 60 * 1000;
-const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
+export const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
 // BLO-21792: the two steps above bound how long a run waits *behind routine
 // work*, but not how long it waits overall. Escalating to rank 2 deliberately
 // preserves ranks 0-1 for critical issues, so on an agent with a SUSTAINED
@@ -2321,7 +2321,7 @@ const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
 // BLO-19337 regressions pin (both use 3h-old runs, comfortably under this).
 // Only genuinely pathological waits — the class BLO-21116 measured at 5-16h —
 // cross it.
-const STARVATION_ABSOLUTE_ESCALATION_MS = 6 * 60 * 60 * 1000;
+export const STARVATION_ABSOLUTE_ESCALATION_MS = 6 * 60 * 60 * 1000;
 // The rank an absolute-floor run escalates to. Named rather than a bare `-1` so
 // the one value that must outrank every routine rank — including the 0-1 the
 // critical lane produces — is stated once and greppable from the lane that

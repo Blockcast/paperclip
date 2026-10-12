@@ -31,7 +31,11 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
-import { heartbeatService } from "../services/heartbeat.js";
+import {
+  heartbeatService,
+  STARVATION_ABSOLUTE_ESCALATION_MS,
+  STARVATION_FULL_ESCALATION_MS,
+} from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { runningProcesses } from "../adapters/index.js";
 
@@ -940,8 +944,17 @@ describeEmbeddedPostgres("queued backlog convergence (BLO-20396)", () => {
     });
 
     // Every row is old enough to have passed the starvation escalation floor,
-    // so ranking is decided by issue priority rather than by age.
-    const baseTime = Date.now() - 12 * 60 * 60 * 1000;
+    // so ranking is decided by issue priority rather than by age. That only
+    // holds while every row stays BELOW the BLO-21792 absolute ceiling too:
+    // past it a ready run of any class, issue-less included since BLO-44443,
+    // ranks ABSOLUTE_STARVATION_DISPATCH_RANK and the queue is plain FIFO, so
+    // the oldest filler row would beat the critical row these tests seed. This
+    // was 12h, written before that ceiling existed. Seeding halfway between the
+    // two floors keeps the whole span (issuelessRows seconds plus the
+    // past-window rows) inside the priority-ranked band with hours of margin on
+    // each side.
+    const baseTime =
+      Date.now() - (STARVATION_FULL_ESCALATION_MS + STARVATION_ABSOLUTE_ESCALATION_MS) / 2;
     let issueNumber = 0;
 
     const addIssueBackedRun = async (priority: string, ageMs: number) => {
