@@ -276,4 +276,44 @@ describeEmbeddedPostgres("scheduler lease (BLO-43292)", () => {
     expect(holder.isLeader()).toBe(false);
     expect(await db.select().from(schedulerLeases)).toHaveLength(1);
   });
+
+  it("fires onAcquire once on the boot leader only, and again on the survivor at takeover (BLO-45212)", async () => {
+    // Stands in for the startup recovery chain: index.ts runs it from
+    // onAcquire, so "fired" == "this process ran recovery".
+    const recoveredBy: string[] = [];
+    const make = (pod: string) => schedulerLeaseHolder(db, {
+      name: LEASE,
+      ttlMs: 45_000,
+      renewIntervalMs: 60_000,
+      identity: { pod, holderId: `${pod}#fixed` },
+      onAcquire: () => recoveredBy.push(pod),
+    });
+    const one = make("pod-1");
+    const two = make("pod-2");
+
+    // Both boot together, then keep renewing: recovery ran in exactly one.
+    await Promise.all([one.tick(), two.tick()]);
+    for (let i = 0; i < 5; i += 1) await Promise.all([one.tick(), two.tick()]);
+    expect(recoveredBy).toHaveLength(1);
+
+    const leader = recoveredBy[0] === "pod-1" ? one : two;
+    const survivor = leader === one ? two : one;
+    await leader.stop();
+    await survivor.tick();
+    expect(recoveredBy).toEqual([leader.identity.pod, survivor.identity.pod]);
+  });
+
+  it("keeps the lease when onAcquire throws", async () => {
+    const holder = schedulerLeaseHolder(db, {
+      name: LEASE,
+      ttlMs: 45_000,
+      renewIntervalMs: 60_000,
+      identity: { pod: "pod-1", holderId: "pod-1#fixed" },
+      onAcquire: () => {
+        throw new Error("boom");
+      },
+    });
+    expect(await holder.tick()).toBe(true);
+    expect(holder.isLeader()).toBe(true);
+  });
 });
