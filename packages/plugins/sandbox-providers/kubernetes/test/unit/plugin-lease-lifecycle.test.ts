@@ -211,7 +211,13 @@ describe("onEnvironmentDestroyLease", () => {
         deleteNamespacedPod: vi.fn().mockResolvedValue({}),
         deleteNamespacedSecret: vi.fn().mockResolvedValue({}),
       },
-      batch: { deleteNamespacedJob: deleteJob },
+      batch: {
+        // BLO-27156: deleteJob reads first so it can precondition on the uid.
+        readNamespacedJob: vi.fn().mockResolvedValue({
+          metadata: { uid: "job-uid-1", labels: { "paperclip.io/managed-by": "paperclip-k8s-plugin" } },
+        }),
+        deleteNamespacedJob: deleteJob,
+      },
     };
 
     await plugin.definition.onEnvironmentDestroyLease!({
@@ -224,7 +230,7 @@ describe("onEnvironmentDestroyLease", () => {
     });
 
     expect(deleteJob).toHaveBeenCalledWith(
-      expect.objectContaining({ namespace: "paperclip-acme", name: "pc-job" }),
+      expect.objectContaining({ namespace: "paperclip-acme", name: "pc-job", body: { preconditions: { uid: "job-uid-1" } } }),
     );
     expect(deleteCr).not.toHaveBeenCalled();
   });
