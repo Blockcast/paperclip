@@ -21,10 +21,19 @@
  *
  * `blocked` -> `todo` is the target status, per BLO-21523's accepted safe
  * default (not the issue's pre-block status).
+ *
+ * PEN-3974: every flip also posts a system comment on the issue announcing the
+ * change and naming the two-line external-wait declaration that would have held
+ * the park. The sweep is correct and stays unconditional; what was wrong is that
+ * it was legible only from `activity_log`, so the assignee that set `blocked`
+ * saw its status change with no actor, no reason and no remedy. See
+ * `announcementBody` for why this is an announcement rather than another
+ * suppression.
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, issueRelations, issues } from "@paperclipai/db";
+import { activityLog, issueComments, issueRelations, issues } from "@paperclipai/db";
+import type { IssueCommentMetadata, IssueCommentPresentation } from "@paperclipai/shared";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import {
   listBlockedIssueAutoResumeSuppressions,
@@ -188,6 +197,105 @@ async function listLockedLivePathIssueIds(
   return new Set(toRows<{ id: string }>(rows).map((row) => row.id));
 }
 
+/**
+ * BLO-21523 / PEN-3974 — the flip has to be legible to the row's assignee, not
+ * only to `activity_log`.
+ *
+ * The sweep already writes `issue.stranded_blocked_reconciled`, so the override
+ * was never unaudited. But an assignee reads the issue thread, not the activity
+ * log, so from the seat that set `blocked` the status simply changed with no
+ * actor and no reason — and the row then advertises itself in `inbox-lite` as
+ * ordinary buildable work. Measured on PEN-3789: the same card was flipped twice
+ * ~2h15m apart while its real gate (a human approving a PR) never moved, and the
+ * assignee spent part of two heartbeats rediscovering the flip by observation
+ * each time, because nothing it reads said the flip had happened.
+ *
+ * So: announce the flip on the thread, and name the one carrier that would have
+ * held the park. Agent-facing guidance sanctions `blocked` for "a named unblock
+ * owner/action" without saying WHERE that has to be written, and prose in a
+ * comment is the documented non-match — which is exactly the mistake PEN-3789
+ * made. The remedy belongs in the announcement because that is the moment the
+ * mistake becomes visible.
+ *
+ * Deliberately NOT a widening of `listBlockedIssueAutoResumeSuppressions` to
+ * scan comments. Every past widening of that predicate has ended up making rows
+ * permanently undrainable — BLO-27553 measured 19 of 23 estate-wide strands
+ * sitting behind a suppression that had quietly become unconditional — and a
+ * comment is writable by any agent, so a comment-scanning suppression would let
+ * any run strand a row forever with two lines of prose. The drain stays; only
+ * its silence goes.
+ */
+const ANNOUNCEMENT_PRESENTATION: IssueCommentPresentation = {
+  kind: "system_notice",
+  tone: "warning",
+  title: "Status changed `blocked` → `todo` automatically",
+  detailsDefaultOpen: false,
+};
+
+function announcementBody(): string {
+  return [
+    "**This issue was `blocked` with no unresolved blocker edges and no recognised hold, so the",
+    "stranded-blocked-issue reconciler returned it to `todo`.** It is dispatchable again.",
+    "",
+    "This is an automatic sweep (BLO-21523), not a decision by a person or an agent. Clearing an",
+    "issue's last blocker does not by itself recompute `status`, so a row left `blocked` with every",
+    "blocker `done` would otherwise sit forever in a state no scheduler can tell apart from a",
+    "genuine block.",
+    "",
+    "**If this issue really is waiting on something the issue graph cannot represent** — an",
+    "approval, a credential grant, a human review — then naming the owner in prose does not",
+    "register, and a comment is not scanned at all. Put both of these lines in the issue",
+    "**description**, each on a line of its own:",
+    "",
+    "```",
+    "external owner: <who must act>",
+    "external action: <the concrete action they must take>",
+    "```",
+    "",
+    "Both lines are required. A declared external wait is exempt from this sweep and from the",
+    "blocker-resolved wake, and the row is surfaced in the blocked inbox as `external_wait` with",
+    "the declared owner and action instead of as a stalled row. Delete the two lines when the gate",
+    "clears — a stale declaration parks the row just as effectively as a live one.",
+    "",
+    "See `doc/execution-semantics.md#declaring-an-external-wait`.",
+  ].join("\n");
+}
+
+function announcementMetadata(identifier: string | null): IssueCommentMetadata {
+  return {
+    version: 1,
+    sections: [
+      {
+        title: "Automatic status change",
+        rows: [
+          { type: "key_value", label: "Changed by", value: "stranded-blocked-issue-reconciler" },
+          { type: "key_value", label: "Status before", value: "blocked" },
+          { type: "key_value", label: "Status after", value: "todo" },
+          { type: "key_value", label: "Reason", value: "no unresolved blockers and no recognised hold" },
+          ...(identifier ? [{ type: "key_value" as const, label: "Issue", value: identifier }] : []),
+        ],
+      },
+    ],
+  };
+}
+
+/**
+ * One announcement per FLIP, not per issue.
+ *
+ * `issue_comments_issue_system_idempotency_idx` is a partial UNIQUE index over
+ * `(issue_id, idempotency_key)` for exactly these author-less rows, so this
+ * enforces at-most-once in the database rather than checking for it — two
+ * replicas sweeping concurrently cannot both post. The key is salted with the
+ * flip's own clock on purpose: a row can be legitimately re-blocked and
+ * re-promoted (PEN-3789 was, twice), and an issue-scoped key would silence every
+ * recurrence after the first — which is precisely the repeat that made the
+ * behaviour expensive. Each real flip announces itself; a retry of the same
+ * transaction does not.
+ */
+function announcementIdempotencyKey(issueId: string, reconciledAt: Date): string {
+  return `stranded-blocked-issue-reconciler:${issueId}:${reconciledAt.toISOString()}`;
+}
+
 async function reconcileCandidateBatch(
   tx: Pick<Db, "execute" | "insert" | "select" | "update">,
   candidates: CandidateRow[],
@@ -226,13 +334,32 @@ async function reconcileCandidateBatch(
   }
 
   if (eligibleIds.length === 0) return [];
+  // One clock for the flip, its audit row and its announcement, so the
+  // announcement's idempotency key is derived from the promotion it describes.
+  const reconciledAt = new Date();
   const reconciled = await tx
     .update(issues)
-    .set({ status: "todo", updatedAt: new Date() })
+    .set({ status: "todo", updatedAt: reconciledAt })
     .where(and(inArray(issues.id, eligibleIds), eq(issues.status, "blocked")))
     .returning({ id: issues.id, companyId: issues.companyId, identifier: issues.identifier });
 
   if (reconciled.length > 0) {
+    // Announce before the audit row: the thread is the surface the assignee
+    // actually reads, and `onConflictDoNothing` keeps a replayed transaction
+    // from double-posting.
+    await tx
+      .insert(issueComments)
+      .values(reconciled.map((row) => ({
+        companyId: row.companyId,
+        issueId: row.id,
+        authorType: "system" as const,
+        idempotencyKey: announcementIdempotencyKey(row.id, reconciledAt),
+        body: announcementBody(),
+        presentation: ANNOUNCEMENT_PRESENTATION,
+        metadata: announcementMetadata(row.identifier),
+      })))
+      .onConflictDoNothing();
+
     await tx.insert(activityLog).values(reconciled.map((row) => ({
       companyId: row.companyId,
       actorType: "system" as const,
