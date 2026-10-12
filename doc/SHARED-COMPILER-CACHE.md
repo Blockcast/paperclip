@@ -16,6 +16,8 @@ Configure these adapter environment values for Blockcast's Kubernetes agents:
 ```text
 RUSTC_WRAPPER=/usr/local/bin/paperclip-sccache
 CARGO_INCREMENTAL=0
+CARGO_HOME=/runtime-cache/cargo
+CARGO_TARGET_DIR=/runtime-cache/cargo-target
 SCCACHE_BUCKET=paperclip-compiler-cache-blockcast
 SCCACHE_ENDPOINT=http://ceph-rgw.kube-system.svc.cluster.local:7480
 SCCACHE_REGION=us-east-1
@@ -39,3 +41,9 @@ a warm hit, zero cache errors, anonymous read denial, outside-prefix denial,
 and denial against another bucket. Inspect `sccache --show-stats --stats-format=json`.
 Cargo still compiles uncached work such as linking binaries and procedural
 macros. A cache-service outage falls back to the compiler.
+
+These fixed Cargo paths refer to separate emptyDirs in each Pod. Registry
+dependency source paths then match across jobs; sccache's Rust keys include
+the Cargo environment and compiler working directory. Different application
+checkout paths can still miss even when their dependencies hit. Keep existing
+operator overrides where a job needs them.
