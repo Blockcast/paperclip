@@ -636,6 +636,13 @@ async function resolveResponsibleUserIdForIssueCreate(
  * would not produce an owned alert, it would refuse to record the alert at all,
  * which is worse than the ownerless row this exists to prevent. Resolved
  * lazily, so an ordinary create still costs zero extra queries.
+ *
+ * Origins whose writer fills the owner in later are left as created. The
+ * alertmanager owner retrofit (BLO-40764) patches `{ assigneeAgentId }` alone
+ * and skips its user leg once `assigneeUserId` is set, so a pre-filled default
+ * user turned every agent retrofit into the `"Issue can only have one
+ * assignee"` 422 and every user retrofit into a silent no-op. Those rows were
+ * ownerless before this change and stay that way until their writer decides.
  */
 async function resolveCreateIssueAssignee(
   input: {
@@ -643,11 +650,13 @@ async function resolveCreateIssueAssignee(
     assigneeUserId?: string | null;
     createdByAgentId?: string | null;
     responsibleUserId?: string | null;
+    originKind?: string | null;
   },
   companyDefaultResponsibleUserId: () => Promise<string | null>,
-): Promise<{ assigneeAgentId: string } | { assigneeUserId: string }> {
+): Promise<{ assigneeAgentId: string } | { assigneeUserId: string } | Record<string, never>> {
   if (input.assigneeAgentId) return { assigneeAgentId: input.assigneeAgentId };
   if (input.assigneeUserId) return { assigneeUserId: input.assigneeUserId };
+  if (input.originKind?.startsWith("plugin:") || input.originKind === "github_dependabot_alert") return {};
   if (input.createdByAgentId) return { assigneeAgentId: input.createdByAgentId };
   if (input.responsibleUserId) return { assigneeUserId: input.responsibleUserId };
   const companyDefault = await companyDefaultResponsibleUserId();
@@ -10676,6 +10685,7 @@ export function issueService(db: Db) {
             assigneeUserId: issueData.assigneeUserId,
             createdByAgentId: issueData.createdByAgentId,
             responsibleUserId,
+            originKind: issueData.originKind,
           }, async () => {
             const [company] = await tx
               .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
