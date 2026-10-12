@@ -953,4 +953,121 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     const comments = await db.select({ id: issueComments.id }).from(issueComments);
     expect(comments).toHaveLength(1);
   });
+  /**
+   * PEN-3989: the horizon retirement has THREE writers, and until this change only one of
+   * them emitted the PEN-3000 counter or the source-row notice.
+   *
+   * Every test above drives `reconcileExpiredRecoveryWakeHorizons` — writer 1, the path that
+   * already worked. That is exactly the blind spot that let this ship: the suite was thorough
+   * about the arm that was never broken. `retiring_bound = 'timeout_horizon'` is also written
+   * by `retireWakeAction` from the stranded-wake backstop and by `retireAndReleaseWakeAttempt`
+   * from the wake dispatch, both from a ternary (`attemptBudgetReached ? ... : ...`) that a
+   * grep for the contiguous literal cannot see, and both behind the DISJUNCTIVE
+   * `strandedRecoveryWakeAttemptsExhausted` — so they fire on the same condition writer 1
+   * exists to handle, and they race it.
+   *
+   * Writer 1 cannot recover afterwards: it selects `status = 'active'` only, so a row the
+   * backstop already flipped to `escalated` is permanently unselectable there. The
+   * announcement was not deferred, it was lost.
+   *
+   * Measured on 2026-10-12: four actions passed a 6 h horizon, were flipped to `escalated`
+   * with `retiring_bound = 'timeout_horizon'` at 07:41:39Z by the backstop, and produced
+   * neither a metric increment nor a notice on any of the four source rows.
+   *
+   * These tests assert BOTH observables, from the BACKSTOP. Asserting only the status
+   * transition is what made the failure invisible — that half never stopped working.
+   */
+  describe("horizon retirement performed by the stranded-wake backstop (PEN-3989)", () => {
+    it("counts and announces a horizon retirement the backstop performs", async () => {
+      // Counts are deliberately ASYMMETRIC (2 never-delivered vs 1 delivered) for the same
+      // reason as the writer-1 test above: with one of each, both series read 1 and an
+      // inverted ternary at the call site is invisible.
+      __resetMetricsForTest();
+      const neverDeliveredA = await seed();
+      await insertAction(neverDeliveredA, { attemptCount: 0 });
+      const neverDeliveredB = await seed();
+      await insertAction(neverDeliveredB, { attemptCount: 0 });
+      // Horizon passed but the budget is NOT spent, so this retires on `timeout_horizon`
+      // with a wake already delivered — the `delivered` arm, through the same gate.
+      const delivered = await seed();
+      await insertAction(delivered, { attemptCount: 2 });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({ now });
+      expect(result).toMatchObject({ exhaustedSkipped: 3 });
+
+      // Half one: the transition. This never stopped working and is NOT what this guards.
+      const actions = await db.select().from(issueRecoveryActions);
+      expect(actions).toHaveLength(3);
+      for (const action of actions) {
+        expect(action.status).toBe("escalated");
+        expect(action.retiringBound).toBe("timeout_horizon");
+      }
+
+      // Half two: the metric. Zero on both series before this change.
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 2`);
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 1`);
+
+      // Half three: the notice on the SOURCE row. Absent entirely before this change, which
+      // is why the four production rows retired with no trace an operator could read.
+      for (const seeded of [neverDeliveredA, neverDeliveredB, delivered]) {
+        const comments = await db
+          .select({ body: issueComments.body })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, seeded.sourceIssueId));
+        expect(comments).toHaveLength(1);
+        expect(comments[0]!.body).toContain("Recovery wake horizon reached");
+      }
+    });
+
+    it("does not count or announce a backstop retirement on the attempt budget", async () => {
+      // Negative control for the ternary. `strandedRecoveryWakeAttemptsExhausted` is
+      // disjunctive, so a spent budget reaches the SAME gate — but it is a different
+      // retirement with a different meaning, and PEN-3322's alerts key on the horizon arm.
+      // Without this, widening the announce to every retirement would still pass the test
+      // above.
+      __resetMetricsForTest();
+      const seeded = await seed();
+      await insertAction(seeded, {
+        attemptCount: 5,
+        maxAttempts: 5,
+        timeoutAt: futureHorizon,
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+      await recovery.reconcileStrandedRecoveryWakeBackstop({ now });
+
+      const [action] = await db.select().from(issueRecoveryActions);
+      expect(action!.retiringBound).toBe("attempt_budget");
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 0`);
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
+      const comments = await db.select({ id: issueComments.id }).from(issueComments);
+      expect(comments).toHaveLength(0);
+    });
+
+    it("announces exactly once when the horizon sweep runs after the backstop retired the row", async () => {
+      // The two paths race the same condition in production. The backstop wins, which leaves
+      // the row `escalated` and therefore invisible to writer 1 — so the horizon sweep must
+      // find nothing to do and must not post a second notice. This pins the dedup that makes
+      // announcing from three call sites safe.
+      __resetMetricsForTest();
+      const seeded = await seed();
+      await insertAction(seeded, { attemptCount: 0 });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+      await recovery.reconcileStrandedRecoveryWakeBackstop({ now });
+      const sweep = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+      expect(sweep).toMatchObject({ escalated: 0, announced: 0 });
+      const comments = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, seeded.sourceIssueId));
+      expect(comments).toHaveLength(1);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 1`);
+    });
+  });
 });
