@@ -205,6 +205,12 @@ export function schedulerLeaseHolder(
   let failOpenLogged = false;
   let timer: ReturnType<typeof setInterval> | null = null;
   let stopped = false;
+  // Single-flight latch. Without it `setInterval` stacks a fresh query every
+  // renew interval while the pool is exhausted — adding load during the exact
+  // starvation this lease exists to survive — and `stop()` has nothing to wait
+  // on, so a renewal still in flight could land AFTER the release and re-insert
+  // the row, holding the lease for a full TTL past process exit.
+  let inFlight: Promise<boolean> | null = null;
 
   const isLeader = () => now() < heldUntilMs;
 
@@ -249,7 +255,17 @@ export function schedulerLeaseHolder(
   };
 
   /** One acquire/renew attempt. Returns whether this process runs the loop. */
-  const tick = async () => {
+  const tick = (): Promise<boolean> => {
+    if (stopped) return Promise.resolve(false);
+    if (!inFlight) {
+      inFlight = attempt().finally(() => {
+        inFlight = null;
+      });
+    }
+    return inFlight;
+  };
+
+  const attempt = async () => {
     const wasLeader = isLeader();
     // Read BEFORE the query so latency is charged against our own validity
     // window — see the clock-handling note at the top of this file.
@@ -333,17 +349,25 @@ export function schedulerLeaseHolder(
       timer.unref?.();
       return leader;
     },
-    stop: async () => {
+    /**
+     * Stop renewing. With `release: false` the row is left to expire on its own
+     * (TTL), which is what shutdown wants when it could not wait for the
+     * scheduler's in-flight work to drain: releasing early would let a
+     * survivor run a tick while this process's last one is still writing.
+     */
+    stop: async ({ release = true }: { release?: boolean } = {}) => {
       stopped = true;
       if (timer) {
         clearInterval(timer);
         timer = null;
       }
+      // Let an in-flight renewal land BEFORE the release, never after it.
+      if (inFlight) await inFlight.catch(() => undefined);
       const wasLeader = isLeader();
       heldUntilMs = 0;
       lastAttemptFailed = false;
       publish();
-      if (!wasLeader) return false;
+      if (!wasLeader || !release) return false;
       try {
         return await releaseSchedulerLease(db, { name, holderId: identity.holderId });
       } catch (err) {

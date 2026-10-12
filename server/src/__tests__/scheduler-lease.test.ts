@@ -228,4 +228,52 @@ describeEmbeddedPostgres("scheduler lease (BLO-43292)", () => {
     expect(await holder.tick()).toBe(false);
     expect(holder.state()).toMatchObject({ everAcquired: false, runsLoop: false });
   });
+
+  it("single-flights renewals and lets an in-flight one land BEFORE stop() releases", async () => {
+    // A renewal held open (pool starvation) must neither stack a second query
+    // nor land after the release and re-insert the row for a full TTL.
+    let gate!: () => void;
+    let calls = 0;
+    const slow = {
+      execute: async (query: unknown) => {
+        calls += 1;
+        if (calls === 2) await new Promise<void>((resolve) => { gate = resolve; });
+        return (db as unknown as { execute: (q: unknown) => Promise<unknown> }).execute(query);
+      },
+    };
+    const holder = schedulerLeaseHolder(slow as never, {
+      name: LEASE,
+      ttlMs: 45_000,
+      renewIntervalMs: 60_000,
+      identity: { pod: "pod-1", holderId: "pod-1#fixed" },
+    });
+    expect(await holder.tick()).toBe(true);
+
+    const pending = holder.tick(); // call 2, parked on the gate
+    void holder.tick();
+    void holder.tick();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls).toBe(2);
+
+    const stopping = holder.stop();
+    gate();
+    expect(await pending).toBe(true);
+    expect(await stopping).toBe(true);
+    expect(await db.select().from(schedulerLeases)).toHaveLength(0);
+    expect(await holder.tick()).toBe(false);
+    expect(calls).toBe(3); // the release; no tick ran after stop
+  });
+
+  it("leaves the row to expire when stop() is told not to release", async () => {
+    const holder = schedulerLeaseHolder(db, {
+      name: LEASE,
+      ttlMs: 45_000,
+      renewIntervalMs: 60_000,
+      identity: { pod: "pod-1", holderId: "pod-1#fixed" },
+    });
+    expect(await holder.tick()).toBe(true);
+    expect(await holder.stop({ release: false })).toBe(false);
+    expect(holder.isLeader()).toBe(false);
+    expect(await db.select().from(schedulerLeases)).toHaveLength(1);
+  });
 });
