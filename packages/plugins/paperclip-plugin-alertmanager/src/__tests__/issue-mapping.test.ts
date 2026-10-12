@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ISSUE_PRIORITIES } from "@paperclipai/shared";
 import {
   alertMatchesLabelFilter,
   buildIssueDescription,
@@ -66,6 +67,36 @@ describe("severityToPriority", () => {
     expect(
       severityToPriority("warning", { critical: "high" }),
     ).toBe("medium");
+  });
+
+  it("never returns a prototype value for a severity named after one", () => {
+    // Both maps are plain objects, so indexing reaches Object.prototype. Only
+    // `constructor` and `__proto__` survive the toLowerCase() — `toString`,
+    // the value the review cited, lowercases to `tostring` and never matched —
+    // and both used to come back as `function Object` / `[object Object]` and
+    // reach ctx.issues.create as a priority.
+    //
+    // Asserted as membership rather than === "medium" so it fails on the
+    // unfixed code rather than on a change to the fallback value.
+    for (const severity of ["constructor", "__proto__", "Constructor", " __proto__ "]) {
+      for (const override of [undefined, { nothing: "low" as const }]) {
+        expect(ISSUE_PRIORITIES).toContain(severityToPriority(severity, override));
+      }
+    }
+    // Same hole on the override map, which is operator-supplied config.
+    expect(
+      ISSUE_PRIORITIES,
+    ).toContain(severityToPriority("constructor", { critical: "high" }));
+  });
+
+  it("rejects an operator override value that is not a priority", () => {
+    // manifest.ts declares an enum for severityToPriority, but that schema is
+    // config-UI documentation, not a runtime gate on what reaches here.
+    const rogue = { warning: "urgent" } as unknown as Record<
+      string,
+      "critical" | "high" | "medium" | "low"
+    >;
+    expect(ISSUE_PRIORITIES).toContain(severityToPriority("warning", rogue));
   });
 });
 
@@ -202,6 +233,35 @@ describe("resolveAlertPriority (BLO-20576 per-rule escape hatch)", () => {
         ),
       ).priority,
     ).toBe("low");
+  });
+
+  it("bounds and flattens the ignored value before it reaches a log line", () => {
+    // webhook-handler.ts interpolates ignoredValue straight into a warn. A
+    // newline forges log records; an unbounded value bloats them.
+    const forged = "hgih\ncritical: all systems nominal\r\n  trailing";
+    const ignored = resolveAlertPriority(
+      withLabels({ severity: "warning", paperclip_priority: forged }),
+    ).ignoredValue;
+    expect(ignored).toBeDefined();
+    expect(ignored).not.toMatch(/[\r\n]/);
+    expect(ignored!.length).toBeLessThanOrEqual(64);
+
+    const long = "x".repeat(500);
+    const bounded = resolveAlertPriority(
+      withLabels({ severity: "warning", paperclip_priority: long }),
+    ).ignoredValue;
+    expect(bounded!.length).toBeLessThanOrEqual(64);
+    // Truncation is visible, so a support reader does not mistake the stand-in
+    // for the whole value the rule author actually set.
+    expect(bounded!.endsWith("…")).toBe(true);
+
+    // A value already short and single-line is echoed verbatim — the existing
+    // expectations above depend on that.
+    expect(
+      resolveAlertPriority(
+        withLabels({ severity: "warning", paperclip_priority: "high;drop table" }),
+      ).ignoredValue,
+    ).toBe("high;drop table");
   });
 
   it("an absent severity still resolves under the operator's `unknown` key", () => {

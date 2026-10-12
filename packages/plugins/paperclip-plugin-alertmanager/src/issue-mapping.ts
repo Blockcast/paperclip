@@ -39,15 +39,21 @@ export function severityToPriority(
   if (!severity) return FALLBACK_PRIORITY;
   const key = severity.trim().toLowerCase();
   if (!key) return FALLBACK_PRIORITY;
-  if (override && key in override) {
-    const value = override[key];
-    if (value !== undefined) return value;
-  }
-  if (key in DEFAULT_SEVERITY_TO_PRIORITY) {
-    const value = DEFAULT_SEVERITY_TO_PRIORITY[key];
-    if (value !== undefined) return value;
+  // Validate the result, not the lookup: both maps are plain objects, so
+  // `constructor` / `__proto__` (the two prototype keys that survive
+  // toLowerCase) used to come back as `function Object` / `[object Object]`
+  // and reach `ctx.issues.create({ priority })`, failing the whole batch. This
+  // also rejects an override value outside the enum — `manifest.ts`'s schema is
+  // config-UI documentation, not a runtime gate.
+  for (const map of [override, DEFAULT_SEVERITY_TO_PRIORITY]) {
+    const value = map && Object.hasOwn(map, key) ? map[key] : undefined;
+    if (isPriority(value)) return value;
   }
   return FALLBACK_PRIORITY;
+}
+
+function isPriority(value: unknown): value is PaperclipPriority {
+  return (ISSUE_PRIORITIES as readonly unknown[]).includes(value);
 }
 
 /**
@@ -61,7 +67,10 @@ export function severityToPriority(
  */
 export interface ResolvedAlertPriority {
   priority: PaperclipPriority;
-  /** Raw value when present but unusable; `undefined` when honoured or absent. */
+  /**
+   * The unusable value, bounded and whitespace-flattened for a log line (see
+   * `forLog`); `undefined` when the value was honoured or absent.
+   */
   ignoredValue?: string;
 }
 
@@ -122,7 +131,29 @@ export function resolveAlertPriority(
   if ((ISSUE_PRIORITIES as readonly string[]).includes(key)) {
     return { priority: key as PaperclipPriority };
   }
-  return { priority, ignoredValue: raw };
+  return { priority, ignoredValue: forLog(raw) };
+}
+
+/** Max length of an operator-supplied value echoed into a log line. */
+const IGNORED_VALUE_MAX = 64;
+
+/**
+ * Bound and flatten an operator-supplied value before it reaches a log line.
+ *
+ * `ignoredValue` is interpolated straight into a `ctx.logger.warn` in
+ * `webhook-handler.ts`. Untrimmed it lets a `PrometheusRule` author — the
+ * surface this module already declines to trust with `ctx.issues.create` —
+ * forge log records with an embedded newline, or bloat them with an arbitrarily
+ * long value. The sibling `paperclip_issue` guard logs no value at all; this
+ * one has to echo it (the whole point is telling the author *which* value was
+ * dropped), so it echoes a bounded stand-in instead, like the
+ * `<non-string …>` case above.
+ */
+function forLog(raw: string): string {
+  const flat = raw.replace(/\s+/g, " ").trim();
+  return flat.length > IGNORED_VALUE_MAX
+    ? `${flat.slice(0, IGNORED_VALUE_MAX - 1)}…`
+    : flat;
 }
 
 /**
