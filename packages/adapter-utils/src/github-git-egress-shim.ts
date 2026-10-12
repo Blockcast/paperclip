@@ -216,9 +216,12 @@ export function isKnownPublishingGitVerb(verb: string): boolean {
  * means `status`, but nothing runs it that way, so it stays refused.
  *
  * Residual: an uninitialised submodule still needs `sync` / `update --init`,
- * which stay refused, so such a workspace fails one step later with the same
- * `workspace_git_submodule_unavailable`. The remedy is an attended repair run
- * with /usr/bin/git directly, not a wider allowlist.
+ * which stay refused here and always will. That is not a gap -- the *server*
+ * no longer comes through this wrapper at all. `resolveServerGitInvocation` in
+ * server/src/services/workspace-runtime.ts pins /usr/bin/git for Paperclip's
+ * own workspace setup, so it repairs such a checkout itself (BLO-42838). For an
+ * agent the refusal stands, and the remedy is an attended repair run with
+ * /usr/bin/git directly, not a wider allowlist.
  */
 export function isReadOnlySubmoduleInvocation(verb: string, args: readonly string[]): boolean {
   return verb === "submodule" && args.find((arg) => arg !== "-q" && arg !== "--quiet") === "status";
