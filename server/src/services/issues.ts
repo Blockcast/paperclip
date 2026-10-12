@@ -11950,11 +11950,13 @@ export function issueService(db: Db) {
      * the reconciler's `status = 'blocked'` predicate — which is the BLO-29597
      * defect, and also why a `status = 'blocked'` census is a floor rather than
      * a count. A census wanting the count must union in `status = 'in_progress'
-     * AND checkout_restore_status = 'blocked'`, and every row that union adds is
-     * a genuine strand rather than a maybe.
+     * AND checkout_restore_status = 'blocked'`, and every row that union adds
+     * was a strand when claimed (a row given a real edge mid-run is genuinely
+     * blocked until its restore runs, so the union is an upper bound on live
+     * strands).
      *
      * The ratchet itself is closed on the way OUT, not the way in:
-     * {@link checkoutRestoreTargetStatus} recomputes readiness from the live
+     * `checkoutRestoreTargetStatus` in `issue-checkout-status.ts` recomputes readiness from the live
      * edges when the promotion is undone, so a no-progress round trip cannot
      * hand the row back in the stranded shape it was found in — and an edge
      * filed DURING the run (the one way a claimed row becomes genuinely blocked)
