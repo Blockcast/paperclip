@@ -122,6 +122,7 @@ import {
 import { instanceSettingsService, readInstanceSettingsOn } from "./instance-settings.js";
 import {
   assertNotDuplicatePrReviewIssue,
+  inferPrReviewTargetFromCanonicalTitle,
   lockPrReviewIssueScopes,
   normalizePrReviewRepoFullName,
 } from "./pr-review-duplicate-issue-guard.js";
@@ -10137,7 +10138,7 @@ export function issueService(db: Db) {
         trustExplicitResponsibleUserId,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
-        prReviewTarget,
+        prReviewTarget: explicitPrReviewTarget,
         onDeduplicated,
         beforeSideEffects,
         fencingPrecondition,
@@ -10150,6 +10151,7 @@ export function issueService(db: Db) {
       // so there are no mixed-case rows to stay compatible with — unlike the
       // live `pr_review:` task keys, whose producers are still mid-rollout and
       // are matched through `matchesAnyTaskKey`'s dual-read predicate instead.
+      const prReviewTarget = explicitPrReviewTarget ?? inferPrReviewTargetFromCanonicalTitle(issueData);
       const prReviewFingerprint = prReviewTarget
         ? `pr_review:${normalizePrReviewRepoFullName(prReviewTarget.repoFullName)}:${prReviewTarget.prNumber}`
         : null;
