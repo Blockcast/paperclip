@@ -3189,22 +3189,6 @@ export async function startServer(): Promise<StartedServer> {
         heartbeatRecoveryChainWatchdogInterval = null;
       }
 
-      // BLO-43292. Released here, right after the tick is disarmed and before
-      // the drain, so the window in which this process holds the lease without
-      // running the loop is as short as possible.
-      //
-      // This is the difference between a rolling restart costing one follower
-      // poll and costing a full lease TTL: the replacement process is a new
-      // holder (the holder id carries a per-process nonce, so it cannot renew
-      // its predecessor's lease) and would otherwise have to wait the lease
-      // out. Best-effort by construction — the holder swallows and logs a
-      // failed release, because the lease expires on its own and a slow
-      // shutdown is worse than a slow handover.
-      if (schedulerLease) {
-        await schedulerLease.stop();
-        schedulerLease = null;
-      }
-
       // Disarmed alongside the scheduler, and before the drain below, because a
       // heap snapshot is a synchronous multi-gigabyte stop-the-world write: one
       // fired during the drain can push the pod past its termination grace and
@@ -3222,6 +3206,25 @@ export async function startServer(): Promise<StartedServer> {
         waitForHeartbeatSchedulerIdle,
       });
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+
+      // BLO-43292. Released only AFTER the scheduler's in-flight work has
+      // drained (`waitedForSchedulerIdle`), not when the tick is disarmed: the
+      // last tick's gated work (sweeps, reconciliations, enqueues) is still
+      // writing until then, and releasing earlier lets a survivor's next poll
+      // acquire and tick concurrently — two writers, the thing this lease
+      // exists to prevent. The renew timer keeps the lease held through that
+      // drain, so nobody can take it over mid-write.
+      //
+      // The release is what makes a rolling restart cost one follower poll
+      // rather than a full TTL: the replacement process is a new holder (the
+      // holder id carries a per-process nonce) and would otherwise wait the
+      // lease out. When the idle wait was skipped (hot restart), do NOT
+      // release — let the TTL expire, trading handover speed for exclusion.
+      // Best-effort either way: the holder logs and swallows a failed release.
+      if (schedulerLease) {
+        await schedulerLease.stop({ release: heartbeatShutdown.waitedForSchedulerIdle });
+        schedulerLease = null;
+      }
       if (skipHeartbeatDrain) {
         logger.info(
           { signal, hotRestart: heartbeatShutdown.hotRestart },
