@@ -449,7 +449,8 @@ async function upsertAggregateMember(
   // with one row now fires onto a DIFFERENT row: it is that row's newest
   // joiner, not its founder. Kept, its old `created_at` would sort it first and
   // its old anchor would drag the new row's **Started** back into a finished
-  // episode. Same predicate as `rejoinsLiveRow` in `describeAggregate`.
+  // episode. `rejoinsLiveRow` in `describeAggregate` mirrors this, keyed on the
+  // same destination `issue_id` its caller passes in.
   const result = await ctx.db.execute(
     `INSERT INTO ${q(ns, AGGREGATE_MEMBERS_TABLE)}
        (company_id, aggregate_key, fingerprint, issue_id, alert_snapshot,
@@ -547,6 +548,13 @@ function memberSnapshot(alert: AlertmanagerAlert): Record<string, unknown> {
  * aggregate belongs on the aggregate's row whichever issue it currently points
  * at, which also makes one computed body correct across a rebind.
  *
+ * `destinationIssueId` is the row this body is written to, or null when it is
+ * about to be created. That row is live by definition — it is open and being
+ * written — even when every member on it has resolved (`autoCloseOnResolve`
+ * off, or a resolve-cancel withheld for a run). Liveness read only from member
+ * `resolved_at` calls such a row dead, so a joiner's first render anchored on
+ * itself and its next heartbeat on the row's founder: **Started** moved back.
+ *
  * Tolerant by construction — a failed read returns `fallback` (or leaves the
  * body alone) and logs. The description is triage context, not a correctness
  * invariant, and failing a delivery over it would trade a stale body for a
@@ -557,6 +565,7 @@ async function describeAggregate(
   ctx: PluginContext,
   companyId: string,
   aggregateKey: string,
+  destinationIssueId: string | null,
   alert: AlertmanagerAlert | null,
   fallback: string | null = null,
 ): Promise<string | null> {
@@ -575,10 +584,12 @@ async function describeAggregate(
        ORDER BY created_at ASC, fingerprint ASC`,
       [companyId, aggregateKey],
     );
-    // Rows that are live right now: those with at least one active member.
+    // Rows that are live right now: those with at least one active member, and
+    // the row being written.
     const liveIssueIds = new Set(
       rows.filter((row) => row.resolved_at === null).map((row) => row.issue_id),
     );
+    if (destinationIssueId !== null) liveIssueIds.add(destinationIssueId);
     // The firing in hand's own row, if it has fired before. A resolved member
     // coming back while a DIFFERENT row is live joins that row as its newest
     // member (`upsertAggregateMember` restarts its join order and anchor on the
@@ -2473,7 +2484,7 @@ export async function handleFiring(
       // below with the other reads; `describeAggregate` swallows its own read
       // failure and hands back the single-alert body, so this cannot fail a
       // delivery that would otherwise have succeeded.
-      const newDescription =
+      const describeOnto = async (issueId: string) =>
         (await describeAggregate(
           ctx,
           // Same company the member write below uses. `companyId` and
@@ -2482,9 +2493,14 @@ export async function handleFiring(
           // skew that only shows up on the row nobody is looking at.
           existing.paperclipCompanyId,
           aggregateKey,
+          issueId,
           alert,
           buildIssueDescription(alert),
         )) ?? buildIssueDescription(alert);
+      // For the row this fingerprint is tracked on. A rebind below lands on a
+      // different row and re-renders for it — another plain DB read, next to
+      // the `findActiveAggregateIssue` read that found that row.
+      const newDescription = await describeOnto(existing.paperclipIssueId);
       // Carried out of the try so the state write below records what actually
       // happened. A decision the RPC then failed to apply must not be persisted
       // as applied — otherwise a transient issues.update outage would bank the
@@ -2559,7 +2575,7 @@ export async function handleFiring(
             const takeOver = async (target: IssueReference) => {
               await ctx.issues.update(
                 target.id,
-                { description: newDescription },
+                { description: await describeOnto(target.id) },
                 existing.paperclipCompanyId,
                 undefined,
                 { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -3090,6 +3106,7 @@ export async function handleFiring(
       ctx,
       companyId,
       aggregateKey,
+      retainedIssue?.id ?? null,
       alert,
       buildIssueDescription(alert),
     )) ?? buildIssueDescription(alert);
@@ -3679,6 +3696,7 @@ export async function handleResolved(
           ctx,
           existing.paperclipCompanyId,
           aggregateKey,
+          aggregateResolution.issueId,
           null,
         );
         if (description) {

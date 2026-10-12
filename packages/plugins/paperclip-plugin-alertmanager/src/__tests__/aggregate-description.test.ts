@@ -50,6 +50,24 @@
  *   9. `rejoinsLiveRow` forced false, so a member rebinding onto a different
  *      live row resumes its old join position → "newly filed row" fails.
  *
+ * Measured 2026-10-12 for the two cases added after Ally's review of e67945ec19
+ * ("open row whose members all resolved", "rebind onto an open, all-resolved
+ * row"), same one-at-a-time rule. Before the fix, both fail on their first
+ * render.
+ *
+ *  10. destination id not seeded into `liveIssueIds` → both new cases fail.
+ *  11. seeded on the join path only (re-fire passes null) → the rebind case.
+ *  12. seeded on the re-fire path only (join passes null) → the open-row case.
+ *  13. rebind branches publish the body rendered for the OLD row (no
+ *      `describeOnto(<rebind target>)`) → the rebind case, and "newly filed row".
+ *  14. resolve path passes null → SURVIVES, as an equivalent mutant: that path
+ *      only re-renders on `has-unresolved-siblings`, whose query is scoped to
+ *      the same `issue_id`, so the destination is already live there.
+ *
+ * ⚠ 10-12 were invisible until `mkIssues().list` honoured `originId`: without
+ * it, state recovery adopted the aggregate's row for every new fingerprint, so
+ * every "join" in this file ran the re-fire path, and 12 survived.
+ *
  * ⚠ 6 and 8 SURVIVED the first draft of those cases: their re-deliveries were
  * byte-identical, so the BLO-33168 replay window skipped them and the asserted
  * body was the previous delivery's. They now go through `heartbeat`, which
@@ -172,6 +190,11 @@ function payloadFor(alert: AlertmanagerAlert): AlertmanagerWebhookPayload {
  * must find the aggregate's active row by `originFingerprint` (that is how a
  * second fingerprint joins rather than creating a second issue), and the body
  * every write leaves behind is what these cases assert on.
+ *
+ * `originId` is honoured too, as the host and the SDK's test harness do.
+ * Ignoring it made state recovery adopt the aggregate's row for every new
+ * fingerprint, so each "join" here ran the RE-FIRE path and the join path's
+ * render was never exercised.
  */
 function mkIssues() {
   const rows = new Map<
@@ -196,11 +219,13 @@ function mkIssues() {
         async (filter: {
           originFingerprint?: string;
           originKind?: string;
+          originId?: string;
           status?: string;
         }) =>
           [...rows.values()].filter(
             (row) =>
               (!filter.originKind || row.originKind === filter.originKind) &&
+              (!filter.originId || row.originId === filter.originId) &&
               (!filter.originFingerprint ||
                 row.originFingerprint === filter.originFingerprint) &&
               (!filter.status || row.status === filter.status),
@@ -271,8 +296,12 @@ function mkCtx() {
   return { ctx: mocks as unknown as PluginContext, issues, logger };
 }
 
-const deliver = (ctx: PluginContext, alert: AlertmanagerAlert) =>
-  handleWebhook(ctx, baseConfig(), true, {
+const deliver = (
+  ctx: PluginContext,
+  alert: AlertmanagerAlert,
+  config: AlertmanagerPluginConfig = baseConfig(),
+) =>
+  handleWebhook(ctx, config, true, {
     companyId: COMPANY_ID,
     endpointKey: "alertmanager",
     headers: { authorization: "Bearer token" },
@@ -293,10 +322,11 @@ async function heartbeat(
   ctx: PluginContext,
   issues: ReturnType<typeof mkIssues>,
   alert: AlertmanagerAlert,
+  config: AlertmanagerPluginConfig = baseConfig(),
 ) {
   __firingReplayCacheForTests(ctx).clear();
   const before = issues.api.update.mock.calls.length;
-  await deliver(ctx, alert);
+  await deliver(ctx, alert, config);
   expect(issues.api.update.mock.calls.length).toBeGreaterThan(before);
 }
 
@@ -538,6 +568,77 @@ describe("BLO-42850 — an aggregate row's body describes every active member", 
     await heartbeat(ctx, issues, alertFor(FP_B, "deploy", EPISODE_2_B));
     expect(second.description).toContain(`**Started**: ${EPISODE_2_B}`);
     expect(second.description).toContain("**Summary**: master is red on deploy");
+    expect(second.description).not.toContain(STARTS_A);
+  });
+
+  it("keeps **Started** on an open row whose members all resolved when a new fingerprint joins it", async () => {
+    const { ctx, issues } = mkCtx();
+    const keepOpen = { ...baseConfig(), autoCloseOnResolve: false };
+    /** Later than A, so an anchor taken from the joiner moves BACKWARDS next render. */
+    const STARTS_C_LATER = "2026-10-10T13:00:00Z";
+    const FP_C = "fp-aggregate-member-c";
+
+    await deliver(ctx, alertFor(FP_A, "build", STARTS_A), keepOpen);
+    await deliver(ctx, alertFor(FP_A, "build", STARTS_A, "resolved"), keepOpen);
+    const row = onlyIssue(issues);
+    // The premise: an OPEN row with no active member. Liveness read only from
+    // member `resolved_at` calls this row dead.
+    expect(row.status).not.toBe("cancelled");
+    const active = await db.query(
+      `SELECT 1 FROM ${MEMBERS} WHERE company_id = $1 AND resolved_at IS NULL`,
+      [COMPANY_ID],
+    );
+    expect(active.rows).toHaveLength(0);
+
+    // C joins the retained row. Its join render runs before C's member write,
+    // so only the destination id can tell `describeAggregate` this row is live.
+    await deliver(ctx, alertFor(FP_C, "deploy", STARTS_C_LATER), keepOpen);
+    expect(onlyIssue(issues).id).toBe(row.id);
+    expect(row.description).toContain(`**Started**: ${STARTS_A}`);
+    expect(row.description).not.toContain(`**Started**: ${STARTS_C_LATER}`);
+
+    // C's next heartbeat sees its own member row on this issue, so it anchors
+    // on A. Both renders must agree, or **Started** moved backwards.
+    await heartbeat(ctx, issues, alertFor(FP_C, "deploy", STARTS_C_LATER), keepOpen);
+    expect(row.description).toContain(`**Started**: ${STARTS_A}`);
+    expect(row.description).not.toContain(`**Started**: ${STARTS_C_LATER}`);
+  });
+
+  it("dates a rebind onto an open, all-resolved row from that row, not the rebinding member's old episode", async () => {
+    const { ctx, issues } = mkCtx();
+    const keepOpen = { ...baseConfig(), autoCloseOnResolve: false };
+    const EPISODE_2_B = "2026-10-11T09:00:00Z";
+    const EPISODE_2_A = "2026-10-11T09:20:00Z";
+    const byOrigin = (fingerprint: string) => {
+      const found = [...issues.rows.values()].filter((r) => r.originId === fingerprint);
+      expect(found).toHaveLength(1);
+      return found[0];
+    };
+
+    // Episode 1 closes A's row (auto-close on).
+    await deliver(ctx, alertFor(FP_A, "build", STARTS_A));
+    await deliver(ctx, alertFor(FP_A, "build", STARTS_A, "resolved"));
+    const first = byOrigin(FP_A);
+    expect(first.status).toBe("cancelled");
+
+    // Episode 2 files B's row, and B resolves with auto-close off, so the row
+    // stays open with no active member — the same state a withheld
+    // resolve-cancel leaves.
+    await deliver(ctx, alertFor(FP_B, "deploy", EPISODE_2_B));
+    await deliver(ctx, alertFor(FP_B, "deploy", EPISODE_2_B, "resolved"), keepOpen);
+    const second = byOrigin(FP_B);
+    expect(second.status).not.toBe("cancelled");
+
+    // A re-fires: the re-fire path rebinds it onto B's open row. The body is
+    // computed before that target is known, so it must be re-rendered for it.
+    await deliver(ctx, alertFor(FP_A, "build", EPISODE_2_A));
+    expect(first.status).toBe("cancelled");
+    expect(second.description).toContain(`**Started**: ${EPISODE_2_B}`);
+    expect(second.description).not.toContain(STARTS_A);
+
+    // After A's member write lands on B's row, A's heartbeat anchors on B.
+    await heartbeat(ctx, issues, alertFor(FP_A, "build", EPISODE_2_A));
+    expect(second.description).toContain(`**Started**: ${EPISODE_2_B}`);
     expect(second.description).not.toContain(STARTS_A);
   });
 
