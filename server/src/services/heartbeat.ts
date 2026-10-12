@@ -31061,6 +31061,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // low work while preserving ranks 0-1 for explicit critical issue
           // work. The PR-review fairness promotion above remains the bounded
           // path for an aged review to jump even critical work.
+          //
+          // BLO-44443: that promotion is one run per pass, and none when the
+          // previous start was already a review, so under a sustained review
+          // backlog it is not a bound at all. Returning here also skipped the
+          // BLO-21792 absolute ceiling below, which exists precisely so that a
+          // ready run of ANY class stops losing to fresh critical arrivals once
+          // its wait becomes pathological. Measured on Ally 2026-10-12: 502
+          // queued pr_review runs, every repo's reviews waiting 24-36h on
+          // average, while every issue-backed tier was capped at 6h. Apply the
+          // same ceiling to this class; past it the run sorts FIFO with every
+          // other escalated run (comparator tiebreak on createdAt), so this
+          // cannot introduce a new starvation order either.
+          if (waitedMs >= STARVATION_ABSOLUTE_ESCALATION_MS) {
+            return ABSOLUTE_STARVATION_DISPATCH_RANK;
+          }
           return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 2 : 10;
         }
         // NB: the aging escalation below stays *underneath* this `!ready`
