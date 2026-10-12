@@ -575,6 +575,11 @@ jobs:
       # list missing `edited` (so the fix the gate asks for re-ran nothing).
       # Both are properties of the commitperclip gate that only fail on a live
       # PR, days later, as a stalled review.
+      - name: Test commit-trailer gate (BLO-43661)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/check-pr-commit-trailers.test.mjs
+        timeout-minutes: 1
+
       - name: Test commitperclip quality-gate orchestrator (BLO-26636)
         if: ${{ !cancelled() }}
         run: node --test ./.github/scripts/tests/run-quality-gates.test.mjs

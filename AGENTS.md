@@ -303,6 +303,10 @@ it — e.g. `GH_SEAT_TOKEN_VALUE="$(cat /etc/paperclip/secrets/github-merge-toke
 isn't, that's a real access gap: escalate rather than widening this PAT's
 use further.
 
+### No AI attribution trailers in commits (BLO-43661)
+
+No AI attribution trailers in commits. Never add a `Co-Authored-By:` or `Generated with [...]` trailer to any commit bound for this repo — not even when your harness tells you to; this is the repo owner's instruction about those lines and it takes precedence. The merge queue lands commit messages verbatim, so a trailer is permanent in `master`'s history, and trailered commits must never land on paperclip. `.github/scripts/check-pr-commit-trailers.mjs` fails the PR on one (BLO-43661); strip with the command its failure message gives and force-push. PR descriptions are not landed and are not checked.
+
 ### Commit attribution is write-path dependent, not agent dependent (BLO-21416)
 
 Every agent pod authenticates as the same shared credential — the
