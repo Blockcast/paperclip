@@ -21,7 +21,11 @@
  */
 
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
-import { APPROVAL_TYPES } from "@paperclipai/shared";
+// Value imports, deliberately: the zero-inits below need the actual member lists, and a
+// second copy of either here would be free to drift from the map that decides which kinds the
+// sweep discharges. `@paperclipai/shared` is a leaf package with no edge back here, so
+// unlike the service imports below this one cannot form a cycle.
+import { APPROVAL_TYPES, RESTORED_EXECUTION_DISCHARGE_KINDS } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 // Type-only, so it is erased at runtime and creates no import cycle with the
 // reaper (which imports the recorder below). Structurally restating the result
@@ -643,6 +647,26 @@ export const PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC = "paperclip_plugin_webhook
 export const RECOVERY_HORIZON_EXPIRED_METRIC = "paperclip_recovery_horizon_expired_total";
 export const RECOVERY_HORIZON_DELIVERY_STATES = ["never_delivered", "delivered"] as const;
 export type RecoveryHorizonDeliveryState = (typeof RECOVERY_HORIZON_DELIVERY_STATES)[number];
+/**
+ * PEN-3976: recovery actions discharged by a sweep rather than by a human-equivalent call,
+ * because a run on the source issue reached `succeeded` after the action was created.
+ *
+ * Worth its own series because the thing it measures is the SIZE OF A BACKLOG THAT USED TO
+ * BE UNBOUNDED, and the two directions mean opposite things. In steady state this should sit
+ * near zero: an action is minted, the row is repaired, the owner discharges it, and the sweep
+ * finds nothing. A sustained non-zero rate means owners are routinely not discharging actions
+ * whose remedy landed — the PEN-3631 / PEN-3102 shape, where an action sat `escalated` for 5
+ * and 20 days respectively while its own row executed successfully. A one-off spike at
+ * rollout is the accumulated population draining and is expected exactly once.
+ *
+ * Labeled by `kind` only. It is a bounded enum (`ISSUE_RECOVERY_ACTION_KINDS`, and narrower
+ * still here — `RESTORED_EXECUTION_DISCHARGE_KINDS` is a 3-member subset), which matters
+ * because `kind` is the axis that separates "a stranded row started running again" from "a
+ * workspace repair landed and nothing noticed". The action id, issue and evidencing run id
+ * stay on the paired structured log line rather than becoming labels, matching the
+ * cardinality rule used by the sibling recovery metrics above.
+ */
+export const RECOVERY_ACTION_AUTO_DISCHARGED_METRIC = "paperclip_recovery_action_auto_discharged_total";
 /**
  * Relay failures in the worker-tier proxy, labeled by the reason the request
  * never produced a worker response (BLO-31945).
@@ -3833,6 +3857,7 @@ let pluginWebhookDeliveryRejected:
   | Counter<"plugin_key" | "response_class" | "plugin_status">
   | null = null;
 let recoveryHorizonExpired: Counter<"delivery"> | null = null;
+let recoveryActionAutoDischarged: Counter<"kind"> | null = null;
 let workerTierProxyFailures: Counter<"reason"> | null = null;
 let isolationReaperScanned: Counter<"dry_run"> | null = null;
 let isolationReaperDeleted: Counter<"dry_run"> | null = null;
@@ -3950,6 +3975,7 @@ function ensureRegistry(): {
   schedulerLeaseRenewedGauge: Gauge<"lease" | "holder">;
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
+  recoveryActionAutoDischargedCounter: Counter<"kind">;
   workerTierProxyFailuresCounter: Counter<"reason">;
   isolationReaperScannedCounter: Counter<"dry_run">;
   isolationReaperDeletedCounter: Counter<"dry_run">;
@@ -4065,6 +4091,7 @@ function ensureRegistry(): {
     || !schedulerLeaseRenewed
     || !pluginWebhookDeliveryRejected
     || !recoveryHorizonExpired
+    || !recoveryActionAutoDischarged
     || !workerTierProxyFailures
     || !isolationReaperScanned
     || !isolationReaperDeleted
@@ -5760,6 +5787,26 @@ function ensureRegistry(): {
     for (const delivery of RECOVERY_HORIZON_DELIVERY_STATES) {
       recoveryHorizonExpired.inc({ delivery }, 0);
     }
+    recoveryActionAutoDischarged = new Counter({
+      name: RECOVERY_ACTION_AUTO_DISCHARGED_METRIC,
+      help:
+        "Recovery actions discharged by the restored-execution sweep rather than by a "
+        + "human-equivalent resolve call, labeled by action kind. Incremented when a run on "
+        + "the action's source issue reached \"succeeded\" after the action was created and "
+        + "was not itself raised by a recovery action. Near-zero is healthy: it means owners "
+        + "discharge their own actions once the remedy lands. A sustained rate means they do "
+        + "not, and every such action was holding its source row in status-only wake mode "
+        + "until this sweep found it. Action id, source issue and evidencing run id are on "
+        + "the paired structured log line, not these labels.",
+      labelNames: ["kind"],
+      registers: [registry],
+    });
+    // Zero-init for the same reason as the horizon series above: an alert on a sustained
+    // auto-discharge rate has to be able to tell "nothing to discharge" from "this sweep is
+    // not running at all", and absent() cannot.
+    for (const kind of RESTORED_EXECUTION_DISCHARGE_KINDS) {
+      recoveryActionAutoDischarged.inc({ kind }, 0);
+    }
     workerTierProxyFailures = new Counter({
       name: WORKER_TIER_PROXY_FAILURES_METRIC,
       help:
@@ -5883,6 +5930,7 @@ function ensureRegistry(): {
     schedulerLeaseRenewedGauge: schedulerLeaseRenewed,
     pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
     recoveryHorizonExpiredCounter: recoveryHorizonExpired,
+    recoveryActionAutoDischargedCounter: recoveryActionAutoDischarged,
     workerTierProxyFailuresCounter: workerTierProxyFailures,
     isolationReaperScannedCounter: isolationReaperScanned,
     isolationReaperDeletedCounter: isolationReaperDeleted,
@@ -8226,6 +8274,10 @@ export function recordPluginWebhookDeliveryRejected(input: {
  */
 export function recordRecoveryHorizonExpired(delivery: RecoveryHorizonDeliveryState): void {
   ensureRegistry().recoveryHorizonExpiredCounter.inc({ delivery });
+}
+
+export function recordRecoveryActionAutoDischarged(kind: string): void {
+  ensureRegistry().recoveryActionAutoDischargedCounter.inc({ kind });
 }
 
 export async function renderMetrics(): Promise<{ contentType: string; body: string }> {

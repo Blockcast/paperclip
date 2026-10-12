@@ -385,6 +385,59 @@ export const ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION: Record<IssueRe
   pr_review_non_convergence: false,
 };
 
+/**
+ * PEN-3976: which recovery-action kinds a successful run on the SOURCE ISSUE discharges.
+ *
+ * The premise this encodes is narrow and must stay narrow: a succeeded run is evidence
+ * that **adapter execution on this issue works**, and nothing else. So a kind belongs
+ * here only when its own `nextAction` text asks for exactly that. Read the text, not the
+ * category — the arms live in `strandedRecoveryActionKind`'s caller in `recovery/service.ts`:
+ *
+ *   - `stranded_assigned_issue` — "Restore a live execution path, fix the runtime/adapter
+ *     failure, or record an intentional manual resolution." Also carries `process_lost`
+ *     ("retry the original assignee"), `provider_quota` ("wait for quota recovery, then
+ *     retry"), `codex_output_inactivity_monitor` ("retry the same agent") and
+ *     `execution_review_participant_recovery`. A run that reached `succeeded` is the retry
+ *     those texts ask for, having already happened.
+ *   - `workspace_validation` — "...before resuming adapter execution." Adapter execution
+ *     resumed and succeeded, so whatever was wrong with the workspace is no longer stopping
+ *     it. This is the shape PEN-3631 measured: an action still `escalated` five days after a
+ *     run on its own issue succeeded, on a founding premise (workspace "missing/archived")
+ *     that was false against a live workspace.
+ *   - `configuration_validation` — "Bind the missing secret(s)... before resuming adapter
+ *     execution." Same reading.
+ *
+ * `false` for the rest, and each for its own reason rather than as a default:
+ *
+ *   - `missing_disposition` — "Choose and record a valid issue disposition." A later run
+ *     succeeding says nothing about whether a disposition was recorded; it is in fact the
+ *     same event that MINTS this kind. Discharging on it would retire the action on the
+ *     evidence of the very thing it complains about. The valid-path resolution for this kind
+ *     already exists elsewhere (`resolveRequiredSuccessfulRunHandoffOnValidPath`).
+ *   - `pr_review_non_convergence` — "Take over the PR, unblock or reassign the author..."
+ *     A run on the source issue does not make a self-review loop converge. PEN-3397 already
+ *     discharges this kind on the only event that does: the PR closing.
+ *   - `active_run_watchdog` / `issue_graph_liveness` — no producer in non-test source, so
+ *     neither has a `nextAction` text to check this predicate against. `false` is the
+ *     no-op here (unlike `ISSUE_RECOVERY_ACTION_KIND_IS_WAKE_PATH_RESTORATION`, where
+ *     `true` was the pre-existing behaviour), so this fails closed. Whoever adds the first
+ *     producer owns the decision: ask whether the kind's `nextAction` is satisfied by
+ *     "adapter execution on this issue works again", and do not inherit this default.
+ */
+export const RECOVERY_ACTION_KIND_DISCHARGED_BY_RESTORED_EXECUTION: Record<IssueRecoveryActionKind, boolean> = {
+  stranded_assigned_issue: true,
+  workspace_validation: true,
+  configuration_validation: true,
+  missing_disposition: false,
+  pr_review_non_convergence: false,
+  active_run_watchdog: false,
+  issue_graph_liveness: false,
+};
+
+export const RESTORED_EXECUTION_DISCHARGE_KINDS = (
+  Object.keys(RECOVERY_ACTION_KIND_DISCHARGED_BY_RESTORED_EXECUTION) as IssueRecoveryActionKind[]
+).filter((kind) => RECOVERY_ACTION_KIND_DISCHARGED_BY_RESTORED_EXECUTION[kind]);
+
 export const ISSUE_RECOVERY_ACTION_STATUSES = [
   "active",
   "escalated",
@@ -443,6 +496,16 @@ export const ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS = [
   "pending_wake_ceiling",
   "discharged",
   "cancelled",
+  // PEN-3976: a machine discharge, written only by
+  // `dischargeActionsWithRestoredExecution`. It is a SEPARATE value from
+  // `discharged` rather than a flag on it, because `outcome` provably cannot carry
+  // the distinction: `POST /issues/:id/recovery-actions/resolve` rewrites the sent
+  // outcome to `handed_back` whenever `returnOwnerAgentId` is non-null, so a manual
+  // discharge and an automatic one can land on the same `outcome`. Before this value
+  // existed, `resolutionNote` — free text — was the only field that separated
+  // "somebody decided this was over" from "a sweep observed the remedy was already
+  // satisfied", which is not a thing to key a query on.
+  "execution_restored",
 ] as const;
 export type IssueRecoveryActionRetiringBound = (typeof ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS)[number];
 

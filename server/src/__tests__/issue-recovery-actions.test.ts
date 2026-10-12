@@ -33,7 +33,12 @@ import { issueRoutes } from "../routes/issues.js";
 import { approvalService } from "../services/approvals.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { computeIssueMonitorGateFingerprint } from "../services/issue-execution-policy.js";
-import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService, recoveryHandoffGrantIsWithinTtl } from "../services/issue-recovery-actions.js";
+import {
+  RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS,
+  RESTORED_EXECUTION_DISCHARGE_NOTE_PREFIX,
+  issueRecoveryActionService,
+  recoveryHandoffGrantIsWithinTtl,
+} from "../services/issue-recovery-actions.js";
 import { issueService } from "../services/issues.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -7650,6 +7655,265 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  describe("a succeeded source run discharges its recovery action (PEN-3976)", () => {
+    // Before this, an action had exactly ONE discharge: a manual resolve from its owner.
+    // Neither the source row recovering nor the action's own `timeoutAt` ended it, so the
+    // active set was a one-way accumulator — and every wake on a row carrying an active
+    // action is dispatched status-only (PEN-3275), so each stuck action permanently degraded
+    // its source. Measured on two rows by two different owners: PEN-3631's sat `escalated`
+    // five days after a run on its own issue succeeded, PEN-3102's sat 20 days across FIVE
+    // succeeded runs with `updatedAt` frozen the whole time.
+    async function seedActionWithRun(overrides?: {
+      kind?: string;
+      actionStatus?: "active" | "escalated";
+      retiringBound?: string | null;
+      runStatus?: string;
+      runCreatedAt?: Date;
+      actionCreatedAt?: Date;
+      runContextExtra?: Record<string, unknown>;
+      omitRun?: boolean;
+    }) {
+      const fixture = await seedCompany();
+      const actionId = randomUUID();
+      const runId = randomUUID();
+      const actionCreatedAt = overrides?.actionCreatedAt ?? new Date("2026-10-05T10:19:31.000Z");
+      await db.insert(issueRecoveryActions).values({
+        id: actionId,
+        companyId: fixture.companyId,
+        sourceIssueId: fixture.sourceIssueId,
+        kind: overrides?.kind ?? "stranded_assigned_issue",
+        status: overrides?.actionStatus ?? "escalated",
+        retiringBound: overrides?.retiringBound === undefined ? "timeout_horizon" : overrides.retiringBound,
+        ownerType: "agent",
+        ownerAgentId: fixture.managerId,
+        previousOwnerAgentId: fixture.coderId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `source_scoped_recovery:${fixture.companyId}:${fixture.sourceIssueId}:stranded_assigned_issue`,
+        nextAction:
+          "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
+        maxAttempts: 5,
+        attemptCount: 1,
+        timeoutAt: new Date(actionCreatedAt.getTime() + 6 * 60 * 60 * 1000),
+        createdAt: actionCreatedAt,
+        updatedAt: actionCreatedAt,
+      });
+      if (!overrides?.omitRun) {
+        const runCreatedAt = overrides?.runCreatedAt
+          ?? new Date(actionCreatedAt.getTime() + 23 * 60 * 60 * 1000);
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId: fixture.companyId,
+          agentId: fixture.coderId,
+          invocationSource: "automation",
+          status: overrides?.runStatus ?? "succeeded",
+          contextSnapshot: { issueId: fixture.sourceIssueId, ...(overrides?.runContextExtra ?? {}) },
+          createdAt: runCreatedAt,
+          startedAt: runCreatedAt,
+          finishedAt: new Date(runCreatedAt.getTime() + 60 * 60 * 1000),
+        });
+      }
+      return { ...fixture, actionId, runId, actionCreatedAt };
+    }
+
+    async function readAction(actionId: string) {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, actionId));
+      return row!;
+    }
+
+    it("discharges an escalated action and records the discharge as machine-written", async () => {
+      // The exact PEN-3631 shape: `escalated` with a spent `timeout_horizon` bound, which is
+      // the population NOTHING could reach — `reconcileStrandedRecoveryWakeBackstop` filters
+      // `retiringBound is null`, and the read-time revalidation only runs when an HTTP route
+      // touches the issue.
+      const { companyId, actionId, runId } = await seedActionWithRun();
+
+      const discharged = await issueRecoveryActionService(db).dischargeActionsWithRestoredExecution({
+        companyId,
+      });
+
+      expect(discharged).toHaveLength(1);
+      expect(discharged[0]!.evidenceRunId).toBe(runId);
+      const action = await readAction(actionId);
+      expect(action.status).toBe("resolved");
+      expect(action.outcome).toBe("restored");
+      // `outcome` provably cannot carry "machine vs human" — the resolve route rewrites it to
+      // `handed_back` whenever `returnOwnerAgentId` is set — so the discriminator is here.
+      expect(action.retiringBound).toBe("execution_restored");
+      expect(action.resolvedAt).not.toBeNull();
+      // The note has to cite the evidence, or an owner reading it cannot check the claim.
+      expect(action.resolutionNote).toContain(runId);
+      expect(action.resolutionNote).toContain(RESTORED_EXECUTION_DISCHARGE_NOTE_PREFIX);
+      expect((action.evidence as Record<string, unknown>).restoredExecutionRunId).toBe(runId);
+      // BLO-33600's snapshot keys: `classifyRecoveryHandoff` reads these instead of a live
+      // join, so a discharge that omits them classifies `unknown` forever after.
+      expect((action.evidence as Record<string, unknown>).resolvedIssueStatus).toBe("in_progress");
+    });
+
+    it("discharges an `active` action too, not only the retired population", async () => {
+      const { companyId, actionId } = await seedActionWithRun({
+        actionStatus: "active",
+        retiringBound: null,
+      });
+
+      const discharged = await issueRecoveryActionService(db).dischargeActionsWithRestoredExecution({
+        companyId,
+      });
+
+      expect(discharged).toHaveLength(1);
+      expect((await readAction(actionId)).status).toBe("resolved");
+    });
+
+    it("does NOT discharge on a run the recovery action itself raised", async () => {
+      // This is the conjunct the whole no-loop argument rests on. Every recovery-raised wake
+      // stamps `recoveryActionId` into its context snapshot. Without this exclusion, an
+      // action's own status-only wake would discharge it, `upsertSourceScoped` would INSERT a
+      // replacement with a fresh budget and a fresh horizon on the next sweep, and the
+      // unbounded re-fire loop BLO-18996 closed would be back — driven by a timer, with no
+      // real work between iterations.
+      const { companyId, actionId } = await seedActionWithRun({
+        runContextExtra: {
+          source: "issue_recovery_action",
+          recoveryActionId: randomUUID(),
+          wakeReason: "source_scoped_recovery_action",
+        },
+      });
+
+      const discharged = await issueRecoveryActionService(db).dischargeActionsWithRestoredExecution({
+        companyId,
+      });
+
+      expect(discharged).toHaveLength(0);
+      expect((await readAction(actionId)).status).toBe("escalated");
+    });
+
+    it("does NOT discharge on a run dispatched before the action was created", async () => {
+      // The arithmetic that bounds this to one discharge per successful run. A replacement
+      // minted at T can never be discharged by a run that already existed at T, so a discharge
+      // cannot feed the mint that follows it. Note the run seeded here FINISHES after the
+      // action was created — only its dispatch predates it — so this also pins that the
+      // predicate is `heartbeat_runs.created_at`, not `finished_at`.
+      const actionCreatedAt = new Date("2026-10-05T10:19:31.000Z");
+      const { companyId, actionId } = await seedActionWithRun({
+        actionCreatedAt,
+        runCreatedAt: new Date(actionCreatedAt.getTime() - 30 * 60 * 1000),
+      });
+
+      const discharged = await issueRecoveryActionService(db).dischargeActionsWithRestoredExecution({
+        companyId,
+      });
+
+      expect(discharged).toHaveLength(0);
+      expect((await readAction(actionId)).status).toBe("escalated");
+    });
+
+    it("does NOT discharge on a run that failed", async () => {
+      const { companyId, actionId } = await seedActionWithRun({ runStatus: "failed" });
+
+      const discharged = await issueRecoveryActionService(db).dischargeActionsWithRestoredExecution({
+        companyId,
+      });
+
+      expect(discharged).toHaveLength(0);
+      expect((await readAction(actionId)).status).toBe("escalated");
+    });
+
+    it("does NOT discharge a `missing_disposition` action", async () => {
+      // Kind scoping, and the one kind where the predicate is actively wrong: that action
+      // asks for a recorded disposition, and a succeeded run with no disposition is the very
+      // event that MINTS it. Discharging here would retire the action on the evidence of the
+      // thing it complains about.
+      const { companyId, actionId } = await seedActionWithRun({ kind: "missing_disposition" });
+
+      const discharged = await issueRecoveryActionService(db).dischargeActionsWithRestoredExecution({
+        companyId,
+      });
+
+      expect(discharged).toHaveLength(0);
+      expect((await readAction(actionId)).status).toBe("escalated");
+    });
+
+    it("leaves an action alone when its issue has had no run at all", async () => {
+      const { companyId, actionId } = await seedActionWithRun({ omitRun: true });
+
+      const discharged = await issueRecoveryActionService(db).dischargeActionsWithRestoredExecution({
+        companyId,
+      });
+
+      expect(discharged).toHaveLength(0);
+      expect((await readAction(actionId)).status).toBe("escalated");
+    });
+
+    it("is idempotent: a second sweep finds nothing to discharge", async () => {
+      const { companyId, actionId } = await seedActionWithRun();
+      const svc = issueRecoveryActionService(db);
+
+      expect(await svc.dischargeActionsWithRestoredExecution({ companyId })).toHaveLength(1);
+      expect(await svc.dischargeActionsWithRestoredExecution({ companyId })).toHaveLength(0);
+      expect((await readAction(actionId)).status).toBe("resolved");
+    });
+
+    it("`timeoutAt` passing is NOT a discharge, and that is deliberate", async () => {
+      // PEN-3976 asked for this to be decided either way. It is decided: `timeoutAt` is a WAKE
+      // horizon, not an action lifetime. `escalateExpiredWakeHorizons` spends it to move the
+      // row `active` -> `escalated` with `retiringBound: "timeout_horizon"` and stops there,
+      // because `escalated` stays inside ACTIVE_RECOVERY_ACTION_STATUSES and so keeps holding
+      // `issue_recovery_actions_active_source_uq`. Discharging on a TIMER would free that slot
+      // and let the next sweep mint a replacement with a fresh budget — the loop BLO-18996
+      // closed, and the reason an earlier revision of BLO-19124 withdrew exactly this change.
+      // So PEN-566's action sitting 82 days past its `timeoutAt` still `escalated` is this
+      // behaviour working, not a sweep failing to run. Pinned so nobody "fixes" it into a
+      // discharge.
+      const actionCreatedAt = new Date("2026-10-05T10:19:31.000Z");
+      const { companyId, actionId } = await seedActionWithRun({
+        actionStatus: "active",
+        retiringBound: null,
+        omitRun: true,
+        actionCreatedAt,
+      });
+
+      const expired = await issueRecoveryActionService(db).escalateExpiredWakeHorizons({
+        companyId,
+        now: new Date(actionCreatedAt.getTime() + 82 * 24 * 60 * 60 * 1000),
+      });
+
+      expect(expired).toHaveLength(1);
+      const action = await readAction(actionId);
+      expect(action.status).toBe("escalated");
+      expect(action.retiringBound).toBe("timeout_horizon");
+      expect(action.resolvedAt).toBeNull();
+    });
+
+    it("the scheduler pass discharges and announces it on the issue's activity log", async () => {
+      const { companyId, sourceIssueId, actionId, runId } = await seedActionWithRun();
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup } as any);
+
+      const result = await recovery.reconcileRestoredExecutionRecoveryActions({ companyId });
+
+      expect(result.discharged).toBe(1);
+      expect(result.issueIds).toEqual([sourceIssueId]);
+      expect((await readAction(actionId)).status).toBe("resolved");
+
+      const entries = await db
+        .select()
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "issue.recovery_action_resolved"),
+        ));
+      expect(entries).toHaveLength(1);
+      const details = entries[0]!.details as Record<string, unknown>;
+      // `source` is what separates this writer from the read-time revalidation, which writes
+      // the same action name.
+      expect(details.source).toBe("restored_execution_sweep");
+      expect(details.evidenceRunId).toBe(runId);
+      expect(details.retiringBound).toBe("execution_restored");
+    });
+  });
+
   describe("a closed PR discharges its non-convergence action (PEN-3397)", () => {
     // These beacons had no resolution-on-merge and no resolution-on-close, so a
     // moot one sat on its owner's plate forever. Measured live: `6542ffc8` asked
@@ -12834,4 +13098,3 @@ describe("summarizeStrandedRecoveryHandBackPass", () => {
     expect(summary!.payload.residualByReason).toEqual({ cooldown: 120 });
   });
 });
-

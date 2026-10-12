@@ -395,6 +395,19 @@ When newer source activity restores a valid live or waiting path, the recovery a
 
 Plain comments alone do not make a recovery action stale. A comment can provide evidence, but the recovery action should remain visible when the source issue is still stalled and the comment does not create a valid action-path primitive such as a wake, monitor, interaction, approval, blocker, human owner, execution participant, terminal disposition, or delegated follow-up.
 
+#### How a recovery action is discharged, and what `timeoutAt` does not do
+
+An action leaves the active set (`active`, `escalated`) by exactly four routes:
+
+- **A recorded disposition.** `POST /api/issues/:id/recovery-actions/resolve` from the owner. The action id goes in the body as an optional `actionId`, never in the path.
+- **A stale premise.** Read- and write-time revalidation cancels an action once the source issue has its own live or waiting path again. This runs only when an HTTP route touches the issue, so it does not reach rows nobody opens.
+- **The condition ending by observation.** A `pr_review_non_convergence` action is discharged when its PR closes, because the self-review loop it flags is over either way.
+- **The remedy already being satisfied.** A scheduler sweep discharges an action whose source issue has had a run dispatched after the action was created reach `succeeded`, where that run was not itself raised by a recovery action. The discharge is recorded as `retiringBound: "execution_restored"`, which is what separates it from a discharge somebody decided — `outcome` cannot carry that distinction, because the resolve route rewrites the sent outcome to `handed_back` whenever a return owner is set.
+
+**A past `timeoutAt` is none of these.** `timeoutAt` bounds the action's WAKE horizon, not its lifetime: spending it moves the row `active` → `escalated` and stamps `retiringBound: "timeout_horizon"`, and `escalated` is deliberately still an active status so the row keeps holding the per-source uniqueness index. That is why an action can sit far past its own `timeoutAt` still reading `escalated` — the field is doing its job, and its job is not discharge.
+
+Discharging on a timer instead would free that uniqueness slot, letting the next sweep mint a replacement with a fresh attempt budget and a fresh horizon, which is the unbounded re-fire loop the uniqueness index exists to close. The restored-execution sweep is not subject to that because its evidence must be a run dispatched strictly after the action it discharges, and must not be a run the recovery subsystem itself caused: one successful run therefore buys at most one discharge, and a discharge can never feed the mint that follows it.
+
 ### Agent-assigned `todo`
 
 This is dispatch state: ready to start, not yet actively claimed.
