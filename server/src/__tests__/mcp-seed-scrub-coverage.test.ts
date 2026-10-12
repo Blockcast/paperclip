@@ -167,11 +167,6 @@ const SEED_COVERAGE: Readonly<Record<string, Coverage>> = {
     ticket: "PEN-2737",
     why: "direct to tempo.monitoring; ASSESSED no-disclosure (PEN-2630) on contents — no instrumentation in this estate captures headers or bodies (headersToSpanAttributes, capture_headers, OTEL_INSTRUMENTATION_* all absent estate-wide; paperclip's tracer is unwired) — but the transport is still unscrubbed and nothing ENFORCES that verdict: no auth, no NetworkPolicy, no redaction processor, and any pod may write spans, so PEN-2737 tracks turning the observation into an invariant",
   },
-  linear: {
-    kind: "unscrubbed",
-    ticket: "PEN-2736",
-    why: "direct to linear-mcp-server; ASSESSED disclosure (PEN-2630) on the GRANT axis, which no response scrubber reaches — the seed entry carries no credential, but the endpoint is unauthenticated, is covered by no ingress policy, and fronts a privileged workspace-wide Linear credential with write tools (create/update/add_comment/archive_project), so any pod acts as the Linear identity unattributably; issue/comment/document bodies remain unassessed BY DESIGN, since sweeping them for pasted secrets is the harm PEN-2370 forbids reproducing",
-  },
   gbrain: {
     kind: "unscrubbed",
     ticket: "PEN-2428",
