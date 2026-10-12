@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_STALE_HOURS,
-  EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS,
+  EXEMPT_SCHEDULED_WORKFLOWS,
   WATCHED_GUARDS,
   WATCHED_WORKFLOWS,
   annotationFor,
@@ -184,6 +184,106 @@ describe("classifyGuard — reconstruction of the 2026-09-15 outage (PEN-3281)",
     const summary = summarize(classifyAll(healthy, now));
     assert.equal(summary.staleCount, 0);
     assert.equal(summary.exitCode, 0);
+  });
+});
+
+// BLO-42887. The seeded fixture this row asks for: a workflow whose expected
+// slots produce NO RUNS AT ALL across the window.
+//
+// This is a different shape from the PEN-3281 reconstruction above, and the
+// difference is the whole point. There, runs were created and starved of a
+// runner. Here GitHub created nothing — queried with no status filter, the 48
+// slots between 2026-10-06T23:31:20Z and 2026-10-09T05:37:00Z contain zero run
+// objects of any status. A run-state scan sees an empty list and has nothing to
+// report; age-since-last-completion sees 54h and reds. That is why this detector
+// is the right instrument for a dispatch outage even though it was built for a
+// starvation one.
+describe("classifyGuard — the 54h dispatch outage on a non-`default` lane (BLO-42887)", () => {
+  const workflow = "scheduled-production-deploy.yml";
+  const lastCompletion = "2026-10-06T23:35:10Z";
+  const resumed = Date.parse("2026-10-09T05:37:00Z");
+
+  /** The workflow as the API reported it throughout: `active`, just not dispatching. */
+  function observedDark() {
+    return {
+      state: "active",
+      name: "Scheduled production deploy dispatch",
+      newest: {
+        updatedAt: lastCompletion,
+        conclusion: "success",
+        htmlUrl: "https://github.com/Blockcast/paperclip/actions/runs/37541195256",
+      },
+    };
+  }
+
+  function classifyAt(iso, staleHours = thresholdFor(workflow)) {
+    return classifyGuard(workflow, observedDark(), { now: Date.parse(iso), staleHours });
+  }
+
+  it("is watched at all — the coverage gap this row was filed about", () => {
+    assert.ok(
+      WATCHED_WORKFLOWS.includes(workflow),
+      "unwatched again: a scheduled workflow off the `default` lane has fallen back out of the set",
+    );
+  });
+
+  it("reds while the workflow still reports state `active`", () => {
+    // The API said `active` the entire time. A state-based detector would have
+    // passed it on every one of the 48 missed slots.
+    const result = classifyAt("2026-10-07T12:00:00Z");
+    assert.equal(result.status, "stale", "a dark-but-active workflow must still trip the alarm");
+  });
+
+  it("catches the outage within 5h, not 54h", () => {
+    // The bar is crossed at lastCompletion + 4h = 03:35:10Z. This job samples
+    // hourly at :47, so the first sample that can see the breach is 03:47Z —
+    // the real sampling instant, not a convenient one. The measured detection
+    // latency on the actual event was 54h06m, and only because an unrelated
+    // org-wide control happened to look.
+    assert.equal(classifyAt("2026-10-07T03:00:00Z").status, "ok", "must not red before the bar");
+    assert.equal(classifyAt("2026-10-07T03:47:00Z").status, "stale", "must red at the first sample past the bar");
+
+    const detectedBy = Date.parse("2026-10-07T03:47:00Z");
+    const darkFrom = Date.parse(lastCompletion);
+    assert.ok(
+      (detectedBy - darkFrom) / HOUR < 5,
+      `detection must land inside 5h, got ${((detectedBy - darkFrom) / HOUR).toFixed(1)}h`,
+    );
+    assert.ok((resumed - darkFrom) / HOUR > 54, "fixture no longer reconstructs a >54h outage");
+  });
+
+  // The threshold is MEASURED for this guard, not inherited, and this asserts
+  // the specific thing measuring bought. Its own jitter ceiling is 173 min —
+  // wider than the hourly six's 118 because it carries `concurrency:` with
+  // `cancel-in-progress: false`, so a queued run is legitimately evicted by the
+  // next arrival and that completion never lands. Handing it the hourly bar
+  // would have false-redded on a real, healthy leg.
+  it("would have false-redded on its own measured jitter at the hourly six's 2.75h bar", () => {
+    const healthyLeg = { now: Date.parse("2026-10-04T13:24:00Z"), updatedAt: "2026-10-04T10:31:00Z" };
+    const observation = {
+      state: "active",
+      name: "Scheduled production deploy dispatch",
+      newest: { updatedAt: healthyLeg.updatedAt, conclusion: "success", htmlUrl: "https://example.invalid/run" },
+    };
+
+    assert.equal(
+      classifyGuard(workflow, observation, { now: healthyLeg.now, staleHours: 2.75 }).status,
+      "stale",
+      "the 173-min healthy leg is exactly what the inherited 2.75h bar would have called an outage",
+    );
+    assert.equal(
+      classifyGuard(workflow, observation, { now: healthyLeg.now, staleHours: thresholdFor(workflow) }).status,
+      "ok",
+      "the measured 4h bar must clear this guard's own jitter ceiling",
+    );
+  });
+
+  // `event: "schedule"` is not decoration here. 3 workflow_dispatch runs landed
+  // on 2026-10-06, the day before the outage; without the filter a manual
+  // dispatch satisfies the newest-run query while the cron is dead.
+  it("reads only schedule runs, so a manual dispatch cannot mask the dead cron", () => {
+    const entry = WATCHED_GUARDS.find((guard) => guard.workflow === workflow);
+    assert.equal(entry.event, "schedule", "dropping the event filter reopens the dispatch-masking window");
   });
 });
 
@@ -918,22 +1018,19 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
       .sort();
   }
 
-  /** Every workflow that is BOTH scheduled and on the starvable `default` lane. */
-  function scheduledDefaultWorkflows() {
-    return scheduledWorkflows().filter((file) =>
-      /^\s*runs-on:\s*default\s*$/m.test(readFileSync(join(workflowDir, file), "utf8")),
-    );
-  }
-
-  it("finds the scheduled default-lane workflows it is supposed to be reasoning about", () => {
+  it("finds the scheduled workflows it is supposed to be reasoning about", () => {
     // Positive control: a silently-empty scan would make every assertion below
     // vacuously pass, which is this row's own failure mode in miniature.
-    const found = scheduledDefaultWorkflows();
-    assert.ok(
-      found.length >= 7,
-      `expected to find the scheduled default-lane workflows, got ${found.length}: ${found.join(", ")}`,
-    );
+    const found = scheduledWorkflows();
+    assert.ok(found.length >= 7, `expected to find the scheduled workflows, got ${found.length}: ${found.join(", ")}`);
     assert.ok(found.includes("codeowners-guard.yml"), "known member missing — the scan is broken");
+    // BLO-42887: the scan must reach past the `default` lane. Asserted
+    // explicitly because the previous scan looked correct and complete while
+    // being blind to exactly this file.
+    assert.ok(
+      found.includes("scheduled-production-deploy.yml"),
+      "the scan is not reaching non-`default` lanes — this is the BLO-42887 blind spot reopening",
+    );
   });
 
   // Regression, review finding on 7bc9e6737. The per-guard thresholds are real
@@ -970,30 +1067,42 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     );
   });
 
-  it("watches or explicitly exempts every scheduled workflow on the default lane", () => {
-    const accounted = new Set([
-      ...WATCHED_WORKFLOWS,
-      ...EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS.map((entry) => entry.workflow),
-    ]);
-    const unaccounted = scheduledDefaultWorkflows().filter((file) => !accounted.has(file));
+  // BLO-42887: THIS INVARIANT USED TO BE SCOPED TO `runs-on: default`, AND THAT
+  // SCOPING IS WHAT THIS ROW IS ABOUT. The justification read "starvation is a
+  // `default`-lane property" — true, and the wrong question. A scheduled workflow
+  // also stops when GitHub never DISPATCHES it at all, and that mode is
+  // lane-independent: from 2026-10-06T23:31Z to 2026-10-09T05:37Z,
+  // scheduled-production-deploy.yml (on `arc-deploy`) had zero runs created
+  // across 48 consecutive slots, queried with no status filter, while 7 sibling
+  // hourly workflows ran 24/24. A starved pool still creates the run and leaves
+  // it queued; non-creation happens upstream of the runner.
+  //
+  // So the lane filter is gone and the invariant is now the honest one: every
+  // scheduled workflow is watched or exempted. The detector needed NO new
+  // capability for this — it reads age-since-last-completion from the API, which
+  // is lane-agnostic, and master-health.yml (arc-light) was already watched.
+  // Only this test's scope was wrong.
+  it("watches or explicitly exempts every scheduled workflow, on any lane", () => {
+    const accounted = new Set([...WATCHED_WORKFLOWS, ...EXEMPT_SCHEDULED_WORKFLOWS.map((entry) => entry.workflow)]);
+    const unaccounted = scheduledWorkflows().filter((file) => !accounted.has(file));
 
     assert.deepEqual(
       unaccounted,
       [],
-      "a scheduled guard on the starvable `default` lane is neither watched nor exempted. Add it " +
+      "a scheduled workflow is neither watched nor exempted. Add it " +
         "to WATCHED_GUARDS with a threshold derived from its own cadence, or to " +
-        "EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS with a reason.",
+        "EXEMPT_SCHEDULED_WORKFLOWS with a reason.",
     );
   });
 
-  it("does not watch a workflow that has stopped being a scheduled guard", () => {
-    // Scoped to `scheduledWorkflows()`, not the `default`-lane subset. The
-    // COVERAGE invariant above is deliberately lane-scoped — it asks which
-    // guards MUST be watched, and starvation is a `default`-lane property. This
-    // one asks whether a watched entry is still a live scheduled workflow, and
-    // that is lane-independent: BLO-38228 added master-health.yml, which runs on
-    // arc-light/arc-paperclip-general. Keeping the lane filter here would have
-    // red-flagged a perfectly live entry as dangling.
+  it("does not watch a workflow that has stopped being a scheduled workflow", () => {
+    // Both this and the COVERAGE invariant above are now lane-independent
+    // (BLO-42887). This one was ALREADY unscoped, and the comment it used to
+    // carry explained why: BLO-38228 added master-health.yml on
+    // arc-light/arc-paperclip-general, and keeping a lane filter here would have
+    // red-flagged a perfectly live entry as dangling. That the two invariants
+    // disagreed about lane — one scoped, one not — was the visible seam the
+    // BLO-42887 outage came through.
     const live = new Set(scheduledWorkflows());
     const dangling = WATCHED_WORKFLOWS.filter((file) => !live.has(file));
 
@@ -1488,7 +1597,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
   });
 
   it("gives every exemption a stated reason", () => {
-    for (const entry of EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS) {
+    for (const entry of EXEMPT_SCHEDULED_WORKFLOWS) {
       assert.ok(
         entry.reason && entry.reason.length > 40,
         `${entry.workflow} is exempt without a reason anyone can audit`,
@@ -1496,7 +1605,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     }
   });
 
-  it("carries the six PEN-3281 guards, the security control the original list missed, the clock-rot guard, and the consumer merge-control guard", () => {
+  it("carries the six PEN-3281 guards, the security control the original list missed, the clock-rot guard, the consumer merge-control guard, and the deploy dispatcher", () => {
     assert.deepEqual(
       [...WATCHED_WORKFLOWS].sort(),
       [
@@ -1510,6 +1619,11 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         "relay-ssl-multicert-guard.yml",
         "review-gate-consumer-protection-guard.yml",
         "review-gate-sweep.yml",
+        // BLO-42887. The first entry here that is NOT on the `default` lane —
+        // it runs on `arc-deploy`, and while the coverage invariant was
+        // lane-scoped this workflow was structurally invisible to it. It went
+        // dark for 54h06m with nothing recording it.
+        "scheduled-production-deploy.yml",
       ],
     );
   });
@@ -1561,13 +1675,29 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(dailyClockRot > 24, "a daily cron must clear one full cycle plus GitHub's delay");
     assert.ok(dailyClockRot <= 48, "looser than two missed cycles stops being a backstop at all");
 
+    // BLO-42887: hourly CADENCE but on its own measured bar, so it is excluded
+    // from the shared-hourly assertion and given its own band here. Its jitter
+    // ceiling is 173 min, not the six's 118, because it carries `concurrency:`
+    // with `cancel-in-progress: false` — a queued run is legitimately evicted by
+    // the next arrival and that completion never lands. Handing it
+    // DEFAULT_STALE_HOURS would false-red on a real healthy leg.
+    const scheduledDeploy = byWorkflow.get("scheduled-production-deploy.yml");
+    assert.ok(
+      scheduledDeploy > 173 / 60,
+      "scheduled-production-deploy would red on its own measured 173-min jitter ceiling",
+    );
+    assert.ok(
+      scheduledDeploy < 3245 / 60,
+      "scheduled-production-deploy would sail over the 54h BLO-42887 dispatch outage it must catch",
+    );
+
     // The hourly six share one bar; a shared GLOBAL threshold across cadences is
     // the bug this replaced. Asserted against DEFAULT_STALE_HOURS rather than a
     // literal so moving the bar stays a one-line change with a reason attached
     // (PEN-3379 moved it 4h -> 2.75h).
     // Derived from TWICE_DAILY rather than re-listed, so adding a twice-daily
     // guard above cannot leave it wrongly asserted against the hourly bar here.
-    const notHourly = new Set([...TWICE_DAILY, "master-health.yml"]);
+    const notHourly = new Set([...TWICE_DAILY, "master-health.yml", "scheduled-production-deploy.yml"]);
     for (const workflow of WATCHED_WORKFLOWS) {
       if (notHourly.has(workflow)) continue;
       assert.equal(
