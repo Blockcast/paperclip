@@ -744,3 +744,28 @@ test('guard (1) step sets pipefail, so a failed read aborts instead of reading a
   const step = pendingReadRegion.slice(pendingReadRegion.lastIndexOf('run: |'));
   assert.match(step, /^\s*set\s+-[\w\s-]*o\s+pipefail\b/m, 'guard (1) step must `set -o pipefail`');
 });
+
+test('the dispatch output names the reviewer set but never states its value (PEN-2918)', () => {
+  // These lines print on every dispatch, so a reader takes them as facts about THAT
+  // run — and nothing in the job reads the reviewer set. "awaiting human approval"
+  // was false for every dispatch after 2026-10-06; "EMPTY ... does not park" goes
+  // false the day a reviewer is restored. Point at RATIFIED_REVIEWERS and stop.
+  const start = code.indexOf('gh workflow run docker.yml');
+  const end = code.indexOf('outcome=dispatched');
+  assert.ok(start !== -1 && end > start, 'expected the dispatch to precede outcome=dispatched');
+  const printed = code
+    .slice(start, end)
+    .split('\n')
+    .filter((line) => /^\s*echo\b/.test(line));
+  assert.ok(
+    printed.some((line) => line.includes('RATIFIED_REVIEWERS')),
+    'the dispatch output must point at RATIFIED_REVIEWERS',
+  );
+  for (const line of printed) {
+    assert.doesNotMatch(
+      line,
+      /\bempty\b|\bdoes not park\b|\bawait(?:s|ing) human approval\b/i,
+      `dispatch output restates the reviewer set's value: ${line.trim()}`,
+    );
+  }
+});
