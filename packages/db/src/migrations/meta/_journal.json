@@ -1765,6 +1765,13 @@
       "when": 1791764600000,
       "tag": "0259_heartbeat_runs_failed_finished_at_index",
       "breakpoints": true
+    },
+    {
+      "idx": 260,
+      "version": "7",
+      "when": 1792002701477,
+      "tag": "0260_issue_recovery_actions_restored_execution_watermark",
+      "breakpoints": true
     }
   ]
 }

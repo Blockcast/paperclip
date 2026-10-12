@@ -1,7 +1,11 @@
-import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 import { heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
-import { RESTORED_EXECUTION_DISCHARGE_KINDS } from "@paperclipai/shared";
+import {
+  RESTORED_EXECUTION_DISCHARGE_KINDS,
+  RESTORED_EXECUTION_EVIDENCE_LAG_MS,
+  RESTORED_EXECUTION_WATERMARK_MIN_ADVANCE_MS,
+} from "@paperclipai/shared";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -1402,6 +1406,15 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
    * discharged, that backstop drops it (`isNull(retiringBound)`) and the only remaining
    * discharge is a human-equivalent call. A sweep that handled only `active` rows would leave
    * every measured instance exactly as stuck as before.
+   *
+   * COST SHAPE. Every pass is a proof of a negative for every row that is not yet
+   * dischargeable, so the probe is bounded from both ends: below by
+   * `restoredExecutionScannedThrough`, which starts null (full historical scan, so the backlog
+   * drains) and then ratchets forward, and above by the examined-row limit. The watermark is
+   * advanced at the END of the pass, over the rows this pass examined, and never past
+   * `now - RESTORED_EXECUTION_EVIDENCE_LAG_MS`. Without that trailing term the floor would
+   * silently step over runs that were queued before it moved and only reached `succeeded`
+   * after.
    */
   async function dischargeActionsWithRestoredExecution(input: {
     now?: Date;
@@ -1416,19 +1429,46 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     const limit = Math.max(1, Math.floor(input.limit ?? 200));
     if (RESTORED_EXECUTION_DISCHARGE_KINDS.length === 0) return [];
 
-    // One definition, shared by the candidate predicate and by the scalar subquery that
-    // names the run in the note. Two copies would be free to drift, and a drifted pair
-    // discharges on one run while citing another.
+    // The floor of this pass's probe, and the thing that makes the scan bounded.
+    //
+    // An action is discharged only once a qualifying run EXISTS, so for every action that is
+    // not yet dischargeable this probe proves a negative — and proving a negative cannot
+    // short-circuit, it has to examine the whole range. Keyed on the action's `createdAt`
+    // alone that range widened on every tick and was re-scanned on every tick, forever, for
+    // exactly the population this sweep exists to drain: a `workspace_validation` row latched
+    // `manual_repair_required`, a `stranded_assigned_issue` whose issue went terminal or whose
+    // assignee is paused. ~132 such rows estate-wide on 2026-10-05 (BLO-40392).
+    //
+    // `restoredExecutionScannedThrough` is null until the first probe, so the first pass over
+    // a row still scans its whole history and the backlog drains completely. A FIXED lookback
+    // cannot have that property, and the difference is not theoretical: PEN-3631's qualifying
+    // run was 1–5 days old throughout the window a rollout would have drained it in, and this
+    // company's ledger shows mint-to-discharge ages up to 15.2 days, so the fixed floor large
+    // enough to drain the backlog is too large to bound anything.
+    //
+    // `greatest` ignores NULL in PostgreSQL, so an unprobed row falls back to its own
+    // `createdAt` with no coalesce. One expression, used three times below — as the probe's
+    // floor, as the candidate ordering, and as the ratchet's "has this moved enough" test —
+    // so those three can never disagree about where a row has been scanned to.
+    const restoredExecutionScanFloor = sql`greatest(${issueRecoveryActions.createdAt}, ${issueRecoveryActions.restoredExecutionScannedThrough})`;
+
+    // One definition, used by the single scalar subquery below. It was duplicated into an
+    // `EXISTS` in the candidate predicate as well; that second copy is gone, so each candidate
+    // is probed once rather than twice and there is no pair left to drift.
     const restoredExecutionEvidence = and(
       // `(company_id, created_at DESC)` is `heartbeat_runs_company_created_at_desc_idx`, and
-      // this pair is what keeps the sweep affordable on a 30s scheduler tick: the evidence
-      // range starts at the action's own `createdAt`, so a fresh action probes a few minutes
-      // of that company's runs and even a month-old one probes a bounded window that it then
-      // leaves forever. There is no index over `(company_id, context_issue_id)`, so dropping
-      // either of these two columns turns each probe into a scan of every run the company has
-      // ever succeeded — multiplied by the candidate count, on every tick.
+      // this pair is what keeps the sweep affordable on a 30s scheduler tick. There is no index
+      // over `(company_id, context_issue_id)`, so dropping either of these two columns turns
+      // each probe into a scan of every run the company has ever succeeded — multiplied by the
+      // candidate count, on every tick.
       eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
+      // LOOP SAFETY, and deliberately written out even though the floor above subsumes it.
+      // "Evidence must post-date the action" is the invariant that makes one successful run buy
+      // at most one discharge (see the numbered conjuncts in this function's header). The floor
+      // is a COST bound and someone will eventually tune it; a correctness invariant must not
+      // be left depending on how they tune it.
       gt(heartbeatRuns.createdAt, issueRecoveryActions.createdAt),
+      sql`${heartbeatRuns.createdAt} > ${restoredExecutionScanFloor}`,
       eq(heartbeatRuns.status, "succeeded"),
       // Generated stored columns over the same snapshot keys every other issue-scoped run
       // query reads, so this is a small-text comparison and not a JSONB detoast per row. Both
@@ -1449,15 +1489,14 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       .orderBy(desc(heartbeatRuns.createdAt))
       .limit(1);
 
+    // No `EXISTS` arm here. It would re-run the probe for every in-scope row BEFORE the
+    // limit applies, so the cheap-looking cap did not cap the expensive part; the scalar
+    // subquery in the projection is evaluated only for the rows the limit actually returns.
+    // The cost of moving it is that the limit is now spent on examined rows rather than on
+    // qualifying ones — see the ORDER BY below, which is what keeps that fair.
     const candidatePredicates = [
       inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
       inArray(issueRecoveryActions.kind, RESTORED_EXECUTION_DISCHARGE_KINDS),
-      exists(
-        db
-          .select({ id: heartbeatRuns.id })
-          .from(heartbeatRuns)
-          .where(restoredExecutionEvidence),
-      ),
     ];
     if (input.companyId) {
       candidatePredicates.push(eq(issueRecoveryActions.companyId, input.companyId));
@@ -1478,9 +1517,13 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       .from(issueRecoveryActions)
       .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
       .where(and(...candidatePredicates))
-      // Oldest first: the backlog this drains is measured in weeks, and a cap that bites
-      // should spend itself on the rows that have been degrading their source longest.
-      .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id))
+      // Least-recently-scanned first. Unprobed rows carry a null watermark and so sort by
+      // their own `createdAt`, which keeps the original property — a cap that bites spends
+      // itself on the rows that have been degrading their source longest — while making the
+      // steady state round-robin instead of re-examining the same head of the queue. That
+      // matters now that the limit counts examined rows: without it, a population larger than
+      // the limit would starve its tail permanently rather than reaching it a tick later.
+      .orderBy(asc(restoredExecutionScanFloor), asc(issueRecoveryActions.id))
       .limit(limit);
 
     const discharged: Array<{
@@ -1489,8 +1532,10 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       previousStatus: IssueRecoveryActionStatus;
     }> = [];
     for (const candidate of candidates) {
-      // The two subqueries agree by construction; a null here would mean the row stopped
-      // qualifying between them, which is a skip rather than a discharge with no citation.
+      // Null is the ordinary "no qualifying run in range" answer now that this is the only
+      // probe, not the anomaly it was when a prior `EXISTS` had already asserted one. Such a
+      // row is examined, not discharged, and the watermark pass below is what stops it being
+      // re-examined over the same range next tick.
       if (!candidate.evidenceRunId) continue;
       const resolutionNote =
         `${RESTORED_EXECUTION_DISCHARGE_NOTE_PREFIX} run ${candidate.evidenceRunId} was dispatched `
@@ -1531,6 +1576,41 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         evidenceRunId: candidate.evidenceRunId,
         previousStatus: candidate.previousStatus as IssueRecoveryActionStatus,
       });
+    }
+
+    // Ratchet the watermark over everything this pass EXAMINED, which is why it runs after the
+    // probe rather than before it: advancing first would move the floor over the very range
+    // this pass was about to read.
+    //
+    // `advanceTo` trails `now` by `RESTORED_EXECUTION_EVIDENCE_LAG_MS` because
+    // `heartbeat_runs.created_at` is stamped at QUEUE time while `status` flips to `succeeded`
+    // later. A watermark set to a bare `now` would permanently skip every run that was already
+    // in flight when it moved — the run would qualify, but its `created_at` would by then sit
+    // below the floor. That is the one thing a naive watermark gets wrong, and it is silent.
+    //
+    // `advanceThreshold` is the same instant minus the minimum advance, so the predicate below
+    // reads directly as "only write when this moves the floor by at least that much". Rows are
+    // re-read rather than trusted from the candidate projection so a row resolved by hand in
+    // the gap keeps its own floor, and the floor can only ever move forward.
+    const examinedIds = candidates.map((candidate) => candidate.id);
+    if (examinedIds.length > 0) {
+      const advanceTo = new Date(now.getTime() - RESTORED_EXECUTION_EVIDENCE_LAG_MS);
+      const advanceThreshold = new Date(advanceTo.getTime() - RESTORED_EXECUTION_WATERMARK_MIN_ADVANCE_MS);
+      await db
+        .update(issueRecoveryActions)
+        // `updatedAt` is deliberately NOT bumped. This is bookkeeping about the sweep, not
+        // activity on the action, and `updatedAt` is load-bearing as a diagnostic: "frozen at
+        // 2026-09-21 while its row executed five times" is how PEN-3102's stuck action was
+        // recognised. Writing it here would hide the next one behind a timestamp that only
+        // means "a sweep looked".
+        .set({ restoredExecutionScannedThrough: advanceTo })
+        .where(and(
+          inArray(issueRecoveryActions.id, examinedIds),
+          // Still in scope. Excludes the rows discharged just above, and any a human resolved
+          // while this pass was running.
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          sql`${restoredExecutionScanFloor} <= ${advanceThreshold.toISOString()}::timestamptz`,
+        ));
     }
 
     return discharged;

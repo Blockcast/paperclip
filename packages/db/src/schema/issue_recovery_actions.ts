@@ -67,6 +67,27 @@ export const issueRecoveryActions = pgTable(
      * inventory is actually asking.
      */
     handBackResidualAt: timestamp("hand_back_residual_at", { withTimezone: true }),
+    /**
+     * PEN-3976: how far `dischargeActionsWithRestoredExecution` has already proved there is
+     * no qualifying run. The floor of its next evidence probe, not a record of activity.
+     *
+     * Null means the action has never been probed, and the floor falls back to `createdAt` —
+     * so the FIRST pass over a row scans its whole history and the accumulated backlog drains
+     * completely, with no rollout special case. That matters concretely: PEN-3631's qualifying
+     * run was already 1-5 days old throughout the window a fixed lookback would have drained
+     * it in, and this company's ledger shows mint-to-discharge ages up to 15.2 days, so a
+     * fixed floor large enough to drain the backlog would not have bounded anything.
+     *
+     * Thereafter it ratchets forward, which is what bounds the steady-state scan. It only ever
+     * increases: moving it backwards would re-open a range already proved empty, and clamping
+     * it below `createdAt` would break the loop-safety conjunct that evidence must post-date
+     * the action.
+     *
+     * Written by at most one UPDATE per `RESTORED_EXECUTION_WATERMARK_MIN_ADVANCE_MS` per row,
+     * for the same reason `handBackResidualAt` above is written only on change: a stable
+     * population must not cost a write on every 30s scheduler tick.
+     */
+    restoredExecutionScannedThrough: timestamp("restored_execution_scanned_through", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

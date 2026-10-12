@@ -21,7 +21,12 @@ import {
   routines,
   routineRuns,
 } from "@paperclipai/db";
-import { ISSUE_STATUSES, type IssueStatus } from "@paperclipai/shared";
+import {
+  ISSUE_STATUSES,
+  RESTORED_EXECUTION_EVIDENCE_LAG_MS,
+  RESTORED_EXECUTION_WATERMARK_MIN_ADVANCE_MS,
+  type IssueStatus,
+} from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -7911,6 +7916,215 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(details.source).toBe("restored_execution_sweep");
       expect(details.evidenceRunId).toBe(runId);
       expect(details.retiringBound).toBe("execution_restored");
+    });
+
+    describe("the evidence probe is bounded by a per-action scan watermark", () => {
+      // The probe proves a NEGATIVE for every action that is not yet dischargeable, and
+      // proving a negative cannot short-circuit. Keyed on the action's `createdAt` alone, the
+      // range widened every tick and was re-scanned every tick, forever, for exactly the
+      // population this sweep targets (~132 latched rows estate-wide, BLO-40392). These pin
+      // both halves of the fix: the first pass still reads the whole history, and every pass
+      // after it reads one lag window.
+
+      async function readWatermark(actionId: string) {
+        const [row] = await db
+          .select({ scannedThrough: issueRecoveryActions.restoredExecutionScannedThrough })
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.id, actionId));
+        return row!.scannedThrough;
+      }
+
+      it("discharges on evidence far older than any fixed lookback would admit", async () => {
+        // ⛔ THE REGRESSION GUARD FOR THIS WHOLE DESIGN. The obvious bound — a fixed
+        // `now - N` floor — fails here, and fails silently: it leaves the backlog exactly as
+        // stuck as before while looking like a fix. The measurements say N would have to
+        // clear ~15 days to drain this company's ledger (mint-to-discharge ages of 15.2d,
+        // 15.1d, 14.3d, 9.9d, 6.4d), and PEN-3631's qualifying run was already 1-5 days old
+        // throughout the window a rollout would have caught it in. A null watermark means
+        // "never probed", so the FIRST pass reads the full history and the drain is complete.
+        // If this test ever fails because someone added a fixed floor, the floor is the bug.
+        const now = new Date("2026-10-12T22:00:00.000Z");
+        const actionCreatedAt = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000);
+        const { companyId, actionId, runId } = await seedActionWithRun({
+          actionCreatedAt,
+          runCreatedAt: new Date(now.getTime() - 59 * 24 * 60 * 60 * 1000),
+        });
+
+        const discharged = await issueRecoveryActionService(db).dischargeActionsWithRestoredExecution({
+          companyId,
+          now,
+        });
+
+        expect(discharged).toHaveLength(1);
+        expect(discharged[0]!.evidenceRunId).toBe(runId);
+        expect((await readAction(actionId)).status).toBe("resolved");
+      });
+
+      it("advances the watermark to `now - lag`, never to `now`", async () => {
+        // The trailing term is load-bearing and its absence is silent: `created_at` is stamped
+        // at QUEUE time but `status` flips to `succeeded` later, so a watermark at a bare
+        // `now` would step over every run that was in flight when it moved and those runs
+        // could never discharge anything afterwards.
+        const now = new Date("2026-10-12T22:00:00.000Z");
+        const { companyId, actionId } = await seedActionWithRun({
+          actionCreatedAt: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
+          omitRun: true,
+        });
+
+        await issueRecoveryActionService(db).dischargeActionsWithRestoredExecution({ companyId, now });
+
+        expect(await readWatermark(actionId)).toEqual(
+          new Date(now.getTime() - RESTORED_EXECUTION_EVIDENCE_LAG_MS),
+        );
+      });
+
+      it("will not re-scan below the watermark, but still sees evidence above it", async () => {
+        // The pair is the point. The first assertion is what bounds the scan — and it is also
+        // the only way to observe the floor from outside, since a bounded and an unbounded
+        // scan return the same thing whenever the evidence is recent. The second is the
+        // control: a floor that also swallowed FRESH evidence would pass the first assertion
+        // while breaking the feature outright.
+        const now = new Date("2026-10-12T22:00:00.000Z");
+        const { companyId, sourceIssueId, coderId, actionId } = await seedActionWithRun({
+          actionCreatedAt: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
+          omitRun: true,
+        });
+        const svc = issueRecoveryActionService(db);
+
+        expect(await svc.dischargeActionsWithRestoredExecution({ companyId, now })).toHaveLength(0);
+
+        // Dispatched after the action, so the loop-safety conjunct admits it — but below the
+        // watermark the pass above just proved empty, so this pass must not reach it.
+        await db.insert(heartbeatRuns).values({
+          id: randomUUID(),
+          companyId,
+          agentId: coderId,
+          invocationSource: "automation",
+          status: "succeeded",
+          contextSnapshot: { issueId: sourceIssueId },
+          createdAt: new Date(now.getTime() - 72 * 60 * 60 * 1000),
+          startedAt: new Date(now.getTime() - 72 * 60 * 60 * 1000),
+          finishedAt: new Date(now.getTime() - 71 * 60 * 60 * 1000),
+        });
+
+        expect(await svc.dischargeActionsWithRestoredExecution({ companyId, now })).toHaveLength(0);
+        expect((await readAction(actionId)).status).toBe("escalated");
+
+        const freshRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: freshRunId,
+          companyId,
+          agentId: coderId,
+          invocationSource: "automation",
+          status: "succeeded",
+          contextSnapshot: { issueId: sourceIssueId },
+          createdAt: new Date(now.getTime() - 60 * 60 * 1000),
+          startedAt: new Date(now.getTime() - 60 * 60 * 1000),
+          finishedAt: new Date(now.getTime() - 30 * 60 * 1000),
+        });
+
+        const discharged = await svc.dischargeActionsWithRestoredExecution({ companyId, now });
+        expect(discharged).toHaveLength(1);
+        expect(discharged[0]!.evidenceRunId).toBe(freshRunId);
+      });
+
+      it("does not rewrite the watermark for an advance below the minimum", async () => {
+        // Same economy `handBackResidualAt` keeps on this table: a stable population must not
+        // cost a write on every 30s tick. Without the floor on the advance this sweep would
+        // UPDATE every latched row ~2,880 times a day to move its watermark by 30 seconds.
+        const now = new Date("2026-10-12T22:00:00.000Z");
+        const { companyId, actionId } = await seedActionWithRun({
+          actionCreatedAt: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
+          omitRun: true,
+        });
+        const svc = issueRecoveryActionService(db);
+
+        await svc.dischargeActionsWithRestoredExecution({ companyId, now });
+        const afterFirst = await readWatermark(actionId);
+
+        await svc.dischargeActionsWithRestoredExecution({
+          companyId,
+          now: new Date(now.getTime() + 30_000),
+        });
+        expect(await readWatermark(actionId)).toEqual(afterFirst);
+
+        // ...and it does move once the advance is worth the write.
+        await svc.dischargeActionsWithRestoredExecution({
+          companyId,
+          now: new Date(now.getTime() + RESTORED_EXECUTION_WATERMARK_MIN_ADVANCE_MS + 60_000),
+        });
+        expect((await readWatermark(actionId))!.getTime()).toBeGreaterThan(afterFirst!.getTime());
+      });
+
+      it("never moves the watermark backwards", async () => {
+        // A retreat would re-open a range already proved empty, which is the unbounded scan
+        // coming back through the side door. An out-of-order pass (a manual call with an
+        // older `now`, a clock correction) must be a no-op, not a reset.
+        const now = new Date("2026-10-12T22:00:00.000Z");
+        const { companyId, actionId } = await seedActionWithRun({
+          actionCreatedAt: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
+          omitRun: true,
+        });
+        const ahead = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+        await db
+          .update(issueRecoveryActions)
+          .set({ restoredExecutionScannedThrough: ahead })
+          .where(eq(issueRecoveryActions.id, actionId));
+
+        await issueRecoveryActionService(db).dischargeActionsWithRestoredExecution({ companyId, now });
+
+        expect(await readWatermark(actionId)).toEqual(ahead);
+      });
+
+      it("round-robins the examined set when the limit bites", async () => {
+        // The limit now counts EXAMINED rows rather than qualifying ones, because the probe
+        // moved out of the WHERE clause (where it ran for every in-scope row before the limit
+        // could cap anything) and into the projection. Ordering by the watermark is what pays
+        // for that: without it a population larger than the limit would re-examine the same
+        // head every tick and starve its tail permanently.
+        const now = new Date("2026-10-12T22:00:00.000Z");
+        const { companyId, coderId, prefix, actionId: firstActionId } = await seedActionWithRun({
+          actionCreatedAt: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
+          omitRun: true,
+        });
+        const secondIssueId = randomUUID();
+        await db.insert(issues).values({
+          id: secondIssueId,
+          companyId,
+          title: "Second stuck row",
+          status: "in_progress",
+          priority: "medium",
+          assigneeAgentId: coderId,
+          issueNumber: 2,
+          identifier: `${prefix}-2`,
+        });
+        const secondActionId = randomUUID();
+        const secondCreatedAt = new Date(now.getTime() - 29 * 24 * 60 * 60 * 1000);
+        await db.insert(issueRecoveryActions).values({
+          id: secondActionId,
+          companyId,
+          sourceIssueId: secondIssueId,
+          kind: "stranded_assigned_issue",
+          status: "escalated",
+          retiringBound: "timeout_horizon",
+          ownerType: "agent",
+          cause: "stranded_assigned_issue",
+          fingerprint: `source_scoped_recovery:${companyId}:${secondIssueId}:stranded_assigned_issue`,
+          nextAction: "Restore a live execution path.",
+          createdAt: secondCreatedAt,
+          updatedAt: secondCreatedAt,
+        });
+        const svc = issueRecoveryActionService(db);
+
+        await svc.dischargeActionsWithRestoredExecution({ companyId, now, limit: 1 });
+        expect(await readWatermark(firstActionId)).not.toBeNull();
+        expect(await readWatermark(secondActionId)).toBeNull();
+
+        // Second pass, same instant: the row already scanned must sort behind the one that
+        // never has been. Ordering by `createdAt` would re-pick the first row forever.
+        await svc.dischargeActionsWithRestoredExecution({ companyId, now, limit: 1 });
+        expect(await readWatermark(secondActionId)).not.toBeNull();
+      });
     });
   });
 

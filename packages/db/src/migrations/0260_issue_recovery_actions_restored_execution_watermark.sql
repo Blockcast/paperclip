@@ -1,0 +1,24 @@
+-- PEN-3976: per-action scan watermark for the restored-execution discharge sweep.
+--
+-- `dischargeActionsWithRestoredExecution` proves a NEGATIVE on every pass for every action
+-- that is not yet dischargeable: it asks whether any run on the source issue succeeded after
+-- the action was created, and `EXISTS` cannot short-circuit when the answer is no. The range
+-- it scans started at the action's `created_at` and ran to now, so for an action that never
+-- becomes dischargeable -- a `workspace_validation` row latched `manual_repair_required`, a
+-- `stranded_assigned_issue` whose assignee is paused -- that range widened on every tick,
+-- forever, and was re-scanned on every tick.
+--
+-- This column is the floor of the next probe. Null means never probed, so the first pass is
+-- still the full historical scan and the accumulated backlog drains with no rollout special
+-- case; after that it ratchets forward and the steady-state probe covers one lag window
+-- rather than the action's whole life.
+--
+-- Nullable with no default and no backfill: null is the meaningful initial state, not an
+-- absence to be filled. A backfill to `now()` would be actively wrong -- it would skip the
+-- historical scan that drains the existing backlog, which is the population this sweep was
+-- built for.
+--
+-- No index. The column is an output of the candidate query's ORDER BY, and the candidate
+-- query is already bounded by `status` + `kind` on a table measured in hundreds of rows.
+ALTER TABLE "issue_recovery_actions"
+  ADD COLUMN IF NOT EXISTS "restored_execution_scanned_through" timestamp with time zone;

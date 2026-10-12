@@ -397,7 +397,7 @@ Plain comments alone do not make a recovery action stale. A comment can provide 
 
 #### How a recovery action is discharged, and what `timeoutAt` does not do
 
-An action leaves the active set (`active`, `escalated`) by exactly four routes:
+An action leaves the active set (`active`, `escalated`) — is *discharged* — by exactly four routes. Count them as four, not five: other passes **retire** an action without discharging it, which is a different thing. `escalateExpiredWakeHorizons` stamps a `retiringBound` and the BLO-24662 sweep moves a wake-exhausted row to `escalated`; both leave it in the active set, still holding the per-source uniqueness index. Retiring ends the action's *wake* budget. Discharging ends the *action*.
 
 - **A recorded disposition.** `POST /api/issues/:id/recovery-actions/resolve` from the owner. The action id goes in the body as an optional `actionId`, never in the path.
 - **A stale premise.** Read- and write-time revalidation cancels an action once the source issue has its own live or waiting path again. This runs only when an HTTP route touches the issue, so it does not reach rows nobody opens.
@@ -407,6 +407,18 @@ An action leaves the active set (`active`, `escalated`) by exactly four routes:
 **A past `timeoutAt` is none of these.** `timeoutAt` bounds the action's WAKE horizon, not its lifetime: spending it moves the row `active` → `escalated` and stamps `retiringBound: "timeout_horizon"`, and `escalated` is deliberately still an active status so the row keeps holding the per-source uniqueness index. That is why an action can sit far past its own `timeoutAt` still reading `escalated` — the field is doing its job, and its job is not discharge.
 
 Discharging on a timer instead would free that uniqueness slot, letting the next sweep mint a replacement with a fresh attempt budget and a fresh horizon, which is the unbounded re-fire loop the uniqueness index exists to close. The restored-execution sweep is not subject to that because its evidence must be a run dispatched strictly after the action it discharges, and must not be a run the recovery subsystem itself caused: one successful run therefore buys at most one discharge, and a discharge can never feed the mint that follows it.
+
+##### What the restored-execution sweep costs, and why it carries a watermark
+
+The sweep asks whether a qualifying run exists. For an action that is not yet dischargeable the answer is no, and proving *no* means examining the whole candidate range — there is nothing to stop early on. That is the normal case for the population the sweep exists to drain: a `workspace_validation` row latched `manual_repair_required` has no automatic retry path by design, and a `stranded_assigned_issue` whose issue went terminal or whose assignee is paused will not produce a run either. Keyed on the action's `createdAt` alone, that range widened on every tick and was re-read on every tick, forever.
+
+Each action therefore carries `restored_execution_scanned_through`: the floor of its next probe, advanced at the end of each pass, over the rows that pass examined.
+
+- **Null means never probed**, so the first pass still reads the action's whole history. This is why the column exists instead of a fixed `now - N` lookback: a fixed floor large enough to drain the measured backlog (mint-to-discharge ages up to 15.2 days) would not bound anything, and one small enough to bound the scan would silently skip the backlog it was added to serve.
+- **It never advances past `now - RESTORED_EXECUTION_EVIDENCE_LAG_MS`.** `heartbeat_runs.created_at` is stamped when a run is queued, but its status reaches `succeeded` later, so a floor at a bare `now` would step over runs that were in flight when it moved. 48h is sized off this repo's own bounds for that gap — a 6h pre-claim wait plus the 2h stale-running reap.
+- **It only moves when the move is worth a write**, so a stable population costs no writes on a 30s tick.
+
+Missing a run is a soft failure: the action is not discharged by *that* run and waits for the next one, which is what would have happened to it anyway. Nothing incorrect is written. The bound is sized to make that rare rather than impossible, because making it impossible means pinning the floor to the oldest non-terminal run in the company, and one zombie `queued` row would then hold the floor open forever and reinstate the unbounded scan.
 
 ### Agent-assigned `todo`
 
