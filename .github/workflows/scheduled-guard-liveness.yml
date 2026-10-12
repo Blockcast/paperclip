@@ -172,10 +172,27 @@
 #
 #   2. CLOSED (was: the watched set could silently drift out of date).
 #      scripts/check-scheduled-guard-liveness.test.mjs now enumerates every
-#      workflow in .github/workflows carrying both `schedule:` and
-#      `runs-on: default`, and asserts each is either watched or explicitly
-#      exempted with a reason. A new scheduled guard on the starvable lane fails
-#      that test in its own PR.
+#      workflow in .github/workflows carrying `schedule:`, and asserts each is
+#      either watched or explicitly exempted with a reason. A new scheduled
+#      workflow fails that test in its own PR.
+#
+#      THAT ENUMERATION WAS SCOPED TO `runs-on: default` UNTIL BLO-42887, and
+#      the scoping was the hole. Its justification — "starvation is a `default`-
+#      lane property" — is true and is the wrong question. A scheduled workflow
+#      also stops when GitHub never DISPATCHES it, and that is lane-independent:
+#      scheduled-production-deploy.yml (on `arc-deploy`) had ZERO runs created
+#      across 48 consecutive slots from 2026-10-06T23:31Z to 2026-10-09T05:37Z —
+#      54h06m, queried with no status filter — while 7 sibling hourly workflows
+#      ran 24/24 on both dark days. A starved pool still creates the run and
+#      leaves it queued; non-creation happens upstream of the runner. Nothing
+#      recorded it; an unrelated org-wide control (BLO-30985) noticed on 10-09.
+#      The lane filter is gone and the invariant is now simply: every scheduled
+#      workflow is watched or exempted.
+#
+#      Worth stating because it is the cheap part: this job needed NO new
+#      capability to cover it. Age-since-last-completion is read from the API
+#      and is lane-agnostic, and master-health.yml (arc-light) was already
+#      watched. Only the test's scope was wrong.
 #
 #      This was not theoretical. Writing that test immediately found the set
 #      incomplete: production-environment-protection-guard — a security control

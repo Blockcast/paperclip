@@ -246,6 +246,63 @@ export const WATCHED_GUARDS = [
     event: "schedule",
     graceUntil: "2026-10-09T12:00:00.000Z",
   },
+
+  // BLO-42887. Hourly (cron "23 0-6,8-23" plus "23 7"), and the first entry here
+  // that is not on the `default` lane — it runs on `arc-deploy`, and the
+  // enumeration test used to be scoped to `runs-on: default`, so this workflow
+  // was structurally invisible to it. It was neither watched nor exempted, and
+  // nobody had erred: the invariant's scope excluded it by design. See the test
+  // for why that scoping is now gone.
+  //
+  // THE EVENT THAT FILED THIS ROW IS NOT STARVATION, WHICH IS WHY THE LANE
+  // SCOPING MISSED IT. From 2026-10-06T23:31:20Z to 2026-10-09T05:37:00Z — 54h06m,
+  // 48 consecutive slots — GitHub created ZERO runs of this workflow. Not queued,
+  // not cancelled, not skipped: queried with NO status filter, the runs simply do
+  // not exist, while 7 sibling hourly workflows in the same repo ran 24/24 on both
+  // dark days. A starved runner pool still CREATES the run and leaves it queued,
+  // so non-creation is upstream of the runner entirely and is lane-independent.
+  // That is the property this entry exists to watch, and it is why no amount of
+  // `default`-lane reasoning would ever have reached this file.
+  //
+  // THRESHOLD, derived by this file's normal method against this guard's OWN
+  // history and NOT inherited from the hourly six — inheriting would have been a
+  // defect, which is the point of measuring. 597 completed `schedule` runs
+  // 2026-09-01 -> 2026-10-10. The pre-2026-09-13 portion is DISCARDED: the hourly
+  // cron did not exist yet, so those legs are ~1440 min by design and baselining
+  // across the cadence change would put the bar above 24h. On the hourly regime
+  // (2026-09-14 ->), 574 gaps, the single 3245-min incident leg excluded:
+  //
+  //   ordinary legs   n=573   p50 59   p95 96   p99 122   CEILING 173 min
+  //   outage          1 leg   3245 min (54.1h), after 2026-10-06T23:35:10Z
+  //
+  // The admissible window is therefore (173, 3245) and it is observed-EMPTY — the
+  // property that matters for an alarm whose whole value is being believed.
+  //
+  //   bar 165 (the hourly six's)  -> 1 FALSE RED, 0.95x the ceiling. Wrong here.
+  //   bar 240 (4h)                -> 0 false reds across 573 legs, 1.39x ceiling.
+  //
+  // 240 is picked because 1.39x matches the 1.40x margin the hourly six earned,
+  // so this guard is no looser relative to its own jitter than they are to theirs.
+  // Its ceiling is wider than their 118 min for a structural reason specific to
+  // this workflow rather than by accident: it carries `concurrency:` with
+  // `cancel-in-progress: false`, so a queued run is legitimately EVICTED by the
+  // next arrival and that completion never lands. Catch is guaranteed, not merely
+  // retrospective — a leg of length G sits over bar B for G-B minutes and an
+  // hourly detector needs G-B > 60; here 3245-240 = 3005. Detection lands within
+  // 240 min plus one sampling interval, i.e. <= 5h against the 54h this took.
+  //
+  // `event: "schedule"` is load-bearing for the BLO-38228 reason, and is not
+  // hypothetical here: this workflow also has `workflow_dispatch`, and 3 dispatch
+  // runs landed on 2026-10-06, the day before it went dark. An unfiltered
+  // newest-run query is satisfied by those while the cron is dead.
+  //
+  // No `graceUntil`: that exists for a workflow with zero completed `schedule`
+  // runs at merge, and this one has 597.
+  {
+    workflow: "scheduled-production-deploy.yml",
+    staleHours: 4,
+    event: "schedule",
+  },
 ];
 
 /**
@@ -279,15 +336,22 @@ export function resolveWatched(workflowsEnv, overrideHours = null) {
 export const WATCHED_WORKFLOWS = WATCHED_GUARDS.map((guard) => guard.workflow);
 
 /**
- * Scheduled `default`-label workflows this job deliberately does NOT watch.
+ * Scheduled workflows this job deliberately does NOT watch.
  *
  * Enumerated rather than left implicit so the colocated drift test can assert
- * that every scheduled `default` workflow in the repo is either watched or
- * exempted here. An unlisted new one fails that test at PR time, which is where
- * the drift is introduced — not silently at 03:00, which is the whole failure
- * mode PEN-3281 exists to close.
+ * that every scheduled workflow in the repo is either watched or exempted here.
+ * An unlisted new one fails that test at PR time, which is where the drift is
+ * introduced — not silently at 03:00, which is the whole failure mode PEN-3281
+ * exists to close.
+ *
+ * RENAMED from EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS (BLO-42887). The old name
+ * carried the premise that the coverage invariant is a `default`-lane question,
+ * and that premise is what let a 54h total dispatch outage on `arc-deploy` go
+ * unwatched. The name is part of the defect, not incidental to it: a reader
+ * checking whether a new `arc-*` guard belonged here would have been told by the
+ * identifier itself that it did not.
  */
-export const EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS = [
+export const EXEMPT_SCHEDULED_WORKFLOWS = [
   {
     workflow: "refresh-shard-manifest.yml",
     reason:
@@ -303,6 +367,19 @@ export const EXEMPT_SCHEDULED_DEFAULT_WORKFLOWS = [
       "re-formation; nothing is enforced, so its stopping degrades to the pre-BLO-41174 status quo " +
       "(orphans hold arc-merge-queue runners until they finish) rather than losing coverage. It " +
       "also has no completion-gap history to derive a threshold from.",
+  },
+  {
+    workflow: "scheduled-guard-liveness.yml",
+    reason:
+      "This job itself. Surfaced by the BLO-42887 widening of the coverage invariant beyond the " +
+      "`default` lane; it is exempt for the reason already argued at length in the workflow " +
+      "header's RESIDUAL 1, not as an oversight. Every self-stop mode — starved, " +
+      "disabled_inactivity, renamed, descheduled — stops this job from running, and a job that " +
+      "does not run cannot report on itself, so watching itself closes nothing. It would only " +
+      "guarantee a red on its first execution after merge, when it has no completed run yet, " +
+      "which is the born-red defect this file argues against everywhere else. The one self-stop " +
+      "mode that IS catchable — the file renamed out from under the watched list — is caught at " +
+      "PR time by the enumeration test, not at 03:00 by this job.",
   },
 ];
 
