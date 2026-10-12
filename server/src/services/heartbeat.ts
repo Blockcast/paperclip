@@ -14428,18 +14428,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function prReviewGateNoticeSuppression(
     target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
   ): Promise<"pull_request_closed" | "reviewer_evidence_found" | null> {
-    const pr = await githubGetPullRequestGate({
-      repoFullName: target.repoFullName,
-      prNumber: target.prNumber,
-    }).catch(() => ({ error: "pull_request_gate_threw" }));
-    if ("state" in pr && pr.state === "closed") return "pull_request_closed";
-
-    const evidence = await githubHasReviewerEvidenceForPr({
-      repoFullName: target.repoFullName,
-      prNumber: target.prNumber,
-      headSha: target.sha,
-    }).catch(() => ({ error: "reviewer_evidence_threw" }));
-    if ("found" in evidence && evidence.found) return "reviewer_evidence_found";
+    try {
+      const pr = await githubGetPullRequestGate({
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+      });
+      if (pr && "state" in pr && pr.state === "closed") return "pull_request_closed";
+      const evidence = await githubHasReviewerEvidenceForPr({
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        headSha: target.sha,
+      });
+      if (evidence && "found" in evidence && evidence.found) return "reviewer_evidence_found";
+    } catch (error) {
+      logger.warn(
+        { err: error, repoFullName: target.repoFullName, prNumber: target.prNumber },
+        "failed to re-read PR state for a failed PR-review gate notice; notifying anyway",
+      );
+    }
     return null;
   }
 
