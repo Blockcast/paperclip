@@ -6895,6 +6895,220 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 
+  describe("an unverifiable restored claim is recorded as such (PEN-3991)", () => {
+    // `outcome: "restored"` asserts the source issue has a live execution path
+    // again. The request schema enforces that only for an EXPLICIT
+    // `sourceIssueStatus` — it refuses `restored` + `blocked` by name. It cannot
+    // enforce it when the field is OMITTED, because the status that then applies
+    // is the issue's existing one and a body validator never sees it.
+    //
+    // That asymmetry is the defect. Measured on four issues, twice in under
+    // eight hours (2026-10-12T00:15Z and 07:54Z): discharged `restored` with
+    // `resolutionSnapshot.issueStatus: "blocked"` captured by the same write,
+    // with replacement actions minted on all four 71 minutes later. The ledger
+    // held both the claim and the evidence against it and accepted the claim.
+    //
+    // It is reached through the SANCTIONED path, not through misuse: the
+    // `nextAction` text this subsystem writes tells resolvers to
+    // `omit "sourceIssueStatus" to leave the source issue's status untouched`.
+    it("records restored_unverified when an omitted status leaves the issue blocked", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:blocked:omitted",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          resolutionNote: "Not chasing this one further.",
+        })
+        // Still ACCEPTED. The discharge is sanctioned; only the claim recorded
+        // about it was false. Refusing would delete a working exit under exactly
+        // the incident pressure it exists for.
+        .expect(200);
+
+      expect(resolved.body.recoveryAction).toMatchObject({
+        id: action.id,
+        status: "resolved",
+        outcome: "restored_unverified",
+      });
+
+      // The contradiction this makes legible: the same write that recorded the
+      // claim also captured the issue sitting on `blocked`.
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect((row!.evidence as Record<string, unknown>).resolvedIssueStatus).toBe("blocked");
+      expect(row!.outcome).toBe("restored_unverified");
+
+      // And the principal that made the claim is recoverable, which the action
+      // record alone cannot say.
+      const [activity] = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, sourceIssueId),
+            eq(activityLog.action, "issue.recovery_action_resolved"),
+          ),
+        );
+      expect(activity!.details).toMatchObject({
+        claimedOutcome: "restored",
+        claimDowngraded: true,
+        effectiveSourceIssueStatus: "blocked",
+      });
+    });
+
+    it("still records a plain restored claim when the issue is left runnable", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:runnable",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          sourceIssueStatus: "in_review",
+          resolutionNote: "Work is up for review again.",
+        })
+        .expect(200);
+
+      expect(resolved.body.recoveryAction.outcome).toBe("restored");
+    });
+
+    it("leaves PEN-2756's omitted-status backlog discharge recorded as restored", async () => {
+      // The branch this check deliberately EXCLUDES. PEN-2756 added the
+      // omitted-`sourceIssueStatus` route so a beacon on a board-approved
+      // `backlog` park (or a live `in_progress` run) could be discharged without
+      // the resolver claiming a status it cannot verify. Downgrading here would
+      // re-break exactly what that ticket fixed.
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, sourceIssueId));
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:backlog",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          resolutionNote: "Board-approved park; beacon retired without disturbing the park.",
+        })
+        .expect(200);
+
+      expect(resolved.body.recoveryAction.outcome).toBe("restored");
+      const [row] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(row!.status).toBe("backlog");
+    });
+
+    it("attributes a replacement action to the restored claim it refutes", async () => {
+      // Each replacement gets a NEW id, so a re-mint read as a fresh unrelated
+      // strand and nothing scored the pair as a loop — the four measured issues
+      // went round twice, invisibly. The back-pointer is written at MINT, because
+      // the refutation does not exist yet when the claim is made.
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const first = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:refuted:first",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+      await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({ actionId: first.id, outcome: "restored", resolutionNote: "Called it restored." })
+        .expect(200);
+
+      // The same fault recurs and the sweep opens a new strand on the same issue.
+      const replacement = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:refuted:second",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      expect(replacement.id).not.toBe(first.id);
+
+      const evidence = replacement.evidence as Record<string, unknown>;
+      expect(evidence.supersedesRestoredClaimActionId).toBe(first.id);
+      expect(evidence.supersedesRestoredClaimOutcome).toBe("restored_unverified");
+      expect(typeof evidence.supersedesRestoredClaimResolvedAt).toBe("string");
+      expect(evidence.supersedesRestoredClaimElapsedMs).toEqual(expect.any(Number));
+      expect(evidence.supersedesRestoredClaimElapsedMs as number).toBeGreaterThanOrEqual(0);
+    });
+
+    it("does not attribute a first-ever action to anything", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:first-ever",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      expect(action.evidence).not.toHaveProperty("supersedesRestoredClaimActionId");
+    });
+  });
+
   describe("a closed PR discharges its non-convergence action (PEN-3397)", () => {
     // These beacons had no resolution-on-merge and no resolution-on-close, so a
     // moot one sat on its owner's plate forever. Measured live: `6542ffc8` asked

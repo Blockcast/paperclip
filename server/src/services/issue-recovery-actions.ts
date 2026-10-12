@@ -85,6 +85,44 @@ const LATEST_RUN_ID_EVIDENCE_KEY = "latestRunId";
 export const RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY = "resolvedAssigneeAgentId";
 export const RESOLVED_ISSUE_STATUS_EVIDENCE_KEY = "resolvedIssueStatus";
 
+// PEN-3991: the restored claim this action's existence falsifies.
+//
+// A recovery action that is discharged and then re-minted gets a NEW id, so the
+// replacement reads as a fresh unrelated strand and nothing scores the pair as a
+// loop. Measured: four issues were discharged `restored` at 2026-10-12T00:15Z and
+// carried four fresh actions 71 minutes later; the same four were discharged
+// `restored` again at 07:54Z. Twice through the same cycle, invisible as a cycle.
+//
+// These keys make the replacement attributable to the claim it refutes. They are
+// a BACK-pointer written at mint, not a forward one written at resolve, because
+// the refutation does not exist yet when the claim is made.
+export const SUPERSEDES_RESTORED_CLAIM_ACTION_ID_EVIDENCE_KEY = "supersedesRestoredClaimActionId";
+export const SUPERSEDES_RESTORED_CLAIM_OUTCOME_EVIDENCE_KEY = "supersedesRestoredClaimOutcome";
+export const SUPERSEDES_RESTORED_CLAIM_RESOLVED_AT_EVIDENCE_KEY = "supersedesRestoredClaimResolvedAt";
+export const SUPERSEDES_RESTORED_CLAIM_ELAPSED_MS_EVIDENCE_KEY = "supersedesRestoredClaimElapsedMs";
+
+/**
+ * The outcomes that assert a live execution path, and are therefore refutable by
+ * a replacement action on the same source issue.
+ *
+ * `restored_unverified` is included even though it already records its own doubt:
+ * a replacement is the independent confirmation that the doubt was warranted, and
+ * leaving it out would make the clearest cases the only unlinked ones.
+ */
+const RESTORED_CLAIM_OUTCOMES = ["restored", "restored_unverified"] as const;
+
+/**
+ * How recently a restored claim must have been discharged for a new action on the
+ * same issue to count as refuting it.
+ *
+ * An unbounded link would assert continuity across arbitrary time — two unrelated
+ * failures months apart are not a loop. 24h is generous against the 71-minute gap
+ * actually measured, which is the point: the window should not be the thing that
+ * decides a borderline case. `supersedesRestoredClaimElapsedMs` records the real
+ * gap, so any consumer can apply a tighter rule without re-deriving this one.
+ */
+const RESTORED_CLAIM_REFUTATION_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 // How long after a recovery transfer the previous owner keeps the comment-only
 // handoff channel opened by BLO-18906 / #827.
 //
@@ -426,6 +464,61 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     return upsertSourceScopedUnlocked(input, retryCount + 1);
   }
 
+  /**
+   * The most recent restored-family claim on this source issue, if a new action
+   * minted now would refute it (PEN-3991).
+   *
+   * Only called on the INSERT path — i.e. when no active action exists and a
+   * genuinely new strand is being opened. The UPDATE path reuses a row that was
+   * never discharged, so there is no claim to refute and no query to pay for.
+   */
+  async function findSupersededRestoredClaim(
+    companyId: string,
+    sourceIssueId: string,
+    now: Date,
+  ): Promise<{ id: string; outcome: string; resolvedAt: Date } | null> {
+    const [candidate] = await db
+      .select({
+        id: issueRecoveryActions.id,
+        outcome: issueRecoveryActions.outcome,
+        resolvedAt: issueRecoveryActions.resolvedAt,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          inArray(issueRecoveryActions.outcome, [...RESTORED_CLAIM_OUTCOMES]),
+          isNotNull(issueRecoveryActions.resolvedAt),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.resolvedAt))
+      .limit(1);
+    if (!candidate) return null;
+    const resolvedAt = toValidDate(candidate.resolvedAt);
+    if (!resolvedAt || !candidate.outcome) return null;
+    const elapsedMs = now.getTime() - resolvedAt.getTime();
+    // Guard both ends. A negative gap means the clocks disagree, not that the
+    // claim was made in the future, and linking on it would publish that
+    // confusion as a measurement.
+    if (elapsedMs < 0 || elapsedMs > RESTORED_CLAIM_REFUTATION_WINDOW_MS) return null;
+    return { id: candidate.id, outcome: candidate.outcome, resolvedAt };
+  }
+
+  function withSupersededRestoredClaimEvidence(
+    evidence: unknown,
+    claim: { id: string; outcome: string; resolvedAt: Date } | null,
+    now: Date,
+  ): Record<string, unknown> {
+    const next = isRecord(evidence) ? { ...evidence } : {};
+    if (!claim) return next;
+    next[SUPERSEDES_RESTORED_CLAIM_ACTION_ID_EVIDENCE_KEY] = claim.id;
+    next[SUPERSEDES_RESTORED_CLAIM_OUTCOME_EVIDENCE_KEY] = claim.outcome;
+    next[SUPERSEDES_RESTORED_CLAIM_RESOLVED_AT_EVIDENCE_KEY] = claim.resolvedAt.toISOString();
+    next[SUPERSEDES_RESTORED_CLAIM_ELAPSED_MS_EVIDENCE_KEY] = now.getTime() - claim.resolvedAt.getTime();
+    return next;
+  }
+
   async function upsertSourceScopedUnlocked(
     input: UpsertIssueRecoveryActionInput,
     retryCount = 0,
@@ -693,6 +786,16 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       return toReadModel(updated!);
     }
 
+    // PEN-3991: minting here means a NEW strand is opening on this issue. If a
+    // restored claim was discharged on it recently, this action is the evidence
+    // that the claim was false — record the back-pointer now, while both ends
+    // are known.
+    const supersededRestoredClaim = await findSupersededRestoredClaim(
+      input.companyId,
+      input.sourceIssueId,
+      now,
+    );
+
     try {
       const [created] = await db
         .insert(issueRecoveryActions)
@@ -709,13 +812,17 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           returnOwnerAgentId: input.returnOwnerAgentId ?? null,
           cause: input.cause,
           fingerprint: input.fingerprint,
-          evidence: withRecoveryHandoffGrantAnchorEvidence(
-            withSourceScopedWakeHorizonEvidence(
-              input.evidence ?? {},
-              (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+          evidence: withSupersededRestoredClaimEvidence(
+            withRecoveryHandoffGrantAnchorEvidence(
+              withSourceScopedWakeHorizonEvidence(
+                input.evidence ?? {},
+                (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+              ),
+              // Creating the row IS the transfer, so it anchors the TTL.
+              { kind: "valid", at: now },
             ),
-            // Creating the row IS the transfer, so it anchors the TTL.
-            { kind: "valid", at: now },
+            supersededRestoredClaim,
+            now,
           ),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
