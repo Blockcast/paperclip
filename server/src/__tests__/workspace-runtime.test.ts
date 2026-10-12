@@ -5543,11 +5543,21 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
       { mode: 0o755 },
     );
     const previousPath = process.env.PATH;
+    const previousServerGit = process.env.PAPERCLIP_SERVER_GIT;
     process.env.PATH = `${fakeBin}${path.delimiter}${previousPath ?? ""}`;
+    // BLO-42838: the server no longer resolves its git off PATH -- it pins the
+    // real binary past the agent egress wrapper -- so prepending a fake `git`
+    // here no longer reaches it. `PAPERCLIP_SERVER_GIT` is that pin's override
+    // seam. Without this the stub is silently bypassed, `git worktree list`
+    // succeeds, and these tests pass without ever entering the failure path
+    // they exist to cover.
+    process.env.PAPERCLIP_SERVER_GIT = path.join(fakeBin, "git");
     try {
       return await run();
     } finally {
       process.env.PATH = previousPath;
+      if (previousServerGit === undefined) delete process.env.PAPERCLIP_SERVER_GIT;
+      else process.env.PAPERCLIP_SERVER_GIT = previousServerGit;
       await fs.rm(fakeBin, { recursive: true, force: true });
     }
   }

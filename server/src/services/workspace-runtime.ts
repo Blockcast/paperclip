@@ -1056,6 +1056,77 @@ export const executeProcessForTests = executeProcess;
  */
 export const isProcessGroupAliveForTests = isProcessGroupAlive;
 
+/** Where the chart writes the credential helper the egress `git` wrapper configures. */
+const SERVER_GIT_CREDENTIAL_HELPER_PATH = "/paperclip/.local/bin/github-token-credential-helper";
+
+/** Where the real git binary lives in the runtime image. */
+const SERVER_GIT_REAL_BINARY_PATH = "/usr/bin/git";
+
+/**
+ * Resolve the git the *server* runs, pinned past the agent egress wrapper
+ * (BLO-42838).
+ *
+ * `deploy/helm/.../statefulset.yaml` publishes a wrapper `git` at
+ * `${PAPERCLIP_HOME}/bin/git`, and the chart-managed container PATH puts that
+ * directory ahead of `/usr/bin` for *every* process in the pod -- the server
+ * included. So a bare `spawn("git")` here resolves to the agent publish guard,
+ * which refuses every `submodule` form except `status`
+ * (`isReadOnlySubmoduleInvocation`). That made `ensureGitSubmodulesReady`'s
+ * repair step -- `submodule sync` then `submodule update --init` -- fail with
+ * `workspace_git_submodule_unavailable` on any checkout whose submodules were
+ * not already initialised, which is every freshly created worktree of a repo
+ * that has them (BLO-41987).
+ *
+ * Widening the guard is the wrong repair and is refused on purpose: `submodule
+ * foreach` runs an arbitrary command and `submodule update` runs a configured
+ * `submodule.<name>.update = !<cmd>`, both with git's exec-path ahead of PATH,
+ * so a `push` inside either reaches the real binary and neither this wrapper
+ * nor the pre-push hook. The guard's subject is the *agent*; this module is
+ * server code that never publishes (it runs no `push`), so pinning the real
+ * binary here removes nothing the guard is there to enforce.
+ *
+ * The two `-c credential...` arguments are carried over verbatim from the
+ * wrapper, and are load-bearing rather than cosmetic: the server does fetch
+ * over https (`refreshRemoteTrackingBaseRef`), so without the helper that fetch
+ * loses authentication. The empty assignment **must** come first, and that is
+ * measured rather than assumed: git consults every helper configured for the
+ * host in config order, and a worktree's `.git/config` is agent-writable, so an
+ * agent can add its own. Against a repo-config helper, with system and global
+ * config neutralised, the agent's helper was invoked when ours was merely
+ * appended and was not invoked once the empty assignment preceded it. This
+ * matches the wrapper's coverage exactly, including its limit: it resets the
+ * `https://github.com`-scoped list only, not an unscoped `credential.helper`.
+ *
+ * Resolved per call rather than cached: two `existsSync` checks are free next to
+ * spawning a process, and it keeps `PAPERCLIP_SERVER_GIT` overridable in tests
+ * with no reset seam. Off-image (dev, CI) both paths are absent and this falls
+ * back to bare `git` on PATH, where no wrapper exists to bypass. `paths` exists
+ * only so tests can drive both branches against real files; production passes
+ * nothing.
+ */
+export function resolveServerGitInvocation(
+  args: readonly string[],
+  paths: { gitBinary?: string; credentialHelper?: string } = {},
+): { command: string; args: string[] } {
+  const gitBinary = paths.gitBinary ?? SERVER_GIT_REAL_BINARY_PATH;
+  const credentialHelper = paths.credentialHelper ?? SERVER_GIT_CREDENTIAL_HELPER_PATH;
+  const override = process.env.PAPERCLIP_SERVER_GIT?.trim();
+  const command = override || (existsSync(gitBinary) ? gitBinary : "git");
+  if (command === "git" || !existsSync(credentialHelper)) {
+    return { command, args: [...args] };
+  }
+  return {
+    command,
+    args: [
+      "-c",
+      "credential.https://github.com.helper=",
+      "-c",
+      `credential.https://github.com.helper=${credentialHelper}`,
+      ...args,
+    ],
+  };
+}
+
 /**
  * Raised when a git subprocess exceeded its wall-clock budget. Distinguished from
  * a non-zero exit so callers can retry a transient stall without also retrying a
@@ -1129,8 +1200,7 @@ async function runGit(
   options: { env?: NodeJS.ProcessEnv; timeoutMs?: number; maxStdoutBytes?: number; maxStderrBytes?: number } = {},
 ): Promise<string> {
   const proc = await executeProcess({
-    command: "git",
-    args,
+    ...resolveServerGitInvocation(args),
     cwd,
     env: options.env,
     timeoutMs: options.timeoutMs,
@@ -1817,8 +1887,7 @@ async function getGitWorktreeBranchAncestryVerdict(input: {
   if (!input.expectedHeadSha || !input.actualHeadSha) return "unknown";
 
   const proc = await executeProcess({
-    command: "git",
-    args: ["merge-base", "--is-ancestor", input.expectedHeadSha, input.actualHeadSha],
+    ...resolveServerGitInvocation(["merge-base", "--is-ancestor", input.expectedHeadSha, input.actualHeadSha]),
     cwd: input.repoRoot,
   }).catch(() => null);
   if (!proc) return "unknown";
@@ -4148,13 +4217,15 @@ async function recordGitOperation(
   let timedOut = false;
   await recorder.recordOperation({
     phase: input.phase,
+    // Display stays the plain `git <args>` the operator would recognise; only
+    // the spawned binary is pinned past the egress wrapper. See
+    // `resolveServerGitInvocation`.
     command: formatCommandForDisplay("git", input.args),
     cwd: input.cwd,
     metadata: input.metadata ?? null,
     run: async () => {
       const result = await executeProcess({
-        command: "git",
-        args: input.args,
+        ...resolveServerGitInvocation(input.args),
         cwd: input.cwd,
         env: input.env,
         timeoutMs: input.timeoutMs,
