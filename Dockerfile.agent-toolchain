@@ -423,6 +423,21 @@ RUN muxers="$(ffmpeg -hide_banner -muxers 2>&1)" || { \
       || { echo 'ERROR: moq_mmt muxer missing from copied ffmpeg; ffmpeg -muxers said:'; \
            printf '%s\n' "$muxers"; exit 1; }
 
+# Compiler results are shared via the company's private Ceph S3 cache; Cargo
+# target directories stay on each Job's emptyDir.
+RUN set -eu; \
+    curl -fsSL --retry 3 \
+      https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz \
+      -o /tmp/sccache.tar.gz; \
+    printf '%s  /tmp/sccache.tar.gz\n' \
+      aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588 \
+      | sha256sum -c -; \
+    tar -xzf /tmp/sccache.tar.gz -C /tmp; \
+    install -m 0755 /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl/sccache /usr/local/bin/sccache; \
+    rm -rf /tmp/sccache.tar.gz /tmp/sccache-v0.16.0-x86_64-unknown-linux-musl; \
+    test "$(sccache --version)" = 'sccache 0.16.0'
+COPY --chmod=0755 scripts/paperclip-sccache.sh /usr/local/bin/paperclip-sccache
+
 # Hand back to the non-root `node` user — paperclip's docker-entrypoint.sh
 # runs as that uid (matches the host user mapping established in the base
 # image's USER_UID/USER_GID args).
