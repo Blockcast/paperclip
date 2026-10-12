@@ -1096,11 +1096,19 @@ const SERVER_GIT_REAL_BINARY_PATH = "/usr/bin/git";
  * appended and was not invoked once the empty assignment preceded it. This
  * matches the wrapper's coverage exactly, including its limit: it resets the
  * `https://github.com`-scoped list only, not an unscoped `credential.helper`.
+ * It defeats a helper added through *repo config*; it is not a trust boundary
+ * against a replaced helper *file*, since the pinned helper itself sits on the
+ * agent-writable `/paperclip` volume (as the wrapper the server used before did).
  *
  * Resolved per call rather than cached: two `existsSync` checks are free next to
  * spawning a process, and it keeps `PAPERCLIP_SERVER_GIT` overridable in tests
- * with no reset seam. Off-image (dev, CI) both paths are absent and this falls
- * back to bare `git` on PATH, where no wrapper exists to bypass. `paths` exists
+ * with no reset seam. The override is taken verbatim, with no credential
+ * arguments, so a test's git shim sees the same argv on every host whether or
+ * not the chart's helper happens to exist there. Off-image (dev, CI) the helper is absent, so the
+ * credential arguments are dropped; `/usr/bin/git` is usually still present and
+ * is used directly, so a test that stubs git must pin `PAPERCLIP_SERVER_GIT`
+ * rather than prepend a shim to PATH. Bare `git` on PATH is the rare fallback
+ * for a host with neither. `paths` exists
  * only so tests can drive both branches against real files; production passes
  * nothing.
  */
@@ -1111,7 +1119,8 @@ export function resolveServerGitInvocation(
   const gitBinary = paths.gitBinary ?? SERVER_GIT_REAL_BINARY_PATH;
   const credentialHelper = paths.credentialHelper ?? SERVER_GIT_CREDENTIAL_HELPER_PATH;
   const override = process.env.PAPERCLIP_SERVER_GIT?.trim();
-  const command = override || (existsSync(gitBinary) ? gitBinary : "git");
+  if (override) return { command: override, args: [...args] };
+  const command = existsSync(gitBinary) ? gitBinary : "git";
   if (command === "git" || !existsSync(credentialHelper)) {
     return { command, args: [...args] };
   }

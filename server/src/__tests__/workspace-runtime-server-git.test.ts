@@ -66,7 +66,7 @@ describe("resolveServerGitInvocation", () => {
     ]);
   });
 
-  it("resets the helper list before adding ours, so an agent-written helper cannot harvest the token", () => {
+  it("resets the helper list before adding ours, so a repo-config helper an agent adds cannot harvest the token", () => {
     const resolved = resolveServerGitInvocation(["status"], {
       gitBinary: fakeGit,
       credentialHelper: fakeHelper,
@@ -102,13 +102,16 @@ describe("resolveServerGitInvocation", () => {
     expect(noHelper.args).toEqual(["fetch"]);
   });
 
-  it("honours the PAPERCLIP_SERVER_GIT override", () => {
+  it("honours the PAPERCLIP_SERVER_GIT override verbatim, with no credential arguments", () => {
     process.env.PAPERCLIP_SERVER_GIT = fakeGit;
+    // The helper exists here, so a non-override resolution would prefix `-c` pairs;
+    // the override must not, or a test shim matching on `$1` misses on any host
+    // that has the chart's helper.
     const resolved = resolveServerGitInvocation(["status"], {
       gitBinary: missing,
-      credentialHelper: missing,
+      credentialHelper: fakeHelper,
     });
-    expect(resolved.command).toBe(fakeGit);
+    expect(resolved).toEqual({ command: fakeGit, args: ["status"] });
   });
 
   it("ignores a blank override rather than spawning an empty command", () => {

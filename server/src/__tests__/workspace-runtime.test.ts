@@ -608,6 +608,8 @@ afterEach(async () => {
   // unrelated timeout in a downstream test rather than as a failure here.
   if (BASELINE_PATH === undefined) delete process.env.PATH;
   else if (process.env.PATH !== BASELINE_PATH) process.env.PATH = BASELINE_PATH;
+  // The shim tests also pin the server git past PATH; clear it the same way.
+  delete process.env.PAPERCLIP_SERVER_GIT;
   delete process.env.PAPERCLIP_CONFIG;
   delete process.env.PAPERCLIP_HOME;
   delete process.env.PAPERCLIP_INSTANCE_ID;
@@ -4205,6 +4207,8 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      // The server resolves git past PATH (`resolveServerGitInvocation`), so pin it.
+      process.env.PAPERCLIP_SERVER_GIT = shimPath;
       // Matches the sibling shim tests; see this block's budget rationale for why
       // the probe is 2_000 rather than a number that just clears process startup.
       setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
@@ -4392,6 +4396,8 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      // The server resolves git past PATH (`resolveServerGitInvocation`), so pin it.
+      process.env.PAPERCLIP_SERVER_GIT = shimPath;
 
       try {
         await expect(
@@ -4474,6 +4480,8 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      // The server resolves git past PATH (`resolveServerGitInvocation`), so pin it.
+      process.env.PAPERCLIP_SERVER_GIT = shimPath;
       // attempts: 3 so that acting on the salvaged evidence is observable -- a
       // correct implementation stops after the first stall because it already has
       // a conclusive answer, rather than spending two more budgets on it.
@@ -4557,6 +4565,8 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      // The server resolves git past PATH (`resolveServerGitInvocation`), so pin it.
+      process.env.PAPERCLIP_SERVER_GIT = shimPath;
       setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
 
       try {
@@ -4635,6 +4645,8 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      // The server resolves git past PATH (`resolveServerGitInvocation`), so pin it.
+      process.env.PAPERCLIP_SERVER_GIT = shimPath;
       setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 3, retryDelayMs: 1 });
       setProcessGroupLivenessProbeForTests(() => true);
 
@@ -4726,6 +4738,8 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      // The server resolves git past PATH (`resolveServerGitInvocation`), so pin it.
+      process.env.PAPERCLIP_SERVER_GIT = shimPath;
       setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 3, retryDelayMs: 1 });
       setProcessGroupLivenessProbeForTests(() => true);
 
@@ -4821,6 +4835,8 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      // The server resolves git past PATH (`resolveServerGitInvocation`), so pin it.
+      process.env.PAPERCLIP_SERVER_GIT = shimPath;
       setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
       // This test asserts "2 attempt(s)" and `attempts: 2` on the post-repair
       // probe, so it needs the retry branch for the same reason as above.
@@ -4931,6 +4947,8 @@ describe("realizeExecutionWorkspace", () => {
       await fs.chmod(shimPath, 0o755);
       const previousPath = process.env.PATH;
       process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+      // The server resolves git past PATH (`resolveServerGitInvocation`), so pin it.
+      process.env.PAPERCLIP_SERVER_GIT = shimPath;
       setSubmoduleInspectSettingsForTests({ timeoutMs: 2_000, attempts: 2, retryDelayMs: 1 });
       // The `repair_withheld` guard keys off whether the timed-out process group
       // survived SIGKILL. In the CI occurrence it had not, so the repair ran; pin
