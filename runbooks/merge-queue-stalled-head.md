@@ -450,9 +450,32 @@ gh run list --repo Blockcast/paperclip --workflow pr.yml --event merge_group \
 
 **Clustered in time is half the reading, and the query above does not print
 it.** A window wide enough to hold two separate reds ranks their *sum* at the
-top, which is a shape neither row of the table describes. Add `createdAt` to
-the `--json` list and carry it through the loop when two rows compete; the
-worked example below is exactly that case.
+top, which is a shape neither row of the table describes. When two rows
+compete, run this timestamped variant; the worked example below is exactly
+that case:
+
+```bash
+# Same as above, plus each PR's earliest failure time on that job.
+gh run list --repo Blockcast/paperclip --workflow pr.yml --event merge_group \
+  --status failure --created "$WINDOW" \
+  --json databaseId,headBranch,createdAt --limit 100 \
+  --jq '.[]|"\(.databaseId)\t\(.headBranch)\t\(.createdAt)"' \
+| while IFS=$'\t' read -r id br ts; do
+    pr=${br##*/pr-}; pr=${pr%%-*}
+    gh api "repos/Blockcast/paperclip/actions/runs/$id/jobs?per_page=100" --paginate \
+      --jq '.jobs[]|select(.conclusion=="failure")|.name' \
+    | grep -vxF verify | sed "s|\$|\t$pr\t$ts|"
+  done | sort -t$'\t' -k3,3 \
+| awk -F'\t' '!seen[$1 SUBSEP $2]++ {n[$1]++; p[$1]=p[$1]" "$2"@"substr($3,6,11)}
+              END{for(j in n) printf "%d\t%s\t%s\n", n[j], j, p[j]}' \
+| sort -rn
+```
+
+Do **not** get there by appending the timestamp and keeping `sort -u`: a
+`job\tpr\tts` line is unique per *run*, so a PR re-queued three times survives
+the dedup three times and the count silently becomes a run count — 9 → 12 and
+6 → 10 on the worked example. The `seen` guard dedupes on job and PR alone, and
+sorting by time first makes the time it keeps each PR's earliest failure.
 
 **Four ways to read this query wrong:**
 
@@ -461,25 +484,32 @@ worked example below is exactly that case.
   construction and reads as "same job everywhere" on *any* bad day. Left in, it
   is a permanent false positive. The `grep -vxF verify` above is load-bearing.
 - **Count distinct PRs, not runs.** One PR re-queued three times contributes
-  three runs and is one data point; the `sort -u` above is what makes the count
-  mean what the table says.
+  three runs and is one data point; the `sort -u` above (the `seen` guard in
+  the timestamped variant) is what makes the count mean what the table says.
 - **Two entries sharing a job name is not a red base.** It is the weakest
   reading the query can produce and a plausible coincidence — the window below
-  contains two of those (`General tests (workspaces-b)`, and the 10-07 01:4xZ
-  `Typecheck + Release Registry` pair), both hours away from any cluster.
+  contains two of those (`General tests (workspaces-b)`, and the 10-07
+  01:43Z/02:03Z `Typecheck + Release Registry` pair — which the query prints
+  inside row 1's 9, and which shows as a pair only in the timestamped
+  variant), both hours away from any cluster.
   **Confirm on `master` itself before acting**: the one `master-health.yml`
   failure in the whole of 2026-10-01→10-08 is the 10-07 red base, at
   `73231deccc3c` `09:29:24Z`. ⚠ That workflow is **not** a detector — it
   self-cancels on supersession (31 of 46 runs that day), so a red can pass
-  under it unobserved. A `success` there is evidence; an absence is not.
+  under it unobserved; an absence is not evidence. Nor is a `success` outside
+  `general_tests`, the only matrix it replicates: it reported `success` twice
+  on the 10-08 red base below (`99c6ae2c4e`, push 18:18:59Z and schedule
+  10-09T01:20:02Z), because that break was a typecheck job.
 - **A window that includes today returns a prefix of today.** Re-run once the
   day has closed, or a cluster still in progress reads as a coincidence. This
   section shipped with `Typecheck + Release Registry` at **2 PRs**, measured
   2026-10-08T14:0xZ and correct then; the same query re-run on 10-10 returns
-  **9**, because a second red base ran 10-08 17:03Z→23:43Z and was still in the
-  future. The row this section offered as its negative control was the positive
-  case. Same trap as the 19/44 snapshot corrected under "Invalidation fan-out"
-  below — a figure measured mid-window and written down as a total.
+  **9**, because a second red base's failures ran 10-08 17:03Z→23:43Z and were
+  still in the future. The row this section offered as its negative control was
+  the positive case. Same trap as the 19/44 snapshot corrected under "2-lane
+  invalidation fan-out" below — a figure measured mid-window and written down
+  as a total. That section's own 10-08 row was measured at the same instant and
+  had the same defect.
 
 **Worked example — 2026-10-07, this repo.** `master` red from **08:59:36Z**
 (`f3e05fc53`, [#2263](https://github.com/Blockcast/paperclip/pull/2263)) until
@@ -500,18 +530,29 @@ the 10-07 red base: six distinct PRs, ten runs, **one assertion** —
 `security-audit-overrides.test.ts > has a guard wired for every ticket bucket`
 — every one of them between 09:29Z and 14:51Z.
 
-Row 1 is **a second, unrelated red base**, not a bigger version of the first.
-Seven of its nine PRs (2311–2333) fail between 10-08 17:03Z and 23:43Z, a
-distinct cluster that cleared without a ticket — all seven merged by 10-09,
-and the queue has run green since. Its other two (1864, 2157) sit at 10-07
-01:4xZ and belong to neither. The count alone cannot separate a 9 that is two
-incidents plus noise from a 9 that is one; the timestamps can, which is what
-the "clustered in time" qualifier in the table is for.
+Row 1 is **a second, unrelated red base**, not a bigger version of the first,
+and it landed the same way. [#2322](https://github.com/Blockcast/paperclip/pull/2322)
+failed its own entry at 17:03Z, was removed from the queue at 18:08:15Z, and
+was merged directly at 18:18:56Z (`99c6ae2c4e`); it put a test file under
+typecheck that call sites already on `master` did not satisfy, and every entry
+built on that base failed the same job until
+[#2343](https://github.com/Blockcast/paperclip/pull/2343) (`319be947b4`)
+merged at 10-09T02:33:47Z. Seven of row 1's nine PRs (2311–2333) are that
+cluster, failing 10-08 17:03Z→23:43Z; six merged by 10-09 and #2331 on
+10-10T16:13Z. Its other two (2157 at 10-07 01:43Z, 1864 at 02:03Z) belong to
+neither. As of 2026-10-12 no later `merge_group` failure shares its job with
+another. The count alone cannot separate a 9 that is two incidents plus noise
+from a 9 that is one; the timestamps can, which is what the "clustered in
+time" qualifier in the table is for. The timestamped variant prints row 1 as:
+
+```
+9  Typecheck + Release Registry  2157@10-07T01:43 1864@10-07T02:03 2322@10-08T17:03 2330@10-08T17:47 2331@10-08T18:19 2318@10-08T20:28 2333@10-08T21:09 2311@10-08T22:06 2312@10-08T23:43
+```
 
 The bottom rows are the other side of the discriminator — different jobs, one
 or two entries each, scattered rather than clustered. Those entries own their
-own failures. PR 2142 appears on both sides: innocent at 09:5xZ against the red
-base, genuinely bad at 18:29Z against a fixed one.
+own failures. PR 2142 appears on both sides: innocent at 13:30Z and 14:51Z
+against the red base, genuinely bad at 18:29Z against a fixed one.
 
 **How it landed** — a semantic conflict between two individually-correct
 commits. `3c6322515` ([BLO-40607](/BLO/issues/BLO-40607)) added a
@@ -849,8 +890,9 @@ mid-incident snapshot taken while it was still running, and 54/90 is the
 complete day.)
 
 **This is a cost of parallelism, not a regression to back out** — and the
-measured cost is modest once the red-base day is set aside. Cancelled share of
-`merge_group` `pr.yml` builds, per day (measured 2026-10-08T14:0xZ):
+measured cost is modest once red-base builds are set aside. Cancelled share of
+`merge_group` `pr.yml` builds, per complete day (re-measured 2026-10-12; the
+10-08 row first shipped as a 14:0xZ prefix, 34 builds / 9 cancelled):
 
 | day | lanes | builds | cancelled | |
 |---|---:|---:|---:|---:|
@@ -859,28 +901,44 @@ measured cost is modest once the red-base day is set aside. Cancelled share of
 | 2026-10-05 | 2 | 43 | 3 | 7.0% |
 | 2026-10-06 | 2 | 42 | 0 | 0.0% |
 | ~~2026-10-07~~ | 2 | 90 | 54 | *60.0% — red base, not fan-out* |
-| 2026-10-08 (partial) | 2 | 34 | 9 | 26.5% |
+| 2026-10-08 | 2 | 52 | 14 | 26.9% — *mixed: 37 builds / 9 fan-out, then 15 builds / 5 cancelled on the red base* |
 
-**1-lane baseline 1.4% (2/140); 2-lane excluding the red-base day 7.4%
-(12/162)** — a ~5× rise, well short of the
+**1-lane baseline 1.4% (2/140); 2-lane excluding red-base builds 7.3%
+(12/165)** — a ~5× rise, well short of the
 [BLO-22289](/BLO/issues/BLO-22289) cascade signature the issue asked for.
 Net drain went 17.3/day → 40.0/day and depth 108 → 27, so the trade is a good
 one at this ratio.
 
-⚠ **Two days get dropped from that figure and only one of them may be.**
-Dropping 10-07 is sound — it is a red base, a different mechanism, named above.
-Dropping 10-08 is not: its 9 cancellations are at 03:15–04:12Z, **eleven hours
-after** [#2290](https://github.com/Blockcast/paperclip/pull/2290) fixed the
-base at 16:31Z, so the red-base explanation does not reach them. They are
-ordinary fan-out around a single bad entry — `pr-2269` failed at 02:52Z, after
-which `pr-2272` re-formed across 4 bases and `pr-2297` across 3, green again by
-04:19Z. Bounded re-formation while merges continue (45 in 24h, depth 8), which
-is the shape this section describes working as intended. An earlier revision
-recorded 2.3% by quoting 10-04→10-06 only; that window ends the day before both
-of these and understates the steady state.
+⚠ **Red-base builds are set aside, not red-base days.** 10-07 is all red
+base and goes entirely. 10-08 is **mixed**, a case that "drop the day" or
+"keep the day" both get wrong:
+
+- **Morning — fan-out, kept.** Its 9 cancellations are at 03:15–04:12Z,
+  **eleven hours after** [#2290](https://github.com/Blockcast/paperclip/pull/2290)
+  fixed the 10-07 base at 16:31Z, so that red base does not reach them. They
+  are ordinary fan-out around a single bad entry — `pr-2269` failed at 02:52Z,
+  after which `pr-2272` re-formed across 4 bases and `pr-2297` across 3, green
+  again by 04:19Z. Bounded re-formation while merges continue (45 in 24h,
+  depth 8), which is the shape this section describes working as intended.
+- **Evening — red base, set aside.** All 15 builds from 17:03:58Z on are the
+  second red base under "The base is red" (#2322's own entry, then the base it
+  left behind): 10 failures and 5 cancellations — `pr-2330` + `pr-2331`
+  formed at 18:08Z as #2322 left the queue, `pr-2333` at 22:34Z, `pr-2311` +
+  `pr-2333` at 23:05Z (build creation times, as in the morning bullet). No
+  other build ran in that window. Those cancellations are the downstream
+  symptom the ☠️ rule above says to set aside.
+
+That gives 10-08 as 37 builds / 9 cancelled, and the 7.3% above. The two
+whole-day readings bracket it and both are wrong: **9.4% (17/180)** counts the
+red base's 5 as fan-out; **2.3% (3/128)** drops 10-08 outright, which an
+earlier revision quoted by stopping at 10-06 and which discards the morning's
+genuine fan-out. The headline barely moved (7.4% → 7.3%) only because the
+14:0xZ prefix ended before the red base began and the three builds between
+them succeeded — the same mid-window trap "The base is red" warns about, and
+luck rather than a reason to skip the re-measure.
 
 **Cancelled builds are wasted runner-seconds, so this is a capacity cost as
-well as a latency one.** A 7.4% cancel rate is a plausible contributor to the
+well as a latency one.** A 7.3% cancel rate is a plausible contributor to the
 p90 23-minute per-job runner wait measured in the stall counter above — the two
 sections are measuring opposite ends of the same pool. Neither figure is near a
 threshold today; they are worth watching together rather than separately.
