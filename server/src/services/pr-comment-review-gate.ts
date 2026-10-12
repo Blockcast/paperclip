@@ -597,9 +597,13 @@ function headsWithUndispositionedFinding(
     const headSha = entry.attesting.attestedHeadSha;
     const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
     if (!reported) return [];
-    return reported
-      .filter((finding) => !ledger.some((prior) => namesFinding(prior, headSha, entry.timeMs, finding)))
-      .map((finding) => `${finding.severity} ${finding.index}`);
+    // A refused author-lane entry DID name the finding; it was only refused.
+    // Listing it here would tell the author to add an entry that already
+    // exists while `carriedTail` says it was refused, which is the routing
+    // loop that tail exists to close.
+    const named = (finding: AllyFindingRef) =>
+      [...ledger, ...refusedByAuthorLane].some((prior) => namesFinding(prior, headSha, entry.timeMs, finding));
+    return reported.filter((finding) => !named(finding)).map((finding) => `${finding.severity} ${finding.index}`);
   };
 
   // True when this head is red *because* a retirement was refused for naming
