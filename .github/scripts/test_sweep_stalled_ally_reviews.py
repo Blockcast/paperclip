@@ -3937,6 +3937,35 @@ class TestVerdictBlockMirrorsTheGateOnFencesAndLedgers(unittest.TestCase):
             [self.block(',"dispositions":%s' % dispositions), "", "## Ally — Consolidated PR Review"]
         )
 
+    def test_a_malformed_reviewer_lane_is_rejected_here_too(self):
+        # BLO-34389, and the third instance of this same defect. The gate fails
+        # a present-but-unreadable `reviewer` closed (parseAllyVerdictBlock ->
+        # "ally-verdict reviewer is not a lane identifier"); without the mirror
+        # this reader answered ("ok", head) for the identical body, so the gate
+        # went red while the sweep saw a review that already happened and never
+        # re-requested the one that would clear it.
+        #
+        # These five shapes are the ones the gate enumerates, and they are what
+        # a model emits when it is unsure which lane it is -- `null` above all.
+        for reviewer in ('null', '7', '""', '"   "', '{"lane":"ally"}'):
+            body = self.body_with_reviewer(reviewer)
+            self.assertIsNone(sweep.parse_reviewed_head(body), reviewer)
+
+    def test_control_an_absent_or_well_formed_reviewer_still_attests(self):
+        # ABSENT is the permissive direction on purpose and must stay that way:
+        # every review posted before the field existed declares no lane, so
+        # failing those closed would wedge the whole open-PR population red.
+        # `self.body()` carries no `reviewer` at all and is that control.
+        self.assertEqual(sweep.parse_reviewed_head(self.body()), self.HEAD)
+        for reviewer in ('"ally@paperclip.blockcast.net"', '"  Staff-Engineer "'):
+            body = self.body_with_reviewer(reviewer)
+            self.assertEqual(sweep.parse_reviewed_head(body), self.HEAD, reviewer)
+
+    def body_with_reviewer(self, reviewer):
+        return "\n".join(
+            [self.block(',"reviewer":%s' % reviewer), "", "## Ally — Consolidated PR Review"]
+        )
+
 
 class TestFloatFormattedIntegersMirrorNumberIsInteger(unittest.TestCase):
     """Ally review of #1721 at bbe6d640 -- `isinstance(_, int)` is not that.
