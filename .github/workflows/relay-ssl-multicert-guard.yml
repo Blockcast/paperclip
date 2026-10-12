@@ -19,20 +19,25 @@
 # rather than in a docs/ file because this is where someone reading a red run
 # actually lands — the same convention scheduled-guard-liveness.yml follows.
 #
-# The routing path is now REAL and is this:
+# The routing path, ONCE Blockcast/onprem-k8s#5324 IS MERGED AND ARGO-SYNCED.
+# Until then it does NOT exist: the exporter's TARGETS does not yet name this
+# workflow, so a red run here still pages nobody. Check before relying on it:
+#   gh api repos/Blockcast/onprem-k8s/contents/monitoring/master-gate-exporter/workload/deployment.yaml \
+#     -H "Accept: application/vnd.github.raw" | grep -c relay-ssl-multicert-guard.yml
+# (0 => not wired; also confirm the live Deployment's env, not just master.)
 #
 #   red run  ->  master-gate-exporter (onprem-k8s,
 #                monitoring/master-gate-exporter/workload/deployment.yaml,
-#                TARGETS names this workflow)
+#                TARGETS names this workflow — after #5324)
 #            ->  blockcast_master_gate_verdict_fatal{workflow="relay-ssl-multicert-guard.yml"}
 #            ->  MasterGateRed, for: 30m, severity=warning, team=platform
 #            ->  Alertmanager default route -> paperclip receiver
 #            ->  a Paperclip issue, assigned, in the Platform/SRE lane.
 #
-# So a sustained red reaches a named owner in ~30-60 min. It is a `warning`,
-# not a page in the wake-a-human sense; that is deliberate and matches every
-# other master gate. If you are reading this because a run is red and NO issue
-# exists, the routing is broken — check the exporter is up and that this
+# Once wired, a sustained red reaches a named owner in ~30-60 min. It is a
+# `warning`, not a page in the wake-a-human sense; that is deliberate and
+# matches every other master gate. If #5324 is deployed and a run is red with
+# NO issue, the routing is broken — check the exporter is up and that this
 # workflow is still named in its TARGETS, and say so on BLO-43371.
 #
 # This is a VERDICT watch. The separate liveness watch
@@ -44,12 +49,20 @@
 # red, and the distinction is in the exit status so you need not read the log:
 #
 #   1  relay pods were read and the file shape is WRONG. A config regression.
-#      Delivery-path / Traffic Ops lane, not Platform.
+#      Delivery-path / Traffic Ops lane, not Platform. MasterGateRed sees only
+#      the job conclusion, so it lands in the Platform lane regardless: the
+#      Platform triager reads the exit code and hands exit-1 reds onward.
 #   2  a namespace had NO running relay pods, so the invariant could not be
 #      evaluated there at all. Usually scheduling or capacity. Platform lane.
 #      The 2026-10-10 red was this: the staging relay was unschedulable.
 #
 # Both fail closed. "No pods" is never read as "nothing wrong".
+#
+# Exit 1 is NOT exclusively a config regression. Two unobservable conditions
+# also exit 1 and must be read off the log, not the code: a missing
+# BLOCKCAST_KUBE_CONFIG_B64 (fails in "Configure kubeconfig", before the
+# script runs), and a thrown kubectl error (the script's top-level catch).
+# Check which STEP failed before routing an exit-1 red.
 # Logic and its tests: scripts/check-relay-ssl-multicert.mjs
 name: Relay SSL Multicert Guard
 
