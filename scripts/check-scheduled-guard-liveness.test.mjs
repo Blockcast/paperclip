@@ -203,7 +203,12 @@ describe("classifyGuard — the 54h dispatch outage on a non-`default` lane (BLO
   const lastCompletion = "2026-10-06T23:35:10Z";
   const resumed = Date.parse("2026-10-09T05:37:00Z");
 
-  /** The workflow as the API reported it throughout: `active`, just not dispatching. */
+  /**
+   * The workflow as the API reported it DURING THE 2026-10-06 -> 10-09 WINDOW:
+   * `active`, just not dispatching. That premise is scoped to that window only —
+   * on 2026-10-11 the same workflow read `disabled_manually`, which takes a
+   * different path (see the `disabled_manually` test below).
+   */
   function observedDark() {
     return {
       state: "active",
@@ -228,8 +233,8 @@ describe("classifyGuard — the 54h dispatch outage on a non-`default` lane (BLO
   });
 
   it("reds while the workflow still reports state `active`", () => {
-    // The API said `active` the entire time. A state-based detector would have
-    // passed it on every one of the 48 missed slots.
+    // The API said `active` throughout the 10-06 -> 10-09 window. A state-based
+    // detector would have passed it on every one of the 48 missed slots.
     const result = classifyAt("2026-10-07T12:00:00Z");
     assert.equal(result.status, "stale", "a dark-but-active workflow must still trip the alarm");
   });
@@ -254,10 +259,10 @@ describe("classifyGuard — the 54h dispatch outage on a non-`default` lane (BLO
 
   // The threshold is MEASURED for this guard, not inherited, and this asserts
   // the specific thing measuring bought. Its own jitter ceiling is 173 min —
-  // wider than the hourly six's 118 because it carries `concurrency:` with
-  // `cancel-in-progress: false`, so a queued run is legitimately evicted by the
-  // next arrival and that completion never lands. Handing it the hourly bar
-  // would have false-redded on a real, healthy leg.
+  // wider than the hourly six's 118, measured but unexplained (concurrency
+  // eviction is NOT the cause: an evicted run completes `cancelled`, which the
+  // detector's any-conclusion query returns). Handing it the hourly bar would
+  // have false-redded on a real, healthy leg.
   it("would have false-redded on its own measured jitter at the hourly six's 2.75h bar", () => {
     const healthyLeg = { now: Date.parse("2026-10-04T13:24:00Z"), updatedAt: "2026-10-04T10:31:00Z" };
     const observation = {
@@ -284,6 +289,34 @@ describe("classifyGuard — the 54h dispatch outage on a non-`default` lane (BLO
   it("reads only schedule runs, so a manual dispatch cannot mask the dead cron", () => {
     const entry = WATCHED_GUARDS.find((guard) => guard.workflow === workflow);
     assert.equal(entry.event, "schedule", "dropping the event filter reopens the dispatch-masking window");
+  });
+
+  // The state this workflow is actually in when the entry lands: read
+  // `disabled_manually` on 2026-10-11. The first post-merge execution takes THIS
+  // path, not the age path above. It must red `disabled` through the real
+  // adapter (no run is ever read) and no grace may suppress it — the dispatcher
+  // is genuinely off, and that red is the control working.
+  it("reds `disabled` when the workflow is disabled_manually — its state at merge", () => {
+    const entry = WATCHED_GUARDS.find((guard) => guard.workflow === workflow);
+    assert.equal(entry.graceUntil, undefined, "grace would not reach the disabled path; do not add it");
+
+    const meta = `repos/Blockcast/paperclip/actions/workflows/${workflow}`;
+    const reads = [];
+    const read = ([, path]) => {
+      reads.push(path);
+      if (path === meta) return JSON.stringify({ state: "disabled_manually", name: "Scheduled production deploy dispatch" });
+      throw new Error(`unexpected read ${path}: a disabled workflow's runs must not be read`);
+    };
+    const observation = observeWorkflow("Blockcast/paperclip", workflow, read, entry.event);
+    assert.deepEqual(reads, [meta]);
+
+    const now = Date.parse("2026-10-11T23:47:00Z");
+    for (const graceUntil of [null, "2099-01-01T00:00:00Z"]) {
+      const result = classifyGuard(workflow, observation, { now, staleHours: entry.staleHours, graceUntil });
+      assert.equal(result.status, "stale", `graceUntil=${graceUntil}`);
+      assert.equal(result.reason, "disabled", `graceUntil=${graceUntil}`);
+      assert.match(result.detail, /disabled_manually/);
+    }
   });
 });
 
@@ -1677,9 +1710,9 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
 
     // BLO-42887: hourly CADENCE but on its own measured bar, so it is excluded
     // from the shared-hourly assertion and given its own band here. Its jitter
-    // ceiling is 173 min, not the six's 118, because it carries `concurrency:`
-    // with `cancel-in-progress: false` — a queued run is legitimately evicted by
-    // the next arrival and that completion never lands. Handing it
+    // ceiling is 173 min, not the six's 118 — measured but unexplained, and not
+    // concurrency eviction (an evicted run completes `cancelled`, which the
+    // detector's any-conclusion query returns). Handing it
     // DEFAULT_STALE_HOURS would false-red on a real healthy leg.
     const scheduledDeploy = byWorkflow.get("scheduled-production-deploy.yml");
     assert.ok(

@@ -283,10 +283,13 @@ export const WATCHED_GUARDS = [
   //
   // 240 is picked because 1.39x matches the 1.40x margin the hourly six earned,
   // so this guard is no looser relative to its own jitter than they are to theirs.
-  // Its ceiling is wider than their 118 min for a structural reason specific to
-  // this workflow rather than by accident: it carries `concurrency:` with
-  // `cancel-in-progress: false`, so a queued run is legitimately EVICTED by the
-  // next arrival and that completion never lands. Catch is guaranteed, not merely
+  // Its ceiling is wider than their 118 min, and that is MEASURED BUT UNEXPLAINED.
+  // Do not cite concurrency eviction for it: an evicted queued run completes as
+  // `cancelled`, and `completedRunsPath` reads the newest completed run of ANY
+  // conclusion, so that completion is returned and resets the age clock. The
+  // population this detector reads contains them — the newest 100 completed
+  // `schedule` runs were 83 success / 16 failure / 1 cancelled (read 2026-10-11).
+  // The 173-min ceiling stands on the data alone. Catch is guaranteed, not merely
   // retrospective — a leg of length G sits over bar B for G-B minutes and an
   // hourly detector needs G-B > 60; here 3245-240 = 3005. Detection lands within
   // 240 min plus one sampling interval, i.e. <= 5h against the 54h this took.
@@ -296,8 +299,15 @@ export const WATCHED_GUARDS = [
   // runs landed on 2026-10-06, the day before it went dark. An unfiltered
   // newest-run query is satisfied by those while the cron is dead.
   //
-  // No `graceUntil`: that exists for a workflow with zero completed `schedule`
-  // runs at merge, and this one has 597.
+  // No `graceUntil`, and none could help. Grace exists for a workflow with zero
+  // completed `schedule` runs at merge; this one has 597. More to the point, the
+  // workflow was `state: "disabled_manually"` when this entry was written (read
+  // 2026-10-11T23:56Z; workflow `updated_at` 2026-10-11T14:32:32Z). For any state
+  // but `active`, `observeWorkflow` returns before reading a run and
+  // `classifyGuard` returns stale / reason `disabled` (a STOPPED_REASONS member)
+  // BEFORE its `graceUntil` branch is reached. So the first execution after merge
+  // reds with `reason: disabled` unless the workflow is re-enabled first. That
+  // red is correct — the dispatcher is genuinely off — and is the control working.
   {
     workflow: "scheduled-production-deploy.yml",
     staleHours: 4,
