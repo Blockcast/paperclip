@@ -26,6 +26,7 @@ import {
   commentAuthorCanGrantIssueMention,
   type AuthorizationActor,
 } from "../services/authorization.js";
+import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -4689,6 +4690,28 @@ describeEmbeddedPostgres("authorization service", () => {
         "mentioned",
         "recovery_handoff",
       ]));
+    });
+
+    it("blocker edge (escape hatch 3) gates checkout and in_progress, not done", async () => {
+      // Pins the scope the doc's hatch 3 claims: an open blockedByIssueIds edge
+      // refuses checkout and the in_progress transition, and is NOT a close gate.
+      // If a close gate is ever added, the last assertion fails; update hatch 3
+      // in the same change rather than flipping this expectation alone.
+      const company = await createCompany(db, "Matrix-blocker-edge");
+      const assignee = await createAgent(db, company.id, { role: "engineer" });
+      const criterion = await createIssue(db, company.id, { title: "Criterion filed as its own issue" });
+      const target = await createIssue(db, company.id, {
+        title: "Matrix target (blocker edge)",
+        assigneeAgentId: assignee.id,
+        createdByAgentId: assignee.id,
+      });
+      const svc = issueService(db);
+      await svc.update(target.id, { blockedByIssueIds: [criterion.id] });
+
+      const unresolved = { status: 422, message: "Issue is blocked by unresolved blockers" };
+      await expect(svc.checkout(target.id, assignee.id, ["todo", "blocked"], null)).rejects.toMatchObject(unresolved);
+      await expect(svc.update(target.id, { status: "in_progress" })).rejects.toMatchObject(unresolved);
+      await expect(svc.update(target.id, { status: "done" })).resolves.toMatchObject({ status: "done" });
     });
   });
 });
