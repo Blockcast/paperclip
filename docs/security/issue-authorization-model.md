@@ -15,9 +15,11 @@ writing down what it was supposed to be. The rule it records is:
 
 ## What the decision actually reads
 
-`decideBase` (`server/src/services/authorization.ts`) takes three inputs and nothing
-else: the **actor**, the **action**, and the **target issue's own columns**
-(`assigneeAgentId`, `createdByAgentId`, `issueId`, `parentIssueId`, `originKind`).
+`decideBase` (`server/src/services/authorization.ts`) decides from the **actor**, the
+**action**, and the target issue, and it looks up the actor's own relations to that
+issue (membership and instance roles, the `reportsTo` chain, mention comments,
+recovery handoffs, review rows). It **never loads the issue's project and never
+walks its ancestry.**
 
 Two consequences are load-bearing and are the source of most confusion:
 
@@ -79,7 +81,8 @@ about. They are intentional; the next section says why.
 
 Every path that can return `allowed: true` for `issue:comment` / `issue:mutate` /
 `issue:coordination_metadata`, in evaluation order. Line numbers are as of
-`98839e63`; the reason strings are stable and are what the tests assert on.
+`98839e63` and will drift. The reason string is authoritative: when a line number
+and a reason disagree, trust the reason. It is also what the tests assert on.
 
 | Reason | `authorization.ts` | comment | mutate | coordination metadata | Condition |
 | --- | --- | :---: | :---: | :---: | --- |
@@ -161,12 +164,18 @@ In order of cost. All three are supported today; none requires a code change.
    the description directly.
 3. **Attach the criterion as a dependency.** Blocker edges *are* reachable by a
    manager holding `tasks:assign` (`issue:coordination_metadata`), so the criterion
-   can be filed as its own issue and attached with `blockedByIssueIds`. This is
-   strictly binding — the issue cannot close while the edge is unresolved — and it
-   is the only one-call option available to a manager.
+   can be filed as its own issue and attached with `blockedByIssueIds`. It is the
+   only one-call option available to a manager, and it binds the **start** of work,
+   not the close: while the edge is unresolved the issue cannot be checked out
+   (`checkout`) or moved to `in_progress` (`update`) — both in
+   `server/src/services/issues.ts`, both refusing with `Issue is blocked by
+   unresolved blockers`. Nothing refuses `status: "done"` while the edge is open,
+   so a principal holding `issue:mutate` can still close past the criterion. A
+   criterion the close must meet still has to reach the description through
+   hatch 1 or 2.
 
-Hatch 1 depends on the assignee being able to run. When it cannot, hatch 3 binds
-without it and hatch 2 does not depend on any agent.
+Hatch 1 depends on the assignee being able to run. When it cannot, hatch 3 still
+keeps the work from starting without it, and hatch 2 does not depend on any agent.
 
 ## Negative controls — what must stay denied
 
@@ -191,6 +200,11 @@ the four board principals included, and the parent-or-sibling row split into two
 asserting every action verdict in the allow-path table, including the denials. The
 four historical incidents are rows in that table rather than separate cases, which
 is the specific thing that was missing when each of them shipped.
+
+Escape hatch 3's scope is pinned by the sibling case **"blocker edge (escape hatch 3)
+gates checkout and in_progress, not done"** in the same describe block. It fails if
+either refusal is dropped, and it fails if a close gate is added without hatch 3
+being updated to say so.
 
 Changing any outcome documented above fails that test. It does **not** notice a new
 allow-path reachable only by a relation the table does not model — so adding an
