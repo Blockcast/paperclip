@@ -198,6 +198,35 @@ export async function raiseIssueCounterAfterImport(
   });
 }
 
+/**
+ * OAuth callback: align the company's issue identity with the Linear team.
+ *
+ * BLO-31228: connecting is not confirmation to re-identify a company, so
+ * `confirmPrefixChange` stays false — a company with nothing minted adopts the
+ * team key, one that already has identifiers keeps its prefix and the refusal
+ * is logged and audited. `highestLinearNumber` is only a sample (the most
+ * recently *updated* issues, or 0 when that fetch failed), so it can only raise
+ * the counter: on an ordinary reconnect Paperclip has minted past it, and that
+ * is a silent no-op, not a counter-regression refusal.
+ */
+export async function syncIssueIdentityFromLinearTeam(
+  db: Db,
+  companyId: string,
+  teamKey: string,
+  highestLinearNumber: number,
+) {
+  return setCompanyIssueIdentity(db, {
+    companyId,
+    prefix: teamKey,
+    counter: highestLinearNumber,
+    confirmPrefixChange: false,
+    raiseCounterOnly: true,
+    actorType: "system",
+    actorId: LINEAR_OAUTH_ACTOR,
+    reason: "linear-oauth-callback",
+  });
+}
+
 export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
   const router = Router();
   const svc = secretService(db);
@@ -419,19 +448,8 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
           console.log(`[linear-auth] highest issue number from Linear: ${issueCounter}`);
         }
 
-        // BLO-31228: never a raw write on identity columns. Connecting is not
-        // confirmation to re-identify a company, so `confirmPrefixChange` stays
-        // false here: a company with no prefix adopts the team key, a company
-        // that already has one keeps it and the refusal is logged and audited.
-        const identity = await setCompanyIssueIdentity(db, {
-          companyId,
-          prefix: teamKey,
-          counter: issueCounter,
-          confirmPrefixChange: false,
-          actorType: "system",
-          actorId: LINEAR_OAUTH_ACTOR,
-          reason: "linear-oauth-callback",
-        });
+        // BLO-31228: never a raw write on identity columns.
+        const identity = await syncIssueIdentityFromLinearTeam(db, companyId, teamKey, issueCounter);
         console.log(
           `[linear-auth] issue identity now prefix=${identity.issuePrefix} ` +
             `counter=${identity.issueCounter}` +
@@ -1471,7 +1489,11 @@ export function linearAuthRoutes(db: Db, config: LinearAuthConfig) {
     }
   });
 
-  // POST /api/auth/linear/configure — update prefix and counter
+  // POST /api/auth/linear/configure — update prefix and counter.
+  // 200: every requested change was applied. 409: some part was refused (a
+  // counter below the stored floor). A 409 is not all-or-nothing: the other
+  // part of the request may already be applied — `changed` says whether it
+  // was, and `issuePrefix`/`issueCounter` are the identity as it now stands.
   router.post("/configure", async (req, res) => {
     assertBoard(req);
     const companyId = req.query.companyId as string;
