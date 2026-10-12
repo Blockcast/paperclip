@@ -3439,8 +3439,10 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     expect(result).toBeTruthy();
     expect(result?.description).toHaveLength(1200);
-    expect(result?.executionPolicy).toBeNull();
-    expect(result?.executionState).toBeNull();
+    // BLO-44407: policy is absent (unbounded, not served here); state is trimmed to its
+    // bounded summary keys, so an unrecognised blob yields an empty summary, not a forged null.
+    expect(result).not.toHaveProperty("executionPolicy");
+    expect(result?.executionState).toEqual({});
     expect(result?.executionWorkspaceSettings).toBeNull();
   });
 
