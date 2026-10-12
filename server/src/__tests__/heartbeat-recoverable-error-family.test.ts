@@ -213,9 +213,9 @@ describe("BLO-35668: skill_materialization_pending retries wherever adapter_fail
   // The actual invariant the #1669 comment asserts. Written as a comparison
   // rather than a literal `true` so it keeps holding if `adapter_failed`'s own
   // gating is ever narrowed — the two must move together or not at all.
+  // Issue context is deliberately absent: BLO-44931 below diverges there.
   it.each([
     ["pr_review context", prReview],
-    ["issue context", { issueId: "issue-a" }],
     ["neither", {}],
   ] as const)("matches adapter_failed exactly (%s)", (_label, contextSnapshot) => {
     expect(
@@ -272,6 +272,49 @@ describe("BLO-35668: skill_materialization_pending retries wherever adapter_fail
     expect(ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has("skill_materialization_pending")).toBe(
       ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has("adapter_failed"),
     );
+  });
+});
+
+// BLO-44931 — the non-PR sibling. The issue continuation sweep re-dispatches to
+// the issue's ASSIGNEE, so a wake for any other agent (here a mention on a row it
+// does not own) had no retry path in either engine: measured on run 4b505e43,
+// 2026-10-11, a blocking CEO decision lost for ~2h. The code is raised before the
+// CLI is spawned, so issue runs may retry it without an invocation proof — which
+// is exactly what `adapter_failed` lacks, hence the deliberate divergence.
+describe("BLO-44931: skill_materialization_pending retries a non-PR issue wake", () => {
+  const mentionWake = {
+    issueId: "issue-owned-by-someone-else",
+    taskKey: "issue-owned-by-someone-else",
+    wakeReason: "issue_comment_mentioned",
+    wakeCommentId: "comment-a",
+  };
+
+  it("schedules a retry for a mention wake with no invocation proof", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "skill_materialization_pending",
+        resultJson: null,
+        contextSnapshot: mentionWake,
+      }),
+    ).toBe(true);
+  });
+
+  // Controls: the siblings on the same arm stay PR-scoped (no pre-spawn
+  // guarantee), and a run with no issue and no PR context stays terminal.
+  it.each(["adapter_failed", "process_lost"])("leaves %s terminal on an issue wake", (errorCode) => {
+    expect(
+      shouldScheduleAutomaticRunRetry({ errorCode, resultJson: null, contextSnapshot: mentionWake }),
+    ).toBe(false);
+  });
+
+  it("stays terminal with neither issue nor PR context", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "skill_materialization_pending",
+        resultJson: null,
+        contextSnapshot: { wakeReason: "heartbeat_timer" },
+      }),
+    ).toBe(false);
   });
 });
 

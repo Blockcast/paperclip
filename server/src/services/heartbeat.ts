@@ -1825,11 +1825,22 @@ export function shouldScheduleAutomaticRunRetry(
   // likewise unasserted: those assertions are keyed on the two literals and
   // cannot see a set they do not name, so enumerate consumers by hand. Site 1
   // is not exported from recovery/service.ts and is unasserted either way.
-  if (
-    run.errorCode !== "adapter_failed" &&
-    run.errorCode !== "process_lost" &&
-    run.errorCode !== "skill_materialization_pending"
-  ) {
+  //
+  // BLO-44931: for ISSUE runs this code is admitted here too, unlike its two
+  // siblings on this arm. The continuation sweep that covers `adapter_failed`
+  // on issue runs re-dispatches to the issue's assignee (or in_review
+  // participant) — recovery/service.ts `reconcileStrandedCandidate` picks
+  // `agentId` from the issue, never from the failed run — so a wake for any
+  // OTHER agent (an `issue_comment_mentioned` on a row it does not own) had no
+  // retry path in either engine and was dropped. Safe without an invocation
+  // proof because the claude-k8s adapter raises it before the CLI is spawned
+  // (vendor/paperclip-adapter-claude-k8s/src/server/execute.ts, the
+  // `catalogBacked` branch). `adapter_failed`/`process_lost` carry no such
+  // guarantee, so they stay PR-scoped.
+  if (run.errorCode === "skill_materialization_pending") {
+    return isIssueRun || isPrReviewRetryContext(contextSnapshot);
+  }
+  if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") {
     return false;
   }
 
