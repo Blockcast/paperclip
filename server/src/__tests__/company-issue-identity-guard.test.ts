@@ -7,10 +7,14 @@ import { and, eq } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import ts from "typescript";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, companies, createDb, issues } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
-import { linearAuthRoutes, raiseIssueCounterAfterImport } from "../routes/linear-auth.js";
+import {
+  linearAuthRoutes,
+  raiseIssueCounterAfterImport,
+  syncIssueIdentityFromLinearTeam,
+} from "../routes/linear-auth.js";
 import {
   ISSUE_IDENTITY_ACTIVITY_ACTION,
   normalizeIssuePrefix,
@@ -77,6 +81,18 @@ describe("planIssueIdentityChange — prefix", () => {
       expect(plan.prefix).toBe("EGY");
       expect(plan.counter).toBe(363);
       expect(plan.refusals).toEqual([]);
+    }
+  });
+
+  it("does not apply a counter that came with a refused prefix", () => {
+    // Ally I1 on #2529: EGY's numbering must not burn BLO identifiers, and a
+    // lower one is not a counter-regression either — the counter belongs to
+    // the identity that was refused, whichever way the caller asked.
+    for (const raiseCounterOnly of [false, true]) {
+      for (const counter of [40000, 363]) {
+        const plan = planIssueIdentityChange(BLOCKCAST, { prefix: "EGY", counter }, { raiseCounterOnly });
+        expect(plan).toEqual({ prefix: null, counter: null, refusals: ["prefix-change-unconfirmed"], changed: false });
+      }
     }
   });
 
@@ -296,7 +312,7 @@ describe("identity writes across server/src", () => {
     expect(Object.keys(flagged).sort()).toEqual(Object.keys(IDENTITY_WRITE_ALLOW_LIST).sort());
   });
 
-  it("never passes confirmPrefixChange from the OAuth callback handler", () => {
+  it("routes the OAuth callback's identity write through syncIssueIdentityFromLinearTeam only", () => {
     const file = fileURLToPath(new URL("../routes/linear-auth.ts", import.meta.url));
     const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
     const handlers: string[] = [];
@@ -315,8 +331,12 @@ describe("identity writes across server/src", () => {
     };
     visit(source);
     expect(handlers).toHaveLength(1);
-    expect(handlers[0]).toContain("confirmPrefixChange: false");
-    expect(handlers[0]).not.toContain("confirmPrefixChange: true");
+    // The helper's db-backed tests below are what pin confirmPrefixChange:false
+    // and raise-only; they only speak for the callback if it calls the helper
+    // and nothing else touches identity there.
+    expect(handlers[0]).toContain("syncIssueIdentityFromLinearTeam(");
+    expect(handlers[0]).not.toContain("setCompanyIssueIdentity(");
+    expect(handlers[0]).not.toContain("confirmPrefixChange");
   });
 });
 
@@ -399,6 +419,8 @@ describeEmbeddedPostgres("setCompanyIssueIdentity (db-backed)", () => {
   });
 
   it("writes an audit row for a refusal, with the stored and proposed values", async () => {
+    // The refused prefix's counter is recorded as proposed but not judged
+    // (rule 3), so the only refusal is the prefix one.
     const companyId = await seedCompany("BLO", 31222);
     await setCompanyIssueIdentity(db, { companyId, prefix: "EGY", counter: 363, reason: "test" });
     const rows = await auditRows(companyId);
@@ -408,32 +430,28 @@ describeEmbeddedPostgres("setCompanyIssueIdentity (db-backed)", () => {
       from: { issuePrefix: "BLO", issueCounter: 31222 },
       to: { issuePrefix: "BLO", issueCounter: 31222 },
       proposed: { issuePrefix: "EGY", issueCounter: 363 },
-      refusals: ["prefix-change-unconfirmed", "counter-regression"],
+      refusals: ["prefix-change-unconfirmed"],
     });
     expect(await identityOf(companyId)).toEqual({ issuePrefix: "BLO", issueCounter: 31222 });
   });
 
-  it("holds the floor when the allocator bumps the counter between the read and the write", async () => {
-    const companyId = await seedCompany("BLO", 100);
-    // Fire a concurrent allocator-style bump just before the guarded UPDATE
-    // executes, i.e. after setCompanyIssueIdentity has planned against 100.
-    let fired = false;
-    const bumpFirst = <T extends object>(target: T): T =>
+  /** `db`, but `beforeUpdate` runs once, just before the first UPDATE executes. */
+  function raceBeforeUpdate(beforeUpdate: () => PromiseLike<unknown>) {
+    const state = { fired: false };
+    const fireFirst = <T extends object>(target: T): T =>
       new Proxy(target, {
         get(obj, prop) {
           const value = Reflect.get(obj, prop, obj);
           if (prop === "then" && typeof value === "function") {
             return (onFulfilled: unknown, onRejected: unknown) =>
-              (fired
-                ? Promise.resolve()
-                : ((fired = true),
-                  db.update(companies).set({ issueCounter: 500 }).where(eq(companies.id, companyId)))
-              ).then(() => value.call(obj, onFulfilled, onRejected));
+              (state.fired ? Promise.resolve() : ((state.fired = true), beforeUpdate())).then(() =>
+                value.call(obj, onFulfilled, onRejected),
+              );
           }
           if (typeof value === "function") {
             return (...args: unknown[]) => {
               const out = value.apply(obj, args);
-              return out && typeof out === "object" ? bumpFirst(out) : out;
+              return out && typeof out === "object" ? fireFirst(out) : out;
             };
           }
           return value;
@@ -442,15 +460,103 @@ describeEmbeddedPostgres("setCompanyIssueIdentity (db-backed)", () => {
     const racingDb = new Proxy(db, {
       get(obj, prop) {
         const value = Reflect.get(obj, prop, obj);
-        if (prop === "update") return (table: typeof companies) => bumpFirst(db.update(table));
+        if (prop === "update") return (table: typeof companies) => fireFirst(db.update(table));
         return typeof value === "function" ? value.bind(obj) : value;
       },
     });
+    return { racingDb, state };
+  }
+
+  it("holds the floor when the allocator bumps the counter between the read and the write", async () => {
+    const companyId = await seedCompany("BLO", 100);
+    // An allocator-style bump lands after setCompanyIssueIdentity planned
+    // against 100, just before its guarded UPDATE executes.
+    const { racingDb, state } = raceBeforeUpdate(() =>
+      db.update(companies).set({ issueCounter: 500 }).where(eq(companies.id, companyId)),
+    );
 
     const result = await setCompanyIssueIdentity(racingDb, { companyId, counter: 200, reason: "test" });
-    expect(fired).toBe(true);
+    expect(state.fired).toBe(true);
     expect(result.issueCounter).toBe(500);
     expect(await identityOf(companyId)).toEqual({ issuePrefix: "BLO", issueCounter: 500 });
+  });
+
+  it("refuses the adoption when the first identifier is minted between the probe and the write", async () => {
+    // Ally S1 on #2529: the "nothing minted yet" probe and the prefix write
+    // are one decision, so the write re-checks it. The counter that came with
+    // the prefix is not applied either (rule 3).
+    const prefix = `R${randomUUID().slice(0, 5).toUpperCase()}`;
+    const companyId = await seedCompany(prefix, 0);
+    const { racingDb, state } = raceBeforeUpdate(async () => {
+      await db.update(companies).set({ issueCounter: 1 }).where(eq(companies.id, companyId));
+      await db.insert(issues).values({ companyId, title: "minted mid-flight", identifier: `${prefix}-1` });
+    });
+
+    const result = await setCompanyIssueIdentity(racingDb, {
+      companyId,
+      prefix: "EGY",
+      counter: 363,
+      confirmPrefixChange: false,
+      reason: "test",
+    });
+    expect(state.fired).toBe(true);
+    expect(result).toMatchObject({ issuePrefix: prefix, issueCounter: 1, changed: false });
+    expect(result.refusals).toEqual(["prefix-change-unconfirmed"]);
+    expect(await identityOf(companyId)).toEqual({ issuePrefix: prefix, issueCounter: 1 });
+    const rows = await auditRows(companyId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.details).toMatchObject({ refusals: ["prefix-change-unconfirmed"] });
+  });
+
+  describe("linear OAuth callback identity sync", () => {
+    // Ally I1 on #2529. `highestLinearNumber` is the max over the 100 most
+    // recently *updated* Linear issues, or 0 when that fetch failed — a sample,
+    // not the company's counter.
+    async function expectSilentNoOp(highestLinearNumber: number) {
+      const companyId = await seedCompany("BLO", 31222);
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const result = await syncIssueIdentityFromLinearTeam(db, companyId, "BLO", highestLinearNumber);
+        expect(result.refusals).toEqual([]);
+        expect(result.changed).toBe(false);
+        expect(errors.mock.calls.filter(([msg]) => String(msg).includes("REFUSED"))).toEqual([]);
+      } finally {
+        errors.mockRestore();
+      }
+      expect(await auditRows(companyId)).toEqual([]);
+      expect(await identityOf(companyId)).toEqual({ issuePrefix: "BLO", issueCounter: 31222 });
+    }
+
+    it("is a silent no-op on a reconnect whose Linear sample is below the stored counter", async () => {
+      await expectSilentNoOp(363);
+    });
+
+    it("is a silent no-op when the Linear counter fetch failed (0)", async () => {
+      await expectSilentNoOp(0);
+    });
+
+    it("refuses a foreign team's prefix, audited, without raising the counter to its numbering", async () => {
+      const companyId = await seedCompany("BLO", 31222);
+      const result = await syncIssueIdentityFromLinearTeam(db, companyId, "EGY", 40000);
+      expect(result.refusals).toEqual(["prefix-change-unconfirmed"]);
+      expect(await identityOf(companyId)).toEqual({ issuePrefix: "BLO", issueCounter: 31222 });
+      const rows = await auditRows(companyId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.details).toMatchObject({
+        reason: "linear-oauth-callback",
+        to: { issuePrefix: "BLO", issueCounter: 31222 },
+        proposed: { issuePrefix: "EGY", issueCounter: 40000 },
+        refusals: ["prefix-change-unconfirmed"],
+      });
+    });
+
+    it("still raises the counter, audited, when the matching team is ahead", async () => {
+      const companyId = await seedCompany("BLO", 31222);
+      const result = await syncIssueIdentityFromLinearTeam(db, companyId, "BLO", 31300);
+      expect(result.refusals).toEqual([]);
+      expect(await identityOf(companyId)).toEqual({ issuePrefix: "BLO", issueCounter: 31300 });
+      expect(await auditRows(companyId)).toHaveLength(1);
+    });
   });
 
   describe("linear import counter bump", () => {

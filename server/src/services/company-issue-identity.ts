@@ -21,9 +21,13 @@
  *      and the stored value kept — unless the caller only asked to raise the
  *      floor (`raiseCounterOnly`), in which case "nothing higher" is a silent
  *      no-op. A refusal means someone tried to re-identify the company, never
- *      that an import had nothing new.
+ *      that an import or a reconnect had nothing new.
+ *   3. A counter proposed together with a refused prefix is not applied. It was
+ *      computed for the identity that was refused (another team's numbering),
+ *      so raising this company's counter with it would be a partial apply of a
+ *      re-identification nobody confirmed.
  */
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companies, issues } from "@paperclipai/db";
 import { logActivity } from "./activity-log.js";
@@ -93,7 +97,11 @@ export function planIssueIdentityChange(
   }
 
   let counter: number | null = null;
-  if (typeof requested.counter === "number" && Number.isFinite(requested.counter)) {
+  // Rule 3: the counter travels with its prefix. Refused prefix, unread counter
+  // — neither a raise nor a counter-regression refusal; the audit row still
+  // carries the proposed value.
+  const prefixRefused = refusals.includes("prefix-change-unconfirmed");
+  if (!prefixRefused && typeof requested.counter === "number" && Number.isFinite(requested.counter)) {
     // Floor before comparing, so a fractional request one notch above the
     // stored value is not reported as a change that writes nothing.
     const wantCounter = Math.floor(requested.counter);
@@ -165,16 +173,18 @@ export async function setCompanyIssueIdentity(
     raiseCounterOnly: input.raiseCounterOnly,
   });
 
-  for (const refusal of plan.refusals) {
-    console.error(
-      `[issue-identity] REFUSED ${refusal} for company ${input.companyId} (${input.reason}): ` +
-        `stored prefix=${before.issuePrefix} counter=${before.issueCounter}, ` +
-        `proposed prefix=${input.prefix ?? "-"} counter=${input.counter ?? "-"}`,
-    );
-  }
-
+  const refusals = [...plan.refusals];
+  let changed = plan.changed;
   let after: IssueIdentityState = before;
   if (plan.changed) {
+    // When the plan adopts a prefix only because nothing has been minted under
+    // the stored one, re-check that in the write itself, as greatest() does
+    // for the counter: an identifier allocated between the probe above and
+    // this UPDATE would otherwise be re-identified without confirmation. The
+    // counter half is re-evaluated on the locked row, so it also holds against
+    // an allocator bump that commits while this UPDATE waits on the row lock.
+    const adoptsUnminted =
+      plan.prefix !== null && !input.confirmPrefixChange && normalizeIssuePrefix(before.issuePrefix) !== null;
     const [updated] = await db
       .update(companies)
       .set({
@@ -187,12 +197,41 @@ export async function setCompanyIssueIdentity(
           : {}),
         updatedAt: new Date(),
       })
-      .where(eq(companies.id, input.companyId))
+      .where(
+        and(
+          eq(companies.id, input.companyId),
+          adoptsUnminted
+            ? sql`${companies.issueCounter} <= 0 and not exists (select 1 from ${issues} where ${issues.companyId} = ${input.companyId})`
+            : undefined,
+        ),
+      )
       .returning({ issuePrefix: companies.issuePrefix, issueCounter: companies.issueCounter });
-    after = updated ?? before;
+    if (updated) {
+      after = updated;
+    } else if (adoptsUnminted) {
+      // Lost that race: the company now has identifiers, so this is the
+      // unconfirmed re-identification rule 1 refuses — and, per rule 3, the
+      // counter that came with it is not applied either.
+      refusals.push("prefix-change-unconfirmed");
+      changed = false;
+      const [current] = await db
+        .select({ issuePrefix: companies.issuePrefix, issueCounter: companies.issueCounter })
+        .from(companies)
+        .where(eq(companies.id, input.companyId))
+        .limit(1);
+      after = current ?? before;
+    }
   }
 
-  if (plan.changed || plan.refusals.length > 0) {
+  for (const refusal of refusals) {
+    console.error(
+      `[issue-identity] REFUSED ${refusal} for company ${input.companyId} (${input.reason}): ` +
+        `stored prefix=${before.issuePrefix} counter=${before.issueCounter}, ` +
+        `proposed prefix=${input.prefix ?? "-"} counter=${input.counter ?? "-"}`,
+    );
+  }
+
+  if (changed || refusals.length > 0) {
     await logActivity(db, {
       companyId: input.companyId,
       actorType: input.actorType ?? "system",
@@ -206,10 +245,10 @@ export async function setCompanyIssueIdentity(
         to: { issuePrefix: after.issuePrefix, issueCounter: after.issueCounter },
         proposed: { issuePrefix: input.prefix ?? null, issueCounter: input.counter ?? null },
         confirmPrefixChange: input.confirmPrefixChange === true,
-        refusals: plan.refusals,
+        refusals,
       },
     });
   }
 
-  return { ...after, before, refusals: plan.refusals, changed: plan.changed };
+  return { ...after, before, refusals, changed };
 }
