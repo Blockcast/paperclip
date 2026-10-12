@@ -93,6 +93,16 @@ beforeEach(() => {
   // A PR author who is not the reviewer identity, so the existing fixtures keep
   // their meaning; the self-attestation tests override it (BLO-34316).
   mockFetchPrAuthor.mockResolvedValue("some-contributor");
+  // Throws rather than resolving, so a future lane-declaring case that forgets
+  // to stub it fails loudly and IMMEDIATELY. Left unstubbed it resolves
+  // `undefined`, which is `== null`, so it burned 1.25 s of real sleep in
+  // `withBoundedRetry` and then took the credit-the-retirement path — the one
+  // outcome a lane test must never reach by accident. `withBoundedRetry` does
+  // not catch, so a throw costs neither a retry nor a sleep (Ally review of
+  // #2498). Matches the same dep's default in `evidence-truth.test.ts`.
+  mockFetchCommitAuthorEmail.mockImplementation(() => {
+    throw new Error("githubFetchCommitAuthorEmail: this case declares a reviewer lane and did not stub the fetch");
+  });
   mockPostCheckRun.mockResolvedValue({ ok: true, statusCode: 201 });
 });
 
