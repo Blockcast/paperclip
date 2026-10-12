@@ -1196,16 +1196,25 @@ an hour later, and the agent stayed wedged until `paperclip-0` was recreated at
 ### Which regime you are in — one Prometheus query, no agent row needed
 
 ```
-paperclip_agent_start_lock_held_seconds{agent_id="<the paged agent>"}
+paperclip_agent_start_lock_held_seconds{agent_id="<the paged agent>"} >= 14400
 ```
 
-`describeHeldAgentStartLocks()` walks `heldSinceByAgent`, so this gauge exists
-**only while a lock is held right now**.
+`describeHeldAgentStartLocks()` walks `heldSinceByAgent`, so this gauge reports
+the age of **whichever section holds the agent's lock right now** — not of the
+section that was aborted. **Decide on the value, not on presence.** A landed
+abort settles the section and releases the lock, and the coalesced follow-up
+section then takes the lock again and re-publishes the series with a small
+value (the identity guard on release in `agent-start-lock.ts` exists for
+exactly this case). On a busy agent, *present* is therefore the normal state of
+a fully recovered agent, and replacing the pod on presence alone restarts the
+singleton worker for nothing. `14400` is `LOCK_ABORT_MS` (4h), the abort
+boundary: a value at or past it means the section holding the lock has already
+had its own abort requested and is still holding.
 
-| result | regime | `dispatchHealth` | what to do |
+| result of the query above | regime | `dispatchHealth` | what to do |
 | --- | --- | --- | --- |
-| **absent** | abort landed | `aborted` | the post-mortem below; dispatch has resumed |
-| **present** | abort did not land | `stalled` | `PaperclipAgentStartLockWedged` is paging this `critical` — go to [the wedged section](#agent-start-lock-wedged-pen-3305) and replace the pod |
+| **empty** — series absent, or present **below 14400** | abort landed | `aborted` | the post-mortem below; dispatch has resumed |
+| **a value ≥ 14400** | abort did not land | `stalled` | `PaperclipAgentStartLockWedged` is paging this `critical` — go to [the wedged section](#agent-start-lock-wedged-pen-3305) and replace the pod |
 
 `dispatchHealth` on the agent row says the same thing and is the authoritative
 in-process reading, but it must be read on the **worker** pod (the api tier

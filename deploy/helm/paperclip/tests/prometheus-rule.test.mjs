@@ -1655,10 +1655,46 @@ test("the start-lock regimes are separable from the alert payload and land on se
     /lock released and dispatch has RESUMED|this is not an outage|[Nn]obody needs waking/,
     "the aborted alert must not assert the abort landed: its counter increments at abort-REQUEST time",
   );
+  // The discriminator must key on the VALUE, not on presence: after a landed
+  // abort the coalesced follow-up section re-takes the lock and re-publishes
+  // the held gauge with a small value, so "present" is the normal state of a
+  // recovered busy agent. Only a value at or past the abort boundary
+  // (LOCK_ABORT_MS, 14400s) is the same, unreleased section.
   assert.match(
     aborted,
-    /paperclip_agent_start_lock_held_seconds/,
-    "the aborted alert must name the held-gauge query that separates landed from unlanded",
+    /paperclip_agent_start_lock_held_seconds\{agent_id=\\"\{\{ \$labels\.agent_id \}\}\\"\} >= 14400/,
+    "the aborted alert must give the held-gauge query WITH the >= 14400 abort-boundary threshold that separates landed from unlanded",
+  );
+  assert.doesNotMatch(
+    aborted,
+    /STILL PRESENT means|ABSENT means/,
+    "the aborted alert must not discriminate the regime on gauge presence alone",
+  );
+
+  // Same discriminator on the page the alert links to: the runbook's regime
+  // table is what a responder acts on, so it must key on the value too.
+  const runbook = readFileSync(
+    path.join(repoRoot, "runbooks/queued-run-stranded.md"),
+    "utf8",
+  );
+  const [, regimeSection] = runbook.match(
+    /\n### Which regime you are in[^\n]*\n([\s\S]*?)(?=\n### )/,
+  ) ?? [];
+  assert.ok(regimeSection, "the runbook must keep its 'Which regime you are in' section");
+  assert.match(
+    regimeSection,
+    /paperclip_agent_start_lock_held_seconds\{agent_id="[^"]*"\} >= 14400/,
+    "the runbook regime query must carry the >= 14400 abort-boundary threshold",
+  );
+  assert.match(
+    regimeSection,
+    /\n\| \*\*a value ≥ 14400\*\* \| abort did not land \| `stalled` \|/,
+    "the runbook must send a responder to the pod-replacement row only on a value at or past the abort boundary",
+  );
+  assert.doesNotMatch(
+    regimeSection,
+    /\n\| \*\*(present|absent)\*\* \|/,
+    "the runbook regime table must not key on gauge presence/absence alone",
   );
 
   // AC2. Both arms carry a per-agent dedupe domain. The bridge keys issue
