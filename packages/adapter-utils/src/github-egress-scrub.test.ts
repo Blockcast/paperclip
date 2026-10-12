@@ -645,6 +645,21 @@ describe("scrubGitHubEgressText", () => {
       expect(result.text).not.toContain(token);
     });
 
+    it.each([
+      // Pins the no-digit half: uppercase-initial, so only the digits refuse it.
+      `/a.b/S${SYNTHETIC_OPAQUE_VALUE.slice(1)}`,
+      // Pins the uppercase-initial half: letters only, so only the case refuses it.
+      `/a.b/${SYNTHETIC_OPAQUE_VALUE.replace(/[0-9]/g, "")}`,
+    ])("still refuses %s: an opaque token in the method position (BLO-45350)", (token) => {
+      // The method run used to be `[A-Za-z][A-Za-z0-9]*`, so any letter-initial
+      // token rode in behind a two-letter dotted package. One case per conjunct
+      // of `[A-Z][A-Za-z]*`, because a mutation to either is invisible to a
+      // fixture the other one already refuses.
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
     it("still refuses a credential with a real method path appended", () => {
       // Pins the start anchor, as the extra-segment case below pins the end
       // one. Unanchored, the regex would find the valid path in the tail and
