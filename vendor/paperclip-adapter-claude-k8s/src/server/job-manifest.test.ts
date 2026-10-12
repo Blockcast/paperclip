@@ -4296,6 +4296,31 @@ describe("scoped writable mounts (BLO-32734)", () => {
     expect(scopedWritableDirs.filter((d) => d.includes("paperclip-k8s-runtimes"))).toEqual([]);
   });
 
+  // With a prompt bundle the effective instructions path is the prompt-cache
+  // copy, so the agent's CANONICAL bundle (`agents/<id>/instructions/`) and its
+  // `memory/` sat under the read-only parent: every self-edit hit EROFS.
+  it("keeps the agent's own bundle dir writable, and no foreign one", () => {
+    const own = "/paperclip/instances/default/companies/co1/agents/agent-abc";
+    const ctx = makeCtx();
+    ctx.config = { ...(ctx.config ?? {}), instructionsFilePath: `${own}/instructions/AGENTS.md` };
+    setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, storage: isolatedStorage("persistent") });
+    const promptBundle = {
+      bundleKey: "abc123",
+      rootDir: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123",
+      addDir: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123",
+      instructionsFilePath: "/paperclip/instances/default/companies/co1/claude-prompt-cache/abc123/agent-instructions.md",
+    };
+    const { job, scopedWritableDirs } = buildJobManifest({ ctx, selfPod: makeSelfPod(), promptBundle } as never);
+    const writable = (target: string) =>
+      (job.spec?.template?.spec?.containers[0]?.volumeMounts ?? []).some(
+        (m) => m.subPath && !m.readOnly && (target === m.mountPath || target.startsWith(`${m.mountPath}/`)),
+      );
+    expect(writable(`${own}/instructions/AGENTS.md`)).toBe(true);
+    expect(writable(`${own}/memory/MEMORY.md`)).toBe(true);
+    expect(writable("/paperclip/instances/default/companies/co1/agents/other-agent/instructions/AGENTS.md")).toBe(false);
+    expect(scopedWritableDirs).toContain(own);
+  });
+
   // This leg deliberately asserts only the pnpm path, NOT `workspaceRoot`/
   // `homeRoot`: its descriptor is runtime-supplied with literal `/paperclip`
   // roots, so under `/srv/agent-data` those are genuinely off-volume and cannot
