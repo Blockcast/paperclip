@@ -389,4 +389,53 @@ describe.sequential("execution workspace routes", () => {
       }),
     }));
   });
+  // BLO-42036: every closed-workspace guard keys on `closedAt`, which this route
+  // does not accept, while it accepted any `status`. A `status: "active"` write
+  // on an archived row returned 200 and changed nothing that mattered: the
+  // caller then read `status: "active"` and "linked to the closed workspace" out
+  // of the same payload.
+  it("refuses to reopen a closed workspace by status alone", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      name: "Alpha",
+      mode: "isolated_workspace",
+      status: "archived",
+      closedAt: new Date("2026-10-09T04:33:41.181Z"),
+    });
+
+    const res = await request(createApp())
+      .patch("/api/execution-workspaces/workspace-1")
+      .send({ status: "active" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toContain("cannot be reopened");
+    expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+  });
+
+  it("still allows an ordinary status write on an open workspace", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      name: "Alpha",
+      mode: "isolated_workspace",
+      status: "active",
+      closedAt: null,
+    });
+    mockExecutionWorkspaceService.update.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      name: "Alpha",
+      mode: "isolated_workspace",
+      status: "idle",
+      closedAt: null,
+    });
+
+    const res = await request(createApp())
+      .patch("/api/execution-workspaces/workspace-1")
+      .send({ status: "idle" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockExecutionWorkspaceService.update).toHaveBeenCalled();
+  });
 });
