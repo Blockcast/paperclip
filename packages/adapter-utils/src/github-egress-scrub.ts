@@ -341,8 +341,19 @@ function classIndex(value: string): number {
  * spacing convention above) is BLO-41153's own verifying signal, and under the
  * unfixed rule the runbook documenting that command could not be pushed.
  */
+/*
+ * BLO-45350: the method run is bounded to `[A-Z][A-Za-z]*` — proto method
+ * style, UpperCamelCase with no digits. The package and service runs above
+ * only have to start with a letter, so without this a value shaped
+ * `/a.b/<opaque token>` was exonerated whole: any base62 token starting with a
+ * letter fit the old method run. Excluding digits is what does the work — a
+ * random 32-char base62 token starts uppercase AND draws no digit in ~0.2% of
+ * cases, against 100% of letter-initial ones before. Shape rather than entropy
+ * on purpose: real long method names (`GetGatewayDeviceInfoAndStatus`, 4.0
+ * bits/char) clear the 3.5 threshold on their own.
+ */
 const GRPC_METHOD_PATH_RE =
-  /^\/[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+\/(?:[A-Za-z][A-Za-z0-9]*)?$/;
+  /^\/[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+\/(?:[A-Z][A-Za-z]*)?$/;
 
 /** A value is "opaque" when it is long, drawn from a token alphabet and from
  *  at least two character classes, is not a hyphenated identifier, and has
