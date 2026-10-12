@@ -80,12 +80,18 @@ gated off and its last snapshot is not trustworthy.
 > The table is the subset of classes whose designed ceiling is known, not the
 > whole allow-list (`KNOWN_RETRY_SCHEDULE_REASONS` in
 > `server/src/services/metrics.ts`). `capacity_blocked` is a separate class from
-> `ccrotate_capacity` and is not covered by its 1,080s row. For a reason that is
-> not in the table, no per-class constant is documented yet, so the flat 5,400s
-> rule is still the only bound in force for it: treat the page as a candidate
-> fault, and read that reason's delay at its writer (grep the reason string under
-> `server/src/services/`) before calling it designed backoff. `other` can never
-> have a row: it is the catch-all that NULL and every unrecognised
+> `ccrotate_capacity` and is not covered by its 1,080s row. Every allow-list
+> member without a table row, `capacity_blocked` and `other` included, carries the
+> **86,400s backstop** arm instead (`MAX_TRANSIENT_RETRY_HORIZON_MS`; the chart's
+> `prometheusRule.scheduledRetryParkHorizonBackstopSeconds`), so judge such a page
+> against 86,400s, not 5,400s. A backstop page is severe but weakly diagnostic:
+> treat it as a candidate fault, and read that reason's delay at its writer (grep
+> the reason string under `server/src/services/`) before calling it designed
+> backoff. A reason with no arm at all, in neither the table nor the backstop
+> list, is dropped by `> on (reason) group_left ()` and can never fire; that is a
+> chart defect, which the chart test "every KNOWN_RETRY_SCHEDULE_REASONS member
+> carries a park-horizon arm" exists to catch. `other` can never
+> have a table row: it is the catch-all that NULL and every unrecognised
 > `scheduled_retry_reason` coerce to, so it mixes classes. On an `other` page,
 > read the raw `heartbeat_runs.scheduled_retry_reason` of the agent's
 > `status='scheduled_retry'` rows first, then judge it as that class.
@@ -93,8 +99,10 @@ gated off and its last snapshot is not trustworthy.
 > Every known agent also carries a `reason="none"` series pinned at 0. It is a
 > per-agent zero floor emitted for **every** agent, including ones with live
 > parks, so `count(...{reason="none"})` is fleet size, not the number of drained
-> agents. It is not a park class and never carries a bound; `max by (agent_id)`
-> aggregates it away, which is why the flat rule reads exactly as before.
+> agents. It is not a park class and never carries a bound. The alert's
+> `max by (agent_id, reason)` keeps it as its own series rather than aggregating
+> it away; its `vector(0)` arm is inert (`0 > 0` is false) and exists only for
+> lockstep with the deployed rule.
 
 > **Do not measure this from `created_at`** ([BLO-31174](/BLO/issues/BLO-31174)).
 > A park is re-decided in place: each re-check UPDATEs the same row with a new

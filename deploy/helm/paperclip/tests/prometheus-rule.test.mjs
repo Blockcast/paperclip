@@ -949,14 +949,11 @@ test("no rendered alert applies a vector-matching modifier to a scalar operand (
 // that metric. Pre-aggregating each side with `max by (agent_id)` collapses it
 // to a 1:1 join, yields exactly one alert per dark agent instead of one per
 // replica, and keeps alert identity stable across pod restarts.
-test("agent_id-joined alerts pre-aggregate both sides (multi-replica safe, BLO-23413)", () => {
-  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
-
-  const exprs = [...rendered.matchAll(/^\s+expr:\s*(.+?)\s*$/gm)].map(
-    ([, expr]) => expr,
-  );
-
-  const unaggregated = exprs.filter((expr) => {
+// Uses collectExprs, not its own inline-only scrape: that one captured a
+// block-scalar header as the literal "|", so a many-to-many join written as
+// `expr: |` would pass this guard unchecked (BLO-42711 review).
+function unaggregatedAgentJoins(rendered) {
+  return collectExprs(rendered).filter((expr) => {
     if (!/\bon\s*\(\s*agent_id\s*\)/.test(expr)) return false;
     // Every bare selector of a per-agent control-plane gauge must be wrapped in
     // an aggregation that collapses the instance/pod dimension.
@@ -970,6 +967,25 @@ test("agent_id-joined alerts pre-aggregate both sides (multi-replica safe, BLO-2
         ).test(expr),
     );
   });
+}
+
+test("agent_id-joined alerts pre-aggregate both sides (multi-replica safe, BLO-23413)", () => {
+  // The guard must see block-scalar exprs, not only one-line ones.
+  assert.deepEqual(
+    unaggregatedAgentJoins(
+      "    expr: |\n      paperclip_agent_a\n        > on (agent_id) paperclip_agent_b\n    for: 5m\n",
+    ),
+    ["paperclip_agent_a > on (agent_id) paperclip_agent_b"],
+  );
+  assert.deepEqual(
+    unaggregatedAgentJoins(
+      "    expr: |\n      max by (agent_id) (paperclip_agent_a)\n        > on (agent_id) max by (agent_id) (paperclip_agent_b)\n    for: 5m\n",
+    ),
+    [],
+  );
+
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+  const unaggregated = unaggregatedAgentJoins(rendered);
 
   assert.deepEqual(
     unaggregated,
@@ -1184,6 +1200,50 @@ test("PaperclipScheduledRetryParkHorizonImplausible joins per-reason ceilings, n
   );
 });
 
+// The alert's runbook_url points an operator at this section, so its fallback
+// guidance must describe the expression that actually renders. At b30b5f4c the
+// intro was rewritten for the per-reason join while the body still said a
+// reason outside the table was bounded by "the flat 5,400s rule" (it is bounded
+// by the backstop, 16x higher, or unalertable) and that `max by (agent_id)`
+// aggregates `reason="none"` away (the expr groups by (agent_id, reason) and
+// carries `none` through an inert arm). Read the chart, not a pinned string.
+test("park-horizon runbook section describes the rendered expr, not the flat rule (BLO-42711)", () => {
+  const runbook = readFileSync(path.join(repoRoot, "runbooks/queued-run-stranded.md"), "utf8");
+  const start = runbook.indexOf("## Scheduled-retry park horizon");
+  assert.notStrictEqual(start, -1, "runbook must keep the park-horizon section heading");
+  const end = runbook.indexOf("\n## ", start + 1);
+  const section = runbook.slice(start, end === -1 ? undefined : end);
+
+  const [, grouping] =
+    renderChart(["--show-only", "templates/prometheusrule.yaml", "--set", "prometheusRule.enabled=true"]).match(
+      /alert: PaperclipScheduledRetryParkHorizonImplausible\n[\s\S]*?max by \(([^)]*)\) \(paperclip_scheduled_retry_park_horizon_seconds\)/,
+    ) ?? [];
+  assert.ok(grouping, "park-horizon alert must render a max by (...) over the horizon gauge");
+  const named = [...section.matchAll(/max by \(([^)]*)\)/g)].map(([, g]) => g);
+  assert.ok(named.length > 0, "runbook section must name the aggregation it describes");
+  assert.deepEqual(
+    [...new Set(named)],
+    [grouping],
+    `runbook names an aggregation the rendered expr does not use (rendered: max by (${grouping}))`,
+  );
+
+  const [, backstop] =
+    readFileSync(path.join(repoRoot, "deploy/helm/paperclip/values.yaml"), "utf8").match(
+      /^\s+scheduledRetryParkHorizonBackstopSeconds: (\d+)$/m,
+    ) ?? [];
+  assert.ok(backstop, "values.yaml must define scheduledRetryParkHorizonBackstopSeconds");
+  assert.ok(
+    section.includes(`${Number(backstop).toLocaleString("en-US")}s backstop`),
+    `runbook must state the ${backstop}s backstop that bounds a reason with no per-class arm`,
+  );
+  assert.match(section, /can never fire/, "runbook must name the unalertable case (a reason with no arm at all)");
+  assert.doesNotMatch(
+    section,
+    /5,400s?\b[^.]*\b(?:still|only)\b[^.]*\bbound/,
+    "runbook must not present the superseded flat 5,400s rule as a bound still in force",
+  );
+});
+
 // The assertions above pin the chart against itself: they would stay green
 // if a new park class were added to the writer and never given an arm. That
 // is the exact drift that produced BLO-42711, and it fails open -- the join
@@ -1224,7 +1284,7 @@ test("every KNOWN_RETRY_SCHEDULE_REASONS member carries a park-horizon arm (BLO-
   assert.ok(expr, "park-horizon alert must render a block expr");
 
   const unarmed = reasons.filter(
-    (reason) => !new RegExp(`"reason", "${reason}", "", ""`).test(expr),
+    (reason) => !expr.includes(`"reason", "${reason}", "", ""`),
   );
   assert.deepEqual(
     unarmed,
