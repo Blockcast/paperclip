@@ -293,6 +293,9 @@ describe("/api/health as a readiness probe path", () => {
     // What this pins is that the handler *completes*. The verdict is the same
     // 503 either way; the difference is whether anything answers at all.
     expect(HEALTH_PROBE_DEADLINE_MS).toBeLessThan(20_000);
+    // And above the 13.19s saturation tail: below it, a slow-but-alive pool
+    // 503s and readiness drains every replica together.
+    expect(HEALTH_PROBE_DEADLINE_MS).toBeGreaterThan(13_190);
 
     let enteredHandler: () => void = () => {};
     const entered = new Promise<void>((resolve) => {
