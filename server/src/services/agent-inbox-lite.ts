@@ -70,6 +70,10 @@ export async function loadAgentInboxLite({
     assigneeAgentId: agentId,
     status: AGENT_INBOX_LITE_STATUS_FILTER,
     includeRoutineExecutions: true,
+    // BLO-44922: oldest first within a priority band. The list default is
+    // newest-activity first, which under inflow >= drain never reaches a band's
+    // oldest row (measured: a 36-day-old `medium` row at the bottom of 286).
+    sortField: "pick",
     limit: issueListProbeLimit(limit),
     offset,
   });
