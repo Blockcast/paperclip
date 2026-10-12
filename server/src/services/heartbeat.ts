@@ -33509,8 +33509,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // git_worktree is exempt: it gives every run its own path and stamps
     // ownership, so there is no shared tree to warn about. BLO-42212: so is a
     // run whose K8s isolation descriptor relocated the workspace to a per-run
-    // ephemeral root -- it never opens `executionWorkspace.cwd` either. Both
-    // exemptions live in `runLandsInSharedCheckout`, which
+    // ephemeral root AND whose `cwd` is the repo-less `empty-workspaces/<agentId>`
+    // fallback -- there is nothing in that cwd to reach for. A repo-backed
+    // ephemeral run still warns (BLO-31282: it can reach for the base checkout).
+    // Both exemptions live in `runLandsInSharedCheckout`, which
     // `describeSharedCheckoutOccupancy` applies before it queries.
     const sharedCheckoutWarning = await describeSharedCheckoutOccupancy({
       db,

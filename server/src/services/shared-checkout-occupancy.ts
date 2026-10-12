@@ -1,7 +1,15 @@
+import path from "node:path";
 import { and, eq, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
+import type { AdapterRunIsolationDescriptor } from "../adapters/index.js";
+import { resolveAgentEmptyWorkspaceSourceDir } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
+
+/** The one descriptor field the exemption reads. */
+type IsolationWorkspaceStorage = {
+  storage: Pick<AdapterRunIsolationDescriptor["storage"], "workspace">;
+};
 
 // BLO-27858: under a non-`git_worktree` strategy, realizeExecutionWorkspace
 // returns `input.base.baseCwd` verbatim -- no per-run path, no ownership stamp,
@@ -112,17 +120,45 @@ export const SHARED_CHECKOUT_WARNING_RUN_SAMPLE = 4;
  * alone is wrong -- a run pinned to a provisioned worktree is also mode `run`
  * yet keeps a persistent workspace.
  *
+ * An ephemeral workspace is NECESSARY, not sufficient. A relocated run is still
+ * told `executionWorkspace.cwd` is its workspace (`buildPaperclipWorkspaceContext`
+ * publishes it), the pod mounts `/paperclip`, and BLO-31282 records exactly such
+ * a `run:<runId>` run reaching for the project BASE checkout from its empty
+ * scratch dir. So a repo-backed `project_primary` run keeps the warning: that is
+ * the one case where the shared tree is real. The exemption also requires `cwd`
+ * to be the agent's repo-less fallback, `empty-workspaces/<agentId>`
+ * (BLO-18760), the only cwd with nothing in it to reach for -- and the cwd both
+ * measured runs above named. Matched by exact path, not by
+ * `repoUrl`/`projectId`: a managed project checkout can carry `repoUrl: null`,
+ * and the agent-home fallback keeps the issue's `projectId`, so neither field
+ * separates a real checkout from an empty one. The persistent agent home
+ * (`workspaces/<agentId>`) is not exempt either; it accumulates a `.git`.
+ *
  * Absent isolation (non-K8s adapters) means no relocation, so we still warn:
- * forgetting to pass it costs noise, never a missed real collision.
+ * forgetting to pass it costs noise, never a missed real collision. The same
+ * holds for a missing or malformed `agentId`: unprovable means warn.
  */
 export function runLandsInSharedCheckout(input: {
   strategyType: string;
-  isolation?: { storage: { workspace: "ephemeral" | "persistent" } } | null;
+  cwd: string;
+  agentId: string | null;
+  isolation?: IsolationWorkspaceStorage | null;
 }): boolean {
   // git_worktree gives every run its own path and stamps ownership, so there is
   // no shared tree to warn about.
   if (input.strategyType === "git_worktree") return false;
-  return input.isolation?.storage.workspace !== "ephemeral";
+  if (input.isolation?.storage.workspace !== "ephemeral") return true;
+  return !isRepoLessFallbackCwd(input.cwd, input.agentId);
+}
+
+function isRepoLessFallbackCwd(cwd: string, agentId: string | null): boolean {
+  if (!agentId) return false;
+  try {
+    return path.resolve(cwd) === path.resolve(resolveAgentEmptyWorkspaceSourceDir(agentId));
+  } catch {
+    // Invalid agent id: the resolver refuses to build a path from it.
+    return false;
+  }
 }
 
 /**
@@ -181,12 +217,12 @@ export async function describeSharedCheckoutOccupancy(input: {
    * non-K8s run: that is the warn-anyway default (see
    * `runLandsInSharedCheckout`).
    */
-  isolation?: { storage: { workspace: "ephemeral" | "persistent" } } | null;
+  isolation?: IsolationWorkspaceStorage | null;
 }): Promise<string | null> {
   const { db, companyId, agentId, heartbeatRunId, cwd, strategyType, isolation } = input;
   // Before the query, not after: a run that does not land in this tree should
   // cost nothing to clear.
-  if (!runLandsInSharedCheckout({ strategyType, isolation })) return null;
+  if (!runLandsInSharedCheckout({ strategyType, cwd, agentId, isolation })) return null;
   // Without a db, an agent identity, and our own run id we cannot tell a
   // sibling from ourselves -- and counting ourselves as contention would warn
   // on every single-run agent. Stay silent rather than cry wolf.
