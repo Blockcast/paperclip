@@ -6,6 +6,7 @@ import {
   currentAgentStartLockSignal,
   describeAgentStartLockDispatchHealth,
   describeHeldAgentStartLocks,
+  rethrowIfAgentStartLockAborted,
   withAgentStartLock,
 } from "../services/agent-start-lock.js";
 import { logger } from "../middleware/logger.js";
@@ -526,5 +527,143 @@ describe("agent start lock cancellation (PEN-3328)", () => {
     );
 
     expect(detachedSignal).toBeUndefined();
+  });
+});
+
+/**
+ * BLO-42493. The abort is delivered *as a rejection*, and `runExclusively`
+ * releases the lock if and only if `fn` settles — so any broad `catch` on the
+ * dispatch path is a hole in it. A catch that logs and continues turns the
+ * abort into a no-op: the section resumes, keeps the lock, and the escalating
+ * log reports `aborted: true` with the abort "not landed" indefinitely, which
+ * is indistinguishable from a section wedged on a genuinely unabortable await.
+ * Measured once in production as 15.3 h of dead dispatch for one agent, 11.5 h
+ * of it under a continuously-firing `critical` page, ended only by replacing
+ * the pod.
+ *
+ * Three such catches sit in the `slot_check` phase specifically:
+ * `hasActiveJobForAgent`'s inner (`isRunTerminal`) and outer (fail-open)
+ * handlers, and `noteDispatchDeclined`'s "instrumentation must never fail
+ * dispatch" handler. Each is correct for the fault it was written for and
+ * wrong for this one.
+ *
+ * Every case here carries its own negative control — the same section with the
+ * guard removed — because a test that only asserts the fixed behaviour cannot
+ * tell a working guard from a scenario that never reached it.
+ */
+describe("agent start lock abort survives a swallowing catch (BLO-42493)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    seedFault.active = false;
+    _resetAgentStartLocksForTesting();
+  });
+
+  /**
+   * A section shaped like the real `slot_check` span: an abortable database
+   * await inside a `catch` that absorbs the failure and carries on to another
+   * await that never settles on its own.
+   */
+  function sectionSwallowing(
+    guard: (error: unknown) => void,
+    reject: () => Promise<never>,
+  ): () => Promise<string> {
+    return async () => {
+      try {
+        await reject();
+      } catch (error) {
+        guard(error);
+        // Swallowed: the pass continues as if nothing was asked of it.
+      }
+      await unabortableAwait();
+      return "unreachable";
+    };
+  }
+
+  async function runToAbort(fn: () => Promise<string>) {
+    vi.useFakeTimers();
+    vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    vi.spyOn(logger, "error").mockImplementation(() => logger);
+    const agentId = randomUUID();
+    const settled = withAgentStartLock(agentId, fn, coalesced).then(
+      () => "resolved" as const,
+      (err: unknown) => err,
+    );
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS + 2_000);
+    return { agentId, settled };
+  }
+
+  it("releases the lock when a catch would otherwise swallow the abort", async () => {
+    const { settled } = await runToAbort(
+      sectionSwallowing(rethrowIfAgentStartLockAborted, abortableAwait),
+    );
+
+    expect(await settled).toBeInstanceOf(AgentStartLockAbortedError);
+    expect(describeHeldAgentStartLocks()).toEqual([]);
+  });
+
+  it("negative control: without the guard the same section holds the lock forever", async () => {
+    const { agentId } = await runToAbort(sectionSwallowing(() => {}, abortableAwait));
+
+    // The abort was raised and absorbed, so the section never settles and the
+    // `finally` that releases the lock is never reached. This is the production
+    // failure verbatim: health reports `stalled`, not `aborted`.
+    expect(describeHeldAgentStartLocks()).toHaveLength(1);
+    expect(describeAgentStartLockDispatchHealth(agentId)?.status).toBe("stalled");
+
+    // A further four hours changes nothing — there is no second abort, and no
+    // in-process path back. Only replacing the pod clears it.
+    await vi.advanceTimersByTimeAsync(LOCK_ABORT_MS);
+    expect(describeHeldAgentStartLocks()).toHaveLength(1);
+  });
+
+  it("keys on the signal, not the error type: a cancelled statement rejects 57014", async () => {
+    // The dominant abort path never raises `AgentStartLockAbortedError` at all.
+    // postgres.js `Query#cancel()` takes down an in-flight statement and rejects
+    // it with a PostgreSQL `57014 query_canceled` — an ordinary database error
+    // carrying nothing that identifies it as this section's abort. A guard
+    // written as `instanceof AgentStartLockAbortedError` passes this case while
+    // looking correct, which is why the guard tests the signal instead.
+    const queryCanceled = () => {
+      const signal = currentAgentStartLockSignal();
+      return new Promise<never>((_resolve, reject) => {
+        if (!signal) return;
+        const fail = () => reject(Object.assign(new Error("canceling statement due to user request"), {
+          code: "57014",
+        }));
+        if (signal.aborted) fail();
+        else signal.addEventListener("abort", fail, { once: true });
+      });
+    };
+
+    const { settled } = await runToAbort(sectionSwallowing(rethrowIfAgentStartLockAborted, queryCanceled));
+
+    // Rethrown as itself, so the catch site's log still names the real fault.
+    const outcome = await settled;
+    expect((outcome as { code?: string }).code).toBe("57014");
+    expect(describeHeldAgentStartLocks()).toEqual([]);
+  });
+
+  it("leaves an ordinary failure swallowed when the section was never aborted", async () => {
+    // The guard must not convert every caught error into a thrown dispatch
+    // pass. `noteDispatchDeclined`'s handler exists because a rejected roster
+    // read used to fail the whole pass, which `resumeQueuedRuns` rethrows as a
+    // fleet-wide dispatch fault.
+    const agentId = randomUUID();
+    const result = await withAgentStartLock(
+      agentId,
+      async () => {
+        try {
+          throw new Error("roster read failed");
+        } catch (error) {
+          rethrowIfAgentStartLockAborted(error);
+        }
+        return "completed";
+      },
+      coalesced,
+    );
+
+    expect(result).toBe("completed");
+    expect(describeHeldAgentStartLocks()).toEqual([]);
   });
 });

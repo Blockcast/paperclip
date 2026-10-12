@@ -543,6 +543,7 @@ import {
   LOCK_HELD_WARN_MS,
   agentStartLockSweepContext,
   markAgentStartLockPhase,
+  rethrowIfAgentStartLockAborted,
   runDetachedFromAgentStartLock,
   withAgentStartLock,
 } from "./agent-start-lock.js";
@@ -29994,6 +29995,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // read here would otherwise convert an ordinary decline into a thrown
       // pass, which `resumeQueuedRuns` collects and rethrows — turning a
       // reporting improvement into a fleet-wide dispatch fault.
+      //
+      // The one error that must still propagate is this section's own abort
+      // (BLO-42493). "Never fail dispatch" is the right rule for a fault the
+      // pass can shrug off; the abort is the opposite — it is the lock asking
+      // the pass to stop, and the lock is released only when `fn` settles. A
+      // decline recorded on an aborted section is also worthless, since the
+      // pass it describes is being torn down.
+      rethrowIfAgentStartLockAborted(error);
       logger.debug(
         { agentId, reason, error },
         "startNextQueuedRunForAgent: failed to record dispatch decline",
