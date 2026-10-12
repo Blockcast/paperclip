@@ -287,9 +287,10 @@ const LIST_MARKER_SOURCE = "^(?:[-*]|\\d+[.)])\\s+";
  *     previous call's offset.
  *   - `String.prototype.matchAll` iterates a CLONE, so it never writes back to
  *     the original's `lastIndex` — but it SEEDS that clone from it, so it can
- *     still SUFFER an offset some other caller left behind. Measured: with
- *     `lastIndex = 6`, a two-match input yields one match, and the original
- *     stays at 6.
+ *     still SUFFER an offset some other caller left behind. Measured on
+ *     `"- alpha\n- beta"`: with `lastIndex = 6` it yields one match instead of
+ *     two, and the original stays at 6. The count depends on where the offset
+ *     lands relative to the second match — `"- a\n- b"` at 6 yields zero.
  *
  * `.test()` / `.exec()` have neither property: they advance `lastIndex` and
  * resume from it, so adding one against either constant would silently skip
@@ -300,12 +301,18 @@ const LIST_MARKER_SOURCE = "^(?:[-*]|\\d+[.)])\\s+";
  * consecutive trues and reads as fine — the skipped call is the one after the
  * last match. That is the kind of bug that survives a green test suite.
  *
- * If you need `.test()`/`.exec()`, reach for a NON-GLOBAL regex. That is the
- * fix — not a fresh global one per call, which is wasteful and re-acquires
- * this hazard the moment anyone hoists it to module scope. `FENCE_LINE_RE`
- * below is the in-file pattern to copy: module-scoped, no `g`, consumed by
- * `.exec()`. For these markers that means `new RegExp(LIST_MARKER_SOURCE,
- * "m")` — note the flags: `m`, not `gm`.
+ * If you need a SINGLE-SHOT `.test()`/`.exec()`, reach for a NON-GLOBAL regex.
+ * `FENCE_LINE_RE` below is the in-file pattern to copy: module-scoped, no `g`,
+ * one `.exec()` per line. For these markers that means
+ * `new RegExp(LIST_MARKER_SOURCE, "m")` — note the flags: `m`, not `gm`.
+ *
+ * To ITERATE with `while ((m = re.exec(s)) !== null)`, the opposite holds: the
+ * regex MUST be global, or `lastIndex` never advances and the loop never ends
+ * (measured on `"- a\n- b\n- c"`: non-global gives indices 0, 0, 0, … forever;
+ * `gm` gives 0, 4, 8 and terminates). Build it fresh per call, never at module
+ * scope, so no other caller shares its `lastIndex`. `doneWhenSections` below
+ * is the in-file pattern to copy: `new RegExp(..., "gim")` inside the function,
+ * driven by a `while`/`exec` loop.
  *
  * Dropping `g` from THESE TWO constants specifically is not available:
  * `matchAll` throws a TypeError without it, and `.match()` needs it to return
