@@ -146,14 +146,17 @@ env:
     # PAPERCLIP_PR_REVIEWER_AGENT_ID for older deployments.
     - name: PAPERCLIP_PR_REVIEWER_AGENT_IDS
       value: "e0a5011d-5c94-4801-be52-64c14f98ac26"
-    # Phase one of the PR-review task-key casing rollout. Keep issue-create
-    # locking disabled while this release deploys dual-read/dual-lock webhook
-    # pods: a pre-compatibility pod locks GitHub's canonical mixed-case repo
-    # spelling, which cannot be reconstructed from a lowercase user-authored
-    # PR URL. Remove this override only after every API pod runs the
-    # compatibility code, then deploy again to enable the duplicate guard.
+    # Phase two of the PR-review task-key casing rollout (BLO-20526). Phase one
+    # held issue-create locking off while dual-read/dual-lock webhook pods
+    # drained, because a pre-compatibility pod locks GitHub's canonical
+    # mixed-case repo spelling, which cannot be reconstructed from a lowercase
+    # user-authored PR URL. The compatibility code (#1604, 7abd6d3a0) is an
+    # ancestor of the deployed commit on both the API Deployment and the
+    # StatefulSet, so every pod now runs it and the guard is enabled.
+    # Flip the VALUE, never remove the var: the live admission policy pins an
+    # exact container env-list length, so a removal is inadmissible.
     - name: PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD
-      value: "true"
+      value: "false"
     # Designated Dependabot remediation agent (Release Engineer). The
     # github-webhook route wakes this agent on `dependabot_alert`
     # created/reintroduced/reopened events at or above the severity floor
