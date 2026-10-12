@@ -114,7 +114,9 @@ decision was. `paperclip_pr_review_queue_wait_seconds` carries buckets
 in the single `(14400, 28800]` bucket, so the p95 target rank landed inside
 one bucket **4 hours wide** and the reported figure was just a linear
 interpolation across it. It could not tell a 4.5h wait from a 7.5h one, and
-past 8h it degenerates to `+Inf`.
+past 8h it clamps to the top finite bucket edge, 28800s, and stays there:
+`histogram_quantile` never returns `+Inf` for a classic histogram, so the
+worst case was a silent plateau, not a sentinel.
 
 The tell was that the p95 held **flat to within 0.4% across 24 hours** while
 the true mean over the identical window moved **3.1×** (5169s → 16003s). A
