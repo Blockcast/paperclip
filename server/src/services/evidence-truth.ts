@@ -339,9 +339,26 @@ async function probeOne(
       // could vouch `clean` while the gate — reading the lane successfully —
       // publishes `failure`. Over-vouching is the one direction a probe whose
       // premise is that it never fabricates a pass must not take.
+      //
+      // RETURN, rather than only setting `failed` — which does not withhold the
+      // vouch and so did not fail closed at all (Ally review of #2498). Nothing
+      // downstream reads `failed`: `out.clean` below never consults it, the
+      // aggregator treats `probeFailed` as suppressing the escalation branch and
+      // not the `pass` path, and `evidence-gate` reads it as "could not ask" and
+      // uses it to DEMOTE an unlabeled block to a warn. So on the one route
+      // where the lane changes the verdict — a retirement this lane would refuse,
+      // beside a formal review attesting this head without the `## Ally` heading
+      // (the Surface-2-only population below) — an unread lane left this probe
+      // vouching `clean` against a gate publishing `failure`, and softened the
+      // unlabeled-block gate while it did so.
+      //
+      // Early return costs nothing: `PerPr` carries no redder-than-clean field,
+      // so the re-evaluation below can only lower `out.clean`, which is already
+      // false here. Same shape as the `head_sha` and `surfaces` returns above.
       if (laneDeclared && !prAuthorLane) {
         out.failed = true;
         out.diagnostics.push(`github-truth-probe-failed:commit_author_lane:${tag}`);
+        return out;
       }
       commentVerdict = evaluateCommentReviewGate({ ...commentInput, prAuthorLogin, prAuthorLane });
       // A null `prAuthorLogin` leaves the verdict at the withheld positive, so
