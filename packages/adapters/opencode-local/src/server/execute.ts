@@ -213,7 +213,10 @@ export async function ensureReferencedSharedDocsMaterialized(input: {
     if (await pathExists(targetPath)) {
       // Refresh a stale placeholder only once a real source exists; otherwise leave the
       // workspace copy — placeholder or genuine doc — exactly as it is.
-      if (!sourcePath || !await isOwnPlaceholder(targetPath, relativeDocPath)) continue;
+      const ownPlaceholder = await isOwnPlaceholder(targetPath, relativeDocPath);
+      // Heals workspaces whose placeholder predates the exclude below.
+      if (ownPlaceholder) await excludeFromGitStatus(input.cwd, relativeDocPath, input.onLog);
+      if (!sourcePath || !ownPlaceholder) continue;
       await fs.writeFile(targetPath, await fs.readFile(sourcePath, "utf8"), "utf8");
       await input.onLog(
         "stderr",
@@ -238,6 +241,44 @@ export async function ensureReferencedSharedDocsMaterialized(input: {
     }
     await fs.mkdir(path.dirname(targetPath), { recursive: true });
     await fs.writeFile(targetPath, content, "utf8");
+    await excludeFromGitStatus(input.cwd, relativeDocPath, input.onLog);
+  }
+}
+
+/**
+ * A materialized doc is an untracked file Paperclip wrote, so without this every
+ * workspace reads as dirty forever: the execution-workspace collector refuses it
+ * (`retained_dirty`), every clean-tree guard refuses it, and a broad `git add` commits
+ * it (BLO-22984). `info/exclude` is shared by all worktrees of the repo, so one entry
+ * cleans every existing workspace at once. It never hides a tracked file; it does hide
+ * a genuinely new untracked file at this exact path, which by construction is meant to
+ * come from the instruction bundle. Best-effort: never fails the run.
+ */
+async function excludeFromGitStatus(
+  cwd: string,
+  relativeDocPath: string,
+  onLog: AdapterExecutionContext["onLog"],
+) {
+  try {
+    const dotGit = path.join(cwd, ".git");
+    let gitDir = dotGit;
+    if ((await fs.stat(dotGit)).isFile()) {
+      const pointer = (await fs.readFile(dotGit, "utf8")).match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+      if (!pointer) return;
+      gitDir = path.resolve(cwd, pointer);
+      const commonDir = await fs.readFile(path.join(gitDir, "commondir"), "utf8").catch(() => null);
+      if (commonDir) gitDir = path.resolve(gitDir, commonDir.trim());
+    }
+    const excludePath = path.join(gitDir, "info", "exclude");
+    const entry = "/" + relativeDocPath.replace(/([*?[\]\\!#])/g, "\\$1");
+    const existing = await fs.readFile(excludePath, "utf8").catch(() => "");
+    if (existing.split(/\r?\n/).includes(entry)) return;
+    await fs.mkdir(path.dirname(excludePath), { recursive: true });
+    await fs.appendFile(excludePath, `${existing && !existing.endsWith("\n") ? "\n" : ""}${entry}\n`, "utf8");
+  } catch (error) {
+    // No `.git` here (not a repo root) is the common case and is not worth a log line.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    await onLog("stderr", `[paperclip] Could not exclude shared doc ${relativeDocPath} from git status: ${String(error)}\n`);
   }
 }
 
