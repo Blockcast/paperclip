@@ -4,6 +4,7 @@ import type { AddressInfo, Server as NetServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Server as TlsServer } from "node:tls";
+import { afterAll } from "vitest";
 
 type SupertestServer = NetServer & {
   address(): ReturnType<NetServer["address"]>;
@@ -28,6 +29,12 @@ if (!process.env.CODEX_HOME) {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-codex-home-"));
   fs.writeFileSync(path.join(codexHome, "auth.json"), '{"OPENAI_API_KEY":"sk-vitest"}\n', { mode: 0o600 });
   process.env.CODEX_HOME = codexHome;
+  // Setup files run once per test file; without this every server test file
+  // leaves one of these dirs behind in $TMPDIR (BLO-44941).
+  afterAll(() => {
+    fs.rmSync(codexHome, { recursive: true, force: true });
+    if (process.env.CODEX_HOME === codexHome) delete process.env.CODEX_HOME;
+  });
 }
 
 if (!SupertestTest.prototype.__paperclipLoopbackPatched) {
