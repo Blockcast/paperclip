@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { heartbeatRuns } from "@paperclipai/db";
+import { resolveAgentEmptyWorkspaceSourceDir, resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import { buildPaperclipWorkspaceContext } from "../services/heartbeat.js";
 import {
   SHARED_CHECKOUT_WARNING_RUN_SAMPLE,
@@ -15,6 +16,10 @@ const SELF_RUN = "11111111-1111-1111-1111-111111111111";
 const SIBLING_RUN = "22222222-2222-2222-2222-222222222222";
 
 const CWD = "/paperclip/instances/default/workspaces/bbbbbbbb";
+/** BLO-18760's repo-less fallback: the only cwd the ephemeral exemption covers. */
+const EMPTY_CWD = resolveAgentEmptyWorkspaceSourceDir(AGENT);
+/** A repo-backed project_primary base checkout -- the tree that really is shared. */
+const PROJECT_CWD = "/paperclip/instances/default/projects/cccccccc/_default";
 
 /**
  * Minimal drizzle-shaped stub: db.select().from().where() resolves to rows.
@@ -179,45 +184,70 @@ describe("listSiblingRunningRunIds", () => {
 describe("runLandsInSharedCheckout", () => {
   const ephemeral = { storage: { workspace: "ephemeral" as const } };
   const persistent = { storage: { workspace: "persistent" as const } };
+  const run = { strategyType: "project_primary", cwd: EMPTY_CWD, agentId: AGENT };
 
   it("warns on a project_primary run with no isolation descriptor", () => {
     // Non-K8s adapters relocate nothing, and omitting the field must not buy a
     // silent exemption: the cost of forgetting it is noise, never a missed
     // collision.
-    expect(runLandsInSharedCheckout({ strategyType: "project_primary" })).toBe(true);
-    expect(runLandsInSharedCheckout({ strategyType: "project_primary", isolation: null })).toBe(true);
+    expect(runLandsInSharedCheckout(run)).toBe(true);
+    expect(runLandsInSharedCheckout({ ...run, isolation: null })).toBe(true);
   });
 
-  it("stays silent when the isolation descriptor made the workspace ephemeral", () => {
+  it("stays silent for an ephemeral run whose cwd is the repo-less fallback", () => {
     // BLO-42212. This is the case that fired on every run of every
     // concurrency-enabled K8s agent: the run executes in
-    // /runtime-cache/paperclip-runs/<runId>/workspace and never opens the cwd
-    // the warning names.
+    // /runtime-cache/paperclip-runs/<runId>/workspace, and the cwd the warning
+    // names is `empty-workspaces/<agentId>`, which has nothing in it to reach for.
+    expect(runLandsInSharedCheckout({ ...run, isolation: ephemeral })).toBe(false);
+    // A trailing slash is the same directory.
+    expect(runLandsInSharedCheckout({ ...run, cwd: `${EMPTY_CWD}/`, isolation: ephemeral })).toBe(
+      false,
+    );
+  });
+
+  it("still warns a repo-backed project_primary run even when its workspace is ephemeral", () => {
+    // The Ally I1 control on #2589. `executionWorkspace.cwd` is still published
+    // to the run as its workspace and is reachable from the pod, and BLO-31282
+    // records an ephemeral `run:<runId>` run reaching for exactly this base
+    // checkout. Ephemeral alone must not silence the warning here.
     expect(
-      runLandsInSharedCheckout({ strategyType: "project_primary", isolation: ephemeral }),
-    ).toBe(false);
+      runLandsInSharedCheckout({ ...run, cwd: PROJECT_CWD, isolation: ephemeral }),
+    ).toBe(true);
+    // The persistent agent home is not exempt either: it accumulates a `.git`.
+    expect(
+      runLandsInSharedCheckout({
+        ...run,
+        cwd: resolveDefaultAgentWorkspaceDir(AGENT),
+        isolation: ephemeral,
+      }),
+    ).toBe(true);
+    // Another agent's empty dir is not ours, and an unprovable identity warns.
+    expect(
+      runLandsInSharedCheckout({ ...run, agentId: SIBLING_RUN, isolation: ephemeral }),
+    ).toBe(true);
+    expect(runLandsInSharedCheckout({ ...run, agentId: null, isolation: ephemeral })).toBe(true);
+    expect(runLandsInSharedCheckout({ ...run, agentId: "../x", isolation: ephemeral })).toBe(true);
   });
 
   it("still warns when isolation kept the workspace persistent", () => {
     // The control that separates this fix from "exempt isolationMode === run".
     // `shared` and `workspace` modes, and a run pinned to a provisioned
     // worktree, all keep storage.workspace persistent -- they really do open
-    // executionWorkspace.cwd, so BLO-27858's warning must survive.
+    // executionWorkspace.cwd, so BLO-27858's warning must survive, even on the
+    // repo-less fallback cwd.
+    expect(runLandsInSharedCheckout({ ...run, isolation: persistent })).toBe(true);
     expect(
-      runLandsInSharedCheckout({ strategyType: "project_primary", isolation: persistent }),
-    ).toBe(true);
-    expect(
-      runLandsInSharedCheckout({ strategyType: "shared_workspace", isolation: persistent }),
+      runLandsInSharedCheckout({ ...run, strategyType: "shared_workspace", isolation: persistent }),
     ).toBe(true);
   });
 
   it("stays silent for git_worktree regardless of isolation", () => {
     // Pre-existing exemption, moved here from the heartbeat call site. Assert
     // it against both descriptors so the move cannot quietly narrow it.
-    expect(runLandsInSharedCheckout({ strategyType: "git_worktree" })).toBe(false);
-    expect(runLandsInSharedCheckout({ strategyType: "git_worktree", isolation: persistent })).toBe(
-      false,
-    );
+    const worktree = { ...run, cwd: PROJECT_CWD, strategyType: "git_worktree" };
+    expect(runLandsInSharedCheckout(worktree)).toBe(false);
+    expect(runLandsInSharedCheckout({ ...worktree, isolation: persistent })).toBe(false);
   });
 });
 
@@ -260,7 +290,7 @@ describe("describeSharedCheckoutOccupancy", () => {
     await expect(describeSharedCheckoutOccupancy({ ...base, db })).resolves.toBeNull();
   });
 
-  it("clears an ephemeral-workspace run without querying for siblings", async () => {
+  it("clears an ephemeral run on the repo-less fallback without querying for siblings", async () => {
     // The `where` assertion is the load-bearing half. Returning null after the
     // query would still read as "silent" here, so without it this test would
     // pass even if the exemption were applied in the wrong place -- and the
@@ -270,10 +300,26 @@ describe("describeSharedCheckoutOccupancy", () => {
       describeSharedCheckoutOccupancy({
         ...base,
         db,
+        cwd: EMPTY_CWD,
         isolation: { storage: { workspace: "ephemeral" } },
       }),
     ).resolves.toBeNull();
     expect(where).not.toHaveBeenCalled();
+  });
+
+  it("still warns a repo-backed ephemeral run that has a sibling", async () => {
+    // Ally I1 on #2589, end to end: the cwd the warning names is a real base
+    // checkout, so the sibling count must run and the warning must reach the run.
+    const { db, where } = selectStub([{ id: SIBLING_RUN }]);
+    await expect(
+      describeSharedCheckoutOccupancy({
+        ...base,
+        db,
+        cwd: PROJECT_CWD,
+        isolation: { storage: { workspace: "ephemeral" } },
+      }),
+    ).resolves.toContain(PROJECT_CWD);
+    expect(where).toHaveBeenCalledTimes(1);
   });
 
   it("clears git_worktree without querying for siblings", async () => {
