@@ -464,6 +464,41 @@ describe("REST — GET /api/agents/me/inbox-lite (BLO-39015)", () => {
     expect(mockIssueService.list).not.toHaveBeenCalled();
   });
 
+  // BLO-43664. Control A then B: without A's row count, "B is not a silent A"
+  // is unfalsifiable. Reverting the time-filter guard alone turns B into a 200
+  // carrying A's CAP rows, so the status assertion goes red.
+  it("rejects a time-bound param with 400 rather than serving the unfiltered page", async () => {
+    serveRestPopulation(CAP + 1);
+    const app = await buildApp();
+
+    const control = await request(app).get("/api/agents/me/inbox-lite");
+    expect(control.status).toBe(200);
+    expect(control.body).toHaveLength(CAP);
+    mockIssueService.list.mockClear();
+
+    const bounded = await request(app)
+      .get("/api/agents/me/inbox-lite")
+      .query({ updated_after: "2099-01-01T00:00:00Z" });
+    expect(bounded.status).toBe(400);
+    expect(bounded.body.unsupportedParams).toEqual(["updated_after"]);
+    expect(bounded.body.error).toMatch(/\/search/);
+    expect(mockIssueService.list).not.toHaveBeenCalled();
+  });
+
+  // Precedence: the time bound is named, not `limit` — so the guard must run
+  // before the pagination and limit guards.
+  it("names the time bound when limit rides with it", async () => {
+    serveRestPopulation(CAP + 1);
+
+    const res = await request(await buildApp())
+      .get("/api/agents/me/inbox-lite")
+      .query({ limit: "1", updated_after: "2099-01-01T00:00:00Z" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.unsupportedParams).toEqual(["updated_after"]);
+    expect(mockIssueService.list).not.toHaveBeenCalled();
+  });
+
   // The positive control for both guards above. Without it, "reject `limit`"
   // and "reject `per_page`" are satisfiable by rejecting everything.
   it("still serves a plain request and one carrying only offset", async () => {
