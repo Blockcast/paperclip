@@ -117,6 +117,7 @@ import {
   ISSUE_LIST_TRUNCATED_HEADER,
   parseOffsetParam,
   parseUnsupportedPaginationParams,
+  parseUnsupportedTimeFilterParams,
 } from "../lib/issue-list-query.js";
 import { recoveryObservabilityService } from "../services/recovery-observability.js";
 import { logger } from "../middleware/logger.js";
@@ -2791,6 +2792,20 @@ export function agentRoutes(
     // window 0 — a 200 the caller reads as "I advanced". Worse here than on the
     // sibling, because on a truncated lane the envelope says `truncated: true`
     // and so CONFIRMS there is more while the offset asked for was discarded.
+    // BLO-43664: the time-filter family was dropped unread here too —
+    // `?updated_after=T` returned the full priority page and a 200, the same
+    // silent-unbounded read BLO-40145/BLO-41592 closed on the issue-list routes.
+    // Checked BEFORE the pagination/limit guards so `?limit=1&updated_after=X`
+    // names the time bound, the precedence BLO-41592 settled.
+    const unsupportedTimeFilterParams = parseUnsupportedTimeFilterParams(req.query);
+    if (unsupportedTimeFilterParams.length > 0) {
+      res.status(400).json({
+        error:
+          "time-bound filtering is not supported on this endpoint; the param was previously dropped unread and returned the whole inbox page. Use GET /api/companies/:companyId/search with updatedAfter or updatedWithin.",
+        unsupportedParams: unsupportedTimeFilterParams,
+      });
+      return;
+    }
     const unsupportedPaginationParams = parseUnsupportedPaginationParams(req.query);
     if (unsupportedPaginationParams.length > 0) {
       res.status(400).json({
