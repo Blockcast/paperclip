@@ -727,6 +727,92 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("BLO-43580: a nested assignment is not swallowed by the one before it", () => {
+    // Every binding is assembled at runtime: written out contiguously each one
+    // is the material the deployed guard refuses, so a literal would make this
+    // file unpushable. Same convention as the fixtures above.
+    const T = SYNTHETIC_OPAQUE_VALUE;
+    const bind = (name: string, value: string) => `${name}=${value}`;
+    const MARKER = redactionMarker("high-entropy-assignment");
+    const expectRedacted = (text: string) => {
+      const result = scrubGitHubEgressText(text);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(T);
+    };
+
+    it("redacts the token behind a gRPC method path and a `?`", () => {
+      // The measured case. The method path itself still passes (BLO-41153).
+      const text = `${bind("method", "/magma.orc8r.Bootstrapper/GetChallenge")}?${bind("key", T)}`;
+      const result = scrubGitHubEgressText(text);
+      expect(result.classes).toEqual(["high-entropy-assignment"]);
+      expect(result.text).toBe(`${bind("method", "/magma.orc8r.Bootstrapper/GetChallenge")}?${bind("key", MARKER)}`);
+    });
+
+    const JOINERS = ["?", "&", ",", ";", "(", ")", "{", "}", "|", "#"];
+    const filler = (name: string) => bind(name, "alpha");
+
+    it.each(JOINERS)("redacts a token in second position after %s", (j) => {
+      // Second of three: an out-of-alphabet joiner on BOTH sides of the token,
+      // so the capture has to stop at the trailing one too.
+      expectRedacted([filler("one"), bind("key", T), filler("two")].join(j));
+    });
+
+    it.each(JOINERS)("redacts a token in third position after %s", (j) => {
+      expectRedacted([filler("one"), filler("two"), bind("key", T), filler("three")].join(j));
+    });
+
+    it.each(JOINERS)("redacts a token in last position after %s", (j) => {
+      expectRedacted([filler("one"), filler("two"), bind("key", T)].join(j));
+    });
+
+    it("redacts a quoted token followed by junk before the closing quote", () => {
+      // The old `\2` backreference demanded the closing quote right after the
+      // value, so `"<token>?…"` matched neither arm and escaped.
+      expectRedacted(`${bind("token", `"${T}?x=1"`)}`);
+    });
+
+    it("redacts a token nested inside a quoted URL", () => {
+      expectRedacted(bind("href", `"/cb?${bind("key", T)}"`));
+    });
+
+    it("keeps both quotes around a quoted token, exactly once each", () => {
+      // The closing quote is no longer consumed, so the replacer must not
+      // re-append it.
+      expect(scrubGitHubEgressText(bind("token", `"${T}"`)).text).toBe(bind("token", `"${MARKER}"`));
+    });
+
+    // pnpm-lock.yaml writes `postgres@3.4.9(patch_hash=<26 base32>)`. It used to
+    // pass only because the trailing `)` failed the old greedy capture; the
+    // narrower capture exposed it and every dependency bump re-writing such a
+    // line became unpushable. Derived: base32 of an md5, as pnpm does.
+    const BASE32 = "abcdefghijklmnopqrstuvwxyz234567";
+    const md5 = createHash("md5").update("synthetic-patch").digest();
+    let bits = 0n;
+    for (const byte of md5) bits = (bits << 8n) | BigInt(byte);
+    const PATCH_HASH = Array.from({ length: 26 }, (_, i) =>
+      BASE32[Number((bits << 2n >> BigInt(125 - i * 5)) & 31n)],
+    ).join("");
+
+    it("passes a pnpm lockfile patch_hash through byte-exact", () => {
+      expect(PATCH_HASH).toMatch(/^[a-z2-7]{26}$/);
+      const text = `postgres@3.4.9(${bind("patch_hash", PATCH_HASH)})`;
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+    });
+
+    it("still refuses the same value under any other name", () => {
+      // Name half of the conjunction: the shape alone is a 130-bit token.
+      const result = scrubGitHubEgressText(`(${bind("access_hash", PATCH_HASH)})`);
+      expect(result.classes).toContain("high-entropy-assignment");
+    });
+
+    it("still refuses an opaque token bound to patch_hash", () => {
+      // Shape half: the name alone exonerates nothing.
+      expectRedacted(`(${bind("patch_hash", T)})`);
+    });
+  });
+
   describe("BLO-41262: locateGitHubEgressMatches names the line", () => {
     const token = SYNTHETIC_OPAQUE_VALUE;
 
