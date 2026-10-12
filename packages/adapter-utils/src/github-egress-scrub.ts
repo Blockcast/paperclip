@@ -186,11 +186,19 @@ const LEXICAL_SEGMENT_RE = /^(?:[A-Za-z]+|[0-9]+)$/;
  *  Prometheus scrape-job name already public on onprem-k8s master, made every
  *  agent push touching that file unpublishable. Bounded so it stays a word:
  *  must open with a letter, one digit run of at most 2, and an exonerated value
- *  may carry at most ONE such segment. A UUID stays opaque — `386c81e8` opens
- *  with a digit, `e454` has a 3-digit run. This is NOT a widening of
- *  LEXICAL_SEGMENT_RE: a random token mixes letters and digits repeatedly, and
- *  one mixed segment per value admits a few bits, not an opaque run. */
-const MIXED_LEXICAL_SEGMENT_RE = /^(?=.{2,8}$)[A-Za-z]+[0-9]{1,2}[A-Za-z]*$/;
+ *  may carry at most ONE such segment, written in a single case. A UUID stays
+ *  opaque — `386c81e8` opens with a digit, `e454` has a 3-digit run.
+ *
+ *  This DOES widen exoneration for random tokens, and the residual is measured,
+ *  not zero (Ally, review 5496550156). A random token often has all-but-one
+ *  segment letters-only, and this forgives exactly that one. Single case cuts
+ *  base64url-32 from ~70 to ~12 per 100k; fixed-layout keys are closed by the
+ *  uniform-length check in isLexicalIdentifier. What remains, through the whole
+ *  of isOpaqueSecretValue, 100k random values per shape: base64url-32 ~1e-4,
+ *  lower+digit with random separators ~3–5e-4 at 24–28 chars and ~2e-5 at 32,
+ *  fixed-layout 4×6 / 5×5 keys and base64url-43 0. Accepted: the alternative was refusing every agent
+ *  push touching a file that names an `orc8r` job. */
+const MIXED_LEXICAL_SEGMENT_RE = /^(?=.{2,8}$)(?:[a-z]+[0-9]{1,2}[a-z]*|[A-Z]+[0-9]{1,2}[A-Z]*)$/;
 
 /** Longest segment an identifier may carry and still be exonerated. This is
  *  identifier HEADROOM, not a security bound: 16 random lowercase letters is
@@ -234,7 +242,8 @@ const LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH = 3 * LEXICAL_LONG_SEGMENT_LENGTH;
  *
  * The discriminator is structure, not vocabulary (no word list to drift): a
  * credential is ONE opaque run, so a value is exonerated only when every
- * separator-delimited segment is itself a plain word or number, none exceeds
+ * separator-delimited segment is itself a plain word or number (BLO-44747: or,
+ * for at most one segment, MIXED_LEXICAL_SEGMENT_RE), none exceeds
  * LEXICAL_SEGMENT_MAX_LENGTH, at most one exceeds LEXICAL_LONG_SEGMENT_LENGTH,
  * AND the segments sum to at most LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH. Each
  * conjunct carries weight — `release-Candidate-<20 letters>` is refused on the
@@ -248,6 +257,8 @@ const LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH = 3 * LEXICAL_LONG_SEGMENT_LENGTH;
  * shape (Ally, review 5476147384): 0/20000 alnum-40, 1/20000 base64url-43 and
  * 1/20000 alnum-24 pass, and each of those passes is the entropy floor, not
  * this rule; re-measured with the summed-length cap in place, 0/20000 of each.
+ * Those figures predate the mixed-segment branch and hold for the all-plain
+ * path only; that branch's own residual is on MIXED_LEXICAL_SEGMENT_RE.
  * A UUID stays opaque, because `386c81e8` is neither a word nor a number.
  */
 function isLexicalIdentifier(value: string): boolean {
@@ -259,7 +270,12 @@ function isLexicalIdentifier(value: string): boolean {
   if (contentLength > LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH) return false;
   if (segments.some((s) => s.length > LEXICAL_SEGMENT_MAX_LENGTH)) return false;
   const nonPlain = segments.filter((s) => !LEXICAL_SEGMENT_RE.test(s));
-  return nonPlain.length === 0 || (nonPlain.length === 1 && MIXED_LEXICAL_SEGMENT_RE.test(nonPlain[0]!));
+  if (nonPlain.length === 0) return true;
+  if (nonPlain.length !== 1 || !MIXED_LEXICAL_SEGMENT_RE.test(nonPlain[0]!)) return false;
+  // Generated keys use a fixed layout (`xxxxxx-xxxxxx-xxxxxx-xxxxxx`); real
+  // identifiers are words of varying length. Without this, ~0.4% of random
+  // 4×6 lower+digit keys carry exactly one admissible mixed segment.
+  return new Set(segments.map((s) => s.length)).size > 1;
 }
 
 /** Character classes a value must draw from at least two of, before the entropy
