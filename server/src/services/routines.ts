@@ -227,7 +227,9 @@ function assertTimeZone(timeZone: string) {
 /**
  * The first UTC minute strictly after `after` whose wall clock in `timeZone`
  * matches the cron expression, or null when none falls within the five-year
- * search horizon. Throws `unprocessable` for an invalid timezone or cron.
+ * search horizon. Throws `unprocessable` for an invalid timezone or cron, and
+ * a RangeError for an invalid `after` or one outside the years
+ * `searchNextZonedCronTick` supports (no caller comes near them).
  *
  * BLO-32638: this used to step one UTC minute at a time, re-parsing the cron
  * and calling `Intl` on every step -- ~527,000 steps for a yearly cron. The

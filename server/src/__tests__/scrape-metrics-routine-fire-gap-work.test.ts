@@ -10,7 +10,7 @@
  * those triggers, and counts `Intl` `formatToParts` calls per tick. That is the
  * cost that used to scale with the number of minutes searched.
  */
-import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Every other refresh on the tick is a no-op here, so the count is the fire-gap
 // refresh's alone.
@@ -36,7 +36,7 @@ const {
 const { resetScrapeMetricsCollectorState, startScrapeMetricsCollector } = await import(
   "../services/scrape-metrics-collector.js"
 );
-const { resetRoutineFireGapsMemoForTests } = await import("../services/routines.js");
+const { deriveRoutineFireGapsMs, resetRoutineFireGapsMemoForTests } = await import("../services/routines.js");
 
 const DAY_SECONDS = 24 * 60 * 60;
 
@@ -90,6 +90,31 @@ const db = {
 // the production set.
 const MAX_FORMAT_TO_PARTS_PER_TRIGGER = 7 * 64;
 
+// Count with a plain counter, not vi.spyOn. A spy keeps every call's
+// arguments, and a regressed search makes millions of calls: a minute-stepper
+// mutant pushed the test worker past 23 GB. Past this cap the counter throws,
+// so a regression fails in seconds instead of running for minutes.
+const FORMAT_TO_PARTS_CALL_CAP = 4 * TRIGGERS.length * MAX_FORMAT_TO_PARTS_PER_TRIGGER;
+const realFormatToParts = Intl.DateTimeFormat.prototype.formatToParts;
+let formatToPartsCalls = 0;
+
+function countedFormatToParts(this: Intl.DateTimeFormat, date?: Date | number) {
+  formatToPartsCalls += 1;
+  if (formatToPartsCalls > FORMAT_TO_PARTS_CALL_CAP) {
+    throw new Error(`formatToParts was called more than ${FORMAT_TO_PARTS_CALL_CAP} times`);
+  }
+  return realFormatToParts.call(this, date);
+}
+
+// What deriving one trigger costs with nothing memoized, at the current time.
+// Clears the memo, so call it after the collector checks.
+function freshDerivationCost(cronExpression: string, timezone: string) {
+  resetRoutineFireGapsMemoForTests();
+  formatToPartsCalls = 0;
+  deriveRoutineFireGapsMs({ kind: "schedule", cronExpression, timezone }, new Date());
+  return formatToPartsCalls;
+}
+
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 async function scrape(metric: string) {
@@ -99,14 +124,13 @@ async function scrape(metric: string) {
 
 let stop: (() => void) | null = null;
 let fireTick: (() => void) | null = null;
-let formatToParts: MockInstance<Intl.DateTimeFormat["formatToParts"]>;
 
 async function tickAt(iso: string) {
   vi.setSystemTime(new Date(iso));
-  formatToParts.mockClear();
+  formatToPartsCalls = 0;
   fireTick!();
   await settle();
-  return formatToParts.mock.calls.length;
+  return formatToPartsCalls;
 }
 
 beforeEach(() => {
@@ -115,7 +139,8 @@ beforeEach(() => {
   resetScrapeMetricsCollectorState();
   resetRoutineFireGapsMemoForTests();
   __resetMetricsForTest();
-  formatToParts = vi.spyOn(Intl.DateTimeFormat.prototype, "formatToParts");
+  formatToPartsCalls = 0;
+  Intl.DateTimeFormat.prototype.formatToParts = countedFormatToParts;
   stop = startScrapeMetricsCollector(db, {
     setInterval: ((callback: () => void) => {
       fireTick = callback;
@@ -129,6 +154,7 @@ afterEach(() => {
   stop?.();
   stop = null;
   fireTick = null;
+  Intl.DateTimeFormat.prototype.formatToParts = realFormatToParts;
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -136,7 +162,7 @@ afterEach(() => {
 describe("scrape-metrics collector: routine-fire-gap refresh work per tick (BLO-32638)", () => {
   it("publishes every trigger's gauge on the boot tick with bounded Intl work", async () => {
     await settle();
-    const bootTick = formatToParts.mock.calls.length;
+    const bootTick = formatToPartsCalls;
 
     // The refresh really ran and published; a refresh that threw would also
     // make zero Intl calls.
@@ -150,24 +176,33 @@ describe("scrape-metrics collector: routine-fire-gap refresh work per tick (BLO-
     expect(intervals).toContain(`${ROUTINE_FIRE_INTERVAL_METRIC}{routine_id="routine-5"} ${4 * 60 * 60}`);
     expect(intervals).toContain(`${ROUTINE_FIRE_INTERVAL_METRIC}{routine_id="routine-7"} ${3 * DAY_SECONDS}`);
 
-    expect(bootTick).toBeGreaterThan(0);
-    expect(bootTick).toBeLessThanOrEqual(TRIGGERS.length * MAX_FORMAT_TO_PARTS_PER_TRIGGER);
+    // The boot tick derived each trigger once, and no single derivation is
+    // over the per-trigger bound.
+    const costs = TRIGGERS.map(([cron, timeZone]) => freshDerivationCost(cron, timeZone));
+    for (const [index, cost] of costs.entries()) {
+      expect(cost, TRIGGERS[index]!.join(" @ ")).toBeGreaterThan(0);
+      expect(cost, TRIGGERS[index]!.join(" @ ")).toBeLessThanOrEqual(MAX_FORMAT_TO_PARTS_PER_TRIGGER);
+    }
+    expect(bootTick).toBe(costs.reduce((sum, cost) => sum + cost, 0));
   });
 
   it("makes no Intl calls on a steady-state tick, and re-derives only the trigger whose tick passed", async () => {
     await settle();
-    expect(formatToParts.mock.calls.length).toBeGreaterThan(0);
+    expect(formatToPartsCalls).toBeGreaterThan(0);
 
     // 15 s later no trigger has fired, so every derivation comes from the memo.
     expect(await tickAt("2026-10-11T08:21:39Z")).toBe(0);
     expect(await tickAt("2026-10-11T08:21:54Z")).toBe(0);
 
-    // `37 */4 * * *` fired at 08:37. Only that trigger is re-derived.
+    // `37 */4 * * *` fired at 08:37. The tick costs exactly what deriving that
+    // trigger alone costs, so no other trigger was re-derived with it.
     const afterTick = await tickAt("2026-10-11T08:37:09Z");
-    expect(afterTick).toBeGreaterThan(0);
-    expect(afterTick).toBeLessThanOrEqual(MAX_FORMAT_TO_PARTS_PER_TRIGGER);
     expect(await scrape(`${ROUTINE_FIRE_GAP_METRICS_REFRESH_SUCCESS_METRIC} `)).toEqual([
       `${ROUTINE_FIRE_GAP_METRICS_REFRESH_SUCCESS_METRIC} 1`,
     ]);
+    const alone = freshDerivationCost("37 */4 * * *", "UTC");
+    expect(alone).toBeGreaterThan(0);
+    expect(alone).toBeLessThanOrEqual(MAX_FORMAT_TO_PARTS_PER_TRIGGER);
+    expect(afterTick).toBe(alone);
   });
 });

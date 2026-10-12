@@ -53,9 +53,9 @@ export const ZONED_CRON_SEARCH_HORIZON_MINUTES = 366 * 24 * 60 * 5;
  * - (A2) no two instants have offsets more than this far apart.
  *
  * Every IANA zone meets both by a wide margin. Offsets span -12:00 to +14:00
- * (26 h). In current tzdata the closest pair of transitions in any zone is
- * weeks apart (Ramadan suspensions in Africa/Casablanca and Asia/Gaza, about
- * a month).
+ * (26 h). In tzdata 2026c no zone has two transitions closer than 95 h
+ * (Africa/Freetown, 1939); since 2000 the closest pair is 167 h apart
+ * (America/Noronha, October 2000).
  *
  * Under those two, a jump whose first and last 30 h keep the cursor's offset
  * cannot pass a matching minute. In that stretch every minute's wall time lies
@@ -73,8 +73,20 @@ const TRANSITION_WINDOW_MS = 30 * HOUR_MS;
  */
 export const ZONED_CRON_SEARCH_MAX_STEPS = 512;
 
+/**
+ * The instants `searchNextZonedCronTick` accepts as `after`. Its calendar
+ * arithmetic runs on `Date`, so the whole five-year window, plus a day of
+ * offset and a month of look-ahead, must stay inside Date's range
+ * (+/-8.64e15 ms, years -271821 to 275760). Outside these bounds it throws a
+ * RangeError. Every caller passes `now`, a stored next-run time, or a tick
+ * derived from those, so none comes near them.
+ */
+export const ZONED_CRON_SEARCH_MIN_AFTER_MS = Date.UTC(-271820, 0, 1);
+export const ZONED_CRON_SEARCH_MAX_AFTER_MS = Date.UTC(275755, 0, 1);
+
 /** The zone's wall clock at one instant, in the shape the cron fields are matched against. */
 export interface ZonedMinuteParts {
+  /** As `Intl` prints it, with no era: wrong before year 1. The search derives the year from the instant instead. */
   year: number;
   month: number;
   day: number;
@@ -236,7 +248,8 @@ function nextWallMatch(mask: CronMask, fromWallMs: number, maxWallMs: number): n
   let minute = from.getUTCMinutes();
   for (;;) {
     const monthStart = wallMs(year, month, 1, 0, 0);
-    if (monthStart > maxWallMs) return null;
+    // Written so a NaN (a month past Date's range) also ends the loop.
+    if (!(monthStart <= maxWallMs)) return null;
     if (mask.month[month]) {
       const lastDay = daysInMonth(year, month);
       const firstWeekday = new Date(monthStart).getUTCDay();
@@ -271,6 +284,10 @@ function nextWallMatch(mask: CronMask, fromWallMs: number, maxWallMs: number): n
  * `partsAt` is a parameter, not a hard-wired `Intl` call, so tests can count
  * lookups and feed adversarial clocks. Production passes
  * {@link getZonedMinuteParts}.
+ *
+ * An invalid `after` throws the minute stepper's RangeError. A valid one
+ * outside {@link ZONED_CRON_SEARCH_MIN_AFTER_MS} to
+ * {@link ZONED_CRON_SEARCH_MAX_AFTER_MS} throws a RangeError too.
  */
 export function searchNextZonedCronTick(
   cron: ParsedCron,
@@ -287,12 +304,23 @@ export function searchNextZonedCronTick(
     }
     return parts;
   };
-  // `% 24`: an ICU that renders midnight as hour 24 (an h24 cycle) still
-  // dates it to the day that is starting, so treat it as hour 0 when deriving
-  // the offset. Matching keeps the raw value, as the minute stepper did.
-  const wallOf = (parts: ZonedMinuteParts) =>
-    wallMs(parts.year, parts.month, parts.day, parts.hour % 24, parts.minute);
-  const offsetAt = (ms: number) => wallOf(lookup(ms)) - ms;
+  // The offset is the wall clock read as UTC, minus the instant.
+  // - The wall clock's year comes from the instant, not from `Intl`. en-US
+  //   dates carry no era, so year 0 prints as "1" and year -1 as "2", which
+  //   would put the offset off by years. The wall date is within a day of the
+  //   UTC date, so its year differs only across New Year. (Matching never
+  //   reads the year, and the minute stepper never did.)
+  // - `% 24`: an ICU that renders midnight as hour 24 (an h24 cycle) still
+  //   dates it to the day that is starting, so treat it as hour 0 here.
+  //   Matching keeps the raw value, as the minute stepper did.
+  const offsetAt = (ms: number) => {
+    const parts = lookup(ms);
+    const utc = new Date(ms);
+    let year = utc.getUTCFullYear();
+    if (parts.month === 12 && utc.getUTCMonth() === 0) year -= 1;
+    else if (parts.month === 1 && utc.getUTCMonth() === 11) year += 1;
+    return wallMs(year, parts.month, parts.day, parts.hour % 24, parts.minute) - ms;
+  };
 
   // First instant at which `offsetAt` differs from `offset`, given that it
   // equals `offset` at `lo` and differs at `hi`.
@@ -330,6 +358,12 @@ export function searchNextZonedCronTick(
     lookup(startMs);
     return { tick: null, steps: 0, lookups: looked.size, exhausted: false };
   }
+  if (afterMs < ZONED_CRON_SEARCH_MIN_AFTER_MS || afterMs >= ZONED_CRON_SEARCH_MAX_AFTER_MS) {
+    throw new RangeError(
+      `cron next-tick search needs an instant from ${new Date(ZONED_CRON_SEARCH_MIN_AFTER_MS).toISOString()} `
+        + `to before ${new Date(ZONED_CRON_SEARCH_MAX_AFTER_MS).toISOString()}, got ${after.toISOString()}`,
+    );
+  }
   const endMs = startMs + ZONED_CRON_SEARCH_HORIZON_MINUTES * MINUTE_MS;
   // Any minute before endMs has a wall time below endMs + its offset, and real
   // offsets are under a day, so this bound covers every wall time that matters.
@@ -342,7 +376,7 @@ export function searchNextZonedCronTick(
     if (partsMatch(mask, parts)) {
       return { tick: new Date(cursor), steps: step, lookups: looked.size, exhausted: false };
     }
-    const offset = wallOf(parts) - cursor;
+    const offset = offsetAt(cursor);
     const nextWall = nextWallMatch(mask, cursor + offset + MINUTE_MS, maxWallMs);
     const target = nextWall === null ? endMs : Math.min(nextWall - offset, endMs);
     cursor = advance(cursor, offset, target);

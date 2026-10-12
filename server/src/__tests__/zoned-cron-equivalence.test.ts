@@ -8,7 +8,8 @@
  * short: start instants sit a few hours before each zone's DST transitions and
  * just before month and year ends, and ticks are chained a few times so daily
  * crons cross the transition. The yearly and monthly production crons get
- * hand-computed expected values here instead of a full oracle walk.
+ * hand-computed expected values here instead of a full oracle walk. Instants
+ * before year 1 and at the ends of the searchable range are covered too.
  *
  * PAPERCLIP_CRON_EQUIVALENCE_EXHAUSTIVE=1 adds a long run: every supported
  * time zone around its own 2026-2027 transitions, the multi-year walks
@@ -21,6 +22,7 @@ import {
   nextCronTickInTimeZone,
   resetRoutineFireGapsMemoForTests,
 } from "../services/routines.js";
+import { ZONED_CRON_SEARCH_MAX_AFTER_MS, ZONED_CRON_SEARCH_MIN_AFTER_MS } from "../services/zoned-cron.js";
 import { nextCronTickInTimeZone as legacyNextCronTickInTimeZone } from "./helpers/legacy-next-cron-tick-in-time-zone.js";
 
 const MINUTE_MS = 60_000;
@@ -193,6 +195,43 @@ describe("nextCronTickInTimeZone matches the minute stepper it replaced (BLO-326
       expect(legacy).not.toBe("no error");
       expect(thrown(() => nextCronTickInTimeZone(cron, timeZone, after))).toBe(legacy);
     }
+  });
+
+  // en-US Intl prints year 0 as "1" and year -1 as "2", with no era. The
+  // stepper never read the year; the search's offset arithmetic does, so it
+  // takes the year from the instant. These are fuzz counterexamples from
+  // before that fix, plus New Year crossings at the era boundary.
+  it("before year 1, where Intl prints years without an era", () => {
+    const mismatches = [
+      ...compareChain("0 12 * * *", "UTC", "-000100-06-15T00:00:00Z", 2),
+      ...compareChain("0 0 * * *", "UTC", "-000100-06-15T00:00:00Z", 2),
+      ...compareChain("0 12 * * 1", "UTC", "0000-06-15T00:00:00Z", 1),
+      ...compareChain("28,37,1-13,23 * * * 0/6,1.9", "Asia/Almaty", "-000003-10-26T17:35:00.001Z", 2),
+      ...compareChain("0 0 1 1 *", "Etc/GMT-14", "-000001-12-31T00:00:00Z", 1),
+      ...compareChain("0 0 1 1 *", "Etc/GMT+12", "0000-12-31T12:30:00Z", 1),
+    ];
+    expect(mismatches).toEqual([]);
+  });
+
+  it("throws a RangeError outside the searchable instants, and matches the stepper at their edges", () => {
+    // The last one used to loop forever: its five-year window ran past the
+    // largest Date, where the calendar arithmetic turns into NaN.
+    const outside = [
+      new Date(ZONED_CRON_SEARCH_MIN_AFTER_MS - 1),
+      new Date(ZONED_CRON_SEARCH_MAX_AFTER_MS),
+      new Date("+275760-09-12T00:00:00Z"),
+    ];
+    for (const after of outside) {
+      expect(() => nextCronTickInTimeZone("0 0 1 1 *", "UTC", after)).toThrow(RangeError);
+      expect(() => nextCronTickInTimeZone("* * * * *", "Pacific/Kiritimati", after)).toThrow(RangeError);
+    }
+    const mismatches = [
+      ...compareChain("*/7 * * * *", "Etc/GMT-14", new Date(ZONED_CRON_SEARCH_MIN_AFTER_MS).toISOString(), 3),
+      ...compareChain("*/7 * * * *", "Etc/GMT+12", new Date(ZONED_CRON_SEARCH_MIN_AFTER_MS).toISOString(), 3),
+      ...compareChain("*/7 * * * *", "Etc/GMT-14", new Date(ZONED_CRON_SEARCH_MAX_AFTER_MS - MINUTE_MS).toISOString(), 1),
+      ...compareChain("*/7 * * * *", "Etc/GMT+12", new Date(ZONED_CRON_SEARCH_MAX_AFTER_MS - MINUTE_MS).toISOString(), 1),
+    ];
+    expect(mismatches).toEqual([]);
   });
 });
 
