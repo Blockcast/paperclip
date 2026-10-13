@@ -118,8 +118,8 @@ jobs:
           tags: |
             type=sha,prefix=sha-,format=short
             type=raw,value=latest,enable={{is_default_branch}}
-            # Stable cache carrier refreshed by both master and tag builds.
-            type=raw,value=buildcache-inline
+            # Stable cache carrier refreshed by master builds.
+            type=raw,value=buildcache-inline,enable=${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
       - name: Build and push
         uses: docker/build-push-action@v7
@@ -138,6 +138,6 @@ jobs:
           # Refresh the primary Harbor cache inline with the image push instead
           # of blocking the release path on separate registry and GHA exports.
           # The old registry/GHA entries remain read-only migration fallbacks.
-          cache-to: type=inline
+          cache-to: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'type=inline' || '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

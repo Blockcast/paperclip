@@ -76,7 +76,7 @@ jobs:
             type=registry,ref=harbor.blockcast.net/paperclip-mcp-gateway/paperclip-mcp-gateway:buildcache-v6
             type=gha,scope=paperclip-mcp-gateway
           cache-to: |
-            type=registry,ref=harbor.blockcast.net/paperclip-mcp-gateway/paperclip-mcp-gateway:buildcache-v6,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
-            type=gha,scope=paperclip-mcp-gateway,mode=min,ignore-error=true
+            ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'type=registry,ref=harbor.blockcast.net/paperclip-mcp-gateway/paperclip-mcp-gateway:buildcache-v6,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true' || '' }}
+            ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'type=gha,scope=paperclip-mcp-gateway,mode=min,ignore-error=true' || '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
