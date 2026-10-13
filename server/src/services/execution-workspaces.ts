@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
@@ -1371,12 +1371,25 @@ export function executionWorkspaceService(db: Db) {
         // telling the operator there is "no active run". The source issue must be among
         // the rows read, so a hidden or missing source never counts as terminal.
         // Orphans (null `sourceIssueId`) still contend: nothing proves them finished.
+        // The terminal test is an uncapped count that includes hidden issues
+        // (BLO-45957): `linkedIssueRows` is capped at 20 and hides hidden rows, so
+        // a live 21st or hidden issue would otherwise read as abandoned.
         if (
           activeRun === null
           && candidate.sourceIssueId
           && linkedIssueRows.some((issue) => issue.id === candidate.sourceIssueId)
-          && linkedIssueRows.every((issue) => issue.status === "done" || issue.status === "cancelled")
-        ) continue;
+        ) {
+          const [{ live }] = await db
+            .select({ live: sql<number>`count(*)::int` })
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, input.companyId),
+              input.excludingSourceIssueId ? ne(issues.id, input.excludingSourceIssueId) : sql`true`,
+              or(eq(issues.executionWorkspaceId, candidate.id), eq(issues.id, candidate.sourceIssueId)),
+              notInArray(issues.status, ["done", "cancelled"]),
+            ));
+          if (live === 0) continue;
+        }
 
         const claimedIssue =
           linkedIssueRows.find((issue) => issue.id === candidate.sourceIssueId)
