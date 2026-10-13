@@ -1162,7 +1162,7 @@ export async function startServer(): Promise<StartedServer> {
   let schedulerLease: SchedulerLeaseHolder | null = null;
   /**
    * BLO-45212. Runs the one-shot recovery chain (crash reconciliation,
-   * external-run reattach, hot-restart adoption, full orphan reap, ...). Null
+   * external-run reattach, full orphan reap, ...). Null
    * when scheduling is suppressed for this instance. Called only by the process
    * that runs the gated loop — see the lease construction below for why.
    */
@@ -1357,6 +1357,29 @@ export async function startServer(): Promise<StartedServer> {
         "heartbeat scheduling suppressed for this runtime instance",
       );
     } else {
+      // BLO-45212: hot-restart adoption is process-local. It adopts the local
+      // child processes this process's predecessor left alive, judged by pids
+      // that only mean anything in this pod's namespace. So it runs at boot in
+      // every unsuppressed process, NOT on lease acquisition: a restarted
+      // follower must still adopt its own children, and a peer that wins the
+      // lease cannot adopt another pod's. Never rejects.
+      const hotRestartAdoption = (async () => {
+        try {
+          const hotRestart = await heartbeat.reconcileHotRestartAdoption();
+          if (hotRestart.mode === "reported") {
+            logger.info(
+              hotRestart,
+              "startup hot-restart adoption reconciliation complete",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup hot-restart adoption reconciliation failed - orphan reaper will serve as degraded backstop",
+          );
+        }
+      })();
+      trackHeartbeatSchedulerWork(hotRestartAdoption);
       runLeaderRecovery = () => {
         // Single-flight: a lease re-acquired while a previous recovery is still
         // running must not start a second one beside it.
@@ -1402,20 +1425,9 @@ export async function startServer(): Promise<StartedServer> {
             );
           }
 
-          try {
-            const hotRestart = await heartbeat.reconcileHotRestartAdoption();
-            if (hotRestart.mode === "reported") {
-              logger.info(
-                hotRestart,
-                "startup hot-restart adoption reconciliation complete",
-              );
-            }
-          } catch (err) {
-            logger.error(
-              { err },
-              "startup hot-restart adoption reconciliation failed - orphan reaper will serve as degraded backstop",
-            );
-          }
+          // Started at boot, not here; see `hotRestartAdoption` above. Awaited
+          // so the reap below still sees the runs this process adopted.
+          await hotRestartAdoption;
 
           for (let attempt = 1; attempt <= 2; attempt++) {
             try {
@@ -1769,10 +1781,13 @@ export async function startServer(): Promise<StartedServer> {
       // follower running it would write shared recovery rows beside a live
       // leader — and `resumeRunningExternalRuntimeRuns` would start driving
       // every live external run the leader is driving, since its "already
-      // mine" test is this process's in-memory set. On acquisition, because the
-      // periodic tick does NOT cover reattach or hot-restart adoption: a
-      // follower that takes over from a dead or restarting holder must run
-      // them, or that holder's in-flight runs are never adopted.
+      // mine" test is this process's in-memory set. On acquisition, because
+      // the periodic tick's reattach + 5-minute reap do not cover what a
+      // takeover needs at once: crash reconciliation and the threshold-0 reap
+      // of the dead holder's rows. (Hot-restart adoption is the exception and
+      // runs at boot — see `hotRestartAdoption`.) This also re-runs when the
+      // same process re-wins the lease after its own renewals lapsed; the
+      // reap's in-process guards keep that safe beside its own live runs.
       schedulerLease = schedulerLeaseHolder(db as any, {
         name: HEARTBEAT_TIMER_LEASE,
         ttlMs: SCHEDULER_LEASE_TTL_MS,

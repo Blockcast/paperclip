@@ -193,7 +193,9 @@ export function schedulerLeaseHolder(
     name: string;
     /**
      * Fired on every transition from not-holding to holding: the first
-     * acquisition and every failover takeover (BLO-45212). Synchronous and
+     * acquisition, every failover takeover, and this same process re-winning
+     * after its own renewals lapsed past the TTL (or a fail-open process
+     * first reaching the table) (BLO-45212). Synchronous and
      * fire-and-forget; a throw is logged and does not affect the lease.
      */
     onAcquire?: () => void;
