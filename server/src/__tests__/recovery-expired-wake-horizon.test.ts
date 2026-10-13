@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -1168,6 +1168,20 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
           // takes it back to 0, which is the discrepancy the announce has to correct for.
           attemptCount: 0,
           timeoutAt: pastHorizon,
+          // BOTH homes of the horizon, not just the column. `upsertSourceScoped` preserves
+          // the creation-anchored horizon across sweeps by reading
+          // `evidence.sourceScopedWakeHorizonAt` FIRST and writing it back into `timeoutAt`
+          // (`carriedWakeHorizonAt` / `wakeHorizonAt`). Backdating the column alone is
+          // silently undone by the next upsert, which restores the future horizon the first
+          // escalation minted — the row then is not exhausted, the dispatch never reaches the
+          // gate, and the test fails having exercised nothing.
+          //
+          // Merged in SQL rather than replaced, so the keys the first escalation wrote
+          // (`latestRunAgentId`, the routing anchors) survive and the fixture differs from a
+          // real row in exactly one field.
+          evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+            sourceScopedWakeHorizonAt: pastHorizon.toISOString(),
+          })}::jsonb`,
           // Stale it so `isUnchangedAction` is false and the upsert reserves.
           fingerprint: `stale:${seeded.sourceIssueId}`,
         })
@@ -1177,8 +1191,15 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
       await db.delete(issueComments).where(eq(issueComments.issueId, seeded.sourceIssueId));
       __resetMetricsForTest();
 
+      // Re-read: the first escalation transfers ownership and writes the issue, so the
+      // object captured above is stale by now.
+      const escalatedIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, seeded.sourceIssueId))
+        .then((rows) => rows[0]!);
       await recovery.escalateStrandedAssignedIssue({
-        issue,
+        issue: escalatedIssue,
         previousStatus: "in_progress",
         latestRun: { ...latestRun, agentId: seeded.ownerAgentId },
         comment: "Automatic continuation recovery failed.",
@@ -1199,22 +1220,38 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
         attemptCount: 0,
       });
 
-      // `never_delivered`, not `delivered`. Announcing the RESERVED count (1) instead of the
-      // refunded one (0) inverts this label, which is the mislabel PEN-3000 exists to catch.
+      // THE discriminator for the `Math.max(attemptCount - 1, 0)` adjustment. The announce is
+      // handed the REFUNDED count, so `neverDelivered` is true and the increment lands on
+      // `never_delivered`. Hand it the reserved count instead — which is what reverting that
+      // one expression does — and `attemptCount === 0` is false, the increment lands on
+      // `delivered`, and a never-woken action is labelled as woken. That is precisely the
+      // mislabel PEN-3000 exists to prevent, and this pair of assertions is what catches it:
+      // the second one matters as much as the first, because a single-series check passes
+      // against a revert that merely moves the count to the other label.
       const { body } = await renderMetrics();
       expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 1`);
       expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
 
+      // Exactly one notice, from two writers that share a marker. `escalateStrandedAssignedIssue`
+      // posts the identical `Recovery wake horizon reached for action ...` text inside the
+      // escalation transaction, which runs BEFORE this dispatch — so on this path the
+      // dispatch's own notice is always deduped away and its contribution is the METRIC
+      // above, not the comment. That is why the metric increment must stay ahead of the dedup
+      // check in `announceRecoveryHorizonRetirement`: behind it, writer 2 would contribute
+      // nothing at all on the only path it ever runs, which is the silence this row exists to
+      // end.
+      //
+      // The surviving notice's `- Attempts:` figure is therefore NOT assertable as the
+      // refunded count here — it is the escalation path's text, and that one renders the
+      // RESERVED count (`action.attemptCount`, pre-refund) against a row that reads 0. That
+      // discrepancy is real but pre-existing and belongs to the other writer; it is recorded
+      // on PEN-3989 rather than widened into this change.
       const comments = await db
         .select({ body: issueComments.body })
         .from(issueComments)
         .where(eq(issueComments.issueId, seeded.sourceIssueId));
       const horizonNotices = comments.filter((row) => row.body.includes("Recovery wake horizon reached"));
       expect(horizonNotices).toHaveLength(1);
-      // The rendered figure, not just the label — this is the half a reader acts on, and it
-      // must agree with the row. `Attempts: 1` here would contradict `attemptCount: 0` above.
-      expect(horizonNotices[0]!.body).toContain("- Attempts: 0 (budget 5)");
-      expect(horizonNotices[0]!.body).toContain("no wake reached the queue");
     });
 
     /**
@@ -1331,15 +1368,21 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
       const action = await readAction(actionId);
       expect(action).toMatchObject({ status: "active", retiringBound: null });
 
+      // THE assertion. Both series flat: the dispatch announced nothing, because the UPDATE
+      // it is reporting on matched no row. Before the fix, `retirementCommitted` meant only
+      // "did not throw", so this same state incremented `never_delivered` — one count, into
+      // the series PEN-3322's alert sums, for a retirement that never happened.
       const { body } = await renderMetrics();
       expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 0`);
       expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
 
-      const comments = await db
-        .select({ body: issueComments.body })
-        .from(issueComments)
-        .where(eq(issueComments.issueId, seeded.sourceIssueId));
-      expect(comments.filter((row) => row.body.includes("Recovery wake horizon reached"))).toHaveLength(0);
+      // Deliberately NOT asserting the absence of a horizon notice. The second consequence
+      // Ally named — a notice claiming a still-`active` row moved to `escalated` — is
+      // unreachable from this path in either direction, because `escalateStrandedAssignedIssue`
+      // posts the identical marker earlier in the same pass and wins the dedup. So the comment
+      // count is 1 whether the gate is fixed or broken, and asserting on it would be a check
+      // that cannot fail for the reason it names. The metric above is the one that
+      // discriminates.
     });
   });
 });
