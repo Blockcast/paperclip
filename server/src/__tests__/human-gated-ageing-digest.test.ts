@@ -685,6 +685,50 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     expect(await digestRow(companyId)).toHaveLength(0);
   });
 
+  // BLO-39642: `local-board` holds a real owner membership but nobody reads it.
+  it("never assigns the digest to the local-board sentinel, even as the oldest owner", async () => {
+    const { companyId } = await createCompany();
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "local-board",
+      status: "active",
+      membershipRole: "owner",
+      createdAt: daysAgo(400),
+    });
+    await insertHumanGatedIssue({ companyId, identifier: "HGD-30", createdAt: daysAgo(40) });
+
+    const created = await humanGatedDigestTick(db, { now: NOW, companyId });
+    expect(created.outcomes[0]?.action).toBe("created");
+    expect((await digestRow(companyId))[0]?.assigneeUserId).toBe(HUMAN_USER_ID);
+  });
+
+  it("does not let a reopened digest keep a local-board assignee", async () => {
+    const { companyId } = await createCompany();
+    await insertHumanGatedIssue({ companyId, identifier: "HGD-31", createdAt: daysAgo(40) });
+    await humanGatedDigestTick(db, { now: NOW, companyId });
+    const digestId = (await digestRow(companyId))[0]?.id;
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "local-board",
+      status: "active",
+      membershipRole: "owner",
+    });
+    await db
+      .update(issues)
+      .set({ status: "done", assigneeUserId: "local-board" })
+      .where(eq(issues.id, digestId!));
+
+    const reopened = await humanGatedDigestTick(db, {
+      now: NOW,
+      companyId,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    expect(reopened.outcomes[0]?.action).toBe("reopened");
+    expect((await digestRow(companyId))[0]?.assigneeUserId).toBe(HUMAN_USER_ID);
+  });
+
   // -- Reopen must apply the same active-owner test as first delivery ---------
 
   it("reassigns a reopened digest when its recorded owner is no longer active", async () => {
